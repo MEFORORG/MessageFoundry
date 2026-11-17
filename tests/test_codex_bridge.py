@@ -212,11 +212,18 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
             "Remove-Item -LiteralPath 'no-such-item-b4' -ErrorAction SilentlyContinue",
             "exit-1",
         ),
-        # A line continuation ending the hook must not swallow the bridge's own statement.
+        # A line continuation ending the hook must not swallow the bridge's own statement, and a
+        # dangling operator must stay a parse error rather than take it in.
         ("& '{py}' -c 'import sys; sys.exit(2)' `", "block"),
+        ("$deny =", "exit-1"),
+        ("Write-Output '{{}}' |", "exit-1"),
+        ("Write-Output '{{}}' ||", "exit-1"),
+        # A last statement that does not reset $? leaves an earlier native 2 to block.
+        ("& '{py}' -c 'import sys; sys.exit(2)'; if ($false) {{ exit 2 }}", "block"),
         ("if ($true) {{ return }}; exit 2", "allow"),
-        # After the bridge's head line, an empty param() fails to parse, but a non-empty one
-        # runs, with its default applied.
+        # After the bridge's head line, an empty param() fails to parse. A non-empty one parses
+        # as a call to a missing command named param, which leaves $? false; its parenthesised
+        # default is evaluated as an expression, so this body sees it and exits 0 by itself.
         ("param()\nexit 2", "exit-1"),
         (
             "param([string]$Mode = 'enforce')\nif ($Mode -eq 'enforce') {{ exit 0 }}; exit 2",
@@ -238,6 +245,10 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         "failed-cmdlet",
         "strict-mode-failed-cmdlet",
         "trailing-continuation",
+        "dangling-assignment",
+        "dangling-pipe",
+        "dangling-or",
+        "stale-2-then-untaken-if",
         "early-return",
         "empty-param",
         "non-empty-param",

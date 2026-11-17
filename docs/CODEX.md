@@ -34,8 +34,9 @@ that sets `"onFailure": "block"` when it fails: a non-zero exit, a timeout, a
 command that cannot start, a defect of its own such as an unsupported handler
 type or shell, or a defect in its group, such as a matcher that is not a valid
 regex, that keeps it from running. Any other hook failure is a
-non-blocking error. The bridge reports it on stderr and as a `systemMessage`,
-naming the hook, ignores that hook's output, and runs the remaining hooks. A JSON
+non-blocking error, except a command-only PowerShell hook that ends with a 2 in
+`$LASTEXITCODE`, as described below. The bridge reports it on stderr and as a
+`systemMessage`, naming the hook, ignores that hook's output, and runs the remaining hooks. A JSON
 `permissionDecision` deny from a hook is a decision, not a failure, and is passed
 on as before.
 
@@ -86,10 +87,10 @@ hook blocks by `exit 2`, as under Claude Code, whose hooks reference blocks a
 PowerShell hook with an explicit `exit 2`. The bridge runs it under
 `pwsh -Command`. That reports as 1 a 2 from a native program, or from a guard
 script the hook calls or dot-sources, when the hook's last statement runs it. So
-the bridge puts a statement after the hook: when the last statement failed and
-`$LASTEXITCODE` is 2, it exits 2. So a hook whose last statement fails while
-`$LASTEXITCODE` is 2, including a 2 left by an earlier native command, blocks.
-It does not reach
+the bridge puts a statement after the hook: a hook that ends with `$?` false
+while `$LASTEXITCODE` is 2, including a 2 left by an earlier native command,
+exits 2 and blocks. A last statement that does not reset `$?`, such as
+`if ($false) { ... }`, keeps it false. It does not reach
 a guard called inside a function or script block, or followed by `return` or
 `break`. The bridge
 puts one line before the hook, turning `$PSNativeCommandUseErrorActionPreference`

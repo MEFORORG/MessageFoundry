@@ -202,17 +202,19 @@ def git_bash() -> str | None:
 # A command-only PowerShell hook runs under pwsh -Command and blocks by `exit 2`, the way Claude
 # Code's hooks reference blocks a PowerShell hook. That reference does not say which flags Claude
 # Code passes, or how a native exit code propagates. Under -Command, a 2 from a native program or a
-# guard script that the hook's last statement runs is reported as 1, so the tail put after the hook
-# exits 2 when the last statement failed with $LASTEXITCODE at 2. So a hook whose last statement
-# fails while $LASTEXITCODE is 2, including a 2 left by an earlier native command, blocks.
-# Otherwise the tail exits 1 when the last statement failed, as -Command would. A blank line first ends a trailing
-# comment or line continuation, and Get-Variable keeps strict mode from faulting on an unset code.
-# The one line put before the hook keeps a native non-zero exit from throwing where a PowerShell
-# build defaults that preference on. A hook that opens with an empty param() then fails to parse,
-# so it exits 1 on every call, and under onFailure: block it blocks every call.
+# guard script that the hook's last statement runs is reported as 1. So the tail put after the
+# hook exits 2 when the hook ends with $? false and $LASTEXITCODE at 2, including a 2 left by an
+# earlier native command, and the hook blocks. A last statement that does not reset $?, such as
+# `if ($false) {...}`, keeps it false. Otherwise the tail exits 1 when $? is false, as -Command
+# would. The tail opens with a lone `;` on its own line: a trailing comment or line continuation
+# ends there, and a dangling operator stays a parse error, as it is without the tail. Get-Variable
+# keeps strict mode from faulting on an unset code. The one line put before the hook keeps a
+# native non-zero exit from throwing where a PowerShell build defaults that preference on. A hook
+# that opens with an empty param() then fails to parse, so it exits 1 on every call, and under
+# onFailure: block it blocks every call.
 POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false\n"
 POWERSHELL_TAIL = (
-    "\n\nif (-not $?) { if ((Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly"
+    "\n;\nif (-not $?) { if ((Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly"
     " -ErrorAction Ignore) -eq 2) { exit 2 }; exit 1 }"
 )
 
