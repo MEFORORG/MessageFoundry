@@ -1973,22 +1973,39 @@ def test_a_programming_error_reading_the_400_propagates(
         _verify_refusal("vault:v2:AAAA")
 
 
-def test_a_memory_error_making_the_unconfirmed_warning_keeps_the_label(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError])
+def test_a_fault_making_the_unconfirmed_warning_keeps_the_label(
+    fault: type[Exception], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #6707: a ``MemoryError`` raised while the unconfirmed warning's closures are made,
-    outside :func:`_warn_when_due`'s own guard, writes a fixed literal on stderr in place of the
-    warning, and the label, so the row's break, still stands."""
+    """BACKLOG #6707: a fault raised while the unconfirmed warning's closures are made, outside
+    :func:`_warn_when_due`'s own guard, writes a fixed literal on stderr in place of the warning,
+    and the label still stands."""
     from messagefoundry.store import crypto_transit
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def short(*_a: Any, **_kw: Any) -> Any:
+        raise fault
+
+    monkeypatch.setattr(crypto_transit, "_unconfirmed_warning", short)
+    refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
+    assert crypto_transit._WARNING_UNBUILT in capsys.readouterr().err
+
+
+def test_a_fault_inside_warn_when_due_is_not_reported_as_unbuilt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: only making the closures is caught beside :func:`_warn_when_due`, so a fault
+    that escapes the call itself is not written as the warning that could not be built."""
+    from messagefoundry.store import crypto_transit
 
     def short_of_memory(*_a: Any, **_kw: Any) -> None:
         raise MemoryError
 
     monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
-    refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
-    assert isinstance(refused, AuditKeyVersionUnverifiedError)
-    assert crypto_transit._WARNING_UNBUILT in capsys.readouterr().err
+    with pytest.raises(MemoryError):
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    assert crypto_transit._WARNING_UNBUILT not in capsys.readouterr().err
 
 
 def test_a_body_hvac_parsed_past_the_bound_is_not_read() -> None:

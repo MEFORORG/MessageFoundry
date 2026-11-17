@@ -149,8 +149,9 @@ _OVERSIZE_BODY = f"its body is past the {_REPARSED_BODY_MAX_CHARS}-character bou
 _NO_ERRORS_LIST = "it carries no errors list"
 _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
-#: The failures that, raised while a 400 is read, label it unconfirmed (BACKLOG #6707): a read
-#: short of memory or stack. Anything else the read raises propagates. No reply is known to cause
+#: The failures caught while a 400 is read, which then picks the unconfirmed label, and while that
+#: label's warning is made (BACKLOG #6707): a step short of memory or stack. Anything else the read
+#: raises propagates; :func:`_warn_quietly` says what can still escape. No reply is known to cause
 #: either: a body past :data:`_REPARSED_BODY_MAX_CHARS` is not read, and the parser,
 #: :func:`~messagefoundry.redaction.json_loads_or_refusal`, returns its ``RecursionError`` refusal
 #: rather than raising it.
@@ -352,9 +353,10 @@ def _report_unlogged(
     by the failure's class alone. The line is written at most once in
     :data:`_WARNING_LOG_INTERVAL_S` for each ``site``, step and failure class, a callable ``site``
     standing for its code, so a log path that fails on every read cannot flood stderr. When that
-    bookkeeping itself fails, :data:`_REPORT_UNTHROTTLED` is written, then the line. Never raises:
-    the text falls back to ``what`` alone when building it fails, and
-    :func:`~messagefoundry.logging_guard._last_resort` suppresses a failure of the write."""
+    bookkeeping itself fails, :data:`_REPORT_UNTHROTTLED` is written, then the line. The text falls
+    back to ``what`` alone when building it fails, and
+    :func:`~messagefoundry.logging_guard._last_resort` suppresses a failure of the write.
+    :func:`_warn_quietly` says what can still escape."""
     try:
         slot = ("unlogged", getattr(site, "__code__", site), what, type(fault))
         now = time.monotonic()
@@ -372,13 +374,16 @@ def _report_unlogged(
 
 
 def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = None) -> bool:
-    """``log.warning(*build())`` that never raises, and whether that call returned without raising
+    """``log.warning(*build())`` under a guard, and whether that call returned without raising
     (BACKLOG #6707); a handler that swallows its own write failure still counts as returned.
-    ``build`` is called inside the guard, so a fault building the message is caught too. The audit
-    verify path logs beside a verdict; a raise there would otherwise turn a row's break into a walk
-    that could not run. A failure is reported by :func:`_report_unlogged` under ``site``, by
-    default ``build``, so each call site is rate-limited apart. The record names the
-    caller ``stacklevel`` frames up."""
+    ``build`` is called inside the guard. A failure is reported by :func:`_report_unlogged` under
+    ``site``, by default ``build``, so each call site is rate-limited apart. The record names the
+    caller ``stacklevel`` frames up.
+
+    What the warning guards in this module and the store's ``_log_timeout_read_as_unverified``
+    hold, stated once here: at least, an exception the log calls raise at normal depth no longer
+    ends the audit walk or the row check that logs it. Out of memory or stack, an exception can
+    still escape, as it could before BACKLOG #6707."""
     where = build if site is None else site
     try:
         parts = build()
@@ -399,8 +404,9 @@ def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
     a later call tries it again. The slot is taken before the warning, so concurrent callers emit
     it at most once. When building or logging the warning fails, the slot is given back, to the
     time it held before or to empty, unless a later caller has taken it since; when giving it back
-    fails too, the slot stays taken for the interval. Never raises: a failure building the key, or in the slot's bookkeeping, is
-    reported by :func:`_report_unlogged` naming that step, and the warning is then not logged."""
+    fails too, the slot stays taken for the interval. A failure building the key, or in the slot's
+    bookkeeping, is reported by :func:`_report_unlogged` naming that step, and the warning is then
+    not logged. :func:`_warn_quietly` says what can still escape."""
     try:
         key = kind()
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
@@ -440,6 +446,25 @@ def _log_unread_decrypt_body(length: int) -> None:
             "plain error",
             length,
             _REPARSED_BODY_MAX_CHARS,
+        ),
+    )
+
+
+def _unconfirmed_warning(
+    audit_key: str, version: int, cause: str, raised: str
+) -> tuple[Callable[[], object], _WarningParts]:
+    """The :func:`_warn_when_due` key and text for an audit-MAC 400 labelled unconfirmed because
+    of ``cause`` (BACKLOG #6707); ``raised`` names the read's fault class, or is empty."""
+    return (
+        lambda: ("unconfirmed", audit_key, cause, raised),
+        lambda: (
+            "an audit MAC verify at key version %d got a 400 labelled unconfirmed, because %s%s "
+            "(key=%r); logged at most once in %d seconds for this key and this cause",
+            version,
+            cause,
+            " " + raised if raised else "",
+            audit_key,
+            _WARNING_LOG_INTERVAL_S,
         ),
     )
 
@@ -852,8 +877,9 @@ class TransitCipher(_UnmarkedPolicy):
         names, raises :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`);
         Transit refusing the version is one cause, not the only one. It raises the subclass
         :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` gives a
-        reason, for example for a proxy's page, or when reading the 400 raises one of
-        :data:`_READ_FAULTS` (BACKLOG #6707). Anything else that read raises propagates.
+        reason, for example for a proxy's page, or raises one of :data:`_READ_FAULTS` (BACKLOG
+        #6707). Anything else that read raises propagates. :func:`_warn_quietly` says what can
+        still escape.
 
         A 400 on which hvac raises something other than ``InvalidRequest`` raises neither of
         those, and is read as the next paragraph says (BACKLOG #6707). hvac 2.4.0 raises
@@ -915,9 +941,8 @@ class TransitCipher(_UnmarkedPolicy):
         handler. Blocking."""
         if self._refuses_only_version(exc, version):
             # The same flow, labelled apart (BACKLOG #6707). Reading the reply only picks the
-            # label, so a failure in _READ_FAULTS picks the unconfirmed one: escaping here, it
-            # would make the walk "could not run" and drop the row's break and its alert. Any
-            # other exception propagates.
+            # label, so a failure in _READ_FAULTS picks the unconfirmed one rather than ending the
+            # walk. Any other exception propagates. _warn_quietly says what can still escape.
             reason: str | None
             raised = ""  # the read's fault, by its class's existing name, so nothing is built
             try:
@@ -927,27 +952,14 @@ class TransitCipher(_UnmarkedPolicy):
             if reason is None:
                 return AuditKeyVersionRefusedError(version)
             unverified = AuditKeyVersionUnverifiedError(version)
-            cause = reason  # narrowed to str for the closures below
-            # The key and the text are built inside _warn_when_due's guard. Making its two
-            # closures allocates outside that guard, so a MemoryError there writes a fixed literal
-            # on stderr in place of the warning, and the row's break still returns. A
-            # RecursionError raised on entering the call, at the stack limit, is not caught here.
+            # Making the warning's closures runs outside _warn_when_due's guard, so a fault there
+            # writes a fixed literal on stderr in place of the warning. Only that step is caught.
             try:
-                _warn_when_due(
-                    lambda: ("unconfirmed", self._audit_key, cause, raised),
-                    lambda: (
-                        "an audit MAC verify at key version %d got a 400 labelled unconfirmed, "
-                        "because %s%s (key=%r); logged at most once in %d seconds for this key "
-                        "and this cause",
-                        version,
-                        cause,
-                        " " + raised if raised else "",
-                        self._audit_key,
-                        _WARNING_LOG_INTERVAL_S,
-                    ),
-                )
-            except MemoryError:
+                kind, build = _unconfirmed_warning(self._audit_key, version, reason, raised)
+            except _READ_FAULTS:
                 _last_resort(_WARNING_UNBUILT)
+            else:
+                _warn_when_due(kind, build)
             return unverified
         if self._is_outage(exc):
             return self._verify_failed(exc)
@@ -1066,7 +1078,7 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             answered = self._probe_mac()
         except Exception as probe_exc:  # the latest version fails too: not a version refusal
-            text = vault_failure_text(probe_exc)  # never raises; a str ties no frame to it
+            text = vault_failure_text(probe_exc)  # a str ties no frame to it
             _warn_quietly(
                 lambda: (
                     "an audit MAC verify at key version %d got HTTP 400, and the probe under the "
@@ -1111,7 +1123,7 @@ class TransitCipher(_UnmarkedPolicy):
                 return False
             valid = self._transit_verify(self._audit_key, _VERSION_PROBE_BYTES, mac)
         except Exception as probe_exc:  # the fixed input fails too: the service, not the row
-            text = vault_failure_text(probe_exc)  # never raises; a str ties no frame to it
+            text = vault_failure_text(probe_exc)  # a str ties no frame to it
             _warn_quietly(
                 lambda: (
                     "an audit MAC verify failed, and a verify over fixed input failed too "
