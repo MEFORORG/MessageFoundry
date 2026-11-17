@@ -1465,7 +1465,7 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
 
 #: The largest SQL Server pin file the engine accepts (BACKLOG #3714). A pin is one certificate,
 #: a few KiB. :func:`read_pinned_server_certificate` reads at most this plus one byte, and so do
-#: the trust-anchor checks (``AnchorSpec.max_bytes``). At store open the cap is judged on the size
+#: the pin's trust-anchor checks (``AnchorSpec.max_bytes``); the PostgreSQL CA has its own cap. At store open the cap is judged on the size
 #: on disk, then on the bytes those checks read. A reload judges it on those bytes, with an
 #: audited row (vault BACKLOG #3714); at start the store open refuses first. At least the expiry
 #: monitor and ``cert inventory`` read the file with no cap.
@@ -1510,6 +1510,9 @@ def pinned_server_certificate(data: bytes) -> x509.Certificate | str:
         return load_pinned_server_certificate(data)
     except PinRefused as exc:
         reason = f"is not a usable SQL Server pin: {exc}"
+    except MemoryError:
+        # Not a verdict on the file: the parse ran out of memory (vault BACKLOG #4203).
+        reason = "could not be loaded (out of memory)"
     except Exception as exc:  # cryptography's ValueError, DuplicateExtension and the like
         reason = f"is not a usable SQL Server pin: it is not a certificate ({type(exc).__name__})"
     return reason

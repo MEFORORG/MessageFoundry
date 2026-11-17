@@ -8184,18 +8184,19 @@ Those keep the old bytes until they are built again, and a reload writes a `chan
 
 **The SQL Server `[store].ssl_root_cert` pin is checked at the next start or reload too, but its
 change check reads its baseline from, and writes its rows to, the store that pin secures, so it
-cannot vouch for its own hop.** The `store_sqlserver_pin` item of the
+cannot vouch for its own hop.** Item 11 of the
 [trust anchors module](../messagefoundry/auth/trust_anchors.py) docstring says what a swapped pin
-can hide and which checks still refuse.
+can hide, which checks still refuse, and why a pin outside its validity period warns there
+rather than refusing.
 
 **The PostgreSQL `[store].ssl_root_cert` CA is checked in `serve` too, at least at start, reload and
 DR activation, but only after the store has opened with it** (vault BACKLOG #4203). It takes at least the permission, path and change
-checks, the private-key refusal and a refusal of a file larger than 1 MiB, not the SQL Server pin's certificate checks. Under `enforce`, a
+checks, the private-key refusal and a refusal of a file larger than 16 MiB, its own cap, not the SQL Server pin's certificate checks. Under `enforce`, a
 file or folder a broad principal can write, or one whose permissions the engine cannot read,
 refuses the start, the reload or the DR activation. The store runs none of these
 checks when it opens, so a start may already have trusted the file and sent the store login, and a
-command that opens the store without this check does not check the file at all. The same docstring
-item says what else the check does not cover.
+command that opens the store without this check does not check the file at all. Item 11 of
+the same docstring says what else the check does not cover.
 
 **What a reload's `restart_required` list covers (BACKLOG #3015).** An empty list in the reload
 response says that no settings anchor with a recorded load changed in the engine process that

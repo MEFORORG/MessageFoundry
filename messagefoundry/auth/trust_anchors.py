@@ -177,7 +177,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     through the alert sinks, the security notifier and the forwarder builder. That is a refactor
     of three modules for a drift no finding has shown. The read and unread tests pin each
     builder's conditions, not their agreement with the hop.
-11. **The SQL Server store pin** (vault BACKLOG #3714). ``[store].ssl_root_cert`` on SQL Server is
+11. **The store's own trust anchors: the SQL Server pin and the PostgreSQL CA** (vault BACKLOG
+    #3714, #4203). The PostgreSQL CA is the last paragraph of this item; the rest is the pin.
+    ``[store].ssl_root_cert`` on SQL Server is
     sent as the ODBC ``ServerCertificate`` pin, under ``Encrypt=strict``, so it is the store hop's
     only trust anchor. :func:`collect_anchor_specs` adds it under the label
     ``store_sqlserver_pin`` (:func:`store_pin_anchor_spec`), so it takes the audited checks of
@@ -239,24 +241,32 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     **A reload runs the anchor checks and the store's content checks.** It checks the ACL, a
     change and the path (items 1, 3 and 4; the spec has no pin), and refuses a file it cannot
     read. It then runs the store open's content checks, in the store's order and words
-    (:func:`_refuse_an_unusable_server_pin`, vault BACKLOG #3714): at least no encryption header
-    (BACKLOG #3090), no private-key label (BACKLOG #3745), one server certificate, inside its
-    validity period. So a pin past notAfter is refused at least at every real operator, held and
-    cluster-convergence reload and at DR activation until the file is replaced, and each
-    convergence retry writes a ``pem_refused`` row. It reads at most :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` and
+    (:func:`_refuse_an_unusable_server_pin`, vault BACKLOG #3714), and refuses at least an
+    encryption header (BACKLOG #3090), a private-key label (BACKLOG #3745), and anything but one
+    server certificate. It reads at most :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` and
     one byte more (``AnchorSpec.max_bytes``), and refuses a longer file as too large, in the store
     open's words, with a ``pem_refused`` row naming why, whose fingerprint covers only the bytes
     read. The store open refuses such a file from its size on disk first, with no row. At
     ``warn`` the start logs the pin's warning once: the preflight skips one the store open just
     logged (:data:`_WARNED_AT_OPEN`).
 
+    **A pin outside its validity period warns and does not refuse a settings check.** The store
+    open refuses a pin that has expired or is not yet valid. A settings check, at least an
+    operator, held or cluster-convergence reload or a DR activation, finds it only after the store
+    was opened with it, and the open store keeps connecting with it until a restart, so refusing
+    there would protect nothing and would block the reload or the failover. The check logs a
+    warning and writes ONE ``pin_outside_validity`` row, with the warning as its ``reason``, per
+    pin file content in each engine process (:data:`_VALIDITY_WARNED`, keyed on the
+    fingerprint, and kept only once the row is written), so a convergence retry writes no
+    further row, and the check goes on. Every other content check above still refuses.
+
     **The PostgreSQL ``ssl_root_cert``** (vault BACKLOG #4203) is a CA bundle the store loads by
     path at each new connection. :func:`collect_anchor_specs` adds it under the label
     ``store_postgres_ca`` (:func:`store_postgres_ca_anchor_spec`), so in ``serve`` it takes the
     audited checks of items 1 to 4 and the private-key refusal at start and at every real reload
-    (a dry-run reload runs no settings preflight), with no pin. It reads at most the pin's cap,
-    :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES`, and one byte more, and refuses a longer
-    file, with a ``pem_refused`` row, as the pin's check does. Unlike the SQL Server pin, the store
+    (a dry-run reload runs no settings preflight), with no pin. It reads at most its own cap,
+    :data:`POSTGRES_CA_MAX_BYTES` (16 MiB, not the pin's), and one byte more, and refuses a
+    longer file, with a ``pem_refused`` row. Unlike the SQL Server pin, the store
     runs none of these checks when it opens. At a
     start the store has already been opened with this file when this check runs, so its
     connections may have trusted the file and sent the store login. A command that opens the
@@ -351,7 +361,9 @@ log = logging.getLogger(__name__)
 #: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025; and,
 #: since BACKLOG #3745, a file naming a private-key label, which the TLS library would load, on
 #: every anchor; at least the other refusals of :func:`_refuse_by_path_content` write it too; its
-#: ``reason`` is the refusal's text, vault BACKLOG #4569), and
+#: ``reason`` is the refusal's text, vault BACKLOG #4569), ``pin_outside_validity`` (a SQL
+#: Server pin outside its validity period, a warning and not a refusal, written once per file
+#: content in each engine process; module item 11, vault BACKLOG #3714), and
 #: ``restart_required`` (a reload found a settings anchor whose bytes differ from the ones its
 #: consumer loaded, BACKLOG #2185).
 AUDIT_ACTION = "auth.trust_anchor"
@@ -360,8 +372,8 @@ AUDIT_ACTION = "auth.trust_anchor"
 class TrustAnchorError(Exception):
     """An operator-supplied trust anchor failed its integrity preflight: at least a configured
     SHA-256 pin mismatch, a file that holds no loadable PEM block or names a private-key label,
-    content its own checks refuse, such as an expired, multi-certificate or oversized SQL Server
-    pin, a file that cannot be read, or, under ``[security].enforcement = enforce``,
+    content its own checks refuse, such as a multi-certificate or oversized SQL Server pin, a
+    file that cannot be read, or, under ``[security].enforcement = enforce``,
     an ACL or path that lets another principal replace it or that could not be read. Raised at
     construction and at reload so the engine refuses a tampered/exposed anchor rather than silently
     trusting it.
@@ -461,7 +473,8 @@ class AnchorSpec:
 
     ``server_pin`` replaces a ``False`` spec's content checks with the SQL Server pin's, the ones
     the store runs at open (module item 11): at least the encryption-header and private-key
-    refusals, in the pin's own words, and one server certificate, inside its validity period. A
+    refusals, in the pin's own words, and one server certificate. A pin outside its validity
+    period is warned about with an audited row, not refused, as module item 11 says. A
     ``True`` spec never reaches those checks, so the two together are refused at construction,
     and so is ``server_pin`` with ``refuses_encryption_header``.
 
@@ -708,7 +721,7 @@ def _refuse_a_private_key(data: bytes, spec: AnchorSpec) -> None:
         )
 
 
-def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
+def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> str | None:
     """The content checks of an anchor its hop reads by path (``loads_verified_bytes`` False):
     the encryption-header refusal when ``spec`` asks for it (module item 12), then the private-key
     refusal (BACKLOG #3745), in the order the DATABASE build runs them. A server pin
@@ -716,10 +729,10 @@ def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
     (:func:`_refuse_an_unusable_server_pin`), which refuse an encryption header and a private key
     too, and a file longer than its own cap. Any other spec refuses a file longer than
     ``spec.max_bytes`` first.
-    The refusal names the setting and the path, never the content."""
+    The refusal names the setting and the path, never the content. The return value is a server
+    pin's validity warning, which is not a refusal (module item 11), or ``None``."""
     if spec.server_pin:
-        _refuse_an_unusable_server_pin(data, spec)
-        return
+        return _refuse_an_unusable_server_pin(data, spec)
     if spec.max_bytes is not None and len(data) > spec.max_bytes:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} is larger than {spec.max_bytes} "
@@ -733,25 +746,22 @@ def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
             "password on an encrypted block. Keep only the CA certificates here"
         )
     _refuse_a_private_key(data, spec)
+    return None
 
 
 #: The wall clock the server pin's validity check reads; a test replaces it.
 _clock: Callable[[], float] = time.time
 
 
-def _refuse_an_unusable_server_pin(data: bytes, spec: AnchorSpec) -> None:
-    """The SQL Server pin's certificate checks, which the store runs at each open, run here too so a
+def _refuse_an_unusable_server_pin(data: bytes, spec: AnchorSpec) -> str | None:
+    """The SQL Server pin's content checks, which the store runs at each open, run here too so a
     reload refuses what the next store open would (vault BACKLOG #3714): the bytes must pass
     :func:`~messagefoundry.pki.pinned_server_certificate`, which refuses at least an encryption
-    header, a private-key label and anything but one server certificate, and that certificate must
-    be inside its validity period now (:data:`_clock`). notAfter itself still counts as valid, as
-    the store's check reads it.
+    header, a private-key label, a file over its cap and anything but one server certificate.
 
-    So once the pin passes notAfter, every settings check is refused until the file is replaced:
-    at least a real operator, held and cluster-convergence reload and a DR activation, and each
-    convergence retry writes a ``pem_refused`` row. The open store keeps connecting until a
-    restart, which the store open refuses too. The certificate-expiry monitor, where it runs, watches this
-    file to warn before that date."""
+    The validity period is judged too, at :data:`_clock`, but a pin outside it is NOT refused
+    (module item 11): the return value is the warning, or ``None`` when the pin is inside it.
+    notAfter itself still counts as valid, as the store's check reads it."""
     from messagefoundry.pki import pinned_server_certificate  # lazy: pki loads cryptography
 
     cert = pinned_server_certificate(data)
@@ -760,17 +770,25 @@ def _refuse_an_unusable_server_pin(data: bytes, spec: AnchorSpec) -> None:
     moment = _clock()
     not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
     if moment > not_after.timestamp():
-        raise TrustAnchorError(
+        return (
             f"{spec.setting} {spec.path!r}: the pinned certificate expired at "
-            f"{log_timestamp(not_after)}. The driver does not check a pin's expiry with "
-            "Encrypt=strict, so the engine refuses it. Pin the server's renewed certificate."
+            f"{log_timestamp(not_after)}. The open store keeps connecting with it until a "
+            "restart, and the next store open refuses it. Pin the server's renewed certificate."
         )
     if moment < not_before.timestamp():
-        raise TrustAnchorError(
+        return (
             f"{spec.setting} {spec.path!r}: the pinned certificate is not valid until "
-            f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). The engine "
-            "refuses a pin outside its validity period."
+            f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). The open store "
+            "keeps connecting with it until a restart, and the next store open refuses it."
         )
+    return None
+
+
+#: The pin content each SQL Server pin's validity warning was last audited for, keyed by label and
+#: path, so a pin outside its validity period writes ONE ``pin_outside_validity`` row per file
+#: content (its fingerprint), and repeated settings checks, such as convergence retries, write no
+#: more (module item 11). An entry is dropped once the pin is back inside its validity period.
+_VALIDITY_WARNED: dict[tuple[str, str], str] = {}
 
 
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
@@ -2368,26 +2386,30 @@ def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
     )
 
 
+#: The largest PostgreSQL ``[store].ssl_root_cert`` CA bundle the settings check reads (vault
+#: BACKLOG #4203). Its own cap, not the SQL Server pin's: a pin is one certificate, but a CA
+#: bundle can be a whole public trust store, so this is generous on purpose. A longer file is refused by this check; the store itself loads the file by path, with
+#: no cap.
+POSTGRES_CA_MAX_BYTES = 16 << 20
+
+
 def store_postgres_ca_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
     """The PostgreSQL ``[store].ssl_root_cert`` CA bundle's anchor spec, or ``None`` when the store
     is another backend or names no file (vault BACKLOG #4203). The store loads it by path at each
     new connection, so the spec carries ``loads_verified_bytes=False`` and no pin.
 
-    Its read is capped at the SQL Server pin's cap, :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES`:
-    a CA bundle is a few certificates. The cap bounds only this check's own read; the store loads
-    the file by path, with no cap. Module item 11 says what the check does not cover."""
+    Its read is capped at :data:`POSTGRES_CA_MAX_BYTES`, which bounds only this check's own read.
+    Module item 11 says what the check does not cover."""
     from messagefoundry.config.settings import StoreBackend
 
     if store.backend is not StoreBackend.POSTGRES or not store.ssl_root_cert:
         return None
-    from messagefoundry.pki import PIN_FILE_MAX_BYTES  # lazy: pki loads cryptography
-
     return AnchorSpec(
         "store_postgres_ca",
         "[store].ssl_root_cert",
         store.ssl_root_cert,
         loads_verified_bytes=False,
-        max_bytes=PIN_FILE_MAX_BYTES,
+        max_bytes=POSTGRES_CA_MAX_BYTES,
     )
 
 
@@ -2552,8 +2574,11 @@ async def _audit_verdict(
     enforcing: bool,
     pin_escapes: bool,
     shape_error: TrustAnchorError | None,
+    validity: str | None = None,
 ) -> None:
     """The audit rows :func:`_preflight_one` writes for ``verdict``, before it enforces.
+    ``validity`` is a SQL Server pin's validity warning to write as a ``pin_outside_validity``
+    row, or ``None`` for no such row (module item 11).
 
     Each store call is tried on its own, so a failed read or row does not stop the violation
     rows after it. The first :class:`AnchorStoreUnavailable` is raised once all were tried."""
@@ -2624,6 +2649,8 @@ async def _audit_verdict(
         # The refusal's own text, which the start or reload raises too, so the row says which
         # content check refused the file (vault BACKLOG #4569).
         await record("pem_refused", fingerprint=verdict.fingerprint, reason=str(shape_error))
+    if validity is not None:
+        await record("pin_outside_validity", fingerprint=verdict.fingerprint, reason=validity)
     if faults:
         raise faults[0]
 
@@ -2658,7 +2685,8 @@ async def _preflight_one(
     for one, so refusing it here would refuse what the build accepts. It takes the private-key
     check (BACKLOG #3745), since no build needs a key in its CA file, a driver's CA takes the
     encryption-header check too, and the SQL Server pin its certificate checks
-    (:func:`_refuse_by_path_content`). Each reads the
+    (:func:`_refuse_by_path_content`), whose validity check warns and does not refuse (module
+    item 11). Each reads the
     bytes this preflight read; the hop reads the file again, so the gap the docs name for a swapped
     file holds for a key too.
 
@@ -2666,7 +2694,8 @@ async def _preflight_one(
     ``OSError`` or a ``ValueError`` from them, such as a missing file or a NUL in the path, is raised as a
     :class:`TrustAnchorError` that names the setting (:func:`_unreadable_anchor`), and so is a
     ``MemoryError`` that reaches it, with no row (vault BACKLOG #4203); the SQL Server pin's
-    certificate parse reports one as content it refuses, with its row. A store call that
+    certificate parse reports one as a pin that could not be loaded (out of memory), refused with
+    its ``pem_refused`` row. A store call that
     fails raises :class:`AnchorStoreUnavailable` instead, so a store fault no longer reads as a
     refused anchor. An anchor the verdict refuses is still refused as one when a store call fails,
     since the verdict is reached first.
@@ -2692,6 +2721,7 @@ async def _preflight_checks(
 ) -> str:
     """The body of :func:`_preflight_one`, whose docstring says what it checks."""
     shape_error: TrustAnchorError | None = None
+    validity: str | None = None  # a SQL Server pin outside its validity period (module item 11)
     try:
         if verdict is None:
             verdict = await asyncio.to_thread(evaluate_anchor, spec)
@@ -2701,9 +2731,11 @@ async def _preflight_checks(
             # A cafile= consumer takes only the private-key check (BACKLOG #3745), and a driver's
             # CA the encryption-header check (module item 12): the rest of the shape check would
             # refuse a TRUSTED CERTIFICATE block its build accepts.
-            check = anchor_cadata if spec.loads_verified_bytes else _refuse_by_path_content
             try:
-                await asyncio.to_thread(check, verdict.data, spec)
+                if spec.loads_verified_bytes:
+                    await asyncio.to_thread(anchor_cadata, verdict.data, spec)
+                else:
+                    validity = await asyncio.to_thread(_refuse_by_path_content, verdict.data, spec)
             except TrustAnchorError as exc:
                 shape_error = exc
     except (OSError, ValueError) as exc:
@@ -2717,6 +2749,15 @@ async def _preflight_checks(
         ) from exc
     # The item 6 escape, the one `_enforce_verdict` grants: a matching pin over the bytes loaded.
     pin_escapes = verdict.pin_ok is True and spec.loads_verified_bytes
+    # A pin outside its validity period is warned about, not refused, once per file content
+    # (_VALIDITY_WARNED), so retries write no further rows (module item 11).
+    warned_key = (spec.label, spec.path)
+    if validity is None:
+        _VALIDITY_WARNED.pop(warned_key, None)
+    elif _VALIDITY_WARNED.get(warned_key) == verdict.fingerprint:
+        validity = None
+    else:
+        log.warning("trust anchor %r: %s", spec.label, validity)
     store_fault: AnchorStoreUnavailable | None = None
     try:
         await _audit_verdict(
@@ -2726,12 +2767,16 @@ async def _preflight_checks(
             enforcing=enforcing,
             pin_escapes=pin_escapes,
             shape_error=shape_error,
+            validity=validity,
         )
     except AnchorStoreUnavailable as exc:
         # The verdict was reached before any store call. An anchor it refuses is refused as one
         # even when its audit row failed, so a substituted anchor never reads as a store outage.
         # Only an anchor that passes raises the store fault.
         store_fault = exc
+    else:
+        if validity is not None:  # remembered only once its row is written
+            _VALIDITY_WARNED[warned_key] = verdict.fingerprint
     # A store open that just logged this warning (_WARNED_AT_OPEN) is not repeated; the row is.
     warned = _WARNED_AT_OPEN.pop((spec.label, spec.path), None)
     quiet = warned is not None and warned == _warned_state(verdict)
