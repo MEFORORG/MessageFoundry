@@ -31,13 +31,14 @@
     reaches a certificate in LocalMachine\CA validates there without its root. A file is refused
     unless it holds a self-signed root and every other unexpired CA in it chains to a self-signed
     root through the file's own unexpired certificates. Each link's signature is verified, and its
-    issuer name must equal its signer's subject byte for byte, as the Windows chain engine requires:
-    names that differ only in string type or letter case do not link there, so a file linked only
-    by such names is refused. Not checked, at least: revocation, name constraints, path length and
+    issuer name must equal its signer's subject byte for byte, so a file linked only by names that
+    differ in string type or letter case is refused. Without key identifiers the Windows chain
+    engine does not link such names either; with them it can, so this check is stricter than
+    SChannel there and refuses some chains SChannel would build. Not checked, at least: revocation, name constraints, path length and
     extended key usage. Any self-signed CA in the file is installed in LocalMachine\Root, whether
     or not another certificate in the file chains to it. With -Confirm the operator may decline a
     root; then nothing is imported if an approved CA chains only through it, unless that root is
-    already in the machine's own LocalMachine\Root store.
+    already in the machine's own Root registry store (see Idempotent below).
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
@@ -64,7 +65,8 @@
     Run from an elevated (Administrator) PowerShell prompt; -WhatIf needs no elevation and changes
     nothing. Idempotent: a root already in the machine's own Root registry store, or any other CA
     already in its own CA or Root registry store, is named and left as it is. A copy seen only
-    through Group Policy or the enterprise store does not count, so that CA is added too. A root
+    through at least Group Policy, the enterprise store or AuthRoot does not count, so that CA is
+    added too, and a root declined under -Confirm counts as held only in that registry store. A root
     found only in the CA store is added to Root, since the CA store anchors nothing for SChannel.
 
 .PARAMETER CaPath
@@ -328,12 +330,12 @@ $SignatureHashes = @{
     '1.2.840.10045.4.3.3' = 'SHA384'; '1.2.840.10045.4.3.4' = 'SHA512'
 }
 
-# Whether two distinguished names are the same name as the Windows chain engine links them: equal
-# as raw DER bytes. A name spelt as a PrintableString in one certificate and a UTF8String in another,
-# or in another letter case, does not link there (X509Chain.Build stops at PartialChain), so it does
-# not link here either, and a file that relies on such a link is refused rather than imported as a
-# chain SChannel cannot build. It is only a filter for candidate issuers: the signature check in
-# Test-SignedBy decides.
+# Whether two distinguished names are the same name: equal as raw DER bytes. A name spelt as a
+# PrintableString in one certificate and a UTF8String in another, or in another letter case, does
+# not link here. Without key identifiers the Windows chain engine does not link it either
+# (X509Chain.Build stops at PartialChain); with matching key identifiers it can, so this refuses
+# some chains SChannel would build rather than accept one it could not. It is only a filter for
+# candidate issuers: the signature check in Test-SignedBy decides.
 function Test-SameName {
     param(
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X500DistinguishedName]$A,
@@ -485,7 +487,8 @@ function Get-CaRefusal {
 # Which of the machine's own registry stores already holds the certificate where it counts, as a key
 # of $stores, or $null. A root counts only in Root, since the CA store anchors nothing for SChannel;
 # any other CA counts in CA or in Root, where it is trusted at least as far. The logical store
-# X509Store reads also shows Group Policy and enterprise copies; those are not read here, so a CA
+# X509Store reads also shows at least Group Policy, enterprise and AuthRoot copies; those are not
+# read here, so a CA
 # held only there is added, and the import does not rest on that policy. $RegistryRoot is a
 # parameter only so a test can point it at a directory.
 function Get-PresentStoreName {

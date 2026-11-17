@@ -213,7 +213,8 @@ def extra(chain: dict[str, tuple[x509.Certificate, _Key]]) -> dict[str, x509.Cer
         .sign(enc_key, hashes.SHA256())
     )
     assert enc_root.subject.public_bytes() != enc_issuing.issuer.public_bytes()
-    # The same text in another letter case: the Windows chain engine does not link it either.
+    # The same text in another letter case. With no key identifiers, as here, the Windows chain
+    # engine does not link it either.
     case_key = ec.generate_private_key(ec.SECP256R1())
     case_root = build(
         x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic Case Root CA")]),
@@ -484,7 +485,7 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert chained("root_and_rekey") == {root: None, rekey: None}
     unchained = "it does not chain to a self-signed root in the file"
     # Names that differ only in string type or letter case do not link a CA to its root, as the
-    # Windows chain engine does not link them.
+    # Windows chain engine does not link them between certificates with no key identifiers.
     for name, root_key, issuing_key in (
         ("pem_encoded_names", "enc_root", "enc_issuing"),
         ("pem_case_names", "case_root", "case_issuing"),
@@ -683,8 +684,9 @@ def test_a_file_whose_only_root_has_expired_imports_nothing(files: dict[str, Pat
 def test_a_chain_whose_names_differ_only_in_encoding_or_case_is_refused(
     name: str, issuing: str, extra: dict[str, x509.Certificate], files: dict[str, Path]
 ) -> None:
-    # The Windows chain engine links an issuer only by the exact bytes of its name, so SChannel
-    # could not build this chain: the file is refused, not imported.
+    # These certificates carry no key identifiers, and without them the Windows chain engine links
+    # an issuer only by the exact bytes of its name, so SChannel could not build this chain: the
+    # file is refused, not imported.
     proc = _run_script(files[name])
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
