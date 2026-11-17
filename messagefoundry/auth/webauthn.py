@@ -189,10 +189,11 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
 def _invalid_response_errors() -> tuple[type[Exception], ...]:
     """:func:`_invalid_input_errors` plus ``RecursionError``, caught around the whole library verify
     call of each ceremony (vault BACKLOG #5341). The library's own ``json.loads`` raises it,
-    unwrapped, for a response nested too deep for the stack: its credential parsers catch only
-    ``JSONDecodeError``. Its message names stack use, not the input.
+    unwrapped, for JSON nested too deep for the stack: at least its credential parsers and its
+    ``clientDataJSON`` parser catch only ``JSONDecodeError``. Its message names stack use, not the
+    input. So the catch stays around the whole call, not one parse.
 
-    Only that JSON parse needs it: the library's CBOR decodes, the stored key's included, go
+    The stored key is not such a source: the library's CBOR decodes, the stored key's included, go
     through its ``parse_cbor``, which wraps every ``Exception`` as ``InvalidCBORData`` (read on
     webauthn 3.0.1). A caller that parses the body itself is not reached by this catch: the web
     console's two passkey JSON routes catch their own parse's ``RecursionError``."""

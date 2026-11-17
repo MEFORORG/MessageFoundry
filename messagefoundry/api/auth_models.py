@@ -325,8 +325,9 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    # The sign-in name rule (vault BACKLOG #5342): the name goes to the directory lookup, and the
-    # name the directory returns to the store, so a NUL is refused before either sees it.
+    # The sign-in name rule (vault BACKLOG #5342), on the typed name, which goes only to the
+    # directory lookup. The name the store receives is the one the directory returns, and this
+    # rule does not check that one.
     username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 

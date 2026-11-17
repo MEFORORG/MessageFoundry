@@ -12,6 +12,7 @@ that rides the same form. All data here is synthetic.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -71,25 +72,29 @@ def _spy_login(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> list[st
 
 @pytest.mark.parametrize("username", ["op\x00", "\x00", "o\x00p"])
 async def test_the_form_sign_in_refuses_a_nul_username_before_the_service(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, username: str
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, username: str
 ) -> None:
     """vault BACKLOG #5342, the form route. Red: the NUL reached ``AuthService.login``, where a
-    PostgreSQL store's lookup would raise an error the route does not catch."""
+    PostgreSQL store's lookup would raise an error the route does not catch. The service writes no
+    audit row for it, so the route logs the refusal, without the name."""
     service = await _service(engine)
     reached = _spy_login(service, monkeypatch)
     async with _client(engine, service) as c:
-        r = await c.post(
-            "/ui/login", data={"username": username, "password": PW}, headers=SAME_ORIGIN
-        )
+        with caplog.at_level(logging.WARNING, logger="messagefoundry_webconsole.routes.core"):
+            r = await c.post(
+                "/ui/login", data={"username": username, "password": PW}, headers=SAME_ORIGIN
+            )
     assert (r.status_code, r.headers["location"]) == (303, "/ui/login?e=bad")
     assert reached == []
+    [line] = [m for m in (rec.getMessage() for rec in caplog.records) if "held a NUL" in m]
+    assert "\x00" not in line
 
 
 async def test_the_combined_passkey_sign_in_refuses_a_nul_username_and_ends_its_challenge(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """vault BACKLOG #5342, the combined passkey sign-in, which rides the same form. Red: as above.
-    The refusal also clears the challenge cookie, as every other refused sign-in does."""
+    The refusal also clears the challenge cookie, as a refused sign-in after the service does."""
     pytest.importorskip("webauthn")
     service = await _service(engine)
     reached = _spy_login(service, monkeypatch)

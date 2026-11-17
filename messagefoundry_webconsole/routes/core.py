@@ -779,7 +779,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if "\x00" in username:
             # The JSON route's sign-in name rule, by hand since this form is not a pydantic model
             # (vault BACKLOG #5342; api/validation.py ``SIGN_IN_NAME_PATTERN`` says why). It covers
-            # the combined passkey sign-in too, which rides this form's username.
+            # the combined passkey sign-in too, which rides this form's username. The service never
+            # sees the name, so it writes no audit row; this line is the record. Never the name.
+            _log.warning(
+                "sign-in refused before the service: username held a NUL, client=%s", client
+            )
             return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,
         # the handle of its challenge the cookie the begin leg set; both or neither. Clamped, so an

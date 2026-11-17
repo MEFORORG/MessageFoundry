@@ -43,11 +43,15 @@ before the value reaches a database query, a filesystem path, a log line or a CS
 | Audit action filter | Printable text, no control characters, 1 to 128 characters | `action` on `GET /audit` and `GET /audit/export` |
 | Display label | Printable text, no control characters, 1 to 128 characters | `name` on `POST /search/presets` |
 | Filesystem path | Printable text, no control characters, 1 to 4096 characters | `config_dir` on `POST /config/reload`, and `archive` on `POST /dr/activate` |
-| Sign-in name | Any text except NUL; on the two API routes, also up to 256 characters | `username` on `POST /auth/login` and `POST /users/directory`, and the `username` field of the web console's `POST /ui/login` form, which checks only the NUL |
+| Sign-in name | Any text except NUL, up to 256 characters (1 to 256 on `POST /users/directory`) | `username` on `POST /auth/login` and `POST /users/directory` |
 | Layered preset ids | Resource ids joined by single commas with no spaces, up to 1024 characters in all | `presets` on `GET /search/layered` |
 
 The email-address row covers `recipient_override` only. The account email fields follow a different
 rule, set out under [Items checked a second time](#items-checked-a-second-time-behind-the-route).
+
+The web console's `POST /ui/login` form applies the sign-in name's NUL rule too, without its length
+bound. It is not a JSON route, so it refuses with its usual redirect to the sign-in page rather
+than a 422.
 
 "Printable text, no control characters" means every character except the C0 range, DEL, and the C1
 range. In practice: no NUL, no tab, no carriage return, no line feed.
