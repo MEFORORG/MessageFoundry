@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _totp_clock import pin_totp_clock
 
 from messagefoundry.auth import service as service_module
+from messagefoundry.auth import totp
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
@@ -46,11 +48,13 @@ from messagefoundry.store.store import (
     SessionRecord,
     UserRecord,
     UserRow,
+    _writer_guard,
     session_seal_ok,
     session_seal_ok_async,
     session_sealed_by_retired_key_async,
     user_seal_ok_async,
 )
+from tests._admin_account import ADMIN_USERNAME, login_admin
 
 
 def _raw(path: Path, sql: str, params: tuple[Any, ...]) -> None:
@@ -525,5 +529,53 @@ async def test_a_session_field_the_encoder_cannot_read_fails_its_seal(tmp_path: 
         wrongly_typed = replace(record, client=Decimal("1"))  # type: ignore[arg-type]
         assert not session_seal_ok(sealer, wrongly_typed)
         assert not await session_seal_ok_async(sealer, wrongly_typed)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("keyed", [False, True])
+async def test_a_recovery_code_cell_that_does_not_parse_is_charged_as_a_wrong_code(
+    tmp_path: Path, keyed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 1 of round 8b6500f2 on PR 3007: a wrong code against an account whose recovery-code
+    cell does not parse is charged to the second-step lockout, and the verify never raises. On a
+    keyed store the cell is written through the store's own sealing helper, so the record passes
+    its seal and only the parse fails."""
+    path = tmp_path / "codes-lockout.db"
+    cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
+    store = await MessageStore.open(path, cipher=cipher)
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        identity, token, password = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        activating = totp.totp(enroll.secret, now=t0)
+        assert (await service.confirm_mfa_enrollment(identity, activating, token=token)).ok
+        if keyed:
+            async with _writer_guard(store._db, store._lock):
+                written = await store._write_user(
+                    identity.user_id, lambda r: r.changed(totp_recovery_codes="{not json")
+                )
+                await store._commit()
+            assert written is not None
+        else:
+            _raw(
+                path,
+                "UPDATE users SET totp_recovery_codes=? WHERE id=?",
+                ("{not json", identity.user_id),
+            )
+        assert await service._load_user(identity.user_id) is not None  # the record still loads
+        out = await service.login(ADMIN_USERNAME, password)
+        assert out.ok and out.mfa_required and out.token is not None
+        wrong = "000000" if activating != "000000" else "111111"
+        first = await service.verify_mfa(out.token, wrong)
+        assert not first.ok
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.second_step_failed_attempts == 1
+        for _ in range(AuthSettings().lockout_threshold - 1):
+            assert not (await service.verify_mfa(out.token, wrong)).ok
+        locked = await store.get_user(identity.user_id)
+        assert locked is not None and locked.second_step_locked_until is not None
     finally:
         await store.close()

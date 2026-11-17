@@ -17794,7 +17794,13 @@ class AuthService:
         normalized = code.upper()  # recovery codes are minted uppercase
         # The hashes the account's seal covered, not a second read nobody checked (BACKLOG #2592).
         # Spending one below goes through the store's write helper, which checks the seal again.
-        real = user.recovery_code_hashes()
+        try:
+            real = user.recovery_code_hashes()
+        except RowSealError:
+            # BACKLOG #5505: a cell that does not parse holds no code the caller could match. The
+            # walk below runs over the padding alone, so a wrong code reaches the second-step
+            # lockout as any other does, and the verify still never raises. The decoder logged it.
+            real = []
         # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
         # first argon2id match, so the NUMBER of ~64 MiB verifications was a function of which code
         # was presented -- and, on the failure path, of how many codes REMAINED. Timing a single
