@@ -15,6 +15,7 @@ import argparse
 import inspect
 import re
 import sys
+import tracemalloc
 import types
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -349,6 +350,203 @@ def test_an_oidc_signing_key_path_is_not_a_secret_but_the_inline_key_is() -> Non
     assert path.listed == ()
     inline = _service(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=-----BEGIN PRIVATE KEY----- x"])
     assert inline.listed_directory_names == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
+    # A whole inline key whose header starts on its second line is still the inline key.
+    later = _service(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=\r\n-----BEGIN PRIVATE KEY-----\r\nx"])
+    assert later.listed_directory_names == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
+
+
+@pytest.mark.parametrize("brk", ["\r\n", "\n", "\r"])
+@pytest.mark.parametrize("key", KEY_CLASS_NAMES)
+def test_a_store_key_on_a_later_line_of_one_value_refuses(key: str, brk: str) -> None:
+    """Vault BACKLOG #5394: one ``REG_SZ`` value can hold several ``NAME=value`` lines. A store
+    key on a line after the first is read as its own variable, whatever breaks the lines."""
+    posture = _service([f"MEFOR_AI_ENVIRONMENT=prod{brk}{key}={_KEY_VALUE}{brk}"])
+    assert posture.listed_keys == (key,)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    # The refusal says the name is not the string's first, so the operator looks below it.
+    assert (
+        f"{key} (in Parameters\\AppEnvironmentExtra, line 2 of a string whose first line is "
+        "another entry)"
+    ) in refusal
+    assert _KEY_VALUE not in refusal
+
+
+def test_an_env_value_on_a_later_line_of_one_value_refuses() -> None:
+    posture = _service(["MEFOR_AI_ENVIRONMENT=prod\nMEFOR_VALUE_PARTNER_HOST="])
+    assert posture.listed_value_names == ("MEFOR_VALUE_PARTNER_HOST",)
+    assert posture.empty_value_names == ("MEFOR_VALUE_PARTNER_HOST",)
+    assert service_env_refusal(posture) is not None
+
+
+def test_a_later_line_of_key_material_is_never_read_as_a_name() -> None:
+    """A padded base64 line holds an equals sign. Read as ``NAME=value`` it would put key
+    material in ``listed``; only a name the refusal is about is read off a later line."""
+    posture = _service(
+        ["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\nMIIB==\n-----END"]
+    )
+    assert posture.listed == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
+
+
+@pytest.mark.parametrize("entry", ["MEFOR_VALUE_A\nX=1", "MEFOR_VALUE_\nFOO=1"])
+def test_a_whole_string_whose_name_holds_a_line_break_still_refuses(entry: str) -> None:
+    """NSSM may set the whole string as one variable, whose name then holds a line feed and
+    still starts ``MEFOR_VALUE_``, which the engine loads. ``main`` refused it, and so must this."""
+    assert service_env_refusal(_service([entry])) is not None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "MEFOR_AI_ENVIRONMENT=prod\nMEFOR_STORE_ENCRYPTION_KEY=\nabcdef",
+        "MEFOR_AI_ENVIRONMENT=prod\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=\n-----BEGIN x",
+    ],
+)
+def test_a_later_name_whose_value_starts_on_the_next_line_refuses(entry: str) -> None:
+    """A later line's name keeps the rest of the string as its value, as the first line's does."""
+    assert service_env_refusal(_service([entry])) is not None
+
+
+@pytest.mark.parametrize("name", DIRECTORY_CLASS_NAMES)
+def test_every_other_secret_class_name_on_a_later_line_refuses(name: str) -> None:
+    posture = _service([f"MEFOR_AI_ENVIRONMENT=prod\n{name}=-----BEGIN x"])
+    assert posture.listed_directory_names == (name,)
+
+
+def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
+    """NSSM may take the whole item as one variable, so a later line's MEFOR_SECRETS_DIRECTORY is
+    not evidence the service has one, and the refusal still says to add it."""
+    posture = _service(
+        ["MEFOR_AI_ENVIRONMENT=prod\nMEFOR_SECRETS_DIRECTORY=C:\\s\nMEFOR_VALUE_X=1"]
+    )
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
+
+
+def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None:
+    """``main`` stripped the name, so a blank first line moved the first name down. The secrets
+    directory below one is set, and the refusal must not tell the operator to add it."""
+    posture = _service(["\nMEFOR_SECRETS_DIRECTORY=C:\\s", "MEFOR_VALUE_X=1"])
+    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "set no MEFOR_SECRETS_DIRECTORY" not in refusal
+
+
+@pytest.mark.parametrize("key", KEY_CLASS_NAMES)
+def test_an_ordinary_name_windows_allows_ends_the_empty_value_above_it(key: str) -> None:
+    """A name such as ``ProgramFiles(x86)`` is an ordinary variable's line, so an empty later
+    ``KEY=`` above it stays empty and nothing refuses, as on ``main``."""
+    posture = _service([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\nProgramFiles(x86)=C:\\x"])
+    assert posture.listed_keys == ()
+    assert service_env_refusal(posture) is None
+
+
+def test_a_secret_class_line_below_an_ordinary_name_windows_allows_still_refuses() -> None:
+    """The control: the widened ordinary name does not hide a real secret-class line below it."""
+    key = KEY_CLASS_NAMES[0]
+    posture = _service([f"MEFOR_AI_ENVIRONMENT=prod\nProgramFiles(x86)=C:\\x\n{key}={_KEY_VALUE}"])
+    assert posture.listed_keys == (key,)
+    assert service_env_refusal(posture) is not None
+
+
+@pytest.mark.parametrize("key", KEY_CLASS_NAMES)
+def test_an_empty_store_key_above_another_variable_still_refuses(key: str) -> None:
+    """Vault BACKLOG #5394: an empty ``KEY=`` line, then another variable's line. The key is
+    empty under the line reading, but NSSM may set the whole string as one variable, and then the
+    key holds the line below it. ``main`` refused this, and so must this."""
+    posture = _service([f"{key}=\nMEFOR_AI_ENVIRONMENT=prod"])
+    assert posture.listed_keys == (key,)
+    assert service_env_refusal(posture) is not None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "MEFOR_STORE_PASSWORD=\nPass=word",
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=\nFOO=bar\n-----BEGIN PRIVATE KEY-----\nx",
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\oidc.pem\nMEFOR_AI_ENVIRONMENT=-----BEGIN x",
+    ],
+)
+def test_a_first_name_whose_whole_string_holds_a_secret_refuses(entry: str) -> None:
+    """A line that sets an ordinary variable ends the value above it only under the line reading.
+    Under the whole-string reading the first name holds every line below it, so a value that
+    reads empty, or a path, on its own line refuses when its string carries more."""
+    assert service_env_refusal(_service([entry])) is not None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "\nMEFOR_STORE_ENCRYPTION_KEY=\nOTHER=1",
+        "MEFOR_STORE_ENCRYPTION_KEY\n=abc",
+        "MEFOR_STORE_PASSWORD\r\n==",
+        "\nMEFOR_VALUE_A\nX=1",
+        "\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\k.pem\nX=-----BEGIN x",
+    ],
+)
+def test_every_string_main_refused_whole_still_refuses(entry: str) -> None:
+    """``main`` read each string whole: the stripped name before the first equals sign, and the
+    rest. A blank first line, or a line break before the equals sign, still names a secret-class
+    variable under that reading, so the line reading must not let it through."""
+    assert service_env_refusal(_service([entry])) is not None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "MEFOR_VALUE_A\nMEFOR_STORE_ENCRYPTION_KEY=",
+        "MEFOR_VALUE_A\nMEFOR_STORE_ENCRYPTION_KEY=   ",
+        "MEFOR_VALUE_A\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\k.pem",
+    ],
+)
+def test_a_broken_value_name_above_a_later_name_nothing_keeps_still_refuses(entry: str) -> None:
+    """The broken ``MEFOR_VALUE_A<LF>...`` name is dropped only when a later line sets a name the
+    refusal keeps. A later key that is empty, blank or a path is not one, so the whole-string
+    variable, which the engine loads, still refuses."""
+    posture = _service([entry])
+    assert posture.unplain_value_names == ("MEFOR_VALUE_A",)
+    assert service_env_refusal(posture) is not None
+
+
+def test_a_line_with_no_equals_sign_is_not_glued_onto_the_next() -> None:
+    posture = _service(["NOT A VARIABLE\nMEFOR_AI_ENVIRONMENT=prod"])
+    assert posture.listed == ()
+    glued = _service(["MEFOR_VALUE_A\nX=1"])
+    assert glued.listed_value_names == ("MEFOR_VALUE_A",)
+    assert glued.unplain_value_names == ("MEFOR_VALUE_A",)
+    assert service_env_refusal(glued) is not None
+
+
+def test_an_empty_env_value_above_another_line_is_still_empty() -> None:
+    posture = _service(["MEFOR_VALUE_A=\nMEFOR_VALUE_B=x"])
+    assert posture.listed_value_names == ("MEFOR_VALUE_A", "MEFOR_VALUE_B")
+    assert posture.empty_value_names == ("MEFOR_VALUE_A",)
+
+
+def test_a_first_line_with_no_equals_sign_is_not_counted_twice() -> None:
+    """``MEFOR_VALUE_A`` with no equals sign, then ``MEFOR_VALUE_B=1``: one variable under
+    either reading, so the refusal counts one."""
+    posture = _service(["MEFOR_VALUE_A\nMEFOR_VALUE_B=1"])
+    assert posture.listed_value_names == ("MEFOR_VALUE_B",)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "1 MEFOR_VALUE_* variable(s)" in refusal
+
+
+def test_a_long_multi_line_value_is_read_in_linear_memory() -> None:
+    """The head read the rest of the string again from every later line, about 160 MB for
+    4,000 lines. Each line is read once now."""
+    entry = "\n".join(f"MEFOR_VALUE_K{n}=synthetic-value-{n}" for n in range(4000))
+    tracemalloc.start()
+    try:
+        posture = _service([entry])
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(posture.listed_value_names) == 4000
+    assert peak < 16 * 1024 * 1024, f"peak {peak} bytes"
 
 
 def test_off_windows_the_host_reading_is_not_a_service() -> None:
