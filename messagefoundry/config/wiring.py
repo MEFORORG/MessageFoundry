@@ -2847,6 +2847,11 @@ def MLLP(
     each message its first read completes is recorded as ``ERROR``, then answered ``AR`` where the
     inbound replies in HL7, and the connection closes. ``docs/CONNECTIONS.md`` states which names count
     and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
+    # A blank tls_ca_file reads as unset, so it would turn the listener's client-certificate check,
+    # or the destination's private CA, off; a malformed pin, or one with no CA, would pass check.
+    # The same two checks every other TLS factory makes (BACKLOG #5329).
+    _check_tls_ca_file("MLLP", tls_ca_file)
+    _check_tls_ca_pin("MLLP", tls_ca_pin, tls_ca_file)
     if tls_client_subjects is not None:
         # The subjects check reads tls by truthiness, so 0 would be refused as "needs tls=True".
         # Only here: elsewhere inbound()/outbound() refuse it, naming the connection.
@@ -3328,6 +3333,10 @@ def Http(
     An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
     body, ``503``, ``413`` or ``422`` for a refused one); every knob above is inert without it, and setting one alone is
     refused rather than silently ignored."""
+    # A blank tls_ca_file reads as unset, so it would turn client-certificate verification off; a
+    # malformed pin, or one with no CA, would pass check (BACKLOG #5329).
+    _check_tls_ca_file("Http", tls_ca_file)
+    _check_tls_ca_pin("Http", tls_ca_pin, tls_ca_file)
     subjects = _intake_subjects_by_issuer(intake_client_subjects)
     settings: dict[str, Any] = {
         "port": port,
