@@ -33,8 +33,8 @@ All notable changes to MessageFoundry are documented here. The format follows
 - On Windows, a generic DATABASE file keyword is now also refused when a best-effort check finds
   its path leads to another host, or cannot finish reading the path; see the Generic ODBC section of
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
-- **A Direct outbound's `subject` is refused at load under the Email outbound's rule.** A
-  subject holding a C0 control character (TAB included), DEL, a Unicode line break, or an encoded
+- **A Direct outbound's `subject` is refused at load under the Email outbound's rule.** At
+  least a subject holding a C0 control character (TAB included), DEL, a Unicode line break, or an encoded
   word that decodes to one of those now fails `check` and start; before, a control the header
   writes raw would have gone out in the S/MIME `Subject`. See the `subject` rows in
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #5360`)
