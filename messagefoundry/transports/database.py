@@ -59,6 +59,7 @@ import re
 import sys
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -85,12 +86,14 @@ from messagefoundry.auth.trust_anchors import (
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import (
     DEFAULT_DB_CONNECT_TIMEOUT,
+    DEFAULT_DB_STATEMENT_TIMEOUT,
     ConnectorType,
     Destination,
     Source,
     bool_setting,
     check_db_connect_timeout,
     hop_attestation_from_settings,
+    whole_seconds,
 )
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
@@ -184,6 +187,9 @@ _TRANSIENT_STATES = frozenset({"HYT00", "HYT01"})
 # (:func:`_classify_db_error`). Class 28 is "invalid authorization specification"; class IM is the
 # ODBC driver manager's own; 01000 is how unixODBC reports a driver library it could not load.
 _CREDENTIAL_PREFIXES = ("28",)
+# BACKLOG #5748: SQLSTATE class 08 is "connection exception": the link failed, not the statement,
+# so the connection is discarded rather than lent again (:func:`_connection_lost`).
+_CONNECTION_LOST_PREFIXES = ("08",)
 _CONFIG_PREFIXES = ("IM",)
 _CONFIG_STATES = frozenset({"01000"})
 # BACKLOG #5714: nextset() states that end the walk rather than fail the write. IM001 and HYC00
@@ -2616,8 +2622,9 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
     :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
 
-    ``connecting`` says the error came from opening the connection, before the statement ran, so
-    no message can be at fault (BACKLOG #5713). There a refused login (class ``28``) is a
+    ``connecting`` says the error came from opening the connection, or from allocating the
+    statement's cursor on it, before the statement ran, so no message can be at fault (BACKLOG
+    #5713, #5749). There a refused login (class ``28``) is a
     ``credential_fault`` and a missing driver or DSN (class ``IM``, or unixODBC's ``01000``) a
     ``config_fault``, so the delivery worker stops the lane and keeps the queue (ADR 0095) rather
     than dead-letter every queued row on the same refusal. Any other permanent state there is
@@ -2680,6 +2687,30 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     if isinstance(state, str) and len(state) == 5 and state.isalnum():
         return state
     return _sqlstate(exc)
+
+
+def _connection_lost(exc: BaseException | None) -> bool:
+    """Whether ``exc``, or an exception in the chain a traceback would print under it, is a driver
+    error of SQLSTATE class 08, a connection exception (BACKLOG #5748).
+
+    Such a connection's handle is usually dead: a dropped link, a failover, a server that ended
+    the session. Returned to its pool, it would be lent again and fail the next poll, mark,
+    lookup or send the same way, until a restart. The chain is walked as ``traceback`` walks it,
+    ``__cause__`` first, then ``__context__`` unless suppressed, because every borrow site in this
+    module raises its own error ``from`` the driver's. A spurious match discards a live connection,
+    which costs one reconnect."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        state = _log_sqlstate(exc)
+        if state is not None and state[:2] in _CONNECTION_LOST_PREFIXES:
+            return True
+        exc = (
+            exc.__cause__
+            if exc.__cause__ is not None
+            else (None if exc.__suppress_context__ else exc.__context__)
+        )
+    return False
 
 
 #: Driver packages whose errors :func:`_raised_by_a_driver` counts though the package has no DB-API
@@ -2848,6 +2879,56 @@ def _login_timeout(s: Mapping[str, Any], label: str) -> int:
     ``DatabaseRef`` checks a literal value when it is declared; an ``env()`` value is checked here,
     at each sync, once resolved."""
     return check_db_connect_timeout(s.get("connect_timeout", DEFAULT_DB_CONNECT_TIMEOUT), label)
+
+
+#: The largest ``statement_timeout`` pyodbc's ``Connection.timeout`` takes on every platform.
+_MAX_STATEMENT_TIMEOUT = 2**31 - 1
+
+#: The generic driver families (:data:`~messagefoundry.transports.db_endpoint.GENERIC_DRIVER_FAMILIES`)
+#: an unset ``statement_timeout`` defaults to 30 on, because the driver is known to take pyodbc's
+#: ``Connection.timeout`` setter, which writes ``SQL_ATTR_CONNECTION_TIMEOUT`` (BACKLOG #5756).
+#:
+#: * ``msodbc``, Microsoft's ODBC Driver for SQL Server: the SQL Server store sets
+#:   ``[store].command_timeout`` through the same setter on the same driver
+#:   (``store/sqlserver.py``, ``SqlServerStore._statement_timeout``). That is a reading of this
+#:   repository's code, not a measurement of the driver.
+#:
+#: Not listed, so they default to ``0``: ``psqlodbc``, whose source is reported to refuse the
+#: attribute (``HYC00``), and ``mysql``, for which nothing here shows either way. A family is
+#: added only with evidence that its driver takes the setter.
+_TIMEOUT_DEFAULT_FAMILIES = frozenset({"msodbc"})
+
+
+def _statement_timeout(s: Mapping[str, Any], label: str) -> int:
+    """A DATABASE connection's ``statement_timeout`` setting, in whole seconds, ``0`` for no limit
+    (BACKLOG #5756). Parsed as :func:`check_db_connect_timeout` parses ``connect_timeout``: a bool
+    and a fractional number are refused, and the refusal names the setting, never the value.
+
+    :func:`_make_pool` records it on the pool and :func:`_acquire` applies it to every borrow, as
+    pyodbc's ``Connection.timeout``, the ODBC ``SQL_ATTR_QUERY_TIMEOUT`` of each cursor made on the
+    connection after it. A statement that runs past it fails with ``HYT00``, a transient error, so a
+    hung statement no longer holds its connection, its lane, its poll or a stop without bound.
+
+    **Unset, the default depends on the driver.** It is
+    :data:`~messagefoundry.config.models.DEFAULT_DB_STATEMENT_TIMEOUT` on the SQL Server preset
+    and on a generic connection whose ``odbc_driver`` is in :data:`_TIMEOUT_DEFAULT_FAMILIES`,
+    Microsoft's, and ``0``, no limit, on every other generic connection, psqlODBC and MySQL
+    among them. A value the operator sets is applied whatever the
+    driver, and a driver that refuses it fails the borrow as a ``config_fault``
+    (:func:`_apply_statement_timeout`)."""
+    value = s.get("statement_timeout")
+    if value is None:
+        if str(s.get("dialect", "sqlserver")).lower() != "generic":
+            return DEFAULT_DB_STATEMENT_TIMEOUT
+        family = generic_driver_family(s.get("odbc_driver"))
+        return DEFAULT_DB_STATEMENT_TIMEOUT if family in _TIMEOUT_DEFAULT_FAMILIES else 0
+    return whole_seconds(
+        value,
+        f"{label} statement_timeout must be a whole number of seconds, 0 for no limit, at most "
+        f"{_MAX_STATEMENT_TIMEOUT} (value withheld)",
+        minimum=0,
+        maximum=_MAX_STATEMENT_TIMEOUT,
+    )
 
 
 class AutocommitNotConfirmed(RuntimeError):
@@ -3310,17 +3391,164 @@ async def _make_pool(dsn: str, pool_max: int, *, autocommit: bool, login_timeout
     autocommit. It comes back only where the driver manager pools by its own configuration
     (unixODBC's ``Pooling = Yes`` in ``odbcinst.ini``), which the engine cannot switch off. The
     mechanism was never reproduced, and the set holds whichever way that falls. A manual-commit pool
-    is returned unwrapped: pyodbc sets autocommit OFF itself, explicitly."""
+    is returned unwrapped: pyodbc sets autocommit OFF itself, explicitly.
+
+    **Each pool runs its driver calls on its own executor (BACKLOG #5756),** sized as the SQL
+    Server store sizes its own (``store/sqlserver.py::_build_pool_executor`` says why), so a hung
+    statement holds a thread of its own pool, never one of the event loop's default executor that
+    every other connector, build and ``to_thread`` hop shares. The executor is shut down once a
+    close of the pool has ended (:func:`_pool_closing`), or when the pool is collected unclosed.
+    A caller with a ``statement_timeout`` records it with :func:`_bound_statements`."""
     aioodbc = _import_aioodbc()
     disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
-    pool = await aioodbc.create_pool(
-        dsn=dsn,
-        minsize=1,
-        maxsize=max(1, pool_max),
-        autocommit=autocommit,
-        timeout=login_timeout,
-    )
+    size = max(1, pool_max)
+    executor = ThreadPoolExecutor(max_workers=size + 4, thread_name_prefix="mefor-database")
+    try:
+        pool = await aioodbc.create_pool(
+            dsn=dsn,
+            minsize=1,
+            maxsize=size,
+            autocommit=autocommit,
+            timeout=login_timeout,
+            executor=executor,
+        )
+    except BaseException:
+        # Nothing holds the executor if the pool never came up (a refused login, a cancel).
+        executor.shutdown(wait=False)
+        raise
+    _register_executor(pool, executor)
     return _AutocommitPool(pool) if autocommit else pool
+
+
+#: Each pool's executor, and the statement timeout its borrows carry (BACKLOG #5756). Keyed by the
+#: aioodbc pool itself (:func:`_pool_key`), as :data:`_HELD_BACK` is, and weak, so a pool nothing
+#: else holds drops out.
+_POOL_EXECUTORS: weakref.WeakKeyDictionary[Any, ThreadPoolExecutor] = weakref.WeakKeyDictionary()
+_STATEMENT_TIMEOUTS: weakref.WeakKeyDictionary[Any, int] = weakref.WeakKeyDictionary()
+
+
+def _register_executor(pool: Any, executor: ThreadPoolExecutor) -> None:
+    """Record ``pool``'s executor, and shut it down if the pool is collected before a close of it
+    retired the executor (:func:`_retire_executor`)."""
+    try:
+        _POOL_EXECUTORS[pool] = executor
+    except TypeError:
+        logger.warning("DATABASE: a pool's executor could not be tracked; it shuts down at exit")
+        return
+    weakref.finalize(pool, executor.shutdown, wait=False)
+
+
+def _bound_statements(pool: Any, seconds: int) -> Any:
+    """Record ``seconds`` (:func:`_statement_timeout`) as the statement timeout every borrow from
+    ``pool`` carries (:func:`_apply_statement_timeout`), and return ``pool``. A pool site with no
+    such setting, the reference-set sync's, does not call it, and its borrows carry none."""
+    try:
+        _STATEMENT_TIMEOUTS[_pool_key(pool)] = seconds
+    except TypeError:
+        logger.warning(
+            "DATABASE: a pool could not be tracked, so its statement_timeout is not applied"
+        )
+    return pool
+
+
+def _tracked[T](table: weakref.WeakKeyDictionary[Any, T], pool: Any) -> T | None:
+    try:
+        return table.get(_pool_key(pool))
+    except TypeError:
+        return None
+
+
+async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
+    """Set ``pool``'s statement timeout on a connection just borrowed from it (BACKLOG #5756).
+
+    pyodbc's ``Connection.timeout`` is set on each cursor as it is made, as the ODBC query timeout.
+    aioodbc exposes it read-only, so it is set on the pyodbc connection (``_conn``), on the loop
+    with no call running on a connection just lent, as the SQL Server store sets
+    ``[store].command_timeout``. pyodbc's setter also hands the value to the driver as a
+    connection attribute, so the write is skipped when the connection already holds the value: a
+    connection lent before, and ``0`` on a fresh one.
+
+    **A driver that refuses the value fails the borrow closed.** The connection goes back to
+    ``pool`` first, since no call ran on it, and a ``config_fault`` naming the setting is raised,
+    so the lane stops rather than running with a bound the operator believes is set.
+
+    **A transient driver state from the setter, class 08 or ``HYT00`` among them, is the
+    connection's failure, not a refusal.** It is classified as a connect failure is
+    (:func:`_classify_db_error`), and the connection is discarded, not lent again. A read of the
+    current value that raises, as pyodbc does on a closed handle, discards the connection and
+    retries too, so the pool slot is never left held.
+
+    A connection with no driver handle to write to is left to the call gate, which refuses it,
+    and a driver connection with no ``timeout`` at all, not pyodbc's shape, is used as is, with
+    one warning per pool."""
+    seconds = _tracked(_STATEMENT_TIMEOUTS, pool)
+    raw = getattr(conn, "_conn", None)
+    if seconds is None or raw is None:
+        return
+    try:
+        current = getattr(raw, "timeout", None)
+    except Exception as exc:  # noqa: BLE001 - a driver's own error class too; re-raised classified
+        if not _raised_by_a_driver(exc):
+            # A bug is not misread as a transport failure: the connection goes back, since no
+            # call ran on it, and the exception propagates unchanged, as _cursor_refused's does.
+            await _return_to_pool(pool, conn)
+            raise
+        await _close_and_release(pool, conn, None, discard=True)
+        raise DeliveryError(
+            f"DATABASE connection unusable reading its statement timeout: {_safe_db_error(exc)}"
+        ) from exc
+    if current is None:
+        if seconds:  # a pool that asked for no limit loses nothing here
+            _warn_no_driver_timeout(pool)
+        return
+    if current == seconds:
+        return
+    try:
+        raw.timeout = seconds
+    except Exception as exc:  # noqa: BLE001 - a driver's own error class too; re-raised classified
+        state = _log_sqlstate(exc)
+        if state is not None and _is_transient(state):
+            await _close_and_release(pool, conn, None, discard=True)
+            raise _classify_db_error(state, str(exc), connecting=True) from exc
+        await _return_to_pool(pool, conn)
+        raise NegativeAckError(
+            "database driver refused statement_timeout"
+            + (f" [{state}]" if state else f" ({type(exc).__name__})")
+            + "; set statement_timeout = 0 on this connection if it cannot take one",
+            code=state or "db",
+            permanent=True,
+            config_fault=True,
+        ) from exc
+
+
+#: Pools already warned that their driver connection has no ``timeout`` (BACKLOG #5756), so the
+#: warning is logged once per pool, not on every borrow.
+_NO_DRIVER_TIMEOUT_WARNED: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+
+
+def _warn_no_driver_timeout(pool: Any) -> None:
+    try:
+        key = _pool_key(pool)
+        if _NO_DRIVER_TIMEOUT_WARNED.get(key):
+            return
+        _NO_DRIVER_TIMEOUT_WARNED[key] = True
+    except TypeError:
+        pass  # an untrackable pool warns on each borrow rather than never
+    logger.warning(
+        "DATABASE: a pooled connection has no driver timeout to set, so its statements run "
+        "with no statement_timeout"
+    )
+
+
+def _retire_executor(pool: Any, closing: asyncio.Future[None]) -> None:
+    """Shut ``pool``'s executor down once a close of it has ended (BACKLOG #5756). A close that
+    failed or was cancelled is retried, and its connections may still need the executor, so the
+    executor is kept for that retry."""
+    if closing.cancelled() or closing.exception() is not None:
+        return
+    executor = _tracked(_POOL_EXECUTORS, pool)
+    if executor is not None:
+        executor.shutdown(wait=False)
 
 
 # WP-L3-07 (ASVS 13.1.2/13.2.6): bound a pooled-connection borrow. One delivery/poll worker per
@@ -3339,7 +3567,8 @@ async def _acquire(pool: Any, timeout: float) -> Any:
     The connection comes back with the call gate installed (BACKLOG #2394), so a cancelled call
     cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded. A
     real aioodbc connection the gate cannot wrap is refused and discarded instead, before any call
-    runs on it (:func:`_require_gate_or_discard`)."""
+    runs on it (:func:`_require_gate_or_discard`). It also carries the pool's statement timeout
+    (:func:`_apply_statement_timeout`, BACKLOG #5756)."""
     try:
         conn = await asyncio.wait_for(pool.acquire(), timeout)
     except TimeoutError as exc:
@@ -3347,6 +3576,7 @@ async def _acquire(pool: Any, timeout: float) -> Any:
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
     await _require_gate_or_discard(pool, conn)
+    await _apply_statement_timeout(pool, conn)
     return conn
 
 
@@ -3455,8 +3685,10 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     through the caller (:func:`_unwinding_a_cancel`, BACKLOG #5004), the return is handed to
     :func:`_return_when_settled` at once. Until the running call returns,
     the connection keeps its pool slot, and counts as held back, so a close of the pool stops
-    waiting for it at a bound (:func:`_close_pool_bounded`). Nothing in the engine bounds that time,
-    because this connector sets no statement timeout (ADR 0159, amendment of 2026-10-30).
+    waiting for it at a bound (:func:`_close_pool_bounded`). The connection's
+    ``statement_timeout`` bounds that time, unless it is ``0`` or the pool set none, as a
+    ``DatabaseRef`` sync's does not (BACKLOG #5756; ADR 0159, amendment of 2026-10-30, recorded the
+    connector before it had one).
 
     **The cancel paths the gate itself closes (BACKLOG #2394).** A cancellation during
     ``conn.cursor()`` reaches this function with no cursor. On a gated connection the rollback
@@ -3484,8 +3716,20 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     and the next borrower's commit would commit it. The handle is dropped here, before any await,
     so no path below can lend the connection again; the job that closes the cursor then closes the
     handle, and the pool gets the connection back closed (:func:`_release`). Where the executor is
-    shut down, no job runs, and the handle is left for pyodbc to close when it is collected."""
+    shut down, no job runs, and the handle is left for pyodbc to close when it is collected.
+
+    **A connection-class failure discards the connection too (BACKLOG #5748).** When the exception
+    in flight through the caller's ``finally`` carries SQLSTATE class 08 (:func:`_connection_lost`),
+    the handle is presumed dead, so it is closed rather than lent to the next borrower. A caller
+    that has already handled its exception, as the login role probe does, passes ``discard``
+    itself."""
     cancelled = _unwinding_a_cancel()
+    if not discard and not cancelled and _connection_lost(sys.exc_info()[1]):
+        discard = True
+        logger.warning(
+            "DATABASE: a connection failure (SQLSTATE class 08) discards the connection rather "
+            "than returning it to its pool"
+        )
     gate = call_gate(conn)
     hand_to_gate = cancelled and gate is not None
     if cancelled and gate is None and getattr(conn, "_conn", None) is not None:
@@ -3619,7 +3863,8 @@ def _close_dropped(raw: Any) -> None:
     before it disconnects, but here a rollback has just failed; per ODBC a disconnect with an open
     transaction fails, and pyodbc ignores both failures, so the session, with its transaction and
     locks, can stay open until the server ends it (ADR 0159, the 2026-10-30 residual). A retry on
-    a fresh connection can wait on those locks, and this connector sets no statement timeout. A
+    a fresh connection can wait on those locks, for at most its ``statement_timeout`` (BACKLOG
+    #5756) unless that is ``0``. A
     close that does raise is logged, not raised; pyodbc's own close is not expected to."""
     if raw is None:
         return
@@ -3641,8 +3886,10 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
     **The bound applies only while that count is above zero** (:func:`_holds_back`), read at the end
     of each tick of :data:`_POOL_CLOSE_TIMEOUT_S`: a close that starts with one held back waits one
     tick, and one held back mid-wait ends the wait at the end of its tick. Such a connection goes back only once its
-    cancelled call returns, which nothing bounds (ADR 0159, amendment of 2026-10-30), so a stop or a
-    reload would otherwise wait as long as that call runs. With no connection held back, an
+    cancelled call returns, which only the connection's ``statement_timeout`` bounds, and nothing
+    when that is ``0`` or its pool set none (BACKLOG #5756; ADR 0159, amendment of 2026-10-30), so
+    a stop or a reload
+    would otherwise wait as long as that call runs. With no connection held back, an
     in-flight call is an ordinary one, and the close waits for it as it did before #2394, however
     long it takes. ``bound`` instead stops the wait at that many seconds whatever the count: the
     source's stop after a cancel (BACKLOG #1620), or after it cut a blocked poll (BACKLOG #4685),
@@ -3717,6 +3964,7 @@ def _pool_closing(pool: Any) -> asyncio.Future[None]:
     fresh: asyncio.Task[None] = asyncio.ensure_future(pool.wait_closed())
     _DETACHED_SETTLES.add(fresh)
     fresh.add_done_callback(_DETACHED_SETTLES.discard)
+    fresh.add_done_callback(partial(_retire_executor, pool))  # BACKLOG #5756
     if key is not None:
         _CLOSING[key] = fresh
         # Dropped once done: a failed close's traceback holds the pool, which would keep the weak
@@ -3762,6 +4010,36 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
         raise _classify_db_error(state, str(exc), connecting=True) from exc
 
 
+#: Cursor-allocation states that are the driver refusing the query timeout ``statement_timeout``
+#: sets, ``SQL_ATTR_QUERY_TIMEOUT``: "optional feature not implemented" and "invalid attribute"
+#: (BACKLOG #5756). Static, so the lane stops on them rather than retrying for ever.
+_QUERY_TIMEOUT_REFUSED_STATES = frozenset({"HYC00", "HY092"})
+
+
+def _cursor_refused(exc: Exception, pool: Any) -> DeliveryError | None:
+    """The classified error for a ``conn.cursor()`` that raised ``exc``, or ``None`` when ``exc``
+    is no driver error, which the caller re-raises unchanged (BACKLOG #5749).
+
+    A cursor the driver cannot allocate is the connection's failure, before any statement ran, so
+    it is classified as a connect failure is: retried, or a stopped lane, never a dead-lettered
+    message. pyodbc sets the connection's query timeout on each cursor as it makes it, so a driver
+    that refuses that attribute refuses every cursor; that is a ``config_fault`` naming the
+    setting, not a retry."""
+    state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE, as _connect reads it
+    if state is None:
+        return None
+    seconds = _tracked(_STATEMENT_TIMEOUTS, pool)
+    if state in _QUERY_TIMEOUT_REFUSED_STATES and seconds:
+        return NegativeAckError(
+            f"database driver refused a cursor [{state}]; if it cannot take the ODBC query "
+            "timeout, set statement_timeout = 0 on this connection",
+            code=state,
+            permanent=True,
+            config_fault=True,
+        )
+    return _classify_db_error(state, str(exc), connecting=True)
+
+
 async def _probe_db(
     get_pool: Callable[[], Any], *, timeout: float = _DEFAULT_DB_ACQUIRE_TIMEOUT
 ) -> None:
@@ -3773,9 +4051,21 @@ async def _probe_db(
     the caller closes it with ``aclose()``."""
     pool, conn = await _connect(get_pool, timeout)
     cur: Any = None
+    discard = False
     try:
-        cur = await conn.cursor()
+        try:
+            cur = await conn.cursor()
+        except Exception as exc:
+            refused = _cursor_refused(
+                exc, pool
+            )  # classified as send() classifies it (BACKLOG #5749)
+            if refused is None:
+                raise
+            discard = True
+            raise refused from exc
         await cur.execute("SELECT 1")
+    except DeliveryError:
+        raise
     except Exception as exc:
         state = _sqlstate(exc)
         raise (
@@ -3784,7 +4074,7 @@ async def _probe_db(
             else DeliveryError(f"DATABASE probe failed: {_safe_db_error(exc)}")
         ) from exc
     finally:
-        await _close_and_release(pool, conn, cur)
+        await _close_and_release(pool, conn, cur, discard=discard)
 
 
 def _json_default(value: Any) -> Any:
@@ -3894,6 +4184,7 @@ class DatabaseDestination(DestinationConnector):
             self._cleartext_guard.enforce_construction()
         self._sql, self._param_names = _parse_named_params(str(s["statement"]))
         self._login_timeout = _login_timeout(s, f"DATABASE connection {config.name!r}")
+        self._statement_timeout = _statement_timeout(s, f"DATABASE connection {config.name!r}")
         self._pool_max = count_setting(
             s.get("pool_max", 5), knob="pool_max", transport="DATABASE destination"
         )
@@ -3936,11 +4227,14 @@ class DatabaseDestination(DestinationConnector):
             return self._pool
         async with self._pool_lock:
             if self._pool is None:
-                self._pool = await _make_pool(
-                    self._dsn,
-                    self._pool_max,
-                    autocommit=False,
-                    login_timeout=self._login_timeout,
+                self._pool = _bound_statements(
+                    await _make_pool(
+                        self._dsn,
+                        self._pool_max,
+                        autocommit=False,
+                        login_timeout=self._login_timeout,
+                    ),
+                    self._statement_timeout,
                 )
         return self._pool
 
@@ -3967,7 +4261,16 @@ class DatabaseDestination(DestinationConnector):
         cur: Any = None
         discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                refused = _cursor_refused(exc, pool)
+                if refused is None:
+                    raise  # not a DB driver error, so an internal/code error, as below
+                discard = (
+                    True  # BACKLOG #5749: a handle that cannot make a cursor is not lent again
+                )
+                raise refused from exc
             try:
                 await cur.execute(self._sql, params)
                 # Capture the RETURNING/OUTPUT rows from the SAME cursor BEFORE commit (re-run-stable:
@@ -4119,7 +4422,7 @@ class DatabaseDestination(DestinationConnector):
 
     async def aclose(self) -> None:
         """Close the pool. It waits for an in-flight send, as before, but not for a connection a
-        cancelled send's statement still holds, which has no time limit (BACKLOG #2394,
+        cancelled send's statement still holds, bounded only by ``statement_timeout`` (BACKLOG #2394,
         :func:`_close_pool_bounded`)."""
         if self._pool is not None:
             await _close_pool_bounded(self._pool, "DATABASE destination")
@@ -4315,10 +4618,9 @@ class DatabaseSource(SourceConnector):
         # so this is a backstop for a graph built past load.
         if not _is_text_codec(self._encoding):
             raise ValueError("DATABASE source 'encoding' names no usable text codec")
-        self._login_timeout = _login_timeout(
-            s,
-            f"DATABASE connection {None if config.name is None else inbound_record_name(config.name)!r}",
-        )
+        label = f"DATABASE connection {None if config.name is None else inbound_record_name(config.name)!r}"
+        self._login_timeout = _login_timeout(s, label)
+        self._statement_timeout = _statement_timeout(s, label)  # BACKLOG #5756
         self._pool_max = count_setting(
             s.get("pool_max", 5), knob="pool_max", transport="DATABASE source"
         )
@@ -4499,11 +4801,14 @@ class DatabaseSource(SourceConnector):
         async with self._pool_lock:
             if self._pool is None:
                 # autocommit: each mark is its own committed statement, giving per-row mark durability.
-                self._pool = await _make_pool(
-                    self._dsn,
-                    self._pool_max,
-                    autocommit=True,
-                    login_timeout=self._login_timeout,
+                self._pool = _bound_statements(
+                    await _make_pool(
+                        self._dsn,
+                        self._pool_max,
+                        autocommit=True,
+                        login_timeout=self._login_timeout,
+                    ),
+                    self._statement_timeout,
                 )
         return self._pool
 
@@ -5126,8 +5431,8 @@ async def probe_login_roles(pool: Any, *, label: str, acquire_timeout: float) ->
     the statement failed or no row came back, warns and returns :attr:`LoginRoleVerdict.NOT_RUN`. A
     cancellation is let through.
 
-    The borrow is bounded by ``acquire_timeout``, as a lookup's is. The statement is not: like the
-    lookup's own statement, it runs until the driver returns."""
+    The borrow is bounded by ``acquire_timeout``, as a lookup's is. The statement is bounded by the
+    pool's ``statement_timeout`` where it set one, as a lookup's pool does (BACKLOG #5756)."""
     reading = await _read_login_roles(pool, acquire_timeout)
     _log_login_role_reading(reading, label)
     return reading
@@ -5140,11 +5445,13 @@ async def _read_login_roles(pool: Any, acquire_timeout: float) -> LoginRoleReadi
     except Exception as exc:
         return LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
     cur: Any = None
+    lost = False
     try:
         cur = await conn.cursor()
         await cur.execute(_LOGIN_ROLE_PROBE_SQL, _LOGIN_ROLE_PROBE_PARAMS)
         row = await cur.fetchone()
     except Exception as exc:
+        lost = _connection_lost(exc)  # handled here, so the release below cannot see it (#5748)
         reading = LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
     except BaseException:  # a cancellation: the connection still goes back, then it propagates
         await _close_and_release(pool, conn, cur)
@@ -5158,7 +5465,7 @@ async def _read_login_roles(pool: Any, acquire_timeout: float) -> LoginRoleReadi
     # Outside a finally, so a release that raises (a pool aclose() is closing, say) cannot escape
     # the never-raises promise; the reading it already holds still stands.
     try:
-        await _close_and_release(pool, conn, cur)
+        await _close_and_release(pool, conn, cur, discard=lost)
     except Exception as exc:
         logger.warning(
             "login role probe: its connection did not go back to the pool cleanly (%s)",
@@ -5210,6 +5517,7 @@ class DatabaseLookupExecutor:
         self._dsn: dict[str, str] = {}
         self._pool_max: dict[str, int] = {}
         self._login_timeout: dict[str, int] = {}
+        self._statement_timeout: dict[str, int] = {}
         self._acquire_timeout: dict[str, float] = {}
         self._max_rows: dict[str, int | None] = {}
         for cname, s in connections.items():
@@ -5235,6 +5543,7 @@ class DatabaseLookupExecutor:
                 s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
             )
             self._login_timeout[cname] = _login_timeout(s, f"DatabaseLookup {cname!r}")
+            self._statement_timeout[cname] = _statement_timeout(s, f"DatabaseLookup {cname!r}")
             self._acquire_timeout[cname] = float_setting(
                 s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT),
                 knob="acquire_timeout",
@@ -5263,6 +5572,7 @@ class DatabaseLookupExecutor:
                 autocommit=True,
                 login_timeout=self._login_timeout[connection],
             )
+            _bound_statements(pool, self._statement_timeout[connection])
             # Kept before the probe runs, so aclose() closes it whatever the probe does.
             self._pools[connection] = pool
             # BACKLOG #2617: once, when the pool first opens, since start does not dial

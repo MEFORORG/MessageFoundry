@@ -18,13 +18,19 @@ read from ``request.extensions["timeout"]``, not what an engine does with it.
 
 from __future__ import annotations
 
+import ast
+import inspect
 from pathlib import Path
 
 import httpx
+import pytest
 
 from messagefoundry.api.request_timeout import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from messagefoundry.apiclient import EngineClient
-from messagefoundry.apiclient.client import SIGN_IN_TIMEOUT_SECONDS
+from messagefoundry.apiclient.client import (
+    _ENGINE_REQUEST_DEADLINE_SECONDS,
+    SIGN_IN_TIMEOUT_SECONDS,
+)
 
 _BASE = "http://127.0.0.1:8765"
 _USER = {
@@ -138,12 +144,67 @@ def test_the_timeout_matches_the_ides_sign_in_timeout() -> None:
 
 def test_the_sign_in_read_outlasts_the_engines_request_deadline() -> None:
     """RED when: ``SIGN_IN_TIMEOUT_SECONDS`` is less than 30 s above the engine's default request
-    deadline (vault BACKLOG #2950 step 1). At or below it, a sign-in still waiting in the
-    per-account queue outlasts the client while the engine goes on to finish; a hair above it, the
-    engine's 503 can still arrive after the read expires. 30 s is the margin ``cluster_stepdown``
-    takes over the same deadline. The client duplicates the deadline rather than importing it, as
-    ``cluster_stepdown`` does (ADR 0088); no test enforces that, so the order is pinned here."""
+    deadline (vault BACKLOG #2950 step 1), or the client's copy of that deadline stops matching the
+    engine's. ``_PAST_ENGINE_DEADLINE_SECONDS`` says why the margin exists."""
+    assert _ENGINE_REQUEST_DEADLINE_SECONDS == DEFAULT_REQUEST_TIMEOUT_SECONDS
     assert SIGN_IN_TIMEOUT_SECONDS - DEFAULT_REQUEST_TIMEOUT_SECONDS >= 30.0
+
+
+@pytest.mark.parametrize(
+    "own",
+    [
+        30.0,  # between the 5 s default and the floor
+        SIGN_IN_TIMEOUT_SECONDS - 0.5,  # just under the floor
+        SIGN_IN_TIMEOUT_SECONDS,  # exactly at the floor
+    ],
+)
+def test_a_client_timeout_up_to_the_floor_gets_the_floor_on_the_queued_reads(own: float) -> None:
+    """RED when: a client built with a timeout between the default and ``SIGN_IN_TIMEOUT_SECONDS``,
+    or exactly at it, gets anything but the floor as its read on a queued call, or loses its own
+    timeout on any other phase or request (vault BACKLOG #2950 added item 7). The two tests above
+    cover only the 5 s default and a timeout above the floor."""
+    client, seen = _recording_client(timeout=own)
+    _send_every_queued_call_then_a_control(client)
+    for path in _QUEUED:
+        assert seen[path] == {**_every_phase(own), "read": SIGN_IN_TIMEOUT_SECONDS}, path
+    assert seen["/auth/me"] == _every_phase(own)
+
+
+def _methods_calling(name: str) -> set[str]:
+    """The ``EngineClient`` methods whose body calls ``self.<name>()``, read from its source."""
+    tree = ast.parse(Path(inspect.getfile(EngineClient)).read_text(encoding="utf-8"))
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == EngineClient.__name__
+    )
+    found: set[str] = set()
+    for fn in cls.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+            ):
+                found.add(fn.name)
+    return found
+
+
+def test_the_census_of_queued_calls_matches_the_client() -> None:
+    """RED when: an ``EngineClient`` method gains or loses the sign-in timeout without this
+    census, and so ``_QUEUED``, moving with it (vault BACKLOG #2950 added item 10). The census is of
+    the client's calls; which engine routes queue per account is read in ``auth/service.py``, not
+    here. Control: the same scan finds ``_adopt_rotated``'s callers, a set it must not confuse."""
+    queued = _methods_calling("_sign_in_timeout")
+    assert queued == {"login", "reauth", "verify_mfa", "confirm_mfa", "change_password"}
+    # Those five calls, sent once each, put the floor on exactly the _QUEUED paths and no other.
+    client, seen = _recording_client()
+    _send_every_queued_call_then_a_control(client)
+    floored = {path for path, phases in seen.items() if phases["read"] == SIGN_IN_TIMEOUT_SECONDS}
+    assert floored == set(_QUEUED)
+    assert _methods_calling("_adopt_rotated") == {"reauth", "verify_mfa", "confirm_mfa"}
 
 
 def test_confirm_mfa_sends_the_enrolment_code_only_when_given() -> None:

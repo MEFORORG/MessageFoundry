@@ -38,12 +38,15 @@ detector keeps running to raise it: every other detector stops.
 **Bounded where the caller chooses the key.** A windowed detector tracks at most
 :data:`MAX_SUBJECTS` subjects. Past :data:`MAX_SUBJECT_ALERTS` alerts in one window it raises under
 one shared ``<prefix>:*`` subject instead, so a spread of addresses cannot open an alert instance,
-and send a page, per address.
+and send a page, per address. A subject pushed out of a full table carries its in-window count into
+one shared overflow sum, which raises under that same ``<prefix>:*`` subject at the threshold, so a
+burst spread over more subjects than the table holds is still counted (BACKLOG #5508).
 """
 
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import time
@@ -93,7 +96,8 @@ SECURITY_SIGNAL_TYPES: Final[frozenset[str]] = frozenset(
     }
 )
 
-#: The most subjects one windowed detector tracks. Past it the least recent subject is dropped.
+#: The most subjects one windowed detector tracks. Past it the least recent subject leaves the
+#: table, and its count inside the window is carried into the detector's overflow sum.
 MAX_SUBJECTS: Final = 4096
 #: The most alerts one windowed detector raises under their own subjects in one window.
 MAX_SUBJECT_ALERTS: Final = 5
@@ -156,12 +160,31 @@ def _bounded(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def _expire(entries: deque[tuple[float, int]], cutoff: float) -> int:
+    """Drop the entries at or before ``cutoff`` off the front of ``entries``; returns their weight."""
+    dropped = 0
+    while entries and entries[0][0] <= cutoff:
+        dropped += entries.popleft()[1]
+    return dropped
+
+
 class _Window:
     """One windowed detector: a sliding sum per subject over ``window_seconds``.
 
     :meth:`hit` adds a weight (1 for a row, the selected count for an export) and returns the sum
     when it reaches the threshold, then starts that subject again. Weights are at least 1, so a
-    subject holds fewer than ``threshold`` entries, and each keeps a running total."""
+    subject holds fewer than ``threshold`` entries, and each keeps a running total.
+
+    **An evicted subject's count is carried, not dropped (BACKLOG #5508).** Past
+    :data:`MAX_SUBJECTS` the least recent subject leaves the table, and its in-window entries move
+    into one shared overflow sum, keeping their own times. :meth:`hit` returns that sum too, once
+    it reaches the threshold, and starts it again. Dropping them instead would let a burst spread
+    over more subjects than the table holds inside one window raise nothing, since each subject
+    would leave before reaching the threshold. Between hits the overflow holds less than
+    ``threshold`` in weight, so fewer than ``threshold`` entries, and memory stays bounded. It
+    counts only what eviction would have dropped: subjects still in the table are counted one by
+    one, so a spread that fits the table, each below the threshold, still raises nothing, as the
+    per-subject design intends."""
 
     def __init__(self, threshold: int, window_seconds: float) -> None:
         self.threshold = threshold
@@ -169,27 +192,55 @@ class _Window:
         self._seen: OrderedDict[str, tuple[deque[tuple[float, int]], list[int]]] = OrderedDict()
         #: Subjects that raised under their own name in the current window, and when.
         self._named: OrderedDict[str, float] = OrderedDict()
+        #: The evicted subjects' in-window entries as a heap on their times, and their sum.
+        self._overflow: list[tuple[float, int]] = []
+        self._overflow_total = 0
 
-    def hit(self, subject: str, now: float, weight: int = 1) -> int | None:
+    def hit(self, subject: str, now: float, weight: int = 1) -> tuple[int | None, int | None]:
+        """``subject``'s sum when this hit took it to the threshold, and the overflow's sum when an
+        eviction this hit made took that to the threshold; None for each that did not."""
         if self.threshold <= 0 or weight <= 0:
-            return None
+            return None, None
         held = self._seen.get(subject)
+        cutoff = now - self.window_seconds
+        carried = None
         if held is None:
+            if weight >= self.threshold:
+                return weight, None  # raises at once, so it takes no slot and evicts nobody
             if len(self._seen) >= MAX_SUBJECTS:
-                self._seen.popitem(last=False)
+                _, (evicted, evicted_total) = self._seen.popitem(last=False)
+                carried = self._carry(evicted, evicted_total[0] - _expire(evicted, cutoff), cutoff)
             held = self._seen[subject] = (deque(), [0])
         else:
             self._seen.move_to_end(subject)
         entries, total = held
-        cutoff = now - self.window_seconds
-        while entries and entries[0][0] <= cutoff:
-            total[0] -= entries.popleft()[1]
+        total[0] -= _expire(entries, cutoff)
         entries.append((now, weight))
         total[0] += weight
         if total[0] < self.threshold:
-            return None
+            return None, carried
         del self._seen[subject]
-        return total[0]
+        return total[0], carried
+
+    def _carry(self, evicted: deque[tuple[float, int]], weight: int, cutoff: float) -> int | None:
+        """Add an evicted subject's in-window entries, summing ``weight``, to the overflow, which
+        expires entry by entry exactly as a subject does. Returns the sum when that reached the
+        threshold, and starts the overflow again. A heap, because an evicted subject's older
+        entries can be older than entries already carried; each entry costs a log of its size."""
+        if not weight:
+            return None  # the subject had aged out: nothing to carry
+        heap = self._overflow
+        while heap and heap[0][0] <= cutoff:
+            self._overflow_total -= heapq.heappop(heap)[1]
+        for entry in evicted:
+            heapq.heappush(heap, entry)
+        self._overflow_total += weight
+        if self._overflow_total < self.threshold:
+            return None
+        total = self._overflow_total
+        heap.clear()
+        self._overflow_total = 0
+        return total
 
     def may_name(self, subject: str, now: float) -> bool:
         """Whether ``subject`` may raise under its own name: it already did this window, or fewer
@@ -214,6 +265,8 @@ class _Burst:
     signal: str
     prefix: str
     sentence: str  # formatted with {total}, {window} and {quiet}, the refusal quiet period
+    #: What the detector counts, for the overflow sentence: "refused sign-ins", for example.
+    counted: str
     by_address: bool = False
 
 
@@ -221,16 +274,26 @@ _SIGNIN = _Burst(
     SIGNIN_FAILURE_BURST,
     "signin",
     "{total} refused sign-ins from this address within {window}",
+    "refused sign-ins",
     True,
 )
 _DENIED = _Burst(
-    ACCESS_DENIED_BURST, "account", "{total} refused requests by this account within {window}"
+    ACCESS_DENIED_BURST,
+    "account",
+    "{total} refused requests by this account within {window}",
+    "refused requests",
 )
 _BODIES = _Burst(
-    BODY_VIEW_BURST, "account", "{total} stored-body reads by this account within {window}"
+    BODY_VIEW_BURST,
+    "account",
+    "{total} stored-body reads by this account within {window}",
+    "stored-body reads",
 )
 _EXPORT = _Burst(
-    BULK_EXPORT, "account", "{total} messages exported by this account within {window}"
+    BULK_EXPORT,
+    "account",
+    "{total} messages exported by this account within {window}",
+    "messages exported",
 )
 #: Prefixed ``inbound``, so the subject is spelled as ``connection_names.inbound_record_name``
 #: spells an inbound; a test pins the two together.
@@ -239,6 +302,7 @@ _REFUSED = _Burst(
     "inbound",
     "{total} connections refused by this inbound's source allowlist or connection caps "
     "within {window}; this inbound's refusals are not counted for {quiet} after this alert",
+    "refused connections",
 )
 
 
@@ -411,14 +475,26 @@ class SecuritySignalDetector:
         return until is not None and until > (self._clock() if now is None else now)
 
     def _on_burst(self, burst: _Burst, window: _Window, key: str | None, weight: int) -> bool:
-        """Count ``weight`` for ``key``; True when that raised an alert and the sink call
-        returned. False when the sink call raised, so a caller that goes quiet after a raise does
+        """Count ``weight`` for ``key``; True when ``key``'s own count raised an alert and the
+        sink call returned. An overflow alert this count carried does not make it True. False when the sink call raised, so a caller that goes quiet after a raise does
         not go quiet on that alert. A sink that takes the alert and then loses part of it still
         returns, so the caller goes quiet: the notifier's full queue drops only the page, after the
         ``alert_instance`` row is already scheduled, and a store fault loses that row."""
         key = key or "unknown"
         now = self._clock()
-        total = window.hit(key, now, weight)
+        total, carried = window.hit(key, now, weight)
+        shared = f"{burst.prefix}:*"
+        if carried is not None:
+            # Under the shared subject, like a spread past MAX_SUBJECT_ALERTS: no one key holds it.
+            # The count is the carried sum alone, so the sentence says the burst was at least that.
+            self._raise(
+                burst.signal,
+                shared,
+                carried,
+                f"at least {carried} {burst.counted} within {self._window_label}, spread over "
+                f"more than the {MAX_SUBJECTS} sources this detector counts one by one; the "
+                "sources still counted one by one are not in this count",
+            )
         if total is None:
             return False
         # A checksum keeps two long keys with one head apart, where a plain cut would merge them.
@@ -428,7 +504,7 @@ class SecuritySignalDetector:
         )
         own_name = window.may_name(subject, now)
         if not own_name:
-            subject = f"{burst.prefix}:*"
+            subject = shared
             sentence += f"; {MAX_SUBJECT_ALERTS} other subjects already raised this window"
         raised = self._raise(burst.signal, subject, total, sentence)
         if raised and own_name:

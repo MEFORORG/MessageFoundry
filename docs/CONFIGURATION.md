@@ -2167,12 +2167,12 @@ path, no git commit and no message content.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `webhook_url` | str | _unset_ | enable the **webhook** transport: HTTP `POST` the event as JSON here (fronts Slack/Teams/PagerDuty/custom inbound webhooks). **Must be `https`**: no other scheme builds. `serve` refuses to start on one ([the escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says so for `http`); an offline command that builds the notifier, such as `provision-admin`, drops the webhook with a WARNING instead. Settings load and `messagefoundry check` do not check the scheme yet. |
-| `webhook_timeout` | num | 10 | seconds per POST |
+| `webhook_timeout` | num | 10 | socket timeout, in seconds, for each wait on the webhook host during a POST (not a deadline for the whole POST). Above 0 and at most 300; infinity and NaN are refused at load (BACKLOG #5770) |
 | `webhook_allowed_hosts` | list | `[]` | egress allowlist for the webhook host (`[]` = any); SSRF defense (ASVS 15.3.2/1.3.6) |
 | `webhook_tls_revocation_attested` | bool | `false` | attests that revocation of the **webhook host's** certificate is covered outside the engine (BACKLOG #2193, owner ruling 2026-10-27, on the pattern of ADR 0173 section 12). The POST carries the webhook's path token over https the engine verifies, and its handshake checks no CRL and no OCSP. So under `[security].enforcement = enforce` an https `webhook_url` whose host is off the box is **refused** when `serve` builds the alert notifier unless this is `true`; under `warn` it builds with a WARNING. A host off a non-empty `webhook_allowed_hosts` is refused at the build, at every posture and before this guard. **It is the only way across:** the webhook dials through one shared opener, so `[tls].crl_file` cannot reach it, and the process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not cross an enforcing hop. Setting it adds no check on the wire, and it never lifts the cleartext `http` refusal. A loosening, named as `alerts.webhook_tls_revocation_attested`; an attested crossing on an enforcing posture, or with none known, logs a WARNING with the reason. Env: `MEFOR_ALERTS_WEBHOOK_TLS_REVOCATION_ATTESTED` |
 | `webhook_tls_revocation_attested_reason` | str | — | **required** with `webhook_tls_revocation_attested = true`: what covers revocation of the webhook host's certificate, for example its short lifetime. The flag without it, a blank one, one holding a control character or a lone surrogate, or a reason without the flag is refused at load. It is printed in the loosening report and the serve-time warning, so put no secret in it. Env: `MEFOR_ALERTS_WEBHOOK_TLS_REVOCATION_ATTESTED_REASON` |
 | `email_smtp_host` | str | _unset_ | SMTP server; with `email_from` + `email_to` set, enables the **email** transport |
-| `email_smtp_port` | int | 587 | SMTP port |
+| `email_smtp_port` | int | 587 | SMTP port, 1 to 65535 |
 | `email_from` | str | _unset_ | sender address (required for email), and the envelope sender (`MAIL FROM`). It must be one plain `local@domain`; a display name, a group or an encoded word is refused at startup. The full address rule, the domain's shape included, is in the `[egress]` `allowed_recipient_domains` row |
 | `email_to` | list | _unset_ | recipient(s) (required for email). Via env: comma-separated `MEFOR_ALERTS_EMAIL_TO`. Each address, and each rule's `recipients` override, is held to the `email_from` rule after any display name is dropped; `RCPT TO` carries exactly that address |
 | `email_use_tls` | bool | `true` | issue STARTTLS before sending. Selects TLS vs **cleartext** — it does not by itself decide whether the relay is authenticated; that is `email_tls_verify` |
@@ -2183,13 +2183,13 @@ path, no git commit and no message content.
 | `email_username` | str | _unset_ | SMTP login user (omit for unauthenticated relays). Set, an empty string included, it starts SMTP AUTH, so the load refuses it beside `email_use_tls = false` or `email_tls_verify = false` (vault BACKLOG #3533) |
 | `email_password` | str | _unset_ | **secret** — supply via `MEFOR_ALERTS_EMAIL_PASSWORD`, never the file (or use `email_password_secret`) |
 | `email_password_secret` | str | _unset_ | connector `SecretProvider` reference (ADR 0019 §5) — when set and `[secrets].provider` is configured, the SMTP password is resolved from that backend (e.g. a Vault KV `path#field`) instead of `email_password`. A reference, not a secret. |
-| `email_timeout` | num | 30 | seconds per send |
+| `email_timeout` | num | 30 | socket timeout, in seconds, for each wait on the SMTP relay during a send, bounded as `webhook_timeout` is |
 | `smtp_allowed_hosts` | list | `[]` | egress allowlist for the SMTP host (`[]` = any); parity with `webhook_allowed_hosts` (WP-11c) |
 | `email_subject_template` | str | _unset_ | optional **operator-editable** alert-email subject (#138, [ADR 0127](adr/0127-operator-editable-alert-email-templates-with-a-non-phi-variable-allowlist.md)). Unset (the default, with its two siblings) = the fixed subject + key/value body, byte-identical to before. When set it is a `{name}` template over a **closed non-PHI variable allow-list**, validated at config load and **fail-closed** — an unknown or message-derived reference raises rather than rendering |
 | `email_body_template` | str | _unset_ | the same, for the **plain-text** body. The plain-text part is **always** sent, even when an HTML alternative is configured |
 | `email_html_template` | str | _unset_ | the same, adding an **HTML alternative** part whose substituted *values* are HTML-escaped. Never HTML-only — it supplements `email_body_template`, it does not replace it |
 | `security_notifications_required` | bool | `true` | **secure-by-default gate (BACKLOG #188, ASVS 6.3.5/6.3.7).** On a **PHI** instance, if no effective out-of-band security-notification channel is configured — `[auth].notify_security_events` on **and** `email_smtp_host` + `email_from` set — `serve` **refuses to start (exit 2)**. **The refuse/warn split is `[security].enforcement`, not the production tier:** the gate reads `enforcing` ([`__main__.py`](../messagefoundry/__main__.py)), which is `enforce` by default on **all three** built-in env names, and all three derive PHI ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) — so `serve --env dev` and `--env staging` on shipped defaults with no `[alerts]` SMTP are refused exactly like `prod`, not warned. (Measured: `dev`/`staging`/`prod` all resolve `data_class=phi, enforcing=True, channel_ready=False`.) It downgrades to a warning only under `enforcement = warn`. **This gate is why `[alerts]` is not optional on a stock instance** — configure the SMTP transport, or set `false` to accept the pull-only `GET /me/security-events` feed instead (audited). **A relay off a non-empty `smtp_allowed_hosts` is no channel, and neither `warn` nor `false` admits it** (BACKLOG #5088): with `[auth].notify_security_events` on, `serve` refuses to start (exit 2) at every enforcement level, because the security notifier would refuse to build. `messagefoundry check` does not catch this. **The same gate also requires a reminder recipient (BACKLOG #2008, ASVS 6.4.5).** Host and sender are enough for the per-user notices, which are addressed to each account. The credential reminders (`initial_credential_expiring`, `cert_expiry`, `secret_rotation`) go to the `[alerts]` notifier instead, and that is built only from `webhook_url`, or from `email_smtp_host` + `email_from` + at least one `email_to`. So when any reminder can fire (`[auth].initial_password_expiry_hours`, `[cert_monitor].warn_days` or `[secret_rotation].warn_days` above `0`; the last since BACKLOG #2227) and neither recipient is set, `serve` refuses under `enforce` and warns under `warn`. Setting this flag `false` waives that check too, with an audit line saying the reminders reach only the log. |
-| `realert_seconds` | num | 300 | suppress re-notifying the same (event, connection) more often than this (anti-spam for a flapping lane). A matching rule's `cooldown_seconds` overrides it. |
+| `realert_seconds` | num | 300 | suppress re-notifying the same (event, connection) more often than this (anti-spam for a flapping lane). A matching rule's `cooldown_seconds` overrides it. `0` = no throttle. At most seven days; infinity and NaN are refused at load (BACKLOG #5770). |
 | `rules` | list | `[]` | ordered `[[alerts.rules]]` table array — per-event severity, transport routing, thresholds, suppression, cooldown (see below). Empty = today's behaviour (every event → every transport at `warning`). |
 | `security_signals` | bool | `true` | the security-signal rule layer over the audit stream (vault BACKLOG #2613). `false` switches off every detector below but the posture one, and is a loosening, so the next start raises `posture_loosened`, whose list of names can be cut before this one ([SECURITY.md](SECURITY.md#audit-1)). With no transport configured, the signals reach the log at `WARNING`, as every alert does |
 | `security_window_seconds` | num | 300 | the sliding window the five counting detectors use. Must be finite and above 0 |
@@ -2217,7 +2217,9 @@ resolve it by hand, is in [SECURITY.md](SECURITY.md#audit-1).
 `log_level_debug` does not resolve itself, and neither do the counting detectors: an operator
 resolves them.
 Past five subjects alerting from one counting detector inside one window, later ones share a
-`<prefix>:*` subject. An account lock raises no alert: the lock rows are withheld from readers
+`<prefix>:*` subject. That subject also carries the counts of subjects pushed out of a full table,
+so a `signin:*` alert need not mean any one address reached the threshold
+([SECURITY.md](SECURITY.md#audit-1) says when it raises). An account lock raises no alert: the lock rows are withheld from readers
 without `users:manage`, and the alert list is readable under `monitoring:diagnose`.
 `docs/SECURITY.md` §Audit says how the layer reads the audit stream.
 
@@ -2232,10 +2234,10 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 | `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_offbox_copy_missing`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `crl_reload_refused`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `no_enabled_administrator`, `queue_buildup`, `remote_debug_refused`, `sandbox_worker_refused`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `store_restored`, `update_available`, `vault_privilege_warning`, and the seven security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `peer_refused_burst`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
-| `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
+| `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long. 0 or more, and finite |
 | `severity` | str | `warning` | `info` \| `warning` \| `critical` — tagged onto the event (webhook JSON + email subject) for downstream triage |
 | `transports` | list | _all_ | which transports fire: subset of `["webhook", "email"]`; **unset = all configured**; **`[]` = SUPPRESS** (drop silently) |
-| `cooldown_seconds` | num | _global_ | override `realert_seconds` for matching events (e.g. re-page a critical sooner) |
+| `cooldown_seconds` | num | _global_ | override `realert_seconds` for matching events (e.g. re-page a critical sooner). Above 0, at most seven days, and finite |
 | `control_action` | str | _unset_ | `restart_inbound` \| `restart_outbound` — restart a connection when the rule fires ([ADR 0128](adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md)). **Allowed only with a connection-scoped `event_type`** (BACKLOG #1898). The source of record is `_ALERT_CONTROL_EVENT_TYPES` in `messagefoundry/config/settings.py`; at the time of writing it holds `connection_stopped`, `connection_error`, `queue_buildup`, `message_stall`, `saturation` and `lane_stuck`. Config load refuses the action with `any` and with every other type. Those other types put a stand-in in `connection`, such as a bare username, `store` or a cert label. A restart aimed at a stand-in could hit an unrelated connection with the same name. The notifier also skips the action, logged, for an event whose `connection` key is not a connection name, such as `reference:<name>`, even when `control_target` is set (BACKLOG #2527). With no `control_target`, the action aims at the event's own name. Inbound and outbound names are separate namespaces, and the event does not say which one its name came from. So the restart runs only when that name is declared on the action's side (an inbound for `restart_inbound`, an outbound for `restart_outbound`) and not on the other. Otherwise the engine logs a WARNING and restarts nothing; set `control_target` to act on a name both sides declare (BACKLOG #2528) |
 | `control_target` | str | _the event's connection_ | the connection `control_action` restarts, when it is not the one that fired. Config load refuses a value that is not a connection name, and refuses it on a rule with no `control_action` |
 
@@ -2346,7 +2348,8 @@ issuer. The engine applies a replaced file only when all three of these hold:
    the marker text out of the comment. The file carries no certificate the hop does not already
    trust. For `[api].tls_client_crl_file`, each CA the hop loaded from `[api].tls_client_ca_file`
    has a CRL of its own in it, as that setting's row says (vault BACKLOG #5627); a file that fails
-   this is refused as `fix_file`.
+   this is refused as `fix_file`. For an inbound connection's `tls_crl_file`, see the
+   [MLLP `tls_crl_file` row](CONNECTIONS.md#mllp--mllp) in CONNECTIONS.md.
 2. Each CRL's signature verifies against a CA certificate in the hop's own trust store. OpenSSL checks
    that signature only during a handshake, so without this rule a badly signed CRL would be applied
    and then fail every handshake it judges. The reload cannot see an intermediate CA that the peer
@@ -2471,15 +2474,20 @@ these cases after that WARNING (the paragraph after this list says which). At le
 
 **`[api].tls_client_crl_file` refuses more at start (vault BACKLOG #5627).** That hop checks the
 whole client chain, so each CA loaded from `[api].tls_client_ca_file` needs a CRL of its own in
-the file; that setting's row says what counts. So on that hop at least the second bullet's case
-refuses the start, and so does the third bullet's where the CRL names no key of that CA, a genuine
+the file; that setting's row says what counts. An inbound listener's `tls_crl_file` checks the
+whole chain too, as the [MLLP `tls_crl_file` row](CONNECTIONS.md#mllp--mllp) in CONNECTIONS.md says. So on each of
+those hops at least the second bullet's case refuses the start, and so does the third bullet's where the CRL names no key of that CA, a genuine
 SHA-1 CRL with no key identifier among them. The SHA-1 trade-off above does not arise there for
 such a CRL, since it never loads. A CRL of the first bullet's kind can refuse too, at least where
 its issuer differs from a loaded CA's name only in white space and that CA did not sign it. Every
-other hop loads all three cases with the WARNING.
+other hop, at least each outbound hop, loads all three cases with the WARNING.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
-it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
+it judged before the failure is proved badly signed, which refuses the file. On a hop that checks
+the whole chain, at least `[api].tls_client_crl_file` and an inbound listener's `tls_crl_file`, the
+rule that each loaded CA has a CRL of its own is applied too. Where that rule refuses the file, the
+start refuses with its reason, unless a CRL already judged is proved badly signed, and the ERROR is
+not logged. Where it loads, the
 CRLs it judged and could not confirm are reported in the WARNING too, which names the first three
 and counts the rest; one it verified is not reported. The CRLs after
 the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
@@ -2538,7 +2546,14 @@ lapse before the new CRL takes effect. Waiting then leaves a gap in which its pe
 the engine says to fix the file with a CRL that is in effect now. A start and a reload both allow
 five minutes of clock skew, so a CRL from a CA whose clock runs a little ahead still counts as in
 effect. At a start, such a CRL refuses every peer it judges until its `thisUpdate` passes, and the
-engine logs a WARNING that says so.
+engine logs a WARNING that says so. A reload applies it too. On a hop that checks CRL time,
+OpenSSL allows no skew, so a revocation only that CRL lists is not enforced until its `thisUpdate`
+passes, and where the hop holds no CRL in effect from that issuer, the hop refuses every peer that
+CRL judges until then, as at a start. The reload's applied line is then a WARNING that says so and
+names the time (vault BACKLOG #5507). It says the same of any CRL in the applied file that is not
+in effect yet, such as a successor kept beside the CRL the hop holds. A hop that sets
+`tls_allow_expired` skips the CRL time check, so there the newer CRL is used at once and the
+reload logs no such WARNING for it.
 
 A reload changes what the next full TLS handshake checks. An established connection is not checked
 again, nor is a session resumed from an earlier handshake. So a newly revoked partner that stays

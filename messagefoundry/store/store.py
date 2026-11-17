@@ -435,7 +435,8 @@ async def _writer_txn(
     takes it at the first write, and a writer in another process that committed after the block's
     read then fails that write with ``SQLITE_BUSY_SNAPSHOT`` rather than wait (BACKLOG #3078 F5).
     The ``asyncio`` lock already serializes this process, so only a block that must decide on a
-    read across processes needs it: the first-administrator grant.
+    read across processes needs it: at least the first-administrator grant, and ``purge_state``,
+    whose read names the keys it evicts (BACKLOG #5734).
 
     **Every writer that opens an EXPLICIT transaction goes through here** — ``execute("BEGIN")``
     appears nowhere else on ``self._db``, and ``tests/test_writer_txn_is_the_only_begin.py`` keeps it
@@ -13631,9 +13632,9 @@ class MessageStore:
         sweep, never mid-run (the sweep is startup-only, like ``reset_stale_inflight``)."""
         self._require_streaming_attachments()
 
-        def _seal() -> tuple[str, int, list[str]]:
-            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
-            # work in proportion to its size, and nothing else would run meanwhile.
+        def _hash() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing here, and sealing in _seal, are CPU
+            # work in proportion to the document's size; nothing else would run meanwhile.
             hasher = hashlib.sha256()
             total = 0
             # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but
@@ -13648,26 +13649,41 @@ class MessageStore:
                 hasher.update(data)
                 total += len(data)
                 plaintext_chunks.append(chunk)
-            ref = hasher.hexdigest()
-            sealed: list[str] = [
+            return hasher.hexdigest(), total, plaintext_chunks
+
+        def _seal(ref: str, plaintext_chunks: list[str]) -> list[str]:
+            return [
                 self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
                 for seq, c in enumerate(plaintext_chunks)
             ]
-            return ref, total, sealed
 
-        ref, total, sealed = await asyncio.to_thread(_seal)
+        ref, total, plaintext_chunks = await asyncio.to_thread(_hash)
+        # BACKLOG #5753: dedup BEFORE sealing, so a re-put spends no AES-GCM invocation on chunks it
+        # then discards. The SELECT opens no write transaction (SQLite reads don't).
+        async with self._read() as conn:
+            cur = await conn.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
+            if await cur.fetchone() is not None:
+                return ref
+        # BACKLOG #5753: reserve the whole burst in the persisted bound (ASVS 11.3.4) before the first
+        # seal, so the persisted total leads every chunk's invocation as the bound requires.
+        await reserve_invocations_ahead(
+            self._cipher, self.add_cipher_invocations, len(plaintext_chunks)
+        )
+        sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
+        del plaintext_chunks
         now = time.time()
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
-            if await cur.fetchone() is not None:
-                # Dedup: identical content already stored — reuse the single copy, write nothing. The
-                # SELECT opened no write transaction (SQLite reads don't), so there is nothing to commit.
-                return ref
-            await self._db.execute(
+            # A concurrent put of the same content may have stored it while this one sealed; its
+            # copy wins and this one's sealed chunks are dropped. Only the id conflict is ignored;
+            # OR IGNORE would also swallow a NOT NULL failure and return a ref with no row.
+            cur = await self._db.execute(
                 "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
-                " VALUES (?,?,?,0,?)",
+                " VALUES (?,?,?,0,?) ON CONFLICT(id) DO NOTHING",
                 (ref, content_type, total, now),
             )
+            if not cur.rowcount:
+                await self._commit()
+                return ref
             if sealed:
                 await self._db.executemany(
                     "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext) VALUES (?,?,?)",
@@ -15426,13 +15442,25 @@ class MessageStore:
 
         async def _body() -> None:
             cur = await self._db.execute(
-                "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
+                "SELECT message_id, destination_name, handler_name, attempts, status FROM queue"
+                " WHERE id=?",
                 (outbox_id,),
             )
             row = await cur.fetchone()
             if row is None:
                 # Row vanished (cancelled mid-flight) — nothing to complete; no response written.
                 # Zero-mutation read so far → idempotent no-op (safe to leave in a group batch).
+                raise _AbortMember(None)
+            if row["status"] == OutboxStatus.DONE.value:
+                # BACKLOG #5752: a DONE row does not complete again. A second completion would mint
+                # a second reply artifact and a second re-ingress child, so nothing is written, as
+                # for a vanished row. Any other row still completes, as mark_done would complete
+                # it: the partner accepted and its reply is real, so keeping it spares a resend.
+                log.warning(
+                    "complete_with_response: outbound row %s is already %s; nothing written",
+                    outbox_id,
+                    row["status"],
+                )
                 raise _AbortMember(None)
             message_id = row["message_id"]
             destination_name = row["destination_name"]
@@ -19536,14 +19564,19 @@ class MessageStore:
             cipher.active_marker_prefix,
             lambda stored, aad: self._reencrypt_value(cipher, stored, aad),
         )
+        seal_prefix = f"{SEAL_PREFIX}{sealer.key_id}:"
+        marker = cipher.active_marker_prefix
         async with self._read() as db:
             # Only records the pass has work on: sealed under another key, or over a TOTP secret not
-            # yet under the active key. The change re-checks both, so this filter only saves work.
+            # yet under the active key. The change re-checks both, so this filter only saves work,
+            # and it must never skip a record: the prefixes are compared byte-exact, because LIKE
+            # folds ASCII case here and reads `_` as a wildcard (BACKLOG #5738).
             cur = await db.execute(
-                "SELECT id FROM users WHERE authz_seal <> '' AND (authz_seal NOT LIKE ?"
-                " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND totp_secret NOT LIKE ?))"
+                "SELECT id FROM users WHERE authz_seal <> '' AND (substr(authz_seal, 1, ?) <> ?"
+                " OR (totp_secret IS NOT NULL AND totp_secret <> ''"
+                " AND substr(totp_secret, 1, ?) <> ?))"
                 " ORDER BY id",
-                (f"{SEAL_PREFIX}{sealer.key_id}:%", f"{cipher.active_marker_prefix}%"),
+                (len(seal_prefix), seal_prefix, len(marker), marker),
             )
             ids = [str(r["id"]) for r in await cur.fetchall()]
         resealed = refused = 0
@@ -19555,11 +19588,14 @@ class MessageStore:
             except RowSealError:
                 refused += 1
                 continue
-            resealed += written is not None
-        if resealed:
-            # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
-            # 11.3.4); charged here, as each generic rotation batch charges its own.
-            await self._charge_bound_batch()
+            if written is not None:
+                resealed += 1
+                # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
+                # 11.3.4), charged after each committed record, so an interrupted pass leaves at
+                # most the one record in flight to the reserve-ahead (BACKLOG #5738). Through the
+                # public checkpoint, which takes the writer lock its commit needs and unwinds a
+                # failed add.
+                await self.checkpoint_cipher_invocations()
         return resealed, refused
 
     async def count_unsealed_users(self) -> int:
@@ -21041,20 +21077,30 @@ class MessageStore:
         self,
         token_hash: str,
         change: Callable[[SessionRecord], SessionRecord],
+        *,
+        owner: str | None = None,
     ) -> SessionRecord | None:
         """The one writer of a session's sealed columns (BACKLOG #2592). Call it inside a writer
         transaction on ``self._db``.
 
         Reads the unrevoked row, verifies its seal, applies ``change``, seals the result and writes
         every sealed column with a compare on the seal it read. Returns the new row, or ``None`` when
-        there is no unrevoked row or the compare lost to a concurrent write. A row sealed under a
+        there is no unrevoked row or the compare lost to a concurrent write. With ``owner`` set, a
+        row of another account reads as no row: it is neither seal-checked nor written, so a revoke
+        handed a foreign kept session cannot fail on, or re-seal, that account's row (BACKLOG
+        #5742). A row sealed under a
         retired key raises :class:`RowSealKeyRetiredError`, which every caller ends quietly
         (build ruling 3, slice 1b-iv). Raises
         :class:`RowSealError` (Forged) or, under a Transit sealer, its sibling
         :class:`RowSealUnverifiableError` or :class:`TransitSealUnavailableError` (Outage), and
         writes nothing, when the row it read does not verify or cannot be checked: re-sealing
         it would turn a change made outside this helper into a sealed row."""
-        cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
+        if owner is None:
+            cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
+        else:
+            cur = await self._db.execute(
+                "SELECT * FROM sessions WHERE token_hash=? AND user_id=?", (token_hash, owner)
+            )
         row = await cur.fetchone()
         if row is None:
             return None
@@ -21275,7 +21321,11 @@ class MessageStore:
         (:func:`write_kept_session`). After a Transit Outage tripped ``outcome`` the re-stamp is not
         attempted, and the session is ended (:class:`RevokeSealOutcome`)."""
         if not outcome.tripped and restamp.kept(
-            await write_kept_session(self._write_session(token_hash, restamp), outcome, token_hash)
+            await write_kept_session(
+                self._write_session(token_hash, restamp, owner=restamp.user_id),
+                outcome,
+                token_hash,
+            )
         ):
             return RevokeResult(revoked, kept=True)
         cur = await self._db.execute(
@@ -22036,14 +22086,22 @@ class MessageStore:
         ``set_at``); per-namespace policy is a documented follow-up. Returns the number of entries
         purged. Off by default — the RetentionRunner calls it only when ``state_max_age_days`` is set."""
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
+        # An idle pass stays a plain read: no write lock, no commit.
+        async with self._read() as db:
+            cur = await db.execute("SELECT 1 FROM state WHERE set_at < ? LIMIT 1", (older_than,))
+            if await cur.fetchone() is None:
+                return 0
+        # BEGIN IMMEDIATE: the SELECT and the DELETE share one write transaction, so an engine shard
+        # in another process cannot refresh a listed key between them; the cache would otherwise
+        # drop a key whose row survives (BACKLOG #5734). Not ``DELETE ... RETURNING``, which needs
+        # SQLite 3.35, newer than some system libraries a Linux Python links.
+        async with _writer_txn(self._db, self._lock, immediate=True):
             cur = await self._db.execute(
                 "SELECT namespace, key FROM state WHERE set_at < ?", (older_than,)
             )
             purged_keys = [(r["namespace"], r["key"]) for r in await cur.fetchall()]
-            if not purged_keys:
-                return 0
-            await self._db.execute("DELETE FROM state WHERE set_at < ?", (older_than,))
+            if purged_keys:
+                await self._db.execute("DELETE FROM state WHERE set_at < ?", (older_than,))
             await self._commit()
         # Commit succeeded → evict the purged keys from the read-through cache (after commit, mirroring
         # the write path: the table is the source of truth, the cache follows it only once durable).

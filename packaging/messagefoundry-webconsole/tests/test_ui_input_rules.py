@@ -273,6 +273,37 @@ async def test_per_name_control_reaches_the_handler_for_a_valid_name(
     assert r.status_code != 422
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"/ui/dead-letters/{BAD_NAME}/replay",
+        f"/ui/dead-letters/{BAD_NAME}/OB_ACME_ADT/replay",
+        f"/ui/dead-letters/IB_ACME_ADT/{BAD_NAME}/replay",
+    ],
+)
+async def test_dead_letter_replay_refuses_a_bad_connection_name(
+    admin: httpx.AsyncClient, path: str
+) -> None:
+    """BACKLOG #5500: 422 on the path segment, before the handler runs. Without the annotation the
+    name reached ``DeadLetterReplayRequest`` inside the handler, whose own rule raised a bare
+    pydantic ``ValidationError`` that nothing turned into a response -- a 500, not a refusal."""
+    r = await admin.post(path, headers=SAME_ORIGIN)
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "path", ["/ui/dead-letters/IB_ACME_ADT/replay", "/ui/dead-letters/IB_ACME_ADT/OB_ACME/replay"]
+)
+async def test_dead_letter_replay_reaches_the_handler_for_a_valid_name(
+    admin: httpx.AsyncClient, path: str
+) -> None:
+    """Positive control for the three 422s above: a well-formed name passes the rule and the replay
+    runs (nothing is dead, so nothing is re-queued) and redirects back to the dead-letter page."""
+    r = await admin.post(path, headers=SAME_ORIGIN)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/ui/dead-letters"
+
+
 async def test_purge_confirm_never_arms_a_name_no_outbound_has(admin: httpx.AsyncClient) -> None:
     """``dest`` is the one name on this surface left unannotated, so this is what guards it instead.
 

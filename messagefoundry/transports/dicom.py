@@ -1816,9 +1816,12 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
         ctx.verify_mode = ssl.CERT_REQUIRED
         # Opt-in revocation (#1005), after the CA load and inside the mTLS branch -- see mllp.py.
         # An HTTP proxy can terminate neither DIMSE nor MLLP, so for this listener the documented
-        # out-of-engine delegation does not reach and there is no workaround.
+        # out-of-engine delegation does not reach and there is no workaround. The whole client
+        # chain is checked, as on mllp.py's listener (vault BACKLOG #5511).
         if crl := s.get("tls_crl_file"):
-            harden_crl_check(ctx, str(crl), setting=f"inbound connection '{name}' tls_crl_file")
+            harden_crl_check(
+                ctx, str(crl), setting=f"inbound connection '{name}' tls_crl_file", chain=True
+            )
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
     # apply_connection_tls_ciphers. Unset (the default) narrows to the approved AEAD suites

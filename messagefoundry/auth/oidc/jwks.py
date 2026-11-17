@@ -7,8 +7,15 @@ The closed ``SignatureAlgorithm`` enum forecloses ``alg:none`` and RS256→HS256
 verify step (``transports/signing.py``). It does **not** foreclose a *weak* key — a 512-bit RSA JWK
 verifies "correctly" and is forgeable in minutes — so this module enforces an explicit floor before a
 key is ever handed to the verifier: ``kty`` ∈ {RSA, EC}; RSA modulus ≥ 2048 bits; EC curve ∈
-{P-256, P-384}; ``use`` (if present) == ``sig``; ``key_ops`` (if present) contains ``verify``; and a
-JWKS is **refused** if two keys share a ``kid`` (take-the-first is an attacker's lever).
+{P-256, P-384}; ``use`` (if present) == ``sig``; ``key_ops`` (if present) contains ``verify``;
+``alg`` (if present) names a supported JWS algorithm that fits the key; and a JWKS is **refused**
+if two usable keys share a ``kid`` (take-the-first is an attacker's lever).
+
+A key's ``alg`` is kept beside it (BACKLOG #5517): :meth:`JwksCache.get_key` refuses a token whose
+``alg`` differs from the one the key is restricted to, so an IdP's restriction is not dropped. A
+key naming an algorithm the engine does not verify (an encryption algorithm such as ``RSA-OAEP``
+included) is skipped like any other key below the floor, so a JWKS of only such keys yields no
+usable key and is refused.
 
 **No network here by construction.** :class:`JwksCache` takes a ``fetch`` callable; production wiring
 supplies one built on a hardened, CA-pinned opener, and tests supply an in-memory counter. The cache
@@ -27,8 +34,13 @@ from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
+from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.redaction import json_loads_or_refusal
-from messagefoundry.transports.signing import _PublicKey  # verify-path public-key union
+from messagefoundry.transports.signing import (
+    SigningError,
+    _PublicKey,  # verify-path public-key union
+    require_public_key_for_alg,
+)
 
 # ADR 0142 key-material floor. RSA below 2048 bits is forgeable; the JOSE curves we verify are the two
 # the signer already supports (ES256/ES384).
@@ -47,6 +59,20 @@ _MAX_JWKS_BYTES = 512 * 1024
 
 class JwksError(ValueError):
     """A JWKS document or an individual JWK was malformed, unsupported, or below the key floor."""
+
+
+class JwkAlgMismatch(JwksError):
+    """The key a token's ``kid`` selects is restricted, by its JWK ``alg``, to an algorithm other
+    than the one the token names (BACKLOG #5517). A refusal of the key, not a missing ``kid``."""
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundKey:
+    """One JWKS key and the algorithm its JWK ``alg`` restricts it to, ``None`` when it names none
+    (``alg`` is OPTIONAL in RFC 7517 section 4.4)."""
+
+    key: _PublicKey
+    alg: SignatureAlgorithm | None
 
 
 def _b64u_uint(value: str) -> int:
@@ -72,13 +98,48 @@ def _check_use_and_ops(jwk: dict[str, object]) -> None:
         raise JwksError("JWK key_ops does not permit 'verify'")
 
 
+def _jwk_alg(jwk: dict[str, object]) -> SignatureAlgorithm | None:
+    """The algorithm ``jwk``'s ``alg`` restricts it to, or ``None`` when it names none. An ``alg``
+    the engine does not verify, an encryption algorithm included, raises :class:`JwksError`."""
+    alg = jwk.get("alg")
+    if alg is None:
+        return None
+    if not isinstance(alg, str):
+        raise JwksError("JWK alg must be a string")
+    supported = sorted(a.value for a in SignatureAlgorithm)
+    if alg not in supported:
+        raise JwksError(
+            f"JWK alg {alg[:32]!r} is not a supported signature algorithm "
+            f"(expected one of {supported})"
+        )
+    return SignatureAlgorithm(alg)
+
+
 def jwk_to_public_key(jwk: dict[str, object]) -> _PublicKey:
     """Build a verifying public key from one JWK, enforcing the ADR 0142 key-material floor.
 
     Raises :class:`JwksError` on anything below the floor — an unsupported ``kty``, an undersized RSA
-    modulus, an unknown EC curve, or a ``use``/``key_ops`` that forbids verification.
+    modulus, an unknown EC curve, a ``use``/``key_ops`` that forbids verification, or an ``alg``
+    that is not a supported signature algorithm or does not fit the key (BACKLOG #5517).
     """
+    return _bound_key(jwk).key
+
+
+def _bound_key(jwk: dict[str, object]) -> _BoundKey:
+    """:func:`jwk_to_public_key`, keeping the algorithm the JWK restricts the key to."""
     _check_use_and_ops(jwk)
+    alg = _jwk_alg(jwk)
+    key = _floor_key(jwk)
+    if alg is not None:
+        try:
+            require_public_key_for_alg(key, alg)
+        except SigningError as exc:
+            raise JwksError(f"JWK alg does not fit its key: {exc}") from exc
+    return _BoundKey(key, alg)
+
+
+def _floor_key(jwk: dict[str, object]) -> _PublicKey:
+    """The key ``jwk`` holds, by ``kty``, enforcing the key-material floor."""
     kty = jwk.get("kty")
     if kty == "RSA":
         n = _b64u_uint(_require_str(jwk, "n"))
@@ -113,10 +174,15 @@ def parse_jwks(body: bytes) -> dict[str, _PublicKey]:
     """Parse a JWKS document into ``{kid: public_key}``, applying the floor to each key.
 
     A key with **no** ``kid`` is skipped (the RP selects by ``kid``, so an unlabelled key is
-    unusable), but a **duplicate** ``kid`` is a hard :class:`JwksError` — silently taking the first of
-    two same-``kid`` keys is a downgrade lever. Keys the floor rejects are skipped, so one rolled-in
+    unusable), but a ``kid`` two usable keys share is a hard :class:`JwksError` — silently taking
+    the first of two same-``kid`` keys is a downgrade lever. Keys the floor rejects are skipped, so one rolled-in
     weak key does not blank the whole set — unless it leaves nothing usable, which raises.
     """
+    return {kid: bound.key for kid, bound in _parse_bound(body).items()}
+
+
+def _parse_bound(body: bytes) -> dict[str, _BoundKey]:
+    """:func:`parse_jwks`, keeping the algorithm each JWK restricts its key to (BACKLOG #5517)."""
     # Returns rather than raises, so the refusal carries no chain holding the body (BACKLOG #2085),
     # and json's depth-limit RecursionError is a JwksError rather than an unaudited 500.
     doc, refused = json_loads_or_refusal(body)
@@ -125,7 +191,7 @@ def parse_jwks(body: bytes) -> dict[str, _PublicKey]:
     if not isinstance(doc, dict) or not isinstance(doc.get("keys"), list):
         raise JwksError("JWKS must be an object with a 'keys' array")
 
-    keys: dict[str, _PublicKey] = {}
+    keys: dict[str, _BoundKey] = {}
     skipped = 0
     for entry in doc["keys"]:
         if not isinstance(entry, dict):
@@ -135,10 +201,8 @@ def parse_jwks(body: bytes) -> dict[str, _PublicKey]:
         if not isinstance(kid, str) or kid == "":
             skipped += 1  # unlabelled → unusable by kid
             continue
-        if kid in keys:
-            raise JwksError(f"JWKS contains two keys with kid {kid!r} (ambiguous; refused)")
         try:
-            keys[kid] = jwk_to_public_key(entry)
+            bound = _bound_key(entry)
         except (JwksError, ValueError):
             # ValueError as well as JwksError: the floor's own checks raise JwksError, but the final
             # construction step in `cryptography` (RSAPublicNumbers/EllipticCurvePublicNumbers
@@ -147,6 +211,13 @@ def parse_jwks(body: bytes) -> dict[str, _PublicKey]:
             # whole parse, blanking the set AND (via the cache's already-stamped fetch attempt)
             # refusing every federated login until the min-refetch floor elapsed.
             skipped += 1  # a single weak/unsupported key must not blank the set
+            continue
+        # Checked among the USABLE keys only, after the floor, so the answer does not depend on
+        # key order: a skipped key (an encryption key sharing a signing key's kid, say) is never a
+        # second candidate, before or after the usable one (BACKLOG #5517).
+        if kid in keys:
+            raise JwksError(f"JWKS contains two keys with kid {kid!r} (ambiguous; refused)")
+        keys[kid] = bound
     if not keys:
         raise JwksError(f"JWKS yielded no usable signing keys ({skipped} skipped)")
     return keys
@@ -154,7 +225,7 @@ def parse_jwks(body: bytes) -> dict[str, _PublicKey]:
 
 @dataclass(slots=True)
 class _CacheState:
-    keys: dict[str, _PublicKey]
+    keys: dict[str, _BoundKey]
     fetched_at: float
 
 
@@ -195,7 +266,7 @@ class JwksCache:
         #: ORDER the two attributes become visible in, not a torn read of either.
         #:
         #: A blocking lock is safe here because ``get_key`` never runs on the event loop. Its one
-        #: caller outside this module is ``claims.py`` ``get_key(kid)``, reached from
+        #: caller outside this module is ``claims.py`` ``get_key(kid, alg=alg)``, reached from
         #: ``service.py``'s ``_exchange_and_validate``, which the caller runs under
         #: ``asyncio.to_thread``. Verified by search, not assumed.
         self._gate = threading.Lock()
@@ -210,14 +281,27 @@ class JwksCache:
         body = self._fetch()
         if len(body) > _MAX_JWKS_BYTES:
             raise JwksError(f"JWKS body exceeds the {_MAX_JWKS_BYTES}-byte bound")
-        self._state = _CacheState(keys=parse_jwks(body), fetched_at=now)
+        self._state = _CacheState(keys=_parse_bound(body), fetched_at=now)
 
-    def get_key(self, kid: str) -> _PublicKey:
+    def get_key(self, kid: str, *, alg: SignatureAlgorithm) -> _PublicKey:
         """Return the verifying key for ``kid``, refetching within the amplification bound on a miss.
+
+        ``alg`` is the algorithm the token names. A key whose JWK restricts it to another algorithm
+        raises :class:`JwkAlgMismatch` (BACKLOG #5517). A key whose JWK names none is returned, and
+        the caller still checks that it fits ``alg``.
 
         Raises :class:`JwksError` if the key is unknown and the min-refetch floor has not elapsed, or
         if a forced refetch still does not yield the ``kid``.
         """
+        bound = self._lookup(kid)
+        if bound.alg is not None and bound.alg != alg:
+            raise JwkAlgMismatch(
+                f"kid {kid!r} is restricted to {bound.alg.value}; the token names {alg.value}"
+            )
+        return bound.key
+
+    def _lookup(self, kid: str) -> _BoundKey:
+        """The cached or refetched key for ``kid``, under the gate ``__init__`` describes."""
         with self._gate:
             now = self._clock()
             state = self._state

@@ -10,7 +10,7 @@ the first time; a release or an activation that is cut short; and an activation 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, time
 from pathlib import Path
@@ -45,6 +45,7 @@ from messagefoundry.pipeline import Engine, wiring_runner
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.wiring_runner import DrParkedError, RegistryRunner
 from messagefoundry.store import MessageStore
+from messagefoundry.transports.base import DestinationConnector
 from messagefoundry.transports.file import FileDestination
 from tests.test_connection_scheduler import (
     _WAIT_BOUND_SECONDS,
@@ -713,6 +714,302 @@ async def test_a_cancelled_first_build_closes_the_connector_it_built(
         await runner.stop()
 
 
+async def test_a_hung_startup_check_at_an_activation_fails_its_lane_and_binds_the_inbounds(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner ruling 2026-11-16: a lane leaving the DR park whose ``validate_startup`` hangs, as a
+    check on a partner file share that does not answer does, is bounded. The lane fails, recorded
+    and alerted as a failed build, the connector the build made is closed, and the activation
+    binds its inbounds. Red before the bound: the prepare runs before the quiesce, so the
+    activation's reload never returned and no listener bound."""
+    closed: list[str] = []
+    real_validate = FileDestination.validate_startup
+
+    async def hang(self: FileDestination) -> None:
+        if self.directory.name == _OB_FILE:
+            await asyncio.Event().wait()
+        await real_validate(self)
+
+    async def aclose(self: FileDestination) -> None:
+        closed.append(self.directory.name)
+
+    monkeypatch.setattr(FileDestination, "validate_startup", hang)
+    monkeypatch.setattr(FileDestination, "aclose", aclose)
+    # Long enough that the healthy _OB_CA build on a busy runner is not cancelled with it.
+    monkeypatch.setattr(wiring_runner, "_DR_PARK_BUILD_TIMEOUT_SECONDS", 5.0)
+    sink = _CountingSink()
+    ca = _ca(tmp_path)
+    runner = _runner(
+        store, _graph(tmp_path, ca, _sha(ca)), dr_standby=Priority.CRITICAL, alert_sink=sink
+    )
+    await runner.start()
+    try:
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await asyncio.wait_for(runner.reload(), timeout=_WAIT_BOUND_SECONDS)
+
+        assert runner.inbound_running(_IB)
+        assert "within 5s as it left the DR park" in (runner.outbound_failed(_OB_FILE) or "")
+        assert sink.stopped.count(_OB_FILE) == 1
+        assert _OB_FILE not in runner._destinations
+        assert runner._dr_unbuilt.get(_OB_FILE) is True  # held parked, as a failed build is
+        assert not runner.outbound_running(_OB_FILE)
+        assert _OB_CA in runner._destinations  # the other lane came up
+        await _wait_until(lambda: closed == [_OB_FILE])
+    finally:
+        await runner.stop()
+
+
+def _with_file_lanes(tmp_path: Path, reg: Registry, *names: str) -> Registry:
+    """``reg`` with a critical File outbound added per name, each in its own directory."""
+    for name in names:
+        out = tmp_path / name
+        out.mkdir(exist_ok=True)
+        spec = ConnectionSpec(ConnectorType.FILE, {"directory": str(out)})
+        reg.add_outbound(build_outbound_connection(name, spec, priority=Priority.CRITICAL))
+    return reg
+
+
+async def test_hung_startup_checks_on_three_lanes_hold_an_activation_for_one_bound(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner ruling 2026-11-16: the bound is on the activation's inbound binds, not on each
+    lane. Three lanes leaving the DR park whose ``validate_startup`` all hang delay the binds by
+    about one bound. Red when the prepare built them one after another: the reload took about
+    three bounds and missed the deadline."""
+    bound = 3.0
+    hung = (_OB_FILE, "OB_FILE_2", "OB_FILE_3")
+    closed: list[str] = []
+    real_validate = FileDestination.validate_startup
+
+    async def hang(self: FileDestination) -> None:
+        if self.directory.name in hung:
+            await asyncio.Event().wait()
+        await real_validate(self)
+
+    async def aclose(self: FileDestination) -> None:
+        closed.append(self.directory.name)
+
+    monkeypatch.setattr(FileDestination, "validate_startup", hang)
+    monkeypatch.setattr(FileDestination, "aclose", aclose)
+    monkeypatch.setattr(wiring_runner, "_DR_PARK_BUILD_TIMEOUT_SECONDS", bound)
+    sink = _CountingSink()
+    ca = _ca(tmp_path)
+    reg = _with_file_lanes(tmp_path, _graph(tmp_path, ca, _sha(ca)), *hung[1:])
+    runner = _runner(store, reg, dr_standby=Priority.CRITICAL, alert_sink=sink)
+    await runner.start()
+    try:
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        # One bound plus a margin, well short of the three bounds a sequential prepare takes.
+        await asyncio.wait_for(runner.reload(), timeout=2.5 * bound)
+
+        assert runner.inbound_running(_IB)
+        for name in hung:
+            assert "as it left the DR park" in (runner.outbound_failed(name) or ""), name
+            assert sink.stopped.count(name) == 1, name
+            assert name not in runner._destinations
+            assert runner._dr_unbuilt.get(name) is True  # held parked, as a failed build is
+        await _wait_until(lambda: sorted(closed) == sorted(hung))
+    finally:
+        await runner.stop()
+
+
+async def test_a_hung_lane_at_an_activation_leaves_a_healthy_lane_to_go_live(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The concurrent builds share one bound, and a healthy lane among them is not failed with
+    the hung one: it builds, goes live and delivers its held row."""
+    healthy = "OB_FILE_OK"
+    real_validate = FileDestination.validate_startup
+
+    async def hang(self: FileDestination) -> None:
+        if self.directory.name == _OB_FILE:
+            await asyncio.Event().wait()
+        await real_validate(self)
+
+    monkeypatch.setattr(FileDestination, "validate_startup", hang)
+    # Long enough that a healthy build on a busy runner is not cancelled with the hung one.
+    monkeypatch.setattr(wiring_runner, "_DR_PARK_BUILD_TIMEOUT_SECONDS", 5.0)
+    ca = _ca(tmp_path)
+    reg = _with_file_lanes(tmp_path, _graph(tmp_path, ca, _sha(ca)), healthy)
+    runner = _runner(store, reg, dr_standby=Priority.CRITICAL)
+    await runner.start()
+    try:
+        row_id = await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(healthy, _ADT)])
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await asyncio.wait_for(runner.reload(), timeout=_WAIT_BOUND_SECONDS)
+
+        assert "as it left the DR park" in (runner.outbound_failed(_OB_FILE) or "")
+        assert runner.outbound_failed(healthy) is None
+        assert healthy in runner._destinations
+        assert runner.outbound_running(healthy)
+        await _delivered_on_first_claim(store, row_id, tmp_path / healthy, lane=healthy)
+    finally:
+        await runner.stop()
+
+
+async def test_the_dr_park_build_bound_leaves_an_ordinary_reload_build_alone(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound is the DR park's only. A reload that rebuilds a lane on a box with no DR
+    profile builds it unbounded: a build slower than the bound still lands."""
+    real_build = wiring_runner._build_off_loop
+
+    async def slow(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(0.3)
+        return await real_build(*args, **kwargs)
+
+    ca = _ca(tmp_path)
+    reg = _graph(tmp_path, ca, _sha(ca))
+    runner = _runner(store, reg)
+    await runner.start()
+    try:
+        monkeypatch.setattr(wiring_runner, "_DR_PARK_BUILD_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(wiring_runner, "_build_off_loop", slow)
+        moved = tmp_path / "moved"
+        moved.mkdir()
+        await runner.reload(_graph(tmp_path, ca, _sha(ca), directory=str(moved)))
+        assert runner.outbound_failed(_OB_FILE) is None
+        assert Path(runner._destinations[_OB_FILE].directory) == moved  # type: ignore[attr-defined]
+    finally:
+        await runner.stop()
+
+
+class _FakeConnector(DestinationConnector):
+    """A connector a fake DR-park build returns, recording its close."""
+
+    def __init__(self, name: str, closed: list[str]) -> None:
+        self.name, self._closed = name, closed
+
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
+        raise AssertionError("never sent")
+
+    async def aclose(self) -> None:
+        self._closed.append(self.name)
+
+
+class _Boom(BaseException):
+    """A build's raise that is not an ``Exception``, which the build does not turn into a
+    failed lane. Not ``KeyboardInterrupt``, which the event loop re-raises out of a task."""
+
+
+async def _cancel_tracked(runner: RegistryRunner, *more: asyncio.Task[Any]) -> None:
+    """Cancel the test's hung builds, a second cancel ending their hung cancel handlers, and
+    wait for them to end."""
+    tasks = [*more, *runner._lookup_close_tasks]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.wait(tasks, timeout=10)
+
+
+def _bare_runner(store: MessageStore, tmp_path: Path) -> RegistryRunner:
+    ca = _ca(tmp_path)
+    return _runner(store, _graph(tmp_path, ca, _sha(ca)))
+
+
+async def test_a_cancelled_dr_park_build_whose_cancel_handler_hangs_releases_the_reload(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled reload waits for its DR-park builds at most one bound. Red when it waited
+    with no limit: a build whose cancel handler hangs held the call, and so the reload lock,
+    for ever. The build still running is tracked with the detached closes."""
+    monkeypatch.setattr(wiring_runner, "_DR_PARK_BUILD_TIMEOUT_SECONDS", 0.3)
+    runner = _bare_runner(store, tmp_path)
+    started = asyncio.Event()
+
+    async def build(name: str, oc: Any) -> Any:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.Event().wait()  # the cancel handler hangs
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(runner, "_build_lane_destination", build)
+    into: dict[str, Any] = {}
+    lanes: Any = [("A", object())]
+    call = asyncio.create_task(runner._build_lane_destinations_bounded(lanes, into))
+    await asyncio.wait_for(started.wait(), timeout=10)
+    call.cancel()
+    try:
+        done, _ = await asyncio.wait([call], timeout=5)
+        assert call in done, "the cancelled call is still waiting on the hung build"
+        assert call.cancelled()
+        # The hung build, and the close waiting on it, are tracked.
+        assert len([t for t in runner._lookup_close_tasks if not t.done()]) == 2
+    finally:
+        await _cancel_tracked(runner, call)
+
+
+async def test_a_second_cancel_of_dr_park_builds_still_closes_and_tracks_them(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red when a second cancellation, landing while the call waited for its cancelled builds,
+    skipped the close: the finished build's connector was dropped open and the running one
+    was tracked by nothing."""
+    monkeypatch.setattr(wiring_runner, "_DR_PARK_BUILD_TIMEOUT_SECONDS", 5.0)
+    runner = _bare_runner(store, tmp_path)
+    closed: list[str] = []
+    hanging = asyncio.Event()
+
+    async def build(name: str, oc: Any) -> Any:
+        if name == "DONE":
+            return wiring_runner._LaneBuild(
+                _FakeConnector(name, closed), wiring_runner._AnchorVerdict()
+            )
+        hanging.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.Event().wait()  # the cancel handler hangs
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(runner, "_build_lane_destination", build)
+    into: dict[str, Any] = {}
+    lanes: Any = [("DONE", object()), ("HUNG", object())]
+    call = asyncio.create_task(runner._build_lane_destinations_bounded(lanes, into))
+    await asyncio.wait_for(hanging.wait(), timeout=10)
+    call.cancel()
+    await asyncio.sleep(0.05)  # into the wait for the cancelled builds
+    call.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(call, timeout=10)  # a timeout is red, not a hung suite
+        assert into == {}
+        await _wait_until(lambda: closed == ["DONE"], timeout=5)
+        # The hung build, and the close waiting on it, are tracked.
+        assert len([t for t in runner._lookup_close_tasks if not t.done()]) == 2
+    finally:
+        await _cancel_tracked(runner)
+
+
+async def test_a_dr_park_build_that_raises_leaves_every_other_result_with_the_caller(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red when one done build's raise skipped the done builds after it: their connectors went
+    into nothing, so nothing closed them."""
+    runner = _bare_runner(store, tmp_path)
+    closed: list[str] = []
+
+    async def build(name: str, oc: Any) -> Any:
+        if name == "RAISES":
+            raise _Boom
+        return wiring_runner._LaneBuild(
+            _FakeConnector(name, closed), wiring_runner._AnchorVerdict()
+        )
+
+    monkeypatch.setattr(runner, "_build_lane_destination", build)
+    into: dict[str, Any] = {}
+    lanes: Any = [("FIRST", object()), ("RAISES", object()), ("LAST", object())]
+    with pytest.raises(_Boom):
+        await runner._build_lane_destinations_bounded(lanes, into)
+    assert sorted(into) == ["FIRST", "LAST"]
+    await asyncio.sleep(0.05)  # any close a wrong abandon started gets its loop passes
+    if runner._lookup_close_tasks:
+        await asyncio.wait(runner._lookup_close_tasks, timeout=10)
+    assert closed == []  # each result is the caller's to close, not abandoned
+
+
 # --- an activation under a log halt -------------------------------------------------------
 
 
@@ -804,6 +1101,87 @@ async def test_a_lane_an_activation_under_a_log_halt_left_unbuilt_keeps_its_isol
         await asyncio.sleep(0.3)
         assert await _ca_row(store, row_id) == ("pending", 0)
         assert not runner.outbound_running(_OB_CA)
+    finally:
+        await runner.stop()
+
+
+def _repair_the_log_after_the_prepare(
+    runner: RegistryRunner, guard: _DeadLogGuard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The disk is repaired once the reload's last prepare has read the #122 halt, so the
+    prepare leaves the lanes it holds unbuilt and the apply's probe then lifts the halt (BACKLOG
+    #5755). The apply awaits nothing, so the repair lands between the two."""
+    real_apply = runner._apply_outbound_reconcile
+
+    def repair_then_apply(*args: Any) -> None:
+        guard.writable = True
+        real_apply(*args)
+
+    monkeypatch.setattr(runner, "_apply_outbound_reconcile", repair_then_apply)
+
+
+async def _halt(runner: RegistryRunner, guard: _DeadLogGuard, monkeypatch: Any) -> None:
+    monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+    await runner._respond_to_log_sink_event(
+        LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+    )
+
+
+async def test_a_halt_lifted_inside_an_activation_keeps_the_passive_starts_ca_record(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prepare left the lane unbuilt under the halt, and the apply's probe lifted it. Red
+    before the fix: the first-build block dropped the passive start's CA failure record before
+    the lane was found held, so the lane read healthy with no connector."""
+    ca, pin = _swapped_ca(tmp_path)
+    guard = _DeadLogGuard()
+    runner = _runner(
+        store, _graph(tmp_path, ca, pin), dr_standby=Priority.CRITICAL, alert_sink=_LogPageSink()
+    )
+    await runner.start()
+    try:
+        assert _PASSIVE_REFUSED in (runner.outbound_failed(_OB_CA) or "")
+        await _halt(runner, guard, monkeypatch)
+        _repair_the_log_after_the_prepare(runner, guard, monkeypatch)
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+
+        assert not runner._delivery_halted  # the apply's probe lifted it
+        assert _OB_CA not in runner._destinations
+        assert runner.outbound_filtered(_OB_CA) is None
+        held = runner.outbound_failed(_OB_CA) or ""
+        assert "passive start" in held and "POST /dr/activate needs it" not in held
+        assert not runner.outbound_dr_failed(_OB_CA)  # no build ran, so none failed
+    finally:
+        await runner.stop()
+
+
+async def test_a_halt_lifted_inside_a_reload_keeps_an_earlier_failed_build_mark(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lane's build failed at the activation, then a reload found it held by the halt the
+    apply's probe lifted. Red before the fix: that path wrote the lane's mark False, so it no
+    longer read as a failed build and its pages went silent."""
+    ca, pin = _swapped_ca(tmp_path)
+    guard = _DeadLogGuard()
+    runner = _runner(
+        store, _graph(tmp_path, ca, pin), dr_standby=Priority.CRITICAL, alert_sink=_LogPageSink()
+    )
+    await runner.start()
+    try:
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+        assert runner.outbound_dr_failed(_OB_CA)
+        failed = runner.outbound_failed(_OB_CA)
+
+        await _halt(runner, guard, monkeypatch)
+        _repair_the_log_after_the_prepare(runner, guard, monkeypatch)
+        await runner.reload()
+
+        assert not runner._delivery_halted  # the apply's probe lifted it
+        assert _OB_CA not in runner._destinations
+        assert runner.outbound_dr_failed(_OB_CA)
+        assert runner.outbound_failed(_OB_CA) == failed
     finally:
         await runner.stop()
 

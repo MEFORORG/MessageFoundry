@@ -879,3 +879,173 @@ def test_per_peer_arm_still_bounds_an_authenticated_peer() -> None:
     limiter.charge_failure("partner")
     limiter.charge_failure("partner")
     assert not limiter.check("partner")
+
+
+# --- BACKLOG #5677: the failed-attempt budgets are validated, at the factory and at start ----
+
+
+@pytest.mark.parametrize(
+    ("knob", "value"),
+    [
+        ("intake_auth_rate_limit", -1),
+        ("intake_auth_rate_limit_global", -5),
+        ("intake_auth_rate_limit", True),
+        ("intake_auth_rate_limit_global", 2.5),
+        ("intake_auth_rate_limit", "1e3"),
+        ("intake_auth_rate_limit", env("budget", default=-1)),
+    ],
+)
+def test_the_factory_refuses_a_budget_that_is_no_count(knob: str, value: object) -> None:
+    knobs: dict[str, Any] = {knob: value}
+    with pytest.raises(WiringError, match=knob) as exc:
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+    shown = value.default if hasattr(value, "default") else value
+    assert str(shown) not in str(exc.value)  # value withheld
+
+
+def test_a_refused_env_default_is_named_as_the_default() -> None:
+    # The factory reads only an env() budget's default=, so the refusal says that is what it
+    # refused; a literal budget's refusal does not mention a default.
+    knobs: dict[str, Any] = {"intake_auth_rate_limit": env("budget", default=-1)}
+    with pytest.raises(WiringError, match="default= of intake_auth_rate_limit") as exc:
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+    assert "-1" not in str(exc.value)
+    with pytest.raises(WiringError) as literal:
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), intake_auth_rate_limit=-1)
+    assert "default=" not in str(literal.value)
+
+
+def test_the_factory_still_accepts_every_count_and_an_env_reference() -> None:
+    for value in (0, None, 7, "10", 10.0, env("budget"), env("budget", default=3)):
+        knobs: dict[str, Any] = {"intake_auth_rate_limit": value}
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+
+
+def _budget_runner(**budgets: Any) -> tuple[Any, Any]:
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.config.wiring import Registry, build_inbound_connection
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    ic = build_inbound_connection(
+        "IB_HTTP",
+        Http(port=0, intake_auth="api_key", intake_api_key=env("k"), **budgets),
+        router="r",
+    )
+    reg = Registry()
+    reg.add_inbound(ic)
+    store: Any = object()  # never touched: only the limiter seam is called
+    return RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False)), ic
+
+
+@pytest.mark.parametrize("value", [5, "5"])
+def test_the_runner_reads_the_resolved_budget_not_the_env_reference(value: object) -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config, check_intake_budgets
+
+    # The global budget off, so the limiter exists only if the per-peer value read is not zero.
+    runner, ic = _budget_runner(
+        intake_auth_rate_limit=env("budget"), intake_auth_rate_limit_global=0
+    )
+    cfg = _source_config(ic, "127.0.0.1", {"budget": value, "k": "synthetic-key"})
+    check_intake_budgets(cfg, ic.name, ic.spec.settings)
+    assert runner._make_intake_rate_limiter(ic, cfg.settings) is not None
+    # Its control: the same wiring with the environment resolving to 0 builds no limiter.
+    off = _source_config(ic, "127.0.0.1", {"budget": "0", "k": "synthetic-key"})
+    assert runner._make_intake_rate_limiter(ic, off.settings) is None
+
+
+@pytest.mark.parametrize("value", [-1, True, "abc"])
+def test_the_runner_refuses_a_resolved_budget_that_is_no_count(value: object) -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config, check_intake_budgets
+
+    runner, ic = _budget_runner(intake_auth_rate_limit_global=env("budget"))
+    cfg = _source_config(ic, "127.0.0.1", {"budget": value, "k": "synthetic-key"})
+    for refuse in (
+        lambda: check_intake_budgets(cfg, ic.name, ic.spec.settings),
+        lambda: runner._make_intake_rate_limiter(ic, cfg.settings),
+    ):
+        with pytest.raises(WiringError, match="intake_auth_rate_limit_global") as exc:
+            refuse()
+        assert "IB_HTTP" in str(exc.value) and str(value) not in str(exc.value)
+
+
+@pytest.mark.parametrize("knob", ["intake_auth_rate_limit", "intake_auth_rate_limit_global"])
+def test_an_env_budget_that_resolves_to_no_value_is_refused(knob: str) -> None:
+    # BACKLOG #5677: a set-but-empty variable would turn the brute-force bound off with nobody
+    # having written None or 0. On main the runner's int() raised a TypeError on every unresolved
+    # env() budget, so this branch's resolved read must refuse the empty one itself.
+    from messagefoundry.pipeline.wiring_runner import _source_config, check_intake_budgets
+
+    runner, ic = _budget_runner(**{knob: env("budget")})
+    cfg = _source_config(ic, "127.0.0.1", {"budget": "", "k": "synthetic-key"})
+    for refuse in (
+        lambda: check_intake_budgets(cfg, ic.name, ic.spec.settings),
+        lambda: runner._make_intake_rate_limiter(ic, cfg.settings),
+    ):
+        with pytest.raises(WiringError, match=knob + r" \(env 'budget'\) resolved to no value"):
+            refuse()
+    # Its control: a None or 0 written in the config still disables that budget, and so does a 0
+    # the environment resolves to.
+    for literal in (None, 0):
+        runner, ic = _budget_runner(**{knob: literal})
+        cfg = _source_config(ic, "127.0.0.1", {"k": "synthetic-key"})
+        check_intake_budgets(cfg, ic.name, ic.spec.settings)
+    runner, ic = _budget_runner(**{knob: env("budget")})
+    cfg = _source_config(ic, "127.0.0.1", {"budget": "0", "k": "synthetic-key"})
+    check_intake_budgets(cfg, ic.name, ic.spec.settings)
+
+
+@pytest.mark.parametrize("default", [None, ""])
+def test_the_factory_refuses_an_env_budget_default_of_no_value(default: object) -> None:
+    # The runner refuses an env() budget that resolves to no value, so a default= of None or ""
+    # would pass `check` wherever the variable is set and be refused at serve wherever it is not.
+    knobs: dict[str, Any] = {"intake_auth_rate_limit": env("budget", default=default)}
+    with pytest.raises(WiringError, match="default= of intake_auth_rate_limit is refused"):
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+
+
+# A literal "" or other non-digit text must not turn a budget off where an env() "" is refused:
+# one rule, however the value arrived (BACKLOG #5677). Before this rule a literal "" (and "0.0")
+# loaded with the budget off.
+_NOT_PLAIN_DIGITS = ["", "   ", "0.0", " 0 ", "+5", "1_000", "٥", "5\n", "-0"]
+
+
+@pytest.mark.parametrize("knob", ["intake_auth_rate_limit", "intake_auth_rate_limit_global"])
+@pytest.mark.parametrize("text", _NOT_PLAIN_DIGITS)
+def test_the_factory_refuses_budget_text_other_than_plain_digits(knob: str, text: str) -> None:
+    knobs: dict[str, Any] = {knob: text}
+    with pytest.raises(WiringError, match=knob):
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+    # The same text as an env() default= is refused too, named as the default.
+    knobs = {knob: env("budget", default=text)}
+    with pytest.raises(WiringError, match=f"default= of {knob}"):
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+
+
+@pytest.mark.parametrize("text", [t for t in _NOT_PLAIN_DIGITS if t])
+def test_the_runner_refuses_resolved_budget_text_other_than_plain_digits(text: str) -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config, check_intake_budgets
+
+    runner, ic = _budget_runner(intake_auth_rate_limit=env("budget"))
+    cfg = _source_config(ic, "127.0.0.1", {"budget": text, "k": "synthetic-key"})
+    for refuse in (
+        lambda: check_intake_budgets(cfg, ic.name, ic.spec.settings),
+        lambda: runner._make_intake_rate_limiter(ic, cfg.settings),
+    ):
+        with pytest.raises(WiringError, match="intake_auth_rate_limit is text other than plain"):
+            refuse()
+
+
+def test_read_intake_budget_off_set_is_none_zero_and_digit_zero_text() -> None:
+    from messagefoundry.config.wiring import read_intake_budget
+
+    for off in (None, 0, "0", "00"):
+        assert read_intake_budget(off, "intake_auth_rate_limit", "HTTP") == 0
+    assert read_intake_budget("12", "intake_auth_rate_limit", "HTTP") == 12
+    assert read_intake_budget(12, "intake_auth_rate_limit", "HTTP") == 12
+    # A float zero is not the integer 0, so it is refused rather than read as off.
+    for bad in [*_NOT_PLAIN_DIGITS, True, False, 2.5, -1, 0.0, -0.0]:
+        with pytest.raises(ValueError, match="intake_auth_rate_limit"):
+            read_intake_budget(bad, "intake_auth_rate_limit", "HTTP")
+    float_zero: dict[str, Any] = {"intake_auth_rate_limit": 0.0}
+    with pytest.raises(WiringError, match="not the integer 0"):
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **float_zero)

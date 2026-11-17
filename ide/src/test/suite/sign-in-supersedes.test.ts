@@ -257,6 +257,14 @@ suite("auth.ts routes sign-in through the superseding path (BACKLOG #2281)", () 
   const logoutSites = (text: string): string[] =>
     text.split(/\r?\n/).filter((l) => l.includes('"/auth/logout"'));
 
+  test("the step-up re-proof carries the sign-in's timeout (vault BACKLOG #2950)", () => {
+    const text = fs.readFileSync(AUTH_TS, "utf8");
+    const sites = text.split(/\r?\n/).filter((l) => l.includes('"/me/reauth"') && l.includes("postJson"));
+    // Control: a scan that matched nothing would pass the check below vacuously.
+    assert.strictEqual(sites.length, 1, `expected one /me/reauth post; found ${sites.length}`);
+    assert.ok(sites[0].includes("SIGN_IN_TIMEOUT_MS)"), `the re-proof lost its timeout: ${sites[0]}`);
+  });
+
   test("signIn posts through signInSuperseding and no longer revokes afterwards", () => {
     const text = fs.readFileSync(AUTH_TS, "utf8");
     assert.ok(text.includes("signInSuperseding(ctx.secrets, secretKey(url), body"), "signIn's call moved");

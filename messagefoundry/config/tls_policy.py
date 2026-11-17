@@ -301,14 +301,24 @@ def harden_crl_check(
     record_held_copy: bool = True,
     chain: bool = False,
 ) -> None:
-    """Load a CRL onto a *verifying* ``ctx`` and turn on leaf revocation checking (BACKLOG #1005).
+    """Load a CRL onto a *verifying* ``ctx`` and turn on revocation checking (BACKLOG #1005).
 
     With ``chain``, revocation is checked for every certificate in the peer's chain, not only the
     leaf (``VERIFY_CRL_CHECK_CHAIN``, vault BACKLOG #5627), so a revoked intermediate CA refuses
     the clients under it. Every CA in the chain then needs its issuer's CRL in the file, or each
-    client under it is refused with ``unable to get certificate CRL``: that fails closed. A
-    single-tier CA, whose own CRL covers its leaves, behaves as without it. The API listener
-    passes it; every other hop keeps the leaf check.
+    client under it is refused with ``unable to get certificate CRL``: that fails closed. So a
+    loaded CA with no CRL of its own in the file refuses here, at start
+    (:func:`messagefoundry.pki.own_crl_reason`), a root that only signs intermediates included.
+    A single-tier CA's own CRL covers its leaves, unless an Issuing Distribution Point scopes it
+    so it does not cover the root: the chain check then refuses every client at the handshake,
+    and nothing here models that scope.
+
+    The listeners that require a client certificate pass it: the API listener (#5627) and, since
+    vault BACKLOG #5511, the MLLP, HTTP and DICOM inbound listeners' ``tls_crl_file``. On each,
+    the start rule reads the CAs loaded from the operator's own client-CA setting, not an OS trust
+    store. Every other hop keeps the
+    leaf check, at least the outbound hops under ``[tls].crl_file``: one may verify against the
+    OS trust store, whose roots no CRL file names, so the start rule would refuse it.
 
     The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
     validation and explicitly NOT revocation. Call it only on a context that already verifies the
@@ -366,9 +376,16 @@ def harden_crl_check(
 
     A sixth, since vault BACKLOG #2905 (owner ruling 2026-10-05): a CRL that is proven badly
     signed. :class:`~messagefoundry.pki.CrlSignature` says what counts as proof. The check is
-    :func:`_check_crl_signatures`. It runs last of all, once
-    OpenSSL is known to hold exactly the CRLs judged, so it hides none of the refusals above. A
-    signature it cannot confirm, short of proof, loads with one warning for the file.
+    :func:`_check_crl_signatures`. It runs once OpenSSL is known to hold exactly the CRLs judged,
+    so it hides none of the refusals above. A signature it cannot confirm, short of proof, loads
+    with one warning for the file.
+
+    A seventh, with ``chain`` only, since vault BACKLOG #5627 and #5511: a loaded CA with no CRL of
+    its own in the file (:func:`messagefoundry.pki.own_crl_reason`). It is the last refusal. It
+    is raised inside :func:`_check_crl_signatures`, after a proven bad signature refuses and before
+    the warning for a signature short of proof, so a refused start never first logs that the file
+    is loaded. The running-hop reload checks in the same order, except where the signature
+    judgment itself raises: a start then refuses on this rule, and the reload retries.
 
     **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
     hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
@@ -391,6 +408,7 @@ def harden_crl_check(
     from pathlib import Path
 
     from messagefoundry.config.loaded_crls import record_crl_load
+    from messagefoundry.pki import own_crl_reason
 
     label = crl_label(crl_file, setting)
     path = Path(crl_file)
@@ -465,11 +483,21 @@ def harden_crl_check(
                 "Check that the engine's account can write to its temporary directory, and that "
                 "there is room for the file"
             ) from exc
-    # Last of the refusals: only now is it known that OpenSSL holds exactly the CRLs judged.
-    _check_crl_signatures(pem, anchors, label=label, crl_file=crl_file)
-    ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    # Last of the refusals: only now is it known that OpenSSL holds exactly the CRLs judged. On a
+    # whole-chain hop the own-CRL rule (vault BACKLOG #5627, #5511) refuses a file that would
+    # refuse every client under a loaded CA. It goes in the reload's order: after a proven bad
+    # signature, before the warning that the file is loaded (messagefoundry.pki.own_crl_reason).
+    _check_crl_signatures(
+        pem,
+        anchors,
+        label=label,
+        crl_file=crl_file,
+        refusal=own_crl_reason(anchors, pem) if chain else None,
+    )
     if chain:
-        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN  # carries the leaf bit too
+    else:
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
 
@@ -585,7 +613,12 @@ _UNCONFIRMED_SHOWN = 3
 
 
 def _check_crl_signatures(
-    pem: bytes, anchors: Sequence[bytes], *, label: str, crl_file: str
+    pem: bytes,
+    anchors: Sequence[bytes],
+    *,
+    label: str,
+    crl_file: str,
+    refusal: str | None = None,
 ) -> None:
     """Check the signature of each CRL in the judged bytes ``pem`` against ``anchors``, the hop's
     own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
@@ -622,7 +655,11 @@ def _check_crl_signatures(
     context build measured at about 9 ms.
 
     There is no setting that turns this off and none that widens it, as for the expired-CRL
-    refusal in :func:`judge_crl_bytes`."""
+    refusal in :func:`judge_crl_bytes`.
+
+    ``refusal``, where given, is raised after a proven bad signature and before the warning, and
+    the ERROR for a failed judgment is not logged beside it, so a start the caller refuses never
+    first logs that the file is loaded (vault BACKLOG #5511)."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
     from messagefoundry.pki import (
         PROVEN_BAD_SIGNATURE,
@@ -643,7 +680,11 @@ def _check_crl_signatures(
         # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
         # that with exception types of its own. The handshake still checks every signature. The
         # verdicts already reached are used below: a proof refuses, and the unconfirmed warn.
-        if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(exc).__name__)):
+        # Not logged where the caller's ``refusal`` refuses the start anyway, since the line says
+        # the file is loaded (vault BACKLOG #5511).
+        if refusal is None and first_unconfirmed_signature(
+            crl_file, fingerprint, ("unjudged", type(exc).__name__)
+        ):
             logger.error(
                 "%s: the engine could not check the signatures of the CRL(s) in this file at "
                 "start (%s), after judging %d of them. That is not a verdict on the rest. Unless "
@@ -659,6 +700,8 @@ def _check_crl_signatures(
             f"{label}: {bad.where} {PROVEN_BAD_SIGNATURE}. Give this setting the CRL that CA "
             "signed, or remove this CRL if a good one from that issuer is already in the file"
         )
+    if refusal is not None:
+        raise ValueError(f"{label}: {refusal}")
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
     finding = tuple(signature.state for signature in judged)
     if not unconfirmed or not first_unconfirmed_signature(crl_file, fingerprint, finding):
@@ -794,7 +837,10 @@ def judge_crl_bytes(
 #: issues a CRL that is "not yet valid" here for that long. Refusing it would fail a start, or hold
 #: a reload back, over ordinary clock skew. The cost: OpenSSL itself allows no skew, so a lone CRL
 #: inside this window refuses every peer it judges until its ``thisUpdate`` passes. A reload is
-#: spared that, because the copy it adds to stays in effect and OpenSSL keeps choosing it until then.
+#: spared that only for an issuer whose CRL the hop already holds in effect: OpenSSL keeps choosing
+#: that copy until then. So a revocation only the new CRL lists waits until then too, and on a hop
+#: that checks CRL time the reload logs that at WARNING (vault BACKLOG #5507). Loading it only once
+#: in effect would enforce it no sooner.
 CRL_CLOCK_SKEW_SECONDS = 300.0
 
 

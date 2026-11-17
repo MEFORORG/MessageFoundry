@@ -14,8 +14,9 @@
 >
 > **One exception: a STALE checkout.** A worktree whose tree predates 2026-09-13 still carries the old
 > `alloc.ps1`, and `-Kind backlog` still runs there (BACKLOG #1829). To make its number harmless, the
-> shared registry holds a tombstone at `alloc/backlog/1000000.json`, written by
-> `scripts/coord/tombstone-retired-backlog-allocator.ps1`. A stale copy then issues `#1000001` or
+> clone-local registry holds a tombstone at `<git-common-dir>/mefor-coord/alloc/backlog/1000000.json`,
+> the only registry a stale copy reads, written by
+> `scripts/coord/tombstone-retired-backlog-allocator.ps1` and never on a shared coordination root. A stale copy then issues `#1000001` or
 > above, which collides with nothing. (Two early revisions refuse a backlog allocation outright.) Do not delete the tombstone. Allocate backlog numbers in the
 > maintainer-internal repository.
 >

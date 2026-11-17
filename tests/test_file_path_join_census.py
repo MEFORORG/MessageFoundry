@@ -944,11 +944,17 @@ SITES: dict[str, Site] = {
     "messagefoundry/transports/file.py::FileDestination._write": Site(
         1, GUARDED, _DEST_NAME, "messagefoundry/transports/file.py::render_filename", called=True
     ),
-    "messagefoundry/transports/file.py::FileSource.__init__": Site(
-        2, OPERATOR, "The operator's processed and error subdirectory settings."
+    "messagefoundry/transports/file.py::_archive_subdir": Site(
+        2,
+        OPERATOR,
+        "The operator's processed or error subdirectory setting, normalised, and refused when it "
+        "names the watch directory or one above it (BACKLOG #5682).",
     ),
     "messagefoundry/transports/file.py::FileSource.guarded_dirs": Site(
-        1, OPERATOR, "The operator's error subdirectory setting, as `__init__` joins it."
+        1,
+        OPERATOR,
+        "The operator's error subdirectory setting, joined unnormalised only when `_archive_subdir` "
+        "refuses it, so the guard still protects what a refused value names.",
     ),
     "messagefoundry/transports/file.py::_prune_entries": Site(
         1,
@@ -993,7 +999,13 @@ SITES: dict[str, Site] = {
         2, GUARDED, _DEST_NAME, "messagefoundry/transports/file.py::render_filename", called=True
     ),
     "messagefoundry/transports/remotefile.py::RemoteFileSource.__init__": Site(
-        2, OPERATOR, "The operator's processed and error subdirectory settings."
+        1, OPERATOR, "The operator's error subdirectory setting."
+    ),
+    "messagefoundry/transports/remotefile.py::_remote_processed_dir": Site(
+        2,
+        OPERATOR,
+        "The operator's processed subdirectory setting, refused when it names the poll directory "
+        "or one above it (BACKLOG #5682).",
     ),
     "messagefoundry/transports/remotefile.py::RemoteFileSource._after_processing": Site(
         1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"

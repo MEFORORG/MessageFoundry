@@ -303,3 +303,485 @@ def test_an_unset_profile_names_no_config_root(tmp_path: Path) -> None:
     (in_cwd / "sessions").mkdir(parents=True)
     write_session(in_cwd, pid=1, session_id="in-the-cwd")
     assert _roots_and_records(None, cwd=tmp_path) == {"Roots": [], "Records": []}
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #5491: the fence must answer, not throw, under Set-StrictMode -Version Latest. seat.ps1 and
+# fleet.ps1 both set it, and it reaches these functions through the caller's scope. A record missing a
+# property is exactly what a registry file caught mid-write looks like.
+# --------------------------------------------------------------------------------------------------
+
+
+def _strict(script: str) -> str:
+    """Run ``script`` after dot-sourcing the registry under StrictMode Latest; return its stdout."""
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{REGISTRY}'; Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; "
+            + script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0 and not proc.stderr.strip(), proc.stderr
+    return proc.stdout.strip()
+
+
+def _strict_fence(record: dict[str, Any]) -> str:
+    """Test-RecordLiveness's State for ``record``, parsed from JSON as a real record is."""
+    payload = json.dumps(record).replace("'", "''")
+    return _strict(f"(Test-RecordLiveness -Record ('{payload}' | ConvertFrom-Json)).State")
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"sessionId": "s", "startedAt": NOW_MS},
+        {"pid": "not-a-number", "sessionId": "s", "startedAt": NOW_MS},
+        {"pid": 2**40, "sessionId": "s", "startedAt": NOW_MS},
+    ],
+    ids=["no-pid-key", "non-numeric-pid", "pid-past-int32"],
+)
+def test_a_record_whose_pid_cannot_be_read_is_unreadable_under_strict_mode(
+    record: dict[str, Any],
+) -> None:
+    """The header's contract: no pid, or one that is not a number, is UNREADABLE -- possibly live."""
+    assert _strict_fence(record) == "UNREADABLE"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"startedAt": "not-a-number"}, {"startedAt": 2**62}],
+    ids=["no-startedat-key", "non-numeric-startedat", "startedat-out-of-range"],
+)
+def test_a_live_pid_whose_start_cannot_be_read_is_unverified_under_strict_mode(
+    extra: dict[str, Any],
+) -> None:
+    """The fence could not be evaluated, so it is not passed, and it must not throw either."""
+    assert _strict_fence({"pid": os.getpid(), "sessionId": "s", **extra}) == "UNVERIFIED"
+
+
+def test_a_live_record_is_still_live_under_strict_mode() -> None:
+    """Control: the guarded reads still pass a record that carries every field, a fractional
+    startedAt included, which the cast this replaced rounded."""
+    assert _strict_fence({"pid": os.getpid(), "sessionId": "s", "startedAt": NOW_MS}) == "LIVE"
+    assert _strict_fence({"pid": os.getpid(), "sessionId": "s", "startedAt": NOW_MS + 0.5}) == (
+        "LIVE"
+    )
+
+
+def test_a_hashtable_record_is_still_fenced_under_strict_mode() -> None:
+    """A dictionary record's keys are read too, as a bare property read of one did."""
+    got = _strict(f"(Test-RecordLiveness -Record @{{ pid = $PID; startedAt = {NOW_MS} }}).State")
+    assert got in {"LIVE", "STALE"}, got
+
+
+def test_a_miss_beside_a_record_naming_no_session_is_not_a_clean_miss(config_root: Path) -> None:
+    """That record may be the session asked about, caught mid-write, so the miss reads UNREADABLE.
+    Under seat.ps1's StrictMode it used to throw, and seat.ps1 refused the clear on the throw."""
+    (config_root / "sessions" / "99004.json").write_text(
+        json.dumps({"pid": os.getpid(), "startedAt": NOW_MS}), encoding="utf-8"
+    )
+    got = _strict(
+        f"$r = Get-SessionLiveness -SessionId 'abcdabcd' -ConfigRoot '{config_root}'; "
+        "'{0}|{1}|{2}' -f $r.Found, $r.State, $r.Detail"
+    )
+    found, state, detail = got.split("|", 2)
+    assert (found, state) == ("False", "UNREADABLE")
+    assert "99004.json" in detail, "the refusal must name the record an operator has to find"
+
+
+def _anonymous(config_root: Path, name: str, record: dict[str, Any], age_h: float = 0) -> Path:
+    """A registry record that names no session, its file last written ``age_h`` hours ago."""
+    path = config_root / "sessions" / name
+    path.write_text(json.dumps(record), encoding="utf-8")
+    if age_h:
+        then = time.time() - age_h * 3600
+        os.utime(path, (then, then))
+    return path
+
+
+def test_an_old_record_naming_no_session_is_reported_but_does_not_veto(config_root: Path) -> None:
+    """The twin of the veto: one that never gains its id must not block every clear for good. Its
+    startedAt and its file are two days old, and it has no pid, so its fence is UNREADABLE."""
+    _anonymous(config_root, "99007.json", {"startedAt": NOW_MS - 48 * 3600 * 1000}, age_h=48)
+    got = liveness(config_root, "5491eeee")
+    assert got["State"] == "UNKNOWN", got
+    assert "99007.json" in got["Detail"], got
+
+
+def test_an_old_startedat_on_a_freshly_written_file_still_vetoes(config_root: Path) -> None:
+    """Age is the newer of startedAt and the file's last write: a rewrite seconds ago is fresh."""
+    _anonymous(config_root, "99011.json", {"startedAt": NOW_MS - 48 * 3600 * 1000})
+    assert liveness(config_root, "5491a1a1")["State"] == "UNREADABLE"
+
+
+@pytest.mark.parametrize(("age_h", "state"), [(0, "UNREADABLE"), (48, "UNKNOWN")])
+def test_a_future_startedat_is_ignored_and_the_file_age_decides(
+    config_root: Path, age_h: float, state: str
+) -> None:
+    """A negative age is not fresh, or one future-dated record would veto until that date."""
+    future = NOW_MS + 10 * 365 * 24 * 3600 * 1000
+    _anonymous(config_root, "99012.json", {"startedAt": future}, age_h=age_h)
+    assert liveness(config_root, "5491b2b2")["State"] == state
+
+
+@pytest.mark.parametrize(
+    ("record", "state"),
+    [
+        ({"pid": os.getpid(), "startedAt": NOW_MS}, "UNREADABLE"),
+        ({"startedAt": NOW_MS}, "UNKNOWN"),
+    ],
+    ids=["live-vetoes-whatever-its-age", "unreadable-past-the-bound-does-not"],
+)
+def test_a_live_record_naming_no_session_vetoes_past_the_freshness_bound(
+    config_root: Path, record: dict[str, Any], state: str
+) -> None:
+    """A LIVE one stops vetoing when its process exits, so the bound does not apply to it. A bound of
+    zero hours makes every record old; only the LIVE one still vetoes."""
+    _anonymous(config_root, "99013.json", record)
+    got = _strict(
+        f"(Get-SessionLiveness -SessionId '5491c3c3' -ConfigRoot '{config_root}' "
+        "-AnonymousFreshHours 0).State"
+    )
+    assert got == state
+
+
+@pytest.mark.parametrize(("age_h", "state"), [(0, "UNREADABLE"), (48, "UNKNOWN")])
+def test_with_no_usable_startedat_the_file_age_decides(
+    config_root: Path, age_h: float, state: str
+) -> None:
+    _anonymous(config_root, "99008.json", {"startedAt": "not-a-number"}, age_h=age_h)
+    assert liveness(config_root, "5491ffff")["State"] == state
+
+
+@pytest.mark.parametrize(
+    ("anon_cwd", "state"),
+    [
+        ("here", "UNREADABLE"),
+        ("here-sub", "UNREADABLE"),
+        ("elsewhere", "DEAD"),
+        (None, "UNREADABLE"),
+    ],
+    ids=["same-worktree", "inside-worktree", "other-worktree", "no-cwd-fails-closed"],
+)
+def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
+    config_root: Path, tmp_path: Path, anon_cwd: str | None, state: str
+) -> None:
+    """A record naming no session vetoes a lookup for its own tree, case and slashes aside, and not
+    one for another tree. One with no readable cwd cannot be placed, so it vetoes everywhere."""
+    here = tmp_path / "wt-here"
+    cwds = {
+        "here": str(here).upper().replace("\\", "/") + "/",
+        "here-sub": str(here / "sub"),
+        "elsewhere": str(tmp_path / "wt-elsewhere"),
+    }
+    write_session(config_root, pid=never_live_pid(), session_id="5491abab-0000")
+    record: dict[str, Any] = {"pid": os.getpid(), "startedAt": NOW_MS}
+    if anon_cwd is not None:
+        record["cwd"] = cwds[anon_cwd]
+    _anonymous(config_root, "99009.json", record)
+    got = _strict(
+        f"(Get-SessionLiveness -SessionId '5491abab' -ConfigRoot '{config_root}' "
+        f"-Worktree '{here}').State"
+    )
+    assert got == state
+
+
+def test_a_vanished_record_file_ages_zero_whatever_its_startedat() -> None:
+    """A file gone between the listing and the read is the shape of one being replaced right now,
+    so it is fresh even with a two-day-old startedAt."""
+    got = _strict(
+        '$row = [pscustomobject]@{ Record = (\'{"startedAt": '
+        f"{NOW_MS - 48 * 3600 * 1000}"
+        "}' | ConvertFrom-Json); File = (Join-Path $env:TEMP 'mefor-5491-vanished-9f3a.json') }; "
+        "$a = @(Get-AnonymousSessionRecords -Records @($row)); '{0}|{1}' -f $a.Count, $a[0].Fresh"
+    )
+    assert got == "1|True"
+
+
+def _fleet(
+    tmp_path: Path,
+    anonymous: dict[str, Any] | None,
+    coord: Path | None = None,
+    anon_in_seat_worktree: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Run fleet.ps1 -Json over one seat whose own registry record is DEAD, beside an optional
+    registry record that names no session. The record's cwd is the seat's worktree, or another
+    worktree, unless ``anonymous`` sets its own. Returns the run and the anonymous record's path."""
+    home = tmp_path / "home"
+    root = home / ".claude"
+    (root / "sessions").mkdir(parents=True)
+    write_session(root, pid=never_live_pid(), session_id="5491dead-0000-0000-0000-000000000000")
+    repo = tmp_path / "repo"
+    seat_wt = repo / "seat-worktree"
+    anon = root / "sessions" / "99010.json"
+    if anonymous is not None:
+        cwd = str(seat_wt) if anon_in_seat_worktree else str(repo / "other-worktree")
+        anon.write_text(json.dumps({"cwd": cwd, **anonymous}), encoding="utf-8")
+
+    repo.mkdir()
+    for args in (
+        ["init", "-q", "-b", "main"],
+        ["-c", "user.email=t@e.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty"]
+        + ["-m", "base"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    shared = tmp_path / "shared"
+    seat_dir = shared / "seats" / "box-5491"
+    seat_dir.mkdir(parents=True)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    seat = {
+        "schema": 1,
+        "asOf": stamp,
+        "lifecycle": "open",
+        "boxKey": "box-5491",
+        "worktree": str(seat_wt),
+        "sessionId": "5491dead-0000-0000-0000-000000000000",
+        "sessionKey": "5491dead",
+        "seat": "builder",
+        "branch": "b",
+        "claims": [],
+        "allocations": [],
+        "handoff": None,
+    }
+    (seat_dir / "5491dead.json").write_text(json.dumps(seat), encoding="utf-8")
+
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k.upper() not in {"USERPROFILE", "MEFOR_COORD_ROOT", "CLAUDE_CODE_SESSION_ID"}
+    }
+    env.update(USERPROFILE=str(home), MEFOR_COORD_ROOT=str(shared))
+    fleet = (coord or REGISTRY.parent) / "fleet.ps1"
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(fleet), "-Json"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+        env=env,
+    )
+    return proc, anon
+
+
+def _fleet_json(proc: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    assert proc.returncode in (0, 2), proc.stderr
+    j: dict[str, Any] = json.loads(proc.stdout)
+    return j
+
+
+def test_fleet_reads_a_seat_with_an_anonymous_record_in_its_worktree_as_possibly_running(
+    tmp_path: Path,
+) -> None:
+    """The record may be this seat relaunched, so the seat must not read INTERRUPTED, which -Chip and
+    respawn.ps1 treat as respawnable. It counts as a live session without reading as a writer that
+    failed, and the receipt names it."""
+    proc, anon = _fleet(tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS})
+    j = _fleet_json(proc)
+    row = {r["Box"]: r for r in j["rows"]}["box-5491"]
+    assert row["State"] == "POSSIBLY RUNNING", row
+    receipt = j["receipt"]
+    assert receipt["anonymousLiveRecords"] == 1, receipt
+    assert str(anon) in receipt["anonymousLiveRecordFiles"]
+    assert receipt["liveSessionsWithoutRecord"] == 0, receipt
+
+
+def test_fleet_leaves_a_seat_alone_when_the_anonymous_record_is_in_another_worktree(
+    tmp_path: Path,
+) -> None:
+    """The twin: a record in another worktree is not this seat, so the seat keeps its own verdict."""
+    proc, _ = _fleet(
+        tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS}, anon_in_seat_worktree=False
+    )
+    row = {r["Box"]: r for r in _fleet_json(proc)["rows"]}["box-5491"]
+    assert row["Fence"] == "DEAD", row
+    assert row["State"] in ("INTERRUPTED", "ORPHANED-STALE"), row
+
+
+def test_fleet_suppresses_the_roster_for_an_anonymous_record_with_no_cwd(tmp_path: Path) -> None:
+    """It cannot be placed, so no seat can be told apart from a relaunch: exit 4 and nothing on
+    stdout, which respawn.ps1 reads as a fleet run with no JSON and stops on."""
+    proc, anon = _fleet(tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS, "cwd": None})
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert not proc.stdout.strip(), proc.stdout
+    assert "ROSTER SUPPRESSED" in proc.stderr and str(anon) in proc.stderr, proc.stderr
+
+
+def test_fleet_renders_with_no_anonymous_record(tmp_path: Path) -> None:
+    """The twin: nothing anonymous, a normal roster and a zero count."""
+    proc, _ = _fleet(tmp_path, None)
+    assert _fleet_json(proc)["receipt"]["anonymousLiveRecords"] == 0
+
+
+def test_fleet_suppresses_the_roster_when_the_anonymous_scan_fails(tmp_path: Path) -> None:
+    """An instrument that failed must not read as no record. The scan is made to throw in a copy of
+    the scripts, so the real ones are untouched."""
+    coord = tmp_path / "coord"
+    coord.mkdir()
+    for name in ("fleet.ps1", "mail-key.ps1", "coord-root.ps1"):
+        shutil.copy2(REGISTRY.parent / name, coord / name)
+    broken = REGISTRY.read_text(encoding="utf-8") + (
+        "\nfunction Get-AnonymousSessionRecords { throw 'scan-broke-5491' }\n"
+    )
+    (coord / "session-registry.ps1").write_text(broken, encoding="utf-8")
+    proc, _ = _fleet(tmp_path, None, coord=coord)
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert not proc.stdout.strip(), proc.stdout
+    assert "scan-broke-5491" in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize(
+    ("pid", "anonymous", "refusal"),
+    [
+        ("not-a-number", None, "UNREADABLE"),
+        (None, None, None),
+        (None, "primary", "names no session"),
+        (None, "elsewhere", None),
+    ],
+    ids=["unreadable", "dead", "anonymous-in-its-tree", "anonymous-elsewhere"],
+)
+def test_sessions_rehome_refuses_an_unreadable_fence(
+    tmp_path: Path, pid: str | None, anonymous: str | None, refusal: str | None
+) -> None:
+    """sessions.ps1 moves a transcript, so an UNREADABLE fence must stop it. A non-numeric pid used
+    to throw in the fence, which stopped the move; reading UNREADABLE must stop it the same way. A
+    record naming no session in the transcript's birth tree stops it too, and the refusal names that
+    record rather than calling a dead session RUNNING. The twins, a DEAD record alone or beside an
+    anonymous record in another tree, pass the guard and find the transcript already filed."""
+    repo = tmp_path / "repo"
+    (repo / "scripts" / "worktree").mkdir(parents=True)
+    (repo / "scripts" / "coord").mkdir(parents=True)
+    shutil.copy2(REGISTRY.parents[1] / "worktree" / "sessions.ps1", repo / "scripts" / "worktree")
+    shutil.copy2(REGISTRY, repo / "scripts" / "coord")
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, capture_output=True)
+    primary = (
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        .stdout.splitlines()[0]
+        .removeprefix("worktree ")
+        .replace("/", "\\")
+    )
+    home = tmp_path / "home"
+    root = home / ".claude"
+    sid = "5491eeee-1111-2222-3333-444444444444"
+    slug = "".join(c if c.isalnum() else "-" for c in primary)
+    transcript = root / "projects" / slug / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps({"type": "user", "cwd": primary}) + "\n", encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(transcript, (old, old))
+    (root / "sessions").mkdir()
+    (root / "sessions" / "1.json").write_text(
+        json.dumps(
+            {"pid": pid if pid else never_live_pid(), "sessionId": sid, "startedAt": NOW_MS}
+        ),
+        encoding="utf-8",
+    )
+    anon = root / "sessions" / "2.json"
+    if anonymous is not None:
+        cwd = primary if anonymous == "primary" else str(tmp_path / "elsewhere")
+        anon.write_text(json.dumps({"startedAt": NOW_MS, "cwd": cwd}), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k.upper() not in {"USERPROFILE"}}
+    env["USERPROFILE"] = str(home)
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+        + [str(repo / "scripts" / "worktree" / "sessions.ps1"), "-Rehome", sid[:8]],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+        env=env,
+    )
+    if refusal:
+        assert proc.returncode != 0 and refusal in proc.stderr, proc.stdout + proc.stderr
+        if anonymous:
+            assert "2.json" in proc.stderr and "still RUNNING" not in proc.stderr, proc.stderr
+    else:
+        assert proc.returncode == 0 and "already filed" in proc.stdout, proc.stdout + proc.stderr
+    assert transcript.exists()
+
+
+def test_a_gone_match_beside_a_live_record_naming_no_session_is_unreadable(
+    config_root: Path,
+) -> None:
+    """The matched record reads DEAD, but the anonymous live one may be the same session, caught
+    mid-write after a relaunch, so the answer must not license a clear."""
+    write_session(config_root, pid=never_live_pid(), session_id="5491cccc-0000")
+    (config_root / "sessions" / "99005.json").write_text(
+        json.dumps({"pid": os.getpid(), "startedAt": NOW_MS}), encoding="utf-8"
+    )
+    assert liveness(config_root, "5491cccc")["State"] == "UNREADABLE"
+
+
+def test_a_dead_record_naming_no_session_does_not_veto(config_root: Path) -> None:
+    """A record whose own fence reads DEAD cannot be a live session, so it leaves a miss clean."""
+    (config_root / "sessions" / "99006.json").write_text(
+        json.dumps({"pid": never_live_pid(), "startedAt": NOW_MS}), encoding="utf-8"
+    )
+    assert liveness(config_root, "5491dddd")["State"] == "UNKNOWN"
+
+
+def test_a_far_future_startedat_is_unverified_not_stale_or_a_throw_under_strict_mode() -> None:
+    """A startedAt in the future is not a registration that happened: UNVERIFIED, which at least
+    seat.ps1, sessions.ps1 and the remove guards treat as possibly live. The cast this replaced
+    threw on this value; STALE would read as gone. A moderate future value, inside the range the
+    cast handled, reads the same under the default skew."""
+    record = {"pid": os.getpid(), "sessionId": "s", "startedAt": 200_000_000_000_000}
+    assert _strict_fence(record) == "UNVERIFIED"
+    record["startedAt"] = int((time.time() + 1800) * 1000)
+    assert _strict_fence(record) == "UNVERIFIED"
+
+
+def test_a_live_anonymous_record_with_a_future_startedat_still_vetoes(
+    config_root: Path, tmp_path: Path
+) -> None:
+    """Its fence reads UNVERIFIED, not STALE, so the scan keeps it and its fresh file vetoes."""
+    wt = tmp_path / "wt-future"
+    future = int((time.time() + 3600) * 1000)
+    _anonymous(config_root, "99014.json", {"pid": os.getpid(), "startedAt": future, "cwd": str(wt)})
+    got = _strict(
+        f"(Get-SessionLiveness -SessionId '5491d4d4' -ConfigRoot '{config_root}' "
+        f"-Worktree '{wt}').State"
+    )
+    assert got == "UNREADABLE"
+
+
+def test_a_session_registered_after_its_process_started_is_live_under_a_wide_skew() -> None:
+    """The twin: an hour-later registration is a real start time, and remove.ps1 widens the skew to
+    read it LIVE. Rejecting every future startedAt turned this UNVERIFIED (PR 3001's red)."""
+    record = {"pid": os.getpid(), "sessionId": "s", "startedAt": int((time.time() + 3600) * 1000)}
+    payload = json.dumps(record).replace("'", "''")
+    got = _strict(
+        f"(Test-RecordLiveness -Record ('{payload}' | ConvertFrom-Json) "
+        "-StartSkewMinutes ([int]::MaxValue)).State"
+    )
+    assert got == "LIVE"
+
+
+def test_a_record_with_no_session_id_does_not_break_a_lookup_under_strict_mode(
+    config_root: Path,
+) -> None:
+    """One sessionId-less record in the registry must not throw every lookup, or a caller that
+    catches the throw reports the session it asked about as unknown."""
+    (config_root / "sessions" / "99003.json").write_text(
+        json.dumps({"pid": os.getpid(), "startedAt": NOW_MS}), encoding="utf-8"
+    )
+    write_session(config_root, pid=os.getpid(), session_id="5491aaaa-0000")
+    got = _strict(
+        f"$r = Get-SessionLiveness -SessionId '5491aaaa' -ConfigRoot '{config_root}'; "
+        f"$l = Get-LoginForSession -SessionId '5491aaaa-0000' -ConfigRoot '{config_root}'; "
+        "'{0}|{1}' -f $r.State, $l.Matched"
+    )
+    assert got == "LIVE|1"

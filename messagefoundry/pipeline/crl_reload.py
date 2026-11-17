@@ -38,7 +38,8 @@ checks the signature too, and refuses only the proven case, which is
 that a start loads with a warning, so this reload holds back some files a start would load. The
 remedy says which (vault BACKLOG #3506): a proven bad signature is a file to fix, and one the engine
 could not confirm asks for a check, then a restart, since such a file can be right.
-A hop that checks revocation for the whole chain, at least the API listener, must also find
+A hop that checks revocation for the whole chain, at least the API listener and the MLLP, HTTP and
+DICOM inbound listeners (vault BACKLOG #5511), must also find
 each CA it lists with a CRL of its own in the file (:func:`~messagefoundry.pki.cas_without_own_crl`,
 vault BACKLOG #5627), the rule a start applies there, so a file that fails it is a file to fix.
 The hop's list holds only its own trust store. An intermediate CA the peer sends in its handshake is
@@ -62,7 +63,12 @@ retried next pass.
 
 **A CRL up to five minutes ahead counts as in effect**
 (:data:`~messagefoundry.config.tls_policy.CRL_CLOCK_SKEW_SECONDS`), at a start and here alike, so a
-CA's clock running a little fast does not hold a reload back.
+CA's clock running a little fast does not hold a reload back. OpenSSL itself allows no skew, so
+such a CRL is loaded but not used until its ``thisUpdate``: a revocation only it lists is not
+enforced before then. A reload that applies a file holding any CRL not yet in effect says so at
+WARNING, and says when, only where some reloaded context checks CRL time (vault BACKLOG #5507);
+a context that skips it (``tls_allow_expired``) uses the newer CRL at once. Waiting for
+``thisUpdate`` to load it would enforce it no sooner.
 
 **A context's trust store only grows.** Each reload adds the file's CRLs and nothing removes the old
 ones, so memory and per-handshake CRL scoring grow with every reload. ``[cert_monitor].crl_max_reloads``
@@ -136,6 +142,7 @@ from messagefoundry.config.tls_policy import (
     crl_not_in_effect,
     crl_scratch_context,
     judge_crl_bytes,
+    skips_validity_period,
     staged_crl,
 )
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
@@ -145,9 +152,8 @@ from messagefoundry.pki import (
     CrlFacts,
     CrlIssuerKey,
     CrlSignatureFinding,
-    cas_without_own_crl,
     crl_signature_finding,
-    own_crl_refusal,
+    own_crl_reason,
     quoted_issuer,
 )
 from messagefoundry.redaction import log_timestamp
@@ -774,7 +780,7 @@ def _reload_path(
     prior = reload_refusal(key, fingerprint)
     label = _label(key, fingerprint, stale, path, refused=prior is not None)
     refusals = _Refusals()
-    reloaded = 0
+    reloaded = timed = 0
     blocks: tuple[CrlBlock, ...] = ()  # stays empty when the bytes cannot be judged
     try:
         # A CRL not in effect yet is judged here, not refused there: a context at the cap, a held
@@ -810,7 +816,7 @@ def _reload_path(
             # OpenSSL's own reading of the file first: a file a start would refuse is a file to
             # fix, which outranks every verdict above.
             certificates = _certificates_in(copy, blocks, label=label)
-            reloaded = _load(
+            reloaded, timed = _load(
                 pem, copy, certificates, label, ready, refusals, fingerprint, facts, blocks
             )
     except _NotProvable as exc:
@@ -854,7 +860,21 @@ def _reload_path(
         # Judged again each pass, so a warning goes once its time has passed, and a refusal a
         # later pass finds for these bytes is reported (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`).
         refusals.reopen()
-    return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)
+    # OpenSSL uses a CRL only once it is in effect, with no skew, so the applied line must say
+    # when each CRL in the file not yet in effect starts to count (vault BACKLOG #5507). Any such
+    # CRL, not only an issuer's sole one: a file that keeps the held CRL beside a successor not yet
+    # in effect is applied too, and the successor's revocations wait all the same. Only on a
+    # context that checks CRL time: one that skips it (tls_allow_expired) enforces the newer CRL
+    # at once, so the line would be false there.
+    early = (
+        sorted(
+            (block for block in blocks if not crl_in_effect(block, now=now, skew=0.0)),
+            key=lambda block: block.this_update,
+        )
+        if timed
+        else []
+    )
+    return _finish(label, path, fingerprint, stale, reloaded, refusals, prior, early, timed)
 
 
 def _load(
@@ -867,18 +887,19 @@ def _load(
     fingerprint: tuple[int, int],
     facts: CrlFacts,
     blocks: tuple[CrlBlock, ...],
-) -> int:
+) -> tuple[int, int]:
     """Load the staged ``copy`` into each context in ``ready`` that passes the per-context checks.
 
     A context paired with a verdict (a wait, a restart) gets the checks and then that verdict, so a
     file to fix is reported as one whatever else holds the context back. Returns how many contexts
-    now hold the file. A failure in one context is that context's refusal alone, retried next pass:
+    now hold the file, and how many of those check CRL time (:func:`skips_validity_period` reads
+    False; vault BACKLOG #5507). A failure in one context is that context's refusal alone, retried next pass:
     the contexts already loaded stay counted, and the rest are still tried.
 
     The check that stops a context decides whether these bytes are judged again
     (:attr:`_Refusals.sticky`). A context that fails a file check is stopped by it, wait or no
     wait. A context that passes every file check and only waits takes them once the wait lifts."""
-    reloaded = 0
+    reloaded = timed = 0
     signatures: dict[frozenset[bytes], CrlSignatureFinding | None] = {}
     unowned: dict[frozenset[bytes], str | None] = {}  # why the own-CRL rule refuses, if it does
     for ctx, held, held_back in ready:
@@ -912,11 +933,7 @@ def _load(
                 # so a CRL OpenSSL may judge a CA's clients by, and that CA did not sign, never
                 # loads live.
                 if anchors not in unowned:
-                    try:
-                        missing = cas_without_own_crl(anchors, pem)
-                        unowned[anchors] = own_crl_refusal(missing) if missing else None
-                    except ValueError as exc:  # a start refuses the same file, naming it
-                        unowned[anchors] = f"it could not be checked against the hop's CAs: {exc}"
+                    unowned[anchors] = own_crl_reason(anchors, pem)
                 if (unowned_why := unowned[anchors]) is not None:
                     refusals.add(f"{label}: {unowned_why}", FIX)
                     continue
@@ -937,7 +954,7 @@ def _load(
             )
             refusals.error = refusals.error or exc
             continue
-        reloaded += replace_held_copy(
+        replaced = replace_held_copy(
             ctx,
             held,
             replace(
@@ -948,7 +965,10 @@ def _load(
                 reloads=held.reloads + 1,
             ),
         )
-    return reloaded
+        reloaded += replaced
+        if replaced and not skips_validity_period(ctx):
+            timed += replaced
+    return reloaded, timed
 
 
 def _finish(
@@ -959,12 +979,42 @@ def _finish(
     reloaded: int,
     refusals: _Refusals,
     prior: ReloadRefusal | None,
+    early: Sequence[CrlBlock],
+    timed: int,
 ) -> ReloadOutcome:
-    """Log and record what one file's reload did, and return it."""
+    """Log and record what one file's reload did, and return it.
+
+    ``early`` holds the applied file's CRLs that are not in effect yet with no clock skew
+    allowed, earliest first, and ``timed`` is how many of the ``reloaded`` contexts check CRL
+    time; ``early`` is empty when none does (vault BACKLOG #5507)."""
     if reloaded:
-        log.info(
-            "crl_reload: applied %s to %d running TLS context(s) without a restart", label, reloaded
-        )
+        if not early:
+            log.info(
+                "crl_reload: applied %s to %d running TLS context(s) without a restart",
+                label,
+                reloaded,
+            )
+        else:
+            # Not a refusal: a CRL up to CRL_CLOCK_SKEW_SECONDS ahead counts as in effect, so a
+            # fast CA clock does not hold a revocation back. But OpenSSL scores a CRL not yet in
+            # effect below one that is, so until thisUpdate a revocation only this CRL lists is
+            # not enforced, and the INFO line alone would say it was applied.
+            log.warning(
+                "crl_reload: applied %s to %d running TLS context(s) without a restart, but %d "
+                "CRL(s) in it take effect only after this host's clock reads now: %s. On the %d "
+                "of those contexts that check CRL time, OpenSSL uses a CRL only once it is in "
+                "effect, so until then a revocation only such a CRL lists is not enforced: each "
+                "such hop judges that issuer's peers by a CRL it holds that is in effect, or "
+                "refuses them with 'CRL is not yet valid' where it holds none",
+                label,
+                reloaded,
+                len(early),
+                "; ".join(
+                    f"from issuer {quoted_issuer(block.issuer)} at {log_timestamp(block.this_update)}"
+                    for block in early
+                ),
+                timed,
+            )
     if refusals.strongest is None:
         clear_reload_refusal(path)
         return ReloadOutcome(path, reloaded, None)

@@ -76,6 +76,7 @@ Concretely:
 - **AC-9** — WHERE `tls=true`, THE ENGINE SHALL perform a full TLS handshake with unchanged verification (CA, hostname, mTLS) on every reconnect of a persistent connection.
   → `tests/test_mllp_persistent.py::test_tls_reconnect_rehandshakes_and_verifies`
 - **AC-10** — WHEN the partner returns a NAK on a persistent connection, THE ENGINE SHALL preserve `NegativeAckError` semantics unchanged (AR/CR dead-letter, AE retry) AND SHALL keep the connection cached (a NAK is a complete transaction on a healthy transport).
+  *Amended 2026-11-16 for a reject naming another message; see [section 10](#10-amendment-2026-11-16--a-reject-naming-another-message-backlog-5681).*
   → `tests/test_mllp_persistent.py::test_nak_semantics_unchanged_connection_retained`
 - **AC-11** — WHEN a reconnect (either class) occurs, THE ENGINE SHALL log it with the detected reason / `_describe_error` detail — metadata only, never payload bytes — and increment the connector's reconnect counter.
   → `tests/test_mllp_persistent.py::test_reconnect_logged_with_detail_no_payload`
@@ -158,3 +159,15 @@ Concretely:
 **Reliability-invariant checklist (delta):** unchanged from §6 — at-least-once (only reconnect-before-first-byte writes zero bytes; any post-write failure is charged), per-lane FIFO (single serial sender; a reconnect happens inside one send), count-and-log, independent lanes (one connection per destination instance), no event-loop blocking (every `wait_closed` bounded), PHI (reconnect logs carry `_describe_error`/OS metadata only). The X12 TA1 retry gate and MLLP-only inbound paths are untouched.
 
 **Out of scope (unchanged):** pooled N-connections-per-destination; MSA-2↔MSH-10 / TA1 mid-transaction stray-frame correlation (BACKLOG #82); a per-connection reconnects-counter API surface (log-only, as in §8).
+
+## 10. Amendment (2026-11-16) — a reject naming another message (BACKLOG #5681)
+
+AC-10 stands as written, with one exception, and only when `verify_ack_control_id` is on. A reject
+(MSA-1 `AR`/`CR`) whose MSA-2 names a different, non-empty control id than the sent MSH-10 is not
+a reject of this message. It is a retryable `DeliveryError`, the same correlation failure a
+mismatched positive ACK already was under BACKLOG #82, and on a persistent connection it discards
+the socket instead of keeping it cached, since the reply shows the socket is out of step with the
+sends. A reject whose MSA-2 matches the sent MSH-10, or is empty, stays a final `NegativeAckError`
+dead-letter, and the connection stays cached, as AC-10 says. An error ACK (`AE`/`CE`) is unchanged
+whatever its MSA-2: a retried `NegativeAckError` that keeps the connection cached. The owner's MLLP
+ACK convention ruling of 2026-11-04 is kept. With `verify_ack_control_id` off, nothing here changes.

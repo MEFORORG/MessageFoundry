@@ -90,3 +90,13 @@ def test_reset_clears_history() -> None:
 def test_sustain_samples_floor() -> None:
     with pytest.raises(ValueError):
         SaturationDetector(sustain_samples=1)  # fewer than 2 can't tell a burst from growth
+
+
+def test_one_arrival_on_an_idle_lane_has_the_shape_of_slow_saturation() -> None:
+    # BACKLOG #5768, reviewed: [0, 0, 0, 1] fires, and so must [5, 5, 5, 6], an outbound sampled on
+    # each retry faster than its arrivals while its backlog grows. Depth samples alone cannot tell
+    # the two apart, so a rule that refuses the first also silences the second.
+    first = _feed(SaturationDetector(sustain_samples=3), [0, 0, 0, 1])
+    second = _feed(SaturationDetector(sustain_samples=3), [5, 5, 5, 6])
+    assert first is not None and second is not None
+    assert first.growth_per_second == second.growth_per_second

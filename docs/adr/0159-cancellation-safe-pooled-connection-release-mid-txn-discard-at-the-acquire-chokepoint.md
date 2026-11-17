@@ -563,7 +563,14 @@ the next reader does not re-derive the wrong precedent from the same comment.
 
   **The trade-off.** The store reaches an unbounded wait only when `[store].command_timeout` is 0.
   The DATABASE connector has no statement timeout at all (`docs/CONNECTIONS.md`), so it is always
-  in that state. A cancelled borrow waits without bound for its running call before its cursor
+  in that state. **SUPERSEDED IN PART by BACKLOG #5756:** the connector now applies a
+  `statement_timeout` to every borrow of a destination, poll source or lookup pool, and each pool
+  runs aioodbc's calls on its own executor. Unset, it is 30 s only on the SQL Server preset and on
+  a generic connection whose driver is Microsoft's; on every other generic driver, psqlODBC and
+  MySQL among them, it defaults to `0` (`docs/CONNECTIONS.md`). So a pool reaches this state when
+  its `statement_timeout` is `0`, which is the default on those generic drivers. A
+  `DatabaseRef` reference sync sets none, so it is still always in this state. The rest of this
+  paragraph, and the one below, hold for every pool in this state. A cancelled borrow waits without bound for its running call before its cursor
   closes, and holds its pool slot for all of that time. The statement's own worker thread is held
   for that time too, as it was before the gate; the close adds no thread to it.
 

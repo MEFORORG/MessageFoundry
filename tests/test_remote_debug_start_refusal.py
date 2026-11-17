@@ -449,6 +449,78 @@ def test_a_refusal_still_reports_a_hook_that_did_not_answer(
     assert len(residual) == 1 and residual[0].startswith("[security] remote_debug_unguarded: ")
 
 
+def test_a_serve_refusal_with_the_hook_in_logs_no_unguarded_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3795 item 13: the unguarded line is for a hook that did not answer, so a
+    refused ``serve`` whose hook is in (``_ON``) does not write it.
+    :func:`test_a_refusal_still_reports_a_hook_that_did_not_answer` is the control that it would."""
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        rc = _serve(tmp_path, monkeypatch, _ON)
+        # The control in the same capture: a WARNING on this logger is recorded here.
+        logging.getLogger(cli.__name__).warning("[security] remote_debug_ control")
+    assert rc == 2 and _REFUSAL in capsys.readouterr().err
+    assert _residual_lines(caplog) == ["[security] remote_debug_ control"]
+
+
+def test_an_accepted_fleet_with_the_hook_missing_logs_the_unguarded_line_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3795 item 13: where the acceptance lifts the refusal, the fleet goes on, and
+    a hook that did not answer is still reported, once: the refusal's own copy of the line is not
+    written as well as the residual's. It may stop at a later gate (no store key is set).
+
+    ``supervise`` only. ``serve`` writes the line in its loosening list, which comes after the
+    store-key gate this harness stops at, so the serve half is not read here."""
+    unguarded = RemoteDebugPosture(interpreter_enabled=True, guard_installed=False)
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        _supervise(tmp_path, monkeypatch, unguarded, accept=True)
+    lines = _cli_lines(caplog, "[security] remote_debug_unguarded: ")
+    assert len(lines) == 1, [r.getMessage() for r in caplog.records]
+
+
+def test_the_pin_replaces_the_command_lines_name_and_not_the_reading() -> None:
+    """Vault BACKLOG #3795 item 16. tests/conftest.py pins the command line's name for the reading,
+    so no in-process start runs the real one. This runs it here: it reads this interpreter's own
+    switch. And the name the pin replaces is the one ``__main__`` binds from
+    ``messagefoundry.remotedebug``, so the gate reads that function wherever it is not pinned."""
+    import ast as pyast
+
+    from messagefoundry import remotedebug
+
+    real = remotedebug.remote_debug_posture()
+    assert real.interpreter_enabled is sys.is_remote_debug_enabled()
+    pinned = vars(cli)["remote_debug_posture"]
+    assert pinned is not remotedebug.remote_debug_posture, "the pin is not in"
+    assert pinned().interpreter_enabled is False
+    tree = pyast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+    name = "remote_debug_posture"
+
+    def binds(node: pyast.stmt) -> bool:
+        """Whether a MODULE-level statement binds the global name the pin replaces."""
+        if isinstance(node, (pyast.Import, pyast.ImportFrom)):
+            return any((alias.asname or alias.name) == name for alias in node.names)
+        if isinstance(node, (pyast.FunctionDef, pyast.AsyncFunctionDef, pyast.ClassDef)):
+            return node.name == name
+        if isinstance(node, (pyast.Assign, pyast.AnnAssign, pyast.AugAssign)):
+            targets = node.targets if isinstance(node, pyast.Assign) else [node.target]
+            return any(isinstance(t, pyast.Name) and t.id == name for t in targets)
+        return False
+
+    module_level = [node for node in tree.body if binds(node)]
+    last = module_level[-1] if module_level else None
+    assert (
+        isinstance(last, pyast.ImportFrom)
+        and last.module == "messagefoundry.remotedebug"
+        and any(a.name == name and a.asname is None for a in last.names)
+    ), f"__main__'s last module-level binding of {name} is not the import from remotedebug"
+
+
 def test_the_acceptance_key_is_the_settings_field_and_its_variable() -> None:
     """Vault BACKLOG #3795 item 7: the one key the qualified name and the loosening name derive
     from is the field the settings load, under its ``MEFOR_SECURITY_`` variable."""
@@ -475,9 +547,27 @@ def _child_env() -> dict[str, str]:
     }
 
 
+#: ``serve`` in a real interpreter with the start-up code gate, which runs just before this one,
+#: pinned to a clean reading, as :func:`_environment` pins it in process. Unpinned, start-up code
+#: this environment happens to carry would refuse first, and the arms below would read that gate.
+#: ``__main__`` is IMPORTED and ``main`` called, not run through ``-m``: its module-level guard
+#: still goes in, and the remote-debugging reading stays the interpreter's own, but runpy's
+#: ``-m`` path and the ``if __name__ == "__main__"`` line are not exercised by these arms.
+_PINNED_SERVE = """\
+import sys
+import messagefoundry.startupcode as startupcode
+from messagefoundry.startupcode import InterpreterLaunch, StartupPosture
+hardened = StartupPosture(launch=InterpreterLaunch(
+    isolated=True, safe_path=True, ignore_environment=True, no_user_site=True))
+startupcode.startup_posture = lambda: hardened
+from messagefoundry.__main__ import main
+sys.exit(main(sys.argv[1:]))
+"""
+
+
 def _real_serve(tmp_path: Path, *options: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, *options, "-m", "messagefoundry", "serve"]
+        [sys.executable, *options, "-c", _PINNED_SERVE, "serve"]
         + ["--config", str(_SAMPLES_CONFIG), "--env", "dev"],
         cwd=tmp_path,
         env=_child_env(),
@@ -531,7 +621,8 @@ def test_a_real_start_with_disable_remote_debug_gets_past_this_gate(tmp_path: Pa
     """The control for the arm above: the launch the refusal names. It stops at a later gate, the
     missing store key, which shows it ran on past this one."""
     _child_interface_on(tmp_path)  # for its skip: the child must import this checkout
-    proc = _real_serve(tmp_path, "-P", "-X", "disable-remote-debug")  # as the refusal names
+    # The interpreter flags the refusal names; the entry is _PINNED_SERVE's, not `-m messagefoundry`.
+    proc = _real_serve(tmp_path, "-P", "-X", "disable-remote-debug")
     assert _REFUSAL not in proc.stderr
     assert proc.returncode == 2, proc.stderr[-2000:]
     assert "no MEFOR_STORE_ENCRYPTION_KEY" in proc.stderr, proc.stderr[-2000:]

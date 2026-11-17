@@ -847,7 +847,9 @@ class QueueStore(StoreLifecycle, Protocol):
         ``(message_id, destination_name, response_seq)``. The delivery worker calls **exactly one** of
         this or :meth:`mark_done` per successful delivery (the capture XOR). The ``response`` table is
         invisible to disposition (the finalizer scans ``queue`` only), so a captured delivery finalizes
-        ``PROCESSED`` exactly as a one-way one does.
+        ``PROCESSED`` exactly as a one-way one does. A row already ``DONE`` writes nothing and logs a
+        WARNING (BACKLOG #5752), so a second completion never mints a second reply or re-ingress
+        child; a vanished row writes nothing either. Neither case is reported to the caller.
 
         When ``reingress_to`` is set (Increment 2), the same transaction *also* inserts a drainable
         ``Stage.RESPONSE`` work-row on the named loopback inbound's lane (a token referencing the

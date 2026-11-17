@@ -69,9 +69,9 @@ POST /ui/connections/{name}/purge/{scope}	scope	path	-	-
 POST /ui/connections/{name}/restart	name	path	connection	422
 POST /ui/connections/{name}/start	name	path	connection	422
 POST /ui/connections/{name}/stop	name	path	connection	422
-POST /ui/dead-letters/{channel_id}/replay	channel_id	path	-	-
-POST /ui/dead-letters/{channel_id}/{destination_name}/replay	channel_id	path	-	-
-POST /ui/dead-letters/{channel_id}/{destination_name}/replay	destination_name	path	-	-
+POST /ui/dead-letters/{channel_id}/replay	channel_id	path	connection	422
+POST /ui/dead-letters/{channel_id}/{destination_name}/replay	channel_id	path	connection	422
+POST /ui/dead-letters/{channel_id}/{destination_name}/replay	destination_name	path	connection	422
 POST /ui/messages/search/presets/{preset_id}/delete	preset_id	path	-	-
 POST /ui/messages/{message_id}/edit-resend	message_id	path	-	-
 POST /ui/messages/{message_id}/replay	message_id	path	-	-
