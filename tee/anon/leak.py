@@ -230,7 +230,7 @@ def _ipv6_candidates(run: str) -> Iterator[str]:
 def _label_dropped_runs(run: str) -> tuple[str, ...]:
     """``run`` without a leading label that ends in hex letters or digits and a colon or dot, as
     in ``Device:`` or ``data.``, without a trailing ``:port``, and without both, as in
-    ``IPv6:<address>:443``. Tried only when no text :func:`_ipv6_candidates` gives parses, so a
+    ``IPv6:<address>:443``, and with a dotted tail cut as the code below says. Tried only when no text :func:`_ipv6_candidates` gives parses, so a
     well-formed address, such as a unique-local ``fd00:1::5``, is never read as the shorter
     address its tail would make."""
     labels = (
@@ -238,10 +238,16 @@ def _label_dropped_runs(run: str) -> tuple[str, ...]:
         run.split(".", 1)[1] if "." in run else run,
     )
     # Every dotted group after the last colon cut off, as in ``4000:a1::5.1.2``, which no dotted
-    # IPv4 tail parses in (BACKLOG #5654).
+    # IPv4 tail parses in, and the tail cut to its first four groups and to its last four, as in
+    # ``::ffff:8.8.8.8.1.2``, whose IPv4 part the first cut would drop (BACKLOG #5654).
     last_colon = run.rfind(":")
     dot = run.find(".", last_colon + 1)
-    cut = (run[:dot],) if last_colon != -1 and dot != -1 else ()
+    cut: tuple[str, ...] = ()
+    if last_colon != -1 and dot != -1:
+        head, groups = run[: last_colon + 1], run[last_colon + 1 :].split(".")
+        cut = (run[:dot],)
+        if len(groups) > 4:
+            cut += (head + ".".join(groups[:4]), head + ".".join(groups[-4:]))
     return (
         *labels,
         run.rsplit(":", 1)[0],
@@ -1338,8 +1344,9 @@ def refusal_advice(
             # The source loaded; the site-code table and the guard's differ (BACKLOG #5541).
             steps.append(
                 "Start a new run so the site-code check and the publish guard load the same token "
-                "source. An entry that is not two digits keeps them apart: the site-code check "
-                "reads two-digit prefixes only."
+                "source, and correct or remove each [site_prefix] entry that is not two digits: "
+                "the site-code check reads two-digit prefixes only, so while such an entry "
+                "stays, a new run does not join them."
             )
         else:
             steps.append("Load the denylist token source.")

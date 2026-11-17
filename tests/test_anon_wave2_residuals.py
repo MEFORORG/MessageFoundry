@@ -202,6 +202,20 @@ def test_an_escape_sequence_in_an_id_becomes_one_letter(surrogates: ModuleType) 
 
 
 @_SURROGATES
+@pytest.mark.parametrize("salt", [_SALT, _SALT + "1", _SALT + "2"])
+def test_a_digit_declared_as_a_separator_is_still_fabricated(
+    surrogates: ModuleType, salt: str
+) -> None:
+    """Under MSH-2 ``^~\\5`` a ``5`` in the real id is a declared subcomponent separator; copying
+    it kept the real id whole. Every digit is fabricated, and none is a declared ``5``."""
+    seps = surrogates.Seps(subcomponent="5")
+    for real in ("555555", "1525354"):
+        fabricated = surrogates.surrogate_id(f"{real}^^^H^MR", Keyer(salt), seps).split("^", 1)[0]
+        assert fabricated != real and "5" not in fabricated, fabricated
+        assert len(fabricated) == len(real) and fabricated.isdigit(), fabricated
+
+
+@_SURROGATES
 def test_a_non_ascii_separator_in_an_id_is_kept(surrogates: ModuleType) -> None:
     """A latin-1 capture may declare a non-ASCII subcomponent separator or escape character."""
     seps = surrogates.Seps(subcomponent="\u00a7", escape="\u00b6")
@@ -290,7 +304,15 @@ def test_a_dashed_shape_behind_an_invisible_or_highlight_is_a_hit(
 
 @_LEAKS
 @pytest.mark.parametrize(
-    "value", ["4000:a1::5.1.2", "fe80::1.4000:a1::5", "fe80::1.4000:a1::5.443"]
+    "value",
+    [
+        "4000:a1::5.1.2",
+        "fe80::1.4000:a1::5",
+        "fe80::1.4000:a1::5.443",
+        "::ffff:8.8.8.8.1.2",  # an IPv4-mapped address with two trailing groups
+        "::8.8.8.8.1.2",  # an IPv4-compatible one
+        "::ffff:1.2.8.8.8.8",  # the IPv4 part last
+    ],
 )
 def test_an_ipv6_form_the_check_passed_is_a_hit(leak: ModuleType, value: str) -> None:
     hits = leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"})
@@ -331,6 +353,22 @@ def test_a_fullwidth_digit_in_an_escape_body_reads_as_the_plain_reading_does(
     seps = surrogates.Seps()
     with _token_source(monkeypatch, "97\n", guards=False, surrogates=True):
         assert surrogates._reads_as_site_code("\\Z97\uff11\uff12\uff13\uff14 x\\", seps, "|")
+
+
+@_SURROGATES
+@pytest.mark.parametrize(
+    "part",
+    ["\\Z97\u00b9\u00b2\u00b3\u2074 x\\", "\\Z97\u2460\u2461\u2462\u2463 x\\"],
+    ids=["superscript", "circled"],
+)
+def test_a_folded_digit_in_an_escape_body_reads_as_a_site_code(
+    surrogates: ModuleType, part: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``\\D`` splits a superscript or circled digit off, so the body is also split folded."""
+    seps = surrogates.Seps()
+    with _token_source(monkeypatch, "97\n", guards=False, surrogates=True):
+        assert surrogates._reads_as_site_code(part, seps, "|")
+        assert surrogates.scrub_site_codes(part, Keyer(_SALT), seps) != part
 
 
 # --- #5532: the decoder's copy of the engine's formatting commands ---------------------------------

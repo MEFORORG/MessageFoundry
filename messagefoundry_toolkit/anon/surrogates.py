@@ -152,7 +152,7 @@ def site_prefix_split(guard_prefixes: tuple[str, ...]) -> str | None:
         return None
     return (
         f"{SITE_PREFIX_SPLIT_LEAD} {len(_SITE_PREFIXES)} two-digit prefix(es) but the publish "
-        f"guard's [site_prefix] table holds {len(set(guard_prefixes))} entr(ies) — an entry that "
+        f"guard's [site_prefix] table holds {len(set(guard_prefixes))} entr(ies), not the same set — an entry that "
         "is not two digits, or a reload of one table without the other "
         "(surrogates.reload_site_prefixes); the site-code check does not match what the guard counts"
     )
@@ -196,12 +196,16 @@ def _fake_like(rng: random.Random, sample: str, seps: Seps) -> str:
     an accented letter of a real id reached the output (BACKLOG #5534).
 
     The subcomponent separator and escape character the message declares are kept
-    even when they are not ASCII, so the value keeps its structure, and each escape sequence a
+    even when they are not ASCII, so the value keeps its structure, except a declared digit, which
+    is fabricated like any other digit; no fabricated digit is one the message declares as a
+    component, repetition or subcomponent separator or escape character. Each escape sequence a
     second escape character closes in the same subcomponent becomes one fabricated letter. Its body
     is never rewritten letter by letter, which could turn ``\\E\\`` into ``\\F\\``."""
     out: list[str] = []
     escape = seps.escape
     kept = (seps.subcomponent, escape)
+    reserved = seps.component + seps.repetition + seps.subcomponent + escape
+    digits = [d for d in "0123456789" if d not in reserved]
     at = 0
     while at < len(sample):
         ch = sample[at]
@@ -211,10 +215,12 @@ def _fake_like(rng: random.Random, sample: str, seps: Seps) -> str:
             out.append(_fake_letter(rng))
             at = end + 1
             continue
-        if ch in kept:
+        if ch.isdigit():
+            # A digit is fabricated even when the message declares it a separator, so the real id's
+            # digits never reach the output; a fabricated digit avoids the declared ones.
+            out.append(str(rng.randrange(10)) if len(digits) == 10 else rng.choice(digits))
+        elif ch in kept:
             out.append(ch)
-        elif ch.isdigit():
-            out.append(str(rng.randrange(10)))
         elif ch.isalpha() or not ch.isascii():
             out.append(_fake_letter(rng))
         else:
@@ -549,6 +555,10 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
             body = pieces[at]
             if at == len(pieces) - 1 or not _HEX_ARGUMENT_ESCAPE.fullmatch(body):
                 forms += _NON_DIGITS.split(body)
+                # Folded first too: ``\D`` splits off a superscript or circled digit, which a
+                # folding consumer shows as an ASCII one (BACKLOG #5654).
+                if not body.isascii():
+                    forms += _NON_DIGITS.split(folded(body))
     # A consumer that folds compatibility characters shows a fullwidth digit as an ASCII one, so
     # each reading is also read folded (BACKLOG #5654).
     forms += [folded(form) for form in forms if not form.isascii()]
