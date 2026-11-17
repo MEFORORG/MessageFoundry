@@ -137,11 +137,16 @@ _VERSION_REFUSAL_TEXTS = (
 )
 #: The longest reply body, in characters, that :func:`_reply_errors` parses when hvac parsed none
 #: (BACKLOG #6707). Vault's own refusal is far shorter, so the bound keeps a body of any size from
-#: being parsed. It bounds both readers of a 400, and a change here changes both:
-#: the audit walk's version check, which reads nothing from a longer body, not even a list hvac
-#: parsed, and the data-key decrypt's AEAD check (BACKLOG #5650), which does not re-parse one, so
-#: such a body is not read as a tag refusal.
+#: being parsed. It bounds both readers of a 400, and a change here changes both. The audit walk's
+#: version check reads nothing from a longer body, not even a list hvac parsed. The data-key
+#: decrypt's AEAD check (BACKLOG #5650) does not re-parse one, but still reads a list hvac parsed.
 _REPARSED_BODY_MAX_CHARS = 64 * 1024
+#: The fixed reasons :func:`_names_no_version_reason` gives, and the one a fault reading the 400
+#: gives, so none is built while the read may be short of memory (BACKLOG #6707).
+_OVERSIZE_BODY = f"its body is past the {_REPARSED_BODY_MAX_CHARS}-character bound and was not read"
+_NO_ERRORS_LIST = "it carries no errors list"
+_NO_VERSION_REFUSAL = "its errors list names no version refusal"
+_READ_RAISED = "reading it raised"
 #: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
 #: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
 #: texts, ``crypto/cipher``'s GCM for ``aes256-gcm96`` and ``golang.org/x/crypto``'s
@@ -155,14 +160,17 @@ _AEAD_FAILURE_TEXTS = frozenset(
 )
 
 
-def _reply_errors(exc: Exception) -> tuple[object, int | None]:
+def _reply_errors(exc: Exception, *, bound_parsed: bool = False) -> tuple[object, int | None]:
     """A Vault error's ``errors`` value, and, when it went unread because the body is too long,
     that body's length. hvac fills ``exc.errors`` only when the reply's Content-Type is exactly
     ``application/json``, so a proxy that adds a charset leaves the same JSON in ``exc.text``;
     that is parsed when hvac parsed no JSON (``exc.json`` is None) and the body is at most
-    :data:`_REPARSED_BODY_MAX_CHARS` long. Callers read only a list."""
+    :data:`_REPARSED_BODY_MAX_CHARS` long. With ``bound_parsed``, a body past that bound is
+    unread even when hvac parsed it. Callers read only a list."""
     errors: object = getattr(exc, "errors", None)
     body: object = getattr(exc, "text", None)
+    if bound_parsed and isinstance(body, str) and len(body) > _REPARSED_BODY_MAX_CHARS:
+        return None, len(body)
     if errors is None and getattr(exc, "json", None) is None and isinstance(body, str):
         if len(body) > _REPARSED_BODY_MAX_CHARS:
             return None, len(body)
@@ -175,25 +183,24 @@ def _reply_errors(exc: Exception) -> tuple[object, int | None]:
 def _names_no_version_reason(exc: Exception) -> str | None:
     """Why an audit-MAC ``verify`` 400 is NOT read as Vault's own refusal of the key version, or
     ``None`` when it is (BACKLOG #6707). It is read as one only when its ``errors`` value
-    (:func:`_reply_errors`) is a list with a text entry holding a :data:`_VERSION_REFUSAL_TEXTS`
-    text, in any case, and its body is at most :data:`_REPARSED_BODY_MAX_CHARS` long. Any other
-    400 gets a fixed reason, never the reply's own text.
+    (:func:`_reply_errors`, ``bound_parsed``) is a list with a text entry holding a
+    :data:`_VERSION_REFUSAL_TEXTS` text, in any case. Any other 400 gets a fixed reason, never the
+    reply's own text.
 
     A 400 with a reason may still be a refusal of the version, so the answer chooses only the
     error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
     its parent."""
-    body: object = getattr(exc, "text", None)
-    if isinstance(body, str) and len(body) > _REPARSED_BODY_MAX_CHARS:
-        return f"its body is past the {_REPARSED_BODY_MAX_CHARS}-character bound and was not read"
-    errors, _ = _reply_errors(exc)
+    errors, oversize = _reply_errors(exc, bound_parsed=True)
+    if oversize is not None:
+        return _OVERSIZE_BODY
     if not isinstance(errors, list):
-        return "it carries no errors list"
+        return _NO_ERRORS_LIST
     for entry in errors:
         if isinstance(entry, str):
             text = entry.lower()
             if any(known in text for known in _VERSION_REFUSAL_TEXTS):
                 return None
-    return "its errors list names no version refusal"
+    return _NO_VERSION_REFUSAL
 
 
 def _batches(costs: Sequence[int]) -> list[list[int]]:
@@ -804,22 +811,24 @@ class TransitCipher(_UnmarkedPolicy):
             # label, so whatever the read raises picks the unconfirmed one: escaping here, it
             # would make the walk "could not run" and drop the row's break and its alert.
             reason: str | None
+            raised = ""  # the read's fault, by its class's existing name, so nothing is built
             try:
                 reason = _names_no_version_reason(exc)
             except Exception as read_exc:  # noqa: BLE001 -- see the comment above
-                reason = f"reading it raised {type(read_exc).__name__}"
+                reason, raised = _READ_RAISED, type(read_exc).__name__
             if reason is None:
                 return AuditKeyVersionRefusedError(version)
             unverified = AuditKeyVersionUnverifiedError(version)
-            # The log is the one step left that allocates; out of memory, the label still stands.
+            # The log builds text; short of memory, it is dropped and the label still stands.
             with contextlib.suppress(MemoryError):
-                if _log_due(f"unconfirmed {self._audit_key!r}: {reason}"):
+                if _log_due(f"unconfirmed {self._audit_key!r}: {reason} {raised}"):
                     log.warning(
                         "an audit MAC verify at key version %d got a 400 labelled unconfirmed, "
-                        "because %s (key=%r); this reason for this key is logged at most once "
+                        "because %s%s (key=%r); this reason for this key is logged at most once "
                         "in %d seconds",
                         version,
                         reason,
+                        f" {raised}" if raised else "",
                         self._audit_key,
                         _WARNING_LOG_INTERVAL_S,
                     )

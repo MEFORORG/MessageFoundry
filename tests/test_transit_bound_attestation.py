@@ -1583,23 +1583,47 @@ def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: An
 
 
 def test_an_unconfirmed_label_logs_its_reason_once_per_interval(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #6707: why a 400 was labelled unconfirmed is logged, by a fixed reason that carries
     none of the reply's text, and once an interval per reason, since a proxy can cause it on every
-    row."""
+    row. Past the interval it is logged again."""
     from messagefoundry.store import crypto_transit
 
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
     caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
     for _ in range(3):
         _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
     _verify_refusal("vault:v2:AAAA", ["reworded refusal"])
     _verify_refusal("vault:v2:AAAA", ["no such key version"])  # the refused label logs nothing
+    now[0] += crypto_transit._WARNING_LOG_INTERVAL_S
+    _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
     logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
-    assert len(logged) == 2, logged
-    assert "because it carries no errors list" in logged[0], logged
-    assert "because its errors list names no version refusal" in logged[1], logged
+    assert len(logged) == 3, logged
+    assert "because it carries no errors list (key=" in logged[0], logged
+    assert "because its errors list names no version refusal (key=" in logged[1], logged
+    assert "because it carries no errors list (key=" in logged[2], logged
     assert not any("400 Bad Request" in line or "reworded" in line for line in logged), logged
+
+
+def test_a_fault_reading_the_400_is_labelled_unconfirmed_and_logged_by_type(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707: a fault while the 400 is read picks the unconfirmed label rather than
+    escaping, and the log names the fault by its class alone."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def broken(*_a: Any, **_kw: Any) -> Any:
+        raise KeyError("not for the log")
+
+    monkeypatch.setattr(crypto_transit, "_names_no_version_reason", broken)
+    caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
+    assert isinstance(_verify_refusal("vault:v2:AAAA"), AuditKeyVersionUnverifiedError)
+    logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
+    assert len(logged) == 1 and "because reading it raised KeyError (key=" in logged[0], logged
+    assert "not for the log" not in logged[0], logged
 
 
 def test_a_body_hvac_parsed_past_the_bound_is_not_read() -> None:
