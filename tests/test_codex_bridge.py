@@ -215,6 +215,13 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         # A line continuation ending the hook must not swallow the bridge's own statement.
         ("& '{py}' -c 'import sys; sys.exit(2)' `", "block"),
         ("if ($true) {{ return }}; exit 2", "allow"),
+        # After the bridge's head line, an empty param() fails to parse, but a non-empty one
+        # runs, with its default applied.
+        ("param()\nexit 2", "exit-1"),
+        (
+            "param([string]$Mode = 'enforce')\nif ($Mode -eq 'enforce') {{ exit 0 }}; exit 2",
+            "allow",
+        ),
     ],
     ids=[
         "explicit-exit-2",
@@ -232,6 +239,8 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         "strict-mode-failed-cmdlet",
         "trailing-continuation",
         "early-return",
+        "empty-param",
+        "non-empty-param",
     ],
 )
 def test_a_powershell_hook_blocks_on_a_2_that_ends_it(bridge, tmp_path, command, outcome):

@@ -87,13 +87,14 @@ PowerShell hook with an explicit `exit 2`. The bridge runs it under
 `pwsh -Command`. That reports as 1 a 2 from a native program, or from a guard
 script the hook calls or dot-sources, when the hook's last statement runs it. So
 the bridge puts a statement after the hook: when the last statement failed and
-`$LASTEXITCODE` is 2, it exits 2. That also blocks a hook whose last statement
-fails while an earlier command's 2 is still in `$LASTEXITCODE`. It does not reach
+`$LASTEXITCODE` is 2, it exits 2. So a hook whose last statement fails while
+`$LASTEXITCODE` is 2, including a 2 left by an earlier native command, blocks.
+It does not reach
 a guard called inside a function or script block, or followed by `return` or
 `break`. The bridge
 puts one line before the hook, turning `$PSNativeCommandUseErrorActionPreference`
-off, so a hook that must open with `param()`, a `using` statement or a named
-block fails on every call with exit 1.
+off. A hook that opens with an empty `param()` then fails to parse, so it exits
+1 on every call, and under `"onFailure": "block"` it blocks every call.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

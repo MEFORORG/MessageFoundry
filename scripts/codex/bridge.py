@@ -203,12 +203,13 @@ def git_bash() -> str | None:
 # Code's hooks reference blocks a PowerShell hook. That reference does not say which flags Claude
 # Code passes, or how a native exit code propagates. Under -Command, a 2 from a native program or a
 # guard script that the hook's last statement runs is reported as 1, so the tail put after the hook
-# exits 2 when the last statement failed with $LASTEXITCODE at 2, whichever command left that 2,
-# and otherwise exits 1 when it failed, as -Command would. A blank line first ends a trailing
+# exits 2 when the last statement failed with $LASTEXITCODE at 2. So a hook whose last statement
+# fails while $LASTEXITCODE is 2, including a 2 left by an earlier native command, blocks.
+# Otherwise the tail exits 1 when the last statement failed, as -Command would. A blank line first ends a trailing
 # comment or line continuation, and Get-Variable keeps strict mode from faulting on an unset code.
 # The one line put before the hook keeps a native non-zero exit from throwing where a PowerShell
-# build defaults that preference on. A hook that must open with at least param(), a using
-# statement or a named block cannot take that line, and fails on every call with exit 1.
+# build defaults that preference on. A hook that opens with an empty param() then fails to parse,
+# so it exits 1 on every call, and under onFailure: block it blocks every call.
 POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false\n"
 POWERSHELL_TAIL = (
     "\n\nif (-not $?) { if ((Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly"
