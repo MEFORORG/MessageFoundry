@@ -360,25 +360,34 @@ def _proxy_bypasses(target: object, no_proxy: object) -> bool:
     return proxy_bypasses_host(host, no_proxy)
 
 
-def _digest_proxy_refused(targets: Sequence[object], no_proxy: object) -> bool:
-    """Whether the build refuses a connection whose web proxy is set up for Digest, read from the
-    targets :func:`_proxy_targets` lists (vault BACKLOG #2989 item 28). Its own ``url`` written
-    ``https`` is refused whatever the bypass list says (ADR 0126 AC-6). A token URL is refused when
-    the transport's own rule says the proxy meets it on a ``CONNECT`` (ADR 0095 B.1). An ``env()``
-    reference is not read, so a hop whose URL comes from one is still listed."""
-    # Lazy, like ``_smart``: the transport owns both rules.
-    from messagefoundry.transports.rest import digest_proxy_meets_the_token_connect
+def _is_https(url: object) -> bool:
+    if not isinstance(url, str):
+        return False  # an env() reference, resolved only when the connector is built
+    try:
+        return urllib.parse.urlsplit(url).scheme.lower() == "https"
+    except ValueError:
+        # Value-free: a URL can carry userinfo.
+        logging.getLogger(__name__).debug("static-credential census: a proxy target does not parse")
+        return False
 
+
+def _digest_proxy_refused(targets: Sequence[object], no_proxy: object) -> bool:
+    """Whether a web proxy set up for Digest never carries this connection's credential, read from
+    the targets :func:`_proxy_targets` lists (vault BACKLOG #2989 item 28).
+
+    The build refuses Digest for a connection whose own ``url`` is ``https``, whatever the bypass
+    list says (ADR 0126 AC-6). Where that ``url`` bypasses the proxy, only a token hop could use
+    it, and an ``https`` token URL the bypass list does not name either meets the proxy on a
+    ``CONNECT``, which the build refuses (ADR 0095 B.1), or is one urllib's own bypass list names,
+    so the proxy is never used. That list lives in the sending process, so it is not read here; both
+    outcomes mean no hop. An ``env()`` reference is not read, so a hop whose URL comes from one is
+    still listed."""
     if not targets:
         return False
     url, *token_urls = targets
-    if isinstance(url, str):
-        try:
-            if urllib.parse.urlsplit(url).scheme.lower() == "https":
-                return True
-        except ValueError:
-            pass  # the build refuses this url for its shape; the hop is listed as before
-    return any(digest_proxy_meets_the_token_connect(t, no_proxy) for t in token_urls)
+    if _is_https(url):
+        return True
+    return bool(token_urls) and _proxy_bypasses(url, no_proxy) and any(map(_is_https, token_urls))
 
 
 def _proxy_targets(
@@ -418,8 +427,8 @@ def _proxy_hop(
     credential never leaves the engine. A loopback address always bypasses it, with no entry in the
     list (vault BACKLOG #2579). The bypass list is the connection's own, else the inherited
     ``[egress].proxy_no_proxy`` (``site_no_proxy``, ``None`` when the caller has no settings). With no
-    ``targets`` the hop is reported, because nothing says it is bypassed. Nor is a Digest proxy the
-    build refuses for those targets (:func:`_digest_proxy_refused`).
+    ``targets`` the hop is reported, because nothing says it is bypassed. Nor is a Digest proxy that
+    never carries the credential to those targets (:func:`_digest_proxy_refused`).
 
     The credential is the ``proxy_user``/``proxy_password`` pair. A user or a password in the proxy
     URL itself (:func:`_proxy_url_holds_credential`) is not a hop: the connector's build refuses it.
@@ -442,7 +451,7 @@ def _proxy_hop(
     # the way the transport reads it.
     kind = str(settings.get("proxy_auth_type") or "basic").strip().lower()
     if kind == "digest" and _digest_proxy_refused(targets, no_proxy):
-        return None  # the build refuses the connection for its Digest proxy, so the hop never runs
+        return None  # the build refuses this Digest proxy, or never sends through it
     if kind not in ("basic", "digest"):
         kind = "static"
     return StaticCredentialHop(

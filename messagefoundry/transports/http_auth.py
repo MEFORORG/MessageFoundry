@@ -277,17 +277,15 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
         return self._post_token(data, headers)
 
 
-def refuse_a_digest_proxy_on_the_token_hop(
-    s: Mapping[str, Any], *, no_proxy: object, connection: str | None
-) -> None:
+def refuse_a_digest_proxy_on_the_token_hop(s: Mapping[str, Any], *, connection: str | None) -> None:
     """Refuse a connection whose bearer provider would mint at an https token endpoint through a
     web proxy set up for Digest (vault BACKLOG #2989 items 11, 20 and 21).
 
     :func:`~messagefoundry.transports.rest.proxy_auth_handler_from_settings` calls it for a Digest
-    proxy credential before it judges that credential's hop, so a connection refused here leaves no
-    record of a proxy-credential crossing. The rule is
-    :func:`~messagefoundry.transports.rest.digest_proxy_meets_the_token_connect`, with ``no_proxy`` as
-    the bypass list, and the refusal is the provider's own
+    proxy credential before it judges that credential's hop, so this refusal comes before any
+    record of that credential crossing. The rule is
+    :func:`~messagefoundry.transports.rest.digest_proxy_meets_the_token_connect`, with the
+    connection's ``proxy_no_proxy`` as the bypass list, and the refusal is the provider's own
     (:meth:`~messagefoundry.transports.smart._TokenEndpointProvider.digest_proxy_refusal`). A mapping
     that configures neither provider, or both, which :func:`bearer_provider_from_settings` refuses,
     passes here."""
@@ -297,7 +295,8 @@ def refuse_a_digest_proxy_on_the_token_hop(
     provider: type[_TokenEndpointProvider] = (
         SmartBackendTokenProvider if has_smart else OAuth2ClientCredentialsProvider
     )
-    if digest_proxy_meets_the_token_connect(s.get(provider._URL_SETTING), no_proxy):
+    token_url = s.get(provider._URL_SETTING)
+    if digest_proxy_meets_the_token_connect(token_url, s.get("proxy_no_proxy")):
         raise provider.digest_proxy_refusal(connection)
 
 

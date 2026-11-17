@@ -2208,10 +2208,9 @@ def digest_proxy_meets_the_token_connect(token_url: object, no_proxy: object) ->
     ``CONNECT``, where Digest cannot answer the proxy's 407 (vault BACKLOG #2989, ADR 0095 B.1).
 
     True for an ``https`` token URL the proxy is used for, as :meth:`ProxyConfig.for_host` resolves
-    it with ``no_proxy`` as the bypass list. Such a token hop is refused at build. The build reads
-    this before it judges the proxy credential, so a refused connection leaves no record of a
-    crossing, and the static-credential report reads it so it lists no proxy hop for one. A value
-    that is not a string, or that does not parse, answers ``False``."""
+    it with ``no_proxy`` as the bypass list. Such a token hop is refused at build, before the proxy
+    credential is judged, so this refusal comes before any record of that credential crossing. A
+    value that is not a string, or that does not parse, answers ``False``."""
     if not isinstance(token_url, str):
         return False
     try:
@@ -2219,6 +2218,8 @@ def digest_proxy_meets_the_token_connect(token_url: object, no_proxy: object) ->
             return False
         return _proxy_route(token_url, _normalize_no_proxy(no_proxy)) == "proxied"
     except ValueError:
+        # Value-free: a URL can carry userinfo.
+        logger.debug("token URL does not parse; the Digest proxy rule does not apply to it")
         return False
 
 
@@ -2371,9 +2372,7 @@ def proxy_auth_handler_from_settings(
         # smart import this module.
         from messagefoundry.transports.http_auth import refuse_a_digest_proxy_on_the_token_hop
 
-        refuse_a_digest_proxy_on_the_token_hop(
-            s, no_proxy=s.get("proxy_no_proxy"), connection=connection
-        )
+        refuse_a_digest_proxy_on_the_token_hop(s, connection=connection)
         result = (), _ProxyDigestRecipe(proxy_url, str(user), str(password))
     elif kind in ("ntlm", "windows"):
         raise ValueError(

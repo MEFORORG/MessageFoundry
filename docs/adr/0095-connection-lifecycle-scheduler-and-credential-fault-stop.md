@@ -380,8 +380,9 @@ built, so no built configuration meets this 407 and the send-time match is gone.
 proxy bypasses builds. A connection with `ech_egress` builds no web proxy, so a token hop behind an
 ECH sidecar never meets this refusal.*
 *Amended 2026-11-17 (BACKLOG #2989 items 20 and 21): the refusal runs where the connection's web
-proxy is built, before the proxy credential's hop is judged, so a refused connection leaves no
-record of that credential crossing. `rest.digest_proxy_meets_the_token_connect` states the rule.
+proxy is built, before the proxy credential's hop is judged, so this refusal comes before any
+record of that credential crossing. A build refusal that runs later can still follow such a
+record. `rest.digest_proxy_meets_the_token_connect` states the rule.
 The delivery hop's own rule still differs on a bypass: it refuses Digest for any `https://`
 destination (ADR 0126 AC-6).* The Digest
 handler never sees that 407, so no retry can answer it, whatever the proxy's challenge says. The
