@@ -9171,12 +9171,9 @@ def create_app(
         under the store DEK when a key is set); step-up-gated + audited (metadata only).
 
         **Text-only (ASVS 14.2.8).** This feature accepts only plain-text diagnostic logs (``.hl7`` /
-        ``.hl7v2`` / ``.txt`` / ``.xml``). A body that is not plain text is refused with **HTTP 415**
-        before anything is written: at least one that begins with a JPEG, PNG, PDF, ZIP (incl. DOCX),
-        GIF or TIFF signature, holds a NUL byte or one of four ZIP record signatures anywhere, or has
-        a control-character-dense 8 KiB window. The check is ``parsing.sniff.nontext_upload_reason``;
-        what it lets through is stated in docs/CONNECTIONS.md, under the uploaded-logs upload policy,
-        "Permitted types".
+        ``.hl7v2`` / ``.txt`` / ``.xml``). A body the text-only check refuses is answered **HTTP 415**
+        before anything is written. Which bodies that check refuses, and what it lets through, are
+        stated in docs/CONNECTIONS.md, under the uploaded-logs upload policy, "Permitted types".
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
         to you and to authorized operators holding ``files:access_any`` (administrators). Your username

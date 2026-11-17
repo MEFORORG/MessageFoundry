@@ -6284,9 +6284,9 @@ def _extract_config_members(
     (:func:`~messagefoundry.parsing.sniff.archive_member_name_reason`) rather than a second private one,
     so at least a traversal, a backslash separator, a drive-relative prefix or a control character is
     refused here exactly as it is on the inbound-archive path. The check's Windows-name arms (BACKLOG
-    #5369) are passed off here: their static list refuses names, such as ``aux.py``, that Windows 11
-    build 26300 opens as ordinary files (measured; see :func:`_win_opens_another`), so a config dir the
-    backup bundled would fail to restore. The resolved-path containment test below stays the backstop.
+    #5369) are passed off here: their static list refuses names, such as ``aux.py``, that a POSIX
+    host writes as ordinary files and that not every Windows build rewrites (see
+    :func:`_win_opens_another`), so a config dir the backup bundled could fail to restore. The resolved-path containment test below stays the backstop.
 
     The per-member cap is not enough on its own here — N members each just under it would still fill the
     disk — so the bundle also carries an AGGREGATE byte ceiling and a member-count ceiling.

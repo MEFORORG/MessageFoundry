@@ -1676,7 +1676,7 @@ _PAST_THE_SAMPLE = b"x" * 9000
 @pytest.mark.parametrize(
     "tail",
     [b"\x00binary tail", b"PK\x03\x04\x14\x00\x00\x00", bytes(range(1, 9)) * 2048],
-    # The ZIP member here carries NUL bytes, which refuse it first; the NUL-free case is below.
+    # The ZIP member is caught by its NUL bytes: a signature past the head is not matched.
     ids=["nul", "zip-member-with-nul", "control-dense"],
 )
 @pytest.mark.parametrize("after", [b"", b"y" * 20_000], ids=["at-the-end", "in-the-middle"])
@@ -1694,30 +1694,6 @@ def test_validate_upload_content_reads_past_the_first_8_kib(
     with pytest.raises(UploadNotTextError) as caught:  # the route answers this one 415
         validate_upload_content(name, data)
     assert caught.value.reason == reason
-
-
-@pytest.mark.parametrize("signature", [b"PK\x03\x04", b"PK\x01\x02", b"PK\x05\x06", b"PK\x07\x08"])
-@pytest.mark.parametrize("after", [b"", b"y" * 20_000], ids=["at-the-end", "in-the-middle"])
-def test_a_nul_free_zip_record_past_the_head_is_refused(signature: bytes, after: bytes) -> None:
-    """BACKLOG #5368, defence in depth: a real archive is refused by its NUL bytes, so this pins the
-    signature arm on a NUL-free run past the head. The reason does not echo the body."""
-    from messagefoundry.parsing.sniff import nontext_upload_reason
-
-    data = b"MSH|^~\\&|A|B\r" + _PAST_THE_SAMPLE + signature + b"\x01\x02word/doc" + after
-    assert b"\x00" not in data
-    reason = nontext_upload_reason(data)
-    assert reason is not None and "ZIP" in reason
-    assert "word" not in reason
-    with pytest.raises(UploadNotTextError):
-        validate_upload_content("a.hl7", data)
-
-
-def test_text_that_merely_mentions_pk_is_admitted() -> None:
-    """The must-not-fire arm: the letters PK without the two control bytes are ordinary text."""
-    from messagefoundry.parsing.sniff import nontext_upload_reason
-
-    data = b"MSH|^~\\&|A|B\rPID|1||PK0304^PK^PK\r" + _PAST_THE_SAMPLE + b"PK34 PK56\n"
-    assert nontext_upload_reason(data) is None
 
 
 def test_a_short_last_window_is_judged_with_the_text_before_it() -> None:

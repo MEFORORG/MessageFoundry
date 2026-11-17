@@ -311,7 +311,8 @@ class UploadContentError(UploadError):
 
 
 class UploadNotTextError(UploadContentError):
-    """An upload's body is not plain text (ASVS 14.2.8), as
+    """An upload's body is not plain text (ASVS 14.2.8): it begins with a binary container's
+    signature, holds a NUL byte, or has a control-dense 8 KiB window, as
     ``parsing.sniff.nontext_upload_reason`` judges it. ``reason`` is that function's
     text. The API answers it 415, where any other :class:`UploadContentError` is 400 (BACKLOG
     #5551)."""
@@ -585,7 +586,7 @@ def validate_upload_content(display: str, data: bytes) -> None:
     """Text-only check, extension allowlist and content-vs-extension sniff for an uploaded file.
 
     First, the whole body must be plain text (ASVS 14.2.8, ``parsing.sniff.nontext_upload_reason``):
-    what that function refuses is listed on it and stated in docs/CONNECTIONS.md. A failure
+    no binary container signature, no NUL byte anywhere, and no control-dense window. A failure
     raises :class:`UploadNotTextError`, which the route answers 415. It is checked here, at the
     chokepoint, and nowhere else, so every caller of :meth:`UploadStore.save` meets it (BACKLOG
     #5551).

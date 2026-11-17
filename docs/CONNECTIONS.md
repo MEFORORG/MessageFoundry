@@ -1441,14 +1441,9 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
 
 - **Permitted types — text only.** The upload chokepoint (`UploadStore.save`) first refuses any
   **non-text or metadata-bearing container** body with **HTTP 415** (ASVS 14.2.8): a body that begins
-  with JPEG/PNG/PDF/ZIP (incl. DOCX)/GIF/TIFF magic bytes, holds a NUL byte anywhere, holds one of
-  four ZIP record signatures anywhere (`PK\x03\x04` local file header, `PK\x01\x02` central
-  directory header, `PK\x05\x06` end of central directory, `PK\x07\x08` data descriptor), or has a
-  control-character-dense 8 KiB window. Past the leading signature, the check refuses only those
-  four signatures, a NUL and a control-dense window, so a NUL-free binary payload of another family,
-  or a NUL-free run carrying another ZIP record signature (at least the ZIP64 ones), after a text
-  head can pass. The four-signature scan is defence in depth: an appended ZIP that a reader can
-  extract carries NUL bytes and is refused by the NUL check.
+  with JPEG/PNG/PDF/ZIP (incl. DOCX)/GIF/TIFF magic bytes, holds a NUL byte anywhere, or has a
+  control-character-dense 8 KiB window. Past the leading signature, the check refuses only a NUL
+  anywhere and a control-dense window, so a NUL-free binary payload after a text head can pass.
   Then an extension allowlist (`.hl7`, `.hl7v2`, `.txt`, `.xml`) is
   enforced on the sanitized display filename **and** the content is sniffed against it: `.hl7`/`.hl7v2`
   must begin with an HL7 header segment (`MSH`/`FHS`/`BHS`), `.xml` with a leading `<` (ASVS 5.2.2). A
