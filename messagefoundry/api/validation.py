@@ -203,6 +203,14 @@ ALERT_SUSPEND_MINUTES_MAX = 43200
 #: Printable text: no C0 control, no DEL, no C1 control. One or more characters.
 PRINTABLE_TEXT_PATTERN = r"^[^\x00-\x1f\x7f-\x9f]+$"
 
+#: A sign-in name: any text but a NUL, empty included (vault BACKLOG #5342). A NUL would reach the
+#: store's lookup, and PostgreSQL text cannot hold one, so its driver raises rather than finding no
+#: row. Only the NUL: no account on that store can hold one, while other control characters can
+#: reach a stored name through paths ``auth.usernames.username_refusal`` does not govern, such as
+#: provision-admin, so refusing them here could lock a holder out. The web console's form sign-in
+#: applies the same rule by hand (``"\x00" in``), since it parses its form without pydantic.
+SIGN_IN_NAME_PATTERN = r"^[^\x00]*$"
+
 #: A member of one of the engine's own closed vocabularies -- ``MessageStatus``, ``OutboxStatus``,
 #: the connection-event kinds. Every member of all three is letters and underscores only. The
 #: vocabulary itself stays the store's to define; this is the shape a member can have.

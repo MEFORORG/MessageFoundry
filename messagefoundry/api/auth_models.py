@@ -18,6 +18,7 @@ from pydantic import AfterValidator, BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
+    SIGN_IN_NAME_PATTERN,
     ChannelScopeEntry,
     PermissionId,
     RoleId,
@@ -34,8 +35,6 @@ _PASSWORD_MAX = 1024
 _GROUP_MAX = 512
 # A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
 _TOKEN_MAX = 256
-#: Any text but a NUL, empty included (vault BACKLOG #5342; ``LoginRequest`` says why).
-_NO_NUL_PATTERN = r"^[^\x00]*$"
 
 #: The response header an ``oidc`` session's step-up refusal carries, set to
 #: :data:`STEP_UP_VIA_IDP`, so a client can branch on a header rather than parse the detail
@@ -57,13 +56,10 @@ class CredentialReply(BaseModel):
 
 
 class LoginRequest(RequestModel):
-    # A NUL in ``username`` is refused here (vault BACKLOG #5342). It would reach the store's
-    # lookup, where PostgreSQL refuses it with an error this route does not catch, so the route
-    # would answer 500 outside its failure-timing pad. Only the NUL: PostgreSQL text cannot hold
-    # one, so no account on that store has one, while other control characters can reach a stored
-    # name through paths ``username_refusal`` does not govern, such as provision-admin. This covers
-    # only the JSON route; at least the web console's form login reaches the service without it.
-    username: str = Field(max_length=_NAME_MAX, pattern=_NO_NUL_PATTERN)
+    # A NUL in ``username`` is refused here (vault BACKLOG #5342; ``SIGN_IN_NAME_PATTERN`` says
+    # why). Unrefused, it would reach the store's lookup, where PostgreSQL raises an error this
+    # route does not catch, so the route would answer 500 outside its failure-timing pad.
+    username: str = Field(max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
     #: The raw session token this sign-in REPLACES in the caller, if any (ASVS 7.2.4, BACKLOG
@@ -329,7 +325,9 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    username: str = Field(min_length=1, max_length=_NAME_MAX)
+    # The sign-in name rule (vault BACKLOG #5342): the name goes to the directory lookup, and the
+    # name the directory returns to the store, so a NUL is refused before either sees it.
+    username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 

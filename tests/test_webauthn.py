@@ -1825,19 +1825,42 @@ async def test_a_passkey_registered_from_a_first_seen_address_records_nothing() 
 _TOO_DEEP = '{"id": ' + "[" * 100_000 + "]" * 100_000 + "}"
 
 
-def test_a_deeply_nested_registration_response_is_the_audited_refusal() -> None:
+def _refused_on_recursion(
+    excinfo: pytest.ExceptionInfo[wa.WebAuthnVerificationError], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refusal came from the RecursionError catch, not from some other library refusal: the
+    precondition holds on this stack, the cause is the RecursionError, and its type was logged."""
+    with pytest.raises(RecursionError):
+        json.loads(_TOO_DEEP)
+    assert isinstance(excinfo.value.__cause__, RecursionError), repr(excinfo.value.__cause__)
+    assert any("raw RecursionError" in r.getMessage() for r in caplog.records)
+
+
+def test_a_deeply_nested_registration_response_is_the_audited_refusal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """vault BACKLOG #5341, at this module's seam only. Red: the library's RecursionError escaped
-    verify_registration. A route that parses the body itself first is not covered here."""
-    with pytest.raises(wa.WebAuthnVerificationError):
+    verify_registration. The web console's routes that parse the body first have their own test,
+    in the web console suite (``test_ui_passkey_body_refusals.py``)."""
+    with (
+        caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
+        pytest.raises(wa.WebAuthnVerificationError) as excinfo,
+    ):
         wa.verify_registration(
             response_json=_TOO_DEEP, challenge=b"c" * 32, rp_id=RP, origin=ORIGIN
         )
+    _refused_on_recursion(excinfo, caplog)
 
 
-def test_a_deeply_nested_assertion_response_is_the_audited_refusal() -> None:
+def test_a_deeply_nested_assertion_response_is_the_audited_refusal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """vault BACKLOG #5341, the text form ``verify_assertion`` accepts. Red: as above."""
     soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
-    with pytest.raises(wa.WebAuthnVerificationError):
+    with (
+        caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
+        pytest.raises(wa.WebAuthnVerificationError) as excinfo,
+    ):
         wa.verify_assertion(
             response_json=_TOO_DEEP,
             challenge=b"c" * 32,
@@ -1846,3 +1869,4 @@ def test_a_deeply_nested_assertion_response_is_the_audited_refusal() -> None:
             public_key=soft.cose_public_key(),
             current_sign_count=0,
         )
+    _refused_on_recursion(excinfo, caplog)

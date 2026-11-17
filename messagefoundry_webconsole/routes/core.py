@@ -768,6 +768,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         provider_value = form.get("provider", "local")
         if provider_value not in ("local", "ad"):
             return RedirectResponse("/ui/login?e=bad", status_code=303)
+
+        def _refused() -> Response:
+            refused = RedirectResponse("/ui/login?e=bad", status_code=303)
+            if handle:
+                clear_passkey_sign_in_cookie(refused, request)
+            return refused
+
+        username = form.get("username", "")
+        if "\x00" in username:
+            # The JSON route's sign-in name rule, by hand since this form is not a pydantic model
+            # (vault BACKLOG #5342; api/validation.py ``SIGN_IN_NAME_PATTERN`` says why). It covers
+            # the combined passkey sign-in too, which rides this form's username.
+            return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,
         # the handle of its challenge the cookie the begin leg set; both or neither. Clamped, so an
         # oversized assertion is simply an invalid one.
@@ -779,7 +792,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             else None
         )
         outcome = await auth.login(
-            form.get("username", ""),
+            username,
             form.get("password", ""),
             provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
             client=client,
@@ -795,10 +808,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             passkey_challenge=staged.challenge if staged is not None else None,
         )
         if not outcome.ok or outcome.token is None:
-            refused = RedirectResponse("/ui/login?e=bad", status_code=303)
-            if handle:
-                clear_passkey_sign_in_cookie(refused, request)
-            return refused
+            return _refused()
         # A must-change account goes straight to the browser rotation page (L4b) — every other
         # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
         # second-factor page for the same reason (ASVS 6.3.3). must_change comes first for an
@@ -2220,7 +2230,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         try:
             body = await request.json()
             response_json = json.dumps(body["response"])
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, RecursionError):
+            # RecursionError: json's own refusal of a body nested too deep for the stack, from the
+            # parse or the re-encode, is a malformed request too, not a 500 (vault BACKLOG #5341).
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         elevation = await auth.finish_webauthn_assertion(
             token, response_json, client=client, rp_id=rp[0], origin=rp[1]

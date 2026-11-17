@@ -189,14 +189,13 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
 def _invalid_response_errors() -> tuple[type[Exception], ...]:
     """:func:`_invalid_input_errors` plus ``RecursionError``, caught around the whole library verify
     call of each ceremony (vault BACKLOG #5341). The library's own ``json.loads`` raises it,
-    unwrapped, for a response nested too deep for the stack. Its message names stack use, not the
-    input.
+    unwrapped, for a response nested too deep for the stack: its credential parsers catch only
+    ``JSONDecodeError``. Its message names stack use, not the input.
 
-    In :func:`verify_assertion` that call also decodes the stored key, so a ``RecursionError``
-    from that decode, for example on a low stack, is refused as invalid input too. Our own
-    stored-key check, :func:`_require_usable_public_key`, runs before that call and does not catch
-    it. Nor does this reach a caller that parses the body itself before calling in: at least the
-    web console's passkey routes do, and their own parse raises it first."""
+    Only that JSON parse needs it: the library's CBOR decodes, the stored key's included, go
+    through its ``parse_cbor``, which wraps every ``Exception`` as ``InvalidCBORData`` (read on
+    webauthn 3.0.1). A caller that parses the body itself is not reached by this catch: the web
+    console's two passkey JSON routes catch their own parse's ``RecursionError``."""
     return (*_invalid_input_errors(), RecursionError)
 
 
