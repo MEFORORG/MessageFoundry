@@ -13385,6 +13385,8 @@ class AuthService:
                 reread = await read_user_or_unreadable(self._store.get_user(user.id))
                 if reread is None:
                     return _SealCheck()  # deleted meanwhile: nothing to report
+                if reread.unreadable:
+                    break  # its row no longer parses, and a stand-in is never verified (#5505)
                 if _lookup_keys(reread) != _lookup_keys(user):
                     # The account was renamed, rebound or re-keyed meanwhile, so it may no longer be
                     # the one the caller looked up. Not reported, and the next request reads afresh.
@@ -20711,8 +20713,8 @@ class AuthService:
         Takes its set from :meth:`sessions_ended_by_ad_map_save`, which reads
         :meth:`_load_users`: every enabled directory account whose record passes its seal. An
         account that fails its seal is reported by :meth:`_verified` and left out, and so are its
-        sessions. On a keyless store there is no seal to check, so only an account whose stored
-        cells do not parse is left out (BACKLOG #5505). Each
+        sessions. On a keyless store there is no seal to check, but an account whose stored cells
+        do not parse still fails, and is left out (BACKLOG #5505). Each
         account's unrevoked rows are then revoked with the store's ``revoke_user_sessions``, so this
         needs no schema change on any backend. The count it returns includes rows already past their
         limits, which the revoke ends too. Unlike the reconciler this is NOT counted against the

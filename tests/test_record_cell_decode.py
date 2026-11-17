@@ -296,8 +296,9 @@ async def _admin(store: MessageStore, user_id: str, password: str) -> None:
 async def test_a_corrupt_role_row_fails_its_account_on_a_keyless_store(tmp_path: Path) -> None:
     """Finding 1 of PR 3007: a keyless store checks no seal, so the role read itself must refuse
     the account, as the write helpers do, or it signs in without the role while every write to it
-    is refused. Sign-in refuses it and reports it, and the last-administrator guard, which does
-    not count it, agrees with what can sign in."""
+    is refused. Sign-in refuses it and reports it, and a session issued before ends. The
+    last-administrator guard already skipped it before this fix; it is checked here only to show
+    the guard and sign-in now agree."""
     path = tmp_path / "keyless-roles.db"
     password = "a-strong-passphrase-here"
     store = await MessageStore.open(path)
@@ -308,7 +309,9 @@ async def test_a_corrupt_role_row_fails_its_account_on_a_keyless_store(tmp_path:
         await service.initialize()  # the built-in roles
         for user_id in ("a-good", "a-bad"):
             await _admin(store, user_id, password)
-        assert (await service.login("a-bad", password)).ok  # control
+        before = await service.login("a-bad", password)
+        assert before.ok and before.token is not None  # control
+        assert await service.identity_for_token(before.token) is not None
         # Control: the guard counts a-bad while it reads, so a-good may go.
         await service.delete_user("a-good", actor="test")
         await _admin(store, "a-good", password)
@@ -322,12 +325,42 @@ async def test_a_corrupt_role_row_fails_its_account_on_a_keyless_store(tmp_path:
         assert not out.ok and out.token is None and out.error == "invalid credentials"
         assert len(alerts) == 1 and "a-bad" in alerts[0]
         assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        assert await service.identity_for_token(before.token) is None
         assert await service._load_user("a-bad") is None
         assert await service._load_user("a-good") is not None  # no other account fails
         # a-bad can no longer sign in, so the guard no longer counts it either.
         with pytest.raises(LastAdministratorRefused):
             await service.delete_user("a-good", actor="test")
         assert await store.get_user("a-good") is not None
+    finally:
+        await store.close()
+
+
+async def test_a_keyless_reread_that_finds_an_unreadable_row_never_verifies_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The role read refuses, and by the re-read the users row no longer parses: the stand-in the
+    re-read returns is reported as failing, never built into a verified account."""
+    path = tmp_path / "keyless-reread.db"
+    store = await MessageStore.open(path)
+    try:
+        await _user(store, "u-rr")
+        user = await store.get_user("u-rr")
+        assert user is not None
+        real = store.get_user_role_grants
+        calls = 0
+
+        async def refuse_once(user_id: str) -> list[RoleGrant]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                _raw(path, "UPDATE users SET failed_attempts=? WHERE id=?", ("x", user_id))
+                raise RowSealError(USER_KIND, "")
+            return await real(user_id)
+
+        monkeypatch.setattr(store, "get_user_role_grants", refuse_once)
+        check = await AuthService(store, AuthSettings())._verified(user)
+        assert check.failed and check.user is None
     finally:
         await store.close()
 

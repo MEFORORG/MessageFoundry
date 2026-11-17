@@ -2821,7 +2821,8 @@ def decode_or_refuse[T](kind: str, ident: str, decode: Callable[[], T]) -> T:
     """``decode()``, or :class:`RowSealError` when a cell it reads does not parse (BACKLOG #5505).
     A row someone wrote outside the store raises the error a failed seal raises, so the handlers
     that already catch that one, at least the re-seal pass and the write helpers' callers, refuse
-    that row alone; a multi-row read decides per row (:func:`listed_users`, :func:`decoded_rows`).
+    that row alone. A multi-row read of users or sessions decides per row (:func:`listed_users`,
+    :func:`decoded_rows`); an account's role read raises for the whole account.
     ``ident`` is the row's stored id or token hash, ``""`` when none is readable; the refusal's
     subject is its :func:`seal_row_ref`.
 
