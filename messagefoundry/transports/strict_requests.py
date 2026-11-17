@@ -1667,8 +1667,8 @@ def mount_strict_reply_adapter(
     #2547), and when requests would send it through a proxy whose URL requests cannot read or
     send, since requests' own error would carry that URL or its credentials (vault BACKLOG #3454).
 
-    On a hop it mounts, it also sets :class:`_NoAmbientAuth` as the session auth where none is
-    set, so requests reads no netrc file for a Vault request (vault BACKLOG #5355).
+    It also sets :class:`_NoAmbientAuth` where the session has no auth (vault BACKLOG #5355).
+
     At least the three Vault clients the engine builds today call this; a new one must too.
     """
     session = getattr(getattr(client, "adapter", None), "session", None)
@@ -1701,8 +1701,7 @@ def mount_strict_reply_adapter(
     # Before the adapter is mounted, so a refused hop leaves the session as hvac built it. The
     # adapter runs the check, so this one and each send's share its one read of the CRL flag.
     adapter.refuse_an_unrevoked_hop(sent, proxy)
-    # Vault BACKLOG #5355: no netrc read and no netrc Basic credentials on any Vault request. A
-    # session auth the caller already set skips the read too, so it is left as it is.
+    # A caller-set auth also skips the netrc read, so it is kept.
     if session.auth is None:
         session.auth = _NoAmbientAuth()
     for prefix in ("https://", "http://"):

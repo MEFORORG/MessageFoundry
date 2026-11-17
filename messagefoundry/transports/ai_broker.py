@@ -486,11 +486,9 @@ class AiBroker:
             },
             method="POST",
         )
-        # Vault BACKLOG #5356: the arms below whose exception can quote the api_key or hold the
-        # provider's bytes set `refusal` and raise AFTER the try, as _refuse_an_unrevoked_ai_hop
-        # does, so neither __cause__ nor __context__ keeps that exception reachable.
-        refusal: str | None = None
-        body = ""
+        # Vault BACKLOG #5356: an arm whose exception can quote the api_key or hold the provider's
+        # bytes sets `refusal`, raised after the try so neither __cause__ nor __context__ keeps it.
+        refusal: str
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as resp:
                 # ASVS 15.2.2: bounded on the socket read. The AI endpoint is operator-configured but
@@ -510,8 +508,7 @@ class AiBroker:
             # TruncatedResponseError escape this arm as an unhandled 500.
             raise AiBrokerError(str(exc)) from exc
         except urllib.error.HTTPError as exc:
-            # Never echo exc.read() — the error body may carry provider detail; redacted host + status
-            # only. Not chained either: the HTTPError holds that body and the provider's headers.
+            # Never echo exc.read() — the error body may carry provider detail; redacted host + status only.
             refusal = f"AI endpoint {_redact_url(self.endpoint)} returned HTTP {exc.code}"
         except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
             raise AiBrokerError(
@@ -532,9 +529,9 @@ class AiBroker:
                 f"AI endpoint {_redact_url(self.endpoint)} sent a malformed HTTP reply "
                 f"({type(exc).__name__})"
             )
-        if refusal is not None:
-            raise AiBrokerError(refusal)
-        return self._extract_text(body)
+        else:
+            return self._extract_text(body)
+        raise AiBrokerError(refusal)
 
     async def chat_async(self, prompt: str) -> str:
         """Awaitable wrapper: run the blocking :meth:`chat` OFF the event loop (CLAUDE.md §6) so the

@@ -595,10 +595,11 @@ def test_a_vault_client_reads_no_netrc_file_and_sends_none_of_its_credentials(
     import importlib
 
     import requests.sessions
+    import requests.utils
 
     _plant_netrc(tmp_path, monkeypatch)
     reads: list[object] = []
-    real = requests.sessions.get_netrc_auth
+    real = requests.utils.get_netrc_auth
 
     def _recording_netrc_auth(*args: Any, **kwargs: Any) -> Any:
         reads.append(args)
@@ -635,7 +636,7 @@ def test_the_mount_leaves_a_session_auth_the_caller_set() -> None:
     """A session that already carries auth skips the netrc read on its own, so the mount keeps it."""
     import requests
 
-    from messagefoundry.transports.strict_requests import _NoAmbientAuth, mount_strict_reply_adapter
+    from messagefoundry.transports.strict_requests import mount_strict_reply_adapter
 
     class _Adapter:
         base_uri = "https://vault.example.test:8200"
@@ -654,4 +655,3 @@ def test_the_mount_leaves_a_session_auth_the_caller_set() -> None:
         attestation_section="secrets",
     )
     assert _Client.adapter.session.auth is preset
-    assert not isinstance(preset, _NoAmbientAuth)

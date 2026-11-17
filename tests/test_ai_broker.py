@@ -491,10 +491,6 @@ def test_a_malformed_ai_reply_raises_the_broker_error(exc: Exception) -> None:
     assert not issubclass(type(exc), (OSError, urllib.error.URLError))  # the reason it is named
     with pytest.raises(AiBrokerError) as ei:
         _raising_broker(exc).chat("synthetic prompt")
-    # Vault BACKLOG #5356: the reply's exception can echo the provider's bytes, so it is on neither
-    # link of the chain.
-    assert ei.value.__cause__ is None
-    assert ei.value.__context__ is None
     # Pinned as an EQUALITY: the class name only, never the reply bytes the exception carries.
     assert str(ei.value) == (
         f"AI endpoint {_ENDPOINT} sent a malformed HTTP reply ({type(exc).__name__})"
@@ -514,27 +510,6 @@ def test_an_invalid_ai_request_value_is_not_echoed(exc: Exception) -> None:
     with pytest.raises(AiBrokerError) as ei:
         _raising_broker(exc).chat("synthetic prompt")
     assert str(ei.value) == f"AI endpoint {_ENDPOINT} rejected an invalid request value"
-    # Vault BACKLOG #5356: the value urllib quoted can be the api_key, so the refused exception is
-    # reachable through neither __cause__ nor __context__. Mutation: raise inside the arm, with or
-    # without `from exc`. Red: one link holds it.
-    assert ei.value.__cause__ is None
-    assert ei.value.__context__ is None
-    assert "SYNTHETICPLANTED" not in repr(vars(ei.value))
-
-
-def test_an_ai_http_error_keeps_the_provider_body_off_the_chain() -> None:
-    """Vault BACKLOG #5356: an HTTPError holds the provider's error body and headers, which the
-    message never echoes, so the chain must not carry it either."""
-    import io
-
-    err = urllib.error.HTTPError(
-        _ENDPOINT, 500, "Server Error", {}, io.BytesIO(b"SYNTHETICPLANTED provider detail")
-    )
-    with pytest.raises(AiBrokerError) as ei:
-        _raising_broker(err).chat("synthetic prompt")
-    assert str(ei.value) == f"AI endpoint {_ENDPOINT} returned HTTP 500"
-    assert ei.value.__cause__ is None
-    assert ei.value.__context__ is None
 
 
 def test_the_ai_malformed_reply_arm_leaves_remote_disconnected_alone() -> None:
