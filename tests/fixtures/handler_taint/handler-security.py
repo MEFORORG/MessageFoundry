@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from builtins import open as bopen
 from pathlib import Path
@@ -16,6 +17,7 @@ from subprocess import run as r
 
 import messagefoundry as mf
 from messagefoundry import db_lookup as dl
+from messagefoundry import handler as h_alias
 
 log = logging.getLogger(__name__)
 opener = open
@@ -79,12 +81,14 @@ def h_file(msg):
     return Send("OB", msg)  # noqa: F821
 
 
-# (5) BACKLOG #5380: a module-qualified decorator is a taint source like the bare one.
+# (5) BACKLOG #5380: the source is the first positional parameter of every function, as in the AST
+# lint, so a module-qualified or import-aliased decorator, an async def, an undecorated helper and a
+# public helper in a `_<feed>_transforms.py` module are all scanned.
 @mf.handler("h_qualified")
 def h_qualified(msg):
     body = msg.raw
     # ruleid: mf-handler-phi-to-log
-    log.info(body)
+    log.error(body)
     return Send("OB", msg)  # noqa: F821
 
 
@@ -95,8 +99,13 @@ def r_qualified(msg):
     return ["h_qualified"]
 
 
-# (5b) BACKLOG #5380: an undecorated underscore helper's parameters are taint sources, because a
-# Handler hands it the message or values read from it.
+@h_alias("h_aliased_decorator")
+async def h_aliased_decorator(msg):
+    # ruleid: mf-handler-phi-to-log
+    log.critical(msg.raw)
+    return Send("OB", msg)  # noqa: F821
+
+
 def _helper_log(m):
     # ruleid: mf-handler-phi-to-log
     log.warning(m.raw)
@@ -112,23 +121,22 @@ def _helper_file(body):
     Path("/tmp/h.hl7").write_bytes(body)
 
 
+def apply_feed_transforms(msg: Message, note: str):  # noqa: F821
+    # ruleid: mf-handler-phi-to-log
+    sys.stderr.write(msg.raw)
+    # Only the first positional parameter is the message symbol, so a second one is not a source.
+    # ok: mf-handler-phi-to-log
+    log.info(note)
+
+
 class _Formatter:
-    # self is not a source, so logging an attribute of it stays clean.
-    def _render(self):
+    def _render(self, msg: Message):  # noqa: F821
+        # On a method the message is the parameter after self.
+        # ruleid: mf-handler-phi-to-log
+        log.exception(msg.raw)
+        # self is not a source, so logging an attribute of it stays clean.
         # ok: mf-handler-phi-to-log
         log.info(self.banner)
-
-
-# A public undecorated function is not a source: nothing ties it to a message.
-def public_util(value):
-    # ok: mf-handler-phi-to-log
-    log.info(value)
-
-
-# A dunder is not a helper.
-def __getattr__(name):
-    # ok: mf-handler-phi-to-log
-    log.info(name)
 
 
 # (6) BACKLOG #5381: the statement or query reached with connection= as a keyword, through a module
@@ -163,8 +171,9 @@ def h_sqli_forms(msg):
     return Send("OB", msg)  # noqa: F821
 
 
-# (7) BACKLOG #5382: file egress the ambient-authority lint does not see -- a non-literal mode,
-# codecs.open, an import-aliased and a name-aliased open, os.write, tempfile and shutil.
+# (7) BACKLOG #5382: file egress through forms the ambient-authority lint misses -- a non-literal mode,
+# codecs.open (whose mode it reads from the wrong slot), an import-aliased and a name-aliased open,
+# os.write and tempfile -- and through shutil, which that lint does flag by name.
 @handler("h_file_forms")  # noqa: F821
 def h_file_forms(msg, mode):
     body = msg.encode()
@@ -177,7 +186,7 @@ def h_file_forms(msg, mode):
     # ruleid: mf-handler-phi-to-file
     bopen("/tmp/c.hl7", "w").write(body)  # noqa: SIM115
     # ruleid: mf-handler-phi-to-file
-    opener("/tmp/d.hl7", "w").write(body)
+    opener("/tmp/d.hl7", "w").writelines([body])
     # ruleid: mf-handler-phi-to-file
     os.write(3, body)
     with tempfile.NamedTemporaryFile("w", delete=False) as tmpf:
@@ -191,4 +200,9 @@ def h_file_forms(msg, mode):
     with open("/tmp/e.log", "w") as fh2:
         # ok: mf-handler-phi-to-file
         fh2.write("processed")
+    # A tainted fd with a constant payload, and a shutil call that writes nothing, are not PHI egress.
+    # ok: mf-handler-phi-to-file
+    os.write(len(body), b"ok")
+    # ok: mf-handler-phi-to-file
+    shutil.which(body)
     return Send("OB", msg)  # noqa: F821

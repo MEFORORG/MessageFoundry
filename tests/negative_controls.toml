@@ -510,7 +510,7 @@ red = [
 ]
 holds = """
 The `# ok` cases in the same fixture -- log.debug, msg.control_id, a parameterized db_lookup -- must
-contribute ZERO findings, and the count equality is what asserts it. A rule set that fired on those
+contribute ZERO findings, and the line-by-line match against the `# ruleid:` annotations is what asserts it. A rule set that fired on those
 would be indistinguishable from one that fires on everything. On the workflow side, the excludes must
 keep matching bandit's rather than growing independently.
 """
