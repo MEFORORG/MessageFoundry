@@ -531,8 +531,9 @@ def emit_audit_tee(
     character, as ``\\u0001`` and ``\\t`` do, so a pattern that needs a word boundary or
     whitespace missed the text on either side when only the handler chain ran. So each text field,
     ``action``, ``actor``, ``channel_id``, ``client`` and ``detail``, is first scrubbed by the same
-    text passes before it is encoded, wherever it holds a C0 control; :func:`_scrub_field` says
-    how. The line that ships is then held, by :func:`_tee_line`, to hide every word the handler
+    text passes before it is encoded, wherever it holds a C0 control in the window
+    :func:`_scrub_field` scans; a control only past that window is not seen. :func:`_scrub_field`
+    says how. The line that ships is then held, by :func:`_tee_line`, to hide every word the handler
     chain hid of the whole record as it was encoded before #3045, on each of up to three sinks,
     so on each sink it redacts no less than that line did there, and parses as JSON wherever that
     line did. Each sink there is a modelled reading, passes of the installed filter chain, not the
@@ -605,8 +606,11 @@ def emit_audit_tee(
       such as ``actor``, can then carry another field's text. The field scrub adds cases of its
       own: where it writes a credential placeholder, as in ``Bearer <redacted>``, just before an
       escape on the line, the chain over the line can take the placeholder and the escape's
-      backslash as one credential value, and a quote that backslash escaped then ends the string,
-      so a record that parsed before #3045 can fail to.
+      backslash as one credential value, and a quote that backslash escaped then ends the string.
+      On each modelled sink the parse floor in :func:`_tee_line` then ships another candidate or
+      the line before #3045, so a record that parsed there before #3045 still does. A sink outside
+      that model is not checked, at least a handler past the third or one with filters of its own,
+      so there a record that parsed before #3045 can fail to.
     * Every handler re-filters the one shared ``LogRecord``, so the file handler and the forwarder
       run the chain again over the first handler's escaped text (``_install_phi_filters``). Then
       ``x%7Cy%7Cz`` followed by DEL, or by U+2028, parses on stdout and not on the later sinks,
@@ -641,8 +645,9 @@ def emit_audit_tee(
         "detail": old_detail if detail else None,
     }
     try:
-        # Each text field is scrubbed before json.dumps escapes a C0 control in it (#3045), and
-        # _tee_line holds the result to what the record above, the line before #3045, hid.
+        # Each text field is scrubbed before json.dumps escapes a C0 control in the window it
+        # scans (#3045), and _tee_line holds the result to what the record above, the line before
+        # #3045, hid.
         try:
             scrubbed: dict[str, object] = {k: _scrub_field(v) for k, v in texts.items()}
             if detail:

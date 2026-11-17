@@ -248,7 +248,7 @@ class RedactionFilter(logging.Filter):
     section 7, *Who the exception-message convention binds*).
     A message escaped before it reaches this filter is another residual: a name or date beside an
     escape can pass. The audit tee's ``json.dumps`` escapes the C0 controls, so since BACKLOG #3045
-    the tee scrubs each field that holds one before it encodes it; see
+    the tee scrubs each field that holds one in the window it scans before it encodes it; see
     :func:`~messagefoundry.store.audit_tee.emit_audit_tee` for what that leaves.
 
     **EVERY FIELD IS BOUNDED BEFORE IT IS SCANNED (BACKLOG #1576).** This filter had no ceiling at all,

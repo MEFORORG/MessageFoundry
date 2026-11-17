@@ -1371,9 +1371,10 @@ def test_scrub_log_text_is_the_handler_chain_without_the_control_scrub() -> None
         assert scrub_log_text(value) != value or value == "ok"
 
 
-def test_a_field_scrub_fault_ships_the_field_redacted(monkeypatch, caplog) -> None:
-    """Fail closed: a fault in the passes ships the field as the placeholder, logged once, by
-    type and never with the value."""
+def test_a_field_scrub_fault_returns_the_field_redacted(monkeypatch, caplog) -> None:
+    """Fail closed: a fault in the passes makes ``_scrub_field`` return the field as the
+    placeholder, logged once, by type and never with the value. What ships is still
+    ``_tee_line``'s choice, which can be the line before #3045, with the field unscrubbed."""
 
     def boom(_text: str) -> str:
         raise RuntimeError("synthetic DOE JANE")
