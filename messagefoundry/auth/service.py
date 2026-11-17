@@ -20734,9 +20734,10 @@ class AuthService:
         role rows do not parse.
 
         BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
-        :meth:`_revoke_ad_sessions` revokes this set, read again, so a route asking whether the
-        save ends the caller's own sessions gets the answer the revoke acts on. The entries being
-        saved do not narrow it, for the reason that method's docstring gives.
+        A route reads it before the save to decide the step-up, and :meth:`_revoke_ad_sessions`
+        reads it again after, so the two can differ when an account's check changes between
+        them. The entries being saved do not narrow it, for the reason that method's docstring
+        gives.
 
         A local account is never named, so a local caller who passes the step-up gate keeps their
         sessions unless a write between the gate's read and the revoke's makes the account a
@@ -20783,8 +20784,9 @@ class AuthService:
         self, entries: Sequence[tuple[str, str]], *, actor: str
     ) -> None:
         """Replace the AD-group → channel-scope map (C3). Revokes directory accounts' sessions so
-        it applies at once, as :meth:`set_ad_group_map` does. This docstring used to end "Takes effect on each AD user's next login", which was
-        an accurate description of the defect BACKLOG #1154 names and is no longer true."""
+        it applies at once, as :meth:`set_ad_group_map` does. This docstring used to end "Takes
+        effect on each AD user's next login", which was an accurate description of the defect
+        BACKLOG #1154 names and is no longer true."""
         await self._store.set_ad_group_scope_map(entries)
         revoked = await self._revoke_ad_sessions(change="ad_scope_map_saved", actor=actor)
         await self._audit(

@@ -1823,9 +1823,9 @@ def require_ui_step_up_when_own_sessions_end(
     session window. ``new_ip`` is checked first, so a forced re-auth leaves the grant unspent.
 
     It decides in the gate, before the body is read, because the answer never needs the body:
-    the directory accounts an AD map save ends do not depend on the entries saved, and a custom role's
-    holders are named by its path. The route then lands a caller whose session the save ended on
-    the sign-in page."""
+    the directory accounts an AD map save ends do not depend on the entries saved, and a custom
+    role's holders are named by its path. The route then lands a caller whose session the save
+    ended on the sign-in page."""
     # mfa_refusal, NOT allow_mfa_pending, for the reason require_ui_step_up gives.
     base = require_ui(
         *permissions,

@@ -997,9 +997,10 @@ such writes, the AD group-map and scope-map saves and the custom-role edit and d
 of the maps. Instead, a save that would end the caller's own sessions takes a single-use proof bound
 to `save_ends_own_sessions`, which only a re-proof made after sign-in mints, and an MFA-pending one
 never (the owner's #1149 Reading B). Any other save keeps the session window. The set it tests is
-the one the revoke ends, read from the stored accounts, and the revoke still ends the caller's own
-sessions, so the edit applies to them at once (BACKLOG #1154). On the console, such a save lands on
-the sign-in page. Those four write no `auth.self_target_refused` row, because they refuse nothing.
+read from the stored accounts by the enumeration the revoke runs again after the save, and the
+revoke still ends the caller's own sessions, so the edit applies to them at once (BACKLOG #1154).
+On the console, such a save lands on the sign-in page. Those four write no
+`auth.self_target_refused` row, because they refuse nothing.
 The row names the actor, the route as `op`, the caller's
 stored id and the caller's address. The guard refuses when the path's spelling or the stored id
 matches the caller (vault BACKLOG #3259); `_refuse_if_self` in `api/auth_routes.py` says why the
