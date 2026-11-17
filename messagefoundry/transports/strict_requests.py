@@ -115,7 +115,7 @@ from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
-    context_checks_revocation,
+    crl_credited,
     insecure_hop_disposition,
     is_loopback_hop_host,
     log_attested_crossing,
@@ -681,7 +681,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         any send, and an attested one built 1. *(This read "about 11 ms (a review agent's
         measurement, 2026-10-13)" until then.)*"""
         if self._crl_checked is None:
-            self._crl_checked = context_checks_revocation(self._ssl_context_factory())
+            self._crl_checked = crl_credited(self._ssl_context_factory())
         return self._crl_checked
 
     def refuse_an_unrevoked_hop(self, url: str, proxy: str | None) -> None:
@@ -1496,7 +1496,7 @@ def _refuse_an_unrevoked_proxy_leg(
         connector=connector,
         # The leg ends at the proxy, so only the proxy's own host decides it, without DNS.
         on_box=bool(host := (proxy_host or "").strip("[]")) and is_loopback_hop_host(host),
-        checks_revocation=lambda: context_checks_revocation(context),
+        checks_revocation=lambda: crl_credited(context),
         revocation_attested=revocation_attested,
         attestation_section=attestation_section,
         posture=posture,

@@ -114,6 +114,7 @@ __all__ = [
     "CaFileUnreadable",
     "cleartext_acceptance_audit_sink",
     "context_checks_revocation",
+    "crl_credited",
     "current_hop_posture",
     "enforce_insecure_hop",
     "CRL_CLOCK_SKEW_SECONDS",
@@ -1024,6 +1025,18 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
     (vault BACKLOG #2188) read the setting too, hand the guard no context, and pass the same flag,
     REST only on a hop with no ECH sidecar (vault BACKLOG #2977 item 2)."""
     return bool(ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME)
+
+
+def crl_credited(ctx: ssl.SSLContext | None) -> bool:
+    """Whether a CRL on ``ctx`` may relax a revocation guard: the one rule every guard reads.
+
+    True only when the context consults a CRL (:func:`context_checks_revocation`) and does not
+    skip validity-period checks (:func:`skips_validity_period`), which would let a CRL past
+    ``nextUpdate`` through. ``None`` is False. :meth:`RevocationHopGuard.capture` and the Vault and
+    proxy legs in ``transports/strict_requests.py`` read it. ``tests/test_revocation_guard_crl_credit.py``
+    fails a call to :func:`context_checks_revocation` by its name anywhere else in the package, so a
+    new guard that asks only half of the rule is named in review (vault BACKLOG #4912)."""
+    return ctx is not None and context_checks_revocation(ctx) and not skips_validity_period(ctx)
 
 
 #: The remedy a revocation refusal names on a hop whose context skips validity-period checks
@@ -2632,8 +2645,8 @@ def revocation_hop_disposition(
        A CRL on a context that skips time validity (:func:`skips_validity_period`) is accepted past
        ``nextUpdate``, so ``capture`` passes False for one (vault BACKLOG #5086). This function does
        not read the context: a caller that derives the flag itself, as the Vault and proxy legs in
-       ``transports/strict_requests.py`` do from :func:`context_checks_revocation` alone, carries
-       that check only while it builds no such context, which neither does today.
+       ``transports/strict_requests.py`` do, reads it through :func:`crl_credited`, the rule
+       ``capture`` reads (vault BACKLOG #4912).
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
@@ -2758,10 +2771,10 @@ class RevocationHopGuard:
     #: Held SEPARATELY from the per-connection ``attested`` (BACKLOG #299) — folding the two into one
     #: field is exactly what let one env var cross every enforcing hop in the instance.
     blanket_attested: bool = False
-    #: Whether this hop's OWN context checks a CRL that is a real revocation check: it sets
-    #: ``VERIFY_CRL_CHECK_LEAF`` (:func:`context_checks_revocation`), the context does not skip time
-    #: validity (:func:`skips_validity_period`), which would let a CRL past ``nextUpdate`` through,
-    #: and the caller did not pass ``expiry_relaxed=True``. Derived in :meth:`capture`, never from a
+    #: Whether this hop's OWN context checks a CRL that is a real revocation check: the context
+    #: passes :func:`crl_credited` (it sets ``VERIFY_CRL_CHECK_LEAF`` and does not skip time
+    #: validity, which would let a CRL past ``nextUpdate`` through), and the caller did not pass
+    #: ``expiry_relaxed=True``. Derived in :meth:`capture`, never from a
     #: global setting. It is the one field that decides both the disposition's CRL arm and whether
     #: the attested crossing is logged (vault BACKLOG #5086, owner ruling 2026-11-03). Find its
     #: readers by symbol; at least :meth:`enforce_construction`, the AI broker and the
@@ -2774,7 +2787,9 @@ class RevocationHopGuard:
     #: it, since :attr:`crl_checked` is already False wherever it is True.
     expiry_relaxed: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
-    #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
+    #: (BACKLOG #1498). That is not only a hop outside a connection: a connection hop whose CRL
+    #: cannot cross passes one too, as the REST destination and the token hop do behind an ECH
+    #: sidecar with ``ECH_HOP_WAYS_ACROSS`` (vault BACKLOG #4912). The default names ``[tls].crl_file`` and a connection's
     #: ``tls_revocation_attested`` — **the connection flag is inapplicable to every non-connection
     #: hop that passes this field, and ``[tls].crl_file`` to most of them**. At least the IdP, the
     #: syslog forwarder and the store each load their own CRL setting and resolve no ``[tls]`` anchor, so ``[tls].crl_file``
@@ -2874,7 +2889,7 @@ class RevocationHopGuard:
             attested=attested,
             posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
-            crl_checked=not expiry_relaxed and context_checks_revocation(context),
+            crl_checked=not expiry_relaxed and crl_credited(context),
             expiry_relaxed=expiry_relaxed,
             ways_across=(
                 EXPIRY_RELAXED_WAYS_ACROSS
