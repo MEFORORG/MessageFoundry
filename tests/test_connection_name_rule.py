@@ -290,10 +290,18 @@ def test_every_record_namespace_has_one_helper() -> None:
     spelled_re = re.compile(
         r"""(?<!\w)[rRbBuU]?[fF]?[rR]?(["'])(?:db_lookup|reference|inbound|fhir_lookup):(?:\{|\1)"""
     )
+    # The positive controls: the pattern finds a hand-spelled prefix in each quote and f-string
+    # form, and passes the prose an error message carries.
+    assert spelled_re.search('f"db_lookup:{x}"')
+    assert spelled_re.search("'reference:' + name")
+    assert not spelled_re.search('"db_lookup: no such connection"')
+    # The walk must see the engine package, or a moved root would pass on nothing. The package held
+    # 337 modules besides connection_names.py when this floor was set.
+    files = [path for path in root.rglob("*.py") if path.name != "connection_names.py"]
+    assert len(files) >= 300
     spelled = [
         f"{path.relative_to(root)}: {match.group(0)}"
-        for path in root.rglob("*.py")
-        if path.name != "connection_names.py"
+        for path in files
         for match in spelled_re.finditer(path.read_text(encoding="utf-8"))
     ]
     assert spelled == []
