@@ -112,7 +112,7 @@ def test_fixture_annotations_match_the_pinned_counts() -> None:
     # the gate's pinned per-rule counts in step, so a case added or deleted on one side reds here
     # before it reds in the security.yml semgrep job (BACKLOG #5380, #5381, #5382).
     gate = _load_gate()
-    want, ok = gate.annotated_findings(gate._FIXTURE.read_text(encoding="utf-8"))
+    want, ok = gate.annotated_findings(gate.read_fixture())
     assert collections.Counter(rule for rule, _ in want) == gate._EXPECTED
     assert not want & ok
     assert set(gate._EXPECTED) <= _EXPECTED
@@ -125,13 +125,15 @@ _POSITIVE_CASES: tuple[tuple[str, str], ...] = (
     ("mf-handler-phi-to-log", "log.info(body)"),
     ("mf-handler-phi-to-log", "log.log(logging.INFO, msg.raw)"),
     # BACKLOG #5380: a module-qualified decorator, an aliased decorator on an async def, an
-    # undecorated `_` helper, a public helper, and the parameter after self on a method.
+    # undecorated `_` helper, a public helper, the parameter after self or _self on a method, and an
+    # attribute-form logger.
     ("mf-handler-phi-to-log", "log.error(body)"),
     ("mf-handler-phi-to-log", "print(msg.raw)"),
     ("mf-handler-phi-to-log", "log.critical(msg.raw)"),
     ("mf-handler-phi-to-log", "log.warning(m.raw)"),
     ("mf-handler-phi-to-log", "sys.stderr.write(msg.raw)"),
     ("mf-handler-phi-to-log", "log.exception(msg.raw)"),
+    ("mf-handler-phi-to-log", "_self.logger.info(msg.raw)"),
     ("mf-handler-ambient-subprocess", 'r(["/bin/echo", msg.raw])'),
     ("mf-handler-ambient-deserialization", "pk(msg.raw)"),
     ("mf-handler-ambient-eval-exec", "eval(msg.text)"),
@@ -169,17 +171,50 @@ _POSITIVE_CASES: tuple[tuple[str, str], ...] = (
 )
 
 
-def test_every_positive_case_is_pinned_by_name() -> None:
-    gate = _load_gate()
-    text = gate._FIXTURE.read_text(encoding="utf-8")
-    want, _ok = gate.annotated_findings(text)
-    lines = text.split("\n")
+# Every `# ok:` case, the same way: an over-match is usually "fixed" by deleting the ok case it
+# fires on, which the counts and the gate's line match cannot see.
+_NEGATIVE_CASES: tuple[tuple[str, str], ...] = (
+    ("mf-handler-phi-to-log", "log.debug(msg.raw)"),
+    ("mf-handler-phi-to-log", 'log.info("processed %s", msg.control_id)'),
+    ("mf-handler-sqli-db-lookup", 'db_lookup("MPI", "select npi from p where mrn = :mrn"'),
+    ("mf-handler-phi-to-log", "log.info(note)"),
+    ("mf-handler-phi-to-log", "log.info(self.banner)"),
+    ("mf-handler-sqli-db-lookup", 'db_lookup(connection="MPI", statement="select npi from p'),
+    ("mf-handler-sqli-db-lookup", 'mf.db_lookup("MPI", "select npi from p'),
+    (
+        "mf-handler-sqli-db-lookup",
+        'fhir_lookup("epic", "Patient", {"identifier": FhirToken("MRN", mrn)})',
+    ),
+    (
+        "mf-handler-sqli-db-lookup",
+        'fhir_lookup("epic", "Patient", {"_sort": FhirRaw("status,-date")})',
+    ),
+    ("mf-handler-phi-to-file", "buf.write(body)"),
+    ("mf-handler-phi-to-file", 'fh2.write("processed")'),
+    ("mf-handler-phi-to-file", 'os.write(len(body), b"ok")'),
+    ("mf-handler-phi-to-file", "shutil.which(body)"),
+    ("mf-handler-phi-to-file", 'shutil.move("/tmp/staged.hl7", body)'),
+)
+
+
+def _pin(cases: tuple[tuple[str, str], ...], lines: list[str]) -> set[tuple[str, int]]:
     pinned: set[tuple[str, int]] = set()
-    for rule, start in _POSITIVE_CASES:
+    for rule, start in cases:
         found = [n for n, line in enumerate(lines, start=1) if line.strip().startswith(start)]
         assert len(found) == 1, (start, found)
         pinned.add((rule, found[0]))
-    assert pinned == want
+    return pinned
+
+
+def test_every_annotated_case_is_pinned_by_name() -> None:
+    gate = _load_gate()
+    text = gate.read_fixture()
+    want, ok = gate.annotated_findings(text)
+    lines = text.split("\n")
+    assert _pin(_POSITIVE_CASES, lines) == want
+    assert _pin(_NEGATIVE_CASES, lines) == ok
+    # A misspelt rule id in an annotation would pin a case no rule can ever fire on.
+    assert {rule for rule, _ in want | ok} <= _EXPECTED
 
 
 def test_annotations_count_lines_as_semgrep_does() -> None:

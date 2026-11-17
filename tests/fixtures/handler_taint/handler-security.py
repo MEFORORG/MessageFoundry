@@ -138,6 +138,11 @@ class _Formatter:
         # ok: mf-handler-phi-to-log
         log.info(self.banner)
 
+    def _emit(_self, msg: Message):  # noqa: F821, N805
+        # An `_self` receiver is skipped too, and an attribute-form logger is a sink.
+        # ruleid: mf-handler-phi-to-log
+        _self.logger.info(msg.raw)
+
 
 # (6) BACKLOG #5381: the statement or query reached with connection= as a keyword, through a module
 # alias and through an import alias; FhirRaw and the FhirToken system half are author syntax.
@@ -205,4 +210,7 @@ def h_file_forms(msg, mode):
     os.write(len(body), b"ok")
     # ok: mf-handler-phi-to-file
     shutil.which(body)
+    # A message-derived destination path moves a constant file; it writes no message content.
+    # ok: mf-handler-phi-to-file
+    shutil.move("/tmp/staged.hl7", body)
     return Send("OB", msg)  # noqa: F821

@@ -27,7 +27,7 @@ _FIXTURE = _ROOT / "tests" / "fixtures" / "handler_taint" / "handler-security.py
 # Findings per rule over the fixture; a case deleted from the fixture alone then reds this gate.
 _EXPECTED: collections.Counter[str] = collections.Counter(
     {
-        "mf-handler-phi-to-log": 8,
+        "mf-handler-phi-to-log": 9,
         "mf-handler-ambient-subprocess": 1,
         "mf-handler-ambient-deserialization": 1,
         "mf-handler-ambient-eval-exec": 1,
@@ -58,16 +58,9 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    got = collections.Counter(r["check_id"].split(".")[-1] for r in results)
-    if got != _EXPECTED:
-        print(
-            f"handler-taint rules REGRESSED: got {dict(got)} != expected {dict(_EXPECTED)}",
-            file=sys.stderr,
-        )
-        return 1
-    # Equal counts can still hide a miss offset by an over-match of the same rule elsewhere, so every
-    # finding must also sit on the line its `# ruleid:` annotation names.
-    want, _ok = annotated_findings(_FIXTURE.read_text(encoding="utf-8"))
+    # Every finding must sit on the line its `# ruleid:` annotation names, checked first so a failure
+    # names the line. Equal counts alone could hide a miss offset by an over-match elsewhere.
+    want, _ok = annotated_findings(read_fixture())
     hit = {(r["check_id"].split(".")[-1], r["start"]["line"]) for r in results}
     if hit != want:
         print(
@@ -76,8 +69,21 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    got = collections.Counter(r["check_id"].split(".")[-1] for r in results)
+    if got != _EXPECTED:
+        print(
+            f"handler-taint rules REGRESSED: got {dict(got)} != expected {dict(_EXPECTED)}",
+            file=sys.stderr,
+        )
+        return 1
     print(f"handler-taint rules fire exactly as annotated: {dict(got)}")
     return 0
+
+
+def read_fixture() -> str:
+    """The fixture's text with its line endings as stored. ``Path.read_text`` would translate a lone
+    ``\\r`` into a line break that semgrep does not count, shifting every later line."""
+    return _FIXTURE.read_bytes().decode("utf-8")
 
 
 _ANNOTATION = re.compile(r"^\s*#\s*(ruleid|ok):\s*([\w-]+)\s*$")

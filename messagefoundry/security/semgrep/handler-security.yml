@@ -5,17 +5,22 @@
 # dependency. Ships in the wheel (hatchling packages every file under messagefoundry/); reference the
 # installed copy via importlib.resources. See docs/security/SECURING-HANDLER-CONFIG-IN-CI.md.
 # Static taint is a filter, not a boundary (~16-70% recall). Run with --error to block; drop it to advise.
-# Known gaps include at least: attribute-form loggers (self.logger.info, mirroring the AST lint); a file
-# handle opened in one function and written in another; an opener or lookup imported under an alias
-# from a module none of the patterns below names; and a function whose first parameter is not the message.
+# Known gaps include at least: a file handle opened in one function and written in another; a write
+# through a handle by anything but its own .write/.writelines (json.dump(x, fh), csv.writer(fh));
+# an opener or lookup imported under an alias from a module none of the patterns below names; a
+# receiver named other than the names below; and a function whose first parameter is not the message.
 rules:
   # --- (1) inter-statement taint: message body/fields -> dangerous sink ------------------------------
-  # SOURCE = the first positional parameter of EVERY function, decorated or not (the one after
-  # self/cls on a method), the scope the AST lint's phi-to-log keys on (ADR 0144, BACKLOG #337).
-  # Undecorated helpers and module-qualified or aliased @handler/@router decorators are therefore
-  # covered (BACKLOG #5380). Taint propagates through accessors (msg.raw, msg.field(...), msg["PID-3"],
-  # msg.encode(), ...) and assignments (body = msg.raw), so a body reaching a sink one or more
-  # statements later is caught.
+  # SOURCE = the first positional parameter of EVERY function, def or async def, decorated or not;
+  # on a method, the parameter after a receiver named self, cls, mcs, klass, metacls or _self. So
+  # undecorated helpers and module-qualified or aliased @handler/@router decorators are covered
+  # (BACKLOG #5380). This is close to, NOT the same as, the AST lint's phi-to-log scope: that lint
+  # also keys on the first positional parameter of every function, but takes `self` on a method and
+  # skips async def. Every function's first parameter is a source, so a helper whose first parameter
+  # is a path, statement or event name is flagged too, and under --error that blocks; the AST lint
+  # carries the same false positive but is advisory by default. Taint propagates through accessors
+  # (msg.raw, msg.field(...), msg["PID-3"], msg.encode(), ...) and assignments (body = msg.raw), so a
+  # body reaching a sink one or more statements later is caught.
   - id: mf-handler-phi-to-log
     mode: taint
     languages: [python]
@@ -34,13 +39,14 @@ rules:
                           ...
                   - metavariable-regex:
                       metavariable: $MSG
-                      regex: ^(?!(self|cls)\b)
-              - pattern: |
-                  def $F(self, $MSG, ...):
-                      ...
-              - pattern: |
-                  def $F(cls, $MSG, ...):
-                      ...
+                      regex: ^(?!(_?self|cls|mcs|klass|metacls)\b)
+              - patterns:
+                  - pattern: |
+                      def $F($RECV, $MSG, ...):
+                          ...
+                  - metavariable-regex:
+                      metavariable: $RECV
+                      regex: ^(_?self|cls|mcs|klass|metacls)\b
           - focus-metavariable: $MSG
     pattern-sinks:
       - pattern: print(...)
@@ -58,12 +64,12 @@ rules:
               - pattern: $LOG.log(...)
           - metavariable-regex:
               metavariable: $LOG
-              regex: (?i)^(.*_)?(log|logger|logging)$
+              regex: (?i)^(.*[._])?(log|logger|logging)$
     pattern-sanitizers:
       # HL7 MSH envelope metadata is non-PHI (control id / message type); logging it is the recommended
       # safe pattern, so it clears the taint on this rule (so the remediation above does not itself flag).
       # A helper that RECEIVES a control id as its first parameter cannot see this sanitizer, and so is
-      # flagged: the same accepted advisory tail as the AST lint's (ADR 0144).
+      # flagged (see the SOURCE note above).
       - pattern: $M.control_id
       - pattern: $M.message_type
       - pattern: $M.message_code
@@ -88,13 +94,14 @@ rules:
                           ...
                   - metavariable-regex:
                       metavariable: $MSG
-                      regex: ^(?!(self|cls)\b)
-              - pattern: |
-                  def $F(self, $MSG, ...):
-                      ...
-              - pattern: |
-                  def $F(cls, $MSG, ...):
-                      ...
+                      regex: ^(?!(_?self|cls|mcs|klass|metacls)\b)
+              - patterns:
+                  - pattern: |
+                      def $F($RECV, $MSG, ...):
+                          ...
+                  - metavariable-regex:
+                      metavariable: $RECV
+                      regex: ^(_?self|cls|mcs|klass|metacls)\b
           - focus-metavariable: $MSG
     pattern-sinks:
       # The statement/query is the 2nd positional or the statement=/query= keyword, whatever form the
@@ -147,6 +154,8 @@ rules:
           - focus-metavariable: $V
   - id: mf-handler-phi-to-file
     mode: taint
+    options:
+      symbolic_propagation: true
     languages: [python]
     severity: WARNING
     metadata: {asvs: "15.2.5", note: "CLAUDE.md §9 payloads go only to the secured store"}
@@ -162,13 +171,14 @@ rules:
                           ...
                   - metavariable-regex:
                       metavariable: $MSG
-                      regex: ^(?!(self|cls)\b)
-              - pattern: |
-                  def $F(self, $MSG, ...):
-                      ...
-              - pattern: |
-                  def $F(cls, $MSG, ...):
-                      ...
+                      regex: ^(?!(_?self|cls|mcs|klass|metacls)\b)
+              - patterns:
+                  - pattern: |
+                      def $F($RECV, $MSG, ...):
+                          ...
+                  - metavariable-regex:
+                      metavariable: $RECV
+                      regex: ^(_?self|cls|mcs|klass|metacls)\b
           - focus-metavariable: $MSG
     pattern-sinks:
       # This rule does NOT lean on Control A. The ambient-authority lint flags a builtin `open` whose
@@ -181,17 +191,22 @@ rules:
       - patterns:
           - pattern: os.write($FD, $DATA)
           - focus-metavariable: $DATA
-      - pattern-either:
-          - pattern: shutil.copyfileobj(...)
-          - pattern: shutil.copyfile(...)
-          - pattern: shutil.copy(...)
-          - pattern: shutil.copy2(...)
-          - pattern: shutil.copytree(...)
-          - pattern: shutil.move(...)
+      # The SOURCE argument of a shutil copy or move: the content or file being written out. A
+      # message-derived destination path alone is not message content, so it is not a sink here.
+      - patterns:
+          - pattern-either:
+              - pattern: shutil.copyfileobj($SRC, ...)
+              - pattern: shutil.copyfile($SRC, ...)
+              - pattern: shutil.copy($SRC, ...)
+              - pattern: shutil.copy2($SRC, ...)
+              - pattern: shutil.copytree($SRC, ...)
+              - pattern: shutil.move($SRC, ...)
+          - focus-metavariable: $SRC
       # A bare `.write()` on ANY receiver is not a sink: it over-matches benign io.StringIO/io.BytesIO
       # payload assembly. `.write()`/`.writelines()` count on a handle this rule saw opened as a file,
       # whatever the mode expression says: chained, assigned or bound by `with`. `builtins.open` and
-      # `$P.open` resolve an import alias (`from builtins import open as o`, codecs.open, io.open).
+      # `$P.open` resolve an import alias (`from builtins import open as o`, codecs.open, io.open), and
+      # symbolic propagation (options, below) resolves an opener bound to a name (`o = open`).
       - patterns:
           - pattern-either:
               - pattern: $OPEN(...).write(...)
@@ -209,36 +224,6 @@ rules:
                       - pattern: $FH.writelines(...)
           - metavariable-pattern:
               metavariable: $OPEN
-              pattern-either:
-                - pattern: open
-                - pattern: builtins.open
-                - pattern: $P.open
-                - pattern: tempfile.NamedTemporaryFile
-                - pattern: tempfile.TemporaryFile
-                - pattern: tempfile.SpooledTemporaryFile
-                - pattern: os.fdopen
-      # The same handles through an opener first bound to a local name (`o = open; o(p, mode)`). The
-      # two lists here repeat the block above: `semgrep --validate` refuses a YAML alias.
-      - patterns:
-          - pattern-inside: |
-              $OPEN = $REAL
-              ...
-          - pattern-either:
-              - pattern: $OPEN(...).write(...)
-              - pattern: $OPEN(...).writelines(...)
-              - patterns:
-                  - pattern-either:
-                      - pattern-inside: |
-                          $FH = $OPEN(...)
-                          ...
-                      - pattern-inside: |
-                          with $OPEN(...) as $FH:
-                              ...
-                  - pattern-either:
-                      - pattern: $FH.write(...)
-                      - pattern: $FH.writelines(...)
-          - metavariable-pattern:
-              metavariable: $REAL
               pattern-either:
                 - pattern: open
                 - pattern: builtins.open
