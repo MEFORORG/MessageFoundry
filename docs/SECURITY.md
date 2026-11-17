@@ -6898,7 +6898,8 @@ leaves the map in at least these ways (BACKLOG #5336):
 - the engine ends the session itself, by a sign-out, a revoke of one, some or all sessions, the
   budget revoke, or the idle or expiry revoke a request meets (the budget revoke drops the count
   only once its revoke commits);
-- a re-proof finds its session already gone;
+- a re-proof finds its session already gone, or lapsed past its absolute expiry or idle window,
+  which that re-proof refuses unverified and ends (the count goes only once that revoke commits);
 - a successful re-proof on the step-up re-auth route (a successful current-password check on the
   password-change route keeps the count);
 - a restart, which forgets every count.
@@ -6912,11 +6913,14 @@ first. A session the store still lists, idle or not, keeps its count. When a new
 failure finds its account at 64 counts or the map full, the age prune runs: counts older than the
 absolute session lifetime, timed from their first failure, go. It reaches a live session's count
 only after a wall-clock step. If there is still no room, that session is revoked on that first
-failure, and its count is held at the cap. The count leaves when that revoke commits, when a later
-re-proof finds the session gone, or by the age prune. If the revoke fails, or never runs because an
-earlier write raised, the count stays, and the session's next re-proof is revoked unverified. A
-session the session reaper purges without the engine ending it, at least one that expired with no
-request, keeps its count until one of the drops above, or the age prune, takes it.
+failure, and its count is held at the cap. That count leaves in at least the ways above, among
+them when that revoke commits, when a later re-proof finds the session gone, and when a later age
+prune reaches it. No count leaves on a timer: the age prune runs only when a new session's first
+failure finds no room, so a count can stay in the map for any length of time past its session's
+lifetime. If the revoke fails, or never runs because an earlier write raised, the count stays, and
+the session's next re-proof is revoked unverified. A session the session reaper purges without the
+engine ending it, at least one that expired with no request, keeps its count until one of the
+drops above takes it, and none of them is bound to run before a restart.
 
 The per-session cap matters for AD, because since the AD sign-in was retired the step-up re-auth
 route is the **only** place an AD password is still bound: a rejected re-bind counts on the

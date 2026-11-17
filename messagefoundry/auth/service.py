@@ -900,10 +900,12 @@ def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
 # idle or expiry revoke a request meets. At the account's cap, a re-proof first drops the counts of
 # the account's sessions the store no longer lists. When a new session's first failure finds the
 # account at its cap or the map full, the age prune runs. If there is still no room, that session
-# is revoked on that failure (fail closed), and its entry is held at the cap. It leaves when the
-# budget revoke commits, when a later re-proof finds the session gone, or by the age prune; a
-# budget revoke that fails, or never runs because an earlier write raised, leaves it in place, and
-# the session's next re-proof is then revoked unverified. Before BACKLOG #5336 the per-account cap
+# is revoked on that failure (fail closed), and its entry is held at the cap. It leaves in at least
+# these ways: the budget revoke commits, a later re-proof finds the session gone (or lapsed, once
+# the revoke that re-proof makes commits), or a later age prune reaches it. No count leaves on a
+# timer, because the age prune runs only when a new session's first failure finds no room. A budget
+# revoke that fails, or never runs because an earlier write raised, leaves it in place, and the
+# session's next re-proof is then revoked unverified. Before BACKLOG #5336 the per-account cap
 # dropped the account's own oldest LIVE count, so round-robin guesses over more sessions than the
 # cap each got a fresh budget.
 _REPROOF_SESSION_MAX = 4096
@@ -12244,8 +12246,8 @@ class AuthService:
             # read is logged, never raised: the revoke and its row have committed, and a raise
             # here would lose the token the sign-in minted. The set is the read's, wider than
             # _session_write_errors by at least the ValueError aiosqlite raises for a closed
-            # connection; a defect still raises. The counts it leaves stay until a later
-            # drop, at the latest the age prune.
+            # connection; a defect still raises. The counts it leaves stay until a later drop
+            # takes them, at least one named on _REPROOF_SESSION_MAX; none runs on a timer.
             try:
                 async with self._account_reproof_lock(user_id):
                     await self._drop_unlisted_reproof_counts(user_id)
