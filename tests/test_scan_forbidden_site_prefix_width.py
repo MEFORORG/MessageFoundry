@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5366: the publish guard counts a ``[site_prefix]`` entry as live only when the anonymizer
-loads it too. Both ``surrogates.py`` copies load two-digit prefixes only, so a guard that counted a
-wider one called the site-code scrub and its leak check live while they matched nothing. Every
+"""BACKLOG #5366: the publish guard and the anonymizer agree on which ``[site_prefix]`` entries are
+live. Both ``surrogates.py`` copies load two-digit prefixes only. The guard still matches a wider
+entry, so it loses no detector, but names it and refuses the source on a required-token run, where
+it used to count it live while the site-code scrub and its leak check matched nothing for it. Every
 prefix here is made up."""
 
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
 
@@ -23,11 +24,14 @@ import scan_forbidden as sfm  # noqa: E402
 
 pytestmark = pytest.mark.tooling
 
-_NAMES = "[names]\n\\bZqwidthsynth\\b | synthetic | i\n"
+_SECTIONS = "[names]\n\\bZqwidthsynth\\b | synthetic | i\n[estate]\nzqwidthestate\n"
+_BOTH = pytest.mark.parametrize(
+    "module", [toolkit_surrogates, tee_surrogates], ids=["toolkit", "tee"]
+)
 
 
 @pytest.fixture
-def load(monkeypatch: pytest.MonkeyPatch) -> Iterator[object]:
+def load(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], None]]:
     def _loader(source: str) -> None:
         monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", source)
         sfm.reload_tokens()
@@ -41,38 +45,38 @@ def load(monkeypatch: pytest.MonkeyPatch) -> Iterator[object]:
         module.reload_site_prefixes()
 
 
-@pytest.mark.parametrize("module", [toolkit_surrogates, tee_surrogates], ids=["toolkit", "tee"])
-def test_a_wide_prefix_alone_does_not_read_as_live(
-    load, module: ModuleType, capsys: pytest.CaptureFixture[str]
+@_BOTH
+def test_the_guard_width_is_the_anonymizer_width(
+    load: Callable[[str], None], module: ModuleType
 ) -> None:
-    load(f"{_NAMES}[site_prefix]\n731\n")
-    assert not module.site_prefixes_loaded()
-    assert sfm.loaded_token_counts()["site_prefixes"] == 0
-    err = capsys.readouterr().err
-    assert "NOT COUNTED" in err
-    assert "731" not in err, "the warning must not echo the prefix"
-    # Detection is not narrowed: the file scan still matches the wide prefix.
-    assert sfm._SITE_CODE_FILE.search("PT_7310000_ADT") is not None
-
-
-def test_a_wide_prefix_alone_leaves_no_token_source(load) -> None:
-    """With no other section, a wide prefix no longer makes ``TOKENS_PRESENT`` true, so
-    ``MEFOR_REQUIRE_TOKENS`` refuses rather than passing a structural-only run."""
-    load("[site_prefix]\n731\n")
-    assert not sfm.TOKENS_PRESENT
-
-
-@pytest.mark.parametrize("module", [toolkit_surrogates, tee_surrogates], ids=["toolkit", "tee"])
-def test_the_guard_counts_what_the_anonymizer_loads(load, module: ModuleType) -> None:
-    load(f"{_NAMES}[site_prefix]\n73\n731\n")
+    """The guard's one width constant agrees with what each anonymizer copy actually loads."""
+    load(f"{_SECTIONS}[site_prefix]\n7\n73\n731\n7310\n")
     assert module._SITE_PREFIXES == ("73",)
-    assert sfm.loaded_token_counts()["site_prefixes"] == len(module._SITE_PREFIXES)
-    assert sfm.TOKENS_PRESENT
+    assert {len(p) for p in module._SITE_PREFIXES} == {sfm._SITE_PREFIX_WIDTH}
 
 
-def test_the_control_a_two_digit_prefix_counts(load, capsys: pytest.CaptureFixture[str]) -> None:
-    load(f"{_NAMES}[site_prefix]\n73\n")
-    assert sfm.loaded_token_counts()["site_prefixes"] == 1
-    assert "NOT COUNTED" not in capsys.readouterr().err
+def test_a_wide_prefix_refuses_a_required_token_run(
+    load: Callable[[str], None], capsys: pytest.CaptureFixture[str]
+) -> None:
+    load(f"{_SECTIONS}[site_prefix]\n73\n731\n")
+    err = capsys.readouterr().err
+    assert "not exactly 2 ASCII digits" in err
+    why = sfm.token_floor_failure()
+    assert why is not None and "1 [site_prefix] entry is not exactly 2" in why
+    assert "731" not in err and "731" not in why, "a site prefix must never be echoed"
+
+
+def test_a_wide_prefix_still_arms_the_file_scan(load: Callable[[str], None]) -> None:
+    """The refusal is the fix; narrowing detection is not."""
+    load(f"{_SECTIONS}[site_prefix]\n73\n731\n")
+    assert sfm._SITE_CODE_FILE.search("PT_7310000_ADT") is not None
     report, failures = sfm.self_test()
     assert failures == [], failures
+
+
+def test_the_control_two_digit_prefixes_pass_the_floor(
+    load: Callable[[str], None], capsys: pytest.CaptureFixture[str]
+) -> None:
+    load(f"{_SECTIONS}[site_prefix]\n73\n74\n")
+    assert sfm.token_floor_failure() is None
+    assert "ASCII digits" not in capsys.readouterr().err
