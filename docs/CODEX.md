@@ -88,19 +88,20 @@ PowerShell hook with an explicit `exit 2`. The bridge runs it under
 `pwsh -Command`. It puts this line before the hook:
 
 ```powershell
-$PSNativeCommandUseErrorActionPreference = $false; $global:LASTEXITCODE = 0
+$PSNativeCommandUseErrorActionPreference = $false
 ```
 
 and appends this fixed tail after it, on new lines:
 
 ```powershell
 ;
-if (-not $?) { if ($global:LASTEXITCODE -eq 2) { exit 2 }; exit 1 }
+if (-not $?) { try { if ($global:LASTEXITCODE -eq 2) { exit 2 } } catch {}; exit 1 }
 ```
 
-The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`, and
-`tests/test_codex_bridge.py` is the record of which shapes block. **A hook that
-must block should end with an explicit `exit 2`.** Shapes that end on an error,
+The source is `POWERSHELL_HEAD` and `POWERSHELL_TAIL` in
+`scripts/codex/bridge.py`, and `tests/test_codex_bridge.py` is the record of
+which shapes block. **A hook that must block should end with an explicit
+`exit 2`.** Shapes that end on an error,
 or with a stale exit code, are decided by the tail and are not listed here.
 
 A hook that opens with an empty `param()` fails to parse after the head line, so

@@ -215,6 +215,18 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
             "trap {{ exit 2 }}; Get-Item -LiteralPath 'no-such-item-b4'",
             "exit-1",
         ),
+        # The hook sees LASTEXITCODE unset, as bare pwsh starts it, so its own strict-mode read
+        # trips its own trap; and a hook that removes the variable gets no block from the tail.
+        (
+            "Set-StrictMode -Version Latest; trap {{ exit 2 }}; "
+            "if ($LASTEXITCODE -ne 0) {{ 'native failed' }}",
+            "block",
+        ),
+        (
+            "Remove-Variable * -ErrorAction SilentlyContinue; Set-StrictMode -Version Latest; "
+            "trap {{ exit 2 }}; Write-Error 'soft failure'",
+            "exit-1",
+        ),
         # A line continuation ending the hook must not swallow the bridge's own statement, and a
         # dangling operator must stay a parse error rather than take it in.
         ("& '{py}' -c 'import sys; sys.exit(2)' `", "block"),
@@ -247,6 +259,8 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         "failed-cmdlet",
         "strict-mode-failed-cmdlet",
         "constrained-language-trap-failed-cmdlet",
+        "strict-mode-reads-unset-code",
+        "strict-mode-after-removing-the-code",
         "trailing-continuation",
         "dangling-assignment",
         "dangling-pipe",

@@ -200,12 +200,14 @@ def git_bash() -> str | None:
 
 
 # A command-only PowerShell hook runs under pwsh -Command. The head line keeps a native non-zero
-# exit from throwing where a PowerShell build defaults that preference on, and sets LASTEXITCODE so
-# the tail reads it as a plain variable, with no command or method a hook can change. The tail
-# lifts a 2 that -Command reports as 1, for example a guard script's exit 2, back to 2. See
-# docs/CODEX.md, "Who decides a block", and the tests for which shapes block.
-POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false; $global:LASTEXITCODE = 0\n"
-POWERSHELL_TAIL = "\n;\nif (-not $?) { if ($global:LASTEXITCODE -eq 2) { exit 2 }; exit 1 }"
+# exit from throwing where a PowerShell build defaults that preference on. The tail lifts a 2 that
+# -Command reports as 1, for example a guard script's exit 2, back to 2. Its read sits in try/catch
+# because under strict mode an unset LASTEXITCODE throws, and a hook's trap would turn that throw
+# into a block. See docs/CODEX.md, "Who decides a block", and the tests for which shapes block.
+POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false\n"
+POWERSHELL_TAIL = (
+    "\n;\nif (-not $?) { try { if ($global:LASTEXITCODE -eq 2) { exit 2 } } catch {}; exit 1 }"
+)
 
 
 def hook_argv(root: Path, hook: dict) -> list[str]:
