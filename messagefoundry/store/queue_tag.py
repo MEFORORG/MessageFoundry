@@ -162,10 +162,14 @@ class _Releaser(Protocol):
 
 async def release_unreturned(store: _Releaser, lanes: Iterable[Iterable[Any]]) -> None:
     """Return every row of ``lanes`` that ``claim_fifo_heads`` claimed but will not return to
-    ``pending``, through ``store.release_claimed``, before the claim re-raises whatever error
-    escaped its decode, a cancellation included (BACKLOG #5735). The claim committed before it
-    decoded, so without this every lane's rows stay ``inflight`` and the next claim delivers past
-    them. A row the claim already settled (dead-lettered) is not ``inflight``, and the release
+    ``pending``, through ``store.release_claimed``, before the claim re-raises an ``Exception``
+    that escaped its decode (BACKLOG #5735). The claim committed before it decoded, so without
+    this every lane's rows stay ``inflight`` and the next claim delivers past them. A cancellation,
+    and any other ``BaseException`` that is not an ``Exception``, never reaches this: the claim
+    leaves its rows ``inflight`` then, as the pooled dispatcher's teardown leaves a cancelled
+    serializer's (ADR 0066), for lease expiry or ``reset_stale_inflight``. A release during a
+    demotion's cancel is a return-to-``pending`` write ADR 0157 C1 leaves unfenced, so it could
+    re-pend rows a successor already claimed. A row the claim already settled (dead-lettered) is not ``inflight``, and the release
     leaves it as it is. A failed release, building the id list included, is logged and swallowed,
     so the caller re-raises the original error; the rows then stay ``inflight`` until
     ``reset_stale_inflight``."""

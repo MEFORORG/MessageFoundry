@@ -779,18 +779,12 @@ async def test_the_server_pooled_claim_releases_every_lane_on_an_engine_error(
     assert sorted(released) == ["A-1", "A-2", "B-3", "B-4"]
 
 
-#: Errors that are not an engine bug and still escape the pooled claim's decode (BACKLOG #5735).
-_ESCAPING = pytest.mark.parametrize(
-    "error", [ValueError("not a bug"), asyncio.CancelledError()], ids=["ValueError", "cancelled"]
-)
-
-
-@_ESCAPING
-async def test_any_escaping_error_in_the_pooled_claim_releases_every_lane(
+async def _claim_raising(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, error: BaseException
-) -> None:
-    """Lane A's two rows open; lane B's head is refused and handling it raises ``error``, which
-    the claim re-raises unchanged. Every claimed row of both lanes is back to ``pending``."""
+) -> list[tuple[str, int]]:
+    """Claim two SQLite lanes whose lane B head is refused, and whose handling of that refusal
+    raises ``error``; assert the claim re-raises it unchanged and return every row's status and
+    attempts afterwards."""
     inner = make_cipher(generate_key(), write_v2=True)
     assert isinstance(inner, AesGcmCipher)
     cipher = _RefusingCipher(inner)
@@ -811,19 +805,37 @@ async def test_any_escaping_error_in_the_pooled_claim_releases_every_lane(
             await store.claim_fifo_heads("ingress", lanes, per_lane_limit=10)
         assert raised.value is error
         rows = _side(db, "SELECT status, attempts FROM queue WHERE stage='ingress' ORDER BY rowid")
-        assert [(str(s), int(a)) for s, a in rows] == [("pending", 0)] * 4
+        return [(str(s), int(a)) for s, a in rows]
     finally:
         await store.close()
 
 
-@_ESCAPING
-@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
-async def test_the_server_pooled_claim_releases_every_lane_on_any_escaping_error(
-    backend: str, monkeypatch: pytest.MonkeyPatch, error: BaseException
+async def test_an_escaping_error_in_the_pooled_claim_releases_every_lane(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The server twins of the test above, offline: lane B's open raises ``error``, which is not
-    a :class:`CipherError`, so it escapes the decode, and every claimed row of every lane is handed
-    to ``release_claimed`` before the claim re-raises it unchanged."""
+    """An ordinary error that is not an engine bug: every claimed row of both lanes is back to
+    ``pending`` with its attempts undone (BACKLOG #5735)."""
+    rows = await _claim_raising(tmp_path, monkeypatch, ValueError("not a bug"))
+    assert rows == [("pending", 0)] * 4
+
+
+async def test_a_cancelled_pooled_claim_leaves_its_rows_inflight(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancellation is the dispatcher's teardown, which leaves claimed rows ``inflight`` for
+    ``reset_stale_inflight`` and never releases them (ADR 0066): a release then is an unfenced
+    return to ``pending`` (ADR 0157 C1) that could re-pend rows a successor holds. No row is
+    re-pended, and the claim's attempts stand."""
+    rows = await _claim_raising(tmp_path, monkeypatch, asyncio.CancelledError())
+    assert rows == [("inflight", 1)] * 4
+
+
+async def _server_claim_raising(
+    backend: str, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> list[str]:
+    """The server twins of :func:`_claim_raising`, offline: lane B's open raises ``error``, which
+    is not a :class:`CipherError`, so it escapes the decode. Assert the claim re-raises it
+    unchanged and return the ids handed to ``release_claimed``."""
     store = _server_store(backend, _FakeServer(None))
     released: list[str] = []
 
@@ -850,7 +862,26 @@ async def test_the_server_pooled_claim_releases_every_lane_on_any_escaping_error
         with pytest.raises(type(error)) as raised:
             await store._open_claimed_heads(by_lane_rows, set())
     assert raised.value is error
-    assert sorted(released) == ["A-1", "A-2", "B-3", "B-4"]
+    return sorted(released)
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_the_server_pooled_claim_releases_every_lane_on_an_escaping_error(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every claimed row of every lane is handed to ``release_claimed``."""
+    released = await _server_claim_raising(backend, monkeypatch, ValueError("not a bug"))
+    assert released == ["A-1", "A-2", "B-3", "B-4"]
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_a_cancelled_server_pooled_claim_releases_nothing(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancellation releases no row, so the rows stay ``inflight`` for lease expiry or
+    ``reset_stale_inflight`` (ADR 0066 teardown, ADR 0157 C1)."""
+    released = await _server_claim_raising(backend, monkeypatch, asyncio.CancelledError())
+    assert released == []
 
 
 async def test_a_failed_id_list_does_not_replace_the_claims_error() -> None:

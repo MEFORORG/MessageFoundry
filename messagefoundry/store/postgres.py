@@ -5594,9 +5594,12 @@ class PostgresStore:
                     by_lane[lane] = items
                 else:
                     rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
-        except BaseException:
-            # Nothing is returned, so no lane's claimed rows may stay inflight behind the error,
-            # whatever it is: a bug, any other escaping error, or a cancellation (#5735).
+        except Exception:
+            # Nothing is returned, so no lane's claimed rows may stay inflight behind the error, a
+            # bug or any other escaping error (#5735). A cancellation is not caught: it leaves the
+            # rows inflight for lease expiry or reset_stale_inflight, as a cancelled serializer's
+            # are (ADR 0066 teardown), since a release during a demotion's cancel could re-pend rows
+            # a successor already claimed (ADR 0157 C1).
             await release_unreturned(self, by_lane_rows.values())
             raise
         return by_lane
