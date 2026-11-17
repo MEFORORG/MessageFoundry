@@ -4911,8 +4911,8 @@ def _serve(args: argparse.Namespace) -> int:
     # BACKLOG #4934: the lifespan's start refusal runs after this mint, so a start that may replace
     # the pair takes it here first. A first-run mint replaces nothing, so it needs no early open.
     # An early open refused on an unmarked value is the exception; _refuse_unrolled_key_before_tls_write
-    # says what that start does instead. The answer is also the mint's `renew`, so renewal is decided
-    # once: a pair that falls due after this check is not renewed past the refusal it skipped.
+    # says what that start does instead. A False answer also makes the mint's `renew` False, so a
+    # pair that falls due after this check is not renewed past the refusal it skipped.
     _may_replace = generated_pair_may_be_replaced(
         settings.api, state_dir=_state_dir, renew=args.shard is None
     )

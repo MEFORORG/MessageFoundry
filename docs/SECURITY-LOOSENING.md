@@ -847,9 +847,9 @@ the next start may do.
   may still break the chain); and the
   key the chain's newest range is under is not configured. It refuses whether or not the key in
   use keyed an earlier range. With it on, this refusal does not fire. An audit row written in that
-  state goes into that range under the key in use and never verifies there, so the chain breaks at
-  that row, and `rotate-key` then cannot roll it, even after the key is put back. Other commands
-  are not refused in that state, whatever the switch.
+  state, by that start or by a command this refusal does not cover, goes into that range under the
+  key in use and never verifies there, so the chain breaks at that row, and `rotate-key` then
+  cannot roll it, even after the key is put back.
 - **What you keep:** the refusal's text, logged as a WARNING on every start the switch lets through,
   and every other start check.
 - **When acceptable:** only when the key the chain's newest range is under is truly lost. If the

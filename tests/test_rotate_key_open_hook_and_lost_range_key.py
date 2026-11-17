@@ -298,10 +298,10 @@ def _mint_a_pair_due_for_renewal(state_dir: Path, monkeypatch: pytest.MonkeyPatc
 
 def _mint_a_pair_that_falls_due_after_the_first_check(
     state_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> bytes:
+) -> tuple[bytes, list[Path]]:
     """As :func:`_mint_a_pair_due_for_renewal`, but the pair is reported fresh to the first renewal
     check after this and due to every later one: a pair crossing the renewal threshold between the
-    start's read-only check and its mint."""
+    start's read-only check and its mint. Also returns the list each renewal check appends to."""
     from messagefoundry.api import tls
     from messagefoundry.config.settings import ApiSettings
 
@@ -313,10 +313,10 @@ def _mint_a_pair_that_falls_due_after_the_first_check(
         return None if len(checks) == 1 else tls._cert_facts(cert_path)
 
     monkeypatch.setattr(tls, "_renewal_due", due_after_the_first_check)
-    return (state_dir / "api-generated-cert.pem").read_bytes()
+    return (state_dir / "api-generated-cert.pem").read_bytes(), checks
 
 
-def test_a_pair_falling_due_mid_start_is_not_renewed_by_a_refused_supervise_start(
+def test_a_pair_falling_due_mid_start_is_not_renewed_by_supervise(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#4934: renewal is decided once, by the check the refusal runs on. A pair that falls due after
@@ -329,11 +329,12 @@ def test_a_pair_falling_due_mid_start_is_not_renewed_by_a_refused_supervise_star
     db, key_a, key_b = tmp_path / "sup.db", generate_key(), generate_key()
     asyncio.run(_seed(db, tmp_path / "uploads", key_a))
     state_dir = generated_state_dir(str(db))
-    minted = _mint_a_pair_that_falls_due_after_the_first_check(state_dir, monkeypatch)
+    minted, checks = _mint_a_pair_that_falls_due_after_the_first_check(state_dir, monkeypatch)
     settings = ServiceSettings(store=StoreSettings(path=str(db), encryption_key=key_b))
     before = _audit_rows(db)
     # Nothing is replaced, so the store is not opened here; each engine shard's lifespan refuses.
     assert cli._renew_api_tls_before_spawning(settings, str(db)) == state_dir
+    assert checks, "positive control: the read-only check never consulted the renewal clock"
     assert (state_dir / "api-generated-cert.pem").read_bytes() == minted
     assert _audit_rows(db) == before
 
@@ -346,7 +347,7 @@ def test_a_pair_falling_due_mid_start_is_not_renewed_by_serve(
     refuse before auditing a renewal. The lifespan itself is not run here."""
     db, key_a, key_b = tmp_path / "messagefoundry.db", generate_key(), generate_key()
     asyncio.run(_seed(db, tmp_path / "uploads", key_a))
-    minted = _mint_a_pair_that_falls_due_after_the_first_check(tmp_path, monkeypatch)
+    minted, checks = _mint_a_pair_that_falls_due_after_the_first_check(tmp_path, monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)
     # The enforce-only start gates (an off-box log collector, ...) are not under test here.
@@ -363,6 +364,7 @@ def test_a_pair_falling_due_mid_start_is_not_renewed_by_serve(
     # Positive control: the start ran past the mint and reached the server.
     assert main(["serve", "--config", str(samples), "--env", "dev"]) == 0
     assert len(started) == 1
+    assert checks, "positive control: the read-only check never consulted the renewal clock"
     assert (tmp_path / "api-generated-cert.pem").read_bytes() == minted
 
 
