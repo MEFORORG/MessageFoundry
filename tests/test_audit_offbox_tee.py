@@ -1101,13 +1101,13 @@ def test_a_detail_hidden_whole_is_the_bounded_placeholder(monkeypatch) -> None:
     assert seen[1][1] != "[redacted]" and seen[1][1].startswith("[redacted]")
 
 
-#: Review of the PR 2864 repair: a ``channel_id`` carrying ``Bearer %7C`` beside a JSON
-#: ``detail``, which hidden whole shows no word main's line hid on any sink, and parses on none
-#: where main's parsed. So the old line ships for the parse floor, not for a word.
+#: Review of the PR 2864 repair: an ``actor`` the scrub hides whole, the only field it changes,
+#: beside a ``channel_id`` carrying ``Bearer %7C``, which it leaves alone. With the actor hidden,
+#: the line shows no word main's line hid on any sink, and parses on none where main's parsed. So
+#: the old line ships for the parse floor, not for a word.
 _PARSE_FLOOR_FALLBACK: dict[str, str | None] = {
     "actor": "token=hunter2\t\\u1234secret",
     "channel_id": "&%7CBearer %7C",
-    "detail": '{"e": "\\\\u1234\\u007fBearer "}',
 }
 
 
@@ -1117,7 +1117,10 @@ def test_the_old_line_names_the_parse_floor_when_that_is_what_fired(monkeypatch,
     names the reason that fired, and no field value. Synthetic values."""
     from messagefoundry.logging_setup import sink_readings
 
-    monkeypatch.setattr(audit_tee, "_OLD_LINE_LOGGED", False)
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    # The control on the fixture: the scrub changes the actor alone.
+    assert audit_tee._scrub_field(_PARSE_FLOOR_FALLBACK["actor"]) == "[redacted]"
+    assert audit_tee._scrub_field(_PARSE_FLOOR_FALLBACK["channel_id"]) == "&%7CBearer %7C"
     with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
         (after,) = _raw_tee_lines([_PARSE_FLOOR_FALLBACK], monkeypatch, scrub=True)
     (before,) = _raw_tee_lines([_PARSE_FLOOR_FALLBACK], monkeypatch, scrub=False)
@@ -1127,6 +1130,75 @@ def test_the_old_line_names_the_parse_floor_when_that_is_what_fired(monkeypatch,
     (warning,) = [r.getMessage() for r in caplog.records if "without the C0" in r.getMessage()]
     assert "unparseable" in warning and "show a word" not in warning
     assert "hunter2" not in warning and "Bearer" not in warning and "%7C" not in warning
+
+
+_SHOWS = "show a word the line before it hid"
+_UNPARSED = "leave a sink's reading unparseable where the line before it parsed"
+#: The old line hid every key after ``ABC|``; hiding the actor shows them. Main's line parses on
+#: no sink, so the parse floor cannot fire.
+_WORD_BEFORE: dict[str, object] = {"actor": "\x01DOE JANE ABC|x", "seq": 1}
+_WORD_AFTER: dict[str, object] = {"actor": "\x01[redacted] ABC|[redacted]", "seq": 1}
+#: :data:`_PARSE_FLOOR_FALLBACK` as a record, with a ``detail`` the scrub changed.
+_FLOOR_BEFORE: dict[str, object] = {**_PARSE_FLOOR_FALLBACK, "detail": "ok", "seq": 1}
+
+
+def _old_line_warnings(caplog, before, after, whole_detail=lambda: "[redacted]") -> list[str]:
+    """The warnings ``_tee_line`` logs for one record, which must ship as the old line."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
+        assert audit_tee._tee_line(before, after, whole_detail) == json.dumps(
+            before, ensure_ascii=False
+        )
+    return [r.getMessage() for r in caplog.records if "without the C0" in r.getMessage()]
+
+
+def _worded(*reasons: str) -> str:
+    return (
+        "an off-box audit record shipped without the C0 field scrub, because hiding its changed "
+        f"fields whole would still {' and '.join(reasons)}; further cases in this process with no "
+        "reason not yet logged are not logged"
+    )
+
+
+def test_the_old_line_names_a_shown_word_alone(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: where only a shown word fired, the warning names that reason
+    alone. Synthetic values."""
+    from messagefoundry.logging_setup import sink_readings
+
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    old_line = json.dumps(_WORD_BEFORE, ensure_ascii=False)
+    assert not any(audit_tee._parses(r) for r in sink_readings(old_line))
+    assert _old_line_warnings(caplog, _WORD_BEFORE, _WORD_AFTER) == [_worded(_SHOWS)]
+
+
+def test_the_old_line_names_both_reasons_joined(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: where the hidden-whole candidate both shows a word, here the
+    ``detail`` ``whole_detail`` gives, and fails the parse floor, the warning names both, joined.
+    Synthetic values."""
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    after = {**_FLOOR_BEFORE, "actor": "[redacted]", "detail": "ko"}
+    warnings = _old_line_warnings(caplog, _FLOOR_BEFORE, after, lambda: "zebra")
+    assert warnings == [_worded(_SHOWS, _UNPARSED)]
+
+
+def test_the_old_line_names_the_last_candidates_reasons(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: the scrubbed line shows a word, ``zebra``, and the line with
+    the changed fields hidden whole fails only the parse floor. The warning names the last
+    candidate's reason, not the first's. Synthetic values."""
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    after = {**_FLOOR_BEFORE, "actor": "zebra"}
+    assert _old_line_warnings(caplog, _FLOOR_BEFORE, after) == [_worded(_UNPARSED)]
+
+
+def test_each_old_line_reason_is_logged_once(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: one flag for both reasons meant a parse-floor fallback after
+    a shown-word one was never logged. Each reason is logged once. Synthetic values."""
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    floor_after = {**_FLOOR_BEFORE, "actor": "[redacted]"}
+    assert _old_line_warnings(caplog, _WORD_BEFORE, _WORD_AFTER) == [_worded(_SHOWS)]
+    assert _old_line_warnings(caplog, _WORD_BEFORE, _WORD_AFTER) == []
+    assert _old_line_warnings(caplog, _FLOOR_BEFORE, floor_after) == [_worded(_UNPARSED)]
+    assert _old_line_warnings(caplog, _FLOOR_BEFORE, floor_after) == []
 
 
 def test_a_long_value_with_no_control_is_not_touched() -> None:

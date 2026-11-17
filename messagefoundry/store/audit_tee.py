@@ -127,8 +127,11 @@ _PLACEHOLDERS = re.compile(r"\[redacted\]|<redacted>")
 _WORD = re.compile(r"[^\W_]+")
 #: Whether this process has logged a field scrub fault; see :func:`_scrub_field`.
 _FIELD_SCRUB_FAULT_LOGGED = False
-#: Whether this process has logged a record shipped as the line before #3045; see :func:`_tee_line`.
-_OLD_LINE_LOGGED = False
+#: The reasons for shipping a record as the line before #3045 that this process has logged, so
+#: each reason is logged once; see :func:`_tee_line`.
+_OLD_LINE_REASONS_LOGGED: set[str] = set()
+_SHOWS_A_WORD = "show a word the line before it hid"
+_UNPARSED = "leave a sink's reading unparseable where the line before it parsed"
 
 
 def _read(text: str, stand_in: str) -> str:
@@ -369,7 +372,8 @@ def _tee_line(
     loses the C0 scrub for that record, and is reached only where hiding the changed fields
     whole still fails the bar on some sink, for either of two reasons: it shows a word the old
     line hid elsewhere in it, or its reading does not parse as JSON where the old line's did. It
-    is logged once per process, naming which reason fired and no field value.
+    is logged naming the reasons that fired for that last candidate and no field value, once per
+    process for each reason.
     On a fault, the old line ships, which meets the bar by definition."""
     old_line = json.dumps(before, ensure_ascii=False)
     if after == before:
@@ -381,27 +385,32 @@ def _tee_line(
             for k, v in before.items()
         }
         bars = [(_line_words(r), _parses(r)) for r in sink_readings(old_line)]
+        candidates = (after,) if whole == after else (after, whole)
         reasons: list[str] = []
-        for candidate in (after,) if whole == after else (after, whole):
+        for candidate in candidates:
             line = json.dumps(candidate, ensure_ascii=False)
             paired = list(zip(sink_readings(line), bars, strict=True))
             shows = not all(_shows_no_more(r, words) for r, (words, _) in paired)
-            unparsed = not all(_parses(r) or not parsed for r, (_, parsed) in paired)
+            # Only the last candidate's reasons are reported, so an earlier one that shows a word
+            # is rejected without its parses.
+            if shows and candidate is not candidates[-1]:
+                continue
+            unparsed = not all(not parsed or _parses(r) for r, (_, parsed) in paired)
             if not (shows or unparsed):
                 return line
             # The last candidate's reasons are the ones that ship the old line.
-            reasons = ["show a word the line before it hid"] if shows else []
+            reasons = [_SHOWS_A_WORD] if shows else []
             if unparsed:
-                reasons.append("leave a sink's reading unparseable where the line before it parsed")
+                reasons.append(_UNPARSED)
     except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
         _log_scrub_fault(exc)
         return old_line
-    global _OLD_LINE_LOGGED
-    if not _OLD_LINE_LOGGED:
-        _OLD_LINE_LOGGED = True
+    if not _OLD_LINE_REASONS_LOGGED.issuperset(reasons):
+        _OLD_LINE_REASONS_LOGGED.update(reasons)
         log.warning(
             "an off-box audit record shipped without the C0 field scrub, because hiding its "
-            "changed fields whole would still %s; further cases in this process are not logged",
+            "changed fields whole would still %s; further cases in this process with no reason "
+            "not yet logged are not logged",
             " and ".join(reasons),
         )
     return old_line
@@ -527,10 +536,11 @@ def emit_audit_tee(
       that record loses at least one of its ``action``, ``actor``, ``channel_id``, ``client`` or
       ``detail``. A typed sign-in name of ``CORP`` and ``JONES`` joined by a control is one: it
       reads as the two-word name the patterns redact. Where :func:`_tee_line` finds the scrubbed
-      line would show a word the line before #3045 hid, every field the scrub changed ships as
-      ``[redacted]``, the one that did not cause it included; and where even that would show
-      such a word, or would not parse as JSON on a sink where that line did, the record ships
-      as the line before #3045 did, so the scrub is lost for it. A field holding a
+      line would show a word the line before #3045 hid, or would not parse as JSON on a sink
+      where that line did, every field the scrub changed ships as ``[redacted]``, the one that
+      did not cause it included; and where even that would show such a word, or would not parse
+      on such a sink, the record ships as the line before #3045 did, so the scrub is lost for
+      it. A field holding a
       segment-shaped token, such as ``ABC|``, does that: on the old line the HL7 segment pattern
       ran from it to the end of the line and hid the record's keys and anchors after it, which
       hiding the field shows again. So a client can switch the scrub off for its own record by
