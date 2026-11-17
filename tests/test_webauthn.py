@@ -1819,3 +1819,29 @@ async def test_a_passkey_registered_from_a_first_seen_address_records_nothing() 
         assert await store.list_known_login_addresses(uid, since=0.0) == ["10.7.7.7"]
     finally:
         await store.close()
+
+
+#: A ceremony response nested past json's depth limit, under a field a real response carries.
+_TOO_DEEP = '{"id": ' + "[" * 100_000 + "]" * 100_000 + "}"
+
+
+def test_a_deeply_nested_registration_response_is_the_audited_refusal() -> None:
+    """vault BACKLOG #5341. Red: json's RecursionError escaped verify_registration, a 500."""
+    with pytest.raises(wa.WebAuthnVerificationError):
+        wa.verify_registration(
+            response_json=_TOO_DEEP, challenge=b"c" * 32, rp_id=RP, origin=ORIGIN
+        )
+
+
+def test_a_deeply_nested_assertion_response_is_the_audited_refusal() -> None:
+    """vault BACKLOG #5341, the text form ``verify_assertion`` accepts. Red: as above."""
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    with pytest.raises(wa.WebAuthnVerificationError):
+        wa.verify_assertion(
+            response_json=_TOO_DEEP,
+            challenge=b"c" * 32,
+            rp_id=RP,
+            origin=ORIGIN,
+            public_key=soft.cose_public_key(),
+            current_sign_count=0,
+        )

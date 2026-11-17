@@ -169,7 +169,7 @@ def _supported_pub_key_algs() -> list[COSEAlgorithmIdentifier]:
 def _invalid_input_errors() -> tuple[type[Exception], ...]:
     """Every exception py_webauthn raises for bad input, which must all reach the audited path.
 
-    ``WebAuthnException`` is the library's own base class. The other three entries catch four raw
+    ``WebAuthnException`` is the library's own base class. The next three entries catch four raw
     exception types (``LookupError`` covers both ``KeyError`` and ``IndexError``) that it lets
     out when a COSE key is malformed rather than merely wrong: its key decoder indexes an
     untyped CBOR value, so a missing label is a ``KeyError``, a short array an ``IndexError``, a
@@ -179,11 +179,15 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
     0068 decision 1 requires rather than escape as a 500. Use it only around library calls, never
     around our own logic, where the same exceptions would mean a bug.
 
+    ``RecursionError`` joins them for a response nested past json's depth limit, which the
+    library's own ``json.loads`` raises and does not wrap (vault BACKLOG #5341). Its message names
+    the depth, not the input.
+
     A function rather than a constant because the library import is lazy (the extra is optional).
     """
     from webauthn.helpers.exceptions import WebAuthnException
 
-    return (WebAuthnException, LookupError, TypeError, ValueError)
+    return (WebAuthnException, LookupError, TypeError, ValueError, RecursionError)
 
 
 def _refusal(exc: Exception, *, ceremony: _Ceremony) -> WebAuthnVerificationError:
