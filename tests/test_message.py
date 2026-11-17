@@ -593,7 +593,9 @@ def test_a_split_during_the_copy_on_write_deepcopy_keeps_the_segment() -> None:
 
 class _SplitWhenCopied(str):
     """A raw line whose deepcopy runs a lazy split of another segment: a reader on another thread
-    popping ``_lazy`` while a copy-on-write copy is walking it."""
+    popping ``_lazy`` while a copy-on-write copy is walking it. clone() never deep-copies a raw
+    line, so on the fixed code the hook does not fire; the test guards against a return to
+    ``copy.deepcopy`` of the tree, and the never-walks test below covers any other walk."""
 
     msg: _builtin_hl7.ParsedMessage
     other: int
@@ -658,3 +660,19 @@ def test_the_copy_on_write_copy_never_walks_the_shared_lazy_map() -> None:
 
     assert pid in tree["_lazy"]  # no walk ran, so no split ran
     assert clone.encode() == ADT.replace("19800101|F", "19800101|M")
+
+
+@pytest.mark.parametrize("copier", [copy.copy, copy.deepcopy], ids=["copy", "deepcopy"])
+def test_the_copy_module_takes_the_copy_on_write_path(copier: Callable[[Message], Message]) -> None:
+    m = Message.parse(ADT)
+    tree = m._m
+    pid = _builtin_hl7.segment_index(tree, "PID", 1)
+    assert pid is not None
+    tree["_lazy"] = _SplitOnWalkLazy(tree, pid)
+
+    other = copier(m)
+    other.set("PID-8", "M")
+
+    assert pid in tree["_lazy"]  # the shared map was never walked
+    assert m["PID-8"] == "F"  # the write did not reach the original
+    assert other["PID-8"] == "M"

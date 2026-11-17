@@ -173,13 +173,12 @@ def test_a_bare_defined_id_in_an_any_segment_message_is_refused() -> None:
 
 @pytest.mark.parametrize(
     "extra",
-    ["BHS|^~\\&|A", "FHS|^~\\&|A", "DSC|CONT1|F", "MSA|AA|1", "ERR|1"],
+    ["DSC|CONT1|F", "MSA|AA|1", "ERR|1"],
     ids=lambda line: line[:3],
 )
-def test_a_header_continuation_or_acknowledgment_segment_gets_no_exemption(extra: str) -> None:
-    """The slot carries master-file or query data; a batch or file header, a continuation
-    pointer or an acknowledgment segment dropped from such a message is refused (BACKLOG #5920
-    step 2)."""
+def test_a_continuation_or_acknowledgment_segment_gets_no_exemption(extra: str) -> None:
+    """The slot carries master-file or query data; a continuation pointer or an acknowledgment
+    segment dropped from such a message is refused (BACKLOG #5920 step 2)."""
     result = validate(_MFN_M01 + "\r" + extra)
     assert not result.ok
     assert result.errors == [
@@ -188,11 +187,12 @@ def test_a_header_continuation_or_acknowledgment_segment_gets_no_exemption(extra
     assert result.unvalidated_segments == ()
 
 
-def test_batch_trailers_on_a_last_member_keep_the_exemption() -> None:
-    """split_batch leaves BTS and FTS on a batch's last member, so they are not refused here."""
-    result = validate(_MFN_M01 + "\rBTS|2\rFTS|1")
+def test_batch_envelope_lines_on_a_split_member_keep_the_exemption() -> None:
+    """split_batch cuts only at MSH, so a member can end with its batch's trailers or the next
+    batch's header; those are not refused here."""
+    result = validate(_MFN_M01 + "\rBTS|2\rBHS|^~\\&\rFTS|1\rFHS|^~\\&")
     assert result.ok, result.errors
-    assert result.unvalidated_segments == (("BTS", 4), ("FTS", 5))
+    assert result.unvalidated_segments == (("BTS", 4), ("BHS", 5), ("FTS", 6), ("FHS", 7))
 
 
 def test_a_structure_borrowed_under_the_same_message_code_keeps_the_exemption() -> None:

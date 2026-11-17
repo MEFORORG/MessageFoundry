@@ -1215,9 +1215,9 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     Where two source separators are the same character, the one split first wins: repetition, then
     component, then subcomponent, the order python-hl7 split them, as the python-hl7 tree walk this
     replaced did (``transports/mllp.py`` ``reencode_delimiters``). The segment id is kept verbatim.
-    Every ``MSH``, ``BHS`` and ``FHS`` header has its field 2 rewritten to the target encoding
-    characters, so a batch or file header advertises the delimiters its message is written in
-    (BACKLOG #5802); :func:`_header_encoding` says which field 2 it refuses. Blank segment lines
+    Every ``MSH``, ``BHS`` and ``FHS`` header has its field 2 rewritten to the four target
+    encoding characters, so a batch or file header advertises the delimiters its message is
+    written in (BACKLOG #5802); :func:`_header_encoding` says which field 2 it refuses. Blank segment lines
     are kept.
 
     Raises ``ValueError`` when the message's own field, component, repetition and subcomponent
@@ -1274,22 +1274,16 @@ def _header_encoding(
 ) -> str:
     """Field 2 of a header line rewritten for :func:`encode_with_separators`.
 
-    A field 2 that holds the source encoding characters, all four or a leading part of them, or
-    nothing, becomes the four target characters, and any characters after the four (such as the
-    v2.7 truncation character) are kept unless one is a target delimiter. Anything else, or a
-    field 1 that is not the source field separator, cannot be said in the target set without
-    losing or restructuring it, so it raises
+    A field 2 that starts with the source encoding characters, or is a leading part of them or
+    empty, becomes the four target characters; a character after the four (such as the v2.7
+    truncation character) is not written, as before. Any other field 2, or a field 1 that is not
+    the source field separator, would lose its text, so it raises
     :class:`DelimiterRewriteRefused` (BACKLOG #5802)."""
     s_field, s_comp, s_rep, s_sub, s_esc = source
-    t_field, t_comp, t_rep, t_sub, t_esc = target
+    _t_field, t_comp, t_rep, t_sub, t_esc = target
     s_enc = s_comp + s_rep + s_esc + s_sub
-    t_enc = t_comp + t_rep + t_esc + t_sub
-    if field_1 == s_field:
-        if s_enc.startswith(field_2):
-            return t_enc
-        rest = field_2[len(s_enc) :]
-        if field_2.startswith(s_enc) and not any(c in rest for c in t_field + t_enc):
-            return t_enc + rest
+    if field_1 == s_field and (s_enc.startswith(field_2) or field_2.startswith(s_enc)):
+        return t_comp + t_rep + t_esc + t_sub
     raise DelimiterRewriteRefused(
         "a header line's encoding characters are not the message's own, so the rewrite would lose them"
     )

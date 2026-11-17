@@ -109,7 +109,7 @@ _TARGET = ("#", "@", "$", "%", "!")  # field, component, repetition, subcomponen
     ("line", "rewritten"),
     [
         ("BHS|^~\\&|A", "BHS#@$!%#A"),
-        ("BHS|^~\\&*|A", "BHS#@$!%*#A"),  # a character past the four is kept
+        ("BHS|^~\\&#|A", "BHS#@$!%#A"),  # a character past the four is not written, as for MSH
         ("FHS|^~|A", "FHS#@$!%#A"),  # a leading part of the four
     ],
 )
@@ -129,11 +129,10 @@ def test_a_header_line_not_in_the_message_delimiters_is_refused(line: str) -> No
             _builtin_hl7.encode_with_separators(parsed, target)
 
 
-def test_a_kept_character_that_is_a_target_delimiter_is_refused() -> None:
-    parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, "BHS|^~\\&#|A"]))
-    with pytest.raises(_builtin_hl7.DelimiterRewriteRefused, match="encoding characters"):
-        _builtin_hl7.encode_with_separators(parsed, _TARGET)  # "#" is the target field separator
-    assert "BHS|^~\\&#|A" in _builtin_hl7.encode_with_separators(parsed, parsed["seps"])
+def test_a_v27_header_with_a_truncation_character_still_rewrites() -> None:
+    """MSH-2 ``^~\\&#`` with a target field separator of ``#`` is delivered, not refused."""
+    parsed = _builtin_hl7.parse("MSH|^~\\&#|SND|FAC|RCV|FAC|20260101||ADT^A01|1|P|2.8\r" + _PID)
+    assert _builtin_hl7.encode_with_separators(parsed, _TARGET).startswith("MSH#@$!%#SND#")
 
 
 #: Bodies whose first line ``strip`` would change: padded single lines, whitespace past the encoding

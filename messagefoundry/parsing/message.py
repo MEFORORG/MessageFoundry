@@ -561,6 +561,14 @@ class Message:
         clone._shared = True
         return clone
 
+    def __copy__(self) -> Message:
+        # copy.copy shares the tree; without the copy-on-write flag a write would reach both.
+        return self.copy()
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Message:
+        # copy.deepcopy would walk a _lazy a reader of a clone may be splitting (BACKLOG #5801).
+        return self.copy()
+
     def _ensure_owned(self) -> None:
         """Copy-on-write hook — every mutator calls this before touching ``self._m``. If the backing tree
         is still shared with a :meth:`copy` snapshot/clone, take a private deepcopy now (and clear the
