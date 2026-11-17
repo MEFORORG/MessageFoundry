@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import collections
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -23,16 +24,15 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[2]
 _RULES = _ROOT / "messagefoundry" / "security" / "semgrep" / "handler-security.yml"
 _FIXTURE = _ROOT / "tests" / "fixtures" / "handler_taint" / "handler-security.py"
-# The expected finding count per rule over the fixtures. phi-to-log = 2 (inter-statement body +
-# log.log(level, body)); control_id / debug / params-dict are `# ok` and MUST contribute 0.
+# Findings per rule over the fixture, pinned so a deleted case cannot shrink the gate unnoticed.
 _EXPECTED: collections.Counter[str] = collections.Counter(
     {
-        "mf-handler-phi-to-log": 2,
+        "mf-handler-phi-to-log": 5,
         "mf-handler-ambient-subprocess": 1,
         "mf-handler-ambient-deserialization": 1,
         "mf-handler-ambient-eval-exec": 1,
-        "mf-handler-sqli-db-lookup": 1,
-        "mf-handler-phi-to-file": 1,
+        "mf-handler-sqli-db-lookup": 10,
+        "mf-handler-phi-to-file": 9,
     }
 )
 
@@ -65,8 +65,34 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    # Equal counts can still hide a miss offset by an over-match of the same rule elsewhere, so every
+    # finding must also sit on the line its `# ruleid:` annotation names.
+    want, _ok = annotated_findings(_FIXTURE.read_text(encoding="utf-8"))
+    hit = {(r["check_id"].split(".")[-1], r["start"]["line"]) for r in results}
+    if hit != want:
+        print(
+            f"handler-taint rules REGRESSED: missed {sorted(want - hit)}, "
+            f"unannotated {sorted(hit - want)}",
+            file=sys.stderr,
+        )
+        return 1
     print(f"handler-taint rules fire exactly as annotated: {dict(got)}")
     return 0
+
+
+_ANNOTATION = re.compile(r"^\s*#\s*(ruleid|ok):\s*([\w-]+)\s*$")
+
+
+def annotated_findings(text: str) -> tuple[set[tuple[str, int]], set[tuple[str, int]]]:
+    """The (rule id, line) pairs the fixture's ``# ruleid:`` and ``# ok:`` comment lines name. Each
+    annotation applies to the line after it, the semgrep --test convention."""
+    want: set[tuple[str, int]] = set()
+    ok: set[tuple[str, int]] = set()
+    for number, line in enumerate(text.splitlines(), start=1):
+        match = _ANNOTATION.match(line)
+        if match:
+            (want if match.group(1) == "ruleid" else ok).add((match.group(2), number + 1))
+    return want, ok
 
 
 if __name__ == "__main__":

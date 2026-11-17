@@ -43,6 +43,11 @@ network-dependent.
 
 from __future__ import annotations
 
+import collections
+import importlib.util
+from pathlib import Path
+from types import ModuleType
+
 import pytest
 
 from messagefoundry.security import handler_semgrep_rules
@@ -87,3 +92,62 @@ def test_rules_are_wellformed_yaml() -> None:
     for tid in _TAINT:
         assert rules[tid]["mode"] == "taint"
         assert rules[tid]["pattern-sources"] and rules[tid]["pattern-sinks"]
+
+
+def _load_gate() -> ModuleType:
+    path = (
+        Path(__file__).resolve().parents[1] / "scripts" / "ci" / "assert_semgrep_handler_taint.py"
+    )
+    spec = importlib.util.spec_from_file_location("_assert_semgrep_handler_taint", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_fixture_annotations_match_the_pinned_counts() -> None:
+    # The CI gate needs semgrep; this half does not. It keeps the fixture's `# ruleid:` annotations and
+    # the gate's pinned per-rule counts in step, so a case added or deleted on one side only reds here
+    # before it reds in the security.yml semgrep job (BACKLOG #5380, #5381, #5382).
+    gate = _load_gate()
+    want, ok = gate.annotated_findings(gate._FIXTURE.read_text(encoding="utf-8"))
+    assert collections.Counter(rule for rule, _ in want) == gate._EXPECTED
+    assert not want & ok
+    assert set(gate._EXPECTED) <= _EXPECTED
+
+
+@pytest.mark.parametrize(
+    ("rule", "needle"),
+    [
+        # BACKLOG #5380: module-qualified decorators and underscore helpers are taint sources.
+        ("mf-handler-phi-to-log", "def h_qualified("),
+        ("mf-handler-phi-to-log", "def r_qualified("),
+        ("mf-handler-phi-to-log", "def _helper_log("),
+        ("mf-handler-sqli-db-lookup", "def _helper_sql("),
+        ("mf-handler-phi-to-file", "def _helper_file("),
+        # BACKLOG #5381: connection= keyword, module alias, import alias, FhirRaw, FhirToken system.
+        ("mf-handler-sqli-db-lookup", 'db_lookup(connection="MPI", statement="select * from'),
+        ("mf-handler-sqli-db-lookup", 'mf.db_lookup("MPI", "select * from'),
+        ("mf-handler-sqli-db-lookup", 'dl("MPI"'),
+        ("mf-handler-sqli-db-lookup", "FhirRaw(mrn)"),
+        ("mf-handler-sqli-db-lookup", 'FhirToken(code="x", system=mrn)'),
+        # BACKLOG #5382: file egress the ambient-authority lint misses.
+        ("mf-handler-phi-to-file", 'with open("/tmp/a.hl7", mode)'),
+        ("mf-handler-phi-to-file", 'codecs.open("/tmp/b.hl7"'),
+        ("mf-handler-phi-to-file", 'bopen("/tmp/c.hl7"'),
+        ("mf-handler-phi-to-file", 'opener("/tmp/d.hl7"'),
+        ("mf-handler-phi-to-file", "os.write(3, body)"),
+        ("mf-handler-phi-to-file", "tempfile.NamedTemporaryFile("),
+        ("mf-handler-phi-to-file", "shutil.copyfileobj("),
+    ],
+)
+def test_fixture_carries_a_positive_case_per_gap(rule: str, needle: str) -> None:
+    # The semgrep job proves the rules fire on the fixture; this pins that the fixture still HOLDS a
+    # positive case for each closed gap, within the next five lines of the needle (the function or the
+    # opening statement), so deleting one case cannot pass by shrinking both the fixture and the count.
+    gate = _load_gate()
+    text = gate._FIXTURE.read_text(encoding="utf-8")
+    want, _ok = gate.annotated_findings(text)
+    starts = [n for n, line in enumerate(text.splitlines(), start=1) if needle in line]
+    assert starts, needle
+    assert any((rule, n + k) in want for n in starts for k in range(6)), (rule, needle)
