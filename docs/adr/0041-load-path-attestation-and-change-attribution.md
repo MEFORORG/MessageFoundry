@@ -366,6 +366,8 @@ fingerprint+git-HEAD covers more cheaply for now.
   before refusing. WHERE the console is not loaded, THE SYSTEM SHALL NOT attest it.
   → `tests/test_startup_attestation.py::test_console_tamper_is_detected_recorded_and_fails_closed`
   → `tests/test_startup_attestation.py::test_a_deleted_console_file_is_missing_drift`
+  → `tests/test_startup_attestation.py::test_an_emptied_console_under_the_install_root_is_missing_drift`
+  → `tests/test_startup_attestation.py::test_a_console_whose_every_file_is_special_is_missing_drift`
   → `tests/test_startup_attestation.py::test_a_loaded_console_that_cannot_be_attested_fails_like_the_engine`
   → `tests/test_startup_attestation.py::test_console_absent_changes_nothing_even_under_fail_closed`
   → `tests/test_startup_attestation.py::test_the_engine_arm_text_is_unchanged`
@@ -398,7 +400,9 @@ fingerprint+git-HEAD covers more cheaply for now.
 > `RECORD`.
 >
 > A console pass that raises is attested-nothing (`console_attestation_raised`), not a crash. The arm
-> never opens a FIFO, device or socket; one at a `RECORD` path is `missing` drift.
+> never opens a FIFO, device or socket; one at a `RECORD` path is `missing` drift. Until BACKLOG
+#5376 that held only while the walk listed some console file under the install root, so a console
+whose every file was deleted or special read as attested-nothing.
 >
 > **Three residuals, recorded rather than fixed here.** The console arm keys on `sys.modules`, so
 > console code that has already run can remove itself from it and be skipped; that is the D3

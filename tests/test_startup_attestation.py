@@ -1829,6 +1829,7 @@ def test_a_console_whose_every_file_is_special_is_missing_drift(
     assert console is not None
     assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
     assert console.checked == 0
+    assert console.unattested_reason == _NOTHING_READ
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
@@ -1845,24 +1846,23 @@ def test_a_console_whose_every_file_is_a_real_fifo_is_missing_drift(
     assert console is not None
     assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
     assert console.checked == 0
+    assert console.unattested_reason == _NOTHING_READ
 
 
-def test_an_emptied_engine_package_is_missing_drift(
+def test_a_console_loaded_from_another_directory_under_the_root_blames_no_intact_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The engine arm with no declared asset listed: the loaded package's own directory is what
-    places it under the install root."""
-    import messagefoundry
+    """Only the directory ``RECORD`` describes counts: an empty package elsewhere under the install
+    root must not report the intact shipped files as ``missing``."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    elsewhere = console_root / "elsewhere" / _CONSOLE_PKG
+    elsewhere.mkdir(parents=True)
+    _load_fake_console(monkeypatch, elsewhere)
 
-    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
-    monkeypatch.setattr(messagefoundry, "__path__", [str(package_dir)])
-    for rel in _ENGINE_FILES:
-        (tmp_path / rel).unlink()
-
-    result = attest_engine()
-    assert _drift(result) == [(rel, "missing") for rel in sorted(_ENGINE_FILES)]
-    assert result.checked == 0
-    assert result.unattested_reason == _NOTHING_READ
+    console = integ.attest_console()
+    assert console is not None
+    assert console.drift == [] and console.checked == 0
+    assert console.unattested_reason == _NOTHING_UNDER_ROOT
 
 
 def test_an_asset_that_fails_to_open_is_drift_and_not_counted(

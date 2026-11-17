@@ -45,8 +45,8 @@ Posture (ADR 0017 amendment, 2026-06-27):
   names why in :data:`UnattestedReason`. At least an absent, empty or package-row-less ``RECORD``, an
   unresolvable install root, and a package imported from *outside* the install root give one. Unless
   the install declares itself editable, such a pass with no drift logs at WARNING, records the
-  ``startup_integrity`` audit row, fires the AlertSink, and — under ``fail_closed_on_drift`` — refuses
-  to start; one that also found drift is reported as drift (:func:`_act_on`). Before #1679 those
+  ``startup_integrity`` audit row, fires the AlertSink, and refuses to start under
+  ``fail_closed_on_drift``. One that also found drift is reported as drift (:func:`_act_on`). Before #1679 those
   shapes returned a silent clean no-op, so a site that opted into hard enforcement would start anyway
   with its tripwire disarmed, and the INFO line would say clean.
 
@@ -189,9 +189,10 @@ _BYTECODE_CACHE_DIR = "__pycache__"
 #: reports a pass carrying any other value as drift when it also found drift, and otherwise as
 #: attested-nothing, which a fail-closed site refuses to start on (BACKLOG #1679). A ``Literal``
 #: rather than a bare ``str`` so a typo at a construction site is a type error instead of a reason
-#: nobody can match on. ``no_attested_file_under_install_root``: no attested file and no loaded package
-#: directory sat under the install root. ``no_file_read_under_install_root``: one did, and no file's
-#: bytes were read, as when every file was deleted or fails to open (BACKLOG #5376).
+#: nobody can match on. ``no_file_read_under_install_root``: an attested file sat under the install
+#: root, or the loaded package's directory is the one ``RECORD`` describes, and no file's bytes were
+#: read, as when every file was deleted or fails to open (BACKLOG #5376).
+#: ``no_attested_file_under_install_root``: neither held.
 #: ``console_attestation_raised`` is the web console arm's alone (BACKLOG #1802): its pass raised, so
 #: it compared nothing that can be trusted.
 UnattestedReason = Literal[
@@ -258,7 +259,7 @@ class AttestationResult:
         """Whether the pass compared **no** file against a baseline row.
 
         Independent of ``drift``: a pass can compare nothing and still report drift, so a caller
-        acting on both must handle drift first — which :func:`_act_on` does."""
+        acting on both must handle drift first, as :func:`_act_on` does."""
         return self.checked == 0
 
     @property
@@ -669,14 +670,14 @@ def attest_engine() -> AttestationResult:
     costs. A true I/O failure reading an attested file marks that file as drift (``missing``) rather
     than crashing startup.
     """
-    import messagefoundry
-
     return _attest_distribution(
         _DIST_NAME,
         _DIST_NAME,
         lambda: [*_loaded_module_files(), *_attested_asset_files()],
+        # No `package_roots`: the declared asset paths are listed whether or not they exist, so an
+        # attested file sits under the install root whenever the loaded package does, every module
+        # gone or not.
         unmatched_rows=_is_module_row,
-        package_roots=messagefoundry.__path__,
     )
 
 
@@ -727,9 +728,10 @@ def _attest_distribution(
     ``attested_files`` is called only once a usable baseline is known to exist. ``unmatched_rows``
     additionally reports each hashed ``RECORD`` row under ``package/`` (bytecode caches aside) that no
     attested file matched, and that the predicate accepts, as ``missing`` drift -- a deleted file. It
-    applies only when an attested file or one of ``package_roots`` (the loaded package's directories)
-    sits under the install root, so a package loaded from outside it is not reported as every file it
-    did not load, while one whose every file is gone still is (BACKLOG #5376).
+    applies only when an attested file sits under the install root or one of ``package_roots`` (the
+    loaded package's directories) is ``<install root>/<package>``, so a package loaded from elsewhere
+    is not reported as every file it did not load, while one whose every file is gone still is
+    (BACKLOG #5376).
 
     ``checked`` counts a file only once its bytes were read.
     """
@@ -798,7 +800,7 @@ def _attest_distribution(
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
     under_root = bool(seen) or any(
-        _record_relpath(Path(root).resolve(), install_root) is not None for root in package_roots
+        _record_relpath(Path(root).resolve(), install_root) == package for root in package_roots
     )
     if unmatched_rows is not None and under_root:
         prefix = f"{package}/"
@@ -811,21 +813,22 @@ def _attest_distribution(
             and rel not in seen
             and unmatched_rows(rel)
         )
+    # A real baseline was read. `UnattestedReason` says which value names which shape of a pass that
+    # compared nothing; `_act_on` decides the outcome.
+    reason: UnattestedReason | None = None
+    if not checked:
+        reason = (
+            "no_file_read_under_install_root"
+            if under_root
+            else "no_attested_file_under_install_root"
+        )
     return AttestationResult(
         attested=True,
         editable=False,
         no_record=False,
         checked=checked,
         drift=drift,
-        # A real baseline was read and still nothing was compared. `UnattestedReason` says which value
-        # names which shape; `_act_on` decides the outcome.
-        unattested_reason=(
-            None
-            if checked
-            else "no_file_read_under_install_root"
-            if under_root
-            else "no_attested_file_under_install_root"
-        ),
+        unattested_reason=reason,
     )
 
 
