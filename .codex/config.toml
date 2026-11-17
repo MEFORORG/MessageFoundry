@@ -1,71 +1,69 @@
 # Claude Code remains the source of hook policy. The bridge reads it on each event.
-# A launcher that cannot run the bridge, or a missing pwsh, is a non-blocking error on every event.
-# Where PowerShell runs this line, pwsh -Command reports the launcher's exit 2 as a non-blocking 1.
 [features]
 hooks = true
 
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event SessionStart"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90
 
 [[hooks.SessionEnd]]
 [[hooks.SessionEnd.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event SessionEnd"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90
 
 [[hooks.PreToolUse]]
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event PreToolUse"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90
 
 [[hooks.PostToolUse]]
 [[hooks.PostToolUse.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event PostToolUse"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90
 
 [[hooks.PermissionRequest]]
 [[hooks.PermissionRequest.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event PermissionRequest"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90
 
 [[hooks.UserPromptSubmit]]
 [[hooks.UserPromptSubmit.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event UserPromptSubmit"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90
 
 [[hooks.PreCompact]]
 [[hooks.PreCompact.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event PreCompact"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90
 
 [[hooks.PostCompact]]
 [[hooks.PostCompact.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event PostCompact"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90
 
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event Stop"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90
 
 [[hooks.SubagentStart]]
 [[hooks.SubagentStart.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event SubagentStart"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90
 
 [[hooks.SubagentStop]]
 [[hooks.SubagentStop.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event SubagentStop"'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook"'''
 timeout = 90

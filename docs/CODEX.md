@@ -24,26 +24,10 @@ matches Claude's `PowerShell` name. Patch calls match `apply_patch`, `Edit`, and
 `Write`. A future hook that needs Claude-specific input fields still needs an
 adapter; alias matching alone cannot translate an edit payload.
 
-New event types appear as unmapped at startup. The bridge does not silently
-claim a failed hook ran.
-
-### Who decides a block
-
-Only a hook blocks. A bridge fault, which the bridge reports on stderr and as a
-`systemMessage`, never blocks. In hook mode `invoke.ps1` turns 10 into 2 and any other non-zero bridge exit
-into a non-blocking 1. Codex's documentation does not say which shell runs a
-hook command. Under a PowerShell outer shell, `pwsh -Command` reports the
-launcher's exit 2 as a non-blocking 1, so no exit 2 blocks under it. With `pwsh`
-missing, the line exits 1 under a PowerShell outer shell.
-
-The bridge differs from Claude Code in at least three ways. It runs an event's
-hooks one after another, where Claude Code runs them in parallel. Exit 2 stops
-the remaining hooks.
-On Windows, a command-only hook with no `shell` runs under pwsh,
-where Claude Code runs it under Git Bash when Git Bash is installed.
-
-Structured `command` and `args` avoid shell parsing. The bridge runs a
-command-only PowerShell hook under `pwsh -Command`.
+New event types appear as unmapped at startup. Unsupported handler types and
+failed commands report errors. The bridge does not silently claim they ran.
+Command-only hooks use PowerShell on Windows and `sh` elsewhere; structured
+`command` and `args` avoid shell parsing. Hook chains have a 90-second outer limit.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.
