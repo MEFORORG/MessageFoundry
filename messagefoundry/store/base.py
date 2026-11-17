@@ -717,7 +717,10 @@ class QueueStore(StoreLifecycle, Protocol):
         lane, as an item whose ``open_fault`` is set and whose ``payload`` is empty and must not be
         read: the caller treats it as an infra fault at that item (ADR 0070 T17). The claim writes
         nothing for it, except where the row failed its queue tag and the dead-letter write then
-        failed: that tag failure is still alerted, and its audit row attempted.
+        failed: that tag failure is still alerted, and its audit row attempted. An ``Exception``
+        that escapes the decode releases every claimed row back to ``pending`` before it is
+        re-raised; a cancellation leaves them ``inflight`` (``queue_tag.release_unreturned`` says
+        why).
 
         **The lane set is always explicit** (the caller's ready-lane subset, registry-intersected).
         There is deliberately no all-lanes-of-stage claim form: disjoint-inbound sharding runs

@@ -831,11 +831,12 @@ async def test_a_cancelled_pooled_claim_leaves_its_rows_inflight(
 
 
 async def _server_claim_raising(
-    backend: str, monkeypatch: pytest.MonkeyPatch, error: BaseException
+    backend: str, monkeypatch: pytest.MonkeyPatch, error: BaseException, *, at_open: bool
 ) -> list[str]:
-    """The server twins of :func:`_claim_raising`, offline: lane B's head is refused, and the
-    awaited handling of that refusal raises ``error``, so it escapes the decode at the claim's own
-    await point. Assert the claim re-raises it unchanged and return the ids handed to
+    """The server twins of :func:`_claim_raising`, offline. With ``at_open``, lane B's open
+    raises ``error``, which is not a :class:`CipherError`, so it escapes the decode. Otherwise lane
+    B's head is refused, and the awaited handling of that refusal raises ``error``, at the claim's
+    own await point. Assert the claim re-raises it unchanged and return the ids handed to
     ``release_claimed``."""
     from messagefoundry.store.queue_tag import QueueTagError  # noqa: PLC0415
 
@@ -853,13 +854,14 @@ async def _server_claim_raising(
 
     def opened(r: Any, *_a: Any) -> Any:
         if r["channel_id"] == "B":
-            raise QueueTagError("t")
+            raise error if at_open else QueueTagError("t")
         return "body" if backend == "sqlserver" else OutboxItem.from_row(r, "body")
 
     async def escaping(*_a: Any, **_kw: Any) -> None:
         raise error
 
-    monkeypatch.setattr(store, "_dead_letter_unopenable", escaping)
+    if not at_open:
+        monkeypatch.setattr(store, "_dead_letter_unopenable", escaping)
     if backend == "sqlserver":
         monkeypatch.setattr(store, "_open_claimed", opened)
         with pytest.raises(type(error)) as raised:
@@ -872,12 +874,15 @@ async def _server_claim_raising(
     return sorted(released)
 
 
+@pytest.mark.parametrize("at_open", [True, False], ids=["at-open", "at-dead-letter"])
 @pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
 async def test_the_server_pooled_claim_releases_every_lane_on_an_escaping_error(
-    backend: str, monkeypatch: pytest.MonkeyPatch
+    backend: str, monkeypatch: pytest.MonkeyPatch, at_open: bool
 ) -> None:
     """Every claimed row of every lane is handed to ``release_claimed``."""
-    released = await _server_claim_raising(backend, monkeypatch, ValueError("not a bug"))
+    released = await _server_claim_raising(
+        backend, monkeypatch, ValueError("not a bug"), at_open=at_open
+    )
     assert released == ["A-1", "A-2", "B-3", "B-4"]
 
 
@@ -887,7 +892,9 @@ async def test_a_cancelled_server_pooled_claim_releases_nothing(
 ) -> None:
     """A cancellation releases no row, so the rows stay ``inflight`` for lease expiry or
     ``reset_stale_inflight`` (ADR 0066 teardown, ADR 0157 C1)."""
-    released = await _server_claim_raising(backend, monkeypatch, asyncio.CancelledError())
+    released = await _server_claim_raising(
+        backend, monkeypatch, asyncio.CancelledError(), at_open=False
+    )
     assert released == []
 
 
