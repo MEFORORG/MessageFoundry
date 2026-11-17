@@ -2627,13 +2627,14 @@ _PROSE = "This paragraph explains the change in plain words and names no require
 @pytest.mark.parametrize("body", _MAIN_CAUGHT_BRANCH_MISSED)
 @pytest.mark.parametrize("layout", ["one-line", "wrapped"])
 def test_a_main_caught_shape_past_the_cap_is_still_caught(sf, body: str, layout: str) -> None:
-    """Round 5: a blanket cut at 2000 characters lost main's reading of every long paragraph. Past the
-    cap the baseline reads with linear-time equals of main's patterns, so it reads the whole body."""
+    """Round 5: a blanket cut at 2000 characters lost main's reading of every long paragraph. The
+    baseline reads with linear-time equals of main's patterns, so it reads the whole body."""
     filler = _PROSE * 30
     if layout == "wrapped":
         filler = "\n".join(_PROSE.strip() for _ in range(30)) + "\n"
     long_body = filler + body
-    assert len(long_body) > sf._PR_BASE_CAP
+    # Longer than the old 2000-character cut, so a return of that cut would lose the shape.
+    assert len(long_body) > 2000
     main_hits = _main_scan_pr_body(sf, long_body)
     assert main_hits, "control: origin/main's reading must catch this shape"
     assert set(main_hits) <= set(sf.scan_pr_body(long_body)), layout
@@ -2704,6 +2705,45 @@ def test_the_baseline_stays_linear_at_the_body_limit(sf, body: str) -> None:
     began = time.perf_counter()
     sf.scan_pr_body(body)
     assert time.perf_counter() - began < 2
+
+
+def test_the_baseline_reads_every_line_and_paragraph_through_the_linear_functions(
+    sf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deterministic revert guard for the floor: the baseline must hand every non-empty line to the
+    linear link function and every paragraph to the linear split, never main's backtracking patterns.
+    A cap that sent short lines back to a pattern fails the counts here, on any machine, where the
+    wall-clock bound above only fails on a slow one."""
+    lines_seen: list[str] = []
+    units_seen: list[str] = []
+    link_sub, split_spans = sf._pr_base_link_sub, sf._pr_base_split_spans
+
+    def spy_link(line: str) -> str:
+        lines_seen.append(line)
+        return link_sub(line)
+
+    def spy_split(unit: str) -> list[tuple[int, int]]:
+        units_seen.append(unit)
+        return split_spans(unit)
+
+    monkeypatch.setattr(sf, "_pr_base_link_sub", spy_link)
+    monkeypatch.setattr(sf, "_pr_base_split_spans", spy_split)
+    bracket_line = "[" * 2000
+    body = f"short [a](b) line\n\n{bracket_line}\n\nShort. Second sentence.\n"
+    sf.scan_pr_body(body)
+    assert [line for line in lines_seen if line] == [
+        "short [a](b) line",
+        bracket_line,
+        "Short. Second sentence.",
+    ]
+    assert units_seen == ["short a line", bracket_line, "Short. Second sentence."]
+    for gone in ("_PR_BASE_CAP", "_PR_BASE_MD_LINK", "_PR_BASE_SENTENCE_SPLIT"):
+        assert not hasattr(sf, gone), gone
+    monkeypatch.undo()
+    # The 2000-character bracket line in CPU time, not wall time, so a busy runner does not fail it.
+    began = time.process_time()
+    sf.scan_pr_body(bracket_line + "\n")
+    assert time.process_time() - began < 0.5
 
 
 def test_the_union_is_deduplicated_and_sorted_by_line_then_kind(sf) -> None:
