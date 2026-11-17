@@ -1765,8 +1765,8 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
     # that flag rather than the setting. The pool builds a fresh context per connection through the
     # same builder (`_per_connection_ssl_connect`). With ssl_crl_file set it either sets the flag or
-    # raises; unset, it loads no CRL. Either way the verdict reached here holds for every connection
-    # the pool opens.
+    # raises; unset, it leaves the flag clear. Either way the verdict reached here holds for every
+    # connection the pool opens.
     _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
     return ctx
 
@@ -1874,7 +1874,7 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
     then, which is what asyncpg's own ``ssl=True`` did for the system trust store.
 
     With ``[store].ssl_crl_file`` set, it loads that CRL and sets ``VERIFY_CRL_CHECK_LEAF``
-    (``harden_crl_check``), or raises. Unset, it loads no CRL and leaves that flag clear, so the
+    (``harden_crl_check``), or raises. Unset, it leaves that flag clear, so the
     context checks no revocation and the store's revocation guard credits it nothing
     (:func:`_refuse_store_revocation`)."""
     if settings.ssl_root_cert:
@@ -2027,8 +2027,8 @@ def _refuse_store_revocation(
     supplies it on both verifying branches. It is built at pool open and not handshaken on: the pool
     builds each connection's context afresh (:func:`_per_connection_ssl_connect`). Both come from
     :func:`_verifying_context` with the same settings. With ``[store].ssl_crl_file`` set, that
-    builder either sets ``VERIFY_CRL_CHECK_LEAF`` or raises; unset, it loads no CRL, so the guard
-    credits none. Either way this verdict holds for every connection. Before BACKLOG #300 the default branch
+    builder either sets ``VERIFY_CRL_CHECK_LEAF`` or raises; unset, it leaves that flag clear, so
+    the guard credits none. Either way this verdict holds for every connection. Before BACKLOG #300 the default branch
     returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
     nowhere to load."""
     RevocationHopGuard.capture(

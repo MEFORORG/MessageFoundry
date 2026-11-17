@@ -1052,9 +1052,9 @@ def crl_no_credit(ctx: ssl.SSLContext | None) -> CrlNoCredit | None:
     """Why a CRL on ``ctx`` may not relax a revocation guard, or ``None`` when it may (vault
     BACKLOG #4912).
 
-    ``None`` only when the context verifies the peer (``verify_mode`` is not ``ssl.CERT_NONE``;
-    in client mode ``CERT_OPTIONAL`` enforces the chain and a loaded CRL as ``CERT_REQUIRED``
-    does), does not skip validity-period
+    ``None`` only when the context's ``verify_mode`` is not ``ssl.CERT_NONE`` (on a client
+    context ``CERT_OPTIONAL`` enforces the chain and a loaded CRL as ``CERT_REQUIRED`` does; the
+    rule does not read whether a context is a client or a server one), does not skip validity-period
     checks (:func:`skips_validity_period`), which would let a CRL past ``nextUpdate`` through,
     and consults a CRL (:func:`context_checks_revocation`). A context that fails more than one of
     these gets the first in that order. ``None`` as ``ctx`` is :attr:`CrlNoCredit.NO_CRL`.
@@ -1105,9 +1105,8 @@ EXPIRY_RELAXED_WAYS_ACROSS = (
 #: verify the peer (:attr:`CrlNoCredit.PEER_NOT_VERIFIED`). No CRL is credited there, so the
 #: connection-shaped default and :data:`EXPIRY_RELAXED_WAYS_ACROSS`, which each offer a
 #: ``[tls].crl_file``, would name a lever that cannot work. It does not offer the attestation
-#: either. The disposition still ALLOWs an attested hop (:func:`revocation_hop_disposition`). No
-#: setting names that context's mode, so the fix is in the code that builds it (vault BACKLOG
-#: #4912).
+#: either. The disposition still ALLOWs an attested hop (:func:`revocation_hop_disposition`)
+#: (vault BACKLOG #4912).
 PEER_NOT_VERIFIED_WAYS_ACROSS = (
     "Make this hop's TLS context verify the peer (verify_mode is not CERT_NONE); until then, no "
     "CRL can admit it."

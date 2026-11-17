@@ -791,7 +791,8 @@ when the context checks a CRL, the context does not skip time validity, and the 
 `expiry_relaxed=True`, so the flag can only take the credit away. [Note 2026-11-17, vault BACKLOG
 #4912: `capture()` also gives no credit to a context that does not verify the peer (`verify_mode`
 is `CERT_NONE`). It reads `crl_no_credit` in `config/tls_policy.py`, whose docstring states the
-conditions.] A CRL on a context that skips time
+conditions. On such a context an omitted `ways_across` becomes `PEER_NOT_VERIFIED_WAYS_ACROSS`, not
+the `EXPIRY_RELAXED_WAYS_ACROSS` this paragraph names below.] A CRL on a context that skips time
 validity earns no credit with or without the flag, so such a hop is decided as one with no CRL:
 at least, off-box and unattested, it is refused under an enforcing posture, and warned on an
 instance that does not enforce unless `MEFOR_TLS_REVOCATION_ATTESTED` is set. Before it, a guard handed such a context without the flag

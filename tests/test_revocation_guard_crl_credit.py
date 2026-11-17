@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""One rule decides whether a CRL may relax a revocation guard (vault BACKLOG #4912, #2977 item 11).
+"""The CRL-credit rule the outbound revocation guards read (vault BACKLOG #4912, #2977 item 11).
 
 ``crl_no_credit`` in ``config/tls_policy.py`` is that rule, and ``crl_credited`` its yes-or-no
 form: the context verifies the peer (``verify_mode`` is not ``CERT_NONE``), does not skip
