@@ -854,9 +854,10 @@ def test_a_json_detail_its_redaction_pushes_past_the_bound_still_parses(capsys) 
 
 
 def test_a_value_over_the_window_ends_with_its_bound_note_and_hides_the_name(capsys) -> None:
-    """Open finding 3 of engine PR 2864: a field over the 64 KiB window holding a control shipped
-    cut with no note saying so, and a ``detail``'s ``(+N chars)`` count was taken over a shorter
-    head than ``safe_text`` reads. Synthetic values."""
+    """Open finding 3 of engine PR 2864: a field over the handler chain's redaction window,
+    :data:`~messagefoundry.redaction._REDACT_WINDOW` characters, holding a control shipped cut
+    with no note saying so, and a ``detail``'s ``(+N chars)`` count was taken over a shorter head
+    than ``safe_text`` reads. Synthetic values."""
     from messagefoundry.redaction import clamp_untrusted, safe_text, safe_text_bound
 
     value = f"{chr(0x01)}DOE JANE " + "word " * 14000
@@ -869,6 +870,88 @@ def test_a_value_over_the_window_ends_with_its_bound_note_and_hides_the_name(cap
     (line,) = _tee_lines([{"detail": value}], capsys)
     detail = _shipped_detail(line)
     assert detail.endswith(note) and "DOE" not in detail
+    # The same value in a field other than detail: the line that ships hides the name too.
+    (line,) = _tee_lines([{"actor": value}], capsys)
+    assert "DOE" not in line
+
+
+#: Review round 13 of engine PR 2864: records whose line is longer than the handler chain's
+#: redaction window, each with the word a C0 control hid from the chain before #3045. The bar read
+#: the chain's bound note as words of the record, and the keys the old reading cut off as words it
+#: hid, so both scrubbed candidates failed and the old line shipped the word. Synthetic values.
+_OVER_WINDOW_LEAKS: tuple[tuple[dict[str, str | None], str], ...] = (
+    ({"actor": "\x01DOE JANE " + "word " * 14000}, "DOE"),
+    ({"actor": "\x01password=hunter2", "client": "x " * 33000}, "hunter2"),
+)
+
+
+def _cut_off_words(old_line: str) -> set[str]:
+    """The words of the part of ``old_line`` the handler chain's bound cut off unread."""
+    from messagefoundry.redaction import clamp_untrusted
+
+    head = clamp_untrusted(old_line)
+    return set(_WORD.findall(old_line[head.rfind("\n") :]))
+
+
+_BOUND_NOTE = re.compile(r"(?:\\+n|\s)\[redaction bound: dropped [0-9_]+ more chars unscanned\]\Z")
+
+
+@pytest.mark.parametrize(("fields", "hidden"), _OVER_WINDOW_LEAKS)
+def test_an_over_window_record_ships_the_scrub_not_the_hidden_word(
+    fields: dict[str, str | None], hidden: str, monkeypatch
+) -> None:
+    """The record ships scrubbed, so no sink shows the word, and every word a sink shows beyond
+    what the old line showed there, outside the chain's bound note, is one the old line's bound
+    cut off unread. Synthetic values."""
+    from collections import Counter
+
+    from messagefoundry.logging_setup import sink_readings
+    from messagefoundry.redaction import _REDACT_WINDOW
+
+    (old,) = _raw_tee_lines([fields], monkeypatch, scrub=False)
+    (new,) = _raw_tee_lines([fields], monkeypatch, scrub=True)
+    assert len(old) > _REDACT_WINDOW  # the control: the record is over the window
+    assert all(hidden in r for r in sink_readings(old))  # and main's line showed the word
+    assert new != old
+    cut_off = _cut_off_words(old)
+    for old_out, new_out in zip(sink_readings(old), sink_readings(new), strict=True):
+        assert hidden not in new_out
+        for escape in (_ESCAPE_TEXT, _JSON_TEXT_ESCAPE):
+            words = [
+                Counter(_WORD.findall(escape.sub(" ", _unplaced(_BOUND_NOTE.sub("", out)))))
+                for out in (old_out, new_out)
+            ]
+            assert set(words[1] - words[0]) <= cut_off
+
+
+def test_an_over_window_record_with_no_control_ships_byte_identical(monkeypatch) -> None:
+    """The control on the over-window cases: the same long value with no C0 control is not
+    touched. Synthetic value."""
+    fields: dict[str, str | None] = {"actor": "DOE JANE " + "word " * 14000}
+    assert _raw_tee_lines([fields], monkeypatch, scrub=True) == _raw_tee_lines(
+        [fields], monkeypatch, scrub=False
+    )
+
+
+def test_an_over_window_candidate_that_shows_a_word_the_old_line_hid_still_falls_back(
+    monkeypatch, caplog
+) -> None:
+    """The safety property holds over the window too: where each candidate shows, inside what the
+    old reading kept, a word the old line hid there, the old line ships, and the warning says the
+    candidates would show a word the old line hid or cut off. Synthetic values."""
+    from messagefoundry.logging_setup import sink_readings
+    from messagefoundry.redaction import _REDACT_WINDOW
+
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    tail = "y " * 40000
+    before: dict[str, object] = {"detail": "password=hunter2 " + tail, "seq": 1}
+    after: dict[str, object] = {"detail": "hunter2 " + tail, "seq": 1}
+    old_line = json.dumps(before, ensure_ascii=False)
+    # The controls: the line is over the window, and the old line hid the word on every sink.
+    assert len(old_line) > _REDACT_WINDOW
+    assert not any("hunter2" in r for r in sink_readings(old_line))
+    warnings = _old_line_warnings(caplog, before, after, lambda: "hunter2")
+    assert warnings == [_worded(audit_tee._SHOWS_A_CUT_WORD)]
 
 
 def _raw_tee_lines(cases: list[dict[str, str | None]], monkeypatch, *, scrub: bool) -> list[str]:
