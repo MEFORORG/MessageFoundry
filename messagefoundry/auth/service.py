@@ -3047,6 +3047,13 @@ def _log_totp_refused(username: str) -> None:
     )
 
 
+def _storable_actor(username: str) -> str:
+    """A typed sign-in username as an audit row's actor (BACKLOG #5342): as typed, unless it holds a
+    NUL, which at least a PostgreSQL store refuses in a text column. Then every control character
+    is escaped, as a log argument's are, so the row is still written and names what was sent."""
+    return scrub_log_argument(username) if "\x00" in username else username
+
+
 def _log_combined_totp_defect(user_id: str, exc: Exception) -> None:
     """Log a defect the combined sign-in met reading or checking a TOTP code (BACKLOG #5335): by
     the exception's type name and the account id, never its text, the username or a traceback, on a
@@ -6009,7 +6016,7 @@ class AuthService:
             # removing it in the same change would lock every AD operator out of factor enrolment
             # and MFA-disable. See docs/research/ad-step-up-after-simple-bind-retirement.md.
             await self._directory_reject_audit(
-                username, "simple_bind", "pathway_retired", client=client
+                _storable_actor(username), "simple_bind", "pathway_retired", client=client
             )
             return LoginOutcome(
                 ok=False,
@@ -6099,11 +6106,20 @@ class AuthService:
         async def unknown_row() -> None:
             await self._audit(
                 "auth.login_failed",
-                actor=username,
+                actor=_storable_actor(username),
                 detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
                 client=client,
             )
 
+        if "\x00" in username:
+            # username_refusal refuses a NUL in a new account's name, and at least a PostgreSQL
+            # store refuses one in a text bind, which would escape as an unhandled error (BACKLOG
+            # #5342). So the name is an unknown one, refused like any other without reaching the
+            # account lookup: the same dummy verify, row and answer, and the caller's limiter
+            # charge stands.
+            await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
+            await later(unknown_row)
+            return LoginOutcome(ok=False, error="invalid credentials")
         user = await self._load_user_by_username(username)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not

@@ -616,6 +616,54 @@ async def test_unknown_user_login_runs_password_verify(
     assert calls["n"] >= 1  # the dummy verify ran for the unknown user
 
 
+async def test_a_username_with_a_nul_is_an_unknown_name_on_both_sign_in_surfaces(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5342: at least a PostgreSQL store refuses a NUL in a text bind, so a username
+    carrying one would escape the sign-in as an unhandled error, outside the failure pad. The
+    service refuses it as an unknown name before the account lookup, on the JSON route and the
+    console form alike: the limiter is charged, the answer is an unknown name's, and the
+    ``auth.login_failed`` row names it with the NUL escaped."""
+    service = await _service(engine)
+    await _add(service, "bob")
+    looked_up: list[str] = []
+    real_lookup = engine.store.get_user_by_username
+
+    async def lookup(username: str) -> object:
+        looked_up.append(username)
+        return await real_lookup(username)
+
+    monkeypatch.setattr(engine.store, "get_user_by_username", lookup)
+    charged: list[str | None] = []
+    real_allow = service.allow_login_attempt
+
+    def allow(client: str | None) -> bool:
+        charged.append(client)
+        return real_allow(client)
+
+    monkeypatch.setattr(service, "allow_login_attempt", allow)
+    async with _client(engine, service, serve_ui=True) as c:
+        unknown = await _login(c, "ghost-user-does-not-exist")
+        looked_up.clear()
+        nul = await _login(c, "bo\x00b")
+        assert (nul.status_code, nul.json()) == (unknown.status_code, unknown.json())
+        ui = await c.post(
+            "/ui/login",
+            data={"username": "bo\x00b", "password": PW},
+            headers={"Origin": "http://t"},
+            follow_redirects=False,
+        )
+        assert ui.status_code == 303 and ui.headers["location"] == "/ui/login?e=bad"
+    assert all("\x00" not in name for name in looked_up), looked_up
+    assert len(charged) == 3, "a sign-in was not charged to the limiter"
+    actors = [
+        row["actor"]
+        for row in await engine.store.list_audit()
+        if row["action"] == "auth.login_failed" and "bo" in str(row["actor"])
+    ]
+    assert actors == ["bo\\u0000b", "bo\\u0000b"], actors
+
+
 # --- #1167 (ASVS 11.2.4): the recovery-code walk must cost the same whatever is presented --------
 
 
