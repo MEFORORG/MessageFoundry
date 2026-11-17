@@ -679,12 +679,44 @@ def _before_and_after(
     cases: list[dict[str, str | None]], capsys, monkeypatch
 ) -> tuple[list[str], list[str]]:
     """Each case teed with the field scrub switched off, which is the code before #3045, then as
-    shipped."""
-    real = audit_tee._scrub_field
-    monkeypatch.setattr(audit_tee, "_scrub_field", lambda value, **_kw: value)
-    before = _tee_lines(cases, capsys)
-    monkeypatch.setattr(audit_tee, "_scrub_field", real)
-    return before, _tee_lines(cases, capsys)
+    shipped. The log clock is frozen for both, so the two passes cannot straddle a second boundary
+    and differ in the formatter's timestamp (windows-2025, run 44112472272)."""
+    real_factory = logging.getLogRecordFactory()
+
+    def frozen(*args: object, **kwargs: object) -> logging.LogRecord:
+        record = real_factory(*args, **kwargs)
+        record.created, record.msecs = _FROZEN_LOG_CLOCK, 0.0
+        return record
+
+    logging.setLogRecordFactory(frozen)
+    try:
+        real = audit_tee._scrub_field
+        monkeypatch.setattr(audit_tee, "_scrub_field", lambda value, **_kw: value)
+        before = _tee_lines(cases, capsys)
+        monkeypatch.setattr(audit_tee, "_scrub_field", real)
+        return before, _tee_lines(cases, capsys)
+    finally:
+        logging.setLogRecordFactory(real_factory)
+
+
+_FROZEN_LOG_CLOCK = 1_700_000_000.0
+
+
+def test_the_before_and_after_lines_do_not_straddle_a_second_boundary(capsys, monkeypatch) -> None:
+    """The clock steps a whole second at each read, as a second boundary between the two passes
+    does. The comparison must still see equal lines. Synthetic values."""
+    now = [1_800_000_000 * 10**9]
+
+    def stepping() -> int:
+        now[0] += 10**9
+        return now[0]
+
+    monkeypatch.setattr("time.time_ns", stepping)
+    cases: list[dict[str, str | None]] = [{"actor": "alice"}]
+    # Control: the stepped clock reaches the line, so the equality below is not vacuous.
+    assert _tee_lines(cases, capsys) != _tee_lines(cases, capsys)
+    before, after = _before_and_after(cases, capsys, monkeypatch)
+    assert after == before
 
 
 # An oracle independent of audit_tee's own word and escape patterns, on purpose.

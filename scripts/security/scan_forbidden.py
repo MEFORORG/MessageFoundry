@@ -796,8 +796,10 @@ _PR_BASE_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
 #: The longest line, and paragraph, the baseline reads with the patterns above. Their link and split
 #: backtrack on a long run (`[` with no `]`, whitespace with no tag after it, `<x` with no `>`), so past
 #: this the baseline runs :func:`_pr_base_link_sub` and :func:`_pr_base_split_spans` instead, which give
-#: the same output in linear time (a test checks them against the patterns). Nothing is cut.
-_PR_BASE_CAP = 2000
+#: the same output in linear time (a test checks them against the patterns). Nothing is cut. At 0,
+#: every non-empty line and paragraph takes the linear path: under a 2000 cap, a body of many lines
+#: just under it paid the link pattern's backtracking once per line.
+_PR_BASE_CAP = 0
 #: The lookahead class of the full-stop split, as ``_PR_BASE_SENTENCE_SPLIT`` spells it.
 _PR_BASE_SPLIT_LOOKAHEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ*`[(\"'#>-")
 PR_BODY_REASONS = {
