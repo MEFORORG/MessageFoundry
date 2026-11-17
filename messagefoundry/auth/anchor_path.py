@@ -549,7 +549,8 @@ def windows_chain(
 
     At least these end the walk with a cause, since Windows would open another object than the text
     names (vault BACKLOG #5197): a drive-relative spelling (:func:`_drive_relative`), in the path, a
-    link target or a ``subst`` target joined to the rest of the path; a name ending in a space or a
+    link target or a ``subst`` target joined to the rest of the path, or in the path joined to the
+    working directory (vault BACKLOG #5337); a name ending in a space or a
     dot, which Win32 strips; and a link target rooted with no drive (:data:`_ROOTED_LINK`); a
     device prefix written with forward slashes (``//?/S:/x``); and a stream name after a link. A path that reaches a share ends with
     :data:`SHARE_CAUSE`."""
@@ -588,6 +589,12 @@ def windows_chain(
         drive, rest = ntpath.splitdrive(norm)
         if not drive:
             return chain, WalkCause.plain("the path has no drive or volume")
+        if _drive_relative(norm):
+            # Checked on every pass, not only on the text the caller gave: a drive-relative working
+            # directory (``C:``) joined to ``ca.pem`` reads ``C:ca.pem``, which the loop below
+            # would walk from the drive root, and which a subst splice would join to its target
+            # with no separator (vault BACKLOG #5337). So ``rest`` below is rooted or empty.
+            return chain, WalkCause.plain(_DRIVE_RELATIVE)
         try:
             substituted = drive_target(drive) if len(drive) == 2 else None
         except OSError as exc:

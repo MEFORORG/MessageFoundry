@@ -1200,3 +1200,45 @@ def test_posix_root_owned_755_placement_loads_at_enforce_with_no_pin(
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)  # 644: no group or other write
     ta.enforce_anchor(AnchorSpec("t", "[x]", str(_pem(tmp_path)), None), enforcing=True)
+
+
+# --- vault BACKLOG #5337: a drive-relative spelling reached through the working directory --------
+
+
+def _plain_probe(p: str) -> tuple[str, str | None]:
+    """Every name is a folder, or a file when it ends in ``.pem``; nothing is a link."""
+    return (FILE if p.lower().endswith(".pem") else DIRECTORY), None
+
+
+def _subst_s(drive: str) -> str | None:
+    return "\\??\\C:\\real" if drive == "S:" else None
+
+
+def _no_subst(_drive: str) -> str | None:
+    return None
+
+
+@pytest.mark.parametrize(
+    ("anchor", "cwd", "drive_target"),
+    [
+        # ``C:`` joined to ``ca.pem`` reads ``C:ca.pem``. Red: walked as C:\ca.pem, from the root.
+        ("ca.pem", "C:", _no_subst),
+        # A subst drive as that working directory. Red: spliced as C:\realcerts\ca.pem.
+        ("certs\\ca.pem", "S:", _subst_s),
+    ],
+)
+def test_a_relative_anchor_under_a_drive_relative_working_directory_is_not_walked(
+    anchor: str, cwd: str, drive_target: Any
+) -> None:
+    """Windows reads ``C:x`` from that drive's own working directory, which the walk does not know,
+    so it refuses on every pass, not only on the text it was given (vault BACKLOG #5337)."""
+    chain, cause = windows_chain(anchor, cwd, _plain_probe, drive_target=drive_target)
+    assert chain == []
+    assert cause is not None and "no separator after it" in cause
+
+
+def test_a_subst_drive_splices_its_target_with_a_separator() -> None:
+    """The control: a subst working directory with a separator is walked under its target."""
+    chain, cause = windows_chain("certs\\ca.pem", "S:\\w", _plain_probe, drive_target=_subst_s)
+    assert cause is None
+    assert chain[-1] == ("C:\\real\\w\\certs\\ca.pem", FILE)
