@@ -237,21 +237,23 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
     **A reload runs the anchor checks and the store's content checks.** It checks the ACL, a
     change and the path (items 1, 3 and 4; the spec has no pin), and refuses a file it cannot
-    read. It then runs the encryption-header refusal (BACKLOG #3090), the private-key refusal
-    (BACKLOG #3745), and the store's certificate checks: one server certificate, inside its
-    validity period (:func:`_refuse_an_unusable_server_pin`, vault BACKLOG #3714). The store's
-    size refusal of a file larger than a pin is not run first, as the store open runs it; the
-    certificate check refuses those bytes as too large once they are read. At ``warn`` the start
-    logs the pin's warning once: the preflight skips one the store open just logged
-    (:data:`_WARNED_AT_OPEN`).
+    read. It then runs the private-key refusal (BACKLOG #3745) and the store's certificate checks
+    (:func:`_refuse_an_unusable_server_pin`, vault BACKLOG #3714): no encryption header (BACKLOG
+    #3090), one server certificate, inside its validity period. So a pin past notAfter refuses
+    every reload until the file is replaced. The store open checks the file's size on disk before
+    it reads it; this check does not, and refuses the bytes as too large once they are read. At
+    ``warn`` the start logs the pin's warning once: the preflight skips one the store open just
+    logged (:data:`_WARNED_AT_OPEN`).
 
     **The PostgreSQL ``ssl_root_cert``** (vault BACKLOG #4203) is a CA bundle the store loads by
     path at each new connection. :func:`collect_anchor_specs` adds it under the label
-    ``store_postgres_ca`` (:func:`store_postgres_ca_anchor_spec`), so it takes the audited checks
-    of items 1 to 4 and the private-key refusal at start and at every reload, with no pin. Unlike
-    the SQL Server pin, the store runs none of these checks when it opens, so at a start the store
-    has already been opened with this file when this check runs. What the paragraphs above say of the pin's audit
-    riding its own hop, and of a refused reload leaving the pool open, holds for this CA too.
+    ``store_postgres_ca`` (:func:`store_postgres_ca_anchor_spec`), so in ``serve`` it takes the
+    audited checks of items 1 to 4 and the private-key refusal at start and at every reload, with
+    no pin. Unlike the SQL Server pin, the store runs none of these checks when it opens. At a
+    start the store has already been opened with this file when this check runs, so its
+    connections may have trusted the file and sent the store login. A command that opens the
+    store and runs no preflight does not check the file at all. What the paragraphs above say of the pin's audit riding its own hop, and of a refused reload
+    leaving the pool open, holds for this CA too.
 12. **A generic DATABASE connection's driver CA** (vault BACKLOG #3090, step 7). The CA file a
     generic-dialect ``Database`` outbound or ``DatabasePoll`` names as ``odbc_params`` ``sslca``
     is a lane CA, as in item 9 (:func:`database_ca_anchor_spec`), under the lane's own label. It
@@ -447,7 +449,8 @@ class AnchorSpec:
     :func:`anchor_cadata` already.
 
     ``server_pin`` adds the SQL Server pin's certificate checks to a ``False`` spec's content
-    checks (module item 11): one server certificate, inside its validity period."""
+    checks (module item 11): one server certificate, inside its validity period. A ``True`` spec
+    never reaches those checks, so the two together are refused at construction."""
 
     label: str
     setting: str
@@ -457,6 +460,10 @@ class AnchorSpec:
     loads_verified_bytes: bool = True
     refuses_encryption_header: bool = False
     server_pin: bool = False
+
+    def __post_init__(self) -> None:
+        if self.server_pin and self.loads_verified_bytes:
+            raise ValueError("server_pin needs loads_verified_bytes=False, or its checks never run")
 
 
 @dataclass(frozen=True)
@@ -675,18 +682,25 @@ def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
         _refuse_an_unusable_server_pin(data, spec)
 
 
+#: The wall clock the server pin's validity check reads; a test replaces it.
+_clock: Callable[[], float] = time.time
+
+
 def _refuse_an_unusable_server_pin(data: bytes, spec: AnchorSpec) -> None:
     """The SQL Server pin's certificate checks, which the store runs at each open, run here too so a
     reload refuses what the next store open would (vault BACKLOG #3714): the bytes must be one
     server certificate (:func:`~messagefoundry.pki.pinned_server_certificate`), inside its validity
-    period now. notAfter itself still counts as valid, as the store's check reads it."""
+    period now (:data:`_clock`). notAfter itself still counts as valid, as the store's check reads
+    it. So once the pin passes notAfter, every reload that runs this check is refused until the
+    file is replaced, though the open store keeps connecting until a restart, which the store open
+    refuses too."""
     from messagefoundry.pki import pinned_server_certificate  # lazy: pki loads cryptography
     from messagefoundry.redaction import log_timestamp
 
     cert = pinned_server_certificate(data)
     if isinstance(cert, str):
         raise TrustAnchorError(f"{spec.setting} {spec.path!r} {cert}")
-    moment = time.time()
+    moment = _clock()
     not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
     if moment > not_after.timestamp():
         raise TrustAnchorError(
@@ -2282,8 +2296,7 @@ def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
         "[store].ssl_root_cert",
         path,
         loads_verified_bytes=False,
-        refuses_encryption_header=True,
-        server_pin=True,
+        server_pin=True,  # which refuses an encryption header too, in the pin's own words
     )
 
 
@@ -2568,8 +2581,9 @@ async def _preflight_one(
     An anchor whose consumer reads ``cafile=`` (``loads_verified_bytes`` False, the outbound CAs,
     vault BACKLOG #2371) skips the shape check. ``cafile=`` loads a ``TRUSTED CERTIFICATE`` block,
     for one, so refusing it here would refuse what the build accepts. It takes the private-key
-    check (BACKLOG #3745), since no build needs a key in its CA file, and a driver's CA takes the
-    encryption-header check too (:func:`_refuse_by_path_content`). Each reads the
+    check (BACKLOG #3745), since no build needs a key in its CA file, a driver's CA takes the
+    encryption-header check too, and the SQL Server pin its certificate checks
+    (:func:`_refuse_by_path_content`). Each reads the
     bytes this preflight read; the hop reads the file again, so the gap the docs name for a swapped
     file holds for a key too.
 

@@ -3336,9 +3336,7 @@ async def test_a_reload_runs_the_store_pins_content_checks(
 ) -> None:
     """Vault BACKLOG #3714 step 12 (d): a reload refuses a pin file the next store open would
     refuse, with a ``pem_refused`` row. Red under: ``server_pin`` dropped from
-    :func:`store_pin_anchor_spec`, where the reload passes the file. The encryption-header case
-    goes red only with ``refuses_encryption_header`` dropped too, since the certificate check
-    refuses a header as well."""
+    :func:`store_pin_anchor_spec`, where the reload passes the file."""
     from messagefoundry.config.wiring import WiringError
 
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
@@ -3371,16 +3369,22 @@ async def test_a_reload_refuses_a_store_pin_outside_its_validity_period(
     """Vault BACKLOG #3714 step 12 (d): the validity check the store runs at open runs at a reload
     too. Red under: ``server_pin`` dropped from :func:`store_pin_anchor_spec`. The control is the
     same pin read at the real time, which passes."""
-    import types
-
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     specs = _store_specs(backend="sqlserver", ssl_root_cert=str(_sqlserver_pin(tmp_path)))
     await run_anchor_preflight(specs, store, enforcing=True)  # the control
-    monkeypatch.setattr(ta, "time", types.SimpleNamespace(time=lambda: moment))
+    monkeypatch.setattr(ta, "_clock", lambda: moment)
     with pytest.raises(TrustAnchorError, match=refusal) as err:
         await run_anchor_preflight(specs, store, enforcing=True)
     assert "[store].ssl_root_cert" in str(err.value)
+
+
+def test_a_server_pin_spec_must_be_read_by_path() -> None:
+    """``server_pin`` checks run only for a ``loads_verified_bytes=False`` spec, so a spec that
+    asks for them on the other path is refused rather than left unchecked."""
+    with pytest.raises(ValueError, match="server_pin"):
+        AnchorSpec("store_sqlserver_pin", "[store].ssl_root_cert", "pin.pem", server_pin=True)
+    assert AnchorSpec("x", "y", "z", loads_verified_bytes=False, server_pin=True).server_pin
 
 
 async def test_the_sqlserver_store_pin_is_audited_at_start_and_rechecked_at_reload(
