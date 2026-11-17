@@ -105,14 +105,16 @@ class FhirResource:
             model = model_class.model_validate(data)
         except ValidationError as exc:
             summary = _safe_validation_summary(resource_type, version, exc)
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except (KeyError, TypeError, RecursionError) as exc:
             # fhir.resources resolves a nested resource (a Bundle entry, a `contained` item) by its
             # untrusted resourceType outside pydantic's error collection: an unknown type escapes as
-            # a KeyError quoting it, a non-string one as a TypeError (BACKLOG #5367). Name only the
-            # exception type, and raise outside the handler so neither chain holds the value.
+            # a KeyError quoting it, a non-string one as a TypeError, and nesting deep enough to
+            # overflow the stack as a RecursionError (BACKLOG #5367; measured on fhir.resources
+            # 8.3.0). Name only the exception type, and raise outside the handler so neither chain
+            # holds the value.
             summary = (
                 f"FHIR {resource_type} ({version}) failed validation: a nested resource could not "
-                f"be resolved ({type(exc).__name__})"
+                f"be validated ({type(exc).__name__})"
             )
         if summary is not None:
             raise FhirValidationError(summary)

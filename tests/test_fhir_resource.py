@@ -120,22 +120,42 @@ _NESTED_UNKNOWN_TYPE = [
         "entry": [{"resource": {"resourceType": PHI_CANARY}}],
     },
     {"resourceType": "Patient", "contained": [{"resourceType": PHI_CANARY}]},
-    # A non-string nested type escaped as a TypeError.
-    {"resourceType": "Bundle", "type": "collection", "entry": [{"resource": {"resourceType": 5}}]},
+    # A non-string nested type escaped as a TypeError; the list holds the canary as a control.
+    {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{"resource": {"resourceType": [PHI_CANARY]}}],
+    },
 ]
 
 
+def _deep_bundle(depth: int) -> dict[str, object]:
+    body: dict[str, object] = {"resourceType": "Patient", "id": PHI_CANARY}
+    for _ in range(depth):
+        body = {"resourceType": "Bundle", "type": "collection", "entry": [{"resource": body}]}
+    return body
+
+
 @pytest.mark.parametrize(
-    "body", _NESTED_UNKNOWN_TYPE, ids=["bundle-entry", "contained", "non-string"]
+    ("body", "raised"),
+    [
+        (_NESTED_UNKNOWN_TYPE[0], "KeyError"),
+        (_NESTED_UNKNOWN_TYPE[1], "KeyError"),
+        (_NESTED_UNKNOWN_TYPE[2], "TypeError"),
+        # Nesting deep enough to overflow the stack escaped as a RecursionError.
+        (_deep_bundle(400), "RecursionError"),
+    ],
+    ids=["bundle-entry", "contained", "non-string", "too-deep"],
 )
-def test_nested_unknown_resource_type_is_a_phi_safe_validation_error(
-    body: dict[str, object],
+def test_nested_resource_failure_is_a_phi_safe_validation_error(
+    body: dict[str, object], raised: str
 ) -> None:
-    """BACKLOG #5367: a nested resource of unknown type fails as a PHI-safe FhirValidationError, with
-    the untrusted type on neither the message nor either exception chain."""
-    with pytest.raises(FhirValidationError, match="nested resource could not be resolved") as ei:
+    """BACKLOG #5367: a nested resource that fails outside pydantic's checks raises a PHI-safe
+    FhirValidationError, with the untrusted value on neither the message nor either chain."""
+    with pytest.raises(FhirValidationError, match="nested resource could not be validated") as ei:
         FhirResource.parse(as_json(body))
     exc = ei.value
+    assert f"({raised})" in str(exc)
     assert PHI_CANARY not in str(exc) and PHI_CANARY not in repr(exc)
     assert exc.__cause__ is None
     assert exc.__context__ is None
