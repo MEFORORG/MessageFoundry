@@ -9179,7 +9179,15 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
     snapshot = (
         source if isinstance(source, ConfigSnapshot) else read_config_snapshot(source, strict=False)
     )
-    unread = [rel for rel in snapshot.unreadable if rel == "." or rel.lower().endswith(".py")]
+    # Only an unread module (a top-level ``*.py``), or the unlistable directory, takes the digest
+    # away: a load refuses both (_require_loadable). A suffix test alone also caught a file in a
+    # folder, such as a value file named ``*.py``, which no load runs and none refuses, so the
+    # graph would load with no digest and the sandbox would skip its comparison (BACKLOG #5334).
+    unread = [
+        rel
+        for rel in snapshot.unreadable
+        if rel == "." or ("/" not in rel and rel.lower().endswith(".py"))
+    ]
     if unread:
         # A module it could not read is not described by the rest.
         _logger.warning(
@@ -9875,9 +9883,18 @@ def load_snapshot(
     one boot frame does not carry each table twice."""
     _require_loadable(snapshot)
     directory = snapshot.directory
+    code_digest = config_code_digest(snapshot)
+    if code_digest is None:
+        # A sandbox worker's graph is compared with this digest only when there is one, so a load
+        # that recorded none would accept a worker running other config code. Refuse instead
+        # (BACKLOG #5334); _require_loadable above already refuses every case known to reach here.
+        raise WiringError(
+            f"{_CONFIG_SOURCE_LEAD} {directory}: the config modules' digest could not be "
+            "computed; see the engine log"
+        )
     registry = Registry(
         source_dir=source_dir if source_dir is not None else directory,
-        code_digest=config_code_digest(snapshot),
+        code_digest=code_digest,
         config_snapshot=snapshot,
     )
     # Load the bundle's reference tables (codesets/ relative to the config dir) BEFORE importing the
