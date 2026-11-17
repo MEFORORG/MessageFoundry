@@ -248,9 +248,10 @@ def refuse_unsafe_subject(subject: str, *, transport: str) -> None:
     except (UnicodeError, ValueError) as exc:
         failure = type(exc).__name__
     if failure:
-        # Raised outside the handler and type-only: UnicodeEncodeError.object holds the subject.
+        # Raised outside the handler and type-only: UnicodeEncodeError.object holds the subject or
+        # its decoded text.
         raise ValueError(f"{transport} 'subject' cannot be set as a header ({failure})")
-    # Read-back catches encoded words that decode to a control character (#3206).
+    # Read-back of encoded words (vault BACKLOG #3206).
     if _holds_control_char(str(probe["Subject"])):
         raise ValueError(
             f"{transport} 'subject' holds an encoded word that decodes to a control character"
