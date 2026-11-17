@@ -482,7 +482,7 @@ def _invoke_file(root, *args, payload=_PAYLOAD, **extra):
 
 
 def _assert_blocked(completed, code):
-    """A block, told apart from a bridge fault (which also exits 2) by the bridge's block line."""
+    """Assert the exit code and the bridge's block line, which a silent blocking hook produces."""
     assert completed.returncode == code, completed.stderr
     assert "Claude hook blocked this event" in completed.stderr
 
@@ -498,7 +498,7 @@ def test_a_direct_bridge_hook_gives_2_for_a_hooks_exit_2(tmp_path):
     _assert_blocked(_direct(root, "hook", "--block-exit", "10"), 10)
 
 
-def test_an_inherited_environment_does_not_change_the_block_exit(tmp_path):
+def test_the_retired_sentinel_variable_does_not_change_the_block_exit(tmp_path):
     root = _make_repo(tmp_path, _EXIT_2, venv=False)
     _assert_blocked(_direct(root, "hook", **_OLD_SENTINEL), 2)
 
