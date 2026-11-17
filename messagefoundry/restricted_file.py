@@ -766,8 +766,8 @@ def _route_source(addr: Any) -> Any:
 
 
 def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
-    """Why the folders on ``path`` let another account move or replace it, or ``None``: a walk that
-    did not finish (:func:`_windows_cause_problem`), a share that may be this host itself
+    """Why the folders on ``path`` let another account move or replace it, or ``None``: at least a
+    walk that did not finish (:func:`_windows_cause_problem`), a share that may be this host itself
     (:func:`_loopback_share_problem`), a junction or link above it that another account can change
     (:func:`_windows_link_problem`), then the directory that holds it
     (:func:`_windows_holder_problem`). Windows only.
@@ -776,8 +776,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     ``subst`` drive root is resolved. The holder is where that walk ends, after every junction,
     link and ``subst`` drive on the way, or for a drive root the folder holding where it leads
     (none for a volume root), and its owner and entries are read there. Where the walk ends on a
-    link back to a folder already on the path, the holder is read by its path as written instead
-    (:func:`_windows_holder_as_written_problem`), and a drive root's is not read. On that walk each
+    link back to a folder already on the path, ``full.parent`` is read by its path as written
+    instead (:func:`_windows_holder_as_written_problem`), and for a drive root nothing is read. On that walk each
     volume's drive type is read, not its file system, and a volume whose drive type cannot be read
     ends it and is refused. A UNC share or a mapped network drive (``GetDriveTypeW`` answers
     ``DRIVE_REMOTE``) stops it; what is then refused, and where the holder is read, is stated once
@@ -824,8 +824,7 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     problem = _windows_cause_problem(cause)
     if problem is None and cause is not None:
         if substituted or any(kind == LINK for _obj, kind in chain):
-            # The share is not the one the path names, so neither the loopback test nor the
-            # holder read below would read the share the walk reached.
+            # The loopback test reads the share the path names, not the one the walk reached.
             return (
                 "it is reached through a junction, link or subst drive onto a network share or a "
                 "mapped network drive, whose folders this check does not walk; name it by its "
@@ -913,8 +912,7 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
 
 
 def _windows_holder_as_written_problem(holder_path: Path) -> str | None:
-    """Why the directory at ``holder_path``, read by its path as written with the config-source
-    reader, lets a broad group or an application package replace a key file in it, or ``None``.
+    """Why ``holder_path``, read by its path as written with the config-source reader, lets a broad group or an application package replace a key file in it, or ``None``.
     This is the holder read the check made before it read the holder where the path resolves to,
     kept for a path the walk cannot resolve (:func:`_windows_surroundings_problem`). Windows
     only."""
@@ -1291,12 +1289,11 @@ def broad_access_problem(
     administrators can change it: on Windows by its own access list or that of any folder above it
     (:func:`_windows_link_problem`), on POSIX by the owner or mode of the folder that holds it or of
     any folder above it (:func:`_posix_link_problem`). Those folders are judged that way only
-    where a link is (:func:`_windows_surroundings_problem`). On Windows a directory holding ``path`` that lets a
-    broad group delete a file in it or change its access list is refused too
-    (:func:`_windows_holder_problem`), read where :func:`_windows_surroundings_problem` says. A file
-    whose access cannot be
-    read is reported as a problem, and so is a path that is itself a link, on every platform,
-    because the file behind it was not judged.
+    where a link is (:func:`_windows_surroundings_problem`). On Windows a directory holding
+    ``path`` that lets a broad group delete a file in it or change its access list is refused too
+    (:func:`_windows_holder_problem`), read where :func:`_windows_surroundings_problem` says. A
+    file whose access cannot be read is reported as a problem, and so is a path that is itself a
+    link, on every platform, because the file behind it was not judged.
 
     The answer names accounts and modes only, never the path or the file's contents."""
     try:
@@ -1320,7 +1317,7 @@ def broad_access_problem(
             host = windows_host_readers()
         except OSError as exc:
             reason = exc.strerror or type(exc).__name__
-            return f"the readers for its owner and the folders on its path could not be built ({reason})"
+            return f"the readers this check needs could not be built ({reason})"
         if engine_owned:
             problem = _windows_engine_owner_problem(security.owner_sid, host.engine_sid)
             if problem is not None or holder_judged:

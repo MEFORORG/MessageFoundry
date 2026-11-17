@@ -2844,7 +2844,7 @@ secret. Each file in that directory holds one setting and is named exactly as it
   it also refuses a directory or file owned by an account other than the engine's own or root,
   and one held in a directory that such an account owns or that a group or other may write
   without the sticky bit, since any account that may write it may replace what it holds. On
-  Windows it also reads the folder that holds the directory, as [PHI.md](PHI.md)
+  Windows it also reads, in most cases, the folder that holds the directory, as [PHI.md](PHI.md)
   section 2, *The folders above a key file*, states for a key file. It also
   refuses a relative path, a file that is not a regular file, a file named for no setting above
   (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
