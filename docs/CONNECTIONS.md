@@ -5000,19 +5000,16 @@ quarantined to the error directory — charges. **One gap in that rule:** a quar
 the error directory fails still charges, although the file stays where it was. A file that can never
 be quarantined would therefore spend the budget on every tick, which is the starvation this rule exists
 to prevent. On `File(...)` under `after_read` `move` or `delete` (BACKLOG #5717) the gap is
-narrowed, not closed. When the move failed for a reason that looks lasting, such as access denied,
-the source remembers the file and skips it unread and uncharged until its size, modification time or
-file identity changes or `STUCK_RETRY_SECONDS` pass, whichever comes first. Once they pass, it
-examines the file again in full, oldest failure first, as soon as a scan's retry allowance reaches
-it: it is read and judged afresh, and a file that now passes, for example because a scanner no
-longer rejects it, is ingested. A file that was copied into the error directory but whose original
-could not be removed is examined the same way, so each retry may write another copy and record
-another event. Retries run after every other candidate in the scan and count against
-`FileSource._retry_allowance`, not against `poll_max_files`, so a scan can take that many files
-beyond the ceiling; the ceiling's log line does not count them. A failure that `_lasting` judges
-transient is not remembered, so such a file still charges on later scans as before. At least a
-restart of the connection and a full memory also leave a file charged again; a full memory is logged
-once. The constants are in
+narrowed, not closed. The source remembers such a file and skips it unread and uncharged until its
+size, modification time or file identity changes, or its retry falls due. A retry runs in a separate
+pass after the scan's other files, a bounded number per scan that the ceiling's log line does not
+count, so a scan can read that many files beyond the ceiling. A retry reads and judges the file
+afresh, so one that now passes is ingested. When the move failed for a reason that looks lasting,
+such as access denied, the retry falls due after `STUCK_RETRY_SECONDS`; otherwise on the next scan.
+A file copied into the error directory whose original could not be removed is retried the same way,
+so each retry may write another copy and record another event. At least a restart of the connection
+and a full memory leave a file charged again; the full memory is logged when it fills, and again
+only after it has drained to half. The constants are in
 [`transports/file.py`](../messagefoundry/transports/file.py). Under `leave`, and on
 `Sftp(...)`/`Ftp(...)`, the gap stands as described.
 

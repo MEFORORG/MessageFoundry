@@ -245,6 +245,18 @@ def test_a_pathlike_archive_subdir_is_accepted_and_checked(tmp_path: Path) -> No
             _source(inbox, processed_subdir=value)
 
 
+def test_a_pathlike_that_names_no_path_is_refused_as_a_setting(tmp_path: Path) -> None:
+    """``os.fspath`` raises TypeError for an ``__fspath__`` that returns neither str nor bytes; the
+    build reports it as the setting refusal, not as a TypeError."""
+
+    class NotAPath:
+        def __fspath__(self) -> Any:
+            return 3
+
+    with pytest.raises(ValueError, match="processed_subdir"):
+        _source(tmp_path / "in", processed_subdir=NotAPath())
+
+
 def test_an_unnormalised_archive_subdir_is_normalised(tmp_path: Path) -> None:
     inbox = tmp_path / "in"
     src = _source(inbox, processed_subdir="./done/../arch", error_subdir="err/")

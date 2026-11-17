@@ -6,9 +6,9 @@ Every quarantine arm charges the per-tick budget whether or not the move to ``.e
 #5717 a reject that could not be moved stayed in place and was read and charged again on later scans,
 so ``poll_max_files`` such rejects sorting first could spend the whole budget and hold back the
 healthy drops behind them. Under ``move`` and ``delete`` a reject that stays for a lasting reason is
-now remembered by path and mark and skipped unread and uncharged until it changes; after
-``STUCK_RETRY_SECONDS`` it is examined again in full, after the other candidates. A transient failure is not remembered, and ``leave``
-is unchanged.
+now remembered by path and mark and skipped unread and uncharged until it changes, and examined
+again in full in a retry pass after the other candidates: after ``STUCK_RETRY_SECONDS`` for a
+lasting failure, on the next scan for a transient one. ``leave`` is unchanged.
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
 """
@@ -203,32 +203,59 @@ async def test_a_new_file_under_the_same_name_size_and_mtime_is_examined(
 
 
 @pytest.mark.parametrize("fail_errno", [errno.EBUSY, errno.ENOSPC])
-async def test_a_transient_move_failure_is_not_remembered(
+async def test_a_transient_move_failure_is_retried_on_the_next_scan_uncharged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_errno: int
 ) -> None:
-    """A failure that may clear by itself is not remembered, so the scans read exactly what they read
-    before #5717 (:data:`_MAIN_SEQUENCE`) and the move is tried again.
+    """A failure that may clear by itself is remembered as due at once, so each such reject is tried
+    again on the next scan, in the retry pass, and spends none of the budget: the healthy drop is
+    handed off a scan sooner than on main (:data:`_MAIN_SEQUENCE`), and no fresh pass reads a reject
+    twice.
 
-    Mutation: make ``_lasting`` return True. Red: the rejects are read once each."""
+    Mutation: do not remember a transient failure. Red: the scans read :data:`_MAIN_SEQUENCE`."""
     rig = _Rig(tmp_path, monkeypatch, cap=1, fail_errno=fail_errno)
     _drop_two_rejects_and_a_healthy_drop(rig)
-    assert [await rig.scan() for _ in range(9)] == _MAIN_SEQUENCE
-    assert rig.source._stuck == {}
+    scans = [await rig.scan() for _ in range(9)]
+    assert scans != _MAIN_SEQUENCE
+    assert scans == [
+        [],
+        ["a1.hl7"],
+        ["a2.hl7", "a1.hl7"],  # a1 in the retry pass
+        ["b_healthy.hl7", "a2.hl7"],
+        ["a1.hl7"],
+        ["a2.hl7"],
+        ["a1.hl7"],
+        ["a2.hl7"],
+        ["a1.hl7"],
+    ]
+    assert rig.handed_off == [_HL7]
+    assert len(rig.source._stuck) == 2
 
 
-@pytest.mark.skipif(os.name != "nt", reason="the Windows code is read only on Windows")
-async def test_a_windows_sharing_violation_is_transient_although_errno_says_eacces() -> None:
-    exc = OSError(errno.EACCES, "in use", None, 32)
-    assert getattr(exc, "winerror", None) == 32
-    assert not file_mod._lasting(exc)
-    assert file_mod._lasting(OSError(errno.EACCES, "denied", None, 5))
-    # A dropped share stays transient even where the archive directory failed to open.
-    bad_netpath = OSError(errno.ENOENT, "bad netpath", None, 53)
-    assert not file_mod._lasting(bad_netpath, stage="archive_dir")
+def _win_os_error(code: int, winerror: int) -> OSError:
+    """An ``OSError`` carrying a Windows code, as Windows raises one, on any platform."""
+    if os.name == "nt":
+        return OSError(code, "test", None, winerror)
+    exc = OSError(code, "test")
+    setattr(exc, "winerror", winerror)  # noqa: B010 -- the attribute exists on Windows only
+    return exc
+
+
+@pytest.mark.parametrize("winerror", [21, 31, 32, 33, 53, 54, 64, 69, 70, 71, 303, 1224, 2250])
+def test_a_transient_windows_code_wins_over_errno(winerror: int) -> None:
+    """Windows maps several transient codes to EACCES or EINVAL, so the code is read first."""
+    assert not file_mod._lasting(_win_os_error(errno.EACCES, winerror))
+    assert not file_mod._lasting(_win_os_error(errno.EACCES, winerror), stage="archive_dir")
+
+
+def test_windows_codes_that_are_lasting() -> None:
+    assert file_mod._lasting(_win_os_error(errno.EACCES, 5))
     # ERROR_PATH_NOT_FOUND is lasting only on the move into the archive directory.
-    path_not_found = OSError(errno.ENOENT, "path not found", None, 3)
+    path_not_found = _win_os_error(errno.ENOENT, 3)
     assert file_mod._lasting(path_not_found, stage="archive")
     assert not file_mod._lasting(path_not_found)
+    # ERROR_FILENAME_EXCED_RANGE is lasting at every stage, although its errno reads as vanished.
+    for stage in ("file", "archive_dir", "archive"):
+        assert file_mod._lasting(_win_os_error(errno.ENOENT, 206), stage=stage)
 
 
 async def test_an_archived_copy_whose_original_cannot_be_removed_is_retried_in_full(
@@ -558,7 +585,138 @@ async def test_a_full_memory_is_logged_once_and_again_after_it_drains(
 def test_lasting_reads_the_engines_own_refusals() -> None:
     assert not file_mod._lasting(file_mod._Replaced("not the file that was read"))
     assert file_mod._lasting(file_mod._Unconfined("a link"))
-    assert file_mod._lasting(OSError("no errno at all"))
+    assert not file_mod._lasting(OSError("no errno at all")), "unknown, so retried soon"
     assert not file_mod._lasting(OSError(errno.ENOENT, "gone"))
     assert file_mod._lasting(OSError(errno.ENOENT, "gone"), stage="archive_dir")
     assert not file_mod._lasting(OSError(errno.ENOENT, "gone"), stage="archive")
+
+
+async def test_a_due_reject_past_the_ceiling_still_gets_its_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under a sustained backlog the fresh pass breaks at the ceiling before a reject sorting late,
+    which is still due: the retry pass takes it anyway.
+
+    Mutation: add only fresh-pass DUE steps to ``due``. Red: z.hl7 is never read again."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    rig.drop("z.hl7", _PDF)
+    await rig.scan()
+    assert await rig.scan() == ["z.hl7"]
+    rig.source.poll_max_files = 1
+    for n in range(5):
+        rig.drop(f"a{n}.hl7", _HL7.replace(b"CTL5717", f"CTL{n}".encode()))
+    await rig.scan()  # the backlog settles
+    _age_stuck(rig)
+    assert await rig.scan() == ["a0.hl7", "z.hl7"]
+    assert len(rig.source._stuck) == 1, "still stuck, so remembered again"
+
+
+async def test_a_retry_left_in_place_stays_remembered_and_due(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry whose read fails transiently is not forgotten: it stays due, so the next scan tries
+    it again in the retry pass rather than reading and charging it in the fresh pass.
+
+    Mutation: drop the re-remember after a FREE retry in ``_scan_once``. Red: it is forgotten."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    _age_stuck(rig)
+    real_read = file_mod._read_confined
+
+    def locked(path: Path, *args: Any) -> Any:
+        rig.reads.append(path.name)
+        raise OSError(errno.EBUSY, "locked")
+
+    monkeypatch.setattr(file_mod, "_read_confined", locked)
+    assert await rig.scan() == ["a.hl7"]
+    key = str(rig.inbox / "a.hl7")
+    assert key in rig.source._stuck, "left in place, so still remembered"
+    monkeypatch.setattr(file_mod, "_read_confined", real_read)
+    rig.fail_errno = None
+    assert await rig.scan() == ["a.hl7"], "due at once, so retried on the next scan"
+    assert (rig.inbox / ".error" / "a.hl7").exists()
+    assert rig.source._stuck == {}
+
+
+async def test_a_due_retry_is_lstat_once_per_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fresh pass's lstat of a due reject serves its retry too.
+
+    Mutation: pass no mark to the retry's ``_examine``. Red: two lstats."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    await rig.scan()
+    _age_stuck(rig)
+    marks: list[str] = []
+    real_mark = file_mod._file_mark
+
+    def counted(path: Path) -> Any:
+        marks.append(path.name)
+        return real_mark(path)
+
+    monkeypatch.setattr(file_mod, "_file_mark", counted)
+    assert await rig.scan() == ["a.hl7"]
+    assert marks == ["a.hl7"]
+
+
+async def test_failed_listings_do_not_wipe_the_stuck_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A listing that raises lists nothing, which is no evidence the rejects have gone, so however
+    many fail in a row the memory is not pruned on them.
+
+    Mutation: prune on a failed listing. Red: the reject is forgotten after SETTLE_MISS_LIMIT."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+
+    def unlistable(_self: Path, _pattern: str) -> Any:
+        raise PermissionError(errno.EACCES, "denied")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Path, "glob", unlistable)
+        for _ in range(file_mod.SETTLE_MISS_LIMIT + 1):
+            assert await rig.scan() == []
+    assert len(rig.source._stuck) == 1
+    assert await rig.scan() == [], "still remembered once the listing recovers"
+
+
+async def test_a_full_memory_hovering_at_its_cap_is_not_logged_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One entry leaving and one more reject arriving does not log the full memory a second time:
+    only a memory drained to half its cap does.
+
+    Mutation: reset the flag whenever the memory is below its cap. Red: logged twice."""
+    monkeypatch.setattr(file_mod, "SETTLE_SEEN_MAX", 4)  # bounds the settle map too
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    for n in range(4):
+        rig.drop(f"a{n}.hl7", _PDF)
+
+    def full_logs() -> int:
+        text = "memory of rejects that cannot be moved is full"
+        return sum(text in r.message for r in caplog.records)
+
+    await rig.scan()
+    await rig.scan()
+    assert len(rig.source._stuck) == 4
+    rig.drop("b0.hl7", _PDF)
+    await rig.scan()
+    await rig.scan()
+    assert full_logs() == 1
+    (rig.inbox / "a0.hl7").unlink()
+    for _ in range(10):
+        await rig.scan()
+        if str(rig.inbox / "b0.hl7") in rig.source._stuck:
+            break
+    assert len(rig.source._stuck) == 4, "a0 forgotten, b0 remembered in its place"
+    rig.drop("c0.hl7", _PDF)
+    await rig.scan()
+    await rig.scan()
+    assert len(rig.source._stuck) == 4
+    assert full_logs() == 1
