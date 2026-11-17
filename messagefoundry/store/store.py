@@ -6914,9 +6914,9 @@ class PinCheck:
     The open's ``before_first_write`` hook (:func:`run_open_store_hook`, BACKLOG #4936) runs after
     the pin check, and the open's first write under the store key after both. Under ``auto``
     schema management the open may already have committed its schema, and on SQL Server altered
-    the database's options, before the pin check; neither is under the key. A mutable cell rather than a flag in a context variable,
-    so a pass recorded under a copied context still reaches the open that set it (vault BACKLOG
-    #8119 item 2)."""
+    the database's options, before the pin check; neither is under the key. A mutable cell rather
+    than a flag in a context variable, so a pass recorded under a copied context still reaches the
+    open that set it (vault BACKLOG #8119 item 2)."""
 
     __slots__ = ("passed",)
 
