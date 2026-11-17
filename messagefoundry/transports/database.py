@@ -120,7 +120,7 @@ from messagefoundry.odbc_call_gate import (
 )
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.redaction import prints_a_codec_error, safe_exc
+from messagefoundry.redaction import prints_a_codec_error, safe_exc, safe_text
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
@@ -2858,7 +2858,7 @@ def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
     What the copy loses: an exception group's members, any ``__notes__``, the stdlib's extra hints
     (``Did you mean``, a ``SyntaxError``'s location), each link's module name, and the text of
     every link :func:`_poll_log_line` withholds; ``safe_exc``'s 200-character bound applies to
-    every non-driver line it keeps.
+    every non-driver line it keeps, and :data:`_ENGINE_TEXT_LIMIT` to the engine's fixed text.
 
     It never raises, because it runs in the poll loop's error arm, which must not kill the poller.
     A copy that fails gives one :class:`RedactedDbError` with no frames, whose message names the
@@ -2917,7 +2917,9 @@ def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     try:
         if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
             return _safe_db_error(exc, withhold=under)
-        if isinstance(exc, (*_ENGINE_FIXED_TEXT, _DriverMissingError, ImportError, UnicodeError)):
+        if isinstance(exc, _ENGINE_FIXED_TEXT):
+            return safe_exc(exc, limit=_ENGINE_TEXT_LIMIT)  # the call-gate remedy is its tail
+        if isinstance(exc, (_DriverMissingError, ImportError, UnicodeError)):
             return _safe_db_error(exc)
         if not exc.args:
             return type(exc).__name__
@@ -3034,6 +3036,12 @@ _ENGINE_FIXED_TEXT: tuple[type[BaseException], ...] = (
     AutocommitNotConfirmed,
     UngatedConnectionError,
 )
+
+#: The bound on an engine error's text where :func:`_credential_free_cause` and
+#: :func:`_poll_log_line` print it. ``safe_exc``'s default of 200 cuts the call-gate refusal,
+#: about 235 characters whose remedy is its tail, and more inside a connect failure's prefix; this
+#: keeps that whole with room, and still bounds a text another module built.
+_ENGINE_TEXT_LIMIT = 600
 
 
 def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> asyncio.Future[T]:
@@ -4811,9 +4819,17 @@ class DatabaseSource(SourceConnector):
             if self._task is task:
                 self._task = None
                 if fault is not None:
-                    logger.warning(
-                        "DATABASE source poll task failed: %s", _credential_free_cause(fault)
-                    )
+                    try:
+                        logger.warning(
+                            "DATABASE source poll task failed: %s", _credential_free_cause(fault)
+                        )
+                    except Exception as failure:  # noqa: BLE001 - the pool below must still close
+                        logger.warning(
+                            "DATABASE source poll task failed: %s [cause withheld: %s while "
+                            "rendering it]",
+                            type(fault).__name__,
+                            type(failure).__name__,
+                        )
         if task is not None and self._task is not None and self._task is not task:
             return  # a later start() made a new poll task, and the pool is now that task's
         try:
@@ -5494,8 +5510,23 @@ def _credential_free_cause(exc: BaseException) -> str:
     Every ``DeliveryError`` and ``NegativeAckError`` this module builds holds fixed text, a
     SQLSTATE and native number, a type name or a setting, never a driver message: at least
     :func:`_connect` and :func:`_probe_db` build theirs with this function. One
-    another module raises is printed as it stands, a bound and not a guarantee."""
-    return str(exc) if isinstance(exc, _ENGINE_FIXED_TEXT) else _credential_free_detail(exc)
+    another module raises is printed as it stands, a bound and not a guarantee. The text is
+    redacted and cut at :data:`_ENGINE_TEXT_LIMIT`, as ``safe_exc`` cuts it, and one holding a
+    codec error is named by ``safe_exc``'s fixed note.
+
+    It never raises, as the ``_safe_db_error`` it replaced at the mark-failure log and in
+    ``_finish_stop`` never did: an error whose rendering raises is named by its type and a
+    fixed note."""
+    try:
+        if not isinstance(exc, _ENGINE_FIXED_TEXT):
+            return _credential_free_detail(exc)
+        if prints_a_codec_error(exc):
+            return safe_exc(exc)
+        return safe_text(str(exc), limit=_ENGINE_TEXT_LIMIT)
+    except Exception as failure:  # noqa: BLE001 - see docstring: its callers are error arms
+        return (
+            f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"
+        )
 
 
 def _log_login_role_reading(reading: LoginRoleReading, label: str) -> None:

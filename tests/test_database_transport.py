@@ -30,7 +30,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Database, DatabasePoll, WiringError
 from messagefoundry.logging_setup import _install_phi_filters, _make_formatter
-from messagefoundry.odbc_call_gate import UngatedConnectionError
+from messagefoundry.odbc_call_gate import UngatedConnectionError, require_call_gate
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports import database as database_module
@@ -1937,6 +1937,133 @@ async def test_source_poll_failure_keeps_the_chain_when_one_link_cannot_be_class
     assert "_UnclassifiableError [message withheld: RuntimeError while rendering it]" in caplog.text
     assert "Exception [23000] driver error 2627" in caplog.text
     assert "traceback withheld" not in caplog.text
+
+
+def test_credential_free_cause_never_raises() -> None:
+    """#5348, batch 613 review: the mark-failure log and ``_finish_stop`` render through
+    ``_credential_free_cause``, and the ``_safe_db_error`` it replaced there never raised. Red
+    mutation: drop its ``try``. The ``sqlstate`` property's ``RuntimeError`` escapes."""
+    assert database_module._credential_free_cause(_UnclassifiableError("x")) == (
+        "_UnclassifiableError [message withheld: RuntimeError while rendering it]"
+    )
+
+
+@pytest.mark.parametrize("broken", ["fault", "render"])
+async def test_finish_stop_closes_the_pool_whatever_the_fault_log_does(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, broken: str
+) -> None:
+    """#5348, batch 613 review: ``stop()`` runs during reload quiesce, so a faulted poll task's
+    log line must neither raise nor keep the pool open. ``fault``: an error whose ``sqlstate``
+    raises, red when ``_credential_free_cause`` has no ``try``. ``render``: the renderer itself
+    raises, red when ``_finish_stop`` does not guard its log line."""
+    src = _src(body_column="payload")
+    fault_exc: Exception = _UnclassifiableError("x") if broken == "fault" else RuntimeError("y")
+    if broken == "render":
+
+        def raising(exc: BaseException) -> NoReturn:
+            raise RecursionError("too deep")
+
+        monkeypatch.setattr(database_module, "_credential_free_cause", raising)
+    closed: list[float | None] = []
+
+    async def aclose(*, timeout: float | None = None) -> None:
+        closed.append(timeout)
+
+    monkeypatch.setattr(src, "aclose", aclose)
+
+    async def fault() -> None:
+        raise fault_exc
+
+    task = asyncio.ensure_future(fault())
+    with contextlib.suppress(type(fault_exc)):
+        await task
+    src._task = task
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await src._finish_stop(task, interrupted=False)
+    assert closed == [None], "the pool was not closed"
+    assert "poll task failed" in caplog.text  # the instrument fired
+    assert src._task is None
+
+
+def _real_ungated_refusal() -> UngatedConnectionError:
+    """The call gate's own refusal, raised by ``require_call_gate`` on an object it reads as a
+    real aioodbc connection it cannot wrap, so its text is the shipped one, not a copy."""
+    conn = type("Connection", (), {"__module__": "aioodbc.connection"})()
+    with pytest.raises(UngatedConnectionError) as refused:
+        require_call_gate(conn)
+    return refused.value
+
+
+def test_credential_free_cause_bounds_the_engines_text() -> None:
+    """#5348, batch 613 review: an engine error's text is printed, so it takes a bound, as the
+    ``safe_exc`` rendering it replaced did. Red mutation: print ``str(exc)`` unbounded."""
+    long = DeliveryError("DATABASE connect failed: " + "word " * 4000)
+    assert len(database_module._credential_free_cause(long)) < 1000
+
+
+#: The real statement_timeout refusal ``_apply_statement_timeout`` builds, SQLSTATE form.
+_TIMEOUT_REMEDY = (
+    "database driver refused statement_timeout [HYC00]; set statement_timeout = 0 on this "
+    "connection if it cannot take one"
+)
+
+
+@pytest.mark.parametrize("kind", ["ungated", "nak"])
+async def test_the_engines_remedy_survives_whole_on_every_path(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """#5348, batch 613 review: the call-gate refusal is about 235 characters, and its remedy is
+    its tail, so a 200-character bound cuts it. Every path keeps it whole: the poll log, alone and
+    inside a connect failure, the mark log, the connect error, the probe cause and the stopped
+    poll task's log. Red mutation: put back ``safe_exc``'s default bound in ``_poll_log_line``'s
+    fixed-text arm, or a bound under 260 in ``_credential_free_cause``."""
+    exc: Exception = (
+        _real_ungated_refusal()
+        if kind == "ungated"
+        else NegativeAckError(_TIMEOUT_REMEDY, code="HYC00", permanent=True, config_fault=True)
+    )
+    text = str(exc)
+    if kind == "ungated":
+        assert len(text) > 230 and text.endswith("(BACKLOG #5005)")  # the instrument
+    wrapped = DeliveryError(f"DATABASE connect failed: {text}")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), exc)
+        await _run_one_failed_poll(_src(body_column="payload"), wrapped)
+        await _run_poll(
+            _src(body_column="payload"),
+            ["id", "payload"],
+            [(1, "A")],
+            _RecordingHandler(),
+            mark_exc=exc,
+        )
+    assert f"RedactedDbError: {type(exc).__name__}: {text}\n" in caplog.text
+    assert f"RedactedDbError: DeliveryError: DATABASE connect failed: {text}\n" in caplog.text
+    assert f"a duplicate): {text}\n" in caplog.text
+    dest = _dest()
+    dest._pool = _RefusingPool(exc)
+    with pytest.raises(DeliveryError) as failed:
+        await dest.test_connection()
+    assert str(failed.value).endswith(text)
+    assert database_module._probe_failure_cause(exc) == text
+
+    src = _src(body_column="payload")
+
+    async def aclose(*, timeout: float | None = None) -> None:
+        return None
+
+    monkeypatch.setattr(src, "aclose", aclose)
+
+    async def fault() -> None:
+        raise wrapped
+
+    task = asyncio.ensure_future(fault())
+    with contextlib.suppress(DeliveryError):
+        await task
+    src._task = task
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await src._finish_stop(task, interrupted=False)
+    assert f"poll task failed: DATABASE connect failed: {text}\n" in caplog.text
 
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
