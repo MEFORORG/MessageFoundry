@@ -547,8 +547,7 @@ def verify(
     because several quote the document.
 
     A document :func:`~messagefoundry.parsing.xml.harden.parse_bytes` cannot parse fails there
-    instead, before any signature processing. That path raises other types than the paragraph
-    above names, and one of them, the :class:`UnicodeEncodeError` below, carries the document.
+    instead, before any signature processing, and that path does NOT hold to the paragraph above.
     It raises at least these:
 
     - a document that declares a DOCTYPE, and one that fails to parse after a prolog DOCTYPE

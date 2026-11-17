@@ -130,8 +130,9 @@ def parse_bytes(data: bytes | str) -> Any:
 
     Returns the root ``_Element``. Raises :class:`XmlSecurityError` if the document declares a DOCTYPE
     (a DTD/entity-definition carrier), and also when the document fails to parse but its prolog
-    opens a DOCTYPE within its first ``_DOCTYPE_SCAN_BYTES``. Raises :class:`XmlParseError` if it
-    is not well-formed XML. Both messages are fixed text plus, for a
+    opens a DOCTYPE within its first ``_DOCTYPE_SCAN_BYTES``, readable in one of the scan encodings
+    above, and
+    :class:`XmlParseError` if it is not well-formed XML. Both messages are fixed text plus, for a
     parse error, the fault's line, column and libxml2 error code; neither carries lxml's message,
     and neither is chained from lxml's error (BACKLOG #5371). Requires the ``[xml]`` extra."""
     etree = load_lxml()
