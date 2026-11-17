@@ -414,3 +414,69 @@ def test_a_later_disarm_owned_by_a_path_git_or_after_a_closer_is_rule_3cs(
 ) -> None:
     reason = _reason(rig, _fmt(rig, template), rig.outside)
     assert "SHARED git" in reason, reason
+
+
+# ------------------------------------------------------------------ BACKLOG #5655 closing steps 1, 3, 6, 7
+#
+# Each DENY row was measured ALLOW on origin/main f0e49f45c5c, run from an ungoverned repository.
+
+
+@pytest.mark.parametrize(
+    ("template", "text"),
+    [
+        # Step 1: the broad git word answered the git inside the closed `$( )`, so no `-C` was read.
+        ("git -C '{p}' -c user.name=$(git log -1 --format=%an) config {k}", "SHARED git configur"),
+        # Step 3: the disarm regex anchored on the inner `config`.
+        ("git -C '{p}' -c user.name=$(git config user.name) config {k}", "SHARED git configur"),
+        # Step 3: an earlier line's subshell chdir switched the added reading off.
+        ("(cd {tmp} && ls)\ngit -C '{p}' reset --hard", "SHARED PRIMARY"),
+        # Step 7: four quoted forms the scan did not unquote.
+        ("git -C $'{p}' reset --hard", "SHARED PRIMARY"),
+        ("git -C ''{p} reset --hard", "SHARED PRIMARY"),
+        ("git -C {p}'' reset --hard", "SHARED PRIMARY"),
+        ("bash -c 'git -C '\"'\"'{p}'\"'\"' reset --hard'", "SHARED PRIMARY"),
+        (r"bash -c 'git -C '\''{p}'\'' reset --hard'", "SHARED PRIMARY"),
+    ],
+)
+def test_closing_step_shapes_are_denied(rig: SimpleNamespace, template: str, text: str) -> None:
+    reason = _reason(rig, _fmt(rig, template), rig.outside)
+    assert text in reason, reason
+
+
+@pytest.mark.parametrize(
+    ("template", "tool"),
+    [
+        ("git -C '{o}' -c user.name=$(git log -1 --format=%an) config {k}", "Bash"),
+        ("git -C '{o}' -c user.name=$(git config user.name) config {k}", "Bash"),
+        ("(cd {tmp} && ls)\ngit -C '{o}' reset --hard", "Bash"),
+        ("git -C $'{o}' reset --hard", "Bash"),
+        ("git -C ''{o} reset --hard", "Bash"),
+        ("git -C {o}'' reset --hard", "Bash"),
+        ("git -C {o}'' reset --hard", "PowerShell"),
+        ("bash -c 'git -C '\"'\"'{o}'\"'\"' reset --hard'", "Bash"),
+        (r"bash -c 'git -C '\''{o}'\'' reset --hard'", "Bash"),
+        ("git commit -m '' ; git -C {o} status", "Bash"),
+    ],
+)
+def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str, tool: str) -> None:
+    assert _allowed(rig, _fmt(rig, template), rig.outside, tool)
+
+
+# Step 6: the known false denies of the added readings, pinned as KNOWN. Each is a strict xfail, so a
+# change that fixes one turns it into an XPASS and must move the row to the ALLOW controls above.
+@pytest.mark.xfail(
+    strict=True, reason="known false deny of the added readings (BACKLOG #5655 step 2)"
+)
+@pytest.mark.parametrize(
+    ("template", "where", "tool"),
+    [
+        # An earlier bracket-joined command's `-C` decides the later reset.
+        ("if (git -C '{p}' diff --quiet) {{ git reset --hard }}", "outside", "PowerShell"),
+        # The later-disarm filter counts `.git` as a git word, so the grep's `-c alias.lg` is judged.
+        ("git config core.hooksPath ; grep --exclude-dir=.git -c alias.lg f", "primary", "Bash"),
+    ],
+)
+def test_known_false_denies_of_the_added_readings(
+    rig: SimpleNamespace, template: str, where: str, tool: str
+) -> None:
+    assert _allowed(rig, _fmt(rig, template), _cwd(rig, where), tool)

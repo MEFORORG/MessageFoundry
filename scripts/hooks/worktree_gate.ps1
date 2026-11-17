@@ -795,9 +795,10 @@ function Get-ScanRawIndexMap($Seg) {
 #          `git reset --hard`; and rule 3b judged only the first verb-bearing invocation.
 #
 # THE READER IS THE SCAN, which is the gate's existing tokenizer: Remove-QuotedSpans unquotes a quoted
-# span holding one bare word, single or double and under either host's escape, joins quoted pieces the
-# way the shell does (`'a'/'b'` reads `a/b`), and blanks a span with whitespace in it, so a quoted
-# commit message or echo cannot supply a token. Each invocation is read from its OWN window -- from the
+# span holding one bare word, single or double and under either host's escape, joins quoted pieces
+# (`'a'/'b'` reads `a/b`; an empty pair joined to a word, and a POSIX `$'<word>'` with no backslash,
+# read the word), and blanks a span with whitespace in it, so a quoted commit message or echo cannot
+# supply a token. It does not unquote every form the shell accepts. Each invocation is read from its OWN window -- from the
 # separator before its owning git token up to its verb -- through the resolver's -OwnWindow branch,
 # which folds that invocation's own `-C` tokens over a chdir it can follow and answers NOTHING where it
 # cannot. The window is also handed in as the resolver's $Line, so --work-tree, GIT_WORK_TREE,
@@ -812,10 +813,11 @@ function Get-ScanRawIndexMap($Seg) {
 # disarm, a chdir on an earlier line, a grep's `-c` after a config read), each fixed with a control
 # row, and others are not ruled out.
 #
-# NO COMMAND-POSITION TEST, DELIBERATELY. Rule 3's verb hunt never had one (`echo git reset --hard`
+# THE VERB HUNT HAS NO COMMAND-POSITION TEST, DELIBERATELY. It never had one (`echo git reset --hard`
 # from the primary denies), and a reading that skipped wrapper words such as `time git` or `command
 # git` would leave exactly the #5655 shape open behind them. A git word in prose costs a false deny in
-# the direction the old reading already errs.
+# the direction the old reading already errs. The owning-word search, Get-GitWordBefore, does test
+# position; rules 3 and 3c read its window BESIDE the broader one, never instead of it.
 #
 # WHAT IT DOES NOT READ, AT LEAST: a quoted path with whitespace in it (blanked by the scan, so the
 # window answers nothing and the old reading decides); a `-C` value the shell would still expand
@@ -824,11 +826,13 @@ function Get-ScanRawIndexMap($Seg) {
 # is a spelling the token pattern misses (`git.EXE reset --hard`, or `GIT` on Windows), which rule 3's
 # first reading exits on before these readings run. That last one is origin/main's too. Also, at
 # least: any line after an earlier line whose chdir sits in a subshell (`(cd x && ls)`), which makes
-# the earlier-line reading answer nothing; and a `--git-dir` after a `-c <key>=<v>` disarm, which is
+# the earlier-line reading answer nothing, unless the invocation's first `-C` is absolute; and a `--git-dir` after a `-c <key>=<v>` disarm, which is
 # not promoted; and a chdir ahead of an invocation joined by a bracket (`cd <p> && git -C <o> log
-# $(git reset --hard)`), whose prefix the chdir follower cannot read. Known new false denies, left open: a later disarm judged by rule 3c's first chain can
-# take an earlier command's `-C`, and a chdir inside a heredoc or here-string body in an earlier line
-# is read as a real one.
+# $(git reset --hard)`), whose prefix the chdir follower cannot read. Known new false denies, left
+# open, at least: a later disarm judged by rule 3c's first chain can take an earlier command's `-C`;
+# an earlier bracket-joined command's `-C` or `--git-dir` can decide (`if (git -C <p> diff --quiet) {
+# git reset --hard }` from outside); rule 3c's later-disarm filter counts `.git` as a git word; and a
+# chdir in an earlier line's heredoc, here-string or multi-line `bash -c` body is read as a real one.
 #
 # THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
@@ -864,17 +868,41 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
     $win = $Scan.Substring($start, $At - $start)
     $chdirAt = Get-ChdirAtCommandPattern
     $priorChdirs = @(($Prior -split '\r?\n') | Where-Object { $_ -match $chdirAt })
-    if ($priorChdirs.Count -eq 0) { return [pscustomobject]@{ ScanPrefix = $pfx; Window = $win } }
+    $plain = [pscustomobject]@{ ScanPrefix = $pfx; Window = $win }
+    if ($priorChdirs.Count -eq 0) { return $plain }
+    # AN ABSOLUTE FIRST `-C` DOES NOT DEPEND ON WHERE THE SHELL STANDS (BACKLOG #5655 step 3), so where
+    # the directory is unknown the plain reading is still returned for it. Without this, an earlier
+    # line's subshell chdir, `(cd x && ls)`, switched the reading off and a single-quoted
+    # `git -C '<p>' reset --hard` on the next line was allowed. Not where the window also names a work
+    # tree or git dir, which a relative spelling would root against the unknown directory.
+    $firstC = [regex]::Match($win, (Get-GitDashCPattern))
+    $absC = $firstC.Success -and (Test-ShellLiteralPath $firstC.Groups[1].Value) -and
+        [System.IO.Path]::IsPathFullyQualified($firstC.Groups[1].Value) -and
+        $win -notmatch '(?:^|\s)(?:--work-tree|--git-dir|GIT_WORK_TREE=|GIT_DIR=)'
     if ($pfx -match $chdirAt) {
         $own = Get-ChdirTargetRaw $pfx
-        if ($own -and [System.IO.Path]::IsPathRooted($own)) { [pscustomobject]@{ ScanPrefix = $pfx; Window = $win } }
+        if (($own -and [System.IO.Path]::IsPathRooted($own)) -or $absC) { $plain }
         return
     }
     $last = $priorChdirs[$priorChdirs.Count - 1]
     $lastTarget = Get-ChdirTargetRaw $last
-    if (-not $lastTarget) { return }
-    if (-not [System.IO.Path]::IsPathRooted($lastTarget) -and $priorChdirs.Count -gt 1) { return }
+    if (-not $lastTarget -or (-not [System.IO.Path]::IsPathRooted($lastTarget) -and $priorChdirs.Count -gt 1)) {
+        if ($absC) { return $plain }
+        return
+    }
     [pscustomobject]@{ ScanPrefix = "$last ; $pfx"; Window = $win }
+}
+
+# The index of the LAST `git` or `git.exe` word before $At, in any case on Windows, or -1. No
+# position or group test: the reading rule 3c's added reading had before the owning-word search. Rule
+# 3c's later-disarm filter reads only this word, because switching it to Get-GitWordBefore dropped a
+# later disarm owned by `/usr/bin/git`, or one after a stray `)` (review round 73e9b81f0a); its window
+# reads both words.
+function Get-AnyGitWordBefore([string]$Scan, [int]$At) {
+    $opts = $(if ($IsWindows) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
+            [System.Text.RegularExpressions.RegexOptions]::None })
+    $words = [regex]::Matches($Scan.Substring(0, $At), '\bgit(\.exe)?\b', $opts)
+    $(if ($words.Count -gt 0) { $words[$words.Count - 1].Index } else { -1 })
 }
 
 # The index of the git WORD that owns the text at $At, or -1 (review round c17b991ada).
@@ -888,19 +916,6 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
 # `git -C '<p>' -c user.name=$(git config user.name) reset --hard` the inner git sits in a `$( )`
 # that closes before `reset`, and taking it as owner dropped the quoted `-C`. A word with more
 # closers than openers between it and $At is skipped, and the search goes on leftwards.
-#
-# RULE 3c USES Get-AnyGitWordBefore BELOW INSTEAD (review round 73e9b81f0a). Switching its later-disarm
-# filter and its window to this narrower word dropped a later disarm owned by `/usr/bin/git`, or one
-# after a stray `)`, which the earlier head judged.
-function Get-AnyGitWordBefore([string]$Scan, [int]$At) {
-    # The last `git` or `git.exe` substring before $At, in any case on Windows: the reading rule 3c's
-    # added reading had before the owning-word search, kept for it.
-    $opts = $(if ($IsWindows) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
-            [System.Text.RegularExpressions.RegexOptions]::None })
-    $words = [regex]::Matches($Scan.Substring(0, $At), '\bgit(\.exe)?\b', $opts)
-    $(if ($words.Count -gt 0) { $words[$words.Count - 1].Index } else { -1 })
-}
-
 function Get-GitWordBefore([string]$Scan, [int]$At) {
     $opts = $(if ($IsWindows) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
             [System.Text.RegularExpressions.RegexOptions]::None })
@@ -1542,7 +1557,28 @@ function Remove-QuotedSpans([string]$s, [string]$Convention = 'none',
             # -c 'alias.ci=commit --no-verify'. Its value contains a space, so quoting is its only writable
             # spelling and this carve-out cannot reach it without re-admitting the prose false-deny. Pinned
             # as an ALLOW test so a later change cannot close it silently or claim it was never there.
-            if ($span.Length -gt 0 -and $span -cnotmatch '[\s''"$(){};&|`]') {
+            # AN EMPTY PAIR JOINED TO A WORD IS NOTHING, as the shell reads it (BACKLOG #5655 step 7):
+            # `-C ''<p>` and `-C <p>''` pass `<p>`. Emitting the pair kept a quote-tainted token that
+            # named nothing. A pair standing alone is still emitted, so an empty argument stays visible.
+            $prevCh = $(if ($out.Length -gt 0) { $out[$out.Length - 1] } else { ' ' })
+            $nextCh = $(if ($i + 1 -lt $s.Length) { $s[$i + 1] } else { ' ' })
+            $wordEdge = '[\s;&|(){}<>]'
+            if ($span.Length -eq 0 -and ([string]$prevCh -notmatch $wordEdge -or [string]$nextCh -notmatch $wordEdge)) {
+                # nothing appended
+            }
+            elseif ($span.Length -gt 0 -and $span -cnotmatch '[\s''"$(){};&|`]') {
+                # POSIX `$'<word>'` IS THE WORD (BACKLOG #5655 step 7): bash's ANSI-C quoting, so
+                # `-C $'<p>'` passes `<p>`. The `$` already emitted is taken back, but only for a word with
+                # no backslash, since `$'...'` decodes backslash escapes and that text is not the word.
+                if ($quote -eq "'" -and $Convention -eq 'posix' -and $span -notmatch '\\' -and
+                    $openAt -gt 0 -and $s[$openAt - 1] -eq '$' -and $out.Length -gt 0 -and $out[$out.Length - 1] -eq '$') {
+                    $bs = 0
+                    for ($k = $openAt - 2; $k -ge 0 -and $s[$k] -eq '\'; $k--) { $bs++ }
+                    if ($bs % 2 -eq 0) {
+                        $out.Length = $out.Length - 1
+                        if ($mapOn) { $Map.RemoveAt($Map.Count - 1) }
+                    }
+                }
                 if ($mapOn) { for ($k = $openAt + 1; $k -lt $i; $k++) { $Map.Add($k) } }
                 [void]$out.Append($span)
             }
@@ -2438,10 +2474,19 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
         # WHICH ARM MATCHED IS RECORDED, because only the double-quoted one can carry an outer escape.
         # A single-quoted word is fully literal on BOTH hosts, so its payload already IS what the
         # interpreter receives and re-decoding it would corrupt a legitimate backslash or backtick.
-        foreach ($spec in @(
+        # A THIRD ARM, POSIX OUTER HOST ONLY (BACKLOG #5655 step 7): a single-quoted argument the shell
+        # joins with an embedded quote, `'..'"'"'..'` or `'..'\''..'`, is one word, so `bash -c 'git -C
+        # '"'"'<p>'"'"' reset --hard'` runs `git -C '<p>' reset --hard`. The second arm stops at the
+        # first joint and saw `git -C ` alone. This arm is added, never substituted: its payload is one
+        # more segment, so it can only add a deny.
+        $specs = @(
             @{ Pat = "(?i)(?:^|\s)$flagThenSep`"$dqCode`""; Escaped = $true }
             @{ Pat = "(?i)(?:^|\s)$flagThenSep'(?<code>[^']*)'"; Escaped = $false }
-        )) {
+        )
+        if ($Convention -eq 'posix') {
+            $specs += @{ Pat = "(?i)(?:^|\s)$flagThenSep'(?<code>[^']*(?:'(?:`"'`"|\\')'[^']*)+)'"; Escaped = $false; Joined = $true }
+        }
+        foreach ($spec in $specs) {
             foreach ($m in [regex]::Matches($ln, $spec.Pat)) {
                 # WHO OWNS THIS FLAG DECIDES BOTH QUESTIONS -- whether to recurse at all, and under
                 # WHICH ESCAPE CONVENTION (BACKLOG #1229 residual, fourth round). `(?:^|\s)` consumes
@@ -2481,8 +2526,10 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
                 # before it: every earlier line, plus this line up to the flag. Blanked here for the
                 # same reason the lines are, and `$m.Index` is an index into `$ln` -- both RAW -- so no
                 # index crosses between a raw string and a blanked one.
+                $code = $m.Groups['code'].Value
+                if ($spec.Joined) { $code = $code.Replace("'`"'`"'", "'").Replace("'\''", "'") }
                 $inner += [pscustomobject]@{
-                    Text    = $m.Groups['code'].Value
+                    Text    = $code
                     Conv    = $owner
                     Escaped = [bool]$spec.Escaped
                     Prior   = $priorForLine + (Remove-QuotedSpans $ln.Substring(0, $m.Index) $Convention)
@@ -4125,8 +4172,8 @@ What to do instead:
         # or GIT_DIR names its path. The first candidate git answers on decides, as above, and only a
         # governed answer is used, so this can add a deny and never remove one. See THE ADDED READINGS.
         #
-        # Its window starts at the git WORD that owns the disarm, as rule 3's does (a `git.EXE` or `GIT`
-        # the token pattern misses must not reach back over `;`), and for a `-c <key>=<v>` disarm it runs
+        # Its window starts after the last separator before a git word that owns the disarm (a
+        # `git.EXE` or `GIT` the token pattern misses must not reach back over `;`), and for a `-c <key>=<v>` disarm it runs
         # on over the global options that follow, so `git -c <key>=<v> -C <ungoverned> commit` reads that
         # `-C` (review round b62475f26d). A `config` disarm has every global option before it.
         if (-not $govCfg) {
@@ -4137,8 +4184,30 @@ What to do instead:
                     '^\S*(?:\s+(?:-[Cc]\s+\S+|--(?:git-dir|work-tree|namespace)(?:=\S+|\s+\S+)|--?[A-Za-z][\w-]*(?:=\S+)?))*')
                 $readTo = $keyAt + $globals.Length
             }
-            $gitWord = Get-AnyGitWordBefore $seg.Scan $dis.Index
-            foreach ($reading in @(Get-InvocationReading $seg.Scan $readTo -GitAt $gitWord -Prior $seg.Prior)) {
+            # BOTH GIT WORDS ARE READ, AND THE DISARM'S LAST `config` WORD TOO (BACKLOG #5655 steps 1
+            # and 3). The broad word answers the git inside a `$( )` that closes before the disarm, so
+            # `git -C '<p>' -c user.name=$(git log -1) config <key>` read no `-C`; the owning word skips
+            # a closed group. And the disarm regex can anchor on an inner `config`
+            # (`-c user.name=$(git config user.name) config <key>`), so the owning word of the LAST
+            # `config` in the match is read as well. Each extra reading can only add a deny.
+            $anchors = @($dis.Index)
+            if ($viaConfig) {
+                $cfgWords = [regex]::Matches($via, '\bconfig\b', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                $lastCfg = $dis.Index + $cfgWords[$cfgWords.Count - 1].Index
+                if ($lastCfg -ne $dis.Index) { $anchors += $lastCfg }
+            }
+            $pairs = [System.Collections.Generic.List[object]]::new()
+            foreach ($anchor in $anchors) {
+                $to = $(if ($viaConfig) { $anchor } else { $readTo })
+                foreach ($gw in @((Get-AnyGitWordBefore $seg.Scan $anchor), (Get-GitWordBefore $seg.Scan $anchor))) {
+                    if ($gw -lt 0 -and $pairs.Count -gt 0) { continue }
+                    if (-not ($pairs | Where-Object { $_.To -eq $to -and $_.Git -eq $gw })) {
+                        $pairs.Add([pscustomobject]@{ To = $to; Git = $gw })
+                    }
+                }
+            }
+            foreach ($reading in @(foreach ($pair in $pairs) {
+                        Get-InvocationReading $seg.Scan $pair.To -GitAt $pair.Git -Prior $seg.Prior })) {
                 $govCfg = Find-FirstAnsweringRoot (Get-InvocationCandidates $reading $cwdRaw `
                               -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir) $cwdRaw
                 if ($govCfg) { break }
