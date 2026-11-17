@@ -141,9 +141,8 @@ characters in it and the command was allowed. Until BACKLOG #5655 rule 3 took th
 every invocation's target, so an earlier command's `-C`, or one inside a quoted argument, hid a later
 `git reset --hard` in the primary, and rule 3b judged only the first invocation. Many more
 invocations, verb-bearing ones for rules 3 and 3b and disarming ones for rule 3c, are now also read
-from their own tokens, after the gate's own unquoting. That reading is added after the old one and can
-only add a refusal, so nothing the gate refused before is allowed now, and the old reading's false
-refusals stay. A misreading in the new one is a new false refusal. It does not close the class: the
+from their own tokens, after the gate's own unquoting. That reading is added after the old one, and the
+old reading's false refusals stay. A misreading in the new one is a new false refusal. It does not close the class: the
 unquoting does not match the shell in every form, and at least some quoted paths and some invocations
 are still allowed. The ADDED READINGS note in the hook is the source of record for what the added
 reading misses and for the known false refusals.

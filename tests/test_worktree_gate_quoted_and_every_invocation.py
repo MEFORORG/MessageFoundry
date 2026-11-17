@@ -599,3 +599,25 @@ def test_a_glued_pair_elsewhere_does_not_arm_the_join_under_powershell(
     subprocess.run(["git", "init", "-q", "-b", "main", str(copy)], check=True, capture_output=True)
     command = _fmt(rig, "echo a'' ; git -C {p}' copy' reset --hard")
     assert _allowed(rig, command, rig.outside, "PowerShell")
+
+
+def test_a_joined_payload_does_not_hide_a_later_lines_payload(rig: SimpleNamespace) -> None:
+    # Review round 462e4285: the joined payload of line 1 was emitted ahead of line 2's payload, so
+    # rule 3b judged line 1's checkout (in an ungoverned repository) and never reached line 2's.
+    # Measured ALLOW at a6da3c77526 and DENY on origin/main f0e49f45c5c.
+    who = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    for args in (["commit", "-q", "--allow-empty", "-m", "x"], ["branch", rig.other]):
+        subprocess.run(
+            ["git", *who, "-C", str(rig.outside), *args], check=True, capture_output=True
+        )
+    first = r"bash -c 'git -C '\''{o}'\'' checkout {b}'"
+    second = "bash -c 'git -C {wt} -C \"\" checkout {b}'"
+    reason = _reason(rig, _fmt(rig, first + "\n" + second), rig.outside)
+    assert "LINKED WORKTREE" in reason, reason
+
+
+def test_known_gap_a_separator_inside_a_closed_substitution(rig: SimpleNamespace) -> None:
+    # Known gap, ALLOW on origin/main f0e49f45c5c too: the `|` inside the closed `$( )` stops rule 3c's
+    # owning-word reading, so the outer quoted `-C` is not read. A fix flips this row.
+    command = _fmt(rig, "git -C '{p}' -c user.name=$(git log -1 | head -1) config {k}")
+    assert _allowed(rig, command, rig.outside)
