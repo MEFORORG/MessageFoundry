@@ -187,14 +187,16 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
 
 
 def _invalid_response_errors() -> tuple[type[Exception], ...]:
-    """:func:`_invalid_input_errors` plus ``RecursionError``, for the library's parse of a ceremony
-    RESPONSE only (vault BACKLOG #5341). The library's own ``json.loads`` raises it, unwrapped, for
-    a response nested too deep for the stack. Its message names stack use, not the input.
+    """:func:`_invalid_input_errors` plus ``RecursionError``, caught around the whole library verify
+    call of each ceremony (vault BACKLOG #5341). The library's own ``json.loads`` raises it,
+    unwrapped, for a response nested too deep for the stack. Its message names stack use, not the
+    input.
 
-    Not around the stored-key check: a key that registered once has no such nesting, so there a
-    ``RecursionError`` would mean a low stack, not a bad credential. Nor does it reach a caller
-    that parses the body itself before calling in: at least the web console's passkey routes do,
-    and their own parse raises it first."""
+    In :func:`verify_assertion` that call also decodes the stored key, so a ``RecursionError``
+    from that decode, for example on a low stack, is refused as invalid input too. Our own
+    stored-key check, :func:`_require_usable_public_key`, runs before that call and does not catch
+    it. Nor does this reach a caller that parses the body itself before calling in: at least the
+    web console's passkey routes do, and their own parse raises it first."""
     return (*_invalid_input_errors(), RecursionError)
 
 
