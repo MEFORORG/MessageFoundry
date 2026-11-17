@@ -839,7 +839,7 @@ Named as `allow_lost_audit_range_key` (BACKLOG #4934), whatever the store holds,
 the next start may do.
 - **What you lose:** the `serve` and `supervise` start refusal that keeps the keyed audit chain across a store key
   change. This entry states when that refusal fires and the way out. With it off,
-  `serve` (and each `supervise` shard) refuses to start when all of these hold: the engine holds a
+  `serve` (and each `supervise` engine shard) refuses to start when all of these hold: the engine holds a
   local store key, so not under `[store].cipher_provider = "vault_transit"`; the stamp does not
   name that key, which covers a different key, no stamp, and a stamp under a scheme this release
   does not know; the store has a keyed audit chain in which the open found no range that fails to
@@ -859,9 +859,10 @@ the next start may do.
 - **Compensating controls:** none that restore the chain. Record when and why the key was lost, keep
   the `audit-verify` output from before the start, and treat the break as a known event in any audit
   review.
-- **Reversible:** no, once a start has used it: the chain stays broken at that row. Turned back
-  off, the next start refuses again while the lost range key is still not configured. Set only and
-  never used, it can be removed.
+- **Reversible:** no, once a start has used it: the chain stays broken at that row. Once it has let
+  a start through on a key whose range key is truly lost, every later start on that key refuses
+  again without it. While it stays on, it also lets through a later, unrelated store key change
+  whose range key is lost. Set only and never used, it can be removed.
 
 ### `[cert_monitor].warn_days` or `[secret_rotation].warn_days` at `0`, or below its default — a credential reminder is off or late
 Named as `cert_monitor.warn_days` and `secret_rotation.warn_days` (ASVS 6.4.5, BACKLOG #2227). A

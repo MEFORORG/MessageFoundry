@@ -5266,7 +5266,7 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
 
     state_dir = generated_state_dir(store_path)
     replaced: list[GeneratedPairReplaced] = []
-    # BACKLOG #4934: a start that may replace the pair opens the store and takes the shards' start
+    # BACKLOG #4934: a start that may replace the pair opens the store and takes the engine shards' start
     # refusal before it renews the pair. Any other start mints or reuses as before, and opens the
     # store only if that replaced a pair after all.
     renew_after_refusal = generated_pair_may_be_replaced(settings.api, state_dir=state_dir)
