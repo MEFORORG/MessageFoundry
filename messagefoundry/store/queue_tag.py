@@ -259,11 +259,13 @@ def is_tag_failure(cipher: Cipher, stored: str) -> bool:
     return bool(holds(stored)) if callable(holds) else True
 
 
-#: The only HTTP statuses that are the key service's verdict on the row (BACKLOG #5765): 400
-#: (invalid ciphertext or input, a key version that is unknown or below the key's
-#: ``min_decryption_version``) and 413 (payload too large). A 404 is not one: Vault answers it for a
-#: path it has no handler for, such as a missing mount or a wrong namespace, and the path is built
-#: from engine config, never from the row.
+#: The only HTTP statuses that are the key service's verdict on the row (BACKLOG #5765): 400 and
+#: 413. A 400 is at least invalid ciphertext or input, or a key version that is unknown or below
+#: the key's ``min_decryption_version``, and Transit also answers it when the configured key itself
+#: is missing ("encryption key not found"); this rule reads every 400 as a verdict all the same. A
+#: 413 is a payload too large. A 404 is not a verdict: Vault answers it for a path it has no handler
+#: for, such as a missing mount or a wrong namespace, and the path is built from engine config,
+#: never from the row.
 _VERDICT_STATUSES: Final = frozenset({400, 413})
 
 #: The ``hvac`` error classes for a reply whose status is not a verdict, as hvac 2.4.0's
@@ -271,9 +273,10 @@ _VERDICT_STATUSES: Final = frozenset({400, 413})
 #: ``InvalidPath``, 429 ``RateLimitExceeded``, 500 ``InternalServerError``, 501
 #: ``VaultNotInitialized``, 502 ``BadGateway``, 503 ``VaultDown`` (a sealed or standby node), and
 #: ``UnexpectedError`` for every other status. hvac also defines ``UnsupportedOperation`` and
-#: ``PreconditionFailed``, which that map does not raise. Read only when no status was recorded on
-#: the error. ``InvalidRequest`` (400) is a verdict, so it is not here. Named rather than imported, so ``hvac`` stays imported in
-#: ``keyprovider_vault`` only (BACKLOG #2337).
+#: ``PreconditionFailed``, which that map does not raise; they are kept in case another hvac
+#: release or caller raises them for a 405 or 412, neither of which is a verdict. Read only when no
+#: status was recorded on the error. ``InvalidRequest`` (400) is a verdict, so it is not here. Named
+#: rather than imported, so ``hvac`` stays imported in ``keyprovider_vault`` only (BACKLOG #2337).
 _NO_VERDICT_HVAC_ERRORS: Final = frozenset(
     {
         "Unauthorized",
