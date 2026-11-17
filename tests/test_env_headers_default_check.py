@@ -75,3 +75,28 @@ def test_a_reference_deeper_than_envrefs_own_scan_is_refused_in_the_default() ->
     ref = messagefoundry.env("all_headers", default={"X-A": deep})  # the control: EnvRef passes it
     with pytest.raises(WiringError, match=r"default= of its headers\) headers may not use env"):
         HEADERS_FACTORIES["Rest"](ref)
+
+
+@pytest.mark.parametrize(
+    "value", [SENTINEL, ["X-A", "b"], MappingProxyType({"X-A": "b"})], ids=["str", "list", "proxy"]
+)
+def test_an_environment_value_that_is_not_a_table_is_refused_once_resolved(value: Any) -> None:
+    """BACKLOG #5328: the environment value is held to the rule the default= is held to."""
+    spec = HEADERS_FACTORIES["Rest"](messagefoundry.env("all_headers"))
+    with pytest.raises(WiringError, match="not a table") as excinfo:
+        resolve_env_settings(spec.settings, {"all_headers": value})
+    assert SENTINEL not in str(excinfo.value)
+
+
+def test_an_environment_table_holding_a_reference_is_refused_once_resolved() -> None:
+    spec = HEADERS_FACTORIES["Rest"](messagefoundry.env("all_headers"))
+    table = {"X-Partner-Key": {"env": "partner_key", "default": SENTINEL}}
+    with pytest.raises(WiringError, match="may not use env") as excinfo:
+        resolve_env_settings(spec.settings, {"all_headers": table})
+    assert SENTINEL not in str(excinfo.value)
+
+
+def test_an_environment_table_still_resolves() -> None:
+    spec = HEADERS_FACTORIES["Rest"](messagefoundry.env("all_headers"))
+    resolved = resolve_env_settings(spec.settings, {"all_headers": {"X-Trace": "probe-1"}})
+    assert resolved["headers"] == {"X-Trace": "probe-1"}

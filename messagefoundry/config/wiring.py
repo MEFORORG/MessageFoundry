@@ -686,6 +686,19 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
         )
 
 
+def _resolved_headers_problem(value: object) -> str | None:
+    """Why the environment value a whole-table ``headers`` reference resolved to cannot be sent,
+    or ``None``: the table rule :func:`_reject_envref_headers` holds its ``default=`` to (BACKLOG
+    #5328). Names only the type or the header names, never a value."""
+    if not isinstance(value, dict):
+        return f"value is not a table but {type(value).__name__} (value withheld)"
+    try:
+        _reject_envref_headers("the resolved", value)
+    except WiringError as exc:
+        return str(exc)
+    return None
+
+
 def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
     """Refuse an ``env()`` reference written as an ITEM of a list-valued setting (BACKLOG #1820).
 
@@ -1892,6 +1905,17 @@ def resolve_env_settings(
                     bad.append(problem)
                 continue
             resolved[name] = got
+            # A whole-table headers reference's environment value is held to the rule its
+            # default= is held to at the factory (BACKLOG #5328): every connector's header builder
+            # sends only a dict, and silently drops anything else.
+            if (
+                name == "headers"
+                and source == "value"
+                and got is not None
+                and (problem_text := _resolved_headers_problem(got))
+            ):
+                bad.append(f"setting {name!r} (env {value.key!r}): {problem_text}")
+                continue
             if name in _NON_BLANK_ENV_SETTINGS and isinstance(got, str) and not got.strip():
                 # No ":" or "=" after the name: the log scrubber reads "LABEL: value" as a secret.
                 owner = f" of connection {connection!r}" if connection else ""

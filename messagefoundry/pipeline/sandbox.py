@@ -348,6 +348,9 @@ def graph_shape(registry: Any) -> GraphShape:
 #: How a refusal names a difference in the config modules' bytes alone.
 _CONTENT_DIFFERS: Final = "config module content"
 
+#: How a refusal names an engine graph that carries no config-module digest (BACKLOG #5334).
+_ENGINE_UNDIGESTED: Final = "the engine's graph was not loaded from a config directory"
+
 #: The accessor each lookup kind names, for the broker's refusals and log lines.
 _LOOKUP_FN: Final = {codec.LOOKUP_DB: "db_lookup", codec.LOOKUP_FHIR: "fhir_lookup"}
 
@@ -383,7 +386,9 @@ def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
 
     ``bindings`` is compared over the inbounds the ENGINE holds. An engine shard holds only its
     own, while its worker loads the whole config, so the worker's other bindings are not a
-    difference. ``code_digest`` is compared whenever the engine has one: a config module whose
+    difference. An engine graph with no ``code_digest`` is itself a difference (BACKLOG #5334): a
+    load always records one, and a graph built in code cannot vouch for the worker's code. Otherwise
+    ``code_digest`` is compared: a config module whose
     bytes differ from the ones the engine loaded differs there even when every name is the same
     (vault BACKLOG #2724; since #2596 a worker runs the engine's snapshot, so this is a backstop). A worker of the same build with no digest could not read its own
     modules, so that is a difference too, never a pass."""
@@ -410,7 +415,13 @@ def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
         found.append(f"router bindings (of inbound: {_shown(rebound)})")
     # Plain comparison: both are public digests of the config's bytes, so there is nothing to time,
     # and the constant-time helper would add a crypto operation to this module's inventory.
-    if engine.code_digest is not None and worker.code_digest != engine.code_digest:
+    if engine.code_digest is None:
+        # FAIL CLOSED (BACKLOG #5334). A load always records a digest, so an engine graph with
+        # none was built in code, or by a path that lost it, and nothing can say the worker runs
+        # the code it runs. Refused rather than given a digest read now from disk, which would
+        # describe the directory, not the functions the engine holds.
+        found.append(f"{_ENGINE_UNDIGESTED} (it has no digest to compare the worker's with)")
+    elif worker.code_digest != engine.code_digest:
         # The worker's digest is checked as hex by the codec, so it needs no scrub here.
         worker_side = (
             worker.code_digest[:12] if worker.code_digest else "none: it could not read them"
@@ -1131,6 +1142,9 @@ class SandboxSession:
                     "The worker ran other config module bytes than the engine loaded: reload the "
                     "config."
                     if content_only
+                    else "Serve a graph loaded from the config directory, whose module digest a "
+                    "worker can be held to."
+                    if engine_graph.code_digest is None
                     else "Config code most likely reads an environment variable the worker is "
                     "not given, because the worker runs the config again under an allowlisted "
                     "environment: name each such variable in [sandbox].pass_environment and "
