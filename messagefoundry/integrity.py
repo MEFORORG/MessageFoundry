@@ -187,10 +187,7 @@ _BYTECODE_CACHE_DIR = "__pycache__"
 #: sanctioned no-op — a dev checkout that has no baseline by design (ADR 0041 AC-12). Every other value
 #: but one is an install whose tripwire is disarmed, which a fail-closed site refuses to start on
 #: (BACKLOG #1679). The exception is ``no_file_compared_under_install_root``: the package sits under
-#: the install root and nothing in it was compared (BACKLOG #5376). Both callers of
-#: :func:`_attest_distribution` pass ``unmatched_rows``, and with it that pass carries ``missing``
-#: drift, which is what is acted on. A caller that passed ``package_roots`` without
-#: ``unmatched_rows`` could get this reason with no drift. A ``Literal`` rather
+#: the install root and nothing in it was compared (BACKLOG #5376). A ``Literal`` rather
 #: than a bare ``str`` so a typo at a construction site is a type error instead of a reason nobody
 #: can match on. ``console_attestation_raised`` is the web console arm's
 #: alone (BACKLOG #1802): its pass raised, so it compared nothing that can be trusted.
@@ -1051,8 +1048,7 @@ async def run_startup_attestation(
       package): a WARNING, the same audit row, and the same alert channel under a distinct subject.
       A pass with ``checked == 0`` AND drift, such as ``no_file_compared_under_install_root`` (an
       emptied package under the install root, BACKLOG #5376), is handled as drift: an ERROR, under
-      the drift subject. The tripwire is disarmed in
-      this shape; before BACKLOG #1679 it was reported as clean;
+      the drift subject;
     - either of the last two **and** ``fail_closed_on_drift``: after recording + alerting, raise
       :class:`IntegrityError` so the caller refuses to start before any listener binds.
 
