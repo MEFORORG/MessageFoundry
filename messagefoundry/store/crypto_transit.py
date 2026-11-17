@@ -342,15 +342,21 @@ def _warn_quietly(message: str, *args: object) -> bool:
 def _warn_when_due(kind: object, message: str, *args: object) -> None:
     """:func:`_warn_quietly`, unless the warning ``kind`` was logged in the last
     :data:`_WARNING_LOG_INTERVAL_S`. Only an emitted warning counts as logged, so one that failed
-    is tried again next time."""
+    is tried again next time. The slot is taken before the warning, so concurrent callers emit it
+    once."""
     with _logged_at_lock:
         last = _logged_at.get(kind)
         now = time.monotonic()
         if last is not None and now - last < _WARNING_LOG_INTERVAL_S:
             return
-    if _warn_quietly(message, *args):
+        _logged_at[kind] = now
+    if not _warn_quietly(message, *args):
         with _logged_at_lock:
-            _logged_at[kind] = now
+            if _logged_at.get(kind) == now:  # give the slot back unless a later caller took it
+                if last is None:
+                    del _logged_at[kind]
+                else:
+                    _logged_at[kind] = last
 
 
 def _log_unread_decrypt_body(length: int) -> None:

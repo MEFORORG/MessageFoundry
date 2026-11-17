@@ -1649,9 +1649,10 @@ def _raising_log_filter() -> Any:
 def test_a_raising_log_filter_never_turns_a_break_into_could_not_run(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """BACKLOG #6707: every audit verify path that logs beside a break keeps the break when the
-    log itself raises: the unconfirmed label, a row refused twice, and a malformed stored MAC
-    whose cost-only call failed. The failure is reported by its class on stderr."""
+    """BACKLOG #6707: the Transit cipher's audit verify paths that log beside a break keep the
+    break when the log call itself raises: at least the unconfirmed label, a row refused twice,
+    and a malformed stored MAC whose cost-only call failed. A failure is reported by its class
+    on stderr."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
