@@ -19,6 +19,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -508,7 +509,8 @@ async def test_retries_go_oldest_first_and_a_deferred_one_survives_pruning(
     allowance leaves for later is still listed, so pruning keeps it. The control: a remembered
     reject that is no longer listed is pruned in the same run, so pruning is live.
 
-    Mutation: drop the ``due.sort`` in ``_scan_once``. Red: a0, which sorts first, is retried first.
+    Mutation: take the due retries in listing order rather than by ``heapq.nsmallest`` in
+    ``_scan_once``. Red: a0, which sorts first, is retried first.
     Mutation: let ``_prune_stuck`` drop an entry that is due. Red: a0 is forgotten."""
     rig = _Rig(tmp_path, monkeypatch, cap=10)
     for name in ("a0.hl7", "a1.hl7", "c.hl7"):
@@ -680,6 +682,89 @@ async def test_a_retry_left_in_place_keeps_its_back_off(
     assert rig.source._stuck == {}
 
 
+def _retry_in(rig: _Rig, name: str) -> float:
+    """Seconds until the remembered reject ``name`` falls due its retry."""
+    return rig.source._stuck[str(rig.inbox / name)][0].due - time.monotonic()
+
+
+@pytest.mark.usefixtures("_no_scan_hook")
+async def test_a_retry_held_back_by_a_handler_failure_waits_the_short_back_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lasting reject whose retry now passes the scan but whose hand-off fails waits
+    ``STUCK_TRANSIENT_RETRY_SECONDS``, since a handler or store outage may clear by itself. Rejected
+    again on the retry after that, with the move still failing for a lasting reason, it waits
+    ``STUCK_RETRY_SECONDS`` again.
+
+    Mutation: drop the ``_delay_retry`` call in ``_examine``'s handler-failure arm. Red: it waits
+    the reject's ``STUCK_RETRY_SECONDS``."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    verdicts = {"reject": True}
+
+    def hook(_raw: bytes, _source: str) -> None:
+        if verdicts["reject"]:
+            raise ScanRejected("test signature")
+
+    async def handler(_raw: bytes) -> str | None:
+        raise RuntimeError("store unavailable")
+
+    set_scan_hook(hook)
+    rig.source._handler = handler
+    rig.drop("a.hl7", _HL7)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    short, long = file_mod.STUCK_TRANSIENT_RETRY_SECONDS, file_mod.STUCK_RETRY_SECONDS
+    assert long - 5 < _retry_in(rig, "a.hl7") <= long, "an EACCES move failure is lasting"
+
+    verdicts["reject"] = False
+    _age_stuck(rig)
+    assert await rig.scan() == []  # the retry settles
+    assert await rig.scan() == ["a.hl7"]
+    assert short - 5 < _retry_in(rig, "a.hl7") <= short
+
+    verdicts["reject"] = True
+    _age_stuck(rig)
+    assert await rig.scan() == []
+    assert await rig.scan() == ["a.hl7"]
+    assert long - 5 < _retry_in(rig, "a.hl7") <= long
+
+
+async def test_a_retry_the_full_settle_memory_refuses_yields_its_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A due retry the settle gate cannot record, because the settle memory is at
+    ``SETTLE_SEEN_MAX``, waits its back-off rather than staying due. Otherwise it would keep the
+    earliest due time and so take the one retry slot on every scan, and the retry behind it would
+    never run.
+
+    Mutation: drop the ``_delay_retry`` call in ``_examine``'s settle branch. Red: a0 takes the slot
+    again on the second scan, and a1 stays due."""
+    monkeypatch.setattr(file_mod, "SETTLE_SEEN_MAX", 2)  # bounds the stuck memory too
+    rig = _Rig(tmp_path, monkeypatch, cap=1)
+    rig.drop("a0.hl7", _PDF)
+    rig.drop("a1.hl7", _PDF)
+    for _ in range(4):
+        await rig.scan()
+    assert len(rig.source._stuck) == 2
+    _age_stuck(rig)
+    stuck = rig.source._stuck
+    key = str(rig.inbox / "a0.hl7")
+    stuck[key] = (stuck[key][0]._replace(due=stuck[key][0].due - 1), 0)  # a0 sorts first
+
+    def fill_settle_memory() -> None:
+        rig.source._settle_seen.clear()
+        for n in range(file_mod.SETTLE_SEEN_MAX):
+            rig.source._settle_seen[f"unlisted{n}"] = ((0, 0), 0)
+
+    fill_settle_memory()
+    assert await rig.scan() == []
+    assert _retry_in(rig, "a0.hl7") > 0, "refused by the settle memory, so it waits"
+    assert _retry_in(rig, "a1.hl7") <= 0
+    fill_settle_memory()
+    assert await rig.scan() == []
+    assert _retry_in(rig, "a1.hl7") > 0, "the slot went to a1"
+
+
 async def test_failed_listings_do_not_wipe_the_stuck_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -772,6 +857,8 @@ async def test_a_reject_gone_after_a_failed_move_is_not_remembered(
 class _FailingStat:
     """A path whose ``lstat`` raises ``exc``."""
 
+    name = "a.hl7"
+
     def __init__(self, exc: OSError) -> None:
         self.exc = exc
 
@@ -789,14 +876,23 @@ class _FailingStat:
         (OSError(errno.ENOENT, "gone"), False),
         (_win_os_error(errno.ENOENT, 2), False),  # ERROR_FILE_NOT_FOUND
         (OSError(errno.EACCES, "denied"), False),
+        (_win_os_error(errno.EACCES, 303), False),  # ERROR_DELETE_PENDING
     ],
 )
-def test_a_transient_stat_failure_does_not_read_as_the_file_gone(exc: OSError, holds: bool) -> None:
+def test_a_transient_stat_failure_does_not_read_as_the_file_gone(
+    exc: OSError, holds: bool, caplog: pytest.LogCaptureFixture
+) -> None:
     """After a failed move, a stat that fails for a reason that may clear by itself is no evidence
-    the file has gone, so the reject is kept; a missing file is still gone.
+    the file has gone, so the reject is kept; a missing file, or one pending deletion, is still
+    gone, and that reading is logged at DEBUG.
 
-    Mutation: return False for every ``OSError`` in ``_holds``. Red: the transient rows."""
+    Mutation: return False for every ``OSError`` in ``_holds``. Red: the transient rows. Mutation:
+    use ``_TRANSIENT_WINERRORS`` for a stat. Red: the ERROR_DELETE_PENDING row."""
+    caplog.set_level(logging.DEBUG, logger=file_mod.__name__)
     assert file_mod._holds(cast(Path, _FailingStat(exc)), None) is holds
+    gone = [r for r in caplog.records if "read as gone" in r.getMessage()]
+    assert len(gone) == (0 if holds else 1)
+    assert all(r.levelno == logging.DEBUG for r in gone)
 
 
 async def test_a_reject_whose_stat_times_out_after_a_failed_move_is_kept(

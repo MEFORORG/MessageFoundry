@@ -145,9 +145,9 @@ class _Archived(NamedTuple):
 # Failures that may clear by themselves (BACKLOG #5717): :func:`_lasting` reads a failed move that hit
 # one as not lasting, and FileSource._quarantine says what that means for the reject's retry. At
 # least: another process holds the file open or locked, the file vanished, the disk or quota is full,
-# or a share timed out or dropped. Any other failure (access denied, a read-only volume, a link) is
-# taken as lasting, and the file is examined again after ``STUCK_RETRY_SECONDS``, which bounds what a
-# wrong guess costs.
+# or a share timed out or dropped. So is an OSError with no errno, which says nothing of its cause.
+# Any other failure (access denied, a read-only volume, a link) is taken as lasting, and the file is
+# examined again after ``STUCK_RETRY_SECONDS``, which bounds what a wrong guess costs.
 _TRANSIENT_ERRNOS = frozenset(
     getattr(errno, name)
     for name in (
@@ -188,6 +188,8 @@ _TRANSIENT_WINERRORS = frozenset(
     {21, 31, 32, 33, 53, 54, 55, 59, 64, 67, 69, 70, 71, 121, 240, 303, 1222, 1224, 1231, 1232}
     | {1236, 1450, 2250}
 )
+# On a stat, ERROR_DELETE_PENDING says the file is being deleted, so :func:`_holds` reads it as gone.
+_TRANSIENT_STAT_WINERRORS = _TRANSIENT_WINERRORS - {303}
 # ERROR_PATH_NOT_FOUND. Windows maps it to ENOENT, which alone would read as a vanished file, but a move
 # by handle of a file the engine already holds meets it when the archive directory is missing.
 _WIN_PATH_NOT_FOUND = 3
@@ -1383,14 +1385,18 @@ class FileSource(SourceConnector):
             # BACKLOG #1811: first sighting, or the file changed since the last poll. Nothing is
             # read, moved or charged against the per-tick budget, the same as #116's skip below. A
             # due retry takes this gate too, and stays due, so a later scan's retry pass reads it.
+            if retry and key in self._stuck and key not in self._settle_seen:
+                # The settle memory is full and refused it, so it would stay due and, sorting
+                # first, hold a retry slot on every scan. It waits its back-off instead.
+                self._delay_retry(key, self._stuck[key][0].wait)
             return _Step.FREE
         if retry and key in self._stuck:
             # Judged afresh below. Its back-off starts again now, before the read, so an arm that
-            # leaves it in place (at least a failed read, a refused link, a scan hook or handler
-            # failure) leaves it waiting that back-off rather than due on every scan. A reject
-            # remembers it anew, and a hand-off or a reject that does not stay forgets it.
-            seen = self._stuck[key][0]
-            self._stuck[key] = (seen._replace(due=time.monotonic() + seen.wait), 0)
+            # leaves it in place (at least a failed read, a refused link or a scan hook failure)
+            # leaves it waiting that back-off rather than due on every scan; a handler failure
+            # shortens it below. A reject remembers it anew, and a hand-off or a reject that does
+            # not stay forgets it.
+            self._delay_retry(key, self._stuck[key][0].wait)
         try:
             raw, read_sig, read_id = await self._run_fs(self._read_settled, path)
         except _Unconfined:
@@ -1542,6 +1548,10 @@ class FileSource(SourceConnector):
                 safe_name(path.name),
                 safe_exc(exc, file_name=path.name),
             )
+            if retry and key in self._stuck:
+                # The file passed this time, and an outage that may clear by itself held it back,
+                # so it is retried after the short back-off rather than the reject's.
+                self._delay_retry(key, STUCK_TRANSIENT_RETRY_SECONDS)
             return _Step.FREE
         if not completed:
             # Stopped between a batch file's hand-offs (#1620). The file stays put, so the next
@@ -1622,6 +1632,11 @@ class FileSource(SourceConnector):
         wait = STUCK_RETRY_SECONDS if lasting else STUCK_TRANSIENT_RETRY_SECONDS
         self._stuck[key] = (_StuckSeen(mark, time.monotonic() + wait, wait), 0)
         return True
+
+    def _delay_retry(self, key: str, wait: float) -> None:
+        """Make the remembered stuck reject at ``key`` due its retry ``wait`` seconds from now."""
+        seen = self._stuck[key][0]
+        self._stuck[key] = (seen._replace(due=time.monotonic() + wait), 0)
 
     def _stuck_step(self, key: str, mark: _FileMark, *, retry: bool) -> _Step | None:
         """What a remembered stuck reject at ``key`` costs this scan (BACKLOG #5717), or None to
@@ -3790,15 +3805,28 @@ def _holds(path: Path, read_id: _FileId | None) -> bool:
     try:
         st = path.lstat()
     except OSError as exc:
-        return _transient_stat_failure(exc)
+        if _transient_stat_failure(exc):
+            return True
+        if logger.isEnabledFor(logging.DEBUG):  # safe_name hashes; at most once per failed move
+            logger.debug(
+                "file source: stat of %s failed (errno %s, winerror %s); read as gone",
+                safe_name(path.name),
+                exc.errno,
+                getattr(exc, "winerror", None),
+            )
+        return False
     return read_id is None or _file_id(st) == read_id
 
 
 def _transient_stat_failure(exc: OSError) -> bool:
-    """Whether a failed stat may clear by itself (BACKLOG #5717): a transient Windows code, or a
-    transient errno other than ENOENT, which says the file is gone."""
-    if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
+    """Whether a failed stat may clear by itself (BACKLOG #5717): a transient Windows code other than
+    ERROR_DELETE_PENDING, or a transient errno other than ENOENT. Both of those say the file is
+    gone, or about to be."""
+    winerror = getattr(exc, "winerror", None)
+    if winerror in _TRANSIENT_STAT_WINERRORS:
         return True
+    if winerror in _TRANSIENT_WINERRORS:
+        return False  # ERROR_DELETE_PENDING: the file is on its way out
     return exc.errno in _TRANSIENT_ERRNOS and exc.errno != errno.ENOENT
 
 
