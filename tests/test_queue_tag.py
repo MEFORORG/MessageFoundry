@@ -362,8 +362,12 @@ def _caused(cause: BaseException | None, cls: type[CipherError] = CipherError) -
     return error
 
 
-def _with_status(exc: BaseException, status: int) -> BaseException:
-    exc.mefor_reply_status = status  # type: ignore[attr-defined]
+def with_reply_status[E: BaseException](exc: E, status: int) -> E:
+    """``exc`` carrying ``status`` as the store's Vault client records it (BACKLOG #8222), under
+    the client's own attribute name, so a rename cannot leave these tests setting a dead one."""
+    from messagefoundry.store import keyprovider_vault  # noqa: PLC0415
+
+    setattr(exc, keyprovider_vault._REPLY_STATUS_ATTR, status)
     return exc
 
 
@@ -384,10 +388,10 @@ def test_the_no_verdict_rule_reads_the_status_first_on_any_cause() -> None:
         hv.RateLimitExceeded(),
         hv.VaultDown(),
         hv.UnexpectedError("no status recorded"),
-        _with_status(hv.UnexpectedError("timeout"), 408),
-        _with_status(TypeError("unreadable body"), 503),
-        _with_status(AttributeError("unreadable body"), 401),
-        _with_status(hv.InvalidRequest(), 503),  # the status wins over the class
+        with_reply_status(hv.UnexpectedError("timeout"), 408),
+        with_reply_status(TypeError("unreadable body"), 503),
+        with_reply_status(AttributeError("unreadable body"), 401),
+        with_reply_status(hv.InvalidRequest(), 503),  # the status wins over the class
         requests.exceptions.SSLError("certificate verify failed"),
         requests.exceptions.ChunkedEncodingError("connection broken"),
         ConnectionResetError("reset by peer"),
@@ -397,9 +401,9 @@ def test_the_no_verdict_rule_reads_the_status_first_on_any_cause() -> None:
     verdict: list[BaseException | None] = [
         hv.InvalidRequest(),
         hv.InvalidPath(),
-        _with_status(hv.UnexpectedError("too large"), 413),
-        _with_status(hv.Forbidden(), 404),  # the status wins over the class
-        _with_status(TypeError("unreadable body"), 400),
+        with_reply_status(hv.UnexpectedError("too large"), 413),
+        with_reply_status(hv.Forbidden(), 404),  # the status wins over the class
+        with_reply_status(TypeError("unreadable body"), 400),
         hv.ParamValidationError("client-side"),  # unknown here: as before the rule
         KeyError("data"),  # a malformed reply, unknown here: as before the rule
         None,
@@ -408,5 +412,5 @@ def test_the_no_verdict_rule_reads_the_status_first_on_any_cause() -> None:
         assert not is_transient_open_failure(_caused(maybe)), maybe
     # A tag check that ran and failed is a verdict whatever its cause says.
     assert not is_transient_open_failure(
-        _caused(_with_status(hv.VaultDown(), 503), UnauthenticatedCipherError)
+        _caused(with_reply_status(hv.VaultDown(), 503), UnauthenticatedCipherError)
     )

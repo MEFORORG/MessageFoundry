@@ -129,9 +129,7 @@ def set_aside_deadline(claim_now: float | None) -> float:
     own ``claim_now`` plus the backoff either, so a claim given an injected time later than the
     clock still finds the row not due."""
     fault_at = time.time()
-    if claim_now is not None and claim_now > fault_at:
-        fault_at = claim_now
-    return fault_at + TRANSIENT_OPEN_BACKOFF_SECONDS
+    return max(fault_at, claim_now or fault_at) + TRANSIENT_OPEN_BACKOFF_SECONDS
 
 
 #: The errors a claim never contains as a failed dead-letter write (BACKLOG #5735): each names a
@@ -309,7 +307,10 @@ def _key_service_gave_no_verdict(exc: CipherError) -> bool:
 
     Deliberately not :func:`~messagefoundry.store.crypto.gave_no_verdict` or
     :func:`~messagefoundry.store.keyprovider_vault.is_vault_timeout_reply`: other modules read
-    those, and this rule does not change them."""
+    those, and this rule does not change them. Nor does it rest on the Transit cipher's own split
+    into :class:`CipherUnavailableError` (``keyprovider_vault.is_vault_unavailable``), which keeps
+    a 403, a 504 and a certificate refusal as plain refusals for the upload routes' 423: this rule
+    reads the cause itself, so for those three the two answers differ on purpose."""
     if isinstance(exc, UnauthenticatedCipherError):
         return False  # the decrypt ran and the tag check failed
     if isinstance(exc, CipherUnavailableError):

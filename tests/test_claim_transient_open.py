@@ -277,10 +277,7 @@ def _transit_error(kind: str) -> Callable[[], CipherError]:
     from hvac import exceptions as hv  # type: ignore[import-untyped]  # noqa: PLC0415
 
     from messagefoundry.store.crypto_transit import _transit_failure  # noqa: PLC0415
-
-    def recorded(exc: Exception, status: int) -> Exception:
-        exc.mefor_reply_status = status  # type: ignore[attr-defined]
-        return exc
+    from tests.test_queue_tag import with_reply_status as recorded  # noqa: PLC0415
 
     def unexpected(status: int) -> Exception:
         return recorded(hv.UnexpectedError(f"status {status}"), status)
