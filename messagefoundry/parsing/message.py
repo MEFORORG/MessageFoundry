@@ -21,7 +21,6 @@ re-encode.
 
 from __future__ import annotations
 
-import copy
 import json
 import re
 from datetime import date, datetime, timedelta
@@ -567,7 +566,8 @@ class Message:
         is still shared with a :meth:`copy` snapshot/clone, take a private deepcopy now (and clear the
         flag) so the mutation lands only on this message; if already owned it is a cheap no-op."""
         if self._shared:
-            self._m = copy.deepcopy(self._m)
+            # Not copy.deepcopy: a reader of the other side may be splitting this tree (#5801).
+            self._m = _builtin_hl7.clone(self._m)
             self._shared = False
 
     def __str__(self) -> str:

@@ -106,7 +106,8 @@ class SegmentGroup:
 
         Positional, so a fieldless bare ``OBR`` line counts here though :meth:`Message.field` and
         :meth:`Message.count_segments` skip it: after one, ``ordinal`` is not the occurrence
-        ``Message.field`` reads. Read the boundary through :meth:`field` instead (BACKLOG #5917)."""
+        ``Message.field`` reads. Read and write the boundary through :meth:`field` and :meth:`set`
+        instead (BACKLOG #5917)."""
         return self._ordinal
 
     def segment_ids(self) -> list[str]:
@@ -139,15 +140,29 @@ class SegmentGroup:
         separator/escaping/repetition behavior is identical. Returns None if absent, which includes
         every boundary field of a group opened by a fieldless bare boundary line, and a fieldless
         member line is no occurrence (BACKLOG #5917)."""
-        if occurrence < 1:
-            raise ValueError("occurrence is 1-based (>= 1)")
-        seg = self._segment_of_path(path)
-        global_occurrence = self._to_global_occurrence(seg, occurrence)
+        _seg, global_occurrence = self._resolve(path, occurrence)
         if global_occurrence is None:
             return None
         return self._m.field(path, occurrence=global_occurrence, repetition=repetition)
 
     # --- mutate --------------------------------------------------------------
+
+    def set(
+        self, path: str, value: str, *, occurrence: int = 1, repetition: int | None = None
+    ) -> None:
+        """Write ``value`` at ``path`` within this group, with ``occurrence`` scoped to the group as
+        :meth:`field` scopes it.
+
+        Use this, not ``Message.set(..., occurrence=group.ordinal)``: after a fieldless bare
+        boundary line the two numberings differ, and that write would land on another order
+        (BACKLOG #5917). Delegates to :meth:`Message.set` at the translated occurrence, so its
+        escaping and refusals apply unchanged. Raises ``KeyError`` when the group holds fewer than
+        ``occurrence`` addressable segments of that id, as ``Message.set`` does for a missing
+        segment; a group opened by a fieldless boundary line has no boundary to write."""
+        seg, global_occurrence = self._resolve(path, occurrence)
+        if global_occurrence is None:
+            raise KeyError(f"group {self._ordinal} holds no {seg} occurrence {occurrence}")
+        self._m.set(path, value, occurrence=global_occurrence, repetition=repetition)
 
     def append_segment(self, line: str) -> None:
         """Add a raw segment ``line`` (``"OBX|3|NM|K^Potassium||4.1"``) at the **end of this group**.
@@ -200,6 +215,15 @@ class SegmentGroup:
             self.append_segment(line)
 
     # --- internals -----------------------------------------------------------
+
+    def _resolve(self, path: str, occurrence: int) -> tuple[str, int | None]:
+        """``path``'s segment id and the message-wide occurrence of its ``occurrence``-th segment
+        in this group (None if the group holds fewer), the translation :meth:`field` and
+        :meth:`set` share."""
+        if occurrence < 1:
+            raise ValueError("occurrence is 1-based (>= 1)")
+        seg = self._segment_of_path(path)
+        return seg, self._to_global_occurrence(seg, occurrence)
 
     def _segment_of_path(self, path: str) -> str:
         """The segment id of an HL7 field ``path`` (e.g. ``"OBX-5"`` -> ``"OBX"``), validated."""

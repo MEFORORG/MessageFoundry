@@ -572,7 +572,7 @@ class _SplitDuringCopySegments(list[_builtin_hl7.Segment]):
 
 
 def test_a_split_during_the_copy_on_write_deepcopy_keeps_the_segment() -> None:
-    # copy.deepcopy reads the tree's keys in insertion order. Were segments read before _lazy, a
+    # The copy-on-write copy (_builtin_hl7.clone) reads _lazy first. Were segments read before it, a
     # split landing between the two would leave the private copy with neither the raw line nor the
     # fields, and it would encode PID as its bare id (BACKLOG #5801).
     m = Message.parse(ADT)
@@ -588,4 +588,38 @@ def test_a_split_during_the_copy_on_write_deepcopy_keeps_the_segment() -> None:
     assert clone["PID-5.1"] == "DOE"
     assert clone.encode() == ADT.replace("19800101|F", "19800101|M")
     tree["raw"] = None  # rebuild the original from its split fields, not parse's cached text
+    assert m.encode() == ADT
+
+
+class _SplitWhenCopied(str):
+    """A raw line whose deepcopy runs a lazy split of another segment: a reader on another thread
+    popping ``_lazy`` while a copy-on-write copy is walking it."""
+
+    msg: _builtin_hl7.ParsedMessage
+    other: int
+
+    def __deepcopy__(self, memo: dict[int, object]) -> str:
+        _builtin_hl7._ensure_split(self.msg, self.other)
+        return str(self)
+
+
+def test_a_split_while_the_copy_walks_lazy_does_not_raise() -> None:
+    # Iterating _lazy while another thread's split pops an entry raised RuntimeError ("dictionary
+    # changed size during iteration") from copy.deepcopy (BACKLOG #5801, added item 1).
+    m = Message.parse(ADT)
+    clone = m.copy()
+    tree = m._m
+    pid = _builtin_hl7.segment_index(tree, "PID", 1)
+    assert pid is not None and pid in tree["_lazy"]
+    evn = pid - 1
+    assert evn in tree["_lazy"]
+    hook = _SplitWhenCopied(tree["_lazy"][evn])
+    hook.msg, hook.other = tree, pid
+    tree["_lazy"][evn] = hook
+
+    clone.set("PID-8", "M")  # the write takes the private copy
+
+    assert clone["PID-5.1"] == "DOE"
+    assert clone.encode() == ADT.replace("19800101|F", "19800101|M")
+    tree["raw"] = None
     assert m.encode() == ADT

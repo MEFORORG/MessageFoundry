@@ -265,3 +265,55 @@ def test_appending_to_earlier_group_does_not_stale_later_group_view() -> None:
     assert g2.field("OBR-4.1") == "LIPID"
     g1.clear()  # shrink the first order; g2 shifts up, ordinal 2 still exists
     assert g2.field("OBR-4.1") == "LIPID"  # g2 still resolves correctly
+
+
+# A fieldless bare OBR line before the first real order: groups stay positional, so it opens
+# group 1, while Message occurrences skip it (BACKLOG #5917).
+BARE_OBR_FIRST = (
+    "MSH|^~\\&|LAB|LABFAC|EHR|HOSP|20260101||ORU^R01^ORU_R01|MSG1|P|2.5.1\r"
+    "PID|1||100^^^HOSP^MR||DOE^JANE^Q||19800101|F\r"
+    "OBR\r"
+    "OBR|1|PLAC1|FILL1|CBC^Complete Blood Count\r"
+    "OBX|1|NM|WBC^White Cells||7.5|10*9/L\r"
+    "OBR|2|PLAC2|FILL2|LIPID^Lipid Panel\r"
+    "OBX|1|NM|CHOL^Cholesterol||190|mg/dL\r"
+)
+
+
+def test_group_set_after_a_bare_boundary_writes_its_own_order() -> None:
+    m = Message.parse(BARE_OBR_FIRST)
+    _bare, cbc, lipid = m.groups()
+    assert cbc.ordinal == 2 and cbc.field("OBR-4.1") == "CBC"
+
+    cbc.set("OBR-4.1", "CBC2")
+    cbc.set("OBX-5", "8.0")
+    lipid.set("OBX-3.1", "LDL", occurrence=1)
+
+    out = Message.parse(m.encode())
+    assert [g.field("OBR-4.1") for g in out.groups()] == [None, "CBC2", "LIPID"]
+    assert out.groups()[1].field("OBX-5") == "8.0"
+    assert out.groups()[2].field("OBX-3.1") == "LDL"
+    assert out.groups()[2].field("OBX-5") == "190"
+    assert "\rOBR\r" in m.encode()  # the bare line is untouched
+
+
+def test_message_set_at_a_group_ordinal_hits_another_order() -> None:
+    # The hazard group.set exists for: Message occurrence 2 is the LIPID order, not group 2.
+    m = Message.parse(BARE_OBR_FIRST)
+    cbc = m.groups()[1]
+    m.set("OBR-4.1", "CBC2", occurrence=cbc.ordinal)
+    assert cbc.field("OBR-4.1") == "CBC"
+    assert m.groups()[2].field("OBR-4.1") == "CBC2"
+
+
+def test_group_set_refuses_what_the_group_does_not_hold() -> None:
+    m = Message.parse(BARE_OBR_FIRST)
+    bare, cbc, _lipid = m.groups()
+    before = m.encode()
+    with pytest.raises(KeyError, match="group 1 holds no OBR occurrence 1"):
+        bare.set("OBR-4", "X")  # a fieldless boundary has nothing to write
+    with pytest.raises(KeyError, match="group 2 holds no OBX occurrence 2"):
+        cbc.set("OBX-5", "X", occurrence=2)  # never reaches into the next order's OBX
+    with pytest.raises(ValueError, match="1-based"):
+        cbc.set("OBX-5", "X", occurrence=0)
+    assert m.encode() == before

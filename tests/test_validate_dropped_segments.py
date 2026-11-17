@@ -171,6 +171,22 @@ def test_a_bare_defined_id_in_an_any_segment_message_is_refused() -> None:
     assert result.errors == ["segment ORC at line 4 has no place in this message's structure"]
 
 
+@pytest.mark.parametrize(
+    "extra",
+    ["BHS|^~\\&|A", "BTS|1", "FHS|^~\\&|A", "FTS|1", "MSA|AA|1", "ERR|1"],
+    ids=lambda line: line[:3],
+)
+def test_an_envelope_or_acknowledgment_segment_gets_no_exemption(extra: str) -> None:
+    """The slot carries master-file or query data; a batch or file envelope segment, or an
+    acknowledgment segment, dropped from such a message is refused (BACKLOG #5920 step 2)."""
+    result = validate(_MFN_M01 + "\r" + extra)
+    assert not result.ok
+    assert result.errors == [
+        f"segment {extra[:3]} at line 4 has no place in this message's structure"
+    ]
+    assert result.unvalidated_segments == ()
+
+
 def test_a_structure_borrowed_under_the_same_message_code_keeps_the_exemption() -> None:
     """MSH-9.2 is not compared, so ``MFN^M02^MFN_M01`` is exempted as ``MFN^M01`` is.
 

@@ -14,7 +14,7 @@ records its answers, and ``tests/test_builtin_hl7_parity.py`` holds this module 
 Data model (a plain built-in structure)::
 
     ParsedMessage = {
-        "_lazy": {index: raw line},  # first, so a deepcopy reads it before segments (_ensure_split)
+        "_lazy": {index: raw line},  # first, read before segments (_ensure_split, clone)
         "segments": [ {"id": str, "fields": list[str | dict]}, ... ],
         "raw": str | None,           # cached encode; None once dirtied
         "seps": (field, component, repetition, subcomponent, escape),
@@ -45,6 +45,7 @@ The semantics here mirror two *distinct* python-hl7 surfaces the existing code r
 
 from __future__ import annotations
 
+import copy
 import operator
 import re
 from collections.abc import Callable
@@ -59,6 +60,7 @@ __all__ = [
     "HL7ParseError",
     "DelimiterRewriteRefused",
     "parse",
+    "clone",
     "extract_field",
     "extract_part",
     "raw_field",
@@ -124,7 +126,8 @@ class Segment(TypedDict):
 
 class ParsedMessage(TypedDict):
     """The whole parsed message — see the module docstring for the shape. Build it with ``_lazy``
-    as the first key, as :func:`parse` does: :func:`_ensure_split` relies on that order."""
+    as the first key, as :func:`parse` does, and copy it with :func:`clone`, never a walk of the
+    dict (:func:`_ensure_split` says why)."""
 
     # Per-segment raw text awaiting a lazy split (index in ``segments`` → raw line). MSH is never
     # here (parsed eagerly). A segment leaves this map the first time a field path touches it.
@@ -243,8 +246,8 @@ def parse(norm: str) -> ParsedMessage:
         segments.append({"id": line.split(field_sep, 1)[0] if line else "", "fields": []})
         lazy[index] = line
 
-    # ``_lazy`` goes in first on purpose: ``copy.deepcopy`` (``Message._ensure_owned``) copies a dict
-    # in insertion order, so it reads ``_lazy`` before ``segments``, the order _ensure_split needs.
+    # ``_lazy`` goes in first so a reader walking the dict in insertion order meets it before
+    # ``segments``, the order _ensure_split needs; clone() takes that order explicitly.
     return {"_lazy": lazy, "segments": segments, "raw": strmsg + "\r", "seps": seps}
 
 
@@ -258,14 +261,12 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
     The fields are stored **before** the raw line leaves ``_lazy``. A :meth:`Message.copy` clone
     shares this tree until one side writes, so another thread can read the segment mid-split. That
     can happen on a GIL build too, not only a free-threaded one: the GIL can switch threads between
-    storing the fields and the ``pop``, or inside a deepcopy's loop. A reader that looks at
-    ``_lazy`` before ``fields`` then sees either the raw line or the full field list, never an
-    empty segment (BACKLOG #5801). That holds for at least the readers in this module and the
-    copy-on-write ``copy.deepcopy``, because :func:`parse` puts ``_lazy`` first in the dict; a new
-    reader must keep the same order. It does not make a deepcopy safe against the ``pop`` itself:
-    one that is iterating ``_lazy`` at that moment can still raise ``RuntimeError`` for a dict that
-    changed size. The ``pop`` keeps its default because a racing split of the same segment may have
-    removed it.
+    storing the fields and the ``pop``. A reader that looks at ``_lazy`` before ``fields`` then sees
+    either the raw line or the full field list, never an empty segment (BACKLOG #5801). That holds
+    for at least the readers in this module and :func:`clone`; a new reader must keep the same
+    order. The ``pop`` changes the size of ``_lazy``, so nothing may iterate a shared ``_lazy`` in
+    Python code: :func:`clone` copies it in one ``dict.copy`` call instead. The ``pop`` keeps its
+    default because a racing split of the same segment may have removed it.
     """
     lazy = msg["_lazy"]
     raw = lazy.get(seg_index)
@@ -277,6 +278,25 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
     # where index 0 is the id and field N is at list index N).
     msg["segments"][seg_index]["fields"] = list(parts)
     lazy.pop(seg_index, None)
+
+
+def clone(msg: ParsedMessage) -> ParsedMessage:
+    """A private deep copy of ``msg``, safe while another thread lazily splits the same tree.
+
+    The copy-on-write copy behind :meth:`Message._ensure_owned`. ``_lazy`` is copied first and in
+    one ``dict.copy`` call, which runs no Python code, so a concurrent :func:`_ensure_split` lands
+    wholly before or after it and its ``pop`` cannot change the dict's size mid-iteration, the
+    ``RuntimeError`` a ``copy.deepcopy`` of the tree could raise (BACKLOG #5801). ``segments`` is
+    deep-copied after it, so a split landing in between leaves the copy holding the raw line, the
+    fields, or both, never neither. The raw lines are ``str`` and shared, as ``copy.deepcopy``
+    shares them.
+    """
+    return {
+        "_lazy": msg["_lazy"].copy(),  # first: a dict display evaluates in order
+        "segments": copy.deepcopy(msg["segments"]),
+        "raw": msg["raw"],
+        "seps": msg["seps"],
+    }
 
 
 def segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:
@@ -1192,10 +1212,11 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     the target set equals the source set.
 
     Where two source separators are the same character, the one split first wins: repetition, then
-    component, then subcomponent, the order python-hl7 split them. The segment id is kept verbatim. On
-    an ``FHS`` or ``BHS`` header the raw MSH-1/MSH-2 leaves change only their escape character. Both
-    match the python-hl7 tree walk this replaced (``transports/mllp.py`` ``reencode_delimiters``). Only
-    an ``MSH`` header has its MSH-2 rewritten. Blank segment lines are kept.
+    component, then subcomponent, the order python-hl7 split them, as the python-hl7 tree walk this
+    replaced did (``transports/mllp.py`` ``reencode_delimiters``). The segment id is kept verbatim.
+    Every ``MSH``, ``BHS`` and ``FHS`` header has its field 2 rewritten to the target encoding
+    characters, so a batch or file header advertises the delimiters its message is written in
+    (BACKLOG #5802). Blank segment lines are kept.
 
     Raises ``ValueError`` when the message's own field, component, repetition and subcomponent
     characters are not four distinct characters. Such a header cannot say which structure a character
@@ -1227,11 +1248,9 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
         if not texts:
             lines.append(seg["id"])
             continue
-        if seg["id"] == "MSH" and len(texts) >= 3:
-            parts = ["MSH", t_comp + t_rep + t_esc + t_sub]
-            tail = texts[3:]
-        elif seg["id"] in ("BHS", "FHS") and len(texts) >= 3:
-            parts = [texts[0], texts[1].replace(s_esc, t_esc), texts[2].replace(s_esc, t_esc)]
+        if seg["id"] in ("MSH", "BHS", "FHS") and len(texts) >= 3:
+            # Field 1 is the field separator the join writes, so only field 2 is a part.
+            parts = [seg["id"], t_comp + t_rep + t_esc + t_sub]
             tail = texts[3:]
         else:
             if t_field in texts[0]:
