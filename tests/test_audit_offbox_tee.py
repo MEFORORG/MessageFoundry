@@ -871,7 +871,7 @@ def test_a_value_over_the_window_ends_with_its_bound_note_and_hides_the_name(cap
     detail = _shipped_detail(line)
     assert detail.endswith(note) and "DOE" not in detail
     # The same value in a field other than detail: the line that ships hides the name too.
-    (line,) = _tee_lines([{"actor": value}], capsys)
+    (line,) = _tee_lines([{"client": value}], capsys)
     assert "DOE" not in line
 
 
@@ -885,7 +885,7 @@ _OVER_WINDOW_LEAKS: tuple[tuple[dict[str, str | None], str], ...] = (
 )
 
 
-def _cut_off_words(old_line: str) -> set[str]:
+def _raw_cut_off_words(old_line: str) -> set[str]:
     """The words of the part of ``old_line`` the handler chain's bound cut off unread."""
     from messagefoundry.redaction import clamp_untrusted
 
@@ -913,7 +913,7 @@ def test_an_over_window_record_ships_the_scrub_not_the_hidden_word(
     assert len(old) > _REDACT_WINDOW  # the control: the record is over the window
     assert all(hidden in r for r in sink_readings(old))  # and main's line showed the word
     assert new != old
-    cut_off = _cut_off_words(old)
+    cut_off = _raw_cut_off_words(old)
     for old_out, new_out in zip(sink_readings(old), sink_readings(new), strict=True):
         assert hidden not in new_out
         for escape in (_ESCAPE_TEXT, _JSON_TEXT_ESCAPE):
@@ -922,6 +922,20 @@ def test_an_over_window_record_ships_the_scrub_not_the_hidden_word(
                 for out in (old_out, new_out)
             ]
             assert set(words[1] - words[0]) <= cut_off
+
+
+def test_a_c0_hidden_word_past_the_cut_is_not_let_through_by_the_cut_off_bar() -> None:
+    """Review round-427695ef, finding 2: the bar takes the words a sink shows of what the cut left
+    unread, read alone, and a C0 escape hides a name there from the chain as it did before #3045.
+    A candidate that pulls that name into its window does not ship it. Synthetic values."""
+    from messagefoundry.logging_setup import sink_readings
+
+    before: dict[str, object] = {"actor": "y " * 40000 + "\x01DOE JANE", "seq": 1}
+    after: dict[str, object] = {"actor": "y \x01DOE JANE", "seq": 1}
+    # The control: the candidate shows the name on every sink.
+    assert all("DOE" in r for r in sink_readings(json.dumps(after, ensure_ascii=False)))
+    line = audit_tee._tee_line(before, after)
+    assert not any("DOE" in r for r in sink_readings(line))
 
 
 def test_an_over_window_record_with_no_control_ships_byte_identical(monkeypatch) -> None:
