@@ -1489,8 +1489,8 @@ _SITE_SKIP_NAMES = {
 
 #: Directories a ``--path`` WALK skips: tool caches, virtual environments and build output that sit
 #: untracked in a working tree, where a whole-tree scan would otherwise read third-party code. Applied
-#: in ``--path`` mode only, and there only to files git does not track; outside a git work tree only
-#: ``.git`` is skipped. A tracked or staged file is content git already holds, whatever directory it
+#: in ``--path`` mode only, and there only to files git does not track, or by name alone where git
+#: cannot list them; outside a git work tree only ``.git`` is skipped. A tracked or staged file is content git already holds, whatever directory it
 #: sits in, so every mode reads it (BACKLOG #5585).
 SKIP_DIRS = {
     ".git",
@@ -2108,23 +2108,38 @@ reload_tokens()
 # --------------------------------------------------------------------------------------------------
 
 
-def _ls_files(root: Path) -> list[str]:
+def _ls_files(root: Path, *, keep_location: bool = False) -> list[str]:
     """``git ls-files`` in ``root``, NUL-separated so a name git would C-quote (non-ASCII, a quote, a
     control byte) comes back as itself rather than as a path that does not exist. Raises on failure.
 
-    Fixed argv, no shell, ``root`` a separate argument. ``safe.bareRepository=explicit`` keeps git from
-    taking a directory of committed files that is shaped like a bare repository as one, and so from
-    reading a config a commit wrote."""
-    # A hook or ``rebase --exec`` exports these, and with them git reads another index or keys the list
-    # from another directory, so the paths would not be relative to ``root``.
-    env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_ENV}
+    Fixed argv, no shell, ``root`` a separate argument. Every call passes two ``-c`` settings, which
+    outrank any config file. ``safe.bareRepository=explicit`` makes git refuse a bare repository it
+    finds by searching rather than one ``GIT_DIR`` names, so a directory of committed files shaped
+    like a bare repository is not taken as one and the config a commit wrote there is not read.
+    ``core.fsmonitor=false`` stops git running a file-system monitor command that a repository's
+    config names: ``ls-files`` runs that command when it reads the index. Any other setting in that
+    config is still read.
+
+    ``keep_location`` passes on ``GIT_DIR``, ``GIT_INDEX_FILE`` and the other location variables, so
+    the tracked scan lists the index a hook names (a temporary one included), as a bare ``git
+    ls-files`` does. The ``--path`` walk drops them, because with them git keys the list from another
+    directory and the paths would not be relative to ``root``."""
+    env = (
+        None
+        if keep_location
+        else {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_ENV}
+    )
     out = subprocess.run(  # nosec B603 B607
-        ["git", "-c", "safe.bareRepository=explicit", "-C", str(root), "ls-files", "-z"],
+        ["git", *_GIT_SAFETY, "-C", str(root), "ls-files", "-z"],
         capture_output=True,
         check=True,
         env=env,
     ).stdout
     return [p for p in out.decode("utf-8", errors="surrogateescape").split("\0") if p]
+
+
+#: The ``-c`` settings every git call this module makes passes; ``_ls_files`` says what each does.
+_GIT_SAFETY = ("-c", "safe.bareRepository=explicit", "-c", "core.fsmonitor=false")
 
 
 _GIT_LOCATION_ENV = frozenset(
@@ -2140,16 +2155,17 @@ def _path_key(rel: str) -> str:
 
 
 def _git_tracked() -> list[str]:
-    return _ls_files(Path("."))
+    return _ls_files(Path("."), keep_location=True)
 
 
 def _tracked_under(root: Path) -> set[str] | None:
-    """The files git tracks under ``root``, relative to it, or ``None`` when nothing can say.
+    """The files git tracks under ``root``, relative to it, an empty set, or ``None``.
 
     ``None`` when no directory from ``root`` up holds a ``.git`` entry, so git is never run in a
-    pushed commit's snapshot, whose files the commit chose; when git fails; and when git tracks no file
-    under ``root``, which is then an untracked copy of content that cannot be told apart. ``None``
-    prunes nothing, the fail-closed side."""
+    pushed commit's snapshot, whose files the commit chose; and when git tracks no file under
+    ``root``, which is then an untracked copy of content that cannot be told apart. ``None`` prunes
+    nothing. An empty set when git is not on PATH or fails, such as when it refuses the directory: the
+    walk then prunes SKIP_DIRS by name, tracked or not, as it did before git was asked."""
     resolved = root.resolve()
     if not root.is_dir() or not any((d / ".git").exists() for d in (resolved, *resolved.parents)):
         return None
@@ -2158,10 +2174,10 @@ def _tracked_under(root: Path) -> set[str] | None:
     except (OSError, subprocess.CalledProcessError) as exc:
         print(
             f"scan_forbidden: git could not list the tracked files under {root} ({type(exc).__name__}),"
-            " so the walk skips no build or environment directory there.",
+            " so the walk skips the build and environment directories there by name, tracked or not.",
             file=sys.stderr,
         )
-        return None
+        return set()
     return tracked or None
 
 
@@ -2169,7 +2185,8 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
     """Every file under the directory ``raw``, keyed by its root-relative posix path, with SKIP_DIRS
     pruned only where git says the files are untracked (BACKLOG #5585). Outside a work tree nothing
     tells tracked from untracked, so nothing but ``.git`` is pruned: a pushed commit's snapshot is
-    committed content wherever it sits. A directory the walk cannot list is reported in ``errors``,
+    committed content wherever it sits. Inside one, where git cannot list the files, SKIP_DIRS is
+    pruned by name (``_tracked_under``). A directory the walk cannot list is reported in ``errors``,
     where ``rglob`` used to drop it without a word."""
     root = Path(raw)
     tracked = _tracked_under(root)
@@ -3088,8 +3105,8 @@ def main(argv: list[str]) -> int:
     unread = 0
     unreadable = len(hits)
     for abs_path, rel in candidates:
-        # SKIP_DIRS is applied by the --path walk alone, and only to files git does not track there
-        # (_walk); the tracked and staged scans read every file they name.
+        # SKIP_DIRS is applied by the --path walk alone (_walk); the tracked and staged scans read
+        # every file they name.
         if _is_skipped(rel):
             continue
         if not abs_path.is_file():

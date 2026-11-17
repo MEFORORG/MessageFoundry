@@ -3183,3 +3183,83 @@ def test_a_tracked_scan_git_cannot_list_exits_2(
     for k in [k for k in os.environ if k.startswith("GIT_")]:
         monkeypatch.delenv(k)
     assert sf_main.main([]) == 2
+
+
+def _no_git_location_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop any GIT_* a calling hook exported, so each test sets only the variables it names."""
+    for k in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(k)
+
+
+@pytest.mark.parametrize("args", [[], ["--path", "."]], ids=["tracked", "walk"])
+def test_a_repository_config_fsmonitor_command_is_not_run(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    """``git ls-files`` runs the command a repository's ``core.fsmonitor`` names when it reads the
+    index, so every git call the scanner makes overrides it."""
+    root = _git_tree(tmp_path / "tree", {"ok.md": "fine\n"}, {})
+    marker = tmp_path / "marker"
+    subprocess.run(
+        ["git", "-C", str(root), "config", "core.fsmonitor", f"echo x > '{marker.as_posix()}'"],
+        check=True,
+        timeout=60,
+        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+    )
+    _no_git_location_env(monkeypatch)
+    monkeypatch.chdir(root)
+    assert sf_main.main(args) == 0
+    assert not marker.exists()
+
+
+def test_the_walk_prunes_skip_dirs_by_name_when_git_is_not_on_path(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Where git cannot say what is tracked inside a work tree, the walk skips build and environment
+    directories by name, as it did before it asked git, rather than reading every one of them."""
+    root = _git_tree(
+        tmp_path / "tree", {"ok.md": "fine\n"}, {"node_modules/leak.md": "contact ACME\n"}
+    )
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    try:
+        subprocess.run(["git", "--version"], capture_output=True, check=False, timeout=60)
+    except FileNotFoundError:
+        pass
+    else:
+        pytest.skip("git is still found with an empty PATH here")
+    assert sf_main.main(["--path", str(root)]) == 0
+    assert "by name" in capsys.readouterr().err
+
+
+def test_the_tracked_scan_lists_the_index_a_hook_names(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hook that commits through a temporary index exports GIT_INDEX_FILE, and the tracked scan lists
+    that index, as a bare ``git ls-files`` does."""
+    root = _git_tree(tmp_path / "tree", {"ok.md": "fine\n"}, {"leak.md": "contact ACME\n"})
+    alt = tmp_path / "alt-index"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_INDEX_FILE=str(alt))
+    subprocess.run(
+        ["git", "-C", str(root), "add", "-f", "--", "leak.md"], check=True, timeout=60, env=env
+    )
+    _no_git_location_env(monkeypatch)
+    monkeypatch.chdir(root)
+    assert sf_main.main([]) == 0  # the control: the default index holds only the clean file
+    monkeypatch.setenv("GIT_INDEX_FILE", str(alt))
+    assert sf_main.main([]) == 1
+
+
+def test_the_tracked_scan_lists_the_repository_git_dir_names(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With GIT_DIR exported, the tracked scan lists that repository's index for the current
+    directory, as a bare ``git ls-files`` does."""
+    root = _git_tree(tmp_path / "tree", {"leak.md": "contact ACME\n"}, {})
+    git_dir = tmp_path / "git-dir"
+    (root / ".git").rename(git_dir)
+    _no_git_location_env(monkeypatch)
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("GIT_DIR", str(git_dir))
+    assert sf_main.main([]) == 1
