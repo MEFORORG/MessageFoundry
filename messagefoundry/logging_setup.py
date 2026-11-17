@@ -478,9 +478,8 @@ SHIPPED_HANDLER_COUNT = 3
 
 
 def sink_readings(text: str, *, sinks: int = SHIPPED_HANDLER_COUNT) -> list[str]:
-    """What each of the first ``sinks`` shipped handlers writes for a record whose message is
-    ``text``: the Nth item is what N passes of the installed filters leave, since each handler
-    runs the whole chain over the one shared record, as :func:`_settled_reading` models. For a
+    """the Nth item is what N passes of the installed filters leave, since each handler runs the
+    whole chain over the one shared record, as :func:`_settled_reading` models. For a
     caller that must hold a line to a bar on every sink, not just the first, as the audit tee
     does (BACKLOG #3045)."""
     filters = _shipped_filters()

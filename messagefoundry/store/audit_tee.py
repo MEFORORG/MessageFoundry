@@ -291,10 +291,10 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
         result = _encode_c0(first) if as_json else first
         if as_json and not _parses(result):
             return whole
-        # This result must hide every word the handler chain alone hides, over the value as the
-        # line carries it. The plain pass can redact a span the chain read differently, a name
-        # run that takes a ``Bearer`` label with it, and leave the credential the chain would have
-        # caught. The bar that binds the line is :func:`_tee_line`'s.
+        # This result must hide every word the handler chain alone hides. The plain pass can
+        # redact a span the chain read differently, a name run that takes a ``Bearer`` label with
+        # it, and leave the credential the chain would have caught. The bar that binds the line is
+        # :func:`_tee_line`'s.
         alone = scrub_log_text(json.dumps(written, ensure_ascii=False)[1:-1])
         if not _shows_no_more(json.dumps(result, ensure_ascii=False)[1:-1], _line_words(alone)):
             return whole
@@ -338,10 +338,8 @@ def _tee_line(
 ) -> str:
     """The line to log for a record whose fields the C0 scrub turned from ``before`` into
     ``after`` (BACKLOG #3045). ``before`` is the record as the code before #3045 built it, the old
-    line. A scrubbed candidate ships only if every word, meaning a run of letters and digits, that
-    the old line hid stays hidden on each modelled sink, and its reading parses as JSON on each
-    sink where the old line's did. The bar is the whole old line, not each field, because the
-    chain over a whole record can hide what it does not over one field.
+    line. A scrubbed candidate ships only if its reading parses as JSON on each sink where the old
+    line's did.
 
     The candidates, in order: the line with every scrubbed field; the old line with each changed
     field as :data:`_FIELD_REDACTED` and a changed ``detail`` as what ``whole_detail`` returns;
@@ -420,10 +418,8 @@ def emit_audit_tee(
     **One residual, stated because "the head hash carries nothing" is too strong.** In
     the keyless posture ``row_hash`` is a plain SHA-256 over a canonical list whose every other
     member -- the previous row's hash, ``ts``, ``actor``, ``action``, ``channel_id``, ``client`` --
-    travels in this same record or the one before it. So for a record whose ``detail`` ``safe_text``
-    actually cut, a reader of the log can TEST guesses at the removed span offline, one hash per guess
-    (``seq`` travels in the record too). The same holds for any field the C0 scrub below cut or
-    shipped as ``[redacted]``, ``actor`` included, such as a typed sign-in name.
+    travels in this same record or the one before it. So a reader of the log can TEST guesses at the
+    removed span offline, one hash per guess (``seq`` travels in the record too).
     It does not arise for a row written by a process that holds a key, where the digest is
     an HMAC under a DEK-derived subkey or a Transit MAC. Keyless is not the shipped default. A row
     written without a key keeps its plain SHA-256: no later open re-keys it, and a keyed process
@@ -498,8 +494,6 @@ def emit_audit_tee(
       typed sign-in name ship that way. A record can ship as the line before #3045, losing the
       scrub; a segment-shaped token such as ``ABC|`` after a control in a field can cause that,
       so a client can turn the scrub off for its own record.
-    * A field whose encoded form is longer than the handler chain's 64 KiB window, as one holding
-      many controls, can lose its scrub.
     * In a JSON ``detail``, an escape is decoded only where it spells a C0 control, one level deep,
       and where the detail parses as JSON within the bound and holds no raw control. Elsewhere,
       as for ``\\u00a0``, the text beside an escape is read by the handler chain alone.

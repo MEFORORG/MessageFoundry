@@ -853,7 +853,7 @@ def test_a_json_detail_its_redaction_pushes_past_the_bound_still_parses(capsys) 
     assert json.loads(_shipped_detail(line)) == "[redacted]"
 
 
-def test_a_value_over_the_window_ships_with_its_bound_note(capsys) -> None:
+def test_a_value_over_the_window_ends_with_its_bound_note_and_hides_the_name(capsys) -> None:
     """Open finding 3 of engine PR 2864: a field over the 64 KiB window holding a control shipped
     cut with no note saying so, and a ``detail``'s ``(+N chars)`` count was taken over a shorter
     head than ``safe_text`` reads. Synthetic values."""
