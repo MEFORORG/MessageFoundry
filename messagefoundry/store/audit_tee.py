@@ -543,7 +543,9 @@ def emit_audit_tee(
     through the 19 placements its ``_C0_SWEEP_TEMPLATES`` lists, each beside or inside a name, a
     ``password=`` or ``token=`` value, a date, a bearer token or an MRN, one of them after an
     HL7-shaped run, in each of those fields and in ``detail`` as a JSON document too, and finds no
-    leak there. Its comparison with the scrub switched off, over that sweep, two-control pairs and
+    leak there except where the control is one the patterns read as whitespace and the handler
+    chain over the same text unencoded leaks the same word; such a value, at least ``MRN 1234``,
+    a tab and ``5678``, ships that word, as any plain log line with a tab there does. Its comparison with the scrub switched off, over that sweep, two-control pairs and
     the review values, runs for ``actor``, ``client`` and ``detail``, plain and as JSON, and finds
     no word the line before #3045 hid. What that leaves, at least:
 
