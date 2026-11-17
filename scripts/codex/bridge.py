@@ -119,7 +119,7 @@ def sync_skills(
 
 
 class HookBlocked(Exception):
-    """A hook exited 2, which Claude Code reads as a deliberate block."""
+    """A hook exited 2."""
 
 
 def child_environment(root: Path, session_id: str) -> dict[str, str]:
