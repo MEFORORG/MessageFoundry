@@ -65,9 +65,10 @@ class SaturationDetector:
       first sample, lowered whenever the depth falls below it, so it is the lowest depth seen since
       the last :meth:`reset`. It is not the window's start, so steady growth slower than
       ``min_growth`` per window still fires once it has built up. Nor does a fall that stays at or
-      above it restart it, so growth with a small dip every few samples still fires once its net
-      rise clears the floor. The cost: once a lane has risen ``min_growth`` above its lowest depth,
-      the floor no longer holds back its later small rises; and
+      above it restart it, so a dip no longer resets the floor's count: growth whose dips are spaced
+      more than ``sustain_samples`` apart fires once its net rise clears the floor (a dip inside the
+      window still suppresses, below). The cost: once a lane has risen ``min_growth`` above its
+      lowest depth, the floor no longer holds back its later small rises; and
     * **sustained** — no step in the window *decreased* (every ``d[i+1] >= d[i]``). A single drop means
       the worker drained at some point in the window, so the growth is a burst being cleared, not
       saturation — and it does **not** fire.

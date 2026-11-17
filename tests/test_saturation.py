@@ -152,6 +152,12 @@ def test_reset_restarts_the_run() -> None:
     assert _feed(det, [3, 4, 5]) is None  # the run starts again at 3, so a rise of 2
 
 
+def test_a_lane_past_the_floor_pages_on_a_small_rise() -> None:
+    # The documented cost of measuring from the lowest depth: a lane first sampled at 0 that has
+    # since settled at 10 is already past the floor, so one arrival after a plateau fires.
+    assert _feed(SaturationDetector(sustain_samples=3), [0, 10, 10, 10, 10, 11]) is not None
+
+
 def test_the_floor_is_exact() -> None:
     assert _feed(SaturationDetector(sustain_samples=2, min_growth=3), [0, 1, 2]) is None
     assert _feed(SaturationDetector(sustain_samples=2, min_growth=3), [0, 1, 3]) is not None

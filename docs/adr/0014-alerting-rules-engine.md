@@ -148,8 +148,8 @@ exactly *arrivals > departures* (**ingest > drain**) held over it — so a lane 
 fire on a bursty-but-draining lane" is the defining property, enforced by `SaturationDetector` (a
 `deque(maxlen=sustain_samples+1)` of `(ts, depth)`; fires only when the newest depth strictly exceeds
 the oldest **and** no step in the window decreased; since BACKLOG #5768 the depth must also have risen by
-`[delivery].saturation_min_growth` messages since it last fell, so one arrival on an idle lane does
-not fire). The detector is pure/synchronous and unit-tested
+`[delivery].saturation_min_growth` messages above the lowest depth sampled since the detector was
+created or reset, so one arrival on an idle lane does not fire). The detector is pure/synchronous and unit-tested
 directly. It rides the existing per-lane buildup tick (`_maybe_alert_buildup` → `_maybe_alert_saturation`),
 so it adds **no new sampler** — and returns before any store read when disabled (zero cost when off).
 
