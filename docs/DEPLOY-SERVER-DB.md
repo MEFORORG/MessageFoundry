@@ -150,7 +150,7 @@ server = "sql01.corp.example.com"
 database = "MessageFoundry"
 auth = "integrated"                # Trusted_Connection=yes — the gMSA's identity authenticates
 encrypt = true                     # default; TLS to the DB
-trust_server_certificate = false   # default; verify the DB cert (import its CA into LocalMachine\Root, §5.2)
+trust_server_certificate = false   # default; verify the DB cert (import its CA into the machine stores, §5.2)
 require_managed_identity = true    # refuse a static SQL login on production PHI (ASVS 13.2.1)
 # schema_management = "external"   # the server-DB default; step 4 owns the DDL (BACKLOG #305)
 ```
@@ -552,9 +552,8 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 .\scripts\service\import-db-ca.ps1 -CaPath C:\certs\internal-root-ca.crt
 ```
 
-The helper shows every certificate in the file, and refuses the whole file in at least these cases:
-any one is not a CA or carries a private key, the file holds no self-signed root, or a DER value in
-it does not end where its bytes end. The helper's own help lists the rest.
+The helper shows every certificate in the file, and refuses the whole file, importing nothing, on
+any of the refusals its own help lists.
 
 **Where each CA goes.** This paragraph and the helper's own help are the statement of it; other
 documents point here. A self-signed root, whose signature verifies under its own key, goes into
@@ -565,10 +564,10 @@ Server hop still checks the chain up to the root. It **is** usable as a trust an
 engine's Python TLS on Windows: CPython's `ssl.create_default_context()`, which the PostgreSQL
 system-trust path calls, loads the `CA` and `ROOT` system stores, and Python 3.13 and later set
 partial-chain verification, so a chain that reaches a certificate in `LocalMachine\CA` validates
-there without its root. The helper refuses a file unless at least one certificate in it is a
-self-signed root. It does not check that each other CA in the file chains to that root, and with
-`-Confirm` you may still decline the root and accept another CA, so give it the root of the CA you
-mean to trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
+there without its root. The helper refuses a file unless it holds a self-signed root and every
+other CA in it chains to a self-signed root through the file's own certificates. With `-Confirm` you
+may still decline the root and accept another CA, so give it the root of the CA you mean to trust,
+alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
 
 The built-ins below check none of that, so use them only for a file holding one self-signed root
 CA you have checked yourself:
@@ -601,9 +600,11 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
 2. **Roll the DB server certificate** to one issued by the new CA (a DB-administrator action). Because
    both CAs are trusted, connections keep validating across the swap.
 3. **Remove the old CA** once every host trusts the new one and the server cert has rolled:
-   - **SQL Server:** delete the old CA from whichever machine store holds it, `LocalMachine\Root` for
-     a root or `LocalMachine\CA` for an issuing CA (e.g.
-     `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA | Where-Object Thumbprint -eq <old> | Remove-Item`).
+   - **SQL Server:** delete every certificate the old CA's file added, the root from
+     `LocalMachine\Root` and any issuing CA from `LocalMachine\CA`, by the thumbprints the helper
+     listed when it imported that file. An issuing CA left in `LocalMachine\CA` stays a trust anchor
+     for the engine's Python TLS (§5.2). For example
+     `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA | Where-Object Thumbprint -in @('<old root>', '<old issuing CA>') | Remove-Item`.
    - **PostgreSQL:** drop the old CA from the PEM bundle and reload.
 
 **Rotating only the server leaf cert** (same CA): no trust-store change is needed — the new leaf still

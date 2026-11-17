@@ -29,21 +29,26 @@
     ssl.create_default_context(), which the PostgreSQL system-trust path calls, loads the CA and
     ROOT system stores, and Python 3.13 and later set partial-chain verification, so a chain that
     reaches a certificate in LocalMachine\CA validates there without its root. A file is refused
-    unless at least one certificate in it is a self-signed root. That is the whole check: it does
-    not check that each other CA in the file chains to that root, and with -Confirm the operator
-    may still decline the root and accept another CA.
+    unless it holds a self-signed root and every other CA in it chains to a self-signed root
+    through the file's own certificates, each link's signature verified. No revocation, name
+    constraint or path length is checked, and with -Confirm the operator may still decline the
+    root and accept another CA.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
 
     The file is read once. Every certificate it holds is shown, checked, and only then added, so
-    nothing reaches a store that the operator was not shown. The whole file is refused, and
-    nothing is imported, when any certificate in it is not marked as a CA by its basic
-    constraints, has a key usage that cannot sign certificates, or carries a private key, when it
-    holds no self-signed root, when a DER value in it (the whole file, a PEM block, or decoded
-    base64) does not end where its bytes end, or when a control character other than tab, CR or
-    LF sits outside its PEM blocks. Other text outside PEM blocks, bare base64 among them, is
-    ignored, not refused. At least a .pfx, and
+    nothing reaches a store that the operator was not shown. Roots are added first. The whole
+    file is refused, and nothing is imported, when any certificate in it is not marked as a CA by
+    its basic constraints, has a key usage that cannot sign certificates, carries a private key,
+    or is outside its validity period, when it holds no self-signed root, when a CA in it does not
+    chain to a self-signed root in the file, when a DER value in it (the whole file, a PEM block,
+    or decoded base64) does not end where its bytes end, or when a control character other than
+    tab, CR or LF sits outside its PEM blocks. A BER value with an indefinite length, which some
+    tools write for a .p7b, is refused by that DER rule; re-encode it as DER first. Only RSA
+    PKCS#1 v1.5 and ECDSA signatures with SHA-1 or SHA-2 are verified, so a root or a chain link
+    signed any other way (RSA-PSS, for one) is refused. Other text outside PEM blocks, bare base64
+    among them, is ignored, not refused. At least a .pfx, and
     a well-formed PEM block with any label but CERTIFICATE, X509 CERTIFICATE or PKCS7 (such as a
     PRIVATE KEY block), are refused before anything is parsed. Key material outside well-formed
     PEM armour is not looked for; no private key is ever loaded either way.
@@ -208,8 +213,11 @@ function Read-CaBundle {
         $encoding = [System.Text.Encoding]::Unicode
     } elseif ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFE -and $Bytes[1] -eq 0xFF) {
         $encoding = [System.Text.Encoding]::BigEndianUnicode
+    } elseif ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
+        $encoding = [System.Text.Encoding]::UTF8
     }
-    $text = $encoding.GetString($Bytes)
+    # GetString keeps a byte-order mark as U+FEFF, which bare base64 would otherwise fail to match.
+    $text = $encoding.GetString($Bytes).TrimStart([char]0xFEFF)
     # Every piece of DER, the whole file or one PEM block, must be a certificate or a PKCS#7 chain,
     # so a .pfx is refused wherever it sits, before it is parsed.
     $importDer = {
@@ -299,13 +307,15 @@ function Read-CaBundle {
     return , $unique
 }
 
-# Whether the certificate is self-signed: its subject and issuer are the same name AND its signature
-# verifies under its own public key. A self-issued certificate another key signed, such as a CA
-# re-key link certificate, is not. RSA PKCS#1 v1.5 and ECDSA with SHA-1 or SHA-2 are checked; any
-# other signature algorithm (RSA-PSS, for one) reads as not self-signed, which fails closed.
-function Test-SelfSigned {
-    param([Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
-    if ([Convert]::ToBase64String($Certificate.SubjectName.RawData) -cne
+# Whether $Signer issued the certificate: the certificate's issuer is $Signer's subject, byte for
+# byte, AND its signature verifies under $Signer's public key. RSA PKCS#1 v1.5 and ECDSA with SHA-1
+# or SHA-2 are checked; any other signature algorithm (RSA-PSS, SHA-224, Ed25519 and DSA among them)
+# reads as not signed, which fails closed: such a certificate is never a root, and never a link.
+function Test-SignedBy {
+    param(
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Signer)
+    if ([Convert]::ToBase64String($Signer.SubjectName.RawData) -cne
         [Convert]::ToBase64String($Certificate.IssuerName.RawData)) { return $false }
     $hashes = @{
         '1.2.840.113549.1.1.5' = 'SHA1'; '1.2.840.113549.1.1.11' = 'SHA256'
@@ -332,12 +342,12 @@ function Test-SelfSigned {
     [Array]::Copy($raw, $bits.Start + 1, $signature, 0, $signature.Length)
     try {
         if ($oid.StartsWith('1.2.840.113549.')) {
-            $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($Certificate)
+            $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($Signer)
             if (-not $rsa) { return $false }
             return [bool]$rsa.VerifyData($signed, $signature, $hash,
                 [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
         }
-        $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPublicKey($Certificate)
+        $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPublicKey($Signer)
         if (-not $ecdsa) { return $false }
         # X.509 carries an ECDSA signature as a DER SEQUENCE of r and s; .NET Framework's VerifyData
         # reads only r and s side by side, each padded to the key's width.
@@ -362,6 +372,42 @@ function Test-SelfSigned {
     }
 }
 
+# Whether the certificate is self-signed: it is its own signer by Test-SignedBy, so its subject and
+# issuer are the same name AND its signature verifies under its own public key. A self-issued
+# certificate another key signed, such as a CA re-key link certificate, is not.
+function Test-SelfSigned {
+    param([Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    return (Test-SignedBy -Certificate $Certificate -Signer $Certificate)
+}
+
+# Why the certificate does not chain to a self-signed root in the file, or $null when it does. The
+# walk follows issuer links through the file only, never a machine store: each step needs a
+# certificate in $Bundle whose subject is the issuer's name and whose key verifies the signature
+# (Test-SignedBy). Every such issuer is followed, not only the first, so a cross-certificate that
+# shares a root's name and key cannot hide the root behind it; each certificate is visited once, so
+# a loop of links ends. Nothing else about the chain is checked here; Get-CaRefusal checks each
+# certificate on its own, and no revocation or name constraint is read.
+function Get-ChainRefusal {
+    param(
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Bundle)
+    $visited = @{ $Certificate.Thumbprint = $true }
+    $pending = [System.Collections.Generic.Queue[object]]::new()
+    $pending.Enqueue($Certificate)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        if (Test-SelfSigned -Certificate $current) { return $null }
+        foreach ($candidate in $Bundle) {
+            if (-not $visited.ContainsKey($candidate.Thumbprint) -and
+                (Test-SignedBy -Certificate $current -Signer $candidate)) {
+                $visited[$candidate.Thumbprint] = $true
+                $pending.Enqueue($candidate)
+            }
+        }
+    }
+    return 'it does not chain to a self-signed root in the file'
+}
+
 # The store a checked CA belongs in: Root for a self-signed one, CertificateAuthority (the
 # intermediate store) for any other. The help's "Where each CA goes" says what each store means.
 function Get-CaStoreName {
@@ -375,11 +421,17 @@ function Get-CaStoreName {
 # extension counts as not a CA here. RFC 5280 (the Basic Constraints section) requires the extension
 # of a version 3 CA certificate; a version 1 root, which cannot carry it, is refused too, by this
 # script's choice rather than the RFC's. A key usage extension that leaves out certificate signing
-# also counts as not a CA (RFC 5280, the Key Usage section).
+# also counts as not a CA (RFC 5280, the Key Usage section). A certificate outside its validity
+# period at $NowUtc is refused as well: nothing that chains through it validates, so importing it
+# is only ever a mistake, and an expired root must not stand in for the one a CA chains to.
 function Get-CaRefusal {
-    param([Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    param(
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [datetime]$NowUtc = [datetime]::UtcNow)
     # Read-CaBundle already refuses every container that can carry a key; this holds if it ever stops.
     if ($Certificate.HasPrivateKey) { return 'it carries a private key' }
+    if ($Certificate.NotAfter.ToUniversalTime() -lt $NowUtc) { return 'it has expired' }
+    if ($Certificate.NotBefore.ToUniversalTime() -gt $NowUtc) { return 'it is not valid yet' }
     $constraints = @($Certificate.Extensions |
         Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] })
     if ($constraints.Count -eq 0) { return 'it has no basic constraints extension, so it is not marked as a CA' }
@@ -413,42 +465,55 @@ try {
     throw "Could not read '$CaPath' as X.509 CA certificates: $($_.Exception.Message)"
 }
 
+$nowUtc = [datetime]::UtcNow
+# Each refused certificate as one line: its thumbprint, its Subject escaped for the console, and why.
+# The host listing and the terminating error both print these same lines.
+$refusals = [System.Collections.Generic.List[string]]::new()
+# Each certificate is checked before it is shown, so a refused one is listed with its reason and
+# never with a store it would not go to. The store shown is the one it is offered for and written to.
+# A certificate that passes on its own must also reach a root through this file's own certificates,
+# so a root that signed none of them cannot carry an unrelated issuing CA in beside it.
 Write-Host "The file holds $($bundle.Count) certificate(s):"
-$now = [datetime]::Now
-$refusals = [System.Collections.Generic.List[object]]::new()
-# The store each certificate is shown with is the one it is offered for and written to.
 $entries = @(foreach ($cert in $bundle) {
     $target = $stores[(Get-CaStoreName -Certificate $cert)]
+    $why = Get-CaRefusal -Certificate $cert -NowUtc $nowUtc
+    if (-not $why) { $why = Get-ChainRefusal -Certificate $cert -Bundle $bundle }
     Write-Host ""
     Write-Host "  Subject    : $(ConvertTo-PrintableText $cert.Subject)"
     Write-Host "  Issuer     : $(ConvertTo-PrintableText $cert.Issuer)"
     Write-Host "  Thumbprint : $($cert.Thumbprint)"
-    Write-Host "  Not after  : $($cert.NotAfter.ToString('u'))"
-    Write-Host "  Store      : $($target.Label)"
-    if ($cert.NotAfter -lt $now -or $cert.NotBefore -gt $now) {
-        Write-Warning "$($cert.Thumbprint) is outside its validity period; a chain through it will not validate."
+    Write-Host "  Not before : $($cert.NotBefore.ToUniversalTime().ToString('u'))"
+    Write-Host "  Not after  : $($cert.NotAfter.ToUniversalTime().ToString('u'))"
+    if ($why) {
+        Write-Host "  Refused    : $why"
+        $refusals.Add("$($cert.Thumbprint) ($(ConvertTo-PrintableText $cert.Subject)): $why")
+    } else {
+        Write-Host "  Store      : $($target.Label)"
     }
-    $why = Get-CaRefusal -Certificate $cert
-    if ($why) { $refusals.Add([pscustomobject]@{ Thumbprint = $cert.Thumbprint; Why = $why }) }
     @{ Certificate = $cert; Target = $target }
 })
-if ($refusals.Count -gt 0) {
-    # Printed one per line for the operator. pwsh 7's default error view rewraps a message at the
-    # console width, which can split a thumbprint from its reason. The error repeats each pair on
-    # one line, for a caller that catches it or keeps only the error stream.
-    Write-Host ""
-    Write-Host "Refused:"
-    foreach ($refusal in $refusals) { Write-Host "  $($refusal.Thumbprint): $($refusal.Why)" }
-    throw ("Nothing was imported. Every certificate in the file must be a CA that may sign " +
-        "certificates and carries no private key. Refused: " +
-        (($refusals | ForEach-Object { "$($_.Thumbprint) ($($_.Why))" }) -join '; ') + ".")
-}
 if (-not ($entries | Where-Object { $_.Target -eq $stores['Root'] })) {
     # Without its root an issuing CA validates nothing over SChannel, and over the engine's Python TLS
     # it would be trusted with no root's revocation or constraints over it (the help's "Where each
-    # CA goes"), so a rootless file is refused rather than imported.
+    # CA goes"), so a rootless file is refused rather than imported. Checked first, since every CA
+    # in such a file is also refused for reaching no root, and this message says why in one line.
     throw ("Nothing was imported. The file holds no self-signed root. Give this script the root " +
         "the CA chains to, alone or in the same .p7b chain.")
+}
+if ($refusals.Count -gt 0) {
+    # Printed one per line for the operator: pwsh 7's default error view rewraps a message at the
+    # console width, which can split a line. The error carries the same lines, joined into its one
+    # message, for a caller that catches it or keeps only the error stream; past the first few it
+    # gives the count instead.
+    Write-Host ""
+    Write-Host "Refused:"
+    foreach ($line in $refusals) { Write-Host "  $line" }
+    $shown = 5
+    $named = ($refusals | Select-Object -First $shown) -join '; '
+    if ($refusals.Count -gt $shown) { $named += "; and $($refusals.Count - $shown) more, listed above" }
+    throw ("Nothing was imported. Every certificate in the file must be a CA, within its validity " +
+        "period, that may sign certificates, carries no private key, and chains to a self-signed " +
+        "root in the file. Refused: $named.")
 }
 
 # --- import ------------------------------------------------------------------
@@ -461,20 +526,27 @@ $approved = @(foreach ($entry in $entries) {
 })
 
 if ($approved.Count -gt 0) {
-    # Each store keys on thumbprint, so re-importing the same CA is a no-op (idempotent).
+    # Each store keys on thumbprint, so re-importing the same CA is a no-op (idempotent). Roots go
+    # first, so a failure part way never leaves an approved issuing CA added and an approved root not.
+    # Nothing is rolled back; the error says how many were added.
     $added = 0
     try {
-        foreach ($entry in $approved) {
-            $entry.Target.Store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        foreach ($name in 'Root', 'CertificateAuthority') {
+            $batch = @($approved | Where-Object { $_.Target -eq $stores[$name] })
+            if ($batch.Count -eq 0) { continue }
+            $store = $stores[$name].Store
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
             try {
-                $entry.Target.Store.Add($entry.Certificate)
+                foreach ($entry in $batch) {
+                    $store.Add($entry.Certificate)
+                    $added++
+                }
             } finally {
-                $entry.Target.Store.Close()
+                $store.Close()
             }
-            $added++
         }
     } catch {
-        throw ("Added $added of $($approved.Count) certificate(s), in the order shown, before this " +
+        throw ("Added $added of $($approved.Count) certificate(s), roots first, before this " +
             "failed: $($_.Exception.Message)")
     }
     Write-Host ""
@@ -489,5 +561,6 @@ if ($approved.Count -gt 0) {
     }
     Write-Host ""
     Write-Host "Rotation: when the CA is replaced, import the NEW CA first (this leaves both trusted),"
-    Write-Host "roll the server cert, then remove the OLD CA -- see docs/DEPLOY-SERVER-DB.md."
+    Write-Host "roll the server cert, then remove every certificate the OLD file added, by the"
+    Write-Host "thumbprints this script listed for it -- see docs/DEPLOY-SERVER-DB.md."
 }
