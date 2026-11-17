@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable
+from collections.abc import Callable, ItemsView
 
 import pytest
 
@@ -623,3 +623,38 @@ def test_a_split_while_the_copy_walks_lazy_does_not_raise() -> None:
     assert clone.encode() == ADT.replace("19800101|F", "19800101|M")
     tree["raw"] = None
     assert m.encode() == ADT
+
+
+class _SplitOnWalkLazy(dict[int, str]):
+    """A ``_lazy`` map that splits another segment the moment Python code walks its ``items()`` (as
+    ``copy.deepcopy`` and a comprehension over it do), as a reader on another thread could.
+    ``dict.copy`` runs in C and does not call it. ``__iter__`` is left alone on purpose: overriding
+    it would send ``dict.copy`` down its generic path, which a real ``_lazy`` never takes."""
+
+    def __init__(self, msg: _builtin_hl7.ParsedMessage, other: int) -> None:
+        super().__init__(msg["_lazy"])
+        self._msg = msg
+        self._other = other
+
+    def _split(self) -> None:
+        _builtin_hl7._ensure_split(self._msg, self._other)
+
+    def items(self) -> ItemsView[int, str]:  # type: ignore[override]
+        self._split()
+        return super().items()
+
+
+def test_the_copy_on_write_copy_never_walks_the_shared_lazy_map() -> None:
+    # Any Python-level walk of a shared _lazy (a deepcopy, a comprehension) can meet a concurrent
+    # split's pop; the copy must take it in one C call instead (BACKLOG #5801, added item 1).
+    m = Message.parse(ADT)
+    clone = m.copy()
+    tree = m._m
+    pid = _builtin_hl7.segment_index(tree, "PID", 1)
+    assert pid is not None and pid in tree["_lazy"]
+    tree["_lazy"] = _SplitOnWalkLazy(tree, pid)
+
+    clone.set("PID-8", "M")  # the write takes the private copy
+
+    assert pid in tree["_lazy"]  # no walk ran, so no split ran
+    assert clone.encode() == ADT.replace("19800101|F", "19800101|M")

@@ -36,8 +36,8 @@ segment whose ID the message's version defines, followed by a field separator, i
 is listed in :attr:`ValidationResult.unvalidated_segments`, but only when the comparison runs,
 which is when no earlier check refused the message (a Z-segment is listed whenever hl7apy parsed
 the message, and nothing is listed for a size, segment-cap or parse refusal). A dropped ID
-the version does not define, a dropped bare defined ID with no field separator, and a dropped
-header, envelope or acknowledgment segment (MSH, BHS, BTS, FHS, FTS, MSA, ERR) are still refused.
+the version does not define, and a dropped bare defined ID with no field separator, are still
+refused, and so is a dropped header, continuation or acknowledgment segment (``_NEVER_EXEMPT``).
 The exemption is per structure, not per slot: it does not count against the slot's
 cardinality or position. It holds only where MSH-9.1 names the structure's own message code, so a
 structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none; one
@@ -365,10 +365,11 @@ def _exempts_defined_segments(message: Any) -> bool:
     )
 
 
-# Header, envelope and acknowledgment segments. A dropped one is refused even in a structure with
-# the "any HL7 segment" slot: each one marks message, batch or file structure, or answers another
-# message, so it is never the data that slot carries (BACKLOG #5920).
-_NEVER_EXEMPT = frozenset({"MSH", "BHS", "BTS", "FHS", "FTS", "MSA", "ERR"})
+# Header, continuation and acknowledgment segments. A dropped one is refused even in a structure
+# with the "any HL7 segment" slot: each one opens a message, batch or file, points at a
+# continuation, or answers another message, so it is never the data that slot carries (BACKLOG
+# #5920). BTS and FTS are not here: split_batch leaves a batch's trailers on its last member.
+_NEVER_EXEMPT = frozenset({"MSH", "BHS", "FHS", "DSC", "MSA", "ERR"})
 
 # Structures whose tree the dropped-segment check could not read, so each is logged once.
 _compare_failures: set[tuple[str, str | None]] = set()

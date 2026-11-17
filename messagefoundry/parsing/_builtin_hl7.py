@@ -1205,9 +1205,10 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     * any other escape sequence (``H``, ``N``, ``Xhh``, ``.br`` and the rest) keeps its text under the
       target escape character.
 
-    Two values the target set cannot represent raise :class:`DelimiterRewriteRefused`: an escape
-    sequence other than the five separator escapes whose text holds a target delimiter, and a segment
-    id holding the target field separator. A field holding no source escape character takes a single
+    At least these values the target set cannot represent raise :class:`DelimiterRewriteRefused`:
+    an escape sequence other than the five separator escapes whose text holds a target delimiter, a
+    segment id holding the target field separator, and a header line whose field 1 or 2 is not the
+    message's own delimiters. A field holding no source escape character takes a single
     ``str.translate`` that also escapes its data characters, and every field takes the plain one when
     the target set equals the source set.
 
@@ -1216,7 +1217,8 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     replaced did (``transports/mllp.py`` ``reencode_delimiters``). The segment id is kept verbatim.
     Every ``MSH``, ``BHS`` and ``FHS`` header has its field 2 rewritten to the target encoding
     characters, so a batch or file header advertises the delimiters its message is written in
-    (BACKLOG #5802). Blank segment lines are kept.
+    (BACKLOG #5802); :func:`_header_encoding` says which field 2 it refuses. Blank segment lines
+    are kept.
 
     Raises ``ValueError`` when the message's own field, component, repetition and subcomponent
     characters are not four distinct characters. Such a header cannot say which structure a character
@@ -1250,7 +1252,7 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
             continue
         if seg["id"] in ("MSH", "BHS", "FHS") and len(texts) >= 3:
             # Field 1 is the field separator the join writes, so only field 2 is a part.
-            parts = [seg["id"], t_comp + t_rep + t_esc + t_sub]
+            parts = [seg["id"], _header_encoding(texts[1], texts[2], msg["seps"], target)]
             tail = texts[3:]
         else:
             if t_field in texts[0]:
@@ -1262,6 +1264,35 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
         parts.extend(rewrite(text) for text in tail)
         lines.append(t_field.join(parts))
     return "\r".join(lines) + "\r"
+
+
+def _header_encoding(
+    field_1: str,
+    field_2: str,
+    source: tuple[str, str, str, str, str],
+    target: tuple[str, str, str, str, str],
+) -> str:
+    """Field 2 of a header line rewritten for :func:`encode_with_separators`.
+
+    A field 2 that holds the source encoding characters, all four or a leading part of them, or
+    nothing, becomes the four target characters, and any characters after the four (such as the
+    v2.7 truncation character) are kept unless one is a target delimiter. Anything else, or a
+    field 1 that is not the source field separator, cannot be said in the target set without
+    losing or restructuring it, so it raises
+    :class:`DelimiterRewriteRefused` (BACKLOG #5802)."""
+    s_field, s_comp, s_rep, s_sub, s_esc = source
+    t_field, t_comp, t_rep, t_sub, t_esc = target
+    s_enc = s_comp + s_rep + s_esc + s_sub
+    t_enc = t_comp + t_rep + t_esc + t_sub
+    if field_1 == s_field:
+        if s_enc.startswith(field_2):
+            return t_enc
+        rest = field_2[len(s_enc) :]
+        if field_2.startswith(s_enc) and not any(c in rest for c in t_field + t_enc):
+            return t_enc + rest
+    raise DelimiterRewriteRefused(
+        "a header line's encoding characters are not the message's own, so the rewrite would lose them"
+    )
 
 
 #: How many distinct escape sequences one :class:`_LeafRewrite` remembers. A real message repeats a

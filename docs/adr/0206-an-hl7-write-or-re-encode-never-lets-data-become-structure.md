@@ -485,8 +485,7 @@ messages with no envelope, now gets an `AR`; the helper's usage text, `docs/USER
 
 **Out of scope** -- A delivery refusing a payload holding more than one `MSH`. Moving the File source
 onto `split_batch_bytes`. Pinning inbound separators per connection. The `FHS`/`BHS` header lines
-`encode_with_separators` rewrites, which kept their python-hl7-parity shape (a later fix,
-BACKLOG #5802, writes their field 2 as it writes MSH-2). The `escape_leaf` defect
+`encode_with_separators` rewrites, which keep their python-hl7-parity shape. The `escape_leaf` defect
 with a letter separator, which ADR 0205 fixed and this branch now carries. The escape-letter
 separator re-split in the delimiter rewrite, vault BACKLOG #2828. The second-`MSH` refusal on the
 loopback re-ingress path. A per-member re-encode check for an MLLP batch.

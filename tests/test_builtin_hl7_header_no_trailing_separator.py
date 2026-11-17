@@ -102,6 +102,40 @@ def test_the_delimiter_rewrite_keeps_a_later_header_line_in_shape(line: str) -> 
     assert line in _builtin_hl7.encode_with_separators(parsed, parsed["seps"]).split("\r")
 
 
+_TARGET = ("#", "@", "$", "%", "!")  # field, component, repetition, subcomponent, escape
+
+
+@pytest.mark.parametrize(
+    ("line", "rewritten"),
+    [
+        ("BHS|^~\\&|A", "BHS#@$!%#A"),
+        ("BHS|^~\\&*|A", "BHS#@$!%*#A"),  # a character past the four is kept
+        ("FHS|^~|A", "FHS#@$!%#A"),  # a leading part of the four
+    ],
+)
+def test_a_later_header_line_takes_the_target_encoding_characters(
+    line: str, rewritten: str
+) -> None:
+    parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
+    assert _builtin_hl7.encode_with_separators(parsed, _TARGET).split("\r")[2] == rewritten
+
+
+@pytest.mark.parametrize("line", ["BHS|SYNTHTEXT", "BHS|SYNTHTEXT|A", "BHSX|A|B"])
+def test_a_header_line_not_in_the_message_delimiters_is_refused(line: str) -> None:
+    """Rewriting field 2 of these would drop its text, so the rewrite refuses (BACKLOG #5802)."""
+    parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
+    for target in (_TARGET, parsed["seps"]):
+        with pytest.raises(_builtin_hl7.DelimiterRewriteRefused, match="encoding characters"):
+            _builtin_hl7.encode_with_separators(parsed, target)
+
+
+def test_a_kept_character_that_is_a_target_delimiter_is_refused() -> None:
+    parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, "BHS|^~\\&#|A"]))
+    with pytest.raises(_builtin_hl7.DelimiterRewriteRefused, match="encoding characters"):
+        _builtin_hl7.encode_with_separators(parsed, _TARGET)  # "#" is the target field separator
+    assert "BHS|^~\\&#|A" in _builtin_hl7.encode_with_separators(parsed, parsed["seps"])
+
+
 #: Bodies whose first line ``strip`` would change: padded single lines, whitespace past the encoding
 #: characters, a trailing ``\r`` run, and a normal multi-line message as the control. The last two
 #: hold whitespace inside the head and data after it on the last line, pinning that the head is

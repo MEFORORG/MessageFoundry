@@ -316,4 +316,16 @@ def test_group_set_refuses_what_the_group_does_not_hold() -> None:
         cbc.set("OBX-5", "X", occurrence=2)  # never reaches into the next order's OBX
     with pytest.raises(ValueError, match="1-based"):
         cbc.set("OBX-5", "X", occurrence=0)
+    with pytest.raises(KeyError, match="group 1 holds no OBR occurrence 1"):
+        bare.set_data("OBR-4", "X")
     assert m.encode() == before
+
+
+def test_group_set_data_writes_a_leaf_in_its_own_order() -> None:
+    m = Message.parse(BARE_OBR_FIRST)
+    cbc = m.groups()[1]
+    cbc.set_data("OBR-4", "A^B")  # separators carried as data, not structure
+    out = Message.parse(m.encode()).groups()
+    assert out[1].field("OBR-4") == "A\\S\\B"  # the whole field, escaped
+    assert out[1].field("OBR-4.1") == "A^B"  # one leaf, read back as written
+    assert out[2].field("OBR-4.1") == "LIPID"
