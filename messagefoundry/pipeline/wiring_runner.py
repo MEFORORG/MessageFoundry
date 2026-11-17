@@ -6986,7 +6986,8 @@ class RegistryRunner:
         its worker refuses it per message through
         :func:`~messagefoundry.pipeline.sandbox.graph_differences`, which stays the backstop.
 
-        **A graph built in code with no config dir cannot isolate**, and degrades to in-process.
+        **Under** ``subprocess`` **(isolated refuses it, above), a graph built in code with no
+        config dir cannot isolate**, and degrades to in-process.
         That degradation is **silent**: a library embedder that asked for ``subprocess`` gets the
         in-process path and nothing says so. It is not refused for its missing digest, because the
         digest exists to hold a worker to the code the engine holds, and here no worker starts: the

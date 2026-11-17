@@ -402,8 +402,8 @@ def test_a_graph_with_no_digest_is_refused_at_start_beside_a_config_dir(
 
 
 def test_a_graph_with_no_digest_and_no_config_dir_runs_in_process() -> None:
-    """The no-config-dir side of the same graph: no worker is ever started, so there is no worker
-    code for a digest to vouch for, and the Router and Handler run as the engine holds them."""
+    """The no-config-dir side of a graph with no digest: it is not refused, and no session is made,
+    so no worker starts for a digest to vouch for."""
     runner = RegistryRunner(
         Registry(),
         object(),  # type: ignore[arg-type]

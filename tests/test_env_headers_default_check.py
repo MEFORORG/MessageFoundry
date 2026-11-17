@@ -121,11 +121,16 @@ def test_a_refused_environment_table_names_nothing_taken_from_the_environment(
 ) -> None:
     """BACKLOG #1183: the refusal names the connection, the setting and the kind of problem only,
     never a header name, an env key or a value the environment value carried."""
+    # The control: the literal rule names what it refuses, so the marker can reach a message.
+    with pytest.raises(WiringError) as literal:
+        HEADERS_FACTORIES["Rest"](table)
+    assert NAME_MARKER in str(literal.value) or "X-B" in str(literal.value)
     spec = HEADERS_FACTORIES["Rest"](messagefoundry.env("all_headers"))
     with pytest.raises(WiringError) as excinfo:
         resolve_env_settings(spec.settings, {"all_headers": table}, connection="OB_ACME_REST")
     text = str(excinfo.value)
     assert NAME_MARKER not in text
+    assert "X-B" not in text
     assert "env() reference" in text
     assert SENTINEL not in text
     assert "partner_key" not in text

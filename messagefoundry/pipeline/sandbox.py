@@ -350,7 +350,10 @@ def graph_shape(registry: Any) -> GraphShape:
 _CONTENT_DIFFERS: Final = "config module content"
 
 #: How a refusal names an engine graph that carries no config-module digest (BACKLOG #5334).
-_ENGINE_UNDIGESTED: Final = "the engine's graph was not loaded from a config directory"
+_ENGINE_UNDIGESTED: Final = (
+    "the engine's graph was not loaded from a config directory (it has no digest to compare the "
+    "worker's with)"
+)
 
 #: The remedy for :data:`_ENGINE_UNDIGESTED`, given at start and by a worker's refusal alike.
 _UNDIGESTED_REMEDY: Final = (
@@ -363,10 +366,7 @@ def undigested_graph_refusal(mode: SandboxMode) -> str:
     the cause-and-remedy words a worker's own refusal uses. The runner raises it when it is made,
     before a listener binds, so a misconfiguration fails at start rather than once per message
     after the ACK; :func:`graph_differences` keeps the same refusal as the backstop."""
-    return (
-        f"[sandbox].mode={mode.value} cannot start: {_ENGINE_UNDIGESTED} (it has no digest to "
-        f"compare a worker's with). {_UNDIGESTED_REMEDY}"
-    )
+    return f"[sandbox].mode={mode.value} cannot start: {_ENGINE_UNDIGESTED}. {_UNDIGESTED_REMEDY}"
 
 
 #: The accessor each lookup kind names, for the broker's refusals and log lines.
@@ -440,7 +440,7 @@ def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
         # none was built in code, or by a path that lost it, and nothing can say the worker runs
         # the code it runs. Refused rather than given a digest read now from disk, which would
         # describe the directory, not the functions the engine holds.
-        found.append(f"{_ENGINE_UNDIGESTED} (it has no digest to compare the worker's with)")
+        found.append(_ENGINE_UNDIGESTED)
     elif worker.code_digest != engine.code_digest:
         # The worker's digest is checked as hex by the codec, so it needs no scrub here.
         worker_side = (
