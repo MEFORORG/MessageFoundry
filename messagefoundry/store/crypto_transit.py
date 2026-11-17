@@ -137,10 +137,11 @@ _VERSION_REFUSAL_TEXTS = (
     "version is too new",
 )
 #: The longest reply body, in characters, that :func:`_reply_errors` parses when hvac parsed none
-#: (BACKLOG #6707). Vault's own refusal is far shorter, so the bound keeps a body of any size from
-#: being parsed. It bounds both readers of a 400, and a change here changes both. The audit walk's
-#: version check reads nothing from a longer body, not even a list hvac parsed. The data-key
-#: decrypt's AEAD check (BACKLOG #5650) does not re-parse one, but still reads a list hvac parsed.
+#: (BACKLOG #6707): a body over this many characters is not parsed, and one of up to this many is.
+#: Vault's own refusal is far shorter. It bounds both readers of a 400, and a change here changes
+#: both. The audit walk's version check reads nothing from a longer body, not even a list hvac
+#: parsed. The data-key decrypt's AEAD check (BACKLOG #5650) does not re-parse one, but still reads
+#: a list hvac parsed.
 _REPARSED_BODY_MAX_CHARS = 64 * 1024
 #: The fixed reasons :func:`_names_no_version_reason` gives, and the one a fault reading the 400
 #: gives, so none is built while the read may be short of memory (BACKLOG #6707).
@@ -148,6 +149,11 @@ _OVERSIZE_BODY = f"its body is past the {_REPARSED_BODY_MAX_CHARS}-character bou
 _NO_ERRORS_LIST = "it carries no errors list"
 _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
+#: What reading a 400 may raise on a reply it cannot read: ``MemoryError`` or ``RecursionError``
+#: on a huge or deeply nested one, and ``ValueError``, the family of the parse refusals
+#: :func:`~messagefoundry.redaction.json_loads_or_refusal` documents. Only these label the 400
+#: unconfirmed; anything else the read raises propagates (BACKLOG #6707).
+_READ_FAULTS = (MemoryError, RecursionError, ValueError)
 #: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
 #: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
 #: texts, ``crypto/cipher``'s GCM for ``aes256-gcm96`` and ``golang.org/x/crypto``'s
@@ -333,28 +339,40 @@ _WARNING_UNLOGGED = "a Transit cipher warning could not be logged"
 _WarningParts = Callable[[], tuple[object, ...]]
 
 
-def _report_unlogged(fault: BaseException) -> None:
+def _report_unlogged(fault: BaseException, site: object = None) -> None:
     """Report, on the last-resort stderr line, that a warning could not be logged, by the
-    failure's class alone. Never raises: :func:`_last_resort` suppresses its own write, and the
-    text falls back to a fixed literal when building it fails."""
-    try:
+    failure's class alone. The line is written at most once in :data:`_WARNING_LOG_INTERVAL_S` for
+    each ``site`` and failure class, a callable ``site`` standing for its code, so a log path that
+    fails on every read cannot flood stderr; when that bookkeeping itself fails, the line is
+    written. Never raises: the text falls back to a fixed literal when building it fails, and a
+    failure of the write is suppressed."""
+    with contextlib.suppress(Exception):
+        slot = ("unlogged", getattr(site, "__code__", site), type(fault))
+        now = time.monotonic()
+        with _logged_at_lock:
+            last = _logged_at.get(slot)
+            if last is not None and now - last < _WARNING_LOG_INTERVAL_S:
+                return
+            _logged_at[slot] = now
+    text = _WARNING_UNLOGGED
+    with contextlib.suppress(Exception):
         text = f"{_WARNING_UNLOGGED} ({ascii(type(fault).__name__)})"
-    except MemoryError:
-        text = _WARNING_UNLOGGED
-    _last_resort(text)
+    with contextlib.suppress(Exception):
+        _last_resort(text)
 
 
-def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2) -> bool:
+def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = None) -> bool:
     """``log.warning(*build())`` that never raises, and whether that call returned without raising
     (BACKLOG #6707); a handler that swallows its own write failure still counts as returned.
     ``build`` is called inside the guard, so a fault building the message is caught too. The audit
     verify path logs beside a verdict; a raise there would otherwise turn a row's break into a walk
-    that could not run. A failure is reported by :func:`_report_unlogged`. The record names the
+    that could not run. A failure is reported by :func:`_report_unlogged` under ``site``, by
+    default ``build``, so each call site is rate-limited apart. The record names the
     caller ``stacklevel`` frames up."""
     try:
         log.warning(*build(), stacklevel=stacklevel)
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
-        _report_unlogged(fault)
+        _report_unlogged(fault, build if site is None else site)
         return False
     return True
 
@@ -373,7 +391,7 @@ def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
             if last is not None and now - last < _WARNING_LOG_INTERVAL_S:
                 return
             _logged_at[key] = now
-        if not _warn_quietly(build, stacklevel=3):
+        if not _warn_quietly(build, stacklevel=3, site=key):
             with _logged_at_lock:
                 if _logged_at.get(key) == now:  # give the slot back unless a later caller took it
                     if last is None:
@@ -381,7 +399,7 @@ def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
                     else:
                         _logged_at[key] = last
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
-        _report_unlogged(fault)
+        _report_unlogged(fault, kind)
 
 
 def _log_unread_decrypt_body(length: int) -> None:
@@ -540,11 +558,13 @@ class TransitCipher(_UnmarkedPolicy):
 
     def _send_alone_from_now(self, op: str, why: str) -> None:
         if not self._batch_alone:
-            log.warning(
-                "Transit %s a batch %s (key=%r); sending each value alone from now on",
-                why,
-                op,
-                self._key,
+            _warn_quietly(
+                lambda: (
+                    "Transit %s a batch %s (key=%r); sending each value alone from now on",
+                    why,
+                    op,
+                    self._key,
+                )
             )
         self._batch_alone = True
 
@@ -806,7 +826,9 @@ class TransitCipher(_UnmarkedPolicy):
         names, raises :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`);
         Transit refusing the version is one cause, not the only one. It raises the subclass
         :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` gives a
-        reason, for example for a proxy's page, or when reading the 400 raises (BACKLOG #6707).
+        reason, for example for a proxy's page, or when reading the 400 raises ``MemoryError``,
+        ``RecursionError`` or ``ValueError`` (BACKLOG #6707). Anything else that read raises
+        propagates.
 
         A 400 on which hvac raises something other than ``InvalidRequest`` raises neither of
         those, and is read as the next paragraph says (BACKLOG #6707). hvac 2.4.0 raises
@@ -868,13 +890,15 @@ class TransitCipher(_UnmarkedPolicy):
         handler. Blocking."""
         if self._refuses_only_version(exc, version):
             # The same flow, labelled apart (BACKLOG #6707). Reading the reply only picks the
-            # label, so whatever the read raises picks the unconfirmed one: escaping here, it
-            # would make the walk "could not run" and drop the row's break and its alert.
+            # label, so a failure the read is known to raise on a hostile or huge reply
+            # (_READ_FAULTS) picks the unconfirmed one: escaping here, it would make the walk
+            # "could not run" and drop the row's break and its alert. Any other exception is a
+            # programming error and propagates.
             reason: str | None
             raised = ""  # the read's fault, by its class's existing name, so nothing is built
             try:
                 reason = _names_no_version_reason(exc)
-            except Exception as read_exc:  # noqa: BLE001 -- see the comment above
+            except _READ_FAULTS as read_exc:
                 reason, raised = _READ_RAISED, type(read_exc).__name__
             if reason is None:
                 return AuditKeyVersionRefusedError(version)

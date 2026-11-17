@@ -1678,6 +1678,77 @@ def test_a_raising_log_filter_never_turns_a_break_into_could_not_run(
     assert capsys.readouterr().err.count("could not be logged ('ValueError')") == 3
 
 
+class _RaisingStream:
+    """A stderr whose every write fails."""
+
+    def write(self, _text: str) -> int:
+        raise OSError("stderr is gone")
+
+    def flush(self) -> None:
+        raise OSError("stderr is gone")
+
+
+def test_the_unlogged_report_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #6707: the stderr report of a warning that could not be logged never raises, even
+    when stderr fails or the failure's class name cannot be rendered, so the warning helpers keep
+    their never-raise contract."""
+    import sys
+
+    from messagefoundry.store import crypto_transit
+
+    monkeypatch.setattr(sys, "stderr", _RaisingStream())
+    crypto_transit._report_unlogged(ValueError("x"), "site-a")
+
+    def no_ascii(_value: object) -> str:
+        raise RuntimeError("cannot render")
+
+    monkeypatch.setattr(crypto_transit, "ascii", no_ascii, raising=False)
+    crypto_transit._report_unlogged(ValueError("x"), "site-b")
+
+    def failing_build() -> tuple[object, ...]:
+        raise ValueError("build fault")
+
+    assert crypto_transit._warn_quietly(failing_build) is False
+    crypto_transit._warn_when_due(lambda: "kind", failing_build)
+
+
+def test_the_unlogged_report_is_rate_limited_per_site(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a log path that fails on every read reports on stderr at most once per
+    interval for each site and failure class; another site, or the next interval, reports
+    again."""
+    from messagefoundry.store import crypto_transit
+
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    for _ in range(5):
+        crypto_transit._report_unlogged(ValueError("x"), "site-a")
+    assert capsys.readouterr().err.count("could not be logged") == 1
+    crypto_transit._report_unlogged(ValueError("x"), "site-b")
+    crypto_transit._report_unlogged(MemoryError(), "site-a")
+    assert capsys.readouterr().err.count("could not be logged") == 2
+    now[0] += crypto_transit._WARNING_LOG_INTERVAL_S
+    crypto_transit._report_unlogged(ValueError("x"), "site-a")
+    assert capsys.readouterr().err.count("could not be logged") == 1
+
+
+@pytest.mark.usefixtures("_raising_log_filter")
+def test_a_persistently_failing_unconfirmed_log_reports_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #6707: an unconfirmed 400 on every read, with a log that always fails, tries the
+    warning each time but writes the stderr line once in the interval."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    for _ in range(4):
+        assert isinstance(
+            _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE),
+            AuditKeyVersionUnverifiedError,
+        )
+    assert capsys.readouterr().err.count("could not be logged ('ValueError')") == 1
+
+
 class _FullDict(dict[object, float]):
     """A throttle table whose write fails, as a dict resize short of memory would."""
 
@@ -1786,23 +1857,41 @@ def test_a_failed_unconfirmed_log_is_tried_again(caplog: pytest.LogCaptureFixtur
     assert len(logged) == 1, logged
 
 
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError, ValueError])
 def test_a_fault_reading_the_400_is_labelled_unconfirmed_and_logged_by_type(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    fault: type[Exception], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #6707: a fault while the 400 is read picks the unconfirmed label rather than
-    escaping, and the log names the fault by its class alone."""
+    """BACKLOG #6707: a failure the read is known to raise on a reply it cannot read picks the
+    unconfirmed label rather than escaping, and the log names the fault by its class alone."""
     from messagefoundry.store import crypto_transit
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     def broken(*_a: Any, **_kw: Any) -> Any:
-        raise KeyError("not for the log")
+        raise fault("not for the log")
 
     monkeypatch.setattr(crypto_transit, "_names_no_version_reason", broken)
     caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
     assert isinstance(_verify_refusal("vault:v2:AAAA"), AuditKeyVersionUnverifiedError)
     logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
-    assert len(logged) == 1 and "because reading it raised KeyError (key=" in logged[0], logged
+    expected = f"because reading it raised {fault.__name__} (key="
+    assert len(logged) == 1 and expected in logged[0], logged
     assert "not for the log" not in logged[0], logged
+
+
+@pytest.mark.parametrize("fault", [TypeError, NameError, AttributeError, AssertionError, KeyError])
+def test_a_programming_error_reading_the_400_propagates(
+    fault: type[Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6707: only the failures a hostile reply can cause label the 400 unconfirmed; a
+    programming error in the reader propagates rather than relabelling the refusal."""
+    from messagefoundry.store import crypto_transit
+
+    def broken(*_a: Any, **_kw: Any) -> Any:
+        raise fault("a bug in the reader")
+
+    monkeypatch.setattr(crypto_transit, "_names_no_version_reason", broken)
+    with pytest.raises(fault):
+        _verify_refusal("vault:v2:AAAA")
 
 
 def test_a_body_hvac_parsed_past_the_bound_is_not_read() -> None:
@@ -1964,6 +2053,11 @@ def test_an_oversized_vault_shaped_body_is_labelled_unconfirmed_unparsed(
     assert isinstance(
         _verify_refusal("vault:v2:AAAA", None, text=body), AuditKeyVersionUnverifiedError
     )
+    # The negative control: with the bound one character wider the body is parsed, and the
+    # parser's AssertionError propagates, so the assertion above can fail.
+    monkeypatch.setattr(crypto_transit, "_REPARSED_BODY_MAX_CHARS", len(body))
+    with pytest.raises(AssertionError, match="an oversized body was parsed"):
+        _verify_refusal("vault:v2:AAAA", None, text=body)
 
 
 def test_a_vault_shaped_body_at_the_bound_is_still_read() -> None:
