@@ -1018,7 +1018,7 @@ def test_a_fault_in_the_line_check_ships_the_line_before_3045(monkeypatch) -> No
         raise RuntimeError("synthetic")
 
     monkeypatch.setattr(audit_tee, "sink_readings", boom)
-    monkeypatch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", True)
+    monkeypatch.setattr(audit_tee, "_LINE_SCRUB_FAULT_LOGGED", True)
     before: dict[str, object] = {"actor": "\x01DOE JANE ABC|x", "seq": 1}
     after: dict[str, object] = {"actor": "\x01[redacted] ABC|[redacted]", "seq": 1}
     assert audit_tee._tee_line(before, after) == json.dumps(before, ensure_ascii=False)
@@ -1033,7 +1033,7 @@ def test_a_fault_while_bounding_the_detail_ships_the_line_before_3045(monkeypatc
 
     with monkeypatch.context() as patch:
         patch.setattr(audit_tee, "_bounded_detail", boom)
-        patch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", True)
+        patch.setattr(audit_tee, "_LINE_SCRUB_FAULT_LOGGED", True)
         scrubbed = _raw_tee_lines([{"detail": "\x01DOE JANE"}], monkeypatch, scrub=True)
     assert scrubbed == _raw_tee_lines([{"detail": "\x01DOE JANE"}], monkeypatch, scrub=False)
 
@@ -1138,7 +1138,8 @@ _UNPARSED = "leave a sink's reading unparseable where the line before it parsed"
 #: no sink, so the parse floor cannot fire.
 _WORD_BEFORE: dict[str, object] = {"actor": "\x01DOE JANE ABC|x", "seq": 1}
 _WORD_AFTER: dict[str, object] = {"actor": "\x01[redacted] ABC|[redacted]", "seq": 1}
-#: :data:`_PARSE_FLOOR_FALLBACK` as a record, with a ``detail`` the scrub changed.
+#: :data:`_PARSE_FLOOR_FALLBACK` as a record, with a ``detail`` the scrub leaves alone, which a
+#: test can change in its ``after``.
 _FLOOR_BEFORE: dict[str, object] = {**_PARSE_FLOOR_FALLBACK, "detail": "ok", "seq": 1}
 
 
@@ -1155,8 +1156,8 @@ def _old_line_warnings(caplog, before, after, whole_detail=lambda: "[redacted]")
 def _worded(*reasons: str) -> str:
     return (
         "an off-box audit record shipped without the C0 field scrub, because hiding its changed "
-        f"fields whole would still {' and '.join(reasons)}; further cases in this process with no "
-        "reason not yet logged are not logged"
+        f"fields whole would still {' and '.join(reasons)}; later cases are logged only where they "
+        "name a reason not yet logged in this process"
     )
 
 
@@ -1199,6 +1200,58 @@ def test_each_old_line_reason_is_logged_once(monkeypatch, caplog) -> None:
     assert _old_line_warnings(caplog, _WORD_BEFORE, _WORD_AFTER) == []
     assert _old_line_warnings(caplog, _FLOOR_BEFORE, floor_after) == [_worded(_UNPARSED)]
     assert _old_line_warnings(caplog, _FLOOR_BEFORE, floor_after) == []
+
+
+def test_a_logged_reason_is_named_again_beside_a_new_one(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: the warning is logged where it names a reason not yet logged,
+    and it names every reason that fired, so a logged one can appear again. Synthetic values."""
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    both_after = {**_FLOOR_BEFORE, "actor": "[redacted]", "detail": "ko"}
+    assert _old_line_warnings(caplog, _WORD_BEFORE, _WORD_AFTER) == [_worded(_SHOWS)]
+    warnings = _old_line_warnings(caplog, _FLOOR_BEFORE, both_after, lambda: "zebra")
+    assert warnings == [_worded(_SHOWS, _UNPARSED)]
+    assert _old_line_warnings(caplog, _FLOOR_BEFORE, both_after, lambda: "zebra") == []
+
+
+def test_an_earlier_candidate_that_shows_a_word_is_not_parsed(monkeypatch) -> None:
+    """Review of the PR 2864 repair: only the last candidate's reasons are reported, so the
+    scrubbed line, which shows ``zebra``, is rejected without parsing its readings. Synthetic."""
+    from messagefoundry.logging_setup import sink_readings
+
+    parsed: list[str] = []
+    real = audit_tee._parses
+
+    def counted(text: str) -> bool:
+        parsed.append(text)
+        return real(text)
+
+    monkeypatch.setattr(audit_tee, "_parses", counted)
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", {_SHOWS, _UNPARSED})
+    after = {**_FLOOR_BEFORE, "actor": "zebra"}
+    audit_tee._tee_line(_FLOOR_BEFORE, after)
+    first = set(sink_readings(json.dumps(after, ensure_ascii=False)))
+    assert parsed and not first & set(parsed)
+
+
+def test_a_fault_that_ships_the_old_line_says_so(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: a fault in the line check logged that the field ships
+    redacted, when the record ships as the line before #3045, and shared one flag with the field
+    fault, so whichever came second was never logged. Synthetic values."""
+
+    def boom(_text: str) -> list[str]:
+        raise RuntimeError("synthetic DOE JANE")
+
+    monkeypatch.setattr(audit_tee, "sink_readings", boom)
+    monkeypatch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", True)
+    monkeypatch.setattr(audit_tee, "_LINE_SCRUB_FAULT_LOGGED", False)
+    with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
+        audit_tee._tee_line(_WORD_BEFORE, _WORD_AFTER)
+        audit_tee._tee_line(_WORD_BEFORE, _WORD_AFTER)
+    (fault,) = [r.getMessage() for r in caplog.records if "scrub failed" in r.getMessage()]
+    assert fault == (
+        "the audit tee's C0 scrub failed (RuntimeError); the record ships without it, as the line "
+        "before the scrub, and further such faults in this process are not logged"
+    )
 
 
 def test_a_long_value_with_no_control_is_not_touched() -> None:

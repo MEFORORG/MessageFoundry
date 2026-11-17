@@ -127,6 +127,9 @@ _PLACEHOLDERS = re.compile(r"\[redacted\]|<redacted>")
 _WORD = re.compile(r"[^\W_]+")
 #: Whether this process has logged a field scrub fault; see :func:`_scrub_field`.
 _FIELD_SCRUB_FAULT_LOGGED = False
+#: Whether this process has logged a fault that ships the line before #3045; see
+#: :func:`_log_line_fault`.
+_LINE_SCRUB_FAULT_LOGGED = False
 #: The reasons for shipping a record as the line before #3045 that this process has logged, so
 #: each reason is logged once; see :func:`_tee_line`.
 _OLD_LINE_REASONS_LOGGED: set[str] = set()
@@ -330,13 +333,26 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
 
 
 def _log_scrub_fault(exc: Exception) -> None:
-    """Log a fault in the C0 scrub once per process, by type and never with the value."""
+    """Log a fault in the C0 field scrub once per process, by type and never with the value."""
     global _FIELD_SCRUB_FAULT_LOGGED
     if not _FIELD_SCRUB_FAULT_LOGGED:
         _FIELD_SCRUB_FAULT_LOGGED = True
         log.warning(
             "the audit tee's field scrub failed (%s); the field ships redacted, and further "
             "faults in this process are not logged",
+            type(exc).__name__,
+        )
+
+
+def _log_line_fault(exc: Exception) -> None:
+    """Log a fault that ships a record as the line before #3045, once per process, by type and
+    never with the value. Apart from :func:`_log_scrub_fault`, whose field ships redacted."""
+    global _LINE_SCRUB_FAULT_LOGGED
+    if not _LINE_SCRUB_FAULT_LOGGED:
+        _LINE_SCRUB_FAULT_LOGGED = True
+        log.warning(
+            "the audit tee's C0 scrub failed (%s); the record ships without it, as the line "
+            "before the scrub, and further such faults in this process are not logged",
             type(exc).__name__,
         )
 
@@ -372,8 +388,9 @@ def _tee_line(
     loses the C0 scrub for that record, and is reached only where hiding the changed fields
     whole still fails the bar on some sink, for either of two reasons: it shows a word the old
     line hid elsewhere in it, or its reading does not parse as JSON where the old line's did. It
-    is logged naming the reasons that fired for that last candidate and no field value, once per
-    process for each reason.
+    is logged naming the reasons that fired for that last candidate and no field value, where it
+    names a reason this process has not logged yet, so a logged reason can be named again
+    beside a new one.
     On a fault, the old line ships, which meets the bar by definition."""
     old_line = json.dumps(before, ensure_ascii=False)
     if after == before:
@@ -403,14 +420,14 @@ def _tee_line(
             if unparsed:
                 reasons.append(_UNPARSED)
     except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
-        _log_scrub_fault(exc)
+        _log_line_fault(exc)
         return old_line
     if not _OLD_LINE_REASONS_LOGGED.issuperset(reasons):
         _OLD_LINE_REASONS_LOGGED.update(reasons)
         log.warning(
             "an off-box audit record shipped without the C0 field scrub, because hiding its "
-            "changed fields whole would still %s; further cases in this process with no reason "
-            "not yet logged are not logged",
+            "changed fields whole would still %s; later cases are logged only where they name "
+            "a reason not yet logged in this process",
             " and ".join(reasons),
         )
     return old_line
@@ -638,7 +655,7 @@ def emit_audit_tee(
                 lambda: _bounded_detail(_FIELD_REDACTED, note, old_detail),
             )
         except Exception as exc:  # noqa: BLE001 - a scrub fault ships the line before #3045
-            _log_scrub_fault(exc)
+            _log_line_fault(exc)
             line = json.dumps(record, ensure_ascii=False)
         # Inside the guard: a sink that cannot be built must not fail the caller's audit write either.
         ensure_logger_sink(audit_logger)
