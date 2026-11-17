@@ -346,12 +346,11 @@ async def close_rotation_record(meta_store: SecretRotationMetaStore, day: str) -
 
 #: The WARNING a start logs when it opened the rotation record itself (BACKLOG #4942).
 _OPENED_AT_START = (
-    "secret rotation: the store key in use is not confirmed by its stamp, and the audit "
-    "chain has not been rolled to it, so no `messagefoundry rotate-key` run has completed on it. A "
+    "secret rotation: the store key in use is not confirmed by its stamp, and the open did not "
+    "find the audit chain rolled to it. A "
     "rotation record was opened for it, its rotation date was not stamped and its age was not "
     "reset. Stop the engine and run `messagefoundry rotate-key`, with the prior key in "
-    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED. If it refuses at its audit chain step, "
-    "its error says whether a re-run can clear that, and the way out where none can."
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED."
 )
 
 #: The WARNING a start logs when it held a key and kept a record open for another key (BACKLOG

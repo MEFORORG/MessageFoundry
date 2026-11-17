@@ -6853,8 +6853,8 @@ class SecretRotationSettings(_Section):
     # security_loosenings() names it, so the opt-out is never silent.
     enforce_store_key_expiry: bool = True
     # BACKLOG #4934 — True starts serve over its refusal of a store key change the keyed audit
-    # chain cannot follow; a LOOSENING, named by security_loosenings(). The refusal's condition and
-    # way out are stated once, in this setting's entry in docs/SECURITY-LOOSENING.md.
+    # chain cannot follow; a LOOSENING, named by security_loosenings(). This setting's entry in
+    # docs/SECURITY-LOOSENING.md states the refusal's condition and way out.
     allow_lost_audit_range_key: bool = False
     # ASVS 13.3.4 / BACKLOG #1932 — the calendar refusal for the NON-DEK classes, OPT-IN per class.
     # Each entry names one class from ENFORCEABLE_SECRET_EXPIRY_CLASSES. Under

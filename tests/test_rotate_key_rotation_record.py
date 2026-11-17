@@ -322,7 +322,7 @@ def test_a_serve_start_before_the_first_run_opens_the_record_and_stamps_nothing(
     assert rows[_DEK].last_rotated == _OLD_DATE
     record = rows[ROTATION_RECORD_ID]
     assert record.fingerprint == dek_fingerprint(_key_id(key_b))
-    assert "the audit chain has not been rolled to it" in caplog.text
+    assert "did not find the audit chain rolled to it" in caplog.text
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.secret_rotation"):

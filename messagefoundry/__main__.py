@@ -5267,7 +5267,7 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     state_dir = generated_state_dir(store_path)
     replaced: list[GeneratedPairReplaced] = []
     # BACKLOG #4934: a start that may replace the pair opens the store and takes the shards' start
-    # refusal before it writes anything. Any other start mints or reuses as before, and opens the
+    # refusal before it renews the pair. Any other start mints or reuses as before, and opens the
     # store only if that replaced a pair after all.
     renew_after_refusal = generated_pair_may_be_replaced(settings.api, state_dir=state_dir)
     if not renew_after_refusal:
@@ -11958,7 +11958,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         async def open_record(opening: object) -> None:
             # BACKLOG #3737, #4936: inside the store open, before its first write under the key,
             # on every store, so a kill anywhere after it, the open's own writes and either data
-            # pass included, leaves the record open.
+            # pass included, leaves any record it opened open.
             nonlocal record_named
             # Every backend's store has cipher_info(); the hook is typed for any of them.
             info = getattr(opening, "cipher_info", None)

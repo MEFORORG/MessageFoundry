@@ -838,11 +838,12 @@ This section is kept rather than deleted, because the claim it used to make is t
 Named as `allow_lost_audit_range_key` (BACKLOG #4934), whatever the store holds, because it says what
 the next start may do.
 - **What you lose:** the start refusal that keeps the keyed audit chain whole across a store key
-  change. This entry is the statement of when that refusal fires and of the way out. With it off,
+  change. This entry states when that refusal fires and the way out. With it off,
   `serve` (and each `supervise` shard) refuses to start when all of these hold: the engine holds a
   local store key, so not under `[store].cipher_provider = "vault_transit"`; the stamp does not
   name that key, which covers a different key, no stamp, and a stamp under a scheme this release
-  does not know; the store has a keyed audit chain whose ranges the open authenticated; and the
+  does not know; the store has a keyed audit chain in which the open found no range that fails to
+  authenticate; and the
   key the chain's newest range is under is not configured. It refuses whether or not the key in
   use keyed an earlier range. With it on, that start goes ahead: its first audit row goes into
   that range under the key in use, never verifies there, and the chain breaks at that row. Once it
