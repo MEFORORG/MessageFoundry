@@ -293,8 +293,7 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
             return whole
         # This result must hide every word the handler chain alone hides. The plain pass can
         # redact a span the chain read differently, a name run that takes a ``Bearer`` label with
-        # it, and leave the credential the chain would have caught. The bar that binds the line is
-        # :func:`_tee_line`'s.
+        # it, and leave the credential the chain would have caught.
         alone = scrub_log_text(json.dumps(written, ensure_ascii=False)[1:-1])
         if not _shows_no_more(json.dumps(result, ensure_ascii=False)[1:-1], _line_words(alone)):
             return whole
@@ -418,8 +417,8 @@ def emit_audit_tee(
     **One residual, stated because "the head hash carries nothing" is too strong.** In
     the keyless posture ``row_hash`` is a plain SHA-256 over a canonical list whose every other
     member -- the previous row's hash, ``ts``, ``actor``, ``action``, ``channel_id``, ``client`` --
-    travels in this same record or the one before it. So a reader of the log can TEST guesses at the
-    removed span offline, one hash per guess (``seq`` travels in the record too).
+    travels in this same record or the one before it. So a reader of the log can TEST guesses
+    offline, one hash per guess (``seq`` travels in the record too).
     It does not arise for a row written by a process that holds a key, where the digest is
     an HMAC under a DEK-derived subkey or a Transit MAC. Keyless is not the shipped default. A row
     written without a key keeps its plain SHA-256: no later open re-keys it, and a keyed process
