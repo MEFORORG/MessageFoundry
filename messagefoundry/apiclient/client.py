@@ -361,7 +361,11 @@ def _seg(value: str | int) -> str:
 
 
 def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
-    """Permit only safe URL schemes, then refuse plaintext ``http`` to a non-loopback host.
+    """Refuse an unsafe base URL, then refuse plaintext ``http`` to a non-loopback host.
+
+    A base URL is refused when httpx cannot parse it, when its scheme is not ``http`` or
+    ``https``, when it has no host, or when it carries userinfo; each refusal is an
+    :class:`ApiError` that chains nothing.
 
     Returns ``True`` when the caller has opted into a **cleartext non-loopback hop** -- the one
     permitted-but-unencrypted shape. :class:`EngineClient` stores that and refuses to put a
@@ -371,10 +375,9 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     load-bearing.
 
     **Scheme allow-list (ASVS 1.2.2, BACKLOG #1107).** Only ``http`` and ``https`` are permitted.
-    This has to run before the host checks because everything below it is keyed on the HOST, and a URL like
-    ``javascript:``, ``data:``, ``file:`` or an OS protocol handler (``ms-msdt:``) has no hostname
-    at all -- ``parts.hostname`` was ``None``, so the former ``host == ""`` early return waved it
-    through. That made the shipped check a host-keyed deny-list for plaintext http rather than a
+    This has to run before the host checks because they are keyed on the HOST, and a URL like
+    ``javascript:``, ``data:``, ``file:`` or an OS protocol handler (``ms-msdt:``) has no host at
+    all, so the former empty-host early return waved it through. That made the shipped check a host-keyed deny-list for plaintext http rather than a
     protocol allow-list, and the two schemes the ASVS verb names by name were exactly the two that
     passed. A positive allow-list is the shape that fixes it: a deny-list of known-bad schemes
     cannot cover the OS protocol handlers a given Windows install happens to register.
@@ -423,7 +426,7 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     """
     try:
         url: httpx.URL | None = httpx.URL(base_url)
-    except httpx.InvalidURL:  # a non-numeric port or a control character, say
+    except (httpx.InvalidURL, UnicodeError):  # a bad port, a control character, a lone surrogate
         url = None
     if url is None:  # raised outside the handler, so it chains no error quoting the URL
         raise ApiError("refusing a base URL that does not parse as a URL.")

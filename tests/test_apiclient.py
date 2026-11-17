@@ -624,7 +624,7 @@ def test_httpx_dials_a_base_url_with_no_host(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(SyncBackend, "connect_tcp", _connect_tcp)
     with (
-        httpx.Client(base_url="http:////engine.example.com:8765") as http,
+        httpx.Client(base_url="http:////engine.example.com:8765", trust_env=False) as http,
         pytest.raises(httpx.ConnectError),
     ):
         http.get("/health")
@@ -656,8 +656,10 @@ def test_transport_guard_raises_no_raw_idna_error() -> None:
         "http://user:s3cret@[::1:8765",
         "http://user:s3cret@127.0.0.1:abc",
         "http://user:s3cret@127.0.0.1:8765/\x01",
+        "http://user:s3cret@127.0.0.1:8765/\udcff",
+        "http://user:s3cret\udcff@127.0.0.1:8765",
     ],
-    ids=["bracket", "port", "control_character"],
+    ids=["bracket", "port", "control_character", "surrogate_path", "surrogate_userinfo"],
 )
 def test_transport_guard_refuses_an_unparsable_base_url_as_api_error(base_url: str) -> None:
     """A URL httpx cannot parse raises :class:`ApiError`, the client's only error type (BACKLOG
