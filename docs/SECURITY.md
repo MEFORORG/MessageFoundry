@@ -6896,8 +6896,8 @@ on K ports gets up to K times the budget. The counts are held in a map keyed by 
 leaves the map in at least these ways (BACKLOG #5336):
 
 - the engine ends the session itself, by a sign-out, a revoke of one, some or all sessions, the
-  budget revoke, or the idle or expiry revoke a request meets (the budget revoke drops the count
-  only once its revoke commits);
+  account's deletion, the budget revoke, or the idle or expiry revoke a request meets (the budget
+  revoke drops the count only once its revoke commits);
 - a re-proof finds its session already gone, or lapsed past its absolute expiry or idle window,
   which that re-proof refuses unverified and ends (the count goes only once that revoke commits);
 - a successful re-proof on the step-up re-auth route (a successful current-password check on the

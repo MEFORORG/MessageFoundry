@@ -609,6 +609,71 @@ async def test_many_accounts_ended_sessions_do_not_fill_the_global_map(
         await store.close()
 
 
+async def test_a_deleted_accounts_counts_are_dropped() -> None:
+    """BACKLOG #5336: deleting an account ends its sessions, so their counts go with it. Kept,
+    they would sit under a user id nobody can re-prove as, which no drop at a cap ever reaches."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+        assert service._session_reproof_failures(hash_token(token)) == 1
+        await service.delete_user("u-bob", actor="admin")
+        assert service._reproof_session_failures == {}
+    finally:
+        await store.close()
+
+
+async def test_the_reproved_session_keeps_its_count_whatever_the_listing_says(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the session was found live, but the listing the cap's drop reads comes a
+    moment later, and a session that expires in between is not listed. Its own count is kept, so
+    the guess is charged on the budget it has, not a fresh one."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 1)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+
+        async def expired_meanwhile(*_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+        monkeypatch.setattr(store, "list_sessions", expired_meanwhile)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+        assert service._session_reproof_failures(hash_token(token)) == 2, "a fresh budget"
+    finally:
+        await store.close()
+
+
+async def test_a_refused_read_at_the_reproof_cap_leaves_the_reproof_to_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the drop at the account's cap is housekeeping. A refused read of the
+    account's sessions, here the closed connection's bare ``ValueError``, is logged, the counts
+    stay, and the re-proof is verified and charged as before, never a 500."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 1)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+
+        async def refused(*_args: object, **_kwargs: object) -> object:
+            raise ValueError("no active connection")
+
+        monkeypatch.setattr(store, "list_sessions", refused)
+        out = await service.reauth(identity, WRONG, token=token)
+        assert not out.ok and not out.session_lost
+        assert service._session_reproof_failures(hash_token(token)) == 2
+    finally:
+        await store.close()
+
+
 async def test_an_admin_revoke_drops_the_accounts_counts_and_keeps_others(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
