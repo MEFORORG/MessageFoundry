@@ -511,7 +511,8 @@ _DR_PASSIVE_REASON = "DR standby is passive"
 
 #: The bound on the builds a reload's prepare runs for the lanes leaving the DR park: each one's
 #: CA verdict, connector build and ``validate_startup`` (owner ruling 2026-11-16, BACKLOG #5755).
-#: The builds run concurrently, so the bound holds for all of them together. The prepare runs
+#: The builds of one prepare round run concurrently under one bound; what it does not hold is
+#: stated once, in :meth:`RegistryRunner._build_lane_destinations_bounded`. The prepare runs
 #: before the quiesce, so a hung check, such as a ``validate_startup`` on a partner file share that
 #: does not answer, would otherwise hold up the activation's inbound binds. A lane past it fails
 #: as a failed build does. A judgment with no measured anchor: it
@@ -5362,51 +5363,78 @@ class RegistryRunner:
     async def _build_lane_destinations_bounded(
         self, lanes: list[tuple[str, OutboundConnection]], into: dict[str, _LaneBuild]
     ) -> None:
-        """:meth:`_build_lane_destination` for every lane leaving the DR park in a reload's
-        prepare, run concurrently and bounded together by ``_DR_PARK_BUILD_TIMEOUT_SECONDS``
-        (owner ruling 2026-11-16, BACKLOG #5755), so N hung lanes hold the activation's inbound
-        binds for one bound, not N. Each result goes into ``into``. A build past the bound goes
-        in as a failed build, so the lane stays parked and is recorded and alerted as one, and
-        the reload goes on to bind its inbounds. Such a build is cancelled and left to close what
-        it made in its own task, tracked with the detached closes, so a close that hangs holds up
-        no reload. A cancellation of the caller cancels every build and waits for them all, as an
-        unbounded build is cancelled, and closes what any of them returned."""
+        """:meth:`_build_lane_destination` for every lane leaving the DR park in one round of a
+        reload's prepare, run concurrently and bounded together by
+        ``_DR_PARK_BUILD_TIMEOUT_SECONDS`` (owner ruling 2026-11-16, BACKLOG #5755), so N hung
+        lanes in one round take one bound, not N.
+
+        **What the bound holds, stated once here.** It holds for the DR-park builds of one call,
+        that is one prepare round, together. It does not hold for at least these other steps
+        before the inbound binds: the ordinary builds of the same round, which run first and
+        unbounded; the reload's CA pre-check; and each further prepare round, which gets a fresh bound of
+        its own. A cancelled call waits at most one further bound for its builds to unwind.
+
+        Each result goes into ``into``. A build past the bound goes in as a failed build, so the
+        lane stays parked and is recorded and alerted as one, and the reload goes on. Such a
+        build is cancelled and left to close what it made in its own task, so a close that hangs
+        holds up no reload. A cancellation of the caller cancels every build and waits for them
+        at most one bound, then propagates, leaving any still running to close what they made.
+
+        Every build is tracked with the detached closes as it is created, before any await. A
+        build is abandoned, cancelled and given the callback that closes what it made, with no
+        await between the wait's return or cancellation and the abandon, so no cancellation can
+        skip it. A build whose result goes into ``into`` is never abandoned, so its connector is
+        the caller's. A build that raised is raised once every other done build's result is in
+        ``into``."""
         if not lanes:
             return
-        builds = {
-            name: asyncio.create_task(self._build_lane_destination(name, oc)) for name, oc in lanes
-        }
-        try:
-            await asyncio.wait(builds.values(), timeout=_DR_PARK_BUILD_TIMEOUT_SECONDS)
-        except asyncio.CancelledError:
-            for build in builds.values():
-                build.cancel()
-            await asyncio.wait(builds.values())
-            for name, build in builds.items():
-                self._close_late_lane_build(name, build)
-            raise
-        # The timed-out builds first, so each is cancelled and tracked before a done build's
-        # result can raise past them.
-        for name, build in builds.items():
-            if build.done():
-                continue
+        builds: dict[str, asyncio.Task[_LaneBuild]] = {}
+
+        def abandon(name: str) -> None:
+            # On a task already done the callback still runs, once, on the next loop pass.
+            build = builds[name]
             build.cancel()
-            self._track_detached_close(build)
             build.add_done_callback(functools.partial(self._close_late_lane_build, name))
-            into[name] = _LaneBuild(
-                TimeoutError(
-                    f"outbound connection '{name}' did not finish its build and startup check "
-                    f"within {_DR_PARK_BUILD_TIMEOUT_SECONDS:g}s as it left the DR park"
-                ),
-                _AnchorVerdict(),
+
+        for name, oc in lanes:
+            builds[name] = build = asyncio.create_task(self._build_lane_destination(name, oc))
+            self._track_detached_close(build)
+        try:
+            _done, pending = await asyncio.wait(
+                builds.values(), timeout=_DR_PARK_BUILD_TIMEOUT_SECONDS
             )
+        except asyncio.CancelledError:
+            # Every build is abandoned before the next await, so a second cancellation below
+            # leaves none unclosed or untracked.
+            for name in builds:
+                abandon(name)
+            # Bounded, as the timeout below is: a cancel handler or close that hangs must not
+            # hold the reload lock.
+            await asyncio.wait(builds.values(), timeout=_DR_PARK_BUILD_TIMEOUT_SECONDS)
+            raise
+        raised: BaseException | None = None
         for name, build in builds.items():
-            if name not in into:
+            if build in pending:
+                abandon(name)
+                into[name] = _LaneBuild(
+                    TimeoutError(
+                        f"outbound connection '{name}' did not finish its build and startup "
+                        f"check within {_DR_PARK_BUILD_TIMEOUT_SECONDS:g}s as it left the DR park"
+                    ),
+                    _AnchorVerdict(),
+                )
+                continue
+            try:
                 into[name] = build.result()
+            except BaseException as exc:  # noqa: BLE001 - raised below, once the rest are in
+                if raised is None:
+                    raised = exc
+        if raised is not None:
+            raise raised
 
     def _close_late_lane_build(self, name: str, build: asyncio.Task[_LaneBuild]) -> None:
-        """Close the connector of a cancelled DR-park build that finished anyway, its check
-        having swallowed the cancellation: nothing holds it."""
+        """Close the connector of an abandoned DR-park build that finished anyway, its check
+        having swallowed the cancellation or having finished before it: nothing holds it."""
         if build.cancelled() or build.exception() is not None:
             return
         outcome = build.result().outcome
@@ -8638,8 +8666,8 @@ class RegistryRunner:
                         warn_query_credentials=False,
                     )
             # build_check already warned for this reload (vault BACKLOG #2910). The lanes leaving
-            # the DR park build concurrently under one bound: a hung check fails its lane, and
-            # the activation's inbound binds wait at most one bound (owner ruling 2026-11-16).
+            # the DR park build concurrently under one bound per round, and a hung check fails
+            # its lane (owner ruling 2026-11-16); the callee says what the bound does not hold.
             await self._build_lane_destinations_bounded(
                 [(name, new.outbound[name]) for name, kind in wanted if kind == "start"],
                 plan.started,
@@ -9371,9 +9399,10 @@ class RegistryRunner:
         The connectors it takes out of a lane are closed only once the swap commits, after the
         reload lock is released (BACKLOG #5755). Restarting inbounds before
         reconciling outbounds keeps a slow or hung outbound from holding up the engine's intake,
-        with one bound: step 3's builds for the lanes a DR activation takes out of the park run
-        in its prepare, before the quiesce, so they can delay the inbound binds by at most about
-        ``_DR_PARK_BUILD_TIMEOUT_SECONDS``, since they run concurrently under that one bound.
+        with one exception: step 3's builds run in its prepare, before the quiesce, so they delay
+        the inbound binds. The builds for the lanes a DR activation takes out of the park are
+        bounded; :meth:`_build_lane_destinations_bounded` says what that bound holds and what it
+        does not.
         """
         async with self._reload_lock:
             if new_registry is None:
