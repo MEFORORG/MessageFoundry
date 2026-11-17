@@ -4246,8 +4246,8 @@ class AuthService:
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
         # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
         # guesses in total however often the account lock expires. Bounded (_REPROOF_SESSION_MAX,
-        # never a live count evicted) and carried across a rotation by _rekey_token_state. PROCESS-LOCAL, with the
-        # same accepted caveat as _action_step_up_grants: a restart forgets the counts, and a topology
+        # never a live count evicted) and carried across a rotation by _rekey_token_state.
+        # PROCESS-LOCAL, with the same accepted caveat as _action_step_up_grants: a restart forgets the counts, and a topology
         # that serves the API from more than one process gives each process its own budget.
         self._reproof_session_failures: dict[str, tuple[int, float, str]] = {}
         # Boot-time Kerberos acceptor preflight outcome (ADR 0068 §9): None = usable (or the
