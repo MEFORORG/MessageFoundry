@@ -189,6 +189,10 @@ def test_list_readers_still_decode_a_well_formed_reply(
         b'{"detail": "ok"}',
         b'{"token": ""}',
         b'{"token": null}',
+        json.dumps({"token": "caf\u00e9"}).encode(),
+        json.dumps({"token": "abc\r\nX-Injected: 1"}).encode(),
+        json.dumps({"token": "   "}).encode(),
+        json.dumps({"token": "a" * 8186}).encode(),
     ],
     ids=[
         "non_utf8",
@@ -199,6 +203,10 @@ def test_list_readers_still_decode_a_well_formed_reply(
         "no_token",
         "empty_token",
         "null_token",
+        "non_ascii_token",
+        "crlf_token",
+        "space_only_token",
+        "oversize_token",
     ],
 )
 def test_a_rotation_reply_without_a_usable_token_raises_a_value_free_apierror(
@@ -223,13 +231,19 @@ def test_a_rotation_reply_without_a_usable_token_raises_a_value_free_apierror(
     assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
 
 
-def test_a_well_formed_rotation_reply_is_adopted() -> None:
-    """NEGATIVE CONTROL: a reply carrying a token, with other fields beside it, is adopted."""
+@pytest.mark.parametrize(
+    "token",
+    ["after", "tok-rotated_~.+/", "YWJj==", "a" * 8185],
+    ids=["word", "token68_punctuation", "padding", "longest_that_fits"],
+)
+def test_a_well_formed_rotation_reply_is_adopted(token: str) -> None:
+    """NEGATIVE CONTROL: a reply carrying a sendable token, with other fields beside it, is
+    adopted, up to the longest token whose ``Bearer`` header fits the bound."""
     client = EngineClient("http://127.0.0.1:8765")
     try:
         client._token = "before"
-        client._adopt_rotated(httpx.Response(200, json={"detail": "ok", "token": "after"}))
-        assert client.token == "after"
+        client._adopt_rotated(httpx.Response(200, json={"detail": "ok", "token": token}))
+        assert client.token == token
     finally:
         client.close()
 

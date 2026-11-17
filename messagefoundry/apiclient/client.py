@@ -104,6 +104,8 @@ _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 # TEST process (where the coupling is harmless) and fails if either drifts.
 MAX_REQUEST_URL_LEN = 8192
 MAX_REQUEST_HEADER_VALUE_LEN = 8192
+#: The Authorization scheme prefix this client sends its session token under.
+_BEARER_PREFIX = "Bearer "
 
 # ASVS 15.2.2 (BACKLOG #1577), the RESPONSE half: the ceiling on a reply body this client will
 # buffer. The bound is enforced ON THE STREAM (see _buffer_bounded), so a reply past it costs one
@@ -290,9 +292,18 @@ class _RotatedToken(BaseModel):
     """The one field every elevation reply must carry: the re-keyed session token (BACKLOG #5344).
 
     Local rather than the engine's ``ElevatedResponse`` so that one decode serves all three
-    elevation routes, whose replies differ in their other fields."""
+    elevation routes, whose replies differ in their other fields.
 
-    token: str = Field(min_length=1)
+    The token must be one this client can send: RFC 6750 token68 characters only, so no space,
+    CR/LF or non-ASCII character that would break the header build, and short enough that
+    ``Bearer <token>`` fits :data:`MAX_REQUEST_HEADER_VALUE_LEN`. A token outside that is refused
+    here, rather than adopted and then failing every later request."""
+
+    token: str = Field(
+        min_length=1,
+        max_length=MAX_REQUEST_HEADER_VALUE_LEN - len(_BEARER_PREFIX),
+        pattern=r"^[A-Za-z0-9._~+/-]+=*$",
+    )
 
 
 class _UserListRow(RootModel[UserListEntry]):
@@ -1041,7 +1052,7 @@ class EngineClient:
         bearer = self._token if _bearer is None else _bearer
         if bearer is not None:
             self._refuse_credential_on_cleartext("a bearer token")
-        headers = {"Authorization": f"Bearer {bearer}"} if bearer else None
+        headers = {"Authorization": f"{_BEARER_PREFIX}{bearer}"} if bearer else None
         # One read of the transport for this attempt, counted as held until the reply is buffered.
         # A renewal on another thread may replace `_http`: _follow_renewed_pin needs to know which
         # transport THIS attempt failed on, and the replaced one must stay open until this attempt
