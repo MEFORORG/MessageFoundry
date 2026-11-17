@@ -14779,7 +14779,7 @@ def _dest_config(
         type=oc.spec.type,
         settings=settings,
         retry=oc.retry or RetryPolicy(),
-        sign=OutboundSigning.from_settings(settings),
+        sign=OutboundSigning.from_settings(settings, connection=oc.name),
         # BACKLOG #107: surface the per-outbound raw-separator escape-hatch as a typed field. Default
         # False → byte-identical; only an explicit `hl7_raw_separators=True` (MLLP() factory or a
         # connections.toml setting) flips it. The MLLP connector reads config.hl7_raw_separators.

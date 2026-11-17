@@ -683,7 +683,7 @@ def signer_from_destination(config: Destination) -> MessageSigner | None:
     Prefers the typed :attr:`Destination.sign` the runner assembled; falls back to flat ``sign_*``
     settings so a directly-built ``Destination`` (e.g. in a test) signs too. ``None`` when unconfigured
     or ``enabled=False`` — every existing outbound is unchanged."""
-    signing = config.sign or OutboundSigning.from_settings(config.settings)
+    signing = config.sign or OutboundSigning.from_settings(config.settings, connection=config.name)
     if signing is None or not signing.enabled:
         return None
     return MessageSigner(signing)
@@ -716,10 +716,20 @@ def with_signing(
 
     ``private_key`` and ``private_key_password`` may be :func:`~messagefoundry.config.wiring.env`
     references (resolved per environment) — keep every secret in ``env()``. Mutates ``spec``'s settings
-    in place and returns it. Signing is OFF on any spec this was not called on."""
+    in place and returns it. Signing is OFF on any spec this was not called on.
+
+    A literal empty ``private_key`` (``""`` or ``None``) is refused here unless ``enabled`` is
+    literally ``False`` (BACKLOG #5364), so ``check`` refuses it on a config dir it cannot build.
+    An ``env()`` key that resolves empty is refused when the outbound is built
+    (:meth:`OutboundSigning.from_settings`)."""
     if spec.type not in (ConnectorType.REST, ConnectorType.SOAP):
         raise SigningError(
             f"message signing applies to REST/SOAP outbound only, not {spec.type.value!r} (ADR 0018)"
+        )
+    if (private_key is None or private_key == "") and enabled is not False:
+        raise SigningError(
+            "with_signing: private_key is empty; pass the signing key, or enabled=False to send "
+            "unsigned"
         )
     spec.settings.update(
         {

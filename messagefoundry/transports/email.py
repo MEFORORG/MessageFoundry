@@ -102,6 +102,7 @@ __all__ = [
     "envelope_address_problem",
     "envelope_recipients",
     "envelope_refusal_under",
+    "refuse_unsafe_subject",
 ]
 
 logger = logging.getLogger(__name__)
@@ -236,10 +237,11 @@ def refuse_unsafe_subject(subject: str, *, transport: str) -> None:
     The Email and Direct destinations both call this at load, so the two cannot drift (vault BACKLOG
     #5360). ``transport`` names the destination in the refusal, for example ``"Email destination"``.
 
-    Three checks, in order. First, a control character in the text: the build either raises on it
-    at every send, where it dead-letters as an internal error, or writes it raw into the header.
-    Second, a lone surrogate, for the reason :func:`~messagefoundry.controlchars.has_lone_surrogate`
-    gives (vault BACKLOG #2842). Third, the header parse: ``policy.default`` parses the ``Subject:`` it is given and decodes RFC 2047 encoded words, so
+    Three checks, in order. First, a control character in the text: the build either raises on
+    it at every send, where it dead-letters as an internal error, or writes it raw into the
+    header. Second, a lone surrogate, for the reason
+    :func:`~messagefoundry.controlchars.has_lone_surrogate` gives (vault BACKLOG #2842). Third,
+    the header parse: ``policy.default`` parses the ``Subject:`` it is given and decodes RFC 2047 encoded words, so
     ``=?utf-8?b?AA==?=`` holds no control character as configured, reads back as a NUL, and the
     generator writes that NUL raw into the header (vault BACKLOG #3206). This sets the subject on a
     scratch message, as :func:`_checked_header` does for an address, and checks what reads back.

@@ -324,6 +324,31 @@ def test_from_settings_enabled_with_empty_key_refuses(key: str | None, enabled: 
 
 
 @pytest.mark.parametrize("key", ["", None])
+def test_with_signing_refuses_a_literal_empty_key(key: str | None) -> None:
+    # BACKLOG #5364: refused at authoring, so a config dir check cannot build still refuses it.
+    with pytest.raises(SigningError, match="private_key is empty"):
+        with_signing(Rest(url=REST_URL), private_key=key)
+    spec = with_signing(Rest(url=REST_URL), private_key=key, enabled=False)
+    assert OutboundSigning.from_settings(spec.settings) is None
+
+
+def test_env_key_resolving_empty_is_refused_naming_the_connection() -> None:
+    # BACKLOG #5364: the env() key resolves empty only at build; the refusal names the outbound and
+    # carries no settings value.
+    spec = with_signing(Rest(url=env("u")), private_key=env("k"), algorithm="ES256")
+    oc = OutboundConnection(name="OB_ACME", spec=spec)
+    with pytest.raises(ValueError, match="sign_private_key is empty") as caught:
+        _dest_config(oc, {"u": REST_URL, "k": ""}, None, EgressSettings(deny_by_default=False))
+    assert "outbound connection 'OB_ACME'" in str(caught.value)
+    assert REST_URL not in str(caught.value)
+
+
+def test_flag_named_with_key_absent_refuses() -> None:
+    with pytest.raises(ValueError, match="sign_private_key is empty"):
+        OutboundSigning.from_settings({"sign_enabled": True})
+
+
+@pytest.mark.parametrize("key", ["", None])
 def test_from_settings_named_empty_key_with_no_flag_refuses(key: str | None) -> None:
     # The model's default for an absent flag is on, so a named but empty key is not "off".
     with pytest.raises(ValueError, match="sign_private_key is empty"):

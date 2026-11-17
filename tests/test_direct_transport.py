@@ -800,6 +800,9 @@ def test_construction_probe_refuses_an_unsupported_algorithm(
         # Controls no build refuses, which the header would write raw.
         "Referral\x01note",
         "Referral\x00note",
+        # TAB and DEL, which the Email destination's rule refuses too.
+        "Referral\tnote",
+        "Referral\x7fnote",
     ],
 )
 def test_a_subject_with_a_control_character_is_refused_at_construction(

@@ -749,10 +749,11 @@ class SignatureAlgorithm(str, Enum):  # noqa: UP042
 _SIGN_FLAG: Final = TypeAdapter(bool)
 
 
-def _sign_flag_is_off(value: object) -> bool:
+def _sign_flag_is_off(value: object, where: str) -> bool:
     """Whether ``sign_enabled`` reads as false, as :class:`OutboundSigning` reads it. ``None`` is
-    undecided, not false. An unreadable value raises a :class:`ValueError` that names the setting,
-    raised outside the handler so neither its text nor its chain holds the value (BACKLOG #296)."""
+    undecided, not false. An unreadable value raises a :class:`ValueError` that names ``where`` and
+    the setting, raised outside the handler so neither its text nor its chain holds the value
+    (BACKLOG #296)."""
     if value is None:
         return False
     readable = True
@@ -761,7 +762,7 @@ def _sign_flag_is_off(value: object) -> bool:
     except ValidationError:
         readable = False
     if not readable:
-        raise ValueError("sign_enabled must be a boolean")
+        raise ValueError(f"{where}: sign_enabled must be a boolean")
     return not enabled
 
 
@@ -793,11 +794,14 @@ class OutboundSigning(_InputHidingModel):
     header_name: str = "X-JWS-Signature"  # the HTTP header that carries the detached JWS
 
     @classmethod
-    def from_settings(cls, settings: Mapping[str, Any]) -> OutboundSigning | None:
+    def from_settings(
+        cls, settings: Mapping[str, Any], *, connection: str | None = None
+    ) -> OutboundSigning | None:
         """Build from flat ``sign_*`` connector settings, or ``None`` when signing isn't configured.
 
-        Signing is OFF (``None``) unless ``sign_private_key`` is present, so every existing outbound is
-        unchanged. The flat keys (vs a nested table) keep each value a top-level setting that ``env()``
+        ``None`` when neither ``sign_private_key`` nor ``sign_enabled`` is named, or when the key
+        is empty and ``sign_enabled`` reads as false. ``connection`` names the outbound in a
+        refusal. The flat keys (vs a nested table) keep each value a top-level setting that ``env()``
         resolution and ``connections.toml`` decoding already handle. Recognized keys: ``sign_enabled``,
         ``sign_algorithm``, ``sign_private_key``, ``sign_private_key_password``, ``sign_key_id``,
         ``sign_header``. An unknown/typo'd field raises (``extra='forbid'``).
@@ -811,10 +815,13 @@ class OutboundSigning(_InputHidingModel):
         if not key:
             if "sign_enabled" not in settings and "sign_private_key" not in settings:
                 return None
-            if not _sign_flag_is_off(settings.get("sign_enabled", True)):
+            where = (
+                "outbound signing" if connection is None else f"outbound connection {connection!r}"
+            )
+            if not _sign_flag_is_off(settings.get("sign_enabled", True), where):
                 raise ValueError(
-                    "sign_enabled is not false but sign_private_key is empty; set the signing key, "
-                    "or set sign_enabled to false to send unsigned"
+                    f"{where}: sign_enabled is not false but sign_private_key is empty; set the "
+                    "signing key, or set sign_enabled to false to send unsigned"
                 )
             return None
         data: dict[str, Any] = {"private_key": key}
