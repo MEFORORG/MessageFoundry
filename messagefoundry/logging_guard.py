@@ -25,8 +25,8 @@ writing a real record to it**, because ``unwritable``, as a sink's own state, is
 failed write and nothing clears it on its own: *repaired* and *still broken* are indistinguishable
 from memory, which is exactly the distinction recovery has to make. The engine gates every re-arm
 path on that answer. (The state :meth:`LogWriteGuard.status` reports may also include the flap
-latch, see :meth:`LogWriteGuard.record_rollover`; :meth:`LogWriteGuard.revalidate` answers from
-each sink's own state.)
+latch, see :meth:`LogWriteGuard.record_rollover`; :meth:`LogWriteGuard.revalidate` releases the
+latch on every sink it does not probe, and then answers as :meth:`LogWriteGuard.can_log` does.)
 
 **Scope of the stop is the PROCESS, and the code says so rather than pretending otherwise.** The
 application log is a process-global handler set on the root logger — a write failure is a property of
@@ -146,8 +146,10 @@ class LogSinkStatus:
 
 
 #: Called (synchronously, from whatever thread was logging) on every stage transition. It MUST be
-#: cheap, non-blocking and never raise — the guard is already handling a failure.
-EscalationCallback = Callable[[LogSinkEvent], None]
+#: cheap, non-blocking and never raise — the guard is already handling a failure. It returns False
+#: when it dropped the event, so that the guard can fire an owed stage-2 event again (see
+#: :meth:`LogWriteGuard.record_unwritable`); any other return counts as delivered.
+EscalationCallback = Callable[[LogSinkEvent], bool | None]
 
 #: One sink's "are you writable again?" self-test. Writes a real record to itself and RAISES if the
 #: sink still refuses it — see :meth:`LogWriteGuard.revalidate`.
@@ -179,8 +181,8 @@ class LogWriteGuard:
         #: latch does, and nothing that clears it, can move the bound; what the bound and the paging
         #: decisions compute does not depend on it (BACKLOG #5812).
         self._flap_latch: dict[str, float] = {}
-        #: Sinks whose current break fired its stage-2 event with no responder wired, so the event
-        #: is fired again on a later failure; see :meth:`record_unwritable`.
+        #: Sinks whose current break fired a stage-2 event that was not delivered, so the event is
+        #: fired again later; see :meth:`record_unwritable`.
         self._unanswered: set[str] = set()
         #: sink -> "write one record to yourself and raise if you still cannot", see :meth:`revalidate`.
         self._probes: dict[str, SinkProbe] = {}
@@ -209,15 +211,44 @@ class LogWriteGuard:
         slot and leave the first silently unguarded, which is the shape where a fail-closed control
         disappears with every check still green. It is not made an error (a test process legitimately
         starts runners back to back), so the honest handling is to be loud about it. The last-resort
-        channel rather than ``logging``: this class must not depend on the tree it guards."""
+        channel rather than ``logging``: this class must not depend on the tree it guards.
+
+        Wiring a responder also fires each stage-2 event still owed (see :meth:`record_unwritable`)
+        for a sink whose own state is still unwritable, without waiting for that sink's next
+        failure."""
         with self._lock:
             previous = self._escalation
             self._escalation = callback
+            owed = self._take_owed_events() if callback is not None else []
         if callback is not None and previous is not None and previous != callback:
             _last_resort(
                 "a second log-sink escalation responder replaced the first; the engine that "
                 "registered first is no longer guarded by this process's log write guard"
             )
+        for event in owed:
+            self._fire_stage2(event)
+
+    def _take_owed_events(self) -> list[LogSinkEvent]:
+        """Clear every owed stage-2 event and return those of sinks still unwritable, rebuilt from
+        each sink's recorded status. Called under the lock, so one owed event is taken once."""
+        owed = sorted(self._unanswered)
+        self._unanswered.clear()
+        all_down = all(s.state == "unwritable" for s in self._sinks.values())
+        events: list[LogSinkEvent] = []
+        for sink in owed:
+            status = self._sinks.get(sink)
+            if status is None or status.state != "unwritable":
+                continue
+            events.append(
+                LogSinkEvent(
+                    sink=sink,
+                    stage="unwritable",
+                    # Already scrubbed: every reason the guard records arrives scrubbed.
+                    reason=status.last_event or "log write failed (no reason recorded)",
+                    stop_requested=self.stop_on_unwritable and all_down,
+                )
+            )
+        return events
 
     def clear_escalation(self, callback: EscalationCallback) -> None:
         """Unwire ``callback`` — but ONLY if it is still the installed one. A runner tearing down must
@@ -251,7 +282,9 @@ class LogWriteGuard:
         :data:`_MAX_ROLLS_PER_WINDOW` rolls inside :data:`_ROLL_FLAP_WINDOW_SECONDS` the sink is
         declared unwritable instead: a log you must replace every few seconds is not a working log,
         and stage 2 is the honest verdict on it. Each further roll past the bound in that window
-        finds the sink already unwritable, so it is counted on :meth:`status` and pages nothing.
+        finds the sink already unwritable, so it is counted on :meth:`status` and pages nothing,
+        unless the break still owes its stage-2 event: then it fires that event again, as
+        :meth:`record_unwritable` states.
 
         **The flap latch holds what the bound declared unwritable** (BACKLOG #5812; this paragraph
         is where the rule is stated). The bound's window restarts a minute after its first roll, so a
@@ -318,9 +351,11 @@ class LogWriteGuard:
         self, sink: str, *, reason: str, cause: str = "after a rollover attempt"
     ) -> None:
         """Stage 2: the replacement could not be written either. Escalates ONCE per break, except
-        that a break whose event found no responder wired fires it again on each later failure of
-        the break until one is answered. ``cause`` is a literal phrase for the stderr line saying
-        how the sink came to be unwritable.
+        that a break whose event was not delivered owes it: no responder was wired, or the responder
+        reported that it dropped the event. An owed event is fired again on the next failure of the
+        break, and by :meth:`set_escalation` when it wires a responder, until one is delivered.
+        ``cause`` is a literal phrase for the stderr line saying how the sink came to be
+        unwritable.
 
         **The STOP is asked for only when EVERY guarded sink is unwritable, and that is a
         correctness point, not a softening.** The ruling is *"we never want to process stuff if the
@@ -350,10 +385,10 @@ class LogWriteGuard:
             # other sink only changes what the stderr line says about them.
             all_reported_down = all(self._reads_unwritable(s) for s in self._sinks.values())
             self._latch_after_failure(sink)
-            # A break whose stage-2 event found no responder wired is still owed one: each later
-            # failure on it fires the event again, without another stderr line, until one is
-            # answered (BACKLOG #5812). Taken here, under the lock, so one owed event is fired by
-            # one failure, not by every thread failing at once.
+            # A break whose stage-2 event was not delivered is still owed one: each later failure
+            # on it fires the event again, without another stderr line, until one is delivered
+            # (BACKLOG #5812). Taken here, under the lock, so one owed event is fired by one
+            # failure, not by every thread failing at once.
             owed = already_down and sink in self._unanswered
             if owed:
                 self._unanswered.discard(sink)
@@ -387,8 +422,8 @@ class LogWriteGuard:
         self._fire_stage2(event)
 
     def _fire_stage2(self, event: LogSinkEvent) -> None:
-        """Fire a stage-2 event, and remember the break as owed one when no responder was wired and
-        the sink is still unwritable."""
+        """Fire a stage-2 event, and remember the break as owed one when the event was not
+        delivered and the sink is still unwritable."""
         if self._fire(event):
             return
         with self._lock:
@@ -453,16 +488,20 @@ class LogWriteGuard:
         answering False would fail closed on a premise it cannot support. A sink the flap latch holds
         counts as unwritable here, as it does on :meth:`status`.
 
-        The #122 halt does not ask this. Its stop request is decided in :meth:`record_unwritable`,
-        and its re-arms by :meth:`revalidate`, from each sink's own state without the latch."""
+        The #122 halt's stop request is decided in :meth:`record_unwritable`, from each sink's own
+        state without the latch. Its re-arms ask :meth:`revalidate`, which answers as this does."""
         with self._lock:
-            if not self._sinks:
-                return True
-            return not all(self._reads_unwritable(s) for s in self._sinks.values())
+            return self._process_can_log()
+
+    def _process_can_log(self) -> bool:
+        """:meth:`can_log`'s answer. Called under the lock."""
+        if not self._sinks:
+            return True
+        return not all(self._reads_unwritable(s) for s in self._sinks.values())
 
     def revalidate(self) -> bool:
         """Re-test every sink whose own state is unwritable BY WRITING TO IT, and report whether the
-        process can log, from each sink's own state.
+        process can log, as :meth:`can_log` and :meth:`status` then read it.
 
         **A cached state cannot answer this, and that is the whole reason this exists.**
         ``unwritable``, as a sink's own state, is only ever set by a failed write, and nothing clears
@@ -487,8 +526,9 @@ class LogWriteGuard:
         flapping trip the bound later. A sink whose own state IS ``unwritable`` gets the probe below,
         and the latch on it is released only with that state. A sink another thread records a roll
         or a failure on while the probes run is neither probed after that nor marked healthy; the
-        loop's own comment says what remains of that race. The answer reads the sinks' own states,
-        not the latch."""
+        loop's own comment says what remains of that race. The answer is :meth:`can_log`'s, read
+        under the lock after the probes, so it is never True while :meth:`status` reads every sink
+        unwritable: a latch another thread set while the probes ran counts against it."""
         with self._lock:
             # Every record_* call replaces a sink's status object, so the object itself tells
             # whether anything was recorded on the sink since this snapshot.
@@ -516,18 +556,19 @@ class LogWriteGuard:
                 if self._sinks.get(name) is seen:
                     self.record_healthy(name)
         with self._lock:
-            if not self._sinks:
-                return True
-            return not all(s.state == "unwritable" for s in self._sinks.values())
+            return self._process_can_log()
 
     def _fire(self, event: LogSinkEvent) -> bool:
-        """Hand ``event`` to the responder. Whether one was wired; a responder that raised was."""
+        """Hand ``event`` to the responder, and report whether it was delivered: False when no
+        responder is wired or the responder returned False, which it does when it dropped the
+        event. A responder that raised counts as delivered, so a responder that always raises
+        is not called again for every failure."""
         with self._lock:
             callback = self._escalation
         if callback is None:
             return False
         try:
-            callback(event)
+            delivered = callback(event)
         except Exception as exc:  # never-raise: we are already handling a logging failure
             # Scrubbed for the reason the stage strings are: this line goes straight to stderr,
             # below every handler filter (BACKLOG #1591).
@@ -535,7 +576,8 @@ class LogWriteGuard:
                 f"log-sink escalation for {_escape_only(event.sink, fallback=_LABEL_DROPPED)} "
                 f"failed: {_safe_reason(exc)}"
             )
-        return True
+            return True
+        return delivered is not False
 
 
 #: The guard the current process's handlers are wired to. Installed by ``configure_logging``.
@@ -736,10 +778,16 @@ _FORMAT_FAULT_OTHER = "format faults of other kinds"
 
 
 def _type_name(exc: BaseException) -> str:
-    """``exc``'s type name through ``ascii()``, or a placeholder. Never raises."""
+    """``exc``'s type name through ``ascii()``, or a placeholder, which is said on the stderr
+    last-resort line. Never raises."""
     try:
         return ascii(type(exc).__name__)
     except Exception:
+        with contextlib.suppress(Exception):
+            _last_resort(
+                "an exception's type name could not be rendered for the log write guard; "
+                "a placeholder was substituted"
+            )
         return _RECORD_LABEL_DROPPED
 
 

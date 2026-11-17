@@ -60,6 +60,7 @@ lock of its own, by design: a second writer is exactly what the directory lock e
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import sys
@@ -72,6 +73,21 @@ from messagefoundry import file_lock
 #: The on-disk format version written into every entry. A reader skips an entry of any other version
 #: (counted as unreadable) rather than guessing at its shape.
 SPOOL_FORMAT_VERSION = 1
+
+#: ``errno`` values that say the spool directory itself is out of reach: a network mount that
+#: dropped, or a stale handle on one. ``getattr``: a platform's ``errno`` may lack either name.
+_DIRECTORY_GONE_ERRNOS = frozenset(
+    code
+    for code in (getattr(errno, "ENOTCONN", None), getattr(errno, "ESTALE", None))
+    if code is not None
+)
+
+
+def _directory_unreachable(exc: OSError) -> bool:
+    """Whether a read's ``OSError`` says the spool directory is gone or out of reach, rather than
+    one file failing: a path component that is no longer a directory, or a mount that dropped."""
+    return isinstance(exc, NotADirectoryError) or exc.errno in _DIRECTORY_GONE_ERRNOS
+
 
 _SEGMENT_PREFIX = "spool-"
 _SEGMENT_SUFFIX = ".jsonl"
@@ -416,9 +432,10 @@ class LogSpool:
         here would end the listener thread for good. Only a segment that is GONE is retired, and the
         read then moves on to the next segment: answering ``None`` there would read as drained, and
         the forwarder would send live records ahead of the older ones still spooled (BACKLOG #5811).
-        A missing spool DIRECTORY is not a gone segment: like any other ``OSError`` (out of
-        descriptors, a sharing violation) it keeps every file and returns ``None``, so the caller
-        tries again later instead of deleting undelivered records."""
+        A spool DIRECTORY that is missing or out of reach is not a gone segment: like any other
+        ``OSError`` (out of descriptors, a sharing violation) it keeps every file and returns
+        ``None``, so the caller tries again later instead of deleting undelivered records. It also
+        closes the writer, for the reason the comment below gives."""
         while True:
             try:
                 entry = self._peek()
@@ -444,10 +461,14 @@ class LogSpool:
                 if seq == self._write_seq:
                     self._close_writer()
                 self._retire(seq)
-            except OSError:
+            except OSError as exc:
                 self.read_errors += 1
                 self.read_faulted = True
                 self._close_reader()
+                if _directory_unreachable(exc):
+                    # The same case as a missing directory above, by another error: the writer is
+                    # closed for the same reason.
+                    self._close_writer()
                 return None
 
     def _close_reader(self) -> None:

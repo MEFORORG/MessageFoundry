@@ -811,6 +811,41 @@ def test_a_spool_directory_out_of_reach_retires_nothing(spool_dir: Path) -> None
         spool.close()
 
 
+@pytest.mark.parametrize(
+    ("error", "closes_writer"),
+    [
+        (NotADirectoryError(errno.ENOTDIR, "not a directory"), True),
+        (OSError(errno.ENOTCONN, "mount dropped"), True),
+        (OSError(errno.ESTALE, "stale handle"), True),
+        (OSError(errno.EMFILE, "too many open files"), False),
+    ],
+)
+def test_a_read_error_that_means_the_directory_is_out_of_reach_closes_the_writer(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, error: OSError, closes_writer: bool
+) -> None:
+    """An error that says the directory itself is gone or out of reach closes the writer, as a
+    missing directory does; one file failing does not. Either way nothing is retired.
+    NEGATIVE CONTROL: on 0a71e8b23f only a missing directory closed the writer."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(3):
+            assert spool.append(_entry(n))
+        assert spool._writer is not None
+        used = spool.bytes_used
+
+        def refuse(seq: int) -> None:
+            raise error
+
+        monkeypatch.setattr(spool, "_open_reader", refuse)
+        assert spool.peek() is None
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        assert (spool._writer is None) is closes_writer
+    finally:
+        spool.close()
+
+
 def test_two_segments_gone_in_a_row_are_both_passed_over(spool_dir: Path) -> None:
     """One peek walks past every missing segment at the head, however many, to the oldest one left."""
     spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)

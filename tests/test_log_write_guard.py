@@ -1075,19 +1075,157 @@ def test_an_owed_stage2_event_is_fired_once_per_failure_not_once_per_thread() ->
     guard.record_unwritable("file", reason="disk gone")  # no responder: owed
     events: list[LogSinkEvent] = []
     nested: list[bool] = []
+    ready: list[bool] = []
 
-    def responder(event: LogSinkEvent) -> None:
+    def responder(event: LogSinkEvent) -> bool:
+        # Dropped until ready, as a runner with no open loop drops it, so the event set_escalation
+        # fires stays owed and the next failure is what fires it.
+        if not ready:
+            return False
         events.append(event)
         if not nested:
             nested.append(True)
             guard.record_unwritable("file", reason="disk still gone")
+        return True
 
     guard.set_escalation(responder)
+    ready.append(True)
     guard.record_unwritable("file", reason="disk still gone")
 
     assert len(events) == 1
     guard.record_unwritable("file", reason="answered now, so nothing more")
     assert len(events) == 1
+
+
+def test_a_stage2_event_the_responder_dropped_is_fired_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The roll that trips the bound fires stage 2, and the responder drops it, as the runner's does
+    # with no open loop. The next roll past the bound, on the sink already unwritable, fires it
+    # again, so the stop is still asked for, as on main, where every roll past the bound fired.
+    # NEGATIVE CONTROL: on 0a71e8b23f a wired responder counted as delivered, so the second roll
+    # fired nothing and the only stop request was the dropped one.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    guard = LogWriteGuard()
+    guard.register("file")
+    delivering: list[bool] = []
+    stage2: list[LogSinkEvent] = []
+
+    def responder(event: LogSinkEvent) -> bool:
+        if event.stage == "unwritable":
+            stage2.append(event)
+        return bool(delivering)
+
+    guard.set_escalation(responder)
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
+    assert [(e.stage, e.stop_requested) for e in stage2] == [("unwritable", True)]
+    delivering.append(True)
+
+    _roll(guard, clock, 6, 7)
+
+    assert [(e.stage, e.stop_requested) for e in stage2] == [("unwritable", True)] * 2
+
+
+async def test_the_runners_responder_reports_an_event_it_dropped(store: MessageStore) -> None:
+    # The guard learns of a drop only from the responder's return. NEGATIVE CONTROL: on
+    # 0a71e8b23f it returned None in every case, which the guard read as delivered.
+    runner, _source = _graph(store, _RecordingSink())
+    event = LogSinkEvent(sink="file", stage="rolled", reason="lock")
+    assert runner._on_log_sink_event(event) is False  # not started: no loop
+    closed = asyncio.new_event_loop()
+    closed.close()
+    runner._loop = closed
+    assert runner._on_log_sink_event(event) is False
+    runner._loop = asyncio.get_running_loop()
+    assert runner._on_log_sink_event(event) is True
+    for _ in range(3):
+        await asyncio.sleep(0)  # let the scheduled stage-1 response run
+
+
+def test_wiring_a_responder_fires_an_owed_stage2_event() -> None:
+    # A break that failed stage 2 before any responder was wired owes its event. Wiring one fires
+    # it at once, with the stop request, rather than waiting for the sink's next failure, which may
+    # never come. A sink that healed meanwhile owes nothing.
+    # NEGATIVE CONTROL: on 0a71e8b23f set_escalation fired nothing.
+    guard = LogWriteGuard()
+    guard.register("file")
+    guard.register("stdout")
+    guard.record_unwritable("stdout", reason="pipe closed")
+    guard.record_healthy("stdout")
+    guard.record_unwritable("file", reason="disk gone")
+    guard.record_unwritable("stdout", reason="pipe closed again")
+    guard.record_healthy("stdout")
+    events: list[LogSinkEvent] = []
+
+    guard.set_escalation(events.append)
+
+    assert [(e.sink, e.stage, e.stop_requested) for e in events] == [("file", "unwritable", False)]
+    assert "disk gone" in events[0].reason
+    guard.record_unwritable("file", reason="still gone")
+    assert len(events) == 1
+
+
+def test_wiring_a_responder_fires_the_owed_stop_when_every_sink_is_down() -> None:
+    # NEGATIVE CONTROL: on 0a71e8b23f set_escalation fired nothing.
+    guard = LogWriteGuard()
+    guard.register("file")
+    guard.record_unwritable("file", reason="disk gone")
+    events: list[LogSinkEvent] = []
+
+    guard.set_escalation(events.append)
+
+    assert [(e.sink, e.stage, e.reason, e.stop_requested) for e in events] == [
+        ("file", "unwritable", "disk gone", True)
+    ]
+
+
+def test_revalidate_never_answers_true_while_a_latch_set_during_its_probe_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The sink tripped the bound, so it is unwritable and latched. While revalidate's probe runs,
+    # another thread records a roll in a fresh window of the bound: its own state reads ``rolled``,
+    # and the latch still holds it, so /status and can_log() read it unwritable. revalidate must
+    # answer as they do.
+    # NEGATIVE CONTROL: on 0a71e8b23f revalidate read the own state alone and answered True while
+    # can_log() answered False.
+    clock = _FakeClock()
+    holder: list[LogWriteGuard] = []
+
+    def probe_while_it_heals() -> None:
+        _at(clock, 61)
+        holder[0].record_rollover("file", reason="lock", rolled_aside=None)
+
+    guard, _events = _guard_on(clock, monkeypatch, probe=probe_while_it_heals)
+    holder.append(guard)
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
+    assert _own_state(guard, "file") == "unwritable"
+
+    answer = guard.revalidate()
+
+    assert _own_state(guard, "file") == "rolled"
+    assert [s.state for s in guard.status()] == ["unwritable"]
+    assert answer is False
+    assert answer is guard.can_log()
+
+
+def test_a_type_name_that_cannot_be_rendered_is_said_on_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # NEGATIVE CONTROL: on 0a71e8b23f the fault was swallowed and stderr stayed empty.
+    from messagefoundry import logging_guard
+
+    def broken_ascii(value: object) -> str:
+        raise RuntimeError("cannot render")
+
+    monkeypatch.setattr(logging_guard, "ascii", broken_ascii, raising=False)
+    capsys.readouterr()
+
+    assert logging_guard._type_name(ValueError("x")) == "<unnameable>"
+
+    err = capsys.readouterr().err
+    assert "type name could not be rendered" in err
+    assert "cannot render" not in err
 
 
 # --- stage 2: STOP -----------------------------------------------------------

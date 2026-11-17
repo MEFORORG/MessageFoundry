@@ -6264,18 +6264,22 @@ class RegistryRunner:
 
     # --- #122 / ADR 0162: fail-closed application-log write guard ------------
 
-    def _on_log_sink_event(self, event: LogSinkEvent) -> None:
+    def _on_log_sink_event(self, event: LogSinkEvent) -> bool:
         """The guard's escalation, called SYNCHRONOUSLY from whatever thread emitted the record that
         could not be written — the event loop, a handler worker thread, a connector thread. It does one
         thing: hand the event to this runner's loop. Never blocks (we are inside a failing
-        ``logging.Handler.emit``) and never raises (the guard is already handling a failure)."""
+        ``logging.Handler.emit``) and never raises (the guard is already handling a failure).
+
+        Returns False when it dropped the event because there is no open loop to hand it to, so the
+        guard keeps a dropped stage-2 event owed and fires it again (BACKLOG #5812)."""
         loop = self._loop
         if loop is None or loop.is_closed():
-            return  # not started, or already torn down — nothing to stop
+            return False  # not started, or already torn down
         try:
             loop.call_soon_threadsafe(self._spawn_log_sink_response, event)
         except RuntimeError:
-            return  # the loop closed between the check and the call
+            return False  # the loop closed between the check and the call
+        return True
 
     def _spawn_log_sink_response(self, event: LogSinkEvent) -> None:
         task = asyncio.ensure_future(self._respond_to_log_sink_event(event))

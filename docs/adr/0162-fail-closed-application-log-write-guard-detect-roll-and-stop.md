@@ -459,9 +459,10 @@ unwritable pages, by a stage-2 failure or by the roll that trips the bound, and 
 the bound does not. A roll the bound calls a heal still writes `rolled` and pages stage 1, as
 before, so a sink that keeps flapping across bound windows pages stage 2 once per window it trips
 in. Whether the bound itself should hold across windows is left open with the latch's enforcement
-question. One retry is kept: a stage-2 event fired while no responder was wired is fired again on
-every later failure of the break until one is answered, at most once per failure and without
-another stderr line. A break that ends with a heal roll before
+question. One retry is kept: a stage-2 event that was not delivered, because no responder was
+wired or the engine's responder had no open event loop to hand it to, is fired again on each
+later failure of the break, at most once per failure and without another stderr line, and once
+when a responder is wired, until one is delivered. A break that ends with a heal roll before
 any such failure is not asked to stop again, as before this amendment.
 
 **The stage-2 stderr line.** Where every other sink reads unwritable but at least one only through
@@ -472,14 +473,22 @@ The stop decision is unchanged.
 lock. A sink on which another thread records a roll or a stage-2 failure after the snapshot is no
 longer probed, and is not marked healthy after a probe that landed, so a latch, a failure or the
 bound's streak recorded meanwhile is kept. A change between that check and the probe's own write
-still meets the probe: the lock is never held across a sink's I/O.
+still meets the probe: the lock is never held across a sink's I/O. Its answer is now `can_log()`'s,
+read after the probes, so a flap latch another thread set while the probes ran counts against it,
+and it never answers that the process can log while `GET /status` reads every sink unwritable.
+Amendment B's statement that `revalidate()`, and every re-arm and runner start gated on it, answers
+as section 1 does no longer holds in that case: the re-arm is refused, and the runner starts
+halted.
 
 **A record that cannot be formatted is not a sink failure** (BACKLOG #5813). This paragraph is
 where the rule is stated. `handleError` used to roll the sink on any failure, then fail to re-write
 the same record and call the sink unwritable. On the handlers `configure_logging` builds, the
 redaction filter already replaces a record whose message cannot be rendered, so this path needs a
 formatter that fails where the filter did not. Now such a record's place is taken by a fixed notice
-naming its logger and level. When the sink takes the notice, neither stage runs. When it refuses
+naming its logger and level. When the sink takes the notice, neither stage runs. **This is a
+change from `main`, where such a record went to stage 2, and so asked for the stop when every sink
+was unwritable.** Now the engine keeps processing: only that record's content is replaced by the
+notice, and a rate-limited stderr line is written. Nothing shows on `GET /status`. When it refuses
 it, the sink is the fault and the two stages decide as before. A formatter that cannot format even
 that notice leaves the process unable to log through that sink, so the sink is recorded unwritable
 with a reason that names a formatter fault, and the stop is asked for when every sink is
