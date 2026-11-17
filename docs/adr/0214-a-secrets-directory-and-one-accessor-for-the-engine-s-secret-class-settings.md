@@ -168,14 +168,17 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
     a CSVFS or FAT volume, or one whose file system cannot be read, as it did not before this
     amendment.
   - On a share the path names, by a UNC path or a mapped drive letter, that folder is read
-    through the share at `full.parent`. It is refused when it is a junction or link there.
+    through the share at `full.parent`. It is refused when it is a reparse point there, a
+    junction or link among others.
   - Where the walk ends on a link back to a folder already on the path, that folder is read at
     `full.parent` by its path as written, as before this amendment.
   - The holder's entries are judged as before: an inherit-only entry is counted, and any
     conditional, object or callback allow entry is refused.
   - A `subst` drive on the path gives no folder the link rule; as before, only a junction or
     link on the path does.
-  - A link or `subst` drive onto a network share or a mapped network drive is refused.
+  - A junction, link or `subst` drive met before the walk stops, leading onto a network share or
+    a mapped network drive, is refused. One the second walk of a mapped drive meets is judged by
+    the link rule alone, wherever it leads.
   - A share spelled with at least some of this host's own names or addresses is refused.
     `_loopback_share_problem` says which. A mapped drive letter is judged through the share
     `WNetGetConnectionW` names for it, and refused when that cannot be read.

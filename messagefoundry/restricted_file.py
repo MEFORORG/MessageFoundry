@@ -699,8 +699,8 @@ def _share_server(path: str) -> str:
 
 
 _LOOPBACK_SHARE = (
-    "it is reached through a network share that may be on this host itself, whose folders this "
-    "check does not walk; name it by its local path if it is on this host"
+    "it is reached through a network share that may be on this host itself; name it by its local "
+    "path if it is on this host"
 )
 
 
@@ -784,8 +784,10 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     it, as at a UNC share, and the path is then walked again as a local volume, so the junctions
     and links on it are judged by the link rule. A walk that reached a share the path names, by a
     UNC path or a mapped drive letter, reads the holder through the share by its path as written,
-    and refuses it when it is a junction or link; one that reached a share, a mapped drive
-    included, through a junction, link or ``subst`` drive is refused. A mapped drive letter is
+    and refuses it when it is a reparse point, a junction or link among others; one that reached a
+    share, a mapped drive included, through a junction, link or ``subst`` drive met before the walk
+    stopped is refused. A junction or link the second walk of a mapped drive meets is judged by the
+    link rule alone, wherever it leads. A mapped drive letter is
     judged by the loopback test through the share ``WNetGetConnectionW`` names for it, and refused
     when that cannot be read. The caller has read ``path`` itself and refused it if it is a link.
     ``host`` holds the readers."""
@@ -903,8 +905,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             # Read with FILE_FLAG_OPEN_REPARSE_POINT, a junction's own list would stand in for the
             # folder it points at, which this check does not read through a share.
             return (
-                "the folder that holds it on the share is a junction or link, whose target this "
-                "check does not read; name the folder it points at instead"
+                "the folder that holds it on the share is a reparse point, such as a junction or "
+                "link, which this check does not read through; name a folder that is not one"
             )
         holder = host.read_security(holder_path, DIRECTORY)
     except OSError as exc:  # a reader that could not be run

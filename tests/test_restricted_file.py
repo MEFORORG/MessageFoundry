@@ -1574,7 +1574,7 @@ def test_windows_a_key_through_a_junction_only_system_can_change_passes() -> Non
     import messagefoundry.auth.anchor_path as anchor_path
 
     host = anchor_path.windows_host_readers()
-    # A folder stands in for the key: the walk reads the path itself, then the folders above it.
+    # A folder stands in for the key: the walk reads the folders above it, and the holder.
     assert restricted_file._windows_surroundings_problem(all_users / "Microsoft", host) is None
 
 
@@ -1688,7 +1688,7 @@ def test_windows_a_junction_holding_a_key_on_a_share_is_refused(
     surroundings = restricted_file._windows_surroundings_problem
     assert surroundings(via_share / "real" / "store.key", host) is None  # the control
     problem = str(surroundings(via_share / "j" / "store.key", host))
-    assert "the folder that holds it on the share is a junction or link" in problem
+    assert "the folder that holds it on the share is a reparse point" in problem
 
 
 @windows_only
@@ -1806,7 +1806,7 @@ def test_windows_a_mapped_network_drive_is_read_as_a_share(
     # The control: the local folder the server's junction names passes when named directly.
     assert surroundings(secure / "client.key", host) is None
     problem = str(surroundings(Path("Y:\\keys\\client.key"), host))
-    assert "the folder that holds it on the share is a junction or link" in problem
+    assert "the folder that holds it on the share is a reparse point" in problem
 
 
 @windows_only
