@@ -3231,7 +3231,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target). Must carry an **RSA** key: the S/MIME envelope supports RSA key transport only, so any other key type (EC included) is refused at construction |
 | `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to, or the `recipient_cert` itself for a pinned self-signed correspondent. What the check refuses is under **Recipient trust** below |
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
-| `subject` | `""` | static `Subject`, under the [Email destination's `subject` rule](#email--smtp--email--smtp-outbound-send-adr-0029). |
+| `subject` | `""` | static `Subject`, under the [Email outbound's `subject` rule](#email--smtp--email--smtp-outbound-send-adr-0029). |
 | `username` / `password` | — | optional SMTP `AUTH` credentials (secrets — via `env()`). Setting a `username` makes the relay a credential hop: to an off-box host it is then **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). With no `username` the relay carries no revocation gate |
 | `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set on an instance at `[security].enforcement = warn`, and SMTP `AUTH` over cleartext is **refused outright**. This is not the same posture as `Email(...)`: `Direct()` reads that clamped escape directly and does **not** route through the shared cleartext-hop authority, so `tls_hop_attested` and `cleartext_accepted` / `cleartext_reason` on the outbound are **not consulted** (declaring them changes nothing here). CORRECTED 2026-10-13: this row said the escape was read raw, so that an enforcing instance would not close the hop; the read has been clamped since #323. The S/MIME body stays signed + encrypted either way — but the SMTP envelope (sender, recipients, subject) does not. |
 | `timeout_seconds` | `30.0` | passed to the `smtplib` constructor (covers connect and each command) |
@@ -3251,7 +3251,7 @@ are the same types the XML signature check allows. Today an Ed25519 or Ed448 key
 `trust_anchor`: the signing library takes RSA and EC signers only, and the envelope takes RSA recipients only.
 The connector then signs and encrypts one fixed synthetic body.
 So a fault that would fail every S/MIME build also fails here. That covers at least a crypto library or
-OpenSSL build that refuses the algorithms. A line break in `subject` never reaches it: the `subject` rule refuses it first. It does not cover the SMTP hop:
+OpenSSL build that refuses the algorithms. It does not cover the SMTP hop:
 the relay can still refuse a `sender` or recipient at send time.
 
 **Recipient trust (BACKLOG #5631).** The issuance check is deliberately **one level**: the recipient cert

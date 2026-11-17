@@ -334,13 +334,22 @@ def test_with_signing_refuses_a_literal_empty_key(key: str | None) -> None:
 
 def test_env_key_resolving_empty_is_refused_naming_the_connection() -> None:
     # BACKLOG #5364: the env() key resolves empty only at build; the refusal names the outbound and
-    # carries no settings value.
-    spec = with_signing(Rest(url=env("u")), private_key=env("k"), algorithm="ES256")
+    # carries no settings value: the signing settings hold two probes that must not appear.
+    spec = with_signing(
+        Rest(url=env("u")),
+        private_key=env("k"),
+        private_key_password=env("p"),
+        algorithm="ES256",
+        key_id="kidprobe",
+    )
     oc = OutboundConnection(name="OB_ACME", spec=spec)
+    values = {"u": REST_URL, "k": "", "p": "pwprobe"}
     with pytest.raises(ValueError, match="sign_private_key is empty") as caught:
-        _dest_config(oc, {"u": REST_URL, "k": ""}, None, EgressSettings(deny_by_default=False))
+        _dest_config(oc, values, None, EgressSettings(deny_by_default=False))
     assert "outbound connection 'OB_ACME'" in str(caught.value)
-    assert REST_URL not in str(caught.value)
+    assert spec.settings["sign_key_id"] == "kidprobe"  # positive control: the settings hold it
+    assert "kidprobe" not in str(caught.value)
+    assert "pwprobe" not in str(caught.value)
 
 
 def test_flag_named_with_key_absent_refuses() -> None:
