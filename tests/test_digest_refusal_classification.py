@@ -981,6 +981,121 @@ def test_an_accepted_proxy_credential_crossing_is_still_recorded(
     assert [r for r in caplog.records if _CROSSING in r.getMessage()]
 
 
+# --- the early refusal is for a caller that builds the provider the settings name -----------------
+#
+# Vault BACKLOG #2989, review round 3. ``rest.proxy_auth_handler_from_settings`` runs the token
+# hop's Digest refusal early only for the REST and FHIR outbounds, which build their bearer with
+# ``bearer_provider_from_settings``. A DICOMweb outbound builds no token provider, and a FhirLookup
+# builds SMART only, so OAuth2 settings on either name a provider that is never built. Each fails
+# on 19540d5bb7, where the early refusal read the settings for every caller.
+
+#: The OAuth2 settings ``with_oauth2_client_credentials`` writes, which only an HTTP spec accepts.
+_OAUTH2_SETTINGS: dict[str, object] = {
+    "oauth2_enabled": True,
+    "oauth2_token_url": _HTTPS_TOKEN_URL,
+    "oauth2_client_id": "cid",
+    "oauth2_client_secret": "s3cr3t",
+}
+_DIGEST_PROXY_SETTINGS: dict[str, object] = {
+    "proxy_url": "http://127.0.0.1:3128",
+    "proxy_user": "pu",
+    "proxy_password": "pw",
+    "proxy_auth_type": "digest",
+    "cleartext_accepted": True,
+    "cleartext_reason": "test peer has no TLS",
+}
+
+
+def _digest_proxied_lookup(**token: object) -> FhirLookupExecutor:
+    settings = {"url": "http://fhir.partner.invalid/fhir", **_DIGEST_PROXY_SETTINGS, **token}
+    with active_hop_posture(_WARN_DIAL):
+        return FhirLookupExecutor({"epic": settings}, egress=permitting(settings))
+
+
+def _smart_settings(private_key: str) -> dict[str, object]:
+    return {
+        "smart_token_url": _HTTPS_TOKEN_URL,
+        "smart_client_id": "cid",
+        "smart_private_key": private_key,
+        "smart_algorithm": "ES256",
+        "smart_scope": "system/*.rs",
+    }
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_fhir_lookup_with_oauth2_settings_behind_a_digest_proxy_builds() -> None:
+    ex = _digest_proxied_lookup(**_OAUTH2_SETTINGS)
+    assert ex._token["epic"] is None
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_fhir_lookup_with_smart_and_oauth2_settings_is_refused_by_its_smart_provider(
+    ec_pem: str,
+) -> None:
+    """THE CONTROL, as on main: a FhirLookup builds its SMART provider whatever OAuth2 settings sit
+    beside it, and that provider refuses the Digest proxy when it is built."""
+    from messagefoundry.transports.smart import SmartAuthError
+
+    with pytest.raises(SmartAuthError, match=_DIGEST_PROXY_REFUSED):
+        _digest_proxied_lookup(**_smart_settings(ec_pem), **_OAUTH2_SETTINGS)
+
+
+@pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("provider", ["oauth2", "smart"])
+def test_a_dicomweb_outbound_with_token_settings_behind_a_digest_proxy_builds(
+    provider: str, ec_pem: str
+) -> None:
+    spec = DICOMweb(
+        url="http://127.0.0.1:9/x",
+        proxy="http://127.0.0.1:3128",
+        proxy_user="pu",
+        proxy_password="pw",
+        proxy_auth_type="digest",
+    )
+    settings = {
+        **spec.settings,
+        **(_OAUTH2_SETTINGS if provider == "oauth2" else _smart_settings(ec_pem)),
+    }
+    with active_hop_posture(_WARN_DIAL):
+        dest: Any = build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.DICOMWEB,
+                settings=settings,
+                cleartext_accepted=True,
+                cleartext_reason="test peer has no TLS",
+            ),
+            egress=permitting(settings),
+        )
+    assert dest._proxy is not None
+    assert dest._proxy.digest is not None
+
+
+def test_the_early_refusal_checks_the_token_url_before_it_reads_it() -> None:
+    """Review round 3, F4: the early refusal runs the provider's own token URL check first, so the
+    Digest rule never reads a URL the provider would refuse. A token URL holding a credential is
+    refused for the credential, as the provider refuses it. On 19540d5bb7 it was refused as a
+    Digest token hop instead."""
+    from messagefoundry.transports.http_auth import refuse_a_digest_proxy_on_the_token_hop
+
+    settings = {
+        **_DIGEST_PROXY_SETTINGS,
+        **_OAUTH2_SETTINGS,
+        "oauth2_token_url": "https://cid:s3cr3t@auth.partner.invalid/token",
+    }
+    with pytest.raises(HttpAuthError) as ei:
+        refuse_a_digest_proxy_on_the_token_hop(settings, connection="OB")
+    message = str(ei.value)
+    assert _DIGEST_PROXY_REFUSED not in message
+    assert "oauth2_token_url" in message
+    assert "s3cr3t" not in message
+    # CONTROL: the same settings with a clean token URL meet the Digest refusal.
+    with pytest.raises(HttpAuthError, match=_DIGEST_PROXY_REFUSED):
+        refuse_a_digest_proxy_on_the_token_hop(
+            {**settings, "oauth2_token_url": _HTTPS_TOKEN_URL}, connection="OB"
+        )
+
+
 @pytest.mark.usefixtures("no_bypass")
 def test_no_built_http_token_endpoint_reaches_the_web_proxy() -> None:
     """ADR 0095 B.1's ``http://`` token-endpoint case is overtaken. An off-box one is refused when

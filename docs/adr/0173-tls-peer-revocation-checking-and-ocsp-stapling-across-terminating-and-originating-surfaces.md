@@ -722,7 +722,9 @@ only while the engine dials the token host itself. With `ech_sidecar` set, `_pos
 the POST to the loopback sidecar, and the sidecar makes its own TLS connection to the token host
 (ADR 0139). The provider's opener then only ever meets the sidecar. A `[tls].crl_file` covering the
 token host still lands on that opener, and the guard read it, so the refusal was lifted with no
-revocation check behind it.
+revocation check behind it. *(On 2026-11-17, BACKLOG #2977 item 5, the ECH arm's opener stopped
+carrying the trust anchor and CRL resolved for the token host; it is the plain opener the REST
+destination's own ECH hop uses. The guard is still handed no opener there.)*
 
 BACKLOG #2169 offered two ways to close this: pass no opener on the ECH arm, or require the
 attestation there. **The first was chosen.** `_open_token_hop` passes

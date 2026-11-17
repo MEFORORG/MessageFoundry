@@ -274,22 +274,25 @@ class _TokenEndpointProvider(abc.ABC):
     expiry_skew_seconds: float
     timeout_seconds: float
 
+    @classmethod
     def _check_token_url(
-        self,
+        cls,
         token_url: str,
         *,
         connection: str | None,
     ) -> str:
-        """Validate the token URL and refuse a cleartext hop; return its lower-cased scheme."""
+        """Validate the token URL and refuse a cleartext hop; return its lower-cased scheme. A
+        classmethod with no side effect, so ``http_auth.refuse_a_digest_proxy_on_the_token_hop``
+        runs it before any provider is built (vault BACKLOG #2989)."""
         if not token_url:
-            raise self._ERROR(self._MISSING_URL)
+            raise cls._ERROR(cls._MISSING_URL)
         scheme = url_scheme(
-            token_url, self._URL_SETTING, use=self._CREDENTIAL_SETTINGS, error=self._ERROR
+            token_url, cls._URL_SETTING, use=cls._CREDENTIAL_SETTINGS, error=cls._ERROR
         )
         if scheme not in ("http", "https"):
-            raise self._ERROR(f"{self._URL_SETTING} must be http or https, got scheme {scheme!r}")
+            raise cls._ERROR(f"{cls._URL_SETTING} must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(
-            token_url, self._URL_SETTING, use=self._CREDENTIAL_SETTINGS, error=self._ERROR
+            token_url, cls._URL_SETTING, use=cls._CREDENTIAL_SETTINGS, error=cls._ERROR
         )
         # The token POST carries a credential, so an off-box cleartext hop is refused with no
         # escape, as the delivery cells' credentials are (vault BACKLOG #3533 item 4): neither
@@ -301,14 +304,14 @@ class _TokenEndpointProvider(abc.ABC):
             refuse_cleartext_credential_hop(
                 scheme,
                 token_url,
-                credential=f"{self._LABEL} {self._CREDENTIAL_NAME}",
+                credential=f"{cls._LABEL} {cls._CREDENTIAL_NAME}",
                 connection=connection,
             )
         except InsecureHopRefused as exc:
-            raise self._ERROR(
-                f"{hop_name_prefix(connection)}{self._LABEL} token endpoint over cleartext http "
+            raise cls._ERROR(
+                f"{hop_name_prefix(connection)}{cls._LABEL} token endpoint over cleartext http "
                 "would expose the "
-                f"{self._CREDENTIAL_NAME}; refused ({CREDENTIAL_HOP_WAYS_ACROSS})"
+                f"{cls._CREDENTIAL_NAME}; refused ({CREDENTIAL_HOP_WAYS_ACROSS})"
             ) from exc
         return scheme
 
@@ -352,10 +355,11 @@ class _TokenEndpointProvider(abc.ABC):
         token_proxy = proxy.for_host(token_url) if proxy and ech_sidecar is None else None
         # BACKLOG #2989 item 11: an https token request reaches its web proxy only as a CONNECT, and
         # urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest
-        # setup could never answer a challenge on this hop (ADR 0095 B.1). A built connection meets
-        # this refusal earlier, in rest.proxy_auth_handler_from_settings, before its proxy
-        # credential is judged (BACKLOG #2989 items 20 and 21); this one serves a provider built
-        # directly. Both read the one rule, so a token host the proxy bypasses builds.
+        # setup could never answer a challenge on this hop (ADR 0095 B.1). A REST or FHIR outbound
+        # meets this refusal earlier, in rest.proxy_auth_handler_from_settings, before its proxy
+        # credential is judged (BACKLOG #2989 items 20 and 21). This one serves every other
+        # provider: a SOAP outbound's, a FhirLookup's, and one built directly. Both read the one
+        # rule, so a token host the proxy bypasses builds.
         if (
             proxy is not None
             and ech_sidecar is None

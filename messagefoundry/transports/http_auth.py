@@ -86,6 +86,7 @@ __all__ = [
     "oauth2_auth_configured",
     "oauth2_cc_provider_from_settings",
     "proxy_auth_handler_from_settings",
+    "refuse_a_digest_proxy_on_the_token_hop",
     "with_http_digest",
     "with_oauth2_client_credentials",
 ]
@@ -282,9 +283,12 @@ def refuse_a_digest_proxy_on_the_token_hop(s: Mapping[str, Any], *, connection: 
     web proxy set up for Digest (vault BACKLOG #2989 items 11, 20 and 21).
 
     :func:`~messagefoundry.transports.rest.proxy_auth_handler_from_settings` calls it for a Digest
-    proxy credential before it judges that credential's hop, so this refusal comes before any
-    record of that credential crossing. The rule is
-    :func:`~messagefoundry.transports.rest.digest_proxy_meets_the_token_connect`, with the
+    proxy credential, before it judges that credential's hop, only for a caller that builds its
+    bearer provider with :func:`bearer_provider_from_settings` (the REST and FHIR outbounds). So on
+    such an outbound that builds exactly one token provider, this refusal comes before any record of
+    that credential crossing. The token URL is first checked as the provider's constructor checks
+    it (``_check_token_url``), so the rule only ever reads a URL the provider would accept. The rule
+    is :func:`~messagefoundry.transports.rest.digest_proxy_meets_the_token_connect`, with the
     connection's ``proxy_no_proxy`` as the bypass list, and the refusal is the provider's own
     (:meth:`~messagefoundry.transports.smart._TokenEndpointProvider.digest_proxy_refusal`). A mapping
     that configures neither provider, or both, which :func:`bearer_provider_from_settings` refuses,
@@ -295,7 +299,9 @@ def refuse_a_digest_proxy_on_the_token_hop(s: Mapping[str, Any], *, connection: 
     provider: type[_TokenEndpointProvider] = (
         SmartBackendTokenProvider if has_smart else OAuth2ClientCredentialsProvider
     )
-    token_url = s.get(provider._URL_SETTING)
+    # Read as the provider factories read it, then checked as the provider's constructor checks it.
+    token_url = str(s.get(provider._URL_SETTING) or "")
+    provider._check_token_url(token_url, connection=connection)
     if digest_proxy_meets_the_token_connect(token_url, s.get("proxy_no_proxy")):
         raise provider.digest_proxy_refusal(connection)
 

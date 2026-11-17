@@ -244,13 +244,16 @@ def test_the_ech_token_hop_opener_carries_no_proxy_and_no_token_host_anchor(
     to a provider built directly, now reach neither the opener nor the request. CONTROL: without
     the sidecar both do."""
     settings = {**settings_for[name], "tls_ca_file": ca_pem}
-    with_ech = _FACTORY[name](settings, ech_sidecar=SIDECAR, proxy=_proxy())
-    direct = _FACTORY[name](settings, proxy=_proxy())
+    # A Basic-credentialed proxy, so an empty _proxy_auth on the ECH arm is a credential that did
+    # not reach the request, not one there never was (review round 3, F3).
+    with_ech = _FACTORY[name](settings, ech_sidecar=SIDECAR, proxy=_proxy(credentialed=True))
+    direct = _FACTORY[name](settings, proxy=_proxy(credentialed=True))
     assert _CA_NAME not in _anchor_names(with_ech._opener)
     assert _proxy_map(with_ech._opener) == {}
     assert with_ech._proxy_auth == {}
     assert _anchor_names(direct._opener) == {_CA_NAME}
     assert _proxy_map(direct._opener) == {"http": _PROXY_URL, "https": _PROXY_URL}
+    assert direct._proxy_auth["Proxy-Authorization"].startswith("Basic ")
 
 
 # --- vault BACKLOG #2977 item 12: the token hop's opener shapes ----------------------------------
@@ -287,9 +290,16 @@ def ca_pem(tmp_path_factory: pytest.TempPathFactory) -> str:
     return str(path)
 
 
-def _proxy() -> ProxyConfig:
+def _proxy(*, credentialed: bool = False) -> ProxyConfig:
+    settings: dict[str, object] = {"proxy_url": _PROXY_URL}
+    if credentialed:
+        settings |= {"proxy_user": "pu", "proxy_password": "pw"}
     proxy = proxy_config_from_settings(
-        {"proxy_url": _PROXY_URL}, dest_scheme="https", connection=None
+        settings,
+        dest_scheme="https",
+        cleartext_accepted=credentialed,
+        cleartext_reason="synthetic test proxy" if credentialed else None,
+        connection=None,
     )
     assert proxy is not None
     return proxy
