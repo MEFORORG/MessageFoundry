@@ -388,6 +388,16 @@ def test_a_graph_with_no_digest_is_refused_at_start_beside_a_config_dir(
     assert f"[sandbox].mode={mode.value}" in text
     assert "the engine's graph was not loaded from a config directory" in text
     assert "Serve a graph loaded from the config directory" in text
+    # The other arm: a graph naming its own directory, with no digest and no configured source.
+    named = dataclasses.replace(loaded, code_digest=None)
+    assert named.source_dir is not None
+    with pytest.raises(ValueError, match="was not loaded from a config directory"):
+        RegistryRunner(
+            named,
+            object(),  # type: ignore[arg-type]
+            sandbox_policy=SandboxPolicy(mode=mode),
+            egress=EgressSettings(deny_by_default=False),
+        )
     make(loaded)  # the control
 
 

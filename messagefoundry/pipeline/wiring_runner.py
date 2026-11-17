@@ -1978,11 +1978,8 @@ class RegistryRunner:
                     "process"
                 )
             if has_config_dir and registry.code_digest is None:
-                # A worker would refuse this graph once per message, after the listener had ACKed
-                # it, so every message would be accepted and then errored (BACKLOG #5334). Refused
-                # here, before a listener binds or a worker spawns; graph_differences stays the
-                # backstop for a graph swapped in later. With no config dir no worker starts:
-                # _sandbox_for says why.
+                # Before a listener binds or a worker spawns (BACKLOG #5334): undigested_graph_refusal
+                # says why, and _sandbox_for why no config dir is exempt.
                 raise ValueError(undigested_graph_refusal(sandbox_policy.mode))
         self._sandbox_sessions: dict[str, SandboxSession] = {}
         self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
@@ -6983,10 +6980,11 @@ class RegistryRunner:
         reads once. A reload of a running runner closes the sessions, so a reload from another root
         moves the children with it (vault BACKLOG #3094).
 
-        **A graph with no** ``code_digest`` **beside a config dir never reaches this method**: the
-        constructor refuses it, before a listener binds, because every worker would refuse it per
-        message after the ACK (BACKLOG #5334). A graph swapped in later with no digest is still
-        refused, by the worker, through :func:`~messagefoundry.pipeline.sandbox.graph_differences`.
+        **A graph with no** ``code_digest`` **beside a config dir is refused when the runner is
+        made** (:func:`~messagefoundry.pipeline.sandbox.undigested_graph_refusal`). One swapped in
+        later, by :meth:`reload` or by assigning ``self.registry``, still reaches this method, and
+        its worker refuses it per message through
+        :func:`~messagefoundry.pipeline.sandbox.graph_differences`, which stays the backstop.
 
         **A graph built in code with no config dir cannot isolate**, and degrades to in-process.
         That degradation is **silent**: a library embedder that asked for ``subprocess`` gets the
