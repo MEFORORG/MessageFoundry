@@ -600,7 +600,10 @@ foreach ($r in $repos) {
         # on the others. The JSON carries the same items under Findings and DetachedUnbacked. But
         # when the trusted exclusion set itself could not be read, every count was taken against
         # too little and would call backed work "on no remote", so the list is withheld.
-        $exclusionFailed = @($r.ScanFailed | Where-Object { $_ -like '(tracking refs of *' -or $_ -eq '(tracking ref object check)' }).Count -gt 0
+        # Only when a remote answered is the exclusion the listed set; with -SkipReachability or
+        # none answering it is the bare --not --remotes glob, which a failed listing cannot shrink.
+        $exclusionFailed = ($r.RemotesReachable -gt 0) -and
+            (@($r.ScanFailed | Where-Object { $_ -like '(tracking refs of *' -or $_ -eq '(tracking ref object check)' }).Count -gt 0)
         if ($exclusionFailed -and ($r.Unbacked -gt 0 -or $r.DetachedUnbacked.Count -gt 0)) {
             Write-Host "              per-branch counts withheld: the trusted remotes' refs could not be read," -ForegroundColor Red
             Write-Host "              so every count here would overstate what is on no remote." -ForegroundColor Red

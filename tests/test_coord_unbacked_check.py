@@ -1009,3 +1009,42 @@ def test_a_failed_EXCLUSION_set_withholds_counts_rather_than_call_backed_work_un
     assert "git FAILED for: (tracking refs of origin)" in r.stdout
     assert "per-branch counts withheld" in r.stdout
     assert not re.search(r"^\s+pushed\s+\d+\s*$", r.stdout, re.MULTILINE), r.stdout
+
+
+def test_a_failed_listing_under_SKIP_REACHABILITY_does_not_withhold_true_counts(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP. Under -SkipReachability the exclusion is the bare ``--not --remotes`` glob, which
+    a failed tracking-ref listing does not shrink, so the counts stay true. Withholding them with
+    "every count here would overstate" was false output and hid the at-risk branch."""
+    git(repo, "checkout", "-q", "-b", "pushed")
+    _commit(repo, "g.txt", "on origin", "work")
+    git(repo, "push", "-q", "origin", "pushed")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "checkout", "-q", "-b", "atrisk")
+    _commit(repo, "h.txt", "this exists on exactly one disk", "work")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "fetch", "-q", "origin")
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "git.cmd").write_text(
+        f'@echo off\r\nif "%3"=="for-each-ref" if "%5"=="refs/remotes/origin" exit /b 128\r\n'
+        f'"{real_git}" %*\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    env = dict(os.environ, PATH=f"{shim}{os.pathsep}{os.environ['PATH']}")
+    r = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(CHECK), "-Path", str(repo), "-SkipReachability"],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        env=env,
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "git FAILED for: (tracking refs of origin)" in r.stdout
+    assert "per-branch counts withheld" not in r.stdout
+    assert re.search(r"^\s+atrisk\s+1\s*$", r.stdout, re.MULTILINE), r.stdout
+    assert not re.search(r"^\s+pushed\s+\d+\s*$", r.stdout, re.MULTILINE), r.stdout
