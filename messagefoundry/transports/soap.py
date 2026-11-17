@@ -780,8 +780,12 @@ class SoapDestination(DestinationConnector):
             self._opener = _insecure_opener(*proxy_handlers)
         # #65: an opt-in bearer provider (OAuth2 client-credentials) for the HTTP *hop*, independent
         # of WS-Security, which secures the SOAP *message*. Minted in _post and _probe. Built after
-        # the data-hop gates, so the token hop's own gate logs no crossing for a build they refuse.
-        from messagefoundry.transports.http_auth import bearer_provider_from_settings
+        # the gates above, so a build one of them refuses never builds it.
+        from messagefoundry.transports.http_auth import (
+            bearer_provider_from_settings,
+            oauth2_auth_configured,
+        )
+        from messagefoundry.transports.smart import smart_auth_configured
 
         # ADR 0126: the token-endpoint call must ALSO traverse the proxy — thread the same ProxyConfig in.
         # #1660: and the instance [tls] trust-anchor policy, resolved for the TOKEN host, so the hop
@@ -789,6 +793,15 @@ class SoapDestination(DestinationConnector):
         self._token_provider = bearer_provider_from_settings(
             s, proxy=self._proxy, trust_anchor_policy=config.trust_anchor_policy
         )
+        # BACKLOG #5526: _build_headers dropped every static credential on these predicates. A
+        # provider missing where they hold would send no credential, so refuse that build.
+        if (self._token_provider is not None) != (
+            oauth2_auth_configured(s) or smart_auth_configured(s)
+        ):
+            raise HttpAuthError(
+                f"{hop_name_prefix(self._connection_name)}SOAP destination bearer auth settings "
+                "did not build a token provider"
+            )
         if self._token_provider is not None:
             refuse_cleartext_credentials(
                 scheme,
