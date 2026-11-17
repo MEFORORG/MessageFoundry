@@ -76,7 +76,8 @@ redaction screen's header test and the query-credential reader; ``_http_literal_
   ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
 
 Pure apart from :func:`apply_static_credential_gate`, which also logs, ``_digest``, which logs
-at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529), and ``_http_literal_static``, whose
+at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529), ``_is_https``, which logs at debug
+a proxy target that does not parse, and ``_http_literal_static``, whose
 ``env()`` resolution runs an operator ``cast`` as the build does (BACKLOG #5510): every function
 reads its arguments and touches nothing else.
 

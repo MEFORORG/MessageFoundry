@@ -287,7 +287,9 @@ def refuse_a_digest_proxy_on_the_token_hop(s: Mapping[str, Any], *, connection: 
     (its ``builds_token_hop``). So on such an outbound that builds exactly one token provider, this
     refusal comes before any record of that credential crossing. A SOAP outbound is not one of
     them. The token URL is first checked by the provider constructor's own ``_check_token_url``, so
-    a URL that check refuses is refused for itself, not as a Digest token hop. The rule
+    a URL that check refuses is refused for itself, not as a Digest token hop. The provider's
+    other refusals, a token URL with no host and a missing client secret among them, run later, so
+    where this rule also holds, this refusal comes first. The rule
     is :func:`~messagefoundry.transports.rest.digest_proxy_meets_the_token_connect`, with the
     connection's ``proxy_no_proxy`` as the bypass list, and the refusal is the provider's own
     (:meth:`~messagefoundry.transports.smart._TokenEndpointProvider.digest_proxy_refusal`). A mapping
