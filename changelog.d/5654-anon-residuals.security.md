@@ -7,8 +7,8 @@
   after its last colon, or joined by a dot to an allowed one, is judged. A report no longer
   calls the denylist live when the site-code check's prefixes differ from the publish guard's
   `[site_prefix]` table. (`BACKLOG #5654`, `#5541`)
-- **The anonymizer's surrogates no longer write a separator digit or invent an id.** The
-  site-code pass writes no digit the message declares as a separator. An identifier surrogate
+- **The anonymizer's site-code pass writes no separator digit, and an identifier surrogate
+  invents no id.** The site-code pass writes no digit the message declares as a separator. An identifier surrogate
   leaves an empty id empty and turns an escape sequence in an id into one letter. The tee's
   `anonymize-captures` names a field-separator refusal and its fix instead of advising a keep.
   (`BACKLOG #5534`, `#5540`)

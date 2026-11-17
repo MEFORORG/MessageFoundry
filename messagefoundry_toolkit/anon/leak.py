@@ -241,8 +241,7 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
     section 9."""
     for match in _IPV6_RUN.finditer(text):
         whole = match.group()
-        joined = _IPV6_DOT_JOIN.split(whole)
-        for run in dict.fromkeys((whole, *joined)):
+        for run in dict.fromkeys((whole, *_dot_joined(whole))):
             if run.count(":") < 2:
                 continue
             verdict = _judge_ipv6_texts(_ipv6_candidates(run), ipv4_is_routable)
@@ -254,9 +253,15 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
     return False
 
 
-#: A dot with a colon later in the same run: it joins two texts that may each be an IPv6 address.
-#: A dot with no colon after it, as in a dotted IPv4 tail, joins nothing.
-_IPV6_DOT_JOIN: re.Pattern[str] = re.compile(r"\.(?=[0-9A-Fa-f.]*:)")
+def _dot_joined(run: str) -> list[str]:
+    """``run`` split at each dot that has a colon later in it: such a dot joins two texts that
+    may each be an IPv6 address. A dot after the last colon, as in a dotted IPv4 tail, joins
+    nothing, so the text after the last colon stays with the piece before it. One pass, so the
+    scan stays linear."""
+    last_colon = run.rfind(":")
+    pieces = run[:last_colon].split(".")
+    pieces[-1] += run[last_colon:]
+    return pieces
 
 
 def _judge_ipv6_texts(texts: Iterable[str], ipv4_is_routable: Callable[[str], bool]) -> bool | None:
@@ -858,8 +863,11 @@ def _is_mrn_type(comp: str, seps: Seps, field_sep: str, *, subcomponents: bool) 
         )
     ]
     for form in forms:
-        typed = trim(form).upper()
-        if typed in _MRN_TYPES or (not typed.isascii() and folded(typed) in _MRN_TYPES):
+        typed = trim(form)
+        if typed.upper() in _MRN_TYPES:
+            return True
+        # Folded first: a compatibility letter with no case mapping folds to lower case.
+        if not typed.isascii() and folded(typed).upper() in _MRN_TYPES:
             return True
     return False
 

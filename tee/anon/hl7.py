@@ -112,7 +112,11 @@ _REFUSED_IN_FIELD = ("\r", "\n", "\x0b", "\x1c", "\x00")
 class SurrogateSeparatorRefused(AnonError):
     """A rule's surrogate would hold the field separator or a character in ``_REFUSED_IN_FIELD``,
     so writing it would add a field or a line (BACKLOG #5540). A ``keep`` on that field does not
-    help: it would emit the captured value."""
+    help: it would emit the captured value. ``path`` is the rule's field address, never a value."""
+
+    def __init__(self, path: str, cause: str) -> None:
+        super().__init__(f"the surrogate for {path} would hold {cause} — refusing to emit")
+        self.path = path
 
 
 def _whole_field(path: str, value: str, field_sep: str) -> str:
@@ -124,9 +128,7 @@ def _whole_field(path: str, value: str, field_sep: str) -> str:
         cause = "a segment separator, an MLLP frame byte or NUL"
     else:
         return value
-    raise SurrogateSeparatorRefused(
-        f"the surrogate for {path} would hold {cause} — refusing to emit"
-    )
+    raise SurrogateSeparatorRefused(path, cause)
 
 
 def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:

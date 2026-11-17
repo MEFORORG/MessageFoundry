@@ -422,7 +422,7 @@ def test_a_field_separator_refusal_is_not_told_to_add_a_keep(
 
     (error,) = [line for line in capsys.readouterr().err.splitlines() if line.startswith("error:")]
     assert "would hold the message's field separator or a control byte" in error
-    assert "point the field at drop" in error
+    assert "in NTE-3." in error and "point the field at drop" in error
     assert _GENERAL not in error
     assert "Then retry." in error
     assert "SYNTHETIC NOTE" not in error

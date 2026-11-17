@@ -837,6 +837,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     # Messages refused because a rule's surrogate would hold the field separator or a control
     # byte (BACKLOG #5540). A keep is the wrong advice for one: it would emit the captured value.
     separator_refused = 0
+    separator_paths: dict[str, None] = {}
 
     def _tally(report: LeakReport) -> None:
         nonlocal residue_reports, residue_mixed
@@ -864,7 +865,9 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             # The error's text is not printed; the summary names the count and fixed causes.
             coverage.refuse()
             failed += 1
-            separator_refused += isinstance(exc, SurrogateSeparatorRefused)
+            if isinstance(exc, SurrogateSeparatorRefused):
+                separator_refused += 1
+                separator_paths[exc.path] = None
             continue
         except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
             failed += 1  # it is a count, not a leak (LeakError, or anything else)
@@ -905,7 +908,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         ]
         if residue_reports:
             # A keep is the wrong advice here: it would leave the whole field.
-            if residue_reports < failed:
+            if residue_reports < failed - separator_refused:
                 rest = ["For the others:", *steps]
             elif residue_mixed:
                 rest = ["At least one of them also had another cause:", *steps]
@@ -920,10 +923,10 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         if separator_refused:
             # A keep is the wrong advice here too: it would emit the captured value whole.
             steps = [
-                f"{separator_refused} of them were refused because a rule's surrogate would hold "
-                "the message's field separator or a control byte, which a custom MSH-1 makes "
-                "possible. A keep on that field would emit the captured value: point the field at "
-                "drop in an overlay, or capture the feed under the standard | field separator.",
+                f"{separator_refused} of them were refused because the surrogate a rule wrote "
+                "would hold the message's field separator or a control byte, in "
+                f"{', '.join(separator_paths)}. A keep on such a field would emit the captured "
+                "value: point the field at drop in an overlay.",
                 *(["For the others:", *steps] if separator_refused < failed else ["Then retry."]),
             ]
         print(

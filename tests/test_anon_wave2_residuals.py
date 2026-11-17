@@ -149,8 +149,9 @@ def test_the_site_code_pass_never_writes_a_digit_field_separator(
 ) -> None:
     """Every site code here holds no ``sep``, so the line splits as written; the surrogate must
     hold none either, or the field after it moves (BACKLOG #5540)."""
-    codes = [f"97{tail}" for tail in ("1246", "2479", "4612", "6794", "7921", "9164")]
-    codes = [code for code in codes if sep not in code]
+    # Many codes, so a fabricated digit drawn from all ten would hit ``sep`` in almost every run.
+    codes = [f"97{n:04d}" for n in range(1000, 10000, 97) if sep not in f"{n:04d}"]
+    assert len(codes) >= 20
     fields = ["ZPD", "1", *codes, "AFTERMARK"]
     header = sep.join(
         # No other value holds a digit, so only the site codes can carry one.
@@ -192,6 +193,9 @@ def test_an_escape_sequence_in_an_id_becomes_one_letter(surrogates: ModuleType) 
         fabricated = out.split("^", 1)[0]
         assert "\\" not in fabricated, out
         assert len(fabricated) == 5, out
+    # Two subcomponents: HL7 splits before it decodes, so no escape closes across the ``&``.
+    out = surrogates.surrogate_id("AB\\C&D\\E^^^H^MR", Keyer(_SALT), seps)
+    assert out.split("^", 1)[0].count("&") == 1, out
 
 
 @_SURROGATES
@@ -230,8 +234,19 @@ def test_an_empty_id_stays_empty(surrogates: ModuleType) -> None:
         "12345^MR\ufe0f",  # a variation selector, category Mn
         "12345^M\u3164R",  # a Hangul filler, category Lo
         "12345^\uff2d\uff32",  # fullwidth MR
+        "12345^\U0001d426\U0001d42b",  # mathematical bold small m and r, folded to lower case
+        "12345^M\u2065R",  # U+2065, unassigned but default-ignorable
     ],
-    ids=["xcn-13", "xon-7", "cgj", "variation-selector", "hangul-filler", "fullwidth"],
+    ids=[
+        "xcn-13",
+        "xon-7",
+        "cgj",
+        "variation-selector",
+        "hangul-filler",
+        "fullwidth",
+        "math-bold",
+        "u2065",
+    ],
 )
 def test_an_mrn_type_the_check_passed_is_a_hit(leak: ModuleType, value: str) -> None:
     hits = leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"})
@@ -325,3 +340,13 @@ def test_the_spacing_commands_are_the_engines(surrogates: ModuleType) -> None:
     writes_text = {command for command, text in _RICH_TEXT_MAP.items() if text}
     assert writes_text == surrogates._SPACING_FORMAT_COMMANDS
     assert surrogates._MAX_ESCAPE_REPEAT == MAX_ESCAPE_REPEAT
+
+
+@_LEAKS
+def test_a_long_dotted_run_is_split_in_linear_time(leak: ModuleType) -> None:
+    """Every dot of a dotted-hex run is a candidate join; the split reads the run once."""
+    import time
+
+    start = time.perf_counter()
+    leak.structural_phi_hits(_zpd("1." * 40000 + "fe80::1"), {"PID-3", "PID-5"})
+    assert time.perf_counter() - start < 5.0

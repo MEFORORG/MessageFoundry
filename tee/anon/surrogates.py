@@ -193,7 +193,7 @@ def _fake_like(rng: random.Random, sample: str, seps: Seps) -> str:
 
     The subcomponent separator and escape character the message declares are kept
     even when they are not ASCII, so the value keeps its structure, and each escape sequence a
-    second escape character closes becomes one fabricated letter, the width it decodes to. Its body
+    second escape character closes in the same subcomponent becomes one fabricated letter. Its body
     is never rewritten letter by letter, which could turn ``\\E\\`` into ``\\F\\``."""
     out: list[str] = []
     escape = seps.escape
@@ -202,7 +202,8 @@ def _fake_like(rng: random.Random, sample: str, seps: Seps) -> str:
     while at < len(sample):
         ch = sample[at]
         end = sample.find(escape, at + 1) if escape and ch == escape else -1
-        if end != -1:
+        # HL7 splits before it decodes, so an escape never closes across a subcomponent separator.
+        if end != -1 and seps.subcomponent not in sample[at + 1 : end]:
             out.append(_fake_letter(rng))
             at = end + 1
             continue
@@ -606,13 +607,13 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|")
     reserved = set(field_sep + seps.component + seps.repetition + seps.subcomponent + seps.escape)
     digits = [d for d in "0123456789" if d not in reserved]
     prefixes = [p for p in _NON_SITE_PREFIXES if not reserved.intersection(p)]
-    if not prefixes:
-        raise AnonError(
-            "every non-site-code prefix holds a digit the message declares as a separator, so no "
-            "site-code surrogate can be written — refusing to emit"
-        )
 
     def _fake(part: str) -> str:
+        if not prefixes:
+            raise AnonError(
+                "every non-site-code prefix holds a digit the message declares as a separator, so "
+                "no site-code surrogate can be written — refusing to emit"
+            )
         rng = keyer.rng("sitecode", part)
         prefix = rng.choice(prefixes)
         if len(digits) == 10:
@@ -820,7 +821,8 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
 #: as the value without it (BACKLOG #5632, #5654).
 _INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf"})
 #: The Unicode default-ignorable code points outside Cc and Cf (DerivedCoreProperties.txt,
-#: Default_Ignorable_Code_Point), as inclusive ranges: among them the combining grapheme joiner
+#: Default_Ignorable_Code_Point), as inclusive ranges: among them U+2065, unassigned, the
+#: combining grapheme joiner
 #: U+034F and the variation selectors, category Mn, and the Hangul fillers U+115F, U+1160, U+3164
 #: and U+FFA0, category Lo. A consumer shows none of them, so a site code or ``MR`` they
 #: interleave reads as the value without them (BACKLOG #5654). The ranges that lie inside Cc or
@@ -830,6 +832,7 @@ _DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
     (0x115F, 0x1160),
     (0x17B4, 0x17B5),
     (0x180B, 0x180F),
+    (0x2065, 0x2065),
     (0x3164, 0x3164),
     (0xFE00, 0xFE0F),
     (0xFFA0, 0xFFA0),
@@ -859,6 +862,8 @@ def _is_blank(char: str) -> bool:
 def dropped(text: str) -> str:
     """``text`` with every invisible character (:func:`_is_invisible`) removed, as a consumer
     that drops them reads it."""
+    if text.isascii() and text.isprintable():
+        return text  # printable ASCII holds no invisible character
     return "".join(c for c in text if not _is_invisible(c))
 
 
