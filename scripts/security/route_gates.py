@@ -541,17 +541,21 @@ def _app_beneath(route: Mount | Host, at: str) -> Any:
     That is a ``Mount``'s app beneath any middleware the mount wraps around it, or a ``Host``'s app,
     then unwrapped through each ASGI middleware layer that keeps the next app as ``.app``, down to
     the first Starlette app or router (vault BACKLOG #3177). A layer that keeps the next app under
-    any other name ends the unwrapping there, so the refusal does not reach past it. More than
-    :data:`_MAX_MIDDLEWARE_LAYERS` layers raise ``ValueError`` rather than unwrap forever, as an
-    object that makes a new ``.app`` on every read would."""
+    any other name ends the unwrapping there, so the refusal does not reach past it.
+
+    It raises ``ValueError`` on reaching one more object that is neither a Starlette app nor a
+    router after :data:`_MAX_MIDDLEWARE_LAYERS` such objects, rather than unwrap forever, as an
+    object that makes a new ``.app`` on every read would. Each middleware layer counts, and so does
+    a leaf app that is neither, such as a plain ASGI function or ``StaticFiles``. So 64 layers
+    around a FastAPI app are unwrapped, while 64 layers around a plain ASGI app are refused."""
     app: Any = _mounted_app(route) if isinstance(route, Mount) else route.app
     # Each layer is held, not only its id, so a freed layer's id cannot come back as a new one's.
     seen: dict[int, Any] = {}
     while not isinstance(app, Starlette | Router) and id(app) not in seen:
         if len(seen) >= _MAX_MIDDLEWARE_LAYERS:
             raise ValueError(
-                f"the app under {at!r} is wrapped in more than "
-                f"{_MAX_MIDDLEWARE_LAYERS} middleware layers, so the route walk cannot reach it"
+                f"the app under {at!r} sits beneath more than {_MAX_MIDDLEWARE_LAYERS} objects "
+                "that are neither a Starlette app nor a router, so the route walk cannot reach it"
             )
         seen[id(app)] = app
         inner = getattr(app, "app", None)
@@ -561,7 +565,8 @@ def _app_beneath(route: Mount | Host, at: str) -> Any:
     return app
 
 
-#: How many ``.app`` middleware layers :func:`_app_beneath` unwraps before it refuses.
+#: How many objects that are neither a Starlette app nor a router :func:`_app_beneath` passes
+#: before it refuses; its docstring says what counts.
 _MAX_MIDDLEWARE_LAYERS = 64
 
 

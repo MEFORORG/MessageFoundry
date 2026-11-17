@@ -1060,16 +1060,20 @@ class _EndlessWrapper:
 def test_a_mount_wrapped_without_end_is_refused_rather_than_unwrapped_forever() -> None:
     app = FastAPI(openapi_url=None)
     app.mount("/stub", _EndlessWrapper())  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="under '/stub' is wrapped in more than 64"):
+    with pytest.raises(ValueError, match=f"under '/stub' sits beneath more than {_CAP} objects"):
         list(route_gates._effective_routes(app))
 
 
-@pytest.mark.parametrize(("layers", "refused"), [(64, False), (65, True)])
-def test_the_middleware_cap_refuses_only_past_64_layers(
+_CAP = route_gates._MAX_MIDDLEWARE_LAYERS
+
+
+@pytest.mark.parametrize(("layers", "refused"), [(_CAP, False), (_CAP + 1, True)])
+def test_the_cap_unwraps_as_many_layers_as_it_names_around_a_fastapi_app(
     layers: int, refused: bool, tmp_path: Path
 ) -> None:
-    """The boundary control for the cap: 64 layers are unwrapped down to the app, which is refused
-    for its frontend group; 65 are refused for the layers themselves."""
+    """The boundary control for the cap, with a FastAPI app as the leaf, which is not counted: that
+    many layers are unwrapped down to the app, which is refused for its frontend group; one more
+    is refused for the layers themselves."""
     inner = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     inner.frontend("/", directory=str(tmp_path), check_dir=False)
     wrapped: Any = inner
@@ -1077,9 +1081,29 @@ def test_the_middleware_cap_refuses_only_past_64_layers(
         wrapped = _PassThrough(wrapped)
     app = FastAPI(openapi_url=None)
     app.mount("/w", wrapped)
-    expected = "middleware layers" if refused else "low-priority route"
+    expected = "objects that are neither" if refused else "low-priority route"
     with pytest.raises(ValueError, match=expected):
         list(route_gates._effective_routes(app))
+
+
+async def _plain_asgi_leaf(scope: Any, receive: Any, send: Any) -> None:  # pragma: no cover
+    return None
+
+
+@pytest.mark.parametrize(("layers", "refused"), [(_CAP - 1, False), (_CAP, True)])
+def test_the_cap_counts_a_plain_asgi_leaf_as_one_object(layers: int, refused: bool) -> None:
+    """A leaf that is neither a Starlette app nor a router counts toward the cap, as
+    ``_app_beneath``'s docstring says, so one layer fewer passes than around a FastAPI app."""
+    wrapped: Any = _plain_asgi_leaf
+    for _ in range(layers):
+        wrapped = _PassThrough(wrapped)
+    app = FastAPI(openapi_url=None)
+    app.mount("/w", wrapped)
+    if refused:
+        with pytest.raises(ValueError, match="objects that are neither"):
+            list(route_gates._effective_routes(app))
+    else:
+        assert [type(s) for _r, s in route_gates._effective_routes(app)] == [Mount]
 
 
 def test_a_mount_cycle_is_refused_rather_than_walked() -> None:
