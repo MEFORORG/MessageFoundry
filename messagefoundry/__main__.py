@@ -4910,9 +4910,8 @@ def _serve(args: argparse.Namespace) -> int:
     _state_dir = generated_state_dir(settings.store.path)
     # BACKLOG #4934: the lifespan's start refusal runs after this mint, so a start that may replace
     # the pair takes it here first. A first-run mint replaces nothing, so it needs no early open.
-    # An early open refused on an unmarked value is the exception: that start goes on to the mint,
-    # which may replace the pair, and the lifespan's hooked open then refuses it and alerts before
-    # the replacement is audited, the order main ran.
+    # An early open refused on an unmarked value is the exception; _refuse_unrolled_key_before_tls_write
+    # says what that start does instead.
     if generated_pair_may_be_replaced(settings.api, state_dir=_state_dir, renew=args.shard is None):
         from messagefoundry.pipeline.secret_rotation import UnrolledStoreKeyRefused
         from messagefoundry.store.base import KeylessAuditChainRefused
@@ -5251,8 +5250,9 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     back to the order main ran: it logs a WARNING, mints, and returns if nothing was replaced, and
     an engine shard that then starts sends the store-cipher alert from its hooked open. If the mint
     replaced the pair, it opens the store again to audit the replacement, with no hook, as main
-    did, and that open raises the refusal again: the start is refused, the replaced pair is left
-    unaudited, and no alert is sent. Any other start mints first and opens the store only if that
+    did, and that open raises ``UnmarkedCipherError`` again, which ``supervise`` does not catch: it
+    ends the start at the dispatch floor, the replaced pair is left unaudited, and no alert is
+    sent. Any other start mints first and opens the store only if that
     replaced a pair, which then takes the start refusal before the audit row; a refusal there also
     leaves the replaced pair unaudited.
     """
@@ -5366,7 +5366,9 @@ def _refuse_unrolled_key_before_tls_write(settings: ServiceSettings) -> None:
     check instead. The start goes on to the mint, which may replace the pair, and, unless a gate
     between the two refuses first, to the lifespan, whose open passes the hook, is refused on the
     same value and sends the store-cipher alert. A pair the mint replaced is then left unaudited,
-    as on main."""
+    as on main. A planted row the open's at-open sweep finds and leaves in place, without raising,
+    is reported to no hook, so it reaches only the log; if the check then refuses, the start ends
+    here and no hooked open runs to alert on it."""
     from messagefoundry.config.settings import hop_posture_from_ai, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store import open_store

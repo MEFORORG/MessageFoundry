@@ -446,6 +446,27 @@ def _sink_for_the_lifespan(monkeypatch: pytest.MonkeyPatch) -> Any:
     return sink
 
 
+class _Recorded(logging.Handler):
+    """The WARNINGs ``messagefoundry.__main__`` logs. A handler on that logger, since ``serve``
+    reconfigures the root handlers that ``caplog`` relies on."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+
+def _record_the_cli_warnings(monkeypatch: pytest.MonkeyPatch) -> _Recorded:
+    recorded = _Recorded()
+    cli_log = logging.getLogger("messagefoundry.__main__")
+    # monkeypatch restores the logger's own handler list and state after the test.
+    monkeypatch.setattr(cli_log, "handlers", [*cli_log.handlers, recorded])
+    monkeypatch.setattr(cli_log, "disabled", False)
+    return recorded
+
+
 def _assert_the_store_cipher_alert(sink: Any) -> None:
     """The alert names the table and column and no planted content, and was sent, not queued."""
     assert sink.events and {e[0] for e in sink.events} == {"store-cipher"}, sink.events
@@ -469,6 +490,7 @@ def test_serve_alerts_on_an_unmarked_state_value_on_a_renewal_due_start(
     _seed_a_planted_state_value(db, key)
     _mint_a_pair_due_for_renewal(tmp_path, monkeypatch)
     sink = _sink_for_the_lifespan(monkeypatch)
+    recorded = _record_the_cli_warnings(monkeypatch)
     refused: list[BaseException] = []
 
     def run_the_lifespan(app: Any, *_a: object, **_k: object) -> None:
@@ -493,6 +515,7 @@ def test_serve_alerts_on_an_unmarked_state_value_on_a_renewal_due_start(
     main(["serve", "--config", str(samples), "--env", "dev"])
     assert refused, "the lifespan never ran its hooked open"
     _assert_the_store_cipher_alert(sink)
+    assert any("before the API pair mint was refused" in line for line in recorded.lines)
 
 
 def test_supervise_alerts_on_an_unmarked_state_value_when_the_pair_is_not_replaced(
@@ -526,8 +549,10 @@ def test_supervise_alerts_on_an_unmarked_state_value_when_the_pair_is_not_replac
     # A pair the read-only check cannot clear, which the mint under the lock then reuses.
     monkeypatch.setattr(tls, "generated_pair_may_be_replaced", lambda *a, **k: True)
     settings = ServiceSettings(store=StoreSettings(path=str(db), encryption_key=key))
+    recorded = _record_the_cli_warnings(monkeypatch)
     assert cli._renew_api_tls_before_spawning(settings, str(db)) == state_dir
     assert (state_dir / "api-generated-cert.pem").read_bytes() == minted
+    assert any("before the API pair renewal was refused" in line for line in recorded.lines)
     # The engine shard the fleet now starts on that store.
     sink = _sink_for_the_lifespan(monkeypatch)
     app = create_managed_app(
