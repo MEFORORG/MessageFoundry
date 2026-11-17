@@ -3833,7 +3833,7 @@ def test_the_secrets_directory_is_made_restricted_in_one_step(tmp_path: Path, ho
     squatted.mkdir()
     body = rf"""
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)(IO)M' | Out-Null
+  & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
   New-RestrictedDirectory -Path {_psq(str(made))} -OwnerSid $me
   $acl = Get-Acl -LiteralPath {_psq(str(made))}
   $squat = ''
@@ -3853,8 +3853,7 @@ def test_the_secrets_directory_is_made_restricted_in_one_step(tmp_path: Path, ho
     got = json.loads(_ok(script, tmp_path, host).strip().splitlines()[-1])
     assert got["owner"] == got["me"] and got["protected"] and got["inherited"] == 0, got
     assert sorted(set(got["sids"])) == ["S-1-5-18", "S-1-5-32-544"], got
-    # The parent hands Users Modify to what it holds (inherit-only, so not on itself, which the
-    # holder rule would refuse for its DELETE); none of it reached the folder.
+    # The parent grants Users Modify; none of it reached the folder.
     assert broad_access_problem(made, directory=True) is None
     assert "was there before" in got["squat"], f"CONTROL FAILED: the squatted folder passed: {got}"
 

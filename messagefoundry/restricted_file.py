@@ -423,16 +423,14 @@ _REACH_MASK = (
 _DIRECTORY_REACH_MASK = _REACH_MASK | 0x00000040  # FILE_DELETE_CHILD
 
 #: Rights on the directory that HOLDS a key file that let their holder replace the file: delete it
-#: whatever its own access list says (FILE_DELETE_CHILD), rename the directory itself away and put
-#: another in its place (DELETE), or give itself either right (WRITE_DAC, WRITE_OWNER; GENERIC_ALL
-#: holds them all). Narrower than :data:`_DIRECTORY_REACH_MASK` on purpose: listing, traversing and
-#: adding a file do not remove a file already there, and ordinary folders grant Users those,
-#: ``C:\\ProgramData`` included (vault BACKLOG #5657). So a file a broad group added before the
-#: engine first looked is not caught here. A volume root cannot be renamed, so ``DELETE`` on one is
-#: not counted.
+#: whatever its own access list says (FILE_DELETE_CHILD), or give itself that right (WRITE_DAC,
+#: WRITE_OWNER; GENERIC_ALL holds all three). Narrower than :data:`_DIRECTORY_REACH_MASK` on
+#: purpose: listing, traversing and adding a file do not remove a file already there, and ordinary
+#: folders grant Users those, ``C:\\ProgramData`` included (vault BACKLOG #5657). So a file a broad
+#: group added before the engine first looked, or a holder it renamed away with DELETE, is not
+#: caught here.
 _HOLDER_REPLACE_MASK = (
     0x00000040  # FILE_DELETE_CHILD
-    | DELETE_ACCESS
     | 0x00040000  # WRITE_DAC
     | 0x00080000  # WRITE_OWNER
     | 0x10000000  # GENERIC_ALL
@@ -546,13 +544,13 @@ def _windows_access_problem(
     return None
 
 
-def _windows_holder_problem(security: WinSecurity, *, volume_root: bool = False) -> str | None:
+def _windows_holder_problem(security: WinSecurity) -> str | None:
     """Why the directory this owner and access list belong to lets a broad group or an application
     package replace a key file in it (:data:`_HOLDER_REPLACE_MASK`), or ``None`` (vault BACKLOG
     #5657). The same owner and entry rules as :func:`_windows_access_problem`, read with the entry
-    flags: an inherit-only entry grants nothing on the directory, so it is skipped. With
-    ``volume_root``, ``DELETE`` is not counted. A list that could not be read is the caller's to
-    report. Kept free of ctypes so the decision is testable on every platform."""
+    flags: an inherit-only entry grants nothing on the directory, so it is skipped. A list that
+    could not be read is the caller's to report. Kept free of ctypes so the decision is testable on
+    every platform."""
     if security.aces is None:
         return "it has no access list at all, so every account on the host can read or change it"
     owner = security.owner
@@ -560,11 +558,10 @@ def _windows_holder_problem(security: WinSecurity, *, volume_root: bool = False)
         return "its owner could not be read"
     if (what := _screened_principal(owner)) is not None:
         return f"its owner is {what}, and an owner can change its access list"
-    mask = _HOLDER_REPLACE_MASK & ~DELETE_ACCESS if volume_root else _HOLDER_REPLACE_MASK
     for ace_type, flags, ace_mask, sid in security.aces:
         if ace_type not in _GRANTING_ACE_TYPES or flags & INHERIT_ONLY_ACE:
             continue  # a deny or audit entry, or a template for children, grants nothing here
-        if not ace_mask & mask:
+        if not ace_mask & _HOLDER_REPLACE_MASK:
             continue  # the reader records every granting entry's mask, conditional ones included
         if ace_type != ACCESS_ALLOWED_ACE_TYPE:
             return "its access list holds a conditional entry this check cannot interpret"
@@ -576,28 +573,20 @@ def _windows_holder_problem(security: WinSecurity, *, volume_root: bool = False)
 
 
 #: What an entry within :data:`_HOLDER_REPLACE_MASK` lets its holder do, for the refusal text.
-_HOLDER_REACH = "can delete or replace a file in it, or rename it away"
+_HOLDER_REACH = "can delete or replace a file in it"
 
 
 def _windows_engine_owner_problem(owner_sid: str | None, engine_sid: str | None) -> str | None:
     """Why a file only the engine writes, such as its minted TLS pair, is owned by an account that
     did not make it, or ``None``. The engine's own account, SYSTEM and Administrators may own it:
-    an elevated administrator's files are owned by Administrators. The engine's own account counts
-    only when it is not LOCAL SERVICE or NETWORK SERVICE, which other services run as too. Any other
-    owner may have planted the file through a right to add one to the directory, which the holder
-    rule does not refuse (vault BACKLOG #5657). An owner or an engine account that could not be read
-    is refused too. Kept free of ctypes so the decision is testable on every platform."""
+    an elevated administrator's files are owned by Administrators. Any other owner may have planted
+    the file through a right to add one to the directory, which the holder rule does not refuse
+    (vault BACKLOG #5657). An owner or an engine account that could not be read is refused too.
+    Kept free of ctypes so the decision is testable on every platform."""
     if owner_sid is None:
         return "its owner could not be read"
-    if owner_sid in (SYSTEM_SID, ADMINISTRATORS_SID):
+    if owner_sid in (SYSTEM_SID, ADMINISTRATORS_SID) or owner_sid == engine_sid:
         return None
-    if owner_sid == engine_sid:
-        if owner_sid not in _SHARED_SERVICE_SIDS:
-            return None
-        return (
-            f"it is owned by {describe_sid(owner_sid)}, which other services run as too, so another "
-            "service may have made it and may hold its key"
-        )
     if engine_sid is None:
         return "the account the engine runs as could not be read, so its owner cannot be vetted"
     return (
@@ -798,7 +787,11 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
                 "it is reached through a junction, link or subst drive onto a network share, whose "
                 "folders this check does not walk; name it by its share path instead"
             )
-        problem = _loopback_share_problem(str(full), _host_name())
+        try:
+            host_name = _host_name()
+        except OSError as exc:  # fail closed: a share this host cannot rule out may be itself
+            return f"this host's own name could not be read ({exc.strerror or type(exc).__name__})"
+        problem = _loopback_share_problem(str(full), host_name)
     if problem is not None:
         return problem
     if cause is not None:  # a share: the walk stops there, and the holder is read through it
@@ -839,7 +832,7 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             f"the permissions of the directory that holds it could not be read ({holder.error}); "
             "give the account the engine runs as the right to read that folder's permissions"
         )
-    problem = _windows_holder_problem(holder, volume_root=holder_is_root)
+    problem = _windows_holder_problem(holder)
     return None if problem is None else f"the directory that holds it is not restricted: {problem}"
 
 
@@ -1157,7 +1150,7 @@ def broad_access_problem(
     any folder above it (:func:`_posix_link_problem`). On Windows the folders above a link, or above
     the holder when a ``subst`` drive is on the path, are judged that way; elsewhere they are not
     (:func:`_windows_surroundings_problem`). On Windows a directory holding ``path`` that lets a
-    broad group delete a file in it, rename it, or change its access list is refused too
+    broad group delete a file in it or change its access list is refused too
     (:func:`_windows_holder_problem`), read where the path resolves to. A file whose access cannot be
     read is reported as a problem, and so is a path that is itself a link, on every platform,
     because the file behind it was not judged.

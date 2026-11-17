@@ -64,8 +64,8 @@ _PEM_MARKER: Final = "-----BEGIN"
 KEY_FILE_REMEDY: Final = (
     "Restrict it to the account the engine runs as, as a file rather than a link, with no junction "
     "or link above it that another account can change (Windows: in a directory no broad group "
-    "may delete a file in, rename, or change the access list of; POSIX: a file that account owns, "
-    "in a directory that account "
+    "may delete a file in or change the access list of; POSIX: a file that account owns, in a "
+    "directory that account "
     "or root owns and only it may write, or that has the sticky bit; for a key kept behind a link, "
     "such as a certbot live/ path, copy the file to a real folder on each renewal)"
 )

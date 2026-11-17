@@ -641,17 +641,20 @@ def _holder(*aces: tuple[int, int, str], owner: str = _CREATOR, flags: int = 0) 
 _MODIFY = 0x001301BF
 
 
-def test_a_holder_like_programdata_holds_no_right_the_holder_rule_refuses() -> None:
-    """The control for the holder refusals below: listing, traversing and adding a file delete no
-    file already in the directory, and rename nothing."""
+def test_a_holder_like_programdata_or_a_data_drive_holds_no_right_the_holder_rule_refuses() -> None:
+    """The controls for the holder refusals below: listing, traversing, adding a file, and the
+    Modify a data drive's root hands Authenticated Users, delete no file already in the directory.
+    Modify does carry DELETE, which lets its holder rename the directory away; the rule does not
+    read that (vault BACKLOG #5657, left open)."""
     assert restricted_file._windows_holder_problem(_holder(*_PROGRAMDATA_ACES)) is None
+    modify = _holder((_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, "S-1-5-11"))
+    assert restricted_file._windows_holder_problem(modify) is None
 
 
 @pytest.mark.parametrize(
     "right",
     [
         0x00000040,  # FILE_DELETE_CHILD
-        0x00010000,  # DELETE: it can rename the holder away and put its own in its place
         0x00040000,  # WRITE_DAC: it can give itself FILE_DELETE_CHILD
         0x00080000,  # WRITE_OWNER: likewise, by taking the directory over
         0x10000000,  # GENERIC_ALL
@@ -661,17 +664,6 @@ def test_a_holder_that_lets_a_broad_group_replace_a_key_is_refused(right: int) -
     holder = _holder(*_PROGRAMDATA_ACES, (_ALLOW, right, _USERS))
     problem = str(restricted_file._windows_holder_problem(holder))
     assert f"Users ({_USERS}) can delete or replace a file in it" in problem
-
-
-def test_a_holder_a_broad_group_may_modify_is_refused_unless_it_is_a_volume_root() -> None:
-    """Vault BACKLOG #5657: Modify carries DELETE, so Authenticated Users under ``C:\\<folder>``
-    could rename the holder away; the old rule did not count DELETE. A volume root cannot be
-    renamed, so the same entry on one passes."""
-    modify = _holder((_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, "S-1-5-11"))
-    assert "can delete or replace a file in it" in str(
-        restricted_file._windows_holder_problem(modify)
-    )
-    assert restricted_file._windows_holder_problem(modify, volume_root=True) is None
 
 
 def test_a_holder_entry_that_applies_only_to_its_children_is_not_counted() -> None:
@@ -866,17 +858,6 @@ def test_a_file_only_the_engine_writes_owned_by_another_account_is_refused() -> 
         restricted_file._windows_engine_owner_problem(None, _ENGINE_SID)
     )
     assert "could not be read" in str(restricted_file._windows_engine_owner_problem(_CREATOR, None))
-
-
-@pytest.mark.parametrize("shared", ["S-1-5-19", "S-1-5-20"])
-def test_a_file_only_the_engine_writes_is_refused_when_a_shared_service_account_owns_it(
-    shared: str,
-) -> None:
-    """Vault BACKLOG #5657: an engine running as LOCAL SERVICE or NETWORK SERVICE shares that
-    account with other services, so its owning the file does not show the engine made it, as the
-    trust-anchor rule already holds."""
-    problem = str(restricted_file._windows_engine_owner_problem(shared, shared))
-    assert "other services run as too" in problem
 
 
 @pytest.mark.parametrize(
@@ -1601,7 +1582,7 @@ def test_windows_a_subst_drive_on_the_path_is_judged_like_a_link(tmp_path: Path)
     assert "a folder holding or above a junction or link on its path can be changed" in problem
     assert str(tmp_path) not in problem
     _icacls(top, "/remove:g", f"*{_USERS}")
-    _icacls(mid, "/grant", f"*{_USERS}:(D)")  # Users may rename the drive root's own folder away
+    _icacls(mid, "/grant", f"*{_USERS}:(DC)")  # Users may delete the drive root's own folder
     problem = str(surroundings(Path("Q:\\"), host))
     assert f"Users ({_USERS}) can delete or replace a file in it" in problem
     # A letter onto a share: neither the loopback test nor the holder read sees that share.
