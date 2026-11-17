@@ -47,12 +47,6 @@ def _strict_loads(text: str) -> Any:
     return json.loads(text, parse_constant=refuse)
 
 
-@pytest.fixture(autouse=True)
-def _fresh_warning_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test sees the unreadable-cell WARNING afresh, whatever an earlier test logged."""
-    monkeypatch.setattr(metadata_module, "_warned", {})
-
-
 # --- #6711: encode_reference_value ------------------------------------------------------------
 
 
@@ -328,14 +322,24 @@ def test_an_unreadable_cell_is_logged_without_its_content(caplog: pytest.LogCapt
         assert record.exc_info is None and record.exc_text is None
 
 
-def test_the_unreadable_cell_warning_is_rate_limited(caplog: pytest.LogCaptureFixture) -> None:
-    """BACKLOG #6712 item 8: a list read over many malformed cells logs one line per kind."""
+def test_every_malformed_cell_read_as_empty_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """Each malformed cell read as ``{}`` leaves its own WARNING, as on main: none is held back."""
     with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
-        # Cut at a different column each time, so the hints differ only in their position.
-        for n in range(5):
-            assert user_metadata('{"user": ' + " " * n) is None
-    assert len(caplog.records) == 1
-    assert list(metadata_module._warned) == ["JSONDecodeError"]
+        for _ in range(5):
+            assert user_metadata('{"user": ') is None
+        assert decode_response_headers("{") == {}
+    assert len(caplog.records) == 6
+
+
+def test_a_released_memoryview_cell_reads_as_empty(caplog: pytest.LogCaptureFixture) -> None:
+    """A released memoryview reads as no metadata in every decoder, as on main."""
+    view = memoryview(json.dumps({"user": {"k": "v"}}).encode("utf-8"))
+    view.release()
+    with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
+        assert decode_response_headers(view) == {}
+        assert user_metadata(view) is None
+        assert json.loads(merge_user_metadata(view, [("k", "v")])) == {"user": {"k": "v"}}
+    assert any("released memoryview" in r.getMessage() for r in caplog.records)
 
 
 def test_a_foreign_type_error_names_only_its_class() -> None:
@@ -399,22 +403,14 @@ def test_a_coercion_error_is_not_read_as_one_of_json_s_own() -> None:
         encode_reference_value({"k": _Digits(2026, 1, 1)})
 
 
-def test_the_unreadable_cell_warning_names_its_row_and_counts_what_it_held_back(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The WARNING names the row's reference, cut and scrubbed, and the next line logged for its
-    kind counts the lines held back since the last one."""
-    clock = [1000.0]
-    monkeypatch.setattr(metadata_module, "_time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+def test_the_unreadable_cell_warning_names_its_row(caplog: pytest.LogCaptureFixture) -> None:
+    """The WARNING names the row's reference, cut and scrubbed."""
     with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
         assert user_metadata('{"user": ', row_id="0123456789abcdef0123") is None
-        for _ in range(3):
-            assert user_metadata('{"user": ', row_id="held") is None
-        clock[0] += metadata_module._WARN_INTERVAL_S
         assert user_metadata('{"user": ', row_id="bad\nid") is None
     first, second = (r.getMessage() for r in caplog.records)
-    assert "message 0123456789ab " in first and "0 more held back" in first
-    assert "message bad?id " in second and "3 more held back" in second
+    assert "message 0123456789ab " in first
+    assert "message bad?id " in second
 
 
 @pytest.mark.parametrize("bag", ['"xyz"', "5", '[["a", "b"]]', "null"])

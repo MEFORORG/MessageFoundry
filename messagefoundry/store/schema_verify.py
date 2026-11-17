@@ -81,14 +81,10 @@ _KEYED_DETAIL = (
     " you set [secret_rotation].store_key_last_rotated, update it."
 )
 
-# Every read skips virtual tables: a pragma on one whose module is not loaded here raises "no such
-# module" (BACKLOG #6719). THIS BUILD CREATES NO VIRTUAL TABLE AND NO VIEW, which
-# tests/test_schema_verify_6719_6720.py pins; the other notes in this module rely on that and point
-# here. So an expected name held by a virtual table reads as a missing table and is refused rather
-# than skipped. A table is skipped as virtual when its stored SQL starts with the text
-# 'CREATE VIRTUAL TABLE' (LIKE, so the case of ASCII letters does not matter). A virtual table
-# whose stored SQL spells those words any other way, extra spaces included, is not skipped: it is
-# read, and where its module is not loaded here that read raises "no such module".
+# The reads below skip a table whose stored SQL is LIKE 'CREATE VIRTUAL TABLE%', because a pragma
+# on a virtual table whose module is not loaded here can raise "no such module" (BACKLOG #6719).
+# THIS BUILD CREATES NO VIRTUAL TABLE AND NO VIEW, which tests/test_schema_verify_6719_6720.py
+# pins; the other notes in this module rely on that and point here.
 _ORDINARY_TABLE = "m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
 # table names travel as bound parameters rather than being spliced into SQL. Only tables the EXPECTED

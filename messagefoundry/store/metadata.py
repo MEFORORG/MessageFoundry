@@ -19,8 +19,6 @@ import base64
 import json
 import logging
 import re
-import threading
-import time as _time
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -59,9 +57,7 @@ class _UnencodableTypeError(TypeError):
     """:func:`_reference_json_default`'s own refusal, whose message names only a type."""
 
 
-#: json's own fixed message prefixes for the ValueErrors it raises, mapped to a content-free kind.
-#: Matched by prefix, so a ValueError a coercion raises through json is read as one of these only if
-#: its message begins as json's does.
+#: Prefixes of ValueErrors raised while json.dumps encodes, each mapped to a content-free kind.
 _JSON_VALUE_ERRORS: Final = (
     ("Out of range float values are not JSON compliant", "a non-finite float"),
     ("Circular reference detected", "a circular value"),
@@ -70,9 +66,7 @@ _JSON_VALUE_ERRORS: Final = (
 
 
 def _unencodable_cause(exc_class: type[BaseException], text: str) -> str:
-    """A content-free name for why json refused a reference value (never a value or a key), from
-    the refusal's class and the start of its message, matched against json's own messages. A value
-    holding two kinds names the one that raised first. An unknown message stays generic."""
+    """A content-free name for a refusal, from its class and the start of its message."""
     if issubclass(exc_class, RecursionError):
         return "a value nested too deep"
     for prefix, kind in _JSON_VALUE_ERRORS:
@@ -100,10 +94,9 @@ def encode_reference_value(value: Any) -> str:
     A non-finite float (a TOML ``nan``, a DATABASE double column) raises the same ``TypeError``
     (BACKLOG #6711): ``json.dumps``' default would write the bare ``NaN`` token, which is not JSON.
 
-    A ``TypeError``, ``ValueError`` or ``RecursionError`` from json is rebuilt as a ``TypeError``
-    that names a kind read off the refusal's class and message, never the value or its key, with
-    none of json's notes, cause or context. The kind is read off the refusal after its handler has
-    exited, and nothing is encoded a second time. Any other exception propagates as raised. One such value
+    A ``TypeError``, ``ValueError`` or ``RecursionError`` from json is replaced by a new
+    ``TypeError`` whose message names a kind, never the value or its key. The refusal's class and
+    message are read inside the handler. Any other exception propagates as raised. One such value
     refuses the whole set, by the rule above."""
     refused: tuple[type[BaseException], str] | None = None
     try:
@@ -159,12 +152,6 @@ class MetadataTooDeepError(RuntimeError):
 #: A stored JSON cell's text: ``str``, or the bytes a driver may hand back for it.
 type StoredJson = str | bytes | bytearray | memoryview | None
 
-#: How long one kind of unreadable-cell WARNING is logged once. A list read over many such cells
-#: would otherwise log one line per row; the next line counts the ones held back.
-_WARN_INTERVAL_S = 60.0
-#: Per kind: when its WARNING was last logged, and how many were held back since.
-_warned: dict[str, tuple[float, int]] = {}
-_warned_lock = threading.Lock()
 #: A row reference is cut to this many characters, as ``cell_tag`` cuts one.
 _ROW_REF_LEN: Final = 12
 _ROW_REF_UNSAFE: Final = re.compile(r"[^A-Za-z0-9_.:-]")
@@ -180,26 +167,9 @@ def _row_ref(row_id: object) -> str:
 
 def _warn_unreadable(hint: str, row_id: object) -> None:
     """Log the content-free unreadable-cell WARNING for ``hint``, naming the reference of
-    ``row_id``, the id of the message the cell belongs to, at most once per interval per kind,
-    with the count held back since the last line. Throttled by the hint's kind, never its line and
-    column, so the memo stays as small as the set of kinds. A count held back after the last line
-    is logged only when that kind is logged again."""
-    kind = hint.split(" at ", 1)[0]
-    now = _time.monotonic()
-    with _warned_lock:
-        last = _warned.get(kind)
-        if last is not None and now - last[0] < _WARN_INTERVAL_S:
-            _warned[kind] = (last[0], last[1] + 1)
-            return
-        held_back = last[1] if last is not None else 0
-        _warned[kind] = (now, 0)
+    ``row_id``, the id of the message the cell belongs to. Every such cell is logged."""
     log.warning(
-        "a stored JSON cell of message %s is unreadable (%s); read as empty (logged at most once per"
-        " %.0f s; %d more held back since the last such line)",
-        _row_ref(row_id),
-        hint,
-        _WARN_INTERVAL_S,
-        held_back,
+        "a stored JSON cell of message %s is unreadable (%s); read as empty", _row_ref(row_id), hint
     )
 
 
@@ -214,10 +184,15 @@ def _load_object(
     outside any handler so nothing is chained, or reads as malformed where ``too_deep_raises`` is
     false. Raising is the default because a metadata cell read as ``{}`` changes an outcome. A
     refusal that reads as empty is logged with json's content-free hint and ``row_id``'s reference,
-    never the text. ``bytes``, ``bytearray`` and ``memoryview`` decode as ``json.loads`` decodes bytes; any other
-    type reads as ``{}`` and is logged by its type name."""
+    never the text. ``bytes``, ``bytearray`` and ``memoryview`` decode as ``json.loads`` decodes
+    bytes. A released ``memoryview`` and any other type read as ``{}`` and are logged."""
     if isinstance(text, (bytearray, memoryview)):
-        text = bytes(text)
+        try:
+            text = bytes(text)
+        except ValueError:
+            # A released memoryview cannot be read, so it reads as {}.
+            _warn_unreadable("released memoryview", row_id)
+            return {}
     if text is None:
         return {}
     if not isinstance(text, str | bytes):
