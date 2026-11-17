@@ -427,6 +427,43 @@ async def test_a_satisfied_sessions_refused_code_lands_on_ui_not_on_a_gate(engin
         assert service._webauthn_challenges.pop((hash_token(token), "assert")) is None
 
 
+async def test_a_passkey_assertion_nested_past_jsons_depth_is_the_audited_refusal(
+    engine: Engine,
+) -> None:
+    """RED when: ``POST /ui/reauth/webauthn`` answers a body nested too deep for json's stack with
+    a 500 (BACKLOG #5341), or with anything but the service's audited malformed-response refusal.
+    The refusal spends the staged ceremony, so the real assertion after it is refused as expired."""
+    import json
+
+    pytest.importorskip("webauthn")
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    key = await _passkey_only(engine, resident_key=True)
+
+    async with _client(engine, service) as c:
+        r = await _login(c)
+        assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+        gate = await c.post("/ui/mfa", data={"code": "000000"}, headers=SAME_ORIGIN)
+        assert gate.status_code == 400
+        assertion = _staged_assertion(gate.text, key)
+        depth = 200_000
+        deep = b'{"response": ' + b"[" * depth + b"]" * depth + b"}"
+        r = await c.post(
+            "/ui/reauth/webauthn",
+            content=deep,
+            headers={**SAME_ORIGIN, "Content-Type": "application/json"},
+        )
+        assert r.status_code == 400, r.text
+        assert r.json() == {"ok": False, "error": "passkey verification failed"}
+        r = await c.post("/ui/reauth/webauthn", json={"response": assertion}, headers=SAME_ORIGIN)
+        assert r.status_code == 400, r.text
+    reasons = [
+        json.loads(str(row["detail"]))["reason"]
+        for row in await engine.store.list_audit(action="auth.webauthn_failed")
+    ]
+    assert reasons == ["expired", "malformed"], reasons  # newest first
+
+
 async def test_a_valid_code_clears_the_gate(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

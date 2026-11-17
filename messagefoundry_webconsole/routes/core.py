@@ -2220,6 +2220,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         try:
             body = await request.json()
             response_json = json.dumps(body["response"])
+        except RecursionError:
+            # Nested too deep for json's stack (BACKLOG #5341); uncaught, it would answer 500. It is
+            # handed to the service as sent, whose own parse refuses it as a malformed response:
+            # audited, and the staged ceremony spent, as a shallow malformed assertion is.
+            response_json = (await request.body()).decode("utf-8", "replace")
         except (ValueError, KeyError, TypeError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         elevation = await auth.finish_webauthn_assertion(
