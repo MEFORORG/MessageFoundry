@@ -262,7 +262,10 @@ function Get-OwnershipRefusal {
 function Get-FenceRefusal {
     param([string]$Primary, [string]$Path)
     $norm = ConvertTo-Norm $Path
-    $occ = Get-WorktreeOccupancy -Repo $Primary
+    # The skew is unbounded, as in remove.ps1 (vault BACKLOG #2985, item 9 and added item 4): the
+    # registry's default reads a live process that started more than 15 minutes before its session
+    # registered as STALE, which vetoes nothing.
+    $occ = Get-WorktreeOccupancy -Repo $Primary -StartSkewMinutes ([int]::MaxValue)
     if (-not $occ.RepoFound) { return "could not list the worktrees of $Primary" }
     if ((ConvertTo-Norm $occ.PrimaryPath) -ne (ConvertTo-Norm $Primary)) { return "$Primary is not the primary checkout git reports ($($occ.PrimaryPath))" }
     $wt2 = @($occ.Worktrees | Where-Object { (ConvertTo-Norm $_.Path) -eq $norm }) | Select-Object -First 1
