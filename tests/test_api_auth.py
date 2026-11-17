@@ -3672,3 +3672,41 @@ async def test_login_supersedes_ends_the_named_token_before_the_cap(engine: Engi
             "/auth/login", json={"username": "sup", "password": PW, "supersedes": "x" * 257}
         )
         assert too_long.status_code == 422
+
+
+# --- vault BACKLOG #5342: a sign-in naming a control character is refused at the body ----------
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"username": "sup\x00"},
+        {"username": "s\x01up"},
+        {"username": "sup\x9f"},
+        {"username": ""},
+        {"supersedes": "tok\x00en"},
+        {"supersedes": "\x1b"},
+        {"supersedes": ""},
+    ],
+)
+async def test_login_refuses_a_control_character_before_the_store(
+    engine: Engine, fields: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red: each reached ``AuthService.login``, where on a PostgreSQL store a NUL would raise an
+    error the route does not catch, a 500 outside the failure-timing pad. Now each is a 422 before
+    the service runs. The control: the same body without the bad field still signs in."""
+    service = await _service(engine, AuthSettings(require_mfa=False))
+    await _add(service, "sup", Role.VIEWER)
+    async with _client(engine, service) as c:
+        ok = await c.post("/auth/login", json={"username": "sup", "password": PW})
+        assert ok.status_code == 200
+        reached: list[str] = []
+
+        async def _spy(*args: object, **kwargs: object) -> object:
+            reached.append("login")
+            raise AssertionError("the service ran")
+
+        monkeypatch.setattr(service, "login", _spy)
+        r = await c.post("/auth/login", json={"username": "sup", "password": PW, **fields})
+        assert r.status_code == 422
+        assert reached == []
