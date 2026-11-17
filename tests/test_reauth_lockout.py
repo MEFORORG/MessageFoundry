@@ -551,6 +551,26 @@ async def test_a_busy_account_whose_old_sessions_ended_is_not_revoked_on_its_fir
         await store.close()
 
 
+def _count_password_verifies(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Wrap the service's ``verify_password`` and return the list each call appends to."""
+    verified: list[object] = []
+    real_verify = verify_password
+
+    def counting_verify(*args: Any, **kwargs: Any) -> bool:
+        verified.append(args)
+        return bool(real_verify(*args, **kwargs))
+
+    monkeypatch.setattr("messagefoundry.auth.service.verify_password", counting_verify)
+    return verified
+
+
+async def _session_ended(store: AuthStore, token: str) -> bool:
+    """The row is still there under this token and carries a revoke. Unlike
+    :func:`_session_revoked`, a missing row does not count, since a step-up re-keys the row away."""
+    session = await store.get_session(hash_token(token))
+    return session is not None and session.revoked_at is not None
+
+
 async def test_a_reproof_on_a_session_past_its_expiry_is_gone_and_never_verified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -566,32 +586,28 @@ async def test_a_reproof_on_a_session_past_its_expiry_is_gone_and_never_verified
         for _ in range(3):
             assert not (await service.reauth(identity, WRONG, token=token)).ok
         assert service._session_reproof_failures(hash_token(token)) == 3
-        verified: list[object] = []
-        real_verify = verify_password
-
-        def counting_verify(*args: Any, **kwargs: Any) -> bool:
-            verified.append(args)
-            return bool(real_verify(*args, **kwargs))
-
-        monkeypatch.setattr("messagefoundry.auth.service.verify_password", counting_verify)
+        verified = _count_password_verifies(monkeypatch)
         lifetime = service._settings.session_absolute_hours * 3600
         later = time.time() + lifetime + 60
         monkeypatch.setattr(time, "time", lambda: later)
         out = await service.reauth(identity, WRONG, token=token)
         assert out.session_lost and not out.ok
         assert verified == [], "a guess on an expired session was verified"
-        assert await _session_revoked(store, token)
+        assert await _session_ended(store, token)
         assert hash_token(token) not in service._reproof_session_failures
     finally:
         await store.close()
 
 
+@pytest.mark.parametrize("ahead", ["both stamps", "last use only"])
 async def test_a_reproof_after_the_clock_steps_back_is_gone_and_never_verified(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, ahead: str
 ) -> None:
     """BACKLOG #5336: after a backward clock step the session's stamps lie ahead of the clock, which
     the validator refuses, so a re-proof on it is refused as gone and ended before any verify -- even
-    with the right password, which would otherwise step the session up."""
+    with the right password, which would otherwise step the session up. ``last use only`` steps
+    back to between a used session's creation and its last use, where only ``last_used_at`` lies
+    ahead and the idle window would read as reset."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
@@ -600,21 +616,20 @@ async def test_a_reproof_after_the_clock_steps_back_is_gone_and_never_verified(
         assert not (await service.reauth(identity, WRONG, token=token)).ok
         assert service._session_reproof_failures(hash_token(token)) == 1
         attempts_before, _ = await _lock_state(store, "u-bob")
-        verified: list[object] = []
-        real_verify = verify_password
-
-        def counting_verify(*args: Any, **kwargs: Any) -> bool:
-            verified.append(args)
-            return bool(real_verify(*args, **kwargs))
-
-        monkeypatch.setattr("messagefoundry.auth.service.verify_password", counting_verify)
-        earlier = time.time() - 600.0
+        row = await store.get_session(hash_token(token))
+        assert row is not None
+        if ahead == "both stamps":
+            earlier = row.created_at - 600.0
+        else:
+            await store.touch_session(hash_token(token), now=row.created_at + 300.0)
+            earlier = row.created_at + 150.0
+        verified = _count_password_verifies(monkeypatch)
         monkeypatch.setattr(time, "time", lambda: earlier)
         out = await service.reauth(identity, GOOD, token=token)
         assert out.session_lost and not out.ok, "a session stamped ahead of the clock stepped up"
         assert verified == [], "a re-proof on a session ahead of the clock was verified"
         assert await _lock_state(store, "u-bob") == (attempts_before, None)
-        assert await _session_revoked(store, token)
+        assert await _session_ended(store, token)
         assert hash_token(token) not in service._reproof_session_failures
     finally:
         await store.close()

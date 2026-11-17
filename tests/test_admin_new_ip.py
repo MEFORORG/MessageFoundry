@@ -847,8 +847,8 @@ async def test_a_reanchor_resets_without_reading_the_clock(
         steps = (("10.2.2.2", -50.0), ("10.1.1.1", -100.0))
         # Mint the session before the earliest skewed clock, so the stepped-back reauths still see
         # a live session rather than one whose stamps lie in their future.
-        minted_at = min(skew for _, skew in steps) - 100.0
-        monkeypatch.setattr(time, "time", lambda: real_time() + minted_at)
+        mint_skew = min(skew for _, skew in steps) - 100.0
+        monkeypatch.setattr(time, "time", lambda: real_time() + mint_skew)
         token, identity = await _enabled_admin(service, client="10.1.1.1")
         monkeypatch.setattr(time, "time", real_time)
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
@@ -857,9 +857,12 @@ async def test_a_reanchor_resets_without_reading_the_clock(
             reauthed = await service.reauth(identity, PW, token=token, client=client)
             assert reauthed.ok is True and reauthed.token is not None
             token = reauthed.token
+            # Seen after this re-anchor, so only the next re-anchor can make it new again. After
+            # the second, stepped-back one it must be new: that reset is the property under test.
+            assert await service.flag_new_client_ip(token, "10.3.3.3", path="/users") is True
         monkeypatch.setattr(time, "time", real_time)
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
-        assert await _new_ip_rows(store) == ["10.2.2.2", "10.2.2.2"]
+        assert await _new_ip_rows(store) == ["10.2.2.2", "10.3.3.3", "10.3.3.3", "10.2.2.2"]
     finally:
         await store.close()
 
