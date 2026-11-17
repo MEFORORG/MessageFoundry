@@ -311,6 +311,22 @@ def test_from_settings_enabled_false_disables(ec_pem: str) -> None:
     assert signer_from_destination(dest) is None
 
 
+@pytest.mark.parametrize("key", ["", None])
+@pytest.mark.parametrize("enabled", [True, "true", 1])
+def test_from_settings_enabled_with_empty_key_refuses(key: str | None, enabled: object) -> None:
+    # BACKLOG #5364: signing asked for with no key must not read as "off" and deliver unsigned.
+    settings = {"sign_enabled": enabled, "sign_private_key": key}
+    with pytest.raises(ValueError, match="sign_private_key is empty"):
+        OutboundSigning.from_settings(settings)
+    with pytest.raises(ValueError, match="sign_private_key is empty"):
+        signer_from_destination(Destination(name="OB", type=ConnectorType.REST, settings=settings))
+
+
+@pytest.mark.parametrize("enabled", [False, None])
+def test_from_settings_empty_key_not_enabled_stays_off(enabled: object) -> None:
+    assert OutboundSigning.from_settings({"sign_enabled": enabled, "sign_private_key": ""}) is None
+
+
 def test_outbound_signing_forbids_unknown_field(ec_pem: str) -> None:
     with pytest.raises(ValidationError):
         OutboundSigning(private_key=ec_pem, algoritm="RS256")  # type: ignore[call-arg]  # typo

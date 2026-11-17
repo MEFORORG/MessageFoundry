@@ -20,7 +20,7 @@ from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from messagefoundry.config.input_hiding import _InputHidingModel
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
@@ -772,9 +772,19 @@ class OutboundSigning(_InputHidingModel):
         unchanged. The flat keys (vs a nested table) keep each value a top-level setting that ``env()``
         resolution and ``connections.toml`` decoding already handle. Recognized keys: ``sign_enabled``,
         ``sign_algorithm``, ``sign_private_key``, ``sign_private_key_password``, ``sign_key_id``,
-        ``sign_header``. An unknown/typo'd field raises (``extra='forbid'``)."""
+        ``sign_header``. An unknown/typo'd field raises (``extra='forbid'``).
+
+        An empty key with ``sign_enabled`` true raises ``ValueError`` (BACKLOG #5364): signing was
+        asked for, so reading the missing key as "off" would deliver every message unsigned."""
         key = settings.get("sign_private_key")
         if not key:
+            enabled = settings.get("sign_enabled")
+            # Pydantic's own bool coercion, so a flag the model would read as on is refused here too.
+            if enabled is not None and TypeAdapter(bool).validate_python(enabled):
+                raise ValueError(
+                    "sign_enabled is true but sign_private_key is empty; set the signing key, or "
+                    "set sign_enabled to false to send unsigned"
+                )
             return None
         data: dict[str, Any] = {"private_key": key}
         if "sign_enabled" in settings:
