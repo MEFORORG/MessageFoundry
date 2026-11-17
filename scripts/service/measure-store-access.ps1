@@ -123,8 +123,9 @@ $GateRefusal = "no enabled Administrator"
 $NoAdminRefusal = "no enabled Administrator exists"
 $ProvisionHint = "provision-admin --username"
 # The words that make it a REFUSAL. The skipped-gate WARNING and the warn-mode line carry the two
-# phrases above too, so without this an engine that started and served would pass step 1 of every
-# arm; Test-GateRefusalLine requires both on one line.
+# phrases above too, so without this an engine that started and served would pass every step that
+# expects a refusal (each Wait-ForGateRefusal call below; ProvisionFirst has none);
+# Test-GateRefusalLine requires both on one line.
 $StartRefused = "refusing to start"
 # The openings of the gate's lines that let a start go on, at least these three in app.py: the
 # skipped-gate warning, the warn-mode line, and the warning that the gate could not run (a Vault
@@ -1086,7 +1087,7 @@ try {
                 } elseif ($script:GateLetStartSeen) {
                     Add-Failure ("control: $ServiceIdentity reopened the store it created and reached " +
                         "the ADR 0167 gate, which let the start go on (the reading above), so this " +
-                        "control expected a refusal it did not get; the store's access is not in question.")
+                        "control expected a refusal it did not get; the service's access is not in question.")
                     Show-LogTail
                 } else {
                     Add-Failure ("control: $ServiceIdentity could not reopen even the store it created " +
