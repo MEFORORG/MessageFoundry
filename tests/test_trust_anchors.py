@@ -46,6 +46,7 @@ from messagefoundry.config.settings import (
     TlsSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.pki import PIN_FILE_MAX_BYTES
 from messagefoundry.store import MessageStore
 
 _posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits (icacls is the nt path)")
@@ -3517,7 +3518,7 @@ async def test_an_oversized_postgres_store_ca_is_refused_with_its_row(
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     ca = _sqlserver_pin(tmp_path)
-    ca.write_bytes(ca.read_bytes() + b"\n" * ta.STORE_CA_MAX_BYTES)
+    ca.write_bytes(ca.read_bytes() + b"\n" * PIN_FILE_MAX_BYTES)
     specs = _store_specs(backend="postgres", ssl_root_cert=str(ca))
     with pytest.raises(TrustAnchorError, match="is larger than 1048576 bytes") as err:
         await run_anchor_preflight(specs, store, enforcing=True)
@@ -3545,8 +3546,8 @@ async def test_a_memory_error_reading_a_store_anchor_is_an_anchor_refusal(
     with pytest.raises(TrustAnchorError) as err:
         await run_anchor_preflight(specs, store, enforcing=True)
     assert str(err.value) == (
-        f"[store].ssl_root_cert: could not read the trust anchor {str(pin)!r}: the engine ran out "
-        "of memory"
+        f"[store].ssl_root_cert: could not read or load the trust anchor {str(pin)!r}: the engine "
+        "ran out of memory"
     )
     assert err.value.setting == "[store].ssl_root_cert"
 
@@ -3575,8 +3576,14 @@ def test_a_server_pin_spec_must_be_read_by_path() -> None:
     asks for them on the other path is refused rather than left unchecked. Nor does it take
     ``refuses_encryption_header``, whose check the pin's own replaces (vault BACKLOG #4569
     finding 8)."""
-    with pytest.raises(ValueError, match="server_pin"):
-        AnchorSpec("store_sqlserver_pin", "[store].ssl_root_cert", "pin.pem", server_pin=True)
+    with pytest.raises(ValueError, match="server_pin needs loads_verified_bytes=False"):
+        AnchorSpec(
+            "store_sqlserver_pin",
+            "[store].ssl_root_cert",
+            "pin.pem",
+            server_pin=True,
+            max_bytes=PIN_FILE_MAX_BYTES,
+        )
     with pytest.raises(ValueError, match="refuses_encryption_header"):
         AnchorSpec(
             "x",
@@ -3585,8 +3592,35 @@ def test_a_server_pin_spec_must_be_read_by_path() -> None:
             loads_verified_bytes=False,
             server_pin=True,
             refuses_encryption_header=True,
+            max_bytes=PIN_FILE_MAX_BYTES,
         )
-    assert AnchorSpec("x", "y", "z", loads_verified_bytes=False, server_pin=True).server_pin
+    assert AnchorSpec(
+        "x", "y", "z", loads_verified_bytes=False, server_pin=True, max_bytes=PIN_FILE_MAX_BYTES
+    ).server_pin
+
+
+@pytest.mark.parametrize("max_bytes", [None, 1024, PIN_FILE_MAX_BYTES + 1, -2, 0])
+def test_a_server_pin_spec_takes_exactly_the_pin_cap(max_bytes: int | None) -> None:
+    """Review round-b56972e6b4 finding 1: the bound a server pin's read takes is enforced, not
+    left to prose. A ``server_pin`` spec with any ``max_bytes`` but
+    :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` is refused at construction: ``None`` would read
+    the whole file, a smaller bound would refuse a pin the store open takes, and a larger one
+    would read more than the store open does. Red under: the ``server_pin`` cap check dropped
+    from ``AnchorSpec.__post_init__``."""
+    with pytest.raises(ValueError, match="max_bytes"):
+        AnchorSpec("x", "y", "z", loads_verified_bytes=False, server_pin=True, max_bytes=max_bytes)
+
+
+@pytest.mark.parametrize("max_bytes", [-2, -1, 0])
+def test_a_bound_below_one_is_refused(max_bytes: int) -> None:
+    """Review round-b56972e6b4 finding 1: a ``max_bytes`` below 1 is refused for any spec, so no
+    value reads the whole file or nothing by accident: ``read_if_regular`` reads all of a file
+    for a negative limit. ``None`` is the one unbounded value, the default. Red under: the lower
+    bound dropped from ``AnchorSpec.__post_init__``."""
+    with pytest.raises(ValueError, match="at least 1"):
+        AnchorSpec("x", "y", "z", loads_verified_bytes=False, max_bytes=max_bytes)
+    assert AnchorSpec("x", "y", "z", loads_verified_bytes=False, max_bytes=1).max_bytes == 1
+    assert AnchorSpec("x", "y", "z", loads_verified_bytes=False).max_bytes is None
 
 
 def test_a_bounded_spec_must_be_read_by_path() -> None:

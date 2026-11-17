@@ -1478,8 +1478,10 @@ def oversized_pin_reason(path: str) -> str | None:
     """The reason a pin file is too large to read, from its size on disk, or ``None``. For a
     caller that judges the size before it reads, as the store open does. A file
     that cannot be stat'ed gives ``None``: the read that follows reports it. A file whose size
-    the OS does not report, such as a FIFO or a device, passes here, and the store open does not
-    guard its read: it can block or never end."""
+    the OS does not report, such as a FIFO or a device, passes here. The store open's read that
+    follows goes through :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which
+    refuses anything but a regular file; on Windows its own stat opens the path first, as its
+    docstring says."""
     try:
         size = os.stat(path).st_size
     except (OSError, ValueError, TypeError):

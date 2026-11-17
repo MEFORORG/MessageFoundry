@@ -11,7 +11,7 @@ authentication path:
 * ``[auth].ad_tls_ca_cert_file`` — trusts the AD LDAPS bind (:mod:`messagefoundry.auth.ldap`).
   Substituting this PEM permits an LDAPS MITM. ``LdapAuthenticator`` checks it at construction and
   hands ``ldap3`` the checked bytes (BACKLOG #2034), and the central preflight below checks it again at
-  start and at every reload.
+  start and at every real reload (a dry-run reload runs no settings preflight).
 * ``[api].tls_client_ca_file`` — the in-process mTLS console client-CA (:mod:`messagefoundry.api.tls`),
   which maps a verified peer cert to a principal with no bearer token. Substituting it admits a forged
   client cert.
@@ -181,7 +181,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     sent as the ODBC ``ServerCertificate`` pin, under ``Encrypt=strict``, so it is the store hop's
     only trust anchor. :func:`collect_anchor_specs` adds it under the label
     ``store_sqlserver_pin`` (:func:`store_pin_anchor_spec`), so it takes the audited checks of
-    items 1 to 4 at start and at every reload. The store checks it too at each open, before any
+    items 1 to 4 at start and at every real reload (a dry-run reload runs no settings
+    preflight). The store checks it too at each open, before any
     connect, with no audit row, because the store that holds the rows is not open yet. So a pin
     the store refuses stops the start with no row: for an ACL or path finding at ``enforce``, and
     for an unreadable file or refused content at either setting.
@@ -240,8 +241,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     read. It then runs the store open's content checks, in the store's order and words
     (:func:`_refuse_an_unusable_server_pin`, vault BACKLOG #3714): at least no encryption header
     (BACKLOG #3090), no private-key label (BACKLOG #3745), one server certificate, inside its
-    validity period. So a pin past notAfter refuses at least every reload and DR activation until
-    the file is replaced. It reads at most :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` and
+    validity period. So a pin past notAfter is refused at least at every real operator, held and
+    cluster-convergence reload and at DR activation until the file is replaced, and each
+    convergence retry writes a ``pem_refused`` row. It reads at most :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` and
     one byte more (``AnchorSpec.max_bytes``), and refuses a longer file as too large, in the store
     open's words, with a ``pem_refused`` row naming why, whose fingerprint covers only the bytes
     read. The store open refuses such a file from its size on disk first, with no row. At
@@ -251,8 +253,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     **The PostgreSQL ``ssl_root_cert``** (vault BACKLOG #4203) is a CA bundle the store loads by
     path at each new connection. :func:`collect_anchor_specs` adds it under the label
     ``store_postgres_ca`` (:func:`store_postgres_ca_anchor_spec`), so in ``serve`` it takes the
-    audited checks of items 1 to 4 and the private-key refusal at start and at every reload, with
-    no pin. It reads at most :data:`STORE_CA_MAX_BYTES` and one byte more, and refuses a longer
+    audited checks of items 1 to 4 and the private-key refusal at start and at every real reload
+    (a dry-run reload runs no settings preflight), with no pin. It reads at most the pin's cap,
+    :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES`, and one byte more, and refuses a longer
     file, with a ``pem_refused`` row, as the pin's check does. Unlike the SQL Server pin, the store
     runs none of these checks when it opens. At a
     start the store has already been opened with this file when this check runs, so its
@@ -322,7 +325,7 @@ from messagefoundry.childenv import system_tool_environment
 from messagefoundry.config.models import ConnectorType, bool_setting, remote_file_protocol
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.credential import constant_time_equal
-from messagefoundry.redaction import codec_safe_str, safe_exc
+from messagefoundry.redaction import codec_safe_str, log_timestamp, safe_exc
 from messagefoundry.service_status import _system_exe
 
 if TYPE_CHECKING:
@@ -465,9 +468,10 @@ class AnchorSpec:
     ``max_bytes`` bounds the read of a ``False`` spec: :func:`evaluate_anchor` reads at most that
     many bytes and one more, and the content checks refuse a file longer than ``max_bytes``, with
     the ``pem_refused`` row, so a huge file is refused rather than read whole. A server pin's own
-    check refuses past :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` instead, so its spec sets
-    ``max_bytes`` to that cap. The fingerprint of a longer file covers only the bytes read.
-    ``None``, the default, reads the whole file."""
+    check refuses past :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` instead, so a ``server_pin``
+    spec must set ``max_bytes`` to exactly that cap, and any other value is refused at
+    construction. The fingerprint of a longer file covers only the bytes read. ``None``, the
+    default, reads the whole file, and is refused for a server pin; any value below 1 is refused."""
 
     label: str
     setting: str
@@ -480,10 +484,19 @@ class AnchorSpec:
     max_bytes: int | None = None
 
     def __post_init__(self) -> None:
-        if self.max_bytes is not None and self.loads_verified_bytes:
-            raise ValueError("max_bytes needs loads_verified_bytes=False, or its check never runs")
+        if self.max_bytes is not None and self.max_bytes < 1:
+            raise ValueError("max_bytes must be at least 1, or None for an unbounded read")
         if self.server_pin and self.loads_verified_bytes:
             raise ValueError("server_pin needs loads_verified_bytes=False, or its checks never run")
+        if self.server_pin:
+            from messagefoundry.pki import PIN_FILE_MAX_BYTES  # lazy: pki loads cryptography
+
+            if self.max_bytes != PIN_FILE_MAX_BYTES:
+                raise ValueError(
+                    f"server_pin needs max_bytes={PIN_FILE_MAX_BYTES}, the store open's own cap"
+                )
+        if self.max_bytes is not None and self.loads_verified_bytes:
+            raise ValueError("max_bytes needs loads_verified_bytes=False, or its check never runs")
         if self.server_pin and self.refuses_encryption_header:
             raise ValueError(
                 "server_pin refuses an encryption header in the pin's own words, so it takes no "
@@ -730,11 +743,11 @@ def _refuse_an_unusable_server_pin(data: bytes, spec: AnchorSpec) -> None:
     the store's check reads it.
 
     So once the pin passes notAfter, every settings check is refused until the file is replaced:
-    at least a reload and a DR activation, though the open store keeps connecting until a restart,
-    which the store open refuses too. The certificate-expiry monitor, where it runs, watches this
+    at least a real operator, held and cluster-convergence reload and a DR activation, and each
+    convergence retry writes a ``pem_refused`` row. The open store keeps connecting until a
+    restart, which the store open refuses too. The certificate-expiry monitor, where it runs, watches this
     file to warn before that date."""
     from messagefoundry.pki import pinned_server_certificate  # lazy: pki loads cryptography
-    from messagefoundry.redaction import log_timestamp
 
     cert = pinned_server_certificate(data)
     if isinstance(cert, str):
@@ -2350,28 +2363,26 @@ def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
     )
 
 
-#: The largest PostgreSQL ``[store].ssl_root_cert`` CA bundle the settings check reads (vault
-#: BACKLOG #4203). A CA bundle is a few certificates. The cap bounds only this check's own read:
-#: the store loads the file by path, with no cap. Its value is the SQL Server pin's cap.
-STORE_CA_MAX_BYTES = 1 << 20
-
-
 def store_postgres_ca_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
     """The PostgreSQL ``[store].ssl_root_cert`` CA bundle's anchor spec, or ``None`` when the store
     is another backend or names no file (vault BACKLOG #4203). The store loads it by path at each
     new connection, so the spec carries ``loads_verified_bytes=False`` and no pin.
 
-    Module item 11 says what the check does not cover."""
+    Its read is capped at the SQL Server pin's cap, :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES`:
+    a CA bundle is a few certificates. The cap bounds only this check's own read; the store loads
+    the file by path, with no cap. Module item 11 says what the check does not cover."""
     from messagefoundry.config.settings import StoreBackend
 
     if store.backend is not StoreBackend.POSTGRES or not store.ssl_root_cert:
         return None
+    from messagefoundry.pki import PIN_FILE_MAX_BYTES  # lazy: pki loads cryptography
+
     return AnchorSpec(
         "store_postgres_ca",
         "[store].ssl_root_cert",
         store.ssl_root_cert,
         loads_verified_bytes=False,
-        max_bytes=STORE_CA_MAX_BYTES,
+        max_bytes=PIN_FILE_MAX_BYTES,
     )
 
 
@@ -2696,8 +2707,8 @@ async def _preflight_checks(
         # A read or parse too large for the process is a refused anchor naming its setting, not a
         # fault that escapes the preflight (vault BACKLOG #4203). No row: as for a failed read.
         raise TrustAnchorError(
-            f"{spec.setting}: could not read the trust anchor {spec.path!r}: the engine ran out "
-            "of memory"
+            f"{spec.setting}: could not read or load the trust anchor {spec.path!r}: the engine "
+            "ran out of memory"
         ) from exc
     # The item 6 escape, the one `_enforce_verdict` grants: a matching pin over the bytes loaded.
     pin_escapes = verdict.pin_ok is True and spec.loads_verified_bytes
