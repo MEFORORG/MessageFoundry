@@ -628,7 +628,10 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
     :func:`resolve_env_settings` does reach it, and it resolves to the real table before the connector
     runs. Measured: ``resolve_env_settings({"headers": env("all_headers")}, ...)`` returns the table.
     Only a reference INSIDE the table is unresolvable, so only that is refused. Such a reference's
-    own ``default=`` is judged when it is made, in :class:`EnvRef`, so it is not walked here.
+    own ``default=`` is what an unset key resolves to, handed to the connector unchanged, so it is
+    held to this function's table rule: a default that is not a table is refused, and one that is
+    is checked as a literal table would be (BACKLOG #5328). An ``env()`` inside a default is also
+    refused when the reference is made, in :class:`EnvRef`.
 
     A non-mapping ``headers`` is refused here too, not merely skipped. ``connections.toml`` is untyped
     input, so ``headers = "not-a-table"`` reaches this function; iterating it raises ``AttributeError``,
@@ -643,7 +646,22 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
     This refuses rather than resolves, which is the row's other option. Recursive resolution would have
     to reach into every nested settings shape and would undercut the top-level-only ruling the two
     functions named above already depend on."""
-    if headers is None or isinstance(headers, EnvRef):
+    if headers is None:
+        return
+    if isinstance(headers, EnvRef):
+        # Wherever the key is unset the reference resolves to its default=, which reaches the
+        # connector unchanged, so a default is held to the table rule below (BACKLOG #5328). A
+        # default of None is no headers, as a literal None is.
+        default = headers.default
+        if default is _UNSET or default is None:
+            return
+        if not isinstance(default, Mapping):
+            raise WiringError(
+                f"{factory} headers is an env() reference whose default= is not a table but "
+                f"{type(default).__name__} (value withheld). The default is sent as the headers "
+                "wherever the key is unset, so give it a table of header name to value, or none."
+            )
+        _reject_envref_headers(factory, default)
         return
     if not isinstance(headers, Mapping):
         raise WiringError(
