@@ -1603,11 +1603,22 @@ _ESTATE_FILE_RES: tuple[tuple[str, re.Pattern[str]], ...] = ()
 #: True when a token source was found AND it actually yielded detectors. Both halves matter: see
 #: ``reload_tokens``.
 TOKENS_PRESENT: bool = False
-#: The parsed site prefixes themselves, kept so ``loaded_token_counts`` can report how many loaded.
+#: The parsed site prefixes the anonymizer also loads, kept so ``loaded_token_counts`` can report how many loaded.
 #: Deriving that number from ``SITE_CODE_RE is not _NEVER`` made it a 0-or-1 presence BIT, so N loaded
 #: prefixes and 1 printed identically -- and the counts line is the ONE diagnostic that distinguishes a
 #: real scan from a vacuous one, so a floor built on it would have inherited the same blindness.
 _SITE_PREFIXES: tuple[str, ...] = ()
+
+#: The width of a site prefix the anonymizer loads (``messagefoundry_toolkit/anon/surrogates.py``
+#: ``_load_site_prefixes``, a two-digit prefix plus four digits). Only a prefix of this width counts as
+#: live in :data:`_SITE_PREFIXES`, so the counts, the floor and ``TOKENS_PRESENT`` never call a site
+#: prefix live that the site-code scrub and its leak check cannot use (BACKLOG #5366).
+_SITE_PREFIX_WIDTH = 2
+
+
+def _anonymizer_prefixes(prefixes: list[str]) -> tuple[str, ...]:
+    """The parsed site prefixes the anonymizer also loads: those of :data:`_SITE_PREFIX_WIDTH`."""
+    return tuple(p for p in prefixes if len(p) == _SITE_PREFIX_WIDTH)
 
 
 def _resolve_token_text() -> str | None:
@@ -1806,6 +1817,18 @@ def _parse_tokens(
             # would compile into the site-code alternation and never match an ASCII site code.
             if line.isdigit() and line.isascii():
                 prefixes.append(line)
+                if len(line) != _SITE_PREFIX_WIDTH:
+                    # KEPT for the file scan, which only ever widens detection, but NOT COUNTED as a
+                    # live prefix: the anonymizer loads two-digit prefixes only, so counting this one
+                    # read the site-code scrub and its leak check as live while they matched nothing
+                    # (BACKLOG #5366). Position only, as below -- a site prefix is customer data.
+                    print(
+                        f"scan_forbidden: line {lineno}: [site_prefix] entry is not exactly "
+                        f"{_SITE_PREFIX_WIDTH} ASCII digits -- the anonymizer cannot load it, so it is "
+                        "NOT COUNTED as a live site prefix; the file scan still matches it "
+                        "(content withheld)",
+                        file=sys.stderr,
+                    )
             else:
                 # Position only -- see the [names] branch above. A site prefix is customer data.
                 print(
@@ -1846,7 +1869,7 @@ def reload_tokens() -> None:
     # MEFOR_REQUIRE_TOKENS=1 passed and the gate ran structural-only with a green tick. The cutover
     # runbook has the owner paste a whole sectioned file into a GitHub secret box, which is exactly the
     # mangling case. Require that parsing actually yielded something.
-    TOKENS_PRESENT = text is not None and bool(names or estate or prefixes)
+    TOKENS_PRESENT = text is not None and bool(names or estate or _anonymizer_prefixes(prefixes))
     FORBIDDEN = names
     ESTATE_TOKENS = estate
     _ESTATE_BODY_ONLY = frozenset(body_only)
@@ -1855,7 +1878,7 @@ def reload_tokens() -> None:
         for token in estate
         if token not in _ESTATE_BODY_ONLY
     )
-    _SITE_PREFIXES = tuple(prefixes)
+    _SITE_PREFIXES = _anonymizer_prefixes(prefixes)
     if prefixes:
         alt = "|".join(re.escape(p) for p in prefixes)
         SITE_CODE_RE = re.compile(rf"(?:{alt})\d{{4}}")
@@ -1897,7 +1920,7 @@ def is_synthetic_token_set() -> bool:
     return (
         tuple(p.pattern for p, _ in ex_names) == tuple(p.pattern for p, _ in FORBIDDEN)
         and tuple(ex_estate) == ESTATE_TOKENS
-        and tuple(ex_prefixes) == _SITE_PREFIXES
+        and _anonymizer_prefixes(ex_prefixes) == _SITE_PREFIXES
     )
 
 
