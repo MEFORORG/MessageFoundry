@@ -27,7 +27,9 @@ reason.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -924,3 +926,51 @@ def test_a_STALE_remote_HEAD_does_not_hide_main(repo: Path, landed: bool) -> Non
     else:
         assert r.returncode == 1, r.stdout + r.stderr
         assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+def test_a_MISSING_git_exits_2_could_not_run(repo: Path, tmp_path: Path) -> None:
+    """MUST TRIP. With no git on PATH the script wrote its message with Write-Error under Stop,
+    which ended it with exit 1 -- "unbacked found" -- before the exit 2 that means "could not run"."""
+    pwsh = shutil.which("pwsh")
+    assert pwsh is not None
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    env = dict(os.environ, PATH=str(empty))
+    r = subprocess.run(
+        [pwsh, "-NoProfile", "-File", str(CHECK), "-Path", str(repo)],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        env=env,
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "git is not on PATH" in r.stderr
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_a_partly_failed_scan_still_lists_what_it_measured(repo: Path, as_json: bool) -> None:
+    """``text`` MUST TRIP; ``json`` pins the same items in the machine output. One branch whose
+    history lost an object made the repository print only the failure, hiding the at-risk branch
+    that scanned fine beside it."""
+    git(repo, "checkout", "-q", "-b", "atrisk")
+    _commit(repo, "g.txt", "this exists on exactly one disk", "work")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "checkout", "-q", "-b", "broken")
+    _commit(repo, "h.txt", "first", "first")
+    first = git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "i.txt", "second", "second")
+    git(repo, "checkout", "-q", "main")
+    obj = repo / ".git" / "objects" / first[:2] / first[2:]
+    os.chmod(obj, stat.S_IWRITE)
+    obj.unlink()
+
+    r = check(repo, extra=["-Json"] if as_json else None)
+    assert r.returncode == 2, r.stdout + r.stderr
+    if as_json:
+        doc = json.loads(r.stdout)
+        repo_doc = doc["Repositories"][0]
+        assert "broken" in repo_doc["ScanFailed"]
+        assert [(f["Ref"], f["Commits"]) for f in repo_doc["Findings"]] == [("atrisk", 1)]
+    else:
+        assert "git FAILED for: broken" in r.stdout
+        assert re.search(r"^\s+atrisk\s+1\s*$", r.stdout, re.MULTILINE), r.stdout

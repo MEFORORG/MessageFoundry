@@ -158,11 +158,13 @@ $ErrorActionPreference = "Stop"
 # runs a binary from the current directory; a bare 'git' handed to ProcessStartInfo would let Windows
 # search pwsh's own folder and the current directory before PATH.
 $gitExe = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue)[0].Source
-if (-not $gitExe) { Write-Error "git is not on PATH."; exit 2 }
+# Could-not-run messages go to stderr directly: Write-Error under Stop would end the script with
+# exit 1, "unbacked found", before the exit 2 that means "could not run" (see .OUTPUTS).
+if (-not $gitExe) { [Console]::Error.WriteLine("git is not on PATH."); exit 2 }
 
 if (-not $Path -or $Path.Count -eq 0) {
     $root = (& git -C $PSScriptRoot rev-parse --show-toplevel 2>$null)
-    if (-not $root) { Write-Error "Not inside a git repository, and no -Path given."; exit 2 }
+    if (-not $root) { [Console]::Error.WriteLine("Not inside a git repository, and no -Path given."); exit 2 }
     $Path = @($root)
 }
 
@@ -305,7 +307,7 @@ $durableFindings = @()
 
 foreach ($p in $Path) {
     if (-not (Test-Path -LiteralPath $p)) {
-        Write-Error "Path does not exist: $p"
+        [Console]::Error.WriteLine("Path does not exist: $p")
         exit 2
     }
     # ABSOLUTE, ONCE, BEFORE ANY GIT CALL. `& git -C .` resolves against PowerShell's location, and
@@ -314,7 +316,7 @@ foreach ($p in $Path) {
     $p = (Resolve-Path -LiteralPath $p).ProviderPath
     $inside = (& git -C $p rev-parse --is-inside-work-tree 2>$null)
     if ($inside -ne "true") {
-        Write-Error "Not a git repository: $p"
+        [Console]::Error.WriteLine("Not a git repository: $p")
         exit 2
     }
 
@@ -591,7 +593,20 @@ foreach ($r in $repos) {
         Write-Host "UNVERIFIABLE  $($r.Repo)" -ForegroundColor Red
         Write-Host "              git FAILED for: $($r.ScanFailed -join ', ')" -ForegroundColor Red
         Write-Host "              A failed scan prints nothing, and nothing is not zero: this repository" -ForegroundColor Red
-        Write-Host "              could not be measured. Run git fsck there; a missing object is the usual cause." -ForegroundColor Red
+        Write-Host "              could not be fully measured. Run git fsck there; a missing object is the usual cause." -ForegroundColor Red
+        # What DID scan is still shown: a failure on one ref must not hide the at-risk work found
+        # on the others. The JSON carries the same items under Findings and DetachedUnbacked.
+        if ($r.Unbacked -gt 0 -or $r.DetachedUnbacked.Count -gt 0) {
+            Write-Host "              measured before or beside the failure, on no remote:" -ForegroundColor Yellow
+            if (-not $Quiet) {
+                foreach ($f in ($r.Findings | Sort-Object Commits -Descending)) {
+                    Write-Host ("              {0,-55} {1}" -f $f.Ref, $f.Commits)
+                }
+                foreach ($f in ($r.DetachedUnbacked | Sort-Object Commits -Descending)) {
+                    Write-Host ("              {0,-55} {1}" -f "(detached) $($f.Worktree) @ $($f.Head)", $f.Commits) -ForegroundColor Yellow
+                }
+            }
+        }
         continue
     }
     if (-not $r.HasRemote) {
