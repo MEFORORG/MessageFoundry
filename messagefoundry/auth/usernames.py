@@ -17,7 +17,10 @@ surrogate, a private-use or unassigned code point), a default-ignorable code poi
 U+2800 among them), or when it takes one of the forms the audit trail writes for its own
 synthetic actors (:data:`RESERVED_ACTOR_FORMS`). An account named
 ``system`` would otherwise be indistinguishable from the engine in ``GET /audit?actor=system``
-and in an audit export, and a NUL would reach a store that cannot hold one.
+and in an audit export, and a NUL name could not sign in with its password, since
+``POST /auth/login`` and the web console's form sign-in both refuse a NUL. Which stores can hold
+such a name at all is stated once, at
+:data:`messagefoundry.api.validation.SIGN_IN_NAME_PATTERN`.
 
 The ``directory`` name is NOT reserved: nothing at HEAD writes it as an audit actor.
 

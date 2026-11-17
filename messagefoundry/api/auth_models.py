@@ -56,9 +56,10 @@ class CredentialReply(BaseModel):
 
 
 class LoginRequest(RequestModel):
-    # A NUL in ``username`` is refused here (vault BACKLOG #5342; ``SIGN_IN_NAME_PATTERN`` says
-    # why). Unrefused, it would reach the store's lookup, where PostgreSQL raises an error this
-    # route does not catch, so the route would answer 500 outside its failure-timing pad.
+    # A NUL in ``username`` is refused here (vault BACKLOG #5342). ``SIGN_IN_NAME_PATTERN`` says
+    # why, and which stores can hold such a name. Unrefused on PostgreSQL, the driver's error at
+    # the store's lookup is not one this route catches, so the route would answer 500 outside its
+    # failure-timing pad.
     username: str = Field(max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
@@ -325,11 +326,13 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    # The sign-in name rule (vault BACKLOG #5342), on the typed name, which goes only to the
-    # directory lookup. The LDAP filter escapes a NUL (``auth.ldap._escape_filter``), so such a
-    # name is not sent raw; the rule refuses it with a 422 before any directory round trip, as
-    # POST /auth/login refuses it before the store. The name the store receives is the one the
-    # directory returns, and this rule does not check that one.
+    # The sign-in name rule (vault BACKLOG #5342), on the typed name. The typed name goes to the
+    # directory lookup, and also to the store when the entry found carries no ``sAMAccountName``:
+    # the lookup then names the account by the name it searched for, the typed name with its
+    # surrounding white space stripped (``fallback_username`` in ``auth.ldap``). The LDAP filter escapes a NUL (``auth.ldap._escape_filter``), so such a name
+    # is not sent raw; the rule refuses it with a 422 before any directory round trip, as
+    # POST /auth/login refuses it before the store. When the entry carries a ``sAMAccountName``,
+    # that is the name the store receives, and this rule does not check it.
     username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
