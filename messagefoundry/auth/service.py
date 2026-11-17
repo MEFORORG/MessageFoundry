@@ -20748,7 +20748,7 @@ class AuthService:
         )
 
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
-        """Replace the AD-group → role map (C3). Revokes directory accounts' sessions so it applies
+        """Replace the AD-group to role map (C3). Revokes directory accounts' sessions so it applies
         at once, as :meth:`sessions_ended_by_ad_map_save` says."""
         await self._store.set_ad_group_role_map(entries)
         revoked = await self._revoke_ad_sessions(change="ad_role_map_saved", actor=actor)
@@ -20761,7 +20761,7 @@ class AuthService:
     async def set_ad_group_scope_map(
         self, entries: Sequence[tuple[str, str]], *, actor: str
     ) -> None:
-        """Replace the AD-group → channel-scope map (C3). Revokes directory accounts' sessions so
+        """Replace the AD-group to channel-scope map (C3). Revokes directory accounts' sessions so
         it applies at once, as :meth:`set_ad_group_map` does. This docstring used to end "Takes
         effect on each AD user's next login", which was an accurate description of the defect
         BACKLOG #1154 names and is no longer true."""
