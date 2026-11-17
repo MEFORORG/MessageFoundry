@@ -200,13 +200,13 @@ def git_bash() -> str | None:
 
 
 # A command-only PowerShell hook runs under pwsh -Command. The head line keeps a native non-zero
-# exit from throwing where a PowerShell build defaults that preference on. The tail restores
-# origin/main's block on a guard script's exit 2, which -Command reports as 1. See docs/CODEX.md,
-# "Who decides a block", and the tests for which shapes block.
+# exit from throwing where a PowerShell build defaults that preference on. The tail lifts a 2 that
+# -Command reports as 1, for example a guard script's exit 2, back to 2. See docs/CODEX.md, "Who
+# decides a block", and the tests for which shapes block.
 POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false\n"
 POWERSHELL_TAIL = (
-    "\n;\nif (-not $?) { if ((Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly"
-    " -ErrorAction Ignore) -eq 2) { exit 2 }; exit 1 }"
+    "\n;\nif (-not $?) { if ((Microsoft.PowerShell.Utility\\Get-Variable -Name LASTEXITCODE"
+    " -Scope Global -ValueOnly -ErrorAction Ignore) -eq 2) { exit 2 }; exit 1 }"
 )
 
 

@@ -267,8 +267,21 @@ def test_a_powershell_hook_blocks_on_a_2_that_ends_it(bridge, tmp_path, command,
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
 @pytest.mark.parametrize(
     "command",
-    ["& ./guard.ps1", ". ./guard.ps1", "& ./guard.ps1 # the guard decides"],
-    ids=["called", "dot-sourced", "called-before-a-comment"],
+    [
+        "& ./guard.ps1",
+        ". ./guard.ps1",
+        "& ./guard.ps1 # the guard decides",
+        # A hook's own Get-Variable must not stand in for the one the bridge's tail calls.
+        "function Get-Variable { 0 }\n& ./guard.ps1",
+        "Set-Alias Get-Variable Write-Output\n& ./guard.ps1",
+    ],
+    ids=[
+        "called",
+        "dot-sourced",
+        "called-before-a-comment",
+        "after-a-Get-Variable-function",
+        "after-a-Get-Variable-alias",
+    ],
 )
 def test_a_powershell_hook_blocks_when_a_guard_it_runs_exits_2(bridge, tmp_path, command):
     """-Command alone reports a guard script's `exit 2` as 1, which would not block."""
