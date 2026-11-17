@@ -100,9 +100,34 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
     the mutual-exclusion screen in :func:`bearer_provider_from_settings`, the static-credential hop
     reader (BACKLOG #1182) and :func:`~messagefoundry.config.wiring.oauth_request_advisories`.
     Before it existed the builder treated any falsy ``oauth2_enabled`` as off while the screen treated
-    only a literal ``False`` as off. Off is the conservative reading, so a falsy value is off, the same
-    rule :func:`~messagefoundry.transports.smart.smart_auth_configured` states."""
-    return bool(s.get("oauth2_token_url")) and bool(s.get("oauth2_enabled", True))
+    only a literal ``False`` as off.
+
+    Read strictly (vault BACKLOG #5362). ``oauth2_enabled`` is absent (on) or a real ``bool``; any
+    other value raises :class:`ValueError`, because a truthiness read takes the string ``"false"`` or
+    ``"0"`` as on and an explicit ``None`` as off, contrary to what was written. ``resolve_env_settings``
+    has already turned an ``env()`` value into a ``bool`` (``None`` into off, vault BACKLOG #3234), so
+    only a mapping written past it reaches the refusal. An unresolved ``env()`` reference is let through
+    as before, for the advisory readers of the loaded graph. With it on, an ``oauth2_token_url`` that is
+    a blank or whitespace-only string raises too, rather than reading as configured or as off. The
+    messages name the keys and the type, never a value."""
+    enabled = s.get("oauth2_enabled", True)
+    if not isinstance(enabled, bool) and not _is_env_ref(enabled):
+        raise ValueError(f"oauth2_enabled must be true or false, not {type(enabled).__name__}")
+    url = s.get("oauth2_token_url")
+    if enabled and isinstance(url, str) and not url.strip():
+        raise ValueError(
+            "oauth2_token_url is blank; set the token endpoint URL, or turn oauth2_enabled off"
+        )
+    return bool(url) and bool(enabled)
+
+
+def _is_env_ref(value: object) -> bool:
+    """Whether ``value`` is an unresolved ``env()`` reference. Imported here, not at the top: the
+    ``config.wiring`` module imports this one's package (the cycle the ``TYPE_CHECKING`` import below
+    avoids)."""
+    from messagefoundry.config.wiring import EnvRef
+
+    return isinstance(value, EnvRef)
 
 
 # Renew this many seconds before the server's stated expiry so a token never expires mid-flight.

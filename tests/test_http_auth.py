@@ -30,6 +30,7 @@ from messagefoundry.transports.http_auth import (
     OAuth2ClientCredentialsProvider,
     bearer_provider_from_settings,
     digest_handler_from_settings,
+    oauth2_auth_configured,
     with_http_digest,
     with_oauth2_client_credentials,
 )
@@ -715,3 +716,52 @@ def test_a_lowercase_sha256_challenge_is_answered_as_sha256() -> None:
     chal = {"realm": "r", "nonce": "n", "algorithm": "sha-256"}
     result = handler.get_authorization(urllib.request.Request(URL), chal)
     assert result and 'algorithm="SHA-256"' in result
+
+
+_TOKEN_URL = "https://auth.example.org/token"
+
+
+@pytest.mark.parametrize("enabled", ["false", "0", "", 0, 1, None])
+def test_oauth2_enabled_must_be_a_real_bool(enabled: object) -> None:
+    """A truthiness read took ``"false"`` and ``"0"`` as on and ``None`` as off (vault BACKLOG
+    #5362). A mapping written past ``resolve_env_settings`` is refused instead, naming the type."""
+    with pytest.raises(ValueError, match="oauth2_enabled must be true or false") as exc:
+        oauth2_auth_configured({"oauth2_token_url": _TOKEN_URL, "oauth2_enabled": enabled})
+    assert "'false'" not in str(exc.value)
+
+
+@pytest.mark.parametrize("url", ["", "   ", "\t\n"])
+def test_oauth2_blank_token_url_with_auth_on_is_refused(url: str) -> None:  # vault BACKLOG #5362
+    for settings in ({"oauth2_token_url": url}, {"oauth2_token_url": url, "oauth2_enabled": True}):
+        with pytest.raises(ValueError, match="oauth2_token_url is blank"):
+            oauth2_auth_configured(settings)
+
+
+def test_oauth2_configured_controls() -> None:  # vault BACKLOG #5362
+    """The reads the strict check leaves alone: absent, off, on, and an unresolved env() flag."""
+    from messagefoundry.config.wiring import env
+
+    assert oauth2_auth_configured({}) is False
+    assert oauth2_auth_configured({"oauth2_token_url": _TOKEN_URL}) is True
+    assert oauth2_auth_configured({"oauth2_token_url": _TOKEN_URL, "oauth2_enabled": True}) is True
+    assert (
+        oauth2_auth_configured({"oauth2_token_url": _TOKEN_URL, "oauth2_enabled": False}) is False
+    )
+    # Off wins over a blank URL: nothing is dialled, so there is nothing to refuse.
+    assert oauth2_auth_configured({"oauth2_token_url": "  ", "oauth2_enabled": False}) is False
+    assert oauth2_auth_configured({"oauth2_token_url": _TOKEN_URL, "oauth2_enabled": env("x")})
+
+
+def test_oauth2_string_flag_refused_at_construction() -> None:  # vault BACKLOG #5362
+    spec = with_oauth2_client_credentials(
+        Rest(url="https://partner.example.org/in"),
+        token_url=_TOKEN_URL,
+        client_id="c",
+        client_secret="s",
+        enabled="false",  # type: ignore[arg-type]
+    )
+    with pytest.raises(ValueError, match="oauth2_enabled must be true or false"):
+        build_destination(
+            Destination(name="OB", type=ConnectorType.REST, settings=spec.settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
