@@ -83,8 +83,9 @@ rules:
       Message-derived data flows into the db_lookup/fhir_lookup STATEMENT/QUERY argument, or into a
       FhirRaw value or the system half of a FhirToken. Keep the statement and query constant; pass
       message values through the parameterized `params` dict, as a plain str or as the FhirToken code
-      half, which the engine screens. Never interpolate them, and never put them in FhirRaw or a
-      FhirToken system, which pass unscreened (SQL / FHIR injection).
+      half, which this rule does not flag; messagefoundry/fhirsearch.py records the limits of the
+      engine's screen on those. Never interpolate them, and never put them in FhirRaw or a FhirToken
+      system, which pass unscreened (SQL / FHIR injection).
     pattern-sources:
       - patterns:
           - pattern-either:
@@ -126,7 +127,8 @@ rules:
           - focus-metavariable: $STMT
       # FHIR search values that are AUTHOR syntax and pass unscreened (messagefoundry/fhirsearch.py):
       # the whole of a FhirRaw, and the system half of a FhirToken. Message data there is injection.
-      # The FhirToken code half is screened (refused on a separator), so it is NOT a sink.
+      # The FhirToken code half is not flagged by this rule; fhirsearch.py records the limits of the
+      # engine's screen on it.
       - patterns:
           - pattern-either:
               - patterns:
@@ -191,8 +193,7 @@ rules:
       - patterns:
           - pattern: os.write($FD, $DATA)
           - focus-metavariable: $DATA
-      # The SOURCE argument of a shutil copy or move: the content or file being written out. A
-      # message-derived destination path alone is not message content, so it is not a sink here.
+      # The SOURCE argument of a shutil copy or move: the content or file being written out.
       - patterns:
           - pattern-either:
               - pattern: shutil.copyfileobj($SRC, ...)

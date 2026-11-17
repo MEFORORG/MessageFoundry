@@ -5,7 +5,7 @@
 
 Deterministic + cross-platform (used instead of ``semgrep --test``, which crashes on Windows in its
 path-pairing): scan the annotated fixtures and assert that every rule fires EXACTLY on the lines its
-``# ruleid:`` annotations name and nowhere else, so an ``# ok`` case (``log.debug`` /
+``# ruleid:`` annotations name and nowhere else, so an ``# ok`` case (at least ``log.debug`` /
 ``msg.control_id`` / parameterized ``db_lookup``) that fires fails it, and that the per-rule totals
 match the pinned counts. Requires ``semgrep`` on PATH; run in the security.yml semgrep job.
 """
