@@ -210,7 +210,7 @@ def _refuse_base_url_query_or_fragment(url: str, connection: str | None) -> None
 
 def dicomweb_credential_problem(s: Mapping[str, Any]) -> str | None:
     """Why a DICOMweb destination's credential settings refuse its build, or ``None`` (vault BACKLOG
-    #5359). Never raises. The one test behind :func:`_refuse_ambiguous_credentials` and the
+    #5359). The one test behind :func:`_refuse_ambiguous_credentials` and the
     static-credential census (``config.static_credentials``), so the census does not list a hop
     this refusal stops. ``s`` holds resolved values: an unresolved ``env()`` reference is the
     caller's to resolve or to leave unjudged.

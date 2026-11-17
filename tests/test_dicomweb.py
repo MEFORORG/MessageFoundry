@@ -1147,7 +1147,7 @@ _REFUSED_CREDENTIALS: list[dict[str, object]] = [
     {"bearer_token": "t", "basic_user": "svc", "basic_password": "pw"},
     {"bearer_token": "t", "headers": {"Authorization ": "Bearer x"}},
     {"basic_user": "svc:x", "basic_password": "pw"},
-    {"bearer_token": "t€n"},
+    {"bearer_token": "t\u20acn"},
 ]
 
 
@@ -1187,6 +1187,38 @@ def test_census_still_lists_a_dicomweb_hop_that_builds(
 ) -> None:  # vault BACKLOG #5359
     _dest(**over)
     assert _census(**over) == ["OB_DW"]
+
+
+def test_census_resolves_env_credentials_before_judging() -> None:  # vault BACKLOG #5359
+    """The serve guard and the posture route pass the instance's values; a refusal they resolve
+    leaves the hop out, and so does a literal ``default=``."""
+    from messagefoundry.config.static_credentials import static_credential_hops
+    from messagefoundry.config.wiring import Registry, build_outbound_connection, env
+
+    registry = Registry()
+    registry.outbound["OB_DW"] = build_outbound_connection(
+        "OB_DW", DICOMweb(url=BASE, bearer_token=env("tok"), basic_user="svc", basic_password="pw")
+    )
+    registry.outbound["OB_DEF"] = build_outbound_connection(
+        "OB_DEF",
+        DICOMweb(url=BASE, bearer_token=env("t2", default="t"), basic_user="s", basic_password="p"),
+    )
+    hops = static_credential_hops(registry=registry, settings=None, env_values={"tok": "t"})
+    assert [hop.name for hop in hops] == []
+    # The control: a token that resolves empty builds, as Basic alone, and is listed.
+    hops = static_credential_hops(registry=registry, settings=None, env_values={"tok": ""})
+    assert [hop.name for hop in hops] == ["OB_DW"]
+
+
+def test_census_leaves_out_the_proxy_hop_of_a_refused_dicomweb() -> None:  # vault BACKLOG #5359
+    over: dict[str, object] = {
+        "proxy": "http://proxy.example.org:8080",
+        "proxy_user": "u",
+        "proxy_password": "p",
+    }
+    assert _census(basic_user="svc", **over) == []
+    # The control: the same proxy beside a credential that builds is listed.
+    assert "proxy:OB_DW" in _census(bearer_token="t", **over)
 
 
 def test_census_lists_a_dicomweb_hop_it_cannot_resolve() -> None:  # vault BACKLOG #5359

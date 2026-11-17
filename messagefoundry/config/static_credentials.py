@@ -77,8 +77,9 @@ redaction screen's header test and the query-credential reader; ``_http_literal_
 
 Pure apart from :func:`apply_static_credential_gate`, which also logs, ``_digest``, which logs
 at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529), and ``_http_literal_static``, whose
-``env()`` resolution runs an operator ``cast`` as the build does (BACKLOG #5510): every function
-reads its arguments and touches nothing else.
+``env()`` resolution runs an operator ``cast`` as the build does (BACKLOG #5510), as does
+``_dicomweb_build_refused`` (vault BACKLOG #5359): every other function reads its arguments and
+touches nothing else.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -267,9 +268,9 @@ def _http_literal_static(
     ``Authorization`` over it: SOAP drops every spelling ``http_auth.is_authorization_header_name``
     matches, and REST and FHIR set the plain name, which replaces only a spelling urllib folds into
     it (any letter case, nothing added). So a REST or FHIR ``"Authorization "``, with a trailing
-    space, still counts: it goes on the wire beside the connector's own. A DICOMweb hop whose build
-    its credential refusal stops is not listed at all (:func:`_dicomweb_build_refused`, vault
-    BACKLOG #5359). A query parameter counts when
+    space, still counts: it goes on the wire beside the connector's own. A DICOMweb hop reaches this
+    function only when :func:`_graph_hops` could not judge it refused
+    (:func:`_dicomweb_build_refused`), and is read by the REST and FHIR rule. A query parameter counts when
     ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses,
     except on a destination type in ``URL_QUERY_REFUSED_DESTINATIONS``.
 
@@ -333,8 +334,6 @@ def _http_hop(
 
     A credential in the ``headers`` table or the ``url`` query is static whatever else the hop
     presents (:func:`_http_literal_static`), so it lists the hop even beside a compliant kind."""
-    if ctype is ConnectorType.DICOMWEB and _dicomweb_build_refused(settings, env_values):
-        return None
     compliant_kind = ctype is not ConnectorType.DICOMWEB
     token = _http_token(ctype, settings, lookup=lookup)
     static = _http_static(ctype, settings, token)
@@ -354,14 +353,15 @@ def _dicomweb_build_refused(
 ) -> bool:
     """Whether DICOMweb's credential refusal (vault BACKLOG #5359) stops this hop's build, so the
     census leaves it out: a refused build is not listed. The settings it judges are resolved as
-    the build resolves them; a value this reading cannot resolve leaves the hop listed."""
+    the build resolves them, a literal ``default=`` included; a value this reading cannot resolve
+    leaves the hop listed."""
     # Lazy, like ``_smart``: the transport owns the refusal, and this reads it rather than
     # restating it.
     from messagefoundry.transports.dicomweb import dicomweb_credential_problem
 
     view: dict[str, Any] = {}
     for key in ("bearer_token", "basic_user", "basic_password", "headers"):
-        value = _db_setting(settings, key, None, env_values)
+        value = _db_setting(settings, key, None, env_values or {})
         if value is _UNRESOLVED:
             return False
         view[key] = value
@@ -580,6 +580,12 @@ def _graph_hops(
         if ic.deployed and ic.spec.type in _DIALLED_INBOUND
     ]
     for name, spec in dialled:
+        # A DICOMweb connection its credential refusal stops never builds, so neither it nor its
+        # proxy hop is listed (vault BACKLOG #5359).
+        if spec.type is ConnectorType.DICOMWEB and _dicomweb_build_refused(
+            spec.settings, env_values
+        ):
+            continue
         hop = _connection_hop(name, spec.type, spec.settings, env_values)
         if hop is not None:
             out.append(hop)
