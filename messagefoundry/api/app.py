@@ -12459,6 +12459,7 @@ def create_managed_app(
     registry_filter: Callable[[Registry], Registry] | None = None,
     registry_guard: Callable[[Registry], None] | None = None,
     registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
+    start_registry: Registry | None = None,
     static_credential_settings: ServiceSettings | None = None,
     log_dir: str | None = None,
     configured_log_level: str | None = None,
@@ -12488,7 +12489,13 @@ def create_managed_app(
     trust-anchor preflight, never in its place, with the graph and its ``env()`` values: at the
     first load, every real reload and a DR activation, after the shard filter (``serve`` passes the
     connection key-file check, BACKLOG #3402). It runs first so a graph it refuses writes no
-    trust-anchor audit row. ``static_credential_settings`` is
+    trust-anchor audit row. ``start_registry`` is a graph the caller already loaded from
+    ``config_dir`` with ``load_config``, unfiltered; the first load takes it instead of loading
+    again, so the operator's config modules run once on that start (BACKLOG #5391, S19-75). Every
+    step the first load takes after its ``load_config`` still runs on it. It is read before the
+    cluster config version is seeded, which a clustered start must not do (vault BACKLOG #3076),
+    so it is refused beside an enabled ``cluster_settings``, and ``serve`` passes it only on a
+    single node. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
     inventory's settings half from; ``None`` makes that route say it could not read it. The Vault
     privilege preflight (ADR 0216) names the Vault tokens to probe from it too, so with ``None`` no
@@ -12513,9 +12520,15 @@ def create_managed_app(
             "create_managed_app: allow_no_auth=True was passed beside auth_settings; pass the "
             "opt-in only with no auth_settings, since settings always require sign-in"
         )
+    if start_registry is not None and config_dir is None:
+        raise ValueError("create_managed_app: start_registry was passed with no config_dir")
+    if start_registry is not None and cluster_settings is not None and cluster_settings.enabled:
+        # vault BACKLOG #3076: a clustered first load reads the directory after the version seed.
+        raise ValueError("create_managed_app: start_registry was passed on a clustered start")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        nonlocal start_registry
         # Process-level last-resort: route any otherwise-unhandled asyncio task/callback exception
         # through safe_exc → the log, so it can't escape as a raw traceback (possible PHI) or die
         # silently (ASVS 16.5.4). Here because set_exception_handler needs the running loop.
@@ -12990,7 +13003,12 @@ def create_managed_app(
                 # Before the load reads the directory, so a sibling's reload that lands after it is
                 # still converged on (vault BACKLOG #3076). Never raises; a no-op on a single node.
                 await engine.seed_config_version()
-                loaded = load_config(config_dir)
+                # The caller's load of this directory, when it made one, so the config modules do
+                # not run a second time on this start (BACKLOG #5391, S19-75).
+                # Cleared once taken, so this closure does not pin the start's graph past a reload
+                # (vault BACKLOG #3076).
+                loaded = start_registry if start_registry is not None else load_config(config_dir)
+                start_registry = None
                 # The values from the bytes the load read, as a reload parses them, so the guard,
                 # the preflight and the runner use what the config_loaded digest names (vault
                 # BACKLOG #2596, step 6). A refusal is a bad config, as the load's own is.
