@@ -877,27 +877,64 @@ def test_a_file_only_the_engine_writes_owned_by_another_account_is_refused() -> 
         "\\\\myhost\\keys\\k.key",
         "\\\\MyHost.corp.example\\keys\\k.key",
         "//localhost/c$/keys/k.key",
+        "\\\\127.1\\c$\\keys\\k.key",  # IPv4 shorthand
+        "\\\\2130706433\\c$\\keys\\k.key",  # 127.0.0.1 as one decimal number
+        "\\\\0.0.0.0\\c$\\keys\\k.key",
+        "\\\\192.0.2.10\\c$\\keys\\k.key",  # this host's own address, by the route below
     ],
 )
 def test_a_share_that_is_this_host_itself_is_refused(path: str) -> None:
     """Vault BACKLOG #5657: a loopback spelling stops the walk at the share, so a junction on the
     local path would go unjudged."""
-    problem = str(restricted_file._loopback_share_problem(path, "myhost"))
+    problem = str(restricted_file._loopback_share_problem(path, "myhost", _routes_to_itself))
     assert "a network share on this host itself" in problem
     assert "keys" not in problem  # names no path
 
 
+def _routes_to_itself(addr: Any) -> Any:
+    """A stand-in route: ``192.0.2.10`` is this host's own address; any other is reached from it."""
+    import ipaddress
+
+    own = ipaddress.ip_address("192.0.2.10")
+    return addr if addr == own else own
+
+
 @pytest.mark.parametrize(
-    "path", ["\\\\fileserver\\keys\\k.key", "\\\\myhost2\\keys\\k.key", "C:\\keys\\k.key"]
+    "path",
+    [
+        "\\\\fileserver\\keys\\k.key",
+        "\\\\myhost2\\keys\\k.key",
+        "C:\\keys\\k.key",
+        "\\\\127.example.com\\keys\\k.key",  # a name, not the 127 range
+        "\\\\192.0.2.99\\keys\\k.key",  # another host's address: the negative control
+    ],
 )
 def test_a_share_on_another_host_or_a_local_path_is_not_a_loopback(path: str) -> None:
-    assert restricted_file._loopback_share_problem(path, "myhost.corp.example") is None
+    problem = restricted_file._loopback_share_problem(
+        path, "myhost.corp.example", _routes_to_itself
+    )
+    assert problem is None
+
+
+def test_a_share_address_whose_route_cannot_be_read_is_refused() -> None:
+    """Fail closed: an address this host cannot place may be its own."""
+    problem = restricted_file._loopback_share_problem(
+        "\\\\192.0.2.99\\keys\\k.key", "myhost", lambda _addr: None
+    )
+    assert problem is not None and "route this host could not read" in problem
+
+
+def test_the_route_probe_answers_a_loopback_address_with_itself() -> None:
+    import ipaddress
+
+    loopback = ipaddress.ip_address("127.0.0.1")
+    assert restricted_file._route_source(loopback) == loopback
 
 
 def test_a_share_named_by_this_hosts_netbios_name_is_refused() -> None:
     """The NetBIOS name is the host name cut to 15 characters."""
     problem = restricted_file._loopback_share_problem(
-        "\\\\LAB-SERVER-NAME\\c$\\k.key", "lab-server-name-01"
+        "\\\\LAB-SERVER-NAME\\c$\\k.key", "lab-server-name-01", _routes_to_itself
     )
     assert problem is not None
 
@@ -1574,6 +1611,65 @@ def test_windows_a_share_is_refused_when_this_hosts_name_cannot_be_read(
         Path("\\\\fileserver\\keys\\store.key"), host
     )
     assert problem is not None and "own name could not be read" in problem
+
+
+@windows_only
+def test_windows_a_path_resolving_to_a_volume_root_still_has_its_links_judged(
+    tmp_path: Path,
+) -> None:
+    """A secrets directory named as a ``subst`` root that reaches a volume root through a junction:
+    the walk returned before the link rule, so a junction Users could re-point passed. The letter
+    is a stand-in, as in the test below. The junction onto the root is removed by ``os.rmdir``,
+    which removes the link only, before anything else can walk it. The root is another drive's:
+    one already on the path is refused for that instead (a folder already on the path)."""
+    import string
+
+    others = [
+        f"{letter}:\\"
+        for letter in string.ascii_uppercase
+        if f"{letter}:" != tmp_path.drive.upper() and os.path.isdir(f"{letter}:\\")
+    ]
+    if not others:
+        pytest.skip("this host has no second drive to point a junction at")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    junction = shared / "j"
+    _junction(junction, Path(others[0]))
+    try:
+        target = "\\??\\" + str(junction)
+        host = _host_judging_only_under(
+            tmp_path, drive_target=lambda d: target if d.upper() == "Q:" else None
+        )
+        assert restricted_file._windows_surroundings_problem(Path("Q:\\"), host) is None
+        _icacls(shared, "/grant", f"*{_USERS}:(DC)")  # Users may delete and replace the junction
+        problem = str(restricted_file._windows_surroundings_problem(Path("Q:\\"), host))
+        assert "a folder holding or above a junction or link on its path can be changed" in problem
+    finally:
+        os.rmdir(junction)
+
+
+@windows_only
+def test_windows_a_junction_holding_a_key_on_a_share_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read through a share, a junction holding the key was judged by its own access list, not by
+    the folder it points at. The share is this host's administrative share, with the loopback
+    refusal stood down so the share reads as another server's."""
+    drive = tmp_path.drive.rstrip(":")
+    root = f"\\\\localhost\\{drive}$"
+    if not os.path.isdir(root):
+        pytest.skip("this account cannot reach the host's administrative share")
+    monkeypatch.setattr(restricted_file, "_loopback_share_problem", lambda *_args: None)
+    real = tmp_path / "real"
+    real.mkdir()
+    write_restricted_file(real / "store.key", b"KEY-MATERIAL-STAND-IN")
+    _junction(tmp_path / "j", real)
+    host = _host_judging_only_under(tmp_path)
+    via_share = Path(root + str(tmp_path)[2:])
+    surroundings = restricted_file._windows_surroundings_problem
+    assert surroundings(via_share / "real" / "store.key", host) is None  # the control
+    problem = str(surroundings(via_share / "j" / "store.key", host))
+    assert "the folder that holds it on the share is a junction or link" in problem
 
 
 @windows_only

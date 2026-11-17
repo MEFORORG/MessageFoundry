@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import errno
 import functools
+import ipaddress
 import ntpath
 import os
 import stat
@@ -700,22 +701,13 @@ def _windows_judged_problem(
     return None
 
 
-#: Server names that reach this host's own disks over SMB, compared lower-cased: at least these,
-#: and the host's own name (:func:`_loopback_share_problem`).
-_LOOPBACK_SERVERS = frozenset(
-    {
-        "localhost",
-        "::1",
-        "[::1]",
-        "0--1.ipv6-literal.net",
-        "0-0-0-0-0-0-0-1.ipv6-literal.net",
-    }
-)
+#: The suffix Windows uses to spell an IPv6 address as a UNC server name.
+_IPV6_LITERAL_SUFFIX = ".ipv6-literal.net"
 
 
 def _share_server(path: str) -> str:
-    """The server name of a UNC ``path`` (``\\\\server\\share`` or ``\\\\?\\UNC\\server\\share``),
-    lower-cased, or ``""`` when it names none."""
+    """The server name of a UNC ``path`` (``\\\\server\\share``, ``\\\\?\\UNC\\server\\share`` or
+    ``\\\\.\\UNC\\server\\share``), lower-cased, or ``""`` when it names none."""
     text = path.replace("/", "\\")
     if text[:8].lower() in ("\\\\?\\unc\\", "\\\\.\\unc\\"):
         rest = text[8:]
@@ -726,45 +718,91 @@ def _share_server(path: str) -> str:
     return rest.split("\\", 1)[0].lower()
 
 
-def _loopback_share_problem(path: str, host_name: str) -> str | None:
-    """Why a key file reached through a share is on this host's own disk, or ``None``. Such a
+_LOOPBACK_SHARE = (
+    "it is reached through a network share on this host itself, whose folders this check does "
+    "not walk; name it by its local path instead"
+)
+
+
+def _loopback_share_problem(
+    path: str,
+    host_name: str,
+    source_of: Callable[[Any], Any],
+) -> str | None:
+    """Why a key file reached through a share may be on this host's own disk, or ``None``. Such a
     spelling stops the walk at the share, so a junction on the local path would go unjudged
-    (vault BACKLOG #5657); the local path is walked instead. ``host_name`` is this host's name.
-    The loopback names recognized are those :data:`_LOOPBACK_SERVERS` names, the ``127.`` range
-    written as four numbers, and the host's own name or its NetBIOS form, with or without a
-    domain or a trailing dot; at least another of the host's addresses, and other spellings of a
-    loopback address, are not. Kept free of I/O so the decision is testable everywhere."""
-    server = _share_server(path).rstrip(".")
+    (vault BACKLOG #5657); the local path is walked instead.
+
+    The server counts as this host when ``config.settings._names_this_host`` reads it as loopback
+    or unspecified (shorthand and decimal forms included); when it is ``host_name``, that name's
+    first label, or the label cut to 15 characters (the NetBIOS form), or its own first label is
+    that label; or when it is an address that ``source_of`` (the route to it) answers with
+    itself. An address whose route cannot be read is refused too, failing closed. A name that
+    resolves to this host by DNS alone is not recognized, and a host in another domain that shares
+    this host's first label is refused. Kept free of I/O, ``source_of`` aside."""
+    from messagefoundry.config.settings import _bare_host, _host_ip_literal, _names_this_host
+
+    server = _share_server(path)
     if not server:
         return None
-    own = host_name.lower().split(".", 1)[0]
-    short = server.split(".", 1)[0]
-    if (
-        server in _LOOPBACK_SERVERS
-        or server.startswith("127.")
-        # The NetBIOS name is the host name cut to 15 characters.
-        or (own and short in (own, own[:15]))
+    if server.endswith(_IPV6_LITERAL_SUFFIX):
+        # 0--1.ipv6-literal.net is ::1: dashes for colons, an "s" before the zone index.
+        server = server.removesuffix(_IPV6_LITERAL_SUFFIX).replace("-", ":").replace("s", "%")
+    bare = _bare_host(server)
+    own = _bare_host(host_name)
+    label = own.partition(".")[0]
+    if _names_this_host(bare) or (
+        label and (bare in (own, label, label[:15]) or bare.partition(".")[0] == label)
     ):
+        return _LOOPBACK_SHARE
+    addr = _host_ip_literal(bare)
+    if addr is None:
+        return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    source = source_of(addr)
+    if source is None:
         return (
-            "it is reached through a network share on this host itself, whose folders this check "
-            "does not walk; name it by its local path instead"
+            "it is on a network share named by an address whose route this host could not read, "
+            "so the share cannot be told apart from this host; name it by a local path or a host "
+            "name"
         )
+    if int(source) == int(addr) and source.version == addr.version:
+        return _LOOPBACK_SHARE
     return None
+
+
+def _route_source(addr: Any) -> Any:
+    """The address this host would send from to reach ``addr``, or ``None`` when the OS will not
+    say. Connecting a UDP socket sends nothing; it asks the routing table, which answers one of
+    this host's own addresses with itself. The same probe as
+    ``config.settings._local_source_address``, which fails open and logs a note naming another
+    setting, so it is not called here."""
+    import socket
+
+    family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as probe:
+            probe.connect((str(addr), 9))  # the discard port; nothing is sent
+            return ipaddress.ip_address(probe.getsockname()[0])
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     """Why the folders on ``path`` let another account move or replace it, or ``None``: a walk that
-    did not finish (:func:`_windows_cause_problem`), a share that is this host itself
+    did not finish (:func:`_windows_cause_problem`), a share that may be this host itself
     (:func:`_loopback_share_problem`), a junction or link above it that another account can change
     (:func:`_windows_link_problem`), a ``subst`` drive on its path whose folders above the holder
     another account can change, then the directory that holds it (:func:`_windows_holder_problem`).
     Windows only.
 
-    ``path`` itself is walked, so a ``subst`` drive root is resolved too. The holder is the folder
-    that holds where the walk ends, after every junction, link and ``subst`` drive on the way, and
-    its owner and entries are read there, not at a junction that stands in for it. A walk that
-    reached a share the path names reads the holder by its lexical path, through the share; one
-    that reached a share through a junction, link or ``subst`` drive is refused. The caller has read
+    ``path`` itself is walked, so a ``subst`` drive root is resolved too, and the links on the way
+    are judged even when it resolves to a volume root. The holder is the folder that holds where
+    the walk ends, after every junction, link and ``subst`` drive on the way, and its owner and
+    entries are read there. A walk that reached a share the path names reads the holder through
+    the share by its path as written, and refuses it when it is a junction or link; one that
+    reached a share through a junction, link or ``subst`` drive is refused. The caller has read
     ``path`` itself and refused it if it is a link. ``host`` holds the readers."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the folders on a Windows path are walked on Windows only")
@@ -796,31 +834,36 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             return (
                 "it is on a network share, and this host's own name could not be read "
                 f"({exc.strerror or type(exc).__name__}), so the share cannot be told apart from "
-                "this host; name it by a local path"
+                "this host; fix the host's name, or name the file by a local path"
             )
-        problem = _loopback_share_problem(str(full), host_name)
+        problem = _loopback_share_problem(str(full), host_name, _route_source)
     if problem is not None:
         return problem
+    holder_path: str | None
     if cause is not None:  # a share: the walk stops there, and the holder is read through it
         holder_path = str(full.parent)
         if holder_path == str(full):
-            return None  # a share's root: nothing on this host holds it
+            holder_path = None  # a share's root: nothing on this host holds it
+    elif not chain:
+        return "the folders on its path could not be walked (the walk read nothing)"
+    elif chain[-1][1] == LINK:
+        # windows_chain adds an object once, so a path that resolves to a folder it already
+        # passed ends on the link that led there; that folder is not resolved here.
+        return (
+            "the folders on its path could not be walked (it resolves, through a junction or "
+            "link, to a folder already on its path, which this check does not resolve)"
+        )
     else:
-        if not chain or chain[-1][1] == LINK:
-            # windows_chain adds an object once, so a path that resolves to a folder it already
-            # passed ends on the link that led back; that folder is not resolved here.
-            return (
-                "the folders on its path could not be walked (a junction or link on it leads back "
-                "to a folder already on the path)"
-            )
         holder_path = ntpath.dirname(chain[-1][0])
         if holder_path == chain[-1][0]:
-            return None  # a volume root: nothing holds it
+            holder_path = None  # a volume root: nothing holds it, but the links are judged
     trust = WinTrust(host.engine_sid, host.admin_member)
     try:
         problem = _windows_link_problem(chain, host.read_security, trust)
+        if holder_path is None or problem is not None:
+            return problem
         holder_is_root = ntpath.dirname(holder_path) == holder_path
-        if problem is None and substituted and not holder_is_root:
+        if substituted and not holder_is_root:
             # A subst letter is spliced in with no link entry, but the folders above its target can
             # rename what lies below, as those above a link can. The walk does not say where the
             # target was, so every folder above the holder is judged by the link rule: stricter
@@ -828,8 +871,15 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             problem = _windows_judged_problem(
                 _folders_above(holder_path, set()), host.read_security, trust
             )
-        if problem is not None:
-            return problem
+            if problem is not None:
+                return problem
+        if cause is not None and _is_reparse_point(holder_path):
+            # Read with FILE_FLAG_OPEN_REPARSE_POINT, a junction's own list would stand in for the
+            # folder it points at, which this check does not read through a share.
+            return (
+                "the folder that holds it on the share is a junction or link, whose target this "
+                "check does not read; name the folder it points at instead"
+            )
         holder = host.read_security(holder_path, DIRECTORY)
     except OSError as exc:  # a reader that could not be run
         reason = exc.strerror or type(exc).__name__
@@ -841,6 +891,13 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
         )
     problem = _windows_holder_problem(holder)
     return None if problem is None else f"the directory that holds it is not restricted: {problem}"
+
+
+def _is_reparse_point(path: str) -> bool:
+    """Whether ``path`` is itself a reparse point, read without following it. Raises ``OSError``
+    when it cannot be read. Windows only."""
+    attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _host_name() -> str:

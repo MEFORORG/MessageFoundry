@@ -155,18 +155,23 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 
 - **2026-11-17, the Windows holder is read where the path resolves to (vault BACKLOG #5657).**
   This replaces parts of the 2026-11-13 amendment below. `_windows_surroundings_problem` now walks
-  the directory's own path, so a `subst` drive root such as `S:\` is resolved, and reads the
-  owner and access list of the folder that holds the directory where the walk ends, after every
-  junction, link and `subst` drive; a path the walk follows onto a share it names is still read
-  at `full.parent`, through the share. Inherit-only entries are skipped. Where a `subst` drive is
-  on the path, every folder above that folder is judged by the link rule. A link or `subst` drive
-  onto a network share is refused, and so is a share spelled with at least some of this host's
-  own names; `_loopback_share_problem` says which, and a mapped drive is not among them. So the
-  drive-root gap the 2026-11-13 list names is closed for a `subst` drive root, and still open for
-  a mapped network drive root, which the walk reads as a volume root; its `DELETE` gap is still
-  open. The code is
-  the record of the rest, and the check is still not a complete check of the directory's
-  surroundings.
+  the directory's own path, so a `subst` drive root such as `S:\` is resolved. It reads the owner
+  and access list of the folder that holds the directory where the walk ends, after every
+  junction, link and `subst` drive.
+
+  - On a share the path names, that folder is read through the share at `full.parent`. It is
+    refused when it is a junction or link there.
+  - Inherit-only entries are skipped.
+  - Where a `subst` drive is on the path, every folder above that folder is judged by the link
+    rule.
+  - A link or `subst` drive onto a network share is refused.
+  - A share spelled with at least some of this host's own names or addresses is refused.
+    `_loopback_share_problem` says which. A mapped drive is not among them.
+
+  So the drive-root gap in the 2026-11-13 list is closed for a `subst` drive root. It is still
+  open for a mapped network drive root, which the walk reads as a volume root. A broad group's
+  `DELETE` on any holder is still not counted. The code is the record of the rest. The check is
+  still not a complete check of the directory's surroundings.
 - **2026-11-13, on Windows the folder just above the directory is read (vault BACKLOG #5656,
   #5657).** On Windows, `_windows_surroundings_problem` in `messagefoundry/restricted_file.py`
   reads the owner and access list of `full.parent`, the folder just above the directory in its
