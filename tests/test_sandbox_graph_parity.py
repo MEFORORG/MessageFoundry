@@ -355,6 +355,55 @@ async def test_the_runner_hands_each_session_the_graph_it_is_serving(
         await store.close()
 
 
+@pytest.mark.parametrize("mode", [SandboxMode.SUBPROCESS, SandboxMode.ISOLATED])
+def test_a_graph_with_no_digest_is_refused_at_start_beside_a_config_dir(
+    config_dir: str, mode: SandboxMode, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5334. A worker would refuse a graph built in code once per message, after the
+    engine had started and ACKed it, so every message would be accepted and then errored. The
+    runner refuses it when it is made instead, before a listener binds, with the worker's cause
+    and remedy. The control is the same graph loaded, which carries a digest and is made."""
+    monkeypatch.delenv(_VARIABLE, raising=False)
+    loaded = load_config(config_dir)
+    built = Registry(
+        inbound=loaded.inbound,
+        outbound=loaded.outbound,
+        routers=loaded.routers,
+        handlers=loaded.handlers,
+    )
+    assert built.code_digest is None
+
+    def make(registry: Registry) -> RegistryRunner:
+        return RegistryRunner(
+            registry,
+            object(),  # type: ignore[arg-type]
+            sandbox_policy=SandboxPolicy(mode=mode),
+            sandbox_config_source=(config_dir, None),
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+    with pytest.raises(ValueError) as refused:
+        make(built)
+    text = str(refused.value)
+    assert f"[sandbox].mode={mode.value}" in text
+    assert "the engine's graph was not loaded from a config directory" in text
+    assert "Serve a graph loaded from the config directory" in text
+    make(loaded)  # the control
+
+
+def test_a_graph_with_no_digest_and_no_config_dir_runs_in_process() -> None:
+    """The no-config-dir side of the same graph: no worker is ever started, so there is no worker
+    code for a digest to vouch for, and the Router and Handler run as the engine holds them."""
+    runner = RegistryRunner(
+        Registry(),
+        object(),  # type: ignore[arg-type]
+        sandbox_policy=SandboxPolicy(mode=SandboxMode.SUBPROCESS),
+        sandbox_config_source=(None, None),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert runner._sandbox_for("IB_ANY") is None
+
+
 # --- the comparison ------------------------------------------------------------------------------
 
 

@@ -226,6 +226,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxSessionClosed,
     SandboxWorkerRefused,
     graph_shape,
+    undigested_graph_refusal,
 )
 from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import inbound_guard_settings, owner_shard_of_destination
@@ -1974,6 +1975,20 @@ class RegistryRunner:
                 "[sandbox].mode=isolated needs a config directory for its workers to load, and "
                 "this graph has none: it never runs a Router or Handler in the engine process"
             )
+        if (
+            sandbox_policy is not None
+            and sandbox_policy.mode is not SandboxMode.OFF
+            and registry.code_digest is None
+            and (
+                registry.source_dir is not None
+                or (sandbox_config_source is not None and sandbox_config_source[0] is not None)
+            )
+        ):
+            # A worker would refuse this graph once per message, after the listener had ACKed it,
+            # so every message would be accepted and then errored (BACKLOG #5334). Refused here,
+            # before a listener binds or a worker spawns; graph_differences stays the backstop for
+            # a graph swapped in later. With no config dir no worker starts: _sandbox_for says why.
+            raise ValueError(undigested_graph_refusal(sandbox_policy.mode))
         self._sandbox_sessions: dict[str, SandboxSession] = {}
         self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # Sessions read that cache from their worker threads. Two building it at once would each
@@ -6971,10 +6986,20 @@ class RegistryRunner:
         the directory (vault BACKLOG #2596). A graph with no snapshot hands the session
         ``Registry.source_dir``, else the constructor's ``sandbox_config_source``, which the session
         reads once. A reload of a running runner closes the sessions, so a reload from another root
-        moves the children with it (vault BACKLOG #3094). **A graph built in code with no
-        config dir cannot isolate**, and degrades to in-process. That degradation is **silent**: a
-        library embedder that asked for ``subprocess`` gets the in-process path and nothing says so.
-        Every ``serve`` route carries a config dir. The :class:`SandboxSession` object is created
+        moves the children with it (vault BACKLOG #3094).
+
+        **A graph with no** ``code_digest`` **beside a config dir never reaches this method**: the
+        constructor refuses it, before a listener binds, because every worker would refuse it per
+        message after the ACK (BACKLOG #5334). A graph swapped in later with no digest is still
+        refused, by the worker, through :func:`~messagefoundry.pipeline.sandbox.graph_differences`.
+
+        **A graph built in code with no config dir cannot isolate**, and degrades to in-process.
+        That degradation is **silent**: a library embedder that asked for ``subprocess`` gets the
+        in-process path and nothing says so. It is not refused for its missing digest, because the
+        digest exists to hold a worker to the code the engine holds, and here no worker starts: the
+        engine runs the very functions it holds. What it gives up is the isolation itself, the
+        import guard and the resource caps, which is this degradation, not a parity gap. Every
+        ``serve`` route carries a config dir. The :class:`SandboxSession` object is created
         here (cheap; loop-safe) but the child subprocess is spawned lazily inside the worker thread on
         first dispatch, so this never blocks the event loop. Sessions are reused per inbound and reaped
         at :meth:`stop`."""

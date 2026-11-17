@@ -139,6 +139,7 @@ __all__ = [
     "GraphShape",
     "graph_shape",
     "graph_differences",
+    "undigested_graph_refusal",
     "run_sandboxed",
     "policy_from_settings",
     "DEFAULT_FORBIDDEN_MODULES",
@@ -351,6 +352,23 @@ _CONTENT_DIFFERS: Final = "config module content"
 #: How a refusal names an engine graph that carries no config-module digest (BACKLOG #5334).
 _ENGINE_UNDIGESTED: Final = "the engine's graph was not loaded from a config directory"
 
+#: The remedy for :data:`_ENGINE_UNDIGESTED`, given at start and by a worker's refusal alike.
+_UNDIGESTED_REMEDY: Final = (
+    "Serve a graph loaded from the config directory, whose module digest a worker can be held to."
+)
+
+
+def undigested_graph_refusal(mode: SandboxMode) -> str:
+    """The refusal for a worker mode serving a graph with no ``code_digest`` (BACKLOG #5334), in
+    the cause-and-remedy words a worker's own refusal uses. The runner raises it when it is made,
+    before a listener binds, so a misconfiguration fails at start rather than once per message
+    after the ACK; :func:`graph_differences` keeps the same refusal as the backstop."""
+    return (
+        f"[sandbox].mode={mode.value} cannot start: {_ENGINE_UNDIGESTED} (it has no digest to "
+        f"compare a worker's with). {_UNDIGESTED_REMEDY}"
+    )
+
+
 #: The accessor each lookup kind names, for the broker's refusals and log lines.
 _LOOKUP_FN: Final = {codec.LOOKUP_DB: "db_lookup", codec.LOOKUP_FHIR: "fhir_lookup"}
 
@@ -387,7 +405,9 @@ def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
     ``bindings`` is compared over the inbounds the ENGINE holds. An engine shard holds only its
     own, while its worker loads the whole config, so the worker's other bindings are not a
     difference. An engine graph with no ``code_digest`` is itself a difference (BACKLOG #5334): a
-    load always records one, and a graph built in code cannot vouch for the worker's code. Otherwise
+    load always records one, and a graph built in code cannot vouch for the worker's code. The runner
+    refuses such a graph at start (:func:`undigested_graph_refusal`), so this is the backstop for a
+    graph swapped in after it. Otherwise
     ``code_digest`` is compared: a config module whose
     bytes differ from the ones the engine loaded differs there even when every name is the same
     (vault BACKLOG #2724; since #2596 a worker runs the engine's snapshot, so this is a backstop). A worker of the same build with no digest could not read its own
@@ -1142,8 +1162,7 @@ class SandboxSession:
                     "The worker ran other config module bytes than the engine loaded: reload the "
                     "config."
                     if content_only
-                    else "Serve a graph loaded from the config directory, whose module digest a "
-                    "worker can be held to."
+                    else _UNDIGESTED_REMEDY
                     if engine_graph.code_digest is None
                     else "Config code most likely reads an environment variable the worker is "
                     "not given, because the worker runs the config again under an allowlisted "
