@@ -530,9 +530,10 @@ _KEY_MATERIAL = re.compile(
 #
 # THIS FIRST PASS STAYS NARROW: a user, and a password that stops at its first "@". The widened reading,
 # an empty user and a password holding an "@" (BACKLOG #5386), is secretscrub's
-# ``_WIDE_DSN_PASSWORD``, and :func:`redact_log_line` runs it LAST of the credential passes, over the
-# whole line. Run here, first, a review measured its run after the password reach past a glued
-# ``\ndbPassword=`` label and print that value's tail on every glue it tried. After the shared
+# ``_WIDE_DSN_PASSWORD``, and :func:`redact_log_line` runs it last of the credential passes, after the
+# member mask and before only the long-base64 sweep, over the whole line. Run here, first, a review
+# measured its run after the password reach past a glued ``\ndbPassword=`` label and print that
+# value's tail on every glue it tried. After the shared
 # vocabulary a value it hid is a placeholder, and the widened run after the password, which stops
 # at "[" and "]", cannot cross it. Nor does the run cross a label: it stops where a key of the
 # write-time query filter, a label word secretscrub reads, or a ``MEFOR_`` name starts, followed by
@@ -566,7 +567,8 @@ _LEADING_TS = re.compile(
 )
 
 
-# WHY THE CREDENTIAL STAGE IS TWO LAYERS, AND WHY THE SHARED ONE RUNS LAST (BACKLOG #2694).
+# WHY THE CREDENTIAL STAGE IS TWO LAYERS, AND WHY THE SHARED ONE RUNS AFTER THE PHI PASS
+# (BACKLOG #2694).
 #
 # The goal was one vocabulary: call ``secretscrub.scrub_credentials`` and delete the copy above. That
 # was built, and it printed values this copy hid. Measured 2026-10-06 against this module at
@@ -657,10 +659,10 @@ def redact_log_line(line: str) -> str:
         scrub_credentials(piece, placeholder=REDACTION_PLACEHOLDER) for piece in pieces
     )
     # A connection-string member, its value's words masked to the next ";" (BACKLOG #5030).
-    # secretscrub's own pattern and mask, not a copy, run LAST of the credential passes: after the PHI
-    # pass and the second layer, so it reads what they left, and over the whole joined body, since
-    # this module's placeholder can sit inside the value (``;PWD=[REDACTED] kx,Pw&mv;``), where the
-    # split above cut it. It masks words only, so the PHI pass and the labels of a later redaction of
+    # secretscrub's own pattern and mask, not a copy, run after the PHI pass and the second layer and
+    # before only the widened DSN pass and the long-base64 sweep below, so it reads what they left,
+    # and over the whole joined body, since this module's placeholder can sit inside the value
+    # (``;PWD=[REDACTED] kx,Pw&mv;``), where the split above cut it. It masks words only, so the PHI pass and the labels of a later redaction of
     # this line read the same separators; secretscrub's comment on the pattern says why that matters.
     if ";" in body:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)

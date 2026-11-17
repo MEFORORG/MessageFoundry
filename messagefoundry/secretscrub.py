@@ -36,8 +36,11 @@ of *that* surface rather than of the vocabulary:
   carve.
 
 AND THE OTHER BOUNDARY, because it looks like a duplicate and is not.
-``logging_setup.CredentialQueryScrubFilter`` keeps its own short list -- ``code``, ``state``,
-``id_token``, ``access_token``, ``token``, ``session_state`` -- and is NOT folded in here. Its words are
+``logging_setup.CredentialQueryScrubFilter`` hides its own short list of keys -- ``code``, ``state``,
+``id_token``, ``access_token``, ``token``, ``session_state`` -- only inside a URL query string. The
+tuple, ``_CREDENTIAL_QUERY_KEYS``, is defined here and ``logging_setup`` re-exports it (BACKLOG #5386),
+so the widened DSN reading can stop at those keys; this module's own label rules do NOT read those
+words as credential labels. Its words are
 safe only *because* they are scoped to a URL query string: ``code`` and ``state`` are ordinary
 operational vocabulary (``code=404``, ``state=RUNNING``), so admitting them to a general
 ``label=value`` rule would redact operator diagnostics and buy nothing. That list also carries a ruling
@@ -1373,8 +1376,11 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # :data:`_CREDENTIAL_QUERY_KEYS` key and no label word this module reads (:data:`_CAMEL_WORDS`),
 # followed by ":" or "=", starts, and no ``MEFOR_`` name starts. A review measured
 # ``smtp://ops:pw@h:587:state=Tk9@Sec_x3`` print ``Sec_x3``: the run reached the value's "@" and
-# took ``state=``, so the query filter, which runs after this module on the log chain and hid that
-# value on ``origin/main``, found no key. The stop is built from those tuples, not copied. It
+# took ``state=``, so the query filter, which hid that value on ``origin/main``, found no key. That
+# order is the store error path's: ``redact_log_line`` runs there first, this module's patterns among
+# its passes, and the log chain's query filter reads its output. On the log chain itself
+# ``_install_phi_filters`` puts the query filter before this module. The stop is built from those
+# tuples, not copied. It
 # matches inside a word too, so ``xstate=`` stops the run as well. Stopping early ends the match at
 # an earlier "@", which with a user is where ``_DSN_PASSWORD`` already ended it, or not at all; so
 # the stop makes this pass hide less, and never makes it take a value a later pass would hide.
