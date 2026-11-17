@@ -2263,7 +2263,7 @@ _SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 # another server or provider, and `OPENROWSET(BULK ...)` reads a server-side file. PostgreSQL and
 # MySQL need a `;` between statements, which rule 3 refuses, so their own statement verbs are not
 # listed. Fail-closed costs at least a read through `OPENQUERY` or `OPENROWSET`, a T-SQL
-# `OPTION (USE HINT(...))` or `USE PLAN` hint, a MySQL `USE INDEX` hint, a MySQL `CHARACTER SET`
+# `OPTION (USE HINT(...))`, `USE PLAN` or `DISABLE EXTERNALPUSHDOWN` hint, a MySQL `USE INDEX` hint, a MySQL `CHARACTER SET`
 # cast, and any unquoted name spelled like one of these words, at least the names `send`, `move`,
 # `enable`, `disable`, `open` and `close`, which T-SQL does not reserve; quote such a name.
 _SQL_WRITE_KEYWORDS = frozenset(
@@ -2527,8 +2527,9 @@ def _require_read_only(
     All three passed the former leading-token gate (BACKLOG #1574, #1658).
 
     This is still a lightweight gate and not a SQL parser, and a statement test is not read-only
-    *authority*: a keyword scan cannot follow a write executed on a linked server through a
-    pass-through literal, so the account itself should be read-only (``docs/CONNECTIONS.md``). Raises
+    *authority*: it refuses ``OPENQUERY``, ``OPENROWSET`` and ``OPENDATASOURCE`` outright, since it
+    cannot read their pass-through literal, but a keyword scan cannot follow a write executed on a
+    linked server another way, so the account itself should be read-only (``docs/CONNECTIONS.md``). Raises
     :class:`DbLookupError` on violation. The message stays PHI-free — it never echoes statement text,
     and any keyword it names comes from the fixed vocabulary above, never from operator data."""
     refusal = _read_only_message(subject)
@@ -2893,8 +2894,8 @@ def _redacted_copy(
 
 def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     """One link's line in the poll-failure traceback: :func:`_safe_db_error`'s, except that a link
-    with no SQLSTATE is named by its type alone, unless it is the missing-extra error or an
-    ``ImportError`` (BACKLOG #5348).
+    with no SQLSTATE is named by its type alone, unless it is the missing-extra error, an
+    ``ImportError`` or a ``UnicodeError`` (BACKLOG #5348).
 
     The poll arm meets connect failures, and a connect error can carry DSN attributes, the server
     and the credentials among them, so the rule :func:`_lookup_connect_failure` states applies here
@@ -2902,15 +2903,20 @@ def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     exemption, because at least ``_connect`` and ``_probe_db`` build one around
     :func:`_safe_db_error`'s text, which for such an error is ``safe_exc``'s. The missing-extra
     error's text is a fixed install hint, and an ``ImportError``'s names the module or shared
-    library that failed to load, which no DSN reaches. What this costs is the text of any other
-    error with no SQLSTATE, the pool-acquire timeout and a bug's message included; the frames
-    still locate it, and their source lines still print. It never raises: a link it cannot
-    classify is named by its type and a fixed note, and the rest of the chain still renders."""
+    library that failed to load, which no DSN reaches; ``safe_exc`` renders a ``UnicodeError`` from
+    its codec, position and reason, never its text. What this costs is the text of any other error
+    with no SQLSTATE, the pool-acquire timeout and a bug's message included; the frames still
+    locate it, and their source lines still print. An error with no arguments has no text to
+    withhold and is named by its type alone. It never raises: a link whose classification raises
+    is named by its type and a fixed note. A failure in :func:`_redacted_copy`'s own driver test
+    on that link still falls to :func:`_safe_db_exc_info`'s whole-chain fallback."""
     try:
         if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
             return _safe_db_error(exc, withhold=under)
-        if isinstance(exc, (_DriverMissingError, ImportError)):
+        if isinstance(exc, (_DriverMissingError, ImportError, UnicodeError)):
             return _safe_db_error(exc)
+        if not exc.args:
+            return type(exc).__name__
     except Exception as failure:  # noqa: BLE001 - see docstring: one link must not cost the chain
         return (
             f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"

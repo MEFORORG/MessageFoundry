@@ -761,12 +761,15 @@ def test_a_quoted_name_spelled_like_a_new_keyword_is_still_read() -> None:
     [
         "SELECT mrn FROM p OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL'))",
         "SELECT * FROM OPENQUERY(clarity, 'SELECT pat_id FROM patient')",
-        "SELECT open, close FROM prices",
+        "SELECT mrn FROM ext_p OPTION (DISABLE EXTERNALPUSHDOWN)",
+        "SELECT open FROM prices",
+        "SELECT close FROM prices",
     ],
 )
 def test_the_documented_fail_closed_costs_of_5346_are_refused(stmt: str) -> None:
     """Pins the costs the keyword-set comment and docs/CONNECTIONS.md name, so a change that admits
-    one of them updates both. Red mutation: drop `USE`, `OPENQUERY` or `OPEN`."""
+    one of them updates both. Red mutation: drop `USE`, `OPENQUERY`, `DISABLE`, `OPEN` or `CLOSE`;
+    each case holds one refused word, so its case reds."""
     with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
         database._require_read_only(stmt)
 

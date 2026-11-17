@@ -1777,17 +1777,25 @@ async def test_source_poll_failure_withholds_a_delivery_error_wrapping_connect_t
     [
         (ImportError("libodbc.so.2: cannot open shared object file"), "libodbc.so.2"),
         (database_module._DriverMissingError("install the 'sqlserver' extra"), "sqlserver"),
+        (UnicodeDecodeError("utf-16-le", b"\x00", 0, 1, "truncated data"), "truncated data"),
     ],
 )
 async def test_source_poll_failure_keeps_a_load_failure_text(
     caplog: pytest.LogCaptureFixture, exc: Exception, kept: str
 ) -> None:
-    """Control for #5348: a failed driver load names a library or the extra, which no DSN reaches,
-    so its text stays. Red mutation: drop the exemption in ``_poll_log_line``. Both red."""
+    """Control for #5348: a failed driver load names a library or the extra, and ``safe_exc``
+    renders a codec error from its attributes; no DSN reaches any of them, so the text stays.
+    Red mutation: drop the exemption in ``_poll_log_line``. Every case reds."""
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
         await _run_one_failed_poll(_src(body_column="payload"), exc)
     assert f"RedactedDbError: {type(exc).__name__}: " in caplog.text
     assert kept in caplog.text.split("RedactedDbError:", 1)[1]
+
+
+def test_poll_log_line_names_an_error_with_no_arguments_by_type_alone() -> None:
+    """#5348, review round 2: an empty ``TimeoutError()`` has no text, so 'withheld' would mislead.
+    Red mutation: drop the ``exc.args`` test in ``_poll_log_line``."""
+    assert database_module._poll_log_line(TimeoutError(), under=False) == "TimeoutError"
 
 
 class _UnclassifiableError(Exception):
@@ -1869,12 +1877,17 @@ async def test_source_poll_failure_log_survives_an_unprintable_error(
     """The render runs in the poll loop's error arm, so an error that cannot be printed must not
     kill the poller: its line becomes a fixed note and its frames are kept.
 
-    Red mutation: drop the ``try`` in ``_safe_db_error``. The ``message withheld`` assertion reds:
-    ``_safe_db_exc_info``'s own fallback then catches the failure, so the poller still survives.
+    Red mutation: drop the ``try`` in ``_safe_db_error``. The direct call below raises. In the poll
+    log ``_poll_log_line``'s own ``try`` (BACKLOG #5348) then prints the same note, so the log
+    assertions alone no longer discriminate that mutation.
     """
+    exc = _UnprintableDriverError("22018", _SQLSERVER_CONVERT)
+    assert _safe_db_error(exc) == (
+        "_UnprintableDriverError [message withheld: AttributeError while rendering it]"
+    )
     src = _src(body_column="payload")
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
-        await _run_one_failed_poll(src, _UnprintableDriverError("22018", _SQLSERVER_CONVERT))
+        await _run_one_failed_poll(src, exc)
     assert "poll failed" in caplog.text
     assert "message withheld: AttributeError while rendering it" in caplog.text
     assert "in _select" in caplog.text
