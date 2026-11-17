@@ -318,10 +318,9 @@ function Get-AnonymousSessionRecords {
         [int]$StartSkewMinutes = 15,
         # The clock the ages are taken against, so a caller with its own -Now ages these records by
         # the same instant it ages everything else.
-        [Nullable[datetime]]$Now
+        # Taken as UTC, as box-activity.ps1 takes its own -Now, and never converted.
+        [datetime]$Now = [DateTime]::UtcNow
     )
-    # Taken as UTC, as box-activity.ps1 takes its own -Now, and never converted.
-    $now = if ($null -ne $Now) { $Now.Value } else { [DateTime]::UtcNow }
     $out = @()
     foreach ($r in @($Records)) {
         if (-not $r.Record -or [string](Get-RecordField $r.Record 'sessionId')) { continue }
@@ -345,17 +344,19 @@ function Get-AnonymousSessionRecords {
     return $out
 }
 
-# Does an anonymous record veto a lookup for -Worktree? Only when the two paths overlap: the record's
-# cwd is that worktree, inside it, or one of its parents. A parent counts because a session started
-# in the primary checkout can work in a worktree under it (BACKLOG #5491). A record with no readable
-# cwd, or a lookup that names no worktree, cannot be placed, so it vetoes wherever it is asked (fail
-# closed).
+# Does an anonymous record veto a lookup for -Worktree? Only when the two name one tree: the record's
+# cwd is that worktree or inside it, or is a git checkout (it holds a .git entry) that the worktree
+# sits under. That last case is a session started in the primary checkout, which can work in a
+# worktree under it (BACKLOG #5491); a plain parent such as a home directory or a drive root does
+# not reach. A record with no readable cwd, or a lookup that names no worktree, cannot be placed, so
+# it vetoes wherever it is asked (fail closed).
 function Test-AnonymousRecordReaches {
     param($Anonymous, [string]$Worktree)
     $w = ConvertTo-RegistryNormPath $Worktree
     if (-not $Anonymous.Cwd -or -not $w) { return $true }
     $c = $Anonymous.Cwd
-    return ($c -eq $w) -or $c.StartsWith($w + '\', 'Ordinal') -or $w.StartsWith($c + '\', 'Ordinal')
+    if (($c -eq $w) -or $c.StartsWith($w + '\', 'Ordinal')) { return $true }
+    return $w.StartsWith($c + '\', 'Ordinal') -and (Test-Path -LiteralPath (Join-Path $c '.git'))
 }
 
 # Look one session up by id (full or unique prefix) and fence it.
@@ -371,7 +372,7 @@ function Get-SessionLiveness {
         [double]$AnonymousFreshHours = 24,
         [string]$Worktree,
         # Passed to Get-AnonymousSessionRecords, which ages the anonymous records by it.
-        [Nullable[datetime]]$Now
+        [datetime]$Now = [DateTime]::UtcNow
     )
     $records = @(Get-SessionRecords -ConfigRoot $ConfigRoot)
     $hit = @($records |

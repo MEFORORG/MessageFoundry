@@ -284,8 +284,9 @@ function Invoke-RevList {
 # refs".
 #
 # With -Advertised (the branch and tag names the remote answered with), a tracking ref is kept only
-# when the remote's fetch refspecs map it back to one of those names: one whose source branch was
-# deleted on the remote is a stale local copy and backs nothing (BACKLOG #5502). Stale counts them.
+# when the remote's fetch refspecs map it back to one of those names, or to a source outside
+# refs/heads/ and refs/tags/ that the probe cannot see: one whose source branch was deleted on the
+# remote is a stale local copy and backs nothing (BACKLOG #5502). Stale counts them.
 # The object id is not compared, so a branch the remote rewound is still trusted at its old tip.
 function Get-RemoteOwnRefs {
     param([string]$Repo, [string]$Remote, [string[]]$AllRemotes, $Advertised, [string[]]$Refspecs)
@@ -298,9 +299,16 @@ function Get-RemoteOwnRefs {
         if ($sym) { continue }
         if (-not $name.StartsWith("refs/remotes/$Remote/", [StringComparison]::Ordinal)) { continue }
         if ($nested | Where-Object { $name.StartsWith("refs/remotes/$_/", [StringComparison]::Ordinal) }) { continue }
-        if ($null -ne $Advertised -and -not (@(Get-RefspecSource -Name $name -Refspecs $Refspecs) | Where-Object { $Advertised.Contains($_) })) {
-            $stale++
-            continue
+        if ($null -ne $Advertised) {
+            # The probe lists branches and tags only, so a source outside refs/heads/ and refs/tags/
+            # (a pull ref, a rescue namespace) cannot be checked and stays trusted, as before.
+            $sources = @(Get-RefspecSource -Name $name -Refspecs $Refspecs)
+            $checkable = @($sources | Where-Object { $_.StartsWith('refs/heads/', [StringComparison]::Ordinal) -or $_.StartsWith('refs/tags/', [StringComparison]::Ordinal) })
+            $uncheckable = $sources.Count -gt $checkable.Count
+            if (-not $uncheckable -and -not ($checkable | Where-Object { $Advertised.Contains($_) })) {
+                $stale++
+                continue
+            }
         }
         $own.Add([pscustomobject]@{ Name = $name; Oid = $oid })
     }
@@ -498,9 +506,6 @@ foreach ($p in $Path) {
             if ($hit) { $upstreamCandidates.Add($hit) }
         }
     }
-    # RELATED HISTORY is decided per ref, in the ref loop below: against HEAD it let an orphan branch
-    # be compared with a main it shares nothing with (BACKLOG #5502).
-    $upstreamCandidates = @($upstreamCandidates)
 
     # Branches as a snapshot of object ids: a branch deleted by another session after this listing is
     # still scanned from its id rather than failing, and a non-ASCII name is only ever displayed.
@@ -619,8 +624,9 @@ foreach ($p in $Path) {
 
     $repos += [pscustomobject]@{
         Repo                = $p
-        HasRemote           = ($remotes.Count -gt 0)
-        RemotesConfigured   = $remotes.Count
+        # Null, not false or 0, when `git remote` failed: an unread listing is not "no remote".
+        HasRemote           = $(if ($remoteList.Ok) { $remotes.Count -gt 0 } else { $null })
+        RemotesConfigured   = $(if ($remoteList.Ok) { $remotes.Count } else { $null })
         RemotesReachable    = $reachable.Count
         RemotesUnreachable  = $unreachable
         RemotesEmpty        = $emptyRemotes

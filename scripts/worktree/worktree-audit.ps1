@@ -137,7 +137,11 @@ function Get-StaleSeatLocks {
     try { $unreadable = @(Get-SessionRecords -ConfigRoot $ConfigRoot -IncludeUnreadable | Where-Object { $_.Unreadable }).Count } catch { }
     foreach ($x in $seatLocks) {
         $w = $x.W; $p = $x.P
-        $r = Get-SeatLockReading -SessionKey $p.SessionKey -ConfigRoot $ConfigRoot -Unreadable $unreadable -Worktree $w.Path
+        # The path comes from a `git worktree list` that Get-RepoWorktrees decodes with the console
+        # code page, so a non-ASCII one may be garbled and would never meet a record's cwd. Only a
+        # plain ASCII path scopes the veto; any other leaves it box-wide (fail closed).
+        $scope = if ([string]$w.Path -match '^[\x20-\x7E]+$') { [string]$w.Path } else { '' }
+        $r = Get-SeatLockReading -SessionKey $p.SessionKey -ConfigRoot $ConfigRoot -Unreadable $unreadable -Worktree $scope
         if (-not ($r.Gone -or $r.State -eq 'CODEX')) { continue }
         $out.Add([pscustomobject]@{ Path = $w.Path; Reason = $w.LockReason; Seat = $p.Seat; SessionKey = $p.SessionKey; State = $r.State; Detail = $r.Detail })
     }

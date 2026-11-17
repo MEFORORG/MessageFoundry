@@ -468,6 +468,7 @@ def test_with_no_usable_startedat_the_file_age_decides(
         ("elsewhere", "DEAD"),
         (None, "UNREADABLE"),
         ("parent", "UNREADABLE"),
+        ("plain-parent", "DEAD"),
         ("long-path-prefix", "UNREADABLE"),
         ("dot-segments", "UNREADABLE"),
         ("sibling-prefix", "DEAD"),
@@ -477,7 +478,8 @@ def test_with_no_usable_startedat_the_file_age_decides(
         "inside-worktree",
         "other-worktree",
         "no-cwd-fails-closed",
-        "parent-of-worktree",
+        "checkout-holding-the-worktree",
+        "plain-parent-does-not-reach",
         "long-path-prefix",
         "dot-segments",
         "sibling-sharing-a-prefix",
@@ -487,18 +489,22 @@ def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
     config_root: Path, tmp_path: Path, anon_cwd: str | None, state: str
 ) -> None:
     """A record naming no session vetoes a lookup for its own tree, case, slashes and a \\\\?\\ or
-    ``..`` spelling aside, and one for a tree under it, as a primary checkout holds its worktrees.
-    It does not veto another tree, even one whose name starts with this one's. One with no readable
-    cwd cannot be placed, so it vetoes everywhere."""
-    here = tmp_path / "wt-here"
+    ``..`` spelling aside, and one for a tree under a git checkout it sits in, as a primary
+    checkout holds its worktrees. A plain parent directory does not reach, nor does another tree,
+    even one whose name starts with this one's. One with no readable cwd cannot be placed, so it
+    vetoes everywhere."""
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    here = checkout / "wt-here"
     cwds = {
         "here": str(here).upper().replace("\\", "/") + "/",
         "here-sub": str(here / "sub"),
         "elsewhere": str(tmp_path / "wt-elsewhere"),
-        "parent": str(tmp_path),
+        "parent": str(checkout),
+        "plain-parent": str(tmp_path),
         "long-path-prefix": "\\\\?\\" + str(here),
-        "dot-segments": str(tmp_path / "x" / ".." / "wt-here"),
-        "sibling-prefix": str(tmp_path / "wt-here-too"),
+        "dot-segments": str(checkout / "x" / ".." / "wt-here"),
+        "sibling-prefix": str(checkout / "wt-here-too"),
     }
     write_session(config_root, pid=never_live_pid(), session_id="5491abab-0000")
     record: dict[str, Any] = {"pid": os.getpid(), "startedAt": NOW_MS}
@@ -508,6 +514,22 @@ def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
     got = _strict(
         f"(Get-SessionLiveness -SessionId '5491abab' -ConfigRoot '{config_root}' "
         f"-Worktree '{here}').State"
+    )
+    assert got == state
+
+
+@pytest.mark.parametrize(("hours_ahead", "state"), [(0, "UNREADABLE"), (48, "UNKNOWN")])
+def test_a_callers_now_ages_the_anonymous_records(
+    config_root: Path, tmp_path: Path, hours_ahead: int, state: str
+) -> None:
+    """box-activity.ps1 passes its own -Now. A fresh record naming no session vetoes at the real
+    time and has aged out 48 hours later, by the caller's clock rather than the wall clock. A
+    nullable -Now read through .Value threw here under StrictMode."""
+    wt = tmp_path / "wt-now"
+    _anonymous(config_root, "99017.json", {"startedAt": NOW_MS, "cwd": str(wt)})
+    got = _strict(
+        f"(Get-SessionLiveness -SessionId '5491e5e5' -ConfigRoot '{config_root}' "
+        f"-Worktree '{wt}' -Now ([DateTime]::UtcNow.AddHours({hours_ahead}))).State"
     )
     assert got == state
 
@@ -604,8 +626,8 @@ def test_fleet_reads_a_seat_with_an_anonymous_record_in_its_worktree_as_possibly
     tmp_path: Path,
 ) -> None:
     """The record may be this seat relaunched, so the seat must not read INTERRUPTED, which -Chip and
-    respawn.ps1 treat as respawnable. It counts as a live session without reading as a writer that
-    failed, and the receipt names it."""
+    respawn.ps1 treat as respawnable, and the receipt names it. The seat's worktree is not a
+    registered git worktree here, so the denominator test below covers counting."""
     proc, anon = _fleet(tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS})
     j = _fleet_json(proc)
     row = {r["Box"]: r for r in j["rows"]}["box-5491"]
@@ -613,7 +635,6 @@ def test_fleet_reads_a_seat_with_an_anonymous_record_in_its_worktree_as_possibly
     receipt = j["receipt"]
     assert receipt["anonymousLiveRecords"] == 1, receipt
     assert str(anon) in receipt["anonymousLiveRecordFiles"]
-    assert receipt["liveSessionsWithoutRecord"] == 0, receipt
 
 
 def test_fleet_leaves_a_seat_alone_when_the_anonymous_record_is_in_another_worktree(
@@ -646,14 +667,9 @@ def test_fleet_renders_with_no_anonymous_record(tmp_path: Path) -> None:
 def test_fleet_suppresses_the_roster_when_the_anonymous_scan_fails(tmp_path: Path) -> None:
     """An instrument that failed must not read as no record. The scan is made to throw in a copy of
     the scripts, so the real ones are untouched."""
-    coord = tmp_path / "coord"
-    coord.mkdir()
-    for name in ("fleet.ps1", "mail-key.ps1", "coord-root.ps1"):
-        shutil.copy2(REGISTRY.parent / name, coord / name)
-    broken = REGISTRY.read_text(encoding="utf-8") + (
-        "\nfunction Get-AnonymousSessionRecords { throw 'scan-broke-5491' }\n"
+    coord = _broken_coord(
+        tmp_path, "function Get-AnonymousSessionRecords { throw 'scan-broke-5491' }"
     )
-    (coord / "session-registry.ps1").write_text(broken, encoding="utf-8")
     proc, _ = _fleet(tmp_path, None, coord=coord)
     assert proc.returncode == 4, proc.stdout + proc.stderr
     assert not proc.stdout.strip(), proc.stdout
@@ -691,9 +707,12 @@ def test_fleet_reads_a_seat_whose_lookup_throws_as_possibly_running(tmp_path: Pa
     INTERRUPTED, which -Chip and respawn.ps1 treat as respawnable."""
     coord = _broken_coord(tmp_path, "function Get-SessionLiveness { throw 'lookup-broke-5491' }")
     proc, _ = _fleet(tmp_path, None, coord=coord)
-    row = {r["Box"]: r for r in _fleet_json(proc)["rows"]}["box-5491"]
+    j = _fleet_json(proc)
+    row = {r["Box"]: r for r in j["rows"]}["box-5491"]
     assert row["Fence"] == "UNREADABLE", row
     assert row["State"] == "POSSIBLY RUNNING", row
+    # The receipt says the instrument failed, so a broken fence cannot pass for a busy fleet.
+    assert "lookup-broke-5491" in json.dumps(j), j
 
 
 def test_fleet_reaches_its_refusal_on_an_empty_object_registry_file(tmp_path: Path) -> None:

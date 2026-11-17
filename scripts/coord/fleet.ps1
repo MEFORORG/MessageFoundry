@@ -148,10 +148,9 @@ try {
     $fenceAvailable = $false
 }
 
-function Get-NormPath([string]$p) {
-    if (-not $p) { return '' }
-    return ($p.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\')
-}
+# The registry's own normalizer, so the denominator and the anonymous-record veto read one cwd the
+# same way.
+function Get-NormPath([string]$p) { return (ConvertTo-RegistryNormPath $p) }
 
 # Worktrees of THIS clone, so the denominator is scoped to this repo rather than to the whole box.
 $repoWorktrees = @()
@@ -427,6 +426,8 @@ foreach ($r in $records) {
 $frozenLegacy = @{}
 
 $rows = @()
+# Seat lookups that threw. Each such seat reads POSSIBLY RUNNING, and the receipt says why.
+$lookupFailures = @()
 foreach ($r in $records) {
     $rec = $r.Rec
     $wt = if ($rec.PSObject.Properties.Name -contains 'worktree') { [string]$rec.worktree } else { '' }
@@ -443,7 +444,11 @@ foreach ($r in $records) {
         # while one in another worktree leaves this seat's own verdict alone.
         # A lookup that throws is an unevaluated fence, not a gone session: UNREADABLE reads POSSIBLY
         # RUNNING, where UNKNOWN read INTERRUPTED and invited a respawn (BACKLOG #5491).
-        try { $fence = (Get-SessionLiveness -SessionId $sid -Worktree $wt).State } catch { $fence = 'UNREADABLE' }
+        try { $fence = (Get-SessionLiveness -SessionId $sid -Worktree $wt).State }
+        catch {
+            $fence = 'UNREADABLE'
+            $lookupFailures += "$($r.File): $($_.Exception.GetType().Name) $($_.Exception.Message)"
+        }
     }
 
     $lifecycle = if ($rec.PSObject.Properties.Name -contains 'lifecycle') { [string]$rec.lifecycle } else { 'open' }
@@ -515,6 +520,7 @@ if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root wi
 if ($anonymousReadError) { $stops += "anonymousLiveRecords=UNREAD -- the scan for registry records that name no session failed ($anonymousReadError), so a relaunched seat could read INTERRUPTED below" }
 if ($anonymousNoCwd.Count -gt 0) { $stops += "anonymousLiveRecordsWithNoCwd=$($anonymousNoCwd.Count) -- registry record(s) name no session, are live or freshly written, and name no readable cwd ($($anonymousNoCwd -join '; ')), so no seat can be told apart from a relaunch of it" }
 if ($liveWithoutRecord.Count -gt 0) { $stops += "liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- live session(s) in this repo's worktrees match no seat record (the writer is not running there, or the registry record names no session yet), so this roster is INCOMPLETE by that many" }
+if ($lookupFailures.Count -gt 0) { $stops += "seatLookupsFailed=$($lookupFailures.Count) -- the liveness lookup threw for these seat records, which read POSSIBLY RUNNING because the fence could not be evaluated: $($lookupFailures -join '; ')" }
 if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExamined=0 AND writerHeartbeatIn=0 -- indistinguishable from a writer that was never installed' }
 # BOTH DIRECTIONS FIRE, and the null one is the reason this rung exists (BACKLOG #1374). The old
 # guard was `-ne $null -and -gt 60`, so the one state where the instrument knows nothing was the one
