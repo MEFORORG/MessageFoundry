@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime, time
 from enum import Enum
-from typing import Any
+from typing import Any, Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
@@ -737,6 +737,10 @@ class SignatureAlgorithm(str, Enum):  # noqa: UP042
     ES384 = "ES384"  # ECDSA P-384 (secp384r1) + SHA-384 (EC key; randomized) — SMART Backend Services (ADR 0024)
 
 
+#: ``sign_enabled`` read as the model reads it, with the input kept out of any error (BACKLOG #296).
+_SIGN_FLAG: Final = TypeAdapter(bool, config=ConfigDict(hide_input_in_errors=True))
+
+
 class OutboundSigning(_InputHidingModel):
     """Opt-in per-connection message signing for a **REST/SOAP outbound** (ASVS 4.1.5, ADR 0018).
 
@@ -774,16 +778,20 @@ class OutboundSigning(_InputHidingModel):
         ``sign_algorithm``, ``sign_private_key``, ``sign_private_key_password``, ``sign_key_id``,
         ``sign_header``. An unknown/typo'd field raises (``extra='forbid'``).
 
-        An empty key with ``sign_enabled`` true raises ``ValueError`` (BACKLOG #5364): signing was
-        asked for, so reading the missing key as "off" would deliver every message unsigned."""
+        An empty key raises ``ValueError`` when ``sign_enabled`` is set and is not false (BACKLOG
+        #5364): signing was asked for, or left undecided by an ``env()`` flag, and reading the
+        missing key as "off" would deliver every message unsigned. With a key, the model refuses an
+        undecided flag the same way."""
         key = settings.get("sign_private_key")
         if not key:
-            enabled = settings.get("sign_enabled")
-            # Pydantic's own bool coercion, so a flag the model would read as on is refused here too.
-            if enabled is not None and TypeAdapter(bool).validate_python(enabled):
+            if "sign_enabled" not in settings:
+                return None
+            enabled = settings["sign_enabled"]
+            # The model's own bool coercion, input hidden, so a flag it reads as on is refused here.
+            if enabled is None or _SIGN_FLAG.validate_python(enabled):
                 raise ValueError(
-                    "sign_enabled is true but sign_private_key is empty; set the signing key, or "
-                    "set sign_enabled to false to send unsigned"
+                    "sign_enabled is not false but sign_private_key is empty; set the signing key, "
+                    "or set sign_enabled to false to send unsigned"
                 )
             return None
         data: dict[str, Any] = {"private_key": key}

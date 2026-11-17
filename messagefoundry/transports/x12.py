@@ -528,6 +528,7 @@ class X12Destination(DestinationConnector):
         the read-failure arm of the ADR 0013/0016 read/parse split, not the captured ``unparseable``
         arm, which is a reply known to answer this send."""
         text = interchange.decode(self.encoding, errors="replace")
+        unparseable: str | None = None
         try:
             msg = X12Message.parse(interchange)
         except X12PeekError as exc:
@@ -539,9 +540,11 @@ class X12Destination(DestinationConnector):
                     outcome="unparseable",
                     detail=f"unparseable X12 reply: {safe_exc(exc)}",  # scrub: a bad reply can embed a fragment (#120)
                 )
-            # Scrubbed like the capturing arm, and not chained: a traceback renders the cause's raw
-            # text, which can carry a reply fragment into a log (BACKLOG #5365).
-            raise DeliveryError(f"unparseable X12 reply: {safe_exc(exc)}") from None
+            # Scrubbed like the capturing arm, and raised below, outside this handler, so neither
+            # __cause__ nor __context__ carries the parse error's raw text (BACKLOG #5365).
+            unparseable = f"unparseable X12 reply: {safe_exc(exc)}"
+        if unparseable is not None:
+            raise DeliveryError(unparseable)
         functional = [sid for sid in msg.segment_ids() if sid != "ISA"]
         if functional and functional[0] == "TA1":
             sent_isa13 = _sent_isa13(payload)

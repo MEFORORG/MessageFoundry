@@ -525,8 +525,8 @@ class DirectDestination(DestinationConnector):
         self.recipients = list(self._envelope.recipients)
         self.subject = str(s.get("subject", ""))
         # The Email destination's subject rule, imported so the two cannot drift (vault BACKLOG
-        # #5360). _probe_build below catches neither a lone surrogate (vault BACKLOG #2842) nor a
-        # control character the header writes raw, from the text or from a decoded encoded word.
+        # #5360). _probe_build below does not catch every lone surrogate (vault BACKLOG #2842), nor
+        # a control character the header writes raw, from the text or from a decoded encoded word.
         refuse_unsafe_subject(self.subject, transport="Direct destination")
         username = s.get("username")
         password = s.get("password")
@@ -934,8 +934,8 @@ class DirectDestination(DestinationConnector):
         Every build input except the body is fixed by now: keys, certs, cipher, subject, addresses
         and codec. A fault in any of them would repeat on every send, and the send-time arm maps a
         build failure to a permanent per-message dead-letter, so without this a connection-wide fault
-        (a FIPS OpenSSL refusing the envelope builder, a library that stopped accepting a key, a
-        line break inside the subject) would quietly drain the whole queue into the dead-letter
+        (a FIPS OpenSSL refusing the envelope builder, a library that stopped accepting a key) would
+        quietly drain the whole queue into the dead-letter
         store. The body is synthetic, so the library's own text is safe to show.
 
         An unknown ``encoding`` never gets this far on a config path: config load refuses a literal

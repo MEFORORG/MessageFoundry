@@ -312,9 +312,10 @@ def test_from_settings_enabled_false_disables(ec_pem: str) -> None:
 
 
 @pytest.mark.parametrize("key", ["", None])
-@pytest.mark.parametrize("enabled", [True, "true", 1])
+@pytest.mark.parametrize("enabled", [True, "true", 1, None])
 def test_from_settings_enabled_with_empty_key_refuses(key: str | None, enabled: object) -> None:
-    # BACKLOG #5364: signing asked for with no key must not read as "off" and deliver unsigned.
+    # BACKLOG #5364: signing asked for with no key must not read as "off" and deliver unsigned. An
+    # undecided (None) flag is refused too, as the model refuses it when a key is present.
     settings = {"sign_enabled": enabled, "sign_private_key": key}
     with pytest.raises(ValueError, match="sign_private_key is empty"):
         OutboundSigning.from_settings(settings)
@@ -322,9 +323,16 @@ def test_from_settings_enabled_with_empty_key_refuses(key: str | None, enabled: 
         signer_from_destination(Destination(name="OB", type=ConnectorType.REST, settings=settings))
 
 
-@pytest.mark.parametrize("enabled", [False, None])
-def test_from_settings_empty_key_not_enabled_stays_off(enabled: object) -> None:
-    assert OutboundSigning.from_settings({"sign_enabled": enabled, "sign_private_key": ""}) is None
+@pytest.mark.parametrize("settings", [{"sign_enabled": False}, {"sign_enabled": "false"}, {}])
+def test_from_settings_empty_key_not_enabled_stays_off(settings: dict[str, object]) -> None:
+    assert OutboundSigning.from_settings({**settings, "sign_private_key": ""}) is None
+
+
+def test_from_settings_unreadable_flag_with_empty_key_hides_the_value() -> None:
+    # The flag is read with its input hidden, as the model reads it (BACKLOG #296).
+    with pytest.raises(ValidationError) as caught:
+        OutboundSigning.from_settings({"sign_enabled": "probe-7f3a", "sign_private_key": ""})
+    assert "probe-7f3a" not in str(caught.value)
 
 
 def test_outbound_signing_forbids_unknown_field(ec_pem: str) -> None:
