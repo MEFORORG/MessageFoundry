@@ -61,8 +61,8 @@ class LoginRequest(RequestModel):
     # lookup, where PostgreSQL refuses it with an error this route does not catch, so the route
     # would answer 500 outside its failure-timing pad. Only the NUL: PostgreSQL text cannot hold
     # one, so no account on that store has one, while other control characters can reach a stored
-    # name through paths ``username_refusal`` does not govern, such as provision-admin. Other
-    # sign-in routes are not covered by this model (``messagefoundry_webconsole``'s form login).
+    # name through paths ``username_refusal`` does not govern, such as provision-admin. This covers
+    # only the JSON route; at least the web console's form login reaches the service without it.
     username: str = Field(max_length=_NAME_MAX, pattern=_NO_NUL_PATTERN)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'

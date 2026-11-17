@@ -1214,15 +1214,11 @@ def _subst_s(drive: str) -> str | None:
     return "\\??\\C:\\real" if drive == "S:" else None
 
 
-def _no_subst(_drive: str) -> str | None:
-    return None
-
-
 @pytest.mark.parametrize(
     ("anchor", "cwd", "drive_target"),
     [
         # ``C:`` joined to ``ca.pem`` reads ``C:ca.pem``. Red: walked as C:\ca.pem, from the root.
-        ("ca.pem", "C:", _no_subst),
+        ("ca.pem", "C:", ap._no_drive_target),
         # A subst drive as that working directory. Red: spliced as C:\realcerts\ca.pem.
         ("certs\\ca.pem", "S:", _subst_s),
     ],

@@ -179,17 +179,23 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
     0068 decision 1 requires rather than escape as a 500. Use it only around library calls, never
     around our own logic, where the same exceptions would mean a bug.
 
-    ``RecursionError`` joins them for a response nested past json's depth limit, which the
-    library's own ``json.loads`` raises and does not wrap (vault BACKLOG #5341). Its message names
-    the stack use, not the input. It covers a response that reaches the library as text; a route
-    that parses the body itself first raises its own ``RecursionError`` there, which this does
-    not cover.
-
     A function rather than a constant because the library import is lazy (the extra is optional).
     """
     from webauthn.helpers.exceptions import WebAuthnException
 
-    return (WebAuthnException, LookupError, TypeError, ValueError, RecursionError)
+    return (WebAuthnException, LookupError, TypeError, ValueError)
+
+
+def _invalid_response_errors() -> tuple[type[Exception], ...]:
+    """:func:`_invalid_input_errors` plus ``RecursionError``, for the library's parse of a ceremony
+    RESPONSE only (vault BACKLOG #5341). The library's own ``json.loads`` raises it, unwrapped, for
+    a response nested too deep for the stack. Its message names stack use, not the input.
+
+    Not around the stored-key check: a key that registered once has no such nesting, so there a
+    ``RecursionError`` would mean a low stack, not a bad credential. Nor does it reach a caller
+    that parses the body itself before calling in: at least the web console's passkey routes do,
+    and their own parse raises it first."""
+    return (*_invalid_input_errors(), RecursionError)
 
 
 def _refusal(exc: Exception, *, ceremony: _Ceremony) -> WebAuthnVerificationError:
@@ -593,7 +599,7 @@ def verify_registration(
             expected_origin=origin,
             supported_pub_key_algs=_supported_pub_key_algs(),
         )
-    except _invalid_input_errors() as exc:
+    except _invalid_response_errors() as exc:
         # The BASE class, deliberately (PR-A review HIGH): structurally-malformed browser input
         # raises siblings of InvalidRegistrationResponse (InvalidJSONStructure, InvalidCBORData,
         # ...) — every library-side rejection must land on the audited return-False/400 path,
@@ -691,7 +697,7 @@ def verify_assertion(
             credential_public_key=public_key,
             credential_current_sign_count=current_sign_count,
         )
-    except _invalid_input_errors() as exc:
+    except _invalid_response_errors() as exc:
         # The BASE class, deliberately (PR-A review HIGH): malformed input raises siblings of
         # InvalidAuthenticationResponse — every rejection lands audited, never a 500. The
         # sign-count regression message ("...sign count...") still rides through for the
@@ -786,11 +792,13 @@ def resident_key_from_response(response_json: str) -> bool | None:
 
 def _transports_from_response(response_json: str) -> list[str] | None:
     """Best-effort ``response.transports`` extraction (browser hint — absence is fine)."""
-    try:
-        parsed = json.loads(response_json)
-        transports = parsed.get("response", {}).get("transports")
-    except (ValueError, AttributeError):  # pragma: no cover - verify_registration already parsed
+    # The same refusal-safe parse as resident_key_from_response, so a RecursionError here cannot
+    # escape after the library's own parse succeeded (vault BACKLOG #5341).
+    parsed, refused = json_loads_or_refusal(response_json)
+    if refused is not None or not isinstance(parsed, dict):
         return None
+    response = parsed.get("response")
+    transports = response.get("transports") if isinstance(response, dict) else None
     if isinstance(transports, list) and all(isinstance(t, str) for t in transports):
         return list(transports) or None
     return None

@@ -1826,7 +1826,8 @@ _TOO_DEEP = '{"id": ' + "[" * 100_000 + "]" * 100_000 + "}"
 
 
 def test_a_deeply_nested_registration_response_is_the_audited_refusal() -> None:
-    """vault BACKLOG #5341. Red: json's RecursionError escaped verify_registration, a 500."""
+    """vault BACKLOG #5341, at this module's seam only. Red: the library's RecursionError escaped
+    verify_registration. A route that parses the body itself first is not covered here."""
     with pytest.raises(wa.WebAuthnVerificationError):
         wa.verify_registration(
             response_json=_TOO_DEEP, challenge=b"c" * 32, rp_id=RP, origin=ORIGIN

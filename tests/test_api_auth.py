@@ -3703,14 +3703,23 @@ async def test_login_refuses_a_nul_username_before_the_store(
     [{"username": "s\x01up"}, {"username": ""}, {"supersedes": "tok\x00en"}, {"supersedes": ""}],
 )
 async def test_login_still_reaches_the_service_for_other_unusual_values(
-    engine: Engine, fields: dict[str, str]
+    engine: Engine, fields: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The controls: another control character, an empty name, and a ``supersedes`` holding a NUL
-    (only ever hashed, never sent to the store) are not refused by the body, so they are still
-    charged, padded and audited as a failed or plain sign-in, as before."""
+    (only ever hashed, never sent to the store) are not refused by the body. They reach
+    ``AuthService.login`` as before, and answer as it decides."""
     service = await _service(engine, AuthSettings(require_mfa=False))
     await _add(service, "sup", Role.VIEWER)
+    reached: list[str] = []
+    real_login = service.login
+
+    async def _spy(username: str, *args: Any, **kwargs: Any) -> Any:
+        reached.append(username)
+        return await real_login(username, *args, **kwargs)
+
+    monkeypatch.setattr(service, "login", _spy)
     async with _client(engine, service) as c:
-        r = await c.post("/auth/login", json={"username": "sup", "password": PW, **fields})
-        expected = 200 if "supersedes" in fields else 401
-        assert r.status_code == expected
+        body = {"username": "sup", "password": PW, **fields}
+        r = await c.post("/auth/login", json=body)
+        assert reached == [body["username"]]
+        assert r.status_code == (200 if "supersedes" in fields else 401)
