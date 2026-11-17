@@ -652,6 +652,8 @@ function Wait-ForGateRefusal([string]$Phase) {
       $false on timeout, and $false at once, with a reading quoting it, when the gate's clause is
       logged without the refusal: the engine read its users and the gate let the start go on.
     #>
+    # Read by callers after a $false, so a failure text never names a lockout the gate ruled out.
+    $script:GateLetStartSeen = $false
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ((Get-Date) -lt $deadline) {
         Update-OwnerSample "during $Phase"
@@ -663,6 +665,7 @@ function Wait-ForGateRefusal([string]$Phase) {
         if ($letStart.Count -gt 0) {
             Add-Reading ("during $Phase the service reached the ADR 0167 gate, which did not refuse " +
                 "the start: $(Get-Excerpt $letStart[0].Line 300)")
+            $script:GateLetStartSeen = $true
             return $false
         }
         Start-Sleep -Seconds 1
@@ -1070,6 +1073,11 @@ try {
                 Stop-TheService
                 if ($own) {
                     Add-Reading "control: $ServiceIdentity reopened the store it created, so the store is restricted to the service and not to nobody"
+                } elseif ($script:GateLetStartSeen) {
+                    Add-Failure ("control: $ServiceIdentity reopened the store it created and reached " +
+                        "the ADR 0167 gate, which let the start go on (the reading above), so this " +
+                        "control expected a refusal it did not get; the store's access is not in question.")
+                    Show-LogTail
                 } else {
                     Add-Failure ("control: $ServiceIdentity could not reopen even the store it created " +
                         "itself, which nobody else touched, so its own first open locked out every " +
@@ -1094,7 +1102,12 @@ try {
                 } else {
                     $reopened = Wait-ForGateRefusal "the restart"
                     Stop-TheService
-                    if (-not $reopened) {
+                    if (-not $reopened -and $script:GateLetStartSeen) {
+                        Add-Failure ("$ServiceIdentity opened $DbPath after $Operator's open and reached " +
+                            "the ADR 0167 gate, which let the start go on (the reading above), so the " +
+                            "restart expected a refusal it did not get; the store's access is not in question.")
+                        Show-LogTail
+                    } elseif (-not $reopened) {
                         Add-Failure ("$ServiceIdentity could not open $DbPath after $Operator's open " +
                             "re-secured it: the restart logged no ADR 0167 refusal in $WaitSeconds s. " +
                             (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))

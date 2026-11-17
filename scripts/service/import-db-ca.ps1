@@ -488,8 +488,9 @@ $nowUtc = [datetime]::UtcNow
 $refusals = [System.Collections.Generic.List[string]]::new()
 # Each certificate is checked before it is shown, so a refused one is listed with its reason and
 # never with a store it would not go to. The store shown is the one it is offered for and written to.
-# A certificate that passes on its own must also reach a root through this file's own certificates,
-# so a root that signed none of them cannot carry an unrelated issuing CA in beside it.
+# A certificate that passes on its own must also reach a self-signed root through this file's own
+# certificates, so an issuing CA whose root is not in the file is refused. Any self-signed CA in the
+# file is its own anchor and passes, so an unrelated root in the file is installed in Root too.
 Write-Host "The file holds $($bundle.Count) certificate(s):"
 $unverifiedRoot = $false
 $entries = @(foreach ($cert in $bundle) {
@@ -612,6 +613,6 @@ if ($approved.Count -gt 0) {
     Write-Host "trust_server_certificate = false (no TrustServerCertificate=true needed)." -ForegroundColor Green
     Write-Host ""
     Write-Host "Rotation: when the CA is replaced, import the NEW CA first (this leaves both trusted),"
-    Write-Host "roll the server cert, then remove only the old certificates that the new chain and"
-    Write-Host "nothing else still needs -- see docs/DEPLOY-SERVER-DB.md section 5.3."
+    Write-Host "roll the server cert, then remove only the old certificates that neither the new chain"
+    Write-Host "nor anything else still needs -- see docs/DEPLOY-SERVER-DB.md section 5.3."
 }
