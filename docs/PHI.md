@@ -117,7 +117,20 @@ error text, unwrapped, as every reason of a single decrypt's 400. That shape was
 either project's source at a commit, so a release that wraps or prefixes the text would turn such a
 refusal back into the cipher's own error, unaudited and unalerted. A queue payload cell still
 classifies through `is_tag_failure`, which counts every marked Transit value as held, so under
-`vault_transit` any failure to open one, an outage included, reads as a queue tag failure. Transit
+`vault_transit` any refusal of one Transit gave a verdict on reads as a queue tag failure, and is
+dead-lettered and alerted as before. A failure on which Transit gave no verdict about the row is
+no tag failure, and the claim does not dead-letter the row (BACKLOG #5765, #5735). Which failures
+are verdicts is stated once, in `_key_service_gave_no_verdict` in `store/queue_tag.py`. Only a row the pooled dispatcher claims through `claim_fifo_heads` takes the ADR 0070
+infra-fault path, so a fault that lasts there stops the lane with a `connection_stopped` alert
+under `infra_fault_policy = "stop"`, or raises `lane_stuck` under `retry_forever`. That covers the
+FIFO lanes under the default `claim_mode = "pooled"`, and no other claim. Every other claim sets the
+row aside for five seconds, and it is retried at least five seconds later, or up to about 30
+seconds later under `per_lane_wake`, where the set-aside arms no wake and the retry waits for the
+idle backstop. It is retried with no cap and no alert of its own while the failure lasts. A lasting
+outage there is recorded by at least a WARNING log line per retry, and an alert that watches the
+lane, such as `message_stall` or `queue_buildup`, may also fire. At least these claims take that path: every claim under `claim_mode = "per_lane"`, and under
+`pooled` an unordered outbound lane's `claim_ready` (ADR 0066 D4) and the extra rows a batch
+window claims through `claim_next_fifo`. Transit
 gives the same AEAD refusal when the data key it is pointed at is not the one that sealed the cell,
 so a recreated key, or another Vault's key of the same name, would read as a moved cell for every
 such cell. An unmarked value refused in a message or saved-search cell is audited, and its alert is
