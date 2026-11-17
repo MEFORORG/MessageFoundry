@@ -90,6 +90,8 @@ _ENGINE_PACKAGES = ("messagefoundry", "messagefoundry_webconsole", "messagefound
 _REPO = Path(__file__).resolve().parents[1]
 
 __all__ = [
+    "ArgumentUnplaced",
+    "argument_for",
     "call_sites",
     "callee_name",
     "calls_to",
@@ -158,6 +160,49 @@ def call_sites(node: ast.AST, name: str, *, bare_only: bool = False) -> list[ast
 def keyword_value(call: ast.Call, name: str) -> ast.expr | None:
     """The expression ``call`` passes as keyword ``name``, or ``None`` when it passes none."""
     return next((kw.value for kw in call.keywords if kw.arg == name), None)
+
+
+class ArgumentUnplaced(LookupError):
+    """:func:`argument_for` cannot tell which argument binds the parameter without running the call."""
+
+
+def argument_for(
+    call: ast.Call, func: ast.FunctionDef | ast.AsyncFunctionDef, param: str, *, receiver: bool
+) -> ast.expr | None:
+    """The expression ``call`` binds to ``func``'s parameter ``param``, or ``None`` when it binds
+    none, so the default applies.
+
+    ``receiver`` is True when ``func``'s first parameter is bound by the call's receiver rather than
+    by an argument: a method called as ``obj.method(...)``. Deciding that is the caller's, because it
+    depends on how ``func`` is decorated and on what the call's receiver is.
+
+    The binding follows Python's: a positional-only parameter is never bound by a keyword, and an
+    ordinary one is bound by position first, then by keyword. Raises :class:`ArgumentUnplaced` when
+    a starred argument sits at or before the parameter's position, or a ``**`` argument could carry
+    it. Raises ``ValueError`` when ``func`` has no such parameter.
+    """
+    positional = [arg.arg for arg in (*func.args.posonlyargs, *func.args.args)]
+    positional_only = {arg.arg for arg in func.args.posonlyargs}
+    if receiver:
+        if not positional:
+            raise ValueError(f"{func.name} takes no receiver parameter")
+        positional_only.discard(positional[0])
+        positional = positional[1:]
+    double_starred = any(kw.arg is None for kw in call.keywords)
+    if param in positional:
+        slot = positional.index(param)
+        if any(isinstance(arg, ast.Starred) for arg in call.args[: slot + 1]):
+            raise ArgumentUnplaced(param)
+        if slot < len(call.args):
+            return call.args[slot]
+        if param in positional_only:
+            return None
+    elif param not in {arg.arg for arg in func.args.kwonlyargs}:
+        raise ValueError(f"{func.name} has no parameter {param!r}")
+    found = keyword_value(call, param)
+    if found is None and double_starred:
+        raise ArgumentUnplaced(param)
+    return found
 
 
 def code_names(node: ast.AST) -> set[str]:

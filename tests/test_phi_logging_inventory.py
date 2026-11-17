@@ -40,6 +40,8 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.logging_setup import __all__ as _LOGGING_SETUP_EXPORTS
 from tests._ast_sites import (
+    ArgumentUnplaced,
+    argument_for,
     call_sites,
     callee_name,
     code_names,
@@ -362,55 +364,297 @@ def test_every_audit_floor_event_is_named_as_such_in_row_6() -> None:
 #: the ``event`` slot is read from each file's own ``def`` rather than assumed.
 _EVENT_HELPERS = frozenset({"_event", "_event_stmt", "_event_sync"})
 
+#: The one store method that forwards a caller's kind to the helpers. The scan cannot read what a
+#: caller passes, so ``check_caller_event_kind`` refuses an undeclared kind there at run time.
+_CALLER_KIND_METHOD = "record_message_event"
 
-def _literal_event_kinds(source: str) -> set[str]:
-    """Every literal ``event`` a backend source passes to its own message_events write helpers.
+#: Declared kinds no store writes itself: only a caller writes them, through
+#: :data:`_CALLER_KIND_METHOD`. Pinned, so a kind leaving the store's own writes is a visible change.
+_CALLER_ONLY_EVENT_KINDS = frozenset({"reply_returned", "reply_timeout"})
 
-    The ``event`` position comes from each helper's signature in ``source``, minus ``self``, and a
-    keyword ``event=`` is read too. A helper with no ``event`` parameter, or a call to a helper the
-    file does not define, fails here rather than being skipped, because a skipped helper is the
-    blind spot this guard exists to close.
+_RAW_EVENT_INSERT = "INSERT INTO message_events"
 
-    A call whose ``event`` argument cannot be placed (a starred argument at or before the slot, or
-    ``event`` passed through ``**kwargs``) fails too.
 
-    Scope, which this does NOT read: a kind passed as a variable or a name rather than a string
-    literal at the call (the routed/filtered/unrouted mapping, for one), a helper reached under
-    another name (an alias or a ``functools.partial``), and a raw
-    ``INSERT INTO message_events`` that bypasses the helpers, as three of SQLite's do. Nothing in
-    this module checks a kind written on those paths. ``check_caller_event_kind`` refuses an
-    undeclared kind at run time only on the public ``record_message_event`` path, not inside the
-    store's own ``_event`` calls.
-    """
-    slots: dict[str, int] = {}
-    calls: list[tuple[str, ast.Call]] = []
-    for node in ast.walk(parse_source(source)):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in _EVENT_HELPERS:
-            params = [a.arg for a in (*node.args.posonlyargs, *node.args.args)]
-            params = params[1:] if params[:1] in (["self"], ["cls"]) else params
-            assert "event" in params, f"{node.name} has no `event` parameter; re-aim this guard"
-            slot = params.index("event")
-            assert slots.setdefault(node.name, slot) == slot, f"two {node.name} signatures disagree"
-        elif isinstance(node, ast.Call) and (name := callee_name(node)) in _EVENT_HELPERS:
-            calls.append((name, node))
-    undefined = sorted({name for name, _call in calls} - set(slots))
-    assert not undefined, (
-        f"calls to {undefined}, which this source does not define; re-aim the scan"
-    )
-    kinds: set[str] = set()
-    unread: list[str] = []
-    for name, call in calls:
-        slot = slots[name]
-        if any(isinstance(arg, ast.Starred) for arg in call.args[: slot + 1]):
-            unread.append(ast.unparse(call))  # the event's position is known only at run time
+def _module_strings(tree: ast.Module) -> dict[str, str]:
+    """Module-level names bound once, to a string literal."""
+    bound: dict[str, list[ast.expr]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            value = node.value
+        else:
             continue
-        value = call.args[slot] if slot < len(call.args) else keyword_value(call, "event")
-        if value is None:
-            unread.append(ast.unparse(call))  # passed through **kwargs, or not at all
-        elif isinstance(value, ast.Constant) and isinstance(value.value, str):
-            kinds.add(value.value)
-    assert not unread, f"event helper calls whose `event` argument the scan cannot place: {unread}"
-    return kinds
+        for target in targets:
+            if isinstance(target, ast.Name):
+                bound.setdefault(target.id, []).append(value)
+    return {
+        name: values[0].value
+        for name, values in bound.items()
+        if len(values) == 1
+        and isinstance(values[0], ast.Constant)
+        and isinstance(values[0].value, str)
+    }
+
+
+def _local_values(scope: ast.AST, name: str) -> list[ast.expr] | None:
+    """Every value ``scope`` assigns to the bare name ``name``, or ``None`` when one of its bindings
+    is not a plain assignment this can read (a parameter anywhere in ``scope``, a loop target, an
+    augmented assignment, a walrus or a ``with`` target). Tuple unpacking is read position by
+    position. An import binds no ``Name`` node and is not seen."""
+    if any(isinstance(node, ast.arg) and node.arg == name for node in ast.walk(scope)):
+        return None  # a parameter of the scope or of a def or lambda nested in it
+    values: list[ast.expr] = []
+    read: set[int] = set()
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    values.append(node.value)
+                    read.add(id(target))
+                elif isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple):
+                    for element, value in zip(target.elts, node.value.elts, strict=False):
+                        if isinstance(element, ast.Name) and element.id == name:
+                            values.append(value)
+                            read.add(id(element))
+    stores = [
+        node
+        for node in ast.walk(scope)
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Store)
+    ]
+    if any(id(node) not in read for node in stores):
+        return None
+    return values
+
+
+def _string_values(expr: ast.expr, scope: ast.AST, module: dict[str, str]) -> set[str] | None:
+    """The strings ``expr`` can evaluate to, read without running it, or ``None`` when that cannot be
+    read. Read: a string literal, both arms of a conditional expression, a dict literal indexed or
+    read with ``.get`` (every value, and the default), a name ``scope`` assigns only those, and a
+    module-level name bound once to a literal."""
+    if isinstance(expr, ast.Constant):
+        return {expr.value} if isinstance(expr.value, str) else None
+    if isinstance(expr, ast.IfExp):
+        body = _string_values(expr.body, scope, module)
+        orelse = _string_values(expr.orelse, scope, module)
+        return None if body is None or orelse is None else body | orelse
+    table: ast.Dict | None = None
+    extra: list[ast.expr] = []
+    if isinstance(expr, ast.Subscript) and isinstance(expr.value, ast.Dict):
+        table = expr.value
+    elif (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "get"
+        and isinstance(expr.func.value, ast.Dict)
+        and not expr.keywords
+        and 1 <= len(expr.args) <= 2
+    ):
+        table = expr.func.value
+        extra = expr.args[1:]
+    if table is not None:
+        found: set[str] = set()
+        for value in (*table.values, *extra):
+            got = _string_values(value, scope, module)
+            if got is None:
+                return None
+            found |= got
+        # A .get with no default can return None, which no helper accepts as a kind.
+        return found if extra or isinstance(expr, ast.Subscript) else None
+    if isinstance(expr, ast.Name):
+        values = _local_values(scope, expr.id)
+        if values is None:
+            return None
+        if not values:
+            return {module[expr.id]} if expr.id in module else None
+        found = set()
+        for value in values:
+            got = _string_values(value, scope, module)
+            if got is None:
+                return None
+            found |= got
+        return found
+    return None
+
+
+def _raw_insert_event(
+    call: ast.Call, scope: ast.AST, module: dict[str, str]
+) -> tuple[ast.expr | None, bool]:
+    """For a call whose first argument is a ``message_events`` INSERT, the expression it binds to
+    the ``event`` column, and True; ``(None, False)`` for any other call. The parameters are either
+    one tuple or list (SQLite, pyodbc) or the arguments after the statement (asyncpg). An INSERT
+    whose shape this cannot read binds ``None``."""
+    if not call.args:
+        return None, False
+    sql_node = call.args[0]
+    sql = _string_values(sql_node, scope, module) if isinstance(sql_node, ast.Name) else None
+    if isinstance(sql_node, ast.Constant) and isinstance(sql_node.value, str):
+        sql = {sql_node.value}
+    if sql is None or len(sql) != 1:
+        return None, False
+    text = next(iter(sql)).strip()
+    if not text.startswith(_RAW_EVENT_INSERT):
+        return None, False
+    columns = [column.strip() for column in text.split("(", 1)[1].split(")", 1)[0].split(",")]
+    if "event" not in columns:
+        return None, True
+    slot = columns.index("event")
+    rest = call.args[1:]
+    if len(rest) == 1 and isinstance(rest[0], ast.Tuple | ast.List):
+        params: list[ast.expr] = list(rest[0].elts)
+    else:
+        params = list(rest)
+    if any(isinstance(param, ast.Starred) for param in params[: slot + 1]) or slot >= len(params):
+        return None, True
+    return params[slot], True
+
+
+def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set[str], set[str]]:
+    """The ``message_events`` kinds a backend source writes, read statically, and the names of the
+    functions whose kind cannot be read that way.
+
+    Read: every call to a helper in :data:`_EVENT_HELPERS`, its ``event`` argument placed by that
+    helper's own ``def`` (``self`` dropped), and every ``INSERT INTO message_events`` statement made
+    outside those helpers, its ``event`` column placed by the statement's column list. The argument
+    is read by :func:`_string_values`, so a literal, a module constant such as ``VIEWED_EVENT``, and
+    a local variable assigned only literals (the routed/unrouted mapping, for one) are all read.
+
+    A helper with no ``event`` parameter, a call to a helper the file does not define, an argument
+    that cannot be placed (a starred argument at or before the slot, or ``event`` through
+    ``**kwargs``) and a reference to a helper or an INSERT statement that is not a direct call each
+    fail here, because a skipped site is the blind spot this guard exists to close.
+
+    ``shared`` is another module's :func:`_module_strings`: a name this source imports from it by
+    ``from ... import`` reads as its value there (Postgres and SQL Server import ``VIEWED_EVENT``
+    from the SQLite store).
+
+    Not read: a helper reached under another name, which the reference check above refuses only
+    when its name is spelled out, and SQL assembled at run time.
+    """
+    tree = parse_source(source)
+    imported = {
+        alias.asname or alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.asname is None or alias.asname == alias.name
+    }
+    module = {
+        name: value for name, value in (shared or {}).items() if name in imported
+    } | _module_strings(tree)
+    helpers: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in _EVENT_HELPERS:
+            assert node.name not in helpers, f"two {node.name} definitions; name the one meant"
+            helpers[node.name] = node
+    for helper in helpers.values():
+        assert "event" in {a.arg for a in (*helper.args.posonlyargs, *helper.args.args)}, (
+            f"{helper.name} has no `event` parameter; re-aim this guard"
+        )
+    kinds: set[str] = set()
+    unread: set[str] = set()
+    unplaced: list[str] = []
+    seen: set[int] = set()
+    methods = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name not in _EVENT_HELPERS
+    ]
+    for helper in helpers.values():
+        seen.update(id(sub) for sub in ast.walk(helper))
+    for scope in methods:
+        for call in ast.walk(scope):
+            if not isinstance(call, ast.Call) or id(call) in seen:
+                continue
+            seen.add(id(call))
+            name = callee_name(call)
+            if name in _EVENT_HELPERS:
+                assert name in helpers, (
+                    f"a call to {name}, which this source does not define; re-aim the scan"
+                )
+                try:
+                    value = argument_for(call, helpers[name], "event", receiver=True)
+                except ArgumentUnplaced:
+                    unplaced.append(ast.unparse(call))
+                    continue
+            else:
+                value, is_insert = _raw_insert_event(call, scope, module)
+                if not is_insert:
+                    continue
+            got = None if value is None else _string_values(value, scope, module)
+            if got is None:
+                unread.add(scope.name)
+            else:
+                kinds |= got
+    assert not unplaced, f"event writes whose `event` argument the scan cannot place: {unplaced}"
+    called = {id(call.func) for call in ast.walk(tree) if isinstance(call, ast.Call)}
+    loose = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute | ast.Name)
+        and id(node) not in called
+        and (node.attr if isinstance(node, ast.Attribute) else node.id) in _EVENT_HELPERS
+    ]
+    assert not loose, f"event helpers referenced but not called directly, at lines {loose}"
+    return kinds, unread
+
+
+def _store_event_kinds() -> dict[str, tuple[set[str], set[str]]]:
+    """:func:`_event_kinds` of each backend, the twins reading names they import from store.py."""
+    sources = {
+        name: (_ROOT / "messagefoundry" / "store" / name).read_text(encoding="utf-8")
+        for name in ("store.py", "postgres.py", "sqlserver.py")
+    }
+    shared = _module_strings(parse_source(sources["store.py"]))
+    return {name: _event_kinds(source, shared) for name, source in sources.items()}
+
+
+def _check_event_kinds(
+    written: dict[str, tuple[set[str], set[str]]], declared: frozenset[str]
+) -> None:
+    """The rule :func:`test_message_event_constant_matches_the_literal_emit_sites` enforces, apart from the
+    scan, so its negative control can feed it a planted case.
+
+    Each backend must write a kind, write only declared kinds, leave unread only
+    :data:`_CALLER_KIND_METHOD`, and write the same kinds as the others; together they must write
+    every declared kind but :data:`_CALLER_ONLY_EVENT_KINDS`. The undeclared check runs first, so
+    an undeclared kind is blamed on the backend that writes it rather than on its twins."""
+    assert declared >= _CALLER_ONLY_EVENT_KINDS, (
+        f"_CALLER_ONLY_EVENT_KINDS names undeclared kinds: "
+        f"{sorted(_CALLER_ONLY_EVENT_KINDS - declared)}"
+    )
+    for name, (kinds, unread) in written.items():
+        assert kinds, f"{name}: the scan read no message_events kind; it went blind, re-aim it"
+        undeclared = sorted(kinds - declared)
+        assert not undeclared, (
+            f"{name} writes message_events kind(s) not in MESSAGE_EVENT_KINDS: {undeclared}. "
+            "Declare each in MESSAGE_EVENT_KINDS and name it in docs/PHI.md section 7 row 6."
+        )
+        assert unread == {_CALLER_KIND_METHOD}, (
+            f"{name}: the kind written in {sorted(unread - {_CALLER_KIND_METHOD})} cannot be read "
+            "statically; pass a literal, a module constant or a local assigned only literals"
+            if unread - {_CALLER_KIND_METHOD}
+            else f"{name}: {_CALLER_KIND_METHOD} no longer forwards a caller's kind; re-aim this"
+        )
+    union = set().union(*(kinds for kinds, _unread in written.values()))
+    differ = {name: sorted(union - kinds) for name, (kinds, _unread) in written.items()}
+    assert not any(differ.values()), (
+        f"the backends write different message_events kinds; each lacks: {differ}"
+    )
+    unwritten = sorted(declared - _CALLER_ONLY_EVENT_KINDS - union)
+    assert not unwritten, (
+        f"declared kinds no backend writes: {unwritten}. A kind removed from the store comes out "
+        "of MESSAGE_EVENT_KINDS and docs/PHI.md section 7 row 6; one now written only by callers "
+        "goes into _CALLER_ONLY_EVENT_KINDS."
+    )
+    written_anyway = sorted(_CALLER_ONLY_EVENT_KINDS & union)
+    assert not written_anyway, (
+        f"_CALLER_ONLY_EVENT_KINDS names kinds a backend now writes itself: {written_anyway}"
+    )
 
 
 def test_message_event_constant_matches_the_literal_emit_sites() -> None:
@@ -419,67 +663,99 @@ def test_message_event_constant_matches_the_literal_emit_sites() -> None:
     RULE (BACKLOG #5498): this read ``args[:2]`` of ``_event`` / ``_event_stmt`` calls in every
     backend. Postgres and SQL Server pass ``conn`` / ``cur`` first, so ``event`` sits at ``args[2]``
     there, and SQL Server's ``_event_sync`` was not read at all; a literal undeclared kind written by
-    either backend would have passed. Every backend must now yield the SAME non-empty set: the three
-    are parity twins, so a scan that goes wholly or partly blind on one file fails instead of
-    passing on what it still sees. The scope :func:`_literal_event_kinds` states still applies.
+    either backend would have passed. Kinds passed as a variable and SQLite's raw INSERT statements
+    were not read either. :func:`_event_kinds` says what is read now, and :func:`_check_event_kinds`
+    what each backend must satisfy.
     """
     from messagefoundry.store.store import MESSAGE_EVENT_KINDS
 
-    emitted = {
-        name: _literal_event_kinds(
-            (_ROOT / "messagefoundry" / "store" / name).read_text(encoding="utf-8")
-        )
-        for name in ("store.py", "postgres.py", "sqlserver.py")
-    }
-    union = set().union(*emitted.values())
-    assert all(kinds == union for kinds in emitted.values()), (
-        "the backends' literal message_events kinds differ; each backend lacks: "
-        f"{ {name: sorted(union - kinds) for name, kinds in emitted.items()} }"
-    )
-    # The declared kinds that no helper call in any backend spells as a string literal.
-    non_literal = {
-        "error",
-        "failed",
-        "filtered",
-        "not_deployed",
-        "reply_returned",
-        "reply_timeout",
-        "routed",
-        "unrouted",
-        "viewed",
-    }
-    expected = set(MESSAGE_EVENT_KINDS) - non_literal
-    assert union == expected, (
-        f"literal kinds written but not expected: {sorted(union - expected)} (an undeclared one "
-        "goes into MESSAGE_EVENT_KINDS AND docs/PHI.md §7 row 6); expected literal kinds no longer "
-        f"seen: {sorted(expected - union)}. Update `non_literal` only for a kind that moved."
-    )
+    _check_event_kinds(_store_event_kinds(), MESSAGE_EVENT_KINDS)
 
 
 def test_the_emit_site_scan_reads_every_backend_signature() -> None:
     """Prove the scan reads the ``event`` slot of each backend's helper shape, and nothing else."""
     source = (
+        "VIEWED = 'module_kind'\n"
         "class S:\n"
         "    async def _event(self, conn, message_id, event, destination, detail, now): ...\n"
         "    def _event_sync(self, cur, message_id, event, destination, detail, now): ...\n"
         "    def _event_stmt(self, message_id, event, destination, detail, now): ...\n"
-        "    async def run(self, conn, cur, kind):\n"
+        "    async def run(self, conn, cur, flag):\n"
         "        await self._event(conn, 'mid', 'pg_kind', None, 'detail_literal', 0.0)\n"
         "        self._event_sync(cur, 'mid', 'sync_kind', None, None, 0.0)\n"
         "        self._event_stmt('mid', 'stmt_kind', None, None, 0.0)\n"
         "        await self._event(conn, 'mid', event='kw_kind', destination=None, detail=None,"
         " now=0.0)\n"
+        "        await self._event(conn, 'mid', VIEWED, None, None, 0.0)\n"
+        "        kind = 'if_kind' if flag else 'else_kind'\n"
         "        await self._event(conn, 'mid', kind, None, None, 0.0)\n"
+        "        other = {1: 'dict_kind'}.get(flag, 'default_kind')\n"
+        "        await self._event(conn, 'mid', other, None, None, 0.0)\n"
+        "        conn.execute('INSERT INTO message_events (message_id, ts, event) VALUES (?,?,?)',"
+        " ('mid', 0.0, 'raw_kind'))\n"
+        "        conn.execute('INSERT INTO message_events (message_id, ts, event)"
+        " VALUES ($1,$2,$3)', 'mid', 0.0, 'pg_raw_kind')\n"
+        "    async def record_message_event(self, conn, message_id, event):\n"
+        "        await self._event(conn, message_id, event, None, None, 0.0)\n"
+        "    async def loop_kind(self, conn, kinds):\n"
+        "        for each in kinds:\n"
+        "            await self._event(conn, 'mid', each, None, None, 0.0)\n"
     )
-    assert _literal_event_kinds(source) == {"pg_kind", "sync_kind", "stmt_kind", "kw_kind"}
+    assert _event_kinds(source) == (
+        {
+            "pg_kind",
+            "sync_kind",
+            "stmt_kind",
+            "kw_kind",
+            "module_kind",
+            "if_kind",
+            "else_kind",
+            "dict_kind",
+            "default_kind",
+            "raw_kind",
+            "pg_raw_kind",
+        },
+        {"record_message_event", "loop_kind"},
+    )
     with pytest.raises(AssertionError, match="no `event` parameter"):
-        _literal_event_kinds("def _event(self, conn, message_id, kind): ...\n")
+        _event_kinds("def _event(self, conn, message_id, kind): ...\n")
     with pytest.raises(AssertionError, match="does not define"):
-        _literal_event_kinds("self._event_sync(cur, 'mid', 'moved_kind', None, None, 0.0)\n")
+        _event_kinds("def f(cur):\n    self._event_sync(cur, 'mid', 'moved', None, None, 0.0)\n")
     helper = "def _event(self, conn, message_id, event, destination, detail, now): ...\n"
     for call in ("_event(*head, 'starred_kind', None, None, 0.0)", "_event(conn, **parts)"):
         with pytest.raises(AssertionError, match="cannot place"):
-            _literal_event_kinds(helper + call + "\n")
+            _event_kinds(helper + f"def f(conn, head, parts):\n    self.{call}\n")
+    with pytest.raises(AssertionError, match="not called directly"):
+        _event_kinds(helper + "def f(self):\n    write = self._event\n")
+
+
+def test_the_event_kind_rule_refuses_each_planted_fault() -> None:
+    """Negative control for :func:`_check_event_kinds`: the shipped backends satisfy it, so nothing
+    there shows each refusal can fire."""
+    declared = frozenset({"a", "b", *_CALLER_ONLY_EVENT_KINDS})
+    caller = {_CALLER_KIND_METHOD}
+
+    def backends(**kinds: set[str]) -> dict[str, tuple[set[str], set[str]]]:
+        found = {"one": {"a", "b"}, "two": {"a", "b"}} | kinds
+        return {name: (written, set(caller)) for name, written in found.items()}
+
+    _check_event_kinds(backends(), declared)
+    for written, match in (
+        (backends(one=set()), "went blind"),
+        (backends(two={"a", "b", "zz"}), "two writes message_events kind"),
+        (backends(two={"a"}), "write different"),
+        (backends(one={"a"}, two={"a"}), "no backend writes"),
+        (
+            backends(one={"a", "b", "reply_timeout"}, two={"a", "b", "reply_timeout"}),
+            "now writes itself",
+        ),
+        ({"one": ({"a", "b"}, {*caller, "extra"}), "two": ({"a", "b"}, set(caller))}, "extra"),
+        ({"one": ({"a", "b"}, set()), "two": ({"a", "b"}, set(caller))}, "no longer forwards"),
+    ):
+        with pytest.raises(AssertionError, match=match):
+            _check_event_kinds(written, declared)
+    with pytest.raises(AssertionError, match="names undeclared"):
+        _check_event_kinds(backends(), frozenset({"a", "b"}))
 
 
 def test_connection_event_row_names_exactly_the_shipped_kinds() -> None:
@@ -520,63 +796,150 @@ def test_connection_event_row_names_exactly_the_shipped_kinds() -> None:
     )
 
 
-def _quarantine_kinds(tree: ast.Module) -> tuple[set[str], list[int]]:
-    """The literal kinds ``tree``'s ``_quarantine`` calls pass, and the lines of any it cannot read.
+def _emit_kind(call: ast.Call) -> ast.expr | None:
+    """The kind an ``_emit_event`` call passes: its first positional argument, or ``kind=``."""
+    return call.args[0] if call.args else keyword_value(call, "kind")
 
-    The rule this enforces, and why, is stated once in :mod:`messagefoundry.connection_events`,
-    under KEEPING IT TRUE. The kind's slot is bound from the one ``def``: positional-only and ordinary
-    parameters with a leading ``self`` or ``cls`` dropped, or keyword-only. A renamed or duplicated
-    helper fails in ``named_func``. One that no longer passes its ``kind`` to ``_emit_event`` fails
-    here, because its call sites' literals would then not be what it emits.
+
+def _binds_receiver(func: ast.FunctionDef | ast.AsyncFunctionDef, methods: set[int]) -> bool | None:
+    """Whether a call through a receiver binds ``func``'s first parameter: True for a method or a
+    classmethod, False for a staticmethod or a function outside a class, and ``None`` for a def
+    under any other decorator, whose call shape cannot be told from its signature."""
+    decorators = {
+        node.id if isinstance(node, ast.Name) else ast.unparse(node) for node in func.decorator_list
+    }
+    if decorators - {"staticmethod", "classmethod"}:
+        return None
+    return id(func) in methods and "staticmethod" not in decorators
+
+
+def _forwarded_kinds(tree: ast.Module) -> tuple[set[str], list[int], set[str]]:
+    """The literal kinds ``tree``'s connection-event FORWARDERS are called with, the lines of any
+    use whose kind the walk cannot read, and the forwarders' names (BACKLOG #5717).
+
+    A forwarder is a ``def`` that passes one of its own parameters to ``_emit_event`` as the kind,
+    as the FILE source's ``_quarantine`` does; its call sites' literals are what it emits. Why the
+    vocabulary must be derived from the emit sites is stated once in
+    :mod:`messagefoundry.connection_events`, under KEEPING IT TRUE.
+
+    Each forwarder's call sites are read through :func:`argument_for`, the receiver bound by its
+    decorators. A use is UNREAD, and its line returned, when the walk cannot say what it emits: a
+    kind that is not a string literal, a call through a receiver other than ``self`` or ``cls``, a
+    def under another decorator, a reference that is not a direct call (an alias, a
+    ``functools.partial``) and a string spelling the forwarder's name (``getattr``). A forwarder
+    that rebinds the parameter, or also passes ``_emit_event`` a kind that is neither that parameter
+    nor a literal, fails here rather than being read.
     """
-    func = named_func(tree, "_quarantine")
-    positional = [arg.arg for arg in (*func.args.posonlyargs, *func.args.args)]
-    if positional[:1] in (["self"], ["cls"]):
-        positional = positional[1:]
-    assert "kind" in positional or "kind" in {arg.arg for arg in func.args.kwonlyargs}, (
-        "_quarantine takes no `kind` parameter any more; re-aim _quarantine_kinds"
-    )
-    slot = positional.index("kind") if "kind" in positional else None
-
-    def _is_kind(node: ast.expr) -> bool:
-        return isinstance(node, ast.Name) and node.id == "kind"
-
-    assert any(
-        (call.args and _is_kind(call.args[0]))
-        or any(kw.arg == "kind" and _is_kind(kw.value) for kw in call.keywords)
-        for call in call_sites(func, "_emit_event")
-    ), "_quarantine no longer passes its `kind` to _emit_event; re-aim _quarantine_kinds"
-    calls = call_sites(tree, "_quarantine")
+    methods = {
+        id(node)
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef)
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    forwarders: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]] = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        params = {a.arg for a in (*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs)}
+        passed = [_emit_kind(call) for call in call_sites(func, "_emit_event")]
+        forwarded = {k.id for k in passed if isinstance(k, ast.Name) and k.id in params}
+        if not forwarded:
+            continue
+        assert len(forwarded) == 1, f"{func.name} forwards several parameters as a kind"
+        param = forwarded.pop()
+        derived = [
+            ast.unparse(k)
+            for k in passed
+            if k is not None
+            and not (isinstance(k, ast.Name) and k.id == param)
+            and not (isinstance(k, ast.Constant) and isinstance(k.value, str))
+        ]
+        assert not derived, f"{func.name} also emits a kind the walk cannot read: {derived}"
+        rebound = [
+            node.lineno
+            for node in ast.walk(func)
+            if (isinstance(node, ast.Name) and node.id == param and isinstance(node.ctx, ast.Store))
+            or (isinstance(node, ast.arg) and node.arg == param and node not in _own_args(func))
+        ]
+        assert not rebound, f"{func.name} rebinds its kind `{param}` at lines {rebound}"
+        assert func.name not in forwarders, f"two forwarders named {func.name}; name the one meant"
+        forwarders[func.name] = (func, param)
     kinds: set[str] = set()
     unread: list[int] = []
-    for call in calls:
-        kind = keyword_value(call, "kind")
-        # A starred argument at or before the slot moves the kind to a position only run time knows.
-        if (
-            kind is None
-            and slot is not None
-            and len(call.args) > slot
-            and not any(isinstance(arg, ast.Starred) for arg in call.args[: slot + 1])
-        ):
-            kind = call.args[slot]
-        if isinstance(kind, ast.Constant) and isinstance(kind.value, str):
-            kinds.add(kind.value)
-        else:
-            unread.append(call.lineno)
-    # A reference that is not a direct call, such as an alias or a functools.partial, hides its
-    # arguments from the walk.
-    called = {id(call.func) for call in calls}
+    called: set[int] = set()
+    for name, (func, param) in forwarders.items():
+        receiver = _binds_receiver(func, methods)
+        for call in call_sites(tree, name):
+            called.add(id(call.func))
+            through = call.func.value if isinstance(call.func, ast.Attribute) else None
+            if receiver is None or (
+                receiver and not (isinstance(through, ast.Name) and through.id in {"self", "cls"})
+            ):
+                unread.append(call.lineno)
+                continue
+            try:
+                kind = argument_for(call, func, param, receiver=receiver)
+            except ArgumentUnplaced:
+                kind = None
+            if isinstance(kind, ast.Constant) and isinstance(kind.value, str):
+                kinds.add(kind.value)
+            else:
+                unread.append(call.lineno)
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Attribute | ast.Name) or id(node) in called:
-            continue
-        if (node.attr if isinstance(node, ast.Attribute) else node.id) == "_quarantine":
+        if isinstance(node, ast.Attribute | ast.Name) and id(node) not in called:
+            if (node.attr if isinstance(node, ast.Attribute) else node.id) in forwarders:
+                unread.append(node.lineno)
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in forwarders
+        ):
             unread.append(node.lineno)
-    return kinds, sorted(unread)
+    return kinds, sorted(unread), set(forwarders)
 
 
-def test_quarantine_kind_walk_reads_literals_and_refuses_anything_else() -> None:
-    """Negative control for :func:`_quarantine_kinds`: the shipped file.py passes only literals, so
-    nothing there shows the refusal can fire."""
+def _own_args(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.arg]:
+    args = func.args
+    return [
+        a for a in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg) if a
+    ]
+
+
+def _connection_kinds(trees: dict[str, ast.Module]) -> tuple[set[str], dict[str, set[str]]]:
+    """The literal connection_event kinds ``trees`` emit, and each tree's forwarders.
+
+    Read: a literal kind passed to ``_emit_event`` directly, a literal ``kind=`` on a call to
+    ``_enqueue_connection_event``, ``HttpRequestError`` or ``Refusal`` (``Refusal`` carries the
+    refusal kinds the shared listener admission returns for a listener to emit,
+    ``transports/admission.py``, vault BACKLOG #2606), and what :func:`_forwarded_kinds` reads.
+    A forwarder use the walk cannot read fails here."""
+    targets = {"_emit_event", "_enqueue_connection_event", "HttpRequestError", "Refusal"}
+    emitted: set[str] = set()
+    forwarders: dict[str, set[str]] = {}
+    for name, tree in trees.items():
+        forwarded, unread, forwarders[name] = _forwarded_kinds(tree)
+        assert not unread, (
+            f"{name}: connection-event forwarder use(s) whose kind is not a string literal in a "
+            f"direct call, at lines {unread}. The walk cannot see what such a use emits, so call "
+            "the forwarder directly and pass the kind as a literal."
+        )
+        emitted |= forwarded
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or callee_name(node) not in targets:
+                continue
+            kinds = [keyword_value(node, "kind")]
+            if callee_name(node) == "_emit_event":
+                kinds.append(_emit_kind(node))
+            emitted |= {
+                k.value for k in kinds if isinstance(k, ast.Constant) and isinstance(k.value, str)
+            }
+    return emitted, forwarders
+
+
+def test_forwarder_walk_reads_literals_and_refuses_anything_else() -> None:
+    """Negative control for :func:`_forwarded_kinds`: the shipped transports pass only literals, so
+    nothing there shows each refusal can fire."""
     probe = ast.parse(
         "class S:\n"
         "    async def _quarantine(self, path, read_id, mark, kind, reason):\n"
@@ -589,16 +952,23 @@ def test_quarantine_kind_walk_reads_literals_and_refuses_anything_else() -> None
         "        await self._quarantine(*head, 'starred', 'r')\n"
         "        q = self._quarantine\n"
         "        functools.partial(self._quarantine, p, i, m, 'partial')\n"
+        "        await S._quarantine(self, p, i, m, 'other_receiver', 'r')\n"
+        "        await getattr(self, '_quarantine')(p, i, m, 'by_name', 'r')\n"
     )
-    assert _quarantine_kinds(probe) == ({"by_position", "by_keyword"}, [7, 8, 9, 10, 11])
+    assert _forwarded_kinds(probe) == (
+        {"by_position", "by_keyword"},
+        [7, 8, 9, 10, 11, 12, 13],
+        {"_quarantine"},
+    )
     reordered = ast.parse(
         "class S:\n"
-        "    async def _quarantine(self, kind, /, path, reason):\n"
-        "        await self._emit_event(kind, reason=reason)\n"
+        "    async def _quarantine(me, kind, /, path, reason):\n"
+        "        await me._emit_event(kind, reason=reason)\n"
         "    async def scan(self):\n"
         "        await self._quarantine('first', p, 'not a kind')\n"
+        "        await self._quarantine(kind='keyword_on_positional_only')\n"
     )
-    assert _quarantine_kinds(reordered) == ({"first"}, [])
+    assert _forwarded_kinds(reordered) == ({"first"}, [6], {"_quarantine"})
     receiverless = ast.parse(
         "class S:\n"
         "    @staticmethod\n"
@@ -606,24 +976,72 @@ def test_quarantine_kind_walk_reads_literals_and_refuses_anything_else() -> None
         "        await emitter._emit_event(kind=kind, reason=reason)\n"
         "    async def scan(self):\n"
         "        await self._quarantine('first', p, 'not a kind')\n"
+        "        await S._quarantine('second', p, 'not a kind')\n"
     )
-    assert _quarantine_kinds(receiverless) == ({"first"}, [])
+    assert _forwarded_kinds(receiverless) == ({"first", "second"}, [], {"_quarantine"})
     keyword_only = ast.parse(
         "class S:\n"
-        "    async def _quarantine(self, path, *, kind, reason):\n"
-        "        await self._emit_event(kind, reason=reason)\n"
+        "    async def _reject(self, path, *, why, reason):\n"
+        "        await self._emit_event(why, reason=reason)\n"
         "    async def scan(self):\n"
-        "        await self._quarantine(p, kind='by_keyword', reason='r')\n"
-        "        await self._quarantine(p, 'no slot', reason='r')\n"
+        "        await self._reject(p, why='by_keyword', reason='r')\n"
+        "        await self._reject(p, 'no slot', reason='r')\n"
     )
-    assert _quarantine_kinds(keyword_only) == ({"by_keyword"}, [6])
-    not_forwarding = ast.parse(
+    assert _forwarded_kinds(keyword_only) == ({"by_keyword"}, [6], {"_reject"})
+    decorated = ast.parse(
         "class S:\n"
-        "    async def _quarantine(self, path, kind, reason):\n"
-        "        await self._emit_event('file_rejected', reason=kind)\n"
+        "    @functools.cache\n"
+        "    async def _quarantine(self, kind):\n"
+        "        await self._emit_event(kind)\n"
+        "    async def scan(self):\n"
+        "        await self._quarantine('first')\n"
     )
-    with pytest.raises(AssertionError, match="no longer passes its `kind`"):
-        _quarantine_kinds(not_forwarding)
+    assert _forwarded_kinds(decorated) == (set(), [6], {"_quarantine"})
+    assert _forwarded_kinds(ast.parse("class S:\n    async def f(self):\n        pass\n")) == (
+        set(),
+        [],
+        set(),
+    )
+    for body, match in (
+        ("        kind = 'x'\n        await self._emit_event(kind)\n", "rebinds"),
+        (
+            "        await self._emit_event(kind)\n        await self._emit_event(kind + '_x')\n",
+            "cannot read",
+        ),
+    ):
+        with pytest.raises(AssertionError, match=match):
+            _forwarded_kinds(ast.parse("class S:\n    async def _q(self, kind):\n" + body))
+
+
+def test_connection_kind_walk_reads_each_emit_shape() -> None:
+    """Negative control for :func:`_connection_kinds`, the vocabulary test's own wiring."""
+    trees = {
+        "a.py": ast.parse(
+            "class S:\n"
+            "    async def _q(self, kind):\n"
+            "        await self._emit_event(kind)\n"
+            "    async def run(self):\n"
+            "        await self._q('forwarded')\n"
+            "        await self._emit_event('direct')\n"
+            "        await self._emit_event(kind='direct_keyword')\n"
+            "        self._enqueue_connection_event(kind='enqueued')\n"
+            "        raise HttpRequestError(400, kind='http')\n"
+            "        return Refusal(kind='refusal')\n"
+        ),
+        "b.py": ast.parse("def f():\n    other(kind='not_an_emit_site')\n"),
+    }
+    emitted, forwarders = _connection_kinds(trees)
+    assert emitted == {"forwarded", "direct", "direct_keyword", "enqueued", "http", "refusal"}
+    assert forwarders == {"a.py": {"_q"}, "b.py": set()}
+    trees["c.py"] = ast.parse(
+        "class S:\n"
+        "    async def _q(self, kind):\n"
+        "        await self._emit_event(kind)\n"
+        "    async def run(self, k):\n"
+        "        await self._q(k)\n"
+    )
+    with pytest.raises(AssertionError, match="c.py: connection-event forwarder"):
+        _connection_kinds(trees)
 
 
 def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
@@ -632,59 +1050,20 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
     The only guard derived its truth set from ``messagefoundry_webconsole.pages.monitoring``'s filter
     DROPDOWN, which never opens a ``transports/`` file — so adding ``_emit_event("tls_handshake_failed")``
     and forgetting the dropdown left CI green with an undocumented kind in the stream. Derived here
-    from the literal call sites, and ``CONNECTION_EVENT_KINDS`` (which the console reads) is
-    cross-checked against them.
+    from the literal call sites (:func:`_connection_kinds`), and ``CONNECTION_EVENT_KINDS`` (which the
+    console reads) is cross-checked against them.
     """
-    import ast as _ast
-
-    emitted: set[str] = set()
-    # `Refusal` carries the refusal kinds the shared listener admission returns for a listener to
-    # emit (transports/admission.py, vault BACKLOG #2606), so its `kind=` literals are emit sites too.
-    targets = {"_emit_event", "_enqueue_connection_event", "HttpRequestError", "Refusal"}
     roots = [
         *(_ROOT / "messagefoundry" / "transports").glob("*.py"),
         _ROOT / "messagefoundry" / "pipeline" / "wiring_runner.py",
     ]
-    read_file_source = False
-    for path in sorted(roots):
-        tree = _ast.parse(path.read_text(encoding="utf-8"))
-        if path.name == "file.py":
-            # The FILE source's reject path forwards its kind through `_quarantine` (BACKLOG #5717).
-            read_file_source = True
-            quarantined, unread = _quarantine_kinds(tree)
-            assert not unread, (
-                f"file.py _quarantine use(s) whose kind is not a string literal in a direct call, "
-                f"at lines {unread}. The walk cannot see what such a use emits, so call it directly "
-                "and pass the kind as a literal."
-            )
-            assert quarantined, (
-                "file.py's _quarantine has no call site the walk could read; the helper moved, "
-                "so re-aim _quarantine_kinds rather than let its kinds leave the walk."
-            )
-            emitted |= quarantined
-        for node in _ast.walk(tree):
-            if not isinstance(node, _ast.Call):
-                continue
-            name = callee_name(node)
-            if name not in targets:
-                continue
-            if (
-                name == "_emit_event"
-                and node.args
-                and isinstance(node.args[0], _ast.Constant)
-                and isinstance(node.args[0].value, str)
-            ):
-                emitted.add(node.args[0].value)
-            for kw in node.keywords:
-                if (
-                    kw.arg == "kind"
-                    and isinstance(kw.value, _ast.Constant)
-                    and isinstance(kw.value.value, str)
-                ):
-                    emitted.add(kw.value.value)
-    assert read_file_source, (
-        "transports/file.py is no longer in the walk, so its _quarantine kinds are not read; "
-        "re-aim the file.py branch above."
+    emitted, forwarders = _connection_kinds(
+        {path.name: parse_source(path.read_text(encoding="utf-8")) for path in sorted(roots)}
+    )
+    # The FILE source's reject path forwards its kind through `_quarantine` (BACKLOG #5717); a
+    # rename must re-aim the walk rather than let its kinds leave it.
+    assert "_quarantine" in forwarders.get("file.py", set()), (
+        "file.py's _quarantine no longer forwards its kind to _emit_event; re-aim _forwarded_kinds"
     )
     assert emitted, "no literal connection_event kind found — the emit-site walk broke, not the doc"
 
