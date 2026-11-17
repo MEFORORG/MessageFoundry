@@ -26,7 +26,7 @@ from typing import Literal, TypeVar
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, RootModel, ValidationError
+from pydantic import BaseModel, Field, RootModel, ValidationError
 
 from messagefoundry.api.auth_models import (
     STEP_UP_VIA_HEADER,
@@ -284,6 +284,15 @@ def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
     except (ValidationError, TypeError) as exc:
         invalid = _invalid_reply(exc)
     raise ApiError(f"invalid response from engine: {invalid}")
+
+
+class _RotatedToken(BaseModel):
+    """The one field every elevation reply must carry: the re-keyed session token (BACKLOG #5344).
+
+    Local rather than the engine's ``ElevatedResponse`` so that one decode serves all three
+    elevation routes, whose replies differ in their other fields."""
+
+    token: str = Field(min_length=1)
 
 
 class _UserListRow(RootModel[UserListEntry]):
@@ -1191,24 +1200,20 @@ class EngineClient:
         step-up would then fail on a token the ceremony itself retired.
 
         Writing through the shared cell (see :class:`_TokenCell`) is what carries the rotation to the
-        background poll clients too. A body without a usable ``token`` leaves the current one in
-        place rather than clearing it: that is an engine older than this contract, and dropping the
-        token there would turn a version skew into a sign-out.
+        background poll clients too.
 
         A rotated token counts as issued to this client even when the one it replaced came from
         :meth:`set_token`: the rotation already ended that one for every holder, so only this client
         holds the new one.
 
-        A reply that does not decode at all is not version skew: the engine has already rotated the
-        session, so the token this client holds is dead, and returning normally would report the
-        elevation as a success. It raises a value-free :class:`ApiError` instead (BACKLOG #5344).
+        A 2xx reply that does not decode to an object with a non-empty string ``token`` raises the
+        value-free :class:`ApiError` of :func:`_decode`, with ``status`` None, and the current
+        token is left in place rather than cleared (BACKLOG #5344). Returning normally would report
+        the elevation as a success. What happened to the session is not known: the engine may have
+        rotated it, so the held token may already be dead, or an intermediary may have answered
+        without reaching the engine, so it may still be live.
         """
-        body, refused = json_loads_or_refusal(response.content)
-        if refused is not None:
-            raise ApiError(f"invalid response from engine: {refused}")
-        token = body.get("token") if isinstance(body, dict) else None
-        if isinstance(token, str) and token:
-            self._hold_issued(token)
+        self._hold_issued(_decode(response, _RotatedToken).token)
 
     def set_step_up_handler(self, handler: Callable[[], bool] | None) -> None:
         """Register the callback invoked when the engine demands step-up re-verification (403 +
@@ -1229,7 +1234,11 @@ class EngineClient:
 
         ``purpose`` names the action up front instead, for a caller that proves BEFORE the call it
         is about to make, so the refusal and the retry never happen (vault BACKLOG #2625: a timed
-        reload must not carry a step-up inside its timer). It wins over a stashed action."""
+        reload must not carry a step-up inside its timer). It wins over a stashed action.
+
+        Raises :class:`ApiError` with ``status`` None when the 2xx reply carries no usable token
+        (BACKLOG #5344). The engine may have rotated the session anyway, so the held token may
+        already be dead; see :meth:`_adopt_rotated`."""
         self._refuse_credential_on_cleartext("a password")
         action = purpose if purpose is not None else self._pending_step_up_action
         self._pending_step_up_action = None  # single-use: one reauth per named action
@@ -1309,7 +1318,11 @@ class EngineClient:
         :class:`ApiError` (401) on a wrong code, and (403) on a directory account the directory could
         not confirm, whose code was not checked (BACKLOG #2023). Raises :class:`IdpStepUpRequired`
         for an ``oidc`` session that already met its factor, whose code was not checked either
-        (BACKLOG #2142). Does not itself trigger the MFA handler."""
+        (BACKLOG #2142). Does not itself trigger the MFA handler.
+
+        Raises :class:`ApiError` with ``status`` None when the 2xx reply carries no usable token
+        (BACKLOG #5344). The engine may have rotated the session anyway, so the held token may
+        already be dead; see :meth:`_adopt_rotated`."""
         self._refuse_credential_on_cleartext("a second factor")
         # Vault BACKLOG #2950: it rotates the token and queues behind the account's credential
         # lock, so it gets the sign-in's timeout (see SIGN_IN_TIMEOUT_SECONDS).

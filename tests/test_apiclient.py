@@ -180,15 +180,36 @@ def test_list_readers_still_decode_a_well_formed_reply(
 
 @pytest.mark.parametrize(
     "content",
-    [b'{"token": "\xff\xfe"}', b"[" * 100_000, b"not json"],
-    ids=["non_utf8", "deep_nesting", "not_json"],
+    [
+        b'{"token": "\xff\xfe"}',
+        b"[" * 100_000,
+        b"not json",
+        b"null",
+        b"[]",
+        b'{"detail": "ok"}',
+        b'{"token": ""}',
+        b'{"token": null}',
+    ],
+    ids=[
+        "non_utf8",
+        "deep_nesting",
+        "not_json",
+        "null",
+        "list",
+        "no_token",
+        "empty_token",
+        "null_token",
+    ],
 )
-def test_an_undecodable_rotation_reply_raises_a_value_free_apierror(content: bytes) -> None:
-    """A 2xx elevation reply that does not decode is not a success (BACKLOG #5344): the engine has
-    already rotated the session, so the held token is dead. It raises an :class:`ApiError` that
-    quotes no reply content and chains nothing, and the token is left as it was.
+def test_a_rotation_reply_without_a_usable_token_raises_a_value_free_apierror(
+    content: bytes,
+) -> None:
+    """A 2xx elevation reply with no usable token is not a success (BACKLOG #5344): the engine may
+    have rotated the session, so the held token may be dead. It raises an :class:`ApiError` with
+    ``status`` None that quotes no reply content and chains nothing, and the token is left as it
+    was. A bare list or a tokenless object used to pass silently as version skew.
 
-    Mutation: return instead of raising on a refused decode. Red: DID NOT RAISE."""
+    Mutation: return instead of raising for a reply with no usable token. Red: DID NOT RAISE."""
     client = EngineClient("http://127.0.0.1:8765")
     try:
         client._token = "before"
@@ -197,20 +218,17 @@ def test_an_undecodable_rotation_reply_raises_a_value_free_apierror(content: byt
         assert client.token == "before"
     finally:
         client.close()
+    assert excinfo.value.status is None
     assert "\ufffd" not in str(excinfo.value) and "not json" not in str(excinfo.value)
     assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
 
 
-def test_a_rotation_reply_without_a_token_keeps_the_token() -> None:
-    """NEGATIVE CONTROL: a reply that decodes but carries no token is version skew, not an error,
-    so it keeps the current token and raises nothing; a well-formed reply is still adopted."""
+def test_a_well_formed_rotation_reply_is_adopted() -> None:
+    """NEGATIVE CONTROL: a reply carrying a token, with other fields beside it, is adopted."""
     client = EngineClient("http://127.0.0.1:8765")
     try:
         client._token = "before"
-        client._adopt_rotated(httpx.Response(200, json=[]))
-        client._adopt_rotated(httpx.Response(200, json={"detail": "ok"}))
-        assert client.token == "before"
-        client._adopt_rotated(httpx.Response(200, json={"token": "after"}))
+        client._adopt_rotated(httpx.Response(200, json={"detail": "ok", "token": "after"}))
         assert client.token == "after"
     finally:
         client.close()
