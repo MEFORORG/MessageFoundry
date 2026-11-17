@@ -717,7 +717,13 @@ def _record_label(value: object) -> str:
     to any object, and its ``str`` may raise, often for the same reason the record did not format."""
     try:
         text = str(value)
-    except Exception:
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            # Reported as _guarded reports its own fallback, and on the same terms: the type only.
+            _last_resort(
+                f"a log record's name could not be rendered ({ascii(type(exc).__name__)}); "
+                "a placeholder was substituted"
+            )
         return _RECORD_LABEL_DROPPED
     return _escape_only(text, fallback=_RECORD_LABEL_DROPPED)
 
@@ -838,7 +844,8 @@ class _GuardedSinkMixin(_SinkBase):
         it can (BACKLOG #5813). Never raises.
 
         A record this handler cannot format is the record's fault, not the sink's: the stand-in is
-        a fixed notice naming its logger and level, never its content. It goes through the sink's
+        a notice naming its logger, its level and the exception's type, never its content or the
+        exception's message. It goes through the sink's
         own formatter and stream, so a sink that refuses it, or a formatter that cannot format even
         that notice, is reported by the two stages as before. On the handlers ``configure_logging``
         builds, ``RedactionFilter`` already replaces a record whose message cannot be rendered, so
@@ -846,10 +853,12 @@ class _GuardedSinkMixin(_SinkBase):
         try:
             self.format(record)
         except Exception as exc:
+            # The exception's TYPE only: its message can quote the record's format string or an
+            # argument, and this notice goes below every handler filter.
             return (
                 f"a log record from logger {_record_label(record.name)!r} at level "
-                f"{_record_label(record.levelname)} could not be formatted ({_safe_reason(exc)}); "
-                "it was not written"
+                f"{_record_label(record.levelname)} could not be formatted "
+                f"({ascii(type(exc).__name__)}); it was not written"
             )
         return None
 

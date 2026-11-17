@@ -165,7 +165,8 @@ class LogSpool:
         self.dropped = 0
         #: Torn, malformed or other-version lines skipped on replay, and segments found gone.
         self.unreadable = 0
-        #: Reads that failed for a reason other than a missing file. The files are kept.
+        #: Reads that failed for a reason other than a missing segment file, a missing spool
+        #: directory included. Nothing is retired for them; a removed directory took its files.
         self.read_errors = 0
         #: Whether the LAST read failed that way. :attr:`read_errors` never goes down, so it cannot
         #: say whether a fault is still standing; this can.
@@ -427,9 +428,13 @@ class LogSpool:
                 if not self.directory.is_dir():
                     # The whole spool is out of reach, not one segment gone: retiring would drop
                     # every segment from the order and the cap while the files may still exist.
+                    # The writer is closed, so the next append must create its file in the
+                    # directory, and fails and is counted as dropped while the directory is gone,
+                    # rather than landing in a file a removed directory left unlinked.
                     self.read_errors += 1
                     self.read_faulted = True
                     self._close_reader()
+                    self._close_writer()
                     return None
                 self.unreadable += 1
                 if not self._segments:

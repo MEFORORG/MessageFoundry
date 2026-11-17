@@ -460,8 +460,12 @@ the bound does not. A roll the bound calls a heal still writes `rolled` and page
 before, so a sink that keeps flapping across bound windows pages stage 2 once per window it trips
 in. Whether the bound itself should hold across windows is left open with the latch's enforcement
 question. One retry is kept: a stage-2 event fired while no responder was wired is fired again on
-the break's next failure, without another stderr line, so a stop is still asked for once a
-responder is there.
+the break's next failure, without another stderr line. A break that ends with a heal roll before
+any such failure is not asked to stop again, as before this amendment.
+
+**The stage-2 stderr line.** Where every other sink reads unwritable but at least one only through
+the flap latch, the line now says so, instead of Amendment B's "another sink is still writable".
+The stop decision is unchanged.
 
 **`revalidate()` and a sink that changes while it is probed.** Each probe runs outside the guard's
 lock. A sink on which another thread records a roll or a stage-2 failure after the snapshot is no

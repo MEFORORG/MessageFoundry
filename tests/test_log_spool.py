@@ -801,6 +801,10 @@ def test_a_spool_directory_out_of_reach_retires_nothing(spool_dir: Path) -> None
         assert spool.peek() is None
         assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
         assert spool.bytes_used == used
+        # The writer was closed, so an append while the directory is gone is refused and counted,
+        # never written into a file the directory no longer holds.
+        assert not spool.append(_entry(99))
+        assert spool.dropped == 1
         spool.directory = spool_dir
         assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
     finally:
