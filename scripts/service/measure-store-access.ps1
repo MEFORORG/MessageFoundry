@@ -70,7 +70,8 @@
     half is the property ADR 0163's restriction exists for. After each such open, every trio file
     may grant only SYSTEM, BUILTIN\Administrators, the service account and the operator, block
     inheritance, and be owned by one of them, or the arm goes RED. The control reopen is not
-    checked, and neither is an open whose step went red, the three let-start reds included.
+    checked, and neither is an open whose proof (the expected refusal, the operator's provision or
+    decline, or /health and sign-in) did not arrive, the three let-start reds included.
     A GREEN CAN BE CONDITIONAL, and says so: store.py only logs when it cannot restrict a file, so a
     restriction warning in the service log or the CLI output prints GREEN (CONDITIONAL) with a warning.
 
@@ -125,7 +126,7 @@ $Email = "w0-admin@example.invalid"
 # either is reworded, the arm goes RED on a missing proof rather than passing on a stale one.
 # $GateRefusal is the clause the gate's no-Administrator and no-address branches both open with, so
 # the file-access arms prove the service read the user table whichever of the two fired. The gate's
-# Vault-transit refusal carries no phrase here (see Wait-ForGateRefusal). $NoAdminRefusal and
+# Vault-transit refusal carries none of these three (see Wait-ForGateRefusal). $NoAdminRefusal and
 # $ProvisionHint are the no-Administrator branch alone, which StartFirstEndToEnd requires (ADR 0183
 # Wave 2, AC-11); $NoAdminRefusal is in it only when no account record failed its integrity seal.
 $GateRefusal = "no enabled Administrator"
@@ -1091,9 +1092,10 @@ try {
                 Add-Failure ("$Operator could not open $DbPath, which $ServiceIdentity created and " +
                     "secured, through provision-admin's open path (exit $($r.Code)). " +
                     (Get-Attribution $Operator (Get-OperatorSids) $r.Text))
-                # CONTROL: nothing re-secured the store, so a service that cannot reopen even its own
-                # store means the first open locked out EVERY identity, not only the operator. That
-                # separates "restricted to the service" from "restricted to nobody usable".
+                # CONTROL: if the operator's failed run did not open and re-secure the store, a service
+                # that cannot reopen even its own store means the first open locked out EVERY identity,
+                # not only the operator. That separates "restricted to the service" from "restricted
+                # to nobody usable".
                 Start-TheService "reopen of its own store (control)"
                 $own = Wait-ForGateRefusal "the control reopen"
                 Stop-TheService
@@ -1106,9 +1108,10 @@ try {
                     Show-LogTail
                 } else {
                     Add-Failure ("control: $ServiceIdentity, restarted on the store it created itself, " +
-                        "which nobody else touched, did not log the expected refusal line in " +
-                        "$WaitSeconds s. If the cause is store access, its own first open locked out " +
-                        "every identity. " + (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
+                        "did not log the expected refusal line in $WaitSeconds s. If the cause is store " +
+                        "access, and the operator's failed run did not open and re-secure the store, " +
+                        "its own first open locked out every identity. " +
+                        (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
                     Show-LogTail
                 }
             } else {

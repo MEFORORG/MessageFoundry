@@ -13,8 +13,9 @@ windows-service-smoke leg does. The tests lift the phrase assignments and functi
 of the script's AST: they call ``Test-GateRefusalLine`` on lines worded as the engine words them,
 and run ``Wait-ForGateRefusal`` against a stand-in log reader. They pin, as literals, that ``app.py``
 still holds each line's prefix and the no-Administrator and no-address detail texts; they do not pin
-``$ProvisionHint`` or ``$ProvisionDecline``, and they do not render the lines from ``app.py``. They
-need ``pwsh`` or ``powershell`` and skip where it is missing.
+``$ProvisionHint`` or ``$ProvisionDecline``, and they do not render the lines from ``app.py``. Each
+case that runs PowerShell needs its own host, ``pwsh`` or ``powershell``, and skips where that host
+is missing; the ``app.py`` pin and the source-text test need neither.
 """
 
 from __future__ import annotations
