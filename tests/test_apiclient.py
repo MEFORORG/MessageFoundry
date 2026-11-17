@@ -522,19 +522,20 @@ def test_apiclient_still_accepts_an_integer_identifier() -> None:
 def test_transport_guard_refuses_a_non_http_url_scheme(base_url: str) -> None:
     """ASVS 1.2.2 clause 2: only safe URL protocols are permitted, as a POSITIVE allow-list.
 
-    The shipped check is host-keyed -- it returns early when the host is loopback OR empty. None of
-    these four URLs has a hostname, so ``host == ""`` and every one of them builds a client today,
+    The check before BACKLOG #1107 was host-keyed -- it returned early when the host was loopback
+    OR empty. None of these four URLs has a hostname, so every one of them built a client then,
     including the two schemes the ASVS verb names by name.
 
-    Mutation: move the allow-list below the ``host == ""`` early return. Red: DID NOT RAISE."""
+    Mutation: delete the allow-list. Red: the no-host refusal answers instead, and its message does
+    not match ``scheme``."""
     with pytest.raises(ApiError, match="scheme"):
         EngineClient(base_url)
 
 
 def test_transport_guard_refuses_a_base_url_with_no_scheme() -> None:
-    """A schemeless base_url is a typo, and today it builds a client that can never work: urlsplit
-    reads ``127.0.0.1:8765`` as scheme ``""`` and ``localhost:8765`` as scheme ``localhost``, both
-    with no hostname, so both slip through the ``host == ""`` early return.
+    """A schemeless base_url is a typo, and before BACKLOG #1107 it built a client that could never
+    work: ``127.0.0.1:8765`` parses as scheme ``""`` and ``localhost:8765`` as scheme
+    ``localhost``, both with no hostname, so both slipped through the old empty-host early return.
 
     This is a DELIBERATE behavior change, pinned here so it stays a decision rather than a side
     effect: an allow-list admitting only ``http`` and ``https`` refuses both. Failing at
@@ -558,40 +559,68 @@ def test_transport_guard_permits_https_and_loopback_http() -> None:
 
 @pytest.mark.parametrize(
     "base_url",
-    ["http:////engine.example.com:8765", "http:///engine.example.com", "http://", "https:////x"],
+    [
+        "http:////engine.example.com:8765",
+        "http:///engine.example.com",
+        "http://",
+        "http://:8765",
+        "http://user@:8765",
+        "https:////x",
+    ],
 )
 @pytest.mark.parametrize("allow_insecure", [False, True], ids=["strict", "allow_insecure"])
 def test_transport_guard_refuses_a_base_url_with_no_host(
     base_url: str, allow_insecure: bool
 ) -> None:
-    """An empty host is not loopback (BACKLOG #5343). ``urlsplit`` reads no host in a multi-slash
-    URL, yet httpx re-reads the URL it builds and names the remote host, so an empty host waved
-    through as loopback would skip the plaintext refusal and the cleartext credential refusal.
+    """An empty host is not loopback (BACKLOG #5343). httpx still dials such a URL, so an empty host
+    waved through as loopback would skip the plaintext refusal and the cleartext credential refusal.
 
     ``allow_insecure`` does not rescue it: a URL with no host names no engine at all.
 
-    Mutation: restore ``or host == ""`` on the loopback early return. Red: DID NOT RAISE."""
+    Mutation: delete the no-host refusal and restore ``or host == ""`` on the loopback early
+    return. Red: DID NOT RAISE."""
     with pytest.raises(ApiError, match="no host"):
         EngineClient(base_url, allow_insecure=allow_insecure)
 
 
-def test_a_multi_slash_url_reaches_the_remote_host_through_httpx() -> None:
-    """The premise of the no-host refusal: httpx sends ``http:////host`` to ``host``.
+def test_httpx_dials_a_base_url_with_no_host() -> None:
+    """The premise of the no-host refusal: httpx does not refuse a hostless URL, it dials the empty
+    host, which the resolver may map to a non-loopback address of this machine.
 
-    Measured on the installed httpx rather than assumed, so a future httpx that refused such a URL
-    would turn this red and say the refusal is belt-and-braces rather than load-bearing."""
+    Measured on the installed httpx at the transport seam, which is the host the request goes to;
+    the URL's string form is not, since ``str()`` reads ``//engine...`` back as an authority. A
+    future httpx that refused such a URL would turn this red and make the refusal belt-and-braces."""
     with httpx.Client(base_url="http:////engine.example.com:8765") as http:
         built = http.build_request("GET", "/health").url
-    assert httpx.URL(str(built)).host == "engine.example.com"
+    assert built.raw_host == b""
 
 
-def test_transport_guard_refuses_an_unparsable_base_url_as_api_error() -> None:
-    """An unparsable URL raises :class:`ApiError`, the client's only error type (BACKLOG #5343),
-    not ``urlsplit``'s ``ValueError``, and chains nothing that could quote the URL."""
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://user:s3cret@[::1:8765",
+        "http://user:s3cret@127.0.0.1:abc",
+        "http://user:s3cret@127.0.0.1:8765/\x01",
+    ],
+    ids=["bracket", "port", "control_character"],
+)
+def test_transport_guard_refuses_an_unparsable_base_url_as_api_error(base_url: str) -> None:
+    """A URL httpx cannot parse raises :class:`ApiError`, the client's only error type (BACKLOG
+    #5343), not ``httpx.InvalidURL``, and chains nothing that could quote the URL."""
     with pytest.raises(ApiError, match="does not parse") as excinfo:
-        EngineClient("http://user:s3cret@[::1:8765")
+        EngineClient(base_url)
     assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
     assert "s3cret" not in str(excinfo.value)
+
+
+def test_transport_guard_reads_the_url_as_httpx_does() -> None:
+    """A leading space: ``urllib.parse`` strips it and reads loopback http, while httpx, which
+    dials, reads a schemeless relative URL. The guard parses with httpx, so it refuses the URL
+    rather than pass a URL the transport reads differently (BACKLOG #5343).
+
+    Mutation: parse with ``urlsplit`` again. Red: DID NOT RAISE."""
+    with pytest.raises(ApiError, match="no scheme"):
+        EngineClient(" http://127.0.0.1:8765")
 
 
 # --- ASVS 14.2.1 (BACKLOG #1184): the search needle never rides the query string -------------------

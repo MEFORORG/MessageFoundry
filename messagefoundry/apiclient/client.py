@@ -24,7 +24,7 @@ from json import JSONDecodeError
 from pathlib import Path
 from types import TracebackType
 from typing import Literal, TypeVar
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, RootModel, ValidationError
@@ -379,15 +379,21 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     passed. A positive allow-list is the shape that fixes it: a deny-list of known-bad schemes
     cannot cover the OS protocol handlers a given Windows install happens to register.
 
-    A base URL with no scheme at all fails here too (``urlsplit("127.0.0.1:8765")`` yields scheme
+    A base URL with no scheme at all fails here too (``httpx.URL("127.0.0.1:8765")`` yields scheme
     ``""``), which is a deliberate change: such a URL could never have reached an engine, and
     failing at construction beats failing later with an opaque transport error.
 
-    **A host is required (BACKLOG #5343).** An empty or unparsable host is not loopback. httpx
-    re-reads a multi-slash URL such as ``http:////engine.example:8765``, whose ``urlsplit`` host is
-    empty, and connects to ``engine.example``, so treating the empty host as loopback would have let
-    a malformed URL skip both the plaintext refusal and the cleartext credential refusal. No URL
-    without a host can name an engine, so it is refused for both schemes.
+    **A host is required (BACKLOG #5343).** An empty or unparsable host is not loopback. The
+    former check waved an empty host through as if it were, yet httpx still dials such a URL: for
+    ``http:////engine.example:8765`` or ``http://:8765`` it connects to the empty host, which the
+    resolver may map to a non-loopback address of this machine (measured on httpx 0.28.1), with the
+    credential in cleartext. No URL without a host can name an engine, so it is refused for both
+    schemes.
+
+    **One parser decides (BACKLOG #5343).** The URL is parsed with ``httpx.URL``, the parser the
+    transport dials with, not ``urllib.parse``. Two parsers that disagree on a URL are how a check
+    passes one host while the request goes to another; a URL httpx cannot parse raises
+    :class:`ApiError` here rather than ``httpx.InvalidURL`` later.
 
     **Plaintext http to a remote host (CONSOLE-3, ASVS 12.3.3, BACKLOG #1179).** A remote
     ``http://`` URL would put the bearer token and PHI on the wire in cleartext, so a remote engine
@@ -411,20 +417,20 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     costs them nothing.
     """
     try:
-        parts = urlsplit(base_url)
-    except ValueError:  # an unbalanced IPv6 bracket, say
-        parts = None
-    if parts is None:  # raised outside the handler, so it chains no error quoting the URL
+        url: httpx.URL | None = httpx.URL(base_url)
+    except httpx.InvalidURL:  # a non-numeric port or a control character, say
+        url = None
+    if url is None:  # raised outside the handler, so it chains no error quoting the URL
         raise ApiError("refusing a base URL that does not parse as a URL.")
-    scheme = parts.scheme.lower()
+    scheme = url.scheme.lower()
     if scheme not in _ALLOWED_URL_SCHEMES:
         found = f"scheme {scheme!r}" if scheme else "no scheme"
         raise ApiError(
             f"refusing a base URL with {found}: this client permits only the "
             f"{' and '.join(sorted(_ALLOWED_URL_SCHEMES))} schemes."
         )
-    host = (parts.hostname or "").lower()
-    if host == "":
+    host = url.host
+    if not host:
         raise ApiError(
             "refusing a base URL with no host: name the engine host, for example "
             "https://engine.example:8765 or http://127.0.0.1:8765."
@@ -977,7 +983,7 @@ class EngineClient:
         """
         if not self._cleartext_hop:
             return
-        host = urlsplit(self.base_url).hostname or self.base_url
+        host = httpx.URL(self.base_url).host  # the constructor refused a URL with no host
         raise ApiError(
             f"refusing to send {what} over plaintext http to non-loopback host {host!r}: "
             "allow_insecure permits unauthenticated reads on a declared-plaintext engine, never a "
