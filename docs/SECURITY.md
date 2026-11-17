@@ -6219,7 +6219,7 @@ At least these events bear on a live engine session:
 | The wall clock steps backward | Every session last used after the new time fails the engine's session check until the clock passes that use again. A failed check revokes the session. The engine fails closed rather than age it wrongly. |
 | The directory disables or deletes the account | The directory reconciler can end every session of the account. The row for a change made in Active Directory, in the [revocation table](#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832), gives the rule. Each engine process keeps its count in memory, so a restart sets it back to 0. |
 | A directory group change alters the account's roles, or withdraws or narrows its channel scope | The reconciler ends every session of the account on the first pass that sees the change. A pass can revoke nothing, as *Directory session reconciliation* explains. The account's next sign-in also ends its other sessions. |
-| An administrator edits the engine's AD group-to-role or group-to-scope map | Ends every session of every enabled directory account. |
+| An administrator edits the engine's AD group-to-role or group-to-scope map | Ends every session of every enabled directory account, and of each account whose record fails its integrity check. |
 | An administrator binds, rebinds or unbinds the account's federated identity | Ends every session of the account, a first bind included. |
 | An administrator signs the user out with `DELETE /users/{user_id}/sessions` | Ends every session of the account. |
 | An administrator disables the user in the engine | Ends every session of the account. Each request also refuses a disabled account. |

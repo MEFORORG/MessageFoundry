@@ -20708,11 +20708,11 @@ class AuthService:
         **Scoped to AD accounts, and deliberately not narrowed further.** Resolving which principals
         a map edit actually affects would mean re-binding to the directory, and both a removed
         mapping and an added one change an outcome, so the affected set is not derivable from the
-        entries alone. Local accounts read neither map and are left alone.
+        entries alone. A local account whose record passes reads neither map and is left alone.
 
         Takes its set from :meth:`sessions_ended_by_ad_map_save`: every enabled directory account
-        whose record passes its seal, and every account whose record fails its integrity check,
-        which :meth:`_verified` reports. On a keyless store there is no seal, but an account whose
+        whose record passes its seal, and each account the admin list shows as failing its
+        integrity check, local ones included, which :meth:`_verified` reports. On a keyless store there is no seal, but an account whose
         users row or role rows do not parse still fails (BACKLOG #5505). Each
         account's unrevoked rows are then revoked with the store's ``revoke_user_sessions``, so this
         needs no schema change on any backend. The count it returns includes rows already past their
@@ -20732,7 +20732,8 @@ class AuthService:
 
     async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:
         """The account ids whose sessions a save of either AD group map would end: every enabled
-        directory account, and every account whose record fails its integrity check.
+        directory account whose record passes, and each account the admin list shows as failing
+        its integrity check.
 
         BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
         :meth:`_revoke_ad_sessions` revokes exactly this set, so a route asking whether the save

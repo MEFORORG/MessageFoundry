@@ -2163,9 +2163,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         ),
     ) -> SimpleMessage:
-        """Replace the AD-group to role map. Ends every directory account's sessions, so a caller
-        signed in through the directory takes the bound proof (BACKLOG #3401,
-        :func:`_prove_group_save`)."""
+        """Replace the AD-group to role map. Ends the sessions of each account
+        ``sessions_ended_by_ad_map_save`` names, so a caller among them takes the bound proof
+        (BACKLOG #3401, :func:`_prove_group_save`)."""
         await _prove_group_save(request, identity, await service.sessions_ended_by_ad_map_save())
         return await _set_ad_group_map_core(body, service=service, identity=identity)
 
@@ -2218,8 +2218,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         ),
     ) -> SimpleMessage:
-        """Replace the AD-group to channel-scope map. Ends every directory account's sessions, as
-        the role map does, and takes the same step-up (BACKLOG #3401)."""
+        """Replace the AD-group to channel-scope map. Ends the same accounts' sessions as the
+        role map does, and takes the same step-up (BACKLOG #3401)."""
         await _prove_group_save(request, identity, await service.sessions_ended_by_ad_map_save())
         return await _set_ad_group_scope_map_core(body, service=service, identity=identity)
 
