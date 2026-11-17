@@ -2192,7 +2192,8 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
     files it does not list, so by name under a root git tracks nothing under; where git cannot list
     them, by name, tracked files included; outside a work tree, not at all. ``.git`` is always
     pruned. A directory the walk cannot list is reported in ``errors``, where ``rglob`` used to drop
-    it without a word."""
+    it without a word, except one below the root whose listing raises ENOENT or ENOTDIR, which is
+    passed over as removed since it was listed, whatever the cause of that errno."""
     root = Path(raw)
     tracked = _tracked_under(root)
     tracked_dirs = {
@@ -2210,7 +2211,13 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
             return  # Removed after it was listed (a cache cleared mid-walk): nothing left to read.
         name = raw if name == "." else name
         why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
-        what = "does not exist" if exc.errno in _GONE else f"unreadable directory ({why})"
+        what = (
+            "does not exist"
+            if exc.errno == errno.ENOENT
+            else "not a directory"
+            if exc.errno == errno.ENOTDIR
+            else f"unreadable directory ({why})"
+        )
         errors.append(f"{name}/:0: {what}, so its files were not scanned (fail closed)")
 
     for top, dirs, files in os.walk(root, onerror=refused):
@@ -2259,8 +2266,9 @@ def _candidate_files(
         for raw in paths:
             root = Path(raw)
             if root.is_file():
-                # rel is the bare name, matching the directory case's intent: components of the path the
-                # caller NAMED must not themselves trigger a SKIP_DIRS short-circuit.
+                # rel is the bare name, matching the directory case, where the rel path starts below
+                # the root the caller NAMED. So the path the caller wrote is not judged: a file named
+                # under docs/security/ earns no location hit here, as on origin/main.
                 if root.name != ".git":
                     out.append((root, root.name))
                 continue
@@ -3152,8 +3160,9 @@ def main(argv: list[str]) -> int:
                     else f"unreadable ({errno.errorcode.get(exc.errno or 0, type(exc).__name__)})"
                 )
             unread += 1
-            # The path alone decides a location or name hit, so it is kept whatever became of the
-            # entry: a missing or unstatable name under docs/security/ still exits 1, not 2.
+            # The path alone decides a location or name hit, so it is kept for every entry that gets
+            # here: an unstatable name under docs/security/, or in staged mode a missing one, still
+            # exits 1, not 2. A gone entry passed over above earns no hit.
             hits.extend(_name_hits(abs_path, rel)[0])
             if reason is None:
                 continue
@@ -3175,7 +3184,8 @@ def main(argv: list[str]) -> int:
     if path_mode:
         print(
             f"scan_forbidden: examined {scanned} file(s) across {len(paths)} named path(s); "
-            f"{unread} more were binary, unreadable or under a forbidden path, so their content "
+            f"{unread} more were binary, not regular files, unreadable or under a forbidden path, "
+            "so their content "
             f"was not scanned, and {unlisted} director(ies) could not be listed.",
             file=sys.stderr,
         )
