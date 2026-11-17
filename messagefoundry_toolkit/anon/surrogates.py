@@ -169,7 +169,8 @@ class Seps:
     """The component/repetition/subcomponent separators, the escape character and the field
     separator of the message being anonymized, read from its own MSH-1/MSH-2 (never hardcoded).
     Splitting a line into fields is the adapter's concern; the surrogate kinds read ``field`` only
-    to keep a digit field separator out of a fabricated value (:func:`_free_digits`). The leak-check
+    to keep the field separator out of a fabricated letter or digit (:func:`_reserved`), and the
+    site-code scrub reads it as what ``\\F\\`` decodes to. The leak-check
     decodes an escaped value with ``escape`` before its detectors look (BACKLOG #5532), and so does
     the site-code scrub (BACKLOG #5632)."""
 
@@ -189,55 +190,63 @@ def _fake_digits(rng: random.Random, length: int, digits: str = _ALL_DIGITS) -> 
     return "".join(rng.choice(digits) for _ in range(max(1, length)))
 
 
-def _free_digits(seps: Seps, field_sep: str) -> str:
-    """The ASCII digits the message does not declare as its field, component, repetition or
-    subcomponent separator or as its escape character: the digits a fabricated value may hold
-    (BACKLOG #5540). ``field_sep`` is the message's field separator."""
-    reserved = field_sep + seps.component + seps.repetition + seps.subcomponent + seps.escape
-    return "".join(d for d in _ALL_DIGITS if d not in reserved)
+def _reserved(seps: Seps) -> str:
+    """The field, component, repetition and subcomponent separators and the escape character the
+    message declares: the characters a fabricated letter or digit never is (BACKLOG #5540)."""
+    return seps.field + seps.component + seps.repetition + seps.subcomponent + seps.escape
 
 
-def _fake_letter(rng: random.Random) -> str:
-    """A fabricated upper-case ASCII letter."""
-    return chr(rng.randrange(ord("A"), ord("Z") + 1))
+def _free_digits(seps: Seps) -> str:
+    """The ASCII digits :func:`_reserved` does not hold: the digits a fabricated value may hold
+    (BACKLOG #5540)."""
+    return "".join(d for d in _ALL_DIGITS if d not in _reserved(seps))
+
+
+#: Every upper-case ASCII letter, the letters :func:`_fake_like` draws from by default.
+_ALL_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _free_letters(seps: Seps) -> str:
+    """The upper-case ASCII letters :func:`_reserved` does not hold: the letters a fabricated value
+    may hold, so a fabricated letter is never a separator or escape character the message
+    declares."""
+    return "".join(c for c in _ALL_LETTERS if c not in _reserved(seps))
 
 
 def _fake_like(rng: random.Random, sample: str, seps: Seps) -> str:
     """A fabricated value with the **same shape** as ``sample``: each digit becomes an ASCII digit,
     each letter and each other non-ASCII character becomes an upper-case ASCII letter, and ASCII
     punctuation and spaces are kept verbatim. Preserves the original width AND the alphanumeric
-    shape (so ``A0049`` becomes ``X7321``, not a shrunk digit-only string). A non-ASCII letter used to be kept as it was, so
-    an accented letter of a real id reached the output (BACKLOG #5534).
+    shape (so ``A0049`` becomes ``X7321``, not a shrunk digit-only string). A non-ASCII letter used
+    to be kept as it was, so an accented letter of a real id reached the output (BACKLOG #5534).
 
-    The subcomponent separator and escape character the message declares are kept
-    even when they are not ASCII, so the value keeps its structure, except a declared digit, which
-    is fabricated like any other digit; no fabricated digit is one the message declares as a
-    separator or escape character (:func:`_free_digits`).
-    Each escape sequence a second escape character closes in the same subcomponent becomes
-    fabricated letters, one for each character it is written with, its escape characters
-    included, so the width holds. Its body is never rewritten character by character, which could
-    turn ``\\E\\`` into ``\\F\\``."""
+    No fabricated letter or digit is a separator or escape character the message declares
+    (:func:`_reserved`). A declared separator that is a letter, a digit or not ASCII is fabricated
+    like any other character of its kind, so no letter, digit or non-ASCII character of
+    ``sample`` reaches the output. Each escape sequence a second escape character closes in the
+    same subcomponent becomes fabricated letters, one for each character it is written with, its
+    escape characters included, so the width holds; its body is never rewritten character by
+    character, which could turn ``\\E\\`` into ``\\F\\``. An escape character that no
+    second one closes becomes a fabricated letter, or a fabricated digit when it is a digit, even
+    when it is ASCII punctuation. So the output holds no escape character, and no escape
+    sequence the sender did not write."""
     out: list[str] = []
     escape = seps.escape
-    kept = (seps.subcomponent, escape)
-    digits = _free_digits(seps, seps.field)
+    digits = _free_digits(seps)
+    letters = _free_letters(seps)
     at = 0
     while at < len(sample):
         ch = sample[at]
         end = sample.find(escape, at + 1) if escape and ch == escape else -1
         # HL7 splits before it decodes, so an escape never closes across a subcomponent separator.
         if end != -1 and seps.subcomponent not in sample[at + 1 : end]:
-            out.extend(_fake_letter(rng) for _ in range(end + 1 - at))
+            out.extend(rng.choice(letters) for _ in range(end + 1 - at))
             at = end + 1
             continue
         if ch.isdigit():
-            # A digit is fabricated even when the message declares it a separator, so the real id's
-            # digits never reach the output; a fabricated digit avoids the declared ones.
             out.append(rng.choice(digits))
-        elif ch in kept:
-            out.append(ch)
-        elif ch.isalpha() or not ch.isascii():
-            out.append(_fake_letter(rng))
+        elif ch.isalpha() or not ch.isascii() or ch == escape:
+            out.append(rng.choice(letters))
         else:
             out.append(ch)
         at += 1
@@ -346,7 +355,7 @@ def surrogate_ssn(rep: str, keyer: Keyer, seps: Seps) -> str:
     :func:`_surrogate_identifier` does (BACKLOG #5534). No fabricated digit is one the message
     declares as a separator or escape character (:func:`_free_digits`, BACKLOG #5540)."""
     rng = keyer.rng("ssn", rep)
-    digits = _free_digits(seps, seps.field)
+    digits = _free_digits(seps)
     comps = _components(rep, seps)
     id_part = comps[0]
     if not id_part:
@@ -610,7 +619,13 @@ _HEX_ARGUMENT_ESCAPE: re.Pattern[str] = re.compile(
 )
 
 
-def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|") -> str:
+class SiteCodeSeparatorRefused(AnonError):
+    """:func:`scrub_site_codes` found a site code but every surrogate prefix it could write holds a
+    digit the message declares as a separator or escape character (BACKLOG #5540). A ``keep`` does
+    not help: the pass reads a kept field too."""
+
+
+def scrub_site_codes(value: str, keyer: Keyer, seps: Seps) -> str:
     """Field-anchored site-code safety pass (ADR 0030 §5): replace any **whole component or
     subcomponent** that is a site code with a fabricated non-site code of the same width, leaving a
     coincidental site-code run inside a longer value with no escape character (timestamps, order
@@ -627,10 +642,11 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|")
     with subcomponents that reads as a site code whole, as received, is replaced whole, its
     subcomponent separators included; otherwise each subcomponent is replaced on its own. The surrogate is keyed on
     the part as written, so one site code written two ways gets two unrelated surrogates.
-    ``field_sep`` is the message's field separator, which ``\\F\\`` decodes to. A fabricated code
-    holds no digit the message declares as a separator (BACKLOG #5540)."""
+    ``seps.field``, the message's field separator, is what ``\\F\\`` decodes to. A fabricated code
+    holds no digit the message declares as a separator or escape character (BACKLOG #5540)."""
     if not value or not _SITE_PREFIXES:
         return value
+    field_sep = seps.field
     # The check also reads the value with its invisible characters dropped, so the fast exit does.
     visible = dropped(value)
     if not visible.isascii():
@@ -640,14 +656,14 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|")
 
     # A digit the message declares as a separator is never written: under a digit MSH-1 or MSH-2
     # it would add a field or a component and shift every later one past its rule (BACKLOG #5540).
-    digits = _free_digits(seps, field_sep)
+    digits = _free_digits(seps)
     prefixes = [p for p in _NON_SITE_PREFIXES if all(d in digits for d in p)]
 
     def _fake(part: str) -> str:
         if not prefixes:
-            raise AnonError(
-                "every non-site-code prefix holds a digit the message declares as a separator, so "
-                "no site-code surrogate can be written — refusing to emit"
+            raise SiteCodeSeparatorRefused(
+                "every non-site-code prefix holds a digit the message declares as a separator or "
+                "escape character, so no site-code surrogate can be written — refusing to emit"
             )
         rng = keyer.rng("sitecode", part)
         prefix = rng.choice(prefixes)
@@ -1097,12 +1113,12 @@ def scrub_message_site_codes(text: str, keyer: Keyer, rules: tuple[FieldRule, ..
         if fields[0].upper() == "MSH":
             # fields[0]="MSH", fields[1]=encoding chars (^~\&) — never scrub the header machinery.
             head = fields[:2]
-            tail = [scrub_site_codes(f, keyer, seps, field_sep) for f in fields[2:]]
+            tail = [scrub_site_codes(f, keyer, seps) for f in fields[2:]]
             out_segments.append(field_sep.join(head + tail))
         else:
             head = fields[:1]
             tail = [
-                f if is_date_output(fields, i) else scrub_site_codes(f, keyer, seps, field_sep)
+                f if is_date_output(fields, i) else scrub_site_codes(f, keyer, seps)
                 for i, f in enumerate(fields[1:], start=1)
             ]
             out_segments.append(field_sep.join(head + tail))

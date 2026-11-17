@@ -21,6 +21,7 @@ unallocated 4000::/3 range, and tokens that name no real partner or vendor.
 from __future__ import annotations
 
 import contextlib
+import random
 from collections.abc import Iterator
 from types import ModuleType
 
@@ -228,13 +229,93 @@ def test_an_ssn_surrogate_writes_no_declared_separator_digit(
         assert "5" not in fabricated.split("^", 1)[0], fabricated
 
 
+def _fabricated_before(char: str) -> bool:
+    """True where the id surrogate before BACKLOG #5534 wrote a fabricated character in place of
+    ``char``: a digit, a letter or a non-ASCII character. It kept only ASCII punctuation and
+    spaces."""
+    return char.isdigit() or char.isalpha() or not char.isascii()
+
+
+#: Ids and the separators they are read under, where a declared separator or escape character is
+#: a letter, a digit or not ASCII. The first three are the reviewer's cases of round 022b1dea.
+_DECLARED_LETTER_CASES = [
+    ({"escape": "Q"}, "QWERTYQ7Q"),
+    ({"escape": "\u00e9"}, "J\u00e9R\u00d4ME12"),
+    ({"subcomponent": "\u00e9"}, "AB\u00e9CD"),
+    ({"subcomponent": "\u00a7", "escape": "\u00b6"}, "AB\u00a7CD\u00b6"),
+    ({"subcomponent": "S", "escape": "\\"}, "A\\BSC\\D"),
+    ({"escape": "Q"}, "AQBQC&DQ"),
+    ({"subcomponent": "5"}, "1525354"),
+]
+
+
 @_SURROGATES
-def test_a_non_ascii_separator_in_an_id_is_kept(surrogates: ModuleType) -> None:
-    """A latin-1 capture may declare a non-ASCII subcomponent separator or escape character."""
-    seps = surrogates.Seps(subcomponent="\u00a7", escape="\u00b6")
-    out = surrogates.surrogate_id("AB\u00a7CD\u00b6", Keyer(_SALT), seps)
-    assert out[2] == "\u00a7" and out[-1] == "\u00b6", out
-    assert out[:2].isascii() and out[3:5].isascii()
+@pytest.mark.parametrize(("declared", "real"), _DECLARED_LETTER_CASES)
+def test_an_id_surrogate_keeps_no_character_it_used_to_fabricate(
+    surrogates: ModuleType, declared: dict[str, str], real: str
+) -> None:
+    """A declared escape or subcomponent character that is a letter, a digit or not ASCII is
+    fabricated like any other character of its kind. Keeping it kept a real character of the id,
+    so ``QWERTYQ7Q`` under escape ``Q`` left its last ``Q``. A character fabricated under every
+    one of many salts is not copied; a copied one matches the real id under all of them."""
+    seps = surrogates.Seps(**declared)
+    outs = [
+        surrogates.surrogate_id(f"{real}^^^H^MR", Keyer(f"{_SALT}{n}"), seps).split("^", 1)[0]
+        for n in range(40)
+    ]
+    reserved = "".join(declared.values()) + "|^~&\\"
+    for out in outs:
+        assert len(out) == len(real) and out.isascii(), out
+        # No fabricated character is a declared separator or escape character, so a fabricated
+        # letter never pairs with another into an escape sequence the sender did not write.
+        assert not any(
+            c in reserved for c, r in zip(out, real, strict=True) if _fabricated_before(r)
+        )
+        assert seps.escape not in out, out
+    for at, char in enumerate(real):
+        if _fabricated_before(char):
+            assert any(out[at] != char for out in outs), (real, at)
+
+
+@_SURROGATES
+def test_the_reviewers_ids_leave_no_real_character(surrogates: ModuleType) -> None:
+    for declared, real in _DECLARED_LETTER_CASES[:2]:
+        out = surrogates.surrogate_id(f"{real}^^^H^MR", Keyer(_SALT), surrogates.Seps(**declared))
+        fabricated = out.split("^", 1)[0]
+        assert declared["escape"] not in fabricated, fabricated
+        assert fabricated.isascii(), ascii(fabricated)
+
+
+@_SURROGATES
+def test_no_id_surrogate_keeps_a_character_the_old_one_fabricated(
+    surrogates: ModuleType,
+) -> None:
+    """Differential against the surrogate before BACKLOG #5534 (:func:`_fabricated_before`), over
+    ids drawn from letters, digits, non-ASCII characters, punctuation and the declared characters,
+    under declarations that make a letter, a digit or a non-ASCII character a separator."""
+    pool = "AQZ059\u00e9\u00d4\u00a7\u00b6&\\-. S"
+    declarations = [
+        {},
+        {"escape": "Q"},
+        {"escape": "\u00e9"},
+        {"subcomponent": "\u00a7", "escape": "\u00b6"},
+        {"subcomponent": "S"},
+        {"subcomponent": "5", "escape": "9"},
+    ]
+    draw = random.Random(5534)
+    for declared in declarations:
+        seps = surrogates.Seps(**declared)
+        for _ in range(60):
+            real = "".join(draw.choice(pool) for _ in range(draw.randrange(1, 10)))
+            outs = [
+                surrogates.surrogate_id(f"{real}^^^H^MR", Keyer(f"{_SALT}{n}"), seps).split("^", 1)[
+                    0
+                ]
+                for n in range(25)
+            ]
+            for at, char in enumerate(real):
+                if _fabricated_before(char):
+                    assert any(out[at] != char for out in outs), (declared, ascii(real), at)
 
 
 @_SURROGATES

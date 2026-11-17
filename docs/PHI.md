@@ -2498,8 +2498,11 @@ Properties of the anonymizer:
   alphabet. The rates and the stated bound are in the docstring of `_estimated_entropy_bits` in
   [`keying.py`](../messagefoundry_toolkit/anon/keying.py) (vault BACKLOG #3359).
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
-  scrubbed dataset stays structurally realistic. An identifier surrogate (`mrn`, `id`) fabricates
-  every letter and digit of the id, as ASCII; `ssn` writes fabricated digits. Each keeps only the
+  scrubbed dataset stays structurally realistic. An identifier surrogate (`mrn`, `id`) writes a
+  fabricated ASCII letter or digit for every letter, digit, non-ASCII character and escape
+  character of the id, and keeps none of them; the docstring of `_fake_like` in
+  [`surrogates.py`](../messagefoundry_toolkit/anon/surrogates.py) says what it keeps.
+  `ssn` writes fabricated digits. Each keeps only the
   CX components that describe the id rather than hold it: CX.3 to CX.6, CX.9 and CX.10. They are
   the check-digit scheme, the identifier type and the issuer's names. It blanks CX.2, the check digit, the CX.7 and
   CX.8 dates, and anything past CX.10. `PID-20`, a driver's licence, takes the `dln` kind: the

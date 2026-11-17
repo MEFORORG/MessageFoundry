@@ -1311,9 +1311,11 @@ def coverage_clause(report: LeakReport) -> str:
 
 
 def denylist_is_live(report: LeakReport) -> bool:
-    """True only if the token tables loaded AND passed the floor check. ``token_tables_live`` alone
-    is true for a source that lost a whole section, which ``token_floor_reason`` then names, so
-    printing "live" from the first field alone overstated the check (BACKLOG #2247)."""
+    """True only if the token tables loaded, passed the floor check, and hold the same
+    ``[site_prefix]`` entries as the table the site-code check reads (``site_prefix_split``,
+    BACKLOG #5541). ``token_tables_live`` alone is true for a source that lost a whole section,
+    which ``token_floor_reason`` then names, so printing "live" from the first field alone
+    overstated the check (BACKLOG #2247)."""
     return report.token_tables_live and report.token_floor_reason is None
 
 

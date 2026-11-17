@@ -10,10 +10,11 @@
   when the site-code check's prefixes differ from the publish guard's `[site_prefix]` table.
   (`BACKLOG #5654`, `#5541`)
 - **The anonymizer's site-code pass writes no separator digit, and an identifier surrogate
-  invents no id.** The site-code pass writes no digit the message declares as a separator. An
-  identifier or SSN surrogate fabricates every digit of an id and writes no digit the message
-  declares as a separator or escape character. An
+  invents no id.** The site-code pass writes no digit the message declares as a separator or
+  escape character. An identifier or SSN surrogate fabricates every digit of an id, and an
+  identifier surrogate every letter, non-ASCII character and escape character too, a declared
+  separator that is a letter or not ASCII among them; neither writes a letter or digit the
+  message declares as a separator or escape character. An
   identifier surrogate leaves an empty id empty and turns an escape sequence in an id into
-  letters of the same width. The
-  tee's `anonymize-captures` names a field-separator refusal and its fix instead of advising a
-  keep. (`BACKLOG #5534`, `#5540`)
+  letters of the same width. The tee's `anonymize-captures` names a field-separator or site-code
+  refusal and its fix instead of advising a keep. (`BACKLOG #5534`, `#5540`)

@@ -67,7 +67,7 @@ from tee.anon.rules import (
     load_rules,
     retargeted_defaults,
 )
-from tee.anon.surrogates import site_prefixes_loaded
+from tee.anon.surrogates import SiteCodeSeparatorRefused, site_prefixes_loaded
 from tee.controlchars import scrub_control_chars
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
@@ -838,6 +838,9 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     # byte (BACKLOG #5540). A keep is the wrong advice for one: it would emit the captured value.
     separator_refused = 0
     separator_paths: dict[str, None] = {}
+    # Messages refused because no site-code surrogate could avoid a declared separator digit. A
+    # keep does not help: the site-code pass reads a kept field too.
+    site_code_refused = 0
 
     def _tally(report: LeakReport) -> None:
         nonlocal residue_reports, residue_mixed
@@ -868,15 +871,18 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             if isinstance(exc, SurrogateSeparatorRefused):
                 separator_refused += 1
                 separator_paths[exc.path] = None
+            elif isinstance(exc, SiteCodeSeparatorRefused):
+                site_code_refused += 1
             continue
         except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
             failed += 1  # it is a count, not a leak (LeakError, or anything else)
             continue
         # The id is read from the anonymized body, with the reader the relay used for row.control_id,
         # so it follows the rules; it is None when that body has no MSH-10. received_at is the
-        # relay's real receive time, which no MSH-7 rule touches (BACKLOG #2994). The surrogates
-        # are ASCII today, but this runs outside the catch above, so a character latin-1 cannot
-        # hold must give None rather than end the run.
+        # relay's real receive time, which no MSH-7 rule touches (BACKLOG #2994). A field no rule
+        # rewrites, and a component an identifier rule keeps, holds what was captured, and this
+        # runs outside the catch above, so a character latin-1 cannot hold must give None rather
+        # than end the run.
         try:
             control_id, _ = mllp.peek_fields(anon.encode("latin-1"))
         except UnicodeEncodeError:
@@ -908,7 +914,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         ]
         if residue_reports:
             # A keep is the wrong advice here: it would leave the whole field.
-            if residue_reports < failed - separator_refused:
+            if residue_reports < failed - separator_refused - site_code_refused:
                 rest = ["For the others:", *steps]
             elif residue_mixed:
                 rest = ["At least one of them also had another cause:", *steps]
@@ -927,7 +933,20 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 "would hold the message's field separator or a control byte, in "
                 f"{', '.join(separator_paths)}. A keep on such a field would emit the captured "
                 "value: point the field at drop in an overlay.",
-                *(["For the others:", *steps] if separator_refused < failed else ["Then retry."]),
+                *(
+                    ["For the others:", *steps]
+                    if separator_refused < failed - site_code_refused
+                    else ["Then retry."]
+                ),
+            ]
+        if site_code_refused:
+            # A keep is the wrong advice here too: the site-code pass reads a kept field.
+            steps = [
+                f"{site_code_refused} of them held a site code that no surrogate could replace "
+                "without a digit the message declares as a separator or escape character. A keep "
+                "does not help: the site-code pass reads a kept field too. Point each field that "
+                "holds a site code at drop in an overlay.",
+                *(["For the others:", *steps] if site_code_refused < failed else ["Then retry."]),
             ]
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "
