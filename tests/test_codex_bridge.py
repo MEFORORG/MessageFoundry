@@ -178,6 +178,12 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
     assert "hook says 2" not in capsys.readouterr().err
 
 
+DENY_JSON = (
+    '{"hookSpecificOutput": {"hookEventName": "PreToolUse", '
+    '"permissionDecision": "deny", "permissionDecisionReason": "no"}}'
+)
+
+
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
 @pytest.mark.parametrize(
     ("command", "outcome"),
@@ -186,64 +192,19 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         ("try {{ Get-Item -LiteralPath 'no-such-item-b4' -EA Stop }} catch {{}}; exit 2", "block"),
         ("trap {{ exit 2 }}; throw 'boom'", "block"),
         ("$p = $input | ConvertFrom-Json; if ($p.tool_name -eq 'Bash') {{ exit 2 }}", "block"),
-        # The rows from here on record what the bridge's tail decides, shape by shape.
         ("& '{py}' -c 'import sys; sys.exit(2)'; exit $LASTEXITCODE", "block"),
-        ("& '{py}' -c 'import sys; sys.exit(2)'", "block"),
-        ("& '{py}' -c 'import sys; sys.exit(3)'", "exit-1"),
-        ("& '{py}' -c 'import sys; sys.exit(2)'; Write-Output '{{}}'", "allow"),
-        (
-            "& '{py}' -c 'import sys; sys.exit(2)'; Get-Item -LiteralPath 'no-such-item-b4'",
-            "block",
-        ),
-        (
-            "& '{py}' -c 'import sys; sys.exit(2)'; "
-            "Remove-Item -LiteralPath 'no-such-item-b4' -ErrorAction Ignore",
-            "block",
-        ),
-        ("& '{py}' -c 'import sys; sys.exit(2)'; $null = Get-Item -LiteralPath 'no-b4'", "block"),
+        # pwsh -Command reports a native or script exit 2 that no explicit exit names as 1.
+        ("& '{py}' -c 'import sys; sys.exit(2)'", "exit-1"),
+        ("& ./guard.ps1", "exit-1"),
         ("Get-Item -LiteralPath 'no-such-item-b4'", "exit-1"),
-        # Under strict mode, with no native code set, the bridge's own statement must not fault.
-        (
-            "Set-StrictMode -Version Latest; trap {{ exit 2 }}; "
-            "Remove-Item -LiteralPath 'no-such-item-b4' -ErrorAction SilentlyContinue",
-            "exit-1",
-        ),
-        # Under Constrained Language Mode the same: a failing cmdlet and a trap exit 1.
-        (
-            "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n"
-            "trap {{ exit 2 }}; Get-Item -LiteralPath 'no-such-item-b4'",
-            "exit-1",
-        ),
-        # The hook sees LASTEXITCODE unset, as bare pwsh starts it, so its own strict-mode read
-        # trips its own trap; and a hook that removes the variable gets no block from the tail.
-        (
-            "Set-StrictMode -Version Latest; trap {{ exit 2 }}; "
-            "if ($LASTEXITCODE -ne 0) {{ 'native failed' }}",
-            "block",
-        ),
-        (
-            "Remove-Variable * -ErrorAction SilentlyContinue; Set-StrictMode -Version Latest; "
-            "trap {{ exit 2 }}; Write-Error 'soft failure'",
-            "exit-1",
-        ),
-        # A line continuation ending the hook must not swallow the bridge's own statement, and a
-        # dangling operator must stay a parse error rather than take it in.
-        ("& '{py}' -c 'import sys; sys.exit(2)' `", "block"),
-        ("$deny =", "exit-1"),
-        ("Write-Output '{{}}' |", "exit-1"),
-        ("Write-Output '{{}}' ||", "exit-1"),
-        ("& '{py}' -c 'import sys; sys.exit(2)'; if ($false) {{ exit 2 }}", "block"),
         ("if ($true) {{ return }}; exit 2", "allow"),
-        ("param()\nexit 2", "block"),
+        ("begin {{ }}\nend {{ exit 2 }}", "block"),
         (
-            "param([string]$Mode = 'enforce')\nif ($Mode -eq 'enforce') {{ exit 0 }}; exit 2",
-            "allow",
+            "begin {{ }}\nend {{ Write-Output '"
+            + DENY_JSON.replace("{", "{{").replace("}", "}}")
+            + "' }}",
+            "deny",
         ),
-        ("[CmdletBinding()]\nparam()\nexit 2", "block"),
-        ("param([string]$A = 'a', [string]$B = 'b')\nexit 2", "block"),
-        ("#Requires -Version 7\nparam()\nexit 2", "block"),
-        ("using namespace System.IO\nexit 2", "block"),
-        ("begin {{ }}\nend {{ exit 2 }}", "exit-1"),
     ],
     ids=[
         "explicit-exit-2",
@@ -252,34 +213,17 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         "reads-input",
         "native-2-passed-on",
         "native-2-last",
-        "native-3-last",
-        "stale-2-then-success",
-        "stale-2-then-failed-cmdlet",
-        "stale-2-then-ignored-cmdlet",
-        "stale-2-then-assignment",
+        "guard-exits-2",
         "failed-cmdlet",
-        "strict-mode-failed-cmdlet",
-        "constrained-language-trap-failed-cmdlet",
-        "strict-mode-reads-unset-code",
-        "strict-mode-after-removing-the-code",
-        "trailing-continuation",
-        "dangling-assignment",
-        "dangling-pipe",
-        "dangling-or",
-        "stale-2-then-untaken-if",
         "early-return",
-        "empty-param",
-        "non-empty-param",
-        "cmdletbinding-param",
-        "two-defaulted-params",
-        "requires-then-param",
-        "using-namespace",
         "named-blocks",
+        "named-blocks-deny",
     ],
 )
-def test_a_powershell_hook_blocks_on_the_last_exit_code_when_it_is_2(
+def test_a_command_only_powershell_hook_blocks_on_an_explicit_exit_2_or_a_deny(
     bridge, tmp_path, command, outcome
 ):
+    (tmp_path / "guard.ps1").write_text("exit 2\n", encoding="utf-8")
     hook = {"type": "command", "shell": "powershell", "command": command.format(py=sys.executable)}
     settings(tmp_path, [hook])
     if outcome == "block":
@@ -289,43 +233,19 @@ def test_a_powershell_hook_blocks_on_the_last_exit_code_when_it_is_2(
     result = bridge.dispatch(tmp_path, BASH_CALL)
     if outcome == "allow":
         assert result == {}, result
+    elif outcome == "deny":
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
     else:
         assert "hook exited 1: " in result["systemMessage"], result
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
-@pytest.mark.parametrize(
-    "command",
-    [
-        "& ./guard.ps1",
-        ". ./guard.ps1",
-        "& ./guard.ps1 # the guard decides",
-        # Each still blocks after the hook defines a Get-Variable function or alias, sets these
-        # default parameter values, or switches to Constrained Language Mode.
-        "function Get-Variable { 0 }\n& ./guard.ps1",
-        "Set-Alias Get-Variable Write-Output\n& ./guard.ps1",
-        "$PSDefaultParameterValues['*:Exclude'] = 'LAST*'\n& ./guard.ps1",
-        "$PSDefaultParameterValues['Get-Variable:Include'] = 'nothing'\n& ./guard.ps1",
-        "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n& ./guard.ps1",
-    ],
-    ids=[
-        "called",
-        "dot-sourced",
-        "called-before-a-comment",
-        "after-a-Get-Variable-function",
-        "after-a-Get-Variable-alias",
-        "after-a-default-Exclude",
-        "after-a-default-Get-Variable-Include",
-        "under-constrained-language",
-    ],
-)
-def test_a_powershell_hook_blocks_when_a_guard_it_runs_exits_2(bridge, tmp_path, command):
+def test_an_args_form_hook_blocks_when_the_guard_it_runs_exits_2(bridge, tmp_path):
     (tmp_path / "guard.ps1").write_text("exit 2\n", encoding="utf-8")
-    settings(tmp_path, [{"type": "command", "shell": "powershell", "command": command}])
+    hook = {"type": "command", "command": "pwsh", "args": ["-NoProfile", "-File", "guard.ps1"]}
+    settings(tmp_path, [hook])
     with pytest.raises(bridge.HookBlocked):
         bridge.dispatch(tmp_path, BASH_CALL)
-    settings(tmp_path, [{"type": "command", "shell": "powershell", "command": command + "\n$null"}])
-    assert bridge.dispatch(tmp_path, BASH_CALL) == {}
 
 
 def test_project_dir_is_substituted_in_every_form(bridge, tmp_path):
@@ -333,7 +253,7 @@ def test_project_dir_is_substituted_in_every_form(bridge, tmp_path):
     assert bridge.hook_argv(tmp_path, structured) == [f"{tmp_path}/guard", "a"]
     shell = {"type": "command", "shell": "powershell", "command": "'${CLAUDE_PROJECT_DIR}_x'"}
     # Braced, so a following name character cannot join the variable name.
-    command = bridge.hook_argv(tmp_path, shell)[-1].removesuffix(bridge.POWERSHELL_TAIL)
+    command = bridge.hook_argv(tmp_path, shell)[-1]
     assert command.endswith("'${env:CLAUDE_PROJECT_DIR}_x'")
 
 
@@ -794,7 +714,8 @@ def test_a_decision_gathered_before_a_fault_still_stands(
     assert result[kept[0]] == kept[1]
 
 
-# --- The launcher and the registered commands: no decision is a non-blocking 1 on every event.
+# --- The launcher and the registered commands: no decision is a non-blocking 1 on every event,
+# and so is a block under a PowerShell outer shell.
 
 _STUB_BRIDGE = "import os, sys\nsys.exit(int(os.environ['STUB_BRIDGE_EXIT']))\n"
 
@@ -881,8 +802,10 @@ def test_a_registered_command_passes_a_decision_and_maps_no_decision(
         check=False,
         timeout=60,
     )
+    if setup == "10" and shell == "pwsh":
+        expected = 1  # pwsh -Command reports the launcher's exit 2 as 1.
     assert completed.returncode == expected, (shell, completed.stdout, completed.stderr)
-    if expected == 1 and setup != "no-repo":  # invoke.ps1 ran and reported it.
+    if expected == 1 and setup not in ("no-repo", "10"):  # invoke.ps1 ran and reported it.
         assert "no decision, not blocking" in json.loads(completed.stdout)["systemMessage"]
 
 

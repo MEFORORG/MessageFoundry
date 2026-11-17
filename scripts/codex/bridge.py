@@ -199,16 +199,6 @@ def git_bash() -> str | None:
     return None
 
 
-# A command-only PowerShell hook runs under pwsh -Command with this tail after it. When the hook
-# ends with $? false, the tail exits with the last exit code, when it is 2, and with 1 otherwise;
-# -Command alone reports a guard script's exit 2 as 1. Its read sits in try/catch because under
-# strict mode an unset LASTEXITCODE throws, and a hook's trap would turn that throw into a block.
-# See docs/CODEX.md, "Who decides a block", and the tests for which shapes block.
-POWERSHELL_TAIL = (
-    "\n;\nif (-not $?) { try { if ($global:LASTEXITCODE -eq 2) { exit 2 } } catch {}; exit 1 }"
-)
-
-
 def hook_argv(root: Path, hook: dict) -> list[str]:
     command = hook["command"]
     if "args" in hook:
@@ -229,7 +219,7 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
         return [bash, "-c", command]
     if shell == "powershell":
         command = command.replace("${CLAUDE_PROJECT_DIR}", "${env:CLAUDE_PROJECT_DIR}")
-        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command + POWERSHELL_TAIL]
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
     raise ValueError(f"Unsupported Claude hook shell: {shell}")
 
 
