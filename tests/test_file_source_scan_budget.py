@@ -8,7 +8,8 @@ so ``poll_max_files`` such rejects sorting first could spend the whole budget an
 healthy drops behind them. Under ``move`` and ``delete`` a reject that stays for a lasting reason is
 now remembered by path and mark and skipped unread and uncharged until it changes, and examined
 again in full in a retry pass after the other candidates: after ``STUCK_RETRY_SECONDS`` for a
-lasting failure, on the next scan for a transient one. ``leave`` is unchanged.
+lasting failure, after ``STUCK_TRANSIENT_RETRY_SECONDS`` for a transient one. A due retry takes the
+settle gate first, so it is read a scan after it falls due. ``leave`` is unchanged.
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
 """
@@ -20,7 +21,7 @@ import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -205,32 +206,54 @@ async def test_a_new_file_under_the_same_name_size_and_mtime_is_examined(
 
 
 @pytest.mark.parametrize("fail_errno", [errno.EBUSY, errno.ENOSPC])
-async def test_a_transient_move_failure_is_retried_on_the_next_scan_uncharged(
+async def test_a_transient_move_failure_waits_its_back_off_uncharged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_errno: int
 ) -> None:
-    """A failure that may clear by itself is remembered as due at once, so each such reject is tried
-    again on the next scan, in the retry pass, and spends none of the budget: the healthy drop is
-    handed off a scan sooner than on main (:data:`_MAIN_SEQUENCE`), and no fresh pass reads a reject
-    twice.
+    """A failure that may clear by itself is remembered with ``STUCK_TRANSIENT_RETRY_SECONDS`` of
+    back-off, so each such reject spends none of the budget again: the healthy drop is handed off a
+    scan sooner than on main (:data:`_MAIN_SEQUENCE`), and no reject is read again until its
+    back-off passes.
 
-    Mutation: do not remember a transient failure. Red: the scans read :data:`_MAIN_SEQUENCE`."""
+    Mutation: do not remember a transient failure. Red: the scans read :data:`_MAIN_SEQUENCE`.
+    Mutation: remember it with no back-off. Red: a1 and a2 are read again in the retry pass."""
     rig = _Rig(tmp_path, monkeypatch, cap=1, fail_errno=fail_errno)
     _drop_two_rejects_and_a_healthy_drop(rig)
     scans = [await rig.scan() for _ in range(9)]
     assert scans != _MAIN_SEQUENCE
-    assert scans == [
-        [],
-        ["a1.hl7"],
-        ["a2.hl7", "a1.hl7"],  # a1 in the retry pass
-        ["b_healthy.hl7", "a2.hl7"],
-        ["a1.hl7"],
-        ["a2.hl7"],
-        ["a1.hl7"],
-        ["a2.hl7"],
-        ["a1.hl7"],
-    ]
+    assert scans == [[], ["a1.hl7"], ["a2.hl7"], ["b_healthy.hl7"], [], [], [], [], []]
     assert rig.handed_off == [_HL7]
     assert len(rig.source._stuck) == 2
+    assert {seen.wait for seen, _missed in rig.source._stuck.values()} == {
+        file_mod.STUCK_TRANSIENT_RETRY_SECONDS
+    }
+
+
+@pytest.mark.usefixtures("_no_scan_hook")
+async def test_a_transient_move_failure_is_not_read_and_scan_hooked_every_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ENOSPC on the move into ``.error``, with the retry falling due before every scan: the retry
+    pass takes the settle gate, so the reject is read and scan-hooked at most every other scan, as
+    on main, and not on every poll.
+
+    Mutation: let a due retry skip the settle gate. Red: read and hooked on every scan."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=errno.ENOSPC)
+    hooked: list[str] = []
+
+    def hook(_raw: bytes, source: str) -> None:
+        hooked.append(source)
+        raise ScanRejected("test signature")
+
+    set_scan_hook(hook)
+    rig.drop("a.hl7", _HL7)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    for _ in range(8):
+        _age_stuck(rig)
+        await rig.scan()
+    assert rig.reads.count("a.hl7") <= 1 + 8 // 2
+    assert len(hooked) == rig.reads.count("a.hl7")
+    assert len(rig.source._stuck) == 1
 
 
 def _win_os_error(code: int, winerror: int) -> OSError:
@@ -288,8 +311,8 @@ async def test_an_archived_copy_whose_original_cannot_be_removed_is_retried_in_f
     assert rig.reads == ["a.hl7"]
 
     _age_stuck(rig)
-    await rig.scan()  # the retry is read and judged again
-    await rig.scan()  # and remembered again, not due
+    await rig.scan()  # the retry settles
+    await rig.scan()  # then is read, judged again and remembered again
     assert archives == ["a.hl7", "a.hl7"]
     assert events == ["file_content_mismatch", "file_content_mismatch"]
     assert rig.reads == ["a.hl7", "a.hl7"]
@@ -375,7 +398,8 @@ async def test_a_due_retry_takes_the_whole_path_and_is_quarantined_once_the_move
 
     rig.fail_errno = None
     _age_stuck(rig)
-    assert await rig.scan() == ["a.hl7"], "unchanged since its move failed, so already settled"
+    assert await rig.scan() == [], "a due retry settles first"
+    assert await rig.scan() == ["a.hl7"]
     assert (rig.inbox / ".error" / "a.hl7").exists()
     assert events == ["file_content_mismatch"]
     assert rig.source._stuck == {}
@@ -403,6 +427,7 @@ async def test_a_retry_that_now_passes_the_verdict_is_ingested(
 
     verdicts["reject"] = False
     _age_stuck(rig)
+    assert await rig.scan() == []  # the retry settles
     assert await rig.scan() == ["a.hl7"]
     assert rig.handed_off == [_HL7]
     assert (rig.inbox / ".processed" / "a.hl7").exists()
@@ -423,8 +448,8 @@ async def test_due_retries_run_after_the_fresh_pass(
     await rig.scan()
     assert len(rig.source._stuck) == 3
     rig.drop("b_healthy.hl7", _HL7)
-    await rig.scan()  # the healthy drop settles
     _age_stuck(rig)
+    assert await rig.scan() == [], "the healthy drop and the retries settle"
     assert await rig.scan() == ["b_healthy.hl7", "a_reject0.hl7", "a_reject1.hl7", "a_reject2.hl7"]
     assert rig.handed_off == [_HL7]
     assert len(rig.source._stuck) == 3, "still stuck, so remembered again"
@@ -444,7 +469,9 @@ async def test_due_retries_are_capped_per_scan(
     await rig.scan()
     assert len(rig.source._stuck) == 4
     _age_stuck(rig)
-    assert await rig.scan() == ["a0.hl7", "a1.hl7"], "a2 and a3 wait, still due"
+    assert await rig.scan() == [], "a0 and a1 settle; a2 and a3 wait, still due"
+    assert await rig.scan() == ["a0.hl7", "a1.hl7"]
+    assert await rig.scan() == [], "a2 and a3 settle"
     assert await rig.scan() == ["a2.hl7", "a3.hl7"]
     assert await rig.scan() == []
     assert len(rig.source._stuck) == 4
@@ -501,14 +528,11 @@ async def test_retries_go_oldest_first_and_a_deferred_one_survives_pruning(
         stuck[key] = (seen._replace(due=seen.due - age), missed)
     (rig.inbox / "c.hl7").unlink()
 
-    assert await rig.scan() == ["b0.hl7", "a1.hl7"], "one slot, to the oldest failure"
+    assert await rig.scan() == ["b0.hl7"], "one slot, to the oldest failure, which settles"
     a0_key = str(rig.inbox / "a0.hl7")
-    for n in range(1, 4):
+    for expected in (["b1.hl7", "a1.hl7"], ["b2.hl7"], ["b3.hl7", "a0.hl7"]):
         assert a0_key in stuck, "deferred and still listed, so kept"
-        if n == 1:
-            assert await rig.scan() == ["b1.hl7", "a0.hl7"]
-        else:
-            await rig.scan()
+        assert await rig.scan() == expected
     assert str(rig.inbox / "c.hl7") not in stuck, "the control: an unlisted entry is pruned"
     assert a0_key in stuck and str(rig.inbox / "a1.hl7") in stuck
 
@@ -609,18 +633,21 @@ async def test_a_due_reject_past_the_ceiling_still_gets_its_retry(
         rig.drop(f"a{n}.hl7", _HL7.replace(b"CTL5717", f"CTL{n}".encode()))
     await rig.scan()  # the backlog settles
     _age_stuck(rig)
-    assert await rig.scan() == ["a0.hl7", "z.hl7"]
+    assert await rig.scan() == ["a0.hl7"], "z.hl7 settles in the retry pass"
+    assert await rig.scan() == ["a1.hl7", "z.hl7"]
     assert len(rig.source._stuck) == 1, "still stuck, so remembered again"
 
 
-async def test_a_retry_left_in_place_stays_remembered_and_due(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_a_retry_left_in_place_keeps_its_back_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A retry whose read fails transiently is not forgotten: it stays due, so the next scan tries
-    it again in the retry pass rather than reading and charging it in the fresh pass.
+    """A retry whose read fails is not forgotten, and it waits its back-off again rather than being
+    due on every scan: an EACCES read is warned about once over scans that would warn on every
+    other one on main and on every one with the retry left due. Once the back-off passes, it settles
+    and is retried, and a move that now works quarantines it.
 
-    Mutation: delete the entry in ``_examine``'s retry branch instead of making it due. Red: it is
-    forgotten."""
+    Mutation: make the entry due at once in ``_examine``'s retry branch. Red: read and warned about
+    on every scan. Mutation: delete the entry there. Red: forgotten, then read every other scan."""
     rig = _Rig(tmp_path, monkeypatch, cap=10)
     rig.drop("a.hl7", _PDF)
     await rig.scan()
@@ -628,17 +655,27 @@ async def test_a_retry_left_in_place_stays_remembered_and_due(
     _age_stuck(rig)
     real_read = file_mod._read_confined
 
-    def locked(path: Path, *args: Any) -> Any:
+    def denied(path: Path, *args: Any) -> Any:
         rig.reads.append(path.name)
-        raise OSError(errno.EBUSY, "locked")
+        raise PermissionError(errno.EACCES, "denied")
 
-    monkeypatch.setattr(file_mod, "_read_confined", locked)
-    assert await rig.scan() == ["a.hl7"]
+    def unreadable() -> int:
+        return sum("could not read" in r.getMessage() for r in caplog.records)
+
+    monkeypatch.setattr(file_mod, "_read_confined", denied)
+    assert await rig.scan() == [], "a due retry settles first"
+    for _ in range(6):
+        await rig.scan()
+    assert rig.reads.count("a.hl7") == 2, "the first read, then the one retry"
+    assert unreadable() == 1
     key = str(rig.inbox / "a.hl7")
     assert key in rig.source._stuck, "left in place, so still remembered"
+
     monkeypatch.setattr(file_mod, "_read_confined", real_read)
     rig.fail_errno = None
-    assert await rig.scan() == ["a.hl7"], "due at once, so retried on the next scan"
+    _age_stuck(rig)
+    assert await rig.scan() == []
+    assert await rig.scan() == ["a.hl7"]
     assert (rig.inbox / ".error" / "a.hl7").exists()
     assert rig.source._stuck == {}
 
@@ -732,6 +769,56 @@ async def test_a_reject_gone_after_a_failed_move_is_not_remembered(
     assert not any("stays in place" in r.message for r in caplog.records)
 
 
+class _FailingStat:
+    """A path whose ``lstat`` raises ``exc``."""
+
+    def __init__(self, exc: OSError) -> None:
+        self.exc = exc
+
+    def lstat(self) -> os.stat_result:
+        raise self.exc
+
+
+@pytest.mark.parametrize(
+    ("exc", "holds"),
+    [
+        (OSError(errno.ETIMEDOUT, "timed out"), True),
+        (OSError(errno.ESTALE, "stale handle"), True),
+        (_win_os_error(errno.EINVAL, 64), True),  # ERROR_NETNAME_DELETED
+        (_win_os_error(errno.EACCES, 53), True),  # ERROR_BAD_NETPATH
+        (OSError(errno.ENOENT, "gone"), False),
+        (_win_os_error(errno.ENOENT, 2), False),  # ERROR_FILE_NOT_FOUND
+        (OSError(errno.EACCES, "denied"), False),
+    ],
+)
+def test_a_transient_stat_failure_does_not_read_as_the_file_gone(exc: OSError, holds: bool) -> None:
+    """After a failed move, a stat that fails for a reason that may clear by itself is no evidence
+    the file has gone, so the reject is kept; a missing file is still gone.
+
+    Mutation: return False for every ``OSError`` in ``_holds``. Red: the transient rows."""
+    assert file_mod._holds(cast(Path, _FailingStat(exc)), None) is holds
+
+
+async def test_a_reject_whose_stat_times_out_after_a_failed_move_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same through the source: a transient move failure followed by a stat that times out
+    leaves the reject remembered, rather than forgotten and read and charged again."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=errno.EBUSY)
+    rig.drop("a.hl7", _PDF)
+
+    real_holds = file_mod._holds
+
+    def timed_out(_path: Path, _read_id: Any) -> bool:
+        return real_holds(cast(Path, _FailingStat(OSError(errno.ETIMEDOUT, "x"))), None)
+
+    monkeypatch.setattr(file_mod, "_holds", timed_out)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    assert str(rig.inbox / "a.hl7") in rig.source._stuck
+    assert await rig.scan() == []
+
+
 async def test_a_due_reject_replaced_before_its_retry_is_forgotten(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -764,6 +851,7 @@ async def test_a_full_memory_still_reschedules_a_retried_reject(
     await rig.scan()
     assert len(rig.source._stuck) == 2
     _age_stuck(rig)
+    assert await rig.scan() == []  # the retries settle
     assert await rig.scan() == ["a0.hl7", "a1.hl7"]
     assert await rig.scan() == [], "remembered again, not due"
     assert not any("is full" in r.message for r in caplog.records)

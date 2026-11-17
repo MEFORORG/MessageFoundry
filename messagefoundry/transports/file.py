@@ -120,6 +120,7 @@ class _StuckSeen(NamedTuple):
 
     mark: _FileMark
     due: float  # monotonic time its retry falls due
+    wait: float  # its back-off: STUCK_RETRY_SECONDS or STUCK_TRANSIENT_RETRY_SECONDS
 
 
 class _Step(enum.Enum):
@@ -137,12 +138,13 @@ class _Archived(NamedTuple):
     """What :meth:`FileSource._archive_to` did with one file (BACKLOG #5717)."""
 
     archived: bool  # a copy now sits in the archive directory
-    stays: bool  # the file that was read is still at its path
+    stays: bool  # the file that was read is still at its path, or may be (:func:`_holds`)
     lasting: bool  # it stays for a reason judged not to clear by itself (:func:`_lasting`)
 
 
-# Failures that may clear by themselves (BACKLOG #5717). A reject whose move hit one is remembered as
-# due its retry on the next scan, so it is tried again soon without spending the per-tick budget. At
+# Failures that may clear by themselves (BACKLOG #5717). A reject whose move hit one is remembered with
+# the shorter ``STUCK_TRANSIENT_RETRY_SECONDS`` back-off, so it is tried again sooner, without spending
+# the per-tick budget. At
 # least: another process holds the file open or locked, the file vanished, the disk or quota is full,
 # or a share timed out or dropped. Any other failure (access denied, a read-only volume, a link) is
 # taken as lasting, and the file is examined again after ``STUCK_RETRY_SECONDS``, which bounds what a
@@ -225,6 +227,10 @@ SETTLE_MISS_LIMIT = 3
 # STUCK_RETRIES_PER_SCAN_MAX of them and often fewer (FileSource._retry_allowance), and spend none of
 # the per-tick budget, so they cannot crowd healthy drops out of a scan however many rejects are stuck.
 STUCK_RETRY_SECONDS = 300.0
+# The same wait for a reject whose move failed for a reason that may clear by itself (_lasting), such
+# as a full disk or a dropped share: shorter, so a recovery is picked up sooner, but long enough that
+# such a reject is not read and scan-hooked again on every poll.
+STUCK_TRANSIENT_RETRY_SECONDS = 30.0
 STUCK_RETRIES_PER_SCAN_MAX = 100
 
 # When `decompress=` is set, this bounds the *decompressed* output (ADR 0123): `max_file_bytes` only
@@ -1344,8 +1350,9 @@ class FileSource(SourceConnector):
     async def _examine(self, path: Path, *, retry: bool = False) -> _Step:
         """Take one candidate as far as it goes this scan, and say what that cost (:class:`_Step`).
         ``retry`` is a remembered stuck reject due a retry (BACKLOG #5717), which :meth:`_scan_once`
-        examines after every other candidate and which takes the whole path again: it is read and
-        judged afresh, and a retry that now passes is ingested. A retry is counted against
+        examines after every other candidate and which takes the whole path again: it settles like
+        a new drop, is read and judged afresh, and a retry that now passes is ingested. A retry is
+        counted against
         :meth:`_retry_allowance`, not the per-tick ceiling. A retry is stat'd again rather than
         trusting the fresh pass's stat, because the fresh pass's hand-offs sit between the two."""
         # One stat serves the leave-mode key, the settle gate and the before-read side of the #116
@@ -1373,17 +1380,18 @@ class FileSource(SourceConnector):
                 already = await self._leave_already_ingested(forms)
             if already:
                 return _Step.FREE
-        if retry and key in self._stuck:
-            # Unchanged since its move failed on an earlier scan, so it is settled. Judged afresh
-            # below. Kept, and due again on the next scan, unless a reject remembers it anew or it
-            # is handed off: an arm that leaves it in place (a failed read, a scan hook or handler
-            # failure) then leaves it due rather than forgotten.
-            seen = self._stuck[key][0]
-            self._stuck[key] = (seen._replace(due=time.monotonic()), 0)
-        elif not self._settled(path, before):
+        if not self._settled(path, before):
             # BACKLOG #1811: first sighting, or the file changed since the last poll. Nothing is
-            # read, moved or charged against the per-tick budget, the same as #116's skip below.
+            # read, moved or charged against the per-tick budget, the same as #116's skip below. A
+            # due retry takes this gate too, and stays due, so a later scan's retry pass reads it.
             return _Step.FREE
+        if retry and key in self._stuck:
+            # Judged afresh below. Its back-off starts again now, before the read, so an arm that
+            # leaves it in place (at least a failed read, a refused link, a scan hook or handler
+            # failure) leaves it waiting that back-off rather than due on every scan. A reject
+            # remembers it anew, and a hand-off or a reject that does not stay forgets it.
+            seen = self._stuck[key][0]
+            self._stuck[key] = (seen._replace(due=time.monotonic() + seen.wait), 0)
         try:
             raw, read_sig, read_id = await self._run_fs(self._read_settled, path)
         except _Unconfined:
@@ -1591,18 +1599,17 @@ class FileSource(SourceConnector):
             # does not write a WARNING per scan.
             logger.log(
                 logging.WARNING if first else logging.DEBUG,
-                "file source %s: rejected file %s stays in place; it is tried again %s",
+                "file source %s: rejected file %s stays in place; it is tried again once it "
+                "changes or %.0f seconds pass",
                 self.directory,
                 safe_name(path.name),
-                f"once it changes or {STUCK_RETRY_SECONDS:.0f} seconds pass"
-                if lasting
-                else "in a later scan's retry pass, due from the next scan",
+                self._stuck[key][0].wait,
             )
 
     def _remember_stuck(self, key: str, mark: _FileMark, *, lasting: bool) -> bool:
         """Remember the reject at ``key`` as stuck, due its retry after ``STUCK_RETRY_SECONDS`` when
-        ``lasting``, else due from the next scan, when the retry pass's per-scan bound reaches it
-        (BACKLOG #5717). False, logged, when the memory is full."""
+        ``lasting``, else after ``STUCK_TRANSIENT_RETRY_SECONDS`` (BACKLOG #5717). False, logged,
+        when the memory is full."""
         if key not in self._stuck and len(self._stuck) >= SETTLE_SEEN_MAX:
             if not self._stuck_full_logged:
                 self._stuck_full_logged = True
@@ -1613,8 +1620,8 @@ class FileSource(SourceConnector):
                     SETTLE_SEEN_MAX,
                 )
             return False
-        due = time.monotonic() + (STUCK_RETRY_SECONDS if lasting else 0.0)
-        self._stuck[key] = (_StuckSeen(mark, due), 0)
+        wait = STUCK_RETRY_SECONDS if lasting else STUCK_TRANSIENT_RETRY_SECONDS
+        self._stuck[key] = (_StuckSeen(mark, time.monotonic() + wait, wait), 0)
         return True
 
     def _stuck_step(self, key: str, mark: _FileMark, *, retry: bool) -> _Step | None:
@@ -1622,7 +1629,7 @@ class FileSource(SourceConnector):
         examine it as usual. A changed file is FORGOTTEN here and examined afresh. An unchanged one
         is skipped unread and uncharged, or, once its retry falls due, deferred to the scan's retry
         pass (``DUE``). In the retry pass (``retry``) it is examined as usual."""
-        seen, due = self._stuck[key][0]
+        seen, due, _wait = self._stuck[key][0]
         if seen != mark:
             del self._stuck[key]
             return None
@@ -3778,19 +3785,29 @@ def _file_mark(path: Path) -> _FileMark:
 
 def _holds(path: Path, read_id: _FileId | None) -> bool:
     """Whether ``path`` still names the file that was read (BACKLOG #5717): False when it is gone,
-    cannot be stat'd, or is another file now. With no ``read_id`` to compare, whether it exists."""
+    is another file now, or cannot be stat'd for a reason :func:`_transient_stat_failure` does not
+    name. A stat failure it names, such as a share that timed out, is no evidence the file has gone,
+    so it reads as True. With no ``read_id`` to compare, whether it exists."""
     try:
         st = path.lstat()
-    except OSError:
-        return False
+    except OSError as exc:
+        return _transient_stat_failure(exc)
     return read_id is None or _file_id(st) == read_id
+
+
+def _transient_stat_failure(exc: OSError) -> bool:
+    """Whether a failed stat may clear by itself (BACKLOG #5717): a transient Windows code, or a
+    transient errno other than ENOENT, which says the file is gone."""
+    if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
+        return True
+    return exc.errno in _TRANSIENT_ERRNOS and exc.errno != errno.ENOENT
 
 
 def _lasting(exc: OSError, *, stage: Literal["file", "archive_dir", "archive"] = "file") -> bool:
     """Whether a failed move or delete is expected to fail the same way on the next scan, as opposed
     to clearing by itself (BACKLOG #5717). A guess either way: a wrong True delays the next attempt
-    by ``STUCK_RETRY_SECONDS``, and a wrong False retries the file on every scan, in the bounded
-    retry pass.
+    by ``STUCK_RETRY_SECONDS``, and a wrong False retries the file after the shorter
+    ``STUCK_TRANSIENT_RETRY_SECONDS``, in the bounded retry pass.
 
     A file replaced since the read is not lasting: the next scan reads the new one. A link is. A
     missing file is not. ``stage`` says where the failure came from: ``archive_dir`` is opening the

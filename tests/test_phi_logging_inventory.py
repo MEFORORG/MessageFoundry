@@ -507,42 +507,66 @@ def _string_values(
     return None
 
 
-#: An INSERT into message_events, in any case and with any conflict clause.
-_RAW_EVENT_INSERT = re.compile(r"\binsert\b[^;]*?\binto\s+message_events\b", re.IGNORECASE)
+#: One SQL identifier part: bare, or quoted by brackets, double quotes or backticks.
+_SQL_NAME_PART = r'(?:\[[^\]]*\]|"[^"]*"|`[^`]*`|\w+)'
+#: An INSERT into message_events, in any case, with any conflict clause, and with the table name
+#: schema-qualified (``dbo.message_events``) or quoted (``[message_events]``, ``"message_events"``).
+_RAW_EVENT_INSERT = re.compile(
+    rf"\binsert\b[^;]*?\binto\s+(?:{_SQL_NAME_PART}\s*\.\s*)*"
+    r'(?:\[message_events\]|"message_events"|`message_events`|message_events\b)',
+    re.IGNORECASE,
+)
 _SQL_PLACEHOLDER = re.compile(r"\?|\$\d+|%s|:\w+")
+_SQL_VALUES_ROW = re.compile(r"\s*\(([^()]*)\)\s*")
 
 
-def _raw_insert_event(call: ast.Call, sql: str) -> ast.expr | None:
-    """The expression ``call`` binds to the ``event`` column of ``sql``, an INSERT into
-    message_events that ``call`` executes as its first argument, or ``None`` when that cannot be
-    placed. The parameters are either one tuple or list (SQLite, pyodbc) or the arguments after the
-    statement (asyncpg); every VALUES entry must be a placeholder, or the mapping from parameters
-    to columns is not known here."""
+def _raw_insert_events(call: ast.Call, sql: str) -> list[ast.expr] | None:
+    """The expressions ``call`` binds to the ``event`` column of ``sql``, an INSERT into
+    message_events that ``call`` executes as its first argument, one per VALUES row, or ``None``
+    when any cannot be placed. The parameters are either one tuple or list (SQLite, pyodbc) or the
+    arguments after the statement (asyncpg); every VALUES entry of every row must be a placeholder,
+    one per listed column, or the mapping from parameters to columns is not known here. A
+    statement this cannot parse, with no column list or no VALUES rows for one, is ``None`` too,
+    so its caller counts the write unread."""
     head, _, tail = sql.partition(")")
-    columns = [column.strip().lower() for column in head.split("(", 1)[-1].split(",")]
-    values = re.search(r"values\s*\(([^)]*)\)", tail, re.IGNORECASE)
-    if (
-        "event" not in columns
-        or values is None
-        or not all(_SQL_PLACEHOLDER.fullmatch(v.strip()) for v in values.group(1).split(","))
+    columns = [column.strip().strip('[]"`').lower() for column in head.split("(", 1)[-1].split(",")]
+    keyword = re.search(r"\bvalues\b", tail, re.IGNORECASE)
+    if "event" not in columns or keyword is None:
+        return None
+    rows: list[list[str]] = []
+    pos = keyword.end()
+    while (row := _SQL_VALUES_ROW.match(tail, pos)) is not None:
+        rows.append([v.strip() for v in row.group(1).split(",")])
+        pos = row.end()
+        if not tail.startswith(",", pos):
+            break
+        pos += 1
+    else:
+        return None  # no row after VALUES, or none after a comma
+    if any(
+        len(row) != len(columns) or not all(_SQL_PLACEHOLDER.fullmatch(v) for v in row)
+        for row in rows
     ):
         return None
-    slot = columns.index("event")
-    placeholders = [v.strip() for v in values.group(1).split(",")]
-    numbered = [int(p[1:]) - 1 for p in placeholders if p.startswith("$")]
-    if numbered:
-        # asyncpg numbers its parameters, so ``$n`` names the argument, not the column position.
-        if len(numbered) != len(placeholders):
-            return None
-        slot = numbered[columns.index("event")]
+    flat = [placeholder for row in rows for placeholder in row]
+    numbered = [p for p in flat if p.startswith("$")]
+    if numbered and len(numbered) != len(flat):
+        return None
+    column = columns.index("event")
+    # asyncpg numbers its parameters, so ``$n`` names the argument, not the position.
+    slots = [
+        int(row[column][1:]) - 1 if numbered else index * len(columns) + column
+        for index, row in enumerate(rows)
+    ]
     rest = call.args[1:]
     if len(rest) == 1 and isinstance(rest[0], ast.Tuple | ast.List):
         params: list[ast.expr] = list(rest[0].elts)
     else:
         params = list(rest)
-    if any(isinstance(param, ast.Starred) for param in params[: slot + 1]) or slot >= len(params):
+    last = max(slots)
+    if any(isinstance(param, ast.Starred) for param in params[: last + 1]) or last >= len(params):
         return None
-    return params[slot]
+    return [params[slot] for slot in slots]
 
 
 def _event_write_sites(
@@ -572,8 +596,10 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
 
     Read, outside the helpers' own defs: every call to a helper in :data:`_EVENT_HELPERS`, its
     ``event`` argument placed by that helper's own ``def`` (``self`` dropped), and every INSERT into
-    message_events executed as a call's first argument, its ``event`` column placed by the
-    statement's column list. The kind is read by :func:`_string_values`, so a literal, a module
+    message_events executed as a call's first argument, its table name bare, schema-qualified or
+    quoted, and the ``event`` column of every VALUES row placed by the statement's column list
+    (:func:`_raw_insert_events`; an INSERT it cannot parse counts as unread). The kind is read by
+    :func:`_string_values`, so a literal, a module
     constant such as ``VIEWED_EVENT``, and a local variable assigned only literals (the
     routed/unrouted mapping, for one) are all read. A write at module or class level counts too,
     under ``<module>``.
@@ -659,7 +685,7 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
         if not isinstance(node, ast.Call):
             continue
         name = callee_name(node)
-        value: ast.expr | None
+        values: list[ast.expr] | None
         if name in _EVENT_HELPERS:
             assert name in helpers, (
                 f"a call to {name}, which this source does not define; re-aim the scan"
@@ -673,10 +699,11 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
                 unplaced.append(ast.unparse(node))
                 continue
             try:
-                value = argument_for(node, helpers[name], "event", receiver=receivers[name])
+                arg = argument_for(node, helpers[name], "event", receiver=receivers[name])
             except ArgumentUnplaced:
                 unplaced.append(ast.unparse(node))
                 continue
+            values = None if arg is None else [arg]
         elif node.args and (
             sql := (
                 node.args[0].value
@@ -688,10 +715,18 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
         ):
             if not _RAW_EVENT_INSERT.search(sql):
                 continue
-            value = _raw_insert_event(node, sql)
+            values = _raw_insert_events(node, sql)
         else:
             continue
-        got = None if value is None else _string_values(value, scope, module)
+        got: set[str] | None = None
+        if values is not None:
+            got = set()
+            for value in values:
+                each = _string_values(value, scope, module)
+                if each is None:
+                    got = None
+                    break
+                got |= each
         if got is None:
             unread.append(scope.name if not isinstance(scope, ast.Module) else "<module>")
         else:
@@ -853,6 +888,49 @@ def test_the_emit_site_scan_reads_every_backend_signature() -> None:
     ):
         with pytest.raises(AssertionError, match="not executed as a call's first argument"):
             _event_kinds(chosen)
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "dbo.message_events",
+        "[message_events]",
+        "[dbo].[message_events]",
+        '"message_events"',
+        'public."message_events"',
+        "`message_events`",
+    ],
+)
+def test_the_emit_site_scan_reads_a_qualified_or_quoted_table_name(table: str) -> None:
+    """A schema-qualified or quoted table name is still an INSERT into message_events: its kind is
+    read, and the same text left unexecuted is still refused as stray. The control: another table
+    under the same quoting is not read as one."""
+    sql = f"INSERT INTO {table} (message_id, event) VALUES (?, ?)"
+    source = f"def f(c):\n    c.execute({sql!r}, ('mid', 'qualified_kind'))\n"
+    assert _event_kinds(source) == ({"qualified_kind"}, [])
+    with pytest.raises(AssertionError, match="not executed as a call's first argument"):
+        _event_kinds(f"def f(c):\n    sql = {sql!r} if c else 'y'\n    c.execute(sql, ())\n")
+    other = sql.replace("message_events", "message_events_old")
+    assert not _RAW_EVENT_INSERT.search(other)
+
+
+def test_the_emit_site_scan_reads_every_row_of_a_multi_row_insert() -> None:
+    """Each VALUES row binds its own ``event``, so every row's kind is read, and one row whose kind
+    cannot be read, or one row that is not all placeholders, makes the write unread."""
+    rows = "INSERT INTO message_events (message_id, event) VALUES (?, ?), (?, ?)"
+    numbered = "INSERT INTO message_events (message_id, event) VALUES ($1, $2), ($3, $4)"
+    source = (
+        "def f(c, k):\n"
+        f"    c.execute({rows!r}, ('m1', 'row_one', 'm2', 'row_two'))\n"
+        f"    c.execute({numbered!r}, 'm1', 'pg_one', 'm2', 'pg_two')\n"
+        "def g(c, k):\n"
+        f"    c.execute({rows!r}, ('m1', 'row_one', 'm2', k))\n"
+        "def h(c):\n"
+        f"    c.execute({rows.replace('(?, ?), (?, ?)', '(?, ?), (?, 1)')!r}, ('m', 'k', 'm'))\n"
+        "def i(c):\n"
+        "    c.execute('INSERT INTO message_events VALUES (?, ?)', ('m', 'k'))\n"
+    )
+    assert _event_kinds(source) == ({"row_one", "row_two", "pg_one", "pg_two"}, ["g", "h", "i"])
 
 
 def test_the_event_kind_rule_refuses_each_planted_fault() -> None:
