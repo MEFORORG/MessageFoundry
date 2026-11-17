@@ -545,7 +545,22 @@ def test_the_verify_off_header_allowlist_is_pinned() -> None:
     assert pinned == VERIFY_OFF_STATIC_HEADER_ALLOWLIST
 
 
-@pytest.mark.parametrize("cell", _CELLS)
+#: The cells whose url may carry a query. A DICOMweb base url refuses any query at construction
+#: (vault BACKLOG #5358), before these refusals read it; ``test_a_dicomweb_url_query_is_refused_first``
+#: pins that it still refuses and still withholds the value.
+_QUERY_CELLS = [cell for cell in _CELLS if cell != "DICOMweb"]
+
+
+@pytest.mark.parametrize("query", ["api_key", "code"])
+@pytest.mark.parametrize("cleartext", [False, True])
+def test_a_dicomweb_url_query_is_refused_first(query: str, cleartext: bool) -> None:
+    ctype, factory, url = (_CLEARTEXT if cleartext else _HTTPS)["DICOMweb"]
+    with pytest.raises(ValueError, match="no query string or fragment") as exc:
+        _build((ctype, factory, f"{url}?{query}={_SECRET}"))
+    assert _SECRET not in str(exc.value)
+
+
+@pytest.mark.parametrize("cell", _QUERY_CELLS)
 def test_a_url_query_credential_over_verify_off_is_refused(
     cell: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -559,7 +574,7 @@ def test_a_url_query_credential_over_verify_off_is_refused(
 
 
 @pytest.mark.parametrize("name", ["code", "CODE", "code1"])
-@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("cell", _QUERY_CELLS)
 def test_a_url_code_parameter_over_verify_off_is_refused(
     cell: str, name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -573,7 +588,7 @@ def test_a_url_code_parameter_over_verify_off_is_refused(
     _assert_credential_refusal(exc)
 
 
-@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("cell", _QUERY_CELLS)
 @pytest.mark.parametrize("declared", ["attested", "accepted"])
 def test_a_url_code_parameter_over_declared_cleartext_is_refused(
     cell: str, declared: str, monkeypatch: pytest.MonkeyPatch

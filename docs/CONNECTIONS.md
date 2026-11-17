@@ -3907,9 +3907,9 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `url` | — (required) | the DICOMweb service **base** URL, e.g. `https://host/dicom-web` (`env()`-able) |
+| `url` | — (required) | the DICOMweb service **base** URL, e.g. `https://host/dicom-web` (`env()`-able). A `?` or `#` anywhere in it is **refused at construction**: the STOW-RS path is appended to the base, so a query or fragment would carry it off the path (vault BACKLOG #5358) |
 | `study_uid` | `None` → `POST {base}/studies` | when set, store into a known study (`POST {base}/studies/{study_uid}`) |
-| `bearer_token` / `basic_user` / `basic_password` | — | OAuth bearer or HTTP Basic (put secrets in `env()`) |
+| `bearer_token` / `basic_user` / `basic_password` | — | OAuth bearer or HTTP Basic (put secrets in `env()`). Set one credential: each of these is **refused at construction** (vault BACKLOG #5359): `basic_user` without `basic_password` or the reverse, `bearer_token` beside a Basic pair, either beside an `Authorization` entry in `headers`, a colon in `basic_user` (RFC 7617; a colon in the password is allowed), a control character in any of the three, a lone surrogate in a Basic half, and any character in `bearer_token` that latin-1 cannot encode (it goes on the wire as written) |
 | `headers` | `{}` | static extra headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `timeout_seconds` | `30.0` | request timeout |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default). **`DICOMweb()` has no `tls_allow_expired`** — it reuses the REST client but does not read that setting, so a DICOMweb hop always enforces certificate expiry |

@@ -211,7 +211,10 @@ def test_the_refusal_leaves_ordinary_urls_alone() -> None:
         "https://[::1]:8443/x?who=a@b",
     ):
         RestDestination(_dest(ConnectorType.REST, url))
-        DicomWebDestination(_dest(ConnectorType.DICOMWEB, url))
+        # A DICOMweb base url refuses any query on its own (vault BACKLOG #5358), so it takes the
+        # query-free urls only; the path and port cases above still reach it.
+        if "?" not in url:
+            DicomWebDestination(_dest(ConnectorType.DICOMWEB, url))
 
 
 # --- 2. the redaction layer drops the userinfo from the InvalidURL shape ------------------------------

@@ -472,7 +472,17 @@ def check_fhir_lookup_allowed(
         _check_credential_token_url_egress(f"FhirLookup {name!r}", settings, egress.allowed_http)
 
 
-def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
+#: The outbound connector types whose build refuses ANY query or fragment in the ``url`` (vault
+#: BACKLOG #5358: DICOMweb appends its STOW-RS path to the base, so a query would carry it off).
+#: A query credential on one of them is never a hop, so the readers of that loosening leave it
+#: out: :func:`warn_url_query_credentials`, ``config.wiring.query_credential_hops`` and the
+#: static-credential census. ``tests/test_dicomweb.py`` pins each against the build's refusal.
+URL_QUERY_REFUSED_DESTINATIONS: frozenset[ConnectorType] = frozenset({ConnectorType.DICOMWEB})
+
+
+def warn_url_query_credentials(
+    label: str, settings: Mapping[str, Any], *, connector_type: ConnectorType | None = None
+) -> None:
     """Log a WARNING when a connection's resolved ``url`` carries a credential-like query parameter
     (ASVS 14.2.1). ``label`` names the connection (``"outbound 'OB_X'"``); the line carries it and
     the parameter NAMES, never a value or the URL.
@@ -505,7 +515,7 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
     ``config.wiring.query_credential_hops`` is the graph-side reader for ``check`` and the posture
     registry, and walks the same two tables."""
     url = settings.get("url")
-    if not isinstance(url, str):
+    if not isinstance(url, str) or connector_type in URL_QUERY_REFUSED_DESTINATIONS:
         return
     names = credential_query_params(url)
     if names:
@@ -530,6 +540,7 @@ def warn_url_query_credentials_before_build(
     env_values: Mapping[str, Any],
     *,
     connection: str,
+    connector_type: ConnectorType | None = None,
 ) -> None:
     """The query-credential WARNING as one step BEFORE a build, for an outbound and a FhirLookup
     alike (BACKLOG #4997). ``declared`` is the connection's settings as configured, ``env()``
@@ -538,7 +549,11 @@ def warn_url_query_credentials_before_build(
 
     It resolves the ``url`` ALONE, so a URL is still read when another setting fails to resolve,
     and nothing a build checks can stop the line. A ``url`` that does not resolve has nothing to
-    read, and logs an INFO line naming the connection instead. Resolution itself does no I/O."""
+    read, and logs an INFO line naming the connection instead. Resolution itself does no I/O.
+    A ``connector_type`` in :data:`URL_QUERY_REFUSED_DESTINATIONS` logs nothing: its build refuses
+    any url query."""
+    if connector_type in URL_QUERY_REFUSED_DESTINATIONS:
+        return
     try:
         resolved = resolve_env_settings(
             {"url": declared.get("url")}, env_values, connection=connection
@@ -576,7 +591,9 @@ def check_egress_allowed(
     # ASVS 14.2.1: a recorded loosening, never a silent one. Before every refusal, so a lane a
     # refusal takes down is still recorded.
     if warn_query_credentials:
-        warn_url_query_credentials(f"outbound {dest.name!r}", dest.settings)
+        warn_url_query_credentials(
+            f"outbound {dest.name!r}", dest.settings, connector_type=dest.type
+        )
     # ADR 0126 forward proxy: an http-family destination may dial through an operator-chosen proxy that
     # receives a Proxy-Authorization credential. Gated by its OWN [egress].allowed_proxy list, BEFORE
     # and independently of the per-transport destination chain below — an empty allowed_http says
