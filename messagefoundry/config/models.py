@@ -557,6 +557,16 @@ class StallThreshold(BaseModel):
     max_oldest_seconds: float | None = None
 
 
+#: BACKLOG #5768: the rise, in messages, a lane's backlog must clear before saturation fires.
+#: ``pipeline.saturation.SaturationDetector`` says why the floor exists and how it is measured.
+#: Five is a JUDGMENT with no measured anchor: past a single message or a small burst, and small
+#: beside the depth a buildup alert is usually set at.
+SATURATION_MIN_GROWTH_DEFAULT = 5
+#: The largest floor that loads. A floor this high already makes the alert a depth ceiling in
+#: disguise, which ``queue_buildup`` does better.
+SATURATION_MIN_GROWTH_MAX = 1_000_000
+
+
 class SaturationThreshold(BaseModel):
     """When to raise a ``saturation`` alert for a lane (BACKLOG #93, ADR 0014 amendment): the lane is
     *becoming* overloaded — its pending backlog is **rising sustained** across the sampling window.
@@ -567,14 +577,22 @@ class SaturationThreshold(BaseModel):
     bursty-but-DRAINING lane (which spikes then falls back) does not trip while a genuinely saturating
     one does — the point of the signal.
 
-    ``sustain_samples`` is how many consecutive non-decreasing depth samples (with a net rise) must be
-    observed before the alert fires (the detector keeps ``sustain_samples + 1`` samples, so it needs
+    ``sustain_samples`` is how many consecutive non-decreasing depth samples (with a net rise, past
+    ``min_growth``) must be observed before the alert fires (the detector keeps ``sustain_samples + 1`` samples, so it needs
     that many observations to prime). ``None`` (the default) **disables** the saturation alert for the
     connection — deny-by-default/off unless an operator opts in (it overlaps ``queue_buildup``'s age
     dimension, so it is opt-in to avoid double-paging). Resolution mirrors the other per-lane policies:
-    the ``[delivery]`` global default > built-in (off)."""
+    the ``[delivery]`` global default > built-in (off).
+
+    ``min_growth`` is the rise, in messages, the alert needs before it fires (BACKLOG #5768,
+    :data:`SATURATION_MIN_GROWTH_DEFAULT`). The ``[delivery]`` key refuses a boolean, as every
+    numeric settings key does (BACKLOG #5509); this model takes what that key passes, or a
+    code-first int."""
 
     sustain_samples: int | None = Field(default=None, ge=2)
+    min_growth: int = Field(
+        default=SATURATION_MIN_GROWTH_DEFAULT, ge=1, le=SATURATION_MIN_GROWTH_MAX
+    )
 
 
 class ActiveWindow(BaseModel):

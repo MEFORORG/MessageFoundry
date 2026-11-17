@@ -889,12 +889,26 @@ def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
     return current
 
 
-# Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
-# its entry is younger than the absolute session lifetime, because evicting it would hand that session
-# a fresh budget. When the map is full, entries older than that lifetime go first; if it is still
-# full, a session with no entry yet is revoked on its first failed re-proof instead (fail closed). One
-# account may hold at most _REPROOF_SESSION_PER_USER entries, dropping its own oldest, so a single
-# account cannot fill the map.
+# Bounds on the per-session re-proof failure counts (BACKLOG #1138). A live session's count is
+# dropped on purpose only by a successful re-proof on the step-up re-auth route, which resets its
+# budget; dropping it any other way would hand that session a fresh budget. The age prune below
+# reaches an entry only once it is older than the absolute session lifetime, timed from its first
+# failure, so it reaches a live session's count only after a wall-clock step. One account may hold
+# _REPROOF_SESSION_PER_USER entries and the map _REPROOF_SESSION_MAX, except an entry held at the
+# cap, which goes past both. A count leaves the map in at least these ways (BACKLOG #5336). The
+# service drops it when it ends the session itself: a sign-out, a revoke, the budget revoke, the
+# idle or expiry revoke a request meets. At the account's cap, a re-proof first drops the counts of
+# the account's sessions the store shows as revoked or holds no row for, whatever the wall clock
+# reads. When a new session's first failure finds the
+# account at its cap or the map full, the age prune runs. If there is still no room, that session
+# is revoked on that failure (fail closed), and its entry is held at the cap. It leaves in at least
+# these ways: the budget revoke commits, a later re-proof finds the session gone (or lapsed, once
+# the revoke that re-proof makes commits), or a later age prune reaches it. No count leaves on a
+# timer, because the age prune runs only when a new session's first failure finds no room. A budget
+# revoke that fails, or never runs because an earlier write raised, leaves it in place, and the
+# session's next re-proof is then revoked unverified. Before BACKLOG #5336 the per-account cap
+# dropped the account's own oldest LIVE count, so round-robin guesses over more sessions than the
+# cap each got a fresh budget.
 _REPROOF_SESSION_MAX = 4096
 _REPROOF_SESSION_PER_USER = 64
 
@@ -3034,6 +3048,56 @@ def _log_totp_refused(username: str) -> None:
     )
 
 
+#: The longest escaped actor :func:`_storable_actor` writes, in UTF-16 code units: the narrowest
+#: shipped ``audit_log.actor`` column, SQL Server's NVARCHAR(256), which counts them. SQLite and
+#: PostgreSQL keep it as TEXT, with no length bound.
+_AUDIT_ACTOR_MAX = 256
+
+
+def _storable_actor(username: str) -> str:
+    """A typed sign-in username as an audit row's actor (BACKLOG #5342): as typed, unless it holds a
+    NUL, which at least a PostgreSQL store refuses in a text column. Then every control character
+    is escaped, as a log argument's are, so the row is still written and names what was sent.
+
+    An escape takes six characters for each NUL, so an escaped name can outgrow
+    :data:`_AUDIT_ACTOR_MAX` and the write would fail on SQL Server. Such a name keeps the longest
+    prefix of whole escapes that fits beside a marker, ``...sha256:`` and the SHA-256 of the name
+    as typed, so the cut is deterministic and two long names that share the prefix stay distinct.
+    A name with no NUL is not bounded here."""
+    if "\x00" not in username:
+        return username
+    escaped = scrub_log_argument(username)
+    # Never fewer units than characters, so an escape longer than the bound in characters is cut
+    # without the full UTF-16 encode, which the console form's uncapped username would make large.
+    if len(escaped) <= _AUDIT_ACTOR_MAX and utf16_units(escaped) <= _AUDIT_ACTOR_MAX:
+        return escaped
+    # surrogatepass, so a lone surrogate cannot make the digest raise.
+    marker = "...sha256:" + hashlib.sha256(username.encode("utf-8", "surrogatepass")).hexdigest()
+    room = _AUDIT_ACTOR_MAX - len(marker)
+    prefix: list[str] = []
+    # Escaped one typed character at a time, which the escape's per-character table makes equal to
+    # the whole, so the cut never splits an escape or a surrogate pair. It stops within the bound.
+    for char in username:
+        piece = scrub_log_argument(char)
+        room -= utf16_units(piece)
+        if room < 0:
+            break
+        prefix.append(piece)
+    return "".join(prefix) + marker
+
+
+def _log_combined_totp_defect(user_id: str, exc: Exception) -> None:
+    """Log a defect the combined sign-in met reading or checking a TOTP code (BACKLOG #5335): by
+    the exception's type name and the account id, never its text, the username or a traceback, on a
+    path reachable with a username alone. The code is read as wrong."""
+    _log.error(
+        "combined sign-in: reading or checking the TOTP code of account id %r raised %s; the code "
+        "is read as wrong",
+        user_id,
+        type(exc).__name__,
+    )
+
+
 def _log_totp_malformed(username: str) -> None:
     """Log an account whose TOTP cell opens to a value that is not base32, so no code can be
     computed from it. Judged unknown rather than refused (BACKLOG #3422), so the gates still count it
@@ -4242,11 +4306,13 @@ class AuthService:
         # _lock_notice_held_back.
         self._lock_notice_read_slots = asyncio.Semaphore(1)
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
-        # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
-        # guesses in total however often the account lock expires. Bounded (_REPROOF_SESSION_MAX,
-        # oldest evicted) and carried across a rotation by _rekey_token_state. PROCESS-LOCAL, with the
-        # same accepted caveat as _action_step_up_grants: a restart forgets the counts, and a topology
-        # that serves the API from more than one process gives each process its own budget.
+        # session, monotonic time of the first, the account's user id). At lockout_threshold the
+        # session is revoked, so a stolen session gets that many guesses in total however often the
+        # account lock expires. Bounded as the comment on _REPROOF_SESSION_MAX says, which also
+        # names at least the ways a count leaves, and carried across a rotation by
+        # _rekey_token_state. PROCESS-LOCAL, with the same accepted
+        # caveat as _action_step_up_grants: a restart forgets the counts, and a topology that serves
+        # the API from more than one process gives each process its own budget.
         self._reproof_session_failures: dict[str, tuple[int, float, str]] = {}
         # Boot-time Kerberos acceptor preflight outcome (ADR 0068 §9): None = usable (or the
         # preflight never ran); a reason string = browser SSO degraded until restart.
@@ -5614,6 +5680,7 @@ class AuthService:
         with ``at`` set to ``session`` none was presented."""
         if await self._store.supersede_session(token_hash, now=time.time()) is None:
             return
+        self._forget_reproof_counts((token_hash,))
         await self._audit_lapsed_credential(
             username, at=at, client=client, proof=proof, proof_checked=proof_checked
         )
@@ -5981,7 +6048,7 @@ class AuthService:
             # removing it in the same change would lock every AD operator out of factor enrolment
             # and MFA-disable. See docs/research/ad-step-up-after-simple-bind-retirement.md.
             await self._directory_reject_audit(
-                username, "simple_bind", "pathway_retired", client=client
+                _storable_actor(username), "simple_bind", "pathway_retired", client=client
             )
             return LoginOutcome(
                 ok=False,
@@ -6071,11 +6138,20 @@ class AuthService:
         async def unknown_row() -> None:
             await self._audit(
                 "auth.login_failed",
-                actor=username,
+                actor=_storable_actor(username),
                 detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
                 client=client,
             )
 
+        if "\x00" in username:
+            # username_refusal refuses a NUL in a new account's name, and at least a PostgreSQL
+            # store refuses one in a text bind, which would escape as an unhandled error (BACKLOG
+            # #5342). So the name is an unknown one, refused like any other without reaching the
+            # account lookup: the same dummy verify, row and answer, and the caller's limiter
+            # charge stands.
+            await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
+            await later(unknown_row)
+            return LoginOutcome(ok=False, error="invalid credentials")
         user = await self._load_user_by_username(username)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
@@ -6358,29 +6434,35 @@ class AuthService:
         # A stored secret that will not decrypt or decode is a wrong code, logged, and never an
         # exception: this decrypt is reachable WITHOUT the password here, so an unpadded 500 would
         # name the account as enrolled to anyone who knows the username. The secret comes from the
-        # checked record, so no driver runs here since BACKLOG #3510; the catch stays broad because
-        # each backend's cipher raises its own classes, which ``auth/`` does not import, and every
-        # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it, and is
+        # checked record, so no driver runs here since BACKLOG #3510, and the open runs off the
+        # loop (:meth:`_open_totp_cell`, BACKLOG #3929). At least the shipped ciphers, Transit
+        # included, refuse a cell as ``CipherError``, and a value that opens but is not base32
+        # raises ``ValueError`` from the verify; each is logged by the census's own one-line logger
+        # (BACKLOG #5335). Anything else is a defect, but raising it would be that unpadded 500, so
+        # it too is a wrong code, logged at ERROR by its type name and the account id alone, with
+        # no traceback. Every arm fails CLOSED. ``consume_totp_step`` below is outside the catch,
         # reached only once a code matched.
+        step: int | None = None
         try:
             secret = await self._totp_secret(user)
-            step = (
-                totp.verify_totp_step(
+        except CipherError:
+            _log_totp_undecryptable(user.username)
+            secret = None
+        except Exception as exc:  # noqa: BLE001 -- see above: a raise here is an enrolment oracle
+            _log_combined_totp_defect(user.id, exc)
+            secret = None
+        if secret:
+            try:
+                step = totp.verify_totp_step(
                     secret,
                     code,
                     window=self._settings.totp_skew_steps,
                     now=arrived,
                 )
-                if secret
-                else None
-            )
-        except Exception:
-            _log.exception(
-                "combined sign-in: the stored TOTP secret for %s could not be read; treating the "
-                "code as wrong",
-                user.username,
-            )
-            step = None
+            except ValueError:  # binascii.Error is a ValueError: opened, but not base32
+                _log_totp_malformed(user.username)
+            except Exception as exc:  # noqa: BLE001 -- as above
+                _log_combined_totp_defect(user.id, exc)
         # The store is asked only once the code matched a step (ASVS 11.2.4, BACKLOG #1167: kept on
         # purpose). Asked on every combined sign-in, it would be a store call only an account with
         # TOTP on makes, reachable with neither factor: its refusal would escape ``login`` as an
@@ -11576,7 +11658,9 @@ class AuthService:
                 return row(result.count)
 
             if with_row:
+                counted = self._reproof_counts_of(revocation.user_id)
                 ended = await self._store.revoke_user_sessions(revocation.user_id, audit=audit)
+                self._forget_reproof_counts(counted)
             else:
                 # Vault BACKLOG #3023 residual (1): the retry without the row is the post-commit
                 # revoke's, so it gets that revoke's attempts, budget and miss row, the attempt
@@ -12205,6 +12289,28 @@ class AuthService:
                 detail=_json({"scope": "cap", "count": revoked, "cap": cap}),
                 client=client,
             )
+            # The store names no hash it revoked, so the account's sessions are read again, under
+            # the re-proof lock every rotation holds (BACKLOG #5336). After the row, and a refused
+            # read is logged, never raised: the revoke and its row have committed, and a raise
+            # here would lose the token the sign-in minted. The set is the read's, wider than
+            # _session_write_errors by at least the ValueError aiosqlite raises for a closed
+            # connection; a defect still raises. The counts it leaves stay until a later drop
+            # takes them, at least one named on _REPROOF_SESSION_MAX; none runs on a timer.
+            # Read before the lock, so a sign-in on an account holding no count never waits
+            # behind a re-proof's verify; _drop_unlisted_reproof_counts reads it again under it.
+            try:
+                if self._reproof_counts_of(user_id):
+                    async with self._account_reproof_lock(user_id):
+                        await self._drop_unlisted_reproof_counts(user_id)
+            except (*store_call_errors(), *store_connect_errors()) as exc:
+                if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                    raise
+                _log.warning(
+                    "the session cap ended sessions of account id %r, but reading its sessions "
+                    "to drop their re-proof counts was refused (%s); the counts stay for now",
+                    user_id,
+                    type(exc).__name__,
+                )
 
     @property
     def session_idle_seconds(self) -> float:
@@ -12387,6 +12493,8 @@ class AuthService:
                 await self._store.revoke_session(token_hash)
             except _session_write_errors() as exc:
                 refused.append(type(exc).__name__)
+            else:
+                self._forget_reproof_counts((token_hash,))
         outcome = (
             f"a revoke was refused too ({', '.join(refused)})" if refused else "it was revoked"
         )
@@ -12468,8 +12576,9 @@ class AuthService:
         async with deferred_revoke_reports():
             while True:
                 attempt += 1
+                counted = self._reproof_counts_of(user_id)
                 try:
-                    return await self._store.revoke_user_sessions(user_id, audit=no_audit_row)
+                    ended = await self._store.revoke_user_sessions(user_id, audit=no_audit_row)
                 except _session_write_errors() as exc:
                     if _is_revoke_defect(exc):
                         raise
@@ -12497,6 +12606,8 @@ class AuthService:
                         reconciled=reconciled,
                     )
                     raise
+                self._forget_reproof_counts(counted)
+                return ended
 
     async def _revoke_for_provision(
         self, user_id: str, *, actor: str, granted: bool
@@ -12828,6 +12939,7 @@ class AuthService:
         # (BACKLOG #2096).
         if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
             await self._store.revoke_session(session.token_hash, now=now)
+            self._forget_reproof_counts((session.token_hash,))
             return None
         user = await self._load_user(session.user_id)
         # Asked before the touch below, so a session about to end is not first marked used.
@@ -12862,6 +12974,7 @@ class AuthService:
         now = time.time()
         if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
             await self._store.revoke_session(session.token_hash, now=now)
+            self._forget_reproof_counts((session.token_hash,))
             return False
         user = await self._load_user(session.user_id)
         if user is not None and (refusal := self._gate_refusal(session, user, now)) is not None:
@@ -12926,6 +13039,8 @@ class AuthService:
             await self._store.revoke_session(token_hash)
         except audit_write_errors():
             _log.exception("a session row that failed its integrity seal could not be revoked")
+        else:
+            self._forget_reproof_counts((token_hash,))
         if key_changed:
             _log.info(
                 "session %s was sealed under a retired store key and has been ended; run"
@@ -14064,6 +14179,8 @@ class AuthService:
         before = time.time()
         since = (before if proven_at is None else proven_at) - _LOGOUT_LINEAGE_SECONDS
         ended = await self._store.supersede_session(presented, now=before, lineage_since=since)
+        if ended is not None:
+            self._forget_reproof_counts((ended.token_hash,))
         if ended is None:
             # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
             # ended, so the trail still records the sign-out request: within the bound when it
@@ -14341,6 +14458,8 @@ class AuthService:
         prior = await self._store.supersede_session(
             prior_hash, now=before, lineage_since=before - self.supersession_lineage_seconds
         )
+        if prior is not None:
+            self._forget_reproof_counts((prior.token_hash,))
         after = time.time()
         if prior is None or not self._was_live_at_revoke(prior, before, after):
             return
@@ -14442,6 +14561,7 @@ class AuthService:
                 defects=(),
             )
             return False
+        self._forget_reproof_counts((session_id,))
         await self._audit(
             "auth.session_revoked",
             actor=actor,
@@ -14468,6 +14588,7 @@ class AuthService:
         :meth:`revoke_every_session` counts it in both cases instead."""
         # A seal refusal the retry below also met is reported once, by the attempt that commits
         # (decision d20261110T063908944-857965, item 4).
+        counted = self._reproof_counts_of(identity.user_id, keep=current_token_hash)
         async with deferred_revoke_reports():
             try:
                 result = await self._store.revoke_user_sessions(
@@ -14480,9 +14601,13 @@ class AuthService:
                 # handler ends it before the sweep, so the count and the reply ("signed out N other
                 # sessions") stay the other sessions only.
                 await self._session_seal_failed(current_token_hash)
+                counted = self._reproof_counts_of(identity.user_id)
                 result = await self._store.revoke_user_sessions(
                     identity.user_id, audit=no_audit_row
                 )
+        self._forget_reproof_counts(counted)
+        if not result.kept:  # the store ended the caller's own session too
+            self._forget_reproof_counts((current_token_hash,))
         others = result.others
         scope = "self_others" if result.kept else "self_all"
         if others or not result.kept:
@@ -14524,7 +14649,9 @@ class AuthService:
     async def revoke_sessions_for_user(self, user_id: str, *, actor: str) -> int:
         """Admin: revoke **all** of a user's sessions (force sign-out everywhere). Returns the count.
         Audited."""
+        counted = self._reproof_counts_of(user_id)
         revoked = (await self._store.revoke_user_sessions(user_id, audit=no_audit_row)).count
+        self._forget_reproof_counts(counted)
         await self._audit(
             "auth.session_revoked",
             actor=actor,
@@ -14557,6 +14684,7 @@ class AuthService:
         of its count."""
         # A seal refusal the retry below also met is reported once, by the attempt that commits
         # (decision d20261110T063908944-857965, item 4).
+        counted = self._reproof_counts_of(None, keep=keep_token_hash)
         async with deferred_revoke_reports():
             try:
                 result = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
@@ -14566,10 +14694,14 @@ class AuthService:
                 # audit row would be one short. The handler still runs if the sweep raises, so the
                 # suspect row is ended either way; its own revoke then matches nothing, and it
                 # reports.
+                counted = self._reproof_counts_of(None)
                 try:
                     result = await self._store.revoke_all_sessions()
                 finally:
                     await self._session_seal_failed(keep_token_hash)
+        self._forget_reproof_counts(counted)
+        if not result.kept:  # the store ended the caller's own session too
+            self._forget_reproof_counts((keep_token_hash,))
         await self._audit(
             "auth.session_revoked",
             actor=actor,
@@ -14885,13 +15017,87 @@ class AuthService:
         entry = self._reproof_session_failures.get(token_hash)
         return 0 if entry is None else entry[0]
 
+    def _reproof_counts_of(self, user_id: str | None, *, keep: str | None = None) -> list[str]:
+        """The sessions holding a re-proof count for ``user_id``, or for every account when it is
+        ``None``, but ``keep`` (BACKLOG #5336). Read BEFORE a bulk revoke and passed to
+        :meth:`_forget_reproof_counts` after it, so an entry a rotation re-keys while the revoke
+        runs is kept: its new key is not in the list, and a live session's count is never dropped
+        for it."""
+        return [
+            h
+            for h, (_, _, uid) in self._reproof_session_failures.items()
+            if (user_id is None or uid == user_id)
+            # Constant time, as _rekey_token_state compares token hashes (ASVS 11.2.4).
+            and (keep is None or not constant_time_equal(h, keep))
+        ]
+
+    def _forget_reproof_counts(self, token_hashes: Iterable[str]) -> None:
+        """Drop the re-proof counts of sessions this service has just ended (BACKLOG #5336), so an
+        ended session's count does not fill its account's cap or the whole map. Called only once
+        the store has ended them; a revoke that raised keeps its counts."""
+        for token_hash in token_hashes:
+            self._reproof_session_failures.pop(token_hash, None)
+
+    async def _drop_unlisted_reproof_counts(self, user_id: str, *, keep: str | None = None) -> None:
+        """Drop the re-proof counts of ``user_id``'s sessions the store shows as revoked or holds no
+        row for (BACKLOG #5336). For an end the store does not name by hash: at least the session
+        cap's revoke, and a row the session reaper purged. **The caller holds the account's
+        re-proof lock**, which every rotation of the account also holds, so no entry is re-keyed
+        between the read and the drop. Every unrevoked row keeps its count, past its expiry or idle
+        window or not, and so does ``keep``.
+
+        The read passes ``now=0.0``, so the listing's ``expires_at >= now`` filter holds for every
+        row and the wall clock decides nothing here, as BACKLOG #2283 made the AD-map revoke match
+        every unrevoked row whatever the clock says. With the clock's own ``now``, a forward
+        wall-clock step would leave live sessions out of the listing, their counts would be
+        dropped, and once the clock was set right those sessions would come back on a fresh budget.
+        So a lapsed session's count is not judged here. It leaves at least when a re-proof on that
+        session ends it (:meth:`_end_lapsed_reproof_session`), when the reaper purges its row and
+        a later drop runs, or by the age prune. Until then it holds its place at the account's cap,
+        so a new session that finds no room is revoked on its first failure (fail closed)."""
+        if not self._reproof_counts_of(user_id, keep=keep):
+            return
+        live = {s.token_hash for s in await self._store.list_sessions(user_id, now=0.0)}
+        self._forget_reproof_counts(
+            h for h in self._reproof_counts_of(user_id, keep=keep) if h not in live
+        )
+
+    async def _drop_ended_reproof_counts(self, user_id: str, token_hash: str) -> None:
+        """At the account's cap, before a re-proof's verify, :meth:`_drop_unlisted_reproof_counts`
+        (BACKLOG #5336): the ends this service names by hash drop their own counts, but at least a
+        row the session reaper purged does not, so without this a busy account's cap could still
+        fill with dead counts. Run under the lock :meth:`_reproof` holds. The read is made only at the cap,
+        so the charge after the verdict stays synchronous.
+
+        ``token_hash``, the session being re-proved, keeps its count whatever the listing says: it
+        was found live just before, but the listing is read at a later instant, and a session ended
+        between the two would otherwise lose its count while this re-proof still verifies it.
+        The drop is housekeeping, so a refused read is logged and the re-proof goes on, its counts
+        kept (fail closed)."""
+        mine = len(self._reproof_counts_of(user_id))
+        if mine < _REPROOF_SESSION_PER_USER:
+            return
+        try:
+            await self._drop_unlisted_reproof_counts(user_id, keep=token_hash)
+        except (*store_call_errors(), *store_connect_errors()) as exc:
+            if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                raise
+            _log.warning(
+                "a re-proof of account id %r at its re-proof cap could not read the account's "
+                "sessions to drop ended ones' counts (%s); the counts stay",
+                user_id,
+                type(exc).__name__,
+            )
+
     def _charge_reproof_failure(self, token_hash: str, user_id: str) -> int:
         """Charge one failed re-proof to a session; return its total. Synchronous on purpose: it runs
         before any await after the verdict, so a store error later in the attempt cannot leave an
         evaluated guess uncharged.
 
-        A live count is never evicted (see :data:`_REPROOF_SESSION_MAX`). When there is no room, the
-        answer is the cap itself, so the caller revokes this session rather than track it."""
+        Here a count leaves only by the age prune, when there is no room (see
+        :data:`_REPROOF_SESSION_MAX`). If there is still none, the session is recorded AT the cap,
+        past the bound, and the answer is the cap, so the caller revokes it and
+        :meth:`_revoke_for_budget` then drops the entry."""
         now = time.monotonic()
         failures = self._reproof_session_failures
         existing = failures.get(token_hash)
@@ -14899,16 +15105,27 @@ class AuthService:
             count, first, _ = existing
             failures[token_hash] = (count + 1, first, user_id)
             return count + 1
-        mine = [h for h, (_, _, uid) in failures.items() if uid == user_id]
-        if len(mine) >= _REPROOF_SESSION_PER_USER:
-            # This account's own oldest entry goes; no other account's count is touched.
-            del failures[mine[0]]
-        if len(failures) >= _REPROOF_SESSION_MAX:
+
+        def no_room() -> bool:
+            mine = sum(1 for _, _, uid in failures.values() if uid == user_id)
+            return mine >= _REPROOF_SESSION_PER_USER or len(failures) >= _REPROOF_SESSION_MAX
+
+        if no_room():
             lifetime = self._settings.session_absolute_hours * 3600
             for stale in [h for h, (_, seen, _) in failures.items() if now - seen > lifetime]:
                 del failures[stale]
-        if len(failures) >= _REPROOF_SESSION_MAX:
-            return max(self._policy.lockout_threshold, 1)
+        if no_room():
+            # No live count is dropped for this one, its account's own included (BACKLOG #5336). It
+            # is recorded AT the cap, past the bound, so a revoke that fails leaves the next attempt
+            # revoking unverified; _revoke_for_budget drops it once the revoke commits.
+            cap = max(self._policy.lockout_threshold, 1)
+            _log.warning(
+                "re-proof failure counts: no room for a new session of account id %r; it is "
+                "answered at the cap, so its caller revokes it (BACKLOG #5336)",
+                user_id,
+            )
+            failures[token_hash] = (cap, now, user_id)
+            return cap
         failures[token_hash] = (1, now, user_id)
         return 1
 
@@ -14918,6 +15135,25 @@ class AuthService:
         instead of starting a fresh budget."""
         await self._store.revoke_session(token_hash, now=now)
         self._reproof_session_failures.pop(token_hash, None)
+
+    async def _end_lapsed_reproof_session(self, token_hash: str) -> None:
+        """End a session a re-proof found lapsed, as the request validator ends one (BACKLOG #5336).
+        Its count is dropped only once the revoke commits. A refused revoke is logged and keeps the
+        count: the re-proof is refused as gone either way, and every later one on the session is
+        refused the same way while it stays lapsed. The refusals caught are the session cap's set,
+        at least the closed connection's bare ``ValueError`` among them; a defect still raises."""
+        try:
+            await self._store.revoke_session(token_hash)
+        except (*store_call_errors(), *store_connect_errors()) as exc:
+            if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                raise
+            _log.warning(
+                "a re-proof found its session lapsed, but its revoke was refused (%s); the "
+                "re-proof is refused as gone and the session's re-proof count stays",
+                type(exc).__name__,
+            )
+        else:
+            self._forget_reproof_counts((token_hash,))
 
     async def _reproof_serialized(
         self,
@@ -14939,6 +15175,11 @@ class AuthService:
             # or by anything else. It is not verified, so a queued burst cannot outrun the budget.
             self._reproof_session_failures.pop(token_hash, None)
             return _Reproof(ok=False, session_gone=True, user=user)
+        if not session.is_live(now=time.time(), idle_seconds=self.session_idle_seconds):
+            # Past its absolute expiry or idle window while this attempt waited behind the lock, so
+            # the validator would refuse it now: gone, ended, and never verified (BACKLOG #5336).
+            await self._end_lapsed_reproof_session(token_hash)
+            return _Reproof(ok=False, session_gone=True, user=user)
         # At least one guess, so a lockout_threshold of 0 (documented as "locks on the first
         # failure") revokes on the first failure rather than on every re-proof.
         threshold = max(self._policy.lockout_threshold, 1)
@@ -14948,6 +15189,7 @@ class AuthService:
             # that earlier attempt's, so this one reports the session gone.
             await self._revoke_for_budget(token_hash, time.time())
             return _Reproof(ok=False, session_gone=True, user=user)
+        await self._drop_ended_reproof_counts(user.id, token_hash)
         verdict: bool | None
         reason: str | None = None
         groups: frozenset[str] = frozenset()
@@ -16696,6 +16938,8 @@ class AuthService:
                     errors=refused,
                     defects=AUDIT_WRITE_DEFECTS,
                 )
+                if session_ended:
+                    self._forget_reproof_counts((rotated,))
                 if not session_ended:
                     session_ended = await write_audit_soft(
                         lambda: self._store.revoke_session(rotated),
@@ -16708,6 +16952,7 @@ class AuthService:
                         defects=AUDIT_WRITE_DEFECTS,
                     )
                     if session_ended:
+                        self._forget_reproof_counts((rotated,))
                         _log.warning(
                             "a refused TOTP enrolment for %s ended the session it rotated on retry",
                             scrub_log_argument(identity.username),
@@ -19587,7 +19832,9 @@ class AuthService:
         """Delete an account. Raises :class:`LastAdministratorRefused`, having written nothing, when
         it is the last enabled administrator; the check and the delete are one store transaction
         (vault BACKLOG #2779). The ``user.deleted`` row commits in the delete's transaction
-        (BACKLOG #2221)."""
+        (BACKLOG #2221). The delete ends the account's sessions, so their re-proof counts are
+        dropped once it commits (BACKLOG #5336)."""
+        counted = self._reproof_counts_of(user_id)
         if not await self._store.remove_unless_last_admin(
             user_id,
             AdminRemoval.DELETE,
@@ -19595,6 +19842,7 @@ class AuthService:
             audits=(AuditAppend("user.deleted", actor=actor, detail=_json({"user_id": user_id})),),
         ):
             raise LastAdministratorRefused("cannot delete the last administrator")
+        self._forget_reproof_counts(counted)
         self._forget_cert_probe_fault(user_id)
 
     async def set_roles(self, user_id: str, roles: Sequence[str], *, actor: str) -> None:
@@ -19744,7 +19992,9 @@ class AuthService:
         # Before the rows are gone, so nothing has committed yet: a refusal is raised at once with
         # the role in place, and not recorded as a miss after a committed change (vault #3023).
         for user_id in await self._custom_role_holders(role_id):
+            counted = self._reproof_counts_of(user_id)
             await self._store.revoke_user_sessions(user_id, audit=no_audit_row)
+            self._forget_reproof_counts(counted)
         # BACKLOG #5725: the store refuses a role it does not find as a custom role by this exact
         # id. That deleted nothing, so no row may record a deletion; the caller answers not found.
         if not await self._store.delete_custom_role(role_id):

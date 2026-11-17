@@ -13666,7 +13666,8 @@ class RegistryRunner:
         """Raise a ``saturation`` alert if a lane's backlog is **rising sustained** (#93, ADR 0014
         amendment) — the DERIVATIVE signal, distinct from :meth:`_maybe_alert_buildup`'s absolute
         depth/age ceiling. A bounded per-``(stage, lane)`` :class:`SaturationDetector` samples the
-        pending depth; a lane whose depth climbs monotonically over the window trips (sustained rising
+        pending depth; a lane whose depth climbs monotonically over the window, past the
+        ``min_growth`` floor (BACKLOG #5768), trips (sustained rising
         depth ⇔ ingest > drain by queue conservation), while a bursty-but-DRAINING lane (spike then
         fall) does not — the whole point.
 
@@ -13688,7 +13689,7 @@ class RegistryRunner:
         depth, _oldest = await self.store.pending_depth(name, stage=stage)
         detector = self._saturation_detectors.get(key)
         if detector is None:
-            detector = SaturationDetector(sustain)
+            detector = SaturationDetector(sustain, min_growth=self._saturation_default.min_growth)
             self._saturation_detectors[key] = detector
         # Sample EVERY tick (even when throttled) so the depth window stays continuous; the throttle
         # only gates the notification, never the sampling.
