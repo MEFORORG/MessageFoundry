@@ -141,11 +141,11 @@ characters in it and the command was allowed. Until BACKLOG #5655 rule 3 took th
 every invocation's target, so an earlier command's `-C`, or one inside a quoted argument, hid a later
 `git reset --hard` in the primary, and rule 3b judged only the first invocation. Many more
 invocations, verb-bearing ones for rules 3 and 3b and disarming ones for rule 3c, are now also read
-from their own tokens, after the gate's own unquoting. That reading is added after the old one, and the
-old reading's false refusals stay. A misreading in the new one is a new false refusal. It does not close the class: the
-unquoting does not match the shell in every form, and at least some quoted paths and some invocations
-are still allowed. The ADDED READINGS note in the hook is the source of record for what the added
-reading misses and for the known false refusals.
+from their own tokens, after the gate's own unquoting. That reading is added after the old one, and
+the old reading's false refusals stay. A misreading in the new one is a new false refusal. It does not
+close the class: the unquoting does not match the shell in every form, and at least some quoted paths
+and some invocations are still allowed. The ADDED READINGS note in the hook is the source of record
+for what the added reading misses and for its known false refusals.
 
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
@@ -294,5 +294,6 @@ becomes real when someone runs the installer.
 - **It does not solve the shared number space** (two sessions both allocating "the next ADR number", which
   merges clean and silently corrupts the ledger). That is a real, separately-measured defect class and it
   needs an allocator, not a file gate.
-- **The added per-invocation readings of rules 3 and 3c make false refusals of their own, and they
-  are left open.** The ADDED READINGS note in the hook lists the known ones.
+- **At least some of the gate's rules make false refusals, and some are left open.** The added
+  per-invocation readings make false refusals of their own. The ADDED READINGS note in the hook holds
+  at least the known ones of those readings, and others are not ruled out.

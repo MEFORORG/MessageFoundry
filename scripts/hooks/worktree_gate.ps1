@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.17.2"
+$GateVersion = "2026.11.17.3"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -842,10 +842,13 @@ function Get-ScanRawIndexMap($Seg) {
 # chdir follower cannot read; a `-C` re-quoted inside a `bash -c` payload with `'\''` or `'"'"'`,
 # because the payload's extraction stops at the first joint, as it did at f0e49f45c5c; and A GIT BASH
 # DRIVE SPELLING, `/c/<primary>`, which no reading maps to the primary, so `git -C /c/<primary> reset
-# --hard` is allowed (fail-open, f0e49f45c5c has it too).
+# --hard` is allowed (fail-open, f0e49f45c5c has it too). And a `config` disarm whose first `config`
+# word sits in a closed `$( )` (`git -C '<p>' -c user.name=$(git config user.name) config <key>`):
+# rule 3c's added reading reads only the inner invocation, so it is allowed from outside (fail-open,
+# f0e49f45c5c has it too).
 #
 # KNOWN FALSE DENIES OF THESE READINGS, left open, at least these. Each one with an example command
-# here, unless it says "not pinned", is pinned as a DENY row in tests/test_worktree_gate_quoted_and_every_invocation.py,
+# here is pinned as a DENY row in tests/test_worktree_gate_quoted_and_every_invocation.py,
 # test_known_false_denies_of_the_added_readings_still_deny:
 #   * a later disarm judged by rule 3c's first chain can take an earlier command's `-C`;
 #   * an earlier bracket-joined command's `-C` or `--git-dir` can decide (`if (git -C <p> diff
@@ -854,20 +857,20 @@ function Get-ScanRawIndexMap($Seg) {
 #     --exclude-dir=.git -c alias.lg f` from the primary);
 #   * a chdir in an earlier line's heredoc, here-string or multi-line `bash -c` body is read as a
 #     real one;
-#   * a closed substitution holding a git word between two `config` words makes rule 3c's reading
-#     fall back to the session cwd (`git -C <o> config --file=$(git rev-parse --git-dir)/config <key>`
-#     from the primary);
 #   * a `config` pathspec after a closed `$( )` reads as a config disarm (`git -C '<p>' log $(git
 #     rev-parse HEAD) -- config <key> x` from outside);
-#   * a bare read whose earlier `config` word sits in a closed `$( )` is judged as if that earlier
-#     word began the disarm (`git -C '<p>' -c user.name=$(git config user.name) config --get
-#     core.hooksPath` from outside);
+#   * rule 3c's first window can start at a git word inside a closed `$( )`, or at the git of a
+#     `.git` path, and then names no `-C`, so that reading falls back to the session cwd (`git -C <o>
+#     -c user.name=$(git log -1 --format=%an) config <key>` and `git -C <o> --git-dir=$(echo .git)
+#     config <key>` from the primary; origin/main's too);
 #   * the $absC fold reads a `-C` inside a closed `$( )` as the outer invocation's, after an earlier
 #     line's chdir in parentheses (`(cd <tmp> && ls)`, then `git -c a=$(git -C '<p>' log -1) config
-#     <key>` from outside);
-#   * a `.git` path segment inside a closed `${ }` is taken as rule 3c's git word, so the reading falls
-#     back to the session cwd (`git -C <o> config --file=${GIT_DIR:-.git}/config <key>` from the
-#     primary; not pinned).
+#     <key>` from outside).
+#
+# KNOWN WRONG REFUSAL TEXT, left open, origin/main's too: rule 3c words its refusal from the disarm
+# match, not from what the command does, so it can call a refused read "changing" or "setting" (`git
+# config --file=.git/config --get core.hooksPath` and `git config --get core.hooksPath x` from the
+# primary).
 #
 # THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
@@ -913,11 +916,11 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
     # `git -C '<p>' reset --hard` on the next line was allowed. (Under Bash that chdir is a subshell's;
     # under the PowerShell tool `(Set-Location <p>)` moves the shell, and a relative `-C` after it is
     # still not read -- see WHAT IT DOES NOT READ.) Not where the window also names a work tree or git
-    # dir in a spelling the regex below matches; a quote-joined one such as `''--git-dir=` is not
-    # matched, so that window is read. Git roots a relative one against the `-C` directory, not the unknown one; the
-    # exclusion leaves those windows unread all the same, and the shapes it allows are listed under
-    # WHAT IT DOES NOT READ. The fold does not skip a `-C` inside a closed
-    # `$( )`, which is a known false deny listed there.
+    # dir in a spelling the regex below matches. Git roots a relative one against the `-C` directory,
+    # not the unknown one, but such a window is left unread all the same; WHAT IT DOES NOT READ lists
+    # shapes that allows. A quote-joined spelling such as `''--git-dir=` is not matched, so its window
+    # is read. The fold does not skip a `-C` inside a closed `$( )`, a known false deny listed under
+    # KNOWN FALSE DENIES.
     $foldC = Get-WindowFoldRaw '' $win
     $absC = $foldC -and [System.IO.Path]::IsPathFullyQualified($foldC) -and
         $win -notmatch '(?:^|\s)(?:--work-tree|--git-dir|GIT_WORK_TREE=|GIT_DIR=)'
@@ -3779,26 +3782,10 @@ if ($tool -in @("Bash", "PowerShell")) {
         # `get --all`). None of these tokens takes a value or sets anything; what follows the key is
         # $rest, and the one exemption left requires it empty.
         $viaRead = $viaConfig -and ($via -cmatch "^config(?:\s+get)?(?:\s+(?:$readOpts))*\s+$")
-        # THE REFUSAL TEXT IS WORDED FROM THE LAST `config` WORD IN $via, the one nearest the key, and
-        # nothing else reads $textRead or $textWrite (PR 3030 review, finding 4). A config-form disarm
-        # that is not the plain `config <key> <v>` shape may REMOVE the key, so $textWrite words it
-        # "changing" rather than "setting". $via starts at the FIRST `config`
-        # word, which can sit in a closed `$( )` ahead of the outer invocation's own (`-c
-        # user.name=$(git config user.name) config --get <key>`), and the refusal then said "changing"
-        # about a read. The verdict still comes from $viaRead above. Only a `config` with whitespace on
-        # both sides counts as a later word, so a path component such as `--file=.git/config` does not
-        # move the wording; with none, $via is used whole. That word is still found by text, not by
-        # parsing the invocation, so the wording can name the wrong action on a line whose `config`
-        # argument stands alone (a known limit). $textRead is the bare read the exemption below would
-        # have passed had $via started at that word: read options only, and nothing after the key.
-        $textVia = $via
-        if ($viaConfig) {
-            $cfgAt = [regex]::Matches($via, '(?<=\s)config(?=\s)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($cfgAt.Count -gt 0) { $textVia = $via.Substring($cfgAt[$cfgAt.Count - 1].Index) }
-        }
-        $textReadForm = $viaConfig -and ($textVia -cmatch "^config(?:\s+get)?(?:\s+(?:$readOpts))*\s+$")
-        $textRead = $textReadForm -and $rest -notmatch '\S'
-        $textWrite = $viaConfig -and -not $textReadForm -and ($textVia -cnotmatch '^config(?:\s+(?:--local|--global|--system|--worktree))*\s+$')
+        # For the refusal's wording only: a config-form disarm that is not the plain `config <key> <v>`
+        # shape may REMOVE the key, so "setting" would misdescribe it. The wording can still misname a
+        # refused read; see KNOWN WRONG REFUSAL TEXT under THE ADDED READINGS.
+        $viaWrite = $viaConfig -and -not $viaRead -and ($via -cnotmatch '^config(?:\s+(?:--local|--global|--system|--worktree))*\s+$')
         # THE EXPLICIT READ FLAGS ARE NO LONGER TESTED ON THEIR OWN (BACKLOG #5589); see the block after
         # $ownCmdWin for the window that did, and why.
         # ...AND THE IMPLICIT ONE (BACKLOG #1306). `git config <key>` with NO VALUE AFTER IT assigns
@@ -4114,13 +4101,13 @@ if ($tool -in @("Bash", "PowerShell")) {
         $whereRaw = Get-FullPathRaw $where[0] $cwdRaw
         if (-not $whereRaw) {
             Write-Deny -Rule "3c" -Detail "git config $badKey (unresolvable target)" -Reason @"
-BLOCKED: $(if ($textRead) { "this names '$badKey' in a git config invocation the rule could not clear as a bare read" } elseif ($textWrite) { "this changes '$badKey'" } else { "this sets '$badKey'" }), and the gate cannot tell WHICH repository it would act on.
+BLOCKED: this $(if ($viaWrite) { 'changes' } else { 'sets' }) '$badKey', and the gate cannot tell WHICH repository it would change it in.
 
 The target path '$(Get-SafeForMessage $where[0])' could not be resolved to an absolute path from this
 session's working directory ('$(Get-SafeForMessage $cwdRaw)'), so the check that would normally answer
 "is this the shared configuration of a governed checkout?" cannot run at all.
 
-'$badKey' is on the disarm list: $(if ($textWrite) { 'changing' } else { 'setting' }) it in a governed repository turns off the ledger, claim and
+'$badKey' is on the disarm list: $(if ($viaWrite) { 'changing' } else { 'setting' }) it in a governed repository turns off the ledger, claim and
 secret-leak commit gates for every worktree of it at once. An unanswerable question about that key is
 refused rather than assumed safe.
 
@@ -4203,10 +4190,10 @@ What to do instead:
         # (a `git.EXE` or `GIT` the token pattern misses must not reach back over `;`). That word comes
         # from Get-AnyGitWordBefore, which can match a `.git` path segment, the git in `--git-dir`, or a
         # git inside a closed `$( )` that owns nothing, so this window is not always the owning
-        # invocation's; the known false denies that follow are listed in THE ADDED READINGS. For a
-        # `-c <key>=<v>` disarm it runs
-        # on over the global options that follow, so `git -c <key>=<v> -C <ungoverned> commit` reads that
-        # `-C` (review round b62475f26d). A `config` disarm has every global option before it.
+        # invocation's. That makes false denies, and THE ADDED READINGS lists at least some of them,
+        # not all. For a `-c <key>=<v>` disarm it runs on over the global options that follow, so
+        # `git -c <key>=<v> -C <ungoverned> commit` reads that `-C` (review round b62475f26d). A
+        # `config` disarm has every global option before it.
         if (-not $govCfg) {
             $readTo = $dis.Index
             if (-not $viaConfig) {
@@ -4215,42 +4202,25 @@ What to do instead:
                     '^\S*(?:\s+(?:-[Cc]\s+\S+|--(?:git-dir|work-tree|namespace)(?:=\S+|\s+\S+)|--?[A-Za-z][\w-]*(?:=\S+)?))*')
                 $readTo = $keyAt + $globals.Length
             }
-            # BOTH GIT WORDS ARE READ, AND THE DISARM'S LAST `config` WORD TOO (BACKLOG #5655 steps 1
-            # and 3). The broad word answers the git inside a `$( )` that closes before the disarm, so
-            # `git -C '<p>' -c user.name=$(git log -1) config <key>` read no `-C`; the owning word skips
-            # a closed group. And the disarm regex can anchor on an inner `config`
-            # (`-c user.name=$(git config user.name) config <key>`), so the owning word of the LAST
-            # `config` in the match is read as well. Each extra reading can only add a deny.
-            $anchors = @($dis.Index)
-            if ($viaConfig) {
-                $cfgWords = [regex]::Matches($via, '\bconfig\b', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                $lastCfg = $dis.Index + $cfgWords[$cfgWords.Count - 1].Index
-                if ($lastCfg -ne $dis.Index) { $anchors += $lastCfg }
+            # THE OWNING GIT WORD IS READ AS WELL (BACKLOG #5655 step 1). The broad word answers the git
+            # inside a `$( )` that closes before the disarm, so `git -C '<p>' -c user.name=$(git log -1)
+            # config <key>` read no `-C`; the owning word skips a closed group. Its reading can only add
+            # a deny. It is searched for only after the last true separator before the disarm, so
+            # `git -C '<p>' log ; /usr/bin/git config <key>` cannot read the earlier command's `-C`
+            # (the owning-word search skips a path-qualified git). It is used only where the span from it
+            # to the disarm holds no more openers than closers (review round e9fa08d529), so `git -C
+            # '<p>' log $(/usr/bin/git config <key>)` does not read the outer `-C` either. That compares
+            # COUNTS, not nesting, so a span such as `x) $(...` passes.
+            $gitWords = @(Get-AnyGitWordBefore $seg.Scan $dis.Index)
+            $seps = [regex]::Matches($seg.Scan.Substring(0, $dis.Index), '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))')
+            $base = $(if ($seps.Count -gt 0) { $seps[$seps.Count - 1].Index + $seps[$seps.Count - 1].Length } else { 0 })
+            $ownAt = Get-GitWordBefore $seg.Scan.Substring($base) ($dis.Index - $base)
+            if ($ownAt -ge 0 -and $base + $ownAt -ne $gitWords[0]) {
+                $span = $seg.Scan.Substring($base + $ownAt, $dis.Index - $base - $ownAt)
+                if (([regex]::Matches($span, '[({]')).Count -le ([regex]::Matches($span, '[)}]')).Count) { $gitWords += $base + $ownAt }
             }
-            # The owning word is read only where no true separator lies between it and the disarm and
-            # the span between them holds no more openers than closers (review rounds 34781a2201,
-            # e9fa08d529). That compares COUNTS, not nesting, so a span such as `x) $(...` passes.
-            # Without that floor, `git -C '<p>' log ; /usr/bin/git config <key>` and `git -C '<p>' log
-            # $(/usr/bin/git config <key>)` would read the outer command's `-C`, because the owning-word
-            # search skips a path-qualified git.
-            $readings = [System.Collections.Generic.List[object]]::new()
-            $seen = @{}
-            foreach ($anchor in $anchors) {
-                $to = $(if ($viaConfig) { $anchor } else { $readTo })
-                $gws = @(Get-AnyGitWordBefore $seg.Scan $anchor)
-                $own = Get-GitWordBefore $seg.Scan $anchor
-                if ($own -ge 0 -and $own -ne $gws[0]) {
-                    $span = $seg.Scan.Substring($own, $anchor - $own)
-                    if (-not (Test-TrueSeparatorIn $span) -and
-                        ([regex]::Matches($span, '[({]')).Count -le ([regex]::Matches($span, '[)}]')).Count) { $gws += $own }
-                }
-                foreach ($gw in $gws) {
-                    if ($seen.ContainsKey("$to/$gw")) { continue }
-                    $seen["$to/$gw"] = $true
-                    foreach ($r in @(Get-InvocationReading $seg.Scan $to -GitAt $gw -Prior $seg.Prior)) { $readings.Add($r) }
-                }
-            }
-            foreach ($reading in $readings) {
+            $readings = foreach ($gw in $gitWords) { Get-InvocationReading $seg.Scan $readTo -GitAt $gw -Prior $seg.Prior }
+            foreach ($reading in @($readings)) {
                 $govCfg = Find-FirstAnsweringRoot (Get-InvocationCandidates $reading $cwdRaw `
                               -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir) $cwdRaw
                 if ($govCfg) { break }
@@ -4276,14 +4246,7 @@ What to do instead:
         # Write-Deny exits on the first hit, so on a multi-line command whose LATER segment does a
         # local write, that sentence would print over a real disarm.
         $scopeFlag = if ($seg.Scan -cmatch '(?:^|\s)--(?<sc>global|system)(?:\s|$)') { $Matches['sc'] } else { $null }
-        # A line whose key-nearest `config` word reads ($textRead) gets its own wording on every scope:
-        # neither "writes" nor "setting" is true of it (PR 3030 review, finding 4).
-        $opening = if ($textRead) {
-            "BLOCKED: this names '$badKey' in a git config invocation the rule could not clear as a bare " +
-            "read, and '$badKey' is on the disarm list for the SHARED git configuration of $($govCfg.Display), " +
-            "so it is refused."
-        }
-        elseif ($scopeFlag) {
+        $opening = if ($scopeFlag) {
             "BLOCKED: '$badKey' is on the disarm list, and --$scopeFlag writes your " +
             $(if ($scopeFlag -eq 'global') { 'per-user' } else { 'machine-wide' }) +
             " git configuration rather than this repository's.`n`nGit falls back to that scope when " +
@@ -4292,15 +4255,11 @@ What to do instead:
         }
         else {
             # A write mode may REMOVE the key (BACKLOG #5588), so "setting" would misdescribe it.
-            "BLOCKED: $(if ($textWrite) { 'changing' } else { 'setting' }) '$badKey' would change the SHARED git configuration of $($govCfg.Display)."
+            "BLOCKED: $(if ($viaWrite) { 'changing' } else { 'setting' }) '$badKey' would change the SHARED git configuration of $($govCfg.Display)."
         }
         # The mechanism paragraph is scope-aware for the same reason the opening is: the shared-.git
         # sentence is TRUE of a repository-scope write and FALSE of --global/--system.
-        $mechanism = if ($textRead) {
-            "Every worktree of this repository shares one .git directory, so a write of this key would " +
-            "take effect for all of them at once."
-        }
-        elseif ($scopeFlag) {
+        $mechanism = if ($scopeFlag) {
             "This is refused on the REACH, not on where the file lands: a key inherited from the " +
             "$(if ($scopeFlag -eq 'global') { 'per-user' } else { 'machine-wide' }) scope applies to " +
             "every repository on this machine that does not override it, including every worktree of " +

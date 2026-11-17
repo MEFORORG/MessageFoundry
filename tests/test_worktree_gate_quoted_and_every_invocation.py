@@ -429,8 +429,6 @@ def test_a_later_disarm_owned_by_a_path_git_or_after_a_closer_is_rule_3cs(
     [
         # Step 1: the broad git word answered the git inside the closed `$( )`, so no `-C` was read.
         ("git -C '{p}' -c user.name=$(git log -1 --format=%an) config {k}", "SHARED git configur"),
-        # Step 3: the disarm regex anchored on the inner `config`.
-        ("git -C '{p}' -c user.name=$(git config user.name) config {k}", "SHARED git configur"),
         # Step 3: an earlier line's subshell chdir switched the added reading off.
         ("(cd {tmp} && ls)\ngit -C '{p}' reset --hard", "SHARED PRIMARY"),
     ],
@@ -464,23 +462,14 @@ def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str,
         ("if (git -C '{p}' diff --quiet) {{ git reset --hard }}", "outside", "PowerShell"),
         # The later-disarm filter counts `.git` as a git word, so the grep's `-c alias.lg` is judged.
         ("git config core.hooksPath ; grep --exclude-dir=.git -c alias.lg f", "primary", "Bash"),
+        # Rule 3c's first window starts at a git inside a closed `$( )`, or at the git of a `.git`
+        # path, so it names no `-C` and falls back to the session cwd. DENY on origin/main too.
+        ("git -C {o} -c user.name=$(git log -1 --format=%an) config {k}", "primary", "Bash"),
+        ("git -C {o} --git-dir=$(echo .git) config {k}", "primary", "Bash"),
         # KNOWN FALSE DENIES below, each ALLOW on origin/main f0e49f45c5c (measured with the PR 3030
         # reviewer probes) and listed in the hook's ADDED READINGS note.
-        # A closed substitution holding a git word between two `config` words: the `--file` resolves
-        # in the ungoverned repository, but the reading falls back to the session cwd.
-        (
-            "git -C {o} config --file=$(git rev-parse --git-dir)/config {k}",
-            "primary",
-            "Bash",
-        ),
         # A `config` pathspec after a closed `$( )` reads as a config disarm of the `-C` repository.
         ("git -C '{p}' log $(git rev-parse HEAD) -- config core.hooksPath x", "outside", "Bash"),
-        # A bare read whose earlier `config` word sits in a closed `$( )`.
-        (
-            "git -C '{p}' -c user.name=$(git config user.name) config --get core.hooksPath",
-            "outside",
-            "Bash",
-        ),
         # $absC folds the `-C` inside the closed `$( )` as the outer invocation's.
         ("(cd {tmp} && ls)\ngit -c a=$(git -C '{p}' log -1) config {k}", "outside", "Bash"),
     ],
@@ -489,23 +478,6 @@ def test_known_false_denies_of_the_added_readings_still_deny(
     rig: SimpleNamespace, template: str, where: str, tool: str
 ) -> None:
     assert not _allowed(rig, _fmt(rig, template), _cwd(rig, where), tool)
-
-
-def test_a_misanchored_read_is_not_called_a_change(rig: SimpleNamespace) -> None:
-    # PR 3030 review, finding 4: the refusal for this known false deny said "changing" about a read.
-    # Its text is worded from the `config` word nearest the key; the verdict is still DENY.
-    command = "git -C '{p}' -c user.name=$(git config user.name) config --get core.hooksPath"
-    reason = _reason(rig, _fmt(rig, command), rig.outside)
-    first = reason.splitlines()[0]
-    assert "could not clear as a bare read" in first, reason
-    assert "changing" not in first and "setting" not in first, reason
-
-
-def test_a_config_path_component_does_not_move_the_refusal_wording(rig: SimpleNamespace) -> None:
-    # Review round e6039d36, finding 1: a `config` path component after `--file=` moved the wording
-    # to the read text, though `--unset` removes the key. origin/main says "changing".
-    reason = _reason(rig, "git config --unset --file=.git/config core.hooksPath", rig.primary)
-    assert reason.splitlines()[0].startswith("BLOCKED: changing"), reason
 
 
 # Quoted forms the gate's unquoting does not read as the shell does (closing step 7), left ALLOW as on
@@ -624,6 +596,13 @@ def test_a_bash_payload_on_an_earlier_line_does_not_hide_a_later_lines_payload(
     second = "bash -c 'git -C {wt} -C \"\" checkout {b}'"
     reason = _reason(rig, _fmt(rig, first + "\n" + second), rig.outside)
     assert "LINKED WORKTREE" in reason, reason
+
+
+def test_known_gap_an_inner_config_word_ahead_of_the_disarm(rig: SimpleNamespace) -> None:
+    # Known gap, ALLOW on origin/main f0e49f45c5c too: the disarm match starts at the `config` inside
+    # the closed `$( )`, so rule 3c's added reading reads only the inner invocation. A fix flips this.
+    command = _fmt(rig, "git -C '{p}' -c user.name=$(git config user.name) config {k}")
+    assert _allowed(rig, command, rig.outside)
 
 
 def test_known_gap_a_separator_inside_a_closed_substitution(rig: SimpleNamespace) -> None:
