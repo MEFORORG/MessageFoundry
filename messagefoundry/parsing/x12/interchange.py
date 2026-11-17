@@ -92,9 +92,10 @@ def split(raw: str) -> list[str]:
       included.
     * A run that does not open with ``ISA`` is returned as its own element and ends at the next
       ``ISA`` that passes, so a trigram in it ("VISA", "ISAAC") does not end it.
-    * A malformed or non-ISA element that ends at a later ``ISA`` loses the whitespace/BOM before
-      that ``ISA``, except that a malformed interchange keeps one of its own segment terminators
-      there, so a whitespace terminator closing its last segment stays.
+    * A malformed or non-ISA element that does not end at its own ``IEA`` loses the whitespace/BOM
+      at its end, before a later ``ISA`` or the end of the buffer. A malformed interchange with a
+      whole header keeps that run up to and through the first of its own segment terminators in
+      it, so a whitespace terminator closing its last segment stays.
 
     An element is not checked beyond that. A malformed one does not parse, but one cut at a later
     ``ISA`` before its ``IEA`` may: :func:`check_integrity` reports its missing trailers, and
@@ -138,22 +139,23 @@ def split(raw: str) -> list[str]:
         else:
             end, at_iea = good, False  # non-ISA data — surface it
         # Ended at its own IEA it is kept verbatim, its terminator too, even a whitespace one.
-        out.append(raw[start:end] if at_iea else _strip_before_isa(raw[start:end], terminator))
+        out.append(raw[start:end] if at_iea else _strip_before_isa(raw, start, end, terminator))
         pos = end
     return out
 
 
-def _strip_before_isa(element: str, terminator: str) -> str:
-    """``element``, which ends at a later ``ISA``, without the whitespace/BOM before that ``ISA``.
-    With the ``terminator`` of a malformed interchange, the run is cut just past the first
-    terminator after the last character that is not whitespace or BOM, so a whitespace terminator
-    closing its last segment, and whitespace data before it, stay (BACKLOG #5921)."""
-    kept = element.rstrip(_LEADING_NOISE)
+def _strip_before_isa(raw: str, start: int, end: int, terminator: str) -> str:
+    """``raw[start:end]`` without the whitespace/BOM run at its end. With the ``terminator`` of a
+    malformed interchange, that run is kept up to and through the first terminator in it, so a
+    whitespace terminator closing its last segment stays (BACKLOG #5921). One copy is made."""
+    cut = end
+    while cut > start and raw[cut - 1] in _LEADING_NOISE:
+        cut -= 1
     if terminator:
-        at = element.find(terminator, len(kept))
+        at = raw.find(terminator, cut, end)
         if at != -1:
-            return element[: at + len(terminator)]
-    return kept
+            cut = at + len(terminator)
+    return raw[start:cut]
 
 
 def _isa_complete_str(raw: str, isa: int) -> bool:
@@ -243,22 +245,23 @@ def _walk_str(
         else:
             run = _SEGMENT_WS_RUN_STR.match(raw, seg_start, idx)
             opens = seg_start if run is None else run.end()  # a star pattern: never None
-        if _iea_id(raw, opens, idx):
+        if _iea_id(raw, opens, idx, raw[isa + 3]):
             return idx + len(terminator), True
         seg_start = idx + len(terminator)
 
 
-def _iea_id(buf: str | bytes | bytearray, at: int, end: int) -> bool:
+def _iea_id(buf: str | bytes | bytearray, at: int, end: int, sep: str | bytes | bytearray) -> bool:
     """Whether the segment opening at ``at`` and ending at ``end`` (its terminator) has the id
-    ``IEA``: it opens with ``IEA``, then ends or goes on with a character that is not an ASCII
-    letter or digit. A segment id is two or three letters or digits, so ``IEAX*...`` is a longer
-    id, not the trailer (BACKLOG #5807). The ISA's element separator is not read, so a header that
-    fails the check, whose +3 may be the corrupted byte, is read the same way."""
+    ``IEA``: it opens with ``IEA``, then ends, or goes on with ``sep`` (the ISA's +3 element
+    separator) or a character that is not an ASCII letter or digit. A segment id is two or three
+    letters or digits, so ``IEAX*...`` is a longer id, not the trailer (BACKLOG #5807), unless
+    ``X`` is the separator. A header that fails the check may have a corrupted +3, and is still
+    closed at ``IEA`` and any character that is not a letter or digit."""
     head = buf[at : min(at + 4, end)]
     if (head[:3] != "IEA") if isinstance(head, str) else (head[:3] != b"IEA"):
         return False
     rest = head[3:]
-    return not (rest.isascii() and rest.isalnum())  # empty: the segment ends at IEA
+    return rest == sep or not (rest.isascii() and rest.isalnum())  # empty: ends at IEA
 
 
 class X12FrameReader:
@@ -454,7 +457,7 @@ class X12FrameReader:
                 opens = self._seg_start if run is None else run.end()
             else:
                 opens = self._seg_ws  # a passing walk has read the opening whitespace already
-            if _iea_id(buf, opens, idx):
+            if _iea_id(buf, opens, idx, buf[3:4]):
                 return self._take(idx + len(terminator))
             self._seg_start = self._scan = idx + len(terminator)
             # A whitespace terminator can end a segment inside the run already read: the run from

@@ -376,11 +376,14 @@ raises for the whole buffer. The reader still discards a run that does not open 
 ## Amendment (2026-11-17) — the `IEA` trailer is matched as a whole segment id (BACKLOG #5807)
 
 `split` and `X12FrameReader` end an interchange at a segment that opens, after cosmetic whitespace,
-with `IEA`, and then ends or goes on with a character that is not an ASCII letter or digit. A
-segment whose id only starts with `IEA`, such as `IEAX*1~`, is data in the interchange. The ISA's
-element separator is not read for this, so a header that fails the structural check is read the
-same way. An interchange whose only such segment is a longer id has no `IEA`, and is framed as the
-2026-11-13 amendment above describes for one.
+with `IEA`, and then ends, or goes on with the ISA's +3 element separator or a character that is not
+an ASCII letter or digit. A segment whose id only starts with `IEA`, such as `IEAX*1~` where `X` is
+not the separator, is data in the interchange. A header that fails the structural check is read the
+same way, so a corrupted +3 does not hold its frame. An interchange whose only such segment is a
+longer id has no `IEA`, and is framed as the 2026-11-13 amendment above describes for one. The parse
+reads the trailer differently: it splits each segment on the element separator and needs the id to
+be exactly `IEA`. So a frame closed at, for example, `IEA|1|...` or `IEA *1*...` in an interchange
+using `*` parses with no `IEA`, and `check_integrity` reports it, as it did before this amendment.
 
 ---
 

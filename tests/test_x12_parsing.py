@@ -424,6 +424,18 @@ def test_iea_then_the_segment_end_or_a_non_alphanumeric_still_ends_an_interchang
         assert _frames_of((raw + nxt).encode(), chunk) == [raw.encode(), nxt.encode()], chunk
 
 
+def test_a_letter_as_the_element_separator_still_ends_at_iea() -> None:
+    # The parse accepts a letter as the element separator, so its trailer "IEAW1W..." is the IEA
+    # segment: the id rule also takes the ISA's own separator after IEA.
+    raw = interchange(el="W")
+    assert raw.endswith("IEAW1W000000001~")
+    nxt = interchange(el="W", control="000000002")
+    assert split(raw + nxt) == [raw, nxt]
+    for chunk in (4096, 1):
+        assert _frames_of((raw + nxt).encode(), chunk) == [raw.encode(), nxt.encode()], chunk
+    assert X12Message.parse(raw).segment_ids()[-1] == "IEA"
+
+
 def test_a_corrupted_interchange_with_another_separator_still_ends_at_its_own_iea() -> None:
     # An interchange with no IEA, then a corrupted one using "|": the walk is bounded from the
     # failing ISA on, and still ends at that interchange's own IEA, whatever its separator.
