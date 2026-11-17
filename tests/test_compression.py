@@ -624,14 +624,6 @@ def test_archive_member_name_reason_admits_near_miss_windows_names(name: str) ->
     assert archive_member_name_reason(name) is None
 
 
-@pytest.mark.parametrize("name", ["aux.py", "sub/con.toml", "x/a:b.toml", "trailing.", "y/z "])
-def test_archive_member_name_reason_windows_arms_can_be_turned_off(name: str) -> None:
-    # The DR config restore passes windows_names=False; the traversal arms still bind there.
-    assert archive_member_name_reason(name) is not None
-    assert archive_member_name_reason(name, windows_names=False) is None
-    assert archive_member_name_reason("../" + name, windows_names=False) is not None
-
-
 @pytest.mark.parametrize(
     ("name", "fragment"),
     [("aux.hl7", "reserved"), ("adt.hl7:stream", "colon"), ("adt.hl7.", "dot or space")],
@@ -645,33 +637,29 @@ def test_zip_decompress_refuses_windows_name_shapes(name: str, fragment: str) ->
         zip_decompress(blob, max_output_bytes=None)
 
 
-def test_dr_config_restore_passes_windows_names_false(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """BACKLOG #5369: the DR config restore keeps its earlier name check, so it calls the shared
-    guard with the Windows-name arms off. The guard is imported inside the function, so the
-    module attribute is what it reads."""
+@pytest.mark.parametrize(
+    "name",
+    ["nul", "routers.py.", "conn.toml:hidden", "aux.py"],
+    # aux.py: the device arm deliberately over-refuses; the measurement is on
+    # dr_backup._win_opens_another.
+)
+def test_dr_config_restore_refuses_windows_alias_names(tmp_path: Path, name: str) -> None:
+    """BACKLOG #5369: the DR config restore runs the same name check as a zip member, so a config
+    member Windows would send to a device, alias by a dropped trailing dot, or hide in an NTFS
+    data stream is refused before any byte of it is written."""
     import tarfile
 
-    from messagefoundry.parsing import sniff
     from messagefoundry.pipeline import dr_backup
 
-    seen: list[object] = []
-    real = sniff.archive_member_name_reason
-
-    def recording(name: object, **kwargs: bool) -> str | None:
-        seen.append(kwargs.get("windows_names", "default"))
-        return real(name, **kwargs)
-
-    monkeypatch.setattr(sniff, "archive_member_name_reason", recording)
     tar_path = tmp_path / "bundle.tar"
     with tarfile.open(tar_path, "w") as tar:
-        info = tarfile.TarInfo("config/plain.toml")
+        info = tarfile.TarInfo("config/" + name)
         info.size = 3
         tar.addfile(info, io.BytesIO(b"x=1"))
-    landed = dr_backup._extract_config_members(tar_path, tmp_path / "out")
-    assert landed == 1
-    assert seen == [False]
+    out = tmp_path / "out"
+    with pytest.raises(dr_backup.BackupError, match="unsafe config member name"):
+        dr_backup._extract_config_members(tar_path, out)
+    assert not out.exists() or list(out.iterdir()) == []
 
 
 def test_zip_decompress_checks_hl7v2_members_against_their_extension() -> None:
