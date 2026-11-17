@@ -539,7 +539,9 @@ class X12Destination(DestinationConnector):
                     outcome="unparseable",
                     detail=f"unparseable X12 reply: {safe_exc(exc)}",  # scrub: a bad reply can embed a fragment (#120)
                 )
-            raise DeliveryError(f"unparseable X12 reply: {exc}") from exc
+            # Scrubbed like the capturing arm, and not chained: a traceback renders the cause's raw
+            # text, which can carry a reply fragment into a log (BACKLOG #5365).
+            raise DeliveryError(f"unparseable X12 reply: {safe_exc(exc)}") from None
         functional = [sid for sid in msg.segment_ids() if sid != "ISA"]
         if functional and functional[0] == "TA1":
             sent_isa13 = _sent_isa13(payload)
