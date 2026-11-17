@@ -734,10 +734,22 @@ def test_a_dead_record_naming_no_session_does_not_veto(config_root: Path) -> Non
 
 
 def test_a_far_future_startedat_is_unverified_not_stale_or_a_throw_under_strict_mode() -> None:
-    """No session registers in the future, so the start is unusable: UNVERIFIED, which every caller
-    treats as possibly live. The cast this replaced threw, which stopped them all; STALE would not."""
+    """A gap past Int32 minutes is not a start time: UNVERIFIED, which every caller treats as
+    possibly live. The cast this replaced threw there, which stopped them all; STALE would not."""
     record = {"pid": os.getpid(), "sessionId": "s", "startedAt": 200_000_000_000_000}
     assert _strict_fence(record) == "UNVERIFIED"
+
+
+def test_a_session_registered_after_its_process_started_is_live_under_a_wide_skew() -> None:
+    """The twin: an hour-later registration is a real start time, and remove.ps1 widens the skew to
+    read it LIVE. Rejecting every future startedAt turned this UNVERIFIED (PR 3001's red)."""
+    record = {"pid": os.getpid(), "sessionId": "s", "startedAt": int((time.time() + 3600) * 1000)}
+    payload = json.dumps(record).replace("'", "''")
+    got = _strict(
+        f"(Test-RecordLiveness -Record ('{payload}' | ConvertFrom-Json) "
+        "-StartSkewMinutes ([int]::MaxValue)).State"
+    )
+    assert got == "LIVE"
 
 
 def test_a_record_with_no_session_id_does_not_break_a_lookup_under_strict_mode(

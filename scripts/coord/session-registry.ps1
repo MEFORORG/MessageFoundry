@@ -173,19 +173,18 @@ function Get-RecordField($Record, [string]$Name) {
     return $null
 }
 
-# A record's startedAt as a UTC DateTime, or $null when it is missing, not a number, out of
-# FromUnixTimeMilliseconds's range, or in the future (a minute of slop for clock jitter). Parsed as a
-# double and rounded, as the [int64] cast this replaced did, so a fractional value still counts; NaN
-# fails both bounds. A future start cannot be a real registration, so it is unusable, which keeps a
-# far-future value from reading STALE where the old cast threw, and from never aging out.
+# A record's startedAt as a UTC DateTime, or $null when it is missing, not a number, or out of
+# FromUnixTimeMilliseconds's range. Parsed as a double and rounded, as the [int64] cast this replaced
+# did, so a fractional value still counts; NaN fails both bounds. A future value is returned as it
+# is: the fence compares it with the process start, as it always did (a session can register after a
+# long-lived process started, and a caller may widen -StartSkewMinutes for exactly that), and the
+# anonymous-record aging drops future values itself.
 function Get-RecordStartedUtc($Record) {
     $ms = 0.0
     if (-not [double]::TryParse([string](Get-RecordField $Record 'startedAt'), [System.Globalization.NumberStyles]::Float,
             [cultureinfo]::InvariantCulture, [ref]$ms) -or
         -not ($ms -ge -62135596800000 -and $ms -le 253402300799999)) { return $null }
-    $at = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$ms).UtcDateTime
-    if ($at -gt [DateTime]::UtcNow.AddMinutes(1)) { return $null }
-    return $at
+    return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$ms).UtcDateTime
 }
 
 # Every registry record, with the root it came from attached.
@@ -263,11 +262,15 @@ function Test-RecordLiveness {
     # A process cannot have started after the session it hosts registered (small forward slop for
     # clock jitter). Started much later => this pid was recycled onto a different process.
     $delta = ($procStart - $registered).TotalMinutes
+    # A gap past Int32 minutes (thousands of years) is not a start time. The [int] cast this replaced
+    # threw on it, which stopped every caller, so it stays a possibly-live answer, never STALE.
+    if ([Math]::Abs($delta) -gt [int]::MaxValue) {
+        return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record's startedAt is implausibly far from the process start" }
+    }
     if ($delta -gt 1) {
         return @{ State = "STALE"; Detail = "pid $procId reused (process started $([long]$delta)m after the session)" }
     }
     if ($delta -lt (-1 * $StartSkewMinutes)) {
-        # [long], not [int]: a gap past Int32 minutes made the cast throw.
         return @{ State = "STALE"; Detail = "pid $procId start precedes the session by $([long](-$delta))m" }
     }
     return @{ State = "LIVE"; Detail = "" }
