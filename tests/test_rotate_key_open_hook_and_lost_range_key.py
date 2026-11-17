@@ -422,3 +422,117 @@ async def test_serve_starts_on_the_new_key_alone_under_the_override(tmp_path: Pa
     app = await asyncio.to_thread(_app_on_the_new_key_alone, tmp_path, True)
     async with app.router.lifespan_context(app):
         assert app.state.engine is not None
+
+
+def _seed_a_planted_state_value(db: Path, key: str) -> None:
+    """A keyed synthetic store whose eagerly loaded ``state`` table holds an unmarked value beside a
+    sealed one, so every keyed open of it raises ``UnmarkedCipherError``."""
+    from tests.test_store_strict_ciphertext import _keyed, _plant_state
+    from tests.test_store_strict_ciphertext import _seed as _seed_messages
+
+    asyncio.run(_seed_messages(db, 1, _keyed(key)))
+    _plant_state(db, key)
+
+
+def _sink_for_the_lifespan(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The notifier every lifespan built from here on uses, recording what it is sent."""
+    import importlib
+
+    from tests.test_store_strict_ciphertext import _LifecycleSink
+
+    sink = _LifecycleSink()
+    app_mod = importlib.import_module("messagefoundry.api.app")
+    monkeypatch.setattr(app_mod, "notifier_from_settings", lambda *a, **k: sink)
+    return sink
+
+
+def _assert_the_store_cipher_alert(sink: Any) -> None:
+    assert sink.events and {e[0] for e in sink.events} == {"store-cipher"}, sink.events
+    assert all("state.value" in reason for _subject, reason, _count in sink.events), sink.events
+
+
+def test_serve_alerts_on_an_unmarked_state_value_on_a_renewal_due_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4934 repair: the early open ahead of the mint passes no refusal hook, so an unmarked value
+    it is refused on must not end the start there. The start goes on to the mint and the lifespan,
+    whose hooked open is refused again and sends the store-cipher alert, as on main."""
+    pytest.importorskip("psutil")
+    from fastapi.testclient import TestClient
+
+    from messagefoundry.store.crypto import CipherError
+
+    db, key = tmp_path / "messagefoundry.db", generate_key()
+    _seed_a_planted_state_value(db, key)
+    _mint_a_pair_due_for_renewal(tmp_path, monkeypatch)
+    sink = _sink_for_the_lifespan(monkeypatch)
+    refused: list[BaseException] = []
+
+    def run_the_lifespan(app: Any, *_a: object, **_k: object) -> None:
+        try:
+            with TestClient(app):
+                pass  # pragma: no cover -- the open is refused
+        except CipherError as exc:
+            refused.append(exc)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    # The enforce-only start gates (an off-box log collector, ...) are not under test here.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    monkeypatch.setattr("uvicorn.run", run_the_lifespan)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.block_unlisted_outbound = true\n"
+        "alerts.security_notifications_required = false\n"
+        "security.local_access_only = true\n",
+        encoding="utf-8",
+    )
+    samples = Path(__file__).resolve().parent.parent / "samples" / "config"
+    main(["serve", "--config", str(samples), "--env", "dev"])
+    assert refused, "the lifespan never ran its hooked open"
+    _assert_the_store_cipher_alert(sink)
+
+
+def test_supervise_alerts_on_an_unmarked_state_value_when_the_pair_is_not_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4934 repair: a fleet start whose pair may be replaced opens the store before the renewal,
+    with no refusal hook. An unmarked value refused there falls back to main's path, so a start
+    that then replaces nothing returns and its engine shards start, and an engine shard's lifespan
+    open is hooked and sends the store-cipher alert. Before the repair the early open ended the
+    start, and no engine shard ran to send it. On a start that does replace the pair, main's own
+    open after the renewal passed no hook either, so that arm has no alert to restore."""
+    pytest.importorskip("psutil")
+    from fastapi.testclient import TestClient
+
+    from messagefoundry import __main__ as cli
+    from messagefoundry.api import create_managed_app, tls
+    from messagefoundry.api.tls import generated_state_dir
+    from messagefoundry.config.settings import (
+        AlertsSettings,
+        ApiSettings,
+        EgressSettings,
+        ServiceSettings,
+    )
+    from messagefoundry.store.crypto import CipherError
+
+    db, key = tmp_path / "sup.db", generate_key()
+    _seed_a_planted_state_value(db, key)
+    state_dir = generated_state_dir(str(db))
+    tls.ensure_api_tls_material(ApiSettings(), state_dir=state_dir)
+    minted = (state_dir / "api-generated-cert.pem").read_bytes()
+    # A pair the read-only check cannot clear, which the mint under the lock then reuses.
+    monkeypatch.setattr(tls, "generated_pair_may_be_replaced", lambda *a, **k: True)
+    settings = ServiceSettings(store=StoreSettings(path=str(db), encryption_key=key))
+    assert cli._renew_api_tls_before_spawning(settings, str(db)) == state_dir
+    assert (state_dir / "api-generated-cert.pem").read_bytes() == minted
+    # The engine shard the fleet now starts on that store.
+    sink = _sink_for_the_lifespan(monkeypatch)
+    app = create_managed_app(
+        store_settings=StoreSettings(path=str(db), encryption_key=key),
+        alerts_settings=AlertsSettings(),
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    with pytest.raises(CipherError), TestClient(app):
+        pass  # pragma: no cover -- the open is refused
+    _assert_the_store_cipher_alert(sink)
