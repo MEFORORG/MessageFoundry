@@ -3151,6 +3151,32 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     url_arm = r"://[^\s:/@]+:[^\s/@]+@"
     assert url_arm in pattern
     assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(url_arm)
+    # The widened reading (BACKLOG #5386) has no arm. With a user, its first segment takes one
+    # character or more, each of them in the arm's class, and past it the pattern adds only a run
+    # that cannot hold whitespace or "/", then the "@": so every text it rewrites with a user, the
+    # arm reads.
+    wide = secretscrub._WIDE_DSN_PASSWORD.pattern
+    assert r"://[^\s:/@]*):" in wide
+    first = secretscrub._DSN_USER_FIRST_SEGMENT
+    assert first == (
+        r"(?>\[[a-z]+\]|<[a-z]+>|(?:" + secretscrub._DSN_RUN_STOP + r"[^\s/@<>\[\]])++)"
+    )
+    tail = wide.split(r"(?<!//:)" + first + ")", 1)[1]
+    run_head = "(?:" + secretscrub._DSN_RUN_STOP + r"[^\s/"
+    assert tail.startswith(run_head) and tail.endswith("])*@"), tail
+
+
+def test_an_empty_user_dsn_does_not_switch_the_encoded_run_off() -> None:
+    """The URL arm keeps a non-empty user (review of BACKLOG #5386). With an empty user allowed, a
+    password-only DSN switched the encoded run off and the PID run beside it printed. Positive
+    control: the same run alone is hidden, and a DSN with a user still switches it off."""
+    run = "id=PID%7C1%7C%7CMRN4455667%5E%5E%5EH"
+    assert "MRN4455667" not in redaction.redact(f"x {run}")
+    assert "MRN4455667" not in redaction.redact(f"smtp://:pw@corp.invalid:587 {run}")
+    assert "MRN4455667" not in redaction.redact(f"smtp://ops@corp.invalid:587,x {run}")
+    assert redaction._CREDENTIAL_AHEAD.search("smtp://ops:pw@corp.invalid:587") is not None
+    assert redaction._CREDENTIAL_AHEAD.search("smtp://:pw@corp.invalid:587") is None
+    assert redaction._CREDENTIAL_AHEAD.search("smtp://ops@corp.invalid:587,admin@corp") is None
 
 
 def _start_labels_at_a_word_boundary_alone(patched: pytest.MonkeyPatch) -> None:
@@ -3178,14 +3204,17 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
     that build each filter's shapes and near misses. THE CONTROL: the filters do change a large
     share of the corpus, and the pattern does not simply match everything.
 
-    The filters are read with the ``\\b`` start this pattern keeps, which is its one stated
-    exception (BACKLOG #2999). The texts that exception covers are counted apart: this pattern with
+    The filters are read with the ``\\b`` start this pattern keeps, which is one of its stated
+    exceptions (BACKLOG #2999). The texts that exception covers are counted apart: this pattern with
     the escape start added must match each one, so the exception cannot hide any other shape, and
     there must be some, or the corpus no longer reaches it.
 
-    The connection-string member pass (BACKLOG #5030) is the second exception, read without it and
+    The connection-string member pass (BACKLOG #5030) is a source with no arm, read without it and
     counted apart the same way: each text only it changes must hold its match, and there must be
-    some. This pattern leaves it out on purpose; ``_CREDENTIAL_AHEAD``'s comment says why."""
+    some. This pattern leaves it out on purpose; ``_CREDENTIAL_AHEAD``'s comment says why.
+
+    The widened DSN reading (BACKLOG #5386), a source with no arm, is not counted apart, and this
+    corpus is not known to reach it, so this test does not gate it."""
     fragments = (
         *secretscrub._CREDENTIAL_WORDS,
         *secretscrub._TOKEN_WORDS,

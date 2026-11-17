@@ -36,13 +36,25 @@ of *that* surface rather than of the vocabulary:
   carve.
 
 AND THE OTHER BOUNDARY, because it looks like a duplicate and is not.
-``logging_setup.CredentialQueryScrubFilter`` keeps its own short list -- ``code``, ``state``,
-``id_token``, ``access_token``, ``token``, ``session_state`` -- and is NOT folded in here. Its words are
-safe only *because* they are scoped to a URL query string: ``code`` and ``state`` are ordinary
-operational vocabulary (``code=404``, ``state=RUNNING``), so admitting them to a general
-``label=value`` rule would redact operator diagnostics and buy nothing. That list also carries a ruling
-about two names deliberately absent from it (docs/PHI.md section 7, BACKLOG #1184), which a merge would
-disturb. Two vocabularies with a stated boundary, not one vocabulary stated twice.
+``logging_setup.CredentialQueryScrubFilter`` hides the value after its own short list of keys --
+``code``, ``state``, ``id_token``, ``access_token``, ``token``, ``session_state`` -- wherever one
+starts at a word boundary and is followed by "=". Its pattern has NO query-string anchor: it fires on
+any ``key=value`` in the line, so ``worker state=RUNNING code=404`` prints as
+``worker state=<redacted> code=<redacted>`` (measured). The tuple, ``_CREDENTIAL_QUERY_KEYS``, is
+defined here and ``logging_setup`` re-exports it (BACKLOG #5386), so the widened DSN reading can stop
+at those keys.
+
+The two lists overlap and are not the same. This module's label rules read ``token``,
+``id_token`` and ``access_token`` as labels too, through ``_BEARER``'s ``token`` word, so
+:func:`scrub_credentials` hides ``token=``, ``id_token=`` and ``access_token=`` values on its own.
+They do NOT read ``code``, ``state`` or ``session_state``: :func:`scrub_credentials` leaves
+``code=404``, ``state=RUNNING`` and ``session_state=abc`` as they were (measured). ``code`` and
+``state`` are ordinary operational vocabulary, so admitting them to this module's rules would add
+nothing on the paths that already run the query filter, and would extend the over-redaction of
+operator diagnostics that filter already does to a surface that does not run it, such as the
+support bundle's read-time pass. That list also carries a ruling about two names deliberately
+absent from it (docs/PHI.md section 7, BACKLOG #1184), which a merge would disturb. Two
+vocabularies with a stated boundary, not one vocabulary stated twice.
 
 COST, because this runs on EVERY record and the read-time pass does not. Measured 2026-09-06 as the
 MINIMUM single-call time over interleaved samples -- a minimum is the one statistic the load of a
@@ -244,6 +256,20 @@ _COMPOUND_KEY_WORDS = (
 
 #: Every word :data:`_KEY_MATERIAL` reads as a label.
 _KEY_LABEL_WORDS = _KEY_MATERIAL_WORDS + _COMPOUND_KEY_WORDS
+
+#: Query-string parameters that carry a credential and must never reach a log line. ``code`` and
+#: ``state`` arrive on the OIDC callback's URL (ADR 0142 pins ``response_mode=query``), and uvicorn's
+#: access logger emits the full request line *including* the query string. ``logging_setup``'s
+#: query filter reads this tuple, and :data:`_WIDE_DSN_PASSWORD` stops at each of these keys, so
+#: it lives here, where both can import it (BACKLOG #5386).
+#:
+#: **``content`` and ``field_value`` are deliberately absent, and this tuple sits two tokens from
+#: containing them** (BACKLOG #1184, ASVS 14.2.1). That is a ruled state, not an omission; the ruling
+#: and its reasoning are ``docs/PHI.md`` §7 and this comment does not restate them. What stops the
+#: two-token edit landing quietly is
+#: ``tests/test_logging.py::test_an_undeclared_phi_needle_is_not_scrubbed_from_the_access_line``.
+#: **Cite the ruling, not this sentence.**
+_CREDENTIAL_QUERY_KEYS = ("code", "state", "id_token", "access_token", "token", "session_state")
 
 #: The environment-variable prefix every MessageFoundry secret arrives under. ``resolve_env_settings``
 #: echoes the NAME and the VALUE together on a cast failure -- ``setting 'password' (env
@@ -1286,6 +1312,124 @@ _KEY_MATERIAL = re.compile(
 # one does not.
 _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
 
+# THE WIDENED READING, A SECOND PASS AFTER THE LABELS (BACKLOG #5386). :func:`_run` applies the
+# narrow pattern above where it always did, then this one after every label pass and before the
+# member mask. Applied in the narrow one's place, it read ``smtp://:pw@h:587PWD=x@y)...`` as one
+# password running to the value's "@", took the ``PWD=`` label the label pass needed, and printed
+# the value that label hid (code review, round 4). After the label passes a value they read is a
+# placeholder, which the run after the password stops at; and every pass before this one is the
+# code ``origin/main`` ran, so on one call this pass only hides more. It does not run at all on a
+# line where :func:`_union` keeps the reading before whole, because that reading is kept as
+# ``origin/main``'s, which had no such pass; :func:`_run` names those lines and says why.
+#
+# THE USER MAY BE EMPTY, AND THE PASSWORD MAY HOLD AN "@". The user was
+# ``[^\s:/@]+``, so ``postgres://:<pw>@host`` -- a DSN that sets only a password -- did not match and
+# printed the password whole. The password was ``[^\s/@]+``, so it stopped at its own first "@": an
+# unencoded ``p@ss`` came out as ``<placeholder>@ss@host`` with the tail printed. Here the user is
+# ``[^\s:/@]*``. The password is a first segment, taken possessively, then a run that may hold an
+# "@", and the match ends at the last "@" in it. With a user, every character of the first segment is
+# in the old class, but the segment stops earlier than that class does (round 9, below).
+#
+# THE USER STILL HOLDS NO "@". A user running to the first ":" was tried and regressed: in
+# ``postgres://svc@db:5432;sslpassword=Tail@Secret9`` it read ``svc@db`` as the user and ``5432;...``
+# as the password, and the member's tail printed; in ``http://user@host:8080,admin@corp`` it hid a
+# port and a host that hold no secret. So a user holding an "@", as the ``user@server`` login of a
+# hosted database does, is a residual: its password prints, as it did before #5386.
+#
+# A FURTHER SEGMENT STOPS AT A SEPARATOR, and it has to. Running the password to the last "@" in
+# the token was tried first and swallowed the next member's label whenever that member's value held
+# an "@": ``postgres://svc:pw@db:5432;sslpassword=Tail@Secret9`` came out as
+# ``svc:<placeholder>@Secret9``, because the label the member pass needed was inside the match, so
+# the tail printed where the old pattern let that pass mask it. So the run after the first segment
+# holds none of ``; ? # & , ( )`` or a quote, the characters a member, a query or a quoted value
+# starts after, nor any of ``| ^ ~ { } < > [ ] %``: a review measured ``|dbPassword=Tail@Sec`` print
+# its tail, an HL7 run after the host, literal or percent-encoded, lose the separators the PHI pass
+# reads it by, and ``:587|cc=admin@corp`` name the wrong host, each where the run reached a later
+# "@". With a user, the old pattern runs first on both callers, :func:`_run` and
+# ``support.redact.redact_log_line``, and rewrites its match to ``user:<placeholder>@``, which this
+# one reads again, the placeholder as its whole first segment, so the tail after that "@" is read.
+#
+# AN EMPTY USER'S FIRST SEGMENT ALSO STOPS AT "=" AND AT EVERY CHARACTER THE RUN AFTER IT STOPS AT.
+# Without the user the pattern reads ``ws://:8765?accessToken=Tail@Tok`` as a password-only DSN, and
+# a review measured the token's tail print where the old pattern, matching nothing, left the query
+# label to the member pass. And a "|" it took, as in ``redis://:Tk|mrn@h``, was a separator the PHI
+# pass of a second handler no longer read, so an unlabelled value elsewhere in the token, which that
+# pass had hidden, printed (code review, round 4). The lookbehind ``(?<=//:)`` is what tells the two
+# cases apart. Residuals, at least these: a password whose own "@" is followed, before the host's
+# "@", by a character the run after the first segment stops at (the class above: at least
+# ``; ? # & , ( ) | ^ ~ { } < > [ ] %`` and a quote, not "=") is cut at that "@" and its tail
+# prints, as the whole tail did before; and an empty user's password holding one of those is not
+# read at all, as before #5386, so ``redis://:p;ss@host`` prints whole. An "=" is not one of those:
+# the run after the first segment may hold it, so ``redis://:p=ss@host`` is read and hidden. Both
+# count a character an earlier filter wrote: on the log chain the PHI pass runs first, so a
+# password holding a date- or name-shaped run reaches this pass holding ``[redacted]``, and
+# ``redis://:Zq7-19800505-Kv9x@host`` prints ``Zq7-`` and ``-Kv9x`` (code review, round 4). A
+# percent-encoded password-only DSN holds a "%", so ``redis://:p%40Kv9x@host`` is not read either.
+#
+# AN EMPTY USER'S FIRST SEGMENT MAY BE EMPTY (``*+``), so ``redis://:=Pw@db`` and ``redis://:@Pw@db``
+# are read (code review of BACKLOG #5386). WITH A USER IT MAY NOT (``++``), so
+# ``postgres://svc:@Pw@db``, a password that STARTS with "@", prints as it did before #5386, and that
+# is a residual. Read, it was rewritten to ``svc:<placeholder>@``, which the URL arm of
+# :data:`messagefoundry.redaction._CREDENTIAL_AHEAD` reads where it did not read ``svc:@Pw@``. That
+# switched the PHI pass's percent-encoded run off on a second handler, and a value later in the
+# token that run had hidden printed (code review, round 4). An empty user's rewrite is not read by
+# that arm, whose user may not be empty.
+#
+# THE FIRST SEGMENT IS POSSESSIVE (``*+``, and an atomic group around ``++``) BECAUSE THE TWO
+# CLASSES OVERLAP. Backtracking into it
+# would try every split of a run that reaches no "@", which is quadratic; possessive, it gives
+# nothing back, so the run after it is the only walk and backs off to its last "@". Written flat,
+# not as a repeated "@"-led group, so no quantifier nests under another. The static ReDoS gate in
+# ``tests/test_security_static.py`` DOES NOT SCAN this pattern: it splices ``_DSN_RUN_STOP`` below,
+# so that gate lists it among the patterns it cannot resolve, and the shape is held by inspection,
+# stated there.
+#
+# NO SEGMENT CROSSES A LABEL ANOTHER PASS HIDES A VALUE UNDER (code review, rounds 5 and 9). A
+# character of either first segment, or of the run after it, is taken only where no
+# :data:`_CREDENTIAL_QUERY_KEYS` key and no label word this module reads (:data:`_CAMEL_WORDS`),
+# followed by ":" or "=", starts, and no ``MEFOR_`` name starts. A review measured
+# ``smtp://ops:pw@h:587:state=Tk9@Sec_x3`` print ``Sec_x3``: the run reached the value's "@" and
+# took ``state=``, so the query filter, which hid that value on ``origin/main``, found no key. That
+# order is the store error path's: ``redact_log_line`` runs there first, this module's patterns among
+# its passes, and the log chain's query filter reads its output. On the log chain itself
+# ``_install_phi_filters`` puts the query filter before this module. The stop is built from those
+# tuples, not copied. It
+# matches inside a word too, so ``xstate=`` stops the run as well. Stopping early ends the match at
+# an earlier "@", which with a user is where ``_DSN_PASSWORD`` already ended it, or not at all; so
+# the stop makes this pass hide less, and never makes it take a value a later pass would hide.
+#
+# THE USER'S FIRST SEGMENT ALSO STOPS AT A PLACEHOLDER (code review, round 9). It was the old class,
+# ``[^\s/@]++``, with no stop, and it read across the placeholders earlier passes wrote over text
+# that had held a "/" the old class stops at. In ``postgres://svc:accessToken=redis://ops:'@Tok_Sec9``
+# the narrow pass hid the quote and a label pass the ``accessToken=`` value, and the segment then
+# took ``accessToken=<placeholder><placeholder>`` and the "@", so on the store error path the query
+# filter found no label and ``Tok_Sec9`` printed, where ``origin/main`` hid it. Now the segment
+# (:data:`_DSN_USER_FIRST_SEGMENT`) is either one word of letters in square or angle brackets,
+# which is the shape every placeholder this module's callers pass has, or a run holding no "[",
+# "]", "<" or ">" that stops where ``_DSN_RUN_STOP`` stops. The first form is where the narrow
+# pass's own ``user:<placeholder>@`` is read, so ``postgres://svc:p@ss@db`` is still hidden whole.
+# The cost, at least: a password the narrow pass did not read, because it held whitespace or a "/"
+# before its "@", is not read here either once a later pass has put a placeholder or a label inside
+# its first segment, and it prints, as it did on ``origin/main``.
+_DSN_RUN_STOP = (
+    r"(?!(?:"
+    + _alternation(_CREDENTIAL_QUERY_KEYS + _CAMEL_WORDS)
+    + r")[:=]|(?-i:"
+    + re.escape(_ENV_PREFIX)
+    + r"))"
+)
+_DSN_USER_FIRST_SEGMENT = r"(?>\[[a-z]+\]|<[a-z]+>|(?:" + _DSN_RUN_STOP + r"[^\s/@<>\[\]])++)"
+_WIDE_DSN_PASSWORD = re.compile(
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
+    r"(?:(?<=//:)(?:"
+    + _DSN_RUN_STOP
+    + r"[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22])*+|(?<!//:)"
+    + _DSN_USER_FIRST_SEGMENT
+    + r")(?:"
+    + _DSN_RUN_STOP
+    + r"[^\s/;?#&,()|^~{}<>\[\]%\x27\x22])*@"
+)
+
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
 #: #5030), so ``;AccessToken=`` is read as ``;sslpassword=`` is. Its own gate,
 #: :data:`_MEMBER_EXTRA_HINT`, admits the member pass beside :data:`_CREDENTIAL_HINT`.
@@ -2007,14 +2151,29 @@ def has_credential_like_segment(text: str) -> bool:
     return False
 
 
-def _run(text: str, placeholder: str, folded: str | None, sub: _Sub | None = None) -> str:
+def _run(
+    text: str, placeholder: str, folded: str | None, sub: _Sub | None = None, *, wide: bool = True
+) -> str:
     """The pass itself. Straight-line rather than a table, so a test monkeypatching one pattern on this
     module reaches the object this function reads -- a table would hold the pre-patch pattern by
     value and the mutation fixture would silently mutate nothing.
 
     ``sub`` applies each pattern: ``pattern.sub`` when it is None, and :func:`_union`'s tracing or
     pre-camelCase reading otherwise. Its last argument names the group a replacement writes back
-    masked at its end, which only the tracing reads."""
+    masked at its end, which only the tracing reads.
+
+    ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). :func:`_union`'s reading before
+    does, because that reading is kept as the code ``origin/main`` ran, which had no widened pass:
+    it is the reference the union holds the shipped reading to, and it is left as it was rather than
+    widened in this change. Widening it is a separate follow-up. The hazard first given as the reason,
+    the widened run crossing a camelCase label only the shipped reading reads, no longer applies:
+    since every segment of the widened match stops at a label word (``_DSN_RUN_STOP``), on
+    ``redis://:pw@h?accessToken=Tail@Sec`` and ``redis://:pw@h;userPassword=Tail@Sec`` the reading
+    before, widened or not, differs only in ``pw``, which the widened pass hides, and leaves the
+    label and its value the same. So where :func:`_union` returns that reading whole, on a line where the
+    shipped one would hide a member key's ";" and on an untraceable one, the widened pass does not
+    run, and a password-only DSN, or the tail of a password holding an "@", prints there as it did
+    before #5386. The support bundle's own last pass still reads it."""
     apply = _plain_sub if sub is None else sub
     if _admits(folded, _ENV_HINT):
         text = apply(_MEFOR_SECRET, lambda m: _keep_label(m, placeholder), text, _BRACED)
@@ -2033,6 +2192,8 @@ def _run(text: str, placeholder: str, folded: str | None, sub: _Sub | None = Non
         text = apply(_KEY_MATERIAL, lambda m: _keep_label(m, placeholder), text, _BRACED)
     if _admits(folded, _DSN_HINT):
         text = apply(_DSN_PASSWORD, lambda m: f"{m.group(1)}:{placeholder}@", text, None)
+        if wide:
+            text = apply(_WIDE_DSN_PASSWORD, lambda m: f"{m.group(1)}:{placeholder}@", text, None)
     # LAST, over what every pass above left, masking words only (BACKLOG #5030; see the pattern).
     if ";" in text and (_admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT)):
         text = apply(_CONNECTION_STRING_MEMBER, _mask_member, text, 2)
@@ -2235,13 +2396,13 @@ def _union(text: str, placeholder: str, folded: str | None) -> str:
     before = _Trace(len(text), _pre_camel)
     shipped = _Trace(len(text), lambda pattern: pattern)
     try:
-        old = _run(text, placeholder, folded, before.sub)
+        old = _run(text, placeholder, folded, before.sub, wide=False)
         if old is text:
             # The reading before hid nothing, so the shipped one alone needs no trace.
             return _run(text, placeholder, folded)
         new = _run(text, placeholder, folded, shipped.sub)
     except _Untraceable:
-        return _run(text, placeholder, folded, _pre_camel_sub)
+        return _run(text, placeholder, folded, _pre_camel_sub, wide=False)
     # What the reading before did with each character of the line: printed it, masked it, or hid it.
     state = bytearray(len(text))  # _HIDDEN
     old_masks: dict[int, str] = {}
