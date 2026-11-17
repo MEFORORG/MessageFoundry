@@ -901,21 +901,6 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
     [pscustomobject]@{ ScanPrefix = "$last ; $pfx"; Window = $win; Start = $start }
 }
 
-# THE SAME READING WITH JOINED QUOTE PIECES READ AS THE SHELL READS THEM (BACKLOG #5655 step 7), or
-# nothing where the window is unchanged. The scan keeps an empty pair joined to a word, and the `$` of a
-# POSIX `$'<word>'`, so `-C ''<p>`, `-C <p>''` and `-C $'<p>'` named nothing. Only the added readings
-# use this, so the shared scan and every reading made before are untouched, and a second reading can
-# only add a deny. A trailing pair joins on both hosts. A leading one joins under POSIX only:
-# PowerShell passes a leading `''` as an argument of its own (measured in review round 34781a2201).
-# The `$` is dropped only before a `-C`, `--work-tree`, `--git-dir`, GIT_WORK_TREE or GIT_DIR value,
-# POSIX only; the window cannot tell a `$'<word>'` from a variable there, so a variable's name is read
-# as a relative path too, which can only add a deny.
-#
-# The scan also blanks a quoted span with whitespace in it to an empty pair, so a pair is joined only
-# where the RAW text behind it is a real empty pair: its two quotes are adjacent in the raw line, read
-# through the segment's raw index map at the window's own position (review rounds e9fa08d529, 4d1a3ae7fd; a
-# glued pair elsewhere on the line used to arm the join). No map, no join. Only POSIX and PowerShell
-# segments are read: in cmd a quote is a literal.
 # The segment's raw index map, built ONCE per segment and kept on it (review round 84a1c1fd70): built
 # per reading, a line of a few hundred invocations re-ran the span scanner for each one, which grows as
 # the square of the line and can pass the hook's timeout. $false stands for "no map".
@@ -931,6 +916,24 @@ function Get-JoinMap($Seg) {
     , $have.Value
 }
 
+# THE SAME READING WITH JOINED QUOTE PIECES READ AS THE SHELL READS THEM (BACKLOG #5655 step 7), or
+# nothing where the window is unchanged. The scan keeps an empty pair joined to a word, and the `$` of a
+# POSIX `$'<word>'`, so `-C ''<p>`, `-C <p>''` and `-C $'<p>'` named nothing. Only the added readings
+# use this, so the shared scan and every reading made before are untouched, and a second reading can
+# only add a deny. A trailing pair joins under POSIX. Under PowerShell it joins too, except right
+# after the same quote character, where it is an escaped quote; the PowerShell model is not complete,
+# since a pair after a quoted word of the other quote (`"<p>"''`) is joined although PowerShell passes
+# it as an empty argument of its own. A leading pair joins under POSIX only:
+# PowerShell passes a leading `''` as an argument of its own (measured in review round 34781a2201).
+# The `$` is dropped only before a `-C`, `--work-tree`, `--git-dir`, GIT_WORK_TREE or GIT_DIR value,
+# POSIX only; the window cannot tell a `$'<word>'` from a variable there, so a variable's name is read
+# as a relative path too, which can only add a deny.
+#
+# The scan also blanks a quoted span with whitespace in it to an empty pair, so a pair is joined only
+# where the RAW text behind it is a real empty pair: its two quotes are adjacent in the raw line, read
+# through the segment's raw index map at the window's own position (review rounds e9fa08d529, 4d1a3ae7fd; a
+# glued pair elsewhere on the line used to arm the join). No map, no join. Only POSIX and PowerShell
+# segments are read: in cmd a quote is a literal.
 function Get-JoinedReading($Reading, [string]$Conv, $Seg) {
     if ($Conv -ne 'posix' -and $Conv -ne 'pwsh') { return }
     $w = [string]$Reading.Window
