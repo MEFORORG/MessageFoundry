@@ -9,8 +9,9 @@ can both read one definition without either pulling in the other.
 
 from __future__ import annotations
 
-#: The longest password, in characters, any sign-in, step-up or password-change request accepts. It
-#: also bounds argon2 work.
+#: The longest password, in characters, the JSON sign-in, step-up and password-change request models
+#: accept; at least the console's sign-in, step-up and password forms apply it too. It also bounds
+#: argon2 work.
 PASSWORD_MAX = 1024
 
 #: What an engine-generated temporary password appends to its random token when an opt-in
@@ -18,6 +19,7 @@ PASSWORD_MAX = 1024
 TEMPORARY_PASSWORD_CLASS_SUFFIX = "aA1!"  # nosec B105 - a fixed class suffix, not a credential
 
 #: The highest ``[auth].password_min_length`` the settings accept. A temporary password is minted at
-#: least that long, plus the class suffix, and must still fit :data:`PASSWORD_MAX`, or no request
-#: would accept the credential the engine issued.
+#: least that long, plus the class suffix when a class rule is on and the random part misses a
+#: class, and must still fit :data:`PASSWORD_MAX`, or those requests would refuse the credential the
+#: engine issued. The cap assumes the suffix whether or not a class rule is on.
 PASSWORD_MIN_LENGTH_MAX = PASSWORD_MAX - len(TEMPORARY_PASSWORD_CLASS_SUFFIX)

@@ -4030,16 +4030,20 @@ class AuthSettings(_Section):
     @field_validator("password_min_length")
     @classmethod
     def _check_password_min_length(cls, value: int) -> int:
-        # BACKLOG #5397: every sign-in, step-up and password-change surface refuses a password
-        # longer than PASSWORD_MAX, and a temporary password is minted at least this long, plus a
-        # class suffix, so a higher floor would mint a credential no surface accepts and leave no
-        # password the policy and the forms both pass. Refused at load rather than lowered.
+        # BACKLOG #5397: at least the JSON sign-in, step-up and password-change requests and the
+        # console's sign-in, step-up and password forms refuse a password longer than PASSWORD_MAX.
+        # A temporary password is minted at least this long, plus a class suffix when a class rule
+        # is on and the random part misses a class, so a higher floor could mint a credential those
+        # surfaces refuse. The cap assumes the suffix whether or not a class rule is on. Refused at
+        # load rather than lowered.
         if value > PASSWORD_MIN_LENGTH_MAX:
             raise ValueError(
                 f"password_min_length must be at most {PASSWORD_MIN_LENGTH_MAX}: an engine-issued "
-                "temporary password is at least that long plus a "
-                f"{len(TEMPORARY_PASSWORD_CLASS_SUFFIX)}-character suffix, and the sign-in and "
-                f"password-change requests accept no password over {PASSWORD_MAX} characters"
+                "temporary password is at least that long, plus a "
+                f"{len(TEMPORARY_PASSWORD_CLASS_SUFFIX)}-character suffix when a character-class "
+                "rule is on and the random part misses a class, and the sign-in and "
+                f"password-change requests accept no password over {PASSWORD_MAX} characters; "
+                "the cap holds whether or not a class rule is on"
             )
         return value
 
