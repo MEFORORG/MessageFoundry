@@ -373,13 +373,15 @@ element data, which the check must not do while #5536 frames a delimiter in ISA 
 #5536), is one such element, framed whole, so the parse of it still refuses it. `split` no longer
 raises for the whole buffer. The reader still discards a run that does not open with `ISA`.
 
-## Amendment (2026-11-17) — a longer segment id opening with `IEA` does not end a passing interchange (BACKLOG #5807)
+## Amendment (2026-11-17) — which segments opening with `IEA` end an interchange (BACKLOG #5807)
 
-In an interchange whose header passes the structural check, `split` and `X12FrameReader` do not end
-the walk at a segment that opens with `IEA` and then a letter or digit other than the header's +3
-element separator, such as `IEAX*1~`. Any other segment opening with `IEA` still ends it. Once the
-walk has met a failing `ISA`, and for a header that fails, every segment opening with `IEA` ends it,
-as before this amendment. A passing interchange whose only such segment is a longer id has no `IEA`,
+While the walk of an interchange whose header passes the structural check has met no failing `ISA`,
+`split` and `X12FrameReader` do not end it at a segment that opens with `IEA` and then a letter or
+digit other than the header's +3 element separator, such as `IEAX*1~`. Any other segment opening
+with `IEA` still ends it. Once the walk has met a failing `ISA`, and for a header that fails, every
+segment opening with `IEA` ends it, as before this amendment. The cost there: a segment such as
+`IEAX*1~` ends the frame, and the reader discards the rest of that interchange as noise, with no
+message row, while `split` returns the rest as its own element. A passing interchange whose only such segment is a longer id has no `IEA`,
 and is framed as the 2026-11-13 amendment above describes for one. The parse needs the id to be exactly
 `IEA`, so a frame closed at, for example, `IEA|1|...` in an interchange using `*` parses with no
 `IEA`, and `check_integrity` reports it.

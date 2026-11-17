@@ -18,9 +18,8 @@ Two surfaces:
 
 The ``IEA`` trailer is recognised only at a **segment boundary** (the three bytes immediately after a
 segment terminator, tolerating cosmetic whitespace), so ``IEA`` appearing inside element data never
-truncates an interchange early. In an interchange whose header passes, a segment opening with
-``IEA`` and then a letter or digit other than its element separator, such as ``IEAX*...``, does not
-end it either (:func:`_iea_id`). Both surfaces preserve the interchange **verbatim** (cosmetic newlines
+truncates an interchange early. A segment opening with ``IEA`` and then a letter or digit, such as
+``IEAX*...``, does not end it either in some cases: :func:`_iea_id` says which. Both surfaces preserve the interchange **verbatim** (cosmetic newlines
 included) — re-encoding/normalisation is :class:`~messagefoundry.parsing.x12.message.X12Message`'s job.
 """
 
@@ -247,7 +246,8 @@ def _walk_str(
         else:
             run = _SEGMENT_WS_RUN_STR.match(raw, seg_start, idx)
             opens = seg_start if run is None else run.end()  # a star pattern: never None
-        # Only a header that passed, before any failing ISA, has a +3 to trust (BACKLOG #5807).
+        # The +3 is passed only while no failing ISA has bounded the walk: after one, the trailer
+        # may belong to that run, whose separator may differ (BACKLOG #5807).
         if _iea_id(raw, opens, idx, raw[isa + 3] if cut_at_isa else None):
             return idx + len(terminator), True
         seg_start = idx + len(terminator)
