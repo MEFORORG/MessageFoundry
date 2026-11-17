@@ -705,8 +705,10 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
     assert bundle_redact._MFB64 is redaction._BINARY_CARRIAGE
     assert bundle_redact._MFB64.pattern == (
         r"(?i)(mfb64(?::|%3A|\\u003A)v1(?::|%3A|\\u003A))"
-        r"(?:[A-Z0-9+/]|%2[BF]|\\/|\\u002[BF])++(?:=|%3D|\\u003D){0,2}"
+        r"((?:[A-Z0-9+/]|%2[BF]|\\/|\\\\/|\\u002[BF]|\\\\u002[BF])++)"
+        r"((?:=|%3D|\\u003D|\\\\u003D){0,2})"
     )
+    assert bundle_redact._MFB64.flags & re.ASCII
     assert redaction._HL7_SEGMENT.pattern.startswith(r"\b([A-Z][A-Z0-9]{2})")
     assert redaction._ENCODED_SEPARATOR.pattern == r"%(?:7[CcEe]|5[Ee]|26)"
     assert redaction._ENCODED_SEPARATOR.pattern in secretscrub._MEMBER_VALUE_UNIT.pattern

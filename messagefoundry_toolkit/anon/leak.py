@@ -892,7 +892,8 @@ def structural_phi_hits(
 ) -> list[str]:
     """Structural PHI-shape hits over the fields no rule matched — reasons name the shape + field
     ADDRESS only (e.g. ``"unmapped SSN-shaped value in ZPD-4"``), never the offending value, so the
-    result is safe to raise/log. Empty when the message has no parseable MSH. ``version`` is
+    result is safe to raise/log. Empty when the message has no parseable MSH, except for
+    :data:`REPEATED_ENCODING_HIT` (see below). ``version`` is
     handed to the walk behind :func:`unmapped_field_values`.
 
     A line no rule can reach (kinds include at least a malformed segment id, a short header line,
@@ -1056,7 +1057,8 @@ class LeakReport:
 
     * ``hits`` — every leak reason (token/IP/site + structural); non-empty means refuse.
     * ``unmapped_fields`` — the addresses present but matched by no rule (the coverage report).
-    * ``structural_hits`` — the subset of ``hits`` from the structural PHI-shape detectors.
+    * ``structural_hits`` — the subset of ``hits`` from the structural PHI-shape detectors,
+      and :data:`REPEATED_ENCODING_HIT`, which is reported with or without ``rules``.
     * ``token_tables_live`` — whether the denylist tables loaded from a real token source.
     * ``token_floor_reason`` — why the denylist is not trustworthy, or ``None`` if it is.
     * ``undecided_fields`` — the addresses present that no rule scrubs, no ``keep`` names and
@@ -1091,7 +1093,8 @@ def leak_report(
     call over a bare string) structural detection is skipped and the check is token-only, as the
     legacy one was, except that the token scan also reads the text decoded from its HL7 escape
     sequences when it has a parseable MSH (BACKLOG #5532), so it can name a token the legacy check
-    missed.
+    missed, and a header that repeats an MSH-2 encoding character is still reported as
+    :data:`REPEATED_ENCODING_HIT` (BACKLOG #5374).
 
     ``version`` is the HL7 version a bare line is judged by. A caller that checks the OUTPUT of
     ``anonymize`` passes the version of the INPUT (:func:`message_version`), because a rule may

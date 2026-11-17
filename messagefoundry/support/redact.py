@@ -71,9 +71,8 @@ __all__ = [
 REDACTION_PLACEHOLDER = "[REDACTED]"
 
 # A base64 binary-carriage marker (ADR 0028) and the embedded blob that follows it: definitely a body.
-# The shared redactor's own pattern (BACKLOG #5378), so the encoded forms it reads are read here too.
-# Its narrower predecessor cut an encoded run at its first ``%`` or ``\/``, took the marker with the
-# head, and left the tail for nothing downstream to recognise.
+# The shared redactor's own pattern (BACKLOG #5378), so the encoded forms it reads are read here too;
+# ``redaction._BINARY_CARRIAGE`` states them.
 _MFB64 = _BINARY_CARRIAGE
 
 # An optional dotted / underscored / hyphenated PREFIX on a credential label, so a snake_case label

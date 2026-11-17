@@ -135,3 +135,51 @@ def test_the_support_bundle_withholds_the_same_forms(carriage: str) -> None:
     for at in range(0, len(_PAYLOAD) - 8, 4):
         assert _PAYLOAD[at : at + 8] not in out
     assert "%2B" not in out and "\\/" not in out
+
+
+def _logged(text: str) -> str:
+    return _through_the_shipped_filters(
+        logging.LogRecord("mf.test", logging.ERROR, __file__, 1, "%s", (text,), None)
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "label", "value"),
+    [
+        (f"bad {MARKER}QUJD/MRN: 12345678", "/MRN: ", "12345678"),
+        (f"bad {MARKER}QUJD+token=zqsecretvalue", "+token=", "zqsecretvalue"),
+        (f"bad {MARKER}QUJD/api_key=zqsecretvalue", "/api_key=", "zqsecretvalue"),
+        (f"bad {MARKER}QUJD/PatientID: 99887766", "/PatientID: ", "99887766"),
+    ],
+    ids=["mrn-slash", "token-plus", "api-key-slash", "dicom-slash"],
+)
+def test_a_label_joined_to_an_unpadded_run_keeps_main_behaviour(
+    text: str, label: str, value: str
+) -> None:
+    """Found by code review round 3: ``/`` and ``+`` are base64 characters, so the run took a label
+    joined by either, and the value printed where main hid it. The label is kept, the value hidden."""
+    out = _logged(text)
+    assert value not in out
+    assert label in out
+    assert "QUJD" not in out
+
+
+def test_real_padding_ends_the_run_even_before_a_label_word() -> None:
+    """``QUJ+pwd=`` is a whole base64 quantum with its padding, so the segment is the body's."""
+    assert redact(f"bad {MARKER}QUJ+pwd= next") == f"bad {_KEPT} next"
+
+
+def test_the_run_is_ascii_only() -> None:
+    """Found by code review round 3: the case fold let the run take a non-ASCII letter."""
+    for letter in ("\u212a", "\u017f", "\u0130", "\u0131"):
+        assert _BINARY_CARRIAGE.fullmatch(f"{MARKER}QUJD{letter}") is None
+        assert redact(f"bad {MARKER}QUJD{letter}x") == f"bad {_KEPT}{letter}x"
+
+
+def test_a_repr_of_a_json_escaped_carriage_is_withheld_whole() -> None:
+    """Found by code review round 3: ``%r`` doubles the backslash of ``\\/`` and ``\\u002B``. The
+    marker's colons stay literal here: a doubled ``\\u003A`` marker is a listed residual."""
+    for escaped in (_JSON_ESCAPED, _UNICODE_ESCAPED.replace("\\u003A", ":")):
+        out = _logged(repr(f'{{"raw": "{escaped}"}}'))
+        for at in range(0, len(_PAYLOAD) - 8, 4):
+            assert _PAYLOAD[at : at + 8] not in out

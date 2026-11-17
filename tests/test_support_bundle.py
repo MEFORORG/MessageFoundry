@@ -134,9 +134,10 @@ def test_config_summary_reports_a_connection_less_config_as_loaded(tmp_path: Pat
 # assertions still passed, so not one of them was evidence about the rule in its own name. Deleting
 # ``_MEFOR_SECRET``, ``_BEARER`` or ``_MFB64`` outright would have left this file green.
 #
-# WHAT THE NEW SHAPES BUY, STATED EXACTLY, BECAUSE IT IS NOT FOUR OUT OF FOUR. ``_MFB64`` and, on the
-# mefor-name line, ``_MEFOR_SECRET`` are now pinned ALONE: delete either and its assertion reds. The
-# other two are pinned to a PAIR, because two rules legitimately reach one label -- ``_MEFOR_SECRET``
+# WHAT THE NEW SHAPES BUY, STATED EXACTLY, BECAUSE IT IS NOT FOUR OUT OF FOUR. On the mefor-name
+# line, ``_MEFOR_SECRET`` is pinned ALONE: delete it and its assertion reds. ``_MFB64`` is not:
+# since BACKLOG #5378 the shared PHI pass's carriage rule reaches the same sentinel, so deleting
+# ``_MFB64`` alone leaves this file green. The other two are pinned to a PAIR, because two rules legitimately reach one label -- ``_MEFOR_SECRET``
 # + ``_KEY_MATERIAL`` on ``MEFOR_STORE_ENCRYPTION_KEY=``, ``_BEARER`` + ``_AUTH_SCHEME`` on an
 # ``Authorization: Bearer`` line. Both of a pair must go before those leak, so deleting ``_BEARER``
 # alone still leaves this file green. That is the #1183 defect shape NARROWED -- from "one backstop

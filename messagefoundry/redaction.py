@@ -1973,25 +1973,65 @@ def redact(text: str) -> str:
 #: Beyond the literal form, the pattern reads a marker whose colons are percent-encoded (``%3A``, as
 #: every stdlib URL encoder writes them) or JSON unicode-escaped (``\u003A``), and a run whose ``+``,
 #: ``/`` or ``=`` is percent-encoded or JSON unicode-escaped, or whose ``/`` is JSON-escaped (``\/``),
-#: so such a carriage is cut whole rather than at its first encoded character. The marker and the
-#: escapes are case-insensitive. The run ends at its padding, so a word after ``=`` keeps its word
-#: boundary: ``mfb64:v1:QUJDRA==/Password: x`` leaves ``/Password: x`` for the credential filter, and
-#: ``==MRN: 123`` its label for the MRN pass. Nothing wider: a ``-``, ``_`` or bare ``\`` in the run
-#: let it swallow a credential label after it (``\nPassword:`` in a ``repr``), whose value the
-#: credential filter then had no label to find. One run character is required, so the placeholder left
-#: behind (``[`` is outside the run) never re-matches, and prose that merely names the marker, such as
-#: ``missing mfb64:v1: marker``, is kept. The support bundle uses this same pattern
-#: (``support/redact.py`` ``_MFB64``).
+#: those two escapes also with the backslash doubled, as a ``repr`` writes them. So such a carriage is
+#: cut whole rather than at its first encoded character. The marker and the escapes are
+#: case-insensitive; the run is ASCII only (``re.ASCII``), so the case fold does not let it take a
+#: non-ASCII letter such as the Kelvin sign. The run ends at its padding, so a word after ``=`` keeps
+#: its word boundary: ``mfb64:v1:QUJDRA==/Password: x`` leaves ``/Password: x`` for the credential
+#: filter, and ``==MRN: 123`` its label for the MRN pass. Nothing wider: a ``-``, ``_`` or bare ``\``
+#: in the run let it swallow a credential label after it (``\nPassword:`` in a ``repr``), whose value
+#: the credential filter then had no label to find. One run character is required, so the placeholder
+#: left behind (``[`` is outside the run) never re-matches, and prose that merely names the marker,
+#: such as ``missing mfb64:v1: marker``, is kept. The support bundle uses this same pattern
+#: (``support/redact.py`` ``_MFB64``), replacing the whole match, so it hands no label back.
 #:
-#: Residuals, at least these: a run with no padding takes a word glued to its end with it, a credential
-#: or PHI label included, whenever the glue is in the base64 alphabet (``/``, ``+``, or none); a
-#: carriage broken by whitespace keeps every piece after the first break (``encode`` never writes
-#: one); a URL-safe (``-``/``_``) carriage keeps the part after its first such character; and a marker
-#: escaped any other way (``\x3a``) is not read at all.
+#: **A label joined to the run by ``/`` or ``+`` is handed back** (:func:`_carriage_replacement`):
+#: both are base64 characters, so ``QUJD/MRN: 123`` and ``QUJD+token=x`` are one run to the pattern,
+#: and replacing it took the label and left its value with nothing to find it by.
+#:
+#: Residuals, at least these: a run takes a word glued to its end with no ``/`` or ``+`` before it, a
+#: label included, and a word after ``/`` or ``+`` that :func:`_starts_with_label` does not read as a
+#: label (a name token, so ``QUJD/DOE JANE`` keeps ``JANE`` alone); a carriage broken by whitespace
+#: keeps every piece after the first break (``encode`` never writes one); a URL-safe (``-``/``_``)
+#: carriage keeps the part after its first such character; a marker escaped any other way (``\x3a``,
+#: a doubled ``\\u003A``) is not read at all; and a carriage whose last segment after ``/`` or
+#: ``+`` is itself a label word followed by a label separator keeps that segment.
 _BINARY_CARRIAGE = re.compile(
     r"(?i)(mfb64(?::|%3A|\\u003A)v1(?::|%3A|\\u003A))"
-    r"(?:[A-Z0-9+/]|%2[BF]|\\/|\\u002[BF])++(?:=|%3D|\\u003D){0,2}"
+    r"((?:[A-Z0-9+/]|%2[BF]|\\/|\\\\/|\\u002[BF]|\\\\u002[BF])++)"
+    r"((?:=|%3D|\\u003D|\\\\u003D){0,2})",
+    re.ASCII,
 )
+#: The last segment of a carriage run after a literal ``/`` or ``+``: a label's word if
+#: :func:`_starts_with_label` reads one there.
+_CARRIAGE_LAST_WORD = re.compile(r"[/+]([A-Za-z0-9]++)\Z")
+#: How much text after a run the label test reads.
+_CARRIAGE_LABEL_PROBE = 64
+
+
+def _starts_with_label(text: str) -> bool:
+    """Whether ``text`` opens with a label a later pass or filter reads its value by: a credential
+    label (:data:`_CREDENTIAL_AHEAD`), an MRN label or a DICOM keyword."""
+    return any(
+        pattern.match(text) is not None
+        for pattern in (_CREDENTIAL_AHEAD, _MRN_LABELLED, _DICOM_PHI_LABEL)
+    )
+
+
+def _carriage_replacement(match: re.Match[str]) -> str:
+    """The placeholder for one carriage run, with the marker kept. A last segment after ``/`` or
+    ``+`` that opens a label, with the padding and the text after the run, is handed back, so the
+    label stays for the pass that reads its value (BACKLOG #5378). Padding that makes a plain run a
+    whole number of base64 quanta is real padding, so the segment before it is the body's."""
+    marker, body, padding = match.group(1, 2, 3)
+    last = _CARRIAGE_LAST_WORD.search(body)
+    if last is not None:
+        plain = "%" not in body and "\\" not in body
+        real_padding = bool(padding) and plain and (len(body) + len(padding)) % 4 == 0
+        after = match.string[match.end() : match.end() + _CARRIAGE_LABEL_PROBE]
+        if not real_padding and _starts_with_label(last.group(1) + padding + after):
+            return f"{marker}{_REDACTED}{body[last.start() :]}{padding}"
+    return f"{marker}{_REDACTED}"
 
 
 def _redact_binary_carriage(text: str) -> str:
@@ -2001,7 +2041,7 @@ def _redact_binary_carriage(text: str) -> str:
     of the marker, so most text skips the case-insensitive search."""
     if "64" not in text:
         return text
-    return _BINARY_CARRIAGE.sub(rf"\g<1>{_REDACTED}", text)
+    return _BINARY_CARRIAGE.sub(_carriage_replacement, text)
 
 
 def _redact_stages(text: str) -> str:
