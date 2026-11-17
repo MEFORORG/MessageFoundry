@@ -597,7 +597,8 @@ async def test_fusion_is_disabled_in_every_worker_mode(
     from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
     runner = RegistryRunner(
-        Registry(),
+        # A digest, because a worker mode beside a config dir refuses a graph with none (#5334).
+        Registry(code_digest="0" * 64),
         object(),  # type: ignore[arg-type]
         sandbox_policy=SandboxPolicy(mode=mode),
         sandbox_config_source=(str(tmp_path), None),

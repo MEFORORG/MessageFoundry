@@ -20,14 +20,20 @@ import threading
 import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from json import JSONDecodeError
 from pathlib import Path
 from types import TracebackType
 from typing import Literal, TypeVar
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, RootModel, ValidationError
+from pydantic import (
+    BaseModel,
+    Field,
+    RootModel,
+    ValidationError,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+)
 
 from messagefoundry.api.auth_models import (
     STEP_UP_VIA_HEADER,
@@ -39,7 +45,6 @@ from messagefoundry.api.auth_models import (
     CurrentUser,
     CustomRoleInfo,
     LoginResponse,
-    MfaConfirmResponse,
     MfaDisableResponse,
     MfaEnrollResponse,
     MfaResetResponse,
@@ -105,6 +110,8 @@ _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 # TEST process (where the coupling is harmless) and fails if either drifts.
 MAX_REQUEST_URL_LEN = 8192
 MAX_REQUEST_HEADER_VALUE_LEN = 8192
+#: The Authorization scheme prefix this client sends its session token under.
+_BEARER_PREFIX = "Bearer "
 
 # ASVS 15.2.2 (BACKLOG #1577), the RESPONSE half: the ceiling on a reply body this client will
 # buffer. The bound is enforced ON THE STREAM (see _buffer_bounded), so a reply past it costs one
@@ -178,11 +185,19 @@ class MfaConfirmed:
     to end the caller's other sessions after the factor change (BACKLOG #1147, #3393).
 
     ``other_sessions`` is how many sessions :meth:`EngineClient.revoke_other_sessions` would end,
-    or None when the engine could not count them. The rotated session token is not here: the
-    client has already adopted it."""
+    or None when the engine could not count them or sent a count this client cannot read. The
+    rotated session token is not here: the
+    client has already adopted it, unless ``token_adopted`` is False.
+
+    ``token_adopted`` is False when the reply carried codes but no rotated token this client can
+    send: missing, null, or not sendable (BACKLOG #5344). The codes are still good and are
+    returned, because the engine committed them before replying and will not show them again.
+    The held token was left in place and may already be dead, since the engine rotated the
+    session, so the caller should save the codes first and then sign in again."""
 
     recovery_codes: tuple[str, ...]
     other_sessions: int | None
+    token_adopted: bool
 
 
 class ApiError(RuntimeError):
@@ -301,6 +316,49 @@ def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
     raise ApiError(f"invalid response from engine: {invalid}")
 
 
+class _RotatedToken(BaseModel):
+    """The one field every elevation reply must carry: the re-keyed session token (BACKLOG #5344).
+
+    Local rather than the engine's ``ElevatedResponse`` so that one token rule serves all three
+    elevation routes, whose replies differ in their other fields. ``confirm_mfa`` checks its token
+    against this model on its own, apart from the recovery codes it reads with
+    :class:`_MfaConfirmCodes`.
+
+    The token must be one this client can send: RFC 6750 token68 characters only, so no space,
+    CR/LF or non-ASCII character that would break the header build, and short enough that
+    ``Bearer <token>`` fits :data:`MAX_REQUEST_HEADER_VALUE_LEN`. A token outside that is refused
+    here, rather than adopted and then failing every later request."""
+
+    token: str = Field(
+        min_length=1,
+        max_length=MAX_REQUEST_HEADER_VALUE_LEN - len(_BEARER_PREFIX),
+        pattern=r"^[A-Za-z0-9._~+/-]+=*$",
+    )
+
+
+class _MfaConfirmCodes(BaseModel):
+    """The ``POST /me/mfa/confirm`` reply's codes and count, without its token (BACKLOG #5344).
+
+    Local rather than the engine's ``MfaConfirmResponse``, whose ``token`` is a required str, so
+    that a reply with a missing or unusable token still yields the one-time recovery codes.
+    :meth:`EngineClient.confirm_mfa` reads the token through :class:`_RotatedToken` instead."""
+
+    recovery_codes: list[str]
+    other_sessions: int | None = None
+
+    @field_validator("other_sessions", mode="wrap")
+    @classmethod
+    def _unknown_when_unreadable(
+        cls, value: object, handler: ValidatorFunctionWrapHandler
+    ) -> object:
+        """An unreadable count is "unknown" (None): it is advisory, and failing the decode on it
+        would lose the one-time codes beside it."""
+        try:
+            return handler(value)
+        except ValidationError:
+            return None
+
+
 class _UserListRow(RootModel[UserListEntry]):
     """One ``GET /users`` row, either shape (BACKLOG #5520), so :func:`_decode_list` reads it."""
 
@@ -376,26 +434,50 @@ def _seg(value: str | int) -> str:
 
 
 def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
-    """Permit only safe URL schemes, then refuse plaintext ``http`` to a non-loopback host.
+    """Refuse an unsafe base URL, then refuse plaintext ``http`` to a non-loopback host.
+
+    A base URL is refused in at least these cases: httpx cannot parse it or IDNA-decode its host,
+    its scheme is not ``http`` or ``https``, it has no host, it carries userinfo, or it is
+    plaintext ``http`` to a non-loopback host without ``allow_insecure``. Each refusal is an
+    :class:`ApiError` that chains nothing.
 
     Returns ``True`` when the caller has opted into a **cleartext non-loopback hop** -- the one
     permitted-but-unencrypted shape. :class:`EngineClient` stores that and refuses to put a
     credential on such a hop; see :meth:`EngineClient._refuse_credential_on_cleartext`.
 
-    Two checks, in this order, and the order is load-bearing.
+    The URL is parsed first; the checks that follow run in this order, and the order is
+    load-bearing.
 
     **Scheme allow-list (ASVS 1.2.2, BACKLOG #1107).** Only ``http`` and ``https`` are permitted.
-    This has to run FIRST because everything below it is keyed on the HOST, and a URL like
-    ``javascript:``, ``data:``, ``file:`` or an OS protocol handler (``ms-msdt:``) has no hostname
-    at all -- ``parts.hostname`` is ``None``, so the ``host == ""`` early return below waves it
-    through. That made the shipped check a host-keyed deny-list for plaintext http rather than a
-    protocol allow-list, and the two schemes the ASVS verb names by name were exactly the two that
-    passed. A positive allow-list is the shape that fixes it: a deny-list of known-bad schemes
+    This has to run before the host checks because they are keyed on the HOST, and a URL like
+    ``javascript:``, ``data:``, ``file:`` or an OS protocol handler (``ms-msdt:``) has no host at
+    all, so the former empty-host early return waved it through. That made the check before
+    BACKLOG #1107 a host-keyed deny-list for plaintext http rather than a protocol allow-list,
+    and the two schemes the ASVS verb names by name were exactly the two that passed. A positive
+    allow-list is the shape that fixes it: a deny-list of known-bad schemes
     cannot cover the OS protocol handlers a given Windows install happens to register.
 
-    A base URL with no scheme at all fails here too (``urlsplit("127.0.0.1:8765")`` yields scheme
+    A base URL with no scheme at all fails here too (``httpx.URL("127.0.0.1:8765")`` yields scheme
     ``""``), which is a deliberate change: such a URL could never have reached an engine, and
     failing at construction beats failing later with an opaque transport error.
+
+    **A host is required (BACKLOG #5343).** An empty or unparsable host is not loopback. The
+    former check waved an empty host through as if it were, yet httpx still dials such a URL: for
+    ``http:////engine.example:8765`` or ``http://:8765`` it connects to the empty host, which the
+    resolver may map to a non-loopback address of this machine (measured on httpx 0.28.1), with the
+    credential in cleartext. No URL without a host can name an engine, so it is refused for both
+    schemes.
+
+    **No userinfo (BACKLOG #5343).** httpx turns a ``user:password@`` in the base URL into a Basic
+    ``Authorization`` header on every request, over whatever hop the URL names, and the error text
+    that quotes the base URL would carry the password. The client's credential is the bearer
+    token, so a base URL carrying userinfo is refused rather than sent.
+
+    **One parser decides (BACKLOG #5343).** The URL is parsed with ``httpx.URL``, the parser the
+    transport dials with, not ``urllib.parse``. Two parsers that disagree on a URL are how a check
+    passes one host while the request goes to another; a URL httpx cannot parse raises
+    :class:`ApiError` here rather than ``httpx.InvalidURL`` later. So does a host whose IDNA
+    decode fails, which httpx would otherwise raise as ``idna.IDNAError`` on every request.
 
     **Plaintext http to a remote host (CONSOLE-3, ASVS 12.3.3, BACKLOG #1179).** A remote
     ``http://`` URL would put the bearer token and PHI on the wire in cleartext, so a remote engine
@@ -418,18 +500,38 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     expression. Every caller that threads ``allow_insecure=True`` today polls tokenless, so the clamp
     costs them nothing.
     """
-    parts = urlsplit(base_url)
-    scheme = parts.scheme.lower()
+    try:
+        parsed = httpx.URL(base_url)
+        # httpx builds every request through ``host``, which IDNA-decodes: a malformed ``xn--``
+        # label raises idna.IDNAError (a UnicodeError) there, so it is read here, at construction.
+        _ = parsed.host
+        url: httpx.URL | None = parsed
+    except (httpx.InvalidURL, UnicodeError):  # a bad port, a control character, a lone surrogate
+        url = None
+    if url is None:  # raised outside the handler, so it chains no error quoting the URL
+        raise ApiError("refusing a base URL that does not parse as a URL.")
+    scheme = url.scheme.lower()
     if scheme not in _ALLOWED_URL_SCHEMES:
         found = f"scheme {scheme!r}" if scheme else "no scheme"
         raise ApiError(
             f"refusing a base URL with {found}: this client permits only the "
             f"{' and '.join(sorted(_ALLOWED_URL_SCHEMES))} schemes."
         )
+    # raw_host, not host: it is what the transport dials, undecoded.
+    host = url.raw_host.decode("ascii").lower()
+    if not host:
+        raise ApiError(
+            "refusing a base URL with no host: name the engine host, for example "
+            "https://engine.example:8765 or http://127.0.0.1:8765."
+        )
+    if url.userinfo:
+        raise ApiError(
+            "refusing a base URL that carries a user name or password: this client authenticates "
+            "with its session token, never with credentials in the URL."
+        )
     if scheme == "https":
         return False
-    host = (parts.hostname or "").lower()
-    if host in _LOOPBACK_HOSTS or host == "":
+    if host in _LOOPBACK_HOSTS:
         return False
     if allow_insecure:
         _log.warning(
@@ -708,7 +810,7 @@ class EngineClient:
         #: How many requests hold each transport right now, from the read of `_http` to the end of
         #: the buffered reply. A transport absent here is held by none.
         self._in_use: dict[httpx.Client, int] = {}
-        if self.base_url.lower().startswith("https"):
+        if httpx.URL(self.base_url).scheme == "https":
             before = _read_pin(cacert) if cacert is not None else None
             try:
                 verify = _build_verify_context(cacert, tls_client_cert, tls_client_key)
@@ -975,7 +1077,7 @@ class EngineClient:
         """
         if not self._cleartext_hop:
             return
-        host = urlsplit(self.base_url).hostname or self.base_url
+        host = httpx.URL(self.base_url).raw_host.decode("ascii")  # refused at construction if empty
         raise ApiError(
             f"refusing to send {what} over plaintext http to non-loopback host {host!r}: "
             "allow_insecure permits unauthenticated reads on a declared-plaintext engine, never a "
@@ -1008,7 +1110,7 @@ class EngineClient:
         bearer = self._token if _bearer is None else _bearer
         if bearer is not None:
             self._refuse_credential_on_cleartext("a bearer token")
-        headers = {"Authorization": f"Bearer {bearer}"} if bearer else None
+        headers = {"Authorization": f"{_BEARER_PREFIX}{bearer}"} if bearer else None
         # One read of the transport for this attempt, counted as held until the reply is buffered.
         # A renewal on another thread may replace `_http`: _follow_renewed_pin needs to know which
         # transport THIS attempt failed on, and the replaced one must stay open until this attempt
@@ -1170,20 +1272,22 @@ class EngineClient:
         step-up would then fail on a token the ceremony itself retired.
 
         Writing through the shared cell (see :class:`_TokenCell`) is what carries the rotation to the
-        background poll clients too. A body without a usable ``token`` leaves the current one in
-        place rather than clearing it: that is an engine older than this contract, and dropping the
-        token there would turn a version skew into a sign-out.
+        background poll clients too.
 
         A rotated token counts as issued to this client even when the one it replaced came from
         :meth:`set_token`: the rotation already ended that one for every holder, so only this client
         holds the new one.
+
+        A 2xx reply that does not decode to an object whose ``token`` this client can send raises
+        the value-free :class:`ApiError` of :func:`_decode`, with ``status`` None, and the current
+        token is left in place rather than cleared (BACKLOG #5344). A sendable token is non-empty,
+        RFC 6750 token68 characters only, and short enough that ``Bearer <token>`` fits
+        :data:`MAX_REQUEST_HEADER_VALUE_LEN`; :class:`_RotatedToken` holds these limits.
+        Returning normally would report the elevation as a success. What happened to the session
+        is not known: the engine may have rotated it, so the held token may already be dead, or an
+        intermediary may have answered without reaching the engine, so it may still be live.
         """
-        try:
-            token = response.json().get("token")
-        except (JSONDecodeError, AttributeError):
-            return
-        if isinstance(token, str) and token:
-            self._hold_issued(token)
+        self._hold_issued(_decode(response, _RotatedToken).token)
 
     def set_step_up_handler(self, handler: Callable[[], bool] | None) -> None:
         """Register the callback invoked when the engine demands step-up re-verification (403 +
@@ -1204,7 +1308,11 @@ class EngineClient:
 
         ``purpose`` names the action up front instead, for a caller that proves BEFORE the call it
         is about to make, so the refusal and the retry never happen (vault BACKLOG #2625: a timed
-        reload must not carry a step-up inside its timer). It wins over a stashed action."""
+        reload must not carry a step-up inside its timer). It wins over a stashed action.
+
+        Raises :class:`ApiError` with ``status`` None when the 2xx reply carries no usable token
+        (BACKLOG #5344). The engine may have rotated the session anyway, so the held token may
+        already be dead; see :meth:`_adopt_rotated`."""
         self._refuse_credential_on_cleartext("a password")
         action = purpose if purpose is not None else self._pending_step_up_action
         self._pending_step_up_action = None  # single-use: one reauth per named action
@@ -1251,11 +1359,15 @@ class EngineClient:
         Confirming an enrolment elevates the session, so it also re-keys it (ASVS 7.2.4) and the new
         token is adopted here — the caller gets the codes and the count, never the token.
 
-        Through :meth:`_adopt_rotated` like the other two elevation calls, deliberately. Assigning
-        ``self._token`` directly worked only by accident of an annotation elsewhere:
-        ``MfaConfirmResponse.token`` is a required ``str`` today, so a token-less body fails in
-        ``_decode`` rather than clearing the session. That is a property of a different file, not of
-        the rule, and the rule is the one thing all three sites must share.
+        The token and the codes are read independently (BACKLOG #5344). A token is adopted first
+        through :meth:`_adopt_rotated`, whatever the rest of the reply holds, since the engine has
+        already rotated the session. A reply whose codes do not decode then raises
+        :class:`ApiError`; an ``other_sessions`` count this client cannot read is None, "unknown",
+        rather than a reason to drop the codes. A reply whose codes decode but whose token is
+        missing, null or not sendable does NOT raise: the codes are returned with
+        ``token_adopted`` False, the held token is left in place and may be dead, and a value-free
+        warning is logged. Raising there would lose codes the engine has already committed and
+        will not show again; see :class:`MfaConfirmed`.
 
         ``enrolment_code`` is the single-use issued enrolment code (ADR 0207), which a
         directory account's first factor needs on a session its identity provider did not stamp.
@@ -1273,10 +1385,23 @@ class EngineClient:
         response = self._request(
             "POST", "/me/mfa/confirm", json=body, timeout=self._sign_in_timeout()
         )
-        self._adopt_rotated(response)
-        confirmed = _decode(response, MfaConfirmResponse)
+        # The token and the codes are read independently. The engine has rotated the session and
+        # committed the codes before it replies, so neither half's failure may take the other down.
+        try:
+            self._adopt_rotated(response)
+            adopted = True
+        except ApiError:  # nothing is raised from here, so nothing chains a value
+            adopted = False
+        confirmed = _decode(response, _MfaConfirmCodes)
+        if not adopted:  # logged only once the codes have decoded, so it never contradicts a raise
+            _log.warning(
+                "MFA enrolment confirmed, but the reply carries no session token this client can "
+                "send; the token is not adopted."
+            )
         return MfaConfirmed(
-            recovery_codes=tuple(confirmed.recovery_codes), other_sessions=confirmed.other_sessions
+            recovery_codes=tuple(confirmed.recovery_codes),
+            other_sessions=confirmed.other_sessions,
+            token_adopted=adopted,
         )
 
     def verify_mfa(self, code: str) -> None:
@@ -1284,7 +1409,11 @@ class EngineClient:
         :class:`ApiError` (401) on a wrong code, and (403) on a directory account the directory could
         not confirm, whose code was not checked (BACKLOG #2023). Raises :class:`IdpStepUpRequired`
         for an ``oidc`` session that already met its factor, whose code was not checked either
-        (BACKLOG #2142). Does not itself trigger the MFA handler."""
+        (BACKLOG #2142). Does not itself trigger the MFA handler.
+
+        Raises :class:`ApiError` with ``status`` None when the 2xx reply carries no usable token
+        (BACKLOG #5344). The engine may have rotated the session anyway, so the held token may
+        already be dead; see :meth:`_adopt_rotated`."""
         self._refuse_credential_on_cleartext("a second factor")
         # Vault BACKLOG #2950: it rotates the token and queues behind the account's credential
         # lock, so it gets the sign-in's timeout (see SIGN_IN_TIMEOUT_SECONDS).
@@ -1487,7 +1616,7 @@ class EngineClient:
             limit=limit,
             offset=offset,
         )
-        return DeadLetterList.model_validate(response.json())
+        return _decode(response, DeadLetterList)
 
     def list_connection_events(
         self,
@@ -1515,7 +1644,7 @@ class EngineClient:
             before_id=before_id,
             reveal=reveal,
         )
-        return ConnectionEventList.model_validate(response.json())
+        return _decode(response, ConnectionEventList)
 
     def replay_dead_letters(
         self, *, channel_id: str | None = None, destination_name: str | None = None

@@ -52,6 +52,10 @@ from tests.test_alert_state import _RecordingStore
 from tests.test_sandbox import RAW
 from tests.test_sandbox_graph_parity import _GRAPH, _VARIABLE
 
+#: A digest for a graph built here: the runner refuses a worker mode beside a config dir for a
+#: graph with none (BACKLOG #5334), and these tests are about the alert, not that refusal.
+_SOME_DIGEST = "0" * 64
+
 #: A value of the message's own that must never reach an alert.
 _BODY_MARKER = "DOE^JANE"
 assert _BODY_MARKER in RAW
@@ -139,7 +143,7 @@ async def test_the_first_refusal_alerts_once_and_later_messages_do_not(
 
 async def test_a_refusal_reached_through_the_closed_session_retry_alerts(tmp_path: Path) -> None:
     """The retry after a reload closed the session mid-dispatch is inside the alerting arm too."""
-    registry = Registry()
+    registry = Registry(code_digest=_SOME_DIGEST)
     sink = _Recorder()
     calls: list[int] = []
 
@@ -167,7 +171,7 @@ async def test_a_refusal_against_a_replaced_graph_does_not_alert(tmp_path: Path)
     """The refused spawn compared with a graph the runner no longer serves, as after a reload,
     or a reload that swapped and then rolled back. The reload is the remedy, so an alert would
     stay open with nothing left to fix."""
-    registry = Registry()
+    registry = Registry(code_digest=_SOME_DIGEST)
     sink = _Recorder()
     compared: list[GraphShape] = []
 
