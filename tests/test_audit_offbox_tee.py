@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -442,25 +443,14 @@ def test_the_redaction_filters_fire_across_an_escaped_character(
     fmt: str, actor: str, needle: str | None, capsys
 ) -> None:
     """The filters run before the scrub and see these characters unescaped, so they redact what
-    follows each exactly as they redact the same text with nothing in front. A C0 control is the
-    exception, because ``json.dumps`` escapes it first; the test below pins that. Synthetic values;
-    the helper's ``json.loads`` is the parse check."""
+    follows each exactly as they redact the same text with nothing in front. A C0 control, which
+    ``json.dumps`` escapes first, is covered by the field scrub; the tests below pin that.
+    Synthetic values; the helper's ``json.loads`` is the parse check."""
     line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
     if needle is not None:
         assert needle not in line, line
 
 
-class _C0Leak(Exception):
-    """The one failure the C0 xfail below expects, so a helper assert cannot satisfy it."""
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=_C0Leak,
-    reason="KNOWN RESIDUAL, not built here and older than vault BACKLOG #3012: json.dumps escapes a "
-    "C0 control before any filter runs, so a pattern that needs a word boundary or whitespace "
-    "misses the text beside it. See emit_audit_tee's docstring.",
-)
 @pytest.mark.parametrize("fmt", ["text", "json"])
 @pytest.mark.parametrize(
     ("actor", "needle"),
@@ -474,14 +464,15 @@ class _C0Leak(Exception):
         (f"MRN{chr(0x09)}12345678", "12345678"),
     ],
 )
-def test_a_c0_control_still_hides_text_from_the_filters(
+def test_a_c0_control_no_longer_hides_text_from_the_filters(
     fmt: str, actor: str, needle: str, capsys
 ) -> None:
-    """Each case leaks only because of the C0 control: the control test asserts the same text
-    is redacted without it. When a case flips to a pass, take the marker off for it."""
+    """``json.dumps`` escapes a C0 control as ``\\u0001`` or ``\\t``, which ends in a word
+    character, so the handler chain alone missed the text beside it. Each field is now scrubbed
+    before it is encoded (BACKLOG #3045). These were strict xfails until then; the control test
+    below asserts the same text is redacted without the control."""
     line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
-    if needle in line:
-        raise _C0Leak(line)
+    assert needle not in line, line
 
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
@@ -497,10 +488,933 @@ def test_a_c0_control_still_hides_text_from_the_filters(
 def test_the_c0_cases_are_redacted_without_the_control(
     fmt: str, actor: str, needle: str, capsys
 ) -> None:
-    """The control for the xfail above: the same text with a space, or nothing, in place of the
-    C0 control is redacted, so the xfail measures the control and not the pattern."""
+    """The control for the test above: the same text with a space, or nothing, in place of the
+    C0 control is redacted, so the test above measures the control and not the pattern."""
     line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
     assert needle not in line, line
+
+
+# --- BACKLOG #3045: each field is scrubbed before json.dumps escapes a C0 control in it ----------
+
+
+def _tee_lines(cases: list[dict[str, str | None]], capsys) -> list[str]:
+    """Tee each case through the stdout handler ``serve`` installs, configured once, and return
+    the physical line of each, in order. Not parsed: a line here may legitimately be broken JSON,
+    a residual ``emit_audit_tee`` states."""
+    with _handlerless_process():
+        configure_logging("INFO", fmt="text")
+        capsys.readouterr()
+        defaults = {"action": "auth.login_failed", "actor": "alice", "detail": "ok"}
+        for fields in cases:
+            emit_audit_tee(
+                ts=1.0,
+                row_id=1,
+                seq=1,
+                row_hash=_HASH,
+                **{"channel_id": None, "client": None, **defaults, **fields},  # type: ignore[arg-type]
+            )
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "messagefoundry.audit: " in ln]
+    assert len(lines) == len(cases), lines
+    return lines
+
+
+#: Where a C0 control goes: ``{c}`` before, after, between a label and its value or between the
+#: parts of a name, after an HL7-shaped run, and inside a token. The third member is what stands
+#: in the control's place for the control case, a space or nothing; with it, each is redacted,
+#: which the sweep checks first, so a leak measures the control and not the pattern.
+_C0_SWEEP_TEMPLATES = (
+    ("{c}DOE JANE", "DOE", " "),
+    ("DOE JANE{c}", "DOE", " "),
+    ("DOE{c}JANE", "DOE", " "),
+    ("SMITH,{c}JOHN", "SMITH", " "),
+    ("a|b|c{c}DOE JANE", "JANE", " "),
+    ("{c}password=hunter2", "hunter2", " "),
+    ("password=hunter2{c}", "hunter2", " "),
+    ("pass{c}word=hunter2", "hunter2", ""),
+    ("password{c}=hunter2", "hunter2", ""),
+    ("{c}05/05/1980", "1980", " "),
+    ("05/05/1980{c}", "1980", " "),
+    ("05{c}/05/1980", "1980", ""),
+    ("{c}Bearer abcdefgh", "abcdefgh", " "),
+    ("Bearer{c}abcdefgh", "abcdefgh", " "),
+    ("{c}MRN 12345678", "12345678", " "),
+    ("MRN{c}12345678", "12345678", " "),
+    ("MRN 12345678{c}", "12345678", " "),
+    ("MRN 1234{c}5678", "5678", ""),
+    ("{c}token=abc123xyz", "abc123xyz", " "),
+)
+
+#: The tee fields a writer's text reaches. ``detail-as-json`` is ``detail`` as most of its writers
+#: hand it over, already through ``json.dumps``, so the control arrives as an escape.
+_SWEEP_FIELDS = ("actor", "channel_id", "client", "action", "detail", "detail-as-json")
+
+
+def _sweep_case(field: str, value: str) -> dict[str, str | None]:
+    if field == "detail-as-json":
+        return {"detail": json.dumps({"error": value})}
+    return {field: value}
+
+
+def _sweep_keys() -> list[tuple[int, str, str]]:
+    """Every C0 code point, and -1 for the control case, in every template."""
+    return [
+        (code, template.format(c=chr(code) if code >= 0 else stand_in), needle)
+        for code in [-1, *range(0x20)]
+        for template, needle, stand_in in _C0_SWEEP_TEMPLATES
+    ]
+
+
+@pytest.mark.parametrize("field", _SWEEP_FIELDS)
+def test_every_c0_control_beside_or_inside_the_text_of_each_field_is_redacted(
+    field: str, capsys
+) -> None:
+    """The sweep the review of engine PR 2040 used, all 32 C0 code points, widened to put the
+    control inside the text as well as on either side, in every text field of the record
+    (BACKLOG #3045). The control case comes first: with a space or nothing in the control's
+    place, each needle is redacted. A leak names the code point and the value. Synthetic values.
+
+    A control the patterns read as whitespace, ``\\s`` in Python (tab, LF, VT, FF, CR and U+001C
+    to U+001F), is never read as nothing, because gluing two lines into one word made names and
+    dates that were not there. Inside a word it splits the word, as it does on any plain log
+    line, so for those the bar is the handler chain's own verdict on the same text unencoded."""
+    from messagefoundry.logging_setup import scrub_log_text
+
+    whitespace = {c for c in range(0x20) if re.fullmatch(r"\s", chr(c))}
+    keys = _sweep_keys()
+    lines = _tee_lines([_sweep_case(field, value) for _code, value, _needle in keys], capsys)
+    leaks = [
+        (hex(code), ascii(value), needle)
+        for (code, value, needle), line in zip(keys, lines, strict=True)
+        if needle in line and (code not in whitespace or needle not in scrub_log_text(value))
+    ]
+    # Non-vacuous: every C0 code point and the control case, in each of the 19 templates.
+    assert len(keys) >= 627
+    assert not leaks, leaks
+    # The carve-out is not vacuous, and covers only what the plain chain itself misses.
+    assert whitespace == {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x1F}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a\x01DOE JANE\x02x",
+        "line one\nDOE\x01JANE",
+        "DOE\x01JANE\tnext",
+        "a\r\nDOE\x1fJANE",
+        'q"DOE\x01JANE',
+        "Bearer\x01abcdefgh pass\x01word=hunter2",
+        "password=hun\x01ter2 DOE\x01JANE\x01SMITH",
+    ],
+)
+def test_a_serialised_detail_with_a_control_still_parses(value: str, capsys) -> None:
+    """A ``detail`` its writer ran through ``json.dumps`` parses after the field scrub, and the
+    text beside the control is gone. Synthetic values."""
+    (line,) = _tee_lines([{"detail": json.dumps({"error": value})}], capsys)
+    detail = _shipped_detail(line)
+    json.loads(detail)
+    for needle in ("JANE", "abcdefgh", "hunter2", "ter2"):
+        assert needle not in detail, detail
+
+
+#: Values the earlier design of this fix leaked, in review: in the first, reading the controls as
+#: spaces before the plain passes exposed a credential tail they hid; in the second, each of two
+#: controls needed a different reading.
+_REVIEW_LEAKS = (
+    ("password=hun\x01ter2 DOE\x01JANE\x01SMITH", ("ter2", "DOE", "JANE")),
+    ("Bearer\x01abcdefgh pass\x01word=hunter2", ("abcdefgh", "hunter2")),
+    ("Authorization:\x01Bearer abcdefgh IB_ACME_ADT", ("abcdefgh",)),
+    ("password: hunter2 MRN 1234\x015678", ("hunter2", "5678")),
+    # Review round 2: the plain pass's name run took the ``Bearer`` label, so the credential the
+    # handler chain alone hid would have shipped; and a ``password=`` value the chain hid.
+    ("rejected:\nInvalid Bearer abc123def", ("abc123def",)),
+    ("05/\x1btoken=password= DOE", ("DOE",)),
+)
+
+
+@pytest.mark.parametrize(
+    ("value", "kept"),
+    [
+        ("user alice\nrole Admin\nscope All", "user alice\nrole Admin\nscope All"),
+        ("count 2025\n0101 rows", "count 2025\n0101 rows"),
+    ],
+)
+def test_a_reading_does_not_glue_lines_into_a_name(value: str, kept: str) -> None:
+    """Review round 2: removing a line break glued two lines into a name or a date that was not
+    there, so the whole field went. Synthetic values."""
+    assert audit_tee._scrub_field(value).startswith(kept)
+
+
+@pytest.mark.parametrize("field", ["actor", "detail", "detail-as-json"])
+@pytest.mark.parametrize(("value", "needles"), _REVIEW_LEAKS)
+def test_a_control_reading_never_exposes_what_another_hides(
+    field: str, value: str, needles: tuple[str, ...], capsys
+) -> None:
+    (line,) = _tee_lines([_sweep_case(field, value)], capsys)
+    assert not [needle for needle in needles if needle in line], line
+
+
+def _corpus() -> list[str]:
+    """The single-control sweep, two templates in one value with a control each, and the review
+    leaks, for the comparisons with the field scrub switched off."""
+    values = [value for _code, value, _needle in _sweep_keys()]
+    for first, _n1, _s1 in _C0_SWEEP_TEMPLATES:
+        for second, _n2, _s2 in _C0_SWEEP_TEMPLATES:
+            for code_1, code_2 in ((0x01, 0x01), (0x00, 0x1F), (0x1B, 0x09)):
+                values.append(f"{first.format(c=chr(code_1))} {second.format(c=chr(code_2))}")
+    values += [value for value, _needles in _REVIEW_LEAKS]
+    values += list(_BELOW_THE_OLD_LINE)
+    return values
+
+
+#: Values the branch's fifth review round measured shipping a word the line before #3045 hid,
+#: through ``configure_logging``: the old line's chain hid them over the whole record, and the
+#: field scrub's own check, the chain over the field alone, did not see it.
+_BELOW_THE_OLD_LINE = (
+    "DOE\x01^\tDOE JANE\nAuthorization:\r\n|\x02Invalid",
+    "McDona\u0000ld",
+)
+
+
+def _before_and_after(
+    cases: list[dict[str, str | None]], capsys, monkeypatch
+) -> tuple[list[str], list[str]]:
+    """Each case teed with the field scrub switched off, which is the code before #3045, then as
+    shipped."""
+    real = audit_tee._scrub_field
+    monkeypatch.setattr(audit_tee, "_scrub_field", lambda value, **_kw: value)
+    before = _tee_lines(cases, capsys)
+    monkeypatch.setattr(audit_tee, "_scrub_field", real)
+    return before, _tee_lines(cases, capsys)
+
+
+# An oracle independent of audit_tee's own word and escape patterns, on purpose.
+_WORD = re.compile(r"[A-Za-z0-9]+")
+#: A JSON escape's text, counted as a word break on both sides of the comparison below. The run
+#: of backslashes is taken whole, so an escape whose backslash is itself escaped, as ``\\u0001``
+#: is in a JSON ``detail`` on the line, reads as one break. Taking one backslash pair left
+#: ``u0001JANE`` behind as a word, and the comparison then missed ``JANE`` on either side.
+_ESCAPE_TEXT = re.compile(r"\\+(?:u[0-9a-fA-F]{4}|.)", re.DOTALL)
+#: One JSON escape read left to right, so an escaped backslash is one break and the text after it
+#: is text: a literal backslash before ``u1234`` leaves ``u1234`` a word (review round-fc1a3906).
+_JSON_TEXT_ESCAPE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|.)", re.DOTALL)
+
+
+def test_the_placeholder_pattern_is_the_two_placeholders() -> None:
+    from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER
+
+    for placeholder in (audit_tee._FIELD_REDACTED, CREDENTIAL_PLACEHOLDER):
+        assert audit_tee._PLACEHOLDERS.fullmatch(placeholder), placeholder
+    assert audit_tee._PLACEHOLDERS.findall("x [redacted] <redacted> y") == [
+        audit_tee._FIELD_REDACTED,
+        CREDENTIAL_PLACEHOLDER,
+    ]
+
+
+def test_the_oracle_reads_a_doubly_escaped_control_as_a_break() -> None:
+    line = json.dumps({"detail": json.dumps({"e": "x\x01JANE"})})
+    assert "JANE" in _WORD.findall(_ESCAPE_TEXT.sub(" ", line))
+
+
+@pytest.mark.parametrize("field", ["actor", "client", "detail", "detail-as-json"])
+def test_the_field_scrub_shows_no_word_the_line_chain_alone_hides(
+    field: str, capsys, monkeypatch
+) -> None:
+    """Closing step 3 of BACKLOG #3045: no word of a value that the line hid before may show after,
+    over the sweep and the two-control corpus. Engine PR 2040's first version lost a redaction.
+    Synthetic values."""
+    hidden_before, shown = _shown_after_hidden_before(field, _corpus(), capsys, monkeypatch)
+    # The control: the line chain alone hides words in this corpus, so the rule is not vacuous.
+    assert hidden_before
+    assert not shown, shown[:20]
+
+
+def _shown_after_hidden_before(
+    field: str, values: list[str] | tuple[str, ...], capsys, monkeypatch
+) -> tuple[int, list[tuple[str, str]]]:
+    """How many words of ``values`` the line before #3045 hid, and each of those the line now
+    shows. The line before is the whole record as that code built it, through the same handler."""
+    before, after = _before_and_after(
+        [_sweep_case(field, value) for value in values], capsys, monkeypatch
+    )
+    hidden_before = 0
+    shown = []
+    for value, old, new in zip(values, before, after, strict=True):
+        old_words = set(_WORD.findall(_ESCAPE_TEXT.sub(" ", old)))
+        new_words = set(_WORD.findall(_ESCAPE_TEXT.sub(" ", new)))
+        for word in _WORD.findall(value):
+            if word not in old_words:
+                hidden_before += 1
+                if word in new_words:
+                    shown.append((ascii(value), word))
+    return hidden_before, shown
+
+
+@pytest.mark.parametrize("field", ["actor", "detail", "detail-as-json"])
+def test_the_values_the_fifth_review_measured_hide_no_less_than_before(
+    field: str, capsys, monkeypatch
+) -> None:
+    """Each shipped a word the line before #3045 hid, at e0e567c8ab, in ``detail``: ``DOE`` and
+    ``McDona``. The line is now held to the old line's chain over the whole record. Synthetic."""
+    _hidden, shown = _shown_after_hidden_before(field, _BELOW_THE_OLD_LINE, capsys, monkeypatch)
+    assert not shown, shown
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "alice",
+        "CORP\\bJONES",
+        "CORP\\mefor-svc$",
+        "DOE JANE",
+        "password=hunter2",
+        "a|b|c",
+        f"Jos{chr(0xE9)}",
+        f"user{chr(0x7F)}name",
+        'q"uote',
+    ],
+)
+def test_a_value_with_no_c0_control_ships_byte_identical(value: str, capsys, monkeypatch) -> None:
+    """A field with no C0 control is not touched, so its line is the line before #3045, byte for
+    byte; a domain account's backslash is not read as an escape. Synthetic values."""
+    cases: list[dict[str, str | None]] = [
+        {"actor": value},
+        {"detail": value},
+        {"detail": json.dumps({"user": value})},
+    ]
+    before, after = _before_and_after(cases, capsys, monkeypatch)
+    assert after == before
+
+
+def test_a_reading_that_hides_one_of_two_equal_words_is_seen() -> None:
+    """The words are counted, so a name hidden by a reading is caught even when each of its words
+    also stands alone, unredacted, elsewhere in the value. Synthetic values."""
+    value = f"x DOE y JANE z DOE{chr(0x01)}JANE"
+    assert f"DOE{chr(0x01)}JANE" not in audit_tee._scrub_field(value)
+
+
+def test_a_deeply_nested_detail_does_not_fail_the_tee(audit_capture) -> None:
+    """``json.loads`` raises ``RecursionError`` on a deep nest, which is not a ``ValueError``. The
+    tee must still ship, and never raise into the committed audit write (review round 1)."""
+    deep = "[" * 20000 + '"x\\n"' + "]" * 20000
+    emit_audit_tee(
+        action="x",
+        actor=None,
+        channel_id=None,
+        detail=deep,
+        ts=1.0,
+        row_id=1,
+        seq=1,
+        row_hash=_HASH,
+    )
+    assert len(audit_capture.messages) == 1
+
+
+def test_a_json_detail_with_an_escape_and_nothing_to_redact_ships_unchanged(
+    capsys, monkeypatch
+) -> None:
+    """A multi-line JSON detail with nothing to redact is not re-encoded, so ``safe_text`` cuts
+    it no sooner than before and it still parses (review round 1: ``\\n`` grew to ``\\u000a``
+    and pushed a 191-character detail past the 200-character bound). Synthetic values."""
+    detail = json.dumps({"error": "\n".join(["step ok"] * 20)})
+    cases: list[dict[str, str | None]] = [{"detail": detail}]
+    before, after = _before_and_after(cases, capsys, monkeypatch)
+    assert after == before
+    json.loads(_shipped_detail(after[0]))
+
+
+def _shipped_detail(line: str) -> str:
+    return json.loads(line.split("messagefoundry.audit: ", 1)[1])["detail"]
+
+
+def test_a_redacted_json_detail_is_re_encoded_no_longer_than_its_writer_wrote_it(capsys) -> None:
+    """Open finding 1 of engine PR 2864: the re-encode wrote ``\\u000a`` for each line break the
+    decode read, so a multi-line JSON detail with something to redact grew past the 200-character
+    bound and shipped cut. It is spelled as ``json.dumps`` spells it now. Synthetic values."""
+    assert audit_tee._encode_c0("a\nb\x01\t") == "a\\nb\\u0001\\t"
+    detail = json.dumps({"error": "step ok \n " * 16 + "DOE JANE"})
+    assert len(detail) < 200
+    (line,) = _tee_lines([{"detail": detail}], capsys)
+    error = json.loads(_shipped_detail(line))["error"]
+    assert error.startswith("step ok \n ") and "DOE" not in error
+
+
+def test_a_json_detail_its_redaction_pushes_past_the_bound_still_parses(capsys) -> None:
+    """Open finding 1 of engine PR 2864: a JSON detail that fit, and shipped parseable before
+    #3045, grows when the scrub redacts in it, so the 200-character cut landed inside it. It
+    ships as the JSON string ``"[redacted]"`` instead. Synthetic values."""
+    from messagefoundry.redaction import safe_text
+
+    detail = json.dumps({"e": "ok " * 56 + "\x01 password=hunter2"})
+    assert len(detail) == 200 and audit_tee._parses(safe_text(detail))
+    # The control: the scrubbed detail, cut by safe_text alone, no longer parses.
+    kept = audit_tee._scrub_field(detail, detail=True)
+    assert not audit_tee._parses(safe_text(kept))
+    (line,) = _tee_lines([{"detail": detail}], capsys)
+    assert json.loads(_shipped_detail(line)) == "[redacted]"
+
+
+def test_a_value_over_the_window_ends_with_its_bound_note_and_hides_the_name(capsys) -> None:
+    """Open finding 3 of engine PR 2864: a field over the 64 KiB window holding a control shipped
+    cut with no note saying so, and a ``detail``'s ``(+N chars)`` count was taken over a shorter
+    head than ``safe_text`` reads. Synthetic values."""
+    from messagefoundry.redaction import clamp_untrusted, safe_text, safe_text_bound
+
+    value = f"{chr(0x01)}DOE JANE " + "word " * 14000
+    clamped = clamp_untrusted(value)
+    scrubbed = audit_tee._scrub_field(value)
+    assert scrubbed.endswith(clamped[clamped.rfind("\n") :]) and "DOE" not in scrubbed
+    # A detail's note is the one safe_text gives the value, and its counts are safe_text's own.
+    head, note = safe_text_bound(value)
+    assert note and audit_tee._bounded_detail(head, note, safe_text(value)) == safe_text(value)
+    (line,) = _tee_lines([{"detail": value}], capsys)
+    detail = _shipped_detail(line)
+    assert detail.endswith(note) and "DOE" not in detail
+
+
+def _raw_tee_lines(cases: list[dict[str, str | None]], monkeypatch, *, scrub: bool) -> list[str]:
+    """Each case's tee line as ``emit_audit_tee`` hands it to the logger, before any handler, with
+    the field scrub on or switched off, which is the code before #3045."""
+    lines: list[str] = []
+
+    class _Capture:
+        def info(self, line: str) -> None:
+            lines.append(line)
+
+    defaults = {"action": "auth.login_failed", "actor": "alice", "detail": "ok"}
+    with monkeypatch.context() as patch:
+        patch.setattr(audit_tee, "audit_logger", _Capture())
+        patch.setattr(audit_tee, "ensure_logger_sink", lambda _logger: None)
+        if not scrub:
+            patch.setattr(audit_tee, "_scrub_field", lambda value, **_kw: value)
+        for fields in cases:
+            emit_audit_tee(
+                ts=1.0,
+                row_id=1,
+                seq=1,
+                row_hash=_HASH,
+                **{"channel_id": None, "client": None, **defaults, **fields},  # type: ignore[arg-type]
+            )
+    return lines
+
+
+def _unplaced(line: str) -> str:
+    """``line`` without the two placeholders the passes write, which are not text of a value."""
+    return line.replace("[redacted]", " ").replace("<redacted>", " ")
+
+
+def _shown_per_sink_that_main_hid(
+    cases: list[dict[str, str | None]], monkeypatch
+) -> list[tuple[int, str, list[str]]]:
+    """Each sink, case and word that this code's line shows on that sink, counted, more often
+    than the line before #3045 showed it on the same sink. The Nth sink runs the chain N times."""
+    from collections import Counter
+
+    from messagefoundry.logging_setup import sink_readings
+
+    before = _raw_tee_lines(cases, monkeypatch, scrub=False)
+    after = _raw_tee_lines(cases, monkeypatch, scrub=True)
+    shown = []
+    for case, old, new in zip(cases, before, after, strict=True):
+        for sink, (old_out, new_out) in enumerate(
+            zip(sink_readings(old), sink_readings(new), strict=True), start=1
+        ):
+            # Both readings: escapes as breaks however many backslashes spell them, and the line
+            # as JSON text, where an escaped backslash is one break and what follows is text.
+            for escape in (_ESCAPE_TEXT, _JSON_TEXT_ESCAPE):
+                old_words = Counter(_WORD.findall(escape.sub(" ", _unplaced(old_out))))
+                new_words = Counter(_WORD.findall(escape.sub(" ", _unplaced(new_out))))
+                if extra := sorted(new_words - old_words):
+                    shown.append((sink, ascii(case), extra))
+    return shown
+
+
+#: The Lander's counterexamples on engine PR 2864: on the second and third sinks, the forwarder
+#: among them, a bar over the first pass alone shipped words main's same sink hid.
+_LATER_SINK_LEAKS: tuple[dict[str, str | None], ...] = (
+    {"actor": "\x1bhunter2DOE\x7fsecret\t:x%7Cy%7Cz"},
+    {"client": '^abcdef0123456789abcd\x01password=\u2028~secretpassword="'},
+    # Review round-fc1a3906: literal backslashes before digits, read as escapes by the bar.
+    {"actor": "\\u1234\\u5678\r&|SMITH,:"},
+    {"actor": "\\u1980\r&|SMITH,:"},
+    {"channel_id": "\\u1980\r&|SMITH,:"},
+    {"action": "\\Jones&|secret\x01\x00\t\\9\x1b"},
+)
+
+
+def test_no_sink_shows_a_word_the_line_before_3045_hid_there(monkeypatch) -> None:
+    """The Lander's hold on engine PR 2864 (B1): every handler re-runs the chain over the one
+    shared record, so the bar holds on each of the three sinks ``configure_logging`` installs,
+    not just the first. The Lander's counterexamples, then the single-control sweep and its
+    two-control pairs in ``actor`` and ``client``. Synthetic values."""
+    cases = list(_LATER_SINK_LEAKS)
+    for field in ("actor", "client"):
+        cases += [{field: value} for value in _corpus()[::7]]
+    assert len(cases) > 400
+    shown = _shown_per_sink_that_main_hid(cases, monkeypatch)
+    assert not shown, shown[:10]
+
+
+def _unparsed_per_sink_where_main_parsed(
+    cases: list[dict[str, str | None]], monkeypatch
+) -> list[tuple[int, str]]:
+    """Each sink and case where the line before #3045, read on that sink, parsed as JSON and this
+    code's line, read on the same sink, does not."""
+    from messagefoundry.logging_setup import sink_readings
+
+    before = _raw_tee_lines(cases, monkeypatch, scrub=False)
+    after = _raw_tee_lines(cases, monkeypatch, scrub=True)
+    unparsed = []
+    for case, old, new in zip(cases, before, after, strict=True):
+        for sink, (old_out, new_out) in enumerate(
+            zip(sink_readings(old), sink_readings(new), strict=True), start=1
+        ):
+            if audit_tee._parses(old_out) and not audit_tee._parses(new_out):
+                unparsed.append((sink, ascii(case)))
+    return unparsed
+
+
+def test_a_line_that_parsed_on_main_still_parses_on_every_sink(monkeypatch) -> None:
+    """Review round-f23e89a6, finding 1: the word bar alone shipped a scrubbed line that parsed
+    on no sink where main's line parsed on each. The parse floor ships a later candidate that
+    parses there, or main's line. Synthetic value."""
+    cases: list[dict[str, str | None]] = [{"actor": "abc^Authorization: abcdef0123456789abcd\r| x"}]
+    assert not _unparsed_per_sink_where_main_parsed(cases, monkeypatch)
+    assert not _shown_per_sink_that_main_hid(cases, monkeypatch)
+
+
+#: Pieces for the seeded per-sink fuzz: controls, the log alphabet's DEL and U+2028, and the
+#: label, name, token and delimiter shapes the counterexamples above are made of.
+_FUZZ_PIECES = (
+    "\x01", "\x1b", "\x00", "\t", "\n", "\r", "\x7f", "\u2028", "%7C", "password=", "secret",
+    "hunter2", "DOE", "JANE", " ", "|", "^", "~", '"', ":", "Bearer ", "abcdef0123456789abcd",
+    "token=", "05/05/1980", "MRN ", "12345678", "x", "ABC|", "\\", "\\u1234", "SMITH,", "=", "&",
+)  # fmt: skip
+
+
+def test_a_seeded_fuzz_shows_no_word_on_any_sink_the_line_before_3045_hid(monkeypatch) -> None:
+    """B1 again, over random joins of the pieces in every text field and in a JSON ``detail``.
+    Seeded, so a failure reproduces. 6,000 records of the same kind found none while building
+    this; the suite runs 1,000 to keep it cheap. Synthetic values."""
+    import random
+
+    rng = random.Random(3045)
+    cases: list[dict[str, str | None]] = []
+    for _ in range(1000):
+        value = "".join(rng.choice(_FUZZ_PIECES) for _ in range(rng.randint(2, 9)))
+        field = rng.choice(["actor", "client", "channel_id", "action", "detail", "detail-as-json"])
+        cases.append(_sweep_case(field, value))
+    shown = _shown_per_sink_that_main_hid(cases, monkeypatch)
+    assert not shown, shown[:10]
+    # The parse floor: no sink loses the JSON that main's line kept there.
+    unparsed = _unparsed_per_sink_where_main_parsed(cases, monkeypatch)
+    assert not unparsed, unparsed[:10]
+
+
+def test_an_over_window_record_shows_no_text_past_mains_cut(monkeypatch) -> None:
+    """An over-window record, read by each modelled sink, shows no text past the sink clamp's cut
+    that main's own line, read by the same sink, does not show. A marker word sits past the
+    window in each case; the control first checks main's sinks drop it. Synthetic values."""
+    from messagefoundry.logging_setup import sink_readings
+
+    tail = "PASTCUTTAIL"
+    filler = "word " * 14000
+    cases: list[dict[str, str | None]] = [
+        {"actor": f"\x01DOE JANE {filler}{tail}"},
+        {"client": f"\x1bhunter2 {filler}{tail}"},
+        {"detail": f"\x01DOE JANE {filler}{tail}"},
+        {"detail": json.dumps({"error": f"\x01DOE JANE {filler}{tail}"})},
+        # Each field under the window, the line over it.
+        {"actor": "\x01DOE JANE " + "word " * 7000, "detail": "word " * 7000 + tail},
+        {"actor": "\x01secret " + "word " * 7000, "client": "word " * 7000 + tail},
+    ]
+    before = _raw_tee_lines(cases, monkeypatch, scrub=False)
+    after = _raw_tee_lines(cases, monkeypatch, scrub=True)
+    for case, old, new in zip(cases, before, after, strict=True):
+        old_reads, new_reads = sink_readings(old), sink_readings(new)
+        # The control: the marker is past main's cut on every sink, so this test measures that cut.
+        assert all(tail not in r for r in old_reads), ascii(case)[:80]
+        assert all(tail not in r for r in new_reads), ascii(case)[:80]
+    shown = _shown_per_sink_that_main_hid(cases, monkeypatch)
+    assert not shown, [(sink, case[:80], words) for sink, case, words in shown[:10]]
+
+
+def test_a_fault_in_the_line_check_ships_the_line_before_3045(monkeypatch) -> None:
+    """The Lander's hold on engine PR 2864 (B2): a fault while reading the sinks ships the old
+    line, which meets the bar by definition, never an unchecked candidate. Synthetic values."""
+
+    def boom(_text: str) -> list[str]:
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(audit_tee, "sink_readings", boom)
+    monkeypatch.setattr(audit_tee, "_LINE_SCRUB_FAULT_LOGGED", True)
+    before: dict[str, object] = {"actor": "\x01DOE JANE ABC|x", "seq": 1}
+    after: dict[str, object] = {"actor": "\x01[redacted] ABC|[redacted]", "seq": 1}
+    assert audit_tee._tee_line(before, after) == json.dumps(before, ensure_ascii=False)
+
+
+def test_a_fault_while_bounding_the_detail_ships_the_line_before_3045(monkeypatch) -> None:
+    """Review of the B1 repair: a fault in ``_bounded_detail``, outside both scrub guards, dropped
+    the record. It ships the line before #3045 instead. Synthetic values."""
+
+    def boom(*_args: object) -> str:
+        raise RuntimeError("synthetic")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(audit_tee, "_bounded_detail", boom)
+        patch.setattr(audit_tee, "_LINE_SCRUB_FAULT_LOGGED", True)
+        scrubbed = _raw_tee_lines([{"detail": "\x01DOE JANE"}], monkeypatch, scrub=True)
+    assert scrubbed == _raw_tee_lines([{"detail": "\x01DOE JANE"}], monkeypatch, scrub=False)
+
+
+def test_a_detail_the_scrub_left_alone_never_builds_the_whole_field_detail(monkeypatch) -> None:
+    """Review of the PR 2864 repair: the whole-field ``detail`` cost two parses and a ``safe_text``
+    per audit row, even for a record the scrub left unchanged. It is built only where a changed
+    ``detail`` needs it. Synthetic values."""
+    calls: list[str] = []
+    real = audit_tee._bounded_detail
+
+    def counted(kept: str, note: str, old: str) -> str:
+        calls.append(kept)
+        return real(kept, note, old)
+
+    monkeypatch.setattr(audit_tee, "_bounded_detail", counted)
+    cases: list[dict[str, str | None]] = [
+        {"detail": "plain detail, no control"},
+        {"detail": json.dumps({"error": "plain"})},
+        {"actor": "\x01DOE JANE", "detail": "plain detail, no control"},
+    ]
+    _raw_tee_lines(cases, monkeypatch, scrub=True)
+    assert calls == []
+
+
+def test_a_detail_the_line_check_hides_whole_keeps_its_json_and_note() -> None:
+    """Review of the PR 2864 repair: where the scrubbed line shows a word the old line hid,
+    ``_tee_line`` hid a changed ``detail`` as bare ``[redacted]``, which is not the JSON a
+    collector parsed before, and dropped any bound note. Synthetic values."""
+    before: dict[str, object] = {"actor": "a", "detail": '{"e": "ok"}'}
+    after: dict[str, object] = {"actor": "a", "detail": '{"e": "zebra"}'}
+    line = json.loads(audit_tee._tee_line(before, after, lambda: json.dumps("[redacted]")))
+    assert json.loads(line["detail"]) == "[redacted]"
+    note = " [redaction bound: dropped 9 more chars unscanned]"
+    whole = audit_tee._bounded_detail("[redacted]", note, "[redacted]")
+    assert whole == "[redacted]" + note
+
+
+def test_a_detail_hidden_whole_is_the_bounded_placeholder(monkeypatch) -> None:
+    """Review of the PR 2864 repair: the whole-field candidate for a changed ``detail`` is
+    ``_bounded_detail(_FIELD_REDACTED, note, old_detail)``, so it keeps the JSON a collector
+    parsed before and the bound note. A bare ``[redacted]`` there fails this. Synthetic values."""
+    from messagefoundry.redaction import safe_text, safe_text_bound
+
+    seen: list[tuple[str, str]] = []
+    real = audit_tee._tee_line
+
+    def spy(before: dict[str, object], after: dict[str, object], whole_detail) -> str:
+        seen.append((str(before["detail"]), whole_detail()))
+        return real(before, after, whole_detail)
+
+    monkeypatch.setattr(audit_tee, "_tee_line", spy)
+    details = [
+        json.dumps({"e": f"{chr(0x01)}DOE JANE"}),
+        f"{chr(0x01)}DOE JANE " + "word " * 14000,
+    ]
+    _raw_tee_lines([{"detail": d} for d in details], monkeypatch, scrub=True)
+    assert len(seen) == len(details)
+    for value, (old_detail, whole) in zip(details, seen, strict=True):
+        _head, note = safe_text_bound(value)
+        assert old_detail == safe_text(value)
+        assert whole == audit_tee._bounded_detail("[redacted]", note, old_detail)
+    # The JSON detail keeps its JSON-ness, and the long one its bound note.
+    assert seen[0][1] == json.dumps("[redacted]")
+    assert seen[1][1] != "[redacted]" and seen[1][1].startswith("[redacted]")
+
+
+#: Review of the PR 2864 repair: an ``actor`` the scrub hides whole, the only field it changes,
+#: beside a ``channel_id`` carrying ``Bearer %7C``, which it leaves alone. With the actor hidden,
+#: the line shows no word main's line hid on any sink, and parses on none where main's parsed. So
+#: the old line ships for the parse floor, not for a word.
+_PARSE_FLOOR_FALLBACK: dict[str, str | None] = {
+    "actor": "token=hunter2\t\\u1234secret",
+    "channel_id": "&%7CBearer %7C",
+}
+
+
+def test_the_old_line_names_the_parse_floor_when_that_is_what_fired(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: the warning said the old line shipped because hiding the
+    changed fields would still show a word, which is false where only the parse floor fired. It
+    names the reason that fired, and no field value. Synthetic values."""
+    from messagefoundry.logging_setup import sink_readings
+
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    # The control on the fixture: the scrub changes the actor alone.
+    assert audit_tee._scrub_field(_PARSE_FLOOR_FALLBACK["actor"]) == "[redacted]"
+    assert audit_tee._scrub_field(_PARSE_FLOOR_FALLBACK["channel_id"]) == "&%7CBearer %7C"
+    with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
+        (after,) = _raw_tee_lines([_PARSE_FLOOR_FALLBACK], monkeypatch, scrub=True)
+    (before,) = _raw_tee_lines([_PARSE_FLOOR_FALLBACK], monkeypatch, scrub=False)
+    assert after == before  # the old line shipped
+    # The control on the example: main's line parses on every sink.
+    assert all(audit_tee._parses(r) for r in sink_readings(before))
+    (warning,) = [r.getMessage() for r in caplog.records if "without the C0" in r.getMessage()]
+    assert "unparseable" in warning and "show a word" not in warning
+    assert "hunter2" not in warning and "Bearer" not in warning and "%7C" not in warning
+
+
+_SHOWS = "show a word the line before it hid"
+_UNPARSED = "leave a sink's reading unparseable where the line before it parsed"
+#: The old line hid every key after ``ABC|``; hiding the actor shows them. Main's line parses on
+#: no sink, so the parse floor cannot fire.
+_WORD_BEFORE: dict[str, object] = {"actor": "\x01DOE JANE ABC|x", "seq": 1}
+_WORD_AFTER: dict[str, object] = {"actor": "\x01[redacted] ABC|[redacted]", "seq": 1}
+#: :data:`_PARSE_FLOOR_FALLBACK` as a record, with a ``detail`` the scrub leaves alone, which a
+#: test can change in its ``after``.
+_FLOOR_BEFORE: dict[str, object] = {**_PARSE_FLOOR_FALLBACK, "detail": "ok", "seq": 1}
+
+
+def _old_line_warnings(caplog, before, after, whole_detail=lambda: "[redacted]") -> list[str]:
+    """The warnings ``_tee_line`` logs for one record, which must ship as the old line."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
+        assert audit_tee._tee_line(before, after, whole_detail) == json.dumps(
+            before, ensure_ascii=False
+        )
+    return [r.getMessage() for r in caplog.records if "without the C0" in r.getMessage()]
+
+
+def _worded(*reasons: str) -> str:
+    return (
+        "an off-box audit record shipped without the C0 field scrub, because hiding its changed "
+        f"fields whole would still {' and '.join(reasons)}; later cases are logged only where they "
+        "name a reason not yet logged in this process"
+    )
+
+
+def test_the_old_line_names_a_shown_word_alone(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: where only a shown word fired, the warning names that reason
+    alone. Synthetic values."""
+    from messagefoundry.logging_setup import sink_readings
+
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    old_line = json.dumps(_WORD_BEFORE, ensure_ascii=False)
+    assert not any(audit_tee._parses(r) for r in sink_readings(old_line))
+    assert _old_line_warnings(caplog, _WORD_BEFORE, _WORD_AFTER) == [_worded(_SHOWS)]
+
+
+def test_the_old_line_names_both_reasons_joined(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: where the hidden-whole candidate both shows a word, here the
+    ``detail`` ``whole_detail`` gives, and fails the parse floor, the warning names both, joined.
+    Synthetic values."""
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    after = {**_FLOOR_BEFORE, "actor": "[redacted]", "detail": "ko"}
+    warnings = _old_line_warnings(caplog, _FLOOR_BEFORE, after, lambda: "zebra")
+    assert warnings == [_worded(_SHOWS, _UNPARSED)]
+
+
+def test_the_old_line_names_the_last_candidates_reasons(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: the scrubbed line shows a word, ``zebra``, and the line with
+    the changed fields hidden whole fails only the parse floor. The warning names the last
+    candidate's reason, not the first's. Synthetic values."""
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    after = {**_FLOOR_BEFORE, "actor": "zebra"}
+    assert _old_line_warnings(caplog, _FLOOR_BEFORE, after) == [_worded(_UNPARSED)]
+
+
+def test_a_second_old_line_reason_is_logged_after_the_first(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: one flag for both reasons meant a parse-floor fallback after
+    a shown-word one was never logged. Each reason is logged, and a warning naming only logged
+    reasons is not logged again. Synthetic values."""
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    floor_after = {**_FLOOR_BEFORE, "actor": "[redacted]"}
+    assert _old_line_warnings(caplog, _WORD_BEFORE, _WORD_AFTER) == [_worded(_SHOWS)]
+    assert _old_line_warnings(caplog, _WORD_BEFORE, _WORD_AFTER) == []
+    assert _old_line_warnings(caplog, _FLOOR_BEFORE, floor_after) == [_worded(_UNPARSED)]
+    assert _old_line_warnings(caplog, _FLOOR_BEFORE, floor_after) == []
+
+
+def test_a_logged_reason_is_named_again_beside_a_new_one(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: the warning is logged where it names a reason not yet logged,
+    and it names every reason that fired, so a logged one can appear again. Synthetic values."""
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
+    both_after = {**_FLOOR_BEFORE, "actor": "[redacted]", "detail": "ko"}
+    assert _old_line_warnings(caplog, _WORD_BEFORE, _WORD_AFTER) == [_worded(_SHOWS)]
+    warnings = _old_line_warnings(caplog, _FLOOR_BEFORE, both_after, lambda: "zebra")
+    assert warnings == [_worded(_SHOWS, _UNPARSED)]
+    assert _old_line_warnings(caplog, _FLOOR_BEFORE, both_after, lambda: "zebra") == []
+
+
+def test_an_earlier_candidate_that_shows_a_word_is_not_parsed(monkeypatch) -> None:
+    """Review of the PR 2864 repair: only the last candidate's reasons are reported, so the
+    scrubbed line, which shows ``zebra``, is rejected without parsing its readings. Synthetic."""
+    from messagefoundry.logging_setup import sink_readings
+
+    parsed: list[str] = []
+    real = audit_tee._parses
+
+    def counted(text: str) -> bool:
+        parsed.append(text)
+        return real(text)
+
+    monkeypatch.setattr(audit_tee, "_parses", counted)
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", {_SHOWS, _UNPARSED})
+    after = {**_FLOOR_BEFORE, "actor": "zebra"}
+    audit_tee._tee_line(_FLOOR_BEFORE, after)
+    first = set(sink_readings(json.dumps(after, ensure_ascii=False)))
+    assert parsed and not first & set(parsed)
+
+
+def test_a_fault_that_ships_the_old_line_says_so(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: a fault in the line check logged that the field ships
+    redacted, when the record ships as the line before #3045, and shared one flag with the field
+    fault, so whichever came second was never logged. Synthetic values."""
+
+    def boom(_text: str) -> list[str]:
+        raise RuntimeError("synthetic DOE JANE")
+
+    monkeypatch.setattr(audit_tee, "sink_readings", boom)
+    monkeypatch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", True)
+    monkeypatch.setattr(audit_tee, "_LINE_SCRUB_FAULT_LOGGED", False)
+    with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
+        audit_tee._tee_line(_WORD_BEFORE, _WORD_AFTER)
+        audit_tee._tee_line(_WORD_BEFORE, _WORD_AFTER)
+    (fault,) = [r.getMessage() for r in caplog.records if "scrub failed" in r.getMessage()]
+    assert fault == _LINE_FAULT
+
+
+_LINE_FAULT = (
+    "the audit tee's C0 scrub failed (RuntimeError); the record ships without it, as the line "
+    "before the scrub, and further such faults in this process are not logged"
+)
+
+
+def test_a_fault_while_bounding_the_detail_says_the_old_line_ships(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: the fault in ``emit_audit_tee`` around ``_bounded_detail``
+    ships the line before #3045, and logs that, not the field fault. Synthetic values."""
+
+    def boom(*_args: object) -> str:
+        raise RuntimeError("synthetic DOE JANE")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(audit_tee, "_bounded_detail", boom)
+        patch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", True)
+        patch.setattr(audit_tee, "_LINE_SCRUB_FAULT_LOGGED", False)
+        with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
+            _raw_tee_lines([{"detail": f"{chr(0x01)}DOE JANE"}], monkeypatch, scrub=True)
+    faults = [r.getMessage() for r in caplog.records if "scrub failed" in r.getMessage()]
+    assert faults == [_LINE_FAULT]
+
+
+def test_a_long_value_with_no_control_is_not_touched() -> None:
+    """The window's own cut ends its note with a newline of its own, which is not the value's
+    control (review round 1)."""
+    value = "word " * 20000
+    assert audit_tee._scrub_field(value) is value
+
+
+class _MixedReadingLeak(Exception):
+    """The one failure the xfail below expects."""
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=_MixedReadingLeak,
+    reason="KNOWN RESIDUAL of BACKLOG #3045: every control in a value is read the same way, so "
+    "text that needs one control as a space and another as nothing is missed by every reading. "
+    "See emit_audit_tee's docstring.",
+)
+def test_text_that_needs_two_controls_read_differently_is_redacted() -> None:
+    value = f"on{chr(0x01)}05/05/19{chr(0x02)}80"
+    if "80" in audit_tee._scrub_field(value):
+        raise _MixedReadingLeak(ascii(value))
+
+
+def test_a_long_backslash_run_is_scanned_in_linear_time() -> None:
+    """Review round 3: the line-escape pattern backtracked quadratically on a run of backslashes
+    at the end of its input, which ``json.dumps(...)[1:-1]`` always gives a field ending in one,
+    on the event loop. The control is the old pattern, slow on a run the new one walks at once."""
+    import time
+
+    old = re.compile(r"\\+(?:u[0-9a-fA-F]{4}|[^\\])")
+    run = "x " + "\\" * 3000
+
+    def took(fn) -> float:
+        """The fastest of five runs, so one scheduler stall cannot decide the comparison."""
+        best = float("inf")
+        for _ in range(5):
+            start = time.perf_counter()
+            fn()
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    old_t = took(lambda: old.sub(" ", run))
+    new_t = took(lambda: audit_tee._LINE_ESCAPE.sub(" ", run))
+    assert old_t > 20 * new_t, (old_t, new_t)
+    # The field scrub as a whole, on a field near the window that ends in a long run.
+    value = f"password=hunter2{chr(0x01)} " + "\\" * 60000
+    assert took(lambda: audit_tee._scrub_field(value)) < 1.0
+    assert "hunter2" not in audit_tee._scrub_field(value)
+
+
+def test_the_line_escape_pattern_still_reads_each_escape_as_a_break() -> None:
+    line = 'a\\nb \\\\u0001c \\"d e\\\\'
+    assert audit_tee._LINE_ESCAPE.sub(" ", line).split() == ["a", "b", "c", "d", "e"]
+
+
+def test_a_fault_on_a_json_detail_ships_a_json_string(monkeypatch) -> None:
+    """Review round 3: every other whole-field path for a JSON detail ships the JSON string."""
+
+    def boom(_text: str) -> str:
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(audit_tee, "scrub_log_text", boom)
+    monkeypatch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", False)
+    out = audit_tee._scrub_field(json.dumps({"error": "a\nb"}), detail=True)
+    assert json.loads(out) == "[redacted]"
+
+
+def test_a_control_with_nothing_to_redact_keeps_the_actor() -> None:
+    """Attribution survives: a typed name holding a control, with nothing a reading redacts, ships
+    as typed, and the handler chain escapes the control. Synthetic values."""
+    for value in (f"ali{chr(0x01)}ce", f"bob{chr(0x09)}", f"{chr(0x1B)}[31mcarol"):
+        assert audit_tee._scrub_field(value) == value
+
+
+def test_scrub_log_text_is_the_handler_chain_without_the_control_scrub() -> None:
+    """The field scrub stands for the filters, so it must be them: each value through
+    ``scrub_log_text`` reads as the three text filters leave a record's message. Synthetic."""
+    from messagefoundry.logging_setup import (
+        CredentialQueryScrubFilter,
+        CredentialScrubFilter,
+        RedactionFilter,
+        scrub_log_text,
+    )
+
+    filters = (RedactionFilter(), CredentialQueryScrubFilter(), CredentialScrubFilter())
+    values = ["DOE JANE", "password=hunter2", "GET /cb?code=abc&state=x", "PID|1||123^^^H", "ok"]
+    values += [f"{chr(0x01)}DOE JANE", "MRN 12345678 Bearer abcdefgh"]
+    for value in values:
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, value, None, None)
+        for f in filters:
+            f.filter(record)
+        assert scrub_log_text(value) == record.getMessage(), value
+        assert scrub_log_text(value) != value or value == "ok"
+
+
+def test_a_field_scrub_fault_returns_the_field_redacted(monkeypatch, caplog) -> None:
+    """Fail closed: a fault in the passes makes ``_scrub_field`` return the field as the
+    placeholder, logged once, by type and never with the value. What ships is still
+    ``_tee_line``'s choice, which can be the line before #3045, with the field unscrubbed."""
+
+    def boom(_text: str) -> str:
+        raise RuntimeError("synthetic DOE JANE")
+
+    monkeypatch.setattr(audit_tee, "scrub_log_text", boom)
+    monkeypatch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", False)
+    with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
+        assert audit_tee._scrub_field(f"{chr(0x01)}DOE JANE") == "[redacted]"
+        assert audit_tee._scrub_field(f"{chr(0x01)}x") == "[redacted]"
+    faults = [r for r in caplog.records if "field scrub failed" in r.getMessage()]
+    assert len(faults) == 1
+    assert "DOE" not in faults[0].getMessage() and "RuntimeError" in faults[0].getMessage()
 
 
 def _tee_line(text: str) -> str:

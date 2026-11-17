@@ -2,9 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ``[alerts]`` send timeouts, cooldowns and SMTP port load only in range (BACKLOG #5770).
 
-An infinite or huge timeout would hold the one-event-at-a-time alert worker, an infinite cooldown
-would make the first page the last, NaN compares False with everything, and a port outside 1-65535
-would fail every send. Each is refused at load, and the defaults and the caps themselves still load.
+A huge timeout would let each wait on a peer hold the one-event-at-a-time alert worker, a
+non-finite one fails every send, an infinite cooldown would make the first page the last, a port
+outside 0-65535 would fail every send. Each is refused at load, and the defaults and the caps
+themselves still load. A boolean on any of these numbers is refused by the shared settings check
+(BACKLOG #5509).
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ def test_a_realert_window_out_of_range_is_refused(value: float) -> None:
         AlertsSettings(realert_seconds=value)
 
 
-@pytest.mark.parametrize("value", [0, -1, 65536])
+@pytest.mark.parametrize("value", [-1, 65536])
 def test_an_smtp_port_out_of_range_is_refused(value: int) -> None:
     with pytest.raises(ValidationError, match="email_smtp_port"):
         AlertsSettings(email_smtp_port=value)
@@ -52,7 +54,7 @@ def test_an_smtp_port_out_of_range_is_refused(value: int) -> None:
         {"email_timeout": _ALERT_SEND_TIMEOUT_MAX_SECONDS},
         {"realert_seconds": 0.0},  # no throttle
         {"realert_seconds": _ALERT_COOLDOWN_MAX_SECONDS},
-        {"email_smtp_port": 1},
+        {"email_smtp_port": 0},  # smtplib's default, port 25
         {"email_smtp_port": 65535},
     ],
 )
@@ -75,3 +77,13 @@ def test_a_rule_oldest_age_out_of_range_is_refused(value: float) -> None:
 def test_in_range_rule_values_load() -> None:
     AlertRule(cooldown_seconds=_ALERT_COOLDOWN_MAX_SECONDS)
     AlertRule(event_type="queue_buildup", min_oldest_seconds=0.0)
+
+
+@pytest.mark.parametrize(
+    "field", ["webhook_timeout", "email_timeout", "realert_seconds", "email_smtp_port"]
+)
+def test_a_boolean_is_refused_for_a_numeric_alert_setting(field: str) -> None:
+    # The shared settings refusal (BACKLOG #5509) decides; the nested rule fields are pinned in
+    # tests/test_settings_numeric_refuses_bool.py.
+    with pytest.raises(ValidationError, match=f"{field} expects a number, not a boolean"):
+        AlertsSettings.model_validate({field: True})
