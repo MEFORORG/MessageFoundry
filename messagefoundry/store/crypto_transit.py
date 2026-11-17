@@ -136,10 +136,11 @@ _VERSION_REFUSAL_TEXTS = (
     "version is too new",
 )
 #: The longest reply body, in characters, that :func:`_reply_errors` parses when hvac parsed none
-#: (BACKLOG #6707). Vault's own refusal is far shorter, so the bound keeps an attacker-sized body
-#: from being parsed and copied only to choose an error's label. It bounds both readers of a 400:
+#: (BACKLOG #6707). Vault's own refusal is far shorter, so the bound keeps a body of any size from
+#: being parsed. It bounds both readers of a 400, and a change here changes both:
 #: the audit walk's version check, which reads nothing from a longer body, not even a list hvac
-#: parsed, and the data-key decrypt's AEAD check (BACKLOG #5650), which does not re-parse one.
+#: parsed, and the data-key decrypt's AEAD check (BACKLOG #5650), which does not re-parse one, so
+#: such a body is not read as a tag refusal.
 _REPARSED_BODY_MAX_CHARS = 64 * 1024
 #: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
 #: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
@@ -305,9 +306,10 @@ def _names_aead_failure(exc: Exception) -> bool:
     return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
 
 
-#: How long each warning about how a 400 was read is logged once per process (BACKLOG #5650,
-#: #6707). A proxy can cause one on every read or every row; once is the signal.
-_UNREAD_BODY_LOG_INTERVAL_S = 3600.0
+#: The seconds within which each warning about how a 400 was read is logged at most once per
+#: process (BACKLOG #5650, #6707). A proxy can cause one on every read or every row; once is the
+#: signal.
+_WARNING_LOG_INTERVAL_S = 3600.0
 #: When each such warning, by kind, was last logged.
 _logged_at: dict[str, float] = {}
 _logged_at_lock = threading.Lock()
@@ -315,11 +317,11 @@ _logged_at_lock = threading.Lock()
 
 def _log_due(kind: str) -> bool:
     """Whether the warning ``kind`` is due: not logged in the last
-    :data:`_UNREAD_BODY_LOG_INTERVAL_S`. A True answer records it as logged now."""
+    :data:`_WARNING_LOG_INTERVAL_S`. A True answer records it as logged now."""
     now = time.monotonic()
     with _logged_at_lock:
         last = _logged_at.get(kind)
-        if last is not None and now - last < _UNREAD_BODY_LOG_INTERVAL_S:
+        if last is not None and now - last < _WARNING_LOG_INTERVAL_S:
             return False
         _logged_at[kind] = now
     return True
@@ -808,15 +810,20 @@ class TransitCipher(_UnmarkedPolicy):
                 reason = f"reading it raised {type(read_exc).__name__}"
             if reason is None:
                 return AuditKeyVersionRefusedError(version)
-            if _log_due(f"unconfirmed: {reason}"):
-                log.warning(
-                    "an audit MAC verify at key version %d got a 400 labelled unconfirmed, "
-                    "because %s (key=%r); logged once an hour for this reason",
-                    version,
-                    reason,
-                    self._audit_key,
-                )
-            return AuditKeyVersionUnverifiedError(version)
+            unverified = AuditKeyVersionUnverifiedError(version)
+            # The log is the one step left that allocates; out of memory, the label still stands.
+            with contextlib.suppress(MemoryError):
+                if _log_due(f"unconfirmed {self._audit_key!r}: {reason}"):
+                    log.warning(
+                        "an audit MAC verify at key version %d got a 400 labelled unconfirmed, "
+                        "because %s (key=%r); this reason for this key is logged at most once "
+                        "in %d seconds",
+                        version,
+                        reason,
+                        self._audit_key,
+                        _WARNING_LOG_INTERVAL_S,
+                    )
+            return unverified
         if self._is_outage(exc):
             return self._verify_failed(exc)
         return None

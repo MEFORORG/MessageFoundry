@@ -41,11 +41,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.base import open_store
-from messagefoundry.store.crypto import (
-    AuditKeyVersionRefusedError,
-    AuditKeyVersionUnverifiedError,
-    CipherError,
-)
+from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.row_seal import transit_mac_version
 from messagefoundry.store.store import MessageStore
 from messagefoundry.store.transit_attestation import (
@@ -594,6 +590,14 @@ _UNHELD_VERSION = 9999999
 _PLANTED = f"vault:v{_UNHELD_VERSION}:" + base64.b64encode(bytes(32)).decode("ascii")
 
 
+@pytest.fixture(autouse=True)
+def _fresh_warning_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test starts with no 400 warning logged, so none depends on test order (BACKLOG #6707)."""
+    from messagefoundry.store import crypto_transit
+
+    monkeypatch.setattr(crypto_transit, "_logged_at", {})
+
+
 def _needs_hvac() -> None:
     """Skip without the [vault] extra: the cipher tells a refused version by hvac's own class."""
     pytest.importorskip("hvac.exceptions")
@@ -698,6 +702,8 @@ async def test_a_planted_unheld_key_version_is_a_chain_break_on_the_startup_walk
     """A DML writer names a Transit key version Transit does not hold. Transit refuses to verify
     at it, and that is the row's own evidence: the startup walk must raise the tamper alert at
     that row, never stop with "could not run" and no alert (the sixth defect on PR 2167)."""
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
     _use_fake(monkeypatch, _RotatingTransit())
     db = tmp_path / "planted.db"
     seq = await _chain_with_a_planted_version(db)
@@ -1529,6 +1535,9 @@ def test_a_verify_400_read_as_a_version_refusal_keeps_the_refused_label(
         pytest.param(None, '{"message": "bad request"}', id="json-without-errors"),
         pytest.param(["missing input for HMAC"], None, id="known-non-version-text"),
         pytest.param(["  Encryption key not found "], None, id="known-non-version-any-case"),
+        pytest.param(
+            ["missing input for HMAC: and more"], None, id="non-version-only-as-substring"
+        ),
         pytest.param(["key version 3 is not held by this key"], None, id="unknown-wording"),
         pytest.param([], None, id="empty-vault-list"),
         pytest.param(None, '{"errors": ["reworded refusal"]}', id="unknown-wording-in-text-only"),
@@ -1574,14 +1583,13 @@ def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: An
 
 
 def test_an_unconfirmed_label_logs_its_reason_once_per_interval(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """BACKLOG #6707: why a 400 was labelled unconfirmed is logged, by a fixed reason that carries
     none of the reply's text, and once an interval per reason, since a proxy can cause it on every
     row."""
     from messagefoundry.store import crypto_transit
 
-    monkeypatch.setattr(crypto_transit, "_logged_at", {})
     caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
     for _ in range(3):
         _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
@@ -1594,7 +1602,7 @@ def test_an_unconfirmed_label_logs_its_reason_once_per_interval(
     assert not any("400 Bad Request" in line or "reworded" in line for line in logged), logged
 
 
-def test_a_body_hvac_parsed_past_the_bound_is_not_read(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_body_hvac_parsed_past_the_bound_is_not_read() -> None:
     """BACKLOG #6707: the bound covers a list hvac already parsed too, so an oversized body gets
     the same label whatever its Content-Type; its refusal text is not read."""
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
@@ -1649,11 +1657,26 @@ class _ProxiedRotatingTransit(_RotatingTransit):
             raise InvalidRequest(self.page, errors=self.errors, text=self.page) from None
 
 
+class _HvacFailingProxiedTransit(_RotatingTransit):
+    """``_RotatingTransit`` behind a proxy whose JSON 400 body makes hvac raise ``AttributeError``
+    in place of ``InvalidRequest`` (``test_hvac_raises_no_invalid_request_for_these_json_400_bodies``)."""
+
+    def verify_signed_data(self, **kw: Any) -> dict[str, Any]:
+        from hvac.exceptions import InvalidRequest
+
+        try:
+            return super().verify_signed_data(**kw)
+        except InvalidRequest:
+            raise AttributeError("'list' object has no attribute 'get'") from None
+
+
 async def test_a_planted_version_behind_a_proxy_is_a_chain_break_on_the_startup_walk(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #6707: a proxy's page in place of Transit's refusal changes the label only. The walk
     still reports the planted row as a break, raises the tamper alert and keeps going."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
     _needs_hvac()
     _use_fake(monkeypatch, _ProxiedRotatingTransit())
     db = tmp_path / "proxied-planted.db"
@@ -1670,10 +1693,34 @@ async def test_a_planted_version_behind_a_proxy_is_a_chain_break_on_the_startup_
     assert not any("could not run" in line for line in lines), lines
 
 
+async def test_a_planted_version_behind_a_proxy_hvac_cannot_parse_is_a_chain_break(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707: a planted version whose 400 hvac fails to build into ``InvalidRequest`` is
+    no refused version, but the row alone fails while the fixed input verifies, so the walk still
+    reports a break at that row with the tamper alert, never "could not run"."""
+    _needs_hvac()
+    _use_fake(monkeypatch, _HvacFailingProxiedTransit())
+    db = tmp_path / "hvac-failing-planted.db"
+    seq = await _chain_with_a_planted_version(db)
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+    assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
+    assert f"seq={seq}," in sink.events[0][1], sink.events
+    assert not any("could not run" in line for line in lines), lines
+
+
 async def test_a_planted_genesis_version_behind_a_proxy_opens_and_reads_as_a_break(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """BACKLOG #6707: the genesis row behaves as on main behind a proxy too; the open goes on."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
     _needs_hvac()
     _use_fake(monkeypatch, _ProxiedRotatingTransit())
     db = tmp_path / "proxied-genesis.db"
@@ -1754,8 +1801,8 @@ class _PaddedProxiedRotatingTransit(_ProxiedRotatingTransit):
 
 
 class _ExplodingText(str):
-    """An ``errors`` entry whose ``lower``, the cipher's one copy of an entry, fails as copying a
-    huge entry would: with MemoryError."""
+    """An ``errors`` entry whose ``lower``, the cipher's one copy of an entry, fails with
+    MemoryError, as a process short of memory would."""
 
     __slots__ = ()
 
@@ -1763,18 +1810,19 @@ class _ExplodingText(str):
         raise MemoryError
 
 
-class _HugeErrorsRotatingTransit(_ProxiedRotatingTransit):
-    """A 400 carrying a huge Vault ``errors`` list, as hvac fills it, and no body to re-parse."""
+class _UnreadableErrorsRotatingTransit(_ProxiedRotatingTransit):
+    """A 400 whose body, within the bound, hvac parsed into an ``errors`` list whose entry cannot
+    be read."""
 
-    page = None
-    errors = [_ExplodingText("no such key version")] * 20_000
+    page = '{"errors": ["no such key version"]}'
+    errors = [_ExplodingText("no such key version")]
 
 
 @pytest.mark.parametrize(
     "transit_class",
     [
         pytest.param(_PaddedProxiedRotatingTransit, id="oversized-body"),
-        pytest.param(_HugeErrorsRotatingTransit, id="oversized-errors-list"),
+        pytest.param(_UnreadableErrorsRotatingTransit, id="unreadable-errors-entry"),
     ],
 )
 async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_walk(
@@ -1786,9 +1834,9 @@ async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_w
     """BACKLOG #6707 item 48: a MemoryError while reading the 400 must not escape as a non-cipher
     error, or the walk logs "could not run" and drops the row's break and its alert. The parser
     raises MemoryError if it is reached at all, and it must not be reached for a body past the
-    bound; a huge ``errors`` list, which hvac parsed, fails in the lower-cased copy of an entry
-    instead."""
+    bound; an ``errors`` list hvac parsed fails in the lower-cased copy of an entry instead."""
     from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     parsed: list[int] = []
 
