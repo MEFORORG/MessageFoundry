@@ -267,11 +267,15 @@ def _http_literal_static(
     every spelling ``http_auth.is_authorization_header_name`` matches, and the other connectors set
     the plain name, which replaces only a spelling urllib folds into it (any letter case, nothing
     added). So a REST or FHIR ``"Authorization "``, with a trailing space, still counts: it goes
-    on the wire beside the connector's own. DICOMweb refuses to build with any spelling of it beside
-    its own credential (vault BACKLOG #5359), and sets no ``Authorization`` of its own without
-    one. A query parameter counts when ``secretscrub.credential_query_params`` names it, the reader
-    ``query_credential_hops`` uses, except on a type in
-    ``transports.egress.URL_QUERY_REFUSED_DESTINATIONS``, whose build refuses any query.
+    on the wire beside the connector's own. A query parameter counts when
+    ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses.
+
+    Which refused builds this census leaves out is uneven for DICOMweb. It leaves out a url query
+    credential on a type in ``transports.egress.URL_QUERY_REFUSED_DESTINATIONS``, whose build
+    refuses any query (vault BACKLOG #5358). It does not model DICOMweb's credential refusals
+    (vault BACKLOG #5359), so it still lists an ``Authorization`` header beside a DICOMweb
+    credential (this function, under the REST rule above) and a bearer beside a Basic pair
+    (``_static_authorization``), though DICOMweb refuses to build with either.
 
     A table counts only as a ``dict``, the one type every connector's header builder sends.
 

@@ -540,9 +540,8 @@ class DicomWebDestination(DestinationConnector):
                 _reject_url_control_chars(str(k), "header name")
                 _reject_url_control_chars(str(v), f"header {str(k)!r} value")
             headers.update({str(k): str(v) for k, v in extra.items()})
-        # _refuse_ambiguous_credentials screens these at the top of __init__. The Basic guard still
-        # asks for both halves, so a caller that reaches this without that screen sends nothing for
-        # a lone half rather than a wrong credential.
+        # _refuse_ambiguous_credentials screens these at the top of __init__. The Basic branch below
+        # also asks for both halves.
         token = s.get("bearer_token")
         user, password = s.get("basic_user"), s.get("basic_password")
         if token:

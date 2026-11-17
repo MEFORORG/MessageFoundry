@@ -96,7 +96,9 @@ _HTTP_CONNECTOR_TYPES = (ConnectorType.REST, ConnectorType.SOAP, ConnectorType.F
 def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
     """Whether a settings mapping has OAuth2 client-credentials auth turned ON.
 
-    ON means ``oauth2_token_url`` is present and ``oauth2_enabled`` is not switched off. The SINGLE
+    ON means ``oauth2_token_url`` holds a non-blank value and ``oauth2_enabled`` is absent, a real
+    ``True``, or an unresolved ``env()`` reference; every other reading is OFF (the strict read
+    below). The SINGLE
     definition, shared by at least :func:`oauth2_cc_provider_from_settings` (which builds the provider),
     the mutual-exclusion screen in :func:`bearer_provider_from_settings`, the static-credential hop
     reader (BACKLOG #1182) and :func:`~messagefoundry.config.wiring.oauth_request_advisories`.
@@ -342,8 +344,11 @@ def oauth2_cc_provider_from_settings(
     trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> OAuth2ClientCredentialsProvider | None:
     """The :class:`OAuth2ClientCredentialsProvider` for an ``env()``-resolved settings mapping, or ``None``
-    when symmetric OAuth2-CC auth is off (``oauth2_token_url`` absent, or ``oauth2_enabled`` is False) — so
-    any connection that didn't configure it is byte-identical. ``proxy`` (ADR 0126) routes the
+    when :func:`oauth2_auth_configured` reads symmetric OAuth2-CC auth as off — so any connection that
+    didn't configure it is byte-identical. That includes the settings :func:`refuse_oauth2_settings`
+    refuses (a non-bool ``oauth2_enabled``, a blank or unset token URL beside the flag): this function
+    does not call it and returns ``None`` for them; :func:`bearer_provider_from_settings` refuses
+    them before it gets here. ``proxy`` (ADR 0126) routes the
     token-endpoint POST through the connection's forward proxy; ``ech_sidecar`` (#1176, ADR 0139)
     re-addresses it to the connection's loopback ECH sidecar instead. The two are mutually exclusive by
     construction.
@@ -647,8 +652,9 @@ def with_oauth2_client_credentials(
     is not applied. The two forms are the same for an id and secret with no reserved character."""
     _require_http_spec(spec, "OAuth2 client-credentials")
     if enabled is True and isinstance(token_url, str) and not token_url.strip():
-        # A literal blank is refused here, where `messagefoundry check` sees it without building the
-        # connector; an env() that resolves blank is refused at the build (vault BACKLOG #5362).
+        # A literal blank or whitespace-only string is refused here, where `messagefoundry check`
+        # sees it without building the connector. A literal None, and an env() that resolves blank
+        # or None, are refused only at the build (vault BACKLOG #5362).
         raise HttpAuthError(
             "OAuth2 client-credentials token_url is blank; set the token endpoint URL"
         )
