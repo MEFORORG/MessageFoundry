@@ -754,6 +754,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `messagefoundry_toolkit/corepoint_import.py` |
 | A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
 | A config digest in the shared cluster store | Unsigned JSON in `cluster_config.config_digest`, which a node writes when it bumps the shared config version. A convergence reload reads it back through `shared_digest_of`, which caps its length before parsing and checks its keys and the types of its values. Nothing authenticates it. | `config/fingerprint.py` |
+| The off-box audit tee line | An audit record's fields, which carry outside text such as a typed sign-in name, and its `detail`, which can carry an exception's text. For the C0 field scrub (vault BACKLOG #3045), the tee parses the `detail` and modelled sink readings of the tee line as JSON in some cases. The `emit_audit_tee` and `_tee_line` docstrings state the rules. | `store/audit_tee.py` |
 
 **Parse sites left out, and why.**
 
