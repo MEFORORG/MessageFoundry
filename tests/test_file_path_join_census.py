@@ -689,7 +689,13 @@ SITES: dict[str, Site] = {
     "messagefoundry/integrity.py::_attested_asset_files": Site(
         1, INTERNAL, "Fixed asset paths under the installed package."
     ),
+    "messagefoundry/integrity.py::_attest_distribution": Site(
+        1, INTERNAL, "A loaded package directory's own name under its resolved parent."
+    ),
     "messagefoundry/integrity.py::_console_loaded_files": Site(3, INTERNAL, _PKG_WALK),
+    "messagefoundry/integrity.py::_console_loaded_files.unlistable": Site(
+        1, INTERNAL, "A directory the package walk could not list, under its resolved parent."
+    ),
     "messagefoundry/integrity.py::_import_capable_files": Site(1, INTERNAL, _PKG_WALK),
     "messagefoundry/log_spool.py::LogSpool._path": Site(
         1, INTERNAL, "A fixed prefix and an integer sequence in the spool directory."

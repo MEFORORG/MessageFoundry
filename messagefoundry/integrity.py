@@ -385,6 +385,13 @@ def _record_has_package_rows(record: dict[str, bytes], package: str) -> bool:
     return any(rel.startswith(f"{package}/") and rel.endswith(_ATTESTED_SUFFIX) for rel in record)
 
 
+def _loaded_package_roots() -> list[str]:
+    """The directories of the loaded first-party ``messagefoundry`` package (BACKLOG #5376)."""
+    import messagefoundry
+
+    return list(messagefoundry.__path__)
+
+
 def _loaded_module_files() -> list[Path]:
     """The on-disk files of the loaded first-party ``messagefoundry`` package that the import system
     can load a module from, sorted. :func:`_import_capable_files` says which files those are.
@@ -680,10 +687,8 @@ def attest_engine() -> AttestationResult:
         _DIST_NAME,
         _DIST_NAME,
         lambda: [*_loaded_module_files(), *_attested_asset_files()],
-        # No `package_roots`: the declared asset paths are listed whether or not they exist, so an
-        # attested file sits in the loaded package whenever that is the directory `RECORD` describes,
-        # every module gone or not.
         unmatched_rows=_is_module_row,
+        package_roots=_loaded_package_roots(),
     )
 
 
@@ -734,10 +739,9 @@ def _attest_distribution(
     ``attested_files`` is called only once a usable baseline is known to exist. ``unmatched_rows``
     additionally reports each hashed ``RECORD`` row under ``package/`` (bytecode caches aside) that no
     attested file matched, and that the predicate accepts, as ``missing`` drift -- a deleted file. It
-    applies only when the loaded package is ``<install root>/<package>``: an attested file sits in it,
-    or one of ``package_roots`` (the loaded package's directories) is it. So a package loaded from
-    elsewhere is not reported as every file it did not load, while one whose every file is gone still
-    is (BACKLOG #5376).
+    applies only when one of ``package_roots`` (the loaded package's directories) is
+    ``<install root>/<package>``. So a package loaded from elsewhere is not reported as every file it
+    did not load, while one whose every file is gone still is (BACKLOG #5376).
 
     ``checked`` counts a file only once its bytes were read.
     """
@@ -806,9 +810,9 @@ def _attest_distribution(
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
     prefix = f"{package}/"
-    # Like the walks, resolve the directory's parent and not the directory itself, so a package
-    # directory swapped for a link still names the place `RECORD` describes.
-    in_package = any(rel.startswith(prefix) for rel in seen) or any(
+    # The parent is resolved and the directory itself is not, so a package directory swapped for a
+    # link still names the place `RECORD` describes.
+    in_package = any(
         _record_relpath(Path(root).parent.resolve() / Path(root).name, install_root) == package
         for root in package_roots
     )

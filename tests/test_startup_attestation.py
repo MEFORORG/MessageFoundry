@@ -130,6 +130,10 @@ def _patch(
     monkeypatch.setattr(integ.metadata, "distribution", _fake_distribution)
     monkeypatch.setattr(integ, "_loaded_module_files", lambda: sorted(loaded))
     monkeypatch.setattr(integ, "_attested_asset_files", lambda: list(assets))
+    # The loaded package's directory: the outermost `pkg` directory above the loaded files, so a
+    # shadowed tree names its own directory and not the installed one.
+    roots = sorted({str(p) for f in loaded for p in f.parents if p.name == pkg}, key=len)[:1]
+    monkeypatch.setattr(integ, "_loaded_package_roots", lambda: roots)
     # The web console arm (BACKLOG #1802) reads `sys.modules`, and whether the real console is imported
     # depends on which tests ran first in this process. Every engine-arm test says "not loaded", so it
     # attests exactly the fabricated engine and nothing else. The console block below opts back in.
@@ -948,6 +952,7 @@ def _install_and_walk_engine(
     monkeypatch.setattr(
         integ, "_loaded_module_files", lambda: integ._import_capable_files([str(package_dir)])
     )
+    monkeypatch.setattr(integ, "_loaded_package_roots", lambda: [str(package_dir)])
     return package_dir
 
 
@@ -1904,6 +1909,43 @@ def test_a_console_package_directory_swapped_for_a_link_is_missing_drift(
     assert console is not None
     assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
     assert console.unattested_reason == _NOTHING_READ
+
+
+def test_a_console_loaded_from_a_directory_nested_in_the_package_blames_no_intact_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A package loaded from ``<pkg>/x/<pkg>/`` sits inside the ``RECORD`` directory but is not it,
+    so only its own planted file is drift."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    nested = console_root / _CONSOLE_PKG / "x" / _CONSOLE_PKG
+    nested.mkdir(parents=True)
+    (nested / "__init__.py").write_bytes(b"")
+    _load_fake_console(monkeypatch, nested)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(f"{_CONSOLE_PKG}/x/{_CONSOLE_PKG}/__init__.py", "missing")]
+    assert console.unattested_reason == _NOTHING_UNDER_ROOT
+
+
+def test_an_engine_package_directory_swapped_for_a_link_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine arm uses the same package-root test as the console: its package directory replaced
+    by a link to a tampered copy outside the root reads every module row as ``missing``."""
+    import shutil
+
+    package_dir = _install_and_walk_engine(tmp_path / "site", monkeypatch)
+    outside = tmp_path / "outside" / _ENGINE_PKG
+    shutil.copytree(package_dir, outside)
+    (outside / "redaction.py").write_bytes(b"def redact(value):\n    return value\n")
+    shutil.rmtree(package_dir)
+    _symlink(package_dir, outside, directory=True)
+
+    result = attest_engine()
+    assert _drift(result) == [(rel, "missing") for rel in sorted(_ENGINE_FILES)]
+    assert result.checked == 0
+    assert result.unattested_reason == _NOTHING_READ
 
 
 def test_an_unlistable_console_directory_is_named_as_drift(
