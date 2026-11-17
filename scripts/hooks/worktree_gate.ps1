@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.14.1"
+$GateVersion = "2026.11.17.1"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -823,7 +823,9 @@ function Get-ScanRawIndexMap($Seg) {
 # WHAT IT DOES NOT READ, AT LEAST: a quoted path with whitespace in it (blanked by the scan, so the
 # window answers nothing and the old reading decides); a `-C` value the shell would still expand
 # (Test-ShellLiteralPath); a chdir the resolver cannot follow (popd, a subshell, two chdirs, a
-# relative chdir after an earlier line's); git options after the verb; and a line whose ONLY git word
+# relative chdir after an earlier line's) where the invocation's `-C` does not make that directory
+# irrelevant -- an absolute `-C` is read past such a chdir, under the conditions in
+# Get-InvocationReading and the resolver's -OwnWindow branch; git options after the verb; and a line whose ONLY git word
 # is a spelling the token pattern misses (`git.EXE reset --hard`, or `GIT` on Windows), which rule 3's
 # first reading exits on before these readings run. That last one is origin/main's too. Also, at
 # least: any line after an earlier line whose chdir sits in a subshell (`(cd x && ls)`), which makes
@@ -857,7 +859,9 @@ function Get-ScanRawIndexMap($Seg) {
 # off for an unrelated `echo $(date)`. Only the LAST earlier line with a chdir at command position is
 # used: an absolute target stands alone, and a relative one only where no earlier line moved the shell
 # before it. A chdir on this line's own prefix wins where it is absolute; a relative one after an
-# earlier line's chdir is unknown, so no reading is returned.
+# earlier line's chdir is unknown, so no prefixed reading is returned. Where the directory is unknown
+# in any of these ways, the plain reading is still returned if the invocation's `-C` fold ends
+# absolute and its window names no work tree or git dir (the $absC test below).
 function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [string]$Prior = "") {
     if ($GitAt -ge 0) {
         $seps = [regex]::Matches($Scan.Substring(0, $GitAt), '[;&|(){}]')
@@ -4167,8 +4171,10 @@ What to do instead:
                 $lastCfg = $dis.Index + $cfgWords[$cfgWords.Count - 1].Index
                 if ($lastCfg -ne $dis.Index) { $anchors += $lastCfg }
             }
-            # The owning word is read only where no true separator and no unclosed opener lie between
-            # it and the disarm (review rounds 34781a2201, e9fa08d529): it skips a path-qualified git,
+            # The owning word is read only where no true separator lies between it and the disarm and
+            # the span between them holds no more openers than closers (review rounds 34781a2201,
+            # e9fa08d529). That compares COUNTS, not nesting, so a span such as `x) $(...` passes. It
+            # skips a path-qualified git,
             # so `git -C '<p>' log ; /usr/bin/git config <key>` and `git -C '<p>' log $(/usr/bin/git
             # config <key>)` read the outer command's `-C` without that floor.
             $readings = [System.Collections.Generic.List[object]]::new()
