@@ -781,18 +781,26 @@ def test_read_log_file_closes_the_descriptor_on_a_refusal(
     opened: list[int] = []
     real_open = os.open
 
+    real_close = os.close
+    closed: list[int] = []
+
     def recording_open(*args: Any, **kwargs: Any) -> int:
         fd = real_open(*args, **kwargs)
         opened.append(fd)
         return fd
 
+    def recording_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
     monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "close", recording_close)
     with pytest.raises(bundle_mod._LogFileRefused):
         bundle_mod._read_log_file(log, listed)
-    monkeypatch.undo()
+    # The descriptor the read opened is the one it closed: compared by the values the two calls
+    # saw, never by asking the OS about a number another open may have reused since.
     assert len(opened) == 1
-    with pytest.raises(OSError):
-        os.fstat(opened[0])  # closed
+    assert closed == opened
 
 
 def test_read_log_file_refuses_a_directory_swapped_in(tmp_path: Path) -> None:

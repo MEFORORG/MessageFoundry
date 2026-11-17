@@ -262,8 +262,9 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
     On POSIX, ``O_NOFOLLOW`` makes the open fail with ``ELOOP`` when a symbolic link has been put
     at the name, so the open never reaches another file through one. ``O_NONBLOCK`` makes the open
     of a FIFO put at the name return at once instead of waiting for a writer; the descriptor is
-    made blocking again before the read. A directory put at the name is refused as
-    :class:`_LogFileRefused`.
+    made blocking again before the read. A directory put at the name opens there, and the check
+    after the open refuses it as :class:`_LogFileRefused`; on Windows its open fails with
+    :class:`PermissionError`.
 
     Windows has neither flag. There the open follows a symbolic link or junction put at the name
     after the listing, so the open itself reaches whatever the link names, and any effect of
@@ -274,10 +275,7 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     nonblocking = getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | nonblocking
-    try:
-        fd = os.open(path, flags)
-    except IsADirectoryError as exc:
-        raise _LogFileRefused("a directory is at the app-log file's name") from exc
+    fd = os.open(path, flags)
     try:
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
