@@ -183,6 +183,43 @@ def test_the_minted_bearer_purge_runs_before_the_construction_gates() -> None:
     assert _auth_keys(_build(spec.settings)) == []
 
 
+@pytest.mark.parametrize(
+    "cred",
+    [
+        {"basic_user": "svc", "basic_password": _PW},
+        {"bearer_token": "tok-synthetic"},
+        {"basic_user": "svc", "basic_password": "x" * 20_000},
+        {"bearer_token": "x" * 20_000},
+    ],
+    ids=["basic", "bearer", "basic-over-long", "bearer-over-long"],
+)
+def test_a_configured_credential_beside_oauth2_is_not_held_or_judged(
+    cred: dict[str, str],
+) -> None:
+    """A minted bearer is written in place of a configured bearer_token or Basic pair, so the
+    header table no longer holds that value, and the construction length gate no longer refuses
+    one that is never sent (review round-2ceecee32f, R3 and R6)."""
+    spec = with_oauth2_client_credentials(
+        Soap(url=URL, **cred),  # type: ignore[arg-type]
+        token_url="https://auth.example.com/token",
+        client_id="cid",
+        client_secret="cs-synthetic",  # noqa: S106 -- a synthetic test credential
+    )
+    d = _build(spec.settings)
+    assert d._token_provider is not None
+    assert _auth_keys(d) == []
+    assert all(v not in d._headers.values() for v in cred.values())
+    d._token_provider = _Provider()
+    opener = _RecordingOpener()
+    d._opener = opener  # type: ignore[assignment]
+    d._post("<soap:Envelope/>")
+    d._probe()
+    assert len(opener.requests) == 2
+    for req in opener.requests:
+        sent = [v for k, v in req.header_items() if is_authorization_header_name(k)]
+        assert sent == ["Bearer AT-synthetic"]
+
+
 def test_control_a_static_authorization_header_alone_is_kept() -> None:
     d = _dest(headers={"authorization": "Basic STATIC"})
     assert _auth_keys(d) == ["authorization"]
@@ -223,9 +260,9 @@ class _RecordingOpener:
 
 
 def test_the_probe_mints_the_bearer_a_send_presents() -> None:
-    """The minted-bearer purge above removes a static Authorization header once a provider exists.
-    A probe that sent ``_headers`` verbatim then carried no credential at all, where before the
-    purge it carried the static one. It now mints, as ``_post`` and the REST and FHIR probes do."""
+    """With a provider, the header table holds no Authorization header, static or configured. A
+    probe that sent ``_headers`` verbatim would then carry no credential. It mints, as ``_post`` and
+    the REST and FHIR probes do."""
     spec = with_oauth2_client_credentials(
         Soap(url=URL, headers={"authorization": "Basic STATIC"}),
         token_url="https://auth.example.com/token",
