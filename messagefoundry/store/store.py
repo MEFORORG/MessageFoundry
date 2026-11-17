@@ -7118,9 +7118,9 @@ _TIMEOUT_WARNING_UNLOGGED: Final = "an audit row check that timed out could not 
 
 def _log_timeout_read_as_unverified(exc: AuditVerifyTimedOutError) -> None:
     """Log that a row check outside the walk timed out and is read as a MAC that does not verify.
-    Never raises (BACKLOG #6707): a log path that raises, such as a failing filter, would
-    otherwise fail the store open that reads the row. A failure is reported on stderr by its class
-    alone."""
+    Never raises (BACKLOG #6707), so the row check returns its answer when a log path raises, such
+    as a failing filter. That does not keep the store open's own later log calls from raising. A
+    failure is reported on stderr by its class alone."""
     try:
         log.warning("%s; read as a MAC that does not verify", exc)
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed

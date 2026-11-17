@@ -928,9 +928,10 @@ class TransitCipher(_UnmarkedPolicy):
                 return AuditKeyVersionRefusedError(version)
             unverified = AuditKeyVersionUnverifiedError(version)
             cause = reason  # narrowed to str for the closures below
-            # The key and the text are built inside _warn_when_due's guard, which never raises.
-            # Making its two closures allocates outside that guard, so a MemoryError there writes
-            # a fixed literal on stderr in place of the warning, and the row's break still returns.
+            # The key and the text are built inside _warn_when_due's guard. Making its two
+            # closures allocates outside that guard, so a MemoryError there writes a fixed literal
+            # on stderr in place of the warning, and the row's break still returns. A
+            # RecursionError raised on entering the call, at the stack limit, is not caught here.
             try:
                 _warn_when_due(
                     lambda: ("unconfirmed", self._audit_key, cause, raised),

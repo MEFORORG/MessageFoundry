@@ -15,6 +15,7 @@
   raised, and a malformed stored MAC whose cost-only call failed is still a break. A log call
   that raises beside a Transit failure classifier fault no longer replaces the cipher's error.
   (vault `BACKLOG #6707`)
-- **A store open's audit row check that timed out is still read as a MAC that does not verify
-  when the log call beside it raises.** The failure's class goes to stderr. (vault
+- **An audit row check outside the walk that timed out is still read as a MAC that does not
+  verify when the log call beside it raises.** The failure's class goes to stderr. The store
+  open's own later log calls are unchanged. (vault
   `BACKLOG #6707`)
