@@ -528,7 +528,8 @@ def test_name_removes_a_tree_whose_amended_commit_only_the_kept_branch_reflog_ho
 ) -> None:
     """The twin of the reflog refusal. Without -DeleteBranch the branch stays, and its own reflog
     with it, so an amended commit survives the removal and must not refuse it. With -DeleteBranch
-    that reflog goes too, so the same tree refuses."""
+    the script may delete the branch and its reflog, so the check keeps counting the commit and the
+    same tree refuses."""
     wt = fx.add("amended")
     _commit(wt, "a.txt", "v1")
     _git(wt, "commit", "-q", "--amend", "-m", "v1 amended")

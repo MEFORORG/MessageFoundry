@@ -565,13 +565,14 @@ if ($LASTEXITCODE -ne 0) {
     # ON -Name WITHOUT -DeleteBranch THE BRANCH STAYS, and its own reflog lives in the common dir, so
     # a commit that reflog holds (an amend, a rebase) survives the removal and is not counted. -Path is
     # unchanged: it reaches checkouts the caller did not make. A branch reflog that cannot be read, or
-    # is longer than the cap, is used as far as it goes, which only makes this stricter.
+    # is longer than the cap, is used as far as it goes, which only makes this stricter. The cap is
+    # 100, not 400, because these ride on the same command line as up to 400 tips below.
     $branchKept = @()
     if (-not $byPath -and -not $DeleteBranch) {
         $ownBranch = "$(& git -C $WorktreePath symbolic-ref -q HEAD 2>$null)".Trim()
         if ($LASTEXITCODE -eq 0 -and $ownBranch -like 'refs/heads/*') {
             $branchKept = @(& git -C $GitRoot reflog show --format=%H $ownBranch 2>$null |
-                    Where-Object { $_ -match '\A[0-9a-f]{40,64}\z' } | Select-Object -Unique -First 400)
+                    Where-Object { $_ -match '\A[0-9a-f]{40,64}\z' } | Select-Object -Unique -First 100)
         }
     }
     if ($logTips.Count -gt 0) {
@@ -1433,7 +1434,7 @@ if ($removeCode -ne 0 -and $parkedRef) {
 # folder that cannot be listed is not a removal.
 $leftoverWhy = ''
 try { if (-not (Test-ConfirmedGoneOrThrow $WorktreePath 'the removed directory')) { $leftoverWhy = 'is still there' } }
-catch { $leftoverWhy = 'could not be confirmed gone: ' + ($_.Exception.Message -replace ' Nothing was removed\.\z', '') }
+catch { $leftoverWhy = 'could not be confirmed gone: ' + ($_.Exception.Message -replace '\.? Nothing was removed\.\z', '') }
 $leftover = [bool]$leftoverWhy
 if ($removeCode -ne 0) {
     $after = @(Get-RepoWorktrees $GitRoot)

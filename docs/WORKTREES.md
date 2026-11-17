@@ -251,7 +251,8 @@ is a copy for readers and can lag it.
   (`refs/worktree`, `refs/bisect`, `refs/rewritten`). The removal deletes that reflog and those
   refs, so nothing would reach the commit afterwards. This one can refuse a harmless tree: a commit
   replaced by an amend counts, although the branch's own reflog still holds it. `-Name` refuses
-  this too.
+  this too, except that without `-DeleteBranch` it does not count a commit the kept branch's own
+  reflog holds.
 - A tree the session registry records a session in.
 - Any tree at all, when the session registry cannot be read.
 - A tree that still holds a work claim, or any tree when a claim file cannot be read. Neither route
