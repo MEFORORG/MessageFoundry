@@ -79,7 +79,7 @@ from messagefoundry.config.tls_policy import (
     urllib_handler_context,
 )
 from messagefoundry.controlchars import strip_control_chars
-from messagefoundry.secretscrub import credential_query_params
+from messagefoundry.secretscrub import credential_query_params, has_credential_like_segment
 from messagefoundry.transports.base import (
     ECH_UNSUPPORTED_DESTINATION_MSG,
     DeliveryError,
@@ -1324,7 +1324,10 @@ def http_credentials_sent(
     and value are both harmless, such as ``X-Routing-Key``, refuses a verify-off hop too, and on a
     hop that already turned verification off that is the cheaper error. A credential-looking query
     parameter in ``url`` counts too, by the reader ``query_credential_hops`` uses, and so does a
-    ``code`` parameter, which that reader leaves out (vault BACKLOG #3533 item 7). A
+    ``code`` parameter, which that reader leaves out (vault BACKLOG #3533 item 7). So does a
+    credential-looking name in a ``;``-split segment, a fragment or after a second ``?`` of
+    ``url``, and, on a FHIR hop, in ``conditional_query``, which crosses the hop too
+    (:func:`_query_credentials_sent`, BACKLOG #5353). A
     ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
     CONNECT, not across this hop.
 
@@ -1370,10 +1373,37 @@ def http_credentials_sent(
                     else _shown_header_key(key)
                 )
                 sent.append(f"{shown}{held}")
-    url = settings.get("url")
-    if isinstance(url, str) and (names := credential_query_params(url, refusal=True)):
-        sent.append(f"url query parameter {', '.join(names)}")
+    sent.extend(_query_credentials_sent("url", settings.get("url"), query_only=False))
+    if ctype is ConnectorType.FHIR:
+        # BACKLOG #5353: a FHIR destination sends conditional_query in the request URL or in the
+        # If-None-Exist header, so it crosses the hop as the url's query does.
+        sent.extend(
+            _query_credentials_sent(
+                "conditional_query", settings.get("conditional_query"), query_only=True
+            )
+        )
     return sent
+
+
+def _query_credentials_sent(setting: str, value: Any, *, query_only: bool) -> list[str]:
+    """The credential entry :func:`http_credentials_sent` adds for one URL-shaped ``setting``, or
+    nothing. ``query_only`` says ``value`` is a bare query string, such as a FHIR
+    ``conditional_query``, rather than a whole URL.
+
+    A credential-looking query parameter is named, by the reader ``credential_query_params`` gives
+    the refusals. A name the ``&``-split query does not reach is counted too, unnamed: a ``;``-split
+    segment (``;jsessionid=``), a fragment or a second ``?``, by
+    :func:`~messagefoundry.secretscrub.has_credential_like_segment` (BACKLOG #5353). That reader
+    knows no ``code`` parameter, so a ``;code=`` segment is not counted."""
+    if not isinstance(value, str) or not value:
+        return []
+    names = credential_query_params(f"?{value}" if query_only else value, refusal=True)
+    if names:
+        noun = "parameter" if query_only else "query parameter"
+        return [f"{setting} {noun} {', '.join(names)}"]
+    if has_credential_like_segment(value):
+        return [f"{setting} segment with a credential-looking name"]
+    return []
 
 
 def refuse_verify_off(
