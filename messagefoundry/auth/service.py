@@ -15098,10 +15098,13 @@ class AuthService:
         """End a session a re-proof found lapsed, as the request validator ends one (BACKLOG #5336).
         Its count is dropped only once the revoke commits. A refused revoke is logged and keeps the
         count: the re-proof is refused as gone either way, and every later one on the session is
-        refused the same way while it stays lapsed."""
+        refused the same way while it stays lapsed. The refusals caught are the session cap's set,
+        at least the closed connection's bare ``ValueError`` among them; a defect still raises."""
         try:
             await self._store.revoke_session(token_hash)
-        except _session_write_errors() as exc:
+        except (*store_call_errors(), *store_connect_errors()) as exc:
+            if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                raise
             _log.warning(
                 "a re-proof found its session lapsed, but its revoke was refused (%s); the "
                 "re-proof is refused as gone and the session's re-proof count stays",

@@ -585,6 +585,32 @@ async def test_a_reproof_on_a_session_past_its_expiry_is_gone_and_never_verified
         await store.close()
 
 
+async def test_a_refused_revoke_of_a_lapsed_session_is_still_refused_as_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the revoke a re-proof makes of a lapsed session is refused here with the
+    closed connection's bare ``ValueError``. The re-proof is still refused as gone, never a 500,
+    and the session keeps its count, since the revoke did not commit."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+
+        async def refused(*_args: object, **_kwargs: object) -> object:
+            raise ValueError("no active connection")
+
+        monkeypatch.setattr(store, "revoke_session", refused)
+        later = time.time() + service._settings.session_absolute_hours * 3600 + 60
+        monkeypatch.setattr(time, "time", lambda: later)
+        out = await service.reauth(identity, WRONG, token=token)
+        assert out.session_lost and not out.ok
+        assert service._session_reproof_failures(hash_token(token)) == 1
+    finally:
+        await store.close()
+
+
 async def test_many_accounts_ended_sessions_do_not_fill_the_global_map(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

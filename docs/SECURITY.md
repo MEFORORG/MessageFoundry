@@ -6904,12 +6904,14 @@ leaves the map in at least these ways (BACKLOG #5336):
   password-change route keeps the count);
 - a restart, which forgets every count.
 
-A rotation moves the count to the session's new key. Of these, only a successful step-up re-auth
-drops the count of a session that is still live, and on purpose, since it resets that session's
-budget. The bounds are 64 counts per account and 4096 in the map, except a count held at the cap,
+A rotation moves the count to the session's new key. Of these, at least two drop the count of a
+session that is still live. A successful step-up re-auth does it on purpose, since it resets that
+session's budget. A restart does it to every count, as the process-local caveat above says. The bounds are 64 counts per account and 4096 in the map, except a count held at the cap,
 which goes past both. When a re-proof starts with its account at 64 counts, the counts of that
 account's sessions the store no longer lists, revoked or past their absolute expiry, are dropped
-first. A session the store still lists, idle or not, keeps its count. When a new session's first
+first. A session the store still lists, idle or not, keeps its count. If the store refuses that
+listing read, the refusal is logged, the unlisted counts are kept, and the re-proof goes on, so the
+account can stay at 64. When a new session's first
 failure finds its account at 64 counts or the map full, the age prune runs: counts older than the
 absolute session lifetime, timed from their first failure, go. It reaches a live session's count
 only after a wall-clock step. If there is still no room, that session is revoked on that first
