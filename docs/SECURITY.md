@@ -6696,6 +6696,12 @@ site may extend with its own terms. The policy screens at least these passwords:
 - each credential the engine generates, for account creation, the password reset and the factor
   reset.
 
+The policy also refuses a password longer than 1024 characters, with the clause
+`be at most 1024 characters` (BACKLOG #5397). The number is `PASSWORD_MAX` in
+[`messagefoundry/password_bounds.py`](../messagefoundry/password_bounds.py), the bound the JSON
+sign-in, step-up and password-change requests apply, so a password the policy accepts is never one
+those requests refuse for its length.
+
 A generated credential skips one screen, the breach check. A random string of at least 192 bits
 cannot be in a corpus of human-chosen passwords. Tune via `[auth]` (see
 [CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
