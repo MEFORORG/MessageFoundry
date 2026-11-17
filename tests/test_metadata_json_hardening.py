@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import types
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -348,6 +349,72 @@ def test_a_foreign_type_error_names_only_its_class() -> None:
     with pytest.raises(TypeError, match=r"an unencodable value \(TypeError\)") as info:
         encode_reference_value({"k": _Leaky("1")})
     assert "SYNTHETIC" not in str(info.value)
+
+
+def _chain(exc: BaseException | None) -> list[BaseException]:
+    """``exc`` and every exception on its cause and context chain."""
+    seen: list[BaseException] = []
+    while exc is not None and all(exc is not s for s in seen):
+        seen.append(exc)
+        exc = exc.__cause__ or exc.__context__
+    return seen
+
+
+def test_naming_the_cause_chains_nothing_to_json_s_error() -> None:
+    """A refusal names its kind after json's handler has exited and encodes nothing a second time,
+    so a value that would raise on a second pass cannot chain json's error, whose notes name the
+    key, to whatever that pass raised (BACKLOG #6711)."""
+
+    class _Overflowing(date):
+        def isoformat(self) -> str:
+            raise OverflowError("synthetic")
+
+    marker = "SYNTHETIC-KEY-123"
+    with pytest.raises(TypeError, match="a non-finite float") as info:
+        encode_reference_value({marker: float("nan"), "z": _Overflowing(2026, 1, 1)})
+    for exc in _chain(info.value):
+        assert marker not in str(exc)
+        assert all(marker not in note for note in getattr(exc, "__notes__", ()))
+    assert info.value.__cause__ is None and info.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{"a": float("nan"), "b": object()}, {"a": float("nan"), "b": 10**5000}],
+    ids=["beside-an-unencodable-type", "beside-an-oversized-int"],
+)
+def test_a_mixed_value_names_the_kind_json_stopped_on(value: Any) -> None:
+    with pytest.raises(TypeError, match="a non-finite float"):
+        encode_reference_value(value)
+
+
+def test_a_coercion_error_is_not_read_as_one_of_json_s_own() -> None:
+    """A ValueError a coercion raises through json is named generically, whatever its text."""
+
+    class _Digits(date):
+        def isoformat(self) -> str:
+            raise ValueError("synthetic: too many digits")
+
+    with pytest.raises(TypeError, match="it holds an unencodable value$"):
+        encode_reference_value({"k": _Digits(2026, 1, 1)})
+
+
+def test_the_unreadable_cell_warning_names_its_row_and_counts_what_it_held_back(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The WARNING names the row's reference, cut and scrubbed, and the next line logged for its
+    kind counts the lines held back since the last one."""
+    clock = [1000.0]
+    monkeypatch.setattr(metadata_module, "_time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
+        assert user_metadata('{"user": ', row_id="0123456789abcdef0123") is None
+        for _ in range(3):
+            assert user_metadata('{"user": ', row_id="held") is None
+        clock[0] += metadata_module._WARN_INTERVAL_S
+        assert user_metadata('{"user": ', row_id="bad\nid") is None
+    first, second = (r.getMessage() for r in caplog.records)
+    assert "row 0123456789ab " in first and "0 more held back" in first
+    assert "row bad?id " in second and "3 more held back" in second
 
 
 @pytest.mark.parametrize("bag", ['"xyz"', "5", '[["a", "b"]]', "null"])

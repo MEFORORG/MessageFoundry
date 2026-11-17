@@ -34,7 +34,6 @@ contained, with the cipher's own refusal as its alert (BACKLOG #5650).
 from __future__ import annotations
 
 import functools
-import inspect
 import json
 import logging
 import re
@@ -588,19 +587,32 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
 
     ``routed_id`` must be keyword-only with no default, so every call that reaches the handoff
     carries it in ``kwargs``; a handoff that takes it any other way is refused here, at decoration
-    (BACKLOG #6698)."""
-    # Read off the code object rather than inspect.signature, which would evaluate annotations (a
+    (BACKLOG #6698). Every layer of a ``functools.wraps`` chain is read, the one this wrapper calls
+    included: the innermost must take ``routed_id`` keyword-only, and no layer may take it
+    positionally or give it a default. What a layer does with ``*args`` or ``**kwargs`` is not
+    read."""
+    # Read off the code objects rather than inspect.signature, which would evaluate annotations (a
     # TYPE_CHECKING-only one raises NameError at decoration) unless asked not to.
     name = getattr(fn, "__qualname__", repr(fn))
-    target = inspect.unwrap(fn)
-    code = getattr(target, "__code__", None)
-    if code is None:
-        raise TypeError(f"{name} must be a plain function or method")
-    keyword_only = code.co_varnames[code.co_argcount : code.co_argcount + code.co_kwonlyargcount]
-    if "routed_id" not in keyword_only:
-        raise TypeError(f"{name} must take routed_id as a keyword-only parameter")
-    if "routed_id" in (getattr(target, "__kwdefaults__", None) or {}):
-        raise TypeError(f"{name} must give its keyword-only routed_id no default")
+    layers: list[object] = [fn]
+    while hasattr(layers[-1], "__wrapped__"):
+        layer = layers[-1].__wrapped__
+        if any(layer is seen for seen in layers):
+            raise TypeError(f"{name} has a cycle in its __wrapped__ chain")
+        layers.append(layer)
+    for depth, layer in enumerate(layers):
+        code = getattr(layer, "__code__", None)
+        if code is None:
+            raise TypeError(f"{name} must be a plain function or method")
+        if "routed_id" in code.co_varnames[: code.co_argcount]:
+            raise TypeError(f"{name} must take routed_id as a keyword-only parameter")
+        keyword_only = code.co_varnames[
+            code.co_argcount : code.co_argcount + code.co_kwonlyargcount
+        ]
+        if depth == len(layers) - 1 and "routed_id" not in keyword_only:
+            raise TypeError(f"{name} must take routed_id as a keyword-only parameter")
+        if "routed_id" in (getattr(layer, "__kwdefaults__", None) or {}):
+            raise TypeError(f"{name} must give its keyword-only routed_id no default")
 
     async def wrapper(self: S, /, *args: P.args, **kwargs: P.kwargs) -> bool:
         try:
@@ -618,14 +630,18 @@ async def dead_letter_on_cell_tag(store: CellTagSink, row_id: str, err: CellTagE
     moves on and the message is ``ERROR`` (count-and-log), then audit the failure. The one policy for
     a stage that met a tag failure, on the async handoffs and the runner's fused path alike.
 
-    The audit is written even when the dead-letter fails, whose error then propagates: the row
-    stays in flight, meets the tag failure again on its re-run and is dead-lettered then, and the
-    audit row is not lost meanwhile (BACKLOG #6698). A cancellation is not held up by a write."""
+    The audit is written even when the dead-letter fails with an ``Exception``, whose error then
+    propagates: the row stays in flight, meets the tag failure again on its re-run and is
+    dead-lettered then, and the audit row is not lost meanwhile (BACKLOG #6698). A
+    ``BaseException`` that is not an ``Exception``, such as a cancellation, ``KeyboardInterrupt`` or
+    ``SystemExit``, propagates with NO audit write, so a store write never holds up a shutdown;
+    that audit row is written only if the cell is refused again."""
     try:
         await store.dead_letter_now(row_id, str(err))
     except Exception:
-        # Exception, not BaseException: a cancellation propagates at once, unheld by the audit
-        # write. Every other failure is re-raised after the audit, so nothing is swallowed.
+        # Exception, not BaseException: a cancellation, KeyboardInterrupt or SystemExit propagates
+        # at once and skips the audit write, which is then made only if the cell is refused again.
+        # An Exception is re-raised after the audit.
         await report_cell_tag_failure(store, err)
         raise
     await report_cell_tag_failure(store, err)

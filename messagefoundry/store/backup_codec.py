@@ -482,8 +482,11 @@ def decrypt_stream(
     """Decrypt the ``.mfbak`` stream ``src`` into the plaintext (tar) stream ``dst`` under ``key``,
     returning the parsed header. Re-derives the monotonic frame counter and requires the AAD-bound
     ``final`` terminator, so a reordered/dropped/truncated/appended chunk **fails the GCM tag**
-    (``BackupCodecError``). A changed header is refused or fails closed: a re-spelled one by
-    :func:`read_header`, a changed ``key_id`` as a key mismatch, any other changed value at the tag.
+    (``BackupCodecError``). A changed header is refused or fails closed, at least: by
+    :func:`read_header` before any decrypt when it is re-spelled, its ``alg`` is not AES-256-GCM,
+    its ``format_version`` differs from the version byte, or its ``chunk_size`` is out of range;
+    as a key mismatch when its ``key_id`` changed; by the frame-length bound when a lowered
+    ``chunk_size`` is below a real frame; and at the tag, which covers the header bytes as read.
     Fail-closed: nothing decrypts unless every frame authenticates.
 
     Raises :class:`BackupKeyMismatch` when the header ``key_id`` does not match ``key`` — checked first,

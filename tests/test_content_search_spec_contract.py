@@ -31,6 +31,7 @@ from messagefoundry.store.content_search import (
     make_spec,
     newest_first,
     row_matches,
+    sends_a_needle,
 )
 from messagefoundry.store.store import MessageStore
 
@@ -114,6 +115,30 @@ def test_a_blank_field_value_beside_content_is_still_accepted() -> None:
         spec = make_spec(content="DOE", field_path=None, field_value=blank)
         assert spec.substring == "DOE"
         assert spec.field_value is None
+
+
+@pytest.mark.parametrize(
+    ("content", "field_path", "accepted"),
+    [
+        ("DOE", "   ", True),
+        ("   ", "PID-3", True),
+        ("   ", None, False),
+        (None, "   ", False),
+        ("   ", "   ", False),
+    ],
+)
+def test_a_blank_term_on_a_one_or_neither_route(
+    content: str | None, field_path: str | None, accepted: bool
+) -> None:
+    """docs/API-INPUT-VALIDATION.md, *Blank values*: on a route where a needle is optional, a blank
+    ``content`` or ``field_path`` beside a real term counts as not sent, and a request whose only
+    terms are blank is sent on to ``make_spec`` and refused there (a 400)."""
+    assert sends_a_needle(content, field_path, None)
+    if accepted:
+        make_spec(content=content, field_path=field_path, field_value=None)
+    else:
+        with pytest.raises(ContentSearchError, match="exactly one"):
+            make_spec(content=content, field_path=field_path, field_value=None)
 
 
 # --- BACKLOG #6700: scan_limit type -----------------------------------------------------------

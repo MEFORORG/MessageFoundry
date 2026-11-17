@@ -442,6 +442,39 @@ async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
     assert sink.dead == ["r-1"] and sink.audits == [MESSAGE_TAG_FAILED_ACTION]
 
 
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_the_handoff_wrapper_reads_every_layer_of_a_wraps_chain() -> None:
+    """A ``functools.wraps`` layer that takes ``routed_id`` positionally, or with a default, is
+    refused at decoration even when the innermost function takes it keyword-only, so the wrapper
+    never meets a call whose ``kwargs`` lack it (BACKLOG #6698)."""
+    import functools
+
+    async def inner(self: _DeadLetterSink, *, routed_id: str) -> bool:
+        raise CellTagError("messages", "raw", "kw-2", "A")
+
+    @functools.wraps(inner)
+    async def positional(self: _DeadLetterSink, routed_id: str) -> bool:
+        return await inner(self, routed_id=routed_id)
+
+    with pytest.raises(TypeError, match="must take routed_id as a keyword-only parameter$"):
+        dead_letters_on_cell_tag(positional)
+
+    @functools.wraps(inner)
+    async def defaulted(self: _DeadLetterSink, *, routed_id: str = "") -> bool:
+        return await inner(self, routed_id=routed_id)
+
+    with pytest.raises(TypeError, match="no default$"):
+        dead_letters_on_cell_tag(defaulted)
+
+    @functools.wraps(inner)
+    async def passes_on(self: _DeadLetterSink, *args: Any, **kwargs: Any) -> bool:
+        return await inner(self, *args, **kwargs)
+
+    sink = _DeadLetterSink()
+    assert await dead_letters_on_cell_tag(passes_on)(sink, routed_id="r-2") is False
+    assert sink.dead == ["r-2"]
+
+
 class _NoKeyringView:
     """A cipher that, like Vault Transit, cannot say which keys it holds, and declares so
     (``names_no_keys``) unless ``declares`` is False: then it is a wrapper that just lacks

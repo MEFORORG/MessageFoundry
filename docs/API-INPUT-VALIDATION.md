@@ -250,7 +250,9 @@ Where each rule lives:
   accepted, not refused, and on the two one-or-neither routes one with neither term is too. It
   keeps any other `content` or `field_value` exactly as sent, spaces included, because a leading
   or trailing space narrows the match. It strips `field_path`, which is a locator. On the two
-  one-or-neither routes, a `content` or `field_path` of only whitespace gets a 400.
+  one-or-neither routes, a request that sends a non-empty `content` or `field_path`, but neither
+  with anything besides whitespace, gets a 400. A blank one beside a real term counts as not sent,
+  so that request is accepted.
 - The console search form: it calls the API's search handler, so a clash gets the same answer.
   With no criteria at all it shows the empty form and does not search.
 - Layered search: `_compose_preset_layers`, in
