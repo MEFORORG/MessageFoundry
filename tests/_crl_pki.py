@@ -2,9 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A throwaway CA and its empty CRL, for the revocation-guard tests. All synthetic.
 
-The revocation-guard test files each built this pair by hand (vault BACKLOG #2977 item 12). Each
-file still writes the shapes it needs; only the build is shared here. EC keys, because nothing
-that uses this pair needs RSA and EC key generation is cheap."""
+Several revocation-guard test files built this pair by hand (vault BACKLOG #2977 item 12). Those
+that import this module share it now, and each still writes the shapes it needs; other test files
+may still build their own. EC keys, because nothing that uses this pair needs RSA and EC key
+generation is cheap."""
 
 from __future__ import annotations
 

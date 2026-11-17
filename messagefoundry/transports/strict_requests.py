@@ -1263,7 +1263,7 @@ def _refuse_an_unrevoked_vault_hop(
     * ``tls_revocation_attested()``, the process-wide variable, goes in ``blanket_attested``
       only. The authority ranks that below the enforcing refusal (BACKLOG #299), so it does not
       cross this hop under an enforcing posture.
-    * ``crl_checked`` is ``checks_revocation()``, which reads the flag off a context the hop's
+    * ``crl_checked`` is ``checks_revocation()``, which reads ``crl_credited`` off a context the hop's
       own factory builds, never off a setting (:meth:`StrictReplyAdapter._checks_revocation`).
       No CRL lever is built for this hop, so it is ``False`` today. It is asked only when the
       answer could matter: the authority is asked first without it, and a CRL check can only

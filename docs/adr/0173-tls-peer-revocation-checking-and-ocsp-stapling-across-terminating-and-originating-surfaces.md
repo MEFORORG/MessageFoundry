@@ -1244,9 +1244,9 @@ ruling:
 - **The ruling rests on Microsoft's driver.** The question cited Microsoft's driver documentation,
   and the test names ODBC Driver 18 only. Another driver can serve these hops, as the second
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
-- **The ruling's "then test it" half has two recorded results.** The test needs a SQL Server
-  whose certificate can be revoked. A control connection to a certificate that is not revoked
-  shows that a refusal comes from the revocation. The amendment of 2026-11-11 below states what
+- **Only two runs have results, and the run on the SQL Server test box is still owed.** The
+  test needs a SQL Server whose certificate can be revoked. A control connection to a
+  certificate that is not revoked shows that a refusal comes from the revocation. The amendment of 2026-11-11 below states what
   the runs measured, their limits, and which run is still owed. *(Corrected 2026-11-17, vault
   BACKLOG #3009: this bullet's heading read "Driver 18 was tested on one build on Windows Server
   2022, and other drivers were not tested", which restated the amendment's limits.)*
@@ -1261,7 +1261,8 @@ ruling:
   below it had overtaken.)* If Driver 18 checks, the text can say
   under what conditions. If it does not, R6 does not say whether the gap stands or the owner's
   other two options come back. BACKLOG #3009's third closing step says the gap stands. That is
-  the ledger row's wording, not the owner's, so it is the owner's to decide when a result exists.
+  the ledger row's wording, not the owner's, so it was the owner's to decide once a result
+  existed; the note below records how that was decided.
   *(Note 2026-11-11: two recorded results exist, in the amendment of that date below. That
   amendment does not change the grade. A Manager decided under the owner's delegation of
   2026-11-11 that the five rows keep the grade R6 gives them, that R6's named gap stands as
@@ -1567,8 +1568,10 @@ cells, whose old grade is quoted once, in the grades bullet:
 ruling's limits and what the test must show. Other places name the ruling and point there. When
 BACKLOG #3009 has a result, it goes in that paragraph. *(Note 2026-11-11: the result is in §7.1's
 amendment of that date, after the 2026-10-04 reading that follows that paragraph. What the test
-must show is still stated in that paragraph's limit *Driver 18 was tested on one build on
-Windows Server 2022, and other drivers were not tested*.)*
+must show is still stated in that paragraph's third limit, headed *Only two runs have results,
+and the run on the SQL Server test box is still owed*. Corrected 2026-11-17, vault BACKLOG #3009:
+this named the limit by its old heading, "Driver 18 was tested on one build on Windows Server
+2022, and other drivers were not tested".)*
 
 **What this amendment does not do.** It builds no guard, changes no code and measures nothing.
 

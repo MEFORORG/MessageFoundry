@@ -1028,15 +1028,22 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
 
 
 def crl_credited(ctx: ssl.SSLContext | None) -> bool:
-    """Whether a CRL on ``ctx`` may relax a revocation guard: the one rule every guard reads.
+    """Whether a CRL on ``ctx`` may relax a revocation guard (vault BACKLOG #4912).
 
-    True only when the context consults a CRL (:func:`context_checks_revocation`) and does not
-    skip validity-period checks (:func:`skips_validity_period`), which would let a CRL past
-    ``nextUpdate`` through. ``None`` is False. :meth:`RevocationHopGuard.capture` and the Vault and
-    proxy legs in ``transports/strict_requests.py`` read it. ``tests/test_revocation_guard_crl_credit.py``
-    fails a call to :func:`context_checks_revocation` by its name anywhere else in the package, so a
-    new guard that asks only half of the rule is named in review (vault BACKLOG #4912)."""
-    return ctx is not None and context_checks_revocation(ctx) and not skips_validity_period(ctx)
+    True only when the context verifies the peer (not ``CERT_NONE``, where a failed check does not
+    stop the handshake), consults a CRL (:func:`context_checks_revocation`), and does not skip
+    validity-period checks (:func:`skips_validity_period`), which would let a CRL past
+    ``nextUpdate`` through. ``None`` is False. Find its readers by symbol; at least
+    :meth:`RevocationHopGuard.capture` and the Vault and proxy legs in
+    ``transports/strict_requests.py`` read it. ``tests/test_revocation_guard_crl_credit.py`` fails
+    a read of :func:`context_checks_revocation` by that name elsewhere in the engine package. A
+    guard that reads the CRL flag another way passes that test, so review still owns it."""
+    return (
+        ctx is not None
+        and ctx.verify_mode is not ssl.CERT_NONE
+        and context_checks_revocation(ctx)
+        and not skips_validity_period(ctx)
+    )
 
 
 #: The remedy a revocation refusal names on a hop whose context skips validity-period checks
@@ -2844,7 +2851,7 @@ class RevocationHopGuard:
         hop (scheme/host only — never a credential or a body).
 
         ``context`` is the :class:`ssl.SSLContext` this hop's handshake will actually use. When supplied,
-        :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off it, so a hop whose CRL was
+        :func:`crl_credited` reads it, so a hop whose CRL was
         really loaded stops being refused while a sibling hop that never got one keeps its guard. Passing
         the context rather than a ``[tls].crl_file`` boolean is what makes the CRL relaxation per-hop:
         one instance-wide setting must never silence a hop whose handshake does not consult it.
