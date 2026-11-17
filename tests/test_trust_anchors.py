@@ -3257,14 +3257,130 @@ def test_the_sqlserver_store_pin_is_a_settings_anchor(tmp_path: Path) -> None:
     assert spec.pin is None and spec.loads_verified_bytes is False
 
 
-def test_a_postgres_ssl_root_cert_is_not_a_settings_anchor(tmp_path: Path) -> None:
-    """The control for the case above: the same file as a PostgreSQL ``ssl_root_cert`` is not
-    collected, since this check covers the SQL Server pin only (module item 11), and neither is a
-    SQL Server store with no pin. Red under: the backend arm dropped from the store's pin
-    predicate."""
-    pin = str(_sqlserver_pin(tmp_path))
-    assert _store_specs(backend="postgres", ssl_root_cert=pin) == []
+def test_a_postgres_ssl_root_cert_is_its_own_settings_anchor(tmp_path: Path) -> None:
+    """Vault BACKLOG #4203. The same file as a PostgreSQL ``ssl_root_cert`` is collected under its
+    own label, without the SQL Server pin's certificate checks, since it is a CA bundle (module
+    item 11). Red under: the PostgreSQL spec left out of :func:`collect_anchor_specs`. The
+    controls: a server-DB store that names no file yields no spec on either backend."""
+    ca = str(_sqlserver_pin(tmp_path))
+    (spec,) = _store_specs(backend="postgres", ssl_root_cert=ca)
+    assert (spec.label, spec.setting, spec.path) == (
+        "store_postgres_ca",
+        "[store].ssl_root_cert",
+        ca,
+    )
+    assert spec.pin is None and spec.loads_verified_bytes is False
+    assert spec.server_pin is False and spec.refuses_encryption_header is False
+    assert _store_specs(backend="postgres") == []
     assert _store_specs(backend="sqlserver") == []
+
+
+#: A key body no certificate text holds, so a refusal that echoed the file would show it.
+_KEY_BODY_MARKER = "SYNTHETICKEYBODYMARKER"
+
+
+def _marked_key_block(label: str) -> bytes:
+    return f"-----BEGIN {label}-----\n{_KEY_BODY_MARKER}\n-----END {label}-----\n".encode("ascii")
+
+
+@pytest.mark.parametrize("label", ["PRIVATE" + " KEY", "ENCRYPTED PRIVATE" + " KEY"])
+async def test_a_postgres_ssl_root_cert_holding_a_private_key_refuses(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str
+) -> None:
+    """Vault BACKLOG #4203: a private key in the PostgreSQL store CA refuses the start or reload
+    check, with a ``pem_refused`` row and a refusal that names the setting and never the key's
+    body. Red under: the PostgreSQL spec left out of :func:`collect_anchor_specs`, where nothing is
+    refused. The control: the certificate alone passes."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    ca = _sqlserver_pin(tmp_path)
+    cert = ca.read_bytes()
+    specs = _store_specs(backend="postgres", ssl_root_cert=str(ca))
+    assert await run_anchor_preflight(specs, store, enforcing=True)  # the control
+    ca.write_bytes(cert + _marked_key_block(label))
+    with pytest.raises(TrustAnchorError) as err:
+        await run_anchor_preflight(specs, store, enforcing=True)
+    text = str(err.value)
+    assert ta.PRIVATE_KEY_SCOPE in text and "[store].ssl_root_cert" in text
+    assert _KEY_BODY_MARKER not in text, "the refusal echoed the key block's body"
+    assert "pem_refused" in [r["event"] for r in await _rows(store, "store_postgres_ca")]
+
+
+def _two_certificates(pin: Path) -> bytes:
+    from messagefoundry import pki
+
+    return pin.read_bytes() + pki.make_self_signed("db2.example", [], 30)[0]
+
+
+@pytest.mark.parametrize(
+    ("shape", "refusal"),
+    [
+        pytest.param(
+            lambda p: p.read_bytes().replace(
+                b"-----BEGIN CERTIFICATE-----\n",
+                b"-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n\n",
+            ),
+            ta.ENCRYPTION_HEADER_SCOPE,
+            id="encryption header",
+        ),
+        pytest.param(_two_certificates, "holds 2 certificates", id="two certificates"),
+        pytest.param(lambda p: b"not a certificate", "it is not a certificate", id="no cert"),
+    ],
+)
+async def test_a_reload_runs_the_store_pins_content_checks(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: Any,
+    refusal: str,
+) -> None:
+    """Vault BACKLOG #3714 step 12 (d): a reload refuses a pin file the next store open would
+    refuse, with a ``pem_refused`` row. Red under: ``server_pin`` dropped from
+    :func:`store_pin_anchor_spec`, where the reload passes the file. The encryption-header case
+    goes red only with ``refuses_encryption_header`` dropped too, since the certificate check
+    refuses a header as well."""
+    from messagefoundry.config.wiring import WiringError
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    await run_anchor_preflight(specs, store, enforcing=True)  # the start, and the control
+    preflight = ta.make_settings_anchor_preflight(specs, store, enforcing=True)
+    assert preflight is not None
+    pin.write_bytes(shape(pin))
+    with pytest.raises(WiringError, match=r"\[store\]\.ssl_root_cert") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert refusal in str(err.value.__cause__)
+    assert "pem_refused" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+
+
+@pytest.mark.parametrize(
+    ("moment", "refusal"),
+    [(10.0**10, "the pinned certificate expired at"), (0.0, "is not valid until")],
+    ids=["expired", "not yet valid"],
+)
+async def test_a_reload_refuses_a_store_pin_outside_its_validity_period(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    moment: float,
+    refusal: str,
+) -> None:
+    """Vault BACKLOG #3714 step 12 (d): the validity check the store runs at open runs at a reload
+    too. Red under: ``server_pin`` dropped from :func:`store_pin_anchor_spec`. The control is the
+    same pin read at the real time, which passes."""
+    import types
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(_sqlserver_pin(tmp_path)))
+    await run_anchor_preflight(specs, store, enforcing=True)  # the control
+    monkeypatch.setattr(ta, "time", types.SimpleNamespace(time=lambda: moment))
+    with pytest.raises(TrustAnchorError, match=refusal) as err:
+        await run_anchor_preflight(specs, store, enforcing=True)
+    assert "[store].ssl_root_cert" in str(err.value)
 
 
 async def test_the_sqlserver_store_pin_is_audited_at_start_and_rechecked_at_reload(

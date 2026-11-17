@@ -1290,6 +1290,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "compare:via messagefoundry.credential",  # BACKLOG #1167: evaluate_anchor's pin compare
             "hash:hashlib.sha256",
+            # Vault BACKLOG #3714: a reload parses the SQL Server pin with pki's certificate check,
+            # the one the store runs at open, and reads its validity period. Parse only, no key.
+            "key_cert:via messagefoundry.pki",
             # BACKLOG #2025: the throwaway cadata= trial load in anchor_cadata.
             "tls_context:.load_verify_locations()",
             "tls_context:ssl.SSLContext",

@@ -235,18 +235,23 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     finding on unchanged bytes, the fix is the one its message names. The refusal's own rows
     travel the hop like any other row.
 
-    **A reload runs the anchor checks and only one of the store's content checks.** It checks
-    the ACL, a change and the path (items 1, 3 and 4; the spec has no pin), refuses a file it
-    cannot read, and runs the private-key refusal (BACKLOG #3745). The store's other content
-    checks run at the next store open, not at a reload: at least that the file is one server
-    certificate, that it is inside its validity period, and the encryption-header refusal
-    (BACKLOG #3090). So a reload can pass a swapped file the next store open refuses, and the
-    driver reads that file at its next connect. At ``warn`` the start logs the pin's warning
-    once: the preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
+    **A reload runs the anchor checks and the store's content checks.** It checks the ACL, a
+    change and the path (items 1, 3 and 4; the spec has no pin), and refuses a file it cannot
+    read. It then runs the encryption-header refusal (BACKLOG #3090), the private-key refusal
+    (BACKLOG #3745), and the store's certificate checks: one server certificate, inside its
+    validity period (:func:`_refuse_an_unusable_server_pin`, vault BACKLOG #3714). The store's
+    size refusal of a file larger than a pin is not run first, as the store open runs it; the
+    certificate check refuses those bytes as too large once they are read. At ``warn`` the start
+    logs the pin's warning once: the preflight skips one the store open just logged
+    (:data:`_WARNED_AT_OPEN`).
 
-    **Not added: a PostgreSQL ``ssl_root_cert``.** It is a CA bundle the store loads by path
-    at each new connection, the shape of item 10's CAs, and nothing checks who can write it.
-    This change covers the SQL Server pin only; that gap is unfiled.
+    **The PostgreSQL ``ssl_root_cert``** (vault BACKLOG #4203) is a CA bundle the store loads by
+    path at each new connection. :func:`collect_anchor_specs` adds it under the label
+    ``store_postgres_ca`` (:func:`store_postgres_ca_anchor_spec`), so it takes the audited checks
+    of items 1 to 4 and the private-key refusal at start and at every reload, with no pin. Unlike
+    the SQL Server pin, the store runs none of these checks when it opens, so at a start the store
+    has already been opened with this file when this check runs. What the paragraphs above say of the pin's audit
+    riding its own hop, and of a refused reload leaving the pool open, holds for this CA too.
 12. **A generic DATABASE connection's driver CA** (vault BACKLOG #3090, step 7). The CA file a
     generic-dialect ``Database`` outbound or ``DatabasePoll`` names as ``odbc_params`` ``sslca``
     is a lane CA, as in item 9 (:func:`database_ca_anchor_spec`), under the lane's own label. It
@@ -292,6 +297,7 @@ import shlex
 import ssl
 import stat
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
+import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -334,7 +340,7 @@ log = logging.getLogger(__name__)
 #: file is not text the TLS library loads as trust anchors: no PEM block or a TRUSTED CERTIFICATE
 #: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025; and,
 #: since BACKLOG #3745, a file naming a private-key label, which the TLS library would load, on
-#: every anchor), and
+#: every anchor; at least the other refusals of :func:`_refuse_by_path_content` write it too), and
 #: ``restart_required`` (a reload found a settings anchor whose bytes differ from the ones its
 #: consumer loaded, BACKLOG #2185).
 AUDIT_ACTION = "auth.trust_anchor"
@@ -422,8 +428,8 @@ class AnchorSpec:
 
     ``label`` is the stable, PHI-free audit key (``"oidc"`` / ``"ad"`` / ``"api_client"`` /
     ``"tls_internal_ca"`` / ``"alerts_email_ca"`` / ``"logging_forward_ca"`` /
-    ``"store_sqlserver_pin"`` / ``"inbound:<connection>"`` / ``"outbound:<connection>"`` /
-    ``"fhir_lookup:<name>"``);
+    ``"store_sqlserver_pin"`` / ``"store_postgres_ca"`` / ``"inbound:<connection>"`` /
+    ``"outbound:<connection>"`` / ``"fhir_lookup:<name>"``);
     ``setting`` is the human-facing config key for messages; ``path`` is the configured PEM; ``pin``
     is the optional configured pin, as :func:`parse_anchor_pin` reads it; ``pin_setting``
     names where that pin is set, so a refusal can name the escape.
@@ -438,7 +444,10 @@ class AnchorSpec:
 
     ``refuses_encryption_header`` adds the encryption-header refusal to a ``False`` spec's content
     checks (module item 12). A spec with ``loads_verified_bytes`` True takes it in
-    :func:`anchor_cadata` already."""
+    :func:`anchor_cadata` already.
+
+    ``server_pin`` adds the SQL Server pin's certificate checks to a ``False`` spec's content
+    checks (module item 11): one server certificate, inside its validity period."""
 
     label: str
     setting: str
@@ -447,6 +456,7 @@ class AnchorSpec:
     pin_setting: str | None = None
     loads_verified_bytes: bool = True
     refuses_encryption_header: bool = False
+    server_pin: bool = False
 
 
 @dataclass(frozen=True)
@@ -651,8 +661,9 @@ def _refuse_a_private_key(data: bytes, spec: AnchorSpec) -> None:
 def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
     """The content checks of an anchor its hop reads by path (``loads_verified_bytes`` False):
     the encryption-header refusal when ``spec`` asks for it (module item 12), then the private-key
-    refusal (BACKLOG #3745), in the order the DATABASE build runs them. The refusal names the
-    setting and the path, never the content."""
+    refusal (BACKLOG #3745), in the order the DATABASE build runs them, then the server pin's
+    certificate checks when ``spec`` asks for them (:func:`_refuse_an_unusable_server_pin`). The
+    refusal names the setting and the path, never the content."""
     if spec.refuses_encryption_header and has_encryption_header_bytes(data):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. Its hop "
@@ -660,6 +671,33 @@ def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
             "password on an encrypted block. Keep only the CA certificates here"
         )
     _refuse_a_private_key(data, spec)
+    if spec.server_pin:
+        _refuse_an_unusable_server_pin(data, spec)
+
+
+def _refuse_an_unusable_server_pin(data: bytes, spec: AnchorSpec) -> None:
+    """The SQL Server pin's certificate checks, which the store runs at each open, run here too so a
+    reload refuses what the next store open would (vault BACKLOG #3714): the bytes must be one
+    server certificate (:func:`~messagefoundry.pki.pinned_server_certificate`), inside its validity
+    period now. notAfter itself still counts as valid, as the store's check reads it."""
+    from messagefoundry.pki import pinned_server_certificate  # lazy: pki loads cryptography
+    from messagefoundry.redaction import log_timestamp
+
+    cert = pinned_server_certificate(data)
+    if isinstance(cert, str):
+        raise TrustAnchorError(f"{spec.setting} {spec.path!r} {cert}")
+    moment = time.time()
+    not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
+    if moment > not_after.timestamp():
+        raise TrustAnchorError(
+            f"{spec.setting} {spec.path!r}: the pinned certificate expired at "
+            f"{log_timestamp(not_after)}. Pin the server's renewed certificate."
+        )
+    if moment < not_before.timestamp():
+        raise TrustAnchorError(
+            f"{spec.setting} {spec.path!r}: the pinned certificate is not valid until "
+            f"{log_timestamp(not_before)}. The engine refuses a pin outside its validity period."
+        )
 
 
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
@@ -2240,7 +2278,30 @@ def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
     if path is None:
         return None
     return AnchorSpec(
-        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
+        "store_sqlserver_pin",
+        "[store].ssl_root_cert",
+        path,
+        loads_verified_bytes=False,
+        refuses_encryption_header=True,
+        server_pin=True,
+    )
+
+
+def store_postgres_ca_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
+    """The PostgreSQL ``[store].ssl_root_cert`` CA bundle's anchor spec, or ``None`` when the store
+    is another backend or names no file (vault BACKLOG #4203). The store loads it by path at each
+    new connection, so the spec carries ``loads_verified_bytes=False`` and no pin.
+
+    Module item 11 says what the check does not cover."""
+    from messagefoundry.config.settings import StoreBackend
+
+    if store.backend is not StoreBackend.POSTGRES or not store.ssl_root_cert:
+        return None
+    return AnchorSpec(
+        "store_postgres_ca",
+        "[store].ssl_root_cert",
+        store.ssl_root_cert,
+        loads_verified_bytes=False,
     )
 
 
@@ -2256,9 +2317,10 @@ def collect_anchor_specs(
     """Every configured operator-supplied trust anchor in the settings, in a stable order: the OIDC,
     AD and API client CAs, then since vault BACKLOG #3188 the settings CAs an engine hop dials with
     (module item 10), then since vault BACKLOG #3714 the SQL Server store pin
-    (:func:`store_pin_anchor_spec`). An anchor with no path set is omitted, and so is a dialling CA
-    its hop does not read and a ``[store].ssl_root_cert`` the store sends as no SQL Server pin, so
-    an install with none yields an empty list: the dormant, byte-identical path.
+    (:func:`store_pin_anchor_spec`), and since vault BACKLOG #4203 the PostgreSQL store CA
+    (:func:`store_postgres_ca_anchor_spec`). An anchor with no path set is omitted, and so is a
+    dialling CA its hop does not read and a ``[store].ssl_root_cert`` on SQL Server the store sends
+    as no pin, so an install with none yields an empty list: the dormant, byte-identical path.
 
     The four section keywords have no default on purpose. A caller that left one out would leave
     its anchor unchecked with nothing to say so.
@@ -2275,6 +2337,7 @@ def collect_anchor_specs(
         alerts_email_anchor_spec(alerts, auth),
         log_forward_anchor_spec(log_settings),
         store_pin_anchor_spec(store),
+        store_postgres_ca_anchor_spec(store),
     )
     return [spec for spec in candidates if spec is not None]
 
@@ -2597,8 +2660,8 @@ async def run_anchor_preflight(
     SQL Server store pin). **Dormant when ``specs`` is empty** — it makes no store call and writes
     no audit row; :func:`collect_anchor_specs` says when serve's list is empty.
 
-    On a fatal violation (a pin mismatch, a file with no loadable PEM block, a private-key label,
-    or under ``enforce`` an
+    On a fatal violation (at least a pin mismatch, a file with no loadable PEM block, a
+    private-key label, content :func:`_refuse_by_path_content` refuses, or under ``enforce`` an
     anchor another principal can replace or whose ACL or path could not be read, unless module item
     6's pin escape applies) it raises :class:`TrustAnchorError` after auditing it, so the caller refuses to start / refuses
     the reload. Otherwise it returns each anchor's fingerprint, keyed by its label."""
