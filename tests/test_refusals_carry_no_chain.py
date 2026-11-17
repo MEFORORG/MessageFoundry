@@ -399,7 +399,8 @@ def test_an_unparseable_ai_reply_keeps_it_off_the_chain() -> None:
     [
         pytest.param(http.client.InvalidURL(_PLANTED), id="invalid-url"),
         pytest.param(ValueError(f"Invalid header value b'{_PLANTED}\\n'"), id="request-value"),
-        pytest.param(http.client.BadStatusLine(_PLANTED), id="malformed-reply"),
+        pytest.param(http.client.BadStatusLine(_PLANTED), id="bad-status-line"),
+        pytest.param(http.client.LineTooLong(_PLANTED), id="line-too-long"),
         pytest.param(
             urllib.error.HTTPError(
                 "https://ai.internal/v1",
@@ -421,6 +422,22 @@ def test_an_ai_call_refusal_keeps_the_key_and_provider_bytes_off_the_chain(
     with pytest.raises(AiBrokerError) as caught:
         _raising_broker(exc).chat("synthetic prompt")
     _assert_bare(caught.value)
+
+
+def test_an_ai_call_that_succeeds_still_returns_its_reply() -> None:
+    """Control for the test above: a provider reply is still read and returned."""
+
+    class _Reply(io.BytesIO):
+        def __enter__(self) -> _Reply:
+            return self
+
+    class _ReplyingOpener:
+        def open(self, req: object, timeout: float | None = None) -> _Reply:
+            return _Reply(json.dumps({"content": [{"type": "text", "text": "hello"}]}).encode())
+
+    broker = _raising_broker(ValueError("unused"))
+    broker._opener = _ReplyingOpener()  # type: ignore[assignment]
+    assert broker.chat("synthetic prompt") == "hello"
 
 
 def test_an_unparseable_database_payload_keeps_it_off_the_chain() -> None:

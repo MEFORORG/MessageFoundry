@@ -488,8 +488,7 @@ class AiBroker:
         )
         # Vault BACKLOG #5356: an arm whose exception can quote the api_key or hold the provider's
         # bytes sets `refusal`, raised after the try so neither __cause__ nor __context__ keeps it.
-        # Bound up front, so an arm that forgets to set it still raises this module's error.
-        refusal = f"AI endpoint {_redact_url(self.endpoint)} request failed"
+        refusal: str | None = None
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as resp:
                 # ASVS 15.2.2: bounded on the socket read. The AI endpoint is operator-configured but
@@ -532,7 +531,8 @@ class AiBroker:
             )
         else:
             return self._extract_text(body)
-        raise AiBrokerError(refusal)
+        # The fallback text keeps an arm that forgot to set `refusal` on this module's error.
+        raise AiBrokerError(refusal or f"AI endpoint {_redact_url(self.endpoint)} request failed")
 
     async def chat_async(self, prompt: str) -> str:
         """Awaitable wrapper: run the blocking :meth:`chat` OFF the event loop (CLAUDE.md §6) so the

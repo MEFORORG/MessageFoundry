@@ -1614,12 +1614,14 @@ class _NoAmbientAuth(requests.auth.AuthBase):
     ``prepare_auth`` did with no auth set, so only the netrc read changes.
 
     ``trust_env`` itself stays on, because it also carries the proxy variables and the system
-    proxy that docs/CONFIGURATION.md documents for both Vault clients, and ``REQUESTS_CA_BUNDLE``
+    proxy that docs/CONFIGURATION.md documents for the Vault clients, and ``REQUESTS_CA_BUNDLE``
     and ``CURL_CA_BUNDLE``, which ``store/keyprovider_vault.py`` records as the fallback anchor
-    when no CA file is set. Both are left as they were. requests' other netrc read is
+    when no CA file is set. Both are left as they were.
+
+    Measured against requests 2.34.2, at least one more netrc read exists:
     ``Session.rebuild_auth``, which runs on any 3xx reply even with redirects refused, since
-    ``Session.send`` still prepares ``Response.next``; :func:`_rebuild_auth_without_netrc`
-    replaces it on the mounted session."""
+    ``Session.send`` still prepares ``Response.next``. :class:`_NetrcFreeSession` covers it.
+    tests/test_vault_strict_reply.py pins both reads; another requests version may add one."""
 
     def __call__(self, r: requests.PreparedRequest) -> requests.PreparedRequest:
         user, password = requests.utils.get_auth_from_url(r.url or "")
@@ -1628,22 +1630,24 @@ class _NoAmbientAuth(requests.auth.AuthBase):
         return r
 
 
-def _rebuild_auth_without_netrc(
-    session: requests.Session,
-    prepared_request: requests.PreparedRequest,
-    response: requests.Response,
-) -> None:
-    """``Session.rebuild_auth`` with its netrc read removed (vault BACKLOG #5355).
+class _NetrcFreeSession(requests.Session):
+    """``requests.Session`` whose ``rebuild_auth`` reads no netrc file (vault BACKLOG #5355).
 
-    It keeps the stock strip: an ``Authorization`` header is dropped when the next URL is
-    another host. The stock method then reads the netrc file for that URL and attaches its
-    entry, so a 3xx naming any host would put that host's netrc credential on ``Response.next``."""
-    headers = prepared_request.headers
-    original = response.request.url if response.request is not None else None
-    if "Authorization" in headers and session.should_strip_auth(
-        original or "", prepared_request.url or ""
-    ):
-        del headers["Authorization"]
+    The mount swaps a Vault session's class to this one, rather than storing a bound override on
+    the session, which would make a reference cycle and keep a discarded client's pool and socket
+    open until the cyclic GC runs. ``rebuild_auth`` keeps the stock strip, an ``Authorization``
+    header dropped when the next URL is another host, and drops the stock netrc read, which would
+    put the netrc credential of whatever host a 3xx names on ``Response.next``."""
+
+    def rebuild_auth(
+        self, prepared_request: requests.PreparedRequest, response: requests.Response
+    ) -> None:
+        headers = prepared_request.headers
+        original = response.request.url if response.request is not None else None
+        if "Authorization" in headers and self.should_strip_auth(
+            original or "", prepared_request.url or ""
+        ):
+            del headers["Authorization"]
 
 
 def mount_strict_reply_adapter(
@@ -1691,7 +1695,8 @@ def mount_strict_reply_adapter(
     #2547), and when requests would send it through a proxy whose URL requests cannot read or
     send, since requests' own error would carry that URL or its credentials (vault BACKLOG #3454).
 
-    It also stops the session's netrc reads, :class:`_NoAmbientAuth` (vault BACKLOG #5355).
+    It also stops the session's netrc reads, at least those :class:`_NoAmbientAuth` names (vault
+    BACKLOG #5355).
 
     At least the three Vault clients the engine builds today call this; a new one must too.
     """
@@ -1700,6 +1705,13 @@ def mount_strict_reply_adapter(
         raise ValueError(
             f"{connector}: cannot mount the strict reply reader, because the Vault client exposes "
             f"no requests session at client.adapter.session"
+        )
+    # A subclass is refused rather than swapped, which would drop its own behaviour: hvac builds
+    # a plain requests.Session, so an engine client never meets this (vault BACKLOG #5355).
+    if type(session) not in (requests.Session, _NetrcFreeSession):
+        raise ValueError(
+            f"{connector}: cannot mount the strict reply reader, because the Vault client's "
+            f"requests session is a {type(session).__name__}, not a plain requests.Session"
         )
     # hvac keeps the proxies it passes with every request in `_kwargs`, private but the only place
     # they live. Read here so the build-time proxy is the one the send picks; when the attribute
@@ -1729,8 +1741,6 @@ def mount_strict_reply_adapter(
     # requests tests truthiness there, so this does too.
     if not session.auth:
         session.auth = _NoAmbientAuth()
-    session.rebuild_auth = functools.partial(  # type: ignore[method-assign]
-        _rebuild_auth_without_netrc, session
-    )
+    session.__class__ = _NetrcFreeSession
     for prefix in ("https://", "http://"):
         session.mount(prefix, adapter)
