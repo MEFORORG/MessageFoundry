@@ -360,8 +360,11 @@ a `nosec` note naming the rule it answers.
 it: the running interpreter's environment, its base installation, then the user scheme's
 (`~/.local/bin` on Linux, where a pipx or `uv tool` ruff may live). It runs `mypy` as a `-m`
 module of that interpreter, by its absolute path and with `-P`. So neither a `PATH` search nor the
-working directory picks the copy (BACKLOG #5375). At least two argument-list starts are not
-pinned that way:
+working directory picks the copy (BACKLOG #5375). `mypy` is also started with `--config-file=`,
+an empty name, so it reads no configuration file at all. Without it, mypy reads a `mypy.ini`,
+`.mypy.ini`, `pyproject.toml` or `setup.cfg` from the working directory or a parent folder, or the
+user's own file, and such a file can name a plugin that mypy imports and runs. At least two
+argument-list starts are not pinned that way:
 
 - `verify/cipher_policy.py` runs `openssl` by bare name on Linux, as the manual check in
   [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 does, so the `PATH` the operator runs

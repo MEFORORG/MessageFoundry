@@ -495,7 +495,10 @@ def run_checks(
     ]
     if run_lint:
         results.append(_run_tool("ruff", "ruff", ["check", str(config_dir)]))
-        results.append(_run_tool("mypy", "mypy", [str(config_dir)]))
+        # --config-file= (empty) reads no mypy configuration file: with none named, mypy looks
+        # in the working directory and every parent up to a repository root, and a file there
+        # can name a plugin that mypy imports and runs (BACKLOG #5375).
+        results.append(_run_tool("mypy", "mypy", ["--config-file=", str(config_dir)]))
         # ADR 0144 part B (Increment 3 curation): flake8-bandit "S" over the config dir — advisory,
         # run-if-installed, the generic SAST net beside the domain-aware _check_handler_security. Keep
         # the FULL S select for breadth (it still catches weak crypto S324, unsafe yaml.load S506,
@@ -4228,7 +4231,7 @@ def _check_reference_backend(
 
 #: The lint tools' own variables, the only ones beyond a Python child's start-up names that cross
 #: into their environment (BACKLOG #5375): where mypy finds stubs and keeps its cache, where ruff
-#: keeps its cache, ``XDG_CONFIG_HOME``, where both look for a user configuration file on POSIX,
+#: keeps its cache, ``XDG_CONFIG_HOME``, where ruff looks for a user configuration file on POSIX,
 #: and the active virtual environment. Nothing of the engine's namespace, so no ``MEFOR_*`` value
 #: and no ``VAULT_TOKEN`` or ``PGPASSWORD`` reaches either tool.
 _LINT_TOOL_NAMES = frozenset(
@@ -4319,7 +4322,7 @@ def _tool_command(module: str) -> list[str] | None:
 
 def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
     """Advisory: run lint tool ``module`` with ``args``, only when it is installed for this
-    interpreter (:func:`_tool_command`); absent → skipped, never blocking. A ``ruff`` or ``mypy``
+    interpreter (:func:`_tool_command`); an absent tool is skipped and never blocks. A ``ruff`` or ``mypy``
     installed only elsewhere on ``PATH`` is not run.
 
     The child gets :func:`~messagefoundry.childenv.worker_environment` plus

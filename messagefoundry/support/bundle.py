@@ -256,28 +256,42 @@ def _log_candidates(directory: Path) -> list[tuple[Path, os.stat_result]]:
 
 def _read_log_file(path: Path, listed: os.stat_result) -> str:
     """The text of ``path``, checked after the open to be the same plain regular file that was
-    listed (BACKLOG #5383): ``fstat`` must report a regular file with the device and file id the
-    listing saw.
+    listed (BACKLOG #5383): ``fstat`` on the new descriptor must report a regular file with the
+    device and file id the listing saw. The descriptor is closed on every path out.
 
-    On POSIX, ``O_NOFOLLOW`` refuses a link swapped in at the name, as a plain :class:`OSError`
-    (``ELOOP``), and ``O_NONBLOCK`` keeps a FIFO swapped in from blocking the open; the descriptor is
-    made blocking again before the read. Windows has neither flag, so there the open still follows a
-    link swapped in after the listing, and what holds is that nothing read through it is used: the
-    file it reached has another id, and the read is refused. Raises :class:`OSError`, the identity
-    refusal as :class:`_LogFileRefused`."""
+    On POSIX, ``O_NOFOLLOW`` makes the open fail with ``ELOOP`` when a symbolic link has been put
+    at the name, so the open never reaches another file through one. ``O_NONBLOCK`` makes the open
+    of a FIFO put at the name return at once instead of waiting for a writer; the descriptor is
+    made blocking again before the read. A directory put at the name is refused as
+    :class:`_LogFileRefused`.
+
+    Windows has neither flag. There the open follows a symbolic link or junction put at the name
+    after the listing, so the open itself reaches whatever the link names, and any effect of
+    opening that target happens: connecting to a named pipe the link points at, for one. What the
+    check after the open prevents is only the read: a target with another id is refused, and
+    none of its content enters the bundle. Raises :class:`OSError`, the identity refusal as
+    :class:`_LogFileRefused`."""
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     nonblocking = getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | nonblocking
-    fd = os.open(path, flags)
-    with os.fdopen(fd, "rb") as handle:
-        opened = os.fstat(handle.fileno())
+    try:
+        fd = os.open(path, flags)
+    except IsADirectoryError as exc:
+        raise _LogFileRefused("a directory is at the app-log file's name") from exc
+    try:
+        opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
             listed.st_dev,
             listed.st_ino,
         ):
             raise _LogFileRefused("the app-log file changed between listing and opening")
         if nonblocking:
-            os.set_blocking(handle.fileno(), True)
+            os.set_blocking(fd, True)
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
         data = handle.read()
     # Read tolerant of a legacy codepage; the redaction pass runs on the decoded text.
     return data.decode("utf-8", errors="replace")

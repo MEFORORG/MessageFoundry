@@ -1453,3 +1453,48 @@ def test_lint_tool_fault_is_still_reported(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(subprocess, "run", fake_run)
     result = checks._run_tool("mypy", "mypy", ["cfg"])
     assert result.skipped is False and result.ok is False
+
+
+def test_gate_runs_mypy_with_no_configuration_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str, list[str]]] = []
+
+    def capture(name: str, module: str, args: list[str]) -> checks.CheckResult:
+        calls.append((name, module, args))
+        return checks.CheckResult(name, ok=True, required=False, skipped=True, detail="x")
+
+    monkeypatch.setattr(checks, "_run_tool", capture)
+    run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
+    mypy_args = [args for name, _module, args in calls if name == "mypy"]
+    assert mypy_args and mypy_args[0][0] == "--config-file="
+
+
+@pytest.mark.skipif(not checks._tool_installed("mypy"), reason="needs mypy for this interpreter")
+@pytest.mark.timeout(300)
+def test_mypy_config_in_the_working_directory_cannot_run_a_plugin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5375: a mypy.ini in the caller's working directory named a plugin that mypy
+    imported and ran. The positive control runs without the flag and sees the plugin run."""
+    work = tmp_path / "work"
+    work.mkdir()
+    marker = tmp_path / "plugin-ran.txt"
+    (work / "planted_plugin.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+        "from mypy.plugin import Plugin\n\n"
+        "def plugin(version):\n"
+        "    return Plugin\n",
+        encoding="utf-8",
+    )
+    (work / "mypy.ini").write_text("[mypy]\nplugins = planted_plugin.py\n", encoding="utf-8")
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("x: int = 1\n", encoding="utf-8")
+    monkeypatch.chdir(work)
+
+    checks._run_tool("mypy", "mypy", [str(cfg)])
+    assert marker.exists(), "positive control: the planted plugin did not run without the flag"
+    marker.unlink()
+
+    checks._run_tool("mypy", "mypy", ["--config-file=", str(cfg)])
+    assert not marker.exists()

@@ -11,6 +11,7 @@ import json
 import os
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -764,3 +765,46 @@ def test_log_tail_a_file_gone_between_listing_and_opening_is_listed_again(
     monkeypatch.setattr(bundle_mod, "_read_log_file", gone_once)
     assert _tail_member(tmp_path, log_dir) == "after rotation"
     assert calls[0] == 2
+
+
+def test_read_log_file_closes_the_descriptor_on_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.support import bundle as bundle_mod
+
+    log = tmp_path / "engine.log"
+    log.write_text("first\n", encoding="utf-8")
+    listed = os.lstat(log)
+    other = tmp_path / "other.log"
+    other.write_text("second\n", encoding="utf-8")
+    os.replace(other, log)
+    opened: list[int] = []
+    real_open = os.open
+
+    def recording_open(*args: Any, **kwargs: Any) -> int:
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", recording_open)
+    with pytest.raises(bundle_mod._LogFileRefused):
+        bundle_mod._read_log_file(log, listed)
+    monkeypatch.undo()
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])  # closed
+
+
+def test_read_log_file_refuses_a_directory_swapped_in(tmp_path: Path) -> None:
+    """POSIX opens a directory read-only, and the check refuses it as not a regular file; Windows
+    refuses the open itself."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    log = tmp_path / "engine.log"
+    log.write_text("first\n", encoding="utf-8")
+    listed = os.lstat(log)
+    log.unlink()
+    log.mkdir()
+    expected: type[OSError] = OSError if os.name == "nt" else bundle_mod._LogFileRefused
+    with pytest.raises(expected):
+        bundle_mod._read_log_file(log, listed)
