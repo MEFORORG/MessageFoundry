@@ -14,6 +14,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+#: The SDDL short names icacls prints for an account a self-hosted runner's service may run as.
+_SERVICE_SHORT_NAMES = {"S-1-5-18": "SY", "S-1-5-19": "LS", "S-1-5-20": "NS"}
+
+
+def my_sids(sid: str) -> set[str]:
+    """Every way SDDL may spell the account whose SID is ``sid``: the SID, ``LA`` when it IS the
+    built-in Administrator (RID 500), which the hosted runners run as (CI run 36039014999), or a
+    service account's short name. Each spells that one account and no other."""
+    if sid.endswith("-500"):
+        return {sid, "LA"}
+    return {sid, _SERVICE_SHORT_NAMES[sid]} if sid in _SERVICE_SHORT_NAMES else {sid}
+
 
 def protected_entries(path: Path) -> tuple[str, str | None, list[tuple[str, str, str, str]]]:
     """The SDDL of ``path``, its owner, and its entries as ``(kind, flags, rights, sid)``, each SID

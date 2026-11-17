@@ -27,12 +27,11 @@ from messagefoundry_toolkit.anon import DEFAULT_RULES, FieldRule, SurrogateKind,
 from tee.__main__ import main as tee_main
 from tee.store import RelayStore
 from tests._refusal_log_capture import TOKEN, assert_no_token, record_texts
+from tests._tee_seed import SYNTHETIC_ADT
+from tests._tee_seed import seed_capture as _seed_capture
 
 _SALT = "integ-salt-0123456789abcdef"
-_RAW = (
-    "MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|C1|P|2.5.1\r"
-    "PID|1||999^^^H^MR||DOE^JOHN||19800101|M"
-)
+_RAW = SYNTHETIC_ADT
 
 
 async def _send_and_ack(port: int, payload: bytes) -> bytes:
@@ -237,17 +236,6 @@ def _no_process_logging_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     ``_configure_logging`` sets a process-global UTC converter and may attach a root handler. The
     subprocess test is where the CLI's own setup is exercised."""
     monkeypatch.setattr("tee.__main__._configure_logging", lambda level: None)
-
-
-def _seed_capture(db: str, raw: bytes, *, direction: str = "corepoint_copy") -> None:
-    async def seed() -> None:
-        store = await RelayStore.open(db)
-        try:
-            await store.record_capture(direction=direction, control_id="C1", raw=raw)
-        finally:
-            await store.close()
-
-    asyncio.run(seed())
 
 
 def test_tee_anonymize_captures_end_to_end(tmp_path, monkeypatch) -> None:
