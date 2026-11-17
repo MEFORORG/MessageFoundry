@@ -49,6 +49,7 @@ from pathlib import Path
 
 from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
+from tee.anon.hl7 import SurrogateSeparatorRefused
 from tee.anon.keying import Keyer
 from tee.anon.leak import (
     MALFORMED_LINE_ADVICE,
@@ -833,6 +834,9 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     residue_advice: dict[str, None] = {}
     # Whether such a report also had another cause, which needs the general advice as well.
     residue_mixed = False
+    # Messages refused because a rule's surrogate would hold the field separator or a control
+    # byte (BACKLOG #5540). A keep is the wrong advice for one: it would emit the captured value.
+    separator_refused = 0
 
     def _tally(report: LeakReport) -> None:
         nonlocal residue_reports, residue_mixed
@@ -854,12 +858,13 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 require_full_coverage=args.require_full_coverage,
                 on_report=_tally,
             )
-        except AnonError:
+        except AnonError as exc:
             # Counted apart from the rest: anonymize refused the message before the leak-check
             # built a report, so the coverage line would not show it at all (BACKLOG #3004).
             # The error's text is not printed; the summary names the count and fixed causes.
             coverage.refuse()
             failed += 1
+            separator_refused += isinstance(exc, SurrogateSeparatorRefused)
             continue
         except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
             failed += 1  # it is a count, not a leak (LeakError, or anything else)
@@ -900,15 +905,26 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         ]
         if residue_reports:
             # A keep is the wrong advice here: it would leave the whole field.
+            if residue_reports < failed:
+                rest = ["For the others:", *steps]
+            elif residue_mixed:
+                rest = ["At least one of them also had another cause:", *steps]
+            else:
+                rest = ["Then retry."]
             steps = [
                 f"{residue_reports} of them carried a PHI shape in a field a rule maps, past its "
                 "first component, where a retarget or an identifier rule left it as captured. "
                 f"{' '.join(residue_advice)} A keep would leave the whole field.",
-                *(
-                    ["For the others:", *steps]
-                    if residue_reports < failed or residue_mixed
-                    else ["Then retry."]
-                ),
+                *rest,
+            ]
+        if separator_refused:
+            # A keep is the wrong advice here too: it would emit the captured value whole.
+            steps = [
+                f"{separator_refused} of them were refused because a rule's surrogate would hold "
+                "the message's field separator or a control byte, which a custom MSH-1 makes "
+                "possible. A keep on that field would emit the captured value: point the field at "
+                "drop in an overlay, or capture the feed under the standard | field separator.",
+                *(["For the others:", *steps] if separator_refused < failed else ["Then retry."]),
             ]
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "

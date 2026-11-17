@@ -137,6 +137,23 @@ def site_prefixes_loaded() -> bool:
     return bool(_SITE_PREFIXES)
 
 
+def site_prefix_split(guard_prefixes: tuple[str, ...]) -> str | None:
+    """Why the site-code check does not use the publish guard's ``[site_prefix]`` table, or
+    ``None`` when it uses the same prefixes. ``guard_prefixes`` is the guard's own table, whose
+    count its token floor counts. The two differ when the guard holds an entry that is not two
+    digits, which this module does not load and no site code matches, or when one of the two was
+    reloaded and the other was not (BACKLOG #5541). The reason gives counts only, never a prefix:
+    the prefixes name a real estate."""
+    if set(guard_prefixes) == set(_SITE_PREFIXES):
+        return None
+    return (
+        f"the site-code check uses {len(_SITE_PREFIXES)} two-digit prefix(es) but the publish "
+        f"guard's [site_prefix] table holds {len(set(guard_prefixes))} entr(ies) — an entry that "
+        "is not two digits, or a reload of one table without the other "
+        "(surrogates.reload_site_prefixes); the site-code check does not match what the guard counts"
+    )
+
+
 #: What :class:`SurrogateKind.FREETEXT` collapses a narrative field to. Free text routinely embeds
 #: identifiers (a name/MRN/DOB in prose) that field-level surrogation cannot reach and the leak-check
 #: only catches as known tokens — so the default is a blunt full-redact (ADR 0030 §3).
@@ -162,22 +179,42 @@ def _fake_digits(rng: random.Random, length: int) -> str:
     return "".join(str(rng.randrange(10)) for _ in range(max(1, length)))
 
 
-def _fake_like(rng: random.Random, sample: str) -> str:
+def _fake_letter(rng: random.Random) -> str:
+    """A fabricated upper-case ASCII letter."""
+    return chr(rng.randrange(ord("A"), ord("Z") + 1))
+
+
+def _fake_like(rng: random.Random, sample: str, seps: Seps) -> str:
     """A fabricated value with the **same shape** as ``sample``: each digit becomes an ASCII digit,
     each letter and each other non-ASCII character becomes an upper-case ASCII letter, and ASCII
     punctuation and spaces are kept verbatim. Preserves the original width AND the alphanumeric
     shape (so ``A0049`` becomes ``X7321``, not a shrunk digit-only string). A non-ASCII letter used to be kept as it was, so
-    an accented letter of a real id reached the output (BACKLOG #5534)."""
-    if not sample:
-        return _fake_digits(rng, 6)
+    an accented letter of a real id reached the output (BACKLOG #5534).
+
+    The subcomponent separator and escape character the message declares are kept
+    even when they are not ASCII, so the value keeps its structure, and each escape sequence a
+    second escape character closes becomes one fabricated letter, the width it decodes to. Its body
+    is never rewritten letter by letter, which could turn ``\\E\\`` into ``\\F\\``."""
     out: list[str] = []
-    for ch in sample:
-        if ch.isdigit():
+    escape = seps.escape
+    kept = (seps.subcomponent, escape)
+    at = 0
+    while at < len(sample):
+        ch = sample[at]
+        end = sample.find(escape, at + 1) if escape and ch == escape else -1
+        if end != -1:
+            out.append(_fake_letter(rng))
+            at = end + 1
+            continue
+        if ch in kept:
+            out.append(ch)
+        elif ch.isdigit():
             out.append(str(rng.randrange(10)))
         elif ch.isalpha() or not ch.isascii():
-            out.append(chr(rng.randrange(ord("A"), ord("Z") + 1)))
+            out.append(_fake_letter(rng))
         else:
             out.append(ch)
+        at += 1
     return "".join(out)
 
 
@@ -234,10 +271,13 @@ def _surrogate_identifier(
     """Replace the **id** component (component 1) with a fabricated value of the same length and
     alphanumeric shape, keep the components ``kept`` names (by default the CX authority
     components, :data:`_CX_KEPT_COMPONENTS`: non-PHI, routing-relevant) and blank the rest — so an alphanumeric MRN keeps its width and shape, not
-    just its digit count, and its check digit and dates do not survive (BACKLOG #5534)."""
+    just its digit count, and its check digit and dates do not survive (BACKLOG #5534). An empty
+    id is left empty, and the separators and escape sequences in it are handled as
+    :func:`_fake_like` says."""
     rng = keyer.rng(kind, rep)
     comps = _components(rep, seps)
-    fabricated = _fake_like(rng, comps[0])
+    # An empty id stays empty: a fabricated one would invent an id the sender never sent.
+    fabricated = _fake_like(rng, comps[0], seps) if comps[0] else ""
     return seps.component.join([fabricated, *_kept_tail(comps, kept)])
 
 
@@ -281,7 +321,9 @@ def surrogate_ssn(rep: str, keyer: Keyer, seps: Seps) -> str:
     rng = keyer.rng("ssn", rep)
     comps = _components(rep, seps)
     id_part = comps[0]
-    if re.fullmatch(r"\d{3}-\d{2}-\d{4}", id_part):
+    if not id_part:
+        fabricated = ""  # an empty id stays empty, as :func:`_surrogate_identifier` leaves one
+    elif re.fullmatch(r"\d{3}-\d{2}-\d{4}", id_part):
         fabricated = f"{_fake_digits(rng, 3)}-{_fake_digits(rng, 2)}-{_fake_digits(rng, 4)}"
     else:
         fabricated = _fake_digits(rng, sum(c.isdigit() for c in id_part) or 9)
@@ -502,11 +544,22 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
             body = pieces[at]
             if at == len(pieces) - 1 or not _HEX_ARGUMENT_ESCAPE.fullmatch(body):
                 forms += _NON_DIGITS.split(body)
+    # A consumer that folds compatibility characters shows a fullwidth digit as an ASCII one, so
+    # each reading is also read folded (BACKLOG #5654).
+    forms += [folded(form) for form in forms if not form.isascii()]
     return any(SITE_CODE_RE.fullmatch(form) for form in forms)
 
 
-#: What splits an escape body read as written: any run of characters that are not ASCII digits.
-_NON_DIGITS: re.Pattern[str] = re.compile(r"[^0-9]+")
+def folded(text: str) -> str:
+    """``text`` in Unicode compatibility form (NFKC), as a consumer that folds a fullwidth digit
+    or letter to its ASCII one reads it."""
+    return unicodedata.normalize("NFKC", text)
+
+
+#: What splits an escape body read as written: any run of characters that are not digits. ``\\D``
+#: as :data:`SITE_CODE_RE`'s ``\\d`` reads a digit, so the two readings agree on a fullwidth
+#: digit (BACKLOG #5654).
+_NON_DIGITS: re.Pattern[str] = re.compile(r"\D+")
 #: The body of a well-formed escape whose argument is hex: ``\\Xhh..\\``, hex data in whole pairs,
 #: and ``\\Mxxyy\\`` or ``\\Mxxyyzz\\``, the multi-byte character-set escape. The argument codes
 #: bytes or a character set, not digits a consumer shows: the hex data is read decoded, and a
@@ -537,18 +590,35 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|")
     with subcomponents that reads as a site code whole, as received, is replaced whole, its
     subcomponent separators included; otherwise each subcomponent is replaced on its own. The surrogate is keyed on
     the part as written, so one site code written two ways gets two unrelated surrogates.
-    ``field_sep`` is the message's field separator, which ``\\F\\`` decodes to."""
+    ``field_sep`` is the message's field separator, which ``\\F\\`` decodes to. A fabricated code
+    holds no digit the message declares as a separator (BACKLOG #5540)."""
     if not value or not _SITE_PREFIXES:
         return value
     # The check also reads the value with its invisible characters dropped, so the fast exit does.
     visible = dropped(value)
+    if not visible.isascii():
+        visible = folded(visible)
     if not any(p in visible for p in _SITE_PREFIXES) and not (seps.escape and seps.escape in value):
         return value
 
+    # A digit the message declares as a separator is never written: under a digit MSH-1 or MSH-2
+    # it would add a field or a component and shift every later one past its rule (BACKLOG #5540).
+    reserved = set(field_sep + seps.component + seps.repetition + seps.subcomponent + seps.escape)
+    digits = [d for d in "0123456789" if d not in reserved]
+    prefixes = [p for p in _NON_SITE_PREFIXES if not reserved.intersection(p)]
+    if not prefixes:
+        raise AnonError(
+            "every non-site-code prefix holds a digit the message declares as a separator, so no "
+            "site-code surrogate can be written — refusing to emit"
+        )
+
     def _fake(part: str) -> str:
         rng = keyer.rng("sitecode", part)
-        prefix = rng.choice(_NON_SITE_PREFIXES)
-        return f"{prefix}{_fake_digits(rng, len(part) - len(prefix))}"
+        prefix = rng.choice(prefixes)
+        if len(digits) == 10:
+            return f"{prefix}{_fake_digits(rng, len(part) - len(prefix))}"
+        tail = "".join(rng.choice(digits) for _ in range(max(1, len(part) - len(prefix))))
+        return f"{prefix}{tail}"
 
     def _one(part: str) -> str:
         return _fake(part) if _reads_as_site_code(part, seps, field_sep) else part
@@ -749,14 +819,36 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
 #: interleaved with one, such as ``971234\\X00\\``, ``97\\XAD\\1234`` or ``MR`` with a U+200B, reads
 #: as the value without it (BACKLOG #5632, #5654).
 _INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf"})
+#: The Unicode default-ignorable code points outside Cc and Cf (DerivedCoreProperties.txt,
+#: Default_Ignorable_Code_Point), as inclusive ranges: among them the combining grapheme joiner
+#: U+034F and the variation selectors, category Mn, and the Hangul fillers U+115F, U+1160, U+3164
+#: and U+FFA0, category Lo. A consumer shows none of them, so a site code or ``MR`` they
+#: interleave reads as the value without them (BACKLOG #5654). The ranges that lie inside Cc or
+#: Cf are left to :data:`_INVISIBLE_CATEGORIES`.
+_DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
 #: The split class besides the delimiters: whitespace, which :func:`decoded_readings` maps every
 #: invisible character to before it splits.
 _TRIM_CLASS = "\\s"
 
 
 def _is_invisible(char: str) -> bool:
-    """True if ``char`` is in :data:`_INVISIBLE_CATEGORIES`."""
-    return unicodedata.category(char) in _INVISIBLE_CATEGORIES
+    """True if ``char`` is in :data:`_INVISIBLE_CATEGORIES` or :data:`_DEFAULT_IGNORABLE_RANGES`."""
+    if unicodedata.category(char) in _INVISIBLE_CATEGORIES:
+        return True
+    code = ord(char)
+    return code >= 0x034F and any(low <= code <= high for low, high in _DEFAULT_IGNORABLE_RANGES)
 
 
 def _is_blank(char: str) -> bool:
@@ -765,8 +857,8 @@ def _is_blank(char: str) -> bool:
 
 
 def dropped(text: str) -> str:
-    """``text`` with every invisible character (:data:`_INVISIBLE_CATEGORIES`) removed, as a
-    consumer that drops them reads it."""
+    """``text`` with every invisible character (:func:`_is_invisible`) removed, as a consumer
+    that drops them reads it."""
     return "".join(c for c in text if not _is_invisible(c))
 
 

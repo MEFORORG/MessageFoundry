@@ -72,7 +72,8 @@ def test_an_mrn_type_past_the_first_subcomponent_or_padded_is_a_hit(
     ids=["second-component-sub", "name-sub", "escaped-sub"],
 )
 def test_an_mr_subcomponent_outside_cx_5_is_no_hit(leak: ModuleType, value: str) -> None:
-    """Outside CX.5 only a whole component counts, so an ``MR`` subcomponent there is text."""
+    """Outside components 5, 7 and 13 only a whole component or its first subcomponent counts,
+    so an ``MR`` subcomponent past the first there is text."""
     assert leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"}) == []
 
 
@@ -164,7 +165,8 @@ def test_component_5_of_any_field_is_read_as_cx_5(leak: ModuleType) -> None:
 def test_the_same_mr_subcomponent_beside_component_5_is_no_hit(
     leak: ModuleType, segment: str
 ) -> None:
-    """Only component 5 is read subcomponent by subcomponent, so the neighbours pass."""
+    """Only components 5, 7 and 13 are read subcomponent by subcomponent, so the neighbours of
+    component 5 pass."""
     assert leak.structural_phi_hits(f"{_HEAD}\r{segment}", {"PID-3", "PID-5"}) == []
 
 
