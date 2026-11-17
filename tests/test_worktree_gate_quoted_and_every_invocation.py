@@ -516,3 +516,31 @@ def test_review_round_shapes_are_denied(
 ) -> None:
     reason = _reason(rig, _fmt(rig, template), _cwd(rig, where))
     assert text in reason, reason
+
+
+# Review round e9fa08d529.
+@pytest.mark.parametrize(
+    ("template", "text"),
+    [
+        ("git -C {p}'''' reset --hard", "SHARED PRIMARY"),
+        ("git --git-dir $'{p}/.git' config {k}", "SHARED git configur"),
+        ("git --work-tree $'{p}' reset --hard", "SHARED PRIMARY"),
+    ],
+)
+def test_review_round_two_joined_shapes_are_denied(
+    rig: SimpleNamespace, template: str, text: str
+) -> None:
+    reason = _reason(rig, _fmt(rig, template), rig.outside)
+    assert text in reason, reason
+
+
+def test_a_disarm_inside_a_substitution_is_not_the_outer_commands(rig: SimpleNamespace) -> None:
+    # The substitution's git runs in the cwd; the outer `-C` must not decide it.
+    assert _allowed(rig, _fmt(rig, "git -C '{p}' log $(/usr/bin/git config {k})"), rig.outside)
+
+
+def test_a_blanked_spacey_suffix_is_not_joined(rig: SimpleNamespace) -> None:
+    # `<p>' copy'` names `<p> copy`; the scan blanks `' copy'` to an empty pair, which is not joined.
+    copy = rig.tmp / "Primary copy"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(copy)], check=True, capture_output=True)
+    assert _allowed(rig, _fmt(rig, "git -C {p}' copy' reset --hard"), rig.outside)

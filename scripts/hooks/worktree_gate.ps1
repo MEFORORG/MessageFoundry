@@ -827,7 +827,8 @@ function Get-ScanRawIndexMap($Seg) {
 # is a spelling the token pattern misses (`git.EXE reset --hard`, or `GIT` on Windows), which rule 3's
 # first reading exits on before these readings run. That last one is origin/main's too. Also, at
 # least: any line after an earlier line whose chdir sits in a subshell (`(cd x && ls)`), which makes
-# the earlier-line reading answer nothing, unless the invocation's first `-C` is absolute; and a `--git-dir` after a `-c <key>=<v>` disarm, which is
+# the earlier-line reading answer nothing, unless the invocation's `-C` fold ends absolute and its
+# window names no work tree or git dir; and a `--git-dir` after a `-c <key>=<v>` disarm, which is
 # not promoted; and a chdir ahead of an invocation joined by a bracket (`cd <p> && git -C <o> log
 # $(git reset --hard)`), whose prefix the chdir follower cannot read. Known new false denies, left
 # open, at least: a later disarm judged by rule 3c's first chain can take an earlier command's `-C`;
@@ -901,15 +902,25 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
 # use this, so the shared scan and every reading made before are untouched, and a second reading can
 # only add a deny. A trailing pair joins on both hosts. A leading one joins under POSIX only:
 # PowerShell passes a leading `''` as an argument of its own (measured in review round 34781a2201).
-# The `$` is dropped only before a `-C`, `--work-tree=`, `--git-dir=`, GIT_WORK_TREE or GIT_DIR value,
+# The `$` is dropped only before a `-C`, `--work-tree`, `--git-dir`, GIT_WORK_TREE or GIT_DIR value,
 # POSIX only; the window cannot tell a `$'<word>'` from a variable there, so a variable's name is read
 # as a relative path too, which can only add a deny.
-function Get-JoinedReading($Reading, [string]$Conv) {
+#
+# The scan also blanks a quoted span with whitespace in it to an empty pair, which this cannot tell from
+# a real one, so the pair joins are made only where the RAW line itself holds an empty pair glued to a
+# word (review round e9fa08d529). Only POSIX and PowerShell segments are read: in cmd a quote is a
+# literal.
+function Get-JoinedReading($Reading, [string]$Conv, [string]$Raw) {
+    if ($Conv -ne 'posix' -and $Conv -ne 'pwsh') { return }
     $w = [string]$Reading.Window
-    $w2 = $w -replace "(?<=[^\s;&|(){}<>'`"])(?:''|`"`")", ''
+    $w2 = $w
+    $glued = "[^\s;&|(){}<>'`"](?:''|`"`")|(?:''|`"`")[^\s;&|(){}<>'`"]"
+    if ($Raw -match $glued) {
+        $w2 = $w2 -replace "(?<=[^\s;&|(){}<>'`"])(?:''|`"`")+", ''
+        if ($Conv -eq 'posix') { $w2 = $w2 -replace "(?<=\s)(?:''|`"`")+(?=[^\s;&|(){}<>'`"])", '' }
+    }
     if ($Conv -eq 'posix') {
-        $w2 = $w2 -replace "(?<=\s)(?:''|`"`")(?=[^\s;&|(){}<>'`"])", ''
-        $w2 = $w2 -replace '(?<=(?:^|\s)-C\s+|--(?:work-tree|git-dir)=|GIT_(?:WORK_TREE|DIR)=)\$(?=[^\s$({''"])', ''
+        $w2 = $w2 -replace '(?<=(?:^|\s)-C\s+|--(?:work-tree|git-dir)(?:=|\s+)|GIT_(?:WORK_TREE|DIR)=)\$(?=[^\s$({''"])', ''
     }
     if ($w2 -ceq $w) { return }
     [pscustomobject]@{ ScanPrefix = $Reading.ScanPrefix; Window = $w2 }
@@ -4197,23 +4208,27 @@ What to do instead:
                 $lastCfg = $dis.Index + $cfgWords[$cfgWords.Count - 1].Index
                 if ($lastCfg -ne $dis.Index) { $anchors += $lastCfg }
             }
-            # The owning word is floored at a true separator (review round 34781a2201): it skips a
-            # path-qualified git, so without the floor `git -C '<p>' log ; /usr/bin/git config <key>`
-            # read the earlier command's `-C`. Rule 3 floors its owning word the same way.
+            # The owning word is read only where no true separator and no unclosed opener lie between
+            # it and the disarm (review rounds 34781a2201, e9fa08d529): it skips a path-qualified git,
+            # so `git -C '<p>' log ; /usr/bin/git config <key>` and `git -C '<p>' log $(/usr/bin/git
+            # config <key>)` read the outer command's `-C` without that floor.
             $readings = [System.Collections.Generic.List[object]]::new()
             $seen = @{}
             foreach ($anchor in $anchors) {
                 $to = $(if ($viaConfig) { $anchor } else { $readTo })
                 $gws = @(Get-AnyGitWordBefore $seg.Scan $anchor)
                 $own = Get-GitWordBefore $seg.Scan $anchor
-                if ($own -ge 0 -and $own -ne $gws[0] -and
-                    -not (Test-TrueSeparatorIn $seg.Scan.Substring($own, $anchor - $own))) { $gws += $own }
+                if ($own -ge 0 -and $own -ne $gws[0]) {
+                    $span = $seg.Scan.Substring($own, $anchor - $own)
+                    if (-not (Test-TrueSeparatorIn $span) -and
+                        ([regex]::Matches($span, '[({]')).Count -le ([regex]::Matches($span, '[)}]')).Count) { $gws += $own }
+                }
                 foreach ($gw in $gws) {
                     if ($seen.ContainsKey("$to/$gw")) { continue }
                     $seen["$to/$gw"] = $true
                     foreach ($r in @(Get-InvocationReading $seg.Scan $to -GitAt $gw -Prior $seg.Prior)) {
                         $readings.Add($r)
-                        foreach ($j in @(Get-JoinedReading $r $seg.Conv)) { $readings.Add($j) }
+                        foreach ($j in @(Get-JoinedReading $r $seg.Conv $seg.Raw)) { $readings.Add($j) }
                     }
                 }
             }
@@ -5106,7 +5121,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
                 $ownGit = Get-GitWordBefore $seg.Scan $vIdx
                 if ($ownGit -gt $vm.Index) { $gitAts += $ownGit }
                 $readings = @(foreach ($gitAt in $gitAts) { Get-InvocationReading $seg.Scan $vIdx -GitAt $gitAt -Prior $seg.Prior })
-                $readings = @($readings) + @(foreach ($r in $readings) { Get-JoinedReading $r $seg.Conv })
+                $readings = @($readings) + @(foreach ($r in $readings) { Get-JoinedReading $r $seg.Conv $seg.Raw })
                 foreach ($reading in $readings) {
                     $ownRepo = ($reading.Window -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
                     [pscustomobject]@{
