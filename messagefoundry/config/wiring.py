@@ -4542,6 +4542,21 @@ def DICOM(
         presentation_contexts=presentation_contexts,
         calling_ae_allowlist=calling_ae_allowlist,
     )
+    # The checks every other TLS factory makes (BACKLOG #5331): a blank tls_ca_file reads as unset,
+    # so the hop would fall back to the instance or OS trust while the config reads as pinned; a CA
+    # beside tls=False is never read, since neither the SCP nor the SCU builds a TLS context then;
+    # and a malformed pin, or one with no CA, would pass check.
+    if tls_ca_file is not None:
+        # The unread reason below reads tls by truthiness, so 0 would be refused as TLS off. Only
+        # here: elsewhere inbound()/outbound() refuse it, naming the connection.
+        _refuse_bool_literals({"tls": tls}, "DICOM")
+    _check_tls_ca_file(
+        "DICOM",
+        tls_ca_file,
+        # An env() tls is truthy here; resolved, the build reads it.
+        unread=None if tls else "tls=False builds no TLS context for the SCP or the SCU",
+    )
+    _check_tls_ca_pin("DICOM", tls_ca_pin, tls_ca_file)
     settings: dict[str, Any] = {
         "ae_title": ae_title,
         "host": host,
