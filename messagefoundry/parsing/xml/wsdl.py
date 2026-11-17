@@ -111,7 +111,9 @@ class WsdlDefinition:
         """Validate a request ``envelope``'s SOAP body against ``operation``'s input element (ADR 0122).
 
         Returns an :class:`~messagefoundry.parsing.xml.schema.XmlSchemaResult` (``valid`` + PHI-safe
-        ``reasons``). Raises :class:`~messagefoundry.parsing.xml.errors.WsdlError` for an unknown operation
+        ``reasons``). The result is invalid unless the root is a SOAP 1.1 or 1.2 ``Envelope`` with
+        exactly one ``Body`` holding exactly one element child (BACKLOG #5373). Raises
+        :class:`~messagefoundry.parsing.xml.errors.WsdlError` for an unknown operation
         or an operation with no resolvable document/literal input element (rpc/encoded not supported for
         validation)."""
         return self._validate(envelope, operation, direction="input")
@@ -135,8 +137,8 @@ class WsdlDefinition:
                 "against (rpc/encoded style is not supported for validation)"
             )
         body_child = _soap_body_child(envelope)
-        if body_child is None:
-            return XmlSchemaResult(valid=False, reasons=("/: missing or empty SOAP Body",))
+        if isinstance(body_child, str):
+            return XmlSchemaResult(valid=False, reasons=(body_child,))
         actual = _clark(body_child)
         if actual != expected:
             # PHI-safe: names the QNames, never the element content.
@@ -363,15 +365,31 @@ def _operations(root: Any, messages: Mapping[str, list[WsdlPart]]) -> dict[str, 
     return operations
 
 
-def _soap_body_child(envelope: str | bytes) -> Any | None:
-    """The first element child of a SOAP (1.1 or 1.2) ``<Body>`` in ``envelope``, or ``None``. Parsed
-    through the hardened parser (untrusted instance body)."""
+def _soap_body_child(envelope: str | bytes) -> Any | str:
+    """The single element child of the ``<Body>`` of a SOAP (1.1 or 1.2) ``envelope``, or a PHI-safe
+    reason string when there is not exactly one to validate. Parsed through the hardened parser
+    (untrusted instance body).
+
+    The root must be a SOAP ``Envelope`` holding exactly one ``Body`` in its own namespace, and that
+    ``Body`` exactly one element child: the operation names one body element, so a sibling beside
+    it would otherwise reach the caller unvalidated under a valid result (BACKLOG #5373). Reasons
+    name only QNames and counts, never content."""
     root = parse_bytes(envelope)
-    for env_ns in (_SOAP11_ENV_NS, _SOAP12_ENV_NS):
-        body = root.find(f"{{{env_ns}}}Body")
-        if body is not None:
-            for child in body:
-                # skip comments / processing instructions — only element children
-                if isinstance(child.tag, str):
-                    return child
-    return None
+    env_ns = next(
+        (ns for ns in (_SOAP11_ENV_NS, _SOAP12_ENV_NS) if _clark(root) == f"{{{ns}}}Envelope"),
+        None,
+    )
+    if env_ns is None:
+        return f"/: root {_clark(root)} is not a SOAP 1.1 or 1.2 Envelope"
+    bodies = root.findall(f"{{{env_ns}}}Body")
+    if not bodies:
+        return "/: missing or empty SOAP Body"
+    if len(bodies) > 1:
+        return f"/Envelope: {len(bodies)} SOAP Body elements; expected exactly one"
+    # skip comments / processing instructions — only element children
+    children = [child for child in bodies[0] if isinstance(child.tag, str)]
+    if not children:
+        return "/: missing or empty SOAP Body"
+    if len(children) > 1:
+        return f"/Envelope/Body: {len(children)} element children; expected exactly one"
+    return children[0]
