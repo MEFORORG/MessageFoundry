@@ -34,11 +34,8 @@ that sets `"onFailure": "block"` when it fails: a non-zero exit, a timeout, a
 command that cannot start, a defect of its own such as an unsupported handler
 type or shell, or a defect in its group, such as a matcher that is not a valid
 regex, that keeps it from running. Any other hook failure is a
-non-blocking error, except where the PowerShell tail below exits 2. The bridge
-reports it on stderr and as a `systemMessage`, ignores that
-hook's output, and runs the remaining hooks. A JSON
-`permissionDecision` deny from a hook is a decision, not a failure, and is passed
-on as before.
+non-blocking error, which the bridge reports on stderr and as a `systemMessage`.
+A JSON `permissionDecision` deny from a hook is a decision, not a failure.
 
 A bridge fault never blocks, on any event. A fault is anything that keeps the
 bridge from running the hooks: settings that cannot be parsed, a missing session
@@ -59,12 +56,13 @@ call that names `hook` as its subcommand, as every registered command does, no
 decision is reported and maps to a non-blocking exit 1 on every event, never to
 2, and never to 0 once `pwsh` has started, except that a help flag prints usage
 and exits 0. `invoke.ps1` ends its process with
-its code, and the command line passes it on, because `pwsh -Command` would
-report an exit 2 as 1. This is tested with PowerShell, `cmd` and `sh` as the
-outer shell. Codex's documentation does not say which shell runs a hook command.
-When `pwsh` itself cannot start, nothing reports it: the line would exit 0 under
-Windows PowerShell 5.1, which proceeds as if every hook passed, 9009 under `cmd`
-and 127 under `sh`; this is reasoned, not measured.
+its code.
+
+Codex's documentation does not say which shell runs a hook command. Under a
+PowerShell outer shell, `pwsh -Command` reports the launcher's exit 2 as a
+non-blocking 1, so no exit 2 blocks under it. A hook's JSON deny reaches Codex
+under every outer shell. With `pwsh` missing, the line exits 1 under a
+PowerShell outer shell.
 
 **A future guard that must block when it fails sets
 `"onFailure": "block"`.** That holds only for a hook the bridge reaches: a
@@ -82,18 +80,10 @@ where Claude Code runs it under Git Bash when Git Bash is installed.
 Command-only hooks use the shell they name. With none, they use pwsh on Windows
 and bash elsewhere.
 Structured `command` and `args` avoid shell parsing. The bridge runs a
-command-only PowerShell hook under `pwsh -Command` and appends this fixed tail
-after it, on new lines:
-
-```powershell
-;
-if (-not $?) { try { if ($global:LASTEXITCODE -eq 2) { exit 2 } } catch {}; exit 1 }
-```
-
-The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`. A hook that opens with `[CmdletBinding()]` does not receive the
-payload through `$input`.
-
-Which PowerShell hook shapes block is recorded by the tests in tests/test_codex_bridge.py; read them rather than this page.
+command-only PowerShell hook under `pwsh -Command`. A guard
+that such a hook runs and that exits 2 is a non-blocking exit 1 there, unless the
+hook itself runs `exit 2` or `exit $LASTEXITCODE`. An `args` hook
+that runs the guard keeps its exit 2.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.
