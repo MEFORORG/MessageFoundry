@@ -178,6 +178,29 @@ def test_list_readers_still_decode_a_well_formed_reply(
     assert result.total == 0
 
 
+@pytest.mark.parametrize(
+    "content",
+    [b'{"token": "\xff\xfe"}', b"[" * 100_000, b"[]", b"not json"],
+    ids=["non_utf8", "deep_nesting", "not_an_object", "not_json"],
+)
+def test_a_malformed_rotation_reply_keeps_the_token_and_raises_nothing(content: bytes) -> None:
+    """An elevation reply that does not decode leaves the current token in place and raises
+    nothing (BACKLOG #5344). ``response.json()`` raised ``UnicodeDecodeError``, whose ``.object`` is
+    the whole reply, or ``RecursionError``, neither of which the old handler caught.
+
+    Mutation: put ``response.json().get("token")`` back. Red: the non-UTF-8 case raises."""
+    client = EngineClient("http://127.0.0.1:8765")
+    try:
+        client._token = "before"
+        client._adopt_rotated(httpx.Response(200, content=content))
+        assert client.token == "before"
+        # Control: a well-formed reply is still adopted.
+        client._adopt_rotated(httpx.Response(200, json={"token": "after"}))
+        assert client.token == "after"
+    finally:
+        client.close()
+
+
 # --- ASVS 4.2.5: the client's own outbound length bound --------------------------------------------
 
 

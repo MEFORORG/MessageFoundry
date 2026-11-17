@@ -20,7 +20,6 @@ import threading
 import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from json import JSONDecodeError
 from pathlib import Path
 from types import TracebackType
 from typing import Literal, TypeVar
@@ -1184,10 +1183,8 @@ class EngineClient:
         :meth:`set_token`: the rotation already ended that one for every holder, so only this client
         holds the new one.
         """
-        try:
-            token = response.json().get("token")
-        except (JSONDecodeError, AttributeError):
-            return
+        body, refused = json_loads_or_refusal(response.content)
+        token = body.get("token") if refused is None and isinstance(body, dict) else None
         if isinstance(token, str) and token:
             self._hold_issued(token)
 
