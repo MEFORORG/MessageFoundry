@@ -274,19 +274,18 @@ open points settled below.
   disposition each member of a batch gets. The mark is read in the decoded text, so under a
   single-byte charset its bytes are three characters, which the batch split keeps too, and a
   `utf-8-sig` or UTF-16 decode drops the mark itself. A one-message file whose decoded text starts
-  with `MSH` after whitespace, and that ends with no envelope line, is still handed over as its own
-  bytes. The split drops the `FHS`, `BHS`, `BTS` and `FTS` envelope lines before the first message,
-  and the run of them that ends an `MSH`-led message (BACKLOG #5806), so a message the split reads
-  as led by `MSH`, the last of an enveloped file or its only one, does not carry the trailer to
-  the Handler. A message led by a character the split keeps, such as `\x1c` before its `MSH`,
-  keeps its trailer. A one-message file led by `MSH` that ends with such lines is handed over as
-  the split read it, as a batch member is. An envelope line here opens, past spaces, tabs and the
-  other ASCII whitespace and byte order marks, with one of those ids, followed by the field
-  separator (MSH-1) of the message it goes with, or by nothing but that noise. For lines that end
-  a message that is the message's own; for lines before the first message it is that of the first
-  message a line break starts, past any byte order marks, and where there is none only a line of
-  an id and noise alone is an envelope line. So a data line such as `FHS: 140 bpm` stays in its
-  message.
+  with `MSH` after whitespace, and that ends with no trailer line, is still handed over as its own
+  bytes. *Changed by BACKLOG #5806:* the split also drops the run of trailer lines that ends an
+  `MSH`-led message, and nothing else changes. A trailer line starts with `BTS`, `FTS`, `BHS` or
+  `FHS` and then, right after the id, that message's own field separator (MSH-1, read from the
+  message's own `MSH` line, and only when it is ASCII). So a data line such as `FHS: 140 bpm`, a
+  bare `FHS`, `BTS^1` under `|`, and a line a space or a byte order mark leads all stay, and an
+  empty line ends the run. The first chunk is read as before, so a `BTS` line before the first
+  `MSH` is still kept as a message for the parser. A one-message file led by `MSH` that ends with
+  trailer lines is handed over as the split read it, as a batch member is. The whole-file byte
+  scan sends a file holding `BTS`, `FTS`, `BHS` or `FHS` right after a line break to the decode.
+  `tests/test_msh_boundary_parity.py` holds the split and the whole-file split to copies of them
+  as they stood before, less the trailer lines.
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
   embedded start byte, so the parser reads a segment whose id begins with that byte, not `MSH`. The
   embedded-byte refusal of ADR 0205 rule 4 runs first in the same guard and is what closes it.
@@ -483,7 +482,8 @@ into one MLLP frame or one HTTP request is told so, with an `AR` where it can be
 is processed as the File source processes one, and an enveloped remote batch is no longer one
 `ERROR`. A batch file led by whitespace or a byte order mark keeps its first message on both file
 sources, and a one-message file led by a byte order mark or an `FHS`/`BHS` envelope header is no
-longer an `ERROR`.
+longer an `ERROR`. An `MSH`-led message no longer carries the trailer lines of its batch
+to the Handler.
 
 **Negative / risks** -- Rule 3 is advisory: a Handler author can still write the unsafe form, and
 the lint sees only literal paths and has the blind spots listed above. A partner that reads a

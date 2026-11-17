@@ -470,19 +470,25 @@ def test_split_messages_reads_a_leading_run_of_marks_as_the_live_split(
 
 @pytest.mark.parametrize(
     "noise",
-    [b"\xc2\xa0", b"\xc2\x85", b"\xe2\x80\x83", b"\x1c", b"\x0b", b"\xef\xbb\xbf"],
-    ids=["nbsp", "nel", "em-space", "fs", "vt", "mark"],
+    [b"", b"\xc2\xa0", b"\xc2\x85", b"\xe2\x80\x83", b"\x1c", b"\x0b", b"\xef\xbb\xbf"],
+    ids=["none", "nbsp", "nel", "em-space", "fs", "vt", "mark"],
 )
 @pytest.mark.parametrize("count", [1, 2], ids=["one-message", "two-messages"])
-def test_split_messages_reads_envelope_noise_as_the_live_split(noise: bytes, count: int) -> None:
-    """Round-three review of BACKLOG #5806, finding 2: the trailer walk read every Unicode space as
-    noise, so the live UTF-8 decode read a non-breaking space after a trailer as noise and dropped
-    the trailer, where the dry run's latin-1 view read the same bytes as two other characters and
-    kept it. Noise is now an explicit ASCII set plus the mark. Mutation: read ``str.isspace`` as
-    noise again. Red: the nbsp, nel and em-space cases differ."""
+def test_split_messages_drops_a_trailer_as_the_live_split(noise: bytes, count: int) -> None:
+    """BACKLOG #5806: the dry run's latin-1 view drops the trailer lines the live UTF-8 split drops,
+    and keeps the lines it keeps, a line of non-ASCII or other noise among them included."""
     body = ADT_A01 + ADT_A01.replace("MSG1", "MSG2") if count == 2 else ADT_A01
     raw = body.encode("utf-8") + b"BTS|1\r" + noise + b"\rFTS|1\r"
     assert split_messages(raw) == split_batch_bytes(raw, "utf-8")
+
+
+def test_split_messages_reads_a_non_ascii_field_separator_as_the_live_split() -> None:
+    """A field separator outside ASCII is one character to the live UTF-8 split and its first byte
+    to the dry run's latin-1 view, so neither drops a trailer under one. Mutation: drop the ASCII
+    test in ``_trailer_start``. Red: the dry run drops the ``BTS`` line the live split keeps."""
+    raw = "MSHé^~\\&éA\rPIDé1\rBTSè1\r".encode()
+    assert split_batch_bytes(raw, "utf-8") == [raw]
+    assert split_messages(raw) == [raw]
 
 
 def test_split_messages_keeps_a_mark_that_leads_no_msh() -> None:
