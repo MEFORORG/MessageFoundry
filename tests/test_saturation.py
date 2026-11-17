@@ -127,10 +127,22 @@ def test_steady_growth_slower_than_the_floor_per_window_still_fires() -> None:
     assert results[5] is not None and results[5].depth == 5
 
 
-def test_a_fall_restarts_the_run_the_floor_is_measured_from() -> None:
+def test_a_drain_below_the_starting_depth_restarts_the_count() -> None:
+    # The count starts at 3, rises 4, then the lane drains to 1, below 3: the count restarts at 1.
     det = SaturationDetector(sustain_samples=2)
-    assert _feed(det, [0, 2, 4, 1, 2, 3]) is None  # rose 4, fell, rose 2: neither run clears 5
-    assert det.observe(6.0, 6) is not None  # the run from 1 now rose 5
+    assert _feed(det, [3, 5, 7, 1, 2, 3]) is None
+    sig = det.observe(6.0, 6)  # 6 is 5 above the new start of 1, but only 3 above the old one
+    assert sig is not None and sig.depth == 6
+
+
+def test_growth_with_a_small_dip_every_few_samples_fires_once_past_the_floor() -> None:
+    # +1, +1, +1, -1 repeating: a 1-message dip never falls below the starting depth of 0, so it
+    # does not restart the count. The first dip-free window after the net rise reaches 5 fires.
+    det = SaturationDetector(sustain_samples=3)
+    depths = [0, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7]
+    results = [det.observe(float(i), d) for i, d in enumerate(depths)]
+    assert results[:7] == [None] * 7
+    assert results[7] is not None and results[7].depth == 5
 
 
 def test_reset_restarts_the_run() -> None:

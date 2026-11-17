@@ -4,7 +4,8 @@
 
 A huge timeout would let each wait on a peer hold the one-event-at-a-time alert worker, a
 non-finite one fails every send, an infinite cooldown would make the first page the last, a port
-outside 0-65535 would fail every send, and a boolean would load as 1. Each is refused at load, and the defaults and the caps themselves still load.
+outside 0-65535 would fail every send, and a boolean would load as a number, `true` as 1 and
+`false` as 0. Each is refused at load, and the defaults and the caps themselves still load.
 """
 
 from __future__ import annotations

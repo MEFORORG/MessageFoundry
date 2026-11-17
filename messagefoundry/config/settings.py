@@ -2276,7 +2276,8 @@ class InboundSettings(_Section):
 
 def _refuse_a_bool(value: object, info: ValidationInfo) -> object:
     """Refuse a TOML boolean for a numeric setting (BACKLOG #5770). Lax pydantic reads ``true`` as
-    1, so ``email_smtp_port = true`` would load as port 1 and pass the range check."""
+    1 and ``false`` as 0, so ``email_smtp_port = true`` would load as port 1 and pass the range
+    check."""
     if isinstance(value, bool):
         raise ValueError(f"{info.field_name} must be a number, not a boolean")
     return value
@@ -2342,9 +2343,9 @@ class DeliverySettings(_Section):
     # documented follow-up); a per-connection AlertRule (connection glob + transports=[]) can still
     # suppress it for a known-bursty feed.
     saturation_sustain_samples: int | None = Field(default=None, ge=2)
-    # BACKLOG #5768: the net rise, in messages, a saturation window must clear before it fires, so
-    # one arrival on an idle lane does not page. SaturationThreshold.min_growth states the default
-    # and the cap.
+    # BACKLOG #5768: how many messages a lane's depth must rise above its lowest depth since the
+    # detector last reset before saturation fires, so one arrival on an idle lane does not page.
+    # SaturationThreshold.min_growth states the default and the cap.
     saturation_min_growth: int = Field(
         default=SATURATION_MIN_GROWTH_DEFAULT, ge=1, le=SATURATION_MIN_GROWTH_MAX
     )
