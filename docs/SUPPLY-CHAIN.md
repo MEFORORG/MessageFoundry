@@ -371,10 +371,16 @@ have not, the document says nothing about that CVE and your scanner's finding st
   **pip-audit**.
 - **VS Code extension** — `@cyclonedx/cyclonedx-npm --package-lock-only` over the committed
   `ide/package-lock.json` (install-free, full tree). The extension bundles its payload with esbuild and
-  has no runtime npm dependencies, so the SBOM inventories the build toolchain. Continuously audited by
-  **npm-audit**. The generator itself, and the jscpd clone report in `quality-advisory.yml`, install
-  from a separate committed lock, `ci/npm-tools/package-lock.json` (vault BACKLOG #2793). **No
-  blocking audit lane reads that lock**; Dependabot watches it. Read 2026-11-06, with the `overrides`
+  has no runtime npm dependencies, so the SBOM inventories the locked build toolchain. Continuously
+  audited by **npm-audit**. **Not in that lock: `@vscode/vsce`, which packages the `.vsix`.** `npm run
+  package` fetches it with `npx` at a pinned top-level version, `@vscode/vsce@4.1.0`; its dependencies
+  are not locked. So the SBOM does not list vsce or its dependencies, and neither npm-audit nor
+  Dependabot reads them. This follows the owner ruling of 2026-11-17. The reason is
+  [GHSA-fc5q-39xc-vjpf](https://github.com/advisories/GHSA-fc5q-39xc-vjpf): vsce pulls in picomatch,
+  which has no patched release, so a locked vsce would turn npm-audit red. The generator itself, and
+  the jscpd clone report in `quality-advisory.yml`, install from a separate committed lock,
+  `ci/npm-tools/package-lock.json` (vault BACKLOG #2793). **No blocking audit lane reads that lock**;
+  Dependabot watches it. Read 2026-11-06, with the `overrides`
   in `ci/npm-tools/package.json` (why: its description), `npm audit` on it reports 0
   vulnerabilities. That is a dated reading, not a standing property.
 - **Container image** — `trivy image --format cyclonedx` over the built image (OS + Python layers).
