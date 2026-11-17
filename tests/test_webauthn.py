@@ -1860,9 +1860,8 @@ def _on_a_small_stack[T](call: Callable[[], T]) -> T:
 def _refused_on_recursion(
     excinfo: pytest.ExceptionInfo[wa.WebAuthnVerificationError], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The refusal came from a RecursionError, not from some other library refusal: the
-    precondition holds on the same stack, the cause is the RecursionError, and its type was
-    logged."""
+    """json raises RecursionError on the same stack, the refusal's cause is a RecursionError,
+    and a WARNING names its type."""
     with pytest.raises(RecursionError):
         _on_a_small_stack(lambda: json.loads(_TOO_DEEP))
     assert isinstance(excinfo.value.__cause__, RecursionError), repr(excinfo.value.__cause__)
@@ -1872,9 +1871,8 @@ def _refused_on_recursion(
 def test_a_deeply_nested_registration_response_is_the_audited_refusal(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """vault BACKLOG #5341, at this module's seam only. Red: the library's RecursionError escaped
-    verify_registration. The web console's routes that parse the body first have their own test,
-    in the web console suite (``test_ui_passkey_body_refusals.py``)."""
+    """verify_registration raises WebAuthnVerificationError caused by RecursionError on a too-deep
+    response (vault BACKLOG #5341)."""
     with (
         caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
         pytest.raises(wa.WebAuthnVerificationError) as excinfo,
@@ -1890,7 +1888,8 @@ def test_a_deeply_nested_registration_response_is_the_audited_refusal(
 def test_a_deeply_nested_assertion_response_is_the_audited_refusal(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """vault BACKLOG #5341, the text form ``verify_assertion`` accepts. Red: as above."""
+    """verify_assertion raises WebAuthnVerificationError caused by RecursionError on a too-deep
+    response (vault BACKLOG #5341)."""
     soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
     with (
         caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
@@ -1927,9 +1926,8 @@ def _safetynet_jws(header: bytes, payload: bytes) -> bytes:
 def test_a_malformed_safetynet_statement_is_the_audited_refusal(
     att_stmt: dict[str, object], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """vault BACKLOG #5341, at this module's seam only: the refusal the service audits. Red:
-    webauthn 3.0.1's android-safetynet check raised AttributeError on these attacker-shaped
-    statements, and it escaped verify_registration as itself."""
+    """verify_registration raises WebAuthnVerificationError caused by AttributeError on each
+    statement, and a WARNING names its type (vault BACKLOG #5341)."""
     from webauthn.helpers import encode_cbor, parse_cbor
 
     challenge = b"c" * 32
@@ -1961,9 +1959,9 @@ _DIRECTORY_NAME, _X400_ADDRESS, _EDI_PARTY_NAME = "a4023000", "a3023000", "a5023
 
 
 def _attestation_cert(*, san: bool = False) -> tuple[bytes, Any]:
-    """A self-signed P-256 leaf in DER, and its private key. Its subject is empty and it carries
-    BasicConstraints then KeyUsage, so the library's tpm check reads it as far as its extensions.
-    With ``san`` it also carries a subjectAltName holding one empty directoryName."""
+    """A self-signed P-256 leaf in DER with an empty subject, BasicConstraints then KeyUsage, and
+    its private key. With ``san`` it also carries a subjectAltName holding one empty
+    directoryName."""
     import datetime
 
     from cryptography import x509
@@ -2007,12 +2005,7 @@ def _attested_registration(
 ) -> tuple[str, bytes]:
     """A registration response re-labelled ``fmt``, its statement carrying a leaf certificate
     patched by ``patch`` (``None`` leaves it intact), and its challenge. ``san`` is passed to
-    :func:`_attestation_cert`.
-
-    The ``tpm`` statement is built to pass every check the library runs before it parses the
-    leaf: ``pubArea`` names the credential's own P-256 point, ``certInfo`` carries the hashes the
-    library recomputes, and the leaf's key signs ``certInfo``. The ``packed`` statement carries a
-    signature that does not verify, which the library finds only after it parses the leaf."""
+    :func:`_attestation_cert`."""
     import hashlib
 
     from cryptography.hazmat.primitives import hashes
@@ -2095,9 +2088,8 @@ def _attested_registration(
 def test_a_malformed_attestation_certificate_is_the_audited_refusal(
     fmt: str, patch: tuple[str, str], raised: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """vault BACKLOG #5341, at this module's seam only: the refusal the service audits. Red:
-    cryptography raised each of these on an attacker-supplied leaf, and it escaped
-    verify_registration as itself, which the route would have served as a 500."""
+    """verify_registration raises WebAuthnVerificationError caused by the listed exception on
+    each patched leaf, and a WARNING names its type (vault BACKLOG #5341)."""
     san = patch[0] == _DIRECTORY_NAME
     response_json, challenge = _attested_registration(fmt, patch, san=san)
     with (
@@ -2124,8 +2116,8 @@ def test_a_malformed_attestation_certificate_is_the_audited_refusal(
 def test_an_intact_attestation_certificate_is_parsed_past_where_the_patched_ones_fail(
     fmt: str, san: bool, refusal: str
 ) -> None:
-    """Positive control for the test above: with the leaf intact, the library parses it and
-    refuses later, on purpose. So each patched leaf, not the statement around it, raised there."""
+    """With the leaf intact, verify_registration raises WebAuthnVerificationError with the listed
+    message, caused by InvalidRegistrationResponse."""
     response_json, challenge = _attested_registration(fmt, None, san=san)
     with pytest.raises(wa.WebAuthnVerificationError, match=refusal) as excinfo:
         wa.verify_registration(

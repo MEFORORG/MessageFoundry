@@ -203,20 +203,9 @@ ALERT_SUSPEND_MINUTES_MAX = 43200
 #: Printable text: no C0 control, no DEL, no C1 control. One or more characters.
 PRINTABLE_TEXT_PATTERN = r"^[^\x00-\x1f\x7f-\x9f]+$"
 
-#: A sign-in name: any text but a NUL, empty included (vault BACKLOG #5342). PostgreSQL text
-#: cannot hold one, so a NUL at the store's lookup would make its driver raise rather than find no
-#: row; the sign-in service refuses such a name as an unknown one before that lookup. This rule
-#: is on ``POST /users/directory`` alone. Neither sign-in surface carries it: the JSON body and the
-#: web console's form both leave a NUL name to that refusal, which the service audits. The
-#: attempt is charged to the sign-in limiter, at ``/ui/login/passkey`` for the combined passkey
-#: sign-in and at the sign-in route otherwise. Only the NUL: other control characters can reach a
-#: stored name through paths ``auth.usernames.username_refusal`` does not govern, such as
-#: provision-admin, so refusing them here could lock a holder out. Refusing a NUL locks no one
-#: out only where no account can hold
-#: one. PostgreSQL is such a store, read from its documentation and not run here. The SQLite store
-#: is not: ``create_user`` stores a NUL name and ``get_user_by_username`` finds it, so on SQLite an
-#: account created with one through a path that rule does not govern could not sign in. The SQL
-#: Server store is not measured.
+#: Any text without a NUL, empty included (vault BACKLOG #5342). Pinned by
+#: tests/test_auth_federated_identity_routes.py::
+#: test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory.
 SIGN_IN_NAME_PATTERN = r"^[^\x00]*$"
 
 #: A member of one of the engine's own closed vocabularies -- ``MessageStatus``, ``OutboxStatus``,

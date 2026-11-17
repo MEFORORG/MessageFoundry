@@ -764,14 +764,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # selector, and "ad" stays in the allow-list only so the ENGINE (_dispatch_login) is the
         # single point that refuses and audits it. Directory accounts sign in by Windows SSO or
         # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth
-        # (and the JSON /me/reauth). A name holding a NUL reaches the service too, which refuses it
-        # as an unknown name before the account lookup, audited (BACKLOG #5342).
+        # (and the JSON /me/reauth). A NUL name (BACKLOG #5342): pinned by
+        # test_ui_passkey_body_refusals.py::test_the_form_sign_in_refuses_a_nul_username_before_the_store.
 
         def _refused() -> Response:
-            # The challenge is already popped, so each refusal this helper builds also ends its
-            # handle cookie. Not every refusal after the pop comes here: at least the login-budget
-            # 429 above raises with the cookie left set, and so does an exception out of
-            # ``request.body()`` or ``auth.login``.
+            # Pinned by test_ui_passkey_body_refusals.py::
+            # test_the_combined_passkey_sign_in_refuses_a_nul_username_and_ends_its_challenge.
             refused = RedirectResponse("/ui/login?e=bad", status_code=303)
             if handle:
                 clear_passkey_sign_in_cookie(refused, request)

@@ -56,9 +56,8 @@ class CredentialReply(BaseModel):
 
 
 class LoginRequest(RequestModel):
-    # No NUL rule here (vault BACKLOG #5342), on purpose: the route charges the sign-in limiter
-    # and the sign-in service refuses a NUL name as an unknown one before the account lookup, and
-    # audits it. A 422 at this body would be neither charged nor audited.
+    # A NUL in ``username`` (vault BACKLOG #5342): behaviour pinned by
+    # tests/test_api_auth.py::test_login_answers_a_nul_username_as_an_audited_unknown_name.
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
@@ -325,13 +324,8 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    # The sign-in name rule (vault BACKLOG #5342), on the typed name. The typed name goes to the
-    # directory lookup, and also to the store when the entry found carries no ``sAMAccountName``:
-    # the lookup then names the account by the name it searched for, the typed name with its
-    # surrounding white space stripped (``fallback_username`` in ``auth.ldap``). The LDAP filter
-    # escapes a NUL (``auth.ldap._escape_filter``), so such a name is not sent raw; the rule
-    # refuses it with a 422 before any directory round trip. When the entry carries a
-    # ``sAMAccountName``, that is the name the store receives, and this rule does not check it.
+    # vault BACKLOG #5342. Pinned by tests/test_auth_federated_identity_routes.py::
+    # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory.
     username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 

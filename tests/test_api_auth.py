@@ -3674,17 +3674,15 @@ async def test_login_supersedes_ends_the_named_token_before_the_cap(engine: Engi
         assert too_long.status_code == 422
 
 
-# --- vault BACKLOG #5342: a sign-in naming a NUL takes the service's audited refusal --------------
+# --- vault BACKLOG #5342: a NUL in the sign-in name ---------------------------------------------
 
 
 @pytest.mark.parametrize("username", ["sup\x00", "\x00", "s\x00up"])
 async def test_login_answers_a_nul_username_as_an_audited_unknown_name(
     engine: Engine, username: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Red: a NUL rule on the body answered 422, which was neither charged to the sign-in limiter
-    nor audited. Now the JSON sign-in answers as for an unknown name, is charged, writes an
-    ``auth.login_failed`` row, and never reaches the store's account lookup. The positive control
-    is the unknown name sent first: the same lookup spy records it."""
+    """A NUL name answers as an unknown name does, both sign-ins are charged, it writes one
+    escaped ``auth.login_failed`` row, and it is never looked up."""
     service = await _service(engine, AuthSettings(require_mfa=False))
     await _add(service, "sup", Role.VIEWER)
     looked_up: list[str] = []
@@ -3725,9 +3723,8 @@ async def test_login_answers_a_nul_username_as_an_audited_unknown_name(
 async def test_login_still_reaches_the_service_for_other_unusual_values(
     engine: Engine, fields: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The controls: another control character, an empty name, and a ``supersedes`` holding a NUL
-    (only ever hashed, never sent to the store) are not refused by the body. They reach
-    ``AuthService.login`` as before, and answer as it decides."""
+    """Another control character, an empty name, and a NUL or empty ``supersedes`` reach the
+    service and answer 200 or 401."""
     service = await _service(engine, AuthSettings(require_mfa=False))
     await _add(service, "sup", Role.VIEWER)
     reached: list[str] = []

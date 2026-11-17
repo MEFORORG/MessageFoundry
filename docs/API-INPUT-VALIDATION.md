@@ -54,20 +54,17 @@ filesystem path, a log line or a CSV export.
 | Audit action filter | Printable text, no control characters, 1 to 128 characters | `action` on `GET /audit` and `GET /audit/export` |
 | Display label | Printable text, no control characters, 1 to 128 characters | `name` on `POST /search/presets` |
 | Filesystem path | Printable text, no control characters, 1 to 4096 characters | `config_dir` on `POST /config/reload`, and `archive` on `POST /dr/activate` |
-| Directory user name | Any text except NUL, 1 to 256 characters | `username` on `POST /users/directory` |
+| Directory user name | No NUL, 1 to 256 characters. Pinned by `tests/test_auth_federated_identity_routes.py::test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory` | `username` on `POST /users/directory` |
 | Layered preset ids | Resource ids joined by single commas with no spaces, up to 1024 characters in all | `presets` on `GET /search/layered` |
 
 The email-address row covers `recipient_override` only. The account email fields follow a different
 rule, set out under [Items checked a second time](#items-checked-a-second-time-behind-the-route).
 
-Neither sign-in surface refuses a NUL in the name at the body: not `username` on
-`POST /auth/login`, and not the web console's `POST /ui/login` form, which has no body model. The
-NUL rule is left off the sign-in body on purpose. A 422 there would be neither charged to the
-sign-in limiter nor audited. On both surfaces the attempt is charged to the limiter, at
-`POST /ui/login/passkey` for the combined passkey sign-in and at the sign-in route otherwise, and
-the sign-in service refuses such a name as an unknown one before the account lookup and audits
-the attempt. `POST /auth/login` answers with its usual failed sign-in, and the form with its usual redirect to
-the sign-in page.
+A NUL in a sign-in name (vault BACKLOG #5342): behaviour pinned by
+`tests/test_api_auth.py::test_login_answers_a_nul_username_as_an_audited_unknown_name`,
+`tests/test_auth_hardening.py::test_a_username_with_a_nul_is_an_unknown_name_on_both_sign_in_surfaces`,
+and, in the web console suite,
+`packaging/messagefoundry-webconsole/tests/test_ui_passkey_body_refusals.py`.
 
 "Printable text, no control characters" means every character except the C0 range, DEL, and the C1
 range. In practice: no NUL, no tab, no carriage return, no line feed.

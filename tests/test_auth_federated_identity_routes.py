@@ -927,9 +927,8 @@ async def test_a_directory_row_created_by_name_takes_its_id_from_the_directory_a
 async def test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory(
     engine: Engine,
 ) -> None:
-    """vault BACKLOG #5342, the sign-in name rule on ``POST /users/directory``. Red: the NUL went
-    on to the directory lookup. THE CONTROL is the same name without it, which the directory is
-    asked about."""
+    """A NUL name answers 422 and the directory is not asked; the same name without it is asked
+    and answers 201 (vault BACKLOG #5342)."""
     directory = _Directory(_principal("jdoe"))
     service = await _directory_service(engine, directory)
     async with _client(engine, service) as c:

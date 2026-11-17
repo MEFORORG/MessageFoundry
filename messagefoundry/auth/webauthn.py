@@ -167,9 +167,8 @@ def _supported_pub_key_algs() -> list[COSEAlgorithmIdentifier]:
 
 
 def _invalid_input_errors() -> tuple[type[Exception], ...]:
-    """Exceptions py_webauthn raises for bad input, caught around its key-decoding calls in
-    :func:`_require_usable_public_key`. Both ceremonies' verify calls catch every ``Exception``
-    instead (vault BACKLOG #5341).
+    """Exceptions py_webauthn raises for bad input. Behaviour pinned by tests/test_webauthn.py::
+    test_an_unusable_stored_key_fails_the_assertion_audited_not_raised.
 
     ``WebAuthnException`` is the library's own base class. The next three entries catch four raw
     exception types (``LookupError`` covers both ``KeyError`` and ``IndexError``) that it lets
@@ -582,8 +581,6 @@ def verify_registration(
     _require_webauthn()
     from webauthn import verify_registration_response
 
-    # Resolved before the ``try`` so the catch below covers the library call alone and not our
-    # code before it.
     supported_algs = _supported_pub_key_algs()
     try:
         verified = verify_registration_response(
@@ -594,8 +591,10 @@ def verify_registration(
             supported_pub_key_algs=supported_algs,
         )
     except Exception as exc:
-        # Every exception from the library call is the audited refusal (vault BACKLOG #5341), and
-        # :func:`_refusal` logs the type of any raw one at WARNING.
+        # vault BACKLOG #5341. Pinned by tests/test_webauthn.py::
+        # test_a_deeply_nested_registration_response_is_the_audited_refusal,
+        # test_a_malformed_safetynet_statement_is_the_audited_refusal and
+        # test_a_malformed_attestation_certificate_is_the_audited_refusal.
         raise _refusal(exc, ceremony="registration") from exc
     _require_usable_public_key(verified.credential_public_key, ceremony="registration")
     return RegistrationResult(
@@ -689,10 +688,8 @@ def verify_assertion(
             credential_current_sign_count=current_sign_count,
         )
     except Exception as exc:
-        # Every exception from the library call is the audited refusal (vault BACKLOG #5341), and
-        # :func:`_refusal` logs the type of any raw one at WARNING. The sign-count regression
-        # message ("...sign count...") still rides through for the service's clone-signal
-        # classification.
+        # vault BACKLOG #5341. Pinned by tests/test_webauthn.py::
+        # test_a_deeply_nested_assertion_response_is_the_audited_refusal.
         raise _refusal(exc, ceremony="assertion") from exc
     return AssertionResult(verified.new_sign_count, bool(verified.user_verified))
 
@@ -782,8 +779,7 @@ def resident_key_from_response(response_json: str) -> bool | None:
 
 def _transports_from_response(response_json: str) -> list[str] | None:
     """Best-effort ``response.transports`` extraction (browser hint — absence is fine)."""
-    # The same refusal-safe parse as resident_key_from_response, so a RecursionError here cannot
-    # escape after the library's own parse succeeded (vault BACKLOG #5341).
+    # vault BACKLOG #5341.
     parsed, refused = json_loads_or_refusal(response_json)
     if refused is not None or not isinstance(parsed, dict):
         return None

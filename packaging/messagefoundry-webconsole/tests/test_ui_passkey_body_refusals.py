@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Two console refusals the engine's own models could not reach (vault BACKLOG #5341, #5342).
-
-``POST /ui/reauth/webauthn`` and ``POST /ui/account/webauthn/verify`` parse their JSON body
-themselves, before the engine's ceremony code sees it, so a body nested too deep for the stack
-raised ``RecursionError`` out of the route. ``POST /ui/login`` parses its form without pydantic,
-and neither it nor the combined passkey sign-in that rides the same form refuses a NUL name
-itself: the service's own refusal, before the account lookup, covers both, as it covers the JSON
-``POST /auth/login``. All data here is synthetic.
+"""Web console tests for too-deep passkey bodies and NUL sign-in names (vault BACKLOG #5341,
+#5342). All data here is synthetic.
 """
 
 from __future__ import annotations
@@ -38,9 +32,7 @@ _SMALL_STACK = 2 * 1024 * 1024
 _TOO_DEEP = "[" * _DEPTH + "]" * _DEPTH
 
 
-#: Each route's too-deep body, and the refusal it answers. The re-auth route hands the body to the
-#: service, whose audited refusal answers; the enrolment route cannot read the label, so it answers
-#: its own malformed-body refusal.
+#: Each route's too-deep body, and the response the test expects from it.
 _DEEP_BODIES = {
     "/ui/reauth/webauthn": (
         '{"response": ' + _TOO_DEEP + "}",
@@ -55,8 +47,7 @@ _DEEP_BODIES = {
 
 def _on_a_small_stack[T](call: Callable[[], Coroutine[Any, Any, T]]) -> T:
     """Run ``call`` in its own event loop on a thread whose stack is :data:`_SMALL_STACK`,
-    re-raising what it raised. The route parses the body on the loop's thread, so the loop and the
-    engine it serves are built there too."""
+    re-raising what it raised."""
     result: list[T] = []
     raised: list[BaseException] = []
 
@@ -80,8 +71,7 @@ def _on_a_small_stack[T](call: Callable[[], Coroutine[Any, Any, T]]) -> T:
 
 @pytest.mark.parametrize("route", sorted(_DEEP_BODIES))
 def test_a_body_nested_too_deep_is_a_refusal_not_a_500(tmp_path: Path, route: str) -> None:
-    """vault BACKLOG #5341. Red: the route's own ``request.json()`` raised ``RecursionError``,
-    which its catch did not list, so it escaped the route (a 500 on a served engine)."""
+    """A too-deep body answers 400 with the route's expected JSON (vault BACKLOG #5341)."""
     body, refusal = _DEEP_BODIES[route]
 
     async def _parse() -> object:
@@ -152,9 +142,8 @@ async def _failed_actors(engine: Engine) -> list[str]:
 async def test_the_form_sign_in_refuses_a_nul_username_before_the_store(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, username: str
 ) -> None:
-    """vault BACKLOG #5342, the form route. Red: the NUL reached the store's account lookup, where
-    at least a PostgreSQL store refuses a NUL in a text bind. The service refuses it as an unknown
-    name before the lookup, with the audit row naming it escaped."""
+    """A NUL name redirects to the error page, reaches the service, is never looked up, and
+    writes one escaped ``auth.login_failed`` row (vault BACKLOG #5342)."""
     service = await _service(engine)
     reached = _spy_login(service, monkeypatch)
     looked_up = _spy_lookup(engine, monkeypatch)
@@ -171,8 +160,8 @@ async def test_the_form_sign_in_refuses_a_nul_username_before_the_store(
 async def test_the_combined_passkey_sign_in_refuses_a_nul_username_and_ends_its_challenge(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """vault BACKLOG #5342, the combined passkey sign-in, which rides the same form. Red: as above.
-    The refusal also clears the challenge cookie, as any refused sign-in after the pop does."""
+    """A NUL name with a passkey assertion redirects to the error page, is never looked up, and
+    clears the passkey cookie (vault BACKLOG #5342)."""
     pytest.importorskip("webauthn")
     service = await _service(engine)
     looked_up = _spy_lookup(engine, monkeypatch)
@@ -194,8 +183,8 @@ async def test_the_combined_passkey_sign_in_refuses_a_nul_username_and_ends_its_
 async def test_the_form_sign_in_still_reaches_the_service_for_other_names(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, username: str
 ) -> None:
-    """The control: another control character and an ordinary unknown name still reach
-    ``AuthService.login``, which refuses them as it decides."""
+    """Another control character and an unknown name reach the service and redirect to the error
+    page."""
     service = await _service(engine)
     reached = _spy_login(service, monkeypatch)
     async with _client(engine, service) as c:
