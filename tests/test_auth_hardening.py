@@ -672,6 +672,7 @@ async def test_a_long_nul_username_writes_an_actor_every_store_column_holds(
     1200-character actor, which SQL Server's ``audit_log.actor NVARCHAR(256)`` refuses, and the
     sign-in would raise instead of writing its row. The actor is cut to 256 UTF-16 units with a
     marker naming the SHA-256 of the name as typed, the same cut every time."""
+    import hashlib
     import inspect
     import re
 
@@ -699,6 +700,9 @@ async def test_a_long_nul_username_writes_an_actor_every_store_column_holds(
     assert len(actors) == 1, actors
     assert _utf16_units(actors[0]) <= _AUDIT_ACTOR_MAX, len(actors[0])
     assert actors[0] == _storable_actor(name), "the cut is not deterministic"
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
+    assert actors[0].endswith("...sha256:" + digest), "the marker is not the typed name's digest"
+    assert len(actors[0].encode("utf-16-le")) // 2 <= 256  # counted apart from the code's helper
     prefix = actors[0].split("...sha256:")[0]
     assert prefix and prefix == "\\u0000" * (len(prefix) // 6), "an escape was split"
     assert _storable_actor("\x00" * 201) != actors[0], "two long names share one actor"

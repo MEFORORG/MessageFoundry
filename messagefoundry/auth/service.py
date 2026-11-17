@@ -3067,7 +3067,8 @@ def _storable_actor(username: str) -> str:
     if "\x00" not in username:
         return username
     escaped = scrub_log_argument(username)
-    # Never fewer units than characters, so a short escape is measured without a full encode.
+    # Never fewer units than characters, so an escape longer than the bound in characters is cut
+    # without the full UTF-16 encode, which the console form's uncapped username would make large.
     if len(escaped) <= _AUDIT_ACTOR_MAX and utf16_units(escaped) <= _AUDIT_ACTOR_MAX:
         return escaped
     # surrogatepass, so a lone surrogate cannot make the digest raise.

@@ -6909,10 +6909,10 @@ session that is still live. A successful step-up re-auth does it on purpose, sin
 session's budget. A restart does it to every count, as the process-local caveat above says. The bounds are 64 counts per account and 4096 in the map, except a count held at the cap,
 which goes past both. When a re-proof starts with its account at 64 counts, the counts of that
 account's sessions the store shows as revoked, or holds no row for, are dropped first. Every
-unrevoked row keeps its count, past its absolute expiry or idle window or not: that read does not
-filter on the wall clock, so a forward clock step cannot drop a live session's count there and hand
-it a fresh budget once the clock is set right. If the store refuses that read, the refusal is
-logged, the counts are kept, and the re-proof goes on, so the account can stay at 64. When a new session's first
+unrevoked row keeps its count, even one past its absolute expiry or idle window. That read does not
+filter on the wall clock. So a forward clock step cannot drop a live session's count there, which
+would hand it a fresh budget once the clock is set right. If the store refuses that read, the
+refusal is logged, the counts are kept, and the re-proof goes on, so the account can stay at 64. When a new session's first
 failure finds its account at 64 counts or the map full, the age prune runs: counts older than the
 absolute session lifetime, timed from their first failure, go. It reaches a live session's count
 only after a wall-clock step. If there is still no room, that session is revoked on that first
