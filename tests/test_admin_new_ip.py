@@ -842,9 +842,13 @@ async def test_a_reanchor_resets_without_reading_the_clock(
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
         await service.initialize()
-        token, identity = await _enabled_admin(service, client="10.1.1.1")
-        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         real_time = time.time
+        # Mint the session before the earliest skewed clock below, so the stepped-back reauths
+        # still see a live session rather than one whose stamps lie in their future.
+        monkeypatch.setattr(time, "time", lambda: real_time() - 200.0)
+        token, identity = await _enabled_admin(service, client="10.1.1.1")
+        monkeypatch.setattr(time, "time", real_time)
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         for client, skew in (("10.2.2.2", -100.0), ("10.1.1.1", -50.0)):
             monkeypatch.setattr(time, "time", lambda skew=skew: real_time() + skew)
             reauthed = await service.reauth(identity, PW, token=token, client=client)
