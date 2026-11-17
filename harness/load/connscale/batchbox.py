@@ -378,18 +378,32 @@ def _band_stranding(report: Mapping[str, Any]) -> tuple[bool | None, str]:
     ``(True, why)`` over budget, ``(False, "")`` within it, ``(None, "")`` when the report does not
     say, or says something its own numbers contradict (BACKLOG #5574): a missing or malformed field
     must not clear the arm. The verdict is read, never worked out again here, because only the band
-    knows the budget argument it passed (connscale-remote computes it with the same ``_excusal`` call
-    ``_reconcile`` makes); the check here is only that ``over_budget`` is ``unconfirmed > budget``,
-    the comparison ``_excusal`` makes.
+    knows the budget argument it passed (connscale-remote publishes the excusal its
+    ``_reconcile_judged`` verdict rests on); the check here is only that ``over_budget`` is
+    ``unconfirmed > budget``, the comparison ``_excusal`` makes. The numbers must also agree with
+    the rest of the report: neither is negative, and the unconfirmed count is no more than the
+    band's ``traffic.timeouts``, which ``_excusal`` takes it out of.
     """
-    stranding = report.get("no_loss", {}).get("stranding")
+    no_loss = report.get("no_loss")
+    traffic = report.get("traffic")
+    if not isinstance(no_loss, Mapping) or not isinstance(traffic, Mapping):
+        return None, ""
+    stranding = no_loss.get("stranding")
     if not isinstance(stranding, Mapping):
         return None, ""
     over, unconfirmed, budget = (stranding.get(k) for k in ("over_budget", "unconfirmed", "budget"))
+    timeouts = traffic.get("timeouts")
     if (
         not isinstance(over, bool)
-        or not all(isinstance(v, int) and not isinstance(v, bool) for v in (unconfirmed, budget))
+        # Each isinstance is spelled out so the comparisons below are typed; bool is an int subtype.
+        or not isinstance(unconfirmed, int)
+        or not isinstance(budget, int)
+        or not isinstance(timeouts, int)
+        or any(isinstance(v, bool) for v in (unconfirmed, budget, timeouts))
         or over != (unconfirmed > budget)
+        or unconfirmed < 0
+        or budget < 0
+        or unconfirmed > timeouts
     ):
         return None, ""
     if not over:
@@ -399,6 +413,20 @@ def _band_stranding(report: Mapping[str, Any]) -> tuple[bool | None, str]:
         f"band at engine index {band}: {unconfirmed} unconfirmed sends exceed its stranding budget "
         f"({budget}) — systemic no-ACK fault, judged on that band's client counters alone"
     )
+
+
+def _band_client_only_loss(report: Mapping[str, Any]) -> bool:
+    """The band's own reconcile proved a loss while it judged no engine-delta arm (the counters
+    reset, or it could not read the engine), so only its client-counter arms ran, and no other band
+    can correct those. The condition :func:`aggregate_cell_record` counts as ``client_lost``."""
+    no_loss = report.get("no_loss")
+    if not isinstance(no_loss, Mapping):
+        return False
+    backlog = no_loss.get("backlog")
+    engine_unjudged = no_loss.get("counter_reset") is not None or (
+        isinstance(backlog, int) and backlog < 0
+    )
+    return engine_unjudged and no_loss.get("ok") is False and no_loss.get("inconclusive") is False
 
 
 def aggregate_cell_record(
@@ -562,9 +590,14 @@ def aggregate_cell_record(
     # undelivering cell satisfies trivially.
     unproven: list[str] = []
     # A fleet that sent nothing was refused above, so only the undelivering cell remains here.
-    if agg_sink_received == 0 and engine_written <= 0:
+    # The written figure is quoted only from a band that read the engine cleanly: with none, the
+    # all-band max is a blind band's stand-in 0 or a delta across a reset, not a reading.
+    if agg_sink_received == 0 and (judged_written is None or judged_written <= 0):
+        written_read = (
+            "not read cleanly by any band" if judged_written is None else str(judged_written)
+        )
         unproven.append(
-            f"nothing was delivered (union sink_received 0, engine_written {engine_written}) — "
+            f"nothing was delivered (union sink_received 0, engine_written {written_read}) — "
             f"no delivery to reconcile"
         )
     if drain_seconds is None:
@@ -686,13 +719,19 @@ def _bands_rate_window(proc_reports: list[dict[str, Any]]) -> str | None:
     return "|".join(windows)
 
 
-def _failed_cell_record(cell: BatchCell, detail: str) -> ConnScaleRecord:
+def _failed_cell_record(
+    cell: BatchCell, detail: str, survivors: list[dict[str, Any]] | None = None
+) -> ConnScaleRecord:
     """A cell whose >= 6 sink-PROCESS fleet could not be driven or aggregated (a crashed remote band, an
     empty/short fleet, a fleet that sent nothing, a null engine gauge), materialised as an EXPLICIT
     failed :class:`ConnScaleRecord` (``no_loss.ok = False``, zero throughput) tagged with the cell's
-    A/B arm. It is INCONCLUSIVE, not LOSS (BACKLOG #5574): the cell measured nothing, so nothing
-    proved a message lost, which is how the reconcilers label a step that sent nothing. It fails
-    closed all the same.
+    A/B arm. It fails closed whatever it is labelled.
+
+    It is INCONCLUSIVE (BACKLOG #5574) unless a band that did report proved a loss no other band can
+    correct: the cell measured nothing as a whole, which is how the reconcilers label a step that
+    sent nothing. ``survivors`` are the band reports that came back. A band among them over its own
+    stranding budget (:func:`_band_stranding`), or one whose own reconcile proved a loss on client
+    counters alone (:func:`_band_client_only_loss`), makes the cell LOSS, and the detail says so.
 
     It surfaces in the ``zero_loss`` SLO (``all(r.no_loss.ok …)`` turns False) and, because it carries the
     cell's ``batch_handoff_statements``/``fuse_thread_hops``/``claim_mode`` tags, in the B0/B1 batch
@@ -700,6 +739,17 @@ def _failed_cell_record(cell: BatchCell, detail: str) -> ConnScaleRecord:
     band FAILS the cell loudly instead of vanishing from the no-loss accounting — the same "fail the step,
     never drop it" posture the connscale runner takes. ``drain_seconds=None`` poisons the worst-case
     drain (a cell that never ran never drained)."""
+    proven: list[str] = []
+    for r in survivors or []:
+        over, why = _band_stranding(r)
+        if over:
+            proven.append(why)
+        elif _band_client_only_loss(r):
+            band = escape_for_terminal(str(r.get("engine_index_base", "?")), single_line=True)
+            proven.append(
+                f"band at engine index {band} proved a loss on client counters alone (its engine "
+                f"arms were not judged) — see the band report"
+            )
     no_loss = NoLoss(
         ok=False,
         sent=0,
@@ -707,8 +757,8 @@ def _failed_cell_record(cell: BatchCell, detail: str) -> ConnScaleRecord:
         engine_written=0,
         sink_received=0,
         backlog=0,
-        detail=f"cell drive failed: {detail}",
-        inconclusive=True,
+        detail="; ".join([f"cell drive failed: {detail}", *proven]),
+        inconclusive=not proven,
     )
     # No `rate_window`: the cell measured no rate, so it names no window (BACKLOG #2012).
     return ConnScaleRecord(
@@ -1037,6 +1087,15 @@ def _ready_number[N: (int, float)](
     return kind(value)
 
 
+class CellFleetFailed(ConnScaleError):
+    """A band of one cell's fleet raised. ``reports`` are the reports its sibling bands wrote."""
+
+    def __init__(self, message: str, reports: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(message)
+        # A default, so a copy or unpickle that rebuilds the error from its message alone works.
+        self.reports = reports or []
+
+
 async def _drive_cell_fleet(
     cell: BatchCell,
     ready: Mapping[str, Any],
@@ -1051,9 +1110,10 @@ async def _drive_cell_fleet(
     Returns ``(reports, band_count)`` where ``band_count == len(plans)`` (the aggregation's expected-band
     guard).
 
-    A band that RAISES (a crashed remote process) fails the WHOLE cell (raises :class:`ConnScaleError`)
+    A band that RAISES (a crashed remote process) fails the WHOLE cell (raises :class:`CellFleetFailed`)
     rather than silently shrinking the fleet into a partial aggregate — the caller records it as an
-    explicit failed/loss cell so a crashed band can never vanish from the no-loss accounting."""
+    explicit failed/loss cell so a crashed band can never vanish from the no-loss accounting. The
+    error carries the reports the other bands did write, so a loss one of them proved is kept."""
     inbound_base = _ready_number(ready, "inbound_base", int)
     api_port = _ready_number(ready, "api_port", int)
     sink_base = _ready_number(ready, "sink_base", int)
@@ -1101,8 +1161,9 @@ async def _drive_cell_fleet(
         detail = "; ".join(
             f"band {idx} raised {type(exc).__name__}: {exc}" for idx, exc in failures
         )
-        raise ConnScaleError(
-            f"cell {cell.cell_id}: {len(failures)}/{len(plans)} sink band(s) failed: {detail}"
+        raise CellFleetFailed(
+            f"cell {cell.cell_id}: {len(failures)}/{len(plans)} sink band(s) failed: {detail}",
+            [res for res in results if isinstance(res, dict)],
         )
     reports = [res for res in results if isinstance(res, dict)]
     return reports, len(plans)
@@ -1151,6 +1212,8 @@ async def run_batch_driver(
             cell_coord.post(BATCH_CELL_DONE, {"cell_id": cell.cell_id, "skipped": True})
             continue
         done: dict[str, Any]
+        # The band reports this cell got back, kept for a failed aggregation's record below.
+        proc_reports: list[dict[str, Any]] = []
         try:
             proc_reports, band_count = await _drive_cell_fleet(
                 cell,
@@ -1176,7 +1239,8 @@ async def run_batch_driver(
             # (mirrors the connscale runner failing a step rather than dropping it).
             notes.append(f"CELL {cell.cell_id} drive failed: {exc}")
             cells_failed += 1
-            record = _failed_cell_record(cell, str(exc))
+            survivors = exc.reports if isinstance(exc, CellFleetFailed) else proc_reports
+            record = _failed_cell_record(cell, str(exc), survivors)
             done = {"cell_id": cell.cell_id, "error": str(exc)}
         # One record and one DONE per cell, posted outside the try so a failed post cannot add a
         # second, failed record for a cell that already ran.
