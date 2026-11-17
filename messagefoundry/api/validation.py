@@ -203,17 +203,18 @@ ALERT_SUSPEND_MINUTES_MAX = 43200
 #: Printable text: no C0 control, no DEL, no C1 control. One or more characters.
 PRINTABLE_TEXT_PATTERN = r"^[^\x00-\x1f\x7f-\x9f]+$"
 
-#: A sign-in name: any text but a NUL, empty included (vault BACKLOG #5342). A NUL would reach the
-#: store's lookup, and PostgreSQL text cannot hold one, so its driver would raise rather than find
-#: no row. Only the NUL: other control characters can reach a stored name through paths
+#: A sign-in name: any text but a NUL, empty included (vault BACKLOG #5342). PostgreSQL text
+#: cannot hold one, so a NUL at the store's lookup would make its driver raise rather than find no
+#: row; the sign-in service refuses such a name as an unknown one before that lookup, and this rule
+#: refuses it earlier, at the JSON body. Only the NUL: other control characters can reach a stored
+#: name through paths
 #: ``auth.usernames.username_refusal`` does not govern, such as provision-admin, so refusing them
 #: here could lock a holder out. Refusing a NUL locks no one out only where no account can hold
 #: one. PostgreSQL is such a store, read from its documentation and not run here. The SQLite store
 #: is not: ``create_user`` stores a NUL name and ``get_user_by_username`` finds it, so on SQLite an
 #: account created with one through a path that rule does not govern could not sign in. The SQL
-#: Server store is not measured. This is the one statement of these facts; the other sites point
-#: here. The web console's form sign-in applies the same rule by hand (``"\x00" in``), since it
-#: parses its form without pydantic.
+#: Server store is not measured. The web console's form sign-in has no body model, so it has no
+#: such rule; the service's refusal covers it.
 SIGN_IN_NAME_PATTERN = r"^[^\x00]*$"
 
 #: A member of one of the engine's own closed vocabularies -- ``MessageStatus``, ``OutboxStatus``,

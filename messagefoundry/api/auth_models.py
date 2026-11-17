@@ -57,9 +57,8 @@ class CredentialReply(BaseModel):
 
 class LoginRequest(RequestModel):
     # A NUL in ``username`` is refused here (vault BACKLOG #5342). ``SIGN_IN_NAME_PATTERN`` says
-    # why, and which stores can hold such a name. On a store whose driver raises on one, the
-    # error at the lookup is not one this route catches, so unrefused the route would answer 500
-    # outside its failure-timing pad.
+    # why, and which stores can hold such a name. Unrefused here, the sign-in service would still
+    # refuse it as an unknown name before the account lookup.
     username: str = Field(max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'

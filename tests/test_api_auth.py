@@ -3681,9 +3681,8 @@ async def test_login_supersedes_ends_the_named_token_before_the_cap(engine: Engi
 async def test_login_refuses_a_nul_username_before_the_store(
     engine: Engine, username: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Red: each reached ``AuthService.login``, where on a PostgreSQL store the NUL would raise an
-    error the route does not catch, a 500 outside the failure-timing pad. Now each is a 422 before
-    the service runs."""
+    """Red: each reached ``AuthService.login``, which refuses a NUL name as an unknown one before
+    the account lookup. Now each is a 422 at the body, before the service runs."""
     service = await _service(engine, AuthSettings(require_mfa=False))
     async with _client(engine, service) as c:
         reached: list[str] = []

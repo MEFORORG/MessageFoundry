@@ -764,8 +764,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # selector, and "ad" stays in the allow-list only so the ENGINE (_dispatch_login) is the
         # single point that refuses and audits it. Directory accounts sign in by Windows SSO or
         # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth
-        # (and the JSON /me/reauth). A name holding a NUL is the exception: it is refused below,
-        # whatever the provider, before the engine sees it.
+        # (and the JSON /me/reauth). A name holding a NUL reaches the service too, which refuses it
+        # as an unknown name before the account lookup, audited (BACKLOG #5342).
 
         def _refused() -> Response:
             # The challenge is already popped, so each refusal this helper builds also ends its
@@ -780,16 +780,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         provider_value = form.get("provider", "local")
         if provider_value not in ("local", "ad"):
             return _refused()
-        username = form.get("username", "")
-        if "\x00" in username:
-            # The JSON route's sign-in name rule, by hand since this form is not a pydantic model
-            # (vault BACKLOG #5342; api/validation.py ``SIGN_IN_NAME_PATTERN`` says why). It covers
-            # the combined passkey sign-in too, which rides this form's username. The service never
-            # sees the name, so it writes no audit row; this line is the record. Never the name.
-            _log.warning(
-                "sign-in refused before the service: username held a NUL, client=%s", client
-            )
-            return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,
         # the handle of its challenge the cookie the begin leg set; both or neither. Clamped, so an
         # oversized assertion is simply an invalid one.
@@ -801,7 +791,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             else None
         )
         outcome = await auth.login(
-            username,
+            form.get("username", ""),
             form.get("password", ""),
             provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
             client=client,

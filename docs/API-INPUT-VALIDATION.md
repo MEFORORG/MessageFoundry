@@ -27,7 +27,7 @@ sections with the code, so read the named code when a number matters.
 
 A value that breaks one of these rules gets an HTTP 422 with the field named, except a malformed HL7
 field path, which gets a 400: its rule is enforced outside the API models, as the note on the field
-path below says. The web console's sign-in form is another exception, described under the table.
+path below says.
 Whatever the status, the value that breaks a rule is refused before it reaches a database query, a
 filesystem path, a log line or a CSV export.
 
@@ -61,9 +61,10 @@ filesystem path, a log line or a CSV export.
 The email-address row covers `recipient_override` only. The account email fields follow a different
 rule, set out under [Items checked a second time](#items-checked-a-second-time-behind-the-route).
 
-The web console's `POST /ui/login` form applies the sign-in name's NUL rule too, without its length
-bound. It is not a JSON route, so it refuses with its usual redirect to the sign-in page rather
-than a 422.
+The web console's `POST /ui/login` form has no body model, so these rules do not run on it. A
+sign-in name holding a NUL reaches the sign-in service there, which refuses it as an unknown name
+before the account lookup and audits the attempt, and the form answers with its usual redirect to
+the sign-in page.
 
 "Printable text, no control characters" means every character except the C0 range, DEL, and the C1
 range. In practice: no NUL, no tab, no carriage return, no line feed.
