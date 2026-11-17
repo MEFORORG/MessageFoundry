@@ -3472,14 +3472,13 @@ async def test_an_expired_store_pin_refuses_a_reload_and_a_dr_activation(
         await engine.stop()
 
 
-async def test_an_oversized_store_pin_is_refused_before_it_is_read(
+async def test_an_oversized_store_pin_is_refused_with_its_row_from_a_bounded_read(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vault BACKLOG #4569 finding 5: a pin file larger than ``PIN_FILE_MAX_BYTES`` is refused
-    from its size on disk, in the store open's words, before the anchor read takes the whole file.
-    The read is stubbed to raise ``MemoryError``, as a huge file's would. Red under: the size check
-    dropped from :func:`_preflight_checks`, where that ``MemoryError`` escapes. The control: a
-    PostgreSQL CA of the same size is not a pin, so it is read."""
+    """Vault BACKLOG #3714, the Manager's ruling on review round-44dc8b48's Q2: a pin file
+    larger than ``PIN_FILE_MAX_BYTES`` is refused in the store open's words, after a read of at
+    most that many bytes and one more, and the refusal leaves a ``pem_refused`` row naming it. Red
+    under: the size check of a7fff14a81, which refused from the size on disk before any row."""
     from messagefoundry import pki
 
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
@@ -3487,8 +3486,57 @@ async def test_an_oversized_store_pin_is_refused_before_it_is_read(
     pin = _sqlserver_pin(tmp_path)
     # Load refuses an oversized pin, so the specs are built first: the file grows after the start.
     specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
-    ca_specs = _store_specs(backend="postgres", ssl_root_cert=str(pin))
     pin.write_bytes(pin.read_bytes() + b"\n" * pki.PIN_FILE_MAX_BYTES)
+    reads: list[int] = []
+    real = ta.read_if_regular
+
+    def counting(path: str, limit: int = -1) -> bytes | None:
+        data = real(path, limit)
+        reads.append(-1 if data is None else len(data))
+        return data
+
+    monkeypatch.setattr(ta, "read_if_regular", counting)
+    with pytest.raises(TrustAnchorError) as err:
+        await run_anchor_preflight(specs, store, enforcing=True)
+    assert str(err.value) == (
+        f"[store].ssl_root_cert {str(pin)!r} is not a usable SQL Server pin: it is larger than "
+        f"{pki.PIN_FILE_MAX_BYTES} bytes"
+    )
+    assert reads == [pki.PIN_FILE_MAX_BYTES + 1]  # bounded, not the whole file
+    (row,) = [r for r in await _rows(store, "store_sqlserver_pin") if r["event"] == "pem_refused"]
+    assert row["reason"] == str(err.value)
+
+
+async def test_an_oversized_postgres_store_ca_is_refused_with_its_row(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #4203, review round-44dc8b48 finding 3: the PostgreSQL CA's read is bounded
+    as the pin's is, and a longer file is refused with its ``pem_refused`` row. Red under:
+    ``max_bytes`` dropped from
+    :func:`store_postgres_ca_anchor_spec`, where the whole file is read and passes."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    ca = _sqlserver_pin(tmp_path)
+    ca.write_bytes(ca.read_bytes() + b"\n" * ta.STORE_CA_MAX_BYTES)
+    specs = _store_specs(backend="postgres", ssl_root_cert=str(ca))
+    with pytest.raises(TrustAnchorError, match="is larger than 1048576 bytes") as err:
+        await run_anchor_preflight(specs, store, enforcing=True)
+    (row,) = [r for r in await _rows(store, "store_postgres_ca") if r["event"] == "pem_refused"]
+    assert row["reason"] == str(err.value)
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_a_memory_error_reading_a_store_anchor_is_an_anchor_refusal(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    """Vault BACKLOG #4203, review round-44dc8b48 finding 3: a ``MemoryError`` raised while a
+    store anchor is read does not escape :func:`run_anchor_preflight`; it is a refusal naming the setting. The previous round
+    pinned that escape for the PostgreSQL CA as its control. Red under: the ``MemoryError`` arm
+    dropped from :func:`_preflight_checks`."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    specs = _store_specs(backend=backend, ssl_root_cert=str(pin))
 
     def huge(_spec: AnchorSpec) -> Any:
         raise MemoryError
@@ -3496,11 +3544,11 @@ async def test_an_oversized_store_pin_is_refused_before_it_is_read(
     monkeypatch.setattr(ta, "evaluate_anchor", huge)
     with pytest.raises(TrustAnchorError) as err:
         await run_anchor_preflight(specs, store, enforcing=True)
-    assert (
-        str(err.value) == f"[store].ssl_root_cert {str(pin)!r} {pki.oversized_pin_reason(str(pin))}"
+    assert str(err.value) == (
+        f"[store].ssl_root_cert: could not read the trust anchor {str(pin)!r}: the engine ran out "
+        "of memory"
     )
-    with pytest.raises(MemoryError):  # the control: the read is reached
-        await run_anchor_preflight(ca_specs, store, enforcing=True)
+    assert err.value.setting == "[store].ssl_root_cert"
 
 
 async def test_a_pem_refused_row_carries_the_refusal(
@@ -3539,6 +3587,15 @@ def test_a_server_pin_spec_must_be_read_by_path() -> None:
             refuses_encryption_header=True,
         )
     assert AnchorSpec("x", "y", "z", loads_verified_bytes=False, server_pin=True).server_pin
+
+
+def test_a_bounded_spec_must_be_read_by_path() -> None:
+    """``max_bytes`` is judged only by the by-path content checks, so a ``loads_verified_bytes``
+    spec that sets it is refused rather than left unbounded (vault BACKLOG #4203, review
+    round-44dc8b48 finding 3)."""
+    with pytest.raises(ValueError, match="max_bytes"):
+        AnchorSpec("x", "y", "z", max_bytes=10)
+    assert AnchorSpec("x", "y", "z", loads_verified_bytes=False, max_bytes=10).max_bytes == 10
 
 
 async def test_the_sqlserver_store_pin_is_audited_at_start_and_rechecked_at_reload(

@@ -241,9 +241,10 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     (:func:`_refuse_an_unusable_server_pin`, vault BACKLOG #3714): at least no encryption header
     (BACKLOG #3090), no private-key label (BACKLOG #3745), one server certificate, inside its
     validity period. So a pin past notAfter refuses at least every reload and DR activation until
-    the file is replaced. Like the store open, it refuses a file larger than
-    :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` from its size on disk before it reads it,
-    with no row, and refuses the bytes as too large once they are read. At
+    the file is replaced. It reads at most :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` and
+    one byte more (``AnchorSpec.max_bytes``), and refuses a longer file as too large, in the store
+    open's words, with a ``pem_refused`` row naming why, whose fingerprint covers only the bytes
+    read. The store open refuses such a file from its size on disk first, with no row. At
     ``warn`` the start logs the pin's warning once: the preflight skips one the store open just
     logged (:data:`_WARNED_AT_OPEN`).
 
@@ -251,7 +252,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     path at each new connection. :func:`collect_anchor_specs` adds it under the label
     ``store_postgres_ca`` (:func:`store_postgres_ca_anchor_spec`), so in ``serve`` it takes the
     audited checks of items 1 to 4 and the private-key refusal at start and at every reload, with
-    no pin. Unlike the SQL Server pin, the store runs none of these checks when it opens. At a
+    no pin. It reads at most :data:`STORE_CA_MAX_BYTES` and one byte more, and refuses a longer
+    file, with a ``pem_refused`` row, as the pin's check does. Unlike the SQL Server pin, the store
+    runs none of these checks when it opens. At a
     start the store has already been opened with this file when this check runs, so its
     connections may have trusted the file and sent the store login. A command that opens the
     store and runs no preflight does not check the file at all. What the paragraphs above say of the pin's audit riding its own hop, and of a refused reload
@@ -352,8 +355,10 @@ AUDIT_ACTION = "auth.trust_anchor"
 
 
 class TrustAnchorError(Exception):
-    """An operator-supplied trust anchor failed its integrity preflight: a configured SHA-256 pin
-    mismatch, a file that holds no loadable PEM block or names a private-key label, or, under ``[security].enforcement = enforce``,
+    """An operator-supplied trust anchor failed its integrity preflight: at least a configured
+    SHA-256 pin mismatch, a file that holds no loadable PEM block or names a private-key label,
+    content its own checks refuse, such as an expired, multi-certificate or oversized SQL Server
+    pin, a file that cannot be read, or, under ``[security].enforcement = enforce``,
     an ACL or path that lets another principal replace it or that could not be read. Raised at
     construction and at reload so the engine refuses a tampered/exposed anchor rather than silently
     trusting it.
@@ -451,10 +456,16 @@ class AnchorSpec:
     checks (module item 12). A spec with ``loads_verified_bytes`` True takes it in
     :func:`anchor_cadata` already.
 
-    ``server_pin`` adds the SQL Server pin's certificate checks to a ``False`` spec's content
-    checks (module item 11): one server certificate, inside its validity period. A ``True`` spec
-    never reaches those checks, so the two together are refused at construction. Those checks
-    run in place of ``refuses_encryption_header``'s, so ``server_pin`` with it is refused too."""
+    ``server_pin`` replaces a ``False`` spec's content checks with the SQL Server pin's, the ones
+    the store runs at open (module item 11): at least the encryption-header and private-key
+    refusals, in the pin's own words, and one server certificate, inside its validity period. A
+    ``True`` spec never reaches those checks, so the two together are refused at construction,
+    and so is ``server_pin`` with ``refuses_encryption_header``.
+
+    ``max_bytes`` bounds the read of a ``False`` spec: :func:`evaluate_anchor` reads at most that
+    many bytes and one more, and the content checks refuse a file longer than ``max_bytes``, with
+    the ``pem_refused`` row, so a huge file is refused rather than read whole. The fingerprint of
+    such a file covers only the bytes read. ``None``, the default, reads the whole file."""
 
     label: str
     setting: str
@@ -464,8 +475,11 @@ class AnchorSpec:
     loads_verified_bytes: bool = True
     refuses_encryption_header: bool = False
     server_pin: bool = False
+    max_bytes: int | None = None
 
     def __post_init__(self) -> None:
+        if self.max_bytes is not None and self.loads_verified_bytes:
+            raise ValueError("max_bytes needs loads_verified_bytes=False, or its check never runs")
         if self.server_pin and self.loads_verified_bytes:
             raise ValueError("server_pin needs loads_verified_bytes=False, or its checks never run")
         if self.server_pin and self.refuses_encryption_header:
@@ -680,10 +694,17 @@ def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
     refusal (BACKLOG #3745), in the order the DATABASE build runs them. A server pin
     (``spec.server_pin``) takes the store open's checks instead, in the store's order and words
     (:func:`_refuse_an_unusable_server_pin`), which refuse an encryption header and a private key
-    too. The refusal names the setting and the path, never the content."""
+    too, and a file longer than its cap. A file longer than ``spec.max_bytes`` is refused first.
+    The refusal names the setting and the path, never the content."""
     if spec.server_pin:
         _refuse_an_unusable_server_pin(data, spec)
         return
+    if spec.max_bytes is not None and len(data) > spec.max_bytes:
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} is larger than {spec.max_bytes} "
+            "bytes, so the engine does not read it whole. A CA bundle needs only its CA "
+            "certificates; name a file holding only those"
+        )
     if spec.refuses_encryption_header and has_encryption_header_bytes(data):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. Its hop "
@@ -1276,11 +1297,12 @@ def read_if_regular(path: str, limit: int = -1) -> bytes | None:
         os.close(fd)
 
 
-def _read_regular_file(path: str) -> bytes:
-    """The whole file at ``path``, read by :func:`read_if_regular`. Anything but a regular file
+def _read_regular_file(path: str, limit: int = -1) -> bytes:
+    """The file at ``path``, at most ``limit`` bytes of it (all of it when negative), read by
+    :func:`read_if_regular`. Anything but a regular file
     raises ``OSError``, which every caller reports as an anchor it cannot read, so a pipe swapped
     in for a CA is refused rather than waited on (vault BACKLOG #3090)."""
-    data = read_if_regular(path)
+    data = read_if_regular(path, limit)
     if data is None:
         raise OSError(errno.EINVAL, "not a regular file")
     return data
@@ -1293,8 +1315,13 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
 
     The file is read ONCE, and the verdict carries those bytes as ``data``, so a consumer can load
     what was hashed rather than open the file again (BACKLOG #1142, slice 2). It reads only a
-    regular file (:func:`_read_regular_file`), so a pipe never makes the check wait."""
-    data = _read_regular_file(spec.path)
+    regular file (:func:`_read_regular_file`), so a pipe never makes the check wait. A spec with
+    ``max_bytes`` set is read to at most that many bytes and one more (vault BACKLOG #3714,
+    #4203), so the content checks can refuse a longer file without reading it whole."""
+    if spec.max_bytes is None:
+        data = _read_regular_file(spec.path)
+    else:
+        data = _read_regular_file(spec.path, spec.max_bytes + 1)
     fingerprint = anchor_digest_hex(ANCHOR_DIGEST, data)
     pin_ok: bool | None = None
     if spec.pin is not None:
@@ -2308,13 +2335,22 @@ def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
     path = store.sqlserver_pin_path()
     if path is None:
         return None
+    from messagefoundry.pki import PIN_FILE_MAX_BYTES  # lazy: pki loads cryptography
+
     return AnchorSpec(
         "store_sqlserver_pin",
         "[store].ssl_root_cert",
         path,
         loads_verified_bytes=False,
         server_pin=True,  # which refuses an encryption header too, in the pin's own words
+        max_bytes=PIN_FILE_MAX_BYTES,  # refused past it in the pin's words (vault BACKLOG #3714)
     )
+
+
+#: The largest PostgreSQL ``[store].ssl_root_cert`` CA bundle the settings check reads (vault
+#: BACKLOG #4203). A CA bundle is a few certificates; the cap only keeps a huge file from being
+#: read whole. It is the SQL Server pin's cap.
+STORE_CA_MAX_BYTES = 1 << 20
 
 
 def store_postgres_ca_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
@@ -2332,6 +2368,7 @@ def store_postgres_ca_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
         "[store].ssl_root_cert",
         store.ssl_root_cert,
         loads_verified_bytes=False,
+        max_bytes=STORE_CA_MAX_BYTES,
     )
 
 
@@ -2608,7 +2645,8 @@ async def _preflight_one(
 
     **Only the file read and the PEM load become an anchor refusal** (BACKLOG #3091). An
     ``OSError`` or a ``ValueError`` from them, such as a missing file or a NUL in the path, is raised as a
-    :class:`TrustAnchorError` that names the setting (:func:`_unreadable_anchor`). A store call that
+    :class:`TrustAnchorError` that names the setting (:func:`_unreadable_anchor`), and so is a
+    ``MemoryError``, with no row (vault BACKLOG #4203). A store call that
     fails raises :class:`AnchorStoreUnavailable` instead, so a store fault no longer reads as a
     refused anchor. An anchor the verdict refuses is still refused as one when a store call fails,
     since the verdict is reached first.
@@ -2634,13 +2672,6 @@ async def _preflight_checks(
 ) -> str:
     """The body of :func:`_preflight_one`, whose docstring says what it checks."""
     shape_error: TrustAnchorError | None = None
-    if verdict is None and spec.server_pin:
-        # The read below takes the whole file, so a pin too large to be one is refused from its
-        # size on disk first, in the store open's words, before any row (vault BACKLOG #3714).
-        from messagefoundry.pki import oversized_pin_reason  # lazy: pki loads cryptography
-
-        if (too_large := await asyncio.to_thread(oversized_pin_reason, spec.path)) is not None:
-            raise TrustAnchorError(f"{spec.setting} {spec.path!r} {too_large}")
     try:
         if verdict is None:
             verdict = await asyncio.to_thread(evaluate_anchor, spec)
@@ -2657,6 +2688,13 @@ async def _preflight_checks(
                 shape_error = exc
     except (OSError, ValueError) as exc:
         raise _unreadable_anchor(spec, exc) from exc
+    except MemoryError as exc:
+        # A read or parse too large for the process is a refused anchor naming its setting, not a
+        # fault that escapes the preflight (vault BACKLOG #4203). No row: as for a failed read.
+        raise TrustAnchorError(
+            f"{spec.setting}: could not read the trust anchor {spec.path!r}: the engine ran out "
+            "of memory"
+        ) from exc
     # The item 6 escape, the one `_enforce_verdict` grants: a matching pin over the bytes loaded.
     pin_escapes = verdict.pin_ok is True and spec.loads_verified_bytes
     store_fault: AnchorStoreUnavailable | None = None

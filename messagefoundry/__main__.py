@@ -5059,9 +5059,10 @@ def _serve(args: argparse.Namespace) -> int:
         # GET /logging/level next to the (possibly runtime-overridden) effective level.
         configured_log_level=settings.logging.level,
         # #285 (ASVS 6.7.1): the operator-supplied auth-path trust anchors (OIDC / AD / api-mTLS client
-        # CA), plus the settings CAs an engine hop dials with (vault BACKLOG #3188) and the SQL
-        # Server store pin (vault BACKLOG #3714), that the
-        # lifespan + /config/reload preflight for ACL + optional SHA-256 pin. Empty when none is
+        # CA), plus the settings CAs an engine hop dials with (vault BACKLOG #3188) and, from the
+        # store settings, at least the SQL Server store pin (vault BACKLOG #3714) and the PostgreSQL
+        # store CA (vault BACKLOG #4203), that the lifespan + /config/reload preflight, with at
+        # least an ACL check and an optional SHA-256 pin. Empty when none is
         # configured → dormant, byte-identical. `enforcing` is the [security].enforcement refuse/warn dial.
         trust_anchor_specs=collect_anchor_specs(
             settings.auth,
@@ -5069,7 +5070,7 @@ def _serve(args: argparse.Namespace) -> int:
             tls=settings.tls,
             alerts=settings.alerts,
             log_settings=settings.logging,
-            store=settings.store,  # the SQL Server pin (vault BACKLOG #3714)
+            store=settings.store,  # at least the SQL Server pin and the PostgreSQL CA
         ),
         trust_anchors_enforcing=enforcing,
         # BACKLOG #3470: the collector CA `_start_logging` refused, for the lifespan to refuse on.

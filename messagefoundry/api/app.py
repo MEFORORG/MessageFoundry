@@ -12717,11 +12717,11 @@ def create_managed_app(
                 )
             # #285 (ASVS 6.7.1): preflight every operator-supplied auth-path trust anchor (OIDC / AD /
             # api-mTLS client CA), the settings CAs a hop dials with (vault BACKLOG #3188;
-            # trust_anchors module item 10) and the SQL Server store pin (that module's
-            # store_sqlserver_pin item), BEFORE any listener binds — a group/world-writable anchor refuses (at enforce) or
+            # trust_anchors module item 10) and, at least, the SQL Server store pin and the
+            # PostgreSQL store CA (that module's item 11), BEFORE any listener binds — a group/world-writable anchor refuses (at enforce) or
             # warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
             # change since the last audited observation is audited (auth.trust_anchor; for the store
-            # pin, that item says where this falls short).
+            # anchors, that item says where this falls short).
             # Dormant (no store call, no audit) when no anchor is configured. On a fatal violation it
             # raises, and the startup guard tears down.
             # BACKLOG #3470: a CA refused before the store opened, here or by serve's forwarder gate.
