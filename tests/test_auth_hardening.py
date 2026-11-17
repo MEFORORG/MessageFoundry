@@ -621,9 +621,10 @@ async def test_a_username_with_a_nul_is_an_unknown_name_on_both_sign_in_surfaces
 ) -> None:
     """BACKLOG #5342: at least a PostgreSQL store refuses a NUL in a text bind, so a username
     carrying one would escape the sign-in as an unhandled error, outside the failure pad. The
-    service refuses it as an unknown name before the account lookup, on the JSON route and the
-    console form alike: the limiter is charged, the answer is an unknown name's, and the
-    ``auth.login_failed`` row names it with the NUL escaped."""
+    service refuses it as an unknown name before the account lookup: at the seam itself, and
+    through the console form, which charges the limiter first. The answer is an unknown name's,
+    and the ``auth.login_failed`` row names it with the NUL escaped. The JSON route is driven at
+    the seam, not over HTTP, because its body model may refuse a NUL before the service."""
     service = await _service(engine)
     await _add(service, "bob")
     looked_up: list[str] = []
@@ -642,11 +643,11 @@ async def test_a_username_with_a_nul_is_an_unknown_name_on_both_sign_in_surfaces
         return real_allow(client)
 
     monkeypatch.setattr(service, "allow_login_attempt", allow)
+    unknown = await service.login("ghost-user-does-not-exist", PW, client="10.0.0.9")
+    looked_up.clear()
+    nul = await service.login("bo\x00b", PW, client="10.0.0.9")
+    assert (nul.ok, nul.error, nul.token) == (unknown.ok, unknown.error, unknown.token)
     async with _client(engine, service, serve_ui=True) as c:
-        unknown = await _login(c, "ghost-user-does-not-exist")
-        looked_up.clear()
-        nul = await _login(c, "bo\x00b")
-        assert (nul.status_code, nul.json()) == (unknown.status_code, unknown.json())
         ui = await c.post(
             "/ui/login",
             data={"username": "bo\x00b", "password": PW},
@@ -655,7 +656,7 @@ async def test_a_username_with_a_nul_is_an_unknown_name_on_both_sign_in_surfaces
         )
         assert ui.status_code == 303 and ui.headers["location"] == "/ui/login?e=bad"
     assert all("\x00" not in name for name in looked_up), looked_up
-    assert len(charged) == 3, "a sign-in was not charged to the limiter"
+    assert len(charged) == 1, "the console sign-in was not charged to the limiter"
     actors = [
         row["actor"]
         for row in await engine.store.list_audit()
