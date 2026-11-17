@@ -451,7 +451,8 @@ than a path is not checked
   engine's own account with full control for the host file, or with read and delete for the
   handoff file.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
-  the owner and access list of the folder just above the key file in its path, as written, and
+  the owner and access list of the folder that holds the key file where its path resolves to,
+  after any junction, link or `subst` drive, and
   refuses the key file when one of the groups above or an application package may delete a file in that folder, change its access list or take it over, or when that
   folder's owner is such a group or cannot be read
   (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`). A folder whose access list
