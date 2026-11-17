@@ -735,7 +735,8 @@ async def test_a_hung_startup_check_at_an_activation_fails_its_lane_and_binds_th
 
     monkeypatch.setattr(FileDestination, "validate_startup", hang)
     monkeypatch.setattr(FileDestination, "aclose", aclose)
-    monkeypatch.setattr(wiring_runner, "_DR_PARK_BUILD_TIMEOUT_SECONDS", 0.2)
+    # Long enough that the healthy _OB_CA build on a busy runner is not cancelled with it.
+    monkeypatch.setattr(wiring_runner, "_DR_PARK_BUILD_TIMEOUT_SECONDS", 5.0)
     sink = _CountingSink()
     ca = _ca(tmp_path)
     runner = _runner(
@@ -747,7 +748,7 @@ async def test_a_hung_startup_check_at_an_activation_fails_its_lane_and_binds_th
         await asyncio.wait_for(runner.reload(), timeout=_WAIT_BOUND_SECONDS)
 
         assert runner.inbound_running(_IB)
-        assert "within 0.2s as it left the DR park" in (runner.outbound_failed(_OB_FILE) or "")
+        assert "within 5s as it left the DR park" in (runner.outbound_failed(_OB_FILE) or "")
         assert sink.stopped.count(_OB_FILE) == 1
         assert _OB_FILE not in runner._destinations
         assert runner._dr_unbuilt.get(_OB_FILE) is True  # held parked, as a failed build is
@@ -934,8 +935,8 @@ async def test_a_cancelled_dr_park_build_whose_cancel_handler_hangs_releases_the
         done, _ = await asyncio.wait([call], timeout=5)
         assert call in done, "the cancelled call is still waiting on the hung build"
         assert call.cancelled()
-        hung = [t for t in runner._lookup_close_tasks if not t.done()]
-        assert len(hung) == 1
+        # The hung build, and the close waiting on it, are tracked.
+        assert [t for t in runner._lookup_close_tasks if not t.done()]
     finally:
         await _cancel_tracked(runner, call)
 
@@ -973,7 +974,7 @@ async def test_a_second_cancel_of_dr_park_builds_still_closes_and_tracks_them(
     call.cancel()
     try:
         with pytest.raises(asyncio.CancelledError):
-            await call
+            await asyncio.wait_for(call, timeout=10)  # a timeout is red, not a hung suite
         assert into == {}
         await _wait_until(lambda: closed == ["DONE"], timeout=5)
         assert len([t for t in runner._lookup_close_tasks if not t.done()]) >= 1
@@ -1002,7 +1003,8 @@ async def test_a_dr_park_build_that_raises_leaves_every_other_result_with_the_ca
     with pytest.raises(_Boom):
         await runner._build_lane_destinations_bounded(lanes, into)
     assert sorted(into) == ["FIRST", "LAST"]
-    if runner._lookup_close_tasks:  # any close a callback started has run
+    await asyncio.sleep(0.05)  # any close a wrong abandon started gets its loop passes
+    if runner._lookup_close_tasks:
         await asyncio.wait(runner._lookup_close_tasks, timeout=10)
     assert closed == []  # each result is the caller's to close, not abandoned
 

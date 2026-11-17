@@ -5381,9 +5381,9 @@ class RegistryRunner:
         at most one bound, then propagates, leaving any still running to close what they made.
 
         Every build is tracked with the detached closes as it is created, before any await. A
-        build is abandoned, cancelled and given the callback that closes what it made, with no
-        await between the wait's return or cancellation and the abandon, so no cancellation can
-        skip it. A build whose result goes into ``into`` is never abandoned, so its connector is
+        build is abandoned, cancelled and given a tracked task that closes what it made, with no
+        await between the wait's return or raise and the abandon, so no cancellation can skip
+        it. A build whose result goes into ``into`` is never abandoned, so its connector is
         the caller's. A build that raised is raised once every other done build's result is in
         ``into``."""
         if not lanes:
@@ -5391,10 +5391,13 @@ class RegistryRunner:
         builds: dict[str, asyncio.Task[_LaneBuild]] = {}
 
         def abandon(name: str) -> None:
-            # On a task already done the callback still runs, once, on the next loop pass.
+            # The close is a tracked task of its own that awaits the build, so a teardown that
+            # waits for the detached closes waits for the close too, not only the build.
             build = builds[name]
             build.cancel()
-            build.add_done_callback(functools.partial(self._close_late_lane_build, name))
+            self._track_detached_close(
+                asyncio.create_task(self._close_late_lane_build(name, build))
+            )
 
         for name, oc in lanes:
             builds[name] = build = asyncio.create_task(self._build_lane_destination(name, oc))
@@ -5403,7 +5406,7 @@ class RegistryRunner:
             _done, pending = await asyncio.wait(
                 builds.values(), timeout=_DR_PARK_BUILD_TIMEOUT_SECONDS
             )
-        except asyncio.CancelledError:
+        except BaseException:
             # Every build is abandoned before the next await, so a second cancellation below
             # leaves none unclosed or untracked.
             for name in builds:
@@ -5429,17 +5432,36 @@ class RegistryRunner:
             except BaseException as exc:  # noqa: BLE001 - raised below, once the rest are in
                 if raised is None:
                     raised = exc
+                else:
+                    log.error(
+                        "outbound connection %r: its build as it left the DR park raised %s, "
+                        "besides the %s this reload raises",
+                        name,
+                        type(exc).__name__,
+                        type(raised).__name__,
+                    )
         if raised is not None:
             raise raised
 
-    def _close_late_lane_build(self, name: str, build: asyncio.Task[_LaneBuild]) -> None:
-        """Close the connector of an abandoned DR-park build that finished anyway, its check
-        having swallowed the cancellation or having finished before it: nothing holds it."""
-        if build.cancelled() or build.exception() is not None:
+    async def _close_late_lane_build(self, name: str, build: asyncio.Task[_LaneBuild]) -> None:
+        """Wait for an abandoned DR-park build to end, and close the connector it made if it
+        finished anyway, its check having swallowed the cancellation or having finished before
+        it: nothing holds it. A build that raised is logged, by type only, since nothing else
+        retrieves it."""
+        await asyncio.wait([build])
+        if build.cancelled():
+            return
+        exc = build.exception()
+        if exc is not None:
+            log.error(
+                "outbound connection %r: its abandoned build as it left the DR park raised %s",
+                name,
+                type(exc).__name__,
+            )
             return
         outcome = build.result().outcome
         if isinstance(outcome, DestinationConnector):
-            self._close_detached([(name, outcome)])
+            await self._aclose_quietly(outcome, name)
 
     def _install_lane_destination(self, name: str, built: _LaneBuild) -> Exception | None:
         """Put a :meth:`_build_lane_destination` result in its lane, with no await: the connector,
