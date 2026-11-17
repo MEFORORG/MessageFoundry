@@ -36,9 +36,10 @@ What is refused, by default and with no setting to turn it off:
 PBKDF2-HMAC-SHA-256 at 2048 iterations, far under the floor, so a key written either way is refused.
 
 PKCS#12 bundles (``cert import``) get the same rules for their bags, plus a MAC rule: only a PBMAC1
-MAC passes, over PBKDF2 at the floor with a keyLength of its HMAC's output size. A MAC that is not
-PBMAC1 is keyed by the PKCS#12 KDF, which Appendix C does not list; a PBMAC1 MAC off those terms
-is refused too (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not the bags are
+MAC passes, and it must meet at least these terms: PBKDF2 at the floor, an HMAC over SHA-256 or
+stronger, and a PBKDF2 keyLength of that HMAC's output size. A MAC that is not PBMAC1 is keyed by
+the PKCS#12 KDF, which Appendix C does not list; a PBMAC1 MAC off those terms is refused too
+(:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not the bags are
 encrypted; only a bundle with clear bags and no MAC at all derives nothing from a password, and it
 passes. A key bag inside a PKCS#12 part that is itself encrypted is checked by the same bag rules
 in a SECOND step: the caller decrypts that part with the passphrase and hands it back
