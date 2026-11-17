@@ -1140,3 +1140,57 @@ def test_dicomweb_query_credential_is_not_reported_as_a_hop(
             "outbound 'OB_REST'", rest.settings, connector_type=ConnectorType.REST
         )
     assert [r for r in caplog.records if "OB_REST" in r.getMessage()]
+
+
+_REFUSED_CREDENTIALS: list[dict[str, object]] = [
+    {"basic_user": "svc"},
+    {"bearer_token": "t", "basic_user": "svc", "basic_password": "pw"},
+    {"bearer_token": "t", "headers": {"Authorization ": "Bearer x"}},
+    {"basic_user": "svc:x", "basic_password": "pw"},
+    {"bearer_token": "t€n"},
+]
+
+
+def _census(**over: object) -> list[str]:
+    from messagefoundry.config.static_credentials import static_credential_hops
+    from messagefoundry.config.wiring import Registry, build_outbound_connection
+
+    registry = Registry()
+    registry.outbound["OB_DW"] = build_outbound_connection(
+        "OB_DW",
+        DICOMweb(url=BASE, **over),  # type: ignore[arg-type]
+    )
+    return [hop.name for hop in static_credential_hops(registry=registry, settings=None)]
+
+
+@pytest.mark.parametrize("over", _REFUSED_CREDENTIALS)
+def test_census_leaves_out_a_dicomweb_hop_its_build_refuses(
+    over: dict[str, object],
+) -> None:  # vault BACKLOG #5359
+    """The census reads the build's own refusal (``dicomweb_credential_problem``), so a hop that
+    cannot build is not listed for an operator to opt out."""
+    with pytest.raises(HttpAuthError):
+        _dest(**over)
+    assert _census(**over) == []
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"bearer_token": "t"},
+        {"basic_user": "svc", "basic_password": "pw"},
+        {},  # no credential at all is a listed hop too
+    ],
+)
+def test_census_still_lists_a_dicomweb_hop_that_builds(
+    over: dict[str, object],
+) -> None:  # vault BACKLOG #5359
+    _dest(**over)
+    assert _census(**over) == ["OB_DW"]
+
+
+def test_census_lists_a_dicomweb_hop_it_cannot_resolve() -> None:  # vault BACKLOG #5359
+    """An env() credential with no values to resolve it is not judged, so the hop stays listed."""
+    from messagefoundry.config.wiring import env
+
+    assert _census(bearer_token=env("tok"), basic_user="svc", basic_password="pw") == ["OB_DW"]

@@ -262,12 +262,14 @@ def _http_literal_static(
 
     A header counts when the redaction screen (``config.wiring._is_secret_header``) reads it as a
     credential, by name or by value, the test the off-box cleartext refusal applies, so at least a
-    ``Proxy-Authorization`` entry counts too. A static ``Authorization`` header does not count when
-    ``displaced``, because the connector then writes its own ``Authorization`` over it: SOAP drops
-    every spelling ``http_auth.is_authorization_header_name`` matches, and REST and FHIR set the
-    plain name, which replaces only a spelling urllib folds into it (any letter case, nothing
-    added). So a REST or FHIR ``"Authorization "``, with a trailing space, still counts: it goes on
-    the wire beside the connector's own. A query parameter counts when
+    ``Proxy-Authorization`` entry counts too. On SOAP, REST and FHIR a static ``Authorization``
+    header does not count when ``displaced``, because the connector then writes its own
+    ``Authorization`` over it: SOAP drops every spelling ``http_auth.is_authorization_header_name``
+    matches, and REST and FHIR set the plain name, which replaces only a spelling urllib folds into
+    it (any letter case, nothing added). So a REST or FHIR ``"Authorization "``, with a trailing
+    space, still counts: it goes on the wire beside the connector's own. A DICOMweb hop whose build
+    its credential refusal stops is not listed at all (:func:`_dicomweb_build_refused`, vault
+    BACKLOG #5359). A query parameter counts when
     ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses,
     except on a destination type in ``URL_QUERY_REFUSED_DESTINATIONS``.
 
@@ -331,6 +333,8 @@ def _http_hop(
 
     A credential in the ``headers`` table or the ``url`` query is static whatever else the hop
     presents (:func:`_http_literal_static`), so it lists the hop even beside a compliant kind."""
+    if ctype is ConnectorType.DICOMWEB and _dicomweb_build_refused(settings, env_values):
+        return None
     compliant_kind = ctype is not ConnectorType.DICOMWEB
     token = _http_token(ctype, settings, lookup=lookup)
     static = _http_static(ctype, settings, token)
@@ -343,6 +347,25 @@ def _http_hop(
     if token or (ctype is ConnectorType.SOAP and settings.get("client_cert_file")):
         return None
     return StaticCredentialHop(name, "none", f"presents no credential ({peer})", compliant_kind)
+
+
+def _dicomweb_build_refused(
+    settings: Mapping[str, Any], env_values: Mapping[str, Any] | None
+) -> bool:
+    """Whether DICOMweb's credential refusal (vault BACKLOG #5359) stops this hop's build, so the
+    census leaves it out: a refused build is not listed. The settings it judges are resolved as
+    the build resolves them; a value this reading cannot resolve leaves the hop listed."""
+    # Lazy, like ``_smart``: the transport owns the refusal, and this reads it rather than
+    # restating it.
+    from messagefoundry.transports.dicomweb import dicomweb_credential_problem
+
+    view: dict[str, Any] = {}
+    for key in ("bearer_token", "basic_user", "basic_password", "headers"):
+        value = _db_setting(settings, key, None, env_values)
+        if value is _UNRESOLVED:
+            return False
+        view[key] = value
+    return dicomweb_credential_problem(view) is not None
 
 
 def _proxy_url_holds_credential(url: object) -> bool:

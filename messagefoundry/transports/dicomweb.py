@@ -94,7 +94,7 @@ from messagefoundry.transports.rest import (
     url_scheme,
 )
 
-__all__ = ["DicomWebDestination"]
+__all__ = ["DicomWebDestination", "dicomweb_credential_problem"]
 
 logger = logging.getLogger(__name__)
 
@@ -208,8 +208,12 @@ def _refuse_base_url_query_or_fragment(url: str, connection: str | None) -> None
         )
 
 
-def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) -> None:
-    """Refuse a credential set the header builder could not send as written (vault BACKLOG #5359).
+def dicomweb_credential_problem(s: Mapping[str, Any]) -> str | None:
+    """Why a DICOMweb destination's credential settings refuse its build, or ``None`` (vault BACKLOG
+    #5359). Never raises. The one test behind :func:`_refuse_ambiguous_credentials` and the
+    static-credential census (``config.static_credentials``), so the census does not list a hop
+    this refusal stops. ``s`` holds resolved values: an unresolved ``env()`` reference is the
+    caller's to resolve or to leave unjudged.
 
     ``basic_user`` without ``basic_password``, or the reverse, would send no credential at all; a
     ``bearer_token`` beside a Basic pair, or either beside an ``Authorization`` entry in the static
@@ -221,24 +225,19 @@ def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) 
     its UTF-8 encode cannot write, and the bearer token, which goes on the wire as written, may not
     hold a character ``http.client``'s latin-1 header encode cannot write; either would otherwise
     surface as an encoder error quoting part of the secret. A colon in the password is legal and
-    admitted.
-
-    Called in the constructor, before any proxy or hop guard records a crossing for a
-    connection that will not build. Raises :class:`HttpAuthError`, as SOAP's half-pair refusal does,
-    naming the connection and the settings, never a value."""
+    admitted. The reason names settings, never a value."""
     # Lazy, as rest.py imports it: http_auth imports this package's siblings at its top.
     from messagefoundry.transports.http_auth import is_authorization_header_name
 
-    prefix = f"{hop_name_prefix(connection)}DICOMweb destination"
     token, user, password = s.get("bearer_token"), s.get("basic_user"), s.get("basic_password")
     if bool(user) != bool(password):
-        raise HttpAuthError(
-            f"{prefix} basic_user and basic_password must be set together; one without the other "
+        return (
+            "basic_user and basic_password must be set together; one without the other "
             "would send no HTTP Basic credential"
         )
     if token and user:
-        raise HttpAuthError(
-            f"{prefix} sets both bearer_token and basic_user/basic_password; set one credential, "
+        return (
+            "sets both bearer_token and basic_user/basic_password; set one credential, "
             "since only one Authorization header can be sent"
         )
     extra = s.get("headers") or {}
@@ -247,8 +246,8 @@ def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) 
         and isinstance(extra, dict)
         and any(is_authorization_header_name(str(name)) for name in extra)
     ):
-        raise HttpAuthError(
-            f"{prefix} sets an Authorization entry in headers beside bearer_token or "
+        return (
+            "sets an Authorization entry in headers beside bearer_token or "
             "basic_user/basic_password; set the credential in one place"
         )
     for field, value in (
@@ -260,16 +259,28 @@ def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) 
             continue
         text = str(value)
         if has_control_char(text):
-            raise HttpAuthError(f"{prefix} {field} contains an illegal control character")
+            return f"{field} contains an illegal control character"
         # The bearer goes out as a raw header value; a Basic half is UTF-8 inside base64.
         if (
             _latin1_refusal_position(text) is not None
             if field == "bearer_token"
             else has_lone_surrogate(text)
         ):
-            raise HttpAuthError(f"{prefix} {field} holds a character the request cannot encode")
+            return f"{field} holds a character the request cannot encode"
     if user and ":" in str(user):
-        raise HttpAuthError(f"{prefix} basic_user may not contain a colon (RFC 7617 section 2)")
+        return "basic_user may not contain a colon (RFC 7617 section 2)"
+    return None
+
+
+def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) -> None:
+    """Raise :class:`HttpAuthError` for what :func:`dicomweb_credential_problem` finds.
+
+    Called in the constructor, before any proxy or hop guard records a crossing for a
+    connection that will not build. Raises :class:`HttpAuthError`, as SOAP's half-pair refusal does,
+    naming the connection and the settings, never a value."""
+    problem = dicomweb_credential_problem(s)
+    if problem is not None:
+        raise HttpAuthError(f"{hop_name_prefix(connection)}DICOMweb destination {problem}")
 
 
 def _reply_is_empty(body: str) -> bool:

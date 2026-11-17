@@ -106,9 +106,9 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
     as off.
 
     Read strictly (vault BACKLOG #5362), and total: it never raises, because readers of the loaded
-    graph (the census, the advisories, the trust-anchor readers) call it as a plain predicate. A
-    truthiness read used to take the string ``"false"`` or ``"0"`` as on and an explicit ``None``
-    as off. The loader refuses a non-bool literal too (``Registry.bool_literal_problems``), and
+    graph (the census, the advisories, the trust-anchor readers) call it as a plain predicate.
+    The build seams refuse, through :func:`refuse_oauth2_settings`, the settings it reads as OFF
+    only because they are wrong, and
     :func:`with_oauth2_client_credentials` a literal blank token URL when ``enabled`` is
     ``True``."""
     if _oauth2_setting_problem(s) is not None:
@@ -646,8 +646,6 @@ def with_oauth2_client_credentials(
     is not applied. The two forms are the same for an id and secret with no reserved character."""
     _require_http_spec(spec, "OAuth2 client-credentials")
     if enabled is True and isinstance(token_url, str) and not token_url.strip():
-        # A literal blank or whitespace-only string is refused here when enabled is True
-        # (vault BACKLOG #5362).
         raise HttpAuthError(
             "OAuth2 client-credentials token_url is blank; set the token endpoint URL"
         )
