@@ -1072,6 +1072,63 @@ def test_a_detail_the_line_check_hides_whole_keeps_its_json_and_note() -> None:
     assert whole == "[redacted]" + note
 
 
+def test_a_detail_hidden_whole_is_the_bounded_placeholder(monkeypatch) -> None:
+    """Review of the PR 2864 repair: the whole-field candidate for a changed ``detail`` is
+    ``_bounded_detail(_FIELD_REDACTED, note, old_detail)``, so it keeps the JSON a collector
+    parsed before and the bound note. A bare ``[redacted]`` there fails this. Synthetic values."""
+    from messagefoundry.redaction import safe_text, safe_text_bound
+
+    seen: list[tuple[str, str]] = []
+    real = audit_tee._tee_line
+
+    def spy(before: dict[str, object], after: dict[str, object], whole_detail) -> str:
+        seen.append((str(before["detail"]), whole_detail()))
+        return real(before, after, whole_detail)
+
+    monkeypatch.setattr(audit_tee, "_tee_line", spy)
+    details = [
+        json.dumps({"e": f"{chr(0x01)}DOE JANE"}),
+        f"{chr(0x01)}DOE JANE " + "word " * 14000,
+    ]
+    _raw_tee_lines([{"detail": d} for d in details], monkeypatch, scrub=True)
+    assert len(seen) == len(details)
+    for value, (old_detail, whole) in zip(details, seen, strict=True):
+        _head, note = safe_text_bound(value)
+        assert old_detail == safe_text(value)
+        assert whole == audit_tee._bounded_detail("[redacted]", note, old_detail)
+    # The JSON detail keeps its JSON-ness, and the long one its bound note.
+    assert seen[0][1] == json.dumps("[redacted]")
+    assert seen[1][1] != "[redacted]" and seen[1][1].startswith("[redacted]")
+
+
+#: Review of the PR 2864 repair: a ``channel_id`` carrying ``Bearer %7C`` beside a JSON
+#: ``detail``, which hidden whole shows no word main's line hid on any sink, and parses on none
+#: where main's parsed. So the old line ships for the parse floor, not for a word.
+_PARSE_FLOOR_FALLBACK: dict[str, str | None] = {
+    "actor": "token=hunter2\t\\u1234secret",
+    "channel_id": "&%7CBearer %7C",
+    "detail": '{"e": "\\\\u1234\\u007fBearer "}',
+}
+
+
+def test_the_old_line_names_the_parse_floor_when_that_is_what_fired(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: the warning said the old line shipped because hiding the
+    changed fields would still show a word, which is false where only the parse floor fired. It
+    names the reason that fired, and no field value. Synthetic values."""
+    from messagefoundry.logging_setup import sink_readings
+
+    monkeypatch.setattr(audit_tee, "_OLD_LINE_LOGGED", False)
+    with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
+        (after,) = _raw_tee_lines([_PARSE_FLOOR_FALLBACK], monkeypatch, scrub=True)
+    (before,) = _raw_tee_lines([_PARSE_FLOOR_FALLBACK], monkeypatch, scrub=False)
+    assert after == before  # the old line shipped
+    # The control on the example: main's line parses on every sink.
+    assert all(audit_tee._parses(r) for r in sink_readings(before))
+    (warning,) = [r.getMessage() for r in caplog.records if "without the C0" in r.getMessage()]
+    assert "unparseable" in warning and "show a word" not in warning
+    assert "hunter2" not in warning and "Bearer" not in warning and "%7C" not in warning
+
+
 def test_a_long_value_with_no_control_is_not_touched() -> None:
     """The window's own cut ends its note with a newline of its own, which is not the value's
     control (review round 1)."""

@@ -367,7 +367,9 @@ def _tee_line(
     the forwarder, the copy that leaves the box, is the last of up to three; a bar taken over
     the first pass alone let a later sink show words main's same sink hid. The last candidate
     loses the C0 scrub for that record, and is reached only where hiding the changed fields
-    whole still shows a word the old line hid elsewhere in it, and is logged once per process.
+    whole still fails the bar on some sink, for either of two reasons: it shows a word the old
+    line hid elsewhere in it, or its reading does not parse as JSON where the old line's did. It
+    is logged once per process, naming which reason fired and no field value.
     On a fault, the old line ships, which meets the bar by definition."""
     old_line = json.dumps(before, ensure_ascii=False)
     if after == before:
@@ -379,14 +381,18 @@ def _tee_line(
             for k, v in before.items()
         }
         bars = [(_line_words(r), _parses(r)) for r in sink_readings(old_line)]
+        reasons: list[str] = []
         for candidate in (after,) if whole == after else (after, whole):
             line = json.dumps(candidate, ensure_ascii=False)
-            readings = sink_readings(line)
-            if all(
-                _shows_no_more(r, words) and (_parses(r) or not parsed)
-                for r, (words, parsed) in zip(readings, bars, strict=True)
-            ):
+            paired = list(zip(sink_readings(line), bars, strict=True))
+            shows = not all(_shows_no_more(r, words) for r, (words, _) in paired)
+            unparsed = not all(_parses(r) or not parsed for r, (_, parsed) in paired)
+            if not (shows or unparsed):
                 return line
+            # The last candidate's reasons are the ones that ship the old line.
+            reasons = ["show a word the line before it hid"] if shows else []
+            if unparsed:
+                reasons.append("leave a sink's reading unparseable where the line before it parsed")
     except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
         _log_scrub_fault(exc)
         return old_line
@@ -395,8 +401,8 @@ def _tee_line(
         _OLD_LINE_LOGGED = True
         log.warning(
             "an off-box audit record shipped without the C0 field scrub, because hiding its "
-            "changed fields would still show text the line before it hid; further cases in this "
-            "process are not logged"
+            "changed fields whole would still %s; further cases in this process are not logged",
+            " and ".join(reasons),
         )
     return old_line
 
@@ -522,8 +528,9 @@ def emit_audit_tee(
       ``detail``. A typed sign-in name of ``CORP`` and ``JONES`` joined by a control is one: it
       reads as the two-word name the patterns redact. Where :func:`_tee_line` finds the scrubbed
       line would show a word the line before #3045 hid, every field the scrub changed ships as
-      ``[redacted]``, the one that did not cause it included; and where even that would, the
-      record ships as the line before #3045 did, so the scrub is lost for it. A field holding a
+      ``[redacted]``, the one that did not cause it included; and where even that would show
+      such a word, or would not parse as JSON on a sink where that line did, the record ships
+      as the line before #3045 did, so the scrub is lost for it. A field holding a
       segment-shaped token, such as ``ABC|``, does that: on the old line the HL7 segment pattern
       ran from it to the end of the line and hid the record's keys and anchors after it, which
       hiding the field shows again. So a client can switch the scrub off for its own record by
