@@ -14,6 +14,7 @@ import email.message
 import http.client
 import io
 import json
+import logging
 import urllib.error
 import urllib.request
 from typing import Any
@@ -375,6 +376,73 @@ def test_header_form_non_latin_1_refused_at_construction() -> None:
 def test_header_form_oversized_conditional_query_refused_at_construction() -> None:
     with pytest.raises(ValueError, match="If-None-Exist header limit"):
         _dest(conditional="if-none-exist", conditional_query=_OVER_HEADER_LIMIT_QUERY)
+
+
+def test_header_form_hash_refused_at_construction() -> None:
+    """BACKLOG #5350: a server reading the If-None-Exist value as a query stops at a '#', so it
+    would match on a shorter search than the one configured."""
+    value = "identifier=sys|MRN#123"
+    with pytest.raises(ValueError, match="no '#'") as ei:
+        _dest(conditional="if-none-exist", conditional_query=value)
+    assert value not in str(ei.value)
+    # The escaped form is the remedy the refusal names, and it constructs.
+    assert _dest(conditional="if-none-exist", conditional_query="identifier=sys|MRN%23123")
+
+
+_QUERY_SECRET = "ZZQUERYSECRET5350"
+
+
+@pytest.mark.parametrize("conditional", ["if-none-exist", "conditional-update"])
+@pytest.mark.parametrize(
+    ("query", "shown"),
+    [
+        (f"identifier=sys|1&api_key={_QUERY_SECRET}", "conditional_query parameter api_key"),
+        (f"identifier=sys|1;token={_QUERY_SECRET}", "conditional_query segment"),
+    ],
+)
+def test_conditional_query_credential_is_warned(
+    conditional: str, query: str, shown: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5350: a credential in conditional_query rides the request line or the If-None-Exist
+    header to a verified peer too, so it is warned about, by name and never by value."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.fhir"):
+        _dest(conditional=conditional, conditional_query=query)
+    lines = [r.getMessage() for r in caplog.records if "conditional_query" in r.getMessage()]
+    assert len(lines) == 1 and shown in lines[0]
+    assert _QUERY_SECRET not in caplog.text
+
+
+@pytest.mark.parametrize("conditional", ["if-match", None])
+def test_an_unsent_conditional_query_is_not_warned_or_refused(
+    conditional: str | None, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only if-none-exist and conditional-update send conditional_query, so with any other
+    conditional a credential in it never crosses, and neither the warning nor a refusal reads it."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    query = f"identifier=sys|1&api_key={_QUERY_SECRET}"
+    with (
+        active_hop_posture(HopPosture(enforcing=False)),
+        caplog.at_level(logging.WARNING, logger="messagefoundry.transports.fhir"),
+    ):
+        _dest(
+            interaction="update",
+            conditional=conditional,
+            conditional_query=query,
+            verify_tls=False,
+        )
+    assert not [r for r in caplog.records if "conditional_query" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    "query", ["identifier=sys|1", "code=http://loinc.org|1234-5&subject=Patient/1"]
+)
+def test_an_ordinary_conditional_query_is_not_warned(
+    query: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``code`` is FHIR's own search parameter in a conditional_query, not a function key."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.fhir"):
+        _dest(conditional="if-none-exist", conditional_query=query)
+    assert not [r for r in caplog.records if "conditional_query" in r.getMessage()]
 
 
 def test_if_none_exist_overflow_at_send_is_not_charged_to_the_message() -> None:
