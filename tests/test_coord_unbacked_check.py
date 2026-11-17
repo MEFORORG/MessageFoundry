@@ -1007,23 +1007,30 @@ def test_a_failed_EXCLUSION_set_withholds_counts_rather_than_call_backed_work_un
     )
     assert r.returncode == 2, r.stdout + r.stderr
     assert "git FAILED for: (tracking refs of origin)" in r.stdout
-    assert "per-branch counts withheld" in r.stdout
+    assert (
+        "a git listing failed for (tracking refs of origin); per-branch counts are not shown"
+        in (r.stdout)
+    )
     assert not re.search(r"^\s+pushed\s+\d+\s*$", r.stdout, re.MULTILINE), r.stdout
 
 
-def test_a_failed_listing_under_SKIP_REACHABILITY_does_not_withhold_true_counts(
-    repo: Path, tmp_path: Path
+@pytest.mark.parametrize("kind", ["never-landed", "squash-landed"])
+def test_a_failed_listing_under_SKIP_REACHABILITY_withholds_counts(
+    repo: Path, tmp_path: Path, kind: str
 ) -> None:
-    """MUST TRIP. Under -SkipReachability the exclusion is the bare ``--not --remotes`` glob, which
-    a failed tracking-ref listing does not shrink, so the counts stay true. Withholding them with
-    "every count here would overstate" was false output and hid the at-risk branch."""
+    """MUST TRIP, both cases. Under -SkipReachability a failed tracking-ref listing also empties
+    the squash candidates, so a squash-landed branch would be listed as at-risk work. The rule is
+    the same in every mode: when a trusted-refs listing failed, per-branch counts are not shown."""
     git(repo, "checkout", "-q", "-b", "pushed")
-    _commit(repo, "g.txt", "on origin", "work")
+    _commit(repo, "p.txt", "on origin", "pushed work")
     git(repo, "push", "-q", "origin", "pushed")
     git(repo, "checkout", "-q", "main")
-    git(repo, "checkout", "-q", "-b", "atrisk")
-    _commit(repo, "h.txt", "this exists on exactly one disk", "work")
-    git(repo, "checkout", "-q", "main")
+    if kind == "squash-landed":
+        _squash_land(repo, "landed")  # branch `side`, its content squashed onto origin/main
+    else:
+        git(repo, "checkout", "-q", "-b", "side")
+        _commit(repo, "h.txt", "this exists on exactly one disk", "work")
+        git(repo, "checkout", "-q", "main")
     git(repo, "fetch", "-q", "origin")
     real_git = shutil.which("git")
     assert real_git is not None
@@ -1044,7 +1051,8 @@ def test_a_failed_listing_under_SKIP_REACHABILITY_does_not_withhold_true_counts(
         env=env,
     )
     assert r.returncode == 2, r.stdout + r.stderr
-    assert "git FAILED for: (tracking refs of origin)" in r.stdout
-    assert "per-branch counts withheld" not in r.stdout
-    assert re.search(r"^\s+atrisk\s+1\s*$", r.stdout, re.MULTILINE), r.stdout
-    assert not re.search(r"^\s+pushed\s+\d+\s*$", r.stdout, re.MULTILINE), r.stdout
+    assert (
+        "a git listing failed for (tracking refs of origin); per-branch counts are not shown"
+        in (r.stdout)
+    )
+    assert not re.search(r"^\s+(side|pushed)\s+\d+\s*$", r.stdout, re.MULTILINE), r.stdout
