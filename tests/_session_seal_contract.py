@@ -371,3 +371,23 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     left = await store.get_session(hash_token(fresh))
     assert left is not None and left.revoked_at is not None
     assert left.user_epoch == one_behind.user_epoch
+
+    # --- a kept session of ANOTHER account is left as it is (BACKLOG #5742) ---------------------
+    # Handed another account's token hash as the kept session, the revoke must neither seal-check
+    # nor re-seal that row: a broken foreign seal would otherwise raise and roll back the caller's
+    # own revocation. The caller's sessions still end; the foreign row is not touched.
+    await _user(store, "seal-u4")
+    await _user(store, "seal-u5")
+    own = [await _mint(store, "seal-u4") for _ in range(2)]
+    foreign = await _mint(store, "seal-u5")
+    bogus = "mfseal:v1:b5742:bogus"
+    await raw("UPDATE sessions SET seal=? WHERE token_hash=?", (bogus, hash_token(foreign)))
+    result = await store.revoke_user_sessions(
+        "seal-u4", except_token_hash=hash_token(foreign), audit=no_audit_row
+    )
+    assert (result.count, result.kept, result.ended_kept) == (2, False, False)
+    for token in own:
+        assert await service.identity_for_token(token) is None
+    untouched = await store.get_session(hash_token(foreign))
+    assert untouched is not None and untouched.revoked_at is None
+    assert untouched.seal == bogus and untouched.user_id == "seal-u5"

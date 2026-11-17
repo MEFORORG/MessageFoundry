@@ -297,7 +297,9 @@ REQUIRED_TRUTHS: tuple[str, ...] = (
     "no accept-rate throttle",
     "at_capacity",
     "acquire_timeout",
-    "no per-statement timeout",
+    # The DATABASE connector's statement bound. It read "no per-statement timeout" until BACKLOG
+    # #5756 gave the connector one; the corrected statement now names the knob that bounds it.
+    "bounds each statement with `statement_timeout`",
     # 13.1.2: the AI broker's real bound, and the absence of the one the doc used to claim.
     "There is NO per-actor pacing on `POST /ai/chat`",
     # 13.1.3: the resource class the requirement names by example, with no knob of its own.

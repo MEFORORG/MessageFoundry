@@ -67,8 +67,8 @@ _ALLOWED: dict[str, tuple[int, str]] = {
     "_writer_txn": (
         2,
         "the writer-transaction helper itself -- unwinds on BaseException, under the lock, bounded;"
-        " a deferred BEGIN, or BEGIN IMMEDIATE for the one caller that must decide on a read across"
-        " processes (BACKLOG #3078 F5), in the same guarded region",
+        " a deferred BEGIN, or BEGIN IMMEDIATE for the callers that must decide on a read across"
+        " processes (BACKLOG #3078 F5, #5734), in the same guarded region",
     ),
     "MessageStore._read": (
         1,

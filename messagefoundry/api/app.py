@@ -418,6 +418,7 @@ from messagefoundry.config.wiring import (
     ConfigDirUnlistable,
     EnvRef,
     InboundConnection,
+    OutboundConnection,
     Registry,
     WiringError,
     accepted_cleartext_hops,
@@ -788,6 +789,24 @@ def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
     the cause is a log halt. A log halt still surfaces here while the graph is up, because neither halt
     site clears ``_running``; only a teardown does, and a torn-down lane is honestly "stopped"."""
     return rr.outbound_status(name) if rr.running else "stopped"
+
+
+def _outbound_display_status(rr: RegistryRunner, name: str, oc: OutboundConnection) -> str:
+    """One declared outbound's display state, the per-lane facts first: ``not_deployed``,
+    ``failed``, ``filtered``, then :func:`_live_outbound_status`. Its ``"running"`` is the only
+    state in which the lane is armed to claim new rows, so the metadata row's ``running`` reads it
+    (BACKLOG #5762); a ``"stopping"`` lane can still finish a row it holds. The ``/connections``
+    rows and the ``/graph/edges`` nodes read it too.
+
+    ``oc`` is the caller's own snapshot of the outbound, never re-read from ``rr.registry``: a
+    reload can swap the registry between a route's snapshot and this read."""
+    if not oc.deployed:
+        return "not_deployed"
+    if rr.outbound_failed(name):
+        return "failed"
+    if rr.outbound_filtered(name):
+        return "filtered"
+    return _live_outbound_status(rr, name)
 
 
 def _backlog(depth: int, recent: int) -> float | None:
@@ -5719,15 +5738,7 @@ def create_app(
                     # operator has to fix on THIS row, while the halt is process-wide and has its own
                     # page (the AlertSink's log_write_failed), so collapsing them away would lose the
                     # only per-lane explanation the row carries.
-                    dstatus = (
-                        "not_deployed"
-                        if not oc.deployed
-                        else (
-                            "failed"
-                            if dfail
-                            else ("filtered" if dfiltered else _live_outbound_status(rr, dname))
-                        )
-                    )
+                    dstatus = _outbound_display_status(rr, dname, oc)
                 else:
                     dmethod, dpeer, dport, dstatus = "—", None, None, "draining"
                 rows.append(
@@ -6246,6 +6257,7 @@ def create_app(
         rr, direction = await _guarded_direction(engine, identity, name, client_ip(request))
         if direction == "in":
             ic = rr.registry.inbound[name]
+            in_failed, in_filtered = rr.inbound_failed(name), rr.inbound_filtered(name)
             return ConnectionMetadata(
                 name=name,
                 direction="in",
@@ -6255,21 +6267,24 @@ def create_app(
                 metadata=dict(ic.metadata) if ic.metadata else None,
                 settings=redacted_settings(ic.spec.settings),
                 # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
-                error=rr.inbound_failed(name) or rr.inbound_filtered(name),
-                fault=_fault(rr.inbound_failed(name), rr.inbound_filtered(name)),
+                error=in_failed or in_filtered,
+                fault=_fault(in_failed, in_filtered),
             )
         oc = rr.registry.outbound[name]
+        failed, filtered = rr.outbound_failed(name), rr.outbound_filtered(name)
         return ConnectionMetadata(
             name=name,
             direction="out",
             method=oc.spec.type.value,
-            running=rr.running,
+            # BACKLOG #5762: the lane's display state, as the graph node reads it, not the graph's
+            # running flag alone, which read running for a lane that delivers nothing.
+            running=_outbound_display_status(rr, name, oc) == "running",
             metadata=dict(oc.metadata) if oc.metadata else None,
             settings=redacted_settings(oc.spec.settings),
             simulated=rr.outbound_simulated(name),
             # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
-            error=rr.outbound_failed(name) or rr.outbound_filtered(name),
-            fault=_fault(rr.outbound_failed(name), rr.outbound_filtered(name)),
+            error=failed or filtered,
+            fault=_fault(failed, filtered),
         )
 
     @app.post("/connections/{name}/test", response_model=ConnectionTestResult)
@@ -10054,17 +10069,6 @@ def create_app(
                 return "filtered"
             return "running" if rr.inbound_running(name) else "stopped"
 
-        def _outbound_status(name: str) -> str:
-            oc = reg.outbound[name]
-            if not oc.deployed:
-                return "not_deployed"
-            if rr.outbound_failed(name):
-                return "failed"
-            if rr.outbound_filtered(name):
-                return "filtered"
-            # Gated (#1814): the inbound node beside it already reads "stopped" on a down graph.
-            return _live_outbound_status(rr, name)
-
         # Node set: every inbound/outbound connection + every router/handler, keyed by (kind, name).
         nodes: dict[tuple[str, str], GraphNode] = {}
         for name in reg.inbound:
@@ -10073,7 +10077,11 @@ def create_app(
             )
         for name in reg.outbound:
             nodes[("outbound", name)] = GraphNode(
-                name=name, kind="outbound", status=_outbound_status(name)
+                # Gated (#1814) in _live_outbound_status: the inbound node beside it already
+                # reads "stopped" on a down graph. reg is this route's snapshot, as for inbounds.
+                name=name,
+                kind="outbound",
+                status=_outbound_display_status(rr, name, reg.outbound[name]),
             )
         for name in reg.routers:
             nodes[("router", name)] = GraphNode(name=name, kind="router", status=None)
