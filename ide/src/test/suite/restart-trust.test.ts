@@ -268,7 +268,10 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     assert.strictEqual(run.started, false);
   });
 
-  test("the same value planted in workspace settings is never statted, trusted and local (BACKLOG #5404)", async () => {
+  test("a value outside the folder planted in workspace settings is never statted, trusted and local (BACKLOG #5404)", async () => {
+    // On POSIX a backslash is not a separator, so the UNC spelling is a file name inside the folder
+    // (the next test); an absolute path elsewhere is the outside value there.
+    stubSetting = process.platform === "win32" ? UNC_SETTING : "/etc/messagefoundry.toml";
     stubScope = "workspaceValue";
     const run = await restart(LOOPBACK);
 
@@ -280,6 +283,20 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     assert.strictEqual(run.stopped, false);
     assert.strictEqual(run.started, false);
   });
+
+  (process.platform === "win32" ? test.skip : test)(
+    "POSIX control: the UNC spelling in workspace settings is a file inside the folder, and is statted there",
+    async () => {
+      stubScope = "workspaceValue";
+      const run = await restart(LOOPBACK);
+
+      assert.deepStrictEqual(run.statted, [`statSync ${path.join(ws, UNC_SETTING)}`]);
+      assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+      assert.match(notices[0], /which is not a file in this workspace/);
+      assert.strictEqual(run.stopped, false);
+      assert.strictEqual(run.started, false);
+    },
+  );
 
   // With the setting unset there is no service config refusal, so only the two refusals stand
   // between a running engine and its stop: a Restart that got past them would act as Stop.
