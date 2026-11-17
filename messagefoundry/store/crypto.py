@@ -793,8 +793,7 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
     refusal, or whose reading raises one of
     :data:`~messagefoundry.store.crypto_transit._READ_FAULTS`, while the key still answers under the
-    latest (BACKLOG #6707). :func:`~messagefoundry.store.crypto_transit._warn_quietly` says what
-    can still escape.
+    latest (BACKLOG #6707).
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
     page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a

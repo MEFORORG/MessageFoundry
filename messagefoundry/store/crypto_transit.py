@@ -151,7 +151,7 @@ _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
 #: The failures caught while a 400 is read, which then picks the unconfirmed label, and while that
 #: label's warning is made (BACKLOG #6707): a step short of memory or stack. Anything else the read
-#: raises propagates; :func:`_warn_quietly` says what can still escape. No reply is known to cause
+#: raises propagates. No reply is known to cause
 #: either: a body past :data:`_REPARSED_BODY_MAX_CHARS` is not read, and the parser,
 #: :func:`~messagefoundry.redaction.json_loads_or_refusal`, returns its ``RecursionError`` refusal
 #: rather than raising it.
@@ -355,8 +355,7 @@ def _report_unlogged(
     standing for its code, so a log path that fails on every read cannot flood stderr. When that
     bookkeeping itself fails, :data:`_REPORT_UNTHROTTLED` is written, then the line. The text falls
     back to ``what`` alone when building it fails, and
-    :func:`~messagefoundry.logging_guard._last_resort` suppresses a failure of the write.
-    :func:`_warn_quietly` says what can still escape."""
+    :func:`~messagefoundry.logging_guard._last_resort` suppresses a failure of the write."""
     try:
         slot = ("unlogged", getattr(site, "__code__", site), what, type(fault))
         now = time.monotonic()
@@ -378,15 +377,7 @@ def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = N
     (BACKLOG #6707); a handler that swallows its own write failure still counts as returned.
     ``build`` is called inside the guard. A failure is reported by :func:`_report_unlogged` under
     ``site``, by default ``build``, so each call site is rate-limited apart. The record names the
-    caller ``stacklevel`` frames up.
-
-    What the warning guards in this module and the store's ``_log_timeout_read_as_unverified``
-    hold, stated once here: at least, an exception those guarded log calls raise at normal depth
-    no longer ends the audit walk or the row check that logs it. The store's guard runs only on a
-    row check outside the walk. Out of memory or stack, an exception can still escape, as it could
-    before BACKLOG #6707. The store's own log calls in the walk are not guarded: an exception that
-    ``_handover_tag_ok``'s warning raises, from a failing filter for example, still ends the
-    walk."""
+    caller ``stacklevel`` frames up."""
     where = build if site is None else site
     try:
         parts = build()
@@ -409,7 +400,7 @@ def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
     time it held before or to empty, unless a later caller has taken it since; when giving it back
     fails too, the slot stays taken for the interval. A failure building the key, or in the slot's
     bookkeeping, is reported by :func:`_report_unlogged` naming that step, and the warning is then
-    not logged. :func:`_warn_quietly` says what can still escape."""
+    not logged."""
     try:
         key = kind()
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
@@ -881,8 +872,7 @@ class TransitCipher(_UnmarkedPolicy):
         Transit refusing the version is one cause, not the only one. It raises the subclass
         :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` gives a
         reason, for example for a proxy's page, or raises one of :data:`_READ_FAULTS` (BACKLOG
-        #6707). Anything else that read raises propagates. :func:`_warn_quietly` says what can
-        still escape.
+        #6707). Anything else that read raises propagates.
 
         A 400 on which hvac raises something other than ``InvalidRequest`` raises neither of
         those, and is read as the next paragraph says (BACKLOG #6707). hvac 2.4.0 raises
@@ -945,7 +935,7 @@ class TransitCipher(_UnmarkedPolicy):
         if self._refuses_only_version(exc, version):
             # The same flow, labelled apart (BACKLOG #6707). Reading the reply only picks the
             # label, so a failure in _READ_FAULTS picks the unconfirmed one rather than ending the
-            # walk. Any other exception propagates. _warn_quietly says what can still escape.
+            # walk. Any other exception propagates.
             reason: str | None
             raised = ""  # the read's fault, by its class's existing name, so nothing is built
             try:

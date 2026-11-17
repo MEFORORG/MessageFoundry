@@ -278,8 +278,7 @@ def vault_failure_text(exc: BaseException) -> str:
     scope; see :func:`messagefoundry.transports.strict_requests.vault_failure_text`.
 
     A fault while rendering, the lazy import's included, gives ``exc``'s type name instead
-    (BACKLOG #6707). :func:`~messagefoundry.store.crypto_transit._warn_quietly` says what can still
-    escape."""
+    (BACKLOG #6707)."""
     try:
         from messagefoundry.transports.strict_requests import vault_failure_text as text
 
