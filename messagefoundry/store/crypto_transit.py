@@ -151,10 +151,10 @@ _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
 #: The failures that, raised while a 400 is read, label it unconfirmed (BACKLOG #6707): anything
 #: else the read raises propagates. ``MemoryError`` is the one a reply is known to cause, on a huge
-#: body. ``RecursionError`` and ``ValueError``, the classes of the parse refusals
-#: :func:`~messagefoundry.redaction.json_loads_or_refusal` documents, are caught as well, though
-#: that function returns those refusals rather than raising them.
-_READ_FAULTS = (MemoryError, RecursionError, ValueError)
+#: body. The parser, :func:`~messagefoundry.redaction.json_loads_or_refusal`, returns its
+#: ``ValueError`` and ``RecursionError`` refusals rather than raising them, so either class raised
+#: here is a defect and propagates.
+_READ_FAULTS = (MemoryError,)
 #: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
 #: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
 #: texts, ``crypto/cipher``'s GCM for ``aes256-gcm96`` and ``golang.org/x/crypto``'s
@@ -333,33 +333,42 @@ _logged_at: dict[object, float] = {}
 _logged_at_lock = threading.Lock()
 
 
-#: What :func:`_report_unlogged` writes when even naming the failure's class fails.
+#: What :func:`_report_unlogged` writes, by the step that failed, when even naming the failure's
+#: class fails: the log call, building the warning, or the warning's rate limit.
 _WARNING_UNLOGGED = "a Transit cipher warning could not be logged"
+_WARNING_UNBUILT = "a Transit cipher warning could not be built"
+_WARNING_UNTHROTTLED = "a Transit cipher warning's rate limit failed"
+#: What :func:`_report_unlogged` writes when its own rate limit fails, before its report.
+_REPORT_UNTHROTTLED = "a Transit cipher warning report's rate limit failed"
 
 #: A warning built on demand: the ``log.warning`` message and its arguments.
 _WarningParts = Callable[[], tuple[object, ...]]
 
 
-def _report_unlogged(fault: BaseException, site: object = None) -> None:
-    """Report, on the last-resort stderr line, that a warning could not be logged, by the
-    failure's class alone. The line is written at most once in :data:`_WARNING_LOG_INTERVAL_S` for
-    each ``site`` and failure class, a callable ``site`` standing for its code, so a log path that
-    fails on every read cannot flood stderr; when that bookkeeping itself fails, the line is
-    written. Never raises: the text falls back to a fixed literal when building it fails, and a
-    failure of the write is suppressed."""
-    with contextlib.suppress(Exception):
-        slot = ("unlogged", getattr(site, "__code__", site), type(fault))
+def _report_unlogged(
+    fault: BaseException, site: object = None, what: str = _WARNING_UNLOGGED
+) -> None:
+    """Report, on the last-resort stderr line, that a warning failed at the step ``what`` names,
+    by the failure's class alone. The line is written at most once in
+    :data:`_WARNING_LOG_INTERVAL_S` for each ``site``, step and failure class, a callable ``site``
+    standing for its code, so a log path that fails on every read cannot flood stderr. When that
+    bookkeeping itself fails, :data:`_REPORT_UNTHROTTLED` is written, then the line. Never raises:
+    the text falls back to ``what`` alone when building it fails, and
+    :func:`~messagefoundry.logging_guard._last_resort` suppresses a failure of the write."""
+    try:
+        slot = ("unlogged", getattr(site, "__code__", site), what, type(fault))
         now = time.monotonic()
         with _logged_at_lock:
             last = _logged_at.get(slot)
             if last is not None and now - last < _WARNING_LOG_INTERVAL_S:
                 return
             _logged_at[slot] = now
-    text = _WARNING_UNLOGGED
+    except Exception:  # noqa: BLE001 -- reported by a fixed literal, then the line is written
+        _last_resort(_REPORT_UNTHROTTLED)
+    text = what
     with contextlib.suppress(Exception):
-        text = f"{_WARNING_UNLOGGED} ({ascii(type(fault).__name__)})"
-    with contextlib.suppress(Exception):
-        _last_resort(text)
+        text = f"{what} ({ascii(type(fault).__name__)})"
+    _last_resort(text)
 
 
 def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = None) -> bool:
@@ -370,10 +379,16 @@ def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = N
     that could not run. A failure is reported by :func:`_report_unlogged` under ``site``, by
     default ``build``, so each call site is rate-limited apart. The record names the
     caller ``stacklevel`` frames up."""
+    where = build if site is None else site
     try:
-        log.warning(*build(), stacklevel=stacklevel)
+        parts = build()
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
-        _report_unlogged(fault, build if site is None else site)
+        _report_unlogged(fault, where, _WARNING_UNBUILT)
+        return False
+    try:
+        log.warning(*parts, stacklevel=stacklevel)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+        _report_unlogged(fault, where)
         return False
     return True
 
@@ -382,25 +397,33 @@ def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
     """:func:`_warn_quietly`, unless the warning ``kind()`` was logged in the last
     :data:`_WARNING_LOG_INTERVAL_S`. A warning whose log call raised does not count as logged, so
     a later call tries it again. The slot is taken before the warning, so concurrent callers emit
-    it at most once. Never raises: the key, the slot and the warning are all built inside one
-    guard."""
+    it at most once. Never raises: a failure building the key, or in the slot's bookkeeping, is
+    reported by :func:`_report_unlogged` naming that step, and the warning is then not logged."""
     try:
         key = kind()
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+        _report_unlogged(fault, kind, _WARNING_UNBUILT)
+        return
+    try:
         with _logged_at_lock:
             last = _logged_at.get(key)
             now = time.monotonic()
             if last is not None and now - last < _WARNING_LOG_INTERVAL_S:
                 return
             _logged_at[key] = now
-        if not _warn_quietly(build, stacklevel=3, site=key):
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+        _report_unlogged(fault, kind, _WARNING_UNTHROTTLED)
+        return
+    if not _warn_quietly(build, stacklevel=3, site=key):
+        try:
             with _logged_at_lock:
                 if _logged_at.get(key) == now:  # give the slot back unless a later caller took it
                     if last is None:
                         del _logged_at[key]
                     else:
                         _logged_at[key] = last
-    except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
-        _report_unlogged(fault, kind)
+        except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+            _report_unlogged(fault, kind, _WARNING_UNTHROTTLED)
 
 
 def _log_unread_decrypt_body(length: int) -> None:

@@ -1088,6 +1088,50 @@ def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verif
     assert real_fixed(), "the control: the fixed input verifies"
 
 
+class _TimedOutVerifier:
+    """An audit MAC verifier whose every check times out on both asks."""
+
+    def __call__(self, data: bytes, /) -> str:
+        return "vault:v1:AAAA"
+
+    def verify(self, data: bytes, stored: str, /) -> bool:
+        from messagefoundry.store.crypto import AuditVerifyTimedOutError
+
+        raise AuditVerifyTimedOutError("synthetic timeout")
+
+
+def test_a_raising_log_filter_does_not_fail_a_timed_out_check_outside_the_walk(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #6707: outside the walk, as on the store open's genesis check, a timed-out row check
+    reads as a MAC that does not verify even when the log call beside it raises; the failure is
+    reported on stderr by its class. In the walk the timeout still propagates."""
+    from messagefoundry.store import store
+    from messagefoundry.store.crypto import AuditVerifyTimedOutError
+
+    row = {
+        "seq": 1,
+        "ts": "2026-01-01T00:00:00Z",
+        "actor": "synthetic",
+        "action": "test",
+        "channel_id": None,
+        "detail": "{}",
+        "client": None,
+        "row_hash": "vault:v1:AAAA",
+    }
+    raising = _RaisingFilter()
+    store.log.addFilter(raising)
+    try:
+        assert store._audit_row_mac(row, "", None, _TimedOutVerifier()) is None
+        with pytest.raises(AuditVerifyTimedOutError):
+            store._audit_row_mac(row, "", None, _TimedOutVerifier(), in_walk=True)
+    finally:
+        store.log.removeFilter(raising)
+    assert "audit row check that timed out could not be logged ('ValueError')" in (
+        capsys.readouterr().err
+    )
+
+
 @pytest.mark.parametrize(
     ("first", "second"),
     [
@@ -1768,7 +1812,39 @@ def test_a_fault_in_the_unconfirmed_throttle_keeps_the_label(
     assert isinstance(
         _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
     )
-    assert "could not be logged ('MemoryError')" in capsys.readouterr().err
+    assert "rate limit failed ('MemoryError')" in capsys.readouterr().err
+
+
+def test_a_fault_building_the_throttle_key_is_reported_as_building(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #6707: the stderr line names the step that failed: a fault in ``kind()`` reads as
+    building the warning, an unhashable key as the rate limit, never as the log call."""
+    from messagefoundry.store import crypto_transit
+
+    def broken_kind() -> object:
+        raise KeyError("kind")
+
+    crypto_transit._warn_when_due(broken_kind, lambda: ("never logged",))
+    crypto_transit._warn_when_due(lambda: ["unhashable"], lambda: ("never logged",))
+    err = capsys.readouterr().err
+    assert "a Transit cipher warning could not be built ('KeyError')" in err, err
+    assert "a Transit cipher warning's rate limit failed ('TypeError')" in err, err
+    assert "could not be logged" not in err, err
+
+
+def test_a_fault_in_the_reports_own_rate_limit_is_reported(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a fault in the stderr report's own bookkeeping is reported by a fixed
+    literal, and the report is still written."""
+    from messagefoundry.store import crypto_transit
+
+    monkeypatch.setattr(crypto_transit, "_logged_at", _FullDict())
+    crypto_transit._report_unlogged(ValueError("x"), "site-a")
+    err = capsys.readouterr().err
+    assert crypto_transit._REPORT_UNTHROTTLED in err, err
+    assert "could not be logged ('ValueError')" in err, err
 
 
 def test_a_fault_rendering_a_break_warning_keeps_the_break(
@@ -1789,7 +1865,7 @@ def test_a_fault_rendering_a_break_warning_keeps_the_break(
 
     monkeypatch.setattr(crypto_transit, "vault_failure_text", broken)
     assert cipher.verify_audit_hmac(b"row", stored) is False
-    assert "could not be logged ('ImportError')" in capsys.readouterr().err
+    assert "could not be built ('ImportError')" in capsys.readouterr().err
 
 
 def test_a_fault_rendering_vault_failure_text_keeps_a_malformed_mac_a_break(
@@ -1857,11 +1933,11 @@ def test_a_failed_unconfirmed_log_is_tried_again(caplog: pytest.LogCaptureFixtur
     assert len(logged) == 1, logged
 
 
-@pytest.mark.parametrize("fault", [MemoryError, RecursionError, ValueError])
+@pytest.mark.parametrize("fault", [MemoryError])
 def test_a_fault_reading_the_400_is_labelled_unconfirmed_and_logged_by_type(
     fault: type[Exception], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #6707: a failure the read is known to raise on a reply it cannot read picks the
+    """BACKLOG #6707: the failure the read is known to raise on a reply it cannot read picks the
     unconfirmed label rather than escaping, and the log names the fault by its class alone."""
     from messagefoundry.store import crypto_transit
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
@@ -1878,12 +1954,16 @@ def test_a_fault_reading_the_400_is_labelled_unconfirmed_and_logged_by_type(
     assert "not for the log" not in logged[0], logged
 
 
-@pytest.mark.parametrize("fault", [TypeError, NameError, AttributeError, AssertionError, KeyError])
+@pytest.mark.parametrize(
+    "fault",
+    [TypeError, NameError, AttributeError, AssertionError, KeyError, ValueError, RecursionError],
+)
 def test_a_programming_error_reading_the_400_propagates(
     fault: type[Exception], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #6707: only the failures a hostile reply can cause label the 400 unconfirmed; a
-    programming error in the reader propagates rather than relabelling the refusal."""
+    """BACKLOG #6707: only ``MemoryError`` labels the 400 unconfirmed; any other exception from
+    the reader, ``ValueError`` and ``RecursionError`` included since the parser returns those
+    refusals rather than raising them, is a defect and propagates."""
     from messagefoundry.store import crypto_transit
 
     def broken(*_a: Any, **_kw: Any) -> Any:
