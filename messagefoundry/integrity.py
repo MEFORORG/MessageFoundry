@@ -41,13 +41,14 @@ Posture (ADR 0017 amendment, 2026-06-27):
   ``fail_closed_on_drift`` that no-op also logs a WARNING naming the reason: the opt-in asked for
   hard enforcement that this install cannot give, and the branch used to return silently, so a
   first deployment in that shape would start with its tripwire disarmed and nothing to read.
-- **Attested-nothing is not clean** (BACKLOG #1679). An absent, empty or package-row-less ``RECORD``,
-  an unresolvable install root, and a package imported from *outside* the install root all leave
-  ``checked == 0``: no file was compared, so the pass proves nothing in either direction. That posture
-  logs at WARNING, records the ``startup_integrity`` audit row, fires the AlertSink, and — under
-  ``fail_closed_on_drift`` — refuses to start. Before #1679 all of those returned a silent clean no-op,
-  so a site that opted into hard enforcement would start anyway with its tripwire disarmed, and the
-  INFO line would say clean.
+- **Attested-nothing is not clean** (BACKLOG #1679). A pass that compared no file (``checked == 0``)
+  names why in :data:`UnattestedReason`. At least an absent, empty or package-row-less ``RECORD``, an
+  unresolvable install root, and a package imported from *outside* the install root give one. Unless
+  the install declares itself editable, such a pass with no drift logs at WARNING, records the
+  ``startup_integrity`` audit row, fires the AlertSink, and refuses to start under
+  ``fail_closed_on_drift``. One that also found drift is reported as drift (:func:`_act_on`). Before
+  #1679 the four shapes named above returned a silent clean no-op, so a site that opted into hard
+  enforcement would start anyway with its tripwire disarmed, and the INFO line would say clean.
 
 **What it detects is an INCONSISTENT edit, not a consistent one.** The baseline ships beside the code it
 attests, inside the same install the stated adversary can write, so an edit that also re-seals ``RECORD``
@@ -69,7 +70,7 @@ import hashlib
 import json
 import logging
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from importlib import machinery, metadata
 from pathlib import Path
@@ -184,11 +185,15 @@ _BYTECODE_CACHE_DIR = "__pycache__"
 
 
 #: Why an attestation pass compared **nothing** (``checked == 0``). Only ``declared_editable`` is a
-#: sanctioned no-op — a dev checkout that has no baseline by design (ADR 0041 AC-12). Every other value
-#: is an install whose tripwire is disarmed, which a fail-closed site refuses to start on (BACKLOG
-#: #1679). A ``Literal`` rather than a bare ``str`` so a typo at a construction site is a type error
-#: instead of a reason nobody can match on. ``console_attestation_raised`` is the web console arm's
-#: alone (BACKLOG #1802): its pass raised, so it compared nothing that can be trusted.
+#: sanctioned no-op — a dev checkout that has no baseline by design (ADR 0041 AC-12). :func:`_act_on`
+#: reports a pass carrying any other value as drift when it also found drift, and otherwise as
+#: attested-nothing, which a fail-closed site refuses to start on (BACKLOG #1679). A ``Literal``
+#: rather than a bare ``str`` so a typo at a construction site is a type error instead of a reason
+#: nobody can match on. ``no_file_read_under_install_root``: the read-back of unmatched ``RECORD``
+#: rows ran (see :func:`_attest_distribution`) and no file's bytes were read (BACKLOG #5376).
+#: ``no_attested_file_under_install_root``: the read-back did not run. ``console_attestation_raised``
+#: is the web console arm's alone (BACKLOG #1802): its pass raised, so it compared nothing that can be
+#: trusted.
 UnattestedReason = Literal[
     "declared_editable",
     "not_an_installed_distribution",
@@ -196,6 +201,7 @@ UnattestedReason = Literal[
     "record_has_no_package_rows",
     "install_root_unresolvable",
     "no_attested_file_under_install_root",
+    "no_file_read_under_install_root",
     "console_attestation_raised",
 ]
 
@@ -205,9 +211,9 @@ class IntegrityError(RuntimeError):
     (BACKLOG #1802), AND ``[integrity].fail_closed_on_drift`` is set — the engine must refuse to start
     rather than run unattested bytes (raised before any listener binds).
 
-    Two causes, not one (BACKLOG #1679): attestation found **drift**, or it verified **nothing** (no
-    baseline, a stripped baseline, or a package loaded from outside the install root). The message names
-    which, and names every arm that failed, the engine's first."""
+    Two causes, not one (BACKLOG #1679): attestation found **drift**, or it verified **nothing** (at
+    least no baseline, a stripped baseline, or a package loaded from outside the install root). The
+    message names which, and names every arm that failed, the engine's first."""
 
 
 @dataclass(frozen=True)
@@ -251,9 +257,8 @@ class AttestationResult:
     def attested_nothing(self) -> bool:
         """Whether the pass compared **no** file against a baseline row.
 
-        Independent of ``drift``: a pass can compare nothing and still report planted files as
-        ``missing`` drift, so a caller acting on both must handle drift first — which
-        :func:`run_startup_attestation` does."""
+        Independent of ``drift``: a pass can compare nothing and still report drift, so a caller
+        acting on both must handle drift first, as :func:`_act_on` does."""
         return self.checked == 0
 
     @property
@@ -378,6 +383,13 @@ def _record_has_package_rows(record: dict[str, bytes], package: str) -> bool:
     a RECORD an adversary stripped: the two states are identical here, which is why the answer alone can
     never license a no-op (BACKLOG #1679)."""
     return any(rel.startswith(f"{package}/") and rel.endswith(_ATTESTED_SUFFIX) for rel in record)
+
+
+def _loaded_package_roots() -> list[str]:
+    """The directories of the loaded first-party ``messagefoundry`` package (BACKLOG #5376)."""
+    import messagefoundry
+
+    return list(messagefoundry.__path__)
 
 
 def _loaded_module_files() -> list[Path]:
@@ -522,12 +534,19 @@ def _console_loaded_files() -> list[Path] | None:
     place under the install root, and hashing it reads the bytes the symlink points at, which is what
     an import would run. Resolving the file itself would move it outside the root, where the comparison
     skips it. ``Path.walk`` does not follow a symlinked directory; it reports it as a file, which has no
-    ``RECORD`` row and so is drift.
+    ``RECORD`` row and so is drift. A directory the walk cannot list is returned too, as the engine
+    walk returns one, so it is drift as well (BACKLOG #5376).
     """
     module = sys.modules.get(_CONSOLE_PACKAGE)
     if module is None:
         return None
     files: set[Path] = set()
+
+    def unlistable(error: OSError) -> None:
+        if error.filename is not None:
+            path = Path(error.filename)
+            files.add(path.parent.resolve() / path.name)
+
     search = getattr(module, "__path__", None)
     if search is None:
         origin = getattr(module, "__file__", None)
@@ -536,7 +555,7 @@ def _console_loaded_files() -> list[Path] | None:
             files.add(path.parent.resolve() / path.name)
         return sorted(files)
     for root in search:
-        for dirpath, dirnames, filenames in Path(root).walk():
+        for dirpath, dirnames, filenames in Path(root).walk(on_error=unlistable):
             dirnames[:] = [name for name in dirnames if name != _BYTECODE_CACHE_DIR]
             directory = dirpath.resolve()
             files.update(
@@ -669,6 +688,7 @@ def attest_engine() -> AttestationResult:
         _DIST_NAME,
         lambda: [*_loaded_module_files(), *_attested_asset_files()],
         unmatched_rows=_is_module_row,
+        package_roots=_loaded_package_roots(),
     )
 
 
@@ -680,13 +700,13 @@ def attest_console() -> AttestationResult | None:
     (``serve_ui`` off) that has it but never imported it: see :func:`_console_loaded_files` for why
     neither is looked into. A loaded console goes through the engine's classifier unchanged, so a
     console that declares itself editable is the same sanctioned no-op (ADR 0041 AC-12), and every
-    other pass that compares nothing is attested-nothing (AC-13), which
-    :func:`run_startup_attestation` treats exactly as it treats the engine's. Same blocking-I/O
-    contract as :func:`attest_engine`.
+    other pass that compares nothing carries an ``unattested_reason`` that :func:`_act_on` acts on
+    exactly as on the engine's. Same blocking-I/O contract as :func:`attest_engine`.
 
-    Unlike the engine arm it reads back EVERY console row in ``RECORD``, not only module rows, so any
-    DELETED console file is ``missing`` drift. The console's own ``RECORD`` ships in the same wheel as
-    its files, and the console ships no file an operator edits in place (BACKLOG #1432).
+    Unlike the engine arm, when the read-back runs (:func:`_attest_distribution` says when) it covers
+    EVERY console row in ``RECORD``, not only module rows, so a DELETED console file is ``missing``
+    drift. The console's own ``RECORD`` ships in the same wheel as its files, and the console ships no
+    file an operator edits in place (BACKLOG #1432).
     """
     files = _console_loaded_files()
     if files is None:
@@ -694,8 +714,14 @@ def attest_console() -> AttestationResult | None:
             "integrity: %s is not loaded in this process; nothing to attest", _CONSOLE_PACKAGE
         )
         return None
+    # From `sys.modules`, like `_console_loaded_files`, so this never imports the console.
+    module = sys.modules.get(_CONSOLE_PACKAGE)
     return _attest_distribution(
-        _CONSOLE_DIST_NAME, _CONSOLE_PACKAGE, lambda: files, unmatched_rows=_any_row
+        _CONSOLE_DIST_NAME,
+        _CONSOLE_PACKAGE,
+        lambda: files,
+        unmatched_rows=_any_row,
+        package_roots=list(getattr(module, "__path__", None) or ()),
     )
 
 
@@ -705,6 +731,7 @@ def _attest_distribution(
     attested_files: Callable[[], list[Path]],
     *,
     unmatched_rows: Callable[[str], bool] | None = None,
+    package_roots: Sequence[str] = (),
 ) -> AttestationResult:
     """Compare ``attested_files()`` against the ``RECORD`` of installed distribution ``dist_name``,
     whose source sits under the top-level ``package`` directory. The one classifier both arms share,
@@ -713,8 +740,14 @@ def _attest_distribution(
     ``attested_files`` is called only once a usable baseline is known to exist. ``unmatched_rows``
     additionally reports each hashed ``RECORD`` row under ``package/`` (bytecode caches aside) that no
     attested file matched, and that the predicate accepts, as ``missing`` drift -- a deleted file. It
-    applies only when at least one attested file sat under the install root, so a package loaded from
-    outside it stays attested-nothing rather than turning into a list of every file it did not load.
+    runs when at least one attested file sat under the install root, or when one of ``package_roots``
+    (the loaded package's directories) is or resolves to ``<install root>/<package>``. The second
+    trigger is BACKLOG #5376: a package whose every file is gone, or whose directory is a link out of
+    the install root, lists no file under it. A package loaded from outside the install root by
+    neither trigger stays attested-nothing rather than turning into a list of every file it did not
+    load.
+
+    ``checked`` counts a file only once its bytes were read.
     """
     try:
         dist = metadata.distribution(dist_name)
@@ -770,7 +803,6 @@ def _attest_distribution(
             # A FIFO, device or socket at a RECORD path: reading it can block startup forever.
             drift.append(DriftEntry(path=rel, reason="missing"))
             continue
-        checked += 1
         try:
             # Streamed: a module swapped for a link to a very large file must not be read into memory.
             with file.open("rb") as handle:
@@ -778,9 +810,21 @@ def _attest_distribution(
         except OSError:
             drift.append(DriftEntry(path=rel, reason="missing"))
             continue
+        checked += 1
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
-    if unmatched_rows is not None and seen:
+    # The package-root trigger matches a root twice: with only its parent resolved, so a package
+    # directory swapped for a link still names the place `RECORD` describes, and fully resolved, so a
+    # link from elsewhere into that place does too.
+    read_back = bool(seen) or any(
+        package
+        in (
+            _record_relpath(Path(root).parent.resolve() / Path(root).name, install_root),
+            _record_relpath(Path(root).resolve(), install_root),
+        )
+        for root in package_roots
+    )
+    if unmatched_rows is not None and read_back:
         prefix = f"{package}/"
         cache = f"/{_BYTECODE_CACHE_DIR}/"
         drift.extend(
@@ -791,16 +835,22 @@ def _attest_distribution(
             and rel not in seen
             and unmatched_rows(rel)
         )
+    reason: UnattestedReason | None = None
+    if not checked:
+        reason = (
+            "no_file_read_under_install_root"
+            if read_back
+            else "no_attested_file_under_install_root"
+        )
     return AttestationResult(
         attested=True,
         editable=False,
         no_record=False,
         checked=checked,
         drift=drift,
-        # A real baseline was read and still nothing was compared: every loaded file resolved outside
-        # the install root (a shadowed `messagefoundry/` the working directory wins with — #1677 from
-        # this control's side). `attested=True` with `checked == 0` is not clean, it is blind.
-        unattested_reason=None if checked else "no_attested_file_under_install_root",
+        # A real baseline was read and still nothing was compared. `UnattestedReason` says which value
+        # names which shape; `_act_on` decides the outcome.
+        unattested_reason=reason,
     )
 
 
@@ -993,12 +1043,11 @@ async def run_startup_attestation(
       logs a WARNING naming the reason, because the opt-in cannot be honoured on this install and the
       branch used to return with no signal at all (AC-14). That line reports a **misconfiguration**,
       not a tamper;
-    - **drift**: an ERROR line, a hash-chained ``startup_integrity`` audit row, and
-      :meth:`AlertSink.integrity_drift`;
-    - **attested nothing** (``checked == 0`` on an install that declares no editable marker — an absent,
-      empty or stripped ``RECORD``, an unresolvable install root, a shadowed package): a WARNING, the
-      same audit row, and the same alert channel under a distinct subject. The tripwire is disarmed in
-      this shape; before BACKLOG #1679 it was reported as clean;
+    - **drift**, whatever ``checked`` is: an ERROR line, a hash-chained ``startup_integrity`` audit
+      row, and :meth:`AlertSink.integrity_drift`;
+    - **attested nothing** (``checked == 0`` with no drift, on an install that declares no editable
+      marker; :data:`UnattestedReason` names the shape): a WARNING, the same audit row, and the same
+      alert channel under a distinct subject. Before BACKLOG #1679 it was reported as clean;
     - either of the last two **and** ``fail_closed_on_drift``: after recording + alerting, raise
       :class:`IntegrityError` so the caller refuses to start before any listener binds.
 

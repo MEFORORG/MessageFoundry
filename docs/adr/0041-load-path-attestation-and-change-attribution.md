@@ -366,6 +366,8 @@ fingerprint+git-HEAD covers more cheaply for now.
   before refusing. WHERE the console is not loaded, THE SYSTEM SHALL NOT attest it.
   → `tests/test_startup_attestation.py::test_console_tamper_is_detected_recorded_and_fails_closed`
   → `tests/test_startup_attestation.py::test_a_deleted_console_file_is_missing_drift`
+  → `tests/test_startup_attestation.py::test_an_emptied_console_under_the_install_root_is_missing_drift`
+  → `tests/test_startup_attestation.py::test_a_console_package_directory_linked_out_of_the_root_is_missing_drift`
   → `tests/test_startup_attestation.py::test_a_loaded_console_that_cannot_be_attested_fails_like_the_engine`
   → `tests/test_startup_attestation.py::test_console_absent_changes_nothing_even_under_fail_closed`
   → `tests/test_startup_attestation.py::test_the_engine_arm_text_is_unchanged`
@@ -382,6 +384,8 @@ fingerprint+git-HEAD covers more cheaply for now.
 >    serves is one that is attested.
 > 2. **Loaded but unattestable fails the same way the engine does (AC-13).** A console with no
 >    distribution metadata, a stripped `RECORD`, or files outside its install root is attested-nothing.
+>    Since BACKLOG #5376 the last shape excludes a console whose package directory is, or links to,
+>    the one its `RECORD` describes: each row there is `missing` drift.
 >    A console that declares itself editable keeps the AC-12 no-op. So does a console with no
 >    distribution beside an engine that declares itself editable: that is a checkout that installed
 >    only the engine, and the engine's exemption already concedes everything this one would.
@@ -398,7 +402,8 @@ fingerprint+git-HEAD covers more cheaply for now.
 > `RECORD`.
 >
 > A console pass that raises is attested-nothing (`console_attestation_raised`), not a crash. The arm
-> never opens a FIFO, device or socket; one at a `RECORD` path is `missing` drift.
+> never opens a FIFO, device or socket; one at a `RECORD` path is `missing` drift. Until BACKLOG
+> #5376 that held only while the walk listed some console file under the install root.
 >
 > **Three residuals, recorded rather than fixed here.** The console arm keys on `sys.modules`, so
 > console code that has already run can remove itself from it and be skipped; that is the D3
@@ -461,8 +466,8 @@ fingerprint+git-HEAD covers more cheaply for now.
 > `__pycache__` file is still unread by either arm, for the reason the 2026-09-25 amendment gives.
 > Bytecode planted under the config tree is vault BACKLOG #2596, and `.pth` files and other start-up
 > code in `site-packages` are vault BACKLOG #2701. A FIFO, device or socket planted under an import
-> name is not listed by the engine walk unless it sits at a `RECORD` path. The console arm's walk still
-> skips a directory it cannot list; this amendment changed only the engine arm. The D3 trust-domain
+> name is not listed by the engine walk unless it sits at a `RECORD` path. Since BACKLOG #5376 the
+> console arm's walk also names a directory it cannot list, as `missing` drift. The D3 trust-domain
 > residual applies unchanged: an adversary who also re-seals `RECORD` passes clean.
 
 ## Options considered

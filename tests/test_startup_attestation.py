@@ -31,11 +31,13 @@ import importlib.machinery
 import json
 import logging
 import os
+import shutil
 import sys
 import types
 from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError, PathDistribution
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -129,6 +131,8 @@ def _patch(
     monkeypatch.setattr(integ.metadata, "distribution", _fake_distribution)
     monkeypatch.setattr(integ, "_loaded_module_files", lambda: sorted(loaded))
     monkeypatch.setattr(integ, "_attested_asset_files", lambda: list(assets))
+    # No package-root trigger unless a test opts in, so the real package's directory never takes part.
+    monkeypatch.setattr(integ, "_loaded_package_roots", lambda: [])
     # The web console arm (BACKLOG #1802) reads `sys.modules`, and whether the real console is imported
     # depends on which tests ran first in this process. Every engine-arm test says "not loaded", so it
     # attests exactly the fabricated engine and nothing else. The console block below opts back in.
@@ -947,6 +951,7 @@ def _install_and_walk_engine(
     monkeypatch.setattr(
         integ, "_loaded_module_files", lambda: integ._import_capable_files([str(package_dir)])
     )
+    monkeypatch.setattr(integ, "_loaded_package_roots", lambda: [str(package_dir)])
     return package_dir
 
 
@@ -1754,5 +1759,284 @@ async def test_the_engine_arm_text_is_unchanged(
             else:
                 await run_startup_attestation(store, sink, fail_closed_on_drift=True)
         assert _ENGINE_TEXT[f"{shape}_log"] in caplog.messages, caplog.messages
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #5376: the package-root trigger, and a file counted only once read ------------------
+#
+# The read-back of unmatched RECORD rows keeps main's trigger (a listed file under the install root)
+# and adds one: a loaded package directory that is, or resolves to, the one RECORD describes. The
+# first three tests pin shapes main already reported as drift, so the addition is checked to take
+# nothing away.
+
+_NOTHING_READ = "no_file_read_under_install_root"
+_NOTHING_UNDER_ROOT = "no_attested_file_under_install_root"
+_NOT_INIT = sorted(rel for rel in _CONSOLE_FILES if not rel.endswith("/__init__.py"))
+
+
+def _console_module(monkeypatch: pytest.MonkeyPatch, **attrs: object) -> None:
+    fake = types.ModuleType(_CONSOLE_PKG)
+    for name, value in attrs.items():
+        setattr(fake, name, value)
+    monkeypatch.setitem(sys.modules, _CONSOLE_PKG, fake)
+    monkeypatch.setattr(integ, "_console_loaded_files", _REAL_CONSOLE_LOADED_FILES)
+
+
+def test_main_shape_no_path_with_file_in_a_subdirectory_still_reads_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    (console_root / _CONSOLE_PKG / "mount.py").unlink()
+    _console_module(monkeypatch, __file__=str(console_root / _CONSOLE_PKG / "static" / "app.js"))
+
+    console = integ.attest_console()
+    assert console is not None
+    assert console.checked == 1
+    assert _drift(console) == [
+        (rel, "missing") for rel in sorted(_CONSOLE_FILES) if not rel.endswith("app.js")
+    ]
+
+
+def test_main_shape_path_nested_in_the_package_still_reads_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    (console_root / _CONSOLE_PKG / "mount.py").unlink()
+    _load_fake_console(monkeypatch, console_root / _CONSOLE_PKG / "static")
+
+    console = integ.attest_console()
+    assert console is not None
+    assert console.checked == 2
+    assert _drift(console) == [
+        (f"{_CONSOLE_PKG}/__init__.py", "missing"),
+        (f"{_CONSOLE_PKG}/mount.py", "missing"),
+    ]
+
+
+def test_main_shape_package_replaced_by_a_single_file_module_still_reads_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    shutil.rmtree(console_root / _CONSOLE_PKG)
+    shadow = console_root / f"{_CONSOLE_PKG}.py"
+    shadow.write_bytes(b"def mount_ui(app, deps):\n    return None\n")
+    _console_module(monkeypatch, __file__=str(shadow))
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == sorted(
+        [(f"{_CONSOLE_PKG}.py", "missing")] + [(rel, "missing") for rel in _CONSOLE_FILES]
+    )
+
+
+def test_an_emptied_console_under_the_install_root_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Main listed no file here, so it read as attested-nothing; the package-root trigger reads every
+    row back."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    for rel in _CONSOLE_FILES:
+        (console_root / rel).unlink()
+    _load_fake_console(monkeypatch, console_root / _CONSOLE_PKG)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
+    assert console.checked == 0
+    assert console.unattested_reason == _NOTHING_READ
+
+
+def test_an_emptied_console_outside_the_install_root_is_attested_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control for the test above: neither trigger fires."""
+    _install_engine_and_console(tmp_path, monkeypatch)
+    elsewhere = tmp_path / "elsewhere" / _CONSOLE_PKG
+    elsewhere.mkdir(parents=True)
+    _load_fake_console(monkeypatch, elsewhere)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert console.drift == [] and console.checked == 0
+    assert console.unattested_reason == _NOTHING_UNDER_ROOT
+
+
+def test_a_console_whose_every_file_is_special_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulated at :func:`_is_special_file`, so it runs where ``mkfifo`` does not exist."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    _load_fake_console(monkeypatch, console_root / _CONSOLE_PKG)
+    monkeypatch.setattr(integ, "_is_special_file", lambda path: True)
+
+    assert integ._console_loaded_files() == []
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
+    assert console.unattested_reason == _NOTHING_READ
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_a_console_whose_every_file_is_a_real_fifo_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    for rel in _CONSOLE_FILES:
+        (console_root / rel).unlink()
+        os.mkfifo(console_root / rel)
+    _load_fake_console(monkeypatch, console_root / _CONSOLE_PKG)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
+    assert console.unattested_reason == _NOTHING_READ
+
+
+def test_a_console_package_directory_linked_out_of_the_root_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    shutil.rmtree(package_dir)
+    empty = tmp_path / "outside" / _CONSOLE_PKG
+    empty.mkdir(parents=True)
+    _symlink(package_dir, empty, directory=True)
+    _load_fake_console(monkeypatch, package_dir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
+    assert console.unattested_reason == _NOTHING_READ
+
+
+def test_an_engine_package_directory_linked_out_of_the_root_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_dir = _install_and_walk_engine(tmp_path / "site", monkeypatch)
+    outside = tmp_path / "outside" / _ENGINE_PKG
+    shutil.copytree(package_dir, outside)
+    (outside / "redaction.py").write_bytes(b"def redact(value):\n    return value\n")
+    shutil.rmtree(package_dir)
+    _symlink(package_dir, outside, directory=True)
+
+    result = attest_engine()
+    assert _drift(result) == [(rel, "missing") for rel in sorted(_ENGINE_FILES)]
+    assert result.checked == 0
+    assert result.unattested_reason == _NOTHING_READ
+
+
+def test_a_console_imported_through_a_link_into_the_package_still_reads_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link outside the install root pointing into the real package: the deleted file is drift."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    (package_dir / "static" / "app.js").unlink()
+    alias = tmp_path / "ahead_on_sys_path" / _CONSOLE_PKG
+    alias.parent.mkdir()
+    _symlink(alias, package_dir, directory=True)
+    _load_fake_console(monkeypatch, alias)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(f"{_CONSOLE_PKG}/static/app.js", "missing")]
+    assert console.checked == len(_CONSOLE_FILES) - 1
+
+
+def test_an_unlistable_console_subdirectory_is_named_as_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulated, since a list-deny ACL is not portable: the directory is named, and the rows it hid
+    are read back."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    static = package_dir / "static"
+    _load_fake_console(monkeypatch, package_dir)
+    real_scandir = os.scandir
+
+    def scandir(path: Any = ".") -> Any:
+        if Path(path) == static:
+            raise PermissionError(13, "denied", str(static))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [
+        (f"{_CONSOLE_PKG}/static", "missing"),
+        (f"{_CONSOLE_PKG}/static/app.css", "missing"),
+        (f"{_CONSOLE_PKG}/static/app.js", "missing"),
+    ]
+    assert console.checked == 2
+
+
+def test_an_asset_that_fails_to_open_is_drift_and_not_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared asset replaced by a directory is neither a special file nor openable."""
+    asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
+    asset.unlink()
+    asset.mkdir()
+
+    result = attest_engine()
+    assert _drift(result) == [(_ASSET, "missing")]
+    assert result.checked == 1, "only the module was read"
+
+
+def test_a_pass_where_no_file_opens_compares_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
+    module = tmp_path / "mfengine" / "__init__.py"
+    for path in (asset, module):
+        path.unlink()
+        path.mkdir()
+
+    result = attest_engine()
+    assert _drift(result) == [("mfengine/__init__.py", "missing"), (_ASSET, "missing")]
+    assert result.checked == 0
+    assert result.unattested_reason == _NOTHING_READ
+
+
+@pytest.mark.parametrize("fail_closed", [False, True])
+async def test_a_pass_that_compared_nothing_and_found_drift_is_reported_as_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fail_closed: bool,
+) -> None:
+    """``checked == 0`` with drift takes the drift branch of :func:`_act_on`: an ERROR line, the
+    drift subject and the drift refusal, not the attested-nothing WARNING."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    for rel in _CONSOLE_FILES:
+        (console_root / rel).unlink()
+    _load_fake_console(monkeypatch, console_root / _CONSOLE_PKG)
+
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "emptied.db")), create=True, keyless_chain_refusal=None
+    )
+    sink = _RecordingSink()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
+            if fail_closed:
+                with pytest.raises(
+                    IntegrityError,
+                    match=rf"^web console integrity attestation failed: {len(_CONSOLE_FILES)} ",
+                ):
+                    await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+            else:
+                await run_startup_attestation(store, sink, fail_closed_on_drift=False)
+        assert_capture_sees(caplog, "messagefoundry.integrity")
+        levels = [r.levelno for r in caplog.records if r.name == "messagefoundry.integrity"]
+        assert levels == [logging.ERROR], caplog.messages
+        assert [event[0] for event in sink.events] == ["webconsole-integrity"]
+        assert sink.events[0][2] == len(_CONSOLE_FILES)
+        rows = _startup_rows(await store.list_audit())
+        assert len(rows) == 1
+        detail = json.loads(str(rows[0]["detail"]))
+        assert detail["checked"] == 0 and detail["drift_count"] == len(_CONSOLE_FILES)
+        assert detail["unattested_reason"] == _NOTHING_READ
     finally:
         await store.close()
