@@ -7,8 +7,9 @@ reused by the dry-run / Test Bench:
 
 * :func:`split_batch` — a **batch** file (an ``FHS``/``BHS`` batch or just several ``MSH`` messages
   concatenated) becomes one message per ``MSH`` boundary, in file order. This is the canonical
-  splitter the File source uses at ingress and that :func:`~messagefoundry.pipeline.dryrun.split_messages`
-  delegates to, so the live engine and a dry-run split identically (single source of truth).
+  splitter the File source uses at ingress and that
+  :func:`~messagefoundry.pipeline.dryrun.split_messages` delegates to; that docstring says where
+  the two still differ.
 
 * :func:`split_by_obr` — one HL7 order message (an ORM/ORU carrying several ``OBR`` order groups)
   becomes one message per ``OBR`` group, each re-attached to the shared header. This is the
@@ -184,8 +185,7 @@ def split_batch(raw: str | bytes) -> list[str]:
     message when it starts with ``MSH``, and is otherwise kept as one too, so the parser records its
     ``ERROR`` rather than the split discarding what the sender sent.
 
-    A payload with a single message, and no trailer line ending it, round-trips unchanged (a
-    one-element list); an empty/whitespace payload yields the normalized text as the sole element
+    A payload with a single message is a one-element list; an empty/whitespace payload yields the normalized text as the sole element
     (the caller — e.g. the parser — then reports it as malformed rather than silently dropping it).
     """
     return [_without_trailer(m) for m in _split_keeping_trailers(raw)]
@@ -295,14 +295,15 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
 def one_message_bytes(raw: bytes, text: str, message: str, encoding: str) -> bytes:
     """What a whole-file source hands over for a file :func:`split_batch` read as one ``message``,
     where ``text`` is the text the split was given: ``raw`` decoded with ``encoding``, or the dry
-    run's latin-1 view of it.
+    run's view of it.
 
     ``raw`` when the parser reads ``text`` as it is: ``text`` starts with ``MSH`` after whitespace,
     or the split found no ``MSH``-led message in it either. In the first case the trailer lines the
     split dropped (BACKLOG #5806) are cut from ``raw`` at the line break before them, and every
-    other byte stays, but only under an ``encoding`` that writes ASCII as itself: one
-    :func:`_writes_ascii_as_itself` accepts, a codec that ``_ASCII_SAFE_CODECS`` or
-    ``_ASCII_SAFE_PREFIXES`` names. ``utf-8-sig``, UTF-16 and cp932 are not. Under any other
+    other byte stays, but only under an ``encoding`` that writes ASCII as itself, one
+    :func:`_writes_ascii_as_itself` accepts: UTF-8, ASCII, ISO 8859 or Windows-125x, as
+    ``_ASCII_SAFE_CODECS`` and ``_ASCII_SAFE_PREFIXES`` spell them. ``utf-8-sig``, UTF-16 and
+    cp932 are not. Under any other
     encoding ``raw`` is handed over whole, trailer lines included, as it was before that change.
 
     Otherwise the split read the message past leading noise the parser refuses, a byte order mark

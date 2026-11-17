@@ -243,11 +243,11 @@ open points settled below.
   `FHS`/`BHS`-led body. Splitting has no ACK to reinterpret, which is the draft's objection to
   splitting on a listener: a file source answers nobody, and each message gets its own disposition.
   The split goes through a new `split_batch_bytes` in `messagefoundry/parsing/split.py`, which decodes
-  with the declared charset, splits with `split_batch`, and re-encodes each message; a single-message
-  or undecodable file is handed over as its original bytes, as the File source does. In a charset
-  whose ASCII bytes always mean ASCII (UTF-8, ASCII, ISO 8859, Windows-125x), a file with no `MSH`
-  after a line break is one message, so it is handed over after one byte scan, with no decode or
-  split. The stop is checked before every hand-off, the first included: a stop part-way leaves the
+  with the declared charset, splits with `split_batch`, and re-encodes each message; an
+  undecodable file is handed over as its original bytes, and a single-message file as
+  `split_batch_bytes` says. In a charset whose ASCII bytes always mean ASCII (UTF-8, ASCII, ISO
+  8859, Windows-125x), a file with no `MSH` after a line break is one message, so a byte scan
+  decides it with no split. The stop is checked before every hand-off, the first included: a stop part-way leaves the
   whole file for the next start, and a store failure on hand-off K leaves it for the next poll; both
   re-emit the first K messages, the at-least-once behaviour the File source already has. The split
   runs in a worker thread, as the poll's other blocking steps do, so a large batch file does not
@@ -486,8 +486,8 @@ into one MLLP frame or one HTTP request is told so, with an `AR` where it can be
 is processed as the File source processes one, and an enveloped remote batch is no longer one
 `ERROR`. A batch file led by whitespace or a byte order mark keeps its first message on both file
 sources, and a one-message file led by a byte order mark or an `FHS`/`BHS` envelope header is no
-longer an `ERROR`. An `MSH`-led message no longer carries the trailer lines that end it
-to the Handler.
+longer an `ERROR`. The split drops the trailer lines that end an `MSH`-led message; where a
+whole-file source still hands them on is said under rule 5.
 
 **Negative / risks** -- Rule 3 is advisory: a Handler author can still write the unsafe form, and
 the lint sees only literal paths and has the blind spots listed above. A partner that reads a
@@ -590,8 +590,7 @@ are spelled, after one scan for `MSH` settles a text holding none.
 **The dry run, changed on purpose.** The dry run's `split_messages` splits a latin-1 view of the
 bytes in which each UTF-8 mark's three bytes are spelled as the mark itself, so it cuts at a marked
 later `MSH` as the live sources do under UTF-8. Before this change it stripped only the
-whitespace and one mark that lead the file, so it did not cut there and handed such a file over
-whole. Under a single-byte charset the live sources keep the three bytes and do not cut there,
+whitespace and one mark that lead the file, so it did not cut there. Under a single-byte charset the live sources keep the three bytes and do not cut there,
 while the dry run still does. That is a further case of the gap vault #2853 names, and it stays
 open.
 

@@ -247,12 +247,13 @@ def b64_head(b64: str, max_bytes: int = 32) -> bytes:
     prefix isn't decodable (the caller treats an unconfirmable magic as a contradiction and downgrades to
     octet-stream — conservative).
 
-    Only the prefix is read, never the whole document: windows of ``b64`` that double in width are
-    compacted until they hold enough characters, so the work grows with the text that holds them,
-    whitespace included, and not with the document (BACKLOG #5805). A ``max_bytes`` of zero or less
-    gives ``b""``. The decode validates, so a character outside the base64 alphabet gives ``b""``.
-    That is a deliberate change by BACKLOG #5805: the decode before it skipped such a character,
-    which could line later characters up into a magic signature."""
+    Windows of ``b64`` that double in width are compacted until they hold enough characters or the
+    text ends, so the work grows with the text up to the prefix, whitespace included, and not with
+    the rest of the document (BACKLOG #5805). A ``max_bytes`` of zero or less gives ``b""``. The
+    decode validates, so a prefix that is not strict base64, such as one holding a character
+    outside the alphabet or a misplaced ``=``, gives ``b""``. That is a deliberate change by
+    BACKLOG #5805: the decode before it accepted such a prefix and skipped any character outside
+    the alphabet, which could line later characters up into a magic signature."""
     if max_bytes <= 0:
         return b""
     need = ((max_bytes + 2) // 3) * 4
