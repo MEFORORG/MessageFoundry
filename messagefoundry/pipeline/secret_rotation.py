@@ -84,7 +84,6 @@ __all__ = [
     "SecretRotationRunner",
     "SecretStamp",
     "StoreKeyRotationOverdueError",
-    "UnrolledStoreKeyRefused",
     "close_rotation_record",
     "dek_changed",
     "dek_fingerprint",
@@ -94,7 +93,6 @@ __all__ = [
     "fingerprints_equal",
     "open_rotation_record",
     "reconcile_rotation_meta",
-    "refuse_unrolled_key_change",
     "secrets_from_settings",
     "secrets_from_settings_and_stamps",
 ]
@@ -398,59 +396,6 @@ def _rotation_hold(record: SecretRotationMetaRow | None, fingerprint: str) -> st
             "docs/PHI.md says how to read the chain. If you cannot tell, do not put it back."
         )
     return None
-
-
-class UnrolledStoreKeyRefused(RuntimeError):
-    """``serve`` refused to start on a changed store key the keyed audit chain cannot follow
-    (BACKLOG #4934); see :func:`refuse_unrolled_key_change`."""
-
-
-#: The refusal :func:`refuse_unrolled_key_change` raises, and the WARNING it logs under the override.
-_UNROLLED_REFUSAL = (
-    "the store key in use is not confirmed by its stamp, the audit chain's current range is not "
-    "under it, and the key that range is under is not configured. This start's "
-    "first audit row would go into that range under another key, and the chain would break there, "
-    "so no later `messagefoundry rotate-key` could roll it. Put the key that range is under back in "
-    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED (it can be older than the last key, where an earlier key "
-    "change was never rolled; the store open's ERROR names the range's first row) and run "
-    "`messagefoundry rotate-key` before you start. Only where that key "
-    "is truly lost, set "
-    "[secret_rotation].allow_lost_audit_range_key = true to start anyway: that is a security "
-    "loosening, and the chain breaks at this start's first audit row."
-)
-
-
-async def refuse_unrolled_key_change(
-    meta_store: SecretRotationMetaStore,
-    *,
-    dek_key_id: str | None,
-    audit_rolled: bool | None,
-    range_key_missing: bool,
-    allow_lost: bool,
-) -> None:
-    """Raise :class:`UnrolledStoreKeyRefused` on the condition the ``allow_lost_audit_range_key``
-    entry in docs/SECURITY-LOOSENING.md states (BACKLOG #4934, owner ruling 2026-11-04). ``serve`` calls it right after the store open, before it writes
-    any audit row. ``audit_rolled`` is :func:`~messagefoundry.store.store.audit_chain_rolled` and
-    ``range_key_missing`` is :func:`~messagefoundry.store.store.audit_range_key_missing`, both for
-    the open store.
-
-    The key counts as changed as :func:`dek_changed` says, so a store with no stamp, or a stamp
-    under a scheme this release does not know, counts too. A stamp naming the key in use does not
-    refuse, even over such a chain. ``allow_lost``, ``[secret_rotation].allow_lost_audit_range_key``,
-    logs the refusal as a WARNING and returns instead of raising."""
-    if not dek_key_id or audit_rolled is not False or not range_key_missing:
-        return
-    prior = (await meta_store.get_secret_rotation_meta()).get(_DEK_CLASS_ID)
-    if dek_changed(prior, dek_fingerprint(dek_key_id)) is False:
-        return
-    if allow_lost:
-        log.warning(
-            "secret rotation: [secret_rotation].allow_lost_audit_range_key is set, so the engine "
-            "starts over this refusal: %s",
-            _UNROLLED_REFUSAL,
-        )
-        return
-    raise UnrolledStoreKeyRefused(f"refusing to start: {_UNROLLED_REFUSAL}")
 
 
 #: Bytes of the per-row random HMAC key a sealed fingerprint cell holds (BACKLOG #3472).

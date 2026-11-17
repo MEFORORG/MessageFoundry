@@ -775,10 +775,7 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    store with a keyed chain, do not start `serve`, or run any other command that writes an audit
    row, on the new key alone before a run's roll succeeds: the chain's current range is then under
    a key it does not hold, so it keys new audit rows under the new key, those rows never verify
-   inside that range, and no later `rotate-key` can roll the chain. `serve` can refuse to start on
-   a changed key (BACKLOG #4934); the
-   `[secret_rotation].allow_lost_audit_range_key` entry in
-   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) states when, and the way out. **A roll that refuses for good holds the key for good (BACKLOG #4934, #4935).** The roll
+   inside that range, and no later `rotate-key` can roll the chain. **A roll that refuses for good holds the key for good (BACKLOG #4934, #4935).** The roll
    verifies the whole chain first, so a chain whose rows do not verify, or whose rows open with no
    genesis row, refuses under every key, a new one included, and the record stays open. A newest
    range under a key that is not configured is not one of these, though `audit-verify` reports it

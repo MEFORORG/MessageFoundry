@@ -3005,7 +3005,6 @@ tracked; set `warn_days = 0` to disable the reminder.
 | `secret_max_age_days` | int | 365 | max age for the **non-DEK** tracked secret classes (connector/AD/SMTP/Vault/OIDC), alerted this many days after their last observed fingerprint change |
 | `enforce_grace_days` | int | 30 | under `[security].enforcement=enforce`, a DEK older than `store_key_max_age_days + this` escalates its rotation alert **and refuses to start** (see `enforce_store_key_expiry`) |
 | `enforce_store_key_expiry` | bool | `true` | under `[security].enforcement=enforce`, a store DEK past `store_key_max_age_days + enforce_grace_days` — or one whose age cannot be determined — **aborts engine start**. `false` keeps the alert, drops the refusal, and is reported as a **security loosening** |
-| `allow_lost_audit_range_key` | bool | `false` | `true` starts `serve` over its refusal of a store key change the keyed audit chain cannot follow, and is reported as a **security loosening**. [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) states when that refusal fires and the way out |
 | `enforce_secret_expiry_classes` | list | `[]` | non-DEK classes whose calendar expiry **aborts engine start** under `[security].enforcement=enforce`, past `secret_max_age_days + enforce_grace_days` or with no recorded age. Entries are the `MEFOR_*` class names above or `connector`; an unknown name is refused at load. Empty keeps every non-DEK class alert-only |
 
 ```toml

@@ -8126,32 +8126,6 @@ def audit_chain_rolled(store: object) -> bool | None:
     return bool(isinstance(keys, list) and keys and keys[-1] == active)
 
 
-def audit_range_key_missing(store: object) -> bool:
-    """Whether the keyed audit chain's current range, as the open authenticated it, is keyed under
-    an audit key this store does not hold (BACKLOG #4934). The open then moves new rows to the
-    active key (:func:`settle_audit_ranges`), so the first row a start writes lands in a range keyed
-    under another key, and the chain breaks there; :func:`roll_audit_key_range` refuses the same
-    state. ``False`` with no keyed chain, and for ranges the open could not authenticate, which
-    say nothing about the current range's key. Read by attribute, as :func:`audit_chain_rolled`
-    reads; no I/O."""
-    if not getattr(store, "_audit_chain_keyed", False):
-        return False
-    if not getattr(store, "_audit_ranges_trusted", False):
-        return False
-    keys = getattr(store, "_audit_range_keys", None)
-    if not (isinstance(keys, list) and keys):
-        return False
-    mac_keys = getattr(store, "_audit_mac_keys", None)
-    return (
-        _audit_secret_for(
-            keys[-1],
-            mac_keys if isinstance(mac_keys, Mapping) else {},
-            getattr(store, "_audit_mac_fn", None),
-        )
-        is None
-    )
-
-
 # #233 (ADR 0111): the event name for a Send declined because its target outbound is present-but-NOT-
 # deployed. Recorded once per declined destination (:func:`not_deployed_detail` for the detail). It has
 # TWO load-bearing roles, and both fail unless it is in the audit floor below: (1) it is the operator-

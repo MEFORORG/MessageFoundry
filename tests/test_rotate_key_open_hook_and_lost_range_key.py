@@ -1,19 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #4936 and #4934, the owner rulings of 2026-11-04.
+"""BACKLOG #4936, the owner ruling of 2026-11-04.
 
-#4936: ``rotate-key`` opens its rotation record through ``open_store``'s ``before_first_write``
-hook, so a run killed inside the store open after the hook leaves any record it
-opened.
-
-#4934: ``serve``'s start refusal of a store key change the keyed audit chain cannot follow, with
-``[secret_rotation].allow_lost_audit_range_key`` as its override; docs/SECURITY-LOOSENING.md
-states when it fires."""
+``rotate-key`` opens its rotation record through ``open_store``'s ``before_first_write`` hook, so a
+run killed inside the store open after the hook leaves any record it opened."""
 
 from __future__ import annotations
 
 import asyncio
-import logging
 from pathlib import Path
 from typing import Any
 
@@ -24,17 +18,14 @@ from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import SecretRotationSettings, StoreSettings
 from messagefoundry.pipeline.secret_rotation import (
     ROTATION_RECORD_ID,
-    UnrolledStoreKeyRefused,
     dek_fingerprint,
     reconcile_rotation_meta,
-    refuse_unrolled_key_change,
 )
 from messagefoundry.store.base import open_store
 from messagefoundry.store.crypto import generate_key
 from messagefoundry.store.store import (
     MessageStore,
     audit_chain_rolled,
-    audit_range_key_missing,
 )
 from tests.test_rotate_key_rotation_record import (
     _DEK,
@@ -42,7 +33,6 @@ from tests.test_rotate_key_rotation_record import (
     _env,
     _key_id,
     _open,
-    _rows,
     _seed,
     _seed_keyless_chain,
 )
@@ -124,160 +114,3 @@ def test_the_hook_runs_before_the_first_write_and_not_on_a_read_only_open(tmp_pa
     assert seen == ["hook"]
     asyncio.run(opened(True))
     assert seen == ["hook"]
-
-
-async def _refusal(db: Path, key: str, *retired: str, allow_lost: bool = False) -> None:
-    store = await _open(db, key, *retired)
-    try:
-        await refuse_unrolled_key_change(
-            store,
-            dek_key_id=_key_id(key),
-            audit_rolled=audit_chain_rolled(store),
-            range_key_missing=audit_range_key_missing(store),
-            allow_lost=allow_lost,
-        )
-    finally:
-        await store.close()
-
-
-def test_a_start_on_the_new_key_alone_refuses_before_any_audit_row(tmp_path: Path) -> None:
-    """#4934 step 3: changed key, chain not rolled, current range key not configured."""
-    db, key_a, key_b = tmp_path / "r.db", generate_key(), generate_key()
-    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
-    with pytest.raises(UnrolledStoreKeyRefused, match="allow_lost_audit_range_key"):
-        asyncio.run(_refusal(db, key_b))
-
-
-@pytest.mark.parametrize("case", ["prior_key_configured", "key_unchanged", "keyless_chain"])
-def test_the_refusal_needs_all_three_conditions(tmp_path: Path, case: str) -> None:
-    """Each condition alone failing lets the start through."""
-    db, key_a, key_b = tmp_path / "c.db", generate_key(), generate_key()
-    if case == "keyless_chain":
-        asyncio.run(_seed_keyless_chain(db, tmp_path / "uploads", key_a))
-        asyncio.run(_refusal(db, key_b))
-        return
-    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
-    if case == "prior_key_configured":
-        asyncio.run(_refusal(db, key_b, key_a))
-    else:
-        asyncio.run(_refusal(db, key_a))
-
-
-def test_a_stamp_naming_the_key_in_use_does_not_refuse(tmp_path: Path) -> None:
-    """The stamp arm alone: chain not rolled and its range key not configured, but the stamp
-    already names the key in use, so the start goes through. The other cases return before the
-    stamp is read."""
-    db, key_a, key_b = tmp_path / "s.db", generate_key(), generate_key()
-    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
-
-    async def stamp_key_b() -> None:
-        store = await _open(db, key_b)
-        try:
-            await store.upsert_secret_rotation_meta(
-                _DEK,
-                fingerprint=dek_fingerprint(_key_id(key_b)),
-                tracked_since=_OLD_DATE,
-                last_rotated=_OLD_DATE,
-            )
-            assert audit_chain_rolled(store) is False
-            assert audit_range_key_missing(store) is True
-        finally:
-            await store.close()
-
-    asyncio.run(stamp_key_b())
-    asyncio.run(_refusal(db, key_b))
-
-
-def test_the_override_starts_with_a_warning_and_is_a_named_loosening(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    db, key_a, key_b = tmp_path / "o.db", generate_key(), generate_key()
-    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.secret_rotation"):
-        asyncio.run(_refusal(db, key_b, allow_lost=True))
-    assert "allow_lost_audit_range_key is set" in caplog.text
-
-
-def _named(settings: SecretRotationSettings) -> dict[str, str]:
-    from messagefoundry.config.settings import (
-        AiSettings,
-        AlertsSettings,
-        ApiSettings,
-        ApprovalsSettings,
-        AuthSettings,
-        BackupSettings,
-        CertMonitorSettings,
-        SecretsSettings,
-        SecuritySettings,
-        security_loosenings,
-    )
-
-    return dict(
-        security_loosenings(
-            SecuritySettings(),
-            StoreSettings(),
-            AuthSettings(),
-            AlertsSettings(),
-            settings,
-            cleartext_hops=(),
-            expiry_relaxed_hops=(),
-            hostname_unchecked_hops=(),
-            query_credential_hops=(),
-            unverified_db_hops=(),
-            attested_hops=(),
-            revocation_attested_hops=(),
-            path_form_fhir_hops=(),
-            ech_cleartext_sidecar_hops=(),
-            api=ApiSettings(),
-            approvals=ApprovalsSettings(),
-            cert_monitor=CertMonitorSettings(),
-            backup=BackupSettings(),
-            secrets=SecretsSettings(),
-            ai=AiSettings(),
-            store_privilege=None,
-            audit_chain_unkeyed=None,
-            remote_debug=None,
-            startup=None,
-            service_env=None,
-        )
-    )
-
-
-def test_the_override_is_a_named_loosening_and_off_by_default() -> None:
-    assert SecretRotationSettings().allow_lost_audit_range_key is False
-    assert "allow_lost_audit_range_key" not in _named(SecretRotationSettings())
-    risk = _named(SecretRotationSettings(allow_lost_audit_range_key=True))[
-        "allow_lost_audit_range_key"
-    ]
-    assert "audit chain breaks" in risk
-
-
-def test_the_range_key_answer_tells_the_states_apart(tmp_path: Path) -> None:
-    keyed, keyless = tmp_path / "keyed.db", tmp_path / "keyless.db"
-    key_a, key_b = generate_key(), generate_key()
-    asyncio.run(_seed(keyed, tmp_path / "u1", key_a))
-    asyncio.run(_seed_keyless_chain(keyless, tmp_path / "u2", key_a))
-
-    async def answer(db: Path, key: str, *retired: str) -> bool:
-        store = await _open(db, key, *retired)
-        try:
-            return audit_range_key_missing(store)
-        finally:
-            await store.close()
-
-    assert asyncio.run(answer(keyed, key_a)) is False
-    assert asyncio.run(answer(keyed, key_b, key_a)) is False
-    assert asyncio.run(answer(keyed, key_b)) is True
-    assert asyncio.run(answer(keyless, key_b)) is False
-    assert audit_range_key_missing(object()) is False
-
-
-def test_the_rows_after_a_refused_start_are_unchanged(tmp_path: Path) -> None:
-    """The refusal writes nothing: the DEK stamp and the record are as the seed left them."""
-    db, key_a, key_b = tmp_path / "u.db", generate_key(), generate_key()
-    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
-    with pytest.raises(UnrolledStoreKeyRefused):
-        asyncio.run(_refusal(db, key_b))
-    rows = asyncio.run(_rows(db, key_b, key_a))
-    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
-    assert ROTATION_RECORD_ID not in rows
