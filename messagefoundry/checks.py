@@ -102,6 +102,7 @@ from __future__ import annotations
 import ast
 import functools
 import importlib.metadata
+import os
 import re
 import subprocess
 import sys
@@ -4243,40 +4244,89 @@ _LINT_TOOL_NAMES = frozenset(
 
 
 def _tool_installed(module: str) -> bool:
-    """Whether ``module`` is importable by this interpreter, which is the one that runs it."""
-    import importlib.util
+    """Whether ``module`` is importable by the child :func:`_run_tool` starts. Searched on this
+    interpreter's absolute import-path entries less the working directory, since the child starts
+    with ``-P`` and :func:`~messagefoundry.childenv.worker_environment` drops a relative
+    ``PYTHONPATH`` entry. Locates only; imports nothing."""
+    import importlib.machinery
 
     try:
-        return importlib.util.find_spec(module) is not None
+        cwd = os.path.normcase(os.path.abspath(os.getcwd()))
+    except OSError:
+        cwd = ""
+    path = [e for e in sys.path if e and os.path.isabs(e) and os.path.normcase(e) != cwd]
+    try:
+        return importlib.machinery.PathFinder.find_spec(module, path) is not None
     except (ImportError, ValueError):
         return False
 
 
-def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
-    """Advisory: run ``python -m <module> <args>`` with this interpreter, only when the module is
-    installed for it; absent → skipped, never blocking.
+def _ruff_binary() -> str | None:
+    """The ``ruff`` program installed beside this interpreter, by absolute path: the scripts folder
+    of its environment, then of its base installation, then of the user scheme, the first three
+    places ruff's own ``find_ruff_bin`` looks. ``None`` when none holds it. Run directly rather than
+    as ``python -m ruff``, which on Windows starts the program as a grandchild that the timeout in
+    :func:`_run_tool` cannot kill."""
+    import sysconfig
 
-    The tool is named by this interpreter's absolute path and a module, never a bare program name a
-    ``PATH`` search resolves; on Windows that search reads the working directory first, which can be
-    the config repository under check. :func:`~messagefoundry.childenv.python_module_argv` adds
-    ``-P``, so the working directory is off the child's import path too. The child gets
-    :func:`~messagefoundry.childenv.worker_environment` plus :data:`_LINT_TOOL_NAMES`, not the
-    caller's whole environment (BACKLOG #5375). ``-X utf8`` pins the output encoding to the UTF-8
-    the decode below expects, and holds under ``-I``, which ``PYTHONIOENCODING`` would not."""
-    from messagefoundry.childenv import python_module_argv, worker_environment
+    program = "ruff" + (sysconfig.get_config_var("EXE") or "")
+    folders = (
+        sysconfig.get_path("scripts"),
+        sysconfig.get_path("scripts", vars={"base": sys.base_prefix}),
+        sysconfig.get_path("scripts", scheme=sysconfig.get_preferred_scheme("user")),
+    )
+    for folder in folders:
+        if folder and os.path.isabs(folder):
+            candidate = os.path.join(folder, program)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
 
+
+def _tool_command(module: str) -> list[str] | None:
+    """The command line that starts lint tool ``module``, or ``None`` when it is not installed for
+    this interpreter. Never a bare program name a ``PATH`` search resolves: on Windows that search
+    reads the working directory first, which can be the config repository under check (BACKLOG
+    #5375). ``ruff`` is its program by absolute path (:func:`_ruff_binary`). Any other tool is
+    ``python -m <module>`` by this interpreter's absolute path, through
+    :func:`~messagefoundry.childenv.python_module_argv`, whose ``-P`` keeps the working directory
+    off the child's import path; ``-X utf8`` sets UTF-8 output where ``-I`` would make the child
+    ignore ``PYTHONIOENCODING``."""
+    from messagefoundry.childenv import python_module_argv
+
+    if module == "ruff":
+        binary = _ruff_binary()
+        return [binary] if binary else None
     if not _tool_installed(module):
+        return None
+    return python_module_argv(module, extra_flags=("-X", "utf8"))
+
+
+def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
+    """Advisory: run lint tool ``module`` with ``args``, only when it is installed for this
+    interpreter (:func:`_tool_command`); absent → skipped, never blocking. A ``ruff`` or ``mypy``
+    installed only elsewhere on ``PATH`` is not run.
+
+    The child gets :func:`~messagefoundry.childenv.worker_environment` plus
+    :data:`_LINT_TOOL_NAMES`, not the caller's whole environment (BACKLOG #5375), with
+    ``PYTHONIOENCODING`` set to the UTF-8 the decode below expects: mypy writes its interpreter's
+    stdout encoding, the locale code page on 3.14."""
+    from messagefoundry.childenv import worker_environment
+
+    cmd = _tool_command(module)
+    if cmd is None:
         return CheckResult(name, ok=True, required=False, skipped=True, detail="not installed")
-    cmd = [*python_module_argv(module, extra_flags=("-X", "utf8")), *args]
     try:
-        # nosec: an absolute interpreter path and a fixed module, no shell; args are repo paths.
+        # nosec: an absolute program or interpreter path, no shell; args are repo paths.
         proc = subprocess.run(  # nosec B603
-            cmd,
+            [*cmd, *args],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=worker_environment(extra_names=_LINT_TOOL_NAMES),
+            env=worker_environment(
+                {**os.environ, "PYTHONIOENCODING": "utf-8"}, extra_names=_LINT_TOOL_NAMES
+            ),
             check=False,
             timeout=120,
         )

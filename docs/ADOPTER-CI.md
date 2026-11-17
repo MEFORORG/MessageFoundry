@@ -349,8 +349,8 @@ failed** — advisory checks and skips never block.
 | **`validate`** | ✅ blocking | every config module imports; **every `inbound → router` reference resolves**; the directory **declares at least one connection** | a router/handler named but not defined, an unresolvable reference, an import error, or a directory that declares no inbound and no outbound at all — pass `--allow-empty-config` when that is deliberate |
 | **`dryrun`** | ✅ blocking *(when fixtures exist)* | each synthetic `*.hl7` fixture **routes through its inbound's Router/Handler(s) without erroring** | a transform throws, or the message lands in `ERROR` disposition |
 | **`posture`** | ✅ blocking *(best-effort)* | the active environment's security posture is resolvable | a **custom** env name with no explicit `[ai].data_class`/`[ai].production` — which would make `serve` fail-closed at runtime |
-| **`ruff`** | advisory | config style/lint | only when installed; never blocks |
-| **`mypy`** | advisory | config types | only when installed; never blocks |
+| **`ruff`** | advisory | config style/lint | only when installed for the Python that runs `check`; never blocks |
+| **`mypy`** | advisory | config types | only when installed for the Python that runs `check`; never blocks |
 
 ### Why `dryrun` is the interface gate that matters
 

@@ -388,7 +388,7 @@ def test_read_message_sets_single_file_is_unmapped(tmp_path: Path) -> None:
 
 
 def test_run_checks_skips_lint_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(checks, "_tool_installed", lambda _module: False)
+    monkeypatch.setattr(checks, "_tool_command", lambda _module: None)
     report = run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
     by_name = {r.name: r for r in report.results}
     for tool in ("ruff", "mypy", "ruff-security"):
@@ -403,9 +403,7 @@ def test_run_checks_no_lint_excludes_tools() -> None:
     assert "validate" in names and "dryrun" in names
 
 
-@pytest.mark.skipif(
-    not checks._tool_installed("ruff"), reason="ruff advisory pass is run-if-installed"
-)
+@pytest.mark.skipif(checks._ruff_binary() is None, reason="ruff advisory pass is run-if-installed")
 def test_ruff_security_ignores_placeholder_token_fp() -> None:
     # ADR 0144 Increment 3: full `S` over the shipped samples trips S105 on the ADR-0015 body_secrets
     # placeholder token (_TOK_PASSWORD); the curated --ignore S105,S106,S107 suppresses that structural
@@ -417,12 +415,7 @@ def test_ruff_security_ignores_placeholder_token_fp() -> None:
     assert "S105" not in rs.detail
 
 
-def test_lint_tool_runs_by_interpreter_path_with_no_engine_secret(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """BACKLOG #5375: the tool was started by its bare name, which a PATH search resolves (the
-    working directory first, on Windows), and with the engine's whole environment."""
-
+def _capture_tool_start(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     seen: dict[str, Any] = {}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -435,22 +428,68 @@ def test_lint_tool_runs_by_interpreter_path_with_no_engine_secret(
     monkeypatch.setenv("PGPASSWORD", "Pw-Hn5Dv1")
     monkeypatch.setenv("CI_DEPLOY_TOKEN_B614", "Ci-Gs9Kb3")
     monkeypatch.setenv("MYPYPATH", "stubs")
-    monkeypatch.setattr(checks, "_tool_installed", lambda _module: True)
+    monkeypatch.setenv("PYTHONIOENCODING", "ascii")
     monkeypatch.setattr(subprocess, "run", fake_run)
+    return seen
 
-    result = checks._run_tool("ruff", "ruff", ["check", "cfg"])
 
-    assert result.ok is True and result.skipped is False
-    cmd = seen["cmd"]
-    assert cmd[0] == sys.executable and Path(cmd[0]).is_absolute()
-    assert cmd[-4:] == ["-m", "ruff", "check", "cfg"]
-    assert "-P" in cmd and cmd[cmd.index("utf8") - 1] == "-X"
-    env = seen["env"]
+def _assert_no_engine_secret(env: dict[str, str]) -> None:
     upper = {name.upper() for name in env}
     assert not any(name.startswith("MEFOR_") for name in upper)
     assert {"VAULT_TOKEN", "PGPASSWORD", "CI_DEPLOY_TOKEN_B614"}.isdisjoint(upper)
     assert env.get("MYPYPATH") == "stubs"  # the tools' own variables still cross
+    assert env.get("PYTHONIOENCODING") == "utf-8"  # pinned over an inherited value
     assert "PATH" in upper
+
+
+def test_mypy_runs_by_interpreter_path_with_no_engine_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5375: the tool was started by its bare name, which a PATH search resolves (the
+    working directory first, on Windows), and with the engine's whole environment."""
+    seen = _capture_tool_start(monkeypatch)
+    monkeypatch.setattr(checks, "_tool_installed", lambda _module: True)
+
+    result = checks._run_tool("mypy", "mypy", ["cfg"])
+
+    assert result.ok is True and result.skipped is False
+    cmd = seen["cmd"]
+    assert cmd[0] == sys.executable and Path(cmd[0]).is_absolute()
+    assert cmd[-3:] == ["-m", "mypy", "cfg"]
+    assert "-P" in cmd and cmd[cmd.index("utf8") - 1] == "-X"
+    _assert_no_engine_secret(seen["env"])
+
+
+def test_ruff_runs_its_program_by_absolute_path_with_no_engine_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ruff is its own program, not ``python -m ruff``: on Windows that module starts the program as
+    a grandchild, which the 120 s timeout cannot kill."""
+    seen = _capture_tool_start(monkeypatch)
+    program = str(tmp_path / "ruff.exe")
+    monkeypatch.setattr(checks, "_ruff_binary", lambda: program)
+
+    result = checks._run_tool("ruff", "ruff", ["check", "cfg"])
+
+    assert result.ok is True and result.skipped is False
+    assert seen["cmd"] == [program, "check", "cfg"]
+    _assert_no_engine_secret(seen["env"])
+
+
+def test_ruff_binary_is_absolute_when_found() -> None:
+    found = checks._ruff_binary()
+    assert found is None or Path(found).is_absolute()
+
+
+def test_tool_probe_ignores_a_module_in_the_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The child starts with ``-P``, so a module only the working directory holds is not one it
+    can run; the probe must not count it as installed."""
+    (tmp_path / "b614_cwd_only_tool.py").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    assert checks._tool_installed("b614_cwd_only_tool") is False
 
 
 def test_lint_tool_absent_is_skipped_without_starting_anything(

@@ -614,21 +614,51 @@ def test_log_tail_passes_over_a_symlink_to_a_file_outside_log_dir(tmp_path: Path
 
 
 def test_log_tail_passes_over_a_directory_with_a_log_suffix(tmp_path: Path) -> None:
+    """Kept by the new listing as the old ``is_file`` filter kept it."""
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     (log_dir / "archive.log").mkdir()
     assert _tail_member(tmp_path, log_dir) is None
 
 
-@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX only")
-@pytest.mark.timeout(30)
-def test_log_tail_does_not_open_a_fifo_with_a_log_suffix(tmp_path: Path) -> None:
-    """A FIFO named ``*.log`` used to be opened for reading, which blocks until a writer appears, so
-    the bundle command hung (BACKLOG #5383)."""
+def test_log_tail_passes_over_a_hard_link_to_a_file_outside_log_dir(tmp_path: Path) -> None:
+    """A second hard link is a regular file to every check but the link count, and the listing
+    and the opened file agree on its id, so the count is what refuses it (BACKLOG #5383)."""
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    os.mkfifo(log_dir / "pipe.log")
-    assert _tail_member(tmp_path, log_dir) is None
+    real = log_dir / "engine.log"
+    real.write_text("2026-06-27 INFO engine started\n", encoding="utf-8")
+    os.utime(real, (1_000_000, 1_000_000))
+    outside = tmp_path / "outside-Wb5Hs1Nq.txt"
+    outside.write_text("OUTSIDE-Wb5Hs1Nq\n", encoding="utf-8")
+    try:
+        os.link(outside, log_dir / "zz-newest.log")
+    except (OSError, NotImplementedError):
+        pytest.skip("this file system cannot create a hard link")
+
+    tail = _tail_member(tmp_path, log_dir)
+    assert tail is not None
+    assert "Wb5Hs1Nq" not in tail
+    assert "engine started" in tail
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX only")
+@pytest.mark.timeout(30)
+def test_read_log_file_does_not_block_on_a_fifo_swapped_in_after_the_listing(
+    tmp_path: Path,
+) -> None:
+    """The listing leaves a FIFO out, as the old ``is_file`` filter did; the race is a FIFO put at
+    the listed name before the open, which would block a plain open until a writer appeared
+    (BACKLOG #5383). ``O_NONBLOCK`` returns at once and the identity check refuses it."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    log = tmp_path / "engine.log"
+    log.write_text("first\n", encoding="utf-8")
+    listed = os.lstat(log)
+    log.unlink()
+    os.mkfifo(log)
+    with pytest.raises(bundle_mod._LogFileRefused):
+        bundle_mod._read_log_file(log, listed)
 
 
 def test_read_log_file_refuses_a_file_swapped_in_after_the_listing(tmp_path: Path) -> None:
@@ -646,25 +676,47 @@ def test_read_log_file_refuses_a_file_swapped_in_after_the_listing(tmp_path: Pat
         bundle_mod._read_log_file(log, listed)
 
 
-def test_log_tail_swapped_file_reports_the_refusal_code(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _stale_listing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, times: int) -> list[int]:
+    """Make the first ``times`` listings carry another file's stat, as a swap or a rotation
+    between listing and opening would. Returns the call counter."""
     from messagefoundry.support import bundle as bundle_mod
 
+    real_candidates = bundle_mod._log_candidates
+    calls = [0]
+
+    def stale(directory: Path) -> list[tuple[Path, os.stat_result]]:
+        calls[0] += 1
+        found = real_candidates(directory)
+        if calls[0] > times:
+            return found
+        decoy = tmp_path / "decoy.log"
+        decoy.write_text("x\n", encoding="utf-8")
+        return [(p, os.lstat(decoy)) for p, _st in found]
+
+    monkeypatch.setattr(bundle_mod, "_log_candidates", stale)
+    return calls
+
+
+def test_log_tail_swapped_file_twice_reports_the_refusal_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     (log_dir / "engine.log").write_text("SWAPPED-Vn3Qx8Rt\n", encoding="utf-8")
-    real_candidates = bundle_mod._log_candidates
+    calls = _stale_listing(monkeypatch, tmp_path, times=2)
+    assert _tail_member(tmp_path, log_dir) == "MF-BUNDLE-LOG-002 _LogFileRefused"
+    assert calls[0] == 2
 
-    def stale(directory: Path) -> list[tuple[float, Path, os.stat_result]]:
-        # The listing saw a different file at the same path.
-        decoy = tmp_path / "decoy.log"
-        decoy.write_text("x\n", encoding="utf-8")
-        return [(m, p, os.lstat(decoy)) for m, p, _st in real_candidates(directory)]
 
-    monkeypatch.setattr(bundle_mod, "_log_candidates", stale)
-    tail = _tail_member(tmp_path, log_dir)
-    assert tail == "MF-BUNDLE-LOG-002 _LogFileRefused"
+def test_log_tail_a_rotation_between_listing_and_opening_is_read_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_text("after rotation\n", encoding="utf-8")
+    calls = _stale_listing(monkeypatch, tmp_path, times=1)
+    assert _tail_member(tmp_path, log_dir) == "after rotation"
+    assert calls[0] == 2
 
 
 @pytest.mark.parametrize("lines", [0, -1, -400])

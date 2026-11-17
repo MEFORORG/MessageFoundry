@@ -1450,7 +1450,8 @@ def test_the_guard_sees_the_calls_it_is_about() -> None:
 
 def test_one_function_builds_the_command_line_of_a_python_child() -> None:
     """``childenv`` is where the interpreter flags are added: ``python_child_argv``, and
-    ``python_module_argv`` for the tray's short login command. A Python child started any other way
+    ``python_module_argv`` for at least the tray's short login command, the dependency auditor and
+    the check gate's ``mypy``. A Python child started any other way
     would start without them. Two tray modules also name the executable. ``tray/branding.py`` reads
     it to place the branded launcher and to tell whether it is running under it.
     ``tray/autostart.py`` reads it to find ``pythonw.exe`` for the login command, which it then
