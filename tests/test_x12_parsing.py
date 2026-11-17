@@ -367,6 +367,65 @@ def test_split_keeps_a_malformed_interchanges_whitespace_terminator() -> None:
     assert split(bad + interchange(control="000000002")) == [bad, interchange(control="000000002")]
 
 
+@pytest.mark.parametrize("term", ["\n", "\r\n"])
+def test_split_keeps_the_whitespace_terminator_of_a_malformed_interchange_cut_at_the_next(
+    term: str,
+) -> None:
+    # A malformed interchange with no IEA ends at the next ISA that passes, and the whitespace
+    # before that ISA is stripped. Its own whitespace terminator, closing its last segment, went
+    # with it (BACKLOG #5921).
+    bad = _without_iea(_corrupt(interchange(term=term)))
+    assert bad.endswith(term)
+    good = interchange(control="000000002")
+    for between in ("", "\r\n \n"):
+        assert split(bad + between + good) == [bad, good]
+    # Whitespace data at the end of the last segment stays too, before its terminator.
+    padded = bad[: -len(term)] + "  " + term
+    assert split(padded + "\n" + good) == [padded, good]
+    # The reader keeps every byte before the next ISA, so its frame holds the terminator too.
+    assert _frames_of((bad + good).encode(), 4096) == [bad.encode(), good.encode()]
+
+
+# Three trailers that close the frame at once, two of them not a clean IEA. Any segment opening with
+# IEA closes it (BACKLOG #5807 keeps that rule): the reader cannot see a connection end, so a frame
+# it held there would be dropped with no row.
+_TRAILERS_THAT_CLOSE = [
+    pytest.param("IEA1*000000001~", id="dropped-separator"),
+    pytest.param("IEAX*1~", id="longer-id"),
+    pytest.param("IEA*1*000000001~", id="clean"),
+]
+
+
+@pytest.mark.parametrize("trailer", _TRAILERS_THAT_CLOSE)
+@pytest.mark.parametrize("chunk", [4096, 7, 1])
+def test_a_segment_opening_with_iea_closes_the_frame_at_once(trailer: str, chunk: int) -> None:
+    raw = _without_iea(interchange()) + trailer
+    reader = X12FrameReader()
+    data = raw.encode()
+    frames = [f for i in range(0, len(data), chunk) for f in reader.feed(data[i : i + chunk])]
+    assert frames == [data] and not reader.in_frame
+    assert split(raw) == [raw]
+
+
+@pytest.mark.parametrize("trailer", _TRAILERS_THAT_CLOSE)
+def test_a_corrupted_trailer_does_not_fold_the_next_interchange_in(trailer: str) -> None:
+    raw = _without_iea(interchange()) + trailer
+    nxt = interchange(control="000000002")
+    assert split(raw + nxt) == [raw, nxt]
+    for chunk in (4096, 7, 1):
+        assert _frames_of((raw + nxt).encode(), chunk) == [raw.encode(), nxt.encode()], chunk
+
+
+@pytest.mark.parametrize("trailer", _TRAILERS_THAT_CLOSE)
+def test_a_ta1_reply_with_a_corrupted_trailer_is_read_at_once(trailer: str) -> None:
+    # An outbound send reads its TA1 reply with this reader: a reply it held would read as a
+    # timeout, and the send would be retried.
+    reply = (isa() + "TA1*000000001*240101*1200*A*000~" + trailer).encode()
+    reader = X12FrameReader()
+    assert list(reader.feed(reply)) == [reply]
+    assert not reader.in_frame
+
+
 def test_split_and_reader_stay_linear_over_many_malformed_interchanges() -> None:
     # Each malformed interchange used to restart the search for the next passing ISA, so k of them
     # in one buffer cost about k * k structural checks. Count the checks rather than time the run.
@@ -1355,6 +1414,45 @@ def test_a_legacy_isa11_u_on_00501_is_not_split_in_component_paths() -> None:
     assert msg["ZZ1-01.2"] == "U071"
     msg["ZZ1-01.1"] = "ABF"
     assert msg["ZZ1-01"] == "ABF:U071"
+
+
+@pytest.mark.parametrize("delims", _REPEATING_DELIMS)
+def test_a_repetition_after_the_first_is_reached_by_get_and_set(delims: dict[str, str]) -> None:
+    # Only the first repetition was reachable: a component path read it and nothing named another.
+    msg = X12Message.parse(_repeating(**delims))
+    rep, comp = msg.delimiters.repetition, msg.delimiters.component
+    assert msg.get("ZZ1-01", repetition=2) == f"C{comp}D"
+    assert msg.get("ZZ1-01.2", repetition=2) == "D"
+    assert msg.get("ZZ1-01.1", repetition=1) == "A"
+    assert msg.get("ZZ1-01", repetition=3) is None
+    assert msg.get("ZZ1-01.1", repetition=3) is None
+    msg.set("ZZ1-01.1", "X", repetition=2)
+    assert msg["ZZ1-01"] == f"A{comp}B{rep}X{comp}D"
+    msg.set("ZZ1-01", f"E{comp}F", repetition=1)  # a whole repetition, the other kept
+    assert msg["ZZ1-01"] == f"E{comp}F{rep}X{comp}D"
+    msg.set_data("ZZ1-01.1", "G", repetition=4)  # repetitions up to it are added empty
+    assert msg["ZZ1-01"] == f"E{comp}F{rep}X{comp}D{rep}{rep}G"
+    reparsed = X12Message.parse(msg.encode())
+    assert reparsed.get("ZZ1-01.1", repetition=4) == "G"
+    assert reparsed.get("ZZ1-01", repetition=3) is None
+
+
+def test_a_repetition_below_1_or_with_no_separator_is_refused() -> None:
+    msg = X12Message.parse(_repeating())
+    before = msg.encode()
+    with pytest.raises(ValueError, match="1-based"):
+        msg.get("ZZ1-01", repetition=0)
+    with pytest.raises(ValueError, match="1-based"):
+        msg.set("ZZ1-01.1", "X", repetition=0)
+    old = X12Message.parse(_repeating(rep="U", version="00401", between="^"))
+    old_before = old.encode()
+    assert old.get("ZZ1-01", repetition=1) == "A:B^C:D"  # no separator: one repetition
+    assert old.get("ZZ1-01", repetition=2) is None
+    with pytest.raises(ValueError, match="no repetition separator"):
+        old.set("ZZ1-01.1", "X", repetition=2)
+    with pytest.raises(ValueError, match="no repetition separator"):
+        msg.set("ISA-06", "X", repetition=2)
+    assert msg.encode() == before and old.encode() == old_before
 
 
 def test_an_isa_component_read_is_unchanged_by_the_repetition_split() -> None:

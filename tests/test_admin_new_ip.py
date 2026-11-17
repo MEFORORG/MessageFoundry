@@ -842,17 +842,30 @@ async def test_a_reanchor_resets_without_reading_the_clock(
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
         await service.initialize()
-        token, identity = await _enabled_admin(service, client="10.1.1.1")
-        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         real_time = time.time
-        for client, skew in (("10.2.2.2", -100.0), ("10.1.1.1", -50.0)):
+        # The second re-verification's clock is earlier than the first's: a backward step.
+        steps = (("10.2.2.2", -50.0), ("10.1.1.1", -100.0))
+        # Mint the session before the earliest skewed clock, so the stepped-back reauths still see
+        # a live session rather than one whose stamps lie in their future.
+        mint_skew = min(skew for _, skew in steps) - 100.0
+        monkeypatch.setattr(time, "time", lambda: real_time() + mint_skew)
+        token, identity = await _enabled_admin(service, client="10.1.1.1")
+        monkeypatch.setattr(time, "time", real_time)
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        for client, skew in steps:
             monkeypatch.setattr(time, "time", lambda skew=skew: real_time() + skew)
             reauthed = await service.reauth(identity, PW, token=token, client=client)
             assert reauthed.ok is True and reauthed.token is not None
             token = reauthed.token
+            # Seen after this re-anchor, so only the next re-anchor can make it new again. After
+            # the second, stepped-back one it must be new: that reset is the property under test.
+            # The flag answers True for a repeat too, so the written row is what discriminates.
+            rows_before = len(await _new_ip_rows(store))
+            assert await service.flag_new_client_ip(token, "10.3.3.3", path="/users") is True
+            assert (await _new_ip_rows(store))[rows_before:] == ["10.3.3.3"], client
         monkeypatch.setattr(time, "time", real_time)
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
-        assert await _new_ip_rows(store) == ["10.2.2.2", "10.2.2.2"]
+        assert await _new_ip_rows(store) == ["10.2.2.2", "10.3.3.3", "10.3.3.3", "10.2.2.2"]
     finally:
         await store.close()
 
