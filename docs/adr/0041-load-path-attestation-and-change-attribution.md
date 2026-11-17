@@ -326,7 +326,7 @@ fingerprint+git-HEAD covers more cheaply for now.
   never bricked.
   → `tests/test_startup_attestation.py::test_editable_install_is_noop`
 - **AC-13** — WHERE `[integrity].fail_closed_on_drift` is true, IF startup attestation compared **no** file
-  against a baseline on an install that does not declare itself editable — an absent, empty or
+  against a baseline, and found no drift, on an install that does not declare itself editable — an absent, empty or
   package-row-less `RECORD`, an unresolvable install root, or a package loaded from outside the install
   root (since BACKLOG #5376, the `_attest_distribution` docstring in `messagefoundry/integrity.py`
   states which loads count as outside) — THEN THE SYSTEM SHALL log at WARNING, record the `startup_integrity` row, fire the `AlertSink`,

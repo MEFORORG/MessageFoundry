@@ -550,7 +550,9 @@ def _console_loaded_files() -> list[Path] | None:
 
     def unlistable(error: OSError) -> None:
         if error.filename is not None:
-            files.add(_record_place(error.filename))
+            # Already at its place: the walk started at one. Placing it again would resolve a
+            # linked package directory out of the install root, where the directory is skipped.
+            files.add(Path(error.filename))
 
     search = getattr(module, "__path__", None)
     if search is None:
@@ -799,6 +801,8 @@ def _attest_distribution(
         )
         if rel is None:
             continue  # loaded from outside the install root — not attestable against this RECORD
+        if rel in seen:
+            continue  # a second root, such as a link alias, reaching a place already compared
         seen.add(rel)
         expected = record.get(rel)
         if expected is None:

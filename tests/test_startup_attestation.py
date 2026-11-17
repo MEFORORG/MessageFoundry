@@ -1938,6 +1938,54 @@ def test_a_console_package_directory_linked_out_of_the_root_is_read_through_the_
     )
 
 
+def test_an_unlistable_directory_in_a_linked_out_console_is_named_as_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk reports the directory at its place under the link, and it stays there: placing it
+    again would resolve it out of the install root, where the classifier skips it."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    _link_out(package_dir, tmp_path / "outside" / _CONSOLE_PKG)
+    _load_fake_console(monkeypatch, package_dir)
+    static = package_dir / "static"
+    real_scandir = os.scandir
+
+    def scandir(path: Any = ".") -> Any:
+        if Path(path) == static:
+            raise PermissionError(13, "denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [
+        (f"{_CONSOLE_PKG}/static", "missing"),
+        (f"{_CONSOLE_PKG}/static/app.css", "missing"),
+        (f"{_CONSOLE_PKG}/static/app.js", "missing"),
+    ]
+    assert console.checked == 2
+
+
+def test_two_roots_reaching_one_place_compare_each_file_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``__path__`` holding the real directory and a link alias to it: each file is one ``RECORD``
+    row, so it is counted once and a changed one is one drift entry."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    (package_dir / "static" / "app.js").write_bytes(b"fetch('/steal');\n")
+    alias = tmp_path / "ahead_on_sys_path" / _CONSOLE_PKG
+    alias.parent.mkdir()
+    _symlink(alias, package_dir, directory=True)
+    _console_module(monkeypatch, __path__=[str(package_dir), str(alias)])
+
+    console = integ.attest_console()
+    assert console is not None
+    assert console.checked == len(_CONSOLE_FILES)
+    assert _drift(console) == [(f"{_CONSOLE_PKG}/static/app.js", "hash_mismatch")]
+
+
 @pytest.mark.parametrize("shape", ["intact", "changed", "emptied"])
 def test_an_engine_package_directory_linked_out_of_the_root_is_read_through_the_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
