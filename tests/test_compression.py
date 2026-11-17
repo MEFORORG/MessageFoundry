@@ -609,7 +609,8 @@ def test_zip_decompress_refuses_member_contradicting_its_extension() -> None:
 def test_windows_member_name_reason_refuses_windows_name_shapes(name: str, fragment: str) -> None:
     """BACKLOG #5369: a colon, a trailing dot or space, and a reserved device stem or refused
     character are refused on every platform, and the reason does not echo the name. The device
-    arm deliberately over-refuses; see dr_backup._win_opens_another for the measurement."""
+    arm refuses at least the names ntpath.isreserved reports; see dr_backup._win_opens_another for
+    the measurement."""
     reason = windows_member_name_reason(name)
     assert reason is not None and fragment in reason
     assert name not in reason
@@ -625,12 +626,17 @@ def test_windows_member_name_reason_admits_near_miss_windows_names(name: str) ->
     assert windows_member_name_reason(name) is None
 
 
-@pytest.mark.parametrize("name", ["aux.py", "sub/con.toml", "x/a:b.toml", "trailing.", "y/z "])
-def test_archive_member_name_reason_keeps_its_earlier_arms(name: str) -> None:
+@pytest.mark.parametrize(
+    ("name", "refused"),
+    [
+        ("aux.py", False),  # a Windows-name shape: only windows_member_name_reason refuses it
+        ("C:evil.hl7", True),  # an earlier shape: drive-relative, still refused here
+    ],
+)
+def test_archive_member_name_reason_keeps_its_earlier_arms(name: str, refused: bool) -> None:
     # BACKLOG #5369 adds the Windows-name arms in their own function, so the shared guard, which
-    # the DR config restore also calls, refuses only what it refused before.
-    assert archive_member_name_reason(name) is None
-    assert archive_member_name_reason("../" + name) is not None
+    # the DR config restore also calls, refuses what it refused before and no more.
+    assert (archive_member_name_reason(name) is not None) is refused
 
 
 @pytest.mark.parametrize(

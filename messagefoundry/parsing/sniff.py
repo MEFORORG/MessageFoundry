@@ -358,7 +358,8 @@ def windows_member_name_reason(name: str) -> str | None:
     ending in a dot or space (``a.hl7.`` opens ``a.hl7``, and its extension would read as ``.`` and
     skip the content check) are refused. So is a component :func:`ntpath.isreserved` names: a
     reserved device stem (``NUL``, ``con.hl7``, ``COM1``, ``CONIN$``) or a character Windows refuses
-    in a name. That arm is a static list and deliberately over-refuses, since which names Windows
+    in a name. That arm is a static list and refuses at least the names ntpath.isreserved reports,
+    since which names Windows
     rewrites differs by build; the measurement is recorded once, on
     :func:`messagefoundry.pipeline.dr_backup._win_opens_another`. These arms do NOT refuse every
     alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or a long name beside its
