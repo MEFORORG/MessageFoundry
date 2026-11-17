@@ -8286,15 +8286,30 @@ def _check_source_ip_allowlist(
 ) -> tuple[str, ...] | None:
     """Validate an inbound peer-IP allowlist and freeze it to a tuple. Each entry must parse as an IP
     address or a CIDR network; the allowlist is only meaningful for an MLLP/TCP/X12/DIMSE **listen**
-    source. ``None``/empty = no restriction (the ``[egress]`` allowlist convention)."""
-    if not allowlist:
+    source. ``None``/empty = no restriction (the ``[egress]`` allowlist convention).
+
+    The allowlist is read once into a tuple before anything tests or iterates it, so a single-pass
+    iterable such as a generator is validated and returned whole, rather than consumed by the
+    validation loop and frozen empty, which a listener would read as no restriction (BACKLOG
+    #5333). A bare string is refused rather than read as one entry per character. An allowlist
+    given on a source that does not listen is refused even when it is empty, so the listen-source
+    rule does not depend on the value."""
+    if allowlist is None:
         return None
+    if isinstance(allowlist, (str, bytes)) or not isinstance(allowlist, Iterable):
+        raise WiringError(
+            f"inbound connection {name!r}: source_ip_allowlist must be a list of IP addresses or "
+            "CIDR networks, not a single value"
+        )
+    entries = tuple(allowlist)
     if not listens:
         raise WiringError(
             f"inbound connection {name!r}: source_ip_allowlist is only valid for an "
             "MLLP/TCP/X12/DIMSE listen source"
         )
-    for position, entry in enumerate(allowlist):
+    if not entries:
+        return None
+    for position, entry in enumerate(entries):
         if not isinstance(entry, str) or not entry.strip():
             raise WiringError(
                 f"inbound connection {name!r}: source_ip_allowlist entries must be non-empty strings"
@@ -8304,7 +8319,7 @@ def _check_source_ip_allowlist(
                 f"inbound connection {name!r}: source_ip_allowlist entry {position} is not a valid "
                 "IP address or CIDR network (value withheld)"
             )
-    return tuple(allowlist)
+    return entries
 
 
 def _is_ip_or_network(entry: str) -> bool:
