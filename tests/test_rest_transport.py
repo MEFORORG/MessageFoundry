@@ -145,6 +145,45 @@ def test_rest_basic_auth_header() -> None:
     assert dest._headers["Authorization"] == "Basic dTpw"  # base64("u:p")
 
 
+_AUTH_SECRET = "ZZAUTHSECRET5354"
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"basic_user": "svc"},
+        {"basic_password": _AUTH_SECRET},
+        {"basic_user": "svc", "basic_password": ""},  # an env() value that resolved empty
+        {"basic_user": "", "basic_password": _AUTH_SECRET},
+    ],
+)
+def test_rest_half_basic_pair_is_refused(over: dict[str, str]) -> None:
+    """BACKLOG #5354: one Basic half alone used to build and send no Authorization at all."""
+    with pytest.raises(rest_mod.HttpAuthError, match="must be set together") as ei:
+        _dest(**over)
+    assert "connection 'OB_REST'" in str(ei.value)
+    assert _AUTH_SECRET not in str(ei.value)
+
+
+def test_rest_basic_user_with_a_colon_is_refused() -> None:
+    """RFC 7617 splits the pair at the first colon, so the server would read a different user."""
+    with pytest.raises(rest_mod.HttpAuthError, match="must not contain ':'") as ei:
+        _dest(basic_user="svc:x", basic_password=_AUTH_SECRET)
+    assert _AUTH_SECRET not in str(ei.value) and "svc:x" not in str(ei.value)
+
+
+def test_rest_bearer_token_beside_basic_is_refused() -> None:
+    """Basic used to replace the configured bearer_token in the one Authorization header, silently."""
+    with pytest.raises(rest_mod.HttpAuthError, match="configure exactly one") as ei:
+        _dest(bearer_token=_AUTH_SECRET, basic_user="svc", basic_password=_AUTH_SECRET)
+    assert _AUTH_SECRET not in str(ei.value)
+
+
+def test_rest_bearer_token_alone_still_sends_it() -> None:
+    dest = _dest(bearer_token="tok")
+    assert dest._headers["Authorization"] == "Bearer tok"
+
+
 def test_rest_rejects_over_length_url() -> None:
     # WP-L3-09 (ASVS 4.2.5): an over-length URL is rejected at construction with a clear config error.
     long_url = URL + "a" * 9000

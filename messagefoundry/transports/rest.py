@@ -2800,6 +2800,35 @@ def egress_route_from_settings(
     )
 
 
+def _refuse_unsendable_static_auth(s: Mapping[str, Any], *, connection: str | None) -> None:
+    """Refuse at construction a static REST credential :meth:`RestDestination._build_headers`
+    could not send as configured (BACKLOG #5354). Read on the resolved settings, since the
+    factory sees ``env()`` references and cannot tell one that resolves empty from a set value.
+
+    One Basic half without the other, or a half that resolves empty, would send no Authorization
+    at all. A ``:`` in ``basic_user`` would move the rest of the user into the password, since RFC
+    7617 splits the pair at the first colon. ``bearer_token`` beside a Basic pair would be replaced
+    by it without a word. Each refusal names settings, never a value. Digest beside either was
+    already refused by ``refuse_http_digest_conflicts``."""
+    prefix = hop_name_prefix(connection)
+    user, password = s.get("basic_user"), s.get("basic_password")
+    if bool(user) != bool(password):
+        raise HttpAuthError(
+            f"{prefix}REST destination basic_user and basic_password must be set together, and "
+            "neither may resolve empty; one without the other would send no HTTP Basic credential"
+        )
+    if user and ":" in str(user):
+        raise HttpAuthError(
+            f"{prefix}REST destination basic_user must not contain ':'; HTTP Basic splits the "
+            "user from the password at the first colon (RFC 7617)"
+        )
+    if user and s.get("bearer_token"):
+        raise HttpAuthError(
+            f"{prefix}REST destination sets both bearer_token and basic_user/basic_password; "
+            "they share the Authorization header, so configure exactly one"
+        )
+
+
 class RestDestination(DestinationConnector):
     """Deliver each transformed payload to an HTTP(S) endpoint (outbound only today)."""
 
@@ -2848,6 +2877,7 @@ class RestDestination(DestinationConnector):
         )
 
         digest_selected = refuse_http_digest_conflicts(s)
+        _refuse_unsendable_static_auth(s, connection=config.name)
         # ADR 0139 (ASVS 12.1.5): opt-in ECH SNI-hiding. When set, this connection re-addresses each
         # request to a loopback terminating sidecar at send time (see _ech_request); destination TLS +
         # ECH are the sidecar's, so no forward proxy is used. Off (default) → None → byte-identical.
