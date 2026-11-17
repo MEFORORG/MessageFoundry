@@ -540,8 +540,9 @@ def _console_loaded_files() -> list[Path] | None:
 
     **Each root is walked at its** :func:`_record_place`, and nothing under it is resolved, as in the
     engine walk (:func:`_import_capable_files`). ``Path.walk`` does not follow a symlinked directory
-    under the root; it reports it as a file, which has no ``RECORD`` row and so is drift. A directory the walk cannot list is returned too, as the engine
-    walk returns one, so it is drift as well (BACKLOG #5376).
+    under the root; it reports it as a file, which has no ``RECORD`` row and so is drift. A directory
+    the walk cannot list is returned too, as the engine walk returns one, so it is drift as well
+    (BACKLOG #5376).
     """
     module = sys.modules.get(_CONSOLE_PACKAGE)
     if module is None:
@@ -752,8 +753,9 @@ def _attest_distribution(
     attested-nothing rather than turning into a list of every file it did not load. This paragraph is
     where the trigger is stated; ADR 0041 AC-13 and ``docs/CONFIGURATION.md`` point here.
 
-    A file sits under the install root at its own path or at its :func:`_record_place`, so a package
-    reached through a link from outside the install root into it is compared as if loaded there.
+    A file under one of ``package_roots`` that is a link from outside the install root into the
+    package is compared at the place the link resolves to, as if loaded there. A file under any other
+    root outside the install root is not compared.
 
     ``checked`` counts a file only once its bytes were read.
     """
@@ -792,13 +794,34 @@ def _attest_distribution(
         log.debug("integrity: could not resolve the %s install root; nothing to attest", dist_name)
         return _nothing_attested("install_root_unresolvable")
 
+    prefix = f"{package}/"
+
+    def in_package(rel: str | None) -> bool:
+        return rel is not None and (rel == package or rel.startswith(prefix))
+
+    # Each root at its record place, and fully resolved. A root whose place is outside the install
+    # root but which resolves into the package is a link from elsewhere into it.
+    places = [(_record_place(root), Path(root).resolve()) for root in package_roots]
+    aliases = [
+        (place, resolved)
+        for place, resolved in places
+        if _record_relpath(place, install_root) is None
+        and in_package(_record_relpath(resolved, install_root))
+    ]
+
+    def record_rel(file: Path) -> str | None:
+        rel = _record_relpath(file, install_root)
+        if rel is None:
+            for place, resolved in aliases:
+                if file.is_relative_to(place):
+                    return _record_relpath(resolved / file.relative_to(place), install_root)
+        return rel
+
     drift: list[DriftEntry] = []
     checked = 0
     seen: set[str] = set()
     for file in attested_files():
-        rel = _record_relpath(file, install_root) or _record_relpath(
-            _record_place(file), install_root
-        )
+        rel = record_rel(file)
         if rel is None:
             continue  # loaded from outside the install root — not attestable against this RECORD
         if rel in seen:
@@ -825,10 +848,6 @@ def _attest_distribution(
         checked += 1
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
-    prefix = f"{package}/"
-
-    def in_package(rel: str | None) -> bool:
-        return rel is not None and (rel == package or rel.startswith(prefix))
 
     # The package-root trigger matches a root twice: at its record place, so a package directory
     # swapped for a link still names the place `RECORD` describes, and fully resolved, so a link from
@@ -836,9 +855,9 @@ def _attest_distribution(
     read_back = unmatched_rows is not None and (
         bool(seen)
         or any(
-            in_package(_record_relpath(_record_place(root), install_root))
-            or in_package(_record_relpath(Path(root).resolve(), install_root))
-            for root in package_roots
+            in_package(_record_relpath(place, install_root))
+            or in_package(_record_relpath(resolved, install_root))
+            for place, resolved in places
         )
     )
     if unmatched_rows is not None and read_back:  # the first test narrows the type for mypy

@@ -326,11 +326,11 @@ fingerprint+git-HEAD covers more cheaply for now.
   never bricked.
   → `tests/test_startup_attestation.py::test_editable_install_is_noop`
 - **AC-13** — WHERE `[integrity].fail_closed_on_drift` is true, IF startup attestation compared **no** file
-  against a baseline, and found no drift, on an install that does not declare itself editable — an absent, empty or
-  package-row-less `RECORD`, an unresolvable install root, or a package loaded from outside the install
-  root (since BACKLOG #5376, the `_attest_distribution` docstring in `messagefoundry/integrity.py`
-  states which loads count as outside) — THEN THE SYSTEM SHALL log at WARNING, record the `startup_integrity` row, fire the `AlertSink`,
-  and **refuse to start**. Under the default alert-only posture it SHALL still log, record and alert.
+  against a baseline, and found no drift, on an install that does not declare itself editable — an
+  absent, empty or package-row-less `RECORD`, an unresolvable install root, or a package loaded from
+  outside the install root (since BACKLOG #5376, the `_attest_distribution` docstring in
+  `messagefoundry/integrity.py` states which loads count as outside) — THEN THE SYSTEM SHALL log at
+  WARNING, record the `startup_integrity` row, fire the `AlertSink`, and **refuse to start**. Under the default alert-only posture it SHALL still log, record and alert.
   → `tests/test_startup_attestation.py::test_attested_nothing_fails_closed_when_opted_in`
   → `tests/test_startup_attestation.py::test_attested_nothing_warns_records_and_alerts_under_alert_only`
 - **AC-14** — WHERE `[integrity].fail_closed_on_drift` is true AND the install declares itself editable,
@@ -409,7 +409,7 @@ fingerprint+git-HEAD covers more cheaply for now.
 > trust-domain residual again, since such code could as easily rewrite this module. The engine arm
 > still resolves each file before
 > comparing it, so an engine module swapped for a symlink to a file outside the install root is
-> skipped rather than compared; the console arm resolves only directories and does not have this gap.
+> skipped rather than compared; the console arm does not resolve the file and does not have this gap.
 > And neither arm reads `__pycache__`, because `RECORD` carries no hash for compiled caches: a crafted
 > cache whose header matches its `.py` is imported without either arm looking at it.
 
@@ -453,8 +453,8 @@ fingerprint+git-HEAD covers more cheaply for now.
 >
 > Decided under the owner's standing rule for a clear adversarial-review recommendation, 2026-10-06.
 >
-> **The engine arm no longer resolves each file**, only the package root, the way the console arm
-> already did, and the same holds for the declared assets. So the symlink residual the 2026-09-25
+> **The engine arm no longer resolves each file**, the way the console arm already did, and the same
+> holds for the declared assets. So the symlink residual the 2026-09-25
 > amendment recorded for the engine arm is closed: a module or asset swapped for a symlink to a file
 > outside the install root is hashed in place and reads as `hash_mismatch`, and a planted one has no
 > row. The walk never descends a link or junction and reports one instead, so a junction loop cannot
@@ -466,7 +466,10 @@ fingerprint+git-HEAD covers more cheaply for now.
 > Bytecode planted under the config tree is vault BACKLOG #2596, and `.pth` files and other start-up
 > code in `site-packages` are vault BACKLOG #2701. A FIFO, device or socket planted under an import
 > name is not listed by the engine walk unless it sits at a `RECORD` path. Since BACKLOG #5376 the
-> console arm's walk also names a directory it cannot list, as `missing` drift. The D3 trust-domain
+> console arm's walk also names a directory it cannot list, as `missing` drift. Since BACKLOG #5376
+> both arms also walk each package root at its `RECORD` place without resolving it, so a package
+> directory swapped for a link out of the install root is read through the link and compared, as a
+> swapped file is; `_record_place` in `messagefoundry/integrity.py` says why. The D3 trust-domain
 > residual applies unchanged: an adversary who also re-seals `RECORD` passes clean.
 
 ## Options considered

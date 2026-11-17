@@ -913,6 +913,7 @@ _ENGINE_PKG = "mfengine"
 #: Captured before any test stubs them, so a test can run the real bodies.
 _REAL_LOADED_MODULE_FILES = integ._loaded_module_files
 _REAL_LOADED_PACKAGE_ROOTS = integ._loaded_package_roots
+_REAL_ATTESTED_ASSET_FILES = integ._attested_asset_files
 _ENGINE_FILES = {
     f"{_ENGINE_PKG}/__init__.py": b"VERSION = '1.0'\n",
     f"{_ENGINE_PKG}/redaction.py": b"def redact(value):\n    return '***'\n",
@@ -1967,6 +1968,31 @@ def test_an_unlistable_directory_in_a_linked_out_console_is_named_as_drift(
     assert console.checked == 2
 
 
+def test_a_shadow_package_with_a_subdirectory_linked_in_stays_attested_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real package directory outside the install root, with one subdirectory linked into the
+    installed package: the root is not a link into the package, so none of its files is compared,
+    and the read-back does not turn the shadow into a list of rows it never loaded. The real walk,
+    asset and root lookups run over ``messagefoundry.__path__``."""
+    import messagefoundry
+
+    site = tmp_path / "site"
+    _install_with_asset(site, monkeypatch, declare_asset=True)
+    shadow = tmp_path / "cwd" / "mfengine"
+    shadow.mkdir(parents=True)
+    (shadow / "__init__.py").write_bytes(b"planted = True\n")
+    _symlink(shadow / "auth", site / "mfengine" / "auth", directory=True)
+    monkeypatch.setattr(messagefoundry, "__path__", [str(shadow)])
+    monkeypatch.setattr(integ, "_loaded_module_files", _REAL_LOADED_MODULE_FILES)
+    monkeypatch.setattr(integ, "_attested_asset_files", _REAL_ATTESTED_ASSET_FILES)
+    monkeypatch.setattr(integ, "_loaded_package_roots", _REAL_LOADED_PACKAGE_ROOTS)
+
+    result = attest_engine()
+    assert result.drift == [] and result.checked == 0
+    assert result.unattested_reason == _NOTHING_UNDER_ROOT
+
+
 def test_two_roots_reaching_one_place_compare_each_file_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2017,7 +2043,9 @@ def test_the_engine_package_root_trigger_reads_the_loaded_package(
 ) -> None:
     """The real ``_loaded_package_roots`` and ``_loaded_module_files``, over ``messagefoundry.__path__``
     pointed at an emptied fabricated package. The paired arm stubs only the roots to nothing, so the
-    real roots are what turn attested-nothing into ``missing`` drift."""
+    real roots are what turn attested-nothing into ``missing`` drift HERE, where the asset lookup is
+    stubbed to none. In a real install the declared asset paths are listed whether or not they exist,
+    so they start the read-back on their own; this pins the root lookup, not a production outcome."""
     import messagefoundry
 
     package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
