@@ -88,7 +88,9 @@ function Get-SeatLockReading {
         already read the registry, so a report over many locks reads it once.
     #>
     # -Worktree is the locked tree, so a fresh registry record that names no session vetoes only the
-    # locks whose tree it overlaps rather than every lock on the box (BACKLOG #5491).
+    # locks whose tree it overlaps rather than every lock on the box (BACKLOG #5491). It is placed by
+    # the path git resolves, not its spelling alone, so a cwd that may be an alias of the tree, or that
+    # cannot be placed, still vetoes (Test-AnonymousRecordReachesResolved).
     param([string]$SessionKey, [string[]]$ConfigRoot, [Nullable[int]]$Unreadable, [string]$Worktree)
     # session-registry.ps1's fence reads its record fields without throwing under StrictMode since
     # BACKLOG #5491. This stays off for any read below it that is still bare, under a caller's
@@ -97,7 +99,10 @@ function Get-SeatLockReading {
     if ($SessionKey.StartsWith('codex-')) {
         return [pscustomobject]@{ State = 'CODEX'; Detail = "Claude's session registry cannot fence a Codex seat"; Gone = $false }
     }
-    try { $l = Get-SessionLiveness -SessionId $SessionKey -ConfigRoot $ConfigRoot -Worktree $Worktree }
+    # The removal paths' unbounded start skew (remove.ps1, prune-merged.ps1 and the nightly removal pass
+    # [int]::MaxValue to Get-WorktreeOccupancy), so a session the removal fence reads LIVE never reads
+    # STALE, and so gone, here.
+    try { $l = Get-SessionLiveness -SessionId $SessionKey -ConfigRoot $ConfigRoot -Worktree $Worktree -ResolveAnonymousCwd -StartSkewMinutes ([int]::MaxValue) }
     catch { return [pscustomobject]@{ State = 'UNREADABLE'; Detail = "the liveness lookup failed: $($_.Exception.Message)"; Gone = $false } }
     if ((-not $l.Found) -and $l.State -eq 'UNKNOWN') {
         if ($null -eq $Unreadable) {

@@ -175,7 +175,8 @@ foreach ($row in $sessionRows) {
     # and it counts in liveWithoutRecord below too: no seat record can be matched to it, so the
     # roster is incomplete by it until it names its session.
     $liveSid = [string](Get-RecordField $row.Record 'sessionId')
-    $l = Test-RecordLiveness -Record $row.Record
+    # The same unbounded start skew as the seat lookup below, so the two count one session alike.
+    $l = Test-RecordLiveness -Record $row.Record -StartSkewMinutes ([int]::MaxValue)
     if ($l.State -eq 'LIVE') {
         $liveInRepo += [pscustomobject]@{
             SessionId = $liveSid
@@ -195,7 +196,7 @@ $anonymousLive = @()
 $anonymousNoCwd = @()
 $anonymousReadError = ''
 try {
-    $fresh = @(Get-AnonymousSessionRecords -Records $sessionRows | Where-Object { $_.Fresh })
+    $fresh = @(Get-AnonymousSessionRecords -Records $sessionRows -StartSkewMinutes ([int]::MaxValue) | Where-Object { $_.Fresh })
     $anonymousLive = @($fresh | ForEach-Object { $_.File })
     $anonymousNoCwd = @($fresh | Where-Object { -not $_.Cwd } | ForEach-Object { $_.File })
 } catch {
@@ -408,7 +409,9 @@ function Get-AgeHours($iso) {
 $legacyKeyOf = @{}
 foreach ($r in $records) {
     $tree = $r.Box
-    $w = if ($r.Rec.PSObject.Properties.Name -contains 'worktree') { [string]$r.Rec.worktree } else { '' }
+    # Get-RecordField, not `.PSObject.Properties.Name`: a seat record holding `{}` has no properties,
+    # and that read throws under StrictMode, as the registry loops above say (BACKLOG #5491).
+    $w = [string](Get-RecordField $r.Rec 'worktree')
     # A worktree that does not normalise to a path names no key; that record keeps its own box.
     try {
         if ($w -and -not $legacyKeyOf.ContainsKey($w)) { $legacyKeyOf[$w] = ConvertTo-LegacyBoxKey -Path $w }
@@ -416,7 +419,7 @@ foreach ($r in $records) {
             $tree = ConvertTo-BoxKey -Path $w -HostName (Get-CoordRecordHost $r.Rec)
         }
     } catch { $tree = $r.Box }
-    $sk = if ($r.Rec.PSObject.Properties.Name -contains 'sessionKey') { [string]$r.Rec.sessionKey } else { '' }
+    $sk = [string](Get-RecordField $r.Rec 'sessionKey')
     $r | Add-Member -NotePropertyName Tree -NotePropertyValue $tree -Force
     $r | Add-Member -NotePropertyName SessionKey -NotePropertyValue $sk -Force
 }
@@ -430,8 +433,10 @@ $rows = @()
 $lookupFailures = @()
 foreach ($r in $records) {
     $rec = $r.Rec
-    $wt = if ($rec.PSObject.Properties.Name -contains 'worktree') { [string]$rec.worktree } else { '' }
-    $sid = if ($rec.PSObject.Properties.Name -contains 'sessionId') { [string]$rec.sessionId } else { $null }
+    # Every field of a seat record is read through Get-RecordField, which answers `{}` under
+    # StrictMode where `.PSObject.Properties.Name` throws (BACKLOG #5491).
+    $wt = [string](Get-RecordField $rec 'worktree')
+    $sid = [string](Get-RecordField $rec 'sessionId')
 
     # Fence state, positive answers only. There is no heartbeat on this host and registry writes are
     # event-driven, so nothing here can PROVE a session is gone -- only that it is present.
@@ -444,15 +449,18 @@ foreach ($r in $records) {
         # while one in another worktree leaves this seat's own verdict alone.
         # A lookup that throws is an unevaluated fence, not a gone session: UNREADABLE reads POSSIBLY
         # RUNNING, where UNKNOWN read INTERRUPTED and invited a respawn (BACKLOG #5491).
-        try { $fence = (Get-SessionLiveness -SessionId $sid -Worktree $wt).State }
+        # The removal paths' unbounded start skew (remove.ps1, prune-merged.ps1 and the nightly removal
+        # pass [int]::MaxValue to Get-WorktreeOccupancy), so a session the removal fence reads LIVE
+        # never reads STALE, and so INTERRUPTED, here.
+        try { $fence = (Get-SessionLiveness -SessionId $sid -Worktree $wt -StartSkewMinutes ([int]::MaxValue)).State }
         catch {
             $fence = 'UNREADABLE'
             $lookupFailures += "$($r.File): $($_.Exception.GetType().Name) $($_.Exception.Message)"
         }
     }
 
-    $lifecycle = if ($rec.PSObject.Properties.Name -contains 'lifecycle') { [string]$rec.lifecycle } else { 'open' }
-    $ageH = Get-AgeHours $rec.asOf
+    $lifecycle = if ($null -ne (Get-RecordField $rec 'lifecycle')) { [string](Get-RecordField $rec 'lifecycle') } else { 'open' }
+    $ageH = Get-AgeHours (Get-RecordField $rec 'asOf')
 
     # SUPERSEDED: a newer record of the same tree (above), or a later record naming this one as
     # predecessor. Without the tree, a session that crossed the box-key change reads as two seats.
@@ -468,7 +476,7 @@ foreach ($r in $records) {
             $frozenLegacy[$r.File] = $true
             continue
         }
-        $oAge = Get-AgeHours $o.Rec.asOf
+        $oAge = Get-AgeHours (Get-RecordField $o.Rec 'asOf')
         if ($null -ne $oAge -and $null -ne $ageH -and $oAge -lt $ageH) { $superseded = $true }
     }
 
@@ -491,21 +499,21 @@ foreach ($r in $records) {
     $writerStale = ($null -ne $ageH -and $ageH -gt 1 -and $state -in @('RUNNING', 'POSSIBLY RUNNING'))
 
     $declared = $null
-    if (($rec.PSObject.Properties.Name -contains 'seat') -and $rec.seat) { $declared = [string]$rec.seat }
+    if (Get-RecordField $rec 'seat') { $declared = [string](Get-RecordField $rec 'seat') }
 
     $rows += [pscustomobject]@{
         Box         = $r.Box
-        SessionKey  = if ($rec.PSObject.Properties.Name -contains 'sessionKey') { [string]$rec.sessionKey } else { '' }
+        SessionKey  = [string](Get-RecordField $rec 'sessionKey')
         Seat        = $declared
         State       = $state
         Fence       = $fence
         AgeHours    = $ageH
         WriterStale = $writerStale
-        Branch      = if ($rec.PSObject.Properties.Name -contains 'branch') { [string]$rec.branch } else { $null }
+        Branch      = if ($null -ne (Get-RecordField $rec 'branch')) { [string](Get-RecordField $rec 'branch') } else { $null }
         Worktree    = $wt
         Host        = Get-CoordRecordHost $rec
         IsHere      = $isHere
-        Epoch       = if ($rec.PSObject.Properties.Name -contains 'poolEpoch') { [int]$rec.poolEpoch } else { $null }
+        Epoch       = if ($null -ne (Get-RecordField $rec 'poolEpoch')) { [int](Get-RecordField $rec 'poolEpoch') } else { $null }
         Rec         = $rec
         File        = $r.File
     }
@@ -540,8 +548,12 @@ if ($null -eq $originMainFetchAgeMinutes) {
 $ptrTotal = 0; $ptrDangling = 0; $ptrDrifted = 0; $ptrUnreadable = 0; $ptrOtherHost = 0
 $ptrBoxes = @{}
 foreach ($o in $records) {
-    $h = $o.Rec.handoff
-    if (-not ($h -and $h.path)) { continue }
+    # Through Get-RecordField: a seat record or a handoff holding `{}` has no such property, and a
+    # bare read throws under StrictMode (BACKLOG #5491).
+    $h = Get-RecordField $o.Rec 'handoff'
+    $hPath = [string](Get-RecordField $h 'path')
+    $hBytes = Get-RecordField $h 'bytes'
+    if (-not $hPath) { continue }
     # Another PC's pointer names a path on that PC. Test-Path here would call it dangling and fire the
     # stop below for a document that resolves where it was written, so it is counted apart.
     if (-not (Test-CoordRecordIsHere $o.Rec)) { $ptrOtherHost++; continue }
@@ -557,8 +569,8 @@ foreach ($o in $records) {
     # remediates. Both are printed so a reader can see 5-across-4 rather than inferring 5 seats.
     $ptrBoxes[$o.Tree] = $true
     try {
-        if (-not (Test-Path -LiteralPath ([string]$h.path) -PathType Leaf)) { $ptrDangling++ }
-        elseif ($null -ne $h.bytes -and [long]$h.bytes -ne (Get-Item -LiteralPath ([string]$h.path) -EA Stop).Length) { $ptrDrifted++ }
+        if (-not (Test-Path -LiteralPath $hPath -PathType Leaf)) { $ptrDangling++ }
+        elseif ($null -ne $hBytes -and [long]$hBytes -ne (Get-Item -LiteralPath $hPath -EA Stop).Length) { $ptrDrifted++ }
     } catch { $ptrUnreadable++ }
 }
 # BACKLOG #1372: A DRIFTED POINTER IS NOT A BROKEN ONE, so it no longer feeds this stop.
@@ -760,14 +772,16 @@ if ($Json) {
         # and a consumer that got the recorded flag would inherit the same never-re-checked value the
         # human render stopped trusting above.
         rows    = @($rows | Select-Object Box, SessionKey, Seat, State, Fence, AgeHours, WriterStale, Branch, Worktree, Host, Epoch,
-            @{n = 'HandoffPath'; e = { if ($_.Rec.handoff) { [string]$_.Rec.handoff.path } else { $null } } },
+            @{n = 'HandoffPath'; e = { $h = Get-RecordField $_.Rec 'handoff'; if ($h) { [string](Get-RecordField $h 'path') } else { $null } } },
             @{n = 'HandoffState'; e = {
-                    $h = $_.Rec.handoff
-                    if (-not ($h -and $h.path)) { return $null }
+                    $h = Get-RecordField $_.Rec 'handoff'
+                    $hPath = [string](Get-RecordField $h 'path')
+                    $hBytes = Get-RecordField $h 'bytes'
+                    if (-not $hPath) { return $null }
                     if (-not $_.IsHere) { return 'not-checkable-here' }
                     try {
-                        if (-not (Test-Path -LiteralPath ([string]$h.path) -PathType Leaf)) { return 'dangling' }
-                        if ($null -ne $h.bytes -and [long]$h.bytes -ne (Get-Item -LiteralPath ([string]$h.path) -EA Stop).Length) { return 'drifted' }
+                        if (-not (Test-Path -LiteralPath $hPath -PathType Leaf)) { return 'dangling' }
+                        if ($null -ne $hBytes -and [long]$hBytes -ne (Get-Item -LiteralPath $hPath -EA Stop).Length) { return 'drifted' }
                         return 'resolves'
                     } catch { return 'unreadable' }
                 }

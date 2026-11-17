@@ -555,11 +555,13 @@ def _fleet(
     coord: Path | None = None,
     anon_in_seat_worktree: bool = True,
     raw_records: dict[str, str] | None = None,
+    extra_seats: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run fleet.ps1 -Json over one seat whose own registry record is DEAD, beside an optional
     registry record that names no session. The record's cwd is the seat's worktree, or another
     worktree, unless ``anonymous`` sets its own. ``raw_records`` maps more registry file names to
-    their exact text. Returns the run and the anonymous record's path."""
+    their exact text, and ``extra_seats`` more seat boxes to the exact text of one seat record in
+    each. Returns the run and the anonymous record's path."""
     home = tmp_path / "home"
     root = home / ".claude"
     (root / "sessions").mkdir(parents=True)
@@ -599,6 +601,9 @@ def _fleet(
         "handoff": None,
     }
     (seat_dir / "5491dead.json").write_text(json.dumps(seat), encoding="utf-8")
+    for box, text in (extra_seats or {}).items():
+        (shared / "seats" / box).mkdir()
+        (shared / "seats" / box / "seat.json").write_text(text, encoding="utf-8")
 
     env = {
         k: v
@@ -910,28 +915,112 @@ def test_a_record_with_no_session_id_does_not_break_a_lookup_under_strict_mode(
 AUDIT = REGISTRY.parents[1] / "worktree" / "worktree-audit.ps1"
 
 
-@pytest.mark.parametrize(
-    ("anon_in_locked_tree", "listed"),
-    [(False, 1), (True, 0)],
-    ids=["anonymous-elsewhere-leaves-the-lock-listed", "anonymous-in-the-tree-vetoes"],
-)
-def test_stale_seat_locks_scope_the_anonymous_veto_to_each_locked_tree(
-    config_root: Path, tmp_path: Path, anon_in_locked_tree: bool, listed: int
-) -> None:
-    """A fresh record naming no session vetoed every lock on the box, because the lookup named no
-    worktree, so one such record hid every stale seat lock. It vetoes only the lock on its own
-    tree now."""
-    sid = "5491a0a0-0000-4000-8000-000000000000"
-    write_session(config_root, pid=never_live_pid(), session_id=sid)
-    locked = tmp_path / "wt-locked"
-    cwd = locked if anon_in_locked_tree else tmp_path / "wt-other"
-    _anonymous(
-        config_root, "99016.json", {"pid": os.getpid(), "startedAt": NOW_MS, "cwd": str(cwd)}
-    )
-    got = _strict(
-        f". '{AUDIT}'; "
+def _git_repo(path: Path) -> Path:
+    """An empty git repository at ``path``, so git can place a directory inside it."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True, capture_output=True)
+    return path
+
+
+def _stale_seat_locks(config_root: Path, locked: Path, sid: str, prelude: str = "") -> str:
+    """How many seat locks Get-StaleSeatLocks lists for one lock on ``locked`` held by ``sid``."""
+    return _strict(
+        f". '{AUDIT}'; {prelude}"
         f"$w = [pscustomobject]@{{ Path = '{locked}'; Locked = $true; "
         f"LockReason = 'builder {sid}' }}; "
         f"@(Get-StaleSeatLocks -Worktrees @($w) -ConfigRoot '{config_root}').Count"
     )
-    assert got == str(listed)
+
+
+@pytest.mark.parametrize(
+    ("anon_cwd", "listed"),
+    [
+        ("other-repo", 1),
+        ("locked", 0),
+        ("junction", 0),
+        ("relative", 0),
+        ("not-a-checkout", 0),
+    ],
+    ids=[
+        "anonymous-in-another-checkout-leaves-the-lock-listed",
+        "anonymous-in-the-tree-vetoes",
+        "a-junction-spelling-of-the-tree-vetoes",
+        "a-relative-cwd-vetoes",
+        "a-cwd-git-cannot-place-vetoes",
+    ],
+)
+def test_stale_seat_locks_scope_the_anonymous_veto_to_each_locked_tree(
+    config_root: Path, tmp_path: Path, anon_cwd: str, listed: int
+) -> None:
+    """A fresh record naming no session vetoed every lock on the box, because the lookup named no
+    worktree, so one such record hid every stale seat lock. It now leaves alone only a lock on a
+    tree git places its cwd outside of. A cwd whose spelling differs from the tree's but may be an
+    alias of it, a junction or a relative path, or one git cannot place, still vetoes as before.
+    The junction, relative and unplaceable cases listed the lock on 3c19a009b6 (negative control)."""
+    sid = "5491a0a0-0000-4000-8000-000000000000"
+    write_session(config_root, pid=never_live_pid(), session_id=sid)
+    locked = _git_repo(tmp_path / "wt-locked")
+    junction = tmp_path / "wt-alias"
+    if anon_cwd == "junction":
+        subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command"]
+            + [f"New-Item -ItemType Junction -Path '{junction}' -Target '{locked}' | Out-Null"],
+            check=True,
+            capture_output=True,
+        )
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    cwds = {
+        "other-repo": str(_git_repo(tmp_path / "wt-other")),
+        "locked": str(locked),
+        "junction": str(junction),
+        "relative": "wt-locked",
+        "not-a-checkout": str(plain),
+    }
+    _anonymous(
+        config_root,
+        "99016.json",
+        {"pid": os.getpid(), "startedAt": NOW_MS, "cwd": cwds[anon_cwd]},
+    )
+    assert _stale_seat_locks(config_root, locked, sid) == str(listed)
+
+
+# A fence stub for the start-skew plumbing: LIVE only under the removal paths' unbounded skew, STALE
+# (gone) under any bounded one, so the seat's reading names which skew its lookup passed.
+_SKEW_STUB = (
+    "function Test-RecordLiveness { param([AllowNull()][object]$Record, [int]$StartSkewMinutes = 15) "
+    "if ($StartSkewMinutes -eq [int]::MaxValue) { return @{ State = 'LIVE'; Detail = '' } } "
+    "return @{ State = 'STALE'; Detail = 'bounded skew' } }"
+)
+
+
+def test_stale_seat_locks_use_the_removal_paths_unbounded_start_skew(
+    config_root: Path, tmp_path: Path
+) -> None:
+    """A session whose process started long before it registered reads LIVE to the removal fence,
+    which passes [int]::MaxValue, and read STALE, so gone, here under the default 15 minutes. The
+    stub reads LIVE only under the unbounded skew; on 3c19a009b6 the lock was listed."""
+    sid = "5491a1a1-0000-4000-8000-000000000000"
+    write_session(config_root, pid=never_live_pid(), session_id=sid)
+    locked = tmp_path / "wt-skew"
+    assert _stale_seat_locks(config_root, locked, sid, prelude=_SKEW_STUB + "; ") == "0"
+
+
+def test_fleet_uses_the_removal_paths_unbounded_start_skew(tmp_path: Path) -> None:
+    """The twin in fleet.ps1: a seat the removal fence reads LIVE read STALE under the default skew,
+    rendered INTERRUPTED, which -Chip and respawn.ps1 treat as respawnable. On 3c19a009b6 it read
+    INTERRUPTED."""
+    proc, _ = _fleet(tmp_path, None, coord=_broken_coord(tmp_path, _SKEW_STUB))
+    row = {r["Box"]: r for r in _fleet_json(proc)["rows"]}["box-5491"]
+    assert row["Fence"] == "LIVE", row
+    assert row["State"] == "RUNNING", row
+
+
+def test_fleet_reads_an_empty_object_seat_record_under_strict_mode(tmp_path: Path) -> None:
+    """A seat record holding ``{}`` has no properties, and ``.PSObject.Properties.Name`` on it threw
+    under fleet.ps1's StrictMode Latest, ending the run with exit 1. On 3c19a009b6 it did."""
+    proc, _ = _fleet(tmp_path, None, extra_seats={"box-empty": "{}"})
+    assert "cannot be found" not in proc.stderr, proc.stderr
+    j = _fleet_json(proc)
+    boxes = {r["Box"] for r in j["rows"]}
+    assert {"box-5491", "box-empty"} <= boxes, boxes

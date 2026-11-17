@@ -363,6 +363,41 @@ function Test-AnonymousRecordReaches {
     return $w.StartsWith($c + '\', 'Ordinal') -and (Test-Path -LiteralPath "$c\.git")
 }
 
+# The path git resolves for a directory, its toplevel plus its prefix, normalized; '' when git cannot
+# place it. Git for Windows prints the real path through a junction and through an 8.3 name (measured
+# 2026-11-17; see remove.ps1's Get-ResolvedGitDir). A relative path is never placed: it would resolve
+# against this process's cwd, not the session's. Nor is any path while GIT_DIR or GIT_WORK_TREE is set,
+# since either makes git answer for a different checkout.
+function Get-GitResolvedDir([string]$Dir) {
+    if (-not $Dir -or -not [System.IO.Path]::IsPathFullyQualified($Dir)) { return '' }
+    if ($env:GIT_DIR -or $env:GIT_WORK_TREE) { return '' }
+    $top = "$(& git -C $Dir rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $top) { return '' }
+    $prefix = "$(& git -C $Dir rev-parse --show-prefix 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0) { return '' }
+    return ConvertTo-RegistryNormPath $(if ($prefix) { "$top/$prefix" } else { $top })
+}
+
+# Test-AnonymousRecordReaches, but a record whose spelling places it elsewhere still vetoes unless git
+# resolves both its cwd and the worktree and the resolved paths do not reach either. So a junction or
+# 8.3 spelling of the tree, or a relative cwd, vetoes, and so does a cwd git cannot place, as a lookup
+# naming no worktree vetoes. Whether git resolves a subst drive was not measured, so a resolved path on
+# a drive `subst` lists vetoes too, as does a run where `subst` cannot be read.
+function Test-AnonymousRecordReachesResolved {
+    param($Anonymous, [string]$Worktree)
+    if (Test-AnonymousRecordReaches $Anonymous $Worktree) { return $true }
+    $c = Get-GitResolvedDir $Anonymous.Cwd
+    $w = Get-GitResolvedDir (ConvertTo-RegistryNormPath $Worktree)
+    if (-not $c -or -not $w) { return $true }
+    try { $substOut = @(& subst.exe 2>$null) } catch [System.Management.Automation.CommandNotFoundException] { return $true }
+    if ($LASTEXITCODE -ne 0) { return $true }
+    $substDrives = @($substOut | ForEach-Object { if ("$_" -match '^([A-Za-z]):') { $Matches[1].ToLowerInvariant() } })
+    foreach ($p in @($c, $w)) {
+        if ($p -match '^([a-z]):' -and $substDrives -contains $Matches[1]) { return $true }
+    }
+    return Test-AnonymousRecordReaches ([pscustomobject]@{ Cwd = $c }) $w
+}
+
 # Look one session up by id (full or unique prefix) and fence it.
 #
 # -Worktree names the tree the caller is about to act on (a seat's worktree, a transcript's birth
@@ -376,7 +411,9 @@ function Get-SessionLiveness {
         [double]$AnonymousFreshHours = 24,
         [string]$Worktree,
         # Passed to Get-AnonymousSessionRecords, which ages the anonymous records by it.
-        [datetime]$Now = [DateTime]::UtcNow
+        [datetime]$Now = [DateTime]::UtcNow,
+        # Scope the anonymous veto with Test-AnonymousRecordReachesResolved rather than by spelling.
+        [switch]$ResolveAnonymousCwd
     )
     $records = @(Get-SessionRecords -ConfigRoot $ConfigRoot)
     $hit = @($records |
@@ -386,7 +423,10 @@ function Get-SessionLiveness {
     # Anonymous lists the vetoing records, so a caller can name the real reason for a refusal.
     $anonymousVeto = {
         $anon = @(Get-AnonymousSessionRecords -Records $records -FreshHours $AnonymousFreshHours -StartSkewMinutes $StartSkewMinutes -Now $Now)
-        $veto = @($anon | Where-Object { $_.Fresh -and (Test-AnonymousRecordReaches $_ $Worktree) })
+        $veto = @($anon | Where-Object {
+                $_.Fresh -and $(if ($ResolveAnonymousCwd) { Test-AnonymousRecordReachesResolved $_ $Worktree }
+                                else { Test-AnonymousRecordReaches $_ $Worktree })
+            })
         if ($veto.Count -gt 0) {
             $named = @($veto | ForEach-Object { if ($_.Cwd) { "$($_.File) (cwd $($_.Cwd))" } else { "$($_.File) (no readable cwd)" } })
             return @{ Veto = $true; Anonymous = $veto; Note = "but $($veto.Count) record(s) that are LIVE or were written in the last ${AnonymousFreshHours}h name no session and may be it: $($named -join '; ')" }
