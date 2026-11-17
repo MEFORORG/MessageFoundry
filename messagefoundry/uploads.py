@@ -312,7 +312,8 @@ class UploadContentError(UploadError):
 
 class UploadNotTextError(UploadContentError):
     """An upload's body is not plain text (ASVS 14.2.8): it begins with a binary container's
-    signature, holds a NUL byte, or has a control-dense 8 KiB window, as
+    signature, holds a ZIP record signature anywhere or a NUL byte, or has a control-dense 8 KiB
+    window, as
     ``parsing.sniff.nontext_upload_reason`` judges it. ``reason`` is that function's
     text. The API answers it 415, where any other :class:`UploadContentError` is 400 (BACKLOG
     #5551)."""

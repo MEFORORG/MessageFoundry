@@ -615,6 +615,25 @@ def test_archive_member_name_reason_refuses_names_windows_rewrites(
     assert name not in reason
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["CONFIG.hl7", "console.txt", "COM10.hl7", "nullable.hl7", "a. b.hl7", "auxiliary/x.hl7"],
+)
+def test_archive_member_name_reason_admits_near_miss_windows_names(name: str) -> None:
+    # The must-not-fire arm for BACKLOG #5369: a stem that only starts like a device, and a dot-space
+    # inside a component, are ordinary names.
+    assert archive_member_name_reason(name) is None
+
+
+@pytest.mark.parametrize("name", ["aux.py", "sub/con.toml", "x/a:b.toml", "trailing.", "y/z "])
+def test_archive_member_name_reason_windows_arms_can_be_turned_off(name: str) -> None:
+    # The DR config restore writes on the host it runs on, so it passes windows_names=False off
+    # Windows; the other arms still bind there.
+    assert archive_member_name_reason(name) is not None
+    assert archive_member_name_reason(name, windows_names=False) is None
+    assert archive_member_name_reason("../" + name, windows_names=False) is not None
+
+
 def test_zip_decompress_refuses_a_windows_device_member_name() -> None:
     with pytest.raises(CompressionError, match="reserves"):
         zip_decompress(_hostile_zip({"aux.hl7": _BODY}), max_output_bytes=None)

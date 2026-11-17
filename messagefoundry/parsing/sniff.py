@@ -205,7 +205,7 @@ _ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x01\x02", b"PK\x05\x06", b"PK\x07\x08")
 
 def nontext_upload_reason(data: bytes) -> str | None:
     """Return a human reason when ``data`` is NOT admissible as a plain-text uploaded log (ASVS 14.2.8),
-    else ``None``. Two independent, pure (no-I/O) rejections, reusing the 5.2.2 magic-byte families:
+    else ``None``. Three independent, pure (no-I/O) rejections, reusing the 5.2.2 magic-byte families:
 
     * a leading magic-byte signature of a metadata-bearing binary container (JPEG/PNG/PDF/ZIP incl. DOCX,
       GIF, TIFF) — these carry embedded metadata (EXIF/XMP/docProps) the text-only feature refuses to store;
@@ -228,13 +228,14 @@ def nontext_upload_reason(data: bytes) -> str | None:
     for mime, prefixes in _MAGIC_PREFIXES.items():
         if head.startswith(prefixes):
             return f"body is a {mime} container; the uploaded-logs feature accepts only plain-text logs"
+    # NUL first: one scan refuses most binaries, so the ZIP scans run only on NUL-free bodies.
+    if b"\x00" in data:
+        return "body contains NUL bytes; the uploaded-logs feature accepts only plain-text logs"
     if any(signature in data for signature in _ZIP_SIGNATURES):
         return (
             "body contains a ZIP record signature; the uploaded-logs feature accepts only "
             "plain-text logs"
         )
-    if b"\x00" in data:
-        return "body contains NUL bytes; the uploaded-logs feature accepts only plain-text logs"
     # The bytes the density counts, deleted by ``translate`` so the count runs at C speed.
     counted = bytes(
         b for b in range(256) if (b < 0x20 or b == 0x7F) and b not in _TEXT_ALLOWED_CONTROLS
@@ -321,7 +322,7 @@ def _member_extension(name: str) -> str:
     return leaf[dot:].lower() if dot > 0 else ""
 
 
-def archive_member_name_reason(name: object) -> str | None:
+def archive_member_name_reason(name: object, *, windows_names: bool = True) -> str | None:
     """Return a human reason when an archive member's name is not a safe RELATIVE path, else ``None``
     (ASVS 5.3.2). The name is chosen by whoever built the archive — for an inbound feed, a remote party —
     so it is untrusted data that a Handler will join onto a directory.
@@ -338,19 +339,23 @@ def archive_member_name_reason(name: object) -> str | None:
     a Windows separator smuggled through a slash-only check), a drive-relative prefix (``C:x.hl7`` carries
     no separator at all), and any control character.
 
-    A Handler may write a member on Windows, so a name Windows would open as some OTHER object is
-    refused too (BACKLOG #5369): a colon anywhere (``a.hl7:x`` names an NTFS alternate data stream of
-    ``a.hl7``), a component ending in a dot or space (``a.hl7.`` opens ``a.hl7``, and its extension
-    would read as ``.`` and skip the content check), and a component :func:`ntpath.isreserved` names,
-    at least a device stem (``NUL``, ``con.hl7``, ``COM1``, ``CONIN$``) and a character Windows
-    refuses in a name. That test runs on every platform: the archive's name is judged for where it
-    may be written, not where it was read.
-
     Two of those arms are unreachable through CPython's own reader, which is a fact about the library and
     not a reason to drop them. ``zipfile._sanitize_filename`` runs inside ``ZipInfo.__init__`` on the read
     path as well as the write path: it truncates a member name at the first NUL everywhere, and replaces
     ``os.sep`` with ``/`` — so the backslash arm is live wherever ``os.sep`` is not a backslash and dead on
-    Windows. Measured on CPython 3.14. A caller reading the archive by some other route still gets both."""
+    Windows. Measured on CPython 3.14. A caller reading the archive by some other route still gets both.
+
+    With ``windows_names`` (the default), some names Windows would open as another object are refused
+    too, because a Handler may write a member on Windows (BACKLOG #5369): at least a colon anywhere
+    (``a.hl7:x`` names an NTFS alternate data stream of ``a.hl7``), a component ending in a dot or
+    space (``a.hl7.`` opens ``a.hl7``, and its extension would read as ``.`` and skip the content
+    check), and a component :func:`ntpath.isreserved` names, such as a device stem (``NUL``,
+    ``con.hl7``, ``COM1``, ``CONIN$``) or a character Windows refuses in a name. They run on every
+    platform, since an archive's name is judged for where it may be written, not where it was read.
+    They do NOT refuse every alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or
+    a long name beside its 8.3 short form still pass, so a Handler writing members on Windows keeps
+    its own collision check. A caller that writes on the host it runs on, and only there, may pass
+    ``windows_names=False`` off Windows, as the DR config restore does."""
     if not isinstance(name, str) or not name:
         return "member name is empty"
     if has_control_char(name):
@@ -359,13 +364,15 @@ def archive_member_name_reason(name: object) -> str | None:
         return "member name contains a backslash, which a slash-only containment check cannot see"
     if len(name) >= 2 and name[0].isascii() and name[0].isalpha() and name[1] == ":":
         return "member name is drive-relative"
-    if ":" in name:
+    if windows_names and ":" in name:
         return "member name contains a colon, which Windows reads as a drive or a data stream"
     if name.startswith("/"):
         return "member name is an absolute path"
     for part in name.split("/"):
         if part in ("", ".", ".."):
             return "member name has an empty or relative path component"
+        if not windows_names:
+            continue
         if part.endswith((".", " ")):
             return "member name has a component ending in a dot or space, which Windows drops"
         if ntpath.isreserved(part):

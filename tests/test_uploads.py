@@ -1676,7 +1676,7 @@ _PAST_THE_SAMPLE = b"x" * 9000
 @pytest.mark.parametrize(
     "tail",
     [b"\x00binary tail", b"PK\x03\x04\x14\x00\x00\x00", bytes(range(1, 9)) * 2048],
-    # The ZIP member is caught by its record signature first, and by its NUL bytes as well.
+    # The ZIP member here carries NUL bytes, which refuse it first; the NUL-free case is below.
     ids=["nul", "zip-member-with-nul", "control-dense"],
 )
 @pytest.mark.parametrize("after", [b"", b"y" * 20_000], ids=["at-the-end", "in-the-middle"])
@@ -1713,8 +1713,9 @@ def test_a_nul_free_zip_record_past_the_head_is_refused(signature: bytes, after:
         validate_upload_content("a.hl7", data)
 
 
-def test_a_real_zip_appended_past_the_head_is_refused_as_zip() -> None:
-    """BACKLOG #5368: a whole DOCX-shaped archive appended past the sample is named as a ZIP."""
+def test_a_real_zip_appended_past_the_head_is_refused() -> None:
+    """BACKLOG #5368: a whole DOCX-shaped archive appended past the sample is refused. A real
+    archive carries NUL bytes, which refuse it first; the NUL-free test above pins the ZIP arm."""
     import io
     import zipfile
 
@@ -1724,8 +1725,7 @@ def test_a_real_zip_appended_past_the_head_is_refused_as_zip() -> None:
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("word/document.xml", "<w:document/>")
     data = b"<root/>\n" + _PAST_THE_SAMPLE + buffer.getvalue()
-    reason = nontext_upload_reason(data)
-    assert reason is not None and "ZIP" in reason
+    assert nontext_upload_reason(data) is not None
 
 
 def test_text_that_merely_mentions_pk_is_admitted() -> None:
