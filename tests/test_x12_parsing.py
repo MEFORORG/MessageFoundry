@@ -367,6 +367,61 @@ def test_split_keeps_a_malformed_interchanges_whitespace_terminator() -> None:
     assert split(bad + interchange(control="000000002")) == [bad, interchange(control="000000002")]
 
 
+@pytest.mark.parametrize("term", ["\n", "\r\n"])
+def test_split_keeps_the_whitespace_terminator_of_a_malformed_interchange_cut_at_the_next(
+    term: str,
+) -> None:
+    # A malformed interchange with no IEA ends at the next ISA that passes, and the whitespace
+    # before that ISA is stripped. Its own whitespace terminator, closing its last segment, went
+    # with it (BACKLOG #5921).
+    bad = _without_iea(_corrupt(interchange(term=term)))
+    assert bad.endswith(term)
+    good = interchange(control="000000002")
+    for between in ("", "\r\n \n"):
+        assert split(bad + between + good) == [bad, good]
+    # The reader keeps every byte before the next ISA, so its frame holds the terminator too.
+    assert _frames_of((bad + good).encode(), 4096) == [bad.encode(), good.encode()]
+
+
+# Segments whose text opens with "IEA" but whose id is longer, so they are not the trailer.
+_IEA_PREFIXED = ["IEAX*1~", "IEA2*1~", "IEAX~"]
+
+
+@pytest.mark.parametrize("term", ["~", "\n"])
+@pytest.mark.parametrize("segment", _IEA_PREFIXED)
+def test_a_segment_whose_id_only_starts_with_iea_does_not_end_an_interchange(
+    segment: str, term: str
+) -> None:
+    # Any segment opening with "IEA" ended the interchange there, without the element separator
+    # check, so the frame was cut short and the rest was framed apart or dropped (BACKLOG #5807).
+    raw = interchange(term=term).replace("GE*", segment.replace("~", term) + "GE*", 1)
+    assert split(raw) == [raw]
+    data = raw.encode()
+    for chunk in (4096, 7, 1):
+        assert _frames_of(data, chunk) == [data], chunk
+    nxt = interchange(control="000000002", term=term)
+    assert split(raw + nxt) == [raw, nxt]
+    # A corrupted header is read the same way, its +3 not trusted: still framed through its IEA.
+    bad = _corrupt(raw)
+    assert split(bad + nxt) == [bad, nxt]
+    for chunk in (4096, 7, 1):
+        assert _frames_of((bad + nxt).encode(), chunk) == [bad.encode(), nxt.encode()], chunk
+
+
+def test_a_passing_interchange_ends_only_at_iea_and_its_own_element_separator() -> None:
+    # A passing header names the element separator, so "IEA" followed by any other character is
+    # a longer segment id. A bare "IEA" segment, with no elements, is still the trailer.
+    raw = interchange().replace("GE*", "IEA^1~GE*", 1)
+    assert split(raw) == [raw]
+    assert _frames_of(raw.encode(), 4096) == [raw.encode()]
+    bare = _without_iea(interchange()) + "IEA~"
+    assert split(bare + interchange(control="000000002")) == [
+        bare,
+        interchange(control="000000002"),
+    ]
+    assert _frames_of(bare.encode(), 1) == [bare.encode()]
+
+
 def test_split_and_reader_stay_linear_over_many_malformed_interchanges() -> None:
     # Each malformed interchange used to restart the search for the next passing ISA, so k of them
     # in one buffer cost about k * k structural checks. Count the checks rather than time the run.
@@ -855,21 +910,17 @@ def test_frame_reader_byte_at_a_time() -> None:
 
 
 def test_iea_segment_whitespace_matches_the_shared_set() -> None:
-    """The frame reader's IEA pattern skips exactly the whitespace the codec strips before a segment.
+    """The framing's segment-opening whitespace patterns skip exactly the whitespace the codec
+    strips before a segment.
 
-    _IEA_SEGMENT spells its class as a literal so the static ReDoS scan can read it; this keeps that
-    literal equal to _SEGMENT_WHITESPACE, byte for byte, so the two cannot drift apart.
+    They spell their classes as literals so the static ReDoS scan can read them; this keeps those
+    literals equal to _SEGMENT_WHITESPACE, so they cannot drift apart.
     """
     from messagefoundry.parsing.x12.delimiters import _SEGMENT_WHITESPACE
-    from messagefoundry.parsing.x12.interchange import (
-        _IEA_SEGMENT,
-        _SEGMENT_WS_RUN,
-        _SEGMENT_WS_RUN_STR,
-    )
+    from messagefoundry.parsing.x12.interchange import _SEGMENT_WS_RUN, _SEGMENT_WS_RUN_STR
 
-    skipped = {chr(b) for b in range(256) if _IEA_SEGMENT.fullmatch(bytes([b, b, *b"IEA"]))}
+    skipped = {chr(b) for b in range(256) if _SEGMENT_WS_RUN.fullmatch(bytes([b, b]))}
     assert skipped == set(_SEGMENT_WHITESPACE)
-    assert {chr(b) for b in range(256) if _SEGMENT_WS_RUN.fullmatch(bytes([b]))} == skipped
     assert {chr(c) for c in range(0x10000) if _SEGMENT_WS_RUN_STR.fullmatch(chr(c))} == skipped
 
 
@@ -1355,6 +1406,63 @@ def test_a_legacy_isa11_u_on_00501_is_not_split_in_component_paths() -> None:
     assert msg["ZZ1-01.2"] == "U071"
     msg["ZZ1-01.1"] = "ABF"
     assert msg["ZZ1-01"] == "ABF:U071"
+
+
+@pytest.mark.parametrize("delims", _REPEATING_DELIMS)
+def test_a_repetition_after_the_first_is_reached_by_get_and_set(delims: dict[str, str]) -> None:
+    # Only the first repetition was reachable: a component path read it and nothing named another.
+    msg = X12Message.parse(_repeating(**delims))
+    rep, comp = msg.delimiters.repetition, msg.delimiters.component
+    assert msg.get("ZZ1-01", repetition=2) == f"C{comp}D"
+    assert msg.get("ZZ1-01.2", repetition=2) == "D"
+    assert msg.get("ZZ1-01.1", repetition=1) == "A"
+    assert msg.get("ZZ1-01", repetition=3) is None
+    assert msg.get("ZZ1-01.1", repetition=3) is None
+    msg.set("ZZ1-01.1", "X", repetition=2)
+    assert msg["ZZ1-01"] == f"A{comp}B{rep}X{comp}D"
+    msg.set("ZZ1-01", f"E{comp}F", repetition=1)  # a whole repetition, the other kept
+    assert msg["ZZ1-01"] == f"E{comp}F{rep}X{comp}D"
+    msg.set_data("ZZ1-01.1", "G", repetition=4)  # repetitions up to it are added empty
+    assert msg["ZZ1-01"] == f"E{comp}F{rep}X{comp}D{rep}{rep}G"
+    reparsed = X12Message.parse(msg.encode())
+    assert reparsed.get("ZZ1-01.1", repetition=4) == "G"
+    assert reparsed.get("ZZ1-01", repetition=3) is None
+
+
+def test_a_repetition_below_1_or_with_no_separator_is_refused() -> None:
+    msg = X12Message.parse(_repeating())
+    before = msg.encode()
+    with pytest.raises(ValueError, match="1-based"):
+        msg.get("ZZ1-01", repetition=0)
+    with pytest.raises(ValueError, match="1-based"):
+        msg.set("ZZ1-01.1", "X", repetition=0)
+    old = X12Message.parse(_repeating(rep="U", version="00401", between="^"))
+    old_before = old.encode()
+    assert old.get("ZZ1-01", repetition=1) == "A:B^C:D"  # no separator: one repetition
+    assert old.get("ZZ1-01", repetition=2) is None
+    with pytest.raises(ValueError, match="no repetition separator"):
+        old.set("ZZ1-01.1", "X", repetition=2)
+    with pytest.raises(ValueError, match="no repetition separator"):
+        msg.set("ISA-06", "X", repetition=2)
+    assert msg.encode() == before and old.encode() == old_before
+
+
+def test_a_legacy_isa11_u_on_00501_lets_a_write_carry_a_u() -> None:
+    # The legacy "U" is read as data, never split on, but every write holding a "U" was refused
+    # as if it were a separator.
+    raw = _repeating(rep="U", between="^").replace("ZZ1*A:B^C:D", "ZZ1*ABK:U071")
+    msg = X12Message.parse(raw)
+    assert msg.delimiters.repetition == "U"
+    msg["ZZ1-01.2"] = "U072"
+    msg["GS-02"] = "USER"
+    msg.set_data("ZZ1-02", "UNIT")
+    reparsed = X12Message.parse(msg.encode())
+    assert reparsed["ZZ1-01"] == "ABK:U072"
+    assert reparsed["GS-02"] == "USER"
+    assert reparsed["ZZ1-02"] == "UNIT"
+    # The real separators are still refused.
+    with pytest.raises(ValueError, match="delimiter"):
+        msg["ZZ1-02"] = "A*B"
 
 
 def test_an_isa_component_read_is_unchanged_by_the_repetition_split() -> None:
