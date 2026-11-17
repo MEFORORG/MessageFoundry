@@ -209,6 +209,12 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
             "Remove-Item -LiteralPath 'no-such-item-b4' -ErrorAction SilentlyContinue",
             "exit-1",
         ),
+        # Under Constrained Language Mode the same: a failing cmdlet and a trap exit 1.
+        (
+            "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n"
+            "trap {{ exit 2 }}; Get-Item -LiteralPath 'no-such-item-b4'",
+            "exit-1",
+        ),
         # A line continuation ending the hook must not swallow the bridge's own statement, and a
         # dangling operator must stay a parse error rather than take it in.
         ("& '{py}' -c 'import sys; sys.exit(2)' `", "block"),
@@ -240,6 +246,7 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         "stale-2-then-assignment",
         "failed-cmdlet",
         "strict-mode-failed-cmdlet",
+        "constrained-language-trap-failed-cmdlet",
         "trailing-continuation",
         "dangling-assignment",
         "dangling-pipe",
@@ -271,12 +278,13 @@ def test_a_powershell_hook_blocks_on_a_2_that_ends_it(bridge, tmp_path, command,
         "& ./guard.ps1",
         ". ./guard.ps1",
         "& ./guard.ps1 # the guard decides",
-        # A hook's own commands or default parameter values must not change how the bridge's
-        # tail reads the exit code.
+        # Each still blocks after the hook defines a Get-Variable function or alias, sets these
+        # default parameter values, or switches to Constrained Language Mode.
         "function Get-Variable { 0 }\n& ./guard.ps1",
         "Set-Alias Get-Variable Write-Output\n& ./guard.ps1",
         "$PSDefaultParameterValues['*:Exclude'] = 'LAST*'\n& ./guard.ps1",
         "$PSDefaultParameterValues['Get-Variable:Include'] = 'nothing'\n& ./guard.ps1",
+        "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n& ./guard.ps1",
     ],
     ids=[
         "called",
@@ -286,6 +294,7 @@ def test_a_powershell_hook_blocks_on_a_2_that_ends_it(bridge, tmp_path, command,
         "after-a-Get-Variable-alias",
         "after-a-default-Exclude",
         "after-a-default-Get-Variable-Include",
+        "under-constrained-language",
     ],
 )
 def test_a_powershell_hook_blocks_when_a_guard_it_runs_exits_2(bridge, tmp_path, command):

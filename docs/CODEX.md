@@ -85,13 +85,17 @@ Code does: Git Bash on Windows, else PowerShell there when Git Bash is missing.
 Structured `command` and `args` avoid shell parsing. A command-only PowerShell
 hook blocks by `exit 2`, as under Claude Code, whose hooks reference blocks a
 PowerShell hook with an explicit `exit 2`. The bridge runs it under
-`pwsh -Command`. It puts one line before the hook, turning
-`$PSNativeCommandUseErrorActionPreference` off, and appends this fixed tail after
-it, on new lines:
+`pwsh -Command`. It puts this line before the hook:
+
+```powershell
+$PSNativeCommandUseErrorActionPreference = $false; $global:LASTEXITCODE = 0
+```
+
+and appends this fixed tail after it, on new lines:
 
 ```powershell
 ;
-if (-not $?) { if ($ExecutionContext.SessionState.PSVariable.GetValue('LASTEXITCODE') -eq 2) { exit 2 }; exit 1 }
+if (-not $?) { if ($global:LASTEXITCODE -eq 2) { exit 2 }; exit 1 }
 ```
 
 The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`, and
