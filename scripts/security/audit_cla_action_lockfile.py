@@ -59,12 +59,15 @@ one in step with those two::
     python scripts/security/audit_cla_action_lockfile.py                  audit live (needs npm)
     python scripts/security/audit_cla_action_lockfile.py --report a.json  judge a saved report
 
+Both forms read a stale entry's ``withdrawn_at`` from GitHub; ``--no-lookup`` keeps a run offline.
+
 Stdlib only, like the provenance script beside it.
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import io
 import json
 import os
@@ -73,6 +76,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import urllib.request
@@ -102,13 +106,17 @@ ATTEMPTS = 5
 #: it can print why it failed. A healthy call takes a few seconds.
 NPM_TIMEOUT = 45
 
-#: Seconds one GitHub advisory lookup may wait on its socket, and how many stale entries are looked
-#: up in one run. Lookups run after the verdict is printed, but they still count against the job's
-#: ``timeout-minutes`` beside the npm retry ladder, and a test holds the sum under it. Past the cap
-#: the run prints that the rest were not looked up. One withdrawal or two is the usual case; dozens
-#: stale at once means the audit stopped seeing the tree, which COVERAGE reports.
+#: The GitHub advisory lookups for stale entries. They run after the verdict is printed, but they
+#: still count against the job's ``timeout-minutes`` beside the npm retry ladder, so they run on
+#: daemon threads under one wall-clock budget, :data:`LOOKUP_BUDGET`, and a test holds the sum
+#: under the job's limit. A socket timeout alone would not bound them: urllib applies it per socket
+#: operation and per resolved address, and name resolution not at all. At most
+#: :data:`MAX_LOOKUPS` distinct ids are looked up; past the cap the run says the rest were not.
+#: One withdrawal or two is the usual case. Lookups are skipped when COVERAGE fails, since every
+#: entry then reads stale because the audit did not see the tree.
 GITHUB_TIMEOUT = 5
 MAX_LOOKUPS = 5
+LOOKUP_BUDGET = 20.0
 
 #: GitHub's global advisory endpoint. Read without a token: the endpoint is public.
 _ADVISORY_API = "https://api.github.com/advisories/"
@@ -122,9 +130,13 @@ Finding = tuple[str, str]
 #: Runs ``npm audit`` in a directory and returns its stdout and stderr. Injected so tests need no npm.
 Runner = Callable[[Path], tuple[str, str]]
 
-#: Returns an advisory's ``withdrawn_at`` (None when not withdrawn), or raises :class:`OSError` or
-#: :class:`ValueError`. Injected so tests need no network.
+#: Returns an advisory's ``withdrawn_at``, or None when it is not withdrawn. Injected so tests need
+#: no network. :data:`_LOOKUP_ERRORS` are printed as a failed read; anything else is a defect.
 Lookup = Callable[[str], str | None]
+
+#: What a failed lookup raises: transport errors, the http.client errors urllib does not wrap (an
+#: IncompleteRead body, a bad status line), and a reply that is not the expected JSON.
+_LOOKUP_ERRORS = (OSError, http.client.HTTPException, ValueError)
 
 
 def lock_entry_count(lock: dict[str, Any]) -> int:
@@ -255,15 +267,18 @@ def evaluate(
 
 
 def stale_entries(reported: dict[Finding, dict[str, str]], baseline: set[Finding]) -> list[Finding]:
-    """The acknowledged advisories the report no longer names, in the order they are reported."""
+    """The acknowledged advisories the report no longer names, sorted by (id, package).
+
+    :func:`evaluate` and :func:`withdrawal_lines` both read this one function, so the STALE lines
+    and the WITHDRAWN_AT lines cannot come from different lists."""
     return sorted(baseline - set(reported))
 
 
 def github_withdrawn_at(ident: str) -> str | None:
     """*ident*'s ``withdrawn_at`` from GitHub's advisory database, or None when it is not withdrawn.
 
-    Raises :class:`OSError` on a transport error and :class:`ValueError` on a reply without the
-    field, so a missing field is never read as "not withdrawn".
+    Raises one of :data:`_LOOKUP_ERRORS` on a failed read, including a reply without the field,
+    so a missing field is never read as "not withdrawn".
     """
     if not _GHSA.fullmatch(ident):
         raise ValueError(f"{ident!r} is not a GitHub advisory id")
@@ -286,33 +301,62 @@ def github_withdrawn_at(ident: str) -> str | None:
     return value
 
 
-def withdrawal_lines(stale: list[Finding], lookup: Lookup) -> list[str]:
+def _look_up_all(
+    idents: list[str], lookup: Lookup, budget: float
+) -> dict[str, str | None | BaseException]:
+    """Run *lookup* for each id on a daemon thread, and wait for all of them up to *budget* seconds.
+
+    An id missing from the result did not answer in time. Its thread is left behind as a daemon, so
+    it cannot hold the process open at exit."""
+    results: dict[str, str | None | BaseException] = {}
+    # A late thread may still write after the deadline, so the copy returned below takes the lock.
+    guard = threading.Lock()
+
+    def one(ident: str) -> None:
+        answer: str | None | BaseException
+        try:
+            answer = lookup(ident)
+        except _LOOKUP_ERRORS as broken:
+            answer = broken
+        with guard:
+            results[ident] = answer
+
+    threads = [threading.Thread(target=one, args=(ident,), daemon=True) for ident in idents]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + budget
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    with guard:
+        return dict(results)
+
+
+def withdrawal_lines(
+    stale: list[Finding], lookup: Lookup, budget: float = LOOKUP_BUDGET
+) -> list[str]:
     """One line per stale entry saying what GitHub records about its withdrawal.
 
     Informational only: the caller has already decided the run is red, and nothing here changes
-    that. A failed lookup is printed with the command that reads the record by hand.
-    """
+    that. A failed or late lookup is printed with the command that reads the record by hand. Each
+    distinct id is looked up once, however many packages it is baselined under."""
+    ghsa = [ident for ident, _package in stale if _GHSA.fullmatch(ident)]
+    asked = list(dict.fromkeys(ghsa))[:MAX_LOOKUPS]
+    results = _look_up_all(asked, lookup, budget)
     lines: list[str] = []
-    looked_up = 0
     for ident, package in stale:
         prefix = f"WITHDRAWN_AT {ident} in {package}:"
         by_hand = f"Read it by hand: gh api advisories/{ident} --jq .withdrawn_at"
         if not _GHSA.fullmatch(ident):
             lines.append(f"{prefix} not a GitHub advisory id, so GitHub holds no record to read.")
-            continue
-        if looked_up >= MAX_LOOKUPS:
+        elif ident not in asked:
             lines.append(f"{prefix} not looked up, past the {MAX_LOOKUPS}-lookup cap. {by_hand}")
-            continue
-        looked_up += 1
-        try:
-            value = lookup(ident)
-        except (OSError, ValueError) as broken:
+        elif ident not in results:
+            lines.append(f"{prefix} GitHub did not answer within {budget:g} s. {by_hand}")
+        elif isinstance(value := results[ident], BaseException):
             lines.append(
-                f"{prefix} could not be read from GitHub ({_one_line(str(broken))[:200]}). "
-                + by_hand
+                f"{prefix} could not be read from GitHub ({_one_line(str(value))[:200]}). {by_hand}"
             )
-            continue
-        if value is None:
+        elif value is None:
             lines.append(
                 f"{prefix} GitHub records it as NOT withdrawn, so check its affected range "
                 "and whether the audit still sees the package."
@@ -451,6 +495,11 @@ def main(
     parser = argparse.ArgumentParser(description=summary)
     parser.add_argument("--report", type=Path, help="judge a saved `npm audit --json` report")
     parser.add_argument("--root", type=Path, default=REPO_ROOT, help="repository root")
+    parser.add_argument(
+        "--no-lookup",
+        action="store_true",
+        help="do not read a stale entry's withdrawn_at from GitHub (an offline --report run)",
+    )
     args = parser.parse_args(argv)
     root: Path = args.root
 
@@ -491,8 +540,14 @@ def main(
     for problem in problems:
         print(f"::error::{problem}")
     # After the verdict lines and outside the verdict: what GitHub says cannot turn a stale red green.
-    for line in withdrawal_lines(stale_entries(reported, baseline), lookup):
-        print(line)
+    stale = stale_entries(reported, baseline)
+    if stale and args.no_lookup:
+        print("WITHDRAWN_AT: not looked up (--no-lookup).")
+    elif stale and audited_total(report) != expected:
+        print("WITHDRAWN_AT: not looked up, because COVERAGE failed and every entry reads stale.")
+    elif stale:
+        for line in withdrawal_lines(stale, lookup):
+            print(line)
     # After the findings, so a broken provenance record cannot hide them behind its own error.
     try:
         print(f"SCOPE: {_limitation(root)}")
