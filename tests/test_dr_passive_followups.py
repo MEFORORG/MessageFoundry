@@ -757,6 +757,93 @@ async def test_a_hung_startup_check_at_an_activation_fails_its_lane_and_binds_th
         await runner.stop()
 
 
+def _with_file_lanes(tmp_path: Path, reg: Registry, *names: str) -> Registry:
+    """``reg`` with a critical File outbound added per name, each in its own directory."""
+    for name in names:
+        out = tmp_path / name
+        out.mkdir(exist_ok=True)
+        spec = ConnectionSpec(ConnectorType.FILE, {"directory": str(out)})
+        reg.add_outbound(build_outbound_connection(name, spec, priority=Priority.CRITICAL))
+    return reg
+
+
+async def test_hung_startup_checks_on_three_lanes_hold_an_activation_for_one_bound(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner ruling 2026-11-16: the bound is on the activation's inbound binds, not on each
+    lane. Three lanes leaving the DR park whose ``validate_startup`` all hang delay the binds by
+    about one bound. Red when the prepare built them one after another: the reload took about
+    three bounds and missed the deadline."""
+    bound = 1.0
+    hung = (_OB_FILE, "OB_FILE_2", "OB_FILE_3")
+    closed: list[str] = []
+    real_validate = FileDestination.validate_startup
+
+    async def hang(self: FileDestination) -> None:
+        if self.directory.name in hung:
+            await asyncio.Event().wait()
+        await real_validate(self)
+
+    async def aclose(self: FileDestination) -> None:
+        closed.append(self.directory.name)
+
+    monkeypatch.setattr(FileDestination, "validate_startup", hang)
+    monkeypatch.setattr(FileDestination, "aclose", aclose)
+    monkeypatch.setattr(wiring_runner, "_DR_PARK_BUILD_TIMEOUT_SECONDS", bound)
+    sink = _CountingSink()
+    ca = _ca(tmp_path)
+    reg = _with_file_lanes(tmp_path, _graph(tmp_path, ca, _sha(ca)), *hung[1:])
+    runner = _runner(store, reg, dr_standby=Priority.CRITICAL, alert_sink=sink)
+    await runner.start()
+    try:
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        # One bound plus a margin, well short of the three bounds a sequential prepare takes.
+        await asyncio.wait_for(runner.reload(), timeout=2.5 * bound)
+
+        assert runner.inbound_running(_IB)
+        for name in hung:
+            assert "as it left the DR park" in (runner.outbound_failed(name) or ""), name
+            assert sink.stopped.count(name) == 1, name
+            assert name not in runner._destinations
+            assert runner._dr_unbuilt.get(name) is True  # held parked, as a failed build is
+        await _wait_until(lambda: sorted(closed) == sorted(hung))
+    finally:
+        await runner.stop()
+
+
+async def test_a_hung_lane_at_an_activation_leaves_a_healthy_lane_to_go_live(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The concurrent builds share one bound, and a healthy lane among them is not failed with
+    the hung one: it builds, goes live and delivers its held row."""
+    healthy = "OB_FILE_OK"
+    real_validate = FileDestination.validate_startup
+
+    async def hang(self: FileDestination) -> None:
+        if self.directory.name == _OB_FILE:
+            await asyncio.Event().wait()
+        await real_validate(self)
+
+    monkeypatch.setattr(FileDestination, "validate_startup", hang)
+    monkeypatch.setattr(wiring_runner, "_DR_PARK_BUILD_TIMEOUT_SECONDS", 0.3)
+    ca = _ca(tmp_path)
+    reg = _with_file_lanes(tmp_path, _graph(tmp_path, ca, _sha(ca)), healthy)
+    runner = _runner(store, reg, dr_standby=Priority.CRITICAL)
+    await runner.start()
+    try:
+        row_id = await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(healthy, _ADT)])
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await asyncio.wait_for(runner.reload(), timeout=_WAIT_BOUND_SECONDS)
+
+        assert "as it left the DR park" in (runner.outbound_failed(_OB_FILE) or "")
+        assert runner.outbound_failed(healthy) is None
+        assert healthy in runner._destinations
+        assert runner.outbound_running(healthy)
+        await _delivered_on_first_claim(store, row_id, tmp_path / healthy, lane=healthy)
+    finally:
+        await runner.stop()
+
+
 async def test_the_dr_park_build_bound_leaves_an_ordinary_reload_build_alone(
     store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
