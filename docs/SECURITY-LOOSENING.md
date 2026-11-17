@@ -846,10 +846,9 @@ the next start may do.
   authenticate; and the
   key the chain's newest range is under is not configured. It refuses whether or not the key in
   use keyed an earlier range. With it on, that start goes ahead: its first audit row goes into
-  that range under the key in use, never verifies there, and the chain breaks at that row. Once it
-  has broken, `audit-verify` reports the break, and no `rotate-key` run can roll the chain.
+  that range under the key in use, never verifies there, and the chain breaks at that row.
 - **What you keep:** the refusal's text, logged as a WARNING on every start the switch lets through,
-  and every other start check. Rows before the break still verify. The setting changes nothing on a
+  and every other start check. The setting changes nothing on a
   start the refusal would not stop.
 - **When acceptable:** only when the key the chain's newest range is under is truly lost. If the
   key exists anywhere, put it back in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and run `rotate-key`
