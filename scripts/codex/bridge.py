@@ -18,12 +18,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-# Hook mode's exit code for a hook's deliberate exit 2, used only where BLOCK_SENTINEL is "1".
-# invoke.ps1 sets it where `hook` is its first argument, and ends its process with 2 for this code,
-# since pwsh -Command reports a script's exit 2 as 1. Without the sentinel a hook's exit 2 exits 2,
-# and every other outcome exits as before.
-BLOCK_EXIT = 10
-BLOCK_SENTINEL = "MEFOR_CODEX_BLOCK_SENTINEL"
 EVENTS = (
     "SessionStart",
     "SessionEnd",
@@ -285,7 +279,13 @@ def main() -> int:
     parser.add_argument("--session-id", default=os.environ.get("CODEX_THREAD_ID", ""))
     parser.add_argument("--migrate-copies", action="store_true")
     parser.add_argument("--include-user-skills", action="store_true")
+    # Hook mode's exit code for a hook's exit 2; 2 when absent. invoke.ps1 passes 10, and ends its
+    # process with 2 for it, since pwsh -Command reports a script's exit 2 as 1. Argv, not the
+    # environment, so no child or ancestor can supply it.
+    parser.add_argument("--block-exit", type=int, help=argparse.SUPPRESS)
     args, rest = parser.parse_known_args()
+    if args.block_exit is not None and args.mode != "hook":
+        parser.error("--block-exit applies only to hook mode")
     if args.mode == "sync-skills":
         user_skills = user_skill_directory() if args.include_user_skills else None
         print(
@@ -304,7 +304,11 @@ def main() -> int:
         return 0
     if args.mode == "hook":
         payload = json.load(sys.stdin)
-        result = dispatch(ROOT, payload)
+        try:
+            result = dispatch(ROOT, payload)
+        except HookBlocked as exc:
+            print(f"Codex bridge: {exc}", file=sys.stderr)
+            return 2 if args.block_exit is None else args.block_exit
         if result:
             print(json.dumps(result))
         return 0
@@ -339,13 +343,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # Popped before any child starts, so no hook or run child inherits it.
-    block_exit = BLOCK_EXIT if os.environ.pop(BLOCK_SENTINEL, None) == "1" else 2
     try:
         sys.exit(main())
-    except HookBlocked as exc:
-        print(f"Codex bridge: {exc}", file=sys.stderr)
-        sys.exit(block_exit)
     except (
         OSError,
         ValueError,

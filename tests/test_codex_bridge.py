@@ -324,7 +324,7 @@ def test_registered_command_runs_from_a_subdirectory(tmp_path):
 
 
 # --- The registered line, end to end: a hook's exit 2 reaches Codex as 2 where the outer shell
-# keeps it, and every fault path stays at least as blocking as on origin/main (a non-zero exit).
+# keeps it, and every fault path is at least as strict as main's exit code (non-zero, as on main).
 
 _DENY = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}}
 _PAYLOAD = {"session_id": "x", "hook_event_name": "PreToolUse", "tool_name": "Bash"}
@@ -429,7 +429,7 @@ _FAULTS = {
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
 @pytest.mark.parametrize("shell", _outer_shells())
 @pytest.mark.parametrize("fault", list(_FAULTS))
-def test_every_fault_path_is_at_least_as_blocking_as_main(tmp_path, shell, fault):
+def test_every_fault_path_is_at_least_as_strict_as_mains_exit_code(tmp_path, shell, fault):
     """On origin/main each of these exits non-zero through the registered line, never 0."""
     settings_text, payload, venv = _FAULTS[fault]
     completed = _run_registered(tmp_path, shell, settings_text, payload, venv)
@@ -440,7 +440,7 @@ def test_every_fault_path_is_at_least_as_blocking_as_main(tmp_path, shell, fault
 @pytest.mark.parametrize("shell", _outer_shells())
 def test_a_hooks_exit_2_reaches_codex_where_the_outer_shell_keeps_it(tmp_path, shell):
     completed = _run_registered(tmp_path, shell, _hooks(_py("import sys; sys.exit(2)")))
-    # pwsh -Command reports any exit 2 as 1; cmd and sh pass the launcher's 2 on.
+    # pwsh -Command reports a last native program's or script's exit 2 as 1; cmd and sh pass it on.
     assert completed.returncode == (1 if shell == "pwsh" else 2), completed.stderr
 
 
@@ -454,18 +454,18 @@ def test_a_deny_and_a_clean_run_exit_0(tmp_path, shell):
     assert clean.returncode == 0, clean.stderr
 
 
-# --- The block sentinel. invoke.ps1 sets MEFOR_CODEX_BLOCK_SENTINEL only for `hook` as its first
-# argument, the condition its 10-to-2 mapping uses; without it a hook's exit 2 exits 2, as on main.
+# --- The block exit flag. invoke.ps1 passes `--block-exit 10` only for `hook` as its first
+# argument, the condition its 10-to-2 mapping uses; without the flag a hook's exit 2 exits 2, as on
+# main. The flag is argv, so neither a child nor an inherited environment carries it.
 
-_SENTINEL = "MEFOR_CODEX_BLOCK_SENTINEL"
 _EXIT_2 = _hooks(_py("import sys; sys.exit(2)"))
-# A hook that blocks only where it inherited the sentinel, and otherwise allows.
-_SEES_SENTINEL = _hooks(_py(f"import os, sys; sys.exit(2 if {_SENTINEL!r} in os.environ else 0)"))
+# The environment variable an earlier head of this branch read in place of the flag.
+_OLD_SENTINEL = {"MEFOR_CODEX_BLOCK_SENTINEL": "1"}
 _needs_pwsh = pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
 
 
 def _env(**extra):
-    env = {k: v for k, v in os.environ.items() if k != _SENTINEL}
+    env = {k: v for k, v in os.environ.items() if k not in _OLD_SENTINEL}
     env.update(extra)
     return env
 
@@ -491,8 +491,32 @@ def test_a_direct_bridge_hook_gives_2_for_a_hooks_exit_2(tmp_path):
     root = _make_repo(tmp_path, _EXIT_2, venv=False)
     completed = _direct(root, "hook")
     assert completed.returncode == 2, completed.stderr
-    blocked = _direct(root, "hook", **{_SENTINEL: "1"})
+    blocked = _direct(root, "hook", "--block-exit", "10")
     assert blocked.returncode == 10, blocked.stderr
+
+
+def test_an_inherited_environment_does_not_change_the_block_exit(tmp_path):
+    root = _make_repo(tmp_path, _EXIT_2, venv=False)
+    completed = _direct(root, "hook", **_OLD_SENTINEL)
+    assert completed.returncode == 2, completed.stderr
+
+
+@_needs_pwsh
+def test_invoke_ignores_an_inherited_environment(tmp_path):
+    root = _make_repo(tmp_path, _EXIT_2)
+    completed = _invoke_file(root, "--session-id", "x", "hook", **_OLD_SENTINEL)
+    assert completed.returncode == 2, completed.stderr
+
+
+def test_the_block_exit_flag_never_reaches_the_run_path(tmp_path):
+    root = _make_repo(tmp_path, _hooks(), venv=False)
+    marker = root / "ran"
+    (root / "scripts/touch.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('x')\n", encoding="utf-8"
+    )
+    completed = _direct(root, "--session-id", "x", "run", "scripts/touch.py", "--block-exit", "10")
+    assert completed.returncode == 2, completed.stderr
+    assert not marker.exists()
 
 
 @_needs_pwsh
@@ -509,21 +533,8 @@ def test_a_run_child_exiting_10_is_not_remapped(tmp_path):
     assert _invoke_file(root, "--session-id", "x", "run", "scripts/exit10.py").returncode == 10
     run_first = _invoke_file(root, "run", "scripts/exit10.py", CODEX_THREAD_ID="x")
     assert run_first.returncode == 10, run_first.stderr
-    direct = _direct(root, "--session-id", "x", "run", "scripts/exit10.py", **{_SENTINEL: "1"})
+    direct = _direct(root, "--session-id", "x", "run", "scripts/exit10.py")
     assert direct.returncode == 10, direct.stderr
-
-
-@_needs_pwsh
-def test_no_hook_child_inherits_the_sentinel(tmp_path):
-    # Positive control: the probe hook does block where the sentinel is in its environment.
-    probe = json.loads(_SEES_SENTINEL)["hooks"]["PreToolUse"][0]["hooks"][0]
-    seen = subprocess.run([probe["command"], *probe["args"]], env=_env(**{_SENTINEL: "1"}))
-    assert seen.returncode == 2
-    registered = _run_registered(tmp_path / "registered", "none", _SEES_SENTINEL)
-    assert registered.returncode == 0, registered.stderr
-    root = _make_repo(tmp_path / "direct", _SEES_SENTINEL, venv=False)
-    direct = _direct(root, "hook", **{_SENTINEL: "1"})
-    assert direct.returncode == 0, direct.stderr
 
 
 # The exit code each fault gave on origin/main, through each launch path. "registered" runs the
@@ -545,7 +556,7 @@ def test_every_fault_path_exits_as_on_main(tmp_path, path, fault):
     else:
         root = _make_repo(tmp_path, settings_text, venv and path != "direct")
         if path == "direct":
-            completed = _direct(root, "hook", payload=payload, **{_SENTINEL: "1"})
+            completed = _direct(root, "hook", "--block-exit", "10", payload=payload)
         else:
             completed = _invoke_file(root, "hook", payload=payload)
     expected = 1 if not venv else _MAIN_FAULT_EXIT[path]
