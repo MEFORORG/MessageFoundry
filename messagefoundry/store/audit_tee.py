@@ -102,8 +102,7 @@ _TEE_FAILURE_LOGGED = False
 
 #: What a field scrubbed whole is shipped as: the redactor's own placeholder.
 _FIELD_REDACTED = _REDACTED
-#: A raw C0 control, U+0000 to U+001F: exactly what ``json.dumps`` escapes, so DEL and the rest
-#: of the log alphabet in :mod:`messagefoundry.controlchars` are deliberately not in it.
+#: A raw C0 control, U+0000 to U+001F, which ``json.dumps`` escapes.
 _RAW_C0 = re.compile(r"[\x00-\x1f]")
 #: One JSON string escape, matched from the left, so the second half of an escaped backslash is
 #: never read as the start of an escape: in a JSON text, ``CORP\\bJONES`` is a backslash and a
@@ -119,11 +118,11 @@ _NONSPACE_C0 = re.compile(r"[\x00-\x08\x0e-\x1b]")
 #: run, at the end of the text above all, is walked once, not once per backslash in it. The
 #: unanchored ``\\+`` form was quadratic there.
 _LINE_ESCAPE = re.compile(r"(?<!\\)\\++(?:u[0-9a-fA-F]{4}|[^\\]|\Z)")
-#: The two placeholders the passes write, which are not text of the value: :data:`_FIELD_REDACTED`
+#: Placeholders the passes write, which are not text of the value: :data:`_FIELD_REDACTED`
 #: and :data:`~messagefoundry.secretscrub.CREDENTIAL_PLACEHOLDER`. Spelled out so the static regex
 #: scan can read it; ``tests/test_audit_offbox_tee.py`` holds it to the two constants.
 _PLACEHOLDERS = re.compile(r"\[redacted\]|<redacted>")
-#: A run of letters or digits: a word, for the check in :func:`_scrub_field`.
+#: A run of letters or digits: a word.
 _WORD = re.compile(r"[^\W_]+")
 #: Whether this process has logged a field scrub fault; see :func:`_scrub_field`.
 _FIELD_SCRUB_FAULT_LOGGED = False
@@ -199,8 +198,7 @@ _C0_SPELLING = {chr(code): json.dumps(chr(code))[1:-1] for code in range(0x20)}
 
 def _encode_c0(text: str) -> str:
     """The inverse of :func:`_decode_c0_escapes`, for a text that held no raw control before it.
-    Each control is spelled as ``json.dumps`` spells it, ``\\n`` rather than ``\\u000a``, so a
-    re-encoded detail is no longer than its writer's and :func:`safe_text` cuts it no sooner."""
+    Each control is spelled as ``json.dumps`` spells it, ``\\n`` rather than ``\\u000a``."""
     return _RAW_C0.sub(lambda m: _C0_SPELLING[m.group()], text)
 
 
@@ -244,8 +242,7 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
     (:func:`_read`), are scrubbed too, of the plain result and, where the plain pass changed
     anything, of the value. If a reading of the plain result shows fewer of its letters and
     digits, or a reading of the value does not show every word the plain result shows, counted,
-    the whole field is returned as :data:`_FIELD_REDACTED`. A reading changes the text's length,
-    so its redactions are not merged into the plain result.
+    the whole field is returned as :data:`_FIELD_REDACTED`.
 
     Where the plain result changed nothing, the value is returned. Otherwise the plain result is
     returned only if, encoded, it shows no word, counted, beyond what the handler chain alone
@@ -420,16 +417,14 @@ def emit_audit_tee(
     skip numbers where ``seq`` never does. None of the three carries PHI directly or discloses a key:
     two are counters and ``row_hash`` is a digest, or on a keyed chain an HMAC.
 
-    **One residual, stated because "the head hash carries nothing" is very slightly too strong.** In
+    **One residual, stated because "the head hash carries nothing" is too strong.** In
     the keyless posture ``row_hash`` is a plain SHA-256 over a canonical list whose every other
     member -- the previous row's hash, ``ts``, ``actor``, ``action``, ``channel_id``, ``client`` --
     travels in this same record or the one before it. So for a record whose ``detail`` ``safe_text``
     actually cut, a reader of the log can TEST guesses at the removed span offline, one hash per guess
     (``seq`` travels in the record too). The same holds for any field the C0 scrub below cut or
     shipped as ``[redacted]``, ``actor`` included, such as a typed sign-in name.
-    That is narrow (it needs an exact byte-for-byte reconstruction of a redacted exception string, and
-    an audit ``detail`` that was not HL7-shaped is forwarded unredacted anyway, so there is nothing left
-    to guess). It does not arise for a row written by a process that holds a key, where the digest is
+    It does not arise for a row written by a process that holds a key, where the digest is
     an HMAC under a DEK-derived subkey or a Transit MAC. Keyless is not the shipped default. A row
     written without a key keeps its plain SHA-256: no later open re-keys it, and a keyed process
     reports it as a break. The "Audit chain" row in ``docs/ASVS-L2-PHASE0-CHANGES.md`` says when a
