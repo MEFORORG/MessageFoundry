@@ -1079,8 +1079,7 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 #: ``MARKER``.
 #:
 #: **It runs LAST, after every label pass** -- the PHI passes here and the credential passes of the
-#: log chain and the support bundle -- through :func:`redact_binary_carriage`, never inside
-#: :func:`redact`. ``/``, ``+`` and ``=`` are base64 characters, so a run read first took a label
+#: log chain -- through :func:`redact_binary_carriage`, never inside :func:`redact`. ``/``, ``+`` and ``=`` are base64 characters, so a run read first took a label
 #: joined to it (``QUJD/MRN: 123``, ``QUJD+token=x``) and left its value with nothing to find it by.
 #: Read last, every labelled value is already hidden as it was before this pass existed, and the
 #: run then takes what is left. A placeholder an earlier pass wrote inside the run (a date-shaped
@@ -1090,7 +1089,7 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 #: still a body.
 #:
 #: Beyond the literal form, the pattern reads a marker whose colons are percent-encoded (``%3A``) or
-#: JSON unicode-escaped (``:``, also with the backslash doubled, as a ``repr`` writes it), and a
+#: JSON unicode-escaped (``\u003A``, also with the backslash doubled, as a ``repr`` writes it), and a
 #: run whose ``+``, ``/`` or ``=`` is percent-encoded or unicode-escaped, or whose ``/`` is
 #: JSON-escaped (``\/``), the escapes also with the backslash doubled. The marker and the escapes are
 #: case-insensitive; the run is ASCII only (``re.ASCII``), so the case fold takes no non-ASCII letter.
@@ -1098,8 +1097,9 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 #: straight after another is still read as its own. One run unit is required, so prose that merely
 #: names the marker, such as ``missing mfb64:v1: marker``, is kept. Because the placeholder is a
 #: run unit, a second pass can extend a run over text glued after the padding, so
-#: :func:`redact_binary_carriage` repeats until nothing changes: two handlers that share one
-#: record then write the same text.
+#: :func:`redact_binary_carriage` repeats until nothing changes, for at most
+#: :data:`_CARRIAGE_ROUNDS` rounds, so two handlers that share one record write the same text
+#: unless more pieces than that are glued after the padding.
 #:
 #: Residuals, at least these: a carriage broken by whitespace keeps every piece after the first
 #: break (``encode`` never writes one); a URL-safe (``-``/``_``) carriage keeps the part after its
@@ -1107,7 +1107,8 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 #: character encoded a way the pattern does not read (a doubly escaped ``\\\\/``, ``%252F``,
 #: ``&#x2F;``) ends the run, and the rest of the body prints in the log chain, which has no
 #: long-base64 backstop. Text that never reaches a log handler, such as :func:`safe_text`,
-#: :func:`safe_exc` and :func:`safe_error` output, gets no carriage pass at all.
+#: :func:`safe_exc` and :func:`safe_error` output, gets no carriage pass at all, and neither does
+#: the support bundle (``support/redact.py``), which keeps its own ``_MFB64`` pass, run first.
 _BINARY_CARRIAGE = re.compile(
     r"(?i)((?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1(?::|%3A|\\u003A|\\\\u003A))"
     r"(?:(?!(?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1)"

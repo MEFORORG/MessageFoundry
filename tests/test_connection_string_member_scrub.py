@@ -402,12 +402,6 @@ _RULE_CONTROLS = (
         _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[0],
     ),
     (
-        "replaced bundle marker head",
-        "_MEMBER_VALUE_UNIT",
-        re.compile(_UNIT.replace(r"(?:<redacted>|\[(?:REDACTED|redacted)\]):v1:|", "")),
-        ';PWD="family": .=amfb64:v1:a1qkey=/"family": ',
-    ),
-    (
         "bundle marker after a glued word",
         "_MEMBER_VALUE_UNIT",
         re.compile(_UNIT.replace(_WORD, r"(?:(?!nonnumeric port: )[\w.\-])++")),
@@ -619,29 +613,10 @@ def test_the_differential_fails_on_the_whole_value_draft(monkeypatch: pytest.Mon
     assert not [path for path, _, _ in printed if path in ("scrub_credentials", "redact_log_line")]
 
 
-#: Controls the support bundle's carriage pass now covers on its own (BACKLOG #5378): it runs after
-#: the member mask and stops a run before a glued marker, so with the mask rule off these shapes no
-#: longer print what the baseline hid. Strict, so the day either prints again it reads as a pass
-#: and the mark must come off.
-_COVERED_BY_THE_CARRIAGE_PASS = frozenset(
-    {"name-token case", "mask keeps where the marker's base64 run ended"}
-)
-
-
 @pytest.mark.parametrize(
     ("attr", "off", "shape"),
-    [
-        pytest.param(
-            *control[1:],
-            id=control[0],
-            marks=pytest.mark.xfail(
-                strict=True, reason="covered by the bundle's carriage pass (BACKLOG #5378)"
-            )
-            if control[0] in _COVERED_BY_THE_CARRIAGE_PASS
-            else (),
-        )
-        for control in _RULE_CONTROLS
-    ],
+    [control[1:] for control in _RULE_CONTROLS],
+    ids=[control[0] for control in _RULE_CONTROLS],
 )
 def test_each_mask_rule_is_needed(
     monkeypatch: pytest.MonkeyPatch, attr: str, off: object, shape: str
@@ -649,11 +624,8 @@ def test_each_mask_rule_is_needed(
     """With one rule of the word mask off, its shape prints a value the baseline hid on a later
     redaction; with every rule on, it does not.
 
-    The carriage passes added by BACKLOG #5378 are off throughout: the write-time one and the
-    bundle's pre-#5378 pattern, which now runs after the member mask. Either reaches the marker
-    shapes below on its own, so with them on these controls would no longer see a mask rule
-    deleted."""
-    monkeypatch.setattr(bundle_redact, "_MFB64_WIDE", _NEVER)
+    The log chain's carriage pass (BACKLOG #5378) is off throughout. It reaches some marker shapes
+    below on its own, so with it on these controls would no longer see a mask rule deleted."""
     monkeypatch.setattr(redaction, "_BINARY_CARRIAGE", re.compile(r"(?!)()"))
     on = getattr(secretscrub, attr)
     if isinstance(off, re.Pattern):
@@ -726,10 +698,7 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
     assert "nonnumeric port: " in secretscrub._MEMBER_VALUE_UNIT.pattern
     # The mask keeps each character's class in the two base64 alphabets the bundle reads.
     assert bundle_redact._LONG_B64.pattern == r"\b[A-Za-z0-9+/]{24,}={0,2}\b"
-    # The shared carriage pattern since BACKLOG #5378, applied after the member mask, which it now
-    # follows; test_each_mask_rule_is_needed ran green with it there.
-    assert bundle_redact._MFB64 is redaction._BINARY_CARRIAGE
-    assert bundle_redact._MFB64.flags & re.ASCII
+    assert bundle_redact._MFB64.pattern == r"mfb64:v1:[A-Za-z0-9+/=]+"
     assert redaction._HL7_SEGMENT.pattern.startswith(r"\b([A-Z][A-Z0-9]{2})")
     assert redaction._ENCODED_SEPARATOR.pattern == r"%(?:7[CcEe]|5[Ee]|26)"
     assert redaction._ENCODED_SEPARATOR.pattern in secretscrub._MEMBER_VALUE_UNIT.pattern
@@ -875,3 +844,20 @@ def test_the_bundle_runs_the_member_pass_after_its_second_layer() -> None:
     that layer hid, and the bundle printed it (round 2 of the review)."""
     out = redact_log_line(";KeyStorePwd=Authorization: Bearer api_token='a1q b2q'")
     assert "a1q" not in out and "b2q" not in out, out
+
+
+def test_the_member_mask_keeps_a_replaced_marker_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #5378: the PHI pass can replace a marker's ``mfb64`` and leave ``[redacted]:v1:``,
+    which the log chain's carriage pass still reads. A mask that took that ``v1`` printed the body
+    on the chain where the baseline hid it; the fuzz differential found the line below. With the
+    unit's alternative removed, it prints again."""
+    line = ';PWD="family": .=amfb64:v1:a1qkey=/"family": '
+    unit = secretscrub._MEMBER_VALUE_UNIT.pattern
+    with monkeypatch.context() as patched:
+        _without_member_pass(patched)
+        baseline = [_every_redaction_path(line)]
+    assert _printed_where_the_baseline_hid([line], [_every_redaction_path(line)], baseline) == []
+    stripped = unit.replace(r"(?:<redacted>|\[(?:REDACTED|redacted)\]):v1:|", "")
+    assert stripped != unit
+    monkeypatch.setattr(secretscrub, "_MEMBER_VALUE_UNIT", re.compile(stripped))
+    assert _printed_where_the_baseline_hid([line], [_every_redaction_path(line)], baseline)

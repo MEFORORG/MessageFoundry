@@ -321,7 +321,7 @@ FAMILIES: tuple[Family, ...] = (
         name="mfb64_body",
         line="outbound blob mfb64:v1:SGVsbG9Xb3JsZEhlbGxvV29ybGQ=",
         secret="SGVsbG9Xb3JsZEhlbGxvV29ybGQ=",
-        patterns=("_MFB64", "_MFB64_WIDE", "_LONG_B64"),
+        patterns=("_MFB64", "_LONG_B64"),
     ),
     Family(
         name="long_base64_run",

@@ -1488,10 +1488,10 @@ _MEMBER_KEEP = re.compile(
 #: earlier pass wrote, a percent-encoded HL7 separator (``%7C``, ``%7E``, ``%5E``, ``%26``), the
 #: PHI pass's userinfo opener, the support bundle's ``mfb64:v1:`` marker and a DICOM tag.
 #:
-#: The marker is spelled in its literal lowercase form only. ``support/redact.py`` ``_MFB64`` reads
-#: more forms, which ``redaction._BINARY_CARRIAGE`` states; this unit keeps one more of them, a
-#: marker whose ``mfb64`` an earlier pass replaced with a placeholder (``[redacted]:v1:``), which
-#: the carriage pass still reads (BACKLOG #5378). A word
+#: The marker is spelled as ``support/redact.py`` ``_MFB64`` spells it, case and all. One more form
+#: is kept whole: a marker whose ``mfb64`` an earlier pass replaced with a placeholder
+#: (``[redacted]:v1:``), which the log chain's carriage pass still reads as a marker (BACKLOG
+#: #5378, ``redaction._BINARY_CARRIAGE``). A word
 #: ends where the marker or the userinfo opener starts, so a word glued on before either
 #: (``amfb64:v1:``, ``xnonnumeric port: ``) cannot take its head: neither reader has a word
 #: boundary. Masking the marker's ``v1`` printed, on a chain line the bundle read back, the body

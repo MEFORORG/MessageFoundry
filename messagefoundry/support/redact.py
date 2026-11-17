@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import re
 
-from messagefoundry.redaction import _BINARY_CARRIAGE
 from messagefoundry.redaction import redact as _redact_phi
 from messagefoundry.secretscrub import (
     _CONNECTION_STRING_MEMBER,
@@ -70,37 +69,7 @@ __all__ = [
 REDACTION_PLACEHOLDER = "[REDACTED]"
 
 # A base64 binary-carriage marker (ADR 0028) and the embedded blob that follows it: definitely a body.
-# The shared redactor's pattern, which states the forms it reads, and applied LAST of the label
-# passes in :func:`redact_log_line`, for the reason it states (BACKLOG #5378).
-_MFB64 = _BINARY_CARRIAGE
-# The pattern this module applied FIRST before BACKLOG #5378. It reads ``=`` anywhere in the run, so
-# it took a value glued after a run with no label this module reads (``QUJD+code=x``) or after its
-# padding (``QQ==Secret``). Applied last, after :data:`_MFB64`'s label-sparing order, it keeps the
-# bundle hiding at least what it hid then.
-_MFB64_WIDE = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
-
-#: How many characters at the end of a long carriage run the label passes still see. The run is
-#: replaced LAST, so without a bound every pass here scanned the whole body: a 1 MiB line took
-#: about 450 ms against under 1 ms when the run went first (measured, code review of BACKLOG
-#: #5378). A label joined to the run sits at its end, so keeping the end keeps the label's context.
-_CARRIAGE_TAIL_KEPT = 256
-
-
-def _shrink_carriage(match: re.Match[str]) -> str:
-    """A long carriage run with its middle replaced by the placeholder, which the final carriage
-    pass reads as part of the run, and its last :data:`_CARRIAGE_TAIL_KEPT` characters kept. The
-    kept end starts where it still reads as a run on its own, so an escape or a placeholder is
-    never cut in half and left behind."""
-    run = match.group(0)
-    head = match.group(1)
-    if len(run) - len(head) <= 2 * _CARRIAGE_TAIL_KEPT:
-        return run
-    tail = run[-_CARRIAGE_TAIL_KEPT:]
-    for start in range(len(tail)):
-        if _MFB64.fullmatch(head + tail[start:]) is not None:
-            return f"{head}{REDACTION_PLACEHOLDER}{tail[start:]}"
-    return run
-
+_MFB64 = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
 
 # An optional dotted / underscored / hyphenated PREFIX on a credential label, so a snake_case label
 # reaches the keyword at its tail.
@@ -187,9 +156,8 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 # linear, are stated once, on the same fragments in ``messagefoundry/secretscrub.py``. THIS COPY RUNS
 # BEFORE THE PHI PASS, and the tail is written back masked, which is the reason for the allowlist; a
 # differential that runs the PHI pass after this layer is the measurement for this copy, not the
-# write-time one. ``_MFB64`` runs after every layer since BACKLOG #5378; before them,
-# :func:`_shrink_carriage` writes ``[REDACTED]`` into the middle of a run longer than 512
-# characters, which the allowlist refuses. The tail is a copy of ``secretscrub``'s, and a test holds the two equal.
+# write-time one. ``_MFB64`` runs before this layer and writes ``[REDACTED]`` into the braces, which
+# the allowlist refuses. The tail is a copy of ``secretscrub``'s, and a test holds the two equal.
 _BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[:=]"
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
 _SPACED_BRACED_TAIL = (
@@ -630,8 +598,8 @@ _LEADING_TS = re.compile(
 def redact_log_line(line: str) -> str:
     """Return ``line`` with PHI/secret patterns replaced by a redaction placeholder.
 
-    Two layers: (1) the bundle-specific **secret** markers (``MEFOR_*`` values, bearer/session
-    tokens) the engine redactor does not carry; then (2) the shared engine **PHI**
+    Two layers: (1) the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
+    bearer/session tokens) the engine redactor does not carry; then (2) the shared engine **PHI**
     redactor (:func:`messagefoundry.redaction.redact`) for HL7-shaped spans (any segment id, not a
     fixed allowlist), free-text DOB/date runs, multi-token name runs, and the labelled values of FHIR
     JSON, DICOM tag dumps and XML (BACKLOG #1711) — so bundled logs match the
@@ -639,8 +607,7 @@ def redact_log_line(line: str) -> str:
     (:func:`messagefoundry.secretscrub.scrub_credentials`) runs over the text between the placeholders
     so far, or over the whole line when the line arrived holding the placeholder text (BACKLOG
     #2694); its last pass masks the words of a connection-string member's value. Then that member
-    mask runs once more over the whole joined line (BACKLOG #5030). Then an ``mfb64:`` carriage body,
-    after every label pass has hidden its value (BACKLOG #5378). A final long-base64 sweep catches
+    mask runs once more over the whole joined line (BACKLOG #5030). A final long-base64 sweep catches
     any residual key/token run.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —
@@ -648,9 +615,7 @@ def redact_log_line(line: str) -> str:
     ts = _LEADING_TS.match(line)
     prefix, body = (line[: ts.end()], line[ts.end() :]) if ts else ("", line)
     logged_placeholder = REDACTION_PLACEHOLDER in body
-    # Bound the carriage run the passes below scan; it is replaced after them (BACKLOG #5378).
-    if "v1" in body or "V1" in body:
-        body = _MFB64.sub(_shrink_carriage, body)
+    body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
     body = _MEFOR_SECRET.sub(_keep_label, body)
     body = _BEARER.sub(_keep_label, body)
     body = _AUTH_SCHEME.sub(_keep_scheme, body)
@@ -673,10 +638,6 @@ def redact_log_line(line: str) -> str:
     # this line read the same separators; secretscrub's comment on the pattern says why that matters.
     if ";" in body:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
-    # The carriage body, after every label pass above has hidden its value (BACKLOG #5378).
-    if "v1" in body or "V1" in body:
-        body = _MFB64_WIDE.sub(REDACTION_PLACEHOLDER, body)
-        body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
     return prefix + body
 

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5378: an ``mfb64:v1:`` binary-carriage body quoted in a log record or exception is
-withheld by the write-time log chain and by the support bundle. The carriage pass runs after every
-label pass in both, so a labelled value is hidden at least as origin/main hid it. Synthetic HL7 only
-(CLAUDE.md section 9)."""
+withheld by the write-time log chain. The carriage pass runs after every label pass there, so a
+labelled value is hidden at least as origin/main hid it. The support bundle is left as origin/main
+has it, with its own ``_MFB64`` run first; the bundle tests here assert its main output. Synthetic
+HL7 only (CLAUDE.md section 9)."""
 
 from __future__ import annotations
 
@@ -58,7 +59,7 @@ def _bundle(text: str) -> str:
     return redact_log_line(f"2026-01-01 00:00:00 ERROR {text}")
 
 
-_CHAINS: dict[str, Callable[[str], str]] = {"log": _log_chain, "bundle": _bundle}
+_CHAINS: dict[str, Callable[[str], str]] = {"log": _log_chain}
 _BOTH = pytest.mark.parametrize("chain", list(_CHAINS), ids=list(_CHAINS))
 
 
@@ -141,7 +142,7 @@ def test_the_run_is_ascii_only() -> None:
 
 
 #: Each case found by code review on the first design, which read the carriage FIRST and printed
-#: these values where origin/main hid them. The value must stay hidden in both chains.
+#: these values where origin/main hid them. The value must stay hidden in the log chain.
 _LABELLED = {
     "mrn-slash": (f"bad {MARKER}QUJD/MRN: 12345678", "12345678"),
     "mrn-equals-aligned": (f"bad {MARKER}QUJ/MRN=12345678", "12345678"),
@@ -177,14 +178,6 @@ def test_a_carriage_that_is_a_labels_value_is_withheld(chain: str, label: str) -
     _no_payload(_CHAINS[chain](f"bad {label}{_CARRIAGE}"))
     _no_payload(_CHAINS[chain](f"bad {label}{MARKER}WlpURVNUXkFMUEhB"))
     assert "WlpURVNUXkFMUEhB" not in _CHAINS[chain](f"bad {label}{MARKER}WlpURVNUXkFMUEhB")
-
-
-def test_the_bundle_bounds_a_long_run_before_its_label_passes() -> None:
-    """Found by code review: the run replaced last made every bundle pass scan the whole body."""
-    long_carriage = encode(bytes(range(256)) * 4096)
-    out = _bundle(f"bad {long_carriage}/MRN: 12345678 end")
-    assert "12345678" not in out
-    assert long_carriage[20:40] not in out and long_carriage[-40:-20] not in out
 
 
 @_BOTH
@@ -230,10 +223,26 @@ def test_two_handlers_on_one_record_write_the_same_text() -> None:
     ["+code=zqsecretvalue", "/state=zqsecretvalue", "/sig=zqsecretvalue", "+jwt=zqsecretvalue"],
 )
 def test_the_bundle_hides_a_value_glued_after_a_run_as_main_did(glued: str) -> None:
-    """Found by code review round 2: main's bundle pattern read ``=`` anywhere in the run and took
-    such a value; the bundle applies that pattern too, after the label passes."""
+    """Main's bundle pattern reads ``=`` anywhere in the run and takes such a value."""
     assert "zqsecretvalue" not in _bundle(f"?x={MARKER}QUJD{glued}")
 
 
 def test_the_bundle_hides_a_word_glued_after_the_padding_as_main_did() -> None:
     assert "Zq9Secret" not in _bundle(f"bad {MARKER}QQ==Zq9Secret end")
+
+
+_BUNDLE_TEXTS = (
+    *(text for text, _ in _LABELLED.values()),
+    *(f"could not route {carriage} after retry" for carriage in _FORMS.values()),
+    f"bad MRN: {_CARRIAGE}",
+    f"bad {MARKER}WlpURVNUXkFMUEhB/{_CARRIAGE} end",
+)
+
+
+@pytest.mark.parametrize("text", _BUNDLE_TEXTS)
+def test_the_bundle_output_is_main_s(text: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bundle reads no part of the #5378 pass: its output is the same with the pass switched
+    off, which is origin/main's output."""
+    with_pass = _bundle(text)
+    monkeypatch.setattr(redaction, "_BINARY_CARRIAGE", re.compile(r"(?!)()"))
+    assert _bundle(text) == with_pass

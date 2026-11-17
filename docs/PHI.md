@@ -1857,7 +1857,7 @@ rest §3 describes and the read-side field gate in [SECURITY.md](SECURITY.md), a
 a log line. For the engine's own authors the convention is a rule, not a check: the
 `raise-fstring` lint above is a nudge, and nothing refuses text that breaks it.
 
-**Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** **Five** handler filters run, **on every record emitted by the engine process and by the ADR 0087 sandbox worker child**, in this
+**Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** **At least five** handler filters run, **on every record emitted by the engine process and by the ADR 0087 sandbox worker child**, in this
 order, on **every** emitted record and on **every** handler — stdout *and* the off-box forwarder —
 installed by `_install_phi_filters`, reached through `configure_logging` in the engine and
 `configure_stderr_logging` in the child
@@ -1889,7 +1889,8 @@ installed by `_install_phi_filters`, reached through `configure_logging` in the 
    binary carriage (ADR 0028), keeping the marker. It runs after every label pass above, so a
    label joined to the run by a base64 character (`/`, `+`, `=`) has its value hidden first; the
    forms it reads and its residuals are stated once, on `_BINARY_CARRIAGE` in
-   [`redaction.py`](../messagefoundry/redaction.py).
+   [`redaction.py`](../messagefoundry/redaction.py). It is a log-chain filter only: the support
+   bundle's redactor does not run it and keeps its own `_MFB64` pass.
 5. **`ControlCharScrubFilter`** — escapes CR/LF and the rest of the log alphabet, which includes at
    least the C1 controls, the bidirectional controls and U+2028/U+2029 (log-injection defence, ASVS
    16.4.1). The alphabet is stated once, in `_escapes_in_a_log_line` in
