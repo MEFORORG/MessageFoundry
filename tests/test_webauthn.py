@@ -1947,3 +1947,163 @@ def test_a_malformed_safetynet_statement_is_the_audited_refusal(
         )
     assert isinstance(excinfo.value.__cause__, AttributeError), repr(excinfo.value.__cause__)
     assert any("raw AttributeError" in r.getMessage() for r in caplog.records)
+
+
+#: id-ecPublicKey (1.2.840.10045.2.1), and the same arc ending in 9, which names no algorithm.
+_EC_PUBLIC_KEY_OID, _UNKNOWN_KEY_OID = "06072a8648ce3d0201", "06072a8648ce3d0209"
+#: The explicit version field reading v3, and the same field reading 5, which X.509 does not define.
+_VERSION_3, _VERSION_5 = "a003020102", "a003020105"
+#: The id-ce-keyUsage OID and the id-ce-basicConstraints OID (id-ce arcs 15 and 19), one length.
+_KEY_USAGE_OID, _BASIC_CONSTRAINTS_OID = "0603551d0f", "0603551d13"
+
+
+def _attestation_cert() -> tuple[bytes, Any]:
+    """A self-signed P-256 leaf in DER, and its private key. Its subject is empty and it carries
+    BasicConstraints then KeyUsage, so the library's tpm check reads it as far as its extensions."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.serialization import Encoding
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    start = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([]))
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "t")]))
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(start)
+        .not_valid_after(start + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(True, False, False, False, False, False, False, False, False),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(Encoding.DER), key
+
+
+def _patched(der: bytes, old: str, new: str) -> bytes:
+    """``der`` with its one occurrence of the hex bytes ``old`` replaced by ``new``."""
+    assert der.count(bytes.fromhex(old)) == 1
+    return der.replace(bytes.fromhex(old), bytes.fromhex(new))
+
+
+def _attested_registration(fmt: str, patch: tuple[str, str] | None) -> tuple[str, bytes]:
+    """A registration response re-labelled ``fmt``, its statement carrying a leaf certificate
+    patched by ``patch`` (``None`` leaves it intact), and its challenge.
+
+    The ``tpm`` statement is built to pass every check the library runs before it parses the
+    leaf: ``pubArea`` names the credential's own P-256 point, ``certInfo`` carries the hashes the
+    library recomputes, and the leaf's key signs ``certInfo``. The ``packed`` statement carries a
+    signature that does not verify, which the library finds only after it parses the leaf."""
+    import hashlib
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from webauthn.helpers import decode_credential_public_key, encode_cbor, parse_cbor
+    from webauthn.helpers.decode_credential_public_key import DecodedEC2PublicKey
+
+    challenge = b"c" * 32
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    response = json.loads(soft.create_response(challenge))
+    attestation = parse_cbor(base64url_to_bytes(response["response"]["attestationObject"]))
+    der, key = _attestation_cert()
+    leaf = der if patch is None else _patched(der, *patch)
+    if fmt == "packed":
+        statement: dict[str, Any] = {"alg": -7, "sig": b"\x30\x00", "x5c": [leaf]}
+    else:
+        point = decode_credential_public_key(soft.cose_public_key())
+        assert isinstance(point, DecodedEC2PublicKey)
+        # TPM_ALG_ECC, nameAlg SHA-256, no attributes or policy, NULL scheme on NIST P-256.
+        pub_area = bytes.fromhex("0023000b00000000000000100010000300100020") + point.x
+        pub_area += b"\x00\x20" + point.y
+        client_data = base64url_to_bytes(response["response"]["clientDataJSON"])
+        extra = hashlib.sha256(
+            attestation["authData"] + hashlib.sha256(client_data).digest()
+        ).digest()
+        name = b"\x00\x0b" + hashlib.sha256(pub_area).digest()
+        cert_info = (
+            bytes.fromhex("ff544347801700000020")  # magic, ATTEST_CERTIFY, no signer
+            + extra
+            + bytes(17 + 8)  # clock info and firmware version
+            + len(name).to_bytes(2, "big")
+            + name
+            + b"\x00\x00"  # no qualified name
+        )
+        statement = {
+            "ver": "2.0",
+            "alg": -7,
+            "x5c": [leaf],
+            "sig": key.sign(cert_info, ec.ECDSA(hashes.SHA256())),
+            "certInfo": cert_info,
+            "pubArea": pub_area,
+        }
+    attestation["fmt"] = fmt
+    attestation["attStmt"] = statement
+    response["response"]["attestationObject"] = bytes_to_base64url(encode_cbor(attestation))
+    return json.dumps(response), challenge
+
+
+@pytest.mark.parametrize(
+    ("fmt", "patch", "raised"),
+    [
+        pytest.param(
+            "packed",
+            (_EC_PUBLIC_KEY_OID, _UNKNOWN_KEY_OID),
+            "UnsupportedAlgorithm",
+            id="packed-unknown-key-algorithm",
+        ),
+        pytest.param("packed", (_VERSION_3, _VERSION_5), "InvalidVersion", id="packed-version"),
+        pytest.param("tpm", (_VERSION_3, _VERSION_5), "InvalidVersion", id="tpm-version"),
+        pytest.param(
+            "tpm",
+            (_KEY_USAGE_OID, _BASIC_CONSTRAINTS_OID),
+            "DuplicateExtension",
+            id="tpm-duplicate-extension",
+        ),
+    ],
+)
+def test_a_malformed_attestation_certificate_is_the_audited_refusal(
+    fmt: str, patch: tuple[str, str], raised: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """vault BACKLOG #5341, at this module's seam only: the refusal the service audits. Red:
+    cryptography raised each of these on an attacker-supplied leaf, and it escaped
+    verify_registration as itself, which the route would have served as a 500."""
+    response_json, challenge = _attested_registration(fmt, patch)
+    with (
+        caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
+        pytest.raises(wa.WebAuthnVerificationError) as excinfo,
+    ):
+        wa.verify_registration(
+            response_json=response_json, challenge=challenge, rp_id=RP, origin=ORIGIN
+        )
+    assert type(excinfo.value.__cause__).__name__ == raised, repr(excinfo.value.__cause__)
+    assert any(f"raw {raised}" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("fmt", "refusal"),
+    [
+        pytest.param("packed", "Could not verify attestation statement signature", id="packed"),
+        pytest.param("tpm", "subjectAltName", id="tpm"),
+    ],
+)
+def test_an_intact_attestation_certificate_is_parsed_past_where_the_patched_ones_fail(
+    fmt: str, refusal: str
+) -> None:
+    """Positive control for the test above: with the leaf intact, the library parses it and
+    refuses later, on purpose. So each patched leaf, not the statement around it, raised there."""
+    response_json, challenge = _attested_registration(fmt, None)
+    with pytest.raises(wa.WebAuthnVerificationError, match=refusal) as excinfo:
+        wa.verify_registration(
+            response_json=response_json, challenge=challenge, rp_id=RP, origin=ORIGIN
+        )
+    from webauthn.helpers.exceptions import InvalidRegistrationResponse
+
+    assert isinstance(excinfo.value.__cause__, InvalidRegistrationResponse)

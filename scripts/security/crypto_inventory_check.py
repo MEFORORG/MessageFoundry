@@ -369,7 +369,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # [webauthn] extra, lazy-imported inside this module's functions) performs the COSE signature
     # verification via cryptography — a CRYPTO_LIBRARY_MODULES trigger, so the delegated verification
     # is a first-class inventory token here, not merely §4 prose.
-    "messagefoundry/auth/webauthn.py": frozenset({"secrets", "webauthn"}),
+    # vault BACKLOG #5341: cryptography for three exception classes alone (UnsupportedAlgorithm,
+    # x509.InvalidVersion, x509.DuplicateExtension), caught around verify_registration_response so a
+    # malformed attestation certificate is the audited refusal. It performs no crypto operation.
+    "messagefoundry/auth/webauthn.py": frozenset({"cryptography", "secrets", "webauthn"}),
     # ADR 0041 (D1): SHA-256 content fingerprint of a loaded config bundle, recorded in the
     # config_reload audit to bind reviewed-commit -> loaded-bytes (integrity/attribution, not a secret).
     "messagefoundry/config/fingerprint.py": frozenset({"hashlib"}),

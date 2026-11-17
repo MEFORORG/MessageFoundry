@@ -217,6 +217,28 @@ def _invalid_response_errors() -> tuple[type[Exception], ...]:
     return (*_invalid_input_errors(), RecursionError)
 
 
+def _attestation_certificate_errors() -> tuple[type[Exception], ...]:
+    """Raw ``cryptography`` exceptions an attacker-supplied attestation certificate raised straight
+    out of ``verify_registration_response`` (BACKLOG #5341). Each derives from ``Exception`` alone,
+    so :func:`_invalid_input_errors` does not hold it. Reproduced on webauthn 3.0.1 and
+    cryptography 50.0.2. :func:`verify_registration` passes the library no root certificates, so
+    its chain check passes and the certificate is parsed as sent:
+
+    * ``UnsupportedAlgorithm``: a ``packed`` statement whose ``x5c`` leaf names a key algorithm
+      cryptography does not know. The library calls ``public_key()`` on it.
+    * ``InvalidVersion``: a ``packed`` or ``tpm`` leaf whose version field is not one X.509
+      defines. ``load_der_x509_certificate`` raises it.
+    * ``DuplicateExtension``: a ``tpm`` leaf carrying one extension twice, once its signature over
+      ``certInfo`` verifies. The library reads ``extensions`` on it.
+
+    Registration only: the assertion ceremony parses no certificate. A function, so this module
+    keeps its third-party imports inside the functions that use them."""
+    from cryptography.exceptions import UnsupportedAlgorithm
+    from cryptography.x509 import DuplicateExtension, InvalidVersion
+
+    return (UnsupportedAlgorithm, InvalidVersion, DuplicateExtension)
+
+
 def _refusal(exc: Exception, *, ceremony: _Ceremony) -> WebAuthnVerificationError:
     """Turn a caught library exception into the audited refusal, and log the raw ones.
 
@@ -615,7 +637,11 @@ def verify_registration(
     # reaching the library (a non-str ``rp_id`` or ``origin``); the arguments are typed ``str``,
     # and :func:`_refusal` logs the type at WARNING, so such a bug is not silent.
     supported_algs = _supported_pub_key_algs()
-    refused: tuple[type[Exception], ...] = (*_invalid_response_errors(), AttributeError)
+    refused: tuple[type[Exception], ...] = (
+        *_invalid_response_errors(),
+        AttributeError,
+        *_attestation_certificate_errors(),
+    )
     try:
         verified = verify_registration_response(
             credential=response_json,
@@ -629,15 +655,14 @@ def verify_registration(
         # raises siblings of InvalidRegistrationResponse (InvalidJSONStructure, InvalidCBORData,
         # ...) — every library-side rejection must land on the audited return-False/400 path,
         # never an unhandled 500. That is the aim, not a proof: a raw type outside this tuple
-        # still escapes. cryptography's UnsupportedAlgorithm derives from Exception alone, so it is
-        # not caught here; code review reported it raised by an attestation certificate whose key
-        # algorithm cryptography does not know, which this branch did not reproduce. The raw
-        # decode errors join it for the same reason (BACKLOG
-        # #1166): a malformed COSE key raised them straight out of this call. AttributeError
-        # joins only here (vault BACKLOG #5341): webauthn 3.0.1's android-safetynet check calls
-        # ``.decode`` on the attestation statement's ``response`` and ``.get`` on the decoded
-        # JWS header and payload with no type check, so a non-bytes ``response``, or a header or
-        # payload decoding to ``null``, a list or a number, raised it straight out of this call.
+        # still escapes. The raw decode errors join it for the same reason (BACKLOG #1166): a
+        # malformed COSE key raised them straight out of this call. More join only here, at
+        # registration (vault BACKLOG #5341). The attestation-certificate errors, and what raised
+        # each, are in :func:`_attestation_certificate_errors`. AttributeError: webauthn 3.0.1's
+        # android-safetynet check calls ``.decode`` on the attestation statement's ``response``
+        # and ``.get`` on the decoded JWS header and payload with no type check, so a non-bytes
+        # ``response``, or a header or payload decoding to ``null``, a list or a number, raised it
+        # straight out of this call.
         raise _refusal(exc, ceremony="registration") from exc
     _require_usable_public_key(verified.credential_public_key, ceremony="registration")
     return RegistrationResult(
