@@ -1026,17 +1026,19 @@ CLEARTEXT_REVOCATION_KEYS = (
 CONNECTION_DECLARATION_KEYS = (*HOP_ATTESTATION_KEYS, *CLEARTEXT_REVOCATION_KEYS)
 
 
-def refuse_raw_declarations(settings: Mapping[str, Any], where: str) -> None:
-    """Refuse any :data:`CONNECTION_DECLARATION_KEYS` key in an inbound's or outbound's transport
-    settings, whatever its value.
+def refuse_raw_declarations(
+    settings: Mapping[str, Any], where: str, keys: tuple[str, ...] = CONNECTION_DECLARATION_KEYS
+) -> None:
+    """Refuse any of ``keys``, by default every :data:`CONNECTION_DECLARATION_KEYS` key, in an
+    inbound's or outbound's transport settings, whatever its value.
 
     The typed fields on the connection are the only carriers the gates read there. Before the
     owner's 2026-09-24 ruling the gate read the hop attestation straight out of the settings dict,
     so a config module could write it past every factory and cross an enforcing refusal unreported.
-    The cleartext and revocation keys used to load clean and be stripped at build, so the author's
-    declaration did nothing and nothing said so (vault BACKLOG #8253 item 2). Run on the declared
-    settings and on the resolved ones at build, before the build mirrors the typed declarations."""
-    raw = [key for key in CONNECTION_DECLARATION_KEYS if key in settings]
+    The cleartext and revocation keys used to load clean and be stripped at an outbound's build, so
+    the author's declaration did nothing and nothing said so (vault BACKLOG #8253 item 2). Run on
+    the declared settings, at the declaration and at the build."""
+    raw = [key for key in keys if key in settings]
     if raw:
         raise WiringError(
             f"{where}: {', '.join(raw)} is not a transport setting. Declare tls_hop_attested or "
@@ -1049,13 +1051,13 @@ def refuse_raw_declarations(settings: Mapping[str, Any], where: str) -> None:
 def apply_hop_attestation(
     settings: dict[str, Any], where: str, attested: bool, reason: str | None
 ) -> None:
-    """Refuse the raw declaration keys in a connection's resolved settings
-    (:func:`refuse_raw_declarations`), then mirror its declared attestation pair there.
+    """Refuse a raw attestation pair in a connection's resolved settings
+    (:func:`refuse_raw_declarations`), then mirror its declared pair there.
 
     The mirror is for the settings-driven seams (the SMART, OAuth2, Digest and FTP guards), which
-    receive only a settings mapping. Written only when declared. Call it before an outbound's
-    cleartext and revocation mirror, which writes keys this refuses."""
-    refuse_raw_declarations(settings, where)
+    receive only a settings mapping. Written only when declared. Only the attestation keys are
+    refused here, so an outbound's cleartext and revocation mirror may run either side of it."""
+    refuse_raw_declarations(settings, where, HOP_ATTESTATION_KEYS)
     settings.update(_hop_attestation_entries(where, attested, reason))
 
 
@@ -1679,7 +1681,7 @@ def _read_bool_setting(value: Any, default: bool | None) -> bool | None:
 def _bool_literal_problem(key: str, value: Any) -> str | None:
     """Why the literal ``value`` may not stand on the boolean setting ``key``, or ``None`` when it
     may (vault BACKLOG #3234). :meth:`Registry.bool_literal_problems` says what is refused and why;
-    :func:`_refuse_bool_literals` asks it too, before a connection's own checks read a flag. The
+    :func:`refuse_bool_literals` asks it too, before a connection's own checks read a flag. The
     value is withheld.
 
     Raises :class:`WiringError` when a factory's annotations do not resolve (:func:`_bool_settings`)."""
@@ -1718,13 +1720,13 @@ def _bool_remedy(key: str, value: object) -> str:
 
 def _bool_literal_problems_in(settings: Mapping[str, Any]) -> Iterator[str]:
     """:func:`_bool_literal_problem` for every setting in ``settings``, in order. The one loop
-    behind :func:`_refuse_bool_literals` and :meth:`Registry.bool_literal_problems`."""
+    behind :func:`refuse_bool_literals` and :meth:`Registry.bool_literal_problems`."""
     for key, value in settings.items():
         if (bad := _bool_literal_problem(key, value)) is not None:
             yield bad
 
 
-def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
+def refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
     """Refuse every non-bool literal on a boolean setting, in one error, before a connection's own
     checks or desugars read one (vault BACKLOG #3234). Those read flags by truthiness, so a quoted
     false would otherwise be refused as if it were set, or overwritten (``reingress_to`` sets
@@ -1734,15 +1736,12 @@ def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
 
     A factory calls it too, on one of its own arguments, where a check inside the factory reads
     that argument by truthiness before ``inbound()`` or ``outbound()`` can refuse it, and names
-    itself as ``where``, since it runs before the declaration has a name. Problems are joined with
-    `` | ``, because a problem can hold a ``;`` before its remedy."""
+    itself as ``where``, since it runs before the declaration has a name. Each carrier's build
+    calls it again on the declared settings, before they resolve, because the dict stays mutable
+    and a Registry built in code was never loaded (vault BACKLOG #3234 added step 8). Problems are
+    joined with `` | ``, because a problem can hold a ``;`` before its remedy."""
     if problems := list(_bool_literal_problems_in(settings)):
         raise WiringError(f"{where}: " + " | ".join(problems))
-
-
-#: The name each carrier's build calls (vault BACKLOG #3234 added step 8): a Registry built in code,
-#: or settings changed after the load, never met :meth:`Registry.bool_literal_problems`.
-refuse_bool_literals = _refuse_bool_literals
 
 
 def _refuse_non_bool_flags(
@@ -2940,7 +2939,7 @@ def MLLP(
     if tls_client_subjects is not None:
         # The subjects check reads tls by truthiness, so 0 would be refused as "needs tls=True".
         # Only here: elsewhere inbound()/outbound() refuse it, naming the connection.
-        _refuse_bool_literals({"tls": tls}, "MLLP")
+        refuse_bool_literals({"tls": tls}, "MLLP")
     client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
     return ConnectionSpec(
         ConnectorType.MLLP,
@@ -3804,7 +3803,7 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
         return
 
     # mtls_subject. The check below reads tls by truthiness, so 0 would be refused as "needs tls=True".
-    _refuse_bool_literals({"tls": settings["tls"]}, "Http")
+    refuse_bool_literals({"tls": settings["tls"]}, "Http")
     if not settings["tls"] or not settings["tls_ca_file"]:
         raise WiringError(
             "Http intake_auth='mtls_subject' needs tls=True and tls_ca_file — without a CA the "
@@ -4768,7 +4767,7 @@ def DICOMweb(
     if tls_ca_file is not None:
         # The CA check below reads verify_tls by truthiness, so 0 would be refused as verification
         # off. Only here: elsewhere outbound() refuses it, naming the connection.
-        _refuse_bool_literals({"verify_tls": verify_tls}, "DICOMweb")
+        refuse_bool_literals({"verify_tls": verify_tls}, "DICOMweb")
     _check_tls_ca_file(
         "DICOMweb",
         tls_ca_file,
@@ -6939,7 +6938,7 @@ class Registry:
         writes its ``enabled`` flag onto a spec after its factory returns, a ``FhirLookup`` already
         registered. ``inbound()``/``outbound()`` refuse a connection's literals at declaration, and
         ``MLLP``, ``DICOMweb`` and ``Http`` refuse the one flag a check of their own reads first
-        (:func:`_refuse_bool_literals`), as ``Ftp`` refuses its ``tls``, ``None`` included, by its
+        (:func:`refuse_bool_literals`), as ``Ftp`` refuses its ``tls``, ``None`` included, by its
         own check; this pass sees the rest, a lookup's and a composer's
         included. ``None`` passes where the setting has one default on every factory: there an
         explicit ``None`` is that default to ``bool_setting`` (vault BACKLOG #3230). It is refused on
@@ -7260,6 +7259,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
     def _refused(name: str, settings: Mapping[str, Any], accepted: bool) -> bool:
         try:
             refuse_unresolved_hop_flags(settings, name)
+            refuse_bool_literals(settings, name)
             # A FhirLookup's typed cleartext_accepted with an attestation written into its settings
             # is refused by the lookup settings builder, so it is marked too.
             _refuse_attested_and_accepted(name, True, accepted)
@@ -8701,7 +8701,7 @@ def build_inbound_connection(
     # because the settings dict stays mutable after the declaration returns. Before the bool-literal
     # refusal, which would otherwise give a raw non-bool tls_hop_attested the generic remedy.
     refuse_raw_declarations(spec.settings, f"inbound connection {name!r}")
-    _refuse_bool_literals(spec.settings, f"inbound connection {name!r}")
+    refuse_bool_literals(spec.settings, f"inbound connection {name!r}")
     # Before any check below reads one: the content_type check read strict="false" as strict on.
     _refuse_non_bool_flags(
         f"inbound connection {name!r}",
@@ -9108,7 +9108,7 @@ def build_outbound_connection(
     # Before the bool-literal refusal, which would otherwise give a raw non-bool tls_hop_attested
     # the generic remedy instead of naming the declaration that carries it.
     refuse_raw_declarations(spec.settings, f"outbound connection {name!r}")
-    _refuse_bool_literals(spec.settings, f"outbound connection {name!r}")
+    refuse_bool_literals(spec.settings, f"outbound connection {name!r}")
     _refuse_non_bool_flags(
         f"outbound connection {name!r}",
         {"simulate": simulate, "auto_start": auto_start, "deployed": deployed},

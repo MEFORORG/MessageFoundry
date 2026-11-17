@@ -540,8 +540,8 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   connection's transport settings before the declaration is refused there as not a transport
   setting, whatever its value. Written after the declaration, the load refuses only a value that
   is not a `bool`, and the connection's build refuses the key whatever its value.
-  `cleartext_accepted`, `tls_revocation_attested` and their reasons are refused the same way in a
-  connection's transport settings, at the declaration and at the build. The
+  `cleartext_accepted`, `tls_revocation_attested` and their reasons are refused in a connection's
+  transport settings too, at the declaration and, written after it, at the build. The
   flags `inbound()` and `outbound()` take themselves, such as
   `simulate`, `deployed`, `auto_start`, `strict` and `capture_ack`, must be a real `True` or
   `False` as well. Any other value there, such as a string or a number, stops the load when the

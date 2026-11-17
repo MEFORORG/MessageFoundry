@@ -14600,7 +14600,7 @@ def _source_config(
     trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> Source:
     _refuse_declared_settings(ic.spec.settings, f"inbound connection {ic.name!r}")
-    # Resolve any env() references first (a missing value raises WiringError here, before bind).
+    # Then resolve any env() references (a missing value raises WiringError here, before bind).
     settings = resolve_env_settings(
         ic.spec.settings, env_values, connection=inbound_record_name(ic.name)
     )

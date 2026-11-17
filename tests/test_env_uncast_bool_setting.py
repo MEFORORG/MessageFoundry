@@ -498,9 +498,29 @@ def test_a_lookup_and_a_reference_set_meet_the_literal_rule_at_build(tmp_path: P
     assert "database lookup 'pt': setting 'trust_server_certificate' must be" in check()
     del reg.lookups["pt"].settings["trust_server_certificate"]
     assert "reference set 'codes': setting 'encrypt' must be" in check()
-    # The sync refuses it too, and its handler logs the refusal whole.
+    # Engine.start's gate, which runs no build check, refuses it too.
     with pytest.raises(WiringError, match="reference set 'codes': setting 'encrypt'"):
         refuse_reference_hop_flags(reg)
+
+
+def test_a_fhir_lookup_meets_the_literal_rule_at_build_and_in_the_census(tmp_path: Path) -> None:
+    from messagefoundry.pipeline.wiring_runner import _fhir_lookup_settings
+
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        "FhirLookup('fh', url='https://fhir.example.org/fhir', tls_hop_attested=True, "
+        "tls_hop_attested_reason='synthetic reason')\n",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+    spec = reg.fhir_lookups["fh"]
+    egress = EgressSettings(deny_by_default=False)
+    _fhir_lookup_settings(spec, {}, egress)  # the control builds
+    assert [h.refused for h in wiring.attested_secure_hop_records(reg)] == [False]
+    spec.settings["verify_tls"] = "false"
+    with pytest.raises(WiringError, match="fhir lookup 'fh': setting 'verify_tls' must be"):
+        _fhir_lookup_settings(spec, {}, egress)
+    assert [h.refused for h in wiring.attested_secure_hop_records(reg)] == [True]
 
 
 def test_the_attested_hop_census_marks_a_literal_the_build_refuses() -> None:
