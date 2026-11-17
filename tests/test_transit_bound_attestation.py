@@ -41,7 +41,11 @@ from messagefoundry.config.settings import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.base import open_store
-from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.crypto import (
+    AuditKeyVersionRefusedError,
+    AuditKeyVersionUnverifiedError,
+    CipherError,
+)
 from messagefoundry.store.row_seal import transit_mac_version
 from messagefoundry.store.store import MessageStore
 from messagefoundry.store.transit_attestation import (
@@ -704,7 +708,8 @@ async def test_a_planted_unheld_key_version_is_a_chain_break_on_the_startup_walk
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
-    assert f"key version {_UNHELD_VERSION}" in str(msg), msg
+    # Vault's own refusal text keeps the refused label, whole (BACKLOG #6707).
+    assert str(AuditKeyVersionRefusedError(_UNHELD_VERSION)) in str(msg), msg
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
     assert f"seq={seq}," in sink.events[0][1], sink.events
     assert not any("could not run" in line for line in lines), lines
@@ -961,6 +966,15 @@ def test_a_400_on_the_row_alone_at_the_latest_version_is_a_break() -> None:
     from hvac.exceptions import InvalidRequest
 
     cipher = _scripted_cipher([InvalidRequest("bad"), InvalidRequest("bad")])
+    assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
+
+
+@pytest.mark.parametrize("failure", [AttributeError, TypeError], ids=lambda f: f.__name__)
+def test_a_row_400_hvac_cannot_build_is_still_a_break(failure: type[Exception]) -> None:
+    """BACKLOG #6707: hvac raises ``AttributeError`` or ``TypeError`` for some JSON 400 bodies
+    (``test_hvac_raises_no_invalid_request_for_these_json_400_bodies``). On one row alone, while
+    the fixed input verifies, that is still a break at the row, not a walk that could not run."""
+    cipher = _scripted_cipher([failure("hvac"), failure("hvac")])
     assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
 
 
@@ -1465,14 +1479,10 @@ def test_a_verify_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: A
             None,
             id="known-policy-refusal",
         ),
-        pytest.param(["key version 3 is not held by this key"], None, id="unknown-wording"),
         pytest.param(
             ["no such key version", "missing input for HMAC"], None, id="refusal-beside-non-version"
         ),
-        pytest.param(
-            ["missing input for HMAC: and more"], None, id="non-version-only-as-substring"
-        ),
-        pytest.param([], None, id="empty-vault-list"),
+        pytest.param(["NO SUCH KEY VERSION"], None, id="known-refusal-any-case"),
         pytest.param(["invalid HMAC: version is too new"], None, id="verify-too-new"),
         pytest.param(
             ["invalid HMAC: version is too new", "encryption key not found"],
@@ -1485,17 +1495,21 @@ def test_a_verify_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: A
             id="verify-below-min-decryption",
         ),
         pytest.param(None, '{"errors": ["no such key version"]}', id="vault-json-in-text-only"),
-        pytest.param(None, '{"errors": ["reworded refusal"]}', id="unknown-wording-in-text-only"),
+        pytest.param(
+            None,
+            '{"errors": [7, "no such key version"]}',
+            id="refusal-beside-non-text-entry-in-text-only",
+        ),
     ],
 )
 def test_a_verify_400_read_as_a_version_refusal_keeps_the_refused_label(
     errors: Any, text: str | None
 ) -> None:
-    """BACKLOG #6707: a 400 whose ``errors`` value is a list is labelled a refused version unless
-    that list is non-empty and holds only whole known non-version texts. An empty list and unknown
-    Vault wording keep that label, so a reworded refusal on an upgraded Vault is labelled as
-    before. hvac fills ``errors`` only for a Content-Type of exactly ``application/json``, so the
-    same JSON in the body (a charset-tagged reply) must read the same way."""
+    """BACKLOG #6707: a 400 whose ``errors`` list has a text entry holding one of Vault's version
+    refusal texts is labelled a refused version, whatever else the list holds. hvac fills
+    ``errors`` only for a Content-Type of exactly ``application/json``, so the same JSON in the
+    body (a charset-tagged reply, which hvac does not parse) reads the same way; that is also
+    where an entry that is not text can arrive, since hvac's own join refuses one."""
     from messagefoundry.store.crypto import (
         AuditKeyVersionRefusedError,
         AuditKeyVersionUnverifiedError,
@@ -1515,16 +1529,22 @@ def test_a_verify_400_read_as_a_version_refusal_keeps_the_refused_label(
         pytest.param(None, '{"message": "bad request"}', id="json-without-errors"),
         pytest.param(["missing input for HMAC"], None, id="known-non-version-text"),
         pytest.param(["  Encryption key not found "], None, id="known-non-version-any-case"),
+        pytest.param(["key version 3 is not held by this key"], None, id="unknown-wording"),
+        pytest.param([], None, id="empty-vault-list"),
+        pytest.param(None, '{"errors": ["reworded refusal"]}', id="unknown-wording-in-text-only"),
+        pytest.param(None, '{"errors": []}', id="empty-list-in-text-only"),
+        pytest.param(None, '{"errors": [7]}', id="non-text-entry-in-text-only"),
+        pytest.param(None, '{"errors": "no such key version"}', id="string-errors-value"),
     ],
 )
 def test_a_verify_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
     errors: Any, text: str | None
 ) -> None:
     """BACKLOG #6707: after a rotation the probe answers under a newer version, so the probe alone
-    labelled ANY 400 on a check a refused version. A 400 with no ``errors`` value that is a list, even
-    one whose reply holds a refusal text elsewhere, or with a list of only whole known non-version
-    texts, is labelled unconfirmed instead. It stays a subclass, so its handlers handle the row as
-    on main."""
+    labelled ANY 400 on a check a refused version. A 400 with no ``errors`` list, even one whose
+    reply holds a refusal text elsewhere, or with a list naming no version refusal (empty, unknown
+    wording, or only a reason Vault gives for something else), is labelled unconfirmed instead. It
+    stays a subclass, so its handlers handle the row as on main."""
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     refused = _verify_refusal("vault:v2:AAAA", errors, text=text)
@@ -1537,25 +1557,80 @@ def test_a_verify_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
     assert _KEY_NAME not in str(refused)  # the walk puts this text in the tamper alert
 
 
-def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error() -> None:
-    """The label changes nothing else: a proxy 400 whose probe also fails is an outage, as on main."""
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(RuntimeError("down"), id="probe-fails"),
+        pytest.param("vault:v3:AAAA", id="probe-names-the-same-version"),
+    ],
+)
+def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: Any) -> None:
+    """The label changes nothing else: a proxy 400 whose probe fails, or answers under the version
+    the row names, is not read as a refused version, as on main."""
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
-    refused = _verify_refusal(RuntimeError("down"), None, text=_PROXY_PAGE)
+    refused = _verify_refusal(answer, None, text=_PROXY_PAGE)
     assert not isinstance(refused, AuditKeyVersionRefusedError)
 
 
-def test_a_non_text_entry_in_vault_errors_is_labelled_a_refused_version() -> None:
-    """A Vault error list holding an entry that is not text could name the version, so it keeps
-    the refused-version label (BACKLOG #6707)."""
+def test_an_unconfirmed_label_logs_its_reason_once_per_interval(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707: why a 400 was labelled unconfirmed is logged, by a fixed reason that carries
+    none of the reply's text, and once an interval per reason, since a proxy can cause it on every
+    row."""
+    from messagefoundry.store import crypto_transit
+
+    monkeypatch.setattr(crypto_transit, "_logged_at", {})
+    caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
+    for _ in range(3):
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    _verify_refusal("vault:v2:AAAA", ["reworded refusal"])
+    _verify_refusal("vault:v2:AAAA", ["no such key version"])  # the refused label logs nothing
+    logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
+    assert len(logged) == 2, logged
+    assert "because it carries no errors list" in logged[0], logged
+    assert "because its errors list names no version refusal" in logged[1], logged
+    assert not any("400 Bad Request" in line or "reworded" in line for line in logged), logged
+
+
+def test_a_body_hvac_parsed_past_the_bound_is_not_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #6707: the bound covers a list hvac already parsed too, so an oversized body gets
+    the same label whatever its Content-Type; its refusal text is not read."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}')
+    refused = _verify_refusal("vault:v2:AAAA", ["no such key version"], text=body)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("[]", id="list"),
+        pytest.param("null", id="null"),
+        pytest.param('"text"', id="string"),
+        pytest.param('{"errors":[{"message":"x"}]}', id="object-entry"),
+        pytest.param('{"errors":[1]}', id="number-entry"),
+        pytest.param('{"errors":5}', id="number"),
+        pytest.param('{"errors":true}', id="true"),
+    ],
+)
+def test_hvac_raises_no_invalid_request_for_these_json_400_bodies(body: str) -> None:
+    """BACKLOG #6707: ``verify_audit_hmac``'s docstring says the installed hvac raises
+    ``AttributeError`` or ``TypeError``, not ``InvalidRequest``, for a JSON 400 body that is not
+    an object, or whose ``errors`` is truthy and a number, ``true`` or a list with a non-text
+    entry. This runs hvac's own adapter on such replies, so a release that changes it fails here."""
     _needs_hvac()
-    from hvac.exceptions import InvalidRequest
+    import requests
+    from hvac.adapters import RawAdapter  # type: ignore[import-untyped]
 
-    from messagefoundry.store.crypto_transit import _names_no_version_reason
-
-    exc = InvalidRequest(errors=["missing input for HMAC"])
-    exc.errors = ["missing input for HMAC", 7]  # hvac's constructor joins entries, so set it after
-    assert not _names_no_version_reason(exc)
+    reply = requests.Response()
+    reply.status_code = 400
+    reply.headers["Content-Type"] = "application/json"
+    reply._content = body.encode("utf-8")
+    with pytest.raises((AttributeError, TypeError)):
+        RawAdapter()._raise_for_error("POST", "https://vault.invalid/v1/transit/verify/k", reply)
 
 
 class _ProxiedRotatingTransit(_RotatingTransit):
@@ -1590,7 +1665,7 @@ async def test_a_planted_version_behind_a_proxy_is_a_chain_break_on_the_startup_
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
-    assert f"check at key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
+    assert str(AuditKeyVersionUnverifiedError(_UNHELD_VERSION)) in str(msg), msg
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
     assert not any("could not run" in line for line in lines), lines
 
@@ -1610,6 +1685,7 @@ async def test_a_planted_genesis_version_behind_a_proxy_opens_and_reads_as_a_bre
     finally:
         await store.close()
     assert not ok and "seq=1," in str(msg), msg
+    assert str(AuditKeyVersionUnverifiedError(_UNHELD_VERSION)) in str(msg), msg
 
 
 def _past_the_reparse_bound(head: str, tail: str, *, over: int = 1) -> str:
@@ -1678,12 +1754,12 @@ class _PaddedProxiedRotatingTransit(_ProxiedRotatingTransit):
 
 
 class _ExplodingText(str):
-    """An ``errors`` entry whose ``strip``, the first step of the cipher's lower-cased copy, fails
-    as copying a huge list would: with MemoryError."""
+    """An ``errors`` entry whose ``lower``, the cipher's one copy of an entry, fails as copying a
+    huge entry would: with MemoryError."""
 
     __slots__ = ()
 
-    def strip(self, chars: str | None = None) -> str:
+    def lower(self) -> str:
         raise MemoryError
 
 
@@ -1710,7 +1786,8 @@ async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_w
     """BACKLOG #6707 item 48: a MemoryError while reading the 400 must not escape as a non-cipher
     error, or the walk logs "could not run" and drops the row's break and its alert. The parser
     raises MemoryError if it is reached at all, and it must not be reached for a body past the
-    bound; a huge ``errors`` list, which hvac parsed, fails in the lower-cased copy instead."""
+    bound; a huge ``errors`` list, which hvac parsed, fails in the lower-cased copy of an entry
+    instead."""
     from messagefoundry.store import crypto_transit
 
     parsed: list[int] = []
@@ -1731,7 +1808,7 @@ async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_w
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
-    assert f"check at key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
+    assert str(AuditKeyVersionUnverifiedError(_UNHELD_VERSION)) in str(msg), msg
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
     assert f"seq={seq}," in sink.events[0][1], sink.events
     assert not any("could not run" in line for line in lines), lines

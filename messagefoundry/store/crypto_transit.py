@@ -126,11 +126,8 @@ _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
 #: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. ``version is too new`` was
 #: read on 2026-11-11 from Vault's ``pathHMACVerify`` at cbc874e2358f only (BACKLOG #2720); OpenBao
-#: was not read for it. They never decide whether
-#: the row is a break, and are read only inside an ``errors`` value that is a list
-#: (:func:`_names_no_version_reason`): a list entry holding one keeps the refused-version label,
-#: even beside a reason in :data:`_NOT_VERSION_TEXTS`. One anywhere else, such as in a bare JSON
-#: list or a string ``errors`` value, is not read.
+#: was not read for it. They choose only the error's label, never whether the row is a break
+#: (:func:`_names_no_version_reason` says where they are looked for).
 _VERSION_REFUSAL_TEXTS = (
     "key version does not exist",
     "no such key version",
@@ -138,17 +135,11 @@ _VERSION_REFUSAL_TEXTS = (
     "no hmac key exists for that key version",
     "version is too new",
 )
-#: Whole Vault error texts, lower-cased, that say an audit-MAC 400 is NOT about the version
-#: (BACKLOG #6707), from the same Vault source. Matched whole once stripped and lower-cased, never
-#: as a substring. Kept short on purpose: :meth:`TransitCipher.verify_audit_hmac` sends base64 it
-#: encoded, a fixed algorithm and only a MAC that :func:`transit_mac_version` accepts, so at least
-#: the input-encoding, MAC-shape and algorithm 400s are not reachable from it.
-_NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not found"})
 #: The longest reply body, in characters, that :func:`_reply_errors` parses when hvac parsed none
-#: (BACKLOG #6707). Vault's own refusal is far shorter. It bounds both readers of a 400: the audit
-#: walk's version check, where a MemoryError would turn a row's break into a walk that could not run
-#: and a longer body is not read as a version refusal, and the data-key decrypt's AEAD check
-#: (BACKLOG #5650), where a longer body is not read as a tag refusal. A change here changes both.
+#: (BACKLOG #6707). Vault's own refusal is far shorter, so the bound keeps an attacker-sized body
+#: from being parsed and copied only to choose an error's label. It bounds both readers of a 400:
+#: the audit walk's version check, which reads nothing from a longer body, not even a list hvac
+#: parsed, and the data-key decrypt's AEAD check (BACKLOG #5650), which does not re-parse one.
 _REPARSED_BODY_MAX_CHARS = 64 * 1024
 #: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
 #: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
@@ -180,37 +171,28 @@ def _reply_errors(exc: Exception) -> tuple[object, int | None]:
     return errors, None
 
 
-def _names_no_version_reason(exc: Exception) -> bool:
-    """Whether an audit-MAC ``verify`` 400 is NOT read as a version refusal (BACKLOG #6707). Only an
-    ``errors`` value that is a list is read. With none, this is True whatever the reply says: at
-    least a proxy or WAF page, text that is not JSON, a bare JSON list, and a string or object
-    ``errors`` value. A list is True only when it is non-empty, every entry is text whose whole
-    value, stripped and lower-cased, is in :data:`_NOT_VERSION_TEXTS`, and no entry holds a
-    :data:`_VERSION_REFUSAL_TEXTS` text; any other list, an empty one, one with a non-text entry
-    and unknown Vault wording included, is False. A True 400 may still be a refusal of the version, so this chooses only the
-    error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
-    its parent.
+def _names_no_version_reason(exc: Exception) -> str | None:
+    """Why an audit-MAC ``verify`` 400 is NOT read as Vault's own refusal of the key version, or
+    ``None`` when it is (BACKLOG #6707). It is read as one only when its ``errors`` value
+    (:func:`_reply_errors`) is a list with a text entry holding a :data:`_VERSION_REFUSAL_TEXTS`
+    text, in any case, and its body is at most :data:`_REPARSED_BODY_MAX_CHARS` long. Any other
+    400 gets a fixed reason, never the reply's own text.
 
-    The list is read by :func:`_reply_errors`, which says when a body hvac did not parse is read. A
-    body too long for it is True, unparsed."""
-    errors, oversize = _reply_errors(exc)
-    if oversize is not None:
-        # Too long to be Vault's own refusal, and never parsed (BACKLOG #6707).
-        log.warning(
-            "an audit MAC verify got a 400 whose %d-character body is past the %d-character "
-            "bound; not read as a version refusal",
-            oversize,
-            _REPARSED_BODY_MAX_CHARS,
-        )
-        return True
+    A 400 with a reason may still be a refusal of the version, so the answer chooses only the
+    error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
+    its parent."""
+    body: object = getattr(exc, "text", None)
+    if isinstance(body, str) and len(body) > _REPARSED_BODY_MAX_CHARS:
+        return f"its body is past the {_REPARSED_BODY_MAX_CHARS}-character bound and was not read"
+    errors, _ = _reply_errors(exc)
     if not isinstance(errors, list):
-        return True  # no errors list, so nothing in the reply is read
-    texts = [text.strip().lower() for text in errors if isinstance(text, str)]
-    if any(known in text for text in texts for known in _VERSION_REFUSAL_TEXTS):
-        return False
-    return (
-        bool(errors) and len(texts) == len(errors) and all(t in _NOT_VERSION_TEXTS for t in texts)
-    )
+        return "it carries no errors list"
+    for entry in errors:
+        if isinstance(entry, str):
+            text = entry.lower()
+            if any(known in text for known in _VERSION_REFUSAL_TEXTS):
+                return None
+    return "its errors list names no version refusal"
 
 
 def _batches(costs: Sequence[int]) -> list[list[int]]:
@@ -323,23 +305,32 @@ def _names_aead_failure(exc: Exception) -> bool:
     return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
 
 
-#: How long a decrypt 400 whose body went unread is logged once per process (BACKLOG #5650).
+#: How long each warning about how a 400 was read is logged once per process (BACKLOG #5650,
+#: #6707). A proxy can cause one on every read or every row; once is the signal.
 _UNREAD_BODY_LOG_INTERVAL_S = 3600.0
-_unread_body_logged_at: float | None = None
-_unread_body_lock = threading.Lock()
+#: When each such warning, by kind, was last logged.
+_logged_at: dict[str, float] = {}
+_logged_at_lock = threading.Lock()
+
+
+def _log_due(kind: str) -> bool:
+    """Whether the warning ``kind`` is due: not logged in the last
+    :data:`_UNREAD_BODY_LOG_INTERVAL_S`. A True answer records it as logged now."""
+    now = time.monotonic()
+    with _logged_at_lock:
+        last = _logged_at.get(kind)
+        if last is not None and now - last < _UNREAD_BODY_LOG_INTERVAL_S:
+            return False
+        _logged_at[kind] = now
+    return True
 
 
 def _log_unread_decrypt_body(length: int) -> None:
-    """Log, once per :data:`_UNREAD_BODY_LOG_INTERVAL_S`, that a data-key decrypt 400 was not read
-    for its AEAD reason because its body is past :data:`_REPARSED_BODY_MAX_CHARS`, so the refusal
-    stays the cipher's plain error. A proxy can cause it on every read; once is the signal."""
-    global _unread_body_logged_at
-    now = time.monotonic()
-    with _unread_body_lock:
-        last = _unread_body_logged_at
-        if last is not None and now - last < _UNREAD_BODY_LOG_INTERVAL_S:
-            return
-        _unread_body_logged_at = now
+    """Log, when due (:func:`_log_due`), that a data-key decrypt 400 was not read for its AEAD
+    reason because its body is past :data:`_REPARSED_BODY_MAX_CHARS`, so the refusal stays the
+    cipher's plain error."""
+    if not _log_due("decrypt-body-unread"):
+        return
     log.warning(
         "a Transit data-key decrypt got a 400 whose %d-character body is past the %d-character "
         "bound; not read as a tag refusal, so the value keeps the cipher's plain error",
@@ -750,17 +741,15 @@ class TransitCipher(_UnmarkedPolicy):
         answers with a string that does not start ``vault:v<N>:`` for the version ``stored``
         names, raises :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`);
         Transit refusing the version is one cause, not the only one. It raises the subclass
-        :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` does not read
-        the 400 as Vault's own refusal, for example a proxy's page, or when reading it runs out of
-        memory or stack (BACKLOG #6707).
+        :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` gives a
+        reason, for example for a proxy's page, or when reading the 400 raises (BACKLOG #6707).
 
-        A 400 on which hvac raises an exception other than ``InvalidRequest`` raises neither of
-        those (BACKLOG #6707). For example, these
-        exact 400 bodies with the Content-Type exactly ``application/json``: ``[]``, ``null``,
-        ``{"errors":[{"message":"x"}]}``, ``{"errors":[1]}``, ``{"errors":5}`` and
-        ``{"errors":true}``. On each, hvac 2.4.0 raises ``AttributeError`` or ``TypeError`` in
-        place of ``InvalidRequest``. A ``MemoryError`` that hvac raises while it joins a truthy
-        ``errors`` value, before it raises any ``InvalidRequest``, is not read as a refusal either.
+        A 400 on which hvac raises something other than ``InvalidRequest`` raises neither of
+        those, and is read as the next paragraph says (BACKLOG #6707). hvac 2.4.0 raises
+        ``AttributeError`` or ``TypeError`` when it parses the body as JSON (see
+        :func:`_reply_errors` for when it does) and the value is not an object, or its ``errors``
+        value is truthy and is a number, ``true``, or a list holding an entry that is not text. A
+        ``MemoryError`` hvac raises while it joins a truthy ``errors`` value is read the same way.
 
         A failure of the verify call not read as a refused version, and not an outage
         (:meth:`_is_outage`), is checked once the handler has let go
@@ -809,26 +798,25 @@ class TransitCipher(_UnmarkedPolicy):
         outage (:meth:`_is_outage`) is plain :class:`CipherError`. Runs inside the caller's
         handler. Blocking."""
         if self._refuses_only_version(exc, version):
-            # The same flow, labelled apart (BACKLOG #6707). A reply that runs out of memory or
-            # stack while it is read, such as a huge errors list, is not read as a refusal:
-            # escaping here, the error would make the walk "could not run" and drop the row's
-            # break and its alert.
-            unreadable: str | None = None
+            # The same flow, labelled apart (BACKLOG #6707). Reading the reply only picks the
+            # label, so whatever the read raises picks the unconfirmed one: escaping here, it
+            # would make the walk "could not run" and drop the row's break and its alert.
+            reason: str | None
             try:
-                unverified = _names_no_version_reason(exc)
-            except (MemoryError, RecursionError) as read_exc:
-                unverified, unreadable = True, type(read_exc).__name__
-            if unreadable is not None:
+                reason = _names_no_version_reason(exc)
+            except Exception as read_exc:  # noqa: BLE001 -- see the comment above
+                reason = f"reading it raised {type(read_exc).__name__}"
+            if reason is None:
+                return AuditKeyVersionRefusedError(version)
+            if _log_due(f"unconfirmed: {reason}"):
                 log.warning(
-                    "could not read the 400 for audit key version %d (%s); labelled "
-                    "unconfirmed (key=%r)",
+                    "an audit MAC verify at key version %d got a 400 labelled unconfirmed, "
+                    "because %s (key=%r); logged once an hour for this reason",
                     version,
-                    unreadable,
+                    reason,
                     self._audit_key,
                 )
-            if unverified:
-                return AuditKeyVersionUnverifiedError(version)
-            return AuditKeyVersionRefusedError(version)
+            return AuditKeyVersionUnverifiedError(version)
         if self._is_outage(exc):
             return self._verify_failed(exc)
         return None
@@ -945,8 +933,8 @@ class TransitCipher(_UnmarkedPolicy):
             answered = self._probe_mac()
         except Exception as probe_exc:  # the latest version fails too: not a version refusal
             log.warning(
-                "Transit refused audit key version %d, and the probe under the latest version failed "
-                "too (key=%r): %s",
+                "an audit MAC verify at key version %d got HTTP 400, and the probe under the "
+                "latest version failed too (key=%r): %s",
                 key_version,
                 self._audit_key,
                 vault_failure_text(probe_exc),
