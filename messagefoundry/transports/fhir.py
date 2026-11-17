@@ -1223,9 +1223,8 @@ class FhirDestination(DestinationConnector):
             self._headers.update(proxy_dest.auth_headers())
         # BACKLOG #5350/#5353: a conditional query rides the request line or the If-None-Exist
         # header, so a credential in it reaches the server, and any proxy or log that records it.
-        # Read only where _resolve_request sends it. A verify-off or off-box cleartext hop refuses
-        # it below; any other hop is warned at the end of __init__, so a connection that never
-        # builds logs nothing.
+        # Read only where _resolve_request sends it. The refusals below count what this finds, and
+        # each entry it finds is warned about, never by value, by the last statement of __init__.
         query_credentials = (
             _query_credentials_sent("conditional_query", self.conditional_query, query_only=True)
             if self.conditional in ("if-none-exist", "conditional-update")
