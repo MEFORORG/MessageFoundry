@@ -373,6 +373,38 @@ def test_an_attested_crossing_without_cert_required_calls_nothing_verified(
     assert "verifies its certificate" not in line, line
 
 
+def _relaxed_opener() -> urllib.request.OpenerDirector:
+    """A ``CERT_REQUIRED`` opener whose context loads a CRL and skips validity-period checks."""
+    ctx = ssl.create_default_context()
+    ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    tls_policy.relax_verify_expiry(ctx, host="ai.internal")
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+
+
+def test_a_relaxed_context_is_not_said_to_check_no_revocation(ai_log: list[str]) -> None:
+    """On a context that skips validity-period checks a CRL still refuses a leaf it lists, so the
+    broker's refusal and crossing line say the guard credits no check there, not that none is
+    performed, and agree with the guard's crossing lead. Red on b8f466b105d, which kept the
+    broker's fixed "NO certificate revocation checking" detail there."""
+    with pytest.raises(AiBrokerError) as info:
+        _ai_hop(ssl.CERT_REQUIRED, _ENFORCING, opener=_relaxed_opener())
+    message = str(info.value)
+    assert "skips validity-period checks" in message, message
+    assert "NO certificate revocation checking" not in message, message
+    assert "crl_file" not in message, message
+    _ai_hop(
+        ssl.CERT_REQUIRED,
+        _ENFORCING,
+        opener=_relaxed_opener(),
+        revocation_attested=True,
+        revocation_reason=_REASON,
+    )
+    assert len(ai_log) == 1
+    line = ai_log[0]
+    assert "skips validity-period checks crossed" in line, line
+    assert "NO certificate revocation checking" not in line, line
+
+
 def test_a_cert_required_context_keeps_the_verified_words_and_the_crl_lever(
     ai_log: list[str],
 ) -> None:

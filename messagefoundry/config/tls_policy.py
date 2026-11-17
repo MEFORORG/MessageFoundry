@@ -2837,7 +2837,9 @@ _DEFAULT_WAYS_ACROSS: dict[CrlNoCredit | None, str] = {
 #: whole word "verified" goes: with the whitespace after it, or, where punctuation follows it, as
 #: in "verified," or "verified)", with the whitespace before it. A caller that writes its own
 #: record, as the AI broker does, reads :attr:`RevocationHopGuard.stated_cell` for its cell and
-#: words the rest itself. The word boundary keeps "unverified" whole.
+#: words the rest itself. The word boundary keeps "unverified" whole, but a negation written as
+#: two words, such as "not verified", loses its second word. No shipped caller writes one, and
+#: nothing checks that a new caller does not.
 _VERIFIED_CLAIM = re.compile(r"\s*\bverified\b(?=[^\w\s])|\bverified\b\s*", re.IGNORECASE)
 
 
