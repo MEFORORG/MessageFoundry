@@ -289,6 +289,7 @@ def _transit_error(kind: str) -> Callable[[], CipherError]:
         "401": lambda: hv.Unauthorized(errors=["missing client token"]),
         "403": lambda: hv.Forbidden(errors=["permission denied"]),
         "404": lambda: hv.InvalidPath(errors=["no handler for route"]),
+        "404-recorded": lambda: recorded(hv.InvalidPath(errors=["no handler for route"]), 404),
         "408": lambda: unexpected(408),
         "413": lambda: unexpected(413),
         # hvac raises a TypeError where it cannot read a reply body's ``errors``; the store's client
@@ -318,9 +319,9 @@ def _transit_error(kind: str) -> Callable[[], CipherError]:
 
 
 #: The replies that are Vault's verdict on the row (``queue_tag._key_service_gave_no_verdict``).
-_VERDICTS = ["400", "404", "413"]
-#: At least these give no verdict on the row. 401, 403, 408, the TLS refusal, the 503 recorded on
-#: a TypeError and the two strict-adapter refusals were verdicts before the rule was revised.
+_VERDICTS = ["400", "413"]
+#: At least these give no verdict on the row. 401, 403, 404, 408, the TLS refusal, the 503 recorded
+#: on a TypeError and the two strict-adapter refusals were verdicts before the rule was revised.
 _NO_VERDICTS = [
     "503",
     "429",
@@ -330,6 +331,8 @@ _NO_VERDICTS = [
     "connection",
     "401",
     "403",
+    "404",
+    "404-recorded",
     "408",
     "tls",
     "503-typeerror",
@@ -343,7 +346,7 @@ _NO_VERDICTS = [
 async def test_a_verdict_is_still_dead_lettered_and_reported(
     tmp_path: pathlib.Path, claim: Claim, kind: str
 ) -> None:
-    """BACKLOG #5765: a 400, a 404 and a 413 are Vault's verdict on the row, so the claim
+    """BACKLOG #5765: a 400 and a 413 are Vault's verdict on the row, so the claim
     dead-letters and reports it as before, never sets it aside to retry with no cap."""
     store, cipher, db = await _open(tmp_path)
     try:

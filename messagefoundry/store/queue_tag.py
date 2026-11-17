@@ -260,22 +260,26 @@ def is_tag_failure(cipher: Cipher, stored: str) -> bool:
 
 
 #: The only HTTP statuses that are the key service's verdict on the row (BACKLOG #5765): 400
-#: (invalid ciphertext or input), 404 (key or key version not found) and 413 (payload too large).
-_VERDICT_STATUSES: Final = frozenset({400, 404, 413})
+#: (invalid ciphertext or input, a key version that is unknown or below the key's
+#: ``min_decryption_version``) and 413 (payload too large). A 404 is not one: Vault answers it for a
+#: path it has no handler for, such as a missing mount or a wrong namespace, and the path is built
+#: from engine config, never from the row.
+_VERDICT_STATUSES: Final = frozenset({400, 413})
 
 #: The ``hvac`` error classes for a reply whose status is not a verdict, as hvac 2.4.0's
-#: ``VaultError.from_status`` maps them: 401 ``Unauthorized``, 403 ``Forbidden``, 405
-#: ``UnsupportedOperation``, 412 ``PreconditionFailed``, 429 ``RateLimitExceeded``, 500
-#: ``InternalServerError``, 501 ``VaultNotInitialized``, 502 ``BadGateway``, 503 ``VaultDown`` (a
-#: sealed or standby node), and ``UnexpectedError`` for every other status. Read only when no status
-#: was recorded on the error. ``InvalidRequest`` (400) and ``InvalidPath`` (404) are verdicts, so
-#: they are not here. Named rather than imported, so ``hvac`` stays imported in
+#: ``VaultError.from_status`` maps them: 401 ``Unauthorized``, 403 ``Forbidden``, 404
+#: ``InvalidPath``, 429 ``RateLimitExceeded``, 500 ``InternalServerError``, 501
+#: ``VaultNotInitialized``, 502 ``BadGateway``, 503 ``VaultDown`` (a sealed or standby node), and
+#: ``UnexpectedError`` for every other status. hvac also defines ``UnsupportedOperation`` and
+#: ``PreconditionFailed``, which that map does not raise. Read only when no status was recorded on
+#: the error. ``InvalidRequest`` (400) is a verdict, so it is not here. Named rather than imported, so ``hvac`` stays imported in
 #: ``keyprovider_vault`` only (BACKLOG #2337).
 _NO_VERDICT_HVAC_ERRORS: Final = frozenset(
     {
         "Unauthorized",
         "Forbidden",
         "UnsupportedOperation",
+        "InvalidPath",
         "PreconditionFailed",
         "RateLimitExceeded",
         "InternalServerError",
@@ -302,10 +306,11 @@ def _key_service_gave_no_verdict(exc: CipherError) -> bool:
     """Whether ``exc`` says nothing about the row, because the key service gave no verdict on it.
 
     **The rule, stated here once (BACKLOG #5765, #5735).** A failed open is the key service's
-    verdict on the row only when the service answered HTTP 400 (invalid ciphertext or input), 404
-    (key or key version not found) or 413 (payload too large), or when a decrypt or tag check ran
-    and failed (:class:`UnauthenticatedCipherError`). Everything else about reaching or
-    authenticating to the key service gives no verdict, at least: a 401, 403 or 408; a 429 or any
+    verdict on the row only when the service answered HTTP 400 (invalid ciphertext or input) or 413
+    (payload too large), or when a decrypt or tag check ran and failed
+    (:class:`UnauthenticatedCipherError`). Everything else about reaching or authenticating to the
+    key service gives no verdict, at least: a 401, 403 or 408; a 404, which names a path the
+    engine's config built, such as a missing mount or a wrong namespace; a 429 or any
     5xx; a connection failure, timeout, dropped connection or cut-off reply (an ``OSError`` cause,
     which every ``requests`` error is); a TLS or certificate refusal, the engine's own hop refusal
     (``InsecureHopRefused``) among them; a reply the engine would not read (``EgressReplyError``,
