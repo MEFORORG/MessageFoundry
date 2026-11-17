@@ -271,9 +271,12 @@ def test_a_powershell_hook_blocks_on_a_2_that_ends_it(bridge, tmp_path, command,
         "& ./guard.ps1",
         ". ./guard.ps1",
         "& ./guard.ps1 # the guard decides",
-        # A hook's own Get-Variable must not stand in for the one the bridge's tail calls.
+        # A hook's own commands or default parameter values must not change how the bridge's
+        # tail reads the exit code.
         "function Get-Variable { 0 }\n& ./guard.ps1",
         "Set-Alias Get-Variable Write-Output\n& ./guard.ps1",
+        "$PSDefaultParameterValues['*:Exclude'] = 'LAST*'\n& ./guard.ps1",
+        "$PSDefaultParameterValues['Get-Variable:Include'] = 'nothing'\n& ./guard.ps1",
     ],
     ids=[
         "called",
@@ -281,6 +284,8 @@ def test_a_powershell_hook_blocks_on_a_2_that_ends_it(bridge, tmp_path, command,
         "called-before-a-comment",
         "after-a-Get-Variable-function",
         "after-a-Get-Variable-alias",
+        "after-a-default-Exclude",
+        "after-a-default-Get-Variable-Include",
     ],
 )
 def test_a_powershell_hook_blocks_when_a_guard_it_runs_exits_2(bridge, tmp_path, command):

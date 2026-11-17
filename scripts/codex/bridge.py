@@ -205,8 +205,8 @@ def git_bash() -> str | None:
 # decides a block", and the tests for which shapes block.
 POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false\n"
 POWERSHELL_TAIL = (
-    "\n;\nif (-not $?) { if ((Microsoft.PowerShell.Utility\\Get-Variable -Name LASTEXITCODE"
-    " -Scope Global -ValueOnly -ErrorAction Ignore) -eq 2) { exit 2 }; exit 1 }"
+    "\n;\nif (-not $?) { if ($ExecutionContext.SessionState.PSVariable.GetValue('LASTEXITCODE')"
+    " -eq 2) { exit 2 }; exit 1 }"
 )
 
 

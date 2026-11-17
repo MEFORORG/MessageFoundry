@@ -91,7 +91,7 @@ it, on new lines:
 
 ```powershell
 ;
-if (-not $?) { if ((Microsoft.PowerShell.Utility\Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly -ErrorAction Ignore) -eq 2) { exit 2 }; exit 1 }
+if (-not $?) { if ($ExecutionContext.SessionState.PSVariable.GetValue('LASTEXITCODE') -eq 2) { exit 2 }; exit 1 }
 ```
 
 The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`, and
