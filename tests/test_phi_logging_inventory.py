@@ -430,10 +430,14 @@ def test_message_event_constant_matches_the_literal_emit_sites() -> None:
         )
         for name in ("store.py", "postgres.py", "sqlserver.py")
     }
+    # Floors measured 2026-11-16: three backends, 13 literal kinds in each. A count, not just
+    # non-empty, so a scan gone equally blind on all three cannot pass the parity check below.
+    assert len(emitted) >= 3, f"expected the three store backends, scanned {sorted(emitted)}"
     assert all(emitted.values()), (
         f"the emit-site scan found no literal kind in a backend: {emitted}"
     )
     union = set().union(*emitted.values())
+    assert len(union) >= 13, f"only {len(union)} literal message_events kinds found: {union}"
     partial = {name: sorted(union - kinds) for name, kinds in emitted.items() if kinds != union}
     assert not partial, (
         f"the backends' literal message_events kinds differ; each lacks {partial}. Either the scan "
