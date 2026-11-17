@@ -96,6 +96,87 @@ def test_decode_helpers_map_bad_body_to_apierror() -> None:
         _decode_list(httpx.Response(200, json={"not": "a list"}), ChannelInfo)
 
 
+#: A synthetic value that stands in for message content in a malformed reply (BACKLOG #5344).
+_REPLY_MARKER = "DOE^JANE^SYNTHETIC"
+
+
+@pytest.mark.parametrize(
+    "call",
+    [lambda c: c.list_dead_letters(), lambda c: c.list_connection_events()],
+    ids=["dead_letters", "connection_events"],
+)
+@pytest.mark.parametrize(
+    "content",
+    [
+        # Not JSON at all: json.loads' error carries the whole body as ``.doc``.
+        f"{{not json {_REPLY_MARKER}".encode(),
+        # JSON of the wrong shape: str(ValidationError) quotes each failing input.
+        json.dumps({"total": _REPLY_MARKER, "events": _REPLY_MARKER}).encode(),
+    ],
+    ids=["not_json", "wrong_shape"],
+)
+def test_list_readers_map_a_malformed_reply_to_a_value_free_apierror(
+    call: Callable[[EngineClient], object], content: bytes
+) -> None:
+    """The dead-letter and connection-event readers decode through ``_decode`` (BACKLOG #5344), so
+    a malformed reply raises only :class:`ApiError`, quotes no value from the body, and chains no
+    error that holds one.
+
+    Mutation: put ``DeadLetterList.model_validate(response.json())`` (or the event twin) back.
+    Red: a raw ``JSONDecodeError`` or ``ValidationError`` escapes instead of ``ApiError``."""
+    client = EngineClient("http://127.0.0.1:8765")
+
+    def _send(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        return httpx.Response(200, content=content, request=request)
+
+    client._http.send = _send  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ApiError, match="invalid response from engine") as excinfo:
+            call(client)
+    finally:
+        client.close()
+    assert _REPLY_MARKER not in str(excinfo.value)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("call", "body"),
+    [
+        (
+            lambda c: c.list_dead_letters(),
+            {
+                "total": 0,
+                "limit": 50,
+                "offset": 0,
+                "dead_letters": [],
+                "replay_targets": [],
+                "replayable_in_scope": False,
+            },
+        ),
+        (
+            lambda c: c.list_connection_events(),
+            {"total": 0, "limit": 200, "offset": 0, "before_id": None, "events": []},
+        ),
+    ],
+    ids=["dead_letters", "connection_events"],
+)
+def test_list_readers_still_decode_a_well_formed_reply(
+    call: Callable[[EngineClient], Any], body: dict[str, object]
+) -> None:
+    """NEGATIVE CONTROL for the test above: a reader that refused every reply would pass it."""
+    client = EngineClient("http://127.0.0.1:8765")
+
+    def _send(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        return httpx.Response(200, json=body, request=request)
+
+    client._http.send = _send  # type: ignore[method-assign]
+    try:
+        result = call(client)
+    finally:
+        client.close()
+    assert result.total == 0
+
+
 # --- ASVS 4.2.5: the client's own outbound length bound --------------------------------------------
 
 

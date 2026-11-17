@@ -1487,7 +1487,7 @@ class EngineClient:
             limit=limit,
             offset=offset,
         )
-        return DeadLetterList.model_validate(response.json())
+        return _decode(response, DeadLetterList)
 
     def list_connection_events(
         self,
@@ -1515,7 +1515,7 @@ class EngineClient:
             before_id=before_id,
             reveal=reveal,
         )
-        return ConnectionEventList.model_validate(response.json())
+        return _decode(response, ConnectionEventList)
 
     def replay_dead_letters(
         self, *, channel_id: str | None = None, destination_name: str | None = None
