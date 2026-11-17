@@ -65,7 +65,6 @@ from messagefoundry.auth.anchor_path import (
     ACCESS_ALLOWED_ACE_TYPE,
     ADMINISTRATORS_SID,
     DIRECTORY,
-    INHERIT_ONLY_ACE,
     LINK,
     PATH,
     SHARE_CAUSE,
@@ -76,7 +75,6 @@ from messagefoundry.auth.anchor_path import (
     WinHost,
     WinSecurity,
     WinTrust,
-    _strip_nt_target,
     _win_probe,
     describe_sid,
     evaluate_windows_object,
@@ -549,12 +547,10 @@ def _windows_access_problem(
 def _windows_holder_problem(security: WinSecurity) -> str | None:
     """Why the directory this owner and access list belong to lets a broad group or an application
     package replace a key file in it (:data:`_HOLDER_REPLACE_MASK`), or ``None`` (vault BACKLOG
-    #5657). The owner and entry rules of :func:`_windows_access_problem`, read with the entry
-    flags, with two differences: an inherit-only entry grants nothing on the directory, so it is
-    skipped, and a conditional entry is counted only when its mask holds a right in
-    :data:`_HOLDER_REPLACE_MASK`, where that function refuses any conditional entry. A list that
-    could not be read is the caller's to report. Kept free of ctypes so the decision is testable on
-    every platform."""
+    #5657). The owner and entry rules of :func:`_windows_access_problem`: every granting entry is
+    read, an inherit-only one included, and any conditional, object or callback allow entry is
+    refused whatever its mask. A list that could not be read is the caller's to report. Kept free
+    of ctypes so the decision is testable on every platform."""
     if security.aces is None:
         return "it has no access list at all, so every account on the host can read or change it"
     owner = security.owner
@@ -562,16 +558,14 @@ def _windows_holder_problem(security: WinSecurity) -> str | None:
         return "its owner could not be read"
     if (what := _screened_principal(owner)) is not None:
         return f"its owner is {what}, and an owner can change its access list"
-    for ace_type, flags, ace_mask, sid in security.aces:
-        if ace_type not in _GRANTING_ACE_TYPES or flags & INHERIT_ONLY_ACE:
-            continue  # a deny or audit entry, or a template for children, grants nothing here
-        if not ace_mask & _HOLDER_REPLACE_MASK:
-            continue  # the reader records every granting entry's mask, conditional ones included
+    for ace_type, _flags, ace_mask, sid in security.aces:
+        if ace_type not in _GRANTING_ACE_TYPES:
+            continue  # a deny or audit entry grants nothing
         if ace_type != ACCESS_ALLOWED_ACE_TYPE:
             return "its access list holds a conditional entry this check cannot interpret"
-        if _is_broad_group(sid):
+        if ace_mask & _HOLDER_REPLACE_MASK and _is_broad_group(sid):
             return f"{describe_sid(sid)} {_HOLDER_REACH}"
-        if _is_package_sid(sid):
+        if ace_mask & _HOLDER_REPLACE_MASK and _is_package_sid(sid):
             return f"the application package {sid} {_HOLDER_REACH}"
     return None
 
@@ -629,12 +623,10 @@ _LINK_FINDING_SUBJECT: Mapping[str, str] = MappingProxyType(
 )
 
 
-def _link_finding_problem(finding: ChainFinding, subject: str | None = None) -> str:
-    """The refusal for one anchor-path ``finding`` about a link on a key file's path, about
-    ``subject`` when given, else about what the finding's kind names. The finding's reason names
-    accounts and modes, never a path, so it is quoted."""
-    if subject is None:
-        subject = _LINK_FINDING_SUBJECT.get(finding.kind, "a part of its path")
+def _link_finding_problem(finding: ChainFinding) -> str:
+    """The refusal for one anchor-path ``finding`` about a link on a key file's path. The finding's
+    reason names accounts and modes, never a path, so it is quoted."""
+    subject = _LINK_FINDING_SUBJECT.get(finding.kind, "a part of its path")
     if not finding.insecure:
         return f"{subject} could not be judged: {finding.reason}"
     return (
@@ -662,58 +654,28 @@ def _windows_link_problem(
     for obj, kind in chain:
         if kind != LINK:
             continue
-        problem = _windows_judged_problem(
-            [(obj, LINK), *_folders_above(obj, judged)], read_security, trust
-        )
-        if problem is not None:
-            return problem
+        targets = [(obj, LINK)]
+        folder = ntpath.dirname(obj)
+        while folder.lower() not in judged:
+            judged.add(folder.lower())
+            targets.append((folder, DIRECTORY))
+            above = ntpath.dirname(folder)
+            if above == folder:
+                break
+            folder = above
+        for target, as_kind in targets:
+            security = read_security(target, as_kind)
+            if ntpath.dirname(target) == target and security.aces is not None:
+                security = WinSecurity(
+                    security.owner,
+                    tuple((t, f, m & ~DELETE_ACCESS, s) for t, f, m, s in security.aces),
+                    security.error,
+                )
+            findings = evaluate_windows_object(target, as_kind, security, trust)
+            if findings:
+                return _link_finding_problem(findings[0])
     return None
 
-
-def _folders_above(obj: str, judged: set[str]) -> list[tuple[str, str]]:
-    """Every folder above ``obj`` up to its volume root, as ``(folder, DIRECTORY)``, leaving out
-    and then adding to ``judged`` (lower-cased), so a shared ancestor is read once."""
-    folders: list[tuple[str, str]] = []
-    folder = ntpath.dirname(obj)
-    while folder.lower() not in judged:
-        judged.add(folder.lower())
-        folders.append((folder, DIRECTORY))
-        above = ntpath.dirname(folder)
-        if above == folder:
-            break
-        folder = above
-    return folders
-
-
-def _windows_judged_problem(
-    targets: Sequence[tuple[str, str]],
-    read_security: Callable[[str, str], WinSecurity],
-    trust: WinTrust,
-    subject: str | None = None,
-) -> str | None:
-    """The first trust-anchor finding on ``targets``, as a refusal about ``subject``
-    (:func:`_link_finding_problem`), or ``None``. A volume root cannot be renamed, so ``DELETE`` on
-    one is not counted."""
-    for target, as_kind in targets:
-        security = read_security(target, as_kind)
-        if ntpath.dirname(target) == target and security.aces is not None:
-            security = WinSecurity(
-                security.owner,
-                tuple((t, f, m & ~DELETE_ACCESS, s) for t, f, m, s in security.aces),
-                security.error,
-            )
-        findings = evaluate_windows_object(target, as_kind, security, trust)
-        if findings:
-            return _link_finding_problem(findings[0], subject)
-    return None
-
-
-#: What a folder judged because a ``subst`` drive is on the path is, for the refusal text.
-_SUBST_FOLDER_SUBJECT = "a folder above the one holding it, where a subst drive on its path leads,"
-#: The same, when the path is a ``subst`` drive's own root, so the folder holding it is judged too.
-_SUBST_ROOT_FOLDER_SUBJECT = (
-    "the folder holding it or a folder above that, where a subst drive on its path leads,"
-)
 
 #: The suffix Windows uses to spell an IPv6 address as a UNC server name.
 _IPV6_LITERAL_SUFFIX = ".ipv6-literal.net"
@@ -752,12 +714,12 @@ def _loopback_share_problem(
     (vault BACKLOG #5657); the share is refused, and the refusal asks for the local path instead.
 
     The server counts as this host when ``config.settings._names_this_host`` reads it as loopback
-    or unspecified (shorthand and decimal forms included); when it is ``host_name``, that name's
-    first label, or the label cut to 15 characters (the NetBIOS form), or its own first label is
-    that label; or when it is an address that ``source_of`` (the route to it) answers with
-    itself. An address whose route cannot be read is refused too, failing closed. A name that
-    resolves to this host by DNS alone is not recognized, and a host in another domain that shares
-    this host's first label is refused. Kept free of I/O, ``source_of`` aside."""
+    or unspecified (shorthand and decimal forms included); when it is ``host_name``, the whole
+    name; or when it is an address that ``source_of`` (the route to it) answers with itself. An
+    address whose route cannot be read is refused too, failing closed. Any other name is not
+    recognized, at least a part of ``host_name``, a longer name that starts with it, its NetBIOS
+    form, and a name that resolves to this host by DNS alone. Kept free of I/O, ``source_of``
+    aside."""
     from messagefoundry.config.settings import _bare_host, _host_ip_literal, _names_this_host
 
     # A trailing dot (the fully qualified spelling) goes before the suffix test.
@@ -769,10 +731,7 @@ def _loopback_share_problem(
         server = server.removesuffix(_IPV6_LITERAL_SUFFIX).replace("-", ":").replace("s", "%")
     bare = _bare_host(server)
     own = _bare_host(host_name)
-    label = own.partition(".")[0]
-    if _names_this_host(bare) or (
-        label and (bare in (own, label, label[:15]) or bare.partition(".")[0] == label)
-    ):
+    if _names_this_host(bare) or (own and bare == own):
         return _LOOPBACK_SHARE
     addr = _host_ip_literal(bare)
     if addr is None:
@@ -811,20 +770,21 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     """Why the folders on ``path`` let another account move or replace it, or ``None``: a walk that
     did not finish (:func:`_windows_cause_problem`), a share that may be this host itself
     (:func:`_loopback_share_problem`), a junction or link above it that another account can change
-    (:func:`_windows_link_problem`), a ``subst`` drive on its path whose folders above the holder
-    another account can change (the holder too, when the walk ends on that drive's target), then
-    the directory that holds it (:func:`_windows_holder_problem`). Windows only.
+    (:func:`_windows_link_problem`), then the directory that holds it
+    (:func:`_windows_holder_problem`). Windows only.
 
-    ``path`` itself is walked, so a ``subst`` drive root is resolved too, and the links on the way
-    are judged even when it resolves to a volume root. The holder is the folder that holds where
-    the walk ends, after every junction, link and ``subst`` drive on the way, and its owner and
-    entries are read there. Each volume's drive type is read, not its file system, so
-    ``host.volume_cause`` is not asked: a volume whose drive type cannot be read ends the walk and
-    is refused. A mapped network
-    drive (``GetDriveTypeW`` answers ``DRIVE_REMOTE``) is a share: the walk stops at it, as at a
-    UNC share, and follows no junction or link on it. A walk that reached a share the path names,
-    by a UNC path or a mapped drive letter, reads the holder through the share by its path as
-    written, and refuses it when it is a junction or link; one that reached a share, a mapped drive
+    The folder holding ``path`` is walked, or ``path`` itself when it is a drive root, so a
+    ``subst`` drive root is resolved. The holder is where that walk ends, after every junction,
+    link and ``subst`` drive on the way, or for a drive root the folder holding where it leads
+    (none for a volume root), and its owner and entries are read there. Where the walk ends on a
+    link back to a folder already on the path, the holder is read by its path as written instead
+    (:func:`_windows_holder_as_written_problem`), and a drive root's is not read. Each volume's drive type is read,
+    not its file system: a volume whose drive type cannot be read ends the walk and is refused. A
+    mapped network drive (``GetDriveTypeW`` answers ``DRIVE_REMOTE``) is a share: the walk stops at
+    it, as at a UNC share, and the path is then walked again as a local volume, so the junctions
+    and links on it are judged by the link rule. A walk that reached a share the path names, by a
+    UNC path or a mapped drive letter, reads the holder through the share by its path as written,
+    and refuses it when it is a junction or link; one that reached a share, a mapped drive
     included, through a junction, link or ``subst`` drive is refused. A mapped drive letter is
     judged by the loopback test through the share ``WNetGetConnectionW`` names for it, and refused
     when that cannot be read. The caller has read ``path`` itself and refused it if it is a link.
@@ -835,18 +795,16 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
         full = Path(os.path.abspath(path))
     except OSError as exc:  # the working directory
         return f"the folders on its path could not be walked ({exc.strerror or type(exc).__name__})"
+    # The path's own name is not walked, so a stream name, or a name ending in a dot or a space, is
+    # not refused by the walk.
+    walked = full if full.parent == full else full.parent
     substituted: list[str] = []
-    #: Where each ``subst`` drive on the path leads, normalized and lower-cased, as the walk reads it.
-    subst_targets: set[str] = set()
     remote: list[str] = []
 
     def drive_target(drive: str) -> str | None:
         answer = host.drive_target(drive)
         if answer is not None:
             substituted.append(drive)
-            stripped = _strip_nt_target(answer)
-            if stripped:
-                subst_targets.add(ntpath.normpath(stripped).lower())
         return answer
 
     def volume_cause(root: str) -> str | None:
@@ -864,10 +822,11 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
         return None
 
     chain, cause = windows_chain(
-        str(full), os.getcwd, _win_probe, volume_cause=volume_cause, drive_target=drive_target
+        str(walked), os.getcwd, _win_probe, volume_cause=volume_cause, drive_target=drive_target
     )
     if remote:  # the volume cause above ends the walk, so this is the cause it answered
         cause = WalkCause.plain(SHARE_CAUSE)
+    trust = WinTrust(host.engine_sid, host.admin_member)
     problem = _windows_cause_problem(cause)
     if problem is None and cause is not None:
         if substituted or any(kind == LINK for _obj, kind in chain):
@@ -878,6 +837,22 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
                 "mapped network drive, whose folders this check does not walk; name it by its "
                 "share path instead"
             )
+        if remote:
+            # Before drive types were read, a mapped drive was walked as a local volume and the
+            # junctions and links met on it were judged by the link rule. That walk is kept, so
+            # stopping at the share leaves none of those unjudged.
+            local_chain, local_cause = windows_chain(
+                str(walked), os.getcwd, _win_probe, drive_target=host.drive_target
+            )
+            problem = _windows_cause_problem(local_cause)
+            if problem is None:
+                try:
+                    problem = _windows_link_problem(local_chain, host.read_security, trust)
+                except OSError as exc:  # a reader that could not be run
+                    reason = exc.strerror or type(exc).__name__
+                    return f"a junction or link on its path could not be judged ({reason})"
+            if problem is not None:
+                return problem
         try:
             host_name = _host_name()
         except OSError as exc:  # fail closed: a share this host cannot rule out may be itself
@@ -902,44 +877,28 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     if problem is not None:
         return problem
     holder_path: str | None
+    as_written = False
     if cause is not None:  # a share: the walk stops there, and the holder is read through it
         holder_path = str(full.parent)
         if holder_path == str(full):
             holder_path = None  # a share's root: nothing on this host holds it
     elif chain[-1][1] == LINK:  # a walk with no cause has added at least the volume root
         # windows_chain adds an object once, so a path that resolves to a folder it already
-        # passed ends on the link that led there; that folder is not resolved here.
-        return (
-            "the folders on its path could not be walked (it resolves, through a junction or "
-            "link, to a folder already on its path, which this check does not resolve)"
-        )
-    else:
+        # passed ends on the link that led there, and does not record which folder that is.
+        holder_path = None if walked == full else str(full.parent)
+        as_written = True
+    elif walked == full:  # a drive root: the folder that holds where it leads
         holder_path = ntpath.dirname(chain[-1][0])
         if holder_path == chain[-1][0]:
             holder_path = None  # a volume root: nothing holds it, but the links are judged
-    trust = WinTrust(host.engine_sid, host.admin_member)
+    else:
+        holder_path = chain[-1][0]
     try:
         problem = _windows_link_problem(chain, host.read_security, trust)
         if holder_path is None or problem is not None:
             return problem
-        holder_is_root = ntpath.dirname(holder_path) == holder_path
-        if substituted:
-            # A subst letter is spliced in with no link entry, but the folders above its target can
-            # rename what lies below, as those above a link can. The target is matched only where
-            # the walk ends on it, so every folder above the holder is judged by the link rule:
-            # stricter than for a link, whose rule starts at the link. The holder is judged below.
-            targets = [] if holder_is_root else _folders_above(holder_path, set())
-            subject = _SUBST_FOLDER_SUBJECT
-            if chain[-1][0].lower() in subst_targets:
-                # The walk ends on a subst drive's target text, the drive's root named or reached
-                # through a junction or link, so the holder holds the target and can
-                # rename it, as the folder holding a link can: it gets the link rule too, a volume
-                # root included.
-                targets = [(holder_path, DIRECTORY), *targets]
-                subject = _SUBST_ROOT_FOLDER_SUBJECT
-            problem = _windows_judged_problem(targets, host.read_security, trust, subject)
-            if problem is not None:
-                return problem
+        if as_written:
+            return _windows_holder_as_written_problem(Path(holder_path))
         if cause is not None and _is_reparse_point(holder_path):
             # Read with FILE_FLAG_OPEN_REPARSE_POINT, a junction's own list would stand in for the
             # folder it points at, which this check does not read through a share.
@@ -957,6 +916,26 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             "give the account the engine runs as the right to read that folder's permissions"
         )
     problem = _windows_holder_problem(holder)
+    return None if problem is None else f"the directory that holds it is not restricted: {problem}"
+
+
+def _windows_holder_as_written_problem(holder_path: Path) -> str | None:
+    """Why the directory at ``holder_path``, read by its path as written with the config-source
+    reader, lets a broad group or an application package replace a key file in it, or ``None``.
+    This is the holder read the check made before it read the holder where the path resolves to,
+    kept for a path the walk cannot resolve (:func:`_windows_surroundings_problem`). Windows
+    only."""
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    holder = _win32_config_source_probes().read_path(holder_path)
+    if holder.status != 0:
+        detail = f": {holder.status_text}" if holder.status_text else ""
+        return (
+            f"the permissions of the directory that holds it could not be read (Win32 error "
+            f"{holder.status}{detail}); give the account the engine runs as the right to read "
+            "that folder's permissions"
+        )
+    problem = _windows_access_problem(holder, _HOLDER_REPLACE_MASK, reach=_HOLDER_REACH)
     return None if problem is None else f"the directory that holds it is not restricted: {problem}"
 
 
@@ -1318,11 +1297,11 @@ def broad_access_problem(
     link among them is refused when an account other than the engine's own and the host's
     administrators can change it: on Windows by its own access list or that of any folder above it
     (:func:`_windows_link_problem`), on POSIX by the owner or mode of the folder that holds it or of
-    any folder above it (:func:`_posix_link_problem`). On Windows the folders above a link, or above
-    the holder when a ``subst`` drive is on the path, are judged that way; elsewhere they are not
-    (:func:`_windows_surroundings_problem`). On Windows a directory holding ``path`` that lets a
+    any folder above it (:func:`_posix_link_problem`). Those folders are judged that way only
+    where a link is (:func:`_windows_surroundings_problem`). On Windows a directory holding ``path`` that lets a
     broad group delete a file in it or change its access list is refused too
-    (:func:`_windows_holder_problem`), read where the path resolves to. A file whose access cannot be
+    (:func:`_windows_holder_problem`), read where :func:`_windows_surroundings_problem` says. A file
+    whose access cannot be
     read is reported as a problem, and so is a path that is itself a link, on every platform,
     because the file behind it was not judged.
 

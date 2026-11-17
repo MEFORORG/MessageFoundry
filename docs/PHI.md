@@ -451,8 +451,9 @@ than a path is not checked
   engine's own account with full control for the host file, or with read and delete for the
   handoff file.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
-  the owner and access list of the folder that holds the key file where its path resolves to,
-  after any junction, link or `subst` drive (on a network share or mapped network drive the path
+  the owner and access list of the folder that holds the key file, in most cases where its path
+  resolves to (the ADR 0214 amendment linked below names the exception), after any junction, link or `subst`
+  drive (on a network share or mapped network drive the path
   names, by its path as written, and refused when that folder is a junction or link; a volume
   on the way whose drive type cannot be read is refused, and the walk to that folder does not read
   a volume's file system), and

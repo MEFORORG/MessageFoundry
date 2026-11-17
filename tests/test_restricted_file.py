@@ -668,13 +668,14 @@ def test_a_holder_that_lets_a_broad_group_replace_a_key_is_refused(right: int) -
     assert f"Users ({_USERS}) can delete or replace a file in it" in problem
 
 
-def test_a_holder_entry_that_applies_only_to_its_children_is_not_counted() -> None:
-    """An inherit-only entry grants nothing on the holder itself (vault BACKLOG #5657); the old
-    reader dropped the flags and refused it."""
+def test_a_holder_entry_that_applies_only_to_its_children_is_still_counted() -> None:
+    """The holder rule refused an inherit-only entry before it read the entry flags, as
+    origin/main's reader, which drops them, still does; skipping one passed a holder origin/main
+    refused, so it is counted again."""
     template = _holder((_ALLOW, _FULL, _USERS), owner=_ADMINS, flags=_INHERIT_ONLY)
-    assert restricted_file._windows_holder_problem(template) is None
-    applies = _holder((_ALLOW, _FULL, _USERS), owner=_ADMINS)
-    assert restricted_file._windows_holder_problem(applies) is not None
+    assert f"Users ({_USERS})" in str(restricted_file._windows_holder_problem(template))
+    as_main_reads_it = _WinPathSecurity(owner_sid=_ADMINS, aces=((_ALLOW, _FULL, _USERS),))
+    assert restricted_file._windows_access_problem(as_main_reads_it, 0x40) is not None
 
 
 def test_a_holder_a_broad_group_owns_is_refused() -> None:
@@ -875,8 +876,7 @@ def test_a_file_only_the_engine_writes_owned_by_another_account_is_refused() -> 
         "\\\\.\\UNC\\localhost\\c$\\keys\\k.key",
         "\\\\localhost.\\c$\\keys\\k.key",
         "\\\\0-0-0-0-0-0-0-1.ipv6-literal.net\\c$\\keys\\k.key",
-        "\\\\myhost\\keys\\k.key",
-        "\\\\MyHost.corp.example\\keys\\k.key",
+        "\\\\MyHost\\keys\\k.key",
         "//localhost/c$/keys/k.key",
         "\\\\127.1\\c$\\keys\\k.key",  # IPv4 shorthand
         "\\\\2130706433\\c$\\keys\\k.key",  # 127.0.0.1 as one decimal number
@@ -938,21 +938,33 @@ def test_the_route_probe_answers_a_loopback_address_with_itself() -> None:
     assert restricted_file._route_source(loopback) == loopback
 
 
-def test_a_share_named_by_this_hosts_netbios_name_is_refused() -> None:
-    """The NetBIOS name is the host name cut to 15 characters."""
-    problem = restricted_file._loopback_share_problem(
-        "\\\\LAB-SERVER-NAME\\c$\\k.key", "lab-server-name-01", _routes_to_itself
+@pytest.mark.parametrize(
+    ("path", "host_name"),
+    [
+        ("\\\\myhost.other.example\\keys\\k.key", "myhost.corp.example"),  # same first label
+        ("\\\\myhost\\keys\\k.key", "myhost.corp.example"),  # the first label alone
+        ("\\\\myhost.corp.example\\keys\\k.key", "myhost"),  # a longer name
+        ("\\\\LAB-SERVER-NAME\\c$\\k.key", "lab-server-name-01"),  # the NetBIOS form
+    ],
+)
+def test_a_share_matching_only_part_of_this_hosts_name_is_not_a_loopback(
+    path: str, host_name: str
+) -> None:
+    """origin/main read no share as this host, so a share on another host that shares this host's
+    first label passed there; the name is now matched whole."""
+    assert restricted_file._loopback_share_problem(path, host_name, _routes_to_itself) is None
+
+
+@pytest.mark.parametrize("ace_type", [0x05, 0x09, 0x0B])  # object, callback, callback object
+def test_a_conditional_holder_entry_is_refused_whatever_its_mask(ace_type: int) -> None:
+    """origin/main refused any conditional, object or callback allow entry on the holder, whom it
+    applies to being unknown; the branch passed one whose mask held no replace right."""
+    read_only = WinSecurity(_ADMINS, ((ace_type, 0, 0x00000001, ""),))
+    assert "conditional entry" in str(restricted_file._windows_holder_problem(read_only))
+    as_main_reads_it = _WinPathSecurity(owner_sid=_ADMINS, aces=((ace_type, 0x00000001, ""),))
+    assert "conditional entry" in str(
+        restricted_file._windows_access_problem(as_main_reads_it, 0x40)
     )
-    assert problem is not None
-
-
-def test_a_conditional_holder_entry_granting_no_replace_right_is_not_counted() -> None:
-    """A callback entry that grants only read cannot replace a file; one within the mask is still
-    refused, since whom it applies to is unknown."""
-    read_only = WinSecurity(_ADMINS, ((0x09, 0, 0x00000001, ""),))
-    assert restricted_file._windows_holder_problem(read_only) is None
-    deleting = WinSecurity(_ADMINS, ((0x09, 0, 0x00000040, ""),))
-    assert "conditional entry" in str(restricted_file._windows_holder_problem(deleting))
 
 
 def test_a_posix_root_that_could_not_be_read_is_refused() -> None:
@@ -1680,11 +1692,13 @@ def test_windows_a_junction_holding_a_key_on_a_share_is_refused(
 
 
 @windows_only
-def test_windows_a_subst_drive_on_the_path_is_judged_like_a_link(tmp_path: Path) -> None:
-    """Vault BACKLOG #5657 steps 2 (b) and 4 (a): a ``subst`` letter was spliced in with no link
-    entry, so the folders above its target went unjudged, and a secrets directory that was itself
-    a ``subst`` drive root got neither the walk nor a holder read. The letter is a stand-in here:
-    the readers answer it as ``subst`` would, so no drive is defined on the host."""
+def test_windows_a_subst_drive_on_the_path_gives_the_folders_above_no_link_rule(
+    tmp_path: Path,
+) -> None:
+    """origin/main judged no folder above a ``subst`` drive's target by the link rule, so a key
+    through ``subst`` with a broad group's delete right above the holder passed there. The branch
+    refused it; it passes again. The holder itself is still read where the drive leads. The letter
+    is a stand-in: the readers answer it as ``subst`` would, so no drive is defined on the host."""
     top = tmp_path / "top"
     mid = top / "mid"
     secrets = mid / "secrets"
@@ -1697,18 +1711,14 @@ def test_windows_a_subst_drive_on_the_path_is_judged_like_a_link(tmp_path: Path)
 
     host = _host_judging_only_under(tmp_path, drive_target=drive_target)
     surroundings = restricted_file._windows_surroundings_problem
-    assert surroundings(Path("Q:\\store.key"), host) is None  # the controls
-    assert surroundings(Path("Q:\\"), host) is None
+    assert surroundings(Path("Q:\\store.key"), host) is None  # the control
     _icacls(top, "/grant", f"*{_USERS}:(DC)")  # Users may rename mid away, from above the holder
+    assert surroundings(Path("Q:\\store.key"), host) is None
+    _icacls(mid, "/grant", f"*{_USERS}:(DC)")  # above the holder too
+    assert surroundings(Path("Q:\\store.key"), host) is None
+    _icacls(secrets, "/grant", f"*{_USERS}:(DC)")  # the holder, read where the drive leads
     problem = str(surroundings(Path("Q:\\store.key"), host))
-    assert "where a subst drive on its path leads, can be changed" in problem
-    assert "junction" not in problem  # there is none on this path
-    assert str(tmp_path) not in problem
-    _icacls(top, "/remove:g", f"*{_USERS}")
-    _icacls(mid, "/grant", f"*{_USERS}:(DC)")  # Users may delete the drive root's own folder
-    problem = str(surroundings(Path("Q:\\"), host))
-    assert "the folder holding it or a folder above that, where a subst drive" in problem
-    assert f"Users ({_USERS})" in problem
+    assert f"Users ({_USERS}) can delete or replace a file in it" in problem
     # A letter onto a share: neither the loopback test nor the holder read sees that share.
     onto_share = dataclasses.replace(
         host, drive_target=lambda d: "\\??\\UNC\\localhost\\c$" if d.upper() == "Q:" else None
@@ -1718,12 +1728,13 @@ def test_windows_a_subst_drive_on_the_path_is_judged_like_a_link(tmp_path: Path)
 
 
 @windows_only
-def test_windows_a_subst_root_secrets_directory_gets_the_link_rule_on_its_holder(
+def test_windows_a_subst_root_secrets_directory_gets_no_link_rule_on_its_holder(
     tmp_path: Path,
 ) -> None:
-    """A ``subst`` drive root named as the secrets directory: the folder holding the target got
-    only the holder rule, which passes a single account that is not an administrator owning it,
-    and that account could rename the target away. It now gets the link rule too."""
+    """A ``subst`` drive root named as the secrets directory: origin/main walked nothing for a
+    drive root, so a single account that is not an administrator owning the folder that holds the
+    target passed there. The branch judged that folder by the link rule and refused it; it passes
+    again, by the holder rule alone."""
     mid = tmp_path / "mid"
     secrets = mid / "secrets"
     secrets.mkdir(parents=True)
@@ -1741,40 +1752,16 @@ def test_windows_a_subst_root_secrets_directory_gets_the_link_rule_on_its_holder
     surroundings = restricted_file._windows_surroundings_problem
     assert surroundings(Path("Q:\\"), base) is None  # the control
     host = dataclasses.replace(base, read_security=read_security)
-    problem = str(surroundings(Path("Q:\\"), host))
-    assert "the folder holding it or a folder above that, where a subst drive" in problem
-    assert str(tmp_path) not in problem
-
-
-@windows_only
-def test_windows_a_subst_root_onto_a_folder_under_a_volume_root_judges_that_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The same, with the target straight under a volume root: the holder is the root, which the
-    subst rule skipped. The target folder and the root's owner are stand-ins."""
-    target = "C:\\mf-stand-in-certs"
-    real = _real_win_probe()
-    monkeypatch.setattr(
-        restricted_file,
-        "_win_probe",
-        lambda path: (DIRECTORY, None) if path.lower() == target.lower() else real(path),
+    assert surroundings(Path("Q:\\"), host) is None
+    # The holder rule still reads that folder: a broad group's delete right there is refused.
+    users = WinSecurity(stranger, ((_ALLOW, 0, 0x00000040, _USERS),))
+    refusing = dataclasses.replace(
+        base,
+        read_security=lambda obj, kind: (
+            users if obj.lower() == str(mid).lower() else base.read_security(obj, kind)
+        ),
     )
-    base = _host_judging_only_under(
-        tmp_path, drive_target=lambda d: "\\??\\" + target if d.upper() == "Q:" else None
-    )
-    stranger = "S-1-5-21-1111111111-2222222222-3333333333-1001"
-
-    def read_security(obj: str, kind: str) -> WinSecurity:
-        if obj.lower() == "c:\\":
-            return WinSecurity(stranger, ((_ALLOW, 0, _FULL, _SYSTEM),))
-        return base.read_security(obj, kind)
-
-    surroundings = restricted_file._windows_surroundings_problem
-    assert surroundings(Path("Q:\\"), base) is None  # the control
-    problem = str(
-        surroundings(Path("Q:\\"), dataclasses.replace(base, read_security=read_security))
-    )
-    assert "the folder holding it or a folder above that, where a subst drive" in problem
+    assert f"Users ({_USERS})" in str(surroundings(Path("Q:\\"), refusing))
 
 
 def _real_win_probe() -> Any:
@@ -1860,7 +1847,13 @@ def test_windows_a_mapped_drive_onto_this_host_is_refused_as_a_loopback_share(
     monkeypatch.setattr(
         restricted_file, "_is_remote_drive", lambda root: root.upper() == "Y:\\", raising=False
     )
-    monkeypatch.setattr(restricted_file, "_host_name", lambda: "engine-host.example.test")
+    monkeypatch.setattr(restricted_file, "_host_name", lambda: "engine-host")
+    real = _real_win_probe()
+    monkeypatch.setattr(  # the mapped folders, as the local walk of the drive reads them
+        restricted_file,
+        "_win_probe",
+        lambda path: (DIRECTORY, None) if path.lower().startswith("y:") else real(path),
+    )
     host = anchor_path.windows_host_readers()
     surroundings = restricted_file._windows_surroundings_problem
     for share in ("\\\\localhost\\c$", "\\\\ENGINE-HOST\\keys"):
@@ -1944,37 +1937,68 @@ def test_windows_a_volume_the_host_cannot_judge_is_judged_as_before(tmp_path: Pa
 
 
 @windows_only
-def test_windows_a_subst_root_reached_through_a_link_gets_the_link_rule_on_its_holder(
+def test_windows_a_junction_above_the_holder_on_a_mapped_drive_is_judged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ``subst`` drive root reached through a junction, not named: the folder holding the
-    drive's target got only the holder rule, which passes a single account that is not an
-    administrator owning it. It now gets the link rule wherever the walk ends on the target. The
-    letter and the link are stand-ins; the link is a plain folder the probe answers as a link."""
-    mid = tmp_path / "mid"
-    secrets = mid / "secrets"
-    secrets.mkdir(parents=True)
-    link = tmp_path / "lnk"
-    link.mkdir()
-    monkeypatch.setattr(
-        restricted_file, "_win_probe", _probe_with_links({str(link).lower(): "Q:\\"})
-    )
-    target = "\\??\\" + str(secrets)
-    base = _host_judging_only_under(
-        tmp_path, drive_target=lambda d: target if d.upper() == "Q:" else None
-    )
+    """origin/main walked a mapped drive as a local volume, so a junction on it above the holder
+    that another account can change was refused; the branch stopped at the share and passed it.
+    The drive, the server's junction and its owner are stand-ins, so no drive is mapped."""
+    secure = tmp_path / "secure"
+    (secure / "inner").mkdir(parents=True)
+    monkeypatch.setattr(restricted_file, "_is_remote_drive", lambda root: root.upper() == "Y:\\")
+    monkeypatch.setattr(restricted_file, "_win_probe", _probe_with_links({"y:\\keys": str(secure)}))
+    monkeypatch.setattr(restricted_file, "_is_reparse_point", lambda _path: False)
+    monkeypatch.setattr(restricted_file, "_mapped_drive_share", lambda _d: "\\\\fileserver\\keys")
+    monkeypatch.setattr(restricted_file, "_host_name", lambda: "engine-host")
+    base = _host_judging_only_under(tmp_path, drive_target=lambda _d: None)
     stranger = "S-1-5-21-1111111111-2222222222-3333333333-1001"
 
     def read_security(obj: str, kind: str) -> WinSecurity:
-        if obj.lower() == str(mid).lower():
+        if obj.lower() == "y:\\keys":
             return WinSecurity(stranger, ((_ALLOW, 0, _FULL, _SYSTEM),))
         return base.read_security(obj, kind)
 
     surroundings = restricted_file._windows_surroundings_problem
-    assert surroundings(link, base) is None  # the control
-    problem = str(surroundings(link, dataclasses.replace(base, read_security=read_security)))
-    assert "the folder holding it or a folder above that, where a subst drive" in problem
-    assert str(tmp_path) not in problem
+    key = Path("Y:\\keys\\inner\\client.key")
+    assert surroundings(key, base) is None  # the control
+    problem = str(surroundings(key, dataclasses.replace(base, read_security=read_security)))
+    assert "a junction or link on its path can be changed" in problem
+
+
+@windows_only
+def test_windows_the_key_files_own_name_is_not_walked(tmp_path: Path) -> None:
+    """origin/main walked the folder holding the key file, not the file's own name, so a stream
+    name passed there; the branch walked the name too and refused it as a path it could not
+    walk."""
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    write_restricted_file(holder / "store.key", b"KEY-MATERIAL-STAND-IN")
+    host = _host_judging_only_under(tmp_path)
+    surroundings = restricted_file._windows_surroundings_problem
+    for name in ("store.key", "store.key:alt", "store.key::$DATA", "store.key.", "store.key "):
+        assert surroundings(holder / name, host) is None, name
+
+
+@windows_only
+def test_windows_a_link_back_to_a_folder_already_on_the_path_is_judged_as_before(
+    tmp_path: Path,
+) -> None:
+    """origin/main read the holder of a path that resolves, through a junction, to a folder
+    already on it, by its path as written; the branch refused every such path. A junction here
+    needs no privilege, so this never skips."""
+    folder = tmp_path / "a"
+    inner = folder / "b"
+    inner.mkdir(parents=True)
+    write_restricted_file(folder / "store.key", b"KEY-MATERIAL-STAND-IN")
+    loop = inner / "up"
+    _junction(loop, folder)
+    try:
+        host = _host_judging_only_under(tmp_path)
+        surroundings = restricted_file._windows_surroundings_problem
+        assert surroundings(loop / "store.key", host) is None  # a key file
+        assert surroundings(loop / "b", host) is None  # a directory, as a secrets directory is
+    finally:
+        os.rmdir(loop)
 
 
 @windows_only

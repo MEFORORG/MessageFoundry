@@ -154,31 +154,34 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 ## Amendments
 
 - **2026-11-17, the Windows holder is read where the path resolves to (vault BACKLOG #5657).**
-  This replaces parts of the 2026-11-13 amendment below. `_windows_surroundings_problem` now walks
-  the directory's own path, so a `subst` drive root such as `S:\` is resolved. It reads the owner
-  and access list of the folder that holds the directory where the walk ends, after every
-  junction, link and `subst` drive.
+  This replaces parts of the 2026-11-13 amendment below. `_windows_surroundings_problem` still
+  walks `full.parent`, except for a drive root such as `S:\`, whose own path it walks, so a
+  `subst` drive root is resolved. It reads the owner and access list of the folder where that
+  walk ends, after every junction, link and `subst` drive, or for a drive root the folder that
+  holds where it leads.
 
-  - A mapped network drive is read as a share: the walk stops at it.
+  - A mapped network drive is read as a share: the walk stops at it. The path is then walked
+    again as a local volume, as before this amendment, and the junctions and links on it are
+    judged by the link rule.
   - Only each volume's drive type is read on the walk. A volume whose drive type cannot be read
     ends the walk and is refused. The walk does not read its file system, so it does not refuse
     a CSVFS or FAT volume, or one whose file system cannot be read, as it did not before this
     amendment.
   - On a share the path names, by a UNC path or a mapped drive letter, that folder is read
     through the share at `full.parent`. It is refused when it is a junction or link there.
-  - Inherit-only entries are skipped.
-  - Where a `subst` drive is on the path, every folder above that folder is judged by the link
-    rule. Where the walk ends on a `subst` drive's target as its text names it, by the drive's
-    root named or reached through a junction or link, that folder is judged by the link rule too.
-    A target that leads on, through another `subst` drive or a junction in it, is not matched,
-    and that folder then gets only the holder rule.
+  - Where the walk ends on a link back to a folder already on the path, that folder is read at
+    `full.parent` by its path as written, as before this amendment.
+  - The holder's entries are judged as before: an inherit-only entry is counted, and any
+    conditional, object or callback allow entry is refused.
+  - A `subst` drive on the path gives no folder the link rule; as before, only a junction or
+    link on the path does.
   - A link or `subst` drive onto a network share or a mapped network drive is refused.
   - A share spelled with at least some of this host's own names or addresses is refused.
     `_loopback_share_problem` says which. A mapped drive letter is judged through the share
     `WNetGetConnectionW` names for it, and refused when that cannot be read.
 
-  So the drive-root gap in the 2026-11-13 list is closed for a `subst` drive root whose target
-  is matched as above. A mapped network drive root is read as a share root, so nothing on this
+  So the drive-root gap in the 2026-11-13 list is closed for a `subst` drive root, by the holder
+  rule on the folder that holds where it leads, unless it leads to a volume root. A mapped network drive root is read as a share root, so nothing on this
   host holds it. By the holder rule, a broad group's `DELETE` on the holder is still not counted;
   the link rule, where it judges the holder, counts it, except on a volume root. The code is the record of the rest. The check is
   still not a complete check of the directory's surroundings.
