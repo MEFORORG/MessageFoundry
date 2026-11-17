@@ -196,6 +196,7 @@ from messagefoundry.store.queue_tag import (
     release_unreturned,
     report_queue_tag_failure,
     reseal_unless_tag_failure,
+    set_aside_deadline,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -5736,8 +5737,9 @@ class PostgresStore:
         return None
 
     async def _set_aside_claimed(self, tail: Sequence[Any], now: float | None) -> None:
-        """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` ahead (BACKLOG #5735), for a
-        per-lane claim. If this write fails too, its error propagates out of the claim; the rows'
+        """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault
+        (:func:`set_aside_deadline`, BACKLOG #5735), for a per-lane claim. If this write fails
+        too, its error propagates out of the claim; the rows'
         lease and startup recovery re-pend them."""
         log.warning(
             "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
@@ -5745,10 +5747,7 @@ class PostgresStore:
             len(tail),
             TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
-        await self.reschedule_claimed(
-            [r["id"] for r in tail],
-            (time.time() if now is None else now) + TRANSIENT_OPEN_BACKOFF_SECONDS,
-        )
+        await self.reschedule_claimed([r["id"] for r in tail], set_aside_deadline(now))
 
     async def _open_queue_body(self, conn: Any, row: Any, *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite

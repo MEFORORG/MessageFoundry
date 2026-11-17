@@ -278,15 +278,26 @@ def _transit_error(kind: str) -> Callable[[], CipherError]:
 
     from messagefoundry.store.crypto_transit import _transit_failure  # noqa: PLC0415
 
-    def unexpected(status: int) -> Exception:
-        exc = hv.UnexpectedError(f"status {status}")
-        exc.mefor_reply_status = status
+    def recorded(exc: Exception, status: int) -> Exception:
+        exc.mefor_reply_status = status  # type: ignore[attr-defined]
         return exc
 
+    def unexpected(status: int) -> Exception:
+        return recorded(hv.UnexpectedError(f"status {status}"), status)
+
     raw: dict[str, Callable[[], Exception]] = {
+        "400": lambda: hv.InvalidRequest(errors=["invalid ciphertext"]),
+        "401": lambda: hv.Unauthorized(errors=["missing client token"]),
         "403": lambda: hv.Forbidden(errors=["permission denied"]),
         "404": lambda: hv.InvalidPath(errors=["no handler for route"]),
+        "408": lambda: unexpected(408),
         "413": lambda: unexpected(413),
+        # hvac raises a TypeError where it cannot read a reply body's ``errors``; the store's client
+        # records the status on it all the same (BACKLOG #8222).
+        "503-typeerror": lambda: recorded(TypeError("string indices must be integers"), 503),
+        "tls": lambda: requests.exceptions.SSLError(
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
+        ),
         "429": lambda: hv.RateLimitExceeded(errors=["rate limited"]),
         "501": lambda: hv.VaultNotInitialized(errors=["not initialized"]),
         "503": lambda: hv.VaultDown(errors=["Vault is sealed"]),
@@ -304,13 +315,32 @@ def _transit_error(kind: str) -> Callable[[], CipherError]:
     return build
 
 
+#: The replies that are Vault's verdict on the row (``queue_tag._key_service_gave_no_verdict``).
+_VERDICTS = ["400", "404", "413"]
+#: At least these give no verdict on the row. 401, 403, 408, the TLS refusal and the 503 recorded on
+#: a TypeError were verdicts before the rule was revised.
+_NO_VERDICTS = [
+    "503",
+    "429",
+    "501",
+    "504",
+    "timeout",
+    "connection",
+    "401",
+    "403",
+    "408",
+    "tls",
+    "503-typeerror",
+]
+
+
 @_ALL_CLAIMS
-@pytest.mark.parametrize("kind", ["403", "404", "413"])
-async def test_a_4xx_verdict_is_still_dead_lettered_and_reported(
+@pytest.mark.parametrize("kind", _VERDICTS)
+async def test_a_verdict_is_still_dead_lettered_and_reported(
     tmp_path: pathlib.Path, claim: Claim, kind: str
 ) -> None:
-    """BACKLOG #5765: a 4xx other than a 429 is Vault's verdict on the request for the row, so the
-    claim dead-letters and reports it as before, never sets it aside to retry with no cap."""
+    """BACKLOG #5765: a 400, a 404 and a 413 are Vault's verdict on the row, so the claim
+    dead-letters and reports it as before, never sets it aside to retry with no cap."""
     store, cipher, db = await _open(tmp_path)
     try:
         cipher.fault = _transit_error(kind)
@@ -323,12 +353,12 @@ async def test_a_4xx_verdict_is_still_dead_lettered_and_reported(
 
 
 @_CLAIMS
-@pytest.mark.parametrize("kind", ["503", "429", "501", "504", "timeout", "connection"])
+@pytest.mark.parametrize("kind", _NO_VERDICTS)
 async def test_a_key_service_with_no_verdict_sets_the_rows_aside(
     tmp_path: pathlib.Path, claim: Claim, kind: str
 ) -> None:
-    """BACKLOG #5765: a 5xx, a 429 (503 is also a sealed or standby node), a timeout and a
-    connection failure give no verdict on the row, so the claim sets it aside unaudited."""
+    """BACKLOG #5765: a failure reaching or authenticating to the key service gives no verdict on
+    the row, so a per-lane claim sets it aside unaudited."""
     store, cipher, db = await _open(tmp_path)
     try:
         cipher.fault = _transit_error(kind)
@@ -339,6 +369,75 @@ async def test_a_key_service_with_no_verdict_sets_the_rows_aside(
         assert _audited(db) == 0
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize("kind", _NO_VERDICTS)
+async def test_the_pooled_claim_hands_a_no_verdict_to_t17(
+    tmp_path: pathlib.Path, kind: str
+) -> None:
+    """The same failures, on ``claim_fifo_heads``: the rows come back carrying the fault, with
+    nothing dead-lettered or audited, for the dispatcher's T17 path."""
+    store, cipher, db = await _open(tmp_path)
+    try:
+        cipher.fault = _transit_error(kind)
+        cipher.healthy_opens = 0
+        items = await _claim_fifo_heads(store)
+        assert items and all(i.open_fault is not None for i in items)
+        statuses = [s for s, _a in _rows(db)]
+        assert statuses[0] == "inflight" and "dead" not in statuses
+        assert _audited(db) == 0
+    finally:
+        await store.close()
+
+
+@_CLAIMS
+async def test_the_set_aside_deadline_runs_from_the_fault_not_the_claim(
+    tmp_path: pathlib.Path, claim: Claim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A decrypt that times out slowly must not leave a deadline already past: the backoff runs
+    from the clock at the set-aside write. The clock is injected and moves 60 seconds while the
+    decrypt runs."""
+    store, cipher, db = await _open(tmp_path)
+    try:
+        start = time.time()
+        clock = {"now": start}
+        monkeypatch.setattr(time, "time", lambda: clock["now"])
+
+        def slow_timeout() -> CipherError:
+            clock["now"] = start + 60.0
+            return CipherUnavailableError("Transit decrypt failed (key='k'): ReadTimeout")
+
+        cipher.fault = slow_timeout
+        cipher.healthy_opens = 0
+        assert await claim(store) == []
+        head = _side(
+            db,
+            "SELECT next_attempt_at FROM queue WHERE rowid=(SELECT MIN(rowid) FROM queue"
+            " WHERE destination_name=?)",
+            (_DEST,),
+        )
+        assert float(head[0][0]) == pytest.approx(start + 65.0)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_the_server_set_aside_deadline_runs_from_the_fault(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server backends compute the deadline the same way, from the clock at the write."""
+    store = _server_store(backend, _FakeServer(None))
+    written: list[tuple[list[str], float]] = []
+
+    async def reschedule(ids: Any, when: float) -> None:
+        written.append((list(ids), when))
+
+    store.reschedule_claimed = reschedule
+    monkeypatch.setattr(time, "time", lambda: 1060.0)
+    await store._set_aside_claimed([{"id": "row-1"}], 1000.0)  # the claim started at 1000
+    assert written == [(["row-1"], 1065.0)]
+    await store._set_aside_claimed([{"id": "row-2"}], 2000.0)  # an injected later claim time
+    assert written[-1] == (["row-2"], 2005.0)
 
 
 # --- the pooled claim hands the fault to the dispatcher's T17 path --------------------------------

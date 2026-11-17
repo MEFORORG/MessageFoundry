@@ -188,6 +188,7 @@ from messagefoundry.store.queue_tag import (
     release_unreturned,
     report_queue_tag_failure,
     reseal_unless_tag_failure,
+    set_aside_deadline,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -10810,8 +10811,9 @@ class SqlServerStore:
         return None
 
     async def _set_aside_claimed(self, tail: Sequence[dict[str, Any]], now: float | None) -> None:
-        """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` ahead (BACKLOG #5735), for a
-        per-lane claim. If this write fails too, its error propagates out of the claim, and on
+        """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault
+        (:func:`set_aside_deadline`, BACKLOG #5735), for a per-lane claim. If this write fails
+        too, its error propagates out of the claim, and on
         this backend only ``reset_stale_inflight`` at the next start re-pends the rows: a claim
         here sets no lease."""
         log.warning(
@@ -10820,10 +10822,7 @@ class SqlServerStore:
             len(tail),
             TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
-        await self.reschedule_claimed(
-            [d["id"] for d in tail],
-            (time.time() if now is None else now) + TRANSIENT_OPEN_BACKOFF_SECONDS,
-        )
+        await self.reschedule_claimed([d["id"] for d in tail], set_aside_deadline(now))
 
     async def _open_queue_body(self, cur: Any, row: dict[str, Any], *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite

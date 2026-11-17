@@ -295,15 +295,17 @@ def _raising_transit() -> tuple[Any, Any]:
 
 def test_a_transit_outage_is_not_a_queue_tag_failure() -> None:
     """BACKLOG #5765: Vault Transit cannot name its keys, so ``is_tag_failure`` counts every marked
-    value as held. A transient outage on open (an unreachable Vault, a timeout, a 5xx) must raise
-    the cipher's own error, never :class:`QueueTagError`, so a claim does not dead-letter the row
-    with a false ``integrity_drift`` alert. Every other 4xx, a refused token (403) among them, is a
-    verdict and still a tag failure. Control: Vault's AEAD refusal of a moved cell is still one."""
+    value as held. A failure reaching or authenticating to Vault (an unreachable Vault, a timeout,
+    a 5xx, a refused token's 403) must raise the cipher's own error, never :class:`QueueTagError`,
+    so a claim does not dead-letter the row with a false ``integrity_drift`` alert. A 400 or a 404
+    is a verdict and still a tag failure. Control: Vault's AEAD refusal of a moved cell is still
+    one."""
     pytest.importorskip("hvac")
     import requests  # noqa: PLC0415
     from hvac.exceptions import (  # type: ignore[import-untyped]  # noqa: PLC0415
         Forbidden,
         InternalServerError,
+        InvalidPath,
         InvalidRequest,
     )
 
@@ -316,6 +318,7 @@ def test_a_transit_outage_is_not_a_queue_tag_failure() -> None:
         requests.exceptions.ConnectionError("connection refused"),
         requests.exceptions.ReadTimeout("read timed out"),
         InternalServerError("upstream"),
+        Forbidden(errors=["permission denied"]),
     ]
     for exc in outages:
         transit.error = exc
@@ -323,10 +326,10 @@ def test_a_transit_outage_is_not_a_queue_tag_failure() -> None:
             open_queue_cell(cipher, row)
         assert not isinstance(refused.value, QueueTagError), exc
         assert is_transient_open_failure(refused.value), exc
-    transit.error = Forbidden(errors=["permission denied"])  # a verdict, not an outage
-    with pytest.raises(QueueTagError) as forbidden:
+    transit.error = InvalidPath(errors=["no handler for route"])  # a verdict, not an outage
+    with pytest.raises(QueueTagError) as missing:
         open_queue_cell(cipher, row)
-    assert not is_transient_open_failure(forbidden.value)
+    assert not is_transient_open_failure(missing.value)
     assert is_transient_open_failure(CipherUnavailableError("down"))
     assert not is_transient_open_failure(QueueTagError("integrity"))
     assert not is_transient_open_failure(OSError("not a cipher error"))
@@ -351,3 +354,59 @@ def test_the_reply_status_attribute_is_the_one_the_vault_client_records() -> Non
     from messagefoundry.store import keyprovider_vault, queue_tag  # noqa: PLC0415
 
     assert queue_tag._REPLY_STATUS_ATTR == keyprovider_vault._REPLY_STATUS_ATTR
+
+
+def _caused(cause: BaseException | None, cls: type[CipherError] = CipherError) -> CipherError:
+    error = cls("Transit decrypt failed")
+    error.__cause__ = cause
+    return error
+
+
+def _with_status(exc: BaseException, status: int) -> BaseException:
+    exc.mefor_reply_status = status  # type: ignore[attr-defined]
+    return exc
+
+
+def test_the_no_verdict_rule_reads_the_status_first_on_any_cause() -> None:
+    """BACKLOG #5765: only a 400, a 404, a 413 or a tag check that ran and failed is a verdict on
+    the row. A recorded reply status decides first, whatever class carries it. A cause the rule
+    names nowhere keeps the verdict it had before the rule was revised."""
+    pytest.importorskip("hvac")
+    import requests  # noqa: PLC0415
+    from hvac import exceptions as hv  # type: ignore[import-untyped]  # noqa: PLC0415
+
+    from messagefoundry.store.crypto import UnauthenticatedCipherError  # noqa: PLC0415
+    from messagefoundry.store.queue_tag import is_transient_open_failure  # noqa: PLC0415
+
+    no_verdict: list[BaseException] = [
+        hv.Unauthorized(),
+        hv.Forbidden(),
+        hv.RateLimitExceeded(),
+        hv.VaultDown(),
+        hv.UnexpectedError("no status recorded"),
+        _with_status(hv.UnexpectedError("timeout"), 408),
+        _with_status(TypeError("unreadable body"), 503),
+        _with_status(AttributeError("unreadable body"), 401),
+        _with_status(hv.InvalidRequest(), 503),  # the status wins over the class
+        requests.exceptions.SSLError("certificate verify failed"),
+        requests.exceptions.ChunkedEncodingError("connection broken"),
+        ConnectionResetError("reset by peer"),
+    ]
+    for cause in no_verdict:
+        assert is_transient_open_failure(_caused(cause)), cause
+    verdict: list[BaseException | None] = [
+        hv.InvalidRequest(),
+        hv.InvalidPath(),
+        _with_status(hv.UnexpectedError("too large"), 413),
+        _with_status(hv.Forbidden(), 404),  # the status wins over the class
+        _with_status(TypeError("unreadable body"), 400),
+        hv.ParamValidationError("client-side"),  # unknown here: as before the rule
+        KeyError("data"),  # a malformed reply, unknown here: as before the rule
+        None,
+    ]
+    for maybe in verdict:
+        assert not is_transient_open_failure(_caused(maybe)), maybe
+    # A tag check that ran and failed is a verdict whatever its cause says.
+    assert not is_transient_open_failure(
+        _caused(_with_status(hv.VaultDown(), 503), UnauthenticatedCipherError)
+    )

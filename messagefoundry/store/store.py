@@ -193,6 +193,7 @@ from messagefoundry.store.queue_tag import (
     release_unreturned,
     report_queue_tag_failure,
     reseal_unless_tag_failure,
+    set_aside_deadline,
 )
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
@@ -14653,8 +14654,8 @@ class MessageStore:
     async def _set_aside_claimed(self, tail: Sequence[aiosqlite.Row], now: float | None) -> None:
         """Re-pend claimed rows with a durable backoff (BACKLOG #5735): ``attempts`` loses the
         claim's increment, as for any fault that is not the message's, and ``next_attempt_at``
-        moves :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` ahead, so a sweep does not re-claim them at
-        once. The per-lane claims call it; the per-lane workers have no ``infra_fault_policy``
+        moves :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault (:func:`set_aside_deadline`),
+        so a sweep does not re-claim them at once. The per-lane claims call it; the per-lane workers have no ``infra_fault_policy``
         bound, so such a row is retried for as long as the fault lasts. If this write fails too,
         its error propagates out of the claim and the rows stay ``inflight`` until
         ``reset_stale_inflight`` at the next start."""
@@ -14664,10 +14665,7 @@ class MessageStore:
             len(tail),
             TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
-        await self.reschedule_claimed(
-            [r["id"] for r in tail],
-            (time.time() if now is None else now) + TRANSIENT_OPEN_BACKOFF_SECONDS,
-        )
+        await self.reschedule_claimed([r["id"] for r in tail], set_aside_deadline(now))
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
         # SQLite is single active node: there is no second writer to fence, so the H1 epoch guard is a
