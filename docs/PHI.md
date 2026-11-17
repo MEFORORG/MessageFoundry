@@ -2158,7 +2158,7 @@ high-volume feed prefer UDP to a collector on another host, which the forwarding
 under `enforcement = "warn"` (BACKLOG #1966).
 
 The tamper-evident **`audit_log`** is **also tee'd off-box** (sec-offbox-log #361/#363): every committed
-audit row is emitted as metadata, with only best-effort PHI redaction of its `detail` (stream 3
+audit row is emitted as metadata, with best-effort PHI redaction of its `detail` (stream 3
 below), through the `messagefoundry.audit` logger to the same
 handlers, across all three store backends
 ([`store/audit_tee.py`](../messagefoundry/store/audit_tee.py)). That logger is **pinned to `INFO`**, so
@@ -2168,10 +2168,13 @@ audit evidence is emitted even when `[logging].level` is `WARNING`. **Not used:*
 **A collector should not assume every tee record parses or is whole.** Each record leaves as one
 JSON object, but the handler filters can rewrite it as text afterwards. On a first deployment, a
 collector could receive a record that fails to parse. It could also receive one that parses with
-fields missing, or with one field's text under another key. And a C0 control in a field, such as a
-typed sign-in name, could let text beside it reach the tee unredacted. The `emit_audit_tee`
-docstring in [`store/audit_tee.py`](../messagefoundry/store/audit_tee.py) names at least three
+fields missing, or with one field's text under another key. The `emit_audit_tee`
+docstring in [`store/audit_tee.py`](../messagefoundry/store/audit_tee.py) names at least two
 residuals that cause these.
+
+Since BACKLOG #3045 the tee scrubs a text field holding a C0 control in the window it scans, such
+as a typed sign-in name, with the log filters' text passes before it encodes the field. Text
+beside a control can still pass in the cases the `emit_audit_tee` docstring lists.
 
 ### Logging inventory (16.1.1 / 16.2.3)
 

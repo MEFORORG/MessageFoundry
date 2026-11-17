@@ -284,6 +284,8 @@ jobs:
     # newly-disclosed advisory in a pinned npm dep now turns CI red — the same forcing function as
     # pip-audit, extended to the extension's supply chain (previously only pip + github-actions were
     # watched). `overrides` in ide/package.json is where a triaged transitive advisory gets pinned out.
+    # NOT COVERED: @vscode/vsce, which packages the .vsix. It is not in the lock; `npm run package`
+    # fetches it with npx, so this job never reads it.
     defaults:
       run:
         working-directory: ide
