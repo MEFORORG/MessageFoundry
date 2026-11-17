@@ -346,8 +346,9 @@ The console stays a **host-side process**; only its target URL changes.
   name used) and the console host must trust the issuing CA — a self-signed cert needs the CA in the
   trust store. Provide a CA bundle or a properly-SAN'd cert in the runbook.
 - **Remote (operator elsewhere on the trusted network):** `https://<engine-host>:8443`. For mTLS, the
-  API sets `tls_client_ca_file` (→ `CERT_REQUIRED`) and the console presents a client cert via
-  `--client-cert`/`--client-key` (threaded into `httpx.Client(cert=…)`).
+  API sets `tls_client_ca_file` (→ `CERT_REQUIRED`) and the client presents a client cert: the
+  `EngineClient` arguments `tls_client_cert`/`tls_client_key` are loaded into the `ssl.SSLContext`
+  that `_build_verify_context` builds, which reaches httpx as `verify=` (httpx's `cert=` is unused).
 - **Plaintext-refuse holds (confirmed):** `_assert_safe_transport` refuses `http` to a non-loopback
   host unless `--insecure` (which then warns). So a remote console **cannot** silently send the bearer
   token + PHI in cleartext — it must be `https`, or the operator must consciously opt into the

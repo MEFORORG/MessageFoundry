@@ -1230,12 +1230,14 @@ class EngineClient:
         :meth:`set_token`: the rotation already ended that one for every holder, so only this client
         holds the new one.
 
-        A 2xx reply that does not decode to an object with a non-empty string ``token`` raises the
-        value-free :class:`ApiError` of :func:`_decode`, with ``status`` None, and the current
-        token is left in place rather than cleared (BACKLOG #5344). Returning normally would report
-        the elevation as a success. What happened to the session is not known: the engine may have
-        rotated it, so the held token may already be dead, or an intermediary may have answered
-        without reaching the engine, so it may still be live.
+        A 2xx reply that does not decode to an object whose ``token`` this client can send raises
+        the value-free :class:`ApiError` of :func:`_decode`, with ``status`` None, and the current
+        token is left in place rather than cleared (BACKLOG #5344). A sendable token is non-empty,
+        RFC 6750 token68 characters only, and short enough that ``Bearer <token>`` fits
+        :data:`MAX_REQUEST_HEADER_VALUE_LEN`; :class:`_RotatedToken` holds both limits.
+        Returning normally would report the elevation as a success. What happened to the session
+        is not known: the engine may have rotated it, so the held token may already be dead, or an
+        intermediary may have answered without reaching the engine, so it may still be live.
         """
         self._hold_issued(_decode(response, _RotatedToken).token)
 

@@ -737,6 +737,19 @@ def test_transport_guard_refuses_a_malformed_idna_host(base_url: str) -> None:
     assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
 
 
+def test_the_exposure_evaluation_names_how_the_client_cert_reaches_httpx() -> None:
+    """docs/CONTAINER-EXPOSURE-EVALUATION.md said the client cert came from ``--client-cert`` /
+    ``--client-key`` threaded into ``httpx.Client(cert=...)``. No such flags exist, and the cert is
+    loaded into the SSLContext ``_build_verify_context`` builds, passed as ``verify=`` (BACKLOG
+    #5343). Red when either false claim comes back."""
+    doc = (
+        pathlib.Path(__file__).resolve().parents[1] / "docs" / "CONTAINER-EXPOSURE-EVALUATION.md"
+    ).read_text(encoding="utf-8")
+    assert "--client-cert" not in doc and "--client-key" not in doc
+    assert "httpx.Client(cert=" not in doc
+    assert doc.count("_build_verify_context") >= 2  # the guard row and the section 5 remote bullet
+
+
 @pytest.mark.parametrize("base_url", ["http://localhost", "http://[::1]", "http://127.0.0.1"])
 def test_transport_guard_permits_every_loopback_host_name(base_url: str) -> None:
     """NEGATIVE CONTROL for the IDNA refusal: each loopback spelling still constructs as loopback
