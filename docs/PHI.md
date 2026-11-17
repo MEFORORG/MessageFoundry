@@ -117,12 +117,12 @@ error text, unwrapped, as every reason of a single decrypt's 400. That shape was
 either project's source at a commit, so a release that wraps or prefixes the text would turn such a
 refusal back into the cipher's own error, unaudited and unalerted. A queue payload cell still
 classifies through `is_tag_failure`, which counts every marked Transit value as held, so under
-`vault_transit` any refusal of one Transit gave a verdict on reads as a queue tag failure. An
-outage does not (BACKLOG #5765): a connection failure, a timeout, an HTTP 5xx, an HTTP 429, or a
-sealed or standby Vault (its 503), and nothing else, is no tag failure, and the claim does not
-dead-letter the row. Every other HTTP 4xx, a 403, a 404 or a 413 among them, is a verdict and is
-dead-lettered and alerted as before (`is_transient_open_failure` in `store/queue_tag.py`, BACKLOG
-#5735). Only a row the pooled dispatcher claims through `claim_fifo_heads` takes the ADR 0070
+`vault_transit` any refusal of one Transit gave a verdict on reads as a queue tag failure, and is
+dead-lettered and alerted as before. Transit gives a verdict on the row only with an HTTP 400, 404
+or 413, or a tag check that ran and failed. Any other failure reaching or authenticating to it
+gives none (BACKLOG #5765, #5735), so it is no tag failure and the claim does not dead-letter the
+row. The rule, with the cases it names, is stated once, in `_key_service_gave_no_verdict` in
+`store/queue_tag.py`. Only a row the pooled dispatcher claims through `claim_fifo_heads` takes the ADR 0070
 infra-fault path, so a fault that lasts there stops the lane with a `connection_stopped` alert
 under `infra_fault_policy = "stop"`, or raises `lane_stuck` under `retry_forever`. That covers the
 FIFO lanes under the default `claim_mode = "pooled"`, and no other claim. Every other claim sets the
