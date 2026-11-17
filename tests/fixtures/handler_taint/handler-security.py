@@ -212,7 +212,6 @@ def h_file_forms(msg, mode):
     os.write(len(body), b"ok")
     # ok: mf-handler-phi-to-file
     shutil.which(body)
-    # A message-derived destination path moves a constant file; it writes no message content.
     # ok: mf-handler-phi-to-file
     shutil.move("/tmp/staged.hl7", body)
     return Send("OB", msg)  # noqa: F821
