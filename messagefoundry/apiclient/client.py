@@ -456,10 +456,11 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     costs them nothing.
     """
     try:
-        url: httpx.URL | None = httpx.URL(base_url)
+        parsed = httpx.URL(base_url)
         # httpx builds every request through ``host``, which IDNA-decodes: a malformed ``xn--``
         # label raises idna.IDNAError (a UnicodeError) there, so it is read here, at construction.
-        _ = url.host
+        _ = parsed.host
+        url: httpx.URL | None = parsed
     except (httpx.InvalidURL, UnicodeError):  # a bad port, a control character, a lone surrogate
         url = None
     if url is None:  # raised outside the handler, so it chains no error quoting the URL
