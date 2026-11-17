@@ -481,31 +481,32 @@ def _invoke_file(root, *args, payload=_PAYLOAD, **extra):
     return _launch(argv, root, payload, _env(**extra))
 
 
+def _assert_blocked(completed, code):
+    """A block, told apart from a bridge fault (which also exits 2) by the bridge's block line."""
+    assert completed.returncode == code, completed.stderr
+    assert "Claude hook blocked this event" in completed.stderr
+
+
 @_needs_pwsh
 def test_the_registered_line_gives_2_for_a_hooks_exit_2(tmp_path):
-    completed = _run_registered(tmp_path, "none", _EXIT_2)
-    assert completed.returncode == 2, completed.stderr
+    _assert_blocked(_run_registered(tmp_path, "none", _EXIT_2), 2)
 
 
 def test_a_direct_bridge_hook_gives_2_for_a_hooks_exit_2(tmp_path):
     root = _make_repo(tmp_path, _EXIT_2, venv=False)
-    completed = _direct(root, "hook")
-    assert completed.returncode == 2, completed.stderr
-    blocked = _direct(root, "hook", "--block-exit", "10")
-    assert blocked.returncode == 10, blocked.stderr
+    _assert_blocked(_direct(root, "hook"), 2)
+    _assert_blocked(_direct(root, "hook", "--block-exit", "10"), 10)
 
 
 def test_an_inherited_environment_does_not_change_the_block_exit(tmp_path):
     root = _make_repo(tmp_path, _EXIT_2, venv=False)
-    completed = _direct(root, "hook", **_OLD_SENTINEL)
-    assert completed.returncode == 2, completed.stderr
+    _assert_blocked(_direct(root, "hook", **_OLD_SENTINEL), 2)
 
 
 @_needs_pwsh
 def test_invoke_ignores_an_inherited_environment(tmp_path):
     root = _make_repo(tmp_path, _EXIT_2)
-    completed = _invoke_file(root, "--session-id", "x", "hook", **_OLD_SENTINEL)
-    assert completed.returncode == 2, completed.stderr
+    _assert_blocked(_invoke_file(root, "--session-id", "x", "hook", **_OLD_SENTINEL), 2)
 
 
 _ARGV_CHILD = "import json, sys\nprint(json.dumps(sys.argv[1:]))\n"
@@ -520,10 +521,10 @@ def test_invoke_adds_no_flag_to_a_run_childs_argv(tmp_path):
     assert json.loads(completed.stdout) == ["--b", "1"]
 
 
-def test_a_run_childs_own_flags_pass_through_as_on_main(tmp_path):
+@pytest.mark.parametrize("flags", [["--block", "1", "--block-exit", "0"], ["--block-exit", "10"]])
+def test_a_run_childs_block_exit_flags_pass_through_as_on_main(tmp_path, flags):
     root = _make_repo(tmp_path, _hooks(), venv=False)
     (root / "scripts/argv.py").write_text(_ARGV_CHILD, encoding="utf-8")
-    flags = ["--block", "1", "--block-exit", "0"]
     completed = _direct(root, "--session-id", "x", "run", "scripts/argv.py", *flags)
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == flags
@@ -531,7 +532,7 @@ def test_a_run_childs_own_flags_pass_through_as_on_main(tmp_path):
 
 def test_only_the_launchers_block_exit_is_honoured(tmp_path):
     root = _make_repo(tmp_path, _EXIT_2, venv=False)
-    assert _direct(root, "hook", "--block-exit", "0").returncode == 2
+    _assert_blocked(_direct(root, "hook", "--block-exit", "0"), 2)
 
 
 @_needs_pwsh
@@ -545,8 +546,7 @@ def test_invoke_forwards_a_single_argument_whole(tmp_path):
 @_needs_pwsh
 def test_invoke_with_a_flag_before_hook_gives_2(tmp_path):
     root = _make_repo(tmp_path, _EXIT_2)
-    completed = _invoke_file(root, "--session-id", "x", "hook")
-    assert completed.returncode == 2, completed.stderr
+    _assert_blocked(_invoke_file(root, "--session-id", "x", "hook"), 2)
 
 
 @_needs_pwsh

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-# No parameter block: forward native arguments, including script-specific flags, unchanged, plus
+# No parameter block: forward native arguments, including script-specific flags, plus
 # `--block-exit 10` in hook mode.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -14,7 +14,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 # Only where `hook` is the first argument, the bridge exits 10 for a hook's exit 2 (--block-exit in
 # bridge.py), and the mapping below ends the process with 2 for it.
 $hookMode = $args[0] -ceq 'hook'
-$blockExit = 10
+$blockExit = 10  # Must equal BLOCK_EXIT in bridge.py.
 # Assigned, never from an if expression, which would unroll a one-element array to a string.
 $bridgeArgs = @($args)
 if ($hookMode) { $bridgeArgs += '--block-exit', "$blockExit" }

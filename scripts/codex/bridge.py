@@ -18,6 +18,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# Must equal $blockExit in invoke.ps1; a mismatch leaves a block at 2, which its caller's
+# pwsh -Command reports as 1.
+BLOCK_EXIT = 10
 EVENTS = (
     "SessionStart",
     "SessionEnd",
@@ -279,13 +282,13 @@ def main() -> int:
     parser.add_argument("--session-id", default=os.environ.get("CODEX_THREAD_ID", ""))
     parser.add_argument("--migrate-copies", action="store_true")
     parser.add_argument("--include-user-skills", action="store_true")
-    # A hook's exit 2 exits 2, or 10 where argv is exactly `hook ... --block-exit 10`, the form
-    # invoke.ps1 builds; it ends its process with 2 for 10. It is taken out before argparse, so no
-    # prefix of it is captured from a run script's own flags. Nothing inherits argv.
+    # A hook's exit 2 exits 2, or BLOCK_EXIT where argv is exactly `hook ... --block-exit 10`, the
+    # form invoke.ps1 builds; it ends its process with 2 for it. It is taken out before argparse, so
+    # no prefix of it is captured from a run script's own flags. Nothing inherits argv.
     argv = sys.argv[1:]
     block_exit = 2
-    if argv[:1] == ["hook"] and argv[-2:] == ["--block-exit", "10"]:
-        argv, block_exit = argv[:-2], 10
+    if argv[:1] == ["hook"] and argv[-2:] == ["--block-exit", str(BLOCK_EXIT)]:
+        argv, block_exit = argv[:-2], BLOCK_EXIT
     args, rest = parser.parse_known_args(argv)
     if args.mode == "sync-skills":
         user_skills = user_skill_directory() if args.include_user_skills else None
