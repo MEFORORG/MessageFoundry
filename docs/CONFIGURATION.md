@@ -554,7 +554,7 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   `outbound()` take, whenever a connection is declared. At least a connection's, lookup's and
   reference set's build refuses such a literal too, so one in a graph built in code, or written
   after the load, is refused there. At start a connection's refusal fails its own lane, and a
-  lookup's or reference set's stops `serve` from starting; `check` or a reload refuses the graph. Some
+  database lookup's or reference set's stops `serve` from starting; `check` or a reload refuses the graph. Some
   checks that run before a build still read such a literal as written. A check inside a factory that reads one
   of the factory's own settings before this one does can stop the load with an error about the
   flag's effect instead. `MLLP`, `DICOMweb`, `Http` and `Ftp` refuse a non-bool `tls` or `verify_tls`

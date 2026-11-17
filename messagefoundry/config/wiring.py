@@ -1042,10 +1042,11 @@ def refuse_raw_declarations(
     if raw:
         verb = "is not a transport setting" if len(raw) == 1 else "are not transport settings"
         raise WiringError(
-            f"{where}: {', '.join(raw)} {verb}. Declare tls_hop_attested or "
-            "tls_revocation_attested on inbound() or outbound(), and cleartext_accepted on "
-            "outbound() only, each with its _reason, or as top-level keys on the connections.toml "
-            "table, so the declaration is validated and reported"
+            f"{where}: {', '.join(raw)} {verb}. Declare tls_hop_attested with "
+            "tls_hop_attested_reason, or tls_revocation_attested with "
+            "tls_revocation_attested_reason, on inbound() or outbound(), and cleartext_accepted "
+            "with cleartext_reason on outbound() only, or as top-level keys on the "
+            "connections.toml table, so the declaration is validated and reported"
         )
 
 
@@ -1744,8 +1745,7 @@ def refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
     #3234 added step 8): an inbound or outbound connection (``_source_config``, ``_dest_config``),
     a database lookup (the executor build and the build check), a FHIR lookup
     (``_fhir_lookup_settings``) and a reference set (the build check, ``refuse_reference_hop_flags``
-    at start, and the sync). This is the one place that list is kept. A caller that resolves
-    settings for any other reason, such as a check or a census, is not covered by it.
+    at start, and the sync). This is the one place that list is kept.
 
     Problems are joined with `` | ``, because a problem can hold a ``;`` before its remedy."""
     if problems := list(_bool_literal_problems_in(settings)):
