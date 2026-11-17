@@ -297,4 +297,5 @@ becomes real when someone runs the installer.
 - **The added per-invocation readings of rules 3 and 3c make some false refusals of their own.** At
   least two are known and left open: in rule 3c, a closed substitution holding a git word between two
   `config` words can make the reading fall back to the session cwd; and a `config` pathspec after a
-  closed `$( )` can read as a config disarm. The ADDED READINGS note in the hook lists the others.
+  closed `$( )` can read as a config disarm. The ADDED READINGS note in the hook lists these two and
+  the others known.

@@ -463,12 +463,41 @@ def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str,
         ("if (git -C '{p}' diff --quiet) {{ git reset --hard }}", "outside", "PowerShell"),
         # The later-disarm filter counts `.git` as a git word, so the grep's `-c alias.lg` is judged.
         ("git config core.hooksPath ; grep --exclude-dir=.git -c alias.lg f", "primary", "Bash"),
+        # KNOWN FALSE DENIES below, each ALLOW on origin/main f0e49f45c5c (measured with the PR 3030
+        # reviewer probes) and listed in the hook's ADDED READINGS note.
+        # A closed substitution holding a git word between two `config` words: the `--file` resolves
+        # in the ungoverned repository, but the reading falls back to the session cwd.
+        (
+            "git -C {o} config --file=$(git rev-parse --git-dir)/config {k}",
+            "primary",
+            "Bash",
+        ),
+        # A `config` pathspec after a closed `$( )` reads as a config disarm of the `-C` repository.
+        ("git -C '{p}' log $(git rev-parse HEAD) -- config core.hooksPath x", "outside", "Bash"),
+        # A bare read whose earlier `config` word sits in a closed `$( )`.
+        (
+            "git -C '{p}' -c user.name=$(git config user.name) config --get core.hooksPath",
+            "outside",
+            "Bash",
+        ),
+        # $absC folds the `-C` inside the closed `$( )` as the outer invocation's.
+        ("(cd {tmp} && ls)\ngit -c a=$(git -C '{p}' log -1) config {k}", "outside", "Bash"),
     ],
 )
 def test_known_false_denies_of_the_added_readings_still_deny(
     rig: SimpleNamespace, template: str, where: str, tool: str
 ) -> None:
     assert not _allowed(rig, _fmt(rig, template), _cwd(rig, where), tool)
+
+
+def test_a_misanchored_read_is_not_called_a_change(rig: SimpleNamespace) -> None:
+    # PR 3030 review, finding 4: the refusal for this known false deny said "changing" about a read.
+    # Its text is worded from the `config` word nearest the key; the verdict is still DENY.
+    command = "git -C '{p}' -c user.name=$(git config user.name) config --get core.hooksPath"
+    reason = _reason(rig, _fmt(rig, command), rig.outside)
+    first = reason.splitlines()[0]
+    assert "could not clear as a bare read" in first, reason
+    assert "changing" not in first and "setting" not in first, reason
 
 
 # Quoted forms the gate's unquoting does not read as the shell does (closing step 7), left ALLOW as on
@@ -509,7 +538,9 @@ def test_a_joined_bash_payload_naming_an_ungoverned_repo_is_allowed_from_the_pri
         # Rule 3c's owning word must not cross `;` to an earlier command's `-C`.
         ("git -C '{p}' log ; /usr/bin/git config {k}", "outside", "Bash"),
         (r"git -C '{p}' log ; \git config {k}", "outside", "Bash"),
-        # PowerShell passes a leading `''` as an argument of its own, so it joins nothing.
+        # PowerShell passes a leading `''` as an argument of its own, so it joins nothing -- only while
+        # $PSNativeCommandArgumentPassing is not Legacy. Under Legacy the empty argument is dropped and
+        # this command runs against the primary, so this row pins the gate's ALLOW, not a safe command.
         ("git -C ''{p} reset --hard", "outside", "PowerShell"),
     ],
 )
@@ -564,6 +595,9 @@ def test_powershell_escaped_or_leading_pairs_stay_allowed(
     rig: SimpleNamespace, template: str
 ) -> None:
     # PowerShell passes `'<p>'''` as `<p>'` and `''"<p>"` as two arguments, so none names the primary.
+    # The two-argument reading of `''"<p>"` holds only while $PSNativeCommandArgumentPassing is not
+    # Legacy; under Legacy the empty argument is dropped and that row runs against the primary, so it
+    # pins the gate's ALLOW, not a safe command.
     assert _allowed(rig, _fmt(rig, template), rig.outside, "PowerShell")
 
 
