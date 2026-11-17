@@ -76,6 +76,7 @@ from messagefoundry.auth.anchor_path import (
     WinHost,
     WinSecurity,
     WinTrust,
+    _strip_nt_target,
     _win_probe,
     describe_sid,
     evaluate_windows_object,
@@ -746,7 +747,7 @@ def _loopback_share_problem(
 ) -> str | None:
     """Why a key file reached through a share may be on this host's own disk, or ``None``. Such a
     spelling stops the walk at the share, so a junction on the local path would go unjudged
-    (vault BACKLOG #5657); the local path is walked instead.
+    (vault BACKLOG #5657); the share is refused, and the refusal asks for the local path instead.
 
     The server counts as this host when ``config.settings._names_this_host`` reads it as loopback
     or unspecified (shorthand and decimal forms included); when it is ``host_name``, that name's
@@ -810,20 +811,22 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     did not finish (:func:`_windows_cause_problem`), a share that may be this host itself
     (:func:`_loopback_share_problem`), a junction or link above it that another account can change
     (:func:`_windows_link_problem`), a ``subst`` drive on its path whose folders above the holder
-    another account can change (the holder too, when ``path`` is that drive's root), then the directory that holds it (:func:`_windows_holder_problem`).
-    Windows only.
+    another account can change (the holder too, when the walk ends on that drive's target), then
+    the directory that holds it (:func:`_windows_holder_problem`). Windows only.
 
     ``path`` itself is walked, so a ``subst`` drive root is resolved too, and the links on the way
     are judged even when it resolves to a volume root. The holder is the folder that holds where
     the walk ends, after every junction, link and ``subst`` drive on the way, and its owner and
-    entries are read there. A mapped network drive (``GetDriveTypeW`` answers ``DRIVE_REMOTE``) is
-    a share: the walk stops at it, as at a UNC share, and follows no junction or link on it. A walk
-    that reached
-    a share the path names, by a UNC path or a mapped drive letter, reads the holder through the
-    share by its path as written, and refuses it when it is a junction or link; one that reached a
-    share, a mapped drive included, through a junction, link or ``subst`` drive is refused. A
-    mapped drive onto this host itself is not recognized as such. The caller has read ``path``
-    itself and refused it if it is a link. ``host`` holds the readers."""
+    entries are read there. Each volume is first asked ``host.volume_cause``, and a volume it
+    answers, or whose drive type cannot be read, ends the walk and is refused. A mapped network
+    drive (``GetDriveTypeW`` answers ``DRIVE_REMOTE``) is a share: the walk stops at it, as at a
+    UNC share, and follows no junction or link on it. A walk that reached a share the path names,
+    by a UNC path or a mapped drive letter, reads the holder through the share by its path as
+    written, and refuses it when it is a junction or link; one that reached a share, a mapped drive
+    included, through a junction, link or ``subst`` drive is refused. A mapped drive letter is
+    judged by the loopback test through the share ``WNetGetConnectionW`` names for it, and refused
+    when that cannot be read. The caller has read ``path`` itself and refused it if it is a link.
+    ``host`` holds the readers."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the folders on a Windows path are walked on Windows only")
     try:
@@ -831,21 +834,30 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     except OSError as exc:  # the working directory
         return f"the folders on its path could not be walked ({exc.strerror or type(exc).__name__})"
     substituted: list[str] = []
+    #: Where each ``subst`` drive on the path leads, normalized and lower-cased, as the walk reads it.
+    subst_targets: set[str] = set()
     remote: list[str] = []
 
     def drive_target(drive: str) -> str | None:
         answer = host.drive_target(drive)
         if answer is not None:
             substituted.append(drive)
+            stripped = _strip_nt_target(answer)
+            if stripped:
+                subst_targets.add(ntpath.normpath(stripped).lower())
         return answer
 
     def volume_cause(root: str) -> str | None:
         # Walked as a local volume, a junction on the file server would be spliced in as a path on
-        # this host, and the holder read here instead of on the server.
-        if _is_remote_drive(root):
-            remote.append(root)
-            return SHARE_CAUSE
-        return None
+        # this host, and the holder read here instead of on the server. A drive type that cannot
+        # be read ends the walk with a cause, which is refused, rather than escaping the check.
+        try:
+            if _is_remote_drive(root):
+                remote.append(root)
+                return SHARE_CAUSE
+            return host.volume_cause(root)
+        except OSError as exc:
+            return f"its drive type could not be read ({exc.strerror or type(exc).__name__})"
 
     chain, cause = windows_chain(
         str(full), os.getcwd, _win_probe, volume_cause=volume_cause, drive_target=drive_target
@@ -870,7 +882,19 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
                 f"({exc.strerror or type(exc).__name__}), so the share cannot be told apart from "
                 "this host; fix the host's name, or name the file by a local path"
             )
-        problem = _loopback_share_problem(str(full), host_name, _route_source)
+        as_share = str(full)
+        if remote:
+            # A mapped drive names its server only through the share it is mapped to.
+            try:
+                mapped = _mapped_drive_share(full.drive)
+            except OSError as exc:
+                return (
+                    "it is on a mapped network drive whose share could not be read "
+                    f"({exc.strerror or type(exc).__name__}), so the share cannot be told apart "
+                    "from this host; name it by its share path or a local path"
+                )
+            as_share = mapped.rstrip("\\") + str(full)[len(full.drive) :]
+        problem = _loopback_share_problem(as_share, host_name, _route_source)
     if problem is not None:
         return problem
     holder_path: str | None
@@ -902,10 +926,11 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             # than for a link, whose rule starts at the link. The holder is judged below.
             targets = [] if holder_is_root else _folders_above(holder_path, set())
             subject = _SUBST_FOLDER_SUBJECT
-            if ntpath.dirname(str(full)) == str(full):
-                # The path is the subst drive's own root, so the holder holds the subst target and
-                # can rename it, as the folder holding a link can: it gets the link rule too, a
-                # volume root included.
+            if chain[-1][0].lower() in subst_targets:
+                # The walk ends on a subst drive's target, however that drive's root was reached
+                # (named, or through a junction or link), so the holder holds the target and can
+                # rename it, as the folder holding a link can: it gets the link rule too, a volume
+                # root included.
                 targets = [(holder_path, DIRECTORY), *targets]
                 subject = _SUBST_ROOT_FOLDER_SUBJECT
             problem = _windows_judged_problem(targets, host.read_security, trust, subject)
@@ -950,6 +975,26 @@ def _is_remote_drive(root: str) -> bool:
     import ctypes
 
     return bool(ctypes.WinDLL("kernel32").GetDriveTypeW(root) == _DRIVE_REMOTE)
+
+
+def _mapped_drive_share(drive: str) -> str:
+    """The share a mapped network ``drive`` (``Z:``) stands for (``\\\\server\\share``), as
+    ``WNetGetConnectionW`` answers it. Raises ``OSError`` when it does not answer. A seam for tests.
+    Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("a mapped drive is read only on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    get_connection = ctypes.WinDLL("mpr").WNetGetConnectionW
+    get_connection.restype = wintypes.DWORD
+    get_connection.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    size = wintypes.DWORD(1024)
+    buf = ctypes.create_unicode_buffer(size.value)
+    error = get_connection(drive, buf, ctypes.byref(size))
+    if error or not buf.value:
+        raise OSError(errno.EIO, f"Win32 error {error}")
+    return str(buf.value)
 
 
 def _host_name() -> str:

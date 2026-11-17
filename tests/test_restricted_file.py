@@ -1813,6 +1813,7 @@ def test_windows_a_mapped_network_drive_is_read_as_a_share(
     monkeypatch.setattr(
         restricted_file, "_is_reparse_point", lambda path: path.lower() == "y:\\keys"
     )
+    monkeypatch.setattr(restricted_file, "_mapped_drive_share", lambda _d: "\\\\fileserver\\keys")
     host = _host_judging_only_under(tmp_path, drive_target=lambda _d: None)
     surroundings = restricted_file._windows_surroundings_problem
     # The control: the local folder the server's junction names passes when named directly.
@@ -1845,6 +1846,93 @@ def test_windows_a_link_or_subst_drive_onto_a_mapped_drive_is_refused(
     for path in (Path(link) / "client.key", Path("Q:\\client.key")):
         problem = str(surroundings(path, host))
         assert "onto a network share or a mapped network drive" in problem, path
+
+
+@windows_only
+def test_windows_a_mapped_drive_onto_this_host_is_refused_as_a_loopback_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mapped drive letter names no server, so the loopback test passed one mapped onto this
+    host. It is now judged through the share the drive is mapped to, and refused when that share
+    cannot be read. The letter and its share are stand-ins, so no drive is mapped."""
+    import messagefoundry.auth.anchor_path as anchor_path
+
+    monkeypatch.setattr(
+        restricted_file, "_is_remote_drive", lambda root: root.upper() == "Y:\\", raising=False
+    )
+    monkeypatch.setattr(restricted_file, "_host_name", lambda: "engine-host.example.test")
+    host = anchor_path.windows_host_readers()
+    surroundings = restricted_file._windows_surroundings_problem
+    for share in ("\\\\localhost\\c$", "\\\\ENGINE-HOST\\keys"):
+        monkeypatch.setattr(
+            restricted_file, "_mapped_drive_share", lambda _d, s=share: s, raising=False
+        )
+        problem = str(surroundings(Path("Y:\\keys\\client.key"), host))
+        assert "a network share on this host itself" in problem, share
+
+    def unreadable(_drive: str) -> str:
+        raise OSError(errno.EIO, "no connection")
+
+    monkeypatch.setattr(restricted_file, "_mapped_drive_share", unreadable, raising=False)
+    problem = str(surroundings(Path("Y:\\keys\\client.key"), host))
+    assert "mapped network drive whose share could not be read" in problem
+
+
+@windows_only
+def test_windows_a_drive_type_that_cannot_be_read_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``OSError`` from the drive-type read escaped the walk, and with it
+    ``broad_access_problem``. It now ends the walk with a cause, which is refused."""
+    secure = tmp_path / "secure"
+    secure.mkdir()
+    key = secure / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    host = _host_judging_only_under(tmp_path)
+    surroundings = restricted_file._windows_surroundings_problem
+    assert surroundings(key, host) is None  # the control
+
+    def unreadable(_root: str) -> bool:
+        raise OSError(errno.EIO, "drive type unreadable")
+
+    monkeypatch.setattr(restricted_file, "_is_remote_drive", unreadable)
+    problem = str(surroundings(key, host))
+    assert "its drive type could not be read" in problem
+    assert str(tmp_path) not in problem
+
+
+@windows_only
+def test_windows_a_subst_root_reached_through_a_link_gets_the_link_rule_on_its_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``subst`` drive root reached through a junction, not named: the folder holding the
+    drive's target got only the holder rule, which passes a single account that is not an
+    administrator owning it. It now gets the link rule wherever the walk ends on the target. The
+    letter and the link are stand-ins; the link is a plain folder the probe answers as a link."""
+    mid = tmp_path / "mid"
+    secrets = mid / "secrets"
+    secrets.mkdir(parents=True)
+    link = tmp_path / "lnk"
+    link.mkdir()
+    monkeypatch.setattr(
+        restricted_file, "_win_probe", _probe_with_links({str(link).lower(): "Q:\\"})
+    )
+    target = "\\??\\" + str(secrets)
+    base = _host_judging_only_under(
+        tmp_path, drive_target=lambda d: target if d.upper() == "Q:" else None
+    )
+    stranger = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+
+    def read_security(obj: str, kind: str) -> WinSecurity:
+        if obj.lower() == str(mid).lower():
+            return WinSecurity(stranger, ((_ALLOW, 0, _FULL, _SYSTEM),))
+        return base.read_security(obj, kind)
+
+    surroundings = restricted_file._windows_surroundings_problem
+    assert surroundings(link, base) is None  # the control
+    problem = str(surroundings(link, dataclasses.replace(base, read_security=read_security)))
+    assert "the folder holding it or a folder above that, where a subst drive" in problem
+    assert str(tmp_path) not in problem
 
 
 @windows_only

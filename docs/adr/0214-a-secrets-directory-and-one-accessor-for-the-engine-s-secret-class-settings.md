@@ -160,14 +160,18 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   junction, link and `subst` drive.
 
   - A mapped network drive is read as a share: the walk stops at it.
+  - A volume `volume_cause` in `messagefoundry/auth/anchor_path.py` cannot judge, or whose drive
+    type cannot be read, ends the walk and is refused.
   - On a share the path names, by a UNC path or a mapped drive letter, that folder is read
     through the share at `full.parent`. It is refused when it is a junction or link there.
   - Inherit-only entries are skipped.
   - Where a `subst` drive is on the path, every folder above that folder is judged by the link
-    rule.
+    rule. Where the walk ends on a `subst` drive's target, by the drive's root named or reached
+    through a junction or link, that folder is judged by the link rule too.
   - A link or `subst` drive onto a network share or a mapped network drive is refused.
   - A share spelled with at least some of this host's own names or addresses is refused.
-    `_loopback_share_problem` says which. A mapped drive is not among them.
+    `_loopback_share_problem` says which. A mapped drive letter is judged through the share
+    `WNetGetConnectionW` names for it, and refused when that cannot be read.
 
   So the drive-root gap in the 2026-11-13 list is closed for a `subst` drive root. A mapped
   network drive root is read as a share root, so nothing on this host holds it. A broad group's
