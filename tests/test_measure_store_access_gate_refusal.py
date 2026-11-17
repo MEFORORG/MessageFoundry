@@ -11,9 +11,10 @@ engine that served. Now a line must also carry the refusal's own words, through
 NOTHING HERE RUNS THE SCRIPT: it installs a service and must run elevated, which only the hosted
 windows-service-smoke leg does. The tests lift the phrase assignments and functions they need out
 of the script's AST: they call ``Test-GateRefusalLine`` on lines worded as the engine words them,
-and run ``Wait-ForGateRefusal`` against a stand-in log reader. They pin, as literals, that ``app.py``
-still holds each line's prefix and the no-Administrator and no-address detail texts; they do not pin
-``$ProvisionHint`` or ``$ProvisionDecline``, and they do not render the lines from ``app.py``. Each
+and run ``Wait-ForGateRefusal`` against a stand-in log reader. A substring check finds each line's
+prefix, and source fragments of the no-Administrator and no-address detail texts, somewhere in
+``app.py``; it does not render the lines, so it does not prove the refusal still puts the clause and
+"refusing to start" on one line. Each
 case that runs PowerShell needs its own host, ``pwsh`` or ``powershell``, and skips where that host
 is missing; the ``app.py`` pin and the source-text test need neither.
 """
