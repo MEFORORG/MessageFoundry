@@ -2161,7 +2161,9 @@ residuals that cause these. A text field holding a C0 control, such as a typed s
 scrubbed before it is encoded where the control lies in the window `_scrub_field` in the same
 file scans, and in at least the cases `_scrub_field` in the same file lists,
 the whole field ships as `[redacted]`, unless the record ships as it did before that scrub, which
-the `_tee_line` docstring in the same file says when. That includes a typed sign-in name a client chose to put a
+the `_tee_line` docstring in the same file says when. A client can bring that about for its own
+record by typing a few characters, such as a segment-shaped token like `ABC|`, and its text beside
+a control then passes as it did before the scrub. That includes a typed sign-in name a client chose to put a
 control in, so on a first deployment a client could keep its own typed name out of the off-box
 copy. The `emit_audit_tee` docstring says what that scrub does not cover.
 

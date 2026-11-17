@@ -573,7 +573,10 @@ def emit_audit_tee(
       ``detail`` is scrubbed before ``safe_text`` bounds it, so that holds for a control
       anywhere in the scanned window, even in text past the 200 characters that would ship.
     * A field holding a control and longer than the handler chain's 64 KiB window does not, in
-      practice, ship scrubbed. A ``detail`` is longer, encoded, than the window the per-field
+      practice, ship scrubbed. A shorter field whose encoded form is longer than that window, as
+      where it holds many controls, each encoded as up to six characters, can lose its scrub the
+      same way: a ``detail`` of 12,023 characters, 72,028 encoded, was measured shipping as
+      ``[redacted]``. A ``detail`` is longer, encoded, than the window the per-field
       check reads, so it ships whole as ``[redacted]`` with its bound note, which is not itself
       a JSON string. Any other such field
       ships as the line before #3045 did, losing the scrub: that line was cut inside the field,
@@ -592,8 +595,11 @@ def emit_audit_tee(
       alone, as before.
     * In ``detail``, a JSON escape is read as the control it spells only where the detail parses as
       JSON within the handler chain's bound and holds no raw control, which is how ``json.dumps``
-      writes it. Elsewhere, at least a pretty-printed JSON detail or a longer one, the escape is
-      read by the handler chain alone, as before.
+      writes it, and only one level deep. Elsewhere, at least a pretty-printed JSON detail, a
+      longer one, and a JSON string holding JSON text, where the control's escape is escaped
+      again, the escape is read by the handler chain alone, as before. So is a control spelled
+      as text another way, such as ``\\x01`` in a Python repr in an exception's text: that is not
+      a control, and the field scrub never sees one there.
 
     **At least two residuals remain, and both can break the JSON a collector receives.** The
     first can also alter it silently.
