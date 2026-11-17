@@ -64,6 +64,7 @@ from messagefoundry.auth.anchor_path import (
     ACCESS_ALLOWED_ACE_TYPE,
     ADMINISTRATORS_SID,
     DIRECTORY,
+    INHERIT_ONLY_ACE,
     LINK,
     PATH,
     SHARE_CAUSE,
@@ -71,13 +72,13 @@ from messagefoundry.auth.anchor_path import (
     ChainFinding,
     PosixStat,
     WalkCause,
+    WinHost,
     WinSecurity,
     WinTrust,
     _win_probe,
     describe_sid,
     evaluate_windows_object,
     posix_path_verdict,
-    query_drive_target,
     windows_chain,
     windows_host_readers,
 )
@@ -86,6 +87,7 @@ if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinPathSecurity
 
 __all__ = [
+    "DELETE_ACCESS",
     "LINUX_CREDENTIAL_FILE_SYSTEMS",
     "LINUX_HOST_FILE_SYSTEMS",
     "WINERROR_ACCESS_DENIED",
@@ -106,8 +108,11 @@ __all__ = [
     "linux_file_system_refusal",
     "linux_file_system_type",
     "local_account_domain_sid",
+    "lookup_account_name",
+    "lookup_sid_kind",
     "posix_access_acl",
     "replace_generated",
+    "resolve_sid",
     "ride_out_a_held_file",
     "unlink_generated",
     "write_restricted_file",
@@ -128,8 +133,8 @@ class RestrictedFileError(OSError):
 #: can delete it through the handle it read it with (the key custody draft, rule 3 step 2).
 _FULL_ACCESS = 0x001F01FF
 _READ_ACCESS = 0x00120089
-_DELETE = 0x00010000
-_READ_DELETE_ACCESS = _READ_ACCESS | _DELETE
+DELETE_ACCESS = 0x00010000
+_READ_DELETE_ACCESS = _READ_ACCESS | DELETE_ACCESS
 _SDDL_RIGHT: Mapping[int, str] = {
     _FULL_ACCESS: "FA",
     _READ_ACCESS: "FR",
@@ -253,7 +258,7 @@ def _name_kind_problem(principal: str, kind: int, *, as_owner: bool) -> str | No
 def handoff_grantee_problem(sid: str, kind_of: Callable[[str], int | None]) -> str | None:
     """Why the account ``sid`` must not be granted a handoff, or ``None`` when it may.
     ``kind_of`` answers a SID's SID_NAME_USE, ``None`` when Windows maps it to no account
-    (:func:`_lookup_sid_kind`); it is asked only once the checks that need no lookup have passed.
+    (:func:`lookup_sid_kind`); it is asked only once the checks that need no lookup have passed.
 
     The grantee must be ONE account. SYSTEM, LOCAL SERVICE and NETWORK SERVICE are refused first
     (:func:`custody_account_problem`), then an application package. One service's own SID
@@ -283,7 +288,7 @@ def handoff_grantee_problem(sid: str, kind_of: Callable[[str], int | None]) -> s
     )
 
 
-def _lookup_sid_kind(sid: str) -> int | None:
+def lookup_sid_kind(sid: str) -> int | None:
     """The SID_NAME_USE ``LookupAccountSidW`` reports for ``sid``, or ``None`` when it maps the SID
     to no account (ERROR_NONE_MAPPED). Raises :class:`RestrictedFileError` for any other failure.
     Windows only."""
@@ -385,7 +390,7 @@ def local_account_domain_sid() -> str | None:
     name = ctypes.create_unicode_buffer(size.value)
     if not kernel32.GetComputerNameW(name, ctypes.byref(size)):
         return None
-    found = _lookup_account_name(name.value)
+    found = lookup_account_name(name.value)
     if found is None:
         return None
     sid, use = found
@@ -404,7 +409,7 @@ _REACH_MASK = (
     0x00000001  # FILE_READ_DATA
     | 0x00000002  # FILE_WRITE_DATA
     | 0x00000004  # FILE_APPEND_DATA
-    | _DELETE
+    | DELETE_ACCESS
     | 0x00040000  # WRITE_DAC
     | 0x00080000  # WRITE_OWNER
     | 0x10000000  # GENERIC_ALL
@@ -418,14 +423,16 @@ _REACH_MASK = (
 _DIRECTORY_REACH_MASK = _REACH_MASK | 0x00000040  # FILE_DELETE_CHILD
 
 #: Rights on the directory that HOLDS a key file that let their holder replace the file: delete it
-#: whatever its own access list says (FILE_DELETE_CHILD), or give itself that right (WRITE_DAC,
-#: WRITE_OWNER; GENERIC_ALL holds all three). Narrower than :data:`_DIRECTORY_REACH_MASK` on
-#: purpose: listing, traversing and adding a file do not remove a file already there, and ordinary
-#: folders grant Users those, ``C:\\ProgramData`` included (vault BACKLOG #5657). So a file a broad
-#: group added before the engine first looked, or a holder it renamed away with DELETE, is not
-#: caught here.
+#: whatever its own access list says (FILE_DELETE_CHILD), rename the directory itself away and put
+#: another in its place (DELETE), or give itself either right (WRITE_DAC, WRITE_OWNER; GENERIC_ALL
+#: holds them all). Narrower than :data:`_DIRECTORY_REACH_MASK` on purpose: listing, traversing and
+#: adding a file do not remove a file already there, and ordinary folders grant Users those,
+#: ``C:\\ProgramData`` included (vault BACKLOG #5657). So a file a broad group added before the
+#: engine first looked is not caught here. A volume root cannot be renamed, so ``DELETE`` on one is
+#: not counted.
 _HOLDER_REPLACE_MASK = (
     0x00000040  # FILE_DELETE_CHILD
+    | DELETE_ACCESS
     | 0x00040000  # WRITE_DAC
     | 0x00080000  # WRITE_OWNER
     | 0x10000000  # GENERIC_ALL
@@ -539,26 +546,52 @@ def _windows_access_problem(
     return None
 
 
-def _windows_holder_problem(security: _WinPathSecurity) -> str | None:
-    """Why the directory this access list belongs to lets a broad group or an application package
-    replace a key file in it (:data:`_HOLDER_REPLACE_MASK`), or ``None`` (vault BACKLOG #5657).
-    The same reading as :func:`_windows_access_problem`, its owner rule included."""
-    return _windows_access_problem(
-        security, _HOLDER_REPLACE_MASK, reach="can delete or replace a file in it"
-    )
+def _windows_holder_problem(security: WinSecurity, *, volume_root: bool = False) -> str | None:
+    """Why the directory this owner and access list belong to lets a broad group or an application
+    package replace a key file in it (:data:`_HOLDER_REPLACE_MASK`), or ``None`` (vault BACKLOG
+    #5657). The same owner and entry rules as :func:`_windows_access_problem`, read with the entry
+    flags: an inherit-only entry grants nothing on the directory, so it is skipped. With
+    ``volume_root``, ``DELETE`` is not counted. A list that could not be read is the caller's to
+    report. Kept free of ctypes so the decision is testable on every platform."""
+    if security.aces is None:
+        return "it has no access list at all, so every account on the host can read or change it"
+    owner = security.owner
+    if owner is None:
+        return "its owner could not be read"
+    if (what := _screened_principal(owner)) is not None:
+        return f"its owner is {what}, and an owner can change its access list"
+    mask = _HOLDER_REPLACE_MASK & ~DELETE_ACCESS if volume_root else _HOLDER_REPLACE_MASK
+    for ace_type, flags, ace_mask, sid in security.aces:
+        if ace_type not in _GRANTING_ACE_TYPES or flags & INHERIT_ONLY_ACE:
+            continue  # a deny or audit entry, or a template for children, grants nothing here
+        if ace_type != ACCESS_ALLOWED_ACE_TYPE:
+            return "its access list holds a conditional entry this check cannot interpret"
+        if ace_mask & mask and _is_broad_group(sid):
+            return f"{describe_sid(sid)} can delete or replace a file in it"
+        if ace_mask & mask and _is_package_sid(sid):
+            return f"the application package {sid} can delete or replace a file in it"
+    return None
 
 
 def _windows_engine_owner_problem(owner_sid: str | None, engine_sid: str | None) -> str | None:
     """Why a file only the engine writes, such as its minted TLS pair, is owned by an account that
     did not make it, or ``None``. The engine's own account, SYSTEM and Administrators may own it:
-    an elevated administrator's files are owned by Administrators. Any other owner may have planted
-    the file through a right to add one to the directory, which the holder rule does not refuse
-    (vault BACKLOG #5657). An owner or an engine account that could not be read is refused too.
-    Kept free of ctypes so the decision is testable on every platform."""
+    an elevated administrator's files are owned by Administrators. The engine's own account counts
+    only when it is not LOCAL SERVICE or NETWORK SERVICE, which other services run as too. Any other
+    owner may have planted the file through a right to add one to the directory, which the holder
+    rule does not refuse (vault BACKLOG #5657). An owner or an engine account that could not be read
+    is refused too. Kept free of ctypes so the decision is testable on every platform."""
     if owner_sid is None:
         return "its owner could not be read"
-    if owner_sid in (SYSTEM_SID, ADMINISTRATORS_SID) or owner_sid == engine_sid:
+    if owner_sid in (SYSTEM_SID, ADMINISTRATORS_SID):
         return None
+    if owner_sid == engine_sid:
+        if owner_sid not in _SHARED_SERVICE_SIDS:
+            return None
+        return (
+            f"it is owned by {describe_sid(owner_sid)}, which other services run as too, so another "
+            "service may have made it and may hold its key"
+        )
     if engine_sid is None:
         return "the account the engine runs as could not be read, so its owner cannot be vetted"
     return (
@@ -569,7 +602,7 @@ def _windows_engine_owner_problem(owner_sid: str | None, engine_sid: str | None)
 
 def _windows_engine_sid() -> str | None:
     """The engine process's own user SID, or ``None`` when its token could not be read. Windows
-    only. A seam, so a test can stand in another account for the engine."""
+    only. :func:`broad_access_problem` reads it from the host readers it builds instead."""
     from messagefoundry.config.wiring import _win32_config_source_probes
 
     return _win32_config_source_probes().self_sid
@@ -625,72 +658,167 @@ def _windows_link_problem(
     for obj, kind in chain:
         if kind != LINK:
             continue
-        targets = [(obj, LINK)]
-        folder = ntpath.dirname(obj)
-        while folder.lower() not in judged:
-            judged.add(folder.lower())
-            targets.append((folder, DIRECTORY))
-            above = ntpath.dirname(folder)
-            if above == folder:
-                break
-            folder = above
-        for target, as_kind in targets:
-            security = read_security(target, as_kind)
-            if ntpath.dirname(target) == target and security.aces is not None:
-                security = WinSecurity(
-                    security.owner,
-                    tuple((t, f, m & ~_DELETE, s) for t, f, m, s in security.aces),
-                    security.error,
-                )
-            findings = evaluate_windows_object(target, as_kind, security, trust)
-            if findings:
-                return _link_finding_problem(findings[0])
+        problem = _windows_judged_problem(
+            [(obj, LINK), *_folders_above(obj, judged)], read_security, trust
+        )
+        if problem is not None:
+            return problem
     return None
 
 
-def _windows_surroundings_problem(
-    path: Path, read_path: Callable[[Path], _WinPathSecurity]
+def _folders_above(obj: str, judged: set[str]) -> list[tuple[str, str]]:
+    """Every folder above ``obj`` up to its volume root, as ``(folder, DIRECTORY)``, leaving out
+    and then adding to ``judged`` (lower-cased), so a shared ancestor is read once."""
+    folders: list[tuple[str, str]] = []
+    folder = ntpath.dirname(obj)
+    while folder.lower() not in judged:
+        judged.add(folder.lower())
+        folders.append((folder, DIRECTORY))
+        above = ntpath.dirname(folder)
+        if above == folder:
+            break
+        folder = above
+    return folders
+
+
+def _windows_judged_problem(
+    targets: Sequence[tuple[str, str]],
+    read_security: Callable[[str, str], WinSecurity],
+    trust: WinTrust,
 ) -> str | None:
+    """The first trust-anchor finding on ``targets``, as a refusal, or ``None``. A volume root
+    cannot be renamed, so ``DELETE`` on one is not counted."""
+    for target, as_kind in targets:
+        security = read_security(target, as_kind)
+        if ntpath.dirname(target) == target and security.aces is not None:
+            security = WinSecurity(
+                security.owner,
+                tuple((t, f, m & ~DELETE_ACCESS, s) for t, f, m, s in security.aces),
+                security.error,
+            )
+        findings = evaluate_windows_object(target, as_kind, security, trust)
+        if findings:
+            return _link_finding_problem(findings[0])
+    return None
+
+
+#: Server names that reach this host's own disks over SMB, compared lower-cased: at least these,
+#: and the host's own name (:func:`_loopback_share_problem`).
+_LOOPBACK_SERVERS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "0--1.ipv6-literal.net"})
+
+
+def _share_server(path: str) -> str:
+    """The server name of a UNC ``path`` (``\\\\server\\share`` or ``\\\\?\\UNC\\server\\share``),
+    lower-cased, or ``""`` when it names none."""
+    text = path.replace("/", "\\")
+    if text[:8].lower() == "\\\\?\\unc\\":
+        rest = text[8:]
+    elif text.startswith("\\\\"):
+        rest = text[2:]
+    else:
+        return ""
+    return rest.split("\\", 1)[0].lower()
+
+
+def _loopback_share_problem(path: str, host_name: str) -> str | None:
+    """Why a key file reached through a share is on this host's own disk, or ``None``. Such a
+    spelling stops the walk at the share, so a junction on the local path would go unjudged
+    (vault BACKLOG #5657); the local path is walked instead. ``host_name`` is this host's name.
+    The loopback addresses are at least those :data:`_LOOPBACK_SERVERS` names, the ``127.``
+    range, and the host's own name, with or without a domain; another of the host's addresses
+    is not recognized. Kept free of I/O so the decision is testable everywhere."""
+    server = _share_server(path)
+    if not server:
+        return None
+    own = host_name.lower().split(".", 1)[0]
+    if (
+        server in _LOOPBACK_SERVERS
+        or server.startswith("127.")
+        or (own and server.split(".", 1)[0] == own)
+    ):
+        return (
+            "it is reached through a network share on this host itself, whose folders this check "
+            "does not walk; name it by its local path instead"
+        )
+    return None
+
+
+def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     """Why the folders on ``path`` let another account move or replace it, or ``None``: a walk that
-    did not finish (:func:`_windows_cause_problem`), a junction or link above it that another
-    account can change (:func:`_windows_link_problem`), then the directory that holds it
-    (:func:`_windows_holder_problem`). Windows only. Win32 collapses ``..`` before it follows a link,
-    so the holder is the lexical parent, and only it and the folders above it are walked: the
-    caller has read ``path`` itself. The host's trust readers are built only for a path with a
-    link on it."""
+    did not finish (:func:`_windows_cause_problem`), a share that is this host itself
+    (:func:`_loopback_share_problem`), a junction or link above it that another account can change
+    (:func:`_windows_link_problem`), a ``subst`` drive on its path whose folders above the holder
+    another account can change, then the directory that holds it (:func:`_windows_holder_problem`).
+    Windows only.
+
+    ``path`` itself is walked, so a ``subst`` drive root is resolved too. The holder is the folder
+    that holds where the walk ends, after every junction, link and ``subst`` drive on the way, and
+    its owner and entries are read there, not at a junction that stands in for it. A walk that
+    reached a share reads the holder by its lexical path, through the share. The caller has read
+    ``path`` itself and refused it if it is a link. ``host`` holds the readers."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the folders on a Windows path are walked on Windows only")
     try:
         full = Path(os.path.abspath(path))
     except OSError as exc:  # the working directory
         return f"the folders on its path could not be walked ({exc.strerror or type(exc).__name__})"
-    if full.parent == full:
-        return None  # a volume root: nothing holds it
-    chain, cause = windows_chain(
-        str(full.parent), os.getcwd, _win_probe, drive_target=query_drive_target
-    )
+    substituted: list[str] = []
+
+    def drive_target(drive: str) -> str | None:
+        answer = host.drive_target(drive)
+        if answer is not None:
+            substituted.append(drive)
+        return answer
+
+    chain, cause = windows_chain(str(full), os.getcwd, _win_probe, drive_target=drive_target)
     problem = _windows_cause_problem(cause)
-    if problem is None and any(kind == LINK for _obj, kind in chain):
-        try:
-            host = windows_host_readers()
-            problem = _windows_link_problem(
-                chain, host.read_security, WinTrust(host.engine_sid, host.admin_member)
-            )
-        except OSError as exc:  # a reader that could not be built or run
-            reason = exc.strerror or type(exc).__name__
-            return f"a junction or link on its path could not be judged ({reason})"
+    if problem is None and cause is not None:
+        problem = _loopback_share_problem(str(full), _host_name())
     if problem is not None:
         return problem
-    holder = read_path(full.parent)
-    if holder.status != 0:
-        detail = f": {holder.status_text}" if holder.status_text else ""
+    if cause is not None:  # a share: the walk stops there, and the holder is read through it
+        holder_path = str(full.parent)
+        if holder_path == str(full):
+            return None  # a share's root: nothing on this host holds it
+    else:
+        if not chain or chain[-1][1] == LINK:
+            return "the folders on its path could not be walked (it resolves to a link it passed)"
+        holder_path = ntpath.dirname(chain[-1][0])
+        if holder_path == chain[-1][0]:
+            return None  # a volume root: nothing holds it
+    trust = WinTrust(host.engine_sid, host.admin_member)
+    try:
+        problem = _windows_link_problem(chain, host.read_security, trust)
+        if problem is None and substituted and cause is None:
+            # A subst letter is spliced in with no link entry, but the folders above its target can
+            # rename what lies below just as they can above a link, so every folder above the holder
+            # is judged by the link rule. The holder itself is judged below, DELETE included.
+            problem = _windows_judged_problem(
+                _folders_above(holder_path, set()), host.read_security, trust
+            )
+        if problem is not None:
+            return problem
+        holder = host.read_security(holder_path, DIRECTORY)
+    except OSError as exc:  # a reader that could not be run
+        reason = exc.strerror or type(exc).__name__
+        return f"the folders on its path could not be judged ({reason})"
+    if holder.error is not None:
         return (
-            f"the permissions of the directory that holds it could not be read (Win32 error "
-            f"{holder.status}{detail}); give the account the engine runs as the right to read "
-            "that folder's permissions"
+            f"the permissions of the directory that holds it could not be read ({holder.error}); "
+            "give the account the engine runs as the right to read that folder's permissions"
         )
-    problem = _windows_holder_problem(holder)
+    problem = _windows_holder_problem(
+        holder, volume_root=ntpath.dirname(holder_path) == holder_path
+    )
     return None if problem is None else f"the directory that holds it is not restricted: {problem}"
+
+
+def _host_name() -> str:
+    """This host's own name, for :func:`_loopback_share_problem`. Read from the system, not from
+    an environment variable a caller could have set. A seam for tests."""
+    import socket
+
+    return socket.gethostname()
 
 
 def _posix_access_problem(mode: int) -> str | None:
@@ -804,6 +932,14 @@ def _posix_link_problem(
 
     for finding in verdict.findings:
         about_holder = finding.kind == DIRECTORY and above_a_link(finding.path)
+        # A folder that could not be read, ``/`` included: the walk stopped there, so no link
+        # below it was judged. With the file system type stubbed, no other directory finding is
+        # neither insecure nor about an owner or a write bit.
+        if finding.kind == DIRECTORY and not finding.insecure:
+            return (
+                "a folder on its path could not be read, so no link on it was judged: "
+                f"{finding.reason}"
+            )
         if finding.kind in (LINK, PATH) or (about_holder and (finding.owner or finding.writable)):
             if finding.kind == LINK and finding.owner:
                 # Its reason quotes the folder's path; this text names none.
@@ -988,9 +1124,11 @@ def broad_access_problem(
     link among them is refused when an account other than the engine's own and the host's
     administrators can change it: on Windows by its own access list or that of any folder above it
     (:func:`_windows_link_problem`), on POSIX by the owner or mode of the folder that holds it or of
-    any folder above it (:func:`_posix_link_problem`). Those folders are read only where a link is.
-    On Windows a directory holding ``path`` that lets a broad group delete a file in it or change
-    its access list is refused too (:func:`_windows_holder_problem`). A file whose access cannot be
+    any folder above it (:func:`_posix_link_problem`). On Windows the folders above a link, or above
+    the holder when a ``subst`` drive is on the path, are judged that way; elsewhere they are not
+    (:func:`_windows_surroundings_problem`). On Windows a directory holding ``path`` that lets a
+    broad group delete a file in it, rename it, or change its access list is refused too
+    (:func:`_windows_holder_problem`), read where the path resolves to. A file whose access cannot be
     read is reported as a problem, and so is a path that is itself a link, on every platform,
     because the file behind it was not judged.
 
@@ -1005,16 +1143,23 @@ def broad_access_problem(
 
         if status.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
             return "it is a link, so the access list of the file behind it was not read"
-        read_path = _win32_config_source_probes().read_path
-        security = read_path(path)
+        security = _win32_config_source_probes().read_path(path)
         problem = _windows_access_problem(
             security, _DIRECTORY_REACH_MASK if directory else _REACH_MASK
         )
-        if problem is None and engine_owned:
-            problem = _windows_engine_owner_problem(security.owner_sid, _windows_engine_sid())
-        if problem is not None or holder_judged:
+        if problem is not None or (holder_judged and not engine_owned):
             return problem
-        return _windows_surroundings_problem(path, read_path)
+        try:
+            # Built once per call: the engine's account and the readers for the folders above.
+            host = windows_host_readers()
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+            return f"the folders on its path could not be judged ({reason})"
+        if engine_owned:
+            problem = _windows_engine_owner_problem(security.owner_sid, host.engine_sid)
+            if problem is not None or holder_judged:
+                return problem
+        return _windows_surroundings_problem(path, host)
     own = _posix_own_problem(mode=status.st_mode, uid=status.st_uid, euid=os.geteuid())
     if own is not None:
         return own
@@ -1990,10 +2135,10 @@ def _create_restricted_windows(
             f"{path} was not created: this process's own account could not be read, so the file "
             "could not be restricted to it"
         )
-    read_sids = [_resolve_sid(name) for name in read_grants]
+    read_sids = [resolve_sid(name) for name in read_grants]
     # Resolved as a grant is, so only a SID Windows itself rendered reaches the descriptor, and the
     # read-back compares like with like.
-    owner_sid = None if owner is None else _resolve_sid(owner, as_owner=True)
+    owner_sid = None if owner is None else resolve_sid(owner, as_owner=True)
     for name, sid in zip(read_grants, read_sids, strict=True):
         # A grant that would make the file broadly readable is not a restricted create.
         if (what := _screened_principal(sid)) is not None:
@@ -2119,7 +2264,7 @@ def _create_restricted_windows(
         raise
 
 
-def _resolve_sid(principal: str, *, as_owner: bool = False) -> str:
+def resolve_sid(principal: str, *, as_owner: bool = False) -> str:
     """The string SID of ``principal``: an account name, or a SID with or without a leading ``*``.
 
     A NAME must resolve to a kind :func:`_name_kind_problem` admits. A SID literal is taken as
@@ -2145,7 +2290,7 @@ def _resolve_sid(principal: str, *, as_owner: bool = False) -> str:
         finally:
             kernel32.LocalFree(sid_pointer)
     else:
-        found = _lookup_account_name(principal)
+        found = lookup_account_name(principal)
         if found is None:
             raise refusal
         rendered, use = found
@@ -2175,7 +2320,7 @@ def _render_sid(sid_pointer: object) -> str | None:
         kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
 
 
-def _lookup_account_name(name: str) -> tuple[str, int] | None:
+def lookup_account_name(name: str) -> tuple[str, int] | None:
     """``(SID, SID_NAME_USE)`` that ``LookupAccountNameW`` answers for ``name`` on this machine, or
     ``None`` when it maps the name to nothing or the SID could not be rendered. Windows only."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX

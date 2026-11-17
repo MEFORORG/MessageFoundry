@@ -283,7 +283,12 @@ def test_a_key_beneath_a_junction_or_a_link_others_can_change_is_refused(
 ) -> None:
     """Vault BACKLOG #5656 and #5657: the check judged the key file, and on POSIX the directory a
     link led to, but never the folders on its path. A link in a folder a broad group may delete
-    entries in is refused. A junction needs no privilege on Windows."""
+    entries in is refused. A junction needs no privilege on Windows. The folders above
+    ``tmp_path`` are read as SYSTEM's alone, so the result does not hang on the test host's own
+    profile folders."""
+    from tests.test_restricted_file import judge_links_only_under
+
+    judge_links_only_under(monkeypatch, tmp_path)
     real = tmp_path / "real"
     real.mkdir(mode=0o700)  # owner-only whatever the umask, so the POSIX holder rule passes it
     key = _key(real / "client.key", broad=False)
