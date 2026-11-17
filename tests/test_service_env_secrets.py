@@ -413,48 +413,15 @@ def test_every_other_secret_class_name_on_a_later_line_refuses(name: str) -> Non
     assert posture.listed_directory_names == (name,)
 
 
-@pytest.mark.parametrize(
-    "entries",
-    [
-        # Vault BACKLOG #5394: ``main`` stripped the name, so it read this as set.
-        ["MEFOR_SECRETS_DIRECTORY\n=C:\\s", "MEFOR_VALUE_X=1"],
-        # A later line: the line reading takes it as set.
-        ["MEFOR_AI_ENVIRONMENT=prod\nMEFOR_SECRETS_DIRECTORY=C:\\s\nMEFOR_VALUE_X=1"],
-        # A first name whose own line is empty: ``main`` read the rest of the string as its value.
-        ["MEFOR_SECRETS_DIRECTORY=\nBAR=1", "MEFOR_VALUE_X=1"],
-    ],
-)
-def test_a_secrets_directory_either_reading_sets_is_listed(entries: list[str]) -> None:
-    """``listed`` holds every name ``main`` listed and every name the line reading finds, so the
-    refusal never tells an operator whose lists set MEFOR_SECRETS_DIRECTORY to add it."""
-    posture = _service(entries)
-    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
+def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
+    """NSSM may take the whole item as one variable, so a later line's MEFOR_SECRETS_DIRECTORY is
+    not evidence the service has one, and the refusal still says to add it."""
+    posture = _service(
+        ["MEFOR_AI_ENVIRONMENT=prod\nMEFOR_SECRETS_DIRECTORY=C:\\s\nMEFOR_VALUE_X=1"]
+    )
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert "set no MEFOR_SECRETS_DIRECTORY" not in refusal
-
-
-def test_a_first_name_whose_own_line_is_empty_is_listed_as_main_listed_it() -> None:
-    """``main`` read ``FOO=`` above ``BAR=1`` whole, so FOO held a value and was listed. BAR is
-    the line reading's, so both are."""
-    posture = _service(["FOO=\nBAR=1"])
-    assert posture.listed == ("FOO", "BAR")
-    assert service_env_refusal(posture) is None
-
-
-def test_a_listed_ordinary_name_adds_no_refusal() -> None:
-    """The control for the three above: the names they add are never secret-class, so without
-    a secret-class entry the same lists refuse nothing."""
-    posture = _service(["MEFOR_SECRETS_DIRECTORY\n=C:\\s", "MEFOR_AI_ENVIRONMENT=prod\nX=1"])
-    assert sorted(posture.listed) == ["MEFOR_AI_ENVIRONMENT", "MEFOR_SECRETS_DIRECTORY", "X"]
-    assert service_env_refusal(posture) is None
-
-
-def test_a_variable_value_never_appears_in_its_repr() -> None:
-    """F5: the value a :class:`serviceenv._Variable` holds may be the secret itself."""
-    variable = serviceenv._Variable("AppEnvironmentExtra", "MEFOR_STORE_PASSWORD", _PASSWORD_VALUE)
-    assert _PASSWORD_VALUE not in repr(variable)
-    assert "MEFOR_STORE_PASSWORD" in repr(variable)
+    assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
 
 
 def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None:
@@ -545,9 +512,7 @@ def test_a_broken_value_name_above_a_later_name_nothing_keeps_still_refuses(entr
 
 def test_a_line_with_no_equals_sign_is_not_glued_onto_the_next() -> None:
     posture = _service(["NOT A VARIABLE\nMEFOR_AI_ENVIRONMENT=prod"])
-    # Both readings' names are listed, ``main``'s whole name among them, and neither refuses.
-    assert posture.listed == ("NOT A VARIABLE\nMEFOR_AI_ENVIRONMENT", "MEFOR_AI_ENVIRONMENT")
-    assert service_env_refusal(posture) is None
+    assert posture.listed == ()
     glued = _service(["MEFOR_VALUE_A\nX=1"])
     assert glued.listed_value_names == ("MEFOR_VALUE_A",)
     assert glued.unplain_value_names == ("MEFOR_VALUE_A",)

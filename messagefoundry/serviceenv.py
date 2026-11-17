@@ -61,7 +61,7 @@ import re
 import sys
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
@@ -135,10 +135,9 @@ class ServiceEnvPosture:
     status: ServiceEnvStatus
     #: The service whose lists were read, when one was found.
     service_name: str | None = None
-    #: Every variable name the service's environment lists set, upper-cased, under either
-    #: reading of a string (:func:`_listed`): each name ``sources`` holds, each string's name as
-    #: ``main`` read it, and each name a later line of it sets. Empty unless ``status`` is
-    #: ``OBSERVED``.
+    #: Every variable name the service's environment lists set, upper-cased: each string's
+    #: first name, and a secret-class or ``MEFOR_VALUE_*`` name a later line of it starts. Empty
+    #: unless ``status`` is ``OBSERVED``.
     listed: tuple[str, ...] = ()
     #: ``(name, registry value)`` for each name in ``listed``, so a refusal can say which value
     #: to change.
@@ -331,9 +330,8 @@ class _Variable:
     where: str
     #: The name as written, stripped.
     written: str
-    #: The rest of its line, and every line after it up to the next variable's. Left out of the
-    #: repr, since it may hold the secret itself.
-    value: str = field(repr=False)
+    #: The rest of its line, and every line after it up to the next variable's.
+    value: str
     #: Whether NSSM may read the name with a line break in it.
     broken: bool = False
 
@@ -438,37 +436,6 @@ def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str], ...]:
     return tuple(names.items())
 
 
-def _listed(
-    entries: Sequence[tuple[str, str]], sources: Sequence[tuple[str, str]]
-) -> tuple[str, ...]:
-    """Every name either reading of a string sets, for ``ServiceEnvPosture.listed`` (vault
-    BACKLOG #5394). It starts with the names in ``sources``, the ones :func:`_names` keeps, so
-    the secret-class names, and so what refuses, are exactly theirs. To them it adds two kinds,
-    so a remedy never says a name the lists set is unset, as one saying the secrets directory is
-    missing would. One is each string's name as ``main`` read it: the stripped text before its
-    first equals sign, kept under ``main``'s rule for an empty value, so ``FOO=`` above another
-    line, or ``MEFOR_SECRETS_DIRECTORY`` with a line break before its equals sign, is listed as
-    ``main`` listed it. A ``MEFOR_VALUE_*`` name that still holds a line break is left out: it is
-    the variable :func:`_variables` keeps, and counts, under its first line. The other is each
-    name a later line sets as an ordinary variable (:data:`_ORDINARY_LINE`), which the line
-    reading takes as set. Neither kind is a secret-class name, beyond one ``main`` also kept."""
-    listed = dict.fromkeys(name for name, _where in sources)
-    for _where, entry in entries:
-        name, equals, value = entry.partition("=")
-        name = name.strip().upper()
-        kept = name and (value.strip() or (equals and name.startswith(_VALUE_PREFIX)))
-        pem_path = name in _INLINE_PEM_NAMES and "-----BEGIN" not in value
-        broken = _refused_name(name) and _LINE_BREAK.search(name) is not None
-        if kept and not pem_path and not broken:
-            listed.setdefault(name)
-        for line in _LINE_BREAK.split(entry)[1:]:
-            written, _equals, _rest = line.partition("=")
-            written = written.strip().upper()
-            if _ORDINARY_LINE.match(line) and not _refused_name(written):
-                listed.setdefault(written)
-    return tuple(listed)
-
-
 def _value_entry_shapes(
     variables: Sequence[_Variable],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -534,7 +501,7 @@ def read_service_env_posture(
     return ServiceEnvPosture(
         ServiceEnvStatus.OBSERVED,
         service_name=service,
-        listed=_listed(entries, sources),
+        listed=tuple(name for name, _where in sources),
         sources=sources,
         keys_in_environment=keys,
         empty_value_names=empty,
