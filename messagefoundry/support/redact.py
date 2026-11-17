@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import re
 
+from messagefoundry.redaction import _BINARY_CARRIAGE
 from messagefoundry.redaction import redact as _redact_phi
 from messagefoundry.secretscrub import (
     _CONNECTION_STRING_MEMBER,
@@ -70,7 +71,10 @@ __all__ = [
 REDACTION_PLACEHOLDER = "[REDACTED]"
 
 # A base64 binary-carriage marker (ADR 0028) and the embedded blob that follows it: definitely a body.
-_MFB64 = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
+# The shared redactor's own pattern (BACKLOG #5378), so the encoded forms it reads are read here too.
+# Its narrower predecessor cut an encoded run at its first ``%`` or ``\/``, took the marker with the
+# head, and left the tail for nothing downstream to recognise.
+_MFB64 = _BINARY_CARRIAGE
 
 # An optional dotted / underscored / hyphenated PREFIX on a credential label, so a snake_case label
 # reaches the keyword at its tail.
@@ -599,8 +603,8 @@ _LEADING_TS = re.compile(
 def redact_log_line(line: str) -> str:
     """Return ``line`` with PHI/secret patterns replaced by a redaction placeholder.
 
-    Two layers: (1) the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
-    bearer/session tokens) the engine redactor does not carry; then (2) the shared engine **PHI**
+    Two layers: (1) the bundle-specific **secret** markers (``MEFOR_*`` values, bearer/session
+    tokens) the engine redactor does not carry, and ``mfb64:`` bodies, which it carries too; then (2) the shared engine **PHI**
     redactor (:func:`messagefoundry.redaction.redact`) for HL7-shaped spans (any segment id, not a
     fixed allowlist), free-text DOB/date runs, multi-token name runs, and the labelled values of FHIR
     JSON, DICOM tag dumps and XML (BACKLOG #1711) — so bundled logs match the

@@ -1876,6 +1876,9 @@ def redact(text: str) -> str:
     redaction); the goal is that a raw HL7 body — or a free-text name/DOB — embedded in an exception
     message can't reach a log or the stored ``last_error``/``detail``. NOT de-identification (PHI.md §9).
 
+    An ``mfb64:v1:`` binary-carriage run is replaced before anything else
+    (:data:`_BINARY_CARRIAGE`, BACKLOG #5378), so no later pass can split it.
+
     Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN`, then the
     separator-aware pass for a message that declares delimiters outside the defaults) is handled first,
     so the free-text passes (:data:`_MRN_LABELLED`, :data:`_DATE_RUN`, :data:`_SSN_RUN`,
@@ -1967,21 +1970,30 @@ def redact(text: str) -> str:
 #: record or traceback quoting a carriage reached every sink whole. The marker is written as a literal
 #: because this module is pure stdlib and must not import ``parsing``; a test pins it to ``MARKER``.
 #:
-#: The run is deliberately WIDER than the base64 alphabet, to fail closed: ``-`` and ``_`` (the URL-safe
-#: alphabet), ``%`` (a percent-encoded ``+``, ``/`` or ``=``) and ``\\`` (a ``repr`` or JSON escape,
-#: such as ``\\/`` or an escaped line break), so an encoded or escaped carriage is cut whole rather than
-#: at its first non-alphabet character. Over-redacting a glued word after it is the accepted price.
-#: The marker is case-insensitive for the same reason. One run is required, so the placeholder left
-#: behind (``[`` is outside the class) never re-matches, and prose that merely names the marker, such
-#: as ``missing mfb64:v1: marker``, is kept. Residual: a carriage broken by a literal whitespace run
-#: keeps every piece after the first break; ``encode`` never writes one.
-_BINARY_CARRIAGE = re.compile(r"(?i)(mfb64:v1:)[A-Z0-9+/=_%\\-]++")
+#: Beyond the literal form, the pattern reads a marker whose colons are percent-encoded (``%3A``, as
+#: every stdlib URL encoder writes them), and a run whose ``+``, ``/`` or ``=`` is percent-encoded or
+#: whose ``/`` is JSON-escaped (``\/``), so such a carriage is cut whole rather than at its first
+#: encoded character. The marker is case-insensitive. Nothing wider: a ``-``, ``_`` or bare ``\`` in the
+#: run let it swallow a credential label after it (``\nPassword:`` in a ``repr``), whose value the
+#: credential filter then had no label to find. One run character is required, so the placeholder left
+#: behind (``[`` is outside the run) never re-matches, and prose that merely names the marker, such as
+#: ``missing mfb64:v1: marker``, is kept. The support bundle uses this same pattern
+#: (``support/redact.py`` ``_MFB64``).
+#:
+#: Residuals, at least these: a word glued to the end of the run with no separator is taken with it,
+#: a credential label included; a carriage broken by whitespace keeps every piece after the first
+#: break (``encode`` never writes one); a URL-safe (``-``/``_``) carriage keeps the part after its first
+#: such character; and a marker escaped any other way (``\x3a``, ``\u003a``) is not read at all.
+_BINARY_CARRIAGE = re.compile(r"(?i)(mfb64(?::|%3A)v1(?::|%3A))(?:[A-Z0-9+/=]|%2[BF]|%3D|\\/)++")
 
 
 def _redact_binary_carriage(text: str) -> str:
     """``text`` with every ``mfb64:v1:`` carriage run replaced by the placeholder, the marker kept so a
     reader can still see a binary body was withheld. Runs before every other pass, so none of them can
-    split the run and leave a piece below its own threshold."""
+    split the run and leave a piece below its own threshold. The ``64`` screen holds for every case
+    of the marker, so most text skips the case-insensitive search."""
+    if "64" not in text:
+        return text
     return _BINARY_CARRIAGE.sub(rf"\g<1>{_REDACTED}", text)
 
 

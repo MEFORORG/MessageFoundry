@@ -699,7 +699,13 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
     assert "nonnumeric port: " in secretscrub._MEMBER_VALUE_UNIT.pattern
     # The mask keeps each character's class in the two base64 alphabets the bundle reads.
     assert bundle_redact._LONG_B64.pattern == r"\b[A-Za-z0-9+/]{24,}={0,2}\b"
-    assert bundle_redact._MFB64.pattern == r"mfb64:v1:[A-Za-z0-9+/=]+"
+    # The shared carriage pattern since BACKLOG #5378: the base64 alphabet, case-insensitive, plus
+    # percent-encoded colons, +, / and = and an escaped /. test_each_mask_rule_is_needed ran green
+    # with the bundle reading it.
+    assert bundle_redact._MFB64 is redaction._BINARY_CARRIAGE
+    assert bundle_redact._MFB64.pattern == (
+        r"(?i)(mfb64(?::|%3A)v1(?::|%3A))(?:[A-Z0-9+/=]|%2[BF]|%3D|\\/)++"
+    )
     assert redaction._HL7_SEGMENT.pattern.startswith(r"\b([A-Z][A-Z0-9]{2})")
     assert redaction._ENCODED_SEPARATOR.pattern == r"%(?:7[CcEe]|5[Ee]|26)"
     assert redaction._ENCODED_SEPARATOR.pattern in secretscrub._MEMBER_VALUE_UNIT.pattern

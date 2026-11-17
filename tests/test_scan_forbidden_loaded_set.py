@@ -114,9 +114,8 @@ _UNPROBEABLE_NAMES = [rf"\b(?:{_STEM}echo|{_STEM}foxtrot)\b", rf"\b{_STEM}go?lf\
 #: Two estate tokens, so a test can hold exactly one of them out under ``[estate_body_only]``.
 _ESTATE = [f"{_STEM}estatealpha".lower(), f"{_STEM}estatebravo".lower()]
 #: A synthetic site prefix. Every source below carries one so ``site_prefixes`` is a HEALTHY sibling
-#: class: a test about one class going unprobed proves nothing if every class went unprobed. Two
-#: digits, because only a prefix the anonymizer loads counts as live (BACKLOG #5366).
-_PREFIX = ["42"]
+#: class: a test about one class going unprobed proves nothing if every class went unprobed.
+_PREFIX = ["4242"]
 
 
 @pytest.fixture
