@@ -371,7 +371,8 @@ def test_trim_field_on_a_delimiter_field_of_an_absent_header_is_a_noop(path: str
 def test_copy_field_never_writes_a_raw_control_into_a_component() -> None:
     # Round-6f70971d finding 3 (ADR 0205 rule 2). An escape sequence holding a raw control was kept
     # as sent. origin/main hex-escaped such a control rather than refusing the copy, so it is still
-    # written, as the data the sequence decodes to. NEGATIVE CONTROL: on d97051786 NK1-2 held 0x01.
+    # written, as the data the sequence decodes to, or as its raw text where that decodes to a CR.
+    # NEGATIVE CONTROL: on d97051786 NK1-2 held 0x01.
     m = Message.parse(MSH_ONLY + "PID|1||1||x\rNK1|1|X^Y\r")
     m.set("PID-5", "a\\X" + chr(1) + "41\\b")
     copy_field(m, "PID-5", "NK1-2.1")
@@ -381,6 +382,11 @@ def test_copy_field_never_writes_a_raw_control_into_a_component() -> None:
     m.set("PID-5", "a" + chr(1) + "\\Z" + chr(0x7F) + "\\")
     copy_field(m, "PID-5", "NK1-2.2")
     assert m.field("NK1-2") == "ab^a\\X01\\"
+    # A sequence decoding to a CR is written as its raw text, so the copy does not raise.
+    m.set("PID-5", "a\\X0D" + chr(1) + "\\b")
+    copy_field(m, "PID-5", "NK1-2.1")
+    assert m.field("NK1-2.1") == "a\\X0D" + chr(1) + "\\b"
+    assert chr(1) not in (m.field("NK1-2") or "")
 
 
 def test_substring_field() -> None:

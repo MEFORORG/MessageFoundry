@@ -99,8 +99,10 @@ def copy_field(msg: Message, src: str, dst: str) -> None:
     ``dst``. Into a component or subcomponent ``dst`` it is written as one leaf that reads back as
     the field's leaves, each decoded, joined by its separators read as data: a field sent as
     ``O\\S\\Brien`` reads back as ``O^Brien``, not as its escape sequence, and one sent as ``A^B``
-    reads back as ``A^B``. A component or subcomponent ``dst`` in field 1 or 2 of ``MSH``, ``BHS``
-    or ``FHS`` raises :class:`ValueError`, whatever ``src`` is."""
+    reads back as ``A^B``. An escape sequence holding a raw control character that decodes to a CR
+    or LF, which no component carries, reads back as sent instead. A component or subcomponent
+    ``dst`` in field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` raises :class:`ValueError`, whatever
+    ``src`` is."""
     _writer(msg, src)(dst, msg.field(src) or "")
 
 
@@ -187,9 +189,8 @@ def split_field(msg: Message, src: str, sep: str, dests: Sequence[str]) -> None:
     ``dests`` (written empty); extra pieces beyond ``dests`` are dropped. An absent ``src`` clears every
     destination. Pieces of a component or subcomponent ``src`` are decoded data, so each is written as
     data at every destination level, as :func:`copy_field` does (ADR 0206). A whole-field ``src`` is
-    split as raw text, and each piece is written as :func:`copy_field` writes a whole-field ``src``:
-    as it is into a whole field, and into a component or subcomponent as one leaf that reads back as
-    the piece's leaves, each decoded, joined by its separators read as data."""
+    split as raw text, and each piece is written as :func:`copy_field` writes a whole-field
+    ``src``."""
     write = _writer(msg, src)
     parts = (msg.field(src) or "").split(sep)
     for i, dest in enumerate(dests):
@@ -649,16 +650,22 @@ def _as_one_leaf(raw: str, seps: _Seps) -> str:
     decoded, joined by its separators read as data. An escape sequence is kept as sent unless it
     holds a control character: a component write never carries a raw control (ADR 0205 rule 2), and
     a hex escape cannot sit inside another sequence, so such a sequence is written as the data it
-    decodes to. Literal text, the separators between leaves and an unclosed trailing escape
-    character are written as data, with their control characters hex-escaped."""
+    decodes to, or, where that holds a CR or LF, which no component carries, as its raw text
+    written as data, so it reads back as sent. Literal text, the separators between leaves and an
+    unclosed trailing escape character are written as data, with their control characters
+    hex-escaped."""
     out: list[str] = []
     for index, token in enumerate(_split_leaves(raw, seps)):
         if index % 2:
             out.append(_escape_data(token, seps))
             continue
         for unit_raw, decoded, kind in _leaf_units(token, seps):
-            keep = kind == "esc" and not any(ch in unit_raw for ch in _HEX_ESCAPED_CONTROLS)
-            out.append(unit_raw if keep else _escape_data(decoded, seps))
+            if kind == "esc" and not any(ch in unit_raw for ch in _HEX_ESCAPED_CONTROLS):
+                out.append(unit_raw)
+            elif kind == "esc" and ("\r" in decoded or "\n" in decoded):
+                out.append(_escape_data(unit_raw, seps))
+            else:
+                out.append(_escape_data(decoded, seps))
     return "".join(out)
 
 
