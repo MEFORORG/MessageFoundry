@@ -365,11 +365,13 @@ def _exempts_defined_segments(message: Any) -> bool:
     )
 
 
-# Message header, continuation and acknowledgment segments. A dropped one is refused even in a
-# structure with the "any HL7 segment" slot: each one opens a message, points at a continuation,
-# or answers another message, so it is never the data that slot carries (BACKLOG #5920). The
-# batch and file envelope (BHS, BTS, FHS, FTS) is not here: split_batch cuts only at MSH, so a
-# member can carry its batch's trailers or the next batch's header.
+# Six IDs a dropped line of which is refused even in a structure with the "any HL7 segment" slot
+# (BACKLOG #5920): MSH opens a message, DSC points at a continuation, and MSA, ERR, QAK and MFA
+# answer another message, so none of the six is the data that slot carries. The list is not every
+# header, continuation or acknowledgment segment the standard defines: at least ADD, SFT, UAC,
+# QPD, QRD, QRF and RCP are not on it and keep the exemption. The batch and file envelope (BHS,
+# BTS, FHS, FTS) is not here either: split_batch cuts only at MSH, so a member can carry its
+# batch's trailers or the next batch's header.
 _NEVER_EXEMPT = frozenset({"MSH", "DSC", "MSA", "ERR", "QAK", "MFA"})
 
 # Structures whose tree the dropped-segment check could not read, so each is logged once.

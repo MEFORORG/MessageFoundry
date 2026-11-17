@@ -1208,18 +1208,19 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     At least these values the target set cannot represent raise :class:`DelimiterRewriteRefused`:
     an escape sequence other than the five separator escapes whose text holds a target delimiter, a
     segment id holding the target field separator, and, with a target set unlike the source set, a
-    header line whose field 1 or 2 holds text :func:`_header_encoding` cannot carry. A field holding no source escape character takes a single
-    ``str.translate`` that also escapes its data characters, and every field takes the plain one when
-    the target set equals the source set.
+    ``BHS`` or ``FHS`` line whose field 1 or 2 holds text :func:`_header_encoding` cannot carry. A
+    field holding no source escape character takes a single ``str.translate`` that also escapes its
+    data characters, and every field takes the plain one when the target set equals the source set.
 
     Where two source separators are the same character, the one split first wins: repetition, then
     component, then subcomponent, the order python-hl7 split them, as the python-hl7 tree walk this
     replaced did (``transports/mllp.py`` ``reencode_delimiters``). The segment id is kept verbatim.
-    When the target set differs, every ``MSH``, ``BHS`` and ``FHS`` header has its field 2
-    rewritten to the target encoding characters, so a batch or file header advertises the
-    delimiters its message is written in (BACKLOG #5802); :func:`_header_encoding` says which field
-    2 it refuses. When the target set equals the source set, a header's fields 1 and 2 are written
-    as they came. Blank segment lines are kept.
+    Every ``MSH`` line has its MSH-2 written as the four target encoding characters, whatever it
+    held. When the target set differs, a ``BHS`` or ``FHS`` header has its field 2 rewritten the
+    same way, so a batch or file header advertises the delimiters its message is written in
+    (BACKLOG #5802); :func:`_header_encoding` says which field 2 it refuses. When the target set
+    equals the source set, a ``BHS`` or ``FHS`` header's fields 1 and 2 are written as they came.
+    Blank segment lines are kept.
 
     Raises ``ValueError`` when the message's own field, component, repetition and subcomponent
     characters are not four distinct characters. Such a header cannot say which structure a character
@@ -1252,7 +1253,12 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
         if not texts:
             lines.append(seg["id"])
             continue
-        if seg["id"] in ("MSH", "BHS", "FHS") and len(texts) >= 3:
+        if seg["id"] == "MSH" and len(texts) >= 3:
+            # MSH keeps the handling it had before BACKLOG #5802: MSH-2 always becomes the four
+            # target characters, with no refusal.
+            parts = ["MSH", t_comp + t_rep + t_esc + t_sub]
+            tail = texts[3:]
+        elif seg["id"] in ("BHS", "FHS") and len(texts) >= 3:
             if same_set:
                 # Nothing to translate in fields 1 and 2, so the header keeps its own bytes.
                 lines.append(_join_header([*texts[:3], *map(rewrite, texts[3:])], t_field))
@@ -1278,14 +1284,14 @@ def _header_encoding(
     source: tuple[str, str, str, str, str],
     target: tuple[str, str, str, str, str],
 ) -> str:
-    """Field 2 of a header line rewritten for :func:`encode_with_separators`.
+    """Field 2 of a ``BHS`` or ``FHS`` line rewritten for :func:`encode_with_separators`.
 
     A field 2 that is the source encoding characters, a leading part of them, or empty becomes the
-    four target characters. One character after the four is the v2.7 truncation character: it is
-    kept, or left out where it is a target delimiter, since written there it would become
-    structure. Any longer field 2, or a field 1 that
-    is not the source field separator, holds text the rewrite would lose, so it raises
-    :class:`DelimiterRewriteRefused` (BACKLOG #5802)."""
+    four target characters. One character after the four is kept as the v2.7 truncation character
+    when it is printable, not a space, and not a source or target delimiter. Any other field 2, or
+    a field 1 that is not the source field separator, raises :class:`DelimiterRewriteRefused`
+    (BACKLOG #5802): rewriting it would lose text, or write a character the receiver would read as
+    structure."""
     s_field, s_comp, s_rep, s_sub, s_esc = source
     t_field, t_comp, t_rep, t_sub, t_esc = target
     s_enc = s_comp + s_rep + s_esc + s_sub
@@ -1294,11 +1300,17 @@ def _header_encoding(
         if s_enc.startswith(field_2):
             return t_enc
         truncation = field_2[len(s_enc) :]
-        if field_2.startswith(s_enc) and len(truncation) == 1:
-            return t_enc if truncation in t_field + t_enc else t_enc + truncation
+        if (
+            field_2.startswith(s_enc)
+            and len(truncation) == 1
+            and truncation.isprintable()
+            and not truncation.isspace()
+            and truncation not in s_field + s_enc + t_field + t_enc
+        ):
+            return t_enc + truncation
     raise DelimiterRewriteRefused(
-        "a header line's field separator or encoding characters are not the message's own, "
-        "so the rewrite would lose text"
+        "a batch or file header's field separator or encoding characters are not ones the "
+        "rewrite can carry, so the rewrite would lose text"
     )
 
 

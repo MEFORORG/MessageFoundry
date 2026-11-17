@@ -110,7 +110,6 @@ _TARGET = ("#", "@", "$", "%", "!")  # field, component, repetition, subcomponen
     [
         ("BHS|^~\\&|A", "BHS#@$!%#A"),
         ("BHS|^~\\&*|A", "BHS#@$!%*#A"),  # a v2.7 truncation character is kept
-        ("BHS|^~\\&#|A", "BHS#@$!%#A"),  # unless it is a target delimiter
         ("FHS|^~|A", "FHS#@$!%#A"),  # a leading part of the four
     ],
 )
@@ -122,24 +121,77 @@ def test_a_later_header_line_takes_the_target_encoding_characters(
 
 
 @pytest.mark.parametrize(
-    "line", ["BHS|SYNTHTEXT", "BHS|SYNTHTEXT|A", "BHSX|A|B", "BHS|^~\\&EXTRA|B", "BHS|^~\\&#*|B"]
+    "line",
+    [
+        "BHS|SYNTHTEXT",
+        "BHS|SYNTHTEXT|A",
+        "BHSX|A|B",
+        "BHS|^~\\&EXTRA|B",
+        "BHS|^~\\&#*|B",
+        "BHS|^~\\&#|B",  # a fifth character that is a target delimiter
+        "BHS|^~\\&^|B",  # or a source delimiter
+        "BHS|^~\\&\x0b|B",  # or a control character
+        "BHS|^~\\& |B",  # or a space
+    ],
 )
 def test_a_header_line_not_in_the_message_delimiters_is_refused(line: str) -> None:
-    """Rewriting field 2 of these would drop its text, so a new delimiter set refuses (BACKLOG
-    #5802)."""
+    """Rewriting field 2 of these would drop its text or write a character the receiver would read
+    as structure, so a new delimiter set refuses (BACKLOG #5802)."""
     parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
     with pytest.raises(_builtin_hl7.DelimiterRewriteRefused, match="would lose text"):
         _builtin_hl7.encode_with_separators(parsed, _TARGET)
 
 
 @pytest.mark.parametrize(
-    "line",
-    ["BHS|SYNTHTEXT", "BHS|", "BHS|^~\\&EXTRA|B", "BHSX|A|B", "MSH|^~\\&#|A", "FHS|^~\\&|A"],
+    "line", ["BHS|SYNTHTEXT", "BHS|", "BHS|^~\\&EXTRA|B", "BHSX|A|B", "FHS|^~\\&|A"]
 )
-def test_a_same_set_override_writes_a_header_line_as_it_came(line: str) -> None:
+def test_a_same_set_override_writes_a_batch_header_line_as_it_came(line: str) -> None:
     """With the target set equal to the message's own, nothing is refused or rewritten."""
     parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
     assert _builtin_hl7.encode_with_separators(parsed, parsed["seps"]).split("\r")[2] == line
+
+
+#: MSH lines and what ``encode_with_separators`` wrote for them on ``origin/main`` before BACKLOG
+#: #5802, as (message, same-set output, ``_TARGET`` output). MSH-2 always becomes the four target
+#: characters, and nothing here is refused.
+_MSH_ON_MAIN = [
+    (
+        "MSH|^~\\&#|A|B\r" + _PID,
+        "MSH|^~\\&|A|B\r" + _PID + "\r",
+        "MSH#@$!%#A#B\rPID#1##100@@@H@MR##DOE@JANE\r",
+    ),
+    (
+        "MSH|^~\\&EXTRA|A\r" + _PID,
+        "MSH|^~\\&|A\r" + _PID + "\r",
+        "MSH#@$!%#A\rPID#1##100@@@H@MR##DOE@JANE\r",
+    ),
+    (
+        "MSH|^~|A\r" + _PID,
+        "MSH|^~\\&|A\r" + _PID + "\r",
+        "MSH#@$!%#A\rPID#1##100@@@H@MR##DOE@JANE\r",
+    ),
+    (
+        "MSH|^~\\&\x0b|A\r" + _PID,
+        "MSH|^~\\&|A\r" + _PID + "\r",
+        "MSH#@$!%#A\rPID#1##100@@@H@MR##DOE@JANE\r",
+    ),
+    (
+        "FHS|^~\\&|A\rMSH!^~\\&!A\r" + _PID,
+        "MSH|^~\\&|A\r" + _PID + "\r",
+        "MSH#@$!%#A\rPID#1##100@@@H@MR##DOE@JANE\r",
+    ),
+]
+
+
+@pytest.mark.parametrize(("message", "same", "target"), _MSH_ON_MAIN)
+def test_an_msh_line_is_rewritten_as_main_rewrote_it(message: str, same: str, target: str) -> None:
+    """BACKLOG #5802 changed only BHS and FHS. An MSH-2 that is long, truncated, or carries a fifth
+    character becomes the four target characters, under the same set too, and is never refused.
+    The comparison starts at the MSH line, since a leading FHS line is #5802's to change."""
+    parsed = _builtin_hl7.parse(message)
+    for seps, expected in ((parsed["seps"], same), (_TARGET, target)):
+        encoded = _builtin_hl7.encode_with_separators(parsed, seps)
+        assert encoded[encoded.index("MSH") :] == expected
 
 
 def test_a_v27_header_with_a_truncation_character_still_rewrites() -> None:
