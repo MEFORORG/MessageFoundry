@@ -395,9 +395,8 @@ bound's `_roll_flap`. `LogWriteGuard.record_rollover`'s docstring states the rul
   failure, and the first roll after a longer gap releases it. A stage-2 failure refreshes that clock
   but never starts a latch: a sink stage 2 alone declared dead is not latched.
 - `revalidate()` releases the latch on every sink whose own state is not `unwritable`, **without
-  writing to it**, so for those sinks its answer is section 4's answer before this amendment. A sink
-  whose own state is `unwritable` gets section 4's probe exactly as before, and its latch goes only
-  with that state, through `record_healthy`. Any write to a sink the latch alone holds would make the
+  writing to it**. On a sink whose own state is `unwritable`, `revalidate()` releases the latch only
+  through `record_healthy`, after a probe that landed. Any write to a sink the latch alone holds would make the
   guard weaker than the bound alone: `record_healthy` resets the bound's window and streak, the
   probe's roll heals a broken handle that the next record would otherwise have rolled through
   `handleError`, where the bound counts it, and even one plain write can take a one-shot fault that
@@ -416,13 +415,12 @@ amendment.
 
 **Stricter than section 1 between recovery actions, and stated rather than hidden.** A sink the
 latch holds reads unwritable while it may be accepting records, so `can_log()` and `/status` can read
-it unwritable where section 1 alone would read `rolled`. `revalidate()`, and so every re-arm and
-runner start gated on it, answers as section 1 does.
+it unwritable where section 1 alone would read `rolled`. Amendment C says how `revalidate()`
+answers.
 
 **The latch requests no stop of its own, and the stop decision does not read it.** With two sinks,
 one held by the latch alone and the other failing stage 2, `can_log()` and `/status` read every sink
-unwritable, while the stage-2 failure asks for no stop and its stderr line says another sink is
-still writable, as both did before this amendment. The process keeps running until a stop event or
+unwritable, while the stage-2 failure asks for no stop, as it did before this amendment. The process keeps running until a stop event or
 a re-arm asks. This is kept deliberately so that the stop requests stay exactly section 1's; whether
 the latch should also take part in the stop decision is left open.
 
@@ -447,9 +445,8 @@ revalidates on real handlers that must neither heal a broken handle nor take a o
 
 ## Amendment C (2026-11-17) -- rolls past the bound, owed stage-2 events, and unformattable records (BACKLOG #5812, #5813)
 
-**Amendment A is unedited. Amendment B is edited only where the code it describes changed under
-this amendment: the latch's stored value, and what it says the latch leaves alone. Where this
-amendment disagrees with either, it is the newer text.**
+**Amendment A is unedited. Amendment B is edited where the code it describes changed under this
+amendment. Where this amendment disagrees with either, it is the newer text.**
 
 **Rolls past the bound, and stage-2 events that were not delivered.** Before this amendment
 every roll past section 1's bound wrote the sink's state as `rolled` before escalating, so for

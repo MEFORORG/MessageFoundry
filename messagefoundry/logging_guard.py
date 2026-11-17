@@ -13,7 +13,8 @@ module is that second half.
 
 * **Stage 1 — RECOVER.** On a write failure the sink is rolled: the broken file is renamed aside
   (``<name>.broken-<UTC>-<n>``), a fresh file is opened at the live path, the **rollover event is
-  recorded** into it, and the record whose write failed is re-written. A transient condition — a
+  recorded** into it, and the record whose write failed, or the notice standing in for it, is
+  re-written. A transient condition — a
   momentary lock, an antivirus scan, a rotation race — heals here and stops nothing.
 * **Stage 2 — STOP.** :meth:`LogWriteGuard.record_unwritable` records the sink unwritable and
   decides whether to ask for the stop. Its docstring names its callers. A write failure reaches it
@@ -22,8 +23,8 @@ module is that second half.
 
 **And a third thing, which is not a stage but is half the enforcement: UN-stopping.** Recovery is an
 operator assertion — *"I fixed the disk"* — and a fail-closed control that simply believes it is a
-control with an off switch. :meth:`LogWriteGuard.revalidate` therefore re-tests each sink whose own
-state is ``unwritable`` **by writing a real record to it**: *repaired* and *still broken* are
+control with an off switch. :meth:`LogWriteGuard.revalidate` therefore re-tests dead sinks **by
+writing a real record to them**, as its docstring says: *repaired* and *still broken* are
 indistinguishable from memory, which is exactly the distinction recovery has to make. The engine
 gates every re-arm path on that answer.
 
@@ -499,8 +500,9 @@ class LogWriteGuard:
         return not all(self._reads_unwritable(s) for s in self._sinks.values())
 
     def revalidate(self) -> bool:
-        """Re-test every sink whose own state is unwritable BY WRITING TO IT, and report whether the
-        process can log, as :meth:`can_log` answers after the probes.
+        """Re-test sinks whose own state is unwritable BY WRITING TO THEM, and report whether the
+        process can log, as :meth:`can_log` answers after the probes. The loop's comments say which
+        such sinks are probed.
 
         **A cached state cannot answer this, and that is the whole reason this exists.** *Repaired*
         and *still broken* are indistinguishable from memory, which is exactly the distinction the
@@ -806,8 +808,8 @@ class _GuardedSinkMixin(_SinkBase):
     """The two-stage ``handleError`` shared by every guarded sink.
 
     Subclasses supply :meth:`_roll` — how *this* kind of sink is rolled. Everything after the roll
-    (write the rollover notice, re-write the record whose emit failed, decide stage 1 vs stage 2) is
-    identical, because "is the replacement writable?" is answered the same way for every sink: by
+    (write the rollover notice, re-write the record whose emit failed or its stand-in, decide stage 1
+    vs stage 2) is identical, because "is the replacement writable?" is answered the same way for every sink: by
     writing to it and seeing whether that raises."""
 
     _guard: LogWriteGuard
