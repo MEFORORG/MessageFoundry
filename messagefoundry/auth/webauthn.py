@@ -613,6 +613,7 @@ def verify_registration(
     # Resolved before the ``try`` so the AttributeError catch below covers the library call only,
     # where it is attacker input, and never our own code, where it would be a bug.
     supported_algs = _supported_pub_key_algs()
+    refused: tuple[type[Exception], ...] = (*_invalid_response_errors(), AttributeError)
     try:
         verified = verify_registration_response(
             credential=response_json,
@@ -621,7 +622,7 @@ def verify_registration(
             expected_origin=origin,
             supported_pub_key_algs=supported_algs,
         )
-    except (*_invalid_response_errors(), AttributeError) as exc:
+    except refused as exc:
         # The BASE class, deliberately (PR-A review HIGH): structurally-malformed browser input
         # raises siblings of InvalidRegistrationResponse (InvalidJSONStructure, InvalidCBORData,
         # ...) — every library-side rejection must land on the audited return-False/400 path,
