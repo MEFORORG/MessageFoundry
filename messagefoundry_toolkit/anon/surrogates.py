@@ -341,7 +341,8 @@ def surrogate_ssn(rep: str, keyer: Keyer, seps: Seps) -> str:
     """A fabricated SSN/national id — preserves a dashed ``NNN-NN-NNNN`` shape if present, and keeps
     the CX authority components a CX-shaped national id carries, blanking the rest as
     :func:`_surrogate_identifier` does (BACKLOG #5534). No fabricated digit is one the message
-    declares as a separator or escape character (:func:`_free_digits`, BACKLOG #5540)."""
+    declares as a component, repetition or subcomponent separator or escape character
+    (:func:`_free_digits`, BACKLOG #5540); a digit field separator is not avoided."""
     rng = keyer.rng("ssn", rep)
     digits = _free_digits(seps)
     comps = _components(rep, seps)
