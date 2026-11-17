@@ -421,8 +421,10 @@ def test_the_run_reports_how_many_files_it_examined(
     clean, _dirty = _clean_and_dirty(tmp_path)
     assert sf_main.main(["--path", str(clean)]) == 0
     err = capsys.readouterr().err
-    assert "examined 1 file(s)" in err
-    assert "1 named path(s)" in err
+    assert (
+        "scan_forbidden: examined 1 file(s) across 1 named path(s); 0 more were binary, not regular"
+        " files, unreadable or under a forbidden path, so their content was not scanned."
+    ) in err.splitlines(), err
 
 
 def test_zero_examined_still_refuses_rather_than_reporting_clean(sf_main, tmp_path: Path) -> None:
@@ -2262,7 +2264,7 @@ def test_an_unlistable_directory_fails_the_walk_as_an_instrument(
     monkeypatch.setattr(os, "scandir", refuse)
     assert sf_main.main(["--path", str(root)]) == 2
     err = capsys.readouterr().err
-    assert "locked/:0: unreadable directory (EACCES)" in err, err
+    assert "locked:0: unreadable (EACCES), so its content was not scanned" in err, err
     assert str(tmp_path) not in err.split("UNREADABLE", 1)[-1], "the hit must not echo the root"
 
 

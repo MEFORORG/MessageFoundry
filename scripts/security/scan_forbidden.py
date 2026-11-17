@@ -2201,15 +2201,11 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
         if name != "." and exc.errno in _GONE:
             return  # Removed after it was listed (a cache cleared mid-walk): nothing left to read.
         name = raw if name == "." else name
+        if exc.errno == errno.ENOENT:
+            errors.append(f"{name}/:0: does not exist, so its files were not scanned (fail closed)")
+            return
         why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
-        what = (
-            "does not exist"
-            if exc.errno == errno.ENOENT
-            else "not a readable directory"
-            if exc.errno == errno.ENOTDIR
-            else f"unreadable directory ({why})"
-        )
-        errors.append(f"{name}/:0: {what}, so its files were not scanned (fail closed)")
+        errors.append(f"{name}:0: unreadable ({why}), so its content was not scanned (fail closed)")
 
     for top, dirs, files in os.walk(root, onerror=refused):
         rel_top = Path(top).relative_to(root).as_posix()
@@ -3108,7 +3104,6 @@ def main(argv: list[str]) -> int:
             f"scan_forbidden: cannot list the tracked files ({type(exc).__name__})", file=sys.stderr
         )
         return 2
-    unlisted = len(hits)
     scanned = 0
     unread = 0
     unreadable = len(hits)
@@ -3176,8 +3171,7 @@ def main(argv: list[str]) -> int:
         print(
             f"scan_forbidden: examined {scanned} file(s) across {len(paths)} named path(s); "
             f"{unread} more were binary, not regular files, unreadable or under a forbidden path, "
-            f"so their content was not scanned, and {unlisted} named path(s) or director(ies) "
-            "under them could not be walked.",
+            "so their content was not scanned.",
             file=sys.stderr,
         )
 
