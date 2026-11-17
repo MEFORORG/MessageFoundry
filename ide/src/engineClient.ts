@@ -449,8 +449,8 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
  * `T`: a caller that does not handle a hold must not read one as success (BACKLOG #1981).
  *
  * `timeoutMs`, when given, fails a request that goes silent for that long, as {@link getJson} does,
- * with a {@link NetworkError} carrying {@link TIMEOUT_CODE}. Omitted, there is no cap. Sign-in passes
- * one (BACKLOG #2281); no other caller does.
+ * with a {@link NetworkError} carrying {@link TIMEOUT_CODE}. Omitted, there is no cap. At least the
+ * sign-in (BACKLOG #2281) and the step-up re-proof (vault BACKLOG #2950) pass one.
  */
 export function postJson<T>(
   baseUrl: string,
