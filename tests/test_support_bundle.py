@@ -59,7 +59,10 @@ def test_bundle_version_and_manifest(tmp_path: Path) -> None:
     assert manifest["version"] == __version__
     assert manifest["generated_at"] == 1_700_000_000.0
     assert "phi_contract" in manifest
-    assert "no raw message bodies" in manifest["phi_contract"]
+    assert "no member reads a message body from the store" in manifest["phi_contract"]
+    # BACKLOG #5385: a DEBUG log can hold a body the redaction does not read, so the contract names it.
+    assert "DEBUG" in manifest["phi_contract"]
+    assert "no raw message bodies" not in manifest["phi_contract"]
 
 
 def test_manifest_phi_contract_does_not_claim_the_bundle_secret_free(tmp_path: Path) -> None:

@@ -316,9 +316,11 @@ class RedactionFilter(logging.Filter):
 
 
 #: The label words ``secretscrub`` redacts a value under: its credential, token and key-material
-#: words. A COPY, because those tuples are private to that module. ``tests/test_logging.py`` holds
-#: this copy, the ``MEFOR_`` prefix and the label prefix below to their sources there, so a change
-#: made there and not here goes red.
+#: words. A COPY, though nothing forces one: this module already imports ``secretscrub``'s
+#: underscore-named ``_CREDENTIAL_QUERY_KEYS`` above, so those tuples are reachable from here too.
+#: ``tests/test_logging.py``
+#: holds this copy, the ``MEFOR_`` prefix and the label prefix below to their sources there, so a
+#: change made there and not here goes red.
 _QUERY_STOP_WORDS = (
     "password",
     "passwd",

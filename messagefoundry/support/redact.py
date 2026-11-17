@@ -536,8 +536,9 @@ _KEY_MATERIAL = re.compile(
 # value's tail on every glue it tried. After the shared
 # vocabulary a value it hid is a placeholder, and the widened run after the password, which stops
 # at "[" and "]", cannot cross it. Nor does the run cross a label: it stops where a key of the
-# write-time query filter, a label word secretscrub reads, or a ``MEFOR_`` name starts, followed by
-# ":" or "=" (``_DSN_RUN_STOP`` there says how, and why). So a value such a label holds is left to
+# write-time query filter or a label word secretscrub reads starts, followed by ":" or "=", and
+# where a ``MEFOR_`` name starts, with no separator required after it (``_DSN_RUN_STOP`` there says
+# how, and why). So a value such a label holds is left to
 # the pass that reads it, as the narrow pass alone left it, including one this function never hides,
 # such as a ``state=`` query value, which the write-time query filter hides on the store error path.
 # What the run still crosses is a label that no pass reads, and there it hides more than the narrow

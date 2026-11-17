@@ -36,16 +36,25 @@ of *that* surface rather than of the vocabulary:
   carve.
 
 AND THE OTHER BOUNDARY, because it looks like a duplicate and is not.
-``logging_setup.CredentialQueryScrubFilter`` hides its own short list of keys -- ``code``, ``state``,
-``id_token``, ``access_token``, ``token``, ``session_state`` -- only inside a URL query string. The
-tuple, ``_CREDENTIAL_QUERY_KEYS``, is defined here and ``logging_setup`` re-exports it (BACKLOG #5386),
-so the widened DSN reading can stop at those keys; this module's own label rules do NOT read those
-words as credential labels. Its words are
-safe only *because* they are scoped to a URL query string: ``code`` and ``state`` are ordinary
-operational vocabulary (``code=404``, ``state=RUNNING``), so admitting them to a general
-``label=value`` rule would redact operator diagnostics and buy nothing. That list also carries a ruling
-about two names deliberately absent from it (docs/PHI.md section 7, BACKLOG #1184), which a merge would
-disturb. Two vocabularies with a stated boundary, not one vocabulary stated twice.
+``logging_setup.CredentialQueryScrubFilter`` hides the value after its own short list of keys --
+``code``, ``state``, ``id_token``, ``access_token``, ``token``, ``session_state`` -- wherever one
+starts at a word boundary and is followed by "=". Its pattern has NO query-string anchor: it fires on
+any ``key=value`` in the line, so ``worker state=RUNNING code=404`` prints as
+``worker state=<redacted> code=<redacted>`` (measured). The tuple, ``_CREDENTIAL_QUERY_KEYS``, is
+defined here and ``logging_setup`` re-exports it (BACKLOG #5386), so the widened DSN reading can stop
+at those keys.
+
+The two lists overlap and are not the same. This module's label rules read ``token``,
+``id_token`` and ``access_token`` as labels too, through ``_BEARER``'s ``token`` word, so
+:func:`scrub_credentials` hides ``token=``, ``id_token=`` and ``access_token=`` values on its own.
+They do NOT read ``code``, ``state`` or ``session_state``: :func:`scrub_credentials` leaves
+``code=404``, ``state=RUNNING`` and ``session_state=abc`` as they were (measured). ``code`` and
+``state`` are ordinary operational vocabulary, so admitting them to this module's rules would add
+nothing on the paths that already run the query filter, and would extend the over-redaction of
+operator diagnostics that filter already does to a surface that does not run it, such as the
+support bundle's read-time pass. That list also carries a ruling about two names deliberately
+absent from it (docs/PHI.md section 7, BACKLOG #1184), which a merge would disturb. Two
+vocabularies with a stated boundary, not one vocabulary stated twice.
 
 COST, because this runs on EVERY record and the read-time pass does not. Measured 2026-09-06 as the
 MINIMUM single-call time over interleaved samples -- a minimum is the one statistic the load of a
@@ -1310,7 +1319,8 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # the value that label hid (code review, round 4). After the label passes a value they read is a
 # placeholder, which the run after the password stops at; and every pass before this one is the
 # code ``origin/main`` ran, so on one call this pass only hides more. It does not run at all on a
-# line where :func:`_union` keeps the reading before whole; :func:`_run` names those.
+# line where :func:`_union` keeps the reading before whole, because that reading is kept as
+# ``origin/main``'s, which had no such pass; :func:`_run` names those lines and says why.
 #
 # THE USER MAY BE EMPTY, AND THE PASSWORD MAY HOLD AN "@". The user was
 # ``[^\s:/@]+``, so ``postgres://:<pw>@host`` -- a DSN that sets only a password -- did not match and
@@ -2130,9 +2140,13 @@ def _run(
     masked at its end, which only the tracing reads.
 
     ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). :func:`_union`'s reading before
-    does: it is the code ``origin/main`` ran, which had none, and with it the pass's run crossed a
-    camelCase label only the shipped reading reads, so the union hid that label (``_WIDE_DSN_PASSWORD``
-    says what printed). So where :func:`_union` returns that reading whole, on a line where the
+    does, because that reading is kept as the code ``origin/main`` ran, which had no widened pass:
+    it is the reference the union holds the shipped reading to, and it is left as it was rather than
+    widened in this change. Widening it is a separate follow-up. The hazard first given as the reason,
+    the widened run crossing a camelCase label only the shipped reading reads, no longer applies:
+    since the run stops at a label word (``_DSN_RUN_STOP``), ``redis://:pw@h?accessToken=Tail@Sec``
+    and ``redis://:pw@h;userPassword=Tail@Sec`` scrub the same with the reading before widened or
+    not. So where :func:`_union` returns that reading whole, on a line where the
     shipped one would hide a member key's ";" and on an untraceable one, the widened pass does not
     run, and a password-only DSN, or the tail of a password holding an "@", prints there as it did
     before #5386. The support bundle's own last pass still reads it."""
