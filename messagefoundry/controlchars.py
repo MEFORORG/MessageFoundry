@@ -207,8 +207,8 @@ def _log_escape(code: int) -> str:
     audit tee need not escape early (vault BACKLOG #3012). On the first handler, the redaction
     filters run before its scrub. They see a character unescaped unless something escaped it
     before logging, as ``json.dumps`` does to the C0 controls in the audit record. A later
-    handler re-runs them over text the first scrub escaped. ``emit_audit_tee`` lists both as
-    residuals.
+    handler re-runs them over text the first scrub escaped. ``emit_audit_tee`` says what is
+    left.
     Python's ``ascii`` spelling, used until then, wrote ``\\x7f`` and ``\\U000e0001``, which JSON
     does not define.
 
