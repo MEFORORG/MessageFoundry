@@ -788,12 +788,41 @@ def test_construction_probe_refuses_an_unsupported_algorithm(
         DirectDestination(_dest(pki))
 
 
-def test_construction_probe_refuses_a_subject_with_a_line_break(pki: dict[str, Any]) -> None:
-    # email.message refuses a header value with CR or LF INSIDE it, on every build. A lone TRAILING
-    # newline is not refused (it is RFC 2047-encoded into the Subject), so the break here is embedded,
-    # which is the header-injection shape.
-    with pytest.raises(ValueError, match="could not build an S/MIME message.*ValueError"):
-        DirectDestination(_dest(pki, subject="Referral\nBcc: someone@hisp.example"))
+@pytest.mark.parametrize(
+    "subject",
+    [
+        # The header-injection shape. Before vault BACKLOG #5360 the build probe refused it.
+        "Referral\nBcc: someone@hisp.example",
+        # A lone TRAILING newline, which the header would RFC 2047-encode rather than refuse.
+        "Referral\n",
+        # A Unicode line break, which the build probe refused too.
+        "Referral\u2028note",
+        # Controls no build refuses, which the header would write raw.
+        "Referral\x01note",
+        "Referral\x00note",
+        # TAB and DEL, which the Email destination's rule refuses too.
+        "Referral\tnote",
+        "Referral\x7fnote",
+    ],
+)
+def test_a_subject_with_a_control_character_is_refused_at_construction(
+    pki: dict[str, Any], subject: str
+) -> None:
+    # vault BACKLOG #5360: the Email destination's subject rule, applied to Direct.
+    with pytest.raises(ValueError, match="Direct destination 'subject' holds a control") as caught:
+        DirectDestination(_dest(pki, subject=subject))
+    assert "Referral" not in str(caught.value)
+
+
+@pytest.mark.parametrize("subject", ["=?utf-8?b?AA==?=", "Note =?utf-8?q?a=01b?= here"])
+def test_a_subject_whose_encoded_word_decodes_to_a_control_is_refused(
+    pki: dict[str, Any], subject: str
+) -> None:
+    # vault BACKLOG #5360: the text holds no control, but the header parser decodes the encoded
+    # word into one and the generator writes it raw (the Email destination's vault BACKLOG #3206).
+    with pytest.raises(ValueError, match="'subject' holds an encoded word") as caught:
+        DirectDestination(_dest(pki, subject=subject))
+    assert subject not in str(caught.value)
 
 
 @pytest.mark.parametrize("code", [0xD800, 0xDC80])
