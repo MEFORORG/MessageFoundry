@@ -415,14 +415,22 @@ class LogSpool:
         here would end the listener thread for good. Only a segment that is GONE is retired, and the
         read then moves on to the next segment: answering ``None`` there would read as drained, and
         the forwarder would send live records ahead of the older ones still spooled (BACKLOG #5811).
-        Any other ``OSError`` (out of descriptors, a sharing violation) keeps every file and returns
-        ``None``, so the caller tries again later instead of deleting undelivered records."""
+        A missing spool DIRECTORY is not a gone segment: like any other ``OSError`` (out of
+        descriptors, a sharing violation) it keeps every file and returns ``None``, so the caller
+        tries again later instead of deleting undelivered records."""
         while True:
             try:
                 entry = self._peek()
                 self.read_faulted = False
                 return entry
             except FileNotFoundError:
+                if not self.directory.is_dir():
+                    # The whole spool is out of reach, not one segment gone: retiring would drop
+                    # every segment from the order and the cap while the files may still exist.
+                    self.read_errors += 1
+                    self.read_faulted = True
+                    self._close_reader()
+                    return None
                 self.unreadable += 1
                 if not self._segments:
                     return None

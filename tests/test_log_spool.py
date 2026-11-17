@@ -788,6 +788,25 @@ def test_a_segment_that_is_gone_is_retired_and_the_rest_still_replays(spool_dir:
         spool.close()
 
 
+def test_a_spool_directory_out_of_reach_retires_nothing(spool_dir: Path) -> None:
+    """A missing directory is a read fault, not a gone segment: every segment stays in the order
+    and the cap, and the spool replays whole once the directory is back."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        used = spool.bytes_used
+        spool.directory = spool_dir / "out-of-reach"
+        assert spool.peek() is None
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        spool.directory = spool_dir
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.close()
+
+
 def test_two_segments_gone_in_a_row_are_both_passed_over(spool_dir: Path) -> None:
     """One peek walks past every missing segment at the head, however many, to the oldest one left."""
     spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)

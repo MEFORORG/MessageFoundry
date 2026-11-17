@@ -854,6 +854,70 @@ def test_a_record_that_cannot_be_formatted_does_not_roll_or_stop_a_healthy_sink(
     assert "the next line" in text
 
 
+def test_an_unformattable_record_on_a_broken_sink_rolls_and_writes_the_notice(
+    tmp_path: Path,
+) -> None:
+    # The record cannot be formatted AND the handle is broken. The notice in its place is refused,
+    # so the sink is the fault: it is rolled, and after the roll the notice, not the record, is
+    # written. A stage-1 heal, with no stop.
+    # NEGATIVE CONTROL: re-writing the record after the roll re-raises the format error and turns
+    # the heal into stage 2.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = _file_handler(log_path, guard)
+    _break_the_open_handle(handler)
+
+    handler.emit(_record("count %d", "not a number"))
+    handler.close()
+
+    assert [(e.stage, e.stop_requested) for e in events] == [("rolled", False)]
+    assert "could not be formatted" in log_path.read_text(encoding="utf-8")
+
+
+def test_a_record_whose_logger_name_cannot_be_rendered_does_not_raise(tmp_path: Path) -> None:
+    # The notice names the record's logger, and a name whose ``str`` raises is the likely reason the
+    # record did not format. Building the notice must not raise into the caller's log call.
+    class BadName:
+        def __str__(self) -> str:
+            raise RuntimeError("no name")
+
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = GuardedFileHandler(str(log_path), guard=guard, sink="file")
+    handler.setFormatter(logging.Formatter("%(name)s %(message)s"))
+    record = logging.makeLogRecord({"name": BadName(), "msg": "hello", "levelname": "INFO"})
+
+    handler.handle(record)
+    handler.close()
+
+    assert events == []
+    assert "from logger '<unnameable>'" in log_path.read_text(encoding="utf-8")
+
+
+def test_a_stage2_event_fired_before_a_responder_is_wired_is_fired_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The roll that trips the bound fires stage 2 while no responder is wired, as in the gap between
+    # a runner's revalidate and its set_escalation. The next roll past the bound fires it again,
+    # once a responder is there, so the stop is still asked for. Once answered, nothing more fires.
+    # NEGATIVE CONTROL: with one page per break and no owed event, nothing fired at all.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    guard = LogWriteGuard()
+    guard.register("file")
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
+    events: list[LogSinkEvent] = []
+    guard.set_escalation(events.append)
+
+    _roll(guard, clock, 6, 7)
+
+    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
+
+
 def test_a_formatter_that_fails_on_every_record_still_reaches_stage2(tmp_path: Path) -> None:
     # The other side of the test above: when the sink cannot format even the guard's own
     # notice, the record is not the fault, and the stages decide as before.

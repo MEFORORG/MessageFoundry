@@ -454,10 +454,14 @@ longer holds after this amendment, for the case below.
 **One page per break past the bound.** Before this amendment every roll past section 1's bound
 wrote the sink's state as `rolled` before escalating, so `record_unwritable` never saw the sink as
 already down: each such roll fired another stage-2 event, stop request and stderr line. Now a roll
-past the bound on a sink already unwritable keeps it unwritable, so only the roll that trips the
-bound pages. A roll the bound calls a heal still writes `rolled` and pages stage 1, as before, so a
-sink that keeps flapping across bound windows pages stage 2 once per window it trips in. Whether
-the bound itself should hold across windows is left open with the latch's enforcement question.
+past the bound on a sink already unwritable keeps it unwritable, so the first move of a break to
+unwritable pages, by a stage-2 failure or by the roll that trips the bound, and a later roll past
+the bound does not. A roll the bound calls a heal still writes `rolled` and pages stage 1, as
+before, so a sink that keeps flapping across bound windows pages stage 2 once per window it trips
+in. Whether the bound itself should hold across windows is left open with the latch's enforcement
+question. One retry is kept: a stage-2 event fired while no responder was wired is fired again on
+the break's next failure, without another stderr line, so a stop is still asked for once a
+responder is there.
 
 **`revalidate()` and a sink that changes while it is probed.** Each probe runs outside the guard's
 lock. A sink on which another thread records a roll or a stage-2 failure after the snapshot is no

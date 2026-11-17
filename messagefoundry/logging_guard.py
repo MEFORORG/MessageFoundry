@@ -175,9 +175,9 @@ class LogWriteGuard:
         #: latch does, and nothing that clears it, can move the bound; what the bound and the paging
         #: decisions compute does not depend on it (BACKLOG #5812).
         self._flap_latch: dict[str, float] = {}
-        #: sink -> how many times a roll or a stage-2 failure has been recorded for it. Lets
-        #: :meth:`revalidate` see that a sink changed while its probe ran outside the lock.
-        self._changes: dict[str, int] = {}
+        #: Sinks whose current break fired its stage-2 event with no responder wired, so the event
+        #: is fired again on the next failure; see :meth:`record_unwritable`.
+        self._unanswered: set[str] = set()
         #: sink -> "write one record to yourself and raise if you still cannot", see :meth:`revalidate`.
         self._probes: dict[str, SinkProbe] = {}
         self._escalation: EscalationCallback | None = None
@@ -293,7 +293,8 @@ class LogWriteGuard:
                 rolled_aside=rolled_aside,
             )
             self._latch_after_roll(sink, now=now, tripped=tripped)
-            self._changes[sink] = self._changes.get(sink, 0) + 1
+            if self._sinks[sink].state == "rolled":
+                self._unanswered.discard(sink)  # the break is over, owed event or not
         if tripped:
             # The precondition holds through this join: ``reason`` arrived scrubbed and everything
             # appended is a literal plus two formatted numbers, so nothing new needs escaping.
@@ -310,7 +311,8 @@ class LogWriteGuard:
         )
 
     def record_unwritable(self, sink: str, *, reason: str) -> None:
-        """Stage 2: the replacement could not be written either. Escalates ONCE per break.
+        """Stage 2: the replacement could not be written either. Escalates ONCE per break, except
+        that a break whose event found no responder wired fires it again on its next failure.
 
         **The STOP is asked for only when EVERY guarded sink is unwritable, and that is a
         correctness point, not a softening.** The ruling is *"we never want to process stuff if the
@@ -340,11 +342,21 @@ class LogWriteGuard:
             # other sink only changes what the stderr line says about them.
             all_reported_down = all(self._reads_unwritable(s) for s in self._sinks.values())
             self._latch_after_failure(sink)
-            self._changes[sink] = self._changes.get(sink, 0) + 1
+            # A break whose stage-2 event found no responder wired is still owed one: the next
+            # failure on it fires the event again, without another stderr line (BACKLOG #5812).
+            owed = already_down and sink in self._unanswered
+        event = LogSinkEvent(
+            sink=sink,
+            stage="unwritable",
+            reason=reason,
+            stop_requested=self.stop_on_unwritable and all_down,
+        )
         if already_down:
             # Latched: one page per break, not one per dropped record. Without this a broken disk
             # turns every subsequent log line into an alert AND a stderr line, and the storm buries
             # the one message that mattered.
+            if owed:
+                self._fire_stage2(event)
             return
         if all_down:
             others = ""
@@ -360,14 +372,16 @@ class LogWriteGuard:
             f"LOG SINK {_escape_only(sink, fallback=_LABEL_DROPPED)} IS UNWRITABLE "
             f"after a rollover attempt: {reason}{others}"
         )
-        self._fire(
-            LogSinkEvent(
-                sink=sink,
-                stage="unwritable",
-                reason=reason,
-                stop_requested=self.stop_on_unwritable and all_down,
-            )
-        )
+        self._fire_stage2(event)
+
+    def _fire_stage2(self, event: LogSinkEvent) -> None:
+        """Fire a stage-2 event, and remember the break as owed one while no responder is wired."""
+        answered = self._fire(event)
+        with self._lock:
+            if answered:
+                self._unanswered.discard(event.sink)
+            else:
+                self._unanswered.add(event.sink)
 
     def record_healthy(self, sink: str) -> None:
         """``sink`` accepted a record again — clear the unwritable latch so a LATER break pages afresh.
@@ -392,6 +406,7 @@ class LogWriteGuard:
             self._roll_flap.pop(sink, None)
             # A record landed, so the flap latch has nothing left to hold either.
             self._flap_latch.pop(sink, None)
+            self._unanswered.discard(sink)
 
     def _latch_after_roll(self, sink: str, *, now: float, tripped: bool) -> None:
         """Move the flap latch for one roll. Called under the lock, after the bound has run.
@@ -462,10 +477,10 @@ class LogWriteGuard:
         loop's own comment says what remains of that race. The answer reads the sinks' own states,
         not the latch."""
         with self._lock:
+            # Every record_* call replaces a sink's status object, so the object itself tells
+            # whether anything was recorded on the sink since this snapshot.
             dead = {
-                name: self._changes.get(name, 0)
-                for name, status in self._sinks.items()
-                if status.state == "unwritable"
+                name: status for name, status in self._sinks.items() if status.state == "unwritable"
             }
             for latched in [sink for sink in self._flap_latch if sink not in dead]:
                 del self._flap_latch[latched]
@@ -477,7 +492,7 @@ class LogWriteGuard:
             # What remains: a change between this check and the probe's write still meets the
             # probe, because the lock is never held across a sink's I/O.
             with self._lock:
-                if self._changes.get(name, 0) != seen:
+                if self._sinks.get(name) is not seen:
                     continue
                 probe = self._probes.get(name)
             # A sink registered without a self-test stays exactly as it is: we cannot ask it, and
@@ -485,18 +500,19 @@ class LogWriteGuard:
             if probe is None or not _probe_lands(probe):
                 continue
             with self._lock:
-                if self._changes.get(name, 0) == seen:
+                if self._sinks.get(name) is seen:
                     self.record_healthy(name)
         with self._lock:
             if not self._sinks:
                 return True
             return not all(s.state == "unwritable" for s in self._sinks.values())
 
-    def _fire(self, event: LogSinkEvent) -> None:
+    def _fire(self, event: LogSinkEvent) -> bool:
+        """Hand ``event`` to the responder. Whether one was wired; a responder that raised was."""
         with self._lock:
             callback = self._escalation
         if callback is None:
-            return
+            return False
         try:
             callback(event)
         except Exception as exc:  # never-raise: we are already handling a logging failure
@@ -506,6 +522,7 @@ class LogWriteGuard:
                 f"log-sink escalation for {_escape_only(event.sink, fallback=_LABEL_DROPPED)} "
                 f"failed: {_safe_reason(exc)}"
             )
+        return True
 
 
 #: The guard the current process's handlers are wired to. Installed by ``configure_logging``.
@@ -691,6 +708,20 @@ def _escape_only(text: str, *, fallback: str) -> str:
     return _guarded(scrub_control_chars, text, fallback=fallback)
 
 
+#: The fallback for a record's logger or level name in the unformattable-record notice.
+_RECORD_LABEL_DROPPED = "<unnameable>"
+
+
+def _record_label(value: object) -> str:
+    """A record's logger or level name, escaped for a notice. Never raises: a caller can set either
+    to any object, and its ``str`` may raise, often for the same reason the record did not format."""
+    try:
+        text = str(value)
+    except Exception:
+        return _RECORD_LABEL_DROPPED
+    return _escape_only(text, fallback=_RECORD_LABEL_DROPPED)
+
+
 def _safe_reason(exc: BaseException | None) -> str:
     """The guard's one way to turn a caught exception into a publishable reason string.
 
@@ -753,10 +784,7 @@ class _GuardedSinkMixin(_SinkBase):
             return
         self._reentry.active = True
         try:
-            # SCRUBBED HERE, WHERE IT IS BUILT, AND NOWHERE ELSE (BACKLOG #1591). The notice below is
-            # written by ``_emit_direct``, so no handler filter will ever see it, and the three other
-            # consumers of this string take it from the guard unchanged. See the module docstring.
-            reason = _safe_reason(sys.exception())
+            failure = sys.exception()
             # A record that cannot be formatted is no reason to roll a healthy sink or to call it
             # unwritable (BACKLOG #5813). When the stand-in lands, the sink has just taken a write
             # and nothing else happens; when it does not, the sink is the fault after all and the
@@ -764,11 +792,15 @@ class _GuardedSinkMixin(_SinkBase):
             stand_in = self._stand_in_for(record)
             if stand_in is not None:
                 try:
-                    stand_in()
+                    self._write_notice(stand_in)
                     return
                 except Exception as sink_exc:
                     # The sink refused the stand-in too, so ITS failure is the reason now.
-                    reason = _safe_reason(sink_exc)
+                    failure = sink_exc
+            # SCRUBBED HERE, WHERE IT IS BUILT, AND NOWHERE ELSE (BACKLOG #1591). The notice below is
+            # written by ``_emit_direct``, so no handler filter will ever see it, and the three other
+            # consumers of this string take it from the guard unchanged. See the module docstring.
+            reason = _safe_reason(failure)
             try:
                 # The path is the notice's OTHER interpolated limb, so it is escaped on the same
                 # terms -- a half-scrubbed notice is a control resting on a false premise.
@@ -786,7 +818,7 @@ class _GuardedSinkMixin(_SinkBase):
                 if stand_in is None:
                     self._rewrite(record)
                 else:
-                    stand_in()
+                    self._write_notice(stand_in)
             except Exception as roll_exc:
                 # ``_safe_reason``, not a bare ``safe_exc``: the guard scrubs nothing of its own, so
                 # each limb of the join has to arrive scrubbed. Bounding them SEPARATELY is also
@@ -801,9 +833,9 @@ class _GuardedSinkMixin(_SinkBase):
         finally:
             self._reentry.active = False
 
-    def _stand_in_for(self, record: logging.LogRecord) -> Callable[[], None] | None:
-        """What to write in place of ``record`` when it cannot be formatted, or ``None`` when it can
-        (BACKLOG #5813).
+    def _stand_in_for(self, record: logging.LogRecord) -> str | None:
+        """The notice to write in place of ``record`` when it cannot be formatted, or ``None`` when
+        it can (BACKLOG #5813). Never raises.
 
         A record this handler cannot format is the record's fault, not the sink's: the stand-in is
         a fixed notice naming its logger and level, never its content. It goes through the sink's
@@ -814,12 +846,10 @@ class _GuardedSinkMixin(_SinkBase):
         try:
             self.format(record)
         except Exception as exc:
-            logger = _escape_only(str(record.name), fallback=_LABEL_DROPPED)
-            level = _escape_only(str(record.levelname), fallback=_LABEL_DROPPED)
-            what = _safe_reason(exc)
-            return lambda: self._write_notice(
-                f"a log record from logger {logger!r} at level {level} could not be formatted "
-                f"({what}); it was not written"
+            return (
+                f"a log record from logger {_record_label(record.name)!r} at level "
+                f"{_record_label(record.levelname)} could not be formatted ({_safe_reason(exc)}); "
+                "it was not written"
             )
         return None
 
