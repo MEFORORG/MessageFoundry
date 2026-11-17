@@ -415,10 +415,10 @@ def emit_audit_tee(
     two are counters and ``row_hash`` is a digest, or on a keyed chain an HMAC.
 
     **One residual, stated because "the head hash carries nothing" is too strong.** In
-    the keyless posture ``row_hash`` is a plain SHA-256 over a canonical list whose every other
-    member -- the previous row's hash, ``ts``, ``actor``, ``action``, ``channel_id``, ``client`` --
-    travels in this same record or the one before it. So a reader of the log can TEST guesses
-    offline, one hash per guess (``seq`` travels in the record too).
+    the keyless posture ``row_hash`` is a plain SHA-256 over a canonical list. So a reader of the
+    log can TEST guesses offline, one hash per guess (``seq`` travels in the record too).
+    The same holds for at least any field the C0 scrub below rewrote or shipped as
+    ``[redacted]``, ``actor`` included.
     It does not arise for a row written by a process that holds a key, where the digest is
     an HMAC under a DEK-derived subkey or a Transit MAC. Keyless is not the shipped default. A row
     written without a key keeps its plain SHA-256: no later open re-keys it, and a keyed process
@@ -493,6 +493,9 @@ def emit_audit_tee(
       typed sign-in name ship that way. A record can ship as the line before #3045, losing the
       scrub; a segment-shaped token such as ``ABC|`` after a control in a field can cause that,
       so a client can turn the scrub off for its own record.
+    * A record whose line is longer than the handler chain's 64 KiB window ships the line from
+      before #3045, unscrubbed. At least a large ``action``, ``actor``, ``channel_id`` or
+      ``client`` can make one.
     * In a JSON ``detail``, an escape is decoded only where it spells a C0 control, one level deep,
       and where the detail parses as JSON within the bound and holds no raw control. Elsewhere,
       as for ``\\u00a0``, the text beside an escape is read by the handler chain alone.
@@ -544,8 +547,7 @@ def emit_audit_tee(
     }
     try:
         # Each text field is scrubbed before json.dumps escapes a C0 control in the window it
-        # scans (#3045), and _tee_line holds the result to what the record above, the line before
-        # #3045, hid.
+        # scans (#3045).
         try:
             scrubbed: dict[str, object] = {k: _scrub_field(v) for k, v in texts.items()}
             if detail:
