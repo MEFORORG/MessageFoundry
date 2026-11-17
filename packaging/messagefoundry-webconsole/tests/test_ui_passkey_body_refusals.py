@@ -11,20 +11,30 @@ that rides the same form. All data here is synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
+from collections.abc import Callable, Coroutine
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from _ui_clients import PW, SAME_ORIGIN, cookie_login, provision
 from _webui_support import _client, _service
 
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
-#: Deep enough that json refuses it on any stack these tests run on, and inside the 1 MiB body cap.
-_DEPTH = 100_000
+#: How deep the too-deep body nests: inside the 1 MiB body cap, and far past what json's C decoder
+#: can reach on :data:`_SMALL_STACK`, since each level costs it at least two C frames.
+_DEPTH = 400_000
+#: The stack the request runs on. A fixed thread stack, because a main thread's stack is the
+#: platform's: 100_000 levels raised RecursionError on Windows and decoded on the Linux runner.
+_SMALL_STACK = 2 * 1024 * 1024
 _TOO_DEEP = "[" * _DEPTH + "]" * _DEPTH
 
 
@@ -34,27 +44,68 @@ _DEEP_BODIES = {
 }
 
 
+def _on_a_small_stack[T](call: Callable[[], Coroutine[Any, Any, T]]) -> T:
+    """Run ``call`` in its own event loop on a thread whose stack is :data:`_SMALL_STACK`,
+    re-raising what it raised. The route parses the body on the loop's thread, so the loop and the
+    engine it serves are built there too."""
+    result: list[T] = []
+    raised: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            result.append(asyncio.run(call()))
+        except BaseException as exc:  # handed back to the test thread, which re-raises it
+            raised.append(exc)
+
+    previous = threading.stack_size(_SMALL_STACK)
+    try:
+        worker = threading.Thread(target=_run)
+        worker.start()
+    finally:
+        threading.stack_size(previous)
+    worker.join()
+    if raised:
+        raise raised[0]
+    return result[0]
+
+
 @pytest.mark.parametrize("route", sorted(_DEEP_BODIES))
-async def test_a_body_nested_too_deep_is_a_malformed_request_not_a_500(
-    engine: Engine, route: str
+def test_a_body_nested_too_deep_is_a_malformed_request_not_a_500(
+    tmp_path: Path, route: str
 ) -> None:
     """vault BACKLOG #5341. Red: the route's own ``request.json()`` raised ``RecursionError``,
     which its catch did not list, so it escaped the route (a 500 on a served engine)."""
     body = _DEEP_BODIES[route]
-    # The precondition that makes this test about RecursionError: on this stack json refuses the
-    # body that way. Were the stack ever deep enough to decode it, this fails rather than passing on
-    # some other path.
+
+    async def _parse() -> object:
+        return json.loads(body)
+
+    # The precondition that makes this test about RecursionError: on the stack the route runs on,
+    # json refuses the body that way. Were that stack ever deep enough to decode it, this fails
+    # rather than passing on some other path.
     with pytest.raises(RecursionError):
-        json.loads(body)
-    service = await _service(engine)
-    await provision(service, "op", [Role.OPERATOR.value])
-    async with _client(engine, service) as c:
-        await cookie_login(c, "op")
-        r = await c.post(
-            route,
-            content=body,
-            headers={**SAME_ORIGIN, "Content-Type": "application/json"},
+        _on_a_small_stack(_parse)
+
+    async def _post() -> httpx.Response:
+        engine = await Engine.create(
+            tmp_path / "webui.db",
+            poll_interval=0.02,
+            egress_settings=EgressSettings(deny_by_default=False),
         )
+        try:
+            service = await _service(engine)
+            await provision(service, "op", [Role.OPERATOR.value])
+            async with _client(engine, service) as c:
+                await cookie_login(c, "op")
+                return await c.post(
+                    route,
+                    content=body,
+                    headers={**SAME_ORIGIN, "Content-Type": "application/json"},
+                )
+        finally:
+            await engine.stop()
+
+    r = _on_a_small_stack(_post)
     assert (r.status_code, r.json()) == (400, {"ok": False, "error": "malformed request"})
 
 

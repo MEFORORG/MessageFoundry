@@ -13,7 +13,9 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -1821,17 +1823,48 @@ async def test_a_passkey_registered_from_a_first_seen_address_records_nothing() 
         await store.close()
 
 
+#: How deep the too-deep response nests. Each level costs json's C decoder at least two C frames, so
+#: this many levels need far more than :data:`_SMALL_STACK` bytes on any build these tests run on.
+_DEPTH = 400_000
+#: The stack the deep parse runs on. A fixed thread stack, because a main thread's stack is the
+#: platform's: 100_000 levels raised RecursionError on Windows and decoded on the Linux runner.
+_SMALL_STACK = 2 * 1024 * 1024
+
 #: A ceremony response nested past json's depth limit, under a field a real response carries.
-_TOO_DEEP = '{"id": ' + "[" * 100_000 + "]" * 100_000 + "}"
+_TOO_DEEP = '{"id": ' + "[" * _DEPTH + "]" * _DEPTH + "}"
+
+
+def _on_a_small_stack[T](call: Callable[[], T]) -> T:
+    """Run ``call`` on a thread whose stack is :data:`_SMALL_STACK`, re-raising what it raised."""
+    result: list[T] = []
+    raised: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            result.append(call())
+        except BaseException as exc:  # handed back to the test thread, which re-raises it
+            raised.append(exc)
+
+    previous = threading.stack_size(_SMALL_STACK)
+    try:
+        worker = threading.Thread(target=_run)
+        worker.start()
+    finally:
+        threading.stack_size(previous)
+    worker.join()
+    if raised:
+        raise raised[0]
+    return result[0]
 
 
 def _refused_on_recursion(
     excinfo: pytest.ExceptionInfo[wa.WebAuthnVerificationError], caplog: pytest.LogCaptureFixture
 ) -> None:
     """The refusal came from the RecursionError catch, not from some other library refusal: the
-    precondition holds on this stack, the cause is the RecursionError, and its type was logged."""
+    precondition holds on the same stack, the cause is the RecursionError, and its type was
+    logged."""
     with pytest.raises(RecursionError):
-        json.loads(_TOO_DEEP)
+        _on_a_small_stack(lambda: json.loads(_TOO_DEEP))
     assert isinstance(excinfo.value.__cause__, RecursionError), repr(excinfo.value.__cause__)
     assert any("raw RecursionError" in r.getMessage() for r in caplog.records)
 
@@ -1846,8 +1879,10 @@ def test_a_deeply_nested_registration_response_is_the_audited_refusal(
         caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
         pytest.raises(wa.WebAuthnVerificationError) as excinfo,
     ):
-        wa.verify_registration(
-            response_json=_TOO_DEEP, challenge=b"c" * 32, rp_id=RP, origin=ORIGIN
+        _on_a_small_stack(
+            lambda: wa.verify_registration(
+                response_json=_TOO_DEEP, challenge=b"c" * 32, rp_id=RP, origin=ORIGIN
+            )
         )
     _refused_on_recursion(excinfo, caplog)
 
@@ -1861,13 +1896,15 @@ def test_a_deeply_nested_assertion_response_is_the_audited_refusal(
         caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
         pytest.raises(wa.WebAuthnVerificationError) as excinfo,
     ):
-        wa.verify_assertion(
-            response_json=_TOO_DEEP,
-            challenge=b"c" * 32,
-            rp_id=RP,
-            origin=ORIGIN,
-            public_key=soft.cose_public_key(),
-            current_sign_count=0,
+        _on_a_small_stack(
+            lambda: wa.verify_assertion(
+                response_json=_TOO_DEEP,
+                challenge=b"c" * 32,
+                rp_id=RP,
+                origin=ORIGIN,
+                public_key=soft.cose_public_key(),
+                current_sign_count=0,
+            )
         )
     _refused_on_recursion(excinfo, caplog)
 
