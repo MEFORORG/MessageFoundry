@@ -353,6 +353,34 @@ def test_apply_refuses_every_unsafe_tree_and_leaves_it(fx: Fx, sleeper: int) -> 
             assert fx.is_registered(p)
 
 
+def test_a_live_process_that_started_long_before_its_session_registered_occupies(
+    fx: Fx, sleeper: int
+) -> None:
+    """Vault BACKLOG #2985, added item 4 (item 9 carried to the nightly). The registry's default skew
+    reads a record as STALE, which vetoes nothing, when its live process started more than 15 minutes
+    before the session registered: a long-running process that starts a new session does that. Red
+    before the fix: the tree went. The prelude stands a Get-Process in that dates the sleeper two hours
+    back, so the record's startedAt is now and still a real registration, never a future one."""
+    tree = fx.tree("clean")
+    _session(fx, sleeper, tree, "late2222-0000")
+    prelude = (
+        "function Get-Process { [CmdletBinding()] param([int]$Id) "
+        "$p = Microsoft.PowerShell.Management\\Get-Process -Id $Id -ErrorAction SilentlyContinue; "
+        f"if ($p -and $Id -eq {sleeper}) {{ [pscustomobject]@{{ Id = $Id; StartTime = (Get-Date).AddHours(-2) }} }} "
+        "else { $p } }"
+    )
+    rows = remove(fx, [tree], apply=True, prelude=prelude)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "occupied: late2222 LIVE" in rows["clean"]["Reason"], rows["clean"]
+    assert tree.is_dir() and fx.is_registered(tree)
+
+    # Control: without that record, the same pass removes the tree.
+    (fx.sessions / f"{sleeper}.json").unlink()
+    rows = remove(fx, [tree], apply=True, prelude=prelude)
+    assert rows["clean"]["Outcome"] == "REMOVED", rows["clean"]
+    assert not tree.exists()
+
+
 @pytest.mark.parametrize("idle", ["6", "0", "([double]::NaN)", "([double]::PositiveInfinity)"])
 def test_a_window_under_the_floor_or_not_a_number_refuses_everything(fx: Fx, idle: str) -> None:
     """NaN compares false both ways, so a `-lt` guard alone would wave it through."""

@@ -755,7 +755,11 @@ def test_fleet_counts_a_live_anonymous_record_in_a_real_worktree_in_its_denomina
     ids=["unreadable", "dead", "anonymous-in-its-tree", "anonymous-elsewhere"],
 )
 def test_sessions_rehome_refuses_an_unreadable_fence(
-    tmp_path: Path, pid: str | None, anonymous: str | None, refusal: str | None
+    tmp_path: Path,
+    pid: str | None,
+    anonymous: str | None,
+    refusal: str | None,
+    home_name: str = "home",
 ) -> None:
     """sessions.ps1 moves a transcript, so an UNREADABLE fence must stop it. A non-numeric pid used
     to throw in the fence, which stopped the move; reading UNREADABLE must stop it the same way. A
@@ -779,7 +783,7 @@ def test_sessions_rehome_refuses_an_unreadable_fence(
         .removeprefix("worktree ")
         .replace("/", "\\")
     )
-    home = tmp_path / "home"
+    home = tmp_path / home_name
     root = home / ".claude"
     sid = "5491eeee-1111-2222-3333-444444444444"
     slug = "".join(c if c.isalnum() else "-" for c in primary)
@@ -818,6 +822,15 @@ def test_sessions_rehome_refuses_an_unreadable_fence(
     else:
         assert proc.returncode == 0 and "already filed" in proc.stdout, proc.stdout + proc.stderr
     assert transcript.exists()
+
+
+def test_sessions_reads_a_profile_whose_name_holds_a_bracket(tmp_path: Path) -> None:
+    """Vault BACKLOG #2985, added item 2. sessions.ps1 listed USERPROFILE as a pattern, so a profile
+    named home[1] matched only a folder named home1, found no config root and no transcript. Red
+    before the fix: the DEAD case below did not find the transcript already filed."""
+    test_sessions_rehome_refuses_an_unreadable_fence(
+        tmp_path, None, None, None, home_name="home[1]"
+    )
 
 
 def test_a_gone_match_beside_a_live_record_naming_no_session_is_unreadable(
