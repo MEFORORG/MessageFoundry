@@ -100,6 +100,21 @@ def test_decode_helpers_map_bad_body_to_apierror() -> None:
 _REPLY_MARKER = "DOE^JANE^SYNTHETIC"
 
 
+@contextlib.contextmanager
+def _client_answering(content: bytes) -> Iterator[EngineClient]:
+    """A loopback client whose transport seam answers every request 200 with ``content``."""
+    client = EngineClient("http://127.0.0.1:8765")
+
+    def _send(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        return httpx.Response(200, content=content, request=request)
+
+    client._http.send = _send  # type: ignore[method-assign]
+    try:
+        yield client
+    finally:
+        client.close()
+
+
 @pytest.mark.parametrize(
     "call",
     [lambda c: c.list_dead_letters(), lambda c: c.list_connection_events()],
@@ -124,17 +139,11 @@ def test_list_readers_map_a_malformed_reply_to_a_value_free_apierror(
 
     Mutation: put ``DeadLetterList.model_validate(response.json())`` (or the event twin) back.
     Red: a raw ``JSONDecodeError`` or ``ValidationError`` escapes instead of ``ApiError``."""
-    client = EngineClient("http://127.0.0.1:8765")
-
-    def _send(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
-        return httpx.Response(200, content=content, request=request)
-
-    client._http.send = _send  # type: ignore[method-assign]
-    try:
-        with pytest.raises(ApiError, match="invalid response from engine") as excinfo:
-            call(client)
-    finally:
-        client.close()
+    with (
+        _client_answering(content) as client,
+        pytest.raises(ApiError, match="invalid response from engine") as excinfo,
+    ):
+        call(client)
     assert _REPLY_MARKER not in str(excinfo.value)
     assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
 
@@ -164,16 +173,8 @@ def test_list_readers_still_decode_a_well_formed_reply(
     call: Callable[[EngineClient], Any], body: dict[str, object]
 ) -> None:
     """NEGATIVE CONTROL for the test above: a reader that refused every reply would pass it."""
-    client = EngineClient("http://127.0.0.1:8765")
-
-    def _send(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
-        return httpx.Response(200, json=body, request=request)
-
-    client._http.send = _send  # type: ignore[method-assign]
-    try:
+    with _client_answering(json.dumps(body).encode()) as client:
         result = call(client)
-    finally:
-        client.close()
     assert result.total == 0
 
 
