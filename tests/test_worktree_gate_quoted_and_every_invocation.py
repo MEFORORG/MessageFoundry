@@ -462,11 +462,10 @@ def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str,
     assert _allowed(rig, _fmt(rig, template), rig.outside, tool)
 
 
-# Step 6: the known false denies of the added readings, pinned as KNOWN. Each is a strict xfail, so a
-# change that fixes one turns it into an XPASS and must move the row to the ALLOW controls above.
-@pytest.mark.xfail(
-    strict=True, reason="known false deny of the added readings (BACKLOG #5655 step 2)"
-)
+# Step 6: the known false denies of the added readings, pinned as KNOWN. Each row is a command whose
+# verdict should be ALLOW and is DENY; a change that fixes one fails its row here, and the row then
+# moves to the ALLOW controls above. Plain asserts rather than a strict xfail, so a pwsh launch timeout
+# (BACKLOG #1304) surfaces as itself instead of reading as the expected failure.
 @pytest.mark.parametrize(
     ("template", "where", "tool"),
     [
@@ -474,9 +473,46 @@ def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str,
         ("if (git -C '{p}' diff --quiet) {{ git reset --hard }}", "outside", "PowerShell"),
         # The later-disarm filter counts `.git` as a git word, so the grep's `-c alias.lg` is judged.
         ("git config core.hooksPath ; grep --exclude-dir=.git -c alias.lg f", "primary", "Bash"),
+        # A joined `bash -c` payload's re-quoted `-C` reaches the first reading, which roots the
+        # quote-tainted token at the governed cwd.
+        (r"bash -c 'git -C '\''{o}'\'' reset --hard'", "primary", "Bash"),
     ],
 )
-def test_known_false_denies_of_the_added_readings(
+def test_known_false_denies_of_the_added_readings_still_deny(
+    rig: SimpleNamespace, template: str, where: str, tool: str
+) -> None:
+    assert not _allowed(rig, _fmt(rig, template), _cwd(rig, where), tool)
+
+
+# Review round 34781a2201: shapes the first build of this change got wrong.
+@pytest.mark.parametrize(
+    ("template", "where", "tool"),
+    [
+        # Rule 3c's owning word must not cross `;` to an earlier command's `-C`.
+        ("git -C '{p}' log ; /usr/bin/git config {k}", "outside", "Bash"),
+        (r"git -C '{p}' log ; \git config {k}", "outside", "Bash"),
+        # PowerShell passes a leading `''` as an argument of its own, so it joins nothing.
+        ("git -C ''{p} reset --hard", "outside", "PowerShell"),
+    ],
+)
+def test_review_round_controls_stay_allowed(
     rig: SimpleNamespace, template: str, where: str, tool: str
 ) -> None:
     assert _allowed(rig, _fmt(rig, template), _cwd(rig, where), tool)
+
+
+@pytest.mark.parametrize(
+    ("template", "where", "text"),
+    [
+        # A later absolute `-C` after a relative one, behind an earlier subshell chdir.
+        ("(cd {tmp} && ls)\ngit -C Primary -C '{p}' reset --hard", "outside", "SHARED PRIMARY"),
+        # Origin/main's reading of an empty pair glued to a chdir verb is kept: the scan is unchanged.
+        ("git commit -C HEAD && cd'' . && git config {k}", "primary", "SHARED git configur"),
+        ("git config core.hooksPath''", "primary", "SHARED git configur"),
+    ],
+)
+def test_review_round_shapes_are_denied(
+    rig: SimpleNamespace, template: str, where: str, text: str
+) -> None:
+    reason = _reason(rig, _fmt(rig, template), _cwd(rig, where))
+    assert text in reason, reason

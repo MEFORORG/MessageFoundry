@@ -796,9 +796,10 @@ function Get-ScanRawIndexMap($Seg) {
 #
 # THE READER IS THE SCAN, which is the gate's existing tokenizer: Remove-QuotedSpans unquotes a quoted
 # span holding one bare word, single or double and under either host's escape, joins quoted pieces
-# (`'a'/'b'` reads `a/b`; an empty pair joined to a word, and a POSIX `$'<word>'` with no backslash,
-# read the word), and blanks a span with whitespace in it, so a quoted commit message or echo cannot
-# supply a token. It does not unquote every form the shell accepts. Each invocation is read from its OWN window -- from the
+# (`'a'/'b'` reads `a/b`), and blanks a span with whitespace in it, so a quoted commit message or echo
+# cannot supply a token. It does not unquote every form the shell accepts; Get-JoinedReading adds a
+# second reading for an empty pair joined to a word and a POSIX `$'<word>'`. Each invocation is read
+# from its OWN window -- from the
 # separator before its owning git token up to its verb -- through the resolver's -OwnWindow branch,
 # which folds that invocation's own `-C` tokens over a chdir it can follow and answers NOTHING where it
 # cannot. The window is also handed in as the resolver's $Line, so --work-tree, GIT_WORK_TREE,
@@ -832,7 +833,9 @@ function Get-ScanRawIndexMap($Seg) {
 # open, at least: a later disarm judged by rule 3c's first chain can take an earlier command's `-C`;
 # an earlier bracket-joined command's `-C` or `--git-dir` can decide (`if (git -C <p> diff --quiet) {
 # git reset --hard }` from outside); rule 3c's later-disarm filter counts `.git` as a git word; and a
-# chdir in an earlier line's heredoc, here-string or multi-line `bash -c` body is read as a real one.
+# chdir in an earlier line's heredoc, here-string or multi-line `bash -c` body is read as a real one;
+# and a `bash -c` payload joined with `'\''` or `'"'"'` is one more segment, so its re-quoted `-C`
+# reaches the first reading too, which roots that quote-tainted token at a governed cwd.
 #
 # THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
@@ -870,14 +873,13 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
     $priorChdirs = @(($Prior -split '\r?\n') | Where-Object { $_ -match $chdirAt })
     $plain = [pscustomobject]@{ ScanPrefix = $pfx; Window = $win }
     if ($priorChdirs.Count -eq 0) { return $plain }
-    # AN ABSOLUTE FIRST `-C` DOES NOT DEPEND ON WHERE THE SHELL STANDS (BACKLOG #5655 step 3), so where
-    # the directory is unknown the plain reading is still returned for it. Without this, an earlier
-    # line's subshell chdir, `(cd x && ls)`, switched the reading off and a single-quoted
+    # A `-C` FOLD THAT ENDS ABSOLUTE DOES NOT DEPEND ON WHERE THE SHELL STANDS (BACKLOG #5655 step 3),
+    # so where the directory is unknown the plain reading is still returned for it. Without this, an
+    # earlier line's subshell chdir, `(cd x && ls)`, switched the reading off and a single-quoted
     # `git -C '<p>' reset --hard` on the next line was allowed. Not where the window also names a work
     # tree or git dir, which a relative spelling would root against the unknown directory.
-    $firstC = [regex]::Match($win, (Get-GitDashCPattern))
-    $absC = $firstC.Success -and (Test-ShellLiteralPath $firstC.Groups[1].Value) -and
-        [System.IO.Path]::IsPathFullyQualified($firstC.Groups[1].Value) -and
+    $foldC = Get-WindowFoldRaw '' $win
+    $absC = $foldC -and [System.IO.Path]::IsPathFullyQualified($foldC) -and
         $win -notmatch '(?:^|\s)(?:--work-tree|--git-dir|GIT_WORK_TREE=|GIT_DIR=)'
     if ($pfx -match $chdirAt) {
         $own = Get-ChdirTargetRaw $pfx
@@ -891,6 +893,26 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
         return
     }
     [pscustomobject]@{ ScanPrefix = "$last ; $pfx"; Window = $win }
+}
+
+# THE SAME READING WITH JOINED QUOTE PIECES READ AS THE SHELL READS THEM (BACKLOG #5655 step 7), or
+# nothing where the window is unchanged. The scan keeps an empty pair joined to a word, and the `$` of a
+# POSIX `$'<word>'`, so `-C ''<p>`, `-C <p>''` and `-C $'<p>'` named nothing. Only the added readings
+# use this, so the shared scan and every reading made before are untouched, and a second reading can
+# only add a deny. A trailing pair joins on both hosts. A leading one joins under POSIX only:
+# PowerShell passes a leading `''` as an argument of its own (measured in review round 34781a2201).
+# The `$` is dropped only before a `-C`, `--work-tree=`, `--git-dir=`, GIT_WORK_TREE or GIT_DIR value,
+# POSIX only; the window cannot tell a `$'<word>'` from a variable there, so a variable's name is read
+# as a relative path too, which can only add a deny.
+function Get-JoinedReading($Reading, [string]$Conv) {
+    $w = [string]$Reading.Window
+    $w2 = $w -replace "(?<=[^\s;&|(){}<>'`"])(?:''|`"`")", ''
+    if ($Conv -eq 'posix') {
+        $w2 = $w2 -replace "(?<=\s)(?:''|`"`")(?=[^\s;&|(){}<>'`"])", ''
+        $w2 = $w2 -replace '(?<=(?:^|\s)-C\s+|--(?:work-tree|git-dir)=|GIT_(?:WORK_TREE|DIR)=)\$(?=[^\s$({''"])', ''
+    }
+    if ($w2 -ceq $w) { return }
+    [pscustomobject]@{ ScanPrefix = $Reading.ScanPrefix; Window = $w2 }
 }
 
 # The index of the LAST `git` or `git.exe` word before $At, in any case on Windows, or -1. No
@@ -1557,28 +1579,7 @@ function Remove-QuotedSpans([string]$s, [string]$Convention = 'none',
             # -c 'alias.ci=commit --no-verify'. Its value contains a space, so quoting is its only writable
             # spelling and this carve-out cannot reach it without re-admitting the prose false-deny. Pinned
             # as an ALLOW test so a later change cannot close it silently or claim it was never there.
-            # AN EMPTY PAIR JOINED TO A WORD IS NOTHING, as the shell reads it (BACKLOG #5655 step 7):
-            # `-C ''<p>` and `-C <p>''` pass `<p>`. Emitting the pair kept a quote-tainted token that
-            # named nothing. A pair standing alone is still emitted, so an empty argument stays visible.
-            $prevCh = $(if ($out.Length -gt 0) { $out[$out.Length - 1] } else { ' ' })
-            $nextCh = $(if ($i + 1 -lt $s.Length) { $s[$i + 1] } else { ' ' })
-            $wordEdge = '[\s;&|(){}<>]'
-            if ($span.Length -eq 0 -and ([string]$prevCh -notmatch $wordEdge -or [string]$nextCh -notmatch $wordEdge)) {
-                # nothing appended
-            }
-            elseif ($span.Length -gt 0 -and $span -cnotmatch '[\s''"$(){};&|`]') {
-                # POSIX `$'<word>'` IS THE WORD (BACKLOG #5655 step 7): bash's ANSI-C quoting, so
-                # `-C $'<p>'` passes `<p>`. The `$` already emitted is taken back, but only for a word with
-                # no backslash, since `$'...'` decodes backslash escapes and that text is not the word.
-                if ($quote -eq "'" -and $Convention -eq 'posix' -and $span -notmatch '\\' -and
-                    $openAt -gt 0 -and $s[$openAt - 1] -eq '$' -and $out.Length -gt 0 -and $out[$out.Length - 1] -eq '$') {
-                    $bs = 0
-                    for ($k = $openAt - 2; $k -ge 0 -and $s[$k] -eq '\'; $k--) { $bs++ }
-                    if ($bs % 2 -eq 0) {
-                        $out.Length = $out.Length - 1
-                        if ($mapOn) { $Map.RemoveAt($Map.Count - 1) }
-                    }
-                }
+            if ($span.Length -gt 0 -and $span -cnotmatch '[\s''"$(){};&|`]') {
                 if ($mapOn) { for ($k = $openAt + 1; $k -lt $i; $k++) { $Map.Add($k) } }
                 [void]$out.Append($span)
             }
@@ -4196,18 +4197,27 @@ What to do instead:
                 $lastCfg = $dis.Index + $cfgWords[$cfgWords.Count - 1].Index
                 if ($lastCfg -ne $dis.Index) { $anchors += $lastCfg }
             }
-            $pairs = [System.Collections.Generic.List[object]]::new()
+            # The owning word is floored at a true separator (review round 34781a2201): it skips a
+            # path-qualified git, so without the floor `git -C '<p>' log ; /usr/bin/git config <key>`
+            # read the earlier command's `-C`. Rule 3 floors its owning word the same way.
+            $readings = [System.Collections.Generic.List[object]]::new()
+            $seen = @{}
             foreach ($anchor in $anchors) {
                 $to = $(if ($viaConfig) { $anchor } else { $readTo })
-                foreach ($gw in @((Get-AnyGitWordBefore $seg.Scan $anchor), (Get-GitWordBefore $seg.Scan $anchor))) {
-                    if ($gw -lt 0 -and $pairs.Count -gt 0) { continue }
-                    if (-not ($pairs | Where-Object { $_.To -eq $to -and $_.Git -eq $gw })) {
-                        $pairs.Add([pscustomobject]@{ To = $to; Git = $gw })
+                $gws = @(Get-AnyGitWordBefore $seg.Scan $anchor)
+                $own = Get-GitWordBefore $seg.Scan $anchor
+                if ($own -ge 0 -and $own -ne $gws[0] -and
+                    -not (Test-TrueSeparatorIn $seg.Scan.Substring($own, $anchor - $own))) { $gws += $own }
+                foreach ($gw in $gws) {
+                    if ($seen.ContainsKey("$to/$gw")) { continue }
+                    $seen["$to/$gw"] = $true
+                    foreach ($r in @(Get-InvocationReading $seg.Scan $to -GitAt $gw -Prior $seg.Prior)) {
+                        $readings.Add($r)
+                        foreach ($j in @(Get-JoinedReading $r $seg.Conv)) { $readings.Add($j) }
                     }
                 }
             }
-            foreach ($reading in @(foreach ($pair in $pairs) {
-                        Get-InvocationReading $seg.Scan $pair.To -GitAt $pair.Git -Prior $seg.Prior })) {
+            foreach ($reading in $readings) {
                 $govCfg = Find-FirstAnsweringRoot (Get-InvocationCandidates $reading $cwdRaw `
                               -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir) $cwdRaw
                 if ($govCfg) { break }
@@ -5096,6 +5106,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
                 $ownGit = Get-GitWordBefore $seg.Scan $vIdx
                 if ($ownGit -gt $vm.Index) { $gitAts += $ownGit }
                 $readings = @(foreach ($gitAt in $gitAts) { Get-InvocationReading $seg.Scan $vIdx -GitAt $gitAt -Prior $seg.Prior })
+                $readings = @($readings) + @(foreach ($r in $readings) { Get-JoinedReading $r $seg.Conv })
                 foreach ($reading in $readings) {
                     $ownRepo = ($reading.Window -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
                     [pscustomobject]@{
