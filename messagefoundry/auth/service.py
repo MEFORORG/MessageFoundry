@@ -184,7 +184,6 @@ from messagefoundry.store.row_seal import (
     UNVERIFIABLE_SUBJECT_PREFIX,
     USER_KIND,
     AnyRowSealer,
-    RevokedRowSealError,
     RowSealError,
     RowSealKeyRetiredError,
     RowSealUnverifiableError,
@@ -5642,7 +5641,7 @@ class AuthService:
         the leg asks for (``password`` or ``factor``), and the row records ``<proof>_checked``: at
         sign-in this action always means the right password was presented, and here it may not;
         with ``at`` set to ``session`` none was presented."""
-        if await self._supersede_session(token_hash, now=time.time()) is None:
+        if await self._store.supersede_session(token_hash, now=time.time()) is None:
             return
         await self._audit_lapsed_credential(
             username, at=at, client=client, proof=proof, proof_checked=proof_checked
@@ -12969,29 +12968,11 @@ class AuthService:
                 ref,
             )
             return
-        await self._report_ended_session(ref)
-
-    async def _report_ended_session(self, ref: str) -> None:
-        """The integrity report for a session row that has been ended, named by its ``ref``."""
         await self._report_seal_failure(
             ref,
             f"a {SESSION_KIND} row failed its integrity check and was ended (session {ref})",
             {"kind": SESSION_KIND, "session": ref},
         )
-
-    async def _supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
-    ) -> SessionRecord | None:
-        """The store's ``supersede_session``, reporting a row it ended that then did not parse
-        (BACKLOG #5505). The store has committed that revoke before it raises
-        :class:`RevokedRowSealError`, which is raised on once the row is reported."""
-        try:
-            return await self._store.supersede_session(
-                token_hash, now=now, lineage_since=lineage_since
-            )
-        except RevokedRowSealError as exc:
-            await self._report_ended_session(exc.subject)
-            raise
 
     async def _report_seal_failure(self, key: str, reason: str, detail: dict[str, str]) -> None:
         """Report one authority row that failed its integrity seal (BACKLOG #2592): a WARNING, an
@@ -14137,7 +14118,7 @@ class AuthService:
         presented = hash_token(token)
         before = time.time()
         since = (before if proven_at is None else proven_at) - _LOGOUT_LINEAGE_SECONDS
-        ended = await self._supersede_session(presented, now=before, lineage_since=since)
+        ended = await self._store.supersede_session(presented, now=before, lineage_since=since)
         if ended is None:
             # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
             # ended, so the trail still records the sign-out request: within the bound when it
@@ -14412,7 +14393,7 @@ class AuthService:
         followed, the hash that was presented.
         """
         before = time.time()
-        prior = await self._supersede_session(
+        prior = await self._store.supersede_session(
             prior_hash, now=before, lineage_since=before - self.supersession_lineage_seconds
         )
         after = time.time()
@@ -14498,7 +14479,7 @@ class AuthService:
         if (
             session is None
             or session.user_id != identity.user_id
-            or await self._supersede_session(session_id, now=time.time()) is None
+            or await self._store.supersede_session(session_id, now=time.time()) is None
         ):
             # The console passes the id as plain text, so only an id-shaped one is copied into the
             # trail; anything else is recorded as malformed, never as the caller's own characters.
@@ -17813,13 +17794,7 @@ class AuthService:
         normalized = code.upper()  # recovery codes are minted uppercase
         # The hashes the account's seal covered, not a second read nobody checked (BACKLOG #2592).
         # Spending one below goes through the store's write helper, which checks the seal again.
-        try:
-            real = user.recovery_code_hashes()
-        except RowSealError:
-            # BACKLOG #5505: a cell that does not parse holds no code the caller could match. The
-            # walk below runs over the padding alone, so a wrong code reaches the second-step
-            # lockout as any other does, and the verify still never raises. The decoder logged it.
-            real = []
+        real = user.recovery_code_hashes()
         # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
         # first argon2id match, so the NUMBER of ~64 MiB verifications was a function of which code
         # was presented -- and, on the failure path, of how many codes REMAINED. Timing a single
