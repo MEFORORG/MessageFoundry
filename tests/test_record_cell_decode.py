@@ -296,7 +296,7 @@ async def _admin(store: MessageStore, user_id: str, password: str) -> None:
 async def test_a_corrupt_role_row_fails_its_account_on_a_keyless_store(tmp_path: Path) -> None:
     """Finding 1 of PR 3007: a keyless store checks no seal, so the role read itself must refuse
     the account, as the write helpers do, or it signs in without the role while every write to it
-    is refused. Sign-in refuses it and reports it, and a session issued before ends. The
+    is refused. Sign-in refuses it and reports it, and a session issued before is refused. The
     last-administrator guard already skipped it before this fix; it is checked here only to show
     the guard and sign-in now agree."""
     path = tmp_path / "keyless-roles.db"
@@ -332,6 +332,50 @@ async def test_a_corrupt_role_row_fails_its_account_on_a_keyless_store(tmp_path:
         with pytest.raises(LastAdministratorRefused):
             await service.delete_user("a-good", actor="test")
         assert await store.get_user("a-good") is not None
+    finally:
+        await store.close()
+
+
+def _revoked(path: Path, token_hash: str) -> bool:
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT revoked_at FROM sessions WHERE token_hash=?", (token_hash,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None and row[0] is not None
+
+
+@pytest.mark.parametrize("keyed", [False, True])
+async def test_an_ad_map_save_revokes_the_sessions_of_a_failing_account(
+    tmp_path: Path, keyed: bool
+) -> None:
+    """Fail closed: a session of an account whose role row does not parse is revoked by an AD map
+    save, not only refused, so a repair made outside the store cannot bring it back on the
+    pre-edit map."""
+    path = tmp_path / "ad-map.db"
+    cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
+    store = await MessageStore.open(path, cipher=cipher)
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()  # the built-in roles
+        tokens: dict[str, str] = {}
+        for user_id in ("ad-good", "ad-bad"):
+            await store.create_user(
+                user_id=user_id,
+                username=user_id,
+                auth_provider="ad",
+                password_generated=False,
+                audits=(),
+            )
+            await store.set_user_roles(user_id, [Role.VIEWER.value], audits=())
+            tokens[user_id] = await _session(store, user_id)
+        _raw(path, "UPDATE user_roles SET assigned_at=? WHERE user_id=?", ("later", "ad-bad"))
+        assert "ad-bad" in await service.sessions_ended_by_ad_map_save()
+        await service.set_ad_group_map([], actor="test")
+        assert _revoked(path, tokens["ad-good"])  # control: a passing AD account is revoked
+        assert _revoked(path, tokens["ad-bad"])
     finally:
         await store.close()
 

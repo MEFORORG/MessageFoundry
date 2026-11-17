@@ -3917,9 +3917,9 @@ class _SealCheck:
     failure was handed to :meth:`AuthService._user_seal_failed`; neither, no account, or one whose
     row was deleted, renamed, rebound or re-keyed between its reads, which is not reported. Only
     ``failed`` reads as a record that fails its seal. From :meth:`AuthService._verified` it means
-    two reads naming the same account both failed, which two honest role writes committing across
-    both reads can also produce: a false alarm that docs/SECURITY.md, *What an admin user read
-    reports*, states. :meth:`AuthService._checked_by_id` also sets it when it fails closed, and
+    the account's record failed every read the check made of it, which two honest role writes
+    committing across two reads can also produce: a false alarm that docs/SECURITY.md, *What an
+    admin user read reports*, states. :meth:`AuthService._checked_by_id` also sets it when it fails closed, and
     for a record Vault transit cannot verify, which it hands to
     :meth:`AuthService._user_seal_unverifiable` instead (ADR 0217 (a))."""
 
@@ -20692,8 +20692,8 @@ class AuthService:
         return False
 
     async def _revoke_ad_sessions(self, *, change: str, actor: str) -> int:
-        """Revoke every unrevoked session held by an enabled directory account whose record passes
-        its seal, lapsed ones included. Returns the number revoked, which is the
+        """Revoke every unrevoked session, lapsed ones included, held by an account that
+        :meth:`sessions_ended_by_ad_map_save` names. Returns the number revoked, which is the
         ``sessions_revoked`` the two map audit rows record; it counts rows, not live sessions.
 
         BACKLOG #1154 (ASVS 8.3.2). The two AD map setters below are authorization-value mutators:
@@ -20710,11 +20710,10 @@ class AuthService:
         mapping and an added one change an outcome, so the affected set is not derivable from the
         entries alone. Local accounts read neither map and are left alone.
 
-        Takes its set from :meth:`sessions_ended_by_ad_map_save`, which reads
-        :meth:`_load_users`: every enabled directory account whose record passes its seal. An
-        account that fails its seal is reported by :meth:`_verified` and left out, and so are its
-        sessions. On a keyless store there is no seal to check, but an account whose stored cells
-        do not parse still fails, and is left out (BACKLOG #5505). Each
+        Takes its set from :meth:`sessions_ended_by_ad_map_save`: every enabled directory account
+        whose record passes its seal, and every account whose record fails its integrity check,
+        which :meth:`_verified` reports. On a keyless store there is no seal, but an account whose
+        users row or role rows do not parse still fails (BACKLOG #5505). Each
         account's unrevoked rows are then revoked with the store's ``revoke_user_sessions``, so this
         needs no schema change on any backend. The count it returns includes rows already past their
         limits, which the revoke ends too. Unlike the reconciler this is NOT counted against the
@@ -20733,17 +20732,24 @@ class AuthService:
 
     async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:
         """The account ids whose sessions a save of either AD group map would end: every enabled
-        directory account.
+        directory account, and every account whose record fails its integrity check.
 
         BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
         :meth:`_revoke_ad_sessions` revokes exactly this set, so a route asking whether the save
         ends the caller's own sessions gets the answer the revoke acts on. The entries being saved
-        do not narrow it, for the reason that method's docstring gives."""
-        return frozenset(
-            user.id
-            for user in await self._load_users()
-            if user.auth_provider == AuthProvider.AD.value and not user.disabled
-        )
+        do not narrow it, for the reason that method's docstring gives.
+
+        A failing account's provider and state are unchecked, so it is included whatever they say
+        (BACKLOG #5505): its sessions are refused while it fails, and ending them means a repair
+        made outside the store cannot bring one back on the pre-edit map."""
+        ids: set[str] = set()
+        for listed in await self.list_checked_users():
+            user = listed.user
+            if user is None:
+                ids.add(listed.id)
+            elif user.auth_provider == AuthProvider.AD.value and not user.disabled:
+                ids.add(user.id)
+        return frozenset(ids)
 
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
         """Replace the AD-group → role map (C3). Revokes directory sessions so it applies at once."""
