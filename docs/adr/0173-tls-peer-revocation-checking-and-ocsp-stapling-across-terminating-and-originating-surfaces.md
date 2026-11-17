@@ -1244,17 +1244,21 @@ ruling:
 - **The ruling rests on Microsoft's driver.** The question cited Microsoft's driver documentation,
   and the test names ODBC Driver 18 only. Another driver can serve these hops, as the second
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
-- **Driver 18 was tested on one build on Windows Server 2022, and other drivers were not
-  tested.** The ruling's "then test it" half has two recorded results. The test needs a SQL
-  Server whose certificate can be revoked. A control connection to a certificate that is not
-  revoked shows that a refusal comes from the revocation. The amendment of 2026-11-11 below
-  states what the runs measured and which run is still owed.
+- **The ruling's "then test it" half has two recorded results.** The test needs a SQL Server
+  whose certificate can be revoked. A control connection to a certificate that is not revoked
+  shows that a refusal comes from the revocation. The amendment of 2026-11-11 below states what
+  the runs measured, their limits, and which run is still owed. *(Corrected 2026-11-17, vault
+  BACKLOG #3009: this bullet's heading read "Driver 18 was tested on one build on Windows Server
+  2022, and other drivers were not tested", which restated the amendment's limits.)*
   *(Until 2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still
   unmeasured.** The ruling's "then test it" half is owed. It needs a SQL Server whose certificate
   can be revoked. A control connection to a certificate that is not revoked shows that a refusal
   comes from the revocation. Until #3009 runs, nothing here says whether Driver 18 checks
   revocation.")*
-- **What a result would mean for the grade is not ruled.** If Driver 18 checks, the text can say
+- **What a result would mean for the grade: R6 does not rule it, and a delegated decision holds
+  the grade for now (the note at the end of this bullet).** *(Corrected 2026-11-17, vault BACKLOG
+  #3009: the heading read "What a result would mean for the grade is not ruled", which the note
+  below it had overtaken.)* If Driver 18 checks, the text can say
   under what conditions. If it does not, R6 does not say whether the gap stands or the owner's
   other two options come back. BACKLOG #3009's third closing step says the gap stands. That is
   the ledger row's wording, not the owner's, so it is the owner's to decide when a result exists.
@@ -1262,7 +1266,8 @@ ruling:
   amendment does not change the grade. A Manager decided under the owner's delegation of
   2026-11-11 that the five rows keep the grade R6 gives them, that R6's named gap stands as
   named, and that #2194's guard and driver-control options are not reopened now: decision
-  d20261112T022118464-c27c39, logged 2026-11-12 UTC.)*
+  d20261112T022118464-c27c39, logged at 02:21 UTC on 2026-11-12, the evening of 2026-11-11 in
+  Central time.)*
 
 *(Until 2026-10-11 this paragraph read: "**What is open on the five ODBC hops.** BACKLOG #2194 names
 three outcomes for a hop: a guard, a documented driver control, or an accepted gap. This note
@@ -1298,8 +1303,8 @@ chosen option gives for building no guard:
 **Amendment 2026-11-11 -- what the ODBC Driver 18 test measured (vault BACKLOG #3009).** This is a
 public summary of two private test records in the vault, each recording one run of the vault's
 ODBC revocation runbook that reached a result. Their contents beyond this summary are not repeated
-here. It changes no code. For the grade, see the limit *What a result would mean for the grade is
-not ruled*, under the ruling above, and its note of 2026-11-11.
+here. It changes no code. For the grade, see the limit headed *What a result would mean for the
+grade*, under the ruling above, and its note of 2026-11-11.
 
 - **Where it ran.** Two runs with results, dated 2026-10-16 and 2026-10-17 in Central time. In
   UTC, the first run's legs ran from 02:22 to 02:25 and the second's from 05:18 to 05:19, both on
@@ -1307,11 +1312,15 @@ not ruled*, under the ruling above, and its note of 2026-11-11.
   test, not on the SQL Server test box, and that the runbook puts the next run there. The second
   run's record says it ran inside a virtual machine, after a revert to checkpoint
   `post-3009-clean-2026-10-16`, a tightening of folder permissions and a new checkpoint,
-  `post-3009-acl-2026-10-17`, and does not say which machine that is. An earlier scripted run
-  stopped at Step 2, as designed, and changed nothing. Neither record says a run took place on the
-  SQL Server test box. The run there is still owed, and BACKLOG #3009's step 2 stays open for it:
+  `post-3009-acl-2026-10-17`. It writes the machine's name as a placeholder, so it cannot show
+  which machine that is. An earlier scripted run stopped at Step 2, as designed, and changed
+  nothing. So no record shows a run on the SQL Server test box. *(Corrected 2026-11-17, vault
+  BACKLOG #3009: this read "does not say which machine that is" and "Neither record says a run
+  took place on the SQL Server test box", which leaned on a name the second record had replaced
+  with a placeholder.)* The run there is still owed, and BACKLOG #3009's step 2 stays open for it:
   a Manager decided so under the owner's delegation of 2026-11-11, decision
-  d20261112T022119877-2ccc8b, logged 2026-11-12 UTC.
+  d20261112T022119877-2ccc8b, logged at 02:21 UTC on 2026-11-12, the evening of 2026-11-11 in
+  Central time.
 - **Versions.** ODBC Driver 18 for SQL Server, 64-bit: `msodbcsql18.dll` ProductVersion 18.7,
   build 1, revision 1, reporting driver version `18.07.0001`. Windows Server 2022 Datacenter,
   build 20348, update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. Both records list
