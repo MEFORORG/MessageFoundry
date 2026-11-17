@@ -86,8 +86,9 @@ async def test_the_form_sign_in_refuses_a_nul_username_before_the_service(
             )
     assert (r.status_code, r.headers["location"]) == (303, "/ui/login?e=bad")
     assert reached == []
-    [line] = [m for m in (rec.getMessage() for rec in caplog.records) if "held a NUL" in m]
-    assert "\x00" not in line
+    [record] = [rec for rec in caplog.records if "held a NUL" in rec.getMessage()]
+    # The client is the line's only argument, so no form of the name reaches the general log.
+    assert record.args == ("127.0.0.1",)
 
 
 async def test_the_combined_passkey_sign_in_refuses_a_nul_username_and_ends_its_challenge(

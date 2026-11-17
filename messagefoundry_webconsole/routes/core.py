@@ -764,17 +764,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # selector, and "ad" stays in the allow-list only so the ENGINE (_dispatch_login) is the
         # single point that refuses and audits it. Directory accounts sign in by Windows SSO or
         # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth
-        # (and the JSON /me/reauth).
-        provider_value = form.get("provider", "local")
-        if provider_value not in ("local", "ad"):
-            return RedirectResponse("/ui/login?e=bad", status_code=303)
+        # (and the JSON /me/reauth). A name holding a NUL is the exception: it is refused below,
+        # whatever the provider, before the engine sees it.
 
         def _refused() -> Response:
+            # The challenge is already popped, so every refusal also ends its handle cookie.
             refused = RedirectResponse("/ui/login?e=bad", status_code=303)
             if handle:
                 clear_passkey_sign_in_cookie(refused, request)
             return refused
 
+        provider_value = form.get("provider", "local")
+        if provider_value not in ("local", "ad"):
+            return _refused()
         username = form.get("username", "")
         if "\x00" in username:
             # The JSON route's sign-in name rule, by hand since this form is not a pydantic model

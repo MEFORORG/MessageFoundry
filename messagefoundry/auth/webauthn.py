@@ -195,8 +195,9 @@ def _invalid_response_errors() -> tuple[type[Exception], ...]:
 
     The stored key is not such a source: the library's CBOR decodes, the stored key's included, go
     through its ``parse_cbor``, which wraps every ``Exception`` as ``InvalidCBORData`` (read on
-    webauthn 3.0.1). A caller that parses the body itself is not reached by this catch: the web
-    console's two passkey JSON routes catch their own parse's ``RecursionError``."""
+    webauthn 3.0.1). A caller that parses the body itself is not reached by this catch, so it
+    must catch its own parse's ``RecursionError``, as at least the web console's passkey routes
+    do."""
     return (*_invalid_input_errors(), RecursionError)
 
 

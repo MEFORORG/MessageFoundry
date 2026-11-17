@@ -326,8 +326,9 @@ class DirectoryUserCreateRequest(RequestModel):
     """
 
     # The sign-in name rule (vault BACKLOG #5342), on the typed name, which goes only to the
-    # directory lookup. The name the store receives is the one the directory returns, and this
-    # rule does not check that one.
+    # directory lookup. Applied here because no account can hold a NUL, so a name holding one can
+    # name no directory account either; the 422 says so before a directory round trip. The name
+    # the store receives is the one the directory returns, and this rule does not check that one.
     username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
