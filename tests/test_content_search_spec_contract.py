@@ -197,3 +197,59 @@ def test_a_spec_built_outside_make_spec_refuses_a_non_int_cap(bad: Any) -> None:
             target=SearchTarget.BOTH,
             scan_limit=bad,
         )
+
+
+@pytest.mark.parametrize(
+    ("substring", "field_path", "field_value"),
+    [
+        (None, None, None),  # no needle
+        ("x", "PID-3", None),  # two needles
+        ("   ", None, None),  # a blank substring
+        ("", None, None),
+        (None, "", None),  # an empty path
+        (None, " PID-3", None),  # a padded path, which make_spec strips
+        ("x", None, "v"),  # a field_value beside a substring
+        (None, "PID-3", "  "),  # a blank field_value, which make_spec drops
+    ],
+)
+def test_a_spec_built_outside_make_spec_holds_the_needle_rules(
+    substring: str | None, field_path: str | None, field_value: str | None
+) -> None:
+    """``SearchSpec`` holds the needle rules ``make_spec`` enforces (BACKLOG #6700 item 4)."""
+    with pytest.raises(ContentSearchError, match="a spec"):
+        SearchSpec(
+            substring=substring,
+            field_path=field_path,
+            field_value=field_value,
+            target=SearchTarget.BOTH,
+            scan_limit=10,
+        )
+
+
+@pytest.mark.parametrize(
+    ("substring", "field_path", "field_value"),
+    [(" x ", None, None), (None, "PID-3", None), (None, "PID-3", " v ")],
+)
+def test_a_spec_built_outside_make_spec_admits_what_make_spec_builds(
+    substring: str | None, field_path: str | None, field_value: str | None
+) -> None:
+    """Control for the test above: each shape ``make_spec`` returns still builds directly."""
+    SearchSpec(
+        substring=substring,
+        field_path=field_path,
+        field_value=field_value,
+        target=SearchTarget.BOTH,
+        scan_limit=10,
+    )
+
+
+def test_an_out_of_range_cap_is_a_content_search_error() -> None:
+    """The range refusal is the type the routes catch for a 400, as the type refusal is (item 16)."""
+    with pytest.raises(ContentSearchError, match="scan_limit must be in"):
+        SearchSpec(
+            substring="x",
+            field_path=None,
+            field_value=None,
+            target=SearchTarget.BOTH,
+            scan_limit=MAX_SCAN_LIMIT + 1,
+        )
