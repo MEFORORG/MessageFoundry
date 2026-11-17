@@ -1865,7 +1865,7 @@ _QUERY_NOT_CREDENTIAL_TAILS = (
 )
 
 #: Names the HTTP family's no-escape credential refusals count beside the heuristic, as the whole
-#: name after :func:`_base_name`, ignoring case (``refusal=True``). ``code`` carries an Azure
+#: name after any reading :func:`_base_names` gives, ignoring case (``refusal=True``). ``code`` carries an Azure
 #: Functions function key, and an OAuth authorization code. The heuristic leaves it out, because it
 #: also names an ordinary parameter such as a status ``?code=404``, and what reads the heuristic
 #: warns and reports. A refusal of a hop that already relaxed verification, or that crosses plain
@@ -1899,8 +1899,35 @@ def _base_name(name: str) -> str:
     return base.rstrip("0123456789") or base
 
 
+def _base_names(name: str) -> tuple[str, ...]:
+    """Every reading of ``name`` the detector judges: :func:`_base_name`'s, and for a bracket-keyed
+    name two more (BACKLOG #5379). Trailing index groups (``[]``, ``[0]``) are dropped
+    first, all of them, so ``token[0][0]`` is judged as ``token``. Then the name before the first
+    ``[`` is one reading, and the name with each ``[`` read as ``.`` is another, so
+    ``user[password]`` is judged as ``user.password`` and ends in the credential word, and
+    ``sort[key]`` as ``sort.key``, which the non-secret list still reads as a sort key. A name
+    matches when any reading does, so this only widens what :func:`_base_name` alone matched."""
+    readings = [_base_name(name)]
+    cleaned = name.replace("\t", "").replace("\r", "").replace("\n", "").strip()
+    if "[" in cleaned or "]" in cleaned:
+        while cleaned.endswith("]") and "[" in cleaned:
+            cut = cleaned.rfind("[")
+            index = cleaned[cut + 1 : -1].strip()
+            if index and not index.isdigit():
+                break
+            cleaned = cleaned[:cut]
+        for reading in (cleaned.split("[", 1)[0], cleaned.replace("[", ".").replace("]", "")):
+            if reading:
+                readings.append(reading.rstrip("0123456789") or reading)
+    return tuple(dict.fromkeys(readings))
+
+
 def _is_credential_param(name: str) -> bool:
-    base = _base_name(name)
+    return any(_is_credential_base(base) for base in _base_names(name))
+
+
+def _is_credential_base(base: str) -> bool:
+    """:func:`_is_credential_param` over one reading from :func:`_base_names`."""
     folded = base.casefold()
     if folded in _QUERY_KEY_MATERIAL or folded in _QUERY_CREDENTIAL_TAILS:
         return True
@@ -1938,7 +1965,8 @@ def credential_query_params(url: str, *, refusal: bool = False) -> list[str]:
     raising, because a parser error would quote the URL.
 
     A heuristic over names, from this module's own vocabulary plus :data:`_QUERY_CREDENTIAL_WORDS`.
-    A name is judged after dropping a trailing index (``[0]``) and trailing digits. It matches as a
+    A name is judged after dropping trailing indexes (``[0]``) and trailing digits, with a bracket
+    key read as a segment (``user[password]``), by :func:`_base_names`. It matches as a
     whole word, as its last segment after ``.``, ``_``, ``-`` or a space (a decoded ``+``), as a
     one-word compound (:data:`_QUERY_CREDENTIAL_COMPOUNDS`), or as a camelCase tail
     (``accessToken``), unless it is a known non-secret (:data:`_QUERY_NOT_CREDENTIAL_TAILS`). It
@@ -1966,7 +1994,10 @@ def credential_query_params(url: str, *, refusal: bool = False) -> list[str]:
             _display_name(name)
             for name, _ in pairs
             if _is_credential_param(name)
-            or (refusal and _base_name(name).casefold() in _QUERY_REFUSAL_NAMES)
+            or (
+                refusal
+                and any(base.casefold() in _QUERY_REFUSAL_NAMES for base in _base_names(name))
+            )
         }
     )
 

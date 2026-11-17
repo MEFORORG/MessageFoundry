@@ -131,6 +131,42 @@ def test_detector_reads_camel_case_tails(url: str, expected: list[str]) -> None:
     assert credential_query_params(url) == expected
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # BACKLOG #5379: a bracket key is read as a segment, and every trailing index is dropped.
+        (
+            "https://p.example.invalid/x?user[password]=a&token[0][0]=b&auth[apiKey]=c"
+            "&creds[client_secret][1]=d&[token]=e&key[]=f",
+            [
+                "'[token]'",
+                "'auth[apiKey]'",
+                "'creds[client_secret][1]'",
+                "'key[]'",
+                "'token[0][0]'",
+                "'user[password]'",
+            ],
+        ),
+        # The old reading still holds: a credential word before a non-index bracket key.
+        ("https://p.example.invalid/x?token[value]=a", ["'token[value]'"]),
+        # Control: a bracket key whose dotted reading is a known non-secret, or no credential word.
+        (
+            "https://p.example.invalid/x?sort[key]=a&filter[name]=b&page[token][0]=c",
+            [],
+        ),
+    ],
+)
+def test_detector_reads_bracket_keyed_names(url: str, expected: list[str]) -> None:
+    assert credential_query_params(url) == expected
+
+
+def test_the_refusal_names_drop_every_trailing_index() -> None:
+    # BACKLOG #5379: ``code`` is a refusal-only name, judged whole, so every index is dropped first.
+    url = "https://p.example.invalid/x?code[0][0]=b"
+    assert credential_query_params(url) == []
+    assert credential_query_params(url, refusal=True) == ["'code[0][0]'"]
+
+
 def test_detector_escapes_a_control_character_in_a_decoded_name() -> None:
     """``parse_qsl`` decodes ``%0A``; the name reaches a log line, so it must not carry a raw newline."""
     [name] = credential_query_params("https://p.example.invalid/x?x%0Afake_token=1")
