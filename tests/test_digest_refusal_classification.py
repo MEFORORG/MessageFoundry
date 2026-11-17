@@ -111,6 +111,9 @@ def _build(
     oauth2_token_url: str | None = None,
     **over: object,
 ) -> Any:
+    if ctype is ConnectorType.DICOMWEB:
+        # A DICOMweb base url refuses a query (vault BACKLOG #5358), so there is none to redact.
+        url = url.split("?", 1)[0]
     spec = _FACTORY[ctype](url=url, **over)
     if digest:
         spec = with_http_digest(spec, user="u", password="p")

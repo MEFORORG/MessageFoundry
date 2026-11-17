@@ -191,6 +191,49 @@ def _reject_url_control_chars(value: str, field: str) -> None:
         raise ValueError(f"DICOMweb {field} contains an illegal control character")
 
 
+def _refuse_base_url_query_or_fragment(url: str) -> None:
+    """Refuse a base ``url`` that carries a query or a fragment (vault BACKLOG #5358).
+
+    The STOW-RS target is DERIVED by appending ``/studies`` to the base, so a ``?`` would put the
+    appended path inside the query and a ``#`` would make it a fragment the client never sends: the
+    POST would go to an endpoint the operator did not name. Any ``?`` or ``#`` counts, an empty
+    query or fragment included, because the appended path lands after it either way. Names the
+    setting, never the value."""
+    if "?" in url or "#" in url:
+        raise ValueError(
+            "DICOMweb destination 'url' must be the service base URL with no query string or "
+            "fragment ('?' or '#'); the STOW-RS path is appended to it"
+        )
+
+
+def _refuse_ambiguous_credentials(token: object, user: object, password: object) -> None:
+    """Refuse a credential set the header builder could not send as written (vault BACKLOG #5359).
+
+    ``basic_user`` without ``basic_password``, or the reverse, would send no credential at all; a
+    ``bearer_token`` beside a Basic pair would have one silently replace the other. A Basic user-id
+    may not hold a colon (RFC 7617 section 2: the first colon ends it, so the server would split the
+    pair somewhere else), and neither half may hold a control character, which would reach the
+    request as a malformed credential. A colon in the password is legal and admitted. Raised at
+    construction, where the operator sees it. Names the settings, never a value."""
+    if bool(user) != bool(password):
+        raise ValueError(
+            "DICOMweb destination basic_user and basic_password must be set together; one without "
+            "the other would send no HTTP Basic credential"
+        )
+    if token and user:
+        raise ValueError(
+            "DICOMweb destination sets both bearer_token and basic_user/basic_password; set one "
+            "credential, since only one Authorization header can be sent"
+        )
+    if user:
+        _reject_url_control_chars(str(user), "basic_user")
+        _reject_url_control_chars(str(password), "basic_password")
+        if ":" in str(user):
+            raise ValueError(
+                "DICOMweb destination basic_user may not contain a colon (RFC 7617 section 2)"
+            )
+
+
 def _reply_is_empty(body: str) -> bool:
     """True for a reply with nothing in it: empty, or only JSON whitespace once a leading BOM is
     dropped. send() and :func:`_stowrs_refusal` both read emptiness through this one test."""
@@ -320,6 +363,7 @@ class DicomWebDestination(DestinationConnector):
                 f"DICOMweb destination 'url' must be http or https, got scheme {scheme!r}"
             )
         refuse_url_credentials(url, "DICOMweb destination 'url'")
+        _refuse_base_url_query_or_fragment(url)
         self.base_url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("DICOMweb", config.name)
@@ -458,12 +502,13 @@ class DicomWebDestination(DestinationConnector):
                 _reject_url_control_chars(str(v), f"header {str(k)!r} value")
             headers.update({str(k): str(v) for k, v in extra.items()})
         token = s.get("bearer_token")
+        user, password = s.get("basic_user"), s.get("basic_password")
+        _refuse_ambiguous_credentials(token, user, password)
         if token:
             # PHI/secret-safe: the helper names the field, never the value.
             _reject_url_control_chars(str(token), "bearer_token")
             headers["Authorization"] = f"Bearer {token}"
-        user, password = s.get("basic_user"), s.get("basic_password")
-        if user and password:
+        elif user and password:
             raw = f"{user}:{password}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
         return headers

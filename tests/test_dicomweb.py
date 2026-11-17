@@ -9,6 +9,7 @@ The opener is faked so nothing hits the network — and because the destination 
 
 from __future__ import annotations
 
+import base64
 import email.message
 import http.client
 import io
@@ -949,3 +950,74 @@ async def test_a_dicomweb_reply_refusal_that_is_also_an_httpexception_passes_thr
     with pytest.raises(DeliveryError) as ei:
         await _call_dicomweb(dest, call)
     assert ei.value is refusal
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"basic_user": "svc"},  # a user with no password would send no credential
+        {"basic_password": "pw"},  # and the reverse
+    ],
+)
+def test_dicomweb_half_basic_pair_refused(over: dict[str, str]) -> None:  # vault BACKLOG #5359
+    with pytest.raises(ValueError, match="must be set together"):
+        _dest(**over)
+
+
+def test_dicomweb_bearer_beside_basic_refused() -> None:  # vault BACKLOG #5359
+    """Basic used to overwrite the bearer silently; now the operator has to pick one."""
+    with pytest.raises(ValueError, match="both bearer_token and basic_user"):
+        _dest(bearer_token="t", basic_user="svc", basic_password="pw")
+
+
+@pytest.mark.parametrize(
+    ("over", "match"),
+    [
+        ({"basic_user": "svc:x", "basic_password": "pw"}, "may not contain a colon"),
+        ({"basic_user": "svc\r\nX-Evil: 1", "basic_password": "pw"}, "illegal control character"),
+        ({"basic_user": "svc", "basic_password": "p\x00w"}, "illegal control character"),
+    ],
+)
+def test_dicomweb_malformed_basic_credential_refused(
+    over: dict[str, str], match: str
+) -> None:  # vault BACKLOG #5359
+    with pytest.raises(ValueError, match=match) as exc:
+        _dest(**over)
+    assert "svc" not in str(exc.value) and "pw" not in str(exc.value)  # names, never values
+
+
+def test_dicomweb_single_credentials_still_construct() -> None:  # vault BACKLOG #5359
+    """Positive controls: each credential alone, and a colon in the password (RFC 7617 allows it)."""
+    assert _dest(bearer_token="t")._headers["Authorization"] == "Bearer t"
+    basic = _dest(basic_user="svc", basic_password="p:w")._headers["Authorization"]
+    assert basic == "Basic " + base64.b64encode(b"svc:p:w").decode("ascii")
+    assert "Authorization" not in _dest()._headers
+
+
+def _dest_at(url: str) -> DicomWebDestination:
+    d = build_destination(
+        Destination(name="OB", type=ConnectorType.DICOMWEB, settings=DICOMweb(url=url).settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert isinstance(d, DicomWebDestination)
+    return d
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"{BASE}?qq7=a",  # /studies would land inside the query
+        f"{BASE}?",  # an empty query still swallows the appended path
+        f"{BASE}#zz9",  # /studies would become a fragment the client never sends
+        f"{BASE}#",
+    ],
+)
+def test_dicomweb_base_url_query_or_fragment_refused(url: str) -> None:  # vault BACKLOG #5358
+    with pytest.raises(ValueError, match="no query string or fragment") as exc:
+        _dest_at(url)
+    assert "qq7" not in str(exc.value) and "zz9" not in str(exc.value)
+
+
+def test_dicomweb_plain_base_url_still_derives_studies() -> None:  # vault BACKLOG #5358
+    assert _dest_at(BASE)._target_url == f"{BASE}/studies"
+    assert _dest_at(f"{BASE}/")._target_url == f"{BASE}/studies"

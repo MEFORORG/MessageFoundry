@@ -412,7 +412,12 @@ def _dest(ctype: ConnectorType, url: str, over: dict[str, Any]) -> Any:
 
     ``_build`` hands the factory's settings straight to the connector. ``reingress_to`` forces
     ``capture_response`` on in ``build_outbound_connection``, a step ``_build`` skips, so the
-    re-ingress row takes its capture setting from that step."""
+    re-ingress row takes its capture setting from that step.
+
+    A DICOMweb base url refuses a query (vault BACKLOG #5358), so its marker query is dropped: the
+    url cannot carry one to a record."""
+    if ctype is ConnectorType.DICOMWEB:
+        url = url.split("?", 1)[0]
     if "reingress_to" not in over:
         return _build(ctype, url, **over)
     wired = build_outbound_connection(
