@@ -36,20 +36,14 @@ hook command. Under a PowerShell outer shell, `pwsh -Command` reports the
 launcher's exit 2 as a non-blocking 1, so no exit 2 blocks under it. With `pwsh`
 missing, the line exits 1 under a PowerShell outer shell.
 
-The bridge differs from Claude Code in at least four ways. It runs an event's
+The bridge differs from Claude Code in at least three ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops
-the remaining hooks, and the bridge exits 10 on every event, which `invoke.ps1`
-turns into 2, including events where Claude Code only shows the hook's stderr.
+the remaining hooks.
 On Windows, a command-only hook with no `shell` runs under pwsh,
 where Claude Code runs it under Git Bash when Git Bash is installed.
 
-Command-only hooks use the shell they name. With none, they use pwsh on Windows
-and bash elsewhere.
 Structured `command` and `args` avoid shell parsing. The bridge runs a
-command-only PowerShell hook under `pwsh -Command`. A guard
-that such a hook runs and that exits 2 is a non-blocking exit 1 there, unless the
-hook itself runs `exit 2` or `exit $LASTEXITCODE`. An `args` hook
-that runs the guard keeps its exit 2.
+command-only PowerShell hook under `pwsh -Command`.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

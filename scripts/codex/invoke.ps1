@@ -15,7 +15,7 @@ function Resolve-BridgePython {
     $python
 }
 
-# The subcommand is the first argument that is not an option, as bridge.py's argparse reads it, so
+# The subcommand is the first argument that is not an option, so
 # `--session-id S hook` is hook mode too and never returns the bridge's raw block code.
 $mode = $null
 for ($i = 0; $i -lt $args.Count; $i++) {
