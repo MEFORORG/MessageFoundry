@@ -1963,32 +1963,27 @@ class RegistryRunner:
         # construction (a /config/reload does NOT re-read it — restart to change, like claim_mode).
         self._sandbox_policy = sandbox_policy
         self._sandbox_config_source = sandbox_config_source
-        if (
-            sandbox_policy is not None
-            and sandbox_policy.mode is SandboxMode.ISOLATED
-            and registry.source_dir is None
-            and (sandbox_config_source is None or sandbox_config_source[0] is None)
-        ):
-            # Refused here, before a listener ACKs anything, rather than once per message by
-            # _sandbox_for, whose refusal stays as the backstop for a reload (vault BACKLOG #3131).
-            raise ValueError(
-                "[sandbox].mode=isolated needs a config directory for its workers to load, and "
-                "this graph has none: it never runs a Router or Handler in the engine process"
+        if sandbox_policy is not None and sandbox_policy.mode is not SandboxMode.OFF:
+            # The same "is a config dir known" test _sandbox_for makes when it picks cfg_dir.
+            has_config_dir = registry.source_dir is not None or (
+                sandbox_config_source is not None and sandbox_config_source[0] is not None
             )
-        if (
-            sandbox_policy is not None
-            and sandbox_policy.mode is not SandboxMode.OFF
-            and registry.code_digest is None
-            and (
-                registry.source_dir is not None
-                or (sandbox_config_source is not None and sandbox_config_source[0] is not None)
-            )
-        ):
-            # A worker would refuse this graph once per message, after the listener had ACKed it,
-            # so every message would be accepted and then errored (BACKLOG #5334). Refused here,
-            # before a listener binds or a worker spawns; graph_differences stays the backstop for
-            # a graph swapped in later. With no config dir no worker starts: _sandbox_for says why.
-            raise ValueError(undigested_graph_refusal(sandbox_policy.mode))
+            if sandbox_policy.mode is SandboxMode.ISOLATED and not has_config_dir:
+                # Refused here, before a listener ACKs anything, rather than once per message by
+                # _sandbox_for, whose refusal stays as the backstop for a reload (vault BACKLOG
+                # #3131).
+                raise ValueError(
+                    "[sandbox].mode=isolated needs a config directory for its workers to load, "
+                    "and this graph has none: it never runs a Router or Handler in the engine "
+                    "process"
+                )
+            if has_config_dir and registry.code_digest is None:
+                # A worker would refuse this graph once per message, after the listener had ACKed
+                # it, so every message would be accepted and then errored (BACKLOG #5334). Refused
+                # here, before a listener binds or a worker spawns; graph_differences stays the
+                # backstop for a graph swapped in later. With no config dir no worker starts:
+                # _sandbox_for says why.
+                raise ValueError(undigested_graph_refusal(sandbox_policy.mode))
         self._sandbox_sessions: dict[str, SandboxSession] = {}
         self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # Sessions read that cache from their worker threads. Two building it at once would each
