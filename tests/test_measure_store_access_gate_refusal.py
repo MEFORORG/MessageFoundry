@@ -11,9 +11,9 @@ engine that served. Now a line must also carry the refusal's own words, through
 NOTHING HERE RUNS THE SCRIPT: it installs a service and must run elevated, which only the hosted
 windows-service-smoke leg does. The tests lift the phrase assignments and functions they need out
 of the script's AST: they call ``Test-GateRefusalLine`` on lines worded as the engine words them,
-and run ``Wait-ForGateRefusal`` against a stand-in log reader. They pin that ``app.py`` still holds
-each line's prefix and the clause text after it, as literals; they do not render the lines from
-``app.py``. They need ``pwsh`` or ``powershell`` and skip where it is missing.
+and run ``Wait-ForGateRefusal`` against a stand-in log reader. They pin, as literals, that ``app.py``
+still holds each line's prefix and the clause texts the script matches on; they do not render the
+lines from ``app.py``. They need ``pwsh`` or ``powershell`` and skip where it is missing.
 """
 
 from __future__ import annotations

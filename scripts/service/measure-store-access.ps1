@@ -679,8 +679,8 @@ function Wait-ForGateRefusal([string]$Phase) {
 function Add-FirstStartFailure {
     <#
       The failure for a first start on a fresh store that Wait-ForGateRefusal did not see refused.
-      As in the control and restart branches: a gate that let the start go on rules out a lockout,
-      so only a start it did not reach gets the store-access attribution.
+      As in the control and restart branches, it gives the store-access attribution unless the wait
+      saw one of the gate's let-start lines ($GateLetStart).
     #>
     $what = if ($script:GateLetStartSeen) { "created $DbPath and reached the ADR 0167 gate, which let the start go on (the READING line quotes it) rather than refusing it," }
             elseif (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
