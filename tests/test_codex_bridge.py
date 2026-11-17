@@ -475,10 +475,10 @@ def _direct(root, *args, payload=_PAYLOAD, **extra):
     return _launch([sys.executable, str(bridge_py), *args], root, payload, _env(**extra))
 
 
-def _invoke_file(root, *args, payload=_PAYLOAD):
+def _invoke_file(root, *args, payload=_PAYLOAD, **extra):
     invoke = root / "scripts/codex/invoke.ps1"
     argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(invoke), *args]
-    return _launch(argv, root, payload, _env())
+    return _launch(argv, root, payload, _env(**extra))
 
 
 @_needs_pwsh
@@ -507,12 +507,18 @@ def test_a_run_child_exiting_10_is_not_remapped(tmp_path):
     root = _make_repo(tmp_path, _hooks())
     (root / "scripts/exit10.py").write_text("import sys\nsys.exit(10)\n", encoding="utf-8")
     assert _invoke_file(root, "--session-id", "x", "run", "scripts/exit10.py").returncode == 10
+    run_first = _invoke_file(root, "run", "scripts/exit10.py", CODEX_THREAD_ID="x")
+    assert run_first.returncode == 10, run_first.stderr
     direct = _direct(root, "--session-id", "x", "run", "scripts/exit10.py", **{_SENTINEL: "1"})
     assert direct.returncode == 10, direct.stderr
 
 
 @_needs_pwsh
 def test_no_hook_child_inherits_the_sentinel(tmp_path):
+    # Positive control: the probe hook does block where the sentinel is in its environment.
+    probe = json.loads(_SEES_SENTINEL)["hooks"]["PreToolUse"][0]["hooks"][0]
+    seen = subprocess.run([probe["command"], *probe["args"]], env=_env(**{_SENTINEL: "1"}))
+    assert seen.returncode == 2
     registered = _run_registered(tmp_path / "registered", "none", _SEES_SENTINEL)
     assert registered.returncode == 0, registered.stderr
     root = _make_repo(tmp_path / "direct", _SEES_SENTINEL, venv=False)
@@ -526,11 +532,12 @@ def test_no_hook_child_inherits_the_sentinel(tmp_path):
 _MAIN_FAULT_EXIT = {"registered": 1, "direct": 2, "invoke": 2}
 
 
-@_needs_pwsh
 @pytest.mark.parametrize("path", list(_MAIN_FAULT_EXIT))
 @pytest.mark.parametrize("fault", list(_FAULTS))
 def test_every_fault_path_exits_as_on_main(tmp_path, path, fault):
     settings_text, payload, venv = _FAULTS[fault]
+    if path != "direct" and shutil.which("pwsh") is None:
+        pytest.skip("requires PowerShell")
     if path == "registered":
         completed = _run_registered(tmp_path, "none", settings_text, payload, venv)
     elif not venv and path == "direct":

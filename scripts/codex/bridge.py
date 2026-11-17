@@ -18,9 +18,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-# Hook mode's exit code for a hook's deliberate exit 2, used only where invoke.ps1 set
-# BLOCK_SENTINEL. invoke.ps1 ends its process with 2 for it, since pwsh -Command reports a script's
-# exit 2 as 1. Without the sentinel a hook's exit 2 exits 2, and every other outcome exits as before.
+# Hook mode's exit code for a hook's deliberate exit 2, used only where BLOCK_SENTINEL is "1".
+# invoke.ps1 sets it in hook mode and ends its process with 2 for this code, since pwsh -Command
+# reports a script's exit 2 as 1. Without the sentinel a hook's exit 2 exits 2, and every other
+# outcome exits as before.
 BLOCK_EXIT = 10
 BLOCK_SENTINEL = "MEFOR_CODEX_BLOCK_SENTINEL"
 EVENTS = (
