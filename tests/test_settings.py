@@ -789,18 +789,28 @@ def test_security_notifications_required_default(tmp_path: Path) -> None:
 def test_auth_password_min_length_may_not_exceed_the_password_bound() -> None:
     """RED when: a password_min_length above the sign-in requests' password bound loads, so the
     engine mints a temporary password at least that long that no sign-in surface accepts (BACKLOG
-    #5397), or the bound the settings check is not the one the requests apply."""
+    #5397), the bound forgets the class suffix a temporary password may carry, or the bound the
+    settings check is not the one the requests apply."""
     from messagefoundry.api.auth_models import LoginRequest, ReauthRequest
-    from messagefoundry.auth.service import _temporary_password_chars
-    from messagefoundry.config.settings import PASSWORD_MAX
+    from messagefoundry.auth.policy import PasswordPolicy
+    from messagefoundry.auth.service import generate_policy_password
+    from messagefoundry.password_bounds import PASSWORD_MAX, PASSWORD_MIN_LENGTH_MAX
 
-    with pytest.raises(ValidationError, match="password_min_length must be at most 1024"):
-        AuthSettings(password_min_length=PASSWORD_MAX + 1)
-    # At the bound it loads, and the longest temporary password it mints still fits the requests.
-    floor = AuthSettings(password_min_length=PASSWORD_MAX).password_min_length
-    minted = "a" * _temporary_password_chars(floor)
-    LoginRequest(username="op", password=minted)
-    ReauthRequest(password=minted)
+    assert PASSWORD_MIN_LENGTH_MAX == 1020
+    with pytest.raises(ValidationError, match="password_min_length must be at most 1020"):
+        AuthSettings(password_min_length=PASSWORD_MIN_LENGTH_MAX + 1)
+    # At the bound it loads, and the longest temporary password it can mint, the suffixed form a
+    # class rule produces, still fits the requests.
+    settings = AuthSettings(
+        password_min_length=PASSWORD_MIN_LENGTH_MAX,
+        password_require_symbol=True,
+        password_check_breached=False,
+    )
+    minted = generate_policy_password(PasswordPolicy.from_settings(settings))
+    longest = "a" * PASSWORD_MAX
+    assert len(minted) <= PASSWORD_MAX
+    LoginRequest(username="op", password=longest)
+    ReauthRequest(password=longest)
 
 
 def test_auth_password_policy_defaults_are_asvs_aligned() -> None:

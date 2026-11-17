@@ -109,6 +109,11 @@ from messagefoundry.domainshape import (
     upn_suffix_key,
 )
 from messagefoundry.logging_setup import LOG_LEVELS
+from messagefoundry.password_bounds import (
+    PASSWORD_MAX,
+    PASSWORD_MIN_LENGTH_MAX,
+    TEMPORARY_PASSWORD_CLASS_SUFFIX,
+)
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import (
     REMOTE_DEBUG_ACCEPTANCE_LOOSENING,
@@ -3365,12 +3370,6 @@ def _normalise_claim_value_list(v: object) -> object:
     return v
 
 
-#: The longest password, in characters, any sign-in, step-up or password-change request accepts
-#: (``messagefoundry.api.auth_models``); it also bounds argon2 work. ``password_min_length`` may not
-#: exceed it (BACKLOG #5397).
-PASSWORD_MAX = 1024
-
-
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file.
 
@@ -4032,13 +4031,15 @@ class AuthSettings(_Section):
     @classmethod
     def _check_password_min_length(cls, value: int) -> int:
         # BACKLOG #5397: every sign-in, step-up and password-change surface refuses a password
-        # longer than PASSWORD_MAX, and a temporary password is minted at least this long, so a
-        # floor above the bound would mint a credential no surface accepts and leave no password
-        # the policy and the forms both pass. Refused at load rather than lowered.
-        if value > PASSWORD_MAX:
+        # longer than PASSWORD_MAX, and a temporary password is minted at least this long, plus a
+        # class suffix, so a higher floor would mint a credential no surface accepts and leave no
+        # password the policy and the forms both pass. Refused at load rather than lowered.
+        if value > PASSWORD_MIN_LENGTH_MAX:
             raise ValueError(
-                f"password_min_length must be at most {PASSWORD_MAX}, the longest password the "
-                "sign-in and password-change requests accept"
+                f"password_min_length must be at most {PASSWORD_MIN_LENGTH_MAX}: an engine-issued "
+                "temporary password is at least that long plus a "
+                f"{len(TEMPORARY_PASSWORD_CLASS_SUFFIX)}-character suffix, and the sign-in and "
+                f"password-change requests accept no password over {PASSWORD_MAX} characters"
             )
         return value
 

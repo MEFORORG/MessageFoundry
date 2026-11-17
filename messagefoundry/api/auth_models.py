@@ -25,7 +25,7 @@ from messagefoundry.api.validation import (
 from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
 from messagefoundry.auth.usernames import username_refusal
-from messagefoundry.config.settings import PASSWORD_MAX as _PASSWORD_MAX
+from messagefoundry.password_bounds import PASSWORD_MAX as _PASSWORD_MAX
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.

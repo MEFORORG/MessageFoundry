@@ -169,6 +169,7 @@ from messagefoundry.credential import constant_time_equal
 from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.logging_setup import redacted_log_field
+from messagefoundry.password_bounds import TEMPORARY_PASSWORD_CLASS_SUFFIX
 from messagefoundry.store.base import (
     AdminStore,
     audit_write_errors,
@@ -1751,7 +1752,7 @@ def generate_policy_password(
         token = secrets.token_urlsafe(length)[:chars]
         # The bare token first. The suffixed form is screened like the token: a site term can sit
         # inside it too.
-        candidates = (token, token + "aA1!") if class_rules else (token,)
+        candidates = (token, token + TEMPORARY_PASSWORD_CLASS_SUFFIX) if class_rules else (token,)
         # THE ONE PLACE THIS REASONING IS WRITTEN OUT (BACKLOG #1447). The candidate is a 192-bit
         # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
         # contain it -- the breach clause is inert on this input by construction. Honouring
