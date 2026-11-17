@@ -17,10 +17,12 @@ The scanner lives under scripts/ (not an installed package), so it is loaded by 
 from __future__ import annotations
 
 import bisect
+import codecs
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import random
 import re
 import subprocess
@@ -2067,13 +2069,70 @@ def test_a_tracked_or_staged_file_under_a_build_directory_is_scanned(
     assert sf_main.main([str(leak)]) == 1
 
 
+def _git_tree(root: Path, tracked: dict[str, str], untracked: dict[str, str]) -> Path:
+    """A git work tree at ``root`` with ``tracked`` files added to the index and ``untracked`` beside."""
+    root.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True, timeout=60)
+    for rel, text in {**tracked, **untracked}.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text, encoding="utf-8")
+    if tracked:
+        subprocess.run(["git", "-C", str(root), "add", "--", *tracked], check=True, timeout=60)
+    return root
+
+
 def test_the_path_walk_still_skips_an_untracked_environment(sf_main, tmp_path: Path) -> None:
-    """The --path walk meets untracked environments and build output, so it keeps its skip."""
-    root = tmp_path / "tree"
+    """The --path walk meets untracked environments and build output, so it keeps its skip there."""
+    root = _git_tree(
+        tmp_path / "tree", {"ok.md": "fine\n"}, {"node_modules/leak.md": "contact ACME\n"}
+    )
+    assert sf_main.main(["--path", str(root)]) == 0
+
+
+@pytest.mark.parametrize("segment", ["build", "dist", "venv", "node_modules", ".venv"])
+def test_the_path_walk_scans_a_tracked_file_under_a_build_directory(
+    sf_main, tmp_path: Path, segment: str
+) -> None:
+    """BACKLOG #5585 step 1. CI scans its checkout with ``--path .``, and the walk skipped every file
+    under these directories, tracked or not, so committed content there was never read."""
+    root = _git_tree(tmp_path / "tree", {f"pkg/{segment}/leak.md": "contact ACME\n"}, {})
+    assert sf_main.main(["--path", str(root)]) == 1
+
+
+def test_the_path_walk_outside_a_work_tree_skips_no_build_directory(
+    sf_main, tmp_path: Path
+) -> None:
+    """BACKLOG #5585 step 1 and #5595. The branch leak scan writes each pushed commit's files to a
+    directory outside any work tree; every file there is committed content, wherever it sits."""
+    root = tmp_path / "snapshot"
     (root / "node_modules").mkdir(parents=True)
     (root / "node_modules" / "leak.md").write_text("contact ACME\n", encoding="utf-8")
     (root / "ok.md").write_text("fine\n", encoding="utf-8")
-    assert sf_main.main(["--path", str(root)]) == 0
+    assert sf_main.main(["--path", str(root)]) == 1
+
+
+def test_an_unlistable_directory_fails_the_walk_as_an_instrument(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#8244 item 17, which holds part of #5583. ``rglob`` dropped a directory it could not list
+    without a word, so its files went unscanned and the run passed."""
+    root = tmp_path / "tree"
+    (root / "locked").mkdir(parents=True)
+    (root / "locked" / "leak.md").write_text("contact ACME\n", encoding="utf-8")
+    (root / "ok.md").write_text("fine\n", encoding="utf-8")
+    locked = root / "locked"
+    real = os.scandir
+
+    def refuse(path=".", *args, **kwargs):
+        if Path(os.fsdecode(path)) == locked:
+            raise PermissionError(13, "denied", os.fsdecode(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", refuse)
+    assert sf_main.main(["--path", str(root)]) == 2
+    err = capsys.readouterr().err
+    assert "locked/:0: unreadable directory (EACCES)" in err, err
+    assert str(tmp_path) not in err.split("UNREADABLE", 1)[-1], "the hit must not echo the root"
 
 
 def test_only_a_vendored_action_bundle_keeps_the_dist_skip(
@@ -2713,3 +2772,89 @@ def test_the_union_is_deduplicated_and_sorted_by_line_then_kind(sf) -> None:
     order = list(sf.PR_BODY_REASONS.values())
     keys = [(int(h.split(":")[1]), order.index(h.split(": ", 1)[1])) for h in hits]
     assert keys == sorted(keys) and len(keys) == 6, hits
+
+
+@pytest.mark.parametrize("name", ["--path", "--require-tokens", "--show-context", "--"])
+def test_a_staged_file_after_the_separator_is_scanned_whatever_its_name(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """BACKLOG #5585 step 2. pre-commit passes its args and then the staged names, so a staged file
+    named like a flag was read as that flag: ``--require-tokens`` was consumed unscanned, and ``--path``
+    switched the run into a walk that judged the files after it by their bare names."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / name).write_text("contact ACME about this\n", encoding="utf-8")
+    (tmp_path / "ok.md").write_text("fine\n", encoding="utf-8")
+    assert sf_main.main(["--", name, "ok.md"]) == 1
+    assert sf_main.main(["--", "ok.md"]) == 0
+
+
+def test_a_staged_path_named_like_the_path_flag_keeps_the_location_rule(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5585 step 2. Read as the flag, ``--path`` made a staged file under docs/security/ a bare
+    name, which the location rule does not match."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "--path").write_text("fine\n", encoding="utf-8")
+    (tmp_path / "docs" / "security").mkdir(parents=True)
+    (tmp_path / "docs" / "security" / "note.md").write_text("fine\n", encoding="utf-8")
+    assert sf_main.main(["--", "--path", "docs/security/note.md"]) == 1
+
+
+def test_the_path_flag_before_the_separator_still_walks(sf_main, tmp_path: Path) -> None:
+    """The control: ``--path`` ahead of ``--`` is still the walk, and the operands are its roots."""
+    clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main(["--path", "--", str(clean), str(dirty)]) == 1
+    assert sf_main.main(["--path", "--", str(clean)]) == 0
+
+
+def _forbidden_content_hook() -> dict:
+    import yaml
+
+    config = yaml.safe_load((_REPO_ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+    hooks = [h for repo in config["repos"] for h in repo["hooks"] if h["id"] == "forbidden-content"]
+    assert len(hooks) == 1, hooks
+    return hooks[0]
+
+
+def test_the_commit_hook_ends_its_options_before_the_staged_names() -> None:
+    """BACKLOG #5585 step 2. pre-commit appends the staged names after ``args``."""
+    args = [str(a) for a in _forbidden_content_hook().get("args") or []]
+    assert args and args[-1] == "--", args
+
+
+def test_the_commit_hook_passes_wide_text_and_binary_files() -> None:
+    """BACKLOG #5585 step 3. pre-commit's text test reads a NUL as binary, so ``types: [text]`` never
+    passed a UTF-16 file to the scanner, which decodes it, and never passed a binary file, which the
+    scanner still judges by its name and path."""
+    hook = _forbidden_content_hook()
+    assert "text" not in (hook.get("types") or []), hook
+    assert "binary" not in (hook.get("exclude_types") or []), hook
+
+
+def test_utf16_text_whose_first_character_is_nul_is_scanned(sf, tmp_path: Path) -> None:
+    """#8244 item 12, which holds part of #5583. A UTF-16-LE mark followed by U+0000 is the UTF-32-LE
+    mark, and the UTF-32 and UTF-8 readings of the rest found no token."""
+    p = tmp_path / "wide.txt"
+    p.write_bytes(
+        codecs.BOM_UTF16_LE
+        + ("\x00first line\nThis note mentions ACME here.\n").encode("utf-16-le")
+    )
+    assert any("customer name (ACME)" in h for h in sf.scan_file(p)), sf.scan_file(p)
+
+
+#: #5582 item 2: an HTML tag before a verdict, gap or map. Each fires; the control below keeps a leading
+#: quote marker stripped.
+@pytest.mark.parametrize(
+    ("line", "kind"),
+    [
+        (f"<p>ASVS {_REQ} stays {_PARTIAL}.</p>", "verdict"),
+        (f"Line one<br>ASVS {_REQ} stays {_PARTIAL}.<br>", "verdict"),
+        (f"<li>ASVS {_REQ} is held at {_PARTIAL}.</li>", "verdict"),
+        (f"Intro<br>ASVS {_REQ} is a gap.<br>", "gap"),
+        (f"Intro<br>ASVS {_REQ} is enforced in scripts/x.py.<br>", "map"),
+        (f"> ASVS {_REQ} stays {_PARTIAL}.", "verdict"),
+        (f">> ASVS {_REQ} stays {_PARTIAL}.", "verdict"),
+    ],
+)
+def test_a_tag_closing_before_a_record_does_not_hide_it(sf, line: str, kind: str) -> None:
+    assert kind in _pr_kinds(sf, line), line

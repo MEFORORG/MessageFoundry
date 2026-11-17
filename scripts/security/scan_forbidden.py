@@ -51,7 +51,8 @@ Token-file format (sectioned; ``#`` comments and blank lines ignored):
   [site_prefix]  one numeric prefix per line; the detector matches PREFIX + four digits.
 
 Usage:
-  scan_forbidden.py [FILE ...]      # scan the given files (how pre-commit invokes it)
+  scan_forbidden.py [FILE ...]      # scan the given files; after a ``--`` every argument is a file,
+                                    #   never an option (how pre-commit invokes it)
   scan_forbidden.py --path DIR      # scan every text file under DIR
   scan_forbidden.py --show-context ...  # FIRST argument only; also print the matched line/value (NEVER used in CI -- a hit
                                     #   means the content already sits in a tracked file, so echoing
@@ -1486,8 +1487,9 @@ _SITE_SKIP_NAMES = {
 
 #: Directories a ``--path`` WALK skips: tool caches, virtual environments and build output that sit
 #: untracked in a working tree, where a whole-tree scan would otherwise read third-party code. Applied
-#: in ``--path`` mode only. A tracked or staged file is content git already holds, whatever directory it
-#: sits in, so the tracked and staged scans read it (BACKLOG #5585).
+#: in ``--path`` mode only, and there only to files git does not track; outside a git work tree only
+#: ``.git`` is skipped. A tracked or staged file is content git already holds, whatever directory it
+#: sits in, so every mode reads it (BACKLOG #5585).
 SKIP_DIRS = {
     ".git",
     ".venv",
@@ -2111,12 +2113,65 @@ def _git_tracked() -> list[str]:
     ).stdout.splitlines()
 
 
-def _candidate_files(argv: list[str]) -> list[tuple[Path, str]]:
-    # Returns (openable path, scan-root-RELATIVE posix). The relative posix is what all skip decisions
-    # and hit reports key on, so the logic is identical whether we scan tracked files (already
-    # repo-relative) or a --path snapshot in an arbitrary directory.
-    if argv and argv[0] == "--path":
-        if len(argv) < 2:
+def _tracked_under(root: Path) -> set[str] | None:
+    """The files git tracks under ``root``, relative to it, or ``None`` when git cannot say (no work
+    tree there, no git, a refused repository). Fixed argv, no shell; ``root`` is a separate argument."""
+    try:
+        out = subprocess.run(  # nosec B603 B607
+            ["git", "-C", str(root), "ls-files", "-z"], capture_output=True, check=True
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return {p for p in out.decode("utf-8", errors="surrogateescape").split("\0") if p}
+
+
+def _walk(root: Path, out: list[tuple[Path, str]], errors: list[str]) -> None:
+    """Every file under ``root``, keyed by its root-relative posix path, with SKIP_DIRS pruned only where
+    git says the files are untracked (BACKLOG #5585). Outside a work tree nothing tells tracked from
+    untracked, so nothing but ``.git`` is pruned: a pushed commit's snapshot is committed content
+    wherever it sits. A directory the walk cannot list is reported in ``errors``, where ``rglob`` used to
+    drop it without a word."""
+    tracked = _tracked_under(root)
+    tracked_dirs = {
+        "/".join(p.split("/")[:i]) for p in tracked or () for i in range(1, p.count("/") + 1)
+    }
+
+    def refused(exc: OSError) -> None:
+        # Root-relative, as every hit is: the absolute form can carry a user-home path.
+        try:
+            name = Path(os.fsdecode(exc.filename)).relative_to(root).as_posix()
+        except (TypeError, ValueError):
+            name = "."
+        why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
+        errors.append(
+            f"{name}/:0: unreadable directory ({why}), so its files were not scanned (fail closed)"
+        )
+
+    for top, dirs, files in os.walk(root, onerror=refused):
+        rel_top = Path(top).relative_to(root).as_posix()
+        prefix = "" if rel_top == "." else rel_top + "/"
+        dirs[:] = [
+            d
+            for d in dirs
+            if d != ".git" and (d not in SKIP_DIRS or tracked is None or prefix + d in tracked_dirs)
+        ]
+        in_skip_dir = bool(set(Path(prefix).parts) & SKIP_DIRS)
+        for name in files:
+            rel = prefix + name
+            if name == ".git" or (in_skip_dir and tracked is not None and rel not in tracked):
+                continue
+            out.append((Path(top) / name, rel))
+
+
+def _candidate_files(
+    paths: list[str], *, path_mode: bool
+) -> tuple[list[tuple[Path, str]], list[str]]:
+    # Returns (openable path, scan-root-RELATIVE posix) pairs, and an unreadable-directory hit for each
+    # directory a --path walk could not list. The relative posix is what all skip decisions and hit
+    # reports key on, so the logic is identical whether we scan tracked files (already repo-relative) or
+    # a --path snapshot in an arbitrary directory.
+    if path_mode:
+        if not paths:
             print("scan_forbidden: --path requires at least one file or directory", file=sys.stderr)
             sys.exit(2)
         # EVERY path after --path is scanned, and a FILE is scanned as itself. Both used to be silent
@@ -2126,18 +2181,20 @@ def _candidate_files(argv: list[str]) -> list[tuple[Path, str]]:
         # paths exited 0 and read as "all of these are clean". Measured 2026-08-04: a four-path audit
         # reported clean having examined one of the four.
         out: list[tuple[Path, str]] = []
-        for raw in argv[1:]:
+        errors: list[str] = []
+        for raw in paths:
             root = Path(raw)
             if root.is_file():
                 # rel is the bare name, matching the directory case's intent: components of the path the
                 # caller NAMED must not themselves trigger a SKIP_DIRS short-circuit.
-                out.append((root, root.name))
+                if root.name != ".git":
+                    out.append((root, root.name))
                 continue
-            out.extend((p, p.relative_to(root).as_posix()) for p in root.rglob("*") if p.is_file())
-        return out
-    if argv:
-        return [(Path(a), Path(a).as_posix()) for a in argv]
-    return [(Path(p), Path(p).as_posix()) for p in _git_tracked()]
+            _walk(root, out, errors)
+        return out, errors
+    if paths:
+        return [(Path(a), Path(a).as_posix()) for a in paths], []
+    return [(Path(p), Path(p).as_posix()) for p in _git_tracked()], []
 
 
 #: Byte-order marks, longest first: a UTF-32-LE mark begins with the UTF-16-LE one. The wide entries of
@@ -2194,8 +2251,13 @@ def _read_text(path: Path) -> str | None:
             return wide_text
         # The bytes disagree with the mark: a UTF-8 body behind a stray mark, or wide text mostly above
         # U+00FF (box drawing, CJK). Neither reading can be ruled out, so both are scanned: picking one
-        # hid every token of the other (fail closed).
-        return wide_text + "\n" + data.decode("utf-8", errors="replace")
+        # hid every token of the other (fail closed). A UTF-32 mark is also UTF-16 text whose first
+        # character is U+0000 (FF FE 00 00 in little-endian), so that reading is scanned too.
+        readings = [wide_text, data.decode("utf-8", errors="replace")]
+        if codec == "utf-32":
+            utf16 = "utf-16-le" if bom == codecs.BOM_UTF32_LE else "utf-16-be"
+            readings.append(data.decode(utf16, errors="replace"))
+        return "\n".join(readings)
     if b"\x00" not in head:
         return data.decode("utf-8", errors="replace")
     wide = _bomless_utf16(head)
@@ -2846,15 +2908,23 @@ def main(argv: list[str]) -> int:
 
     # First only, for the reason the terminal modes above are whole-line only: taken from anywhere, a
     # staged file named ``--show-context`` was dropped unscanned and switched on value echoing.
-    # Anywhere else ``_parse_require_flag`` refuses it. A staged file named ``--path`` still switches
-    # the run to path mode; that needs a ``--`` separator from pre-commit (BACKLOG #5585, remainder).
+    # Anywhere else ``_parse_require_flag`` refuses it.
     show_context = bool(argv) and argv[0] == "--show-context"
     rest = argv[1:] if show_context else list(argv)
+    # Everything after the first ``--`` is a file or directory to scan, never an option, so a staged
+    # file named ``--path`` or ``--require-tokens`` is scanned rather than read as the flag. pre-commit
+    # passes ``--`` ahead of the staged names for that reason (BACKLOG #5585).
+    operands: list[str] = []
+    if "--" in rest:
+        cut = rest.index("--")
+        rest, operands = rest[:cut], rest[cut + 1 :]
     try:
         flag_require, minimum, rest = _parse_require_flag(rest)
     except ValueError as exc:
         print(f"scan_forbidden: {exc}", file=sys.stderr)
         return 2
+    path_mode = bool(rest) and rest[0] == "--path"
+    paths = (rest[1:] if path_mode else rest) + operands
 
     # Announce what loaded BEFORE any refusal, so a failure shows the counts that CAUSED it. Exit 0
     # alone cannot distinguish "scanned with the real tables and found nothing" from "loaded nothing
@@ -2901,25 +2971,18 @@ def main(argv: list[str]) -> int:
             print(f"scan_forbidden: {why} (fail closed).", file=sys.stderr)
             return 2
 
-    path_mode = bool(rest) and rest[0] == "--path"
-    hits: list[str] = []
     # Only a file whose content was read as text counts as scanned. A binary file is judged by its name
     # and location only, and an unreadable one fails the run with exit 2; counting either as scanned let
-    # a run whose files were all unread report coverage it did not have (BACKLOG #5583).
+    # a run whose files were all unread report coverage it did not have (BACKLOG #5583). A directory the
+    # --path walk could not list is unreadable in the same way.
+    candidates, hits = _candidate_files(paths, path_mode=path_mode)
     scanned = 0
     unread = 0
-    unreadable = 0
-    for abs_path, rel in _candidate_files(rest):
-        # SKIP_DIRS is evaluated on the RELATIVE parts, so a scan-root path component that happens to be
-        # named build/venv/dist/… can no longer short-circuit the scan of every file. It applies to the
-        # --path walk only, so the tracked and staged scans read such a file; the CI --path scans still
-        # skip it, because the walk cannot tell tracked from untracked (BACKLOG #5585, remainder). Only
-        # the DIRECTORY parts count: a file named ``build`` is not a build directory. A ``.git`` FILE is
-        # a worktree's pointer to its git directory, and is skipped as that directory is.
+    unreadable = len(hits)
+    for abs_path, rel in candidates:
+        # SKIP_DIRS is applied by the --path walk alone, and only to files git does not track there
+        # (_walk); the tracked and staged scans read every file they name.
         if not abs_path.is_file() or _is_skipped(rel):
-            continue
-        posix_rel = Path(rel)
-        if path_mode and (set(posix_rel.parent.parts) & SKIP_DIRS or posix_rel.name == ".git"):
             continue
         file_hits, state = _scan_file(abs_path, rel, show_context=show_context)
         hits.extend(file_hits)
@@ -2935,7 +2998,7 @@ def main(argv: list[str]) -> int:
     # having to suspect it.
     if path_mode:
         print(
-            f"scan_forbidden: examined {scanned} file(s) across {len(rest) - 1} named path(s); "
+            f"scan_forbidden: examined {scanned} file(s) across {len(paths)} named path(s); "
             f"{unread} more were binary, unreadable or under a forbidden path, so their content "
             "was not scanned.",
             file=sys.stderr,
