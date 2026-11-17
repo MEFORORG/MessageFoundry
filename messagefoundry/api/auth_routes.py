@@ -407,8 +407,8 @@ async def _prove_group_save(request: Request, identity: Identity, ended: frozens
     MFA-pending one never (owner ruling 2026-10-10, #1149 Reading B). Any other save keeps the
     session window it always took, checked here because ``proof_in_route`` drops it from the gate.
 
-    ``ended`` comes from the service's own enumeration of the stored accounts, the one its revoke
-    runs, never from the identity. Not a refusal: an Administrator whose only account is a directory
+    ``ended`` comes from the service's own enumeration of the stored accounts, never from the
+    identity, and the route hands it to the save, whose revoke ends it (BACKLOG #5505). Not a refusal: an Administrator whose only account is a directory
     one would then be locked out of the maps. Not a revoke that spares the caller: the edit must
     still apply to the caller's session at once (BACKLOG #1154, ASVS 8.3.2)."""
     if identity.user_id in ended:
@@ -643,10 +643,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     app.add_exception_handler(RepeatedCredentialError, _repeated_credential)
 
     async def _row_seal_refused(request: Request, exc: Exception) -> Response:
-        # BACKLOG #2592: the store refused a row that fails its integrity check, and wrote nothing.
-        # A write helper meets it when the row's seal does not verify, and since BACKLOG #5505 a
-        # raw read meets it when the row's cells do not parse, so the texts name neither a write
-        # nor a change. A 409 with a fixed text, never the row and never a 500. Logged with the
+        # BACKLOG #2592: the store refused a row that fails its integrity check. A write helper
+        # meets it when the row's seal does not verify, and wrote nothing. Since BACKLOG #5505 a
+        # raw read meets it when the row's cells do not parse, and a session supersession meets it
+        # reading back a row whose revoke has committed (RevokedRowSealError). So the texts name
+        # neither a write nor a change. A 409 with a fixed text, never the row and never a 500. Logged with the
         # row's kind, since this path does not pass the service loader that audits and alerts.
         assert isinstance(exc, RowSealError)
         _log.warning(
@@ -1332,14 +1333,20 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ended = await service.sessions_ended_by_custom_role_save(role_id)
         await _prove_group_save(request, identity, ended)
         return await _update_custom_role_core(
-            role_id, body=body, service=service, identity=identity
+            role_id, body=body, service=service, identity=identity, ended=ended
         )
 
     async def _update_custom_role_core(
-        role_id: str, *, body: CustomRoleRequest, service: AuthService, identity: Identity
+        role_id: str,
+        *,
+        body: CustomRoleRequest,
+        service: AuthService,
+        identity: Identity,
+        ended: frozenset[str] | None = None,
     ) -> CustomRoleInfo:
         """The edit past :func:`update_custom_role`'s step-up. The console's route takes the same
-        proof in its own gate, so the seam hands it this."""
+        proof in its own gate, so the seam hands it this. ``ended`` is the set the gate read, which
+        the revoke ends (BACKLOG #5505)."""
         try:
             role = await service.update_custom_role(
                 role_id,
@@ -1347,6 +1354,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 description=body.description,
                 permissions=body.permissions,
                 actor=identity.username,
+                ended=ended,
             )
         except CustomRoleError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -1374,14 +1382,21 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         the bound proof (BACKLOG #3401, :func:`_prove_group_save`)."""
         ended = await service.sessions_ended_by_custom_role_save(role_id)
         await _prove_group_save(request, identity, ended)
-        return await _delete_custom_role_core(role_id, service=service, identity=identity)
+        return await _delete_custom_role_core(
+            role_id, service=service, identity=identity, ended=ended
+        )
 
     async def _delete_custom_role_core(
-        role_id: str, *, service: AuthService, identity: Identity
+        role_id: str,
+        *,
+        service: AuthService,
+        identity: Identity,
+        ended: frozenset[str] | None = None,
     ) -> SimpleMessage:
-        """The delete past :func:`delete_custom_role`'s step-up, for the seam."""
+        """The delete past :func:`delete_custom_role`'s step-up, for the seam. ``ended`` is as
+        :func:`_update_custom_role_core` takes it."""
         try:
-            await service.delete_custom_role(role_id, actor=identity.username)
+            await service.delete_custom_role(role_id, actor=identity.username, ended=ended)
         except ValueError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
         return SimpleMessage(detail="custom role deleted")
@@ -2166,13 +2181,19 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Replace the AD-group to role map. Ends the sessions of the accounts
         ``sessions_ended_by_ad_map_save`` names, so a caller among them takes the bound proof
         (BACKLOG #3401, :func:`_prove_group_save`)."""
-        await _prove_group_save(request, identity, await service.sessions_ended_by_ad_map_save())
-        return await _set_ad_group_map_core(body, service=service, identity=identity)
+        ended = await service.sessions_ended_by_ad_map_save()
+        await _prove_group_save(request, identity, ended)
+        return await _set_ad_group_map_core(body, service=service, identity=identity, ended=ended)
 
     async def _set_ad_group_map_core(
-        body: AdGroupMap, *, service: AuthService, identity: Identity
+        body: AdGroupMap,
+        *,
+        service: AuthService,
+        identity: Identity,
+        ended: frozenset[str] | None = None,
     ) -> SimpleMessage:
-        """The save past :func:`set_ad_group_map`'s step-up, for the seam."""
+        """The save past :func:`set_ad_group_map`'s step-up, for the seam. ``ended`` is the set the
+        gate read, which the revoke ends (BACKLOG #5505)."""
         groups = _canonical_group_dns([e.ad_group for e in body.entries])
         await _validate_roles(service, [e.role for e in body.entries])
 
@@ -2191,6 +2212,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         await service.set_ad_group_map(
             [(g, e.role) for g, e in zip(groups, body.entries, strict=True)],
             actor=identity.username,
+            ended=ended,
         )
         for group in sorted((await admin_groups() - before) if grants else set()):
             _alert_administrator_granted(
@@ -2220,17 +2242,26 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> SimpleMessage:
         """Replace the AD-group to channel-scope map. Ends the same accounts'
         sessions as the role map does, and takes the same step-up (BACKLOG #3401)."""
-        await _prove_group_save(request, identity, await service.sessions_ended_by_ad_map_save())
-        return await _set_ad_group_scope_map_core(body, service=service, identity=identity)
+        ended = await service.sessions_ended_by_ad_map_save()
+        await _prove_group_save(request, identity, ended)
+        return await _set_ad_group_scope_map_core(
+            body, service=service, identity=identity, ended=ended
+        )
 
     async def _set_ad_group_scope_map_core(
-        body: AdGroupScopeMap, *, service: AuthService, identity: Identity
+        body: AdGroupScopeMap,
+        *,
+        service: AuthService,
+        identity: Identity,
+        ended: frozenset[str] | None = None,
     ) -> SimpleMessage:
-        """The save past :func:`set_ad_group_scope_map`'s step-up, for the seam."""
+        """The save past :func:`set_ad_group_scope_map`'s step-up, for the seam. ``ended`` is as
+        :func:`_set_ad_group_map_core` takes it."""
         groups = _canonical_group_dns([e.ad_group for e in body.entries])
         await service.set_ad_group_scope_map(
             [(g, e.channel) for g, e in zip(groups, body.entries, strict=True)],
             actor=identity.username,
+            ended=ended,
         )
         return SimpleMessage(detail="ad-group scope map updated")
 

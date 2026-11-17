@@ -362,14 +362,15 @@ def _revoked(path: Path, token_hash: str) -> bool:
 
 @pytest.mark.parametrize("save", ["role", "scope"])
 @pytest.mark.parametrize("keyed", [False, True])
-async def test_an_ad_map_save_revokes_every_enabled_directory_account_whatever_its_check_says(
+async def test_an_ad_map_save_revokes_every_directory_account_and_every_failing_one(
     tmp_path: Path, keyed: bool, save: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Either AD map save revokes the sessions of each enabled directory account, whether its
-    record passes, its role row does not parse, or, on a keyed store, its seal is forged or Vault
-    transit cannot verify it, and of each account whose users row does not parse (BACKLOG #5505).
-    A local account whose row parses, failing or not, and a disabled directory account keep theirs.
-    """
+    """Either AD map save revokes the sessions of each account whose stored row reads as an
+    enabled directory account, whatever its check says, of each whose users row does not parse,
+    and of each whose integrity check fails whatever its row says (BACKLOG #5505). So on a keyed
+    store a directory row tampered to read as local or disabled is ended too. A keyless store
+    checks no seal, so there such a row reads as what it says. A local account that passes and a
+    disabled directory account keep their sessions."""
     path = tmp_path / "ad-map.db"
     cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
     store = await MessageStore.open(path, cipher=cipher)
@@ -381,14 +382,16 @@ async def test_an_ad_map_save_revokes_every_enabled_directory_account_whatever_i
             "ad-bad-role": "ad",
             "ad-bad-row": "ad",
             "ad-disabled": "ad",
+            "ad-made-local": "ad",
+            "ad-made-disabled": "ad",
             "local-good": "local",
             "local-bad-role": "local",
             "local-bad-row": "local",
         }
-        ended = {"ad-good", "ad-bad-role", "ad-bad-row", "local-bad-row"}
+        ended = {"ad-good", "ad-bad-role", "ad-bad-row", "local-bad-role", "local-bad-row"}
         if keyed:
             accounts |= {"ad-forged": "ad", "ad-unverifiable": "ad"}
-            ended |= {"ad-forged", "ad-unverifiable"}
+            ended |= {"ad-forged", "ad-unverifiable", "ad-made-local", "ad-made-disabled"}
         tokens: dict[str, str] = {}
         for user_id, provider in accounts.items():
             await store.create_user(
@@ -405,6 +408,9 @@ async def test_an_ad_map_save_revokes_every_enabled_directory_account_whatever_i
             _raw(path, "UPDATE user_roles SET assigned_at=? WHERE user_id=?", ("later", bad))
         for bad in ("ad-bad-row", "local-bad-row"):
             _raw(path, "UPDATE users SET created_at=? WHERE id=?", ("later", bad))
+        # Edited outside the store, so the seal (where there is one) no longer matches.
+        _raw(path, "UPDATE users SET auth_provider=? WHERE id=?", ("local", "ad-made-local"))
+        _raw(path, "UPDATE users SET disabled=? WHERE id=?", (1, "ad-made-disabled"))
         if keyed:
             _raw(path, "UPDATE users SET display_name=? WHERE id=?", ("forged", "ad-forged"))
 
@@ -414,11 +420,74 @@ async def test_an_ad_map_save_revokes_every_enabled_directory_account_whatever_i
                 return await user_seal_ok_async(sealer, record)
 
             monkeypatch.setattr(service_module, "user_seal_ok_async", unverifiable)
-        assert await service.sessions_ended_by_ad_map_save() == ended
+        gate = await service.sessions_ended_by_ad_map_save()
+        assert gate == ended
         if save == "role":
-            await service.set_ad_group_map([], actor="test")
+            await service.set_ad_group_map([], actor="test", ended=gate)
         else:
-            await service.set_ad_group_scope_map([], actor="test")
+            await service.set_ad_group_scope_map([], actor="test", ended=gate)
+        for user_id, token_hash in tokens.items():
+            assert _revoked(path, token_hash) is (user_id in ended), user_id
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("save", ["update", "delete"])
+@pytest.mark.parametrize("keyed", [False, True])
+async def test_a_custom_role_save_revokes_every_holder_and_every_failing_account(
+    tmp_path: Path, keyed: bool, save: str
+) -> None:
+    """Finding 4 of round 8b6500f2 on PR 3007: a custom-role edit or delete revokes the sessions of
+    each account whose stored role rows hold the role, whatever its check says, of each whose rows
+    do not parse, and of each whose integrity check fails whatever its rows say. On a keyed store
+    a holder whose role row was deleted outside the store is ended too; a keyless store checks no
+    seal, so there it reads as no holder."""
+    path = tmp_path / "custom-role.db"
+    cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
+    store = await MessageStore.open(path, cipher=cipher)
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()  # the built-in roles
+        role = await service.create_custom_role(
+            display_name="Lab readers", description=None, permissions=["messages:read"], actor="t"
+        )
+        holders = ("h-good", "h-forged", "h-bad-row", "h-bad-role", "h-dropped")
+        others = ("o-good", "o-forged")
+        tokens: dict[str, str] = {}
+        for user_id in holders + others:
+            await _user(store, user_id)
+            roles = [Role.VIEWER.value] + ([role.id] if user_id in holders else [])
+            await store.set_user_roles(user_id, roles, audits=())
+            tokens[user_id] = await _session(store, user_id)
+        for forged in ("h-forged", "o-forged"):
+            _raw(path, "UPDATE users SET display_name=? WHERE id=?", ("forged", forged))
+        _raw(path, "UPDATE users SET created_at=? WHERE id=?", ("later", "h-bad-row"))
+        _raw(
+            path,
+            "UPDATE user_roles SET assigned_at=? WHERE user_id=? AND role_id=?",
+            ("later", "h-bad-role", role.id),
+        )
+        _raw(
+            path,
+            "DELETE FROM user_roles WHERE user_id=? AND role_id=?",
+            ("h-dropped", role.id),
+        )
+        ended = {"h-good", "h-forged", "h-bad-row", "h-bad-role"}
+        if keyed:
+            ended |= {"h-dropped", "o-forged"}
+        gate = await service.sessions_ended_by_custom_role_save(role.id)
+        assert gate == ended
+        if save == "update":
+            await service.update_custom_role(
+                role.id,
+                display_name="Lab readers 2",
+                description=None,
+                permissions=["messages:read"],
+                actor="test",
+                ended=gate,
+            )
+        else:
+            await service.delete_custom_role(role.id, actor="test", ended=gate)
         for user_id, token_hash in tokens.items():
             assert _revoked(path, token_hash) is (user_id in ended), user_id
     finally:

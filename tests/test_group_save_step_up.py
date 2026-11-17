@@ -342,6 +342,49 @@ async def test_a_directory_caller_whose_check_fails_only_at_the_gate_read_is_nam
         assert (await c.get("/auth/me", headers=_auth(tok))).status_code == 200
 
 
+@pytest.mark.parametrize("case", CASES[2:], ids=IDS[2:])
+async def test_a_role_holder_whose_check_fails_only_at_the_gate_read_is_named(
+    engine: Engine, case: _Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the gate's read of a custom role's holders leaves out a holder whose integrity
+    check fails at that read only. The caller would then save on the window alone, and the revoke
+    would end the caller's own sessions with no bound proof (finding 4 of round 8b6500f2 on PR
+    3007, BACKLOG #3401, #5505)."""
+    service = await _service(engine)
+    role_id = await case.setup(service)
+    method, path, body = case.request(role_id)
+    async with _client(engine, service) as c:
+        tok, password = await _affected(c, case, service, role_id, monkeypatch)
+        tok = await _reauth(c, tok, password)  # the window is live; no bound grant
+        real_set = service.sessions_ended_by_custom_role_save
+        real_check = service._checked_by_id
+        reads = 0
+        racing = False
+
+        async def check(user_id: str, listed: Any = None) -> _SealCheck:
+            if racing:
+                return _SealCheck(failed=True)
+            return await real_check(user_id, listed)
+
+        async def ended(role: str) -> frozenset[str]:
+            nonlocal reads, racing
+            reads += 1
+            racing = reads == 1  # the gate's read only
+            try:
+                return await real_set(role)
+            finally:
+                racing = False
+
+        monkeypatch.setattr(service, "_checked_by_id", check)
+        monkeypatch.setattr(service, "sessions_ended_by_custom_role_save", ended)
+        r = await c.request(method, path, json=body, headers=_auth(tok))
+        assert reads == 1, "the gate did not read the set"
+        assert r.status_code == 403, r.text
+        assert r.headers.get("X-Step-Up-Action") == ACTION
+        assert not await case.saved(engine, service, role_id)
+        assert (await c.get("/auth/me", headers=_auth(tok))).status_code == 200
+
+
 async def test_a_pending_sessions_password_re_proof_mints_no_grant(engine: Engine) -> None:
     """The owner's #1149 Reading B: an MFA-pending password re-proof does not count as
     authenticating again. A password holder on a pending session of an enrolled holder of the role
