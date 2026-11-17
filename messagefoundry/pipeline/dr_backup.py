@@ -6282,8 +6282,11 @@ def _extract_config_members(
     bound (the uncompressed-pinned ``"r:"`` reader, the declared size rejected before streaming, the
     streamed bytes counted). Member names are gated by the shared ASVS 5.3.2 check
     (:func:`~messagefoundry.parsing.sniff.archive_member_name_reason`) rather than a second private one,
-    so a traversal, a backslash separator, a drive-relative prefix or a control character is refused
-    here exactly as it is on the inbound-archive path.
+    so at least a traversal, a backslash separator, a drive-relative prefix or a control character is
+    refused here exactly as it is on the inbound-archive path. The check's Windows-name arms (BACKLOG
+    #5369) are passed off here: their static list refuses names, such as ``aux.py``, that a POSIX
+    host writes as ordinary files and that not every Windows build rewrites (see
+    :func:`_win_opens_another`), so a config dir the backup bundled could fail to restore. The resolved-path containment test below stays the backstop.
 
     The per-member cap is not enough on its own here — N members each just under it would still fill the
     disk — so the bundle also carries an AGGREGATE byte ceiling and a member-count ceiling.
@@ -6325,7 +6328,7 @@ def _extract_config_members(
                     f"config bundle exceeds the restore member-count cap ({_MAX_CONFIG_MEMBERS})",
                 )
             rel = member.name[len(_CONFIG_PREFIX) :]
-            reason = archive_member_name_reason(rel)
+            reason = archive_member_name_reason(rel, windows_names=False)
             if reason is not None:
                 raise BackupError(
                     "restore", f"archive carries an unsafe config member name ({reason})"
