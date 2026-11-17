@@ -889,18 +889,23 @@ def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
     return current
 
 
-# Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is dropped while its
-# session is live only by the age prune below, since dropping it would hand that session a fresh
-# budget. One account may hold at most _REPROOF_SESSION_PER_USER entries, so a single account cannot
-# fill the map, and the map at most _REPROOF_SESSION_MAX. A count leaves the map in at least these
-# ways (BACKLOG #5336). The service drops it when it ends the session itself: a sign-out, a revoke,
-# the budget revoke, the idle or expiry revoke a request meets. At the account's cap, a re-proof
-# first drops the counts of the account's sessions the store no longer lists. When a new session's
-# first failure finds the account at its cap or the map full, entries older than the absolute
-# session lifetime, timed from their first failure, go next. If there is still no room, that session
-# is revoked on that failure (fail closed), and its entry is held at the cap, past both bounds,
-# until the revoke commits. Before BACKLOG #5336 the per-account cap dropped the account's own
-# oldest LIVE count, so round-robin guesses over more sessions than the cap each got a fresh budget.
+# Bounds on the per-session re-proof failure counts (BACKLOG #1138). A live session's count is
+# dropped on purpose only by a successful re-proof on the step-up re-auth route, which resets its
+# budget; dropping it any other way would hand that session a fresh budget. The age prune below
+# reaches an entry only once it is older than the absolute session lifetime, timed from its first
+# failure, so it reaches a live session's count only after a wall-clock step. One account may hold
+# _REPROOF_SESSION_PER_USER entries and the map _REPROOF_SESSION_MAX, except an entry held at the
+# cap, which goes past both. A count leaves the map in at least these ways (BACKLOG #5336). The
+# service drops it when it ends the session itself: a sign-out, a revoke, the budget revoke, the
+# idle or expiry revoke a request meets. At the account's cap, a re-proof first drops the counts of
+# the account's sessions the store no longer lists. When a new session's first failure finds the
+# account at its cap or the map full, the age prune runs. If there is still no room, that session
+# is revoked on that failure (fail closed), and its entry is held at the cap. It leaves when the
+# budget revoke commits, when a later re-proof finds the session gone, or by the age prune; a
+# budget revoke that fails, or never runs because an earlier write raised, leaves it in place, and
+# the session's next re-proof is then revoked unverified. Before BACKLOG #5336 the per-account cap
+# dropped the account's own oldest LIVE count, so round-robin guesses over more sessions than the
+# cap each got a fresh budget.
 _REPROOF_SESSION_MAX = 4096
 _REPROOF_SESSION_PER_USER = 64
 
@@ -12227,11 +12232,6 @@ class AuthService:
             idle_seconds=self.session_idle_seconds,
             split_mfa_pending=split,
         )
-        if revoked > 0 and self._reproof_counts_of(user_id):
-            # The store names no hash it revoked, so the account's sessions are read again, under
-            # the re-proof lock every rotation holds (BACKLOG #5336).
-            async with self._account_reproof_lock(user_id):
-                await self._drop_unlisted_reproof_counts(user_id)
         if revoked > 0:
             await self._audit(
                 "auth.session_revoked",
@@ -12239,6 +12239,21 @@ class AuthService:
                 detail=_json({"scope": "cap", "count": revoked, "cap": cap}),
                 client=client,
             )
+            # The store names no hash it revoked, so the account's sessions are read again, under
+            # the re-proof lock every rotation holds (BACKLOG #5336). After the row, and a refused
+            # read is logged, never raised: the revoke and its row have committed, and a raise
+            # here would lose the token the sign-in minted. The counts it leaves stay until a later
+            # drop, at the latest the age prune.
+            try:
+                async with self._account_reproof_lock(user_id):
+                    await self._drop_unlisted_reproof_counts(user_id)
+            except _session_write_errors() as exc:
+                _log.warning(
+                    "the session cap ended sessions of account id %r, but reading its sessions "
+                    "to drop their re-proof counts was refused (%s); the counts stay for now",
+                    user_id,
+                    type(exc).__name__,
+                )
 
     @property
     def session_idle_seconds(self) -> float:
@@ -14950,7 +14965,9 @@ class AuthService:
         return [
             h
             for h, (_, _, uid) in self._reproof_session_failures.items()
-            if (user_id is None or uid == user_id) and h != keep
+            if (user_id is None or uid == user_id)
+            # Constant time, as _rekey_token_state compares token hashes (ASVS 11.2.4).
+            and (keep is None or not constant_time_equal(h, keep))
         ]
 
     def _forget_reproof_counts(self, token_hashes: Iterable[str]) -> None:

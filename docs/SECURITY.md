@@ -6903,13 +6903,18 @@ leaves the map in at least these ways (BACKLOG #5336):
   password-change route keeps the count);
 - a restart, which forgets every count.
 
-A rotation moves the count to the session's new key. Each account holds at most 64 counts, and the
-map at most 4096. When a re-proof starts with its account at 64 counts, the counts of that account's
-sessions the store no longer lists, revoked or past their absolute expiry, are dropped first. A
-session the store still lists, idle or not, keeps its count. When a new session's first failure
-finds its account at 64 counts or the map full, counts older than the absolute session lifetime,
-timed from their first failure, go next. If there is still no room, that session is revoked on that
-first failure. Its count is then held at the cap, past both bounds, until the revoke commits. A
+A rotation moves the count to the session's new key. Of these, only a successful step-up re-auth
+drops the count of a session that is still live, and on purpose, since it resets that session's
+budget. The bounds are 64 counts per account and 4096 in the map, except a count held at the cap,
+which goes past both. When a re-proof starts with its account at 64 counts, the counts of that
+account's sessions the store no longer lists, revoked or past their absolute expiry, are dropped
+first. A session the store still lists, idle or not, keeps its count. When a new session's first
+failure finds its account at 64 counts or the map full, the age prune runs: counts older than the
+absolute session lifetime, timed from their first failure, go. It reaches a live session's count
+only after a wall-clock step. If there is still no room, that session is revoked on that first
+failure, and its count is held at the cap. The count leaves when that revoke commits, when a later
+re-proof finds the session gone, or by the age prune. If the revoke fails, or never runs because an
+earlier write raised, the count stays, and the session's next re-proof is revoked unverified. A
 session the session reaper purges without the engine ending it, at least one that expired with no
 request, keeps its count until one of the drops above, or the age prune, takes it.
 

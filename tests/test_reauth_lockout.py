@@ -595,6 +595,43 @@ async def test_an_admin_revoke_drops_the_accounts_counts_and_keeps_others(
         await store.close()
 
 
+async def test_a_refused_read_after_the_session_cap_loses_neither_its_row_nor_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the session cap's revoke names no hash, so the counts it ended are found by
+    reading the account's sessions again. That read comes after the cap's ``auth.session_revoked``
+    row, and a refusal of it is logged: the sign-in still returns its token, and the row stands."""
+    import json
+    import sqlite3
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store, AuthSettings(lockout_threshold=5, require_mfa=False, max_sessions_per_user=1)
+        )
+        await _local_user(store)
+        identity, first = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=first)).ok
+        assert service._session_reproof_failures(hash_token(first)) == 1
+
+        async def refused(*_args: object, **_kwargs: object) -> object:
+            raise sqlite3.OperationalError("synthetic: the read was refused")
+
+        monkeypatch.setattr(store, "list_sessions", refused)
+        out = await service.login("bob", GOOD, client="10.0.0.7")
+        assert out.ok and out.token is not None, out.error
+        cap_rows = [
+            json.loads(str(row["detail"]))
+            for row in await store.list_audit()
+            if row["action"] == "auth.session_revoked" and row["detail"]
+        ]
+        assert any(d.get("scope") == "cap" for d in cap_rows), cap_rows
+        # The read was refused, so the ended session's count stays, to a later drop.
+        assert service._session_reproof_failures(hash_token(first)) == 1
+    finally:
+        await store.close()
+
+
 async def test_an_account_at_its_cap_prunes_its_expired_counts_before_refusing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
