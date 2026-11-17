@@ -18,6 +18,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import threading
+import time as _time
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -50,6 +52,21 @@ def _reference_json_default(value: Any) -> Any:
     raise TypeError(f"reference snapshot cannot serialize a {type(value).__name__} value to JSON")
 
 
+def _unencodable_cause(exc: ValueError | RecursionError) -> str:
+    """A content-free name for why json could not encode a reference value, read off the class and
+    json's own fixed message text (never a value or a key)."""
+    if isinstance(exc, RecursionError):
+        return "a value nested too deep"
+    text = str(exc)
+    if "Out of range float" in text:
+        return "a non-finite float"
+    if "Circular reference" in text:
+        return "a circular value"
+    if "digits" in text:
+        return "an oversized int"
+    return "an unencodable value"
+
+
 def encode_reference_value(value: Any) -> str:
     """JSON-encode ONE reference-snapshot value for the ``reference.value`` column (BACKLOG #1090).
 
@@ -67,18 +84,23 @@ def encode_reference_value(value: Any) -> str:
     degradation), which is the same never-accept-and-drop rule the rest of the store follows.
 
     A non-finite float (a TOML ``nan``, a DATABASE double column) raises the same ``TypeError``
-    (BACKLOG #6711): ``json.dumps``' default would write the bare ``NaN`` token, which is not JSON."""
+    (BACKLOG #6711): ``json.dumps``' default would write the bare ``NaN`` token, which is not JSON.
+
+    The refusal names the kind of value that failed, never the value or its key, and carries no
+    json notes, cause or context. One such value refuses the whole set, by the rule above."""
     try:
         return json.dumps(value, default=_reference_json_default, allow_nan=False)
-    except (ValueError, RecursionError):
-        # Raised below, OUTSIDE this handler: json's error carries notes naming the dict keys on the
-        # path, and a reference key may be PHI, so it must ride neither __cause__ nor __context__.
-        # ValueError covers at least a non-finite float, a circular value and an int too long to print.
-        pass
-    raise TypeError(
-        "reference snapshot cannot serialize this value to JSON (at least a non-finite float, a "
-        "circular value, an oversized int or one nested too deep)"
-    )
+    except TypeError as exc:
+        # Our own refusal, or json's for a non-str key: both messages are content-free. Rebuilt and
+        # raised OUTSIDE this handler, because json adds notes naming the dict keys on the path, and
+        # a reference key may be PHI, so neither the notes nor the original may ride along.
+        reason = str(exc)
+    except (ValueError, RecursionError) as exc:
+        reason = (
+            f"reference snapshot cannot serialize this value to JSON: it holds "
+            f"{_unencodable_cause(exc)}"
+        )
+    raise TypeError(reason)
 
 
 def encode_response_headers(headers: Mapping[str, str] | None) -> str | None:
@@ -103,9 +125,33 @@ class MetadataTooDeepError(RuntimeError):
     main, so no ``ValueError`` arm downstream turns it into "no metadata". Carries no content."""
 
 
-def _load_object(
-    text: str | bytes | bytearray | None, *, too_deep_raises: bool = True
-) -> dict[str, Any]:
+#: A stored JSON cell's text: ``str``, or the bytes a driver may hand back for it.
+type StoredJson = str | bytes | bytearray | memoryview | None
+
+#: How long one kind of unreadable-cell WARNING is logged once. A list read over many such cells
+#: would otherwise log one line per row.
+_WARN_INTERVAL_S = 60.0
+_warned: dict[str, float] = {}
+_warned_lock = threading.Lock()
+
+
+def _warn_unreadable(hint: str) -> None:
+    """Log the content-free unreadable-cell WARNING for ``hint``, at most once per interval. The
+    caller holds no row id, so the line names none."""
+    now = _time.monotonic()
+    with _warned_lock:
+        last = _warned.get(hint)
+        if last is not None and now - last < _WARN_INTERVAL_S:
+            return
+        _warned[hint] = now
+    log.warning(
+        "a stored JSON cell is unreadable (%s); read as empty (logged at most once per %.0f s)",
+        hint,
+        _WARN_INTERVAL_S,
+    )
+
+
+def _load_object(text: StoredJson, *, too_deep_raises: bool = True) -> dict[str, Any]:
     """The JSON object ``text`` holds, or ``{}`` for ``None``, empty, malformed or non-object text;
     text nested too deep to decode raises unless ``too_deep_raises`` is false.
 
@@ -114,35 +160,42 @@ def _load_object(
     outside any handler so nothing is chained, or reads as malformed where ``too_deep_raises`` is
     false. Raising is the default because a metadata cell read as ``{}`` changes an outcome. A
     refusal that reads as empty is logged with json's content-free hint, never the text.
-    ``bytes``/``bytearray`` decode as ``json.loads`` decoded them before; any other type reads as
-    ``{}``, as the ``TypeError`` arm this replaced did."""
-    if isinstance(text, bytearray):
+    ``bytes``, ``bytearray`` and ``memoryview`` decode as ``json.loads`` decodes bytes; any other
+    type reads as ``{}`` and is logged by its type name."""
+    if isinstance(text, (bytearray, memoryview)):
         text = bytes(text)
-    if not isinstance(text, str | bytes) or not text:
+    if text is None:
+        return {}
+    if not isinstance(text, str | bytes):
+        _warn_unreadable(f"not text: {type(text).__name__}")
+        return {}
+    if not text:
         return {}
     value, refusal = json_loads_or_refusal(text)
     if refusal is not None:
-        if too_deep_raises and refusal == RecursionError.__name__:
+        # startswith, so a hint that ever grows a suffix still reads as too deep.
+        if too_deep_raises and refusal.startswith(RecursionError.__name__):
             raise MetadataTooDeepError("a stored metadata cell is too deeply nested to decode")
-        log.warning("a stored JSON cell is unreadable (%s); read as empty", refusal)
+        _warn_unreadable(refusal)
         return {}
     return value if isinstance(value, dict) else {}
 
 
-def _dumps_or_raise(value: Any) -> str:
+def _dumps_or_raise(value: Any, *, allow_nan: bool = True) -> str:
     """``json.dumps(value)``, or :class:`MetadataTooDeepError` when json's encoder hits its depth
-    limit, raised outside the handler so nothing is chained.
+    limit, raised outside the handler so nothing is chained. With ``allow_nan`` false, a non-finite
+    float raises json's own ``ValueError``.
 
     The encoder's limit sits below the decoder's, so an object :func:`_load_object` read can still
     be too deep to write back (BACKLOG #6712)."""
     try:
-        return json.dumps(value)
+        return json.dumps(value, allow_nan=allow_nan)
     except RecursionError:
         pass
     raise MetadataTooDeepError("a stored metadata cell is too deeply nested to re-encode")
 
 
-def decode_response_headers(headers_json: str | None) -> dict[str, str]:
+def decode_response_headers(headers_json: StoredJson) -> dict[str, str]:
     """Parse the decrypted ``resp_headers`` JSON back to a ``{name: value}`` map (BACKLOG #154).
 
     ``None``/empty/unparseable/non-object → ``{}`` (the byte-identical default), so a purged row (
@@ -153,7 +206,7 @@ def decode_response_headers(headers_json: str | None) -> dict[str, str]:
     return {k: v for k, v in loaded.items() if isinstance(v, str)}
 
 
-def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str, str]]) -> str:
+def merge_user_metadata(existing_json: StoredJson, meta_ops: Sequence[tuple[str, str]]) -> str:
     """Merge ``SetMeta`` writes into a message's decrypted metadata JSON, under the reserved ``"user"``
     sub-key, and return the new JSON string.
 
@@ -173,7 +226,7 @@ def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str,
     return _dumps_or_raise(parsed)
 
 
-def user_metadata(metadata_json: str | None) -> str | None:
+def user_metadata(metadata_json: StoredJson) -> str | None:
     """The public, read-only user bag from a message's decrypted metadata JSON: the ``"user"`` sub-key
     re-serialized as a JSON string, or ``None`` when there is none.
 
@@ -185,13 +238,20 @@ def user_metadata(metadata_json: str | None) -> str | None:
     refusal names the body's length and the head bound, never the digest or a byte of the body.
 
     Returns ``None`` for absent/empty/unparseable metadata or an empty user bag, so the wire field is
-    ``null`` rather than ``"{}"`` when nothing was attached. A cell too deep to decode or re-encode
-    raises :class:`MetadataTooDeepError` instead: ``None`` would send a ``dynamic_headers`` delivery
-    out without its headers. The delivery worker takes the error on its internal-error arm: under
-    the default ``InternalErrorPolicy.CONTINUE`` it dead-letters the row, and under ``STOP`` it
-    re-pends the row on the retry policy's backoff (dead-lettering it once a finite attempt cap is
-    reached) and halts the lane until an operator reloads or restarts."""
+    ``null`` rather than ``"{}"`` when nothing was attached. A bag holding a non-finite float, which
+    no engine writer stores, reads as unparseable too, so no bare ``NaN`` token reaches a caller.
+
+    A cell too deep to decode or re-encode raises :class:`MetadataTooDeepError` instead, at every
+    caller: ``None`` would send a ``dynamic_headers`` delivery out without its headers. The delivery
+    worker takes it on its internal-error arm (``InternalErrorPolicy``). The API's message summary
+    takes it too, so one such cell fails the whole list, search or uploaded-file page it is on, as
+    json's ``RecursionError`` did before."""
     user = _load_object(metadata_json).get("user")
     if not isinstance(user, dict) or not user:
         return None
-    return _dumps_or_raise(user)
+    try:
+        return _dumps_or_raise(user, allow_nan=False)
+    except ValueError:
+        pass
+    _warn_unreadable("non-finite float")
+    return None
