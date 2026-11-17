@@ -715,12 +715,18 @@ def attest_console() -> AttestationResult | None:
         return None
     # From `sys.modules`, like `_console_loaded_files`, so this never imports the console.
     module = sys.modules.get(_CONSOLE_PACKAGE)
+    roots: list[str] = list(getattr(module, "__path__", None) or ())
+    if getattr(module, "__path__", None) is None:
+        # No `__path__`: the directory holding `__file__` stands in for the package directory.
+        origin = getattr(module, "__file__", None)
+        if origin:
+            roots.append(str(Path(origin).parent))
     return _attest_distribution(
         _CONSOLE_DIST_NAME,
         _CONSOLE_PACKAGE,
         lambda: files,
         unmatched_rows=_any_row,
-        package_roots=getattr(module, "__path__", None) or (),
+        package_roots=roots,
     )
 
 

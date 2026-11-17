@@ -1947,6 +1947,25 @@ def test_a_console_imported_through_a_link_into_the_package_still_reads_back_row
     assert console.checked == len(_CONSOLE_FILES) - 1
 
 
+def test_a_console_with_no_path_whose_file_is_in_the_package_reads_back_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A module with no ``__path__`` whose ``__file__`` is the intact ``__init__.py``: only that file
+    is compared, and every other ``RECORD`` row is ``missing`` drift, as on main before #5376."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    fake = types.ModuleType(_CONSOLE_PKG)
+    fake.__file__ = str(console_root / _CONSOLE_PKG / "__init__.py")
+    monkeypatch.setitem(sys.modules, _CONSOLE_PKG, fake)
+    monkeypatch.setattr(integ, "_console_loaded_files", _REAL_CONSOLE_LOADED_FILES)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert console.checked == 1 and console.ok is False
+    assert _drift(console) == [
+        (rel, "missing") for rel in sorted(_CONSOLE_FILES) if not rel.endswith("/__init__.py")
+    ]
+
+
 def test_an_engine_package_directory_swapped_for_a_link_is_missing_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

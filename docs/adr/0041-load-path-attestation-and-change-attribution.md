@@ -383,9 +383,8 @@ fingerprint+git-HEAD covers more cheaply for now.
 >    would run it. `create_app` imports the console before the lifespan attests, so a console that
 >    serves is one that is attested.
 > 2. **Loaded but unattestable fails the same way the engine does (AC-13).** A console with no
->    distribution metadata or a stripped `RECORD` is attested-nothing. One loaded from a directory
->    that neither is nor resolves to the one its `RECORD` describes compares no file against it, and
->    its `RECORD` rows are not reported. Since BACKLOG #5376, one loaded from that directory, or
+>    distribution metadata or a stripped `RECORD` is attested-nothing. Since BACKLOG #5376, one loaded
+>    from the directory its `RECORD` describes, or
 >    through a link to or from it, reports each `RECORD` row no listed file matched as `missing`
 >    drift.
 >    A console that declares itself editable keeps the AC-12 no-op. So does a console with no
