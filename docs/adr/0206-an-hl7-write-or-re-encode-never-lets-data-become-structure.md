@@ -277,8 +277,9 @@ open points settled below.
   with `MSH` after whitespace is still handed over as its own bytes. The split drops an envelope's
   header lines. *(Changed by BACKLOG #5806: it also drops the run of `FHS`, `BHS`, `BTS` and `FTS`
   lines that ends an `MSH`-led message, so neither the last message of an enveloped file nor its
-  only message carries the trailer to the Handler. A file handed over as its own bytes keeps
-  whatever it holds.)*
+  only message carries the trailer to the Handler. A one-message file led by `MSH` that ends with
+  such lines is handed over as the split read it, as a batch member is, rather than as its own
+  bytes.)*
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
   embedded start byte, so the parser reads a segment whose id begins with that byte, not `MSH`. The
   embedded-byte refusal of ADR 0205 rule 4 runs first in the same guard and is what closes it.

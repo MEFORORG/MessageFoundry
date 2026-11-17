@@ -21,8 +21,10 @@ split, the ingress guard and the byte scan now take a later ``MSH`` line that by
 lead as a boundary, as the delivery reading already did, and the split cuts past those marks.
 Each edited line says what it read at a0a5e4f5a4.
 
-BACKLOG #5806 changed the split on purpose too, and its copy with it: an ``MSH``-led message no
-longer ends with the batch envelope lines that followed it in the file.
+BACKLOG #5806 changed the split and the byte scan on purpose too, and their copies with them: an
+``MSH``-led message no longer ends with the batch envelope lines that followed it in the file, the
+first chunk is read past trailer lines as well as header lines, and an envelope segment id
+anywhere in a file needs a decode. The corpus gained a ``BTS|`` token for it.
 """
 
 from __future__ import annotations
@@ -86,6 +88,9 @@ def _old_needs_a_decode(raw: bytes, encoding: str) -> bool:
         return True
     if b"\rMSH" in raw or b"\nMSH" in raw:
         return True
+    # BACKLOG #5806: an envelope segment id anywhere now needs a decode too.
+    if any(segment in raw for segment in (b"FHS", b"BHS", b"BTS", b"FTS")):
+        return True
     # BACKLOG #5918: a later MSH that UTF-8 byte order marks lead now needs a decode too.
     return _OLD_LATER_MSH_BYTES_PAST_BOM.search(raw) is not None
 
@@ -95,7 +100,8 @@ def _old_split_batch(raw: str | bytes) -> list[str]:
     first, *rest = _OLD_MSH_BOUNDARY.split(text)
     messages = [chunk[1:].lstrip(BOM) for chunk in rest]  # BACKLOG #5918: was chunk[1:]
     head = first.lstrip(_LEADING_WS_STR)
-    while head.startswith(("FHS", "BHS")):
+    # BACKLOG #5806: was ("FHS", "BHS").
+    while head.startswith(_OLD_ENVELOPE_LINES):
         head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
     if head.strip():
         messages.insert(0, head)
@@ -103,32 +109,40 @@ def _old_split_batch(raw: str | bytes) -> list[str]:
     return messages or [text]
 
 
-#: BACKLOG #5806: the envelope lines a message's chunk may end with, dropped from it.
+#: BACKLOG #5806: the envelope lines, dropped before the first message and at a message's end.
 _OLD_ENVELOPE_LINES = ("FHS", "BHS", "BTS", "FTS")
 
 
 def _old_drop_trailer(message: str) -> str:
     """BACKLOG #5806, written as lines rather than as the live code's scan from the end: an
-    ``MSH``-led message loses the trailing run of empty and envelope lines from its first envelope
-    line on, keeping the CR before it; one whose run holds no envelope line is unchanged."""
+    ``MSH``-led message loses the trailing run of noise-only and envelope lines (an envelope line
+    perhaps led by noise) from its first envelope line on, keeping the CR before it; one whose run
+    holds no envelope line is unchanged."""
     if not message.startswith("MSH"):
         return message
+
+    def noise(line: str) -> bool:
+        return line.strip(_LEADING_WS_STR) == ""
+
+    def envelope(line: str) -> bool:
+        return line.lstrip(_LEADING_WS_STR).startswith(_OLD_ENVELOPE_LINES)
+
     lines = message.split("\r")
     run = len(lines)
-    while run > 1 and (lines[run - 1] == "" or lines[run - 1].startswith(_OLD_ENVELOPE_LINES)):
+    while run > 1 and (noise(lines[run - 1]) or envelope(lines[run - 1])):
         run -= 1
-    envelope = [i for i in range(run, len(lines)) if lines[i].startswith(_OLD_ENVELOPE_LINES)]
-    if not envelope:
+    first = next((i for i in range(run, len(lines)) if envelope(lines[i])), None)
+    if first is None:
         return message
-    return "\r".join(lines[: envelope[0]]) + "\r"
+    return "\r".join(lines[:first]) + "\r"
 
 
 # --- the corpus ---------------------------------------------------------------------------------
 
 #: Tokens for each shape the readings tell apart: both line ends, a whole and a broken ``MSH``,
 #: the byte order mark, other leading whitespace and a vertical tab, a field separator, the batch
-#: envelope headers, another segment, and a non-Latin-1 character (a wider string kind).
-TOKENS = ("\r", "\n", "MSH", "MS", "H", BOM, " ", "\x0b", "|", "FHS|", "BHS|", "PID|", "王")
+#: envelope headers and a trailer (BACKLOG #5806), another segment, and a non-Latin-1 character (a wider string kind).
+TOKENS = ("\r", "\n", "MSH", "MS", "H", BOM, " ", "\x0b", "|", "FHS|", "BHS|", "BTS|", "PID|", "王")
 #: Every string of up to this many tokens, then a seeded sample of longer ones, which is where a
 #: marked second boundary or two boundaries behind an envelope header first fit.
 EXHAUSTIVE_TOKENS = 4

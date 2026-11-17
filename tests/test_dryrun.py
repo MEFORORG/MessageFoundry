@@ -450,6 +450,24 @@ def test_split_messages_splits_where_byte_order_marks_lead_a_later_msh(
     assert split_messages(raw) == live
 
 
+@pytest.mark.parametrize(
+    "lead",
+    [b"\xef\xbb\xbf\r\n\xef\xbb\xbf", b"\xef\xbb\xbf\xef\xbb\xbf", b"\r\n\xef\xbb\xbf\xef\xbb\xbf"],
+    ids=["mark-break-mark", "two-marks", "break-two-marks"],
+)
+@pytest.mark.parametrize("count", [1, 2], ids=["one-message", "two-messages"])
+def test_split_messages_reads_a_leading_run_of_marks_as_the_live_split(
+    lead: bytes, count: int
+) -> None:
+    """Round-one review of BACKLOG #5918: the dry run stripped one leading mark before its view, so
+    a second mark, or a mark after a leading line break, stayed three characters and the first
+    member was refused where the live UTF-8 split reads past it. Mutation: strip one leading mark
+    and spell only marks after a line break. Red: a member led by the mark's bytes."""
+    body = ADT_A01 + ADT_A01.replace("MSG1", "MSG2") if count == 2 else ADT_A01
+    raw = lead + body.encode("utf-8")
+    assert split_messages(raw) == split_batch_bytes(raw, "utf-8")
+
+
 def test_split_messages_keeps_a_mark_that_leads_no_msh() -> None:
     """Control: marks after a line break that no MSH follows are data, kept byte for byte."""
     raw = ADT_A01.encode("utf-8") + b"NTE|1||\xef\xbb\xbfnote\r\xef\xbb\xbfNTE|2\r"

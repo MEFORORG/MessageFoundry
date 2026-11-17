@@ -6,6 +6,7 @@ alphabet (BACKLOG #5805). The documents here are synthetic bytes, never real con
 from __future__ import annotations
 
 import base64
+import tracemalloc
 
 import pytest
 
@@ -14,23 +15,19 @@ from messagefoundry.parsing.sniff import b64_head
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
 
 
-class _WholeSplitRecorder(str):
-    """A ``str`` that records the length of every ``split`` called on itself, so a test can tell a
-    read of the whole document from a read of slices of it (a slice is a plain ``str``)."""
-
-    splits: list[int]
-
-    def split(self, sep: str | None = None, maxsplit: int = -1) -> list[str]:  # type: ignore[override]
-        self.splits.append(len(self))
-        return super().split(sep, maxsplit)
-
-
-def test_b64_head_never_compacts_the_whole_document() -> None:
-    """Mutation: compact ``b64`` whole before slicing. Red: a split of the full length."""
-    doc = _WholeSplitRecorder(base64.b64encode(PNG * 4096).decode("ascii"))
-    doc.splits = []
-    assert b64_head(doc).startswith(b"\x89PNG\r\n\x1a\n")
-    assert doc.splits == []
+def test_b64_head_allocates_for_its_prefix_not_the_document() -> None:
+    """Mutation: compact ``b64`` whole before slicing. Red: the peak holds a copy of the line-wrapped
+    document, several MiB, where the prefix needs a few hundred bytes."""
+    encoded = base64.b64encode(PNG * 65536).decode("ascii")  # about 6 MiB of base64
+    wrapped = "\r\n".join(encoded[i : i + 76] for i in range(0, len(encoded), 76))
+    tracemalloc.start()
+    try:
+        head = b64_head(wrapped)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert head.startswith(b"\x89PNG\r\n\x1a\n")
+    assert peak < 64 * 1024
 
 
 @pytest.mark.parametrize("wrap", [1, 4, 76])

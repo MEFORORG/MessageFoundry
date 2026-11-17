@@ -21,7 +21,9 @@ import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.parsing import Message, split_batch, split_by_obr
-from messagefoundry.parsing.split import encode_batch
+from messagefoundry.parsing import split as split_module
+from messagefoundry.parsing.sniff import _LEADING_WS_STR
+from messagefoundry.parsing.split import encode_batch, split_batch_bytes
 from messagefoundry.transports import build_source
 
 # --- synthetic fixtures ------------------------------------------------------
@@ -114,6 +116,53 @@ def test_split_batch_and_encode_batch_round_trip_a_batch_with_its_trailer() -> N
     split = split_batch(envelope)
     # A member cut at the next MSH loses the CR before it; the last keeps its own.
     assert split == [ADT_A01.rstrip("\r"), ADT_A02.rstrip("\r"), ADT_A03]
+
+
+BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "BTS|1\rFTS|1\r" + BOM + "FHS|^~\\&|SEND|FAC\r" + BOM + "BHS|^~\\&|SEND|FAC\r",
+        "BTS|1\rFTS|1\r  \t\r",
+        "BTS|1\r\x0c\r" + BOM + "\rFTS|1\r",
+    ],
+    ids=["marked-next-file-header", "trailing-whitespace-line", "noise-lines-between"],
+)
+def test_split_batch_reads_an_envelope_run_past_tolerated_noise(tail: str) -> None:
+    """Round-one review of BACKLOG #5806: a mark-led envelope line (two marked batch files
+    concatenated, a boundary since #5918) or a line of whitespace alone stopped the run, so the
+    trailer before it stayed on the member. Mutation: match the envelope ids without the noise
+    class, or skip only empty lines. Red: the first member ends with ``BTS|1``."""
+    assert split_batch(ADT_A01 + tail + ADT_A02)[0] == ADT_A01
+
+
+def test_the_trailer_noise_class_is_the_tolerated_leading_noise() -> None:
+    """The class in split's envelope-line patterns is spelled out for the ReDoS scanner; it must
+    stay the content sniff's one definition of tolerated noise."""
+    matched = {chr(c) for c in range(0x10000) if split_module._NOISE_LINE.fullmatch(chr(c))}
+    assert matched == set(_LEADING_WS_STR)
+
+
+def test_split_batch_drops_an_empty_leading_batch() -> None:
+    """Round-one review of BACKLOG #5806: the first chunk was read past header lines only, so an
+    empty first batch became a message of envelope lines, recorded as an ERROR. Mutation: read the
+    first chunk past FHS/BHS only. Red: a first element of ``BTS|0`` and ``BHS``."""
+    filed = "FHS|^~\\&\rBHS|^~\\&\rBTS|0\rBHS|^~\\&\r" + ADT_A01 + "BTS|1\rFTS|2\r"
+    assert split_batch(filed) == [ADT_A01]
+
+
+@pytest.mark.parametrize("lead", ["", "\r\n"], ids=["msh-led", "whitespace-led"])
+def test_one_message_file_with_a_trailer_goes_over_as_a_batch_member_would(lead: str) -> None:
+    """Round-one review of BACKLOG #5806: a one-message file led by MSH was handed over as its own
+    bytes, trailer included, where the same message led by a header lost it. Mutation: return
+    ``raw`` whenever the text starts with MSH. Red: the trailer reaches the Handler."""
+    raw = (lead + ADT_A01 + "BTS|1\rFTS|1\r").encode("utf-8")
+    assert split_batch_bytes(raw, "utf-8") == [ADT_A01.encode("utf-8")]
+    # Control: with no envelope line the file is still handed over as its own bytes.
+    clean = (lead + ADT_A01).encode("utf-8")
+    assert split_batch_bytes(clean, "utf-8") == [clean]
 
 
 def test_split_batch_keeps_a_segment_that_only_follows_an_envelope_line() -> None:
