@@ -404,11 +404,30 @@ def test_a_segment_whose_id_only_starts_with_iea_does_not_end_an_interchange(
         assert _frames_of(data, chunk) == [data], chunk
     nxt = interchange(control="000000002", term=term)
     assert split(raw + nxt) == [raw, nxt]
-    # A corrupted header is read the same way, its +3 not trusted: still framed through its IEA.
-    bad = _corrupt(raw)
-    assert split(bad + nxt) == [bad, nxt]
-    for chunk in (4096, 7, 1):
-        assert _frames_of((bad + nxt).encode(), chunk) == [bad.encode(), nxt.encode()], chunk
+
+
+def _corrupt_sep(raw: str) -> str:
+    return raw[:3] + "*" + raw[4:]  # a corrupted +3, the separator the gates are read against
+
+
+@pytest.mark.parametrize("chunk", [4096, 7, 1])
+def test_a_trailer_with_no_trusted_separator_still_ends_the_frame_at_iea(chunk: int) -> None:
+    # A letter separator's trailer is "IEAW1W...". With the header's +3 corrupted, or after a
+    # failing ISA has bounded the walk, there is no +3 to trust, so any segment opening with IEA
+    # ends the frame, as before: the id rule must not hold a frame the reader used to take.
+    alone = _corrupt_sep(interchange(el="W"))
+    assert alone.endswith("IEAW1W000000001~")
+    reader = X12FrameReader()
+    data = alone.encode()
+    frames = [f for i in range(0, len(data), chunk) for f in reader.feed(data[i : i + chunk])]
+    assert frames == [data] and not reader.in_frame
+    assert split(alone) == [alone]
+    after = _without_iea(interchange()) + _corrupt(interchange(el="W", control="000000002"))
+    reader = X12FrameReader()
+    data = after.encode()
+    frames = [f for i in range(0, len(data), chunk) for f in reader.feed(data[i : i + chunk])]
+    assert frames == [data] and not reader.in_frame
+    assert split(after) == [after]
 
 
 @pytest.mark.parametrize("trailer", ["IEA~", "IEA *1*000000001~", "IEA|1|000000001~"])

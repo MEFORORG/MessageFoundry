@@ -18,8 +18,9 @@ Two surfaces:
 
 The ``IEA`` trailer is recognised only at a **segment boundary** (the three bytes immediately after a
 segment terminator, tolerating cosmetic whitespace), so ``IEA`` appearing inside element data never
-truncates an interchange early, and only as the whole segment id, so a segment such as ``IEAX*...``
-does not either. Both surfaces preserve the interchange **verbatim** (cosmetic newlines
+truncates an interchange early. In an interchange whose header passes, a segment opening with
+``IEA`` and then a letter or digit other than its element separator, such as ``IEAX*...``, does not
+end it either (:func:`_iea_id`). Both surfaces preserve the interchange **verbatim** (cosmetic newlines
 included) — re-encoding/normalisation is :class:`~messagefoundry.parsing.x12.message.X12Message`'s job.
 """
 
@@ -205,7 +206,8 @@ def _walk_str(
     past its fixed-width header (so the ISA is never searched) up to ``bound`` (the end of ``raw``
     by default). Returns the index just past the terminator that closes its ``IEA`` segment and
     True, or None and False if that is not complete before ``bound``. ``IEA`` is matched only at a
-    segment boundary, and only as the whole segment id (:func:`_iea_id`).
+    segment boundary. While ``cut_at_isa`` holds, a segment opening with ``IEA`` and then a letter
+    or digit other than the ISA's +3 does not end the walk (:func:`_iea_id`).
 
     With ``cut_at_isa``, a segment that opens, after any whitespace, with an ``ISA`` that
     :func:`_isa_complete_str` accepts ends the walk too: it returns that segment's start, just past
@@ -245,21 +247,26 @@ def _walk_str(
         else:
             run = _SEGMENT_WS_RUN_STR.match(raw, seg_start, idx)
             opens = seg_start if run is None else run.end()  # a star pattern: never None
-        if _iea_id(raw, opens, idx, raw[isa + 3]):
+        # Only a header that passed, before any failing ISA, has a +3 to trust (BACKLOG #5807).
+        if _iea_id(raw, opens, idx, raw[isa + 3] if cut_at_isa else None):
             return idx + len(terminator), True
         seg_start = idx + len(terminator)
 
 
-def _iea_id(buf: str | bytes | bytearray, at: int, end: int, sep: str | bytes | bytearray) -> bool:
-    """Whether the segment opening at ``at`` and ending at ``end`` (its terminator) has the id
-    ``IEA``: it opens with ``IEA``, then ends, or goes on with ``sep`` (the ISA's +3 element
-    separator) or a character that is not an ASCII letter or digit. A segment id is two or three
-    letters or digits, so ``IEAX*...`` is a longer id, not the trailer (BACKLOG #5807), unless
-    ``X`` is the separator. A header that fails the check may have a corrupted +3, and is still
-    closed at ``IEA`` and any character that is not a letter or digit."""
+def _iea_id(
+    buf: str | bytes | bytearray, at: int, end: int, sep: str | bytes | bytearray | None
+) -> bool:
+    """Whether the segment opening at ``at`` and ending at ``end`` (its terminator) ends the
+    interchange. It must open with ``IEA``. With ``sep``, the +3 element separator of a header that
+    passed the check, it must then end or go on with ``sep`` or a character that is not an ASCII
+    letter or digit, so ``IEAX*...`` is a longer segment id, not the trailer (BACKLOG #5807).
+    Without ``sep`` any segment opening with ``IEA`` does, as before: a header that failed may have
+    a corrupted +3, and a trailer after a failing ISA may belong to that run."""
     head = buf[at : min(at + 4, end)]
     if (head[:3] != "IEA") if isinstance(head, str) else (head[:3] != b"IEA"):
         return False
+    if sep is None:
+        return True
     rest = head[3:]
     return rest == sep or not (rest.isascii() and rest.isalnum())  # empty: ends at IEA
 
@@ -457,7 +464,8 @@ class X12FrameReader:
                 opens = self._seg_start if run is None else run.end()
             else:
                 opens = self._seg_ws  # a passing walk has read the opening whitespace already
-            if _iea_id(buf, opens, idx, buf[3:4]):
+            # A suspect has no trusted +3: see _iea_id (BACKLOG #5807).
+            if _iea_id(buf, opens, idx, None if self._suspect else buf[3:4]):
                 return self._take(idx + len(terminator))
             self._seg_start = self._scan = idx + len(terminator)
             # A whitespace terminator can end a segment inside the run already read: the run from

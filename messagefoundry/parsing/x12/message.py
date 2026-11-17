@@ -9,8 +9,9 @@ id), and an optional 1-based component index. Reads/writes address the **first**
 segment unless ``occurrence=`` is given. In a repeating element (from 00501, where ISA-11 is the
 repetition separator) a component path addresses the **first** repetition unless ``repetition=``
 names another, and a write keeps the rest; before 00501, on a 00501 header still carrying the legacy
-ISA-11 ``U``, and in the ISA, there is no repetition separator, so a component path reads across the
-whole element and only repetition 1 exists. A whole-element read returns the raw element, every
+ISA-11 ``U``, and in the ISA, the model splits on no repetition separator, so a component path reads
+across the whole element and only repetition 1 exists; a write on a legacy ``U`` header still refuses
+a value holding ``U``. A whole-element read returns the raw element, every
 repetition included, unless ``repetition=`` names one; a whole-element write refuses the repetition
 separator, so it replaces the element with one repetition, or with ``repetition=`` replaces just that
 repetition. All structure is rebuilt with the interchange's **own** discovered
