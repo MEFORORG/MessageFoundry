@@ -2309,6 +2309,29 @@ def test_an_intact_package_reached_through_a_link_inside_the_install_root_reads_
     assert result.unattested_reason is None and result.ok
 
 
+def test_a_package_directory_swapped_for_a_link_to_a_sibling_in_the_install_root_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``<install root>/<package>`` moved to ``<install root>/<package>_real`` with a link left in its
+    place: the files are compared where the link resolves, as origin/main compared them, so they have
+    no rows and the package's own rows are read back as gone."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    _link_out(package_dir, console_root / f"{_CONSOLE_PKG}_real")
+    _load_fake_console(monkeypatch, package_dir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == sorted(
+        [
+            (rel.replace(_CONSOLE_PKG, f"{_CONSOLE_PKG}_real", 1), "missing")
+            for rel in _CONSOLE_FILES
+        ]
+        + [(rel, "missing") for rel in _CONSOLE_FILES]
+    )
+    assert not console.ok
+
+
 @pytest.mark.parametrize("arm", ["engine", "console"])
 def test_a_package_root_ending_in_a_parent_reference_reads_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str

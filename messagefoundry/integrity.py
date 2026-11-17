@@ -399,9 +399,10 @@ def _record_place(path: str | Path) -> Path:
     Resolving the name too would move a linked package directory out of the install root, where every
     row reads as ``missing`` although each file is there (BACKLOG #5376).
 
-    A path whose last component is ``..`` (or that has no name) is resolved whole: its own name is
-    not a place, and what it names is the resolved parent of what precedes it, whose components are
-    already real directories."""
+    A path whose last component is ``..`` (or that has no name) is resolved whole, as origin/main
+    resolved every root, because ``..`` is not a name ``RECORD`` can hold. So a package directory
+    linked out of the install root and named through ``..`` reads as loaded from outside the install
+    root, not through the link."""
     path = Path(path)
     if path.name in ("", ".."):
         return path.resolve()
@@ -774,9 +775,11 @@ def _attest_distribution(
     (``package_directory_links_out_of_install_root``). This paragraph is where the triggers are
     stated; ADR 0041 AC-13 and ``docs/CONFIGURATION.md`` point here.
 
-    A file under one of ``package_roots`` whose record place is not in the package but which resolves
-    into it, a link from elsewhere into the package, is compared at the place the root resolves to, as
-    if loaded there. A file under any other root outside the install root is not compared.
+    A file under one of ``package_roots`` that resolves under the install root is compared at the
+    place the root resolves to, as if loaded there, so a link from elsewhere into the package is
+    compared as the package. One under a package directory linked out of the install root is compared
+    at its record place, through the link. One under any other root that resolves outside the install
+    root is not compared.
 
     ``checked`` counts a file only once its bytes were read.
     """
@@ -820,25 +823,34 @@ def _attest_distribution(
     def in_package(rel: str | None) -> bool:
         return rel is not None and (rel == package or rel.startswith(prefix))
 
-    # Where each loaded root's files sit in `RECORD`. A root whose record place is in the package is
-    # anchored there, so a package directory swapped for a link is read through the link at the place
-    # `RECORD` describes. Any other root that resolves into the package, such as a link from inside or
-    # outside the install root, is anchored where it resolves, as if loaded there.
-    anchors: list[tuple[Path, Path]] = []
-    linked_out = False
+    # Where each loaded root's files sit in `RECORD`. A root that resolves under the install root is
+    # anchored where it resolves, as origin/main walked every root, so a link into the package from
+    # anywhere is compared as if loaded there, and a package directory swapped for a link to another
+    # directory in the install root is compared as that directory. A root that resolves outside the
+    # install root is read through the link at its record place when that place is in the package (a
+    # package directory linked out of the install root), and is otherwise not compared at all.
+    anchors: list[tuple[Path, Path | None]] = []
+    linked_out = rooted = False
     for root in package_roots:
         place, resolved = _record_place(root), Path(root).resolve()
-        if in_package(_record_relpath(place, install_root)):
-            anchors.append((place, place))
-            linked_out = linked_out or _record_relpath(resolved, install_root) is None
-        elif in_package(_record_relpath(resolved, install_root)):
+        place_rel = _record_relpath(place, install_root)
+        resolved_rel = _record_relpath(resolved, install_root)
+        rooted = rooted or in_package(place_rel) or in_package(resolved_rel)
+        if resolved_rel is not None:
             anchors.append((place, resolved))
+        elif in_package(place_rel):
+            anchors.append((place, place))
+            linked_out = True
+        else:
+            anchors.append((place, None))
     anchors.sort(key=lambda anchor: len(anchor[0].parts), reverse=True)  # the deepest root wins
 
     def record_rel(file: Path) -> str | None:
-        for place, anchor in anchors:
+        for place, anchor_root in anchors:
             if file.is_relative_to(place):
-                return _record_relpath(anchor / file.relative_to(place), install_root)
+                if anchor_root is None:
+                    return None
+                return _record_relpath(anchor_root / file.relative_to(place), install_root)
         return _record_relpath(file, install_root)
 
     drift: list[DriftEntry] = []
@@ -873,7 +885,7 @@ def _attest_distribution(
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
 
-    read_back = unmatched_rows is not None and (bool(seen) or bool(anchors))
+    read_back = unmatched_rows is not None and (bool(seen) or rooted)
     if unmatched_rows is not None and read_back:  # the first test narrows the type for mypy
         cache = f"/{_BYTECODE_CACHE_DIR}/"
         drift.extend(
@@ -1053,9 +1065,9 @@ async def _act_on(
         if reason == "package_directory_links_out_of_install_root":
             # Files were compared here, through the link, so "no file was compared" would be false.
             what = (
-                f"the {arm.noun} package directory is a link out of the install root, so the "
-                f"{arm.noun} files compared against the installed {arm.wheel} RECORD sit outside "
-                "the install it describes"
+                f"the {arm.noun} package directory is a link out of the install root, so files "
+                "read through it are not counted as verified, whatever they hash to; replace the "
+                "link with the installed directory"
             )
             log.warning(
                 "startup integrity: attestation verified NOTHING (%s) — %s (fail_closed=%s)",
