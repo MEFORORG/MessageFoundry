@@ -6,8 +6,8 @@ Most of these assert the YAML wiring of ``.github/workflows/dependabot-auto-merg
 behavioural ones go further and **execute the shipped ``run:`` bodies under ``bash -e``** — the shell
 GitHub Actions applies by default on Linux — because the guardrails are shell logic and "the YAML
 names a step" is a much weaker claim than "the step holds what it must hold". That is possible only
-because both new steps take every input through ``env:`` and interpolate nothing — asserted by
-``test_new_steps_take_every_input_through_env_not_interpolation``, which is a precondition for the
+because every ``run:`` step takes every input through ``env:`` and interpolates nothing — asserted by
+``test_every_run_step_takes_every_input_through_env_not_interpolation``, a precondition for the
 behavioural tests as much as it is zizmor template-injection parity.
 
 The guardrail numbers below are DEPENDENCY-POSTURE-REVIEW.md's, carried with two corrections that
@@ -723,23 +723,76 @@ def test_the_token_permissions_are_exactly_what_each_job_needs() -> None:
     assert got == expected, got
 
 
-def test_new_steps_take_every_input_through_env_not_interpolation() -> None:
-    """Both new steps must read their inputs from ``env:``, never from an inlined ``${{ }}``.
+#: ``gh`` as a command word, anywhere in the body, comments included. ``gh`` reads ``GH_TOKEN``
+#: without the body ever naming it, so the ``$VAR`` check below cannot see that key go missing. It
+#: over-matches on purpose: a step that only mentions gh must still declare the token, which costs
+#: one env line, where an under-match would let a real call run without it.
+_GH_CALL = re.compile(r"(?<![\w./$-])gh(?![\w./-])")
+
+
+def _step_label(step: dict) -> str:
+    return str(step.get("id") or step.get("name"))
+
+
+def _assert_inputs_come_through_env(label: str, step: dict) -> None:
+    body = str(step.get("run", ""))
+    assert "${{" not in body, (
+        f"the {label} step interpolates an Actions expression into its shell body; pass it "
+        f"through env: instead"
+    )
+    declared = set((step.get("env") or {}).keys())
+    undeclared = set(_ENV_REF.findall(body)) - _RUNNER_PROVIDED - declared
+    assert not undeclared, f"{label} reads undeclared env var(s): {sorted(undeclared)}"
+    if _GH_CALL.search(body):
+        assert "GH_TOKEN" in declared, f"{label} calls gh but declares no GH_TOKEN in env:"
+
+
+def test_every_run_step_takes_every_input_through_env_not_interpolation() -> None:
+    """Every ``run:`` step must read its inputs from ``env:``, never from an inlined ``${{ }}``.
 
     This is zizmor template-injection parity asserted in-tree — a PR-controlled value pasted into a
     shell body is a code-execution seam — and it is simultaneously the precondition that lets the
-    behavioural tests below execute the shipped bodies verbatim."""
-    for step_id in ("allowset", "age", "authors", "disarm"):
-        step = _step(step_id)
-        body = str(step.get("run", ""))
-        assert "${{" not in body, (
-            f"the {step_id} step interpolates an Actions expression into its shell body; pass it "
-            f"through env: instead"
-        )
-        declared = set((step.get("env") or {}).keys())
-        referenced = set(_ENV_REF.findall(body)) - _RUNNER_PROVIDED
-        undeclared = referenced - declared
-        assert not undeclared, f"{step_id} reads undeclared env var(s): {sorted(undeclared)}"
+    behavioural tests below execute the shipped bodies verbatim.
+
+    RULE (BACKLOG #5503): this iterated a hand-kept list of step ids that left out ``ghsa`` and the
+    unnamed merge step, so an interpolation into either body, or a dropped env key there, would have
+    passed. The steps are now every ``run:`` step in every job, with a floor naming the ones known
+    today so a broken walk cannot pass on nothing.
+    """
+    run_steps = [s for s in _steps() if "run" in s]
+    labelled = {_step_label(s): s for s in run_steps}
+    assert len(labelled) == len(run_steps), f"two run steps share a label: {list(labelled)}"
+    expected = {"disarm", "allowset", "ghsa", "age", "authors", _step_label(_merge_step())}
+    missing = sorted(expected - set(labelled))
+    assert not missing, f"run steps {list(labelled)} miss {missing}"
+    for label, step in labelled.items():
+        _assert_inputs_come_through_env(label, step)
+
+
+@pytest.mark.parametrize(
+    ("body", "env", "message"),
+    [
+        ('echo "${{ github.event.pull_request.title }}"\n', {}, "interpolates"),
+        ('echo "$DEPS_JSON"\n', {"GH_TOKEN": "t"}, "undeclared env var"),
+        ("gh api -X GET /advisories\n", {}, "declares no GH_TOKEN"),
+        ('gh pr merge --auto "$PR_URL"\n', {"PR_URL": "u"}, "declares no GH_TOKEN"),
+        ('gh -R o/r pr merge --auto "$PR_URL"\n', {"PR_URL": "u"}, "declares no GH_TOKEN"),
+        ("gh release view v1\n", {}, "declares no GH_TOKEN"),
+        ("gh \\\n  api /x\n", {}, "declares no GH_TOKEN"),
+        ('n="${#X}"; echo "PR #1" && gh pr view 1\n', {"X": "x"}, "declares no GH_TOKEN"),
+        ('"gh" api /x\n', {}, "declares no GH_TOKEN"),
+        ("out=$(gh)\n", {}, "declares no GH_TOKEN"),
+    ],
+)
+def test_the_env_check_refuses_each_planted_seam(body: str, env: dict, message: str) -> None:
+    """Prove the per-step check fires on each defect the ghsa and merge steps could carry."""
+    with pytest.raises(AssertionError, match=message):
+        _assert_inputs_come_through_env("planted", {"run": body, "env": env})
+
+
+@pytest.mark.parametrize("body", ["echo high\n", "./bin/gh-check\n", 'echo "$SIGH"\n'])
+def test_the_gh_token_check_does_not_fire_without_a_gh_command(body: str) -> None:
+    _assert_inputs_come_through_env("plain", {"run": body, "env": {"SIGH": "s"}})
 
 
 # --------------------------------------------------------------------------------------------------
