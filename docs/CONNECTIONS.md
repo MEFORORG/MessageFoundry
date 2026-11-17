@@ -5001,24 +5001,11 @@ the error directory fails still charges, although the file stays where it was. A
 be quarantined would therefore spend the budget on every tick, which is the starvation this rule exists
 to prevent. On `File(...)` under `after_read` `move` or `delete` (BACKLOG #5717) the gap is
 narrowed, not closed. The source remembers such a file and skips it unread and uncharged until its
-size, modification time or file identity changes, or its retry falls due. A retry runs in a separate
-pass after the scan's other files, a bounded number per scan that the ceiling's log line does not
-count, so a scan can read that many files beyond the ceiling. A due retry settles like a new drop,
-then is read and judged afresh, so one that now passes is ingested. When the move failed for a
-reason that looks lasting, such as access denied, or a copy already sits in the error directory, the
-retry falls due after `STUCK_RETRY_SECONDS`; otherwise after `STUCK_TRANSIENT_RETRY_SECONDS`. Some
-retries that read the file and leave it in place wait again: at least a failed read, a refused link
-and a scan hook failure wait the file's back-off again, a reject that stays waits by the rule just
-stated, and a handler failure waits `STUCK_TRANSIENT_RETRY_SECONDS`. Others forget the file, at
-least one that changed during the read and one that passed but could then not be moved or deleted,
-and it is read and charged on later scans like any other file. A retry that finds the file not
-yet settled stays due, and a later scan's retry pass takes it; only when the settle memory is full
-does it wait again. Due retries go
-earliest first, as many per scan as the bound allows.
-A file copied into the error directory whose original could not be removed is retried the same way,
-so each retry may write another copy and record another event. At least a restart of the connection
-and a full memory leave a file charged again; the full memory is logged when it fills, and again
-only after it has drained to half. The constants are in
+size, modification time or file identity changes, or its retry falls due. Retries run in a separate
+pass after the scan's other files, a bounded number per scan outside `poll_max_files` that the
+ceiling's log line does not count. A due retry is judged afresh, so a file that now
+passes is ingested. When a retry falls due is the back-off rule
+stated once at `STUCK_RETRY_SECONDS` in
 [`transports/file.py`](../messagefoundry/transports/file.py). Under `leave`, and on
 `Sftp(...)`/`Ftp(...)`, the gap stands as described.
 

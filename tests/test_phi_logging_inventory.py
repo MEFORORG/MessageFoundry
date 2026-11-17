@@ -611,10 +611,10 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
     helper's name (``getattr(self, '_event')``), and an INSERT statement that is not a call's first
     argument each fail here, because a skipped site is the blind spot this guard exists to close.
 
-    ``shared`` is another module's :func:`_module_strings`: a name this source imports by
-    ``from ... import``, unrenamed, reads as its value there (Postgres and SQL Server import
-    ``VIEWED_EVENT`` from the SQLite store). The module the import names is not checked, so a name
-    imported from any other module also reads as ``shared``'s value.
+    ``shared`` is another module's :func:`_module_strings`. Only names a top-level ``from ...
+    import`` statement binds, not renamed, are looked up in it (Postgres and SQL Server import
+    ``VIEWED_EVENT`` from the SQLite store); the module that statement names is not checked. A kind
+    held in any other name that is not a literal binding of this source reads as unread.
 
     Not read, at least: a helper reached under another name, which the reference check refuses only
     when its name is spelled out whole, as an identifier or a string, an INSERT reached through an
@@ -1285,7 +1285,7 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
         _ROOT / "messagefoundry" / "pipeline" / "wiring_runner.py",
     ]
     emitted, forwarders = _connection_kinds(
-        {path.name: parse_source(path.read_text(encoding="utf-8")) for path in sorted(roots)}
+        {path.name: ast.parse(path.read_text(encoding="utf-8")) for path in sorted(roots)}
     )
     # The FILE source's reject path forwards its kind through `_quarantine` (BACKLOG #5717); a
     # rename must re-aim the walk rather than let its kinds leave it.

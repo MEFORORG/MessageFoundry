@@ -19,6 +19,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -1018,6 +1019,76 @@ async def test_an_unlistable_watch_directory_is_a_failed_listing(tmp_path: Path)
         source = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(folder)}))
         assert source._candidates() == []
         assert source._listing_failed
+
+
+async def test_a_literal_pattern_on_a_traverse_only_directory_is_not_a_failed_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A literal pattern is answered by a stat, so a watch directory the engine can traverse but not
+    list (POSIX mode 0o111) serves it as on main: no failed listing, no warning, no false recovery
+    line, and the memories are pruned as usual.
+
+    Mutation: list the directory for a literal pattern too. Red: the scan is a failed listing."""
+    if sys.platform == "win32":
+        pytest.skip("POSIX directory modes")
+    if os.geteuid() == 0:
+        pytest.skip("root lists a mode-0o111 directory")
+    caplog.set_level(logging.DEBUG, logger=file_mod.logger.name)
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    (rig.inbox / "present.hl7").write_bytes(b"MSH|^~\\&|\r")
+    rig.inbox.chmod(0o111)
+    try:
+        try:
+            os.listdir(rig.inbox)
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("this process lists a mode-0o111 directory")
+        gone = str(rig.inbox / "gone.hl7")
+        rig.source._refused.add(gone)
+        rig.source.pattern = "absent.hl7"
+        await rig.scan()
+        assert not rig.source._listing_failed
+        assert gone not in rig.source._refused, "the scan pruned as on an empty drop"
+        rig.source.pattern = "present.hl7"
+        assert rig.source._candidates() == [rig.inbox / "present.hl7"]
+        texts = [r.getMessage() for r in caplog.records]
+        assert not any("could not list" in t for t in texts)
+        assert not any("can list its watch directory again" in t for t in texts)
+    finally:
+        rig.inbox.chmod(0o700)
+
+
+async def test_a_literal_pattern_is_not_checked_by_a_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same contract on every platform, with the listing refused by a patched ``os.listdir``:
+    a literal pattern that matches nothing is an empty drop, pruned as usual, and a wildcard
+    pattern on the same directory is still a failed listing.
+
+    Mutation: list the directory for a literal pattern too. Red: the literal row is a failed
+    listing and warns."""
+    caplog.set_level(logging.DEBUG, logger=file_mod.logger.name)
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    real_listdir = os.listdir
+
+    def listdir(path: Any) -> list[str]:
+        if Path(path) == rig.inbox:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", listdir)
+    gone = str(rig.inbox / "gone.hl7")
+    rig.source._refused.add(gone)
+    rig.source.pattern = "absent.hl7"
+    assert await rig.scan() == []
+    assert not rig.source._listing_failed
+    assert gone not in rig.source._refused, "the scan pruned as on an empty drop"
+    texts = [r.getMessage() for r in caplog.records]
+    assert not any("could not list" in t for t in texts)
+    rig.source.pattern = "*.hl7"
+    assert await rig.scan() == []
+    assert rig.source._listing_failed, "a wildcard pattern is still checked"
 
 
 async def test_an_empty_watch_directory_is_not_a_failed_listing(

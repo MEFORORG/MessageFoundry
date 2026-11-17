@@ -23,6 +23,7 @@ import ctypes
 import enum
 import errno
 import functools
+import glob
 import hashlib
 import heapq
 import logging
@@ -1358,9 +1359,8 @@ class FileSource(SourceConnector):
     async def _examine(self, path: Path, *, retry: bool = False) -> _Step:
         """Take one candidate as far as it goes this scan, and say what that cost (:class:`_Step`).
         ``retry`` is a remembered stuck reject due a retry (BACKLOG #5717), which :meth:`_scan_once`
-        examines after every other candidate and which takes the whole path again: it settles like
-        a new drop, is read and judged afresh, and a retry that now passes is ingested. A retry is
-        counted against
+        examines after every other candidate. It takes the settle gate, and once past it is read
+        and judged afresh, so a retry that now passes is ingested. A retry is counted against
         :meth:`_retry_allowance`, not the per-tick ceiling. A retry is stat'd again rather than
         trusting the fresh pass's stat, because the fresh pass's hand-offs sit between the two."""
         # One stat serves the leave-mode key, the settle gate and the before-read side of the #116
@@ -1998,12 +1998,14 @@ class FileSource(SourceConnector):
         globber = self.directory.rglob if self.recursive else self.directory.glob
         try:
             matched = list(globber(self.pattern))
-            if not matched:
+            if not matched and (self.recursive or glob.has_magic(self.pattern)):
                 # Path.glob and rglob return nothing, rather than raising, for a watch directory
                 # that is missing or unreadable, which would read as an empty drop and prune every
                 # memory on it (BACKLOG #5717). So an empty result is checked by a listing that
                 # raises. os.listdir, not os.scandir: on Windows scandir fails on an empty drive
-                # root, which has no entries at all, and listdir returns [] there.
+                # root, which has no entries at all, and listdir returns [] there. A literal
+                # pattern without recursion is answered by a stat, not a listing, so it is not
+                # checked: a directory the engine can traverse but not list serves it as before.
                 os.listdir(self.directory)
         except (OSError, ValueError, NotImplementedError) as exc:
             # Watch dir vanished/unreadable, or a glob pattern Path.glob refuses (NotImplementedError
