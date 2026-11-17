@@ -203,8 +203,8 @@ async def test_a_quarantine_whose_move_failed_records_nothing(
 
     def failed_move(path: Path, _dest: Path, *_rest: object) -> file_mod._Archived:
         moves.append(path)
-        # Nothing archived (BACKLOG #5717: and not remembered as stuck).
-        return file_mod._Archived(archived=False, stays=False, lasting=False)
+        # Nothing archived; the file stays for a lasting reason, so it is remembered (#5717).
+        return file_mod._Archived(archived=False, stays=True, lasting=True)
 
     monkeypatch.setattr(FileSource, "_archive_to", staticmethod(failed_move))
 
@@ -214,3 +214,4 @@ async def test_a_quarantine_whose_move_failed_records_nothing(
     assert moves == [inbox / _NAME], "the oversize arm really tried the move (not a vacuous pass)"
     assert sink.events == []
     assert (inbox / _NAME).exists()
+    assert len(source._stuck) == 1

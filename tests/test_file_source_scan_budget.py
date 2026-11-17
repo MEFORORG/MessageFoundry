@@ -353,7 +353,7 @@ def _age_stuck(rig: _Rig) -> None:
     """Make every remembered reject due its retry."""
     stuck = rig.source._stuck
     for key, (seen, missed) in list(stuck.items()):
-        stuck[key] = (seen._replace(since=seen.since - file_mod.STUCK_RETRY_SECONDS), missed)
+        stuck[key] = (seen._replace(due=seen.due - file_mod.STUCK_RETRY_SECONDS), missed)
 
 
 async def test_a_due_retry_takes_the_whole_path_and_is_quarantined_once_the_move_works(
@@ -496,7 +496,7 @@ async def test_retries_go_oldest_first_and_a_deferred_one_survives_pruning(
     for name, age in (("a0.hl7", retry), ("a1.hl7", 2 * retry)):
         key = str(rig.inbox / name)
         seen, missed = stuck[key]
-        stuck[key] = (seen._replace(since=seen.since - age), missed)
+        stuck[key] = (seen._replace(due=seen.due - age), missed)
     (rig.inbox / "c.hl7").unlink()
 
     assert await rig.scan() == ["b0.hl7", "a1.hl7"], "one slot, to the oldest failure"
@@ -640,29 +640,6 @@ async def test_a_retry_left_in_place_stays_remembered_and_due(
     assert rig.source._stuck == {}
 
 
-async def test_a_due_retry_is_lstat_once_per_scan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The fresh pass's lstat of a due reject serves its retry too.
-
-    Mutation: pass no mark to the retry's ``_examine``. Red: two lstats."""
-    rig = _Rig(tmp_path, monkeypatch, cap=10)
-    rig.drop("a.hl7", _PDF)
-    await rig.scan()
-    await rig.scan()
-    _age_stuck(rig)
-    marks: list[str] = []
-    real_mark = file_mod._file_mark
-
-    def counted(path: Path) -> Any:
-        marks.append(path.name)
-        return real_mark(path)
-
-    monkeypatch.setattr(file_mod, "_file_mark", counted)
-    assert await rig.scan() == ["a.hl7"]
-    assert marks == ["a.hl7"]
-
-
 async def test_failed_listings_do_not_wipe_the_stuck_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -720,3 +697,49 @@ async def test_a_full_memory_hovering_at_its_cap_is_not_logged_again(
     await rig.scan()
     assert len(rig.source._stuck) == 4
     assert full_logs() == 1
+
+
+async def test_a_reject_gone_after_a_failed_move_is_not_remembered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A transient failure leaves a file to retry only while it is still the file that was read: one
+    deleted or replaced meanwhile is not remembered, and no "stays in place" line is logged.
+
+    Mutation: return ``stays=True`` for every failed move. Red: a phantom entry and the line."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=None)
+    gone = rig.drop("a_gone.hl7", _PDF)
+    # Windows refuses a rename over the file the move holds open, so the replaced case is POSIX's.
+    replaced = rig.drop("b_replaced.hl7", _PDF) if os.name != "nt" else None
+
+    def vanishing_dest(_dest_dir: Path, *_args: Any) -> Any:
+        if gone.exists():
+            gone.unlink()
+        elif replaced is not None:
+            other = rig.inbox.parent / "other.hl7"
+            other.write_bytes(_HL7)
+            os.replace(other, replaced)
+        raise OSError(errno.EBUSY, "busy")
+
+    monkeypatch.setattr(file_mod, "_open_dest", vanishing_dest)
+    await rig.scan()
+    read = await rig.scan()
+    assert read == ["a_gone.hl7"] + (["b_replaced.hl7"] if replaced else [])
+    assert rig.source._stuck == {}
+    assert not any("stays in place" in r.message for r in caplog.records)
+
+
+async def test_a_due_reject_replaced_before_its_retry_is_forgotten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry's own stat sees the new file, so the entry is dropped and the new file takes the
+    settle gate like any drop, rather than staying in the stuck memory under the old mark."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    path = rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    _age_stuck(rig)
+    path.write_bytes(_HL7)
+    assert await rig.scan() == [], "a changed file settles first"
+    assert rig.source._stuck == {}
+    assert await rig.scan() == ["a.hl7"]
+    assert rig.handed_off == [_HL7]

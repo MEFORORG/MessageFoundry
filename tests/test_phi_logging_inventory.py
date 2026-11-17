@@ -372,8 +372,6 @@ _CALLER_KIND_METHOD = "record_message_event"
 #: :data:`_CALLER_KIND_METHOD`. Pinned, so a kind leaving the store's own writes is a visible change.
 _CALLER_ONLY_EVENT_KINDS = frozenset({"reply_returned", "reply_timeout"})
 
-_RAW_EVENT_INSERT = "INSERT INTO message_events"
-
 
 def _module_strings(tree: ast.Module) -> dict[str, str]:
     """Module-level names bound once, to a string literal."""
@@ -402,8 +400,9 @@ def _module_strings(tree: ast.Module) -> dict[str, str]:
 def _local_values(scope: ast.AST, name: str) -> list[ast.expr] | None:
     """Every value ``scope`` assigns to the bare name ``name``, or ``None`` when one of its bindings
     is not a plain assignment this can read (a parameter anywhere in ``scope``, a loop target, an
-    augmented assignment, a walrus or a ``with`` target). Tuple unpacking is read position by
-    position. An import binds no ``Name`` node and is not seen."""
+    augmented assignment, a walrus, a ``with`` target, or a tuple unpacking with a starred part).
+    Plain tuple unpacking is read position by position. An import binds no ``Name`` node and is not
+    seen."""
     if any(isinstance(node, ast.arg) and node.arg == name for node in ast.walk(scope)):
         return None  # a parameter of the scope or of a def or lambda nested in it
     values: list[ast.expr] = []
@@ -415,8 +414,15 @@ def _local_values(scope: ast.AST, name: str) -> list[ast.expr] | None:
                 if isinstance(target, ast.Name) and target.id == name:
                     values.append(node.value)
                     read.add(id(target))
-                elif isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple):
-                    for element, value in zip(target.elts, node.value.elts, strict=False):
+                elif (
+                    isinstance(target, ast.Tuple)
+                    and isinstance(node.value, ast.Tuple)
+                    and len(target.elts) == len(node.value.elts)
+                    and not any(
+                        isinstance(e, ast.Starred) for e in (*target.elts, *node.value.elts)
+                    )
+                ):
+                    for element, value in zip(target.elts, node.value.elts, strict=True):
                         if isinstance(element, ast.Name) and element.id == name:
                             values.append(value)
                             read.add(id(element))
@@ -430,16 +436,19 @@ def _local_values(scope: ast.AST, name: str) -> list[ast.expr] | None:
     return values
 
 
-def _string_values(expr: ast.expr, scope: ast.AST, module: dict[str, str]) -> set[str] | None:
+def _string_values(
+    expr: ast.expr, scope: ast.AST, module: dict[str, str], resolving: frozenset[str] = frozenset()
+) -> set[str] | None:
     """The strings ``expr`` can evaluate to, read without running it, or ``None`` when that cannot be
     read. Read: a string literal, both arms of a conditional expression, a dict literal indexed or
     read with ``.get`` (every value, and the default), a name ``scope`` assigns only those, and a
-    module-level name bound once to a literal."""
+    module-level name bound once to a literal. A name that depends on itself, which ``resolving``
+    tracks, cannot be read."""
     if isinstance(expr, ast.Constant):
         return {expr.value} if isinstance(expr.value, str) else None
     if isinstance(expr, ast.IfExp):
-        body = _string_values(expr.body, scope, module)
-        orelse = _string_values(expr.orelse, scope, module)
+        body = _string_values(expr.body, scope, module, resolving)
+        orelse = _string_values(expr.orelse, scope, module, resolving)
         return None if body is None or orelse is None else body | orelse
     table: ast.Dict | None = None
     extra: list[ast.expr] = []
@@ -458,13 +467,15 @@ def _string_values(expr: ast.expr, scope: ast.AST, module: dict[str, str]) -> se
     if table is not None:
         found: set[str] = set()
         for value in (*table.values, *extra):
-            got = _string_values(value, scope, module)
+            got = _string_values(value, scope, module, resolving)
             if got is None:
                 return None
             found |= got
         # A .get with no default can return None, which no helper accepts as a kind.
         return found if extra or isinstance(expr, ast.Subscript) else None
     if isinstance(expr, ast.Name):
+        if expr.id in resolving:
+            return None
         values = _local_values(scope, expr.id)
         if values is None:
             return None
@@ -472,7 +483,7 @@ def _string_values(expr: ast.expr, scope: ast.AST, module: dict[str, str]) -> se
             return {module[expr.id]} if expr.id in module else None
         found = set()
         for value in values:
-            got = _string_values(value, scope, module)
+            got = _string_values(value, scope, module, resolving | {expr.id})
             if got is None:
                 return None
             found |= got
@@ -480,27 +491,26 @@ def _string_values(expr: ast.expr, scope: ast.AST, module: dict[str, str]) -> se
     return None
 
 
-def _raw_insert_event(
-    call: ast.Call, scope: ast.AST, module: dict[str, str]
-) -> tuple[ast.expr | None, bool]:
-    """For a call whose first argument is a ``message_events`` INSERT, the expression it binds to
-    the ``event`` column, and True; ``(None, False)`` for any other call. The parameters are either
-    one tuple or list (SQLite, pyodbc) or the arguments after the statement (asyncpg). An INSERT
-    whose shape this cannot read binds ``None``."""
-    if not call.args:
-        return None, False
-    sql_node = call.args[0]
-    sql = _string_values(sql_node, scope, module) if isinstance(sql_node, ast.Name) else None
-    if isinstance(sql_node, ast.Constant) and isinstance(sql_node.value, str):
-        sql = {sql_node.value}
-    if sql is None or len(sql) != 1:
-        return None, False
-    text = next(iter(sql)).strip()
-    if not text.startswith(_RAW_EVENT_INSERT):
-        return None, False
-    columns = [column.strip() for column in text.split("(", 1)[1].split(")", 1)[0].split(",")]
-    if "event" not in columns:
-        return None, True
+#: An INSERT into message_events, in any case and with any conflict clause.
+_RAW_EVENT_INSERT = re.compile(r"\binsert\b[^;]*?\binto\s+message_events\b", re.IGNORECASE)
+_SQL_PLACEHOLDER = re.compile(r"\?|\$\d+|%s|:\w+")
+
+
+def _raw_insert_event(call: ast.Call, sql: str) -> ast.expr | None:
+    """The expression ``call`` binds to the ``event`` column of ``sql``, an INSERT into
+    message_events that ``call`` executes as its first argument, or ``None`` when that cannot be
+    placed. The parameters are either one tuple or list (SQLite, pyodbc) or the arguments after the
+    statement (asyncpg); every VALUES entry must be a placeholder, or the mapping from parameters
+    to columns is not known here."""
+    head, _, tail = sql.partition(")")
+    columns = [column.strip().lower() for column in head.split("(", 1)[-1].split(",")]
+    values = re.search(r"values\s*\(([^)]*)\)", tail, re.IGNORECASE)
+    if (
+        "event" not in columns
+        or values is None
+        or not all(_SQL_PLACEHOLDER.fullmatch(v.strip()) for v in values.group(1).split(","))
+    ):
+        return None
     slot = columns.index("event")
     rest = call.args[1:]
     if len(rest) == 1 and isinstance(rest[0], ast.Tuple | ast.List):
@@ -508,31 +518,55 @@ def _raw_insert_event(
     else:
         params = list(rest)
     if any(isinstance(param, ast.Starred) for param in params[: slot + 1]) or slot >= len(params):
-        return None, True
-    return params[slot], True
+        return None
+    return params[slot]
 
 
-def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set[str], set[str]]:
-    """The ``message_events`` kinds a backend source writes, read statically, and the names of the
-    functions whose kind cannot be read that way.
+def _event_write_sites(
+    tree: ast.Module,
+) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef | ast.Module, ast.AST]]:
+    """Every node outside the event helpers' own defs, with the scope its names resolve in: the
+    outermost enclosing ``def``, or the module for code at module or class level."""
+    sites: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef | ast.Module, ast.AST]] = []
 
-    Read: every call to a helper in :data:`_EVENT_HELPERS`, its ``event`` argument placed by that
-    helper's own ``def`` (``self`` dropped), and every ``INSERT INTO message_events`` statement made
-    outside those helpers, its ``event`` column placed by the statement's column list. The argument
-    is read by :func:`_string_values`, so a literal, a module constant such as ``VIEWED_EVENT``, and
-    a local variable assigned only literals (the routed/unrouted mapping, for one) are all read.
+    def visit(node: ast.AST, scope: ast.FunctionDef | ast.AsyncFunctionDef | ast.Module) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                if child.name in _EVENT_HELPERS:
+                    continue
+                visit(child, child if scope is tree else scope)
+            else:
+                sites.append((scope, child))
+                visit(child, scope)
+
+    visit(tree, tree)
+    return sites
+
+
+def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set[str], list[str]]:
+    """The ``message_events`` kinds a backend source writes, read statically, and, once per write
+    whose kind cannot be read that way, the name of the function it is in.
+
+    Read, outside the helpers' own defs: every call to a helper in :data:`_EVENT_HELPERS`, its
+    ``event`` argument placed by that helper's own ``def`` (``self`` dropped), and every INSERT into
+    message_events executed as a call's first argument, its ``event`` column placed by the
+    statement's column list. The kind is read by :func:`_string_values`, so a literal, a module
+    constant such as ``VIEWED_EVENT``, and a local variable assigned only literals (the
+    routed/unrouted mapping, for one) are all read. A write at module or class level counts too,
+    under ``<module>``.
 
     A helper with no ``event`` parameter, a call to a helper the file does not define, an argument
     that cannot be placed (a starred argument at or before the slot, or ``event`` through
-    ``**kwargs``) and a reference to a helper or an INSERT statement that is not a direct call each
-    fail here, because a skipped site is the blind spot this guard exists to close.
+    ``**kwargs``), a reference to a helper that is not a direct call, and an INSERT statement that
+    is not a call's first argument each fail here, because a skipped site is the blind spot this
+    guard exists to close.
 
     ``shared`` is another module's :func:`_module_strings`: a name this source imports from it by
     ``from ... import`` reads as its value there (Postgres and SQL Server import ``VIEWED_EVENT``
     from the SQLite store).
 
-    Not read: a helper reached under another name, which the reference check above refuses only
-    when its name is spelled out, and SQL assembled at run time.
+    Not read: a helper reached under another name, which the reference check refuses only when its
+    name is spelled out, and SQL assembled at run time.
     """
     tree = parse_source(source)
     imported = {
@@ -545,6 +579,7 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
     module = {
         name: value for name, value in (shared or {}).items() if name in imported
     } | _module_strings(tree)
+    insert_names = {name for name, text in module.items() if _RAW_EVENT_INSERT.search(text)}
     helpers: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in _EVENT_HELPERS:
@@ -554,43 +589,74 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
         assert "event" in {a.arg for a in (*helper.args.posonlyargs, *helper.args.args)}, (
             f"{helper.name} has no `event` parameter; re-aim this guard"
         )
+    prose = {
+        id(stmt.value)
+        for stmt in ast.walk(tree)
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+    }
+    defining = {
+        id(stmt.value)
+        for stmt in tree.body
+        if isinstance(stmt, ast.Assign | ast.AnnAssign) and stmt.value is not None
+    }
+    sites = _event_write_sites(tree)
+    executed = {
+        id(node.args[0]) for _scope, node in sites if isinstance(node, ast.Call) and node.args
+    }
     kinds: set[str] = set()
-    unread: set[str] = set()
+    unread: list[str] = []
     unplaced: list[str] = []
-    seen: set[int] = set()
-    methods = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-        and node.name not in _EVENT_HELPERS
-    ]
-    for helper in helpers.values():
-        seen.update(id(sub) for sub in ast.walk(helper))
-    for scope in methods:
-        for call in ast.walk(scope):
-            if not isinstance(call, ast.Call) or id(call) in seen:
+    stray: list[int] = []
+    for scope, node in sites:
+        is_sql = (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in prose | defining
+            and _RAW_EVENT_INSERT.search(node.value)
+        ) or (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in insert_names
+        )
+        if is_sql and id(node) not in executed:
+            stray.append(getattr(node, "lineno", 0))
+        if not isinstance(node, ast.Call):
+            continue
+        name = callee_name(node)
+        value: ast.expr | None
+        if name in _EVENT_HELPERS:
+            assert name in helpers, (
+                f"a call to {name}, which this source does not define; re-aim the scan"
+            )
+            try:
+                value = argument_for(node, helpers[name], "event", receiver=True)
+            except ArgumentUnplaced:
+                unplaced.append(ast.unparse(node))
                 continue
-            seen.add(id(call))
-            name = callee_name(call)
-            if name in _EVENT_HELPERS:
-                assert name in helpers, (
-                    f"a call to {name}, which this source does not define; re-aim the scan"
-                )
-                try:
-                    value = argument_for(call, helpers[name], "event", receiver=True)
-                except ArgumentUnplaced:
-                    unplaced.append(ast.unparse(call))
-                    continue
-            else:
-                value, is_insert = _raw_insert_event(call, scope, module)
-                if not is_insert:
-                    continue
-            got = None if value is None else _string_values(value, scope, module)
-            if got is None:
-                unread.add(scope.name)
-            else:
-                kinds |= got
+        elif node.args and (
+            sql := (
+                node.args[0].value
+                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+                else module.get(node.args[0].id)
+                if isinstance(node.args[0], ast.Name) and node.args[0].id in insert_names
+                else None
+            )
+        ):
+            if not _RAW_EVENT_INSERT.search(sql):
+                continue
+            value = _raw_insert_event(node, sql)
+        else:
+            continue
+        got = None if value is None else _string_values(value, scope, module)
+        if got is None:
+            unread.append(scope.name if not isinstance(scope, ast.Module) else "<module>")
+        else:
+            kinds |= got
     assert not unplaced, f"event writes whose `event` argument the scan cannot place: {unplaced}"
+    assert not stray, (
+        f"INSERT INTO message_events text not executed as a call's first argument, at lines "
+        f"{sorted(stray)}; the scan cannot read what it writes"
+    )
     called = {id(call.func) for call in ast.walk(tree) if isinstance(call, ast.Call)}
     loose = [
         node.lineno
@@ -600,10 +666,10 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
         and (node.attr if isinstance(node, ast.Attribute) else node.id) in _EVENT_HELPERS
     ]
     assert not loose, f"event helpers referenced but not called directly, at lines {loose}"
-    return kinds, unread
+    return kinds, sorted(unread)
 
 
-def _store_event_kinds() -> dict[str, tuple[set[str], set[str]]]:
+def _store_event_kinds() -> dict[str, tuple[set[str], list[str]]]:
     """:func:`_event_kinds` of each backend, the twins reading names they import from store.py."""
     sources = {
         name: (_ROOT / "messagefoundry" / "store" / name).read_text(encoding="utf-8")
@@ -614,15 +680,15 @@ def _store_event_kinds() -> dict[str, tuple[set[str], set[str]]]:
 
 
 def _check_event_kinds(
-    written: dict[str, tuple[set[str], set[str]]], declared: frozenset[str]
+    written: dict[str, tuple[set[str], list[str]]], declared: frozenset[str]
 ) -> None:
-    """The rule :func:`test_message_event_constant_matches_the_literal_emit_sites` enforces, apart from the
-    scan, so its negative control can feed it a planted case.
+    """The rule :func:`test_message_event_constant_matches_the_literal_emit_sites` enforces, apart
+    from the scan, so its negative control can feed it a planted case.
 
-    Each backend must write a kind, write only declared kinds, leave unread only
-    :data:`_CALLER_KIND_METHOD`, and write the same kinds as the others; together they must write
-    every declared kind but :data:`_CALLER_ONLY_EVENT_KINDS`. The undeclared check runs first, so
-    an undeclared kind is blamed on the backend that writes it rather than on its twins."""
+    Each backend must write a kind, write only declared kinds, leave exactly one write unread, the
+    one in :data:`_CALLER_KIND_METHOD`, and write the same kinds as the others; together they must
+    write every declared kind but :data:`_CALLER_ONLY_EVENT_KINDS`. The undeclared check runs first,
+    so an undeclared kind is blamed on the backend that writes it rather than on its twins."""
     assert declared >= _CALLER_ONLY_EVENT_KINDS, (
         f"_CALLER_ONLY_EVENT_KINDS names undeclared kinds: "
         f"{sorted(_CALLER_ONLY_EVENT_KINDS - declared)}"
@@ -634,11 +700,10 @@ def _check_event_kinds(
             f"{name} writes message_events kind(s) not in MESSAGE_EVENT_KINDS: {undeclared}. "
             "Declare each in MESSAGE_EVENT_KINDS and name it in docs/PHI.md section 7 row 6."
         )
-        assert unread == {_CALLER_KIND_METHOD}, (
-            f"{name}: the kind written in {sorted(unread - {_CALLER_KIND_METHOD})} cannot be read "
-            "statically; pass a literal, a module constant or a local assigned only literals"
-            if unread - {_CALLER_KIND_METHOD}
-            else f"{name}: {_CALLER_KIND_METHOD} no longer forwards a caller's kind; re-aim this"
+        assert unread == [_CALLER_KIND_METHOD], (
+            f"{name}: writes whose kind cannot be read statically, by function: {unread}. Only "
+            f"one, in {_CALLER_KIND_METHOD}, is expected: pass a literal, a module constant or a "
+            "local assigned only literals."
         )
     union = set().union(*(kinds for kinds, _unread in written.values()))
     differ = {name: sorted(union - kinds) for name, (kinds, _unread) in written.items()}
@@ -693,13 +758,21 @@ def test_the_emit_site_scan_reads_every_backend_signature() -> None:
         "        await self._event(conn, 'mid', other, None, None, 0.0)\n"
         "        conn.execute('INSERT INTO message_events (message_id, ts, event) VALUES (?,?,?)',"
         " ('mid', 0.0, 'raw_kind'))\n"
-        "        conn.execute('INSERT INTO message_events (message_id, ts, event)"
-        " VALUES ($1,$2,$3)', 'mid', 0.0, 'pg_raw_kind')\n"
+        "        conn.execute('insert or ignore into message_events (message_id, ts, event)"
+        " values ($1,$2,$3)', 'mid', 0.0, 'pg_raw_kind')\n"
         "    async def record_message_event(self, conn, message_id, event):\n"
         "        await self._event(conn, message_id, event, None, None, 0.0)\n"
         "    async def loop_kind(self, conn, kinds):\n"
         "        for each in kinds:\n"
         "            await self._event(conn, 'mid', each, None, None, 0.0)\n"
+        "        a, *b, star = ('x', 'y', 'mid', 'real')\n"
+        "        await self._event(conn, 'mid', star, None, None, 0.0)\n"
+        "        x = x if flag else 'cycle'\n"
+        "        await self._event(conn, 'mid', x, None, None, 0.0)\n"
+        "        conn.execute('INSERT INTO message_events (message_id, event) VALUES (?, \"k\")',"
+        " ('mid',))\n"
+        "    lambda self, c: self._event(c, 'mid', 'class_level_kind', None, None, 0.0)\n"
+        "S()._event(c, 'mid', 'module_level_kind', None, None, 0.0)\n"
     )
     assert _event_kinds(source) == (
         {
@@ -714,8 +787,10 @@ def test_the_emit_site_scan_reads_every_backend_signature() -> None:
             "default_kind",
             "raw_kind",
             "pg_raw_kind",
+            "class_level_kind",
+            "module_level_kind",
         },
-        {"record_message_event", "loop_kind"},
+        ["loop_kind"] * 4 + ["record_message_event"],
     )
     with pytest.raises(AssertionError, match="no `event` parameter"):
         _event_kinds("def _event(self, conn, message_id, kind): ...\n")
@@ -727,17 +802,24 @@ def test_the_emit_site_scan_reads_every_backend_signature() -> None:
             _event_kinds(helper + f"def f(conn, head, parts):\n    self.{call}\n")
     with pytest.raises(AssertionError, match="not called directly"):
         _event_kinds(helper + "def f(self):\n    write = self._event\n")
+    for chosen in (
+        "def f(c, x):\n    sql = 'INSERT INTO message_events (event) VALUES (?)' if x else 'y'\n"
+        "    c.execute(sql, ('k',))\n",
+        "def f(c):\n    c.execute(sql='INSERT INTO message_events (event) VALUES (?)', p=('k',))\n",
+    ):
+        with pytest.raises(AssertionError, match="not executed as a call's first argument"):
+            _event_kinds(chosen)
 
 
 def test_the_event_kind_rule_refuses_each_planted_fault() -> None:
     """Negative control for :func:`_check_event_kinds`: the shipped backends satisfy it, so nothing
     there shows each refusal can fire."""
     declared = frozenset({"a", "b", *_CALLER_ONLY_EVENT_KINDS})
-    caller = {_CALLER_KIND_METHOD}
+    caller = [_CALLER_KIND_METHOD]
 
-    def backends(**kinds: set[str]) -> dict[str, tuple[set[str], set[str]]]:
+    def backends(**kinds: set[str]) -> dict[str, tuple[set[str], list[str]]]:
         found = {"one": {"a", "b"}, "two": {"a", "b"}} | kinds
-        return {name: (written, set(caller)) for name, written in found.items()}
+        return {name: (written, list(caller)) for name, written in found.items()}
 
     _check_event_kinds(backends(), declared)
     for written, match in (
@@ -749,8 +831,9 @@ def test_the_event_kind_rule_refuses_each_planted_fault() -> None:
             backends(one={"a", "b", "reply_timeout"}, two={"a", "b", "reply_timeout"}),
             "now writes itself",
         ),
-        ({"one": ({"a", "b"}, {*caller, "extra"}), "two": ({"a", "b"}, set(caller))}, "extra"),
-        ({"one": ({"a", "b"}, set()), "two": ({"a", "b"}, set(caller))}, "no longer forwards"),
+        ({"one": ({"a", "b"}, [*caller, "extra"]), "two": ({"a", "b"}, caller)}, "extra"),
+        ({"one": ({"a", "b"}, caller * 2), "two": ({"a", "b"}, caller)}, "Only"),
+        ({"one": ({"a", "b"}, []), "two": ({"a", "b"}, caller)}, "Only"),
     ):
         with pytest.raises(AssertionError, match=match):
             _check_event_kinds(written, declared)
