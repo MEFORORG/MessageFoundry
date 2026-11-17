@@ -355,16 +355,16 @@ def _revoked(path: Path, token_hash: str) -> bool:
     return row is not None and row[0] is not None
 
 
+@pytest.mark.parametrize("save", ["role", "scope"])
 @pytest.mark.parametrize("keyed", [False, True])
-async def test_an_ad_map_save_revokes_a_directory_account_whose_role_row_does_not_parse(
-    tmp_path: Path, keyed: bool, monkeypatch: pytest.MonkeyPatch
+async def test_an_ad_map_save_revokes_every_enabled_directory_account_whatever_its_check_says(
+    tmp_path: Path, keyed: bool, save: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An AD map save revokes the sessions of an enabled directory account whose role row does not
-    parse, as well as those of one that passes, so a repair made outside the store cannot bring
-    them back on the pre-edit map (BACKLOG #5505). It leaves alone a local account, failing or
-    not, a directory account whose users row does not parse, and, on a keyed store, a directory
-    account whose seal does not verify or that Vault transit cannot verify: those can be false
-    alarms on a genuine account, whose sessions a revoke would end."""
+    """Either AD map save revokes the sessions of each enabled directory account, whether its
+    record passes, its role row does not parse, or, on a keyed store, its seal is forged or Vault
+    transit cannot verify it, and of each account whose users row does not parse (BACKLOG #5505).
+    A local account whose row parses, failing or not, and a disabled directory account keep theirs.
+    """
     path = tmp_path / "ad-map.db"
     cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
     store = await MessageStore.open(path, cipher=cipher)
@@ -375,11 +375,15 @@ async def test_an_ad_map_save_revokes_a_directory_account_whose_role_row_does_no
             "ad-good": "ad",
             "ad-bad-role": "ad",
             "ad-bad-row": "ad",
+            "ad-disabled": "ad",
             "local-good": "local",
             "local-bad-role": "local",
+            "local-bad-row": "local",
         }
+        ended = {"ad-good", "ad-bad-role", "ad-bad-row", "local-bad-row"}
         if keyed:
             accounts |= {"ad-forged": "ad", "ad-unverifiable": "ad"}
+            ended |= {"ad-forged", "ad-unverifiable"}
         tokens: dict[str, str] = {}
         for user_id, provider in accounts.items():
             await store.create_user(
@@ -391,9 +395,11 @@ async def test_an_ad_map_save_revokes_a_directory_account_whose_role_row_does_no
             )
             await store.set_user_roles(user_id, [Role.VIEWER.value], audits=())
             tokens[user_id] = await _session(store, user_id)
+        await store.set_user_disabled("ad-disabled", disabled=True)
         for bad in ("ad-bad-role", "local-bad-role"):
             _raw(path, "UPDATE user_roles SET assigned_at=? WHERE user_id=?", ("later", bad))
-        _raw(path, "UPDATE users SET created_at=? WHERE id=?", ("later", "ad-bad-row"))
+        for bad in ("ad-bad-row", "local-bad-row"):
+            _raw(path, "UPDATE users SET created_at=? WHERE id=?", ("later", bad))
         if keyed:
             _raw(path, "UPDATE users SET display_name=? WHERE id=?", ("forged", "ad-forged"))
 
@@ -403,9 +409,11 @@ async def test_an_ad_map_save_revokes_a_directory_account_whose_role_row_does_no
                 return await user_seal_ok_async(sealer, record)
 
             monkeypatch.setattr(service_module, "user_seal_ok_async", unverifiable)
-        ended = {"ad-good", "ad-bad-role"}
         assert await service.sessions_ended_by_ad_map_save() == ended
-        await service.set_ad_group_map([], actor="test")
+        if save == "role":
+            await service.set_ad_group_map([], actor="test")
+        else:
+            await service.set_ad_group_scope_map([], actor="test")
         for user_id, token_hash in tokens.items():
             assert _revoked(path, token_hash) is (user_id in ended), user_id
     finally:

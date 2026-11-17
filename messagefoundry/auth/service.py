@@ -13132,13 +13132,10 @@ class AuthService:
     # --- the user loader (BACKLOG #2592) -----------------------------------------------------------
 
     async def _load_user(self, user_id: str) -> VerifiedUser | None:
-        """The account ``user_id`` names, its integrity seal checked, or ``None``. With
-        :meth:`_lookup_user`, :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
-        :meth:`_load_user_by_federated_subject`, :meth:`list_checked_users`,
-        :meth:`_checked_by_id` and :meth:`_verified`, the ONLY readers of the store's user readers
-        in this service, beside the existence questions (at least :meth:`_username_held`,
-        :meth:`_user_id_held` and :meth:`_federated_subject_held_elsewhere`);
-        ``tests/test_user_seal.py`` holds the list. See :meth:`_verified` for what ``None`` covers."""
+        """The account ``user_id`` names, its integrity seal checked, or ``None``. The functions
+        in this service that may call the store's user readers are listed, each with its reason,
+        in ``tests/test_user_seal.py`` (``_LOADERS``), which fails on a read outside that list.
+        See :meth:`_verified` for what ``None`` covers."""
         return (await self._lookup_user(user_id)).user
 
     async def _lookup_user(self, user_id: str) -> _UserLookup:
@@ -20708,11 +20705,11 @@ class AuthService:
         **Scoped to directory accounts, and deliberately not narrowed further.** Resolving which
         principals a map edit actually affects would mean re-binding to the directory, and both a
         removed mapping and an added one change an outcome, so the affected set is not derivable
-        from the entries alone. Local accounts read neither map and are left alone.
+        from the entries alone. A local account reads neither map, and one whose row parses is left
+        alone.
 
         Takes its set from :meth:`sessions_ended_by_ad_map_save`, whose docstring says which
-        directory accounts it names. Each
-        account's unrevoked rows are then revoked with the store's ``revoke_user_sessions``, so this
+        accounts it names. Each account's unrevoked rows are then revoked with the store's ``revoke_user_sessions``, so this
         needs no schema change on any backend. The count it returns includes rows already past their
         limits, which the revoke ends too. Unlike the reconciler this is NOT counted against the
         mass-revoke breaker: that breaker exists to catch a directory the engine cannot read, and
@@ -20729,45 +20726,26 @@ class AuthService:
         )
 
     async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:
-        """The account ids whose sessions a save of either AD group map would end: each enabled
-        directory account whose record passes its seal, and each enabled directory account whose
-        role rows do not parse.
+        """The account ids whose sessions a save of either AD group map would end: each account
+        whose stored ``users`` row reads as an enabled directory account, whatever its integrity
+        check says, and each account whose ``users`` row does not parse. A local account whose row
+        parses is never named.
 
         BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
-        A route reads it before the save to decide the step-up, and :meth:`_revoke_ad_sessions`
-        reads it again after, so the two can differ when an account's check changes between
-        them. The entries being saved do not narrow it, for the reason that method's docstring
-        gives.
+        The step-up gate and :meth:`_revoke_ad_sessions` each call this, and neither checks a seal,
+        so a check that fails or races at one read and not the other cannot change the answer. Only
+        a write to the caller's row between the two reads can. The entries being saved do not
+        narrow it, for the reason that method's docstring gives.
 
-        A local account is never named, so a local caller who passes the step-up gate keeps their
-        sessions unless a write between the gate's read and the revoke's makes the account a
-        directory one.
-
-        An account whose role rows do not parse is named (BACKLOG #5505); its provider and state
-        come from its ``users`` row, which the seal did not check. No other failing account is
-        named: a seal that does not verify can be a false alarm, as :class:`_SealCheck` says, and
-        so can a Vault transit check, and a revoke would end a genuine account's sessions. Nor is
-        an account whose ``users`` row does not parse, since its provider cannot be read."""
-        ids: set[str] = set()
-        for raw in await self._store.list_users():
-            if raw.unreadable or raw.auth_provider != AuthProvider.AD.value or raw.disabled:
-                continue
-            found = await self._checked_by_id(raw.id, raw)
-            if found.user is not None:
-                if found.user.auth_provider == AuthProvider.AD.value and not found.user.disabled:
-                    ids.add(found.user.id)
-            elif found.failed and await self._role_rows_unparseable(raw.id):
-                ids.add(raw.id)
-        return frozenset(ids)
-
-    async def _role_rows_unparseable(self, user_id: str) -> bool:
-        """Whether a read of ``user_id``'s role rows refuses a cell that does not parse (BACKLOG
-        #5505)."""
-        try:
-            await self._store.get_user_role_grants(user_id)
-        except RowSealError:
-            return True
-        return False
+        No seal is checked (BACKLOG #5505): an account whose check fails has its sessions refused
+        anyway, so ending them costs nothing, and a repair made later cannot bring them back on the
+        pre-edit map. The provider and state are therefore read unchecked. A row whose ``users``
+        cells do not parse has no readable provider, so it is named whatever it was."""
+        return frozenset(
+            raw.id
+            for raw in await self._store.list_users()
+            if raw.unreadable or (raw.auth_provider == AuthProvider.AD.value and not raw.disabled)
+        )
 
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
         """Replace the AD-group → role map (C3). Revokes directory accounts' sessions so it applies
