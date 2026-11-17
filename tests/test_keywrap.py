@@ -1315,6 +1315,46 @@ def test_a_pbmac1_mac_over_sha1_and_a_truncated_bundle_are_refused(material: Mat
         assert refusal is not None and why in refusal
 
 
+@pytest.mark.parametrize(
+    ("prf", "key_length", "why"),
+    [
+        ("sha256", 1, "1-octet PBKDF2 key"),
+        ("sha256", 31, "31-octet PBKDF2 key"),
+        ("sha512", 32, "takes a 64-octet key"),
+        ("sha256", 65, "65-octet PBKDF2 key"),
+        ("sha256", None, "omit keyLength"),
+    ],
+    ids=["one-octet", "one-short", "sha512-at-32", "past-the-largest", "omitted"],
+)
+def test_a_pbmac1_mac_with_a_truncated_or_missing_key_length_is_refused(
+    material: Material, prf: str, key_length: int | None, why: str
+) -> None:
+    # BACKLOG #5377. RFC 9579 section 5: keyLength MUST be present and SHOULD be the HMAC's output
+    # size. Everything else about these bundles is at the floor, so the key length is what refuses.
+    clear = pkcs12_bundle(material.key, _p12_cert(material.key), b"synthetic-pfx")
+    bundle = with_pbmac1(
+        clear,
+        b"synthetic-pfx",
+        iterations=600_000 if prf == "sha256" else 210_000,
+        prf=prf,
+        key_length=key_length,
+        omit_key_length=key_length is None,
+    )
+    refusal = _p12_refusal(bundle)
+    assert refusal is not None and why in refusal and "-pbmac1_pbkdf2" in refusal
+
+
+@pytest.mark.parametrize(("prf", "iterations"), [("sha256", 600_000), ("sha512", 210_000)])
+def test_a_pbmac1_mac_keyed_at_the_hmac_output_size_passes(
+    material: Material, prf: str, iterations: int
+) -> None:
+    # The control for the refusals above: the same bundle with keyLength at the HMAC's output size.
+    clear = pkcs12_bundle(material.key, _p12_cert(material.key), b"synthetic-pfx")
+    assert (
+        _p12_refusal(with_pbmac1(clear, b"synthetic-pfx", iterations=iterations, prf=prf)) is None
+    )
+
+
 # --- PKCS#12 key bags inside an encrypted part (BACKLOG #1352) ---------------------------------
 #
 # The check that reads a bundle's outside cannot see a key bag inside an EncryptedData part: that

@@ -742,10 +742,13 @@ _PBMAC1: Final = "1.2.840.113549.1.5.14"
 _MD5: Final = "1.2.840.113549.2.5"
 _SHA1: Final = "1.3.14.3.2.26"
 
-#: HMAC schemes a PBMAC1 MAC may use: SHA-2 at 256 bits and up.
-_PBMAC1_SCHEMES: Final = frozenset(
-    {"1.2.840.113549.2.9", "1.2.840.113549.2.10", "1.2.840.113549.2.11"}
-)
+#: HMAC schemes a PBMAC1 MAC may use, SHA-2 at 256 bits and up, each with its output length in
+#: octets. The length is the floor for the PBKDF2 keyLength that keys it (BACKLOG #5377).
+_PBMAC1_SCHEMES: Final = {
+    "1.2.840.113549.2.9": 32,  # HMAC-SHA-256
+    "1.2.840.113549.2.10": 48,  # HMAC-SHA-384
+    "1.2.840.113549.2.11": 64,  # HMAC-SHA-512
+}
 
 #: How deep a SafeContentsBag may nest. Real bundles do not nest at all.
 _MAX_BAG_DEPTH: Final = 4
@@ -807,11 +810,29 @@ def _mac_problem(buf: bytes, mac_data: _Tlv) -> str | None:
         return (
             "is integrity-protected by PBMAC1 over a key derivation this engine does not recognise"
         )
-    problem = _pbkdf2_problem(buf, kdf_params)
+    fields = _pbkdf2_fields(buf, kdf_params)
+    problem = _pbkdf2_fields_problem(fields)
     if problem is not None:
         return problem.replace("is wrapped with", "has a PBMAC1 MAC keyed by", 1)
-    if scheme not in _PBMAC1_SCHEMES:
+    mac_length = _PBMAC1_SCHEMES.get(scheme)
+    if mac_length is None:
         return "has a PBMAC1 MAC over a hash that is not approved (HMAC-SHA-256 or stronger)"
+    # RFC 9579 section 5: PBKDF2-params under PBMAC1 MUST carry keyLength, an implementation MUST NOT
+    # accept them without it, and the key SHOULD be the HMAC's output size. The length is otherwise
+    # free, so a keyLength of 1 would key the MAC with one octet and a password check against it
+    # would be near free (BACKLOG #5377). The floor is the HMAC output size, which is also stricter
+    # than section 9's recommended 20-octet minimum. The ceiling is the largest approved output:
+    # a longer key adds nothing to the HMAC, and nothing here needs one.
+    if fields.key_length is None:
+        return (
+            "has a PBMAC1 MAC whose PBKDF2 parameters omit keyLength, which RFC 9579 forbids an "
+            "implementation to accept"
+        )
+    if not mac_length <= fields.key_length <= max(_PBMAC1_SCHEMES.values()):
+        return (
+            f"has a PBMAC1 MAC keyed by a {fields.key_length}-octet PBKDF2 key; the HMAC it keys "
+            f"takes a {mac_length}-octet key (RFC 9579)"
+        )
     return None
 
 
