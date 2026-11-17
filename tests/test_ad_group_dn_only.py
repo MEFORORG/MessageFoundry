@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import gc
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -305,16 +306,23 @@ _PATHOLOGICAL_DNS: dict[str, tuple[Callable[[int], str], bool]] = {
 _MAX_LINEAR_RATIO = 8.0
 
 
-def _attempt_ratio(judge: Callable[[str], object], small: str, large: str) -> float:
-    """One attempt: a reading of :func:`_growth_between`, which says how it samples, taken with
-    the collector off."""
+@contextmanager
+def _collector_off() -> Iterator[None]:
+    """The cyclic collector off for a timing, and back to how it was after."""
     was_enabled = gc.isenabled()
     gc.disable()
     try:
-        return _growth_between(judge, small, large, rounds=3)
+        yield
     finally:
         if was_enabled:
             gc.enable()
+
+
+def _attempt_ratio(judge: Callable[[str], object], small: str, large: str) -> float:
+    """One attempt: a reading of :func:`_growth_between`, which says how it samples, taken with
+    the collector off."""
+    with _collector_off():
+        return _growth_between(judge, small, large, rounds=3)
 
 
 def _scaling_ratios(
@@ -354,8 +362,8 @@ def _attempts(readings: list[float]) -> str:
 
 def _cpu_ratio(judge: Callable[[str], object], make: Callable[[int], str], k: int) -> float:
     """The inputs :func:`_scaling_ratios` builds from ``make`` and ``k``, timed again on the calling
-    thread's CPU clock, for the record only
-    (BACKLOG #3452, step 1). Nothing asserts on it.
+    thread's CPU clock, for the record only (BACKLOG #3452, step 1). The control asserts nothing
+    on it, and records a failure inside it instead of failing.
 
     It tells the two causes of a low wall reading apart, on the runner where the reading was taken.
     A host that takes the core away charges this clock nothing, so a wall reading under the line
@@ -363,16 +371,18 @@ def _cpu_ratio(judge: Callable[[str], object], make: Callable[[int], str], k: in
     itself scaled less than its square, so a larger ``k`` or another subject is the answer, not a
     better clock. The calls interleave, as :func:`interleaved_thread_cpu` says why."""
     small, large = make(k), make(4 * k)
-    was_enabled = gc.isenabled()
-    gc.disable()
-    try:
+    with _collector_off():
         per_call = interleaved_thread_cpu(
             {"small": lambda: judge(small), "large": lambda: judge(large)}
         )
-    finally:
-        if was_enabled:
-            gc.enable()
     return per_call["large"] / per_call["small"]
+
+
+def _quadratic(text: str) -> None:
+    """The control's subject: re-parses a prefix every 100 characters, the shape of a parser that
+    rescans from the start at each separator. Its work grows with the square of the length."""
+    for end in range(100, len(text) + 1, 100):
+        canonical_group_dn(text[:end])
 
 
 @pytest.mark.parametrize(
@@ -400,32 +410,35 @@ def test_the_linear_time_check_fails_a_quadratic_parser(
     """Control: the ratio check must catch a quadratic parser, or its pass above proves nothing.
     It asserts exactly the negation of the linear test's pass condition.
 
-    This one re-parses a prefix every 100 characters, the shape of a parser that rescans from the
-    start at each separator. Its work grows with the square of the length. It runs at ``k`` =
-    2,000; :func:`_scaling_ratios` says why the size went up (BACKLOG #3452).
+    Its subject is :func:`_quadratic`. It runs at ``k`` = 2,000; :func:`_scaling_ratios` says why
+    the size went up (BACKLOG #3452).
 
     THE CAUSE OF A LOW READING IS MEASURED HERE, ON EVERY RUN THAT REACHES IT, PASS OR FAIL
     (BACKLOG #3452, step 1). The wall readings and :func:`_cpu_ratio`'s reading go into the
     failure message and, as ``wall_ratios`` and ``cpu_ratio``, into this test's junit properties.
-    ci.yml writes that file on the engine ``test`` legs and uploads it on every run, pass or fail,
-    as the ``junit-test-shard-*`` artifacts. A passing run is recorded too, because a sample taken
-    only on a red is selected on the outcome and cannot say how often the control reads low."""
-
-    def quadratic(text: str) -> None:
-        for end in range(100, len(text) + 1, 100):
-            canonical_group_dn(text[:end])
-
+    ci.yml's engine ``test`` job writes and uploads that file; its ``Upload engine suite junit``
+    steps say when and for how long. A passing run is recorded too, because a sample taken only on
+    a red is selected on the outcome and cannot say how often the control reads low."""
     make, k = _PATHOLOGICAL_DNS["many-rdns"][0], 2_000
-    readings = _scaling_ratios(quadratic, make, k)
-    # Recorded before the CPU reading, so a failure inside that reading keeps the wall record.
+    readings = _scaling_ratios(_quadratic, make, k)
     record_property("wall_ratios", ",".join(f"{reading:.3f}" for reading in readings))
-    cpu = _cpu_ratio(quadratic, make, k)
-    record_property("cpu_ratio", f"{cpu:.3f}")
+    try:
+        cpu = f"{_cpu_ratio(_quadratic, make, k):.3f}"
+    except RuntimeError as broken:  # interleaved_thread_cpu's spin guard; a reading, not a verdict
+        cpu = f"error: {broken}"
+    record_property("cpu_ratio", cpu)
     ratio = min(readings)
     assert ratio >= _MAX_LINEAR_RATIO, (
         f"a quadratic parser scaled by only {ratio:.2f}x ({_attempts(readings)}; "
-        f"thread CPU clock {cpu:.2f}x)"
+        f"thread CPU clock {cpu})"
     )
+
+
+def test_the_cpu_reading_reads_large_over_small() -> None:
+    """The CPU reading unstubbed, on the control's own subject: large over small, not inverted.
+    An inverted ratio would read near 0.06 and send #3452's cause the wrong way. The bound is far
+    below the 16 a quadratic gives, so it checks direction, not speed."""
+    assert _cpu_ratio(_quadratic, _PATHOLOGICAL_DNS["many-rdns"][0], 2_000) > 2.0
 
 
 def _stub_attempts(monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...]) -> list[float]:
@@ -447,7 +460,7 @@ def _stub_attempts(monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...])
 @pytest.mark.parametrize(
     ("attempts", "spent", "failure"),
     [
-        ((4.0, 4.0, 4.0), 1, "only 4.00x (attempts: 4.00x; thread CPU clock 15.00x)"),
+        ((4.0, 4.0, 4.0), 1, "only 4.00x (attempts: 4.00x; thread CPU clock 15.000)"),
         ((15.0, 15.0, 4.0), 3, "only 4.00x (attempts: 15.00x, 15.00x, 4.00x; thread"),
         ((8.0, 8.0, 8.0), 3, None),
         ((15.0, 9.0, 12.0), 3, None),
