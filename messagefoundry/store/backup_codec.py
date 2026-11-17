@@ -30,9 +30,11 @@ module imports ``cryptography`` / ``hashlib``, it is registered in
         ctlen      = uint32                       # length of (ciphertext ‖ GCM tag)
         ciphertext = AESGCM.encrypt(nonce, chunk, aad)   # ‖ 16-byte tag appended by AESGCM
 
-The per-chunk **AAD binds**: ``header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)``. So a
-reordered, dropped, truncated, or appended chunk — or a tampered header (the ``key_id`` / ``chunk_size``)
-— changes the AAD and **fails the GCM tag** (fail-closed). ``final_flag = 1`` on the last frame and the
+The per-chunk **AAD binds**: ``header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)``, where
+the header digest is over the canonical header bytes the writer emits. The reader refuses a header
+not in that exact form, so a header changed in any byte is either refused or fails the tag. A
+reordered, dropped, truncated, or appended chunk, or a changed header field, changes the AAD and
+**fails the GCM tag** (fail-closed). ``final_flag = 1`` on the last frame and the
 decoder requires it, so a truncation that drops the tail frame is detected as a missing terminator, not
 silently accepted. The frame counter is **monotonic from 0**, re-derived on decode, so a frame replayed
 out of order authenticates against the wrong counter and fails the tag.
@@ -143,7 +145,8 @@ def key_fingerprint(key: bytes) -> str:
 
 @dataclass(frozen=True)
 class ArchiveHeader:
-    """The PHI-free, plaintext (but AAD-bound) header at the front of a ``.mfbak`` archive. Carries only
+    """The PHI-free, plaintext header at the front of a ``.mfbak`` archive, bound by the frames' AAD
+    because the reader accepts it only in its canonical form (:meth:`to_json_bytes`). Carries only
     enough to identify the archive + drive decryption; the rich manifest (row counts, fingerprints, …)
     lives INSIDE the encrypted tar. ``key_id`` is a one-way fingerprint — **never** key bytes."""
 
@@ -322,10 +325,9 @@ def _header_salt(obj: dict[str, object], version: int) -> bytes | None:
 def _header_int(obj: dict[str, object], name: str) -> int:
     """The header's integer field ``name``, taken as written.
 
-    ``int()`` would accept ``1024.0``, ``"1024"`` or ``true`` and turn each into a number. The
-    header bytes are not authenticated; the frames' associated data hashes the header as this code
-    re-serializes it. So a coerced value that re-serialized to the writer's bytes passed the tag and
-    decrypted. Refusing it here makes such a header a header refusal."""
+    ``int()`` would accept ``1024.0``, ``"1024"`` or ``true`` and turn each into a number the
+    writer never wrote. :func:`read_header` also refuses any header that is not in the writer's
+    exact form; this check makes a wrong type its own refusal before that."""
     value = obj[name]
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError(f"{name} must be an integer")
@@ -436,7 +438,8 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
     except (KeyError, TypeError, ValueError) as exc:
         raise BackupCodecError("malformed .mfbak header (missing/invalid field)") from exc
     if header.format_version != version:
-        # The JSON copy is AAD-bound and the byte is not; a disagreement is a tampered prefix.
+        # The JSON copy is bound by the AAD (see the canonical-form check below) and the byte is
+        # not; a disagreement is a tampered prefix.
         raise BackupCodecError(
             f"malformed .mfbak header (format_version {header.format_version} != version byte "
             f"{version})"
@@ -452,6 +455,11 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
             f"malformed .mfbak header (chunk_size must be in 1..{MAX_CHUNK_SIZE} bytes, got "
             f"{header.chunk_size})"
         )
+    # The frames' AAD hashes header.to_json_bytes(), not the bytes read, so the header is bound only
+    # if the two are the same bytes. The writer emits exactly that form; any other spelling of the
+    # same fields (spacing, key order, an extra or repeated key, a coerced value) is refused here.
+    if header_bytes != header.to_json_bytes():
+        raise BackupCodecError("malformed .mfbak header (not in the form this format writes)")
     return header
 
 

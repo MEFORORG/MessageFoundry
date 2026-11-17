@@ -612,8 +612,8 @@ def _with_header_field(name: str, value: object) -> bytes:
 @pytest.mark.parametrize("name", ["chunk_size", "format_version"])
 @pytest.mark.parametrize("kind", ["float", "string", "bool"])
 def test_a_header_integer_field_that_is_not_an_int_is_refused(name: str, kind: str) -> None:
-    # int() turned 1024.0, "1024" and true into numbers. The tag covers the re-serialized header,
-    # not the bytes read, so a coerced value that re-serialized to the writer's bytes passed it.
+    # int() turned 1024.0, "1024" and true into numbers the writer never wrote. Each is now refused
+    # as a wrong type, ahead of the canonical-form check below.
     good = 1024 if name == "chunk_size" else bc.FORMAT_VERSION
     value: object = {"float": float(good), "string": str(good), "bool": True}[kind]
     with pytest.raises(bc.BackupCodecError, match="missing/invalid field"):
@@ -621,10 +621,67 @@ def test_a_header_integer_field_that_is_not_an_int_is_refused(name: str, kind: s
 
 
 def test_a_header_with_its_integer_fields_as_written_still_reads() -> None:
-    # Negative control for the test above: the helper's rewrite alone does not trip the refusal.
-    assert bc.read_header(io.BytesIO(_with_header_field("chunk_size", 1024))).chunk_size == 1024
-    rewritten = _with_header_field("format_version", bc.FORMAT_VERSION)
-    assert bc.read_header(io.BytesIO(rewritten)).format_version == bc.FORMAT_VERSION
+    # Negative control for the test above: the helper's rewrite alone does not trip the refusal. A
+    # CHANGED valid int reads back as written, so the helper is shown to rewrite the field.
+    assert bc.read_header(io.BytesIO(_with_header_field("chunk_size", 2048))).chunk_size == 2048
+
+
+@pytest.mark.parametrize("salted", [False, True], ids=["unsalted", "salted"])
+@pytest.mark.parametrize("chunk_size", [1, 1024, bc.MAX_CHUNK_SIZE])
+def test_every_header_the_writer_emits_is_in_canonical_form(chunk_size: int, salted: bool) -> None:
+    # The canonical-form check must never refuse this build's own archive.
+    key = os.urandom(32)
+    enc = io.BytesIO()
+    bc.encrypt_stream(
+        io.BytesIO(b"x" * 3),
+        enc,
+        key,
+        chunk_size=chunk_size,
+        salt=os.urandom(STORE_SALT_BYTES) if salted else None,
+    )
+    blob = enc.getvalue()
+    off = len(bc.MAGIC) + 1
+    (hdrlen,) = _U32.unpack(blob[off : off + _U32.size])
+    raw = blob[off + _U32.size : off + _U32.size + hdrlen]
+    assert bc.read_header(io.BytesIO(blob)).to_json_bytes() == raw
+    out = io.BytesIO()
+    bc.decrypt_stream(io.BytesIO(blob), out, key)
+    assert out.getvalue() == b"x" * 3
+
+
+def _respelled(blob: bytes, spell: str) -> bytes:
+    """``blob`` with its header JSON re-spelled, the parsed fields unchanged unless ``spell`` adds
+    one, and ``hdrlen`` refitted."""
+    off = len(bc.MAGIC) + 1
+    (old_len,) = _U32.unpack(blob[off : off + _U32.size])
+    obj = json.loads(blob[off + _U32.size : off + _U32.size + old_len])
+    if spell == "pretty":
+        header = json.dumps(obj, sort_keys=True, indent=2).encode()
+    elif spell == "reordered":
+        header = json.dumps(dict(reversed(list(obj.items()))), separators=(",", ":")).encode()
+    elif spell == "extra-key":
+        header = json.dumps({**obj, "zz": "x"}, sort_keys=True, separators=(",", ":")).encode()
+    else:  # "canonical", the control
+        header = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+    return blob[:off] + _U32.pack(len(header)) + header + blob[off + _U32.size + old_len :]
+
+
+@pytest.mark.parametrize("spell", ["pretty", "reordered", "extra-key"])
+def test_a_header_respelled_with_the_same_fields_is_refused_before_decrypt(spell: str) -> None:
+    # The AAD hashes the re-serialized header, so these used to authenticate and decrypt.
+    key = os.urandom(32)
+    blob, _, _ = _archive(b"y" * 100, key)
+    with pytest.raises(bc.BackupCodecError, match="not in the form this format writes"):
+        bc.decrypt_stream(io.BytesIO(_respelled(blob, spell)), io.BytesIO(), key)
+
+
+def test_a_header_respelled_canonically_still_decrypts() -> None:
+    # Control for the test above: the helper's rebuild alone does not trip the refusal.
+    key = os.urandom(32)
+    blob, _, _ = _archive(b"y" * 100, key)
+    out = io.BytesIO()
+    bc.decrypt_stream(io.BytesIO(_respelled(blob, "canonical")), out, key)
+    assert out.getvalue() == b"y" * 100
 
 
 # --- BACKLOG #6687 items 3 and 7: memoryview reads, non-bytes reads, the field named ---------------
