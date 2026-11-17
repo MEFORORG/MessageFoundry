@@ -615,9 +615,8 @@ def windows_chain(
                 )
             # The target with the rest of the path, not the target alone: a letter defined onto a
             # bare drive (``\??\C:``) makes ``S:\ca.pem`` read as ``C:\ca.pem``, which is rooted.
+            # A drive-relative result (``\??\C:certs``) is refused at the top of the next pass.
             pending = target + rest
-            if _drive_relative(pending):
-                return chain, WalkCause.plain(_DRIVE_RELATIVE)
             continue
         root = drive + "\\"
         why = volume_cause(root)
