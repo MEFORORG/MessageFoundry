@@ -118,11 +118,9 @@ either project's source at a commit, so a release that wraps or prefixes the tex
 refusal back into the cipher's own error, unaudited and unalerted. A queue payload cell still
 classifies through `is_tag_failure`, which counts every marked Transit value as held, so under
 `vault_transit` any refusal of one Transit gave a verdict on reads as a queue tag failure, and is
-dead-lettered and alerted as before. Transit gives a verdict on the row only with an HTTP 400, 404
-or 413, or a tag check that ran and failed. Any other failure reaching or authenticating to it
-gives none (BACKLOG #5765, #5735), so it is no tag failure and the claim does not dead-letter the
-row. The rule, with the cases it names, is stated once, in `_key_service_gave_no_verdict` in
-`store/queue_tag.py`. Only a row the pooled dispatcher claims through `claim_fifo_heads` takes the ADR 0070
+dead-lettered and alerted as before. A failure on which Transit gave no verdict about the row is
+no tag failure, and the claim does not dead-letter the row (BACKLOG #5765, #5735). Which failures
+are verdicts is stated once, in `_key_service_gave_no_verdict` in `store/queue_tag.py`. Only a row the pooled dispatcher claims through `claim_fifo_heads` takes the ADR 0070
 infra-fault path, so a fault that lasts there stops the lane with a `connection_stopped` alert
 under `infra_fault_policy = "stop"`, or raises `lane_stuck` under `retry_forever`. That covers the
 FIFO lanes under the default `claim_mode = "pooled"`, and no other claim. Every other claim sets the

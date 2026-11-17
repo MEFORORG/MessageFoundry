@@ -277,6 +277,8 @@ def _transit_error(kind: str) -> Callable[[], CipherError]:
     from hvac import exceptions as hv  # type: ignore[import-untyped]  # noqa: PLC0415
 
     from messagefoundry.store.crypto_transit import _transit_failure  # noqa: PLC0415
+    from messagefoundry.transports.bounded_read import EgressReplyError  # noqa: PLC0415
+    from messagefoundry.transports.strict_requests import VaultHopRefused  # noqa: PLC0415
     from tests.test_queue_tag import with_reply_status as recorded  # noqa: PLC0415
 
     def unexpected(status: int) -> Exception:
@@ -301,6 +303,9 @@ def _transit_error(kind: str) -> Callable[[], CipherError]:
         "504": lambda: unexpected(504),
         "timeout": lambda: requests.exceptions.ReadTimeout("read timed out"),
         "connection": lambda: requests.exceptions.ConnectionError("connection refused"),
+        # The strict Vault adapter raises these unwrapped, through hvac.
+        "hop-refused": lambda: VaultHopRefused("vault_transit: refused"),
+        "reply-refused": lambda: EgressReplyError("a reply the engine cannot read strictly"),
     }
 
     def build() -> CipherError:
@@ -314,8 +319,8 @@ def _transit_error(kind: str) -> Callable[[], CipherError]:
 
 #: The replies that are Vault's verdict on the row (``queue_tag._key_service_gave_no_verdict``).
 _VERDICTS = ["400", "404", "413"]
-#: At least these give no verdict on the row. 401, 403, 408, the TLS refusal and the 503 recorded on
-#: a TypeError were verdicts before the rule was revised.
+#: At least these give no verdict on the row. 401, 403, 408, the TLS refusal, the 503 recorded on
+#: a TypeError and the two strict-adapter refusals were verdicts before the rule was revised.
 _NO_VERDICTS = [
     "503",
     "429",
@@ -328,6 +333,8 @@ _NO_VERDICTS = [
     "408",
     "tls",
     "503-typeerror",
+    "hop-refused",
+    "reply-refused",
 ]
 
 
@@ -591,7 +598,8 @@ async def test_the_server_classifier_matches_sqlite(backend: str) -> None:
     store_fault = OSError("connection reset")
     fake = _FakeServer(store_fault)  # the dead-letter write fails: still reported, then returned
     fault = await _classify(backend, _server_store(backend, fake), QueueTagError("t"))
-    assert isinstance(fault, QueueOpenFault) and str(fault) == "OSError: connection reset"
+    # Named by its type alone: a driver's text can echo a value, and T17 logs the fault at ERROR.
+    assert isinstance(fault, QueueOpenFault) and str(fault) == "OSError"
     assert fake.audited == [QUEUE_TAG_FAILED_ACTION]
 
     fake = _FakeServer(TypeError("bug"))  # an engine bug stays loud

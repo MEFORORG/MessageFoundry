@@ -5563,8 +5563,9 @@ class PostgresStore:
                         continue
                 kept_rows.append(row)
         # Group by lane and sort by `seq` in memory (RETURNING does not guarantee order), then
-        # decode AFTER the claim txn: an undecryptable row is dead-lettered (its own txn) and
-        # DROPPED; the surviving tail keeps its order.
+        # decode AFTER the claim txn: a row refused for its own content is dead-lettered (its own
+        # txn) and DROPPED; the surviving tail keeps its order. Any other open failure returns the
+        # row and its lane's tail as unopened items (#5735).
         by_lane_rows: dict[str, list[Any]] = {}
         for row in kept_rows:
             by_lane_rows.setdefault(row[lane_col], []).append(row)

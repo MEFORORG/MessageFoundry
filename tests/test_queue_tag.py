@@ -381,6 +381,11 @@ def test_the_no_verdict_rule_reads_the_status_first_on_any_cause() -> None:
 
     from messagefoundry.store.crypto import UnauthenticatedCipherError  # noqa: PLC0415
     from messagefoundry.store.queue_tag import is_transient_open_failure  # noqa: PLC0415
+    from messagefoundry.transports.bounded_read import (  # noqa: PLC0415
+        EgressReplyError,
+        ResponseTooLargeError,
+    )
+    from messagefoundry.transports.strict_requests import VaultHopRefused  # noqa: PLC0415
 
     no_verdict: list[BaseException] = [
         hv.Unauthorized(),
@@ -395,6 +400,11 @@ def test_the_no_verdict_rule_reads_the_status_first_on_any_cause() -> None:
         requests.exceptions.SSLError("certificate verify failed"),
         requests.exceptions.ChunkedEncodingError("connection broken"),
         ConnectionResetError("reset by peer"),
+        # The strict Vault adapter raises these unwrapped: a hop it refused, a reply it would not
+        # read, and a reply past its byte bound.
+        VaultHopRefused("vault_transit: refused"),
+        EgressReplyError("a reply the engine cannot read strictly"),
+        ResponseTooLargeError("too large"),
     ]
     for cause in no_verdict:
         assert is_transient_open_failure(_caused(cause)), cause
@@ -414,3 +424,16 @@ def test_the_no_verdict_rule_reads_the_status_first_on_any_cause() -> None:
     assert not is_transient_open_failure(
         _caused(with_reply_status(hv.VaultDown(), 503), UnauthenticatedCipherError)
     )
+
+
+def test_an_open_fault_names_a_non_cipher_error_by_its_type_alone() -> None:
+    """BACKLOG #5735: the T17 path logs a :class:`QueueOpenFault` at ERROR, so a failed store
+    write's driver text, which can echo a value, must not ride in it. A cipher error's own text,
+    which never holds a value, is kept."""
+    from messagefoundry.store.crypto import CipherUnavailableError  # noqa: PLC0415
+    from messagefoundry.store.queue_tag import queue_open_fault  # noqa: PLC0415
+
+    leaked = "String or binary data would be truncated. Truncated value: 'DOE^JANE'"
+    assert str(queue_open_fault(OSError(leaked))) == "OSError"
+    assert str(queue_open_fault(RuntimeError(leaked))) == "RuntimeError"
+    assert str(queue_open_fault(CipherUnavailableError("down"))) == "CipherUnavailableError: down"

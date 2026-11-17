@@ -622,10 +622,10 @@ class QueueStore(StoreLifecycle, Protocol):
         failure is also audited and alerted, BACKLOG #2593). A failure that is not the row's
         (BACKLOG #5735) is not dead-lettered: at least a key service that gave no verdict, a failed
         read of the store (SQLite), and a dead-letter write that fails. The row is set aside, back
-        to ``pending`` with ``attempts`` undone and ``next_attempt_at`` five seconds ahead
+        to ``pending`` with ``attempts`` undone and ``next_attempt_at`` five seconds past the fault
         (:meth:`reschedule_claimed`), and is retried no sooner than that, for as long as the
         failure lasts, with no cap and no alert of its own. A tag failure whose dead-letter write
-        failed is still audited and alerted. On the server backends, which contain only
+        failed is still alerted, and its audit row attempted. On the server backends, which contain only
         ``CipherError``, any other error propagates and leaves the row ``inflight`` until
         :meth:`reset_stale_inflight` or, on Postgres, its lease expiry re-pends it; the SQLite
         claims dead-letter it as an unopenable row. :meth:`claim_ready` and
@@ -717,7 +717,7 @@ class QueueStore(StoreLifecycle, Protocol):
         lane, as an item whose ``open_fault`` is set and whose ``payload`` is empty and must not be
         read: the caller treats it as an infra fault at that item (ADR 0070 T17). The claim writes
         nothing for it, except where the row failed its queue tag and the dead-letter write then
-        failed: that tag failure is still audited and alerted.
+        failed: that tag failure is still alerted, and its audit row attempted.
 
         **The lane set is always explicit** (the caller's ready-lane subset, registry-intersected).
         There is deliberately no all-lanes-of-stage claim form: disjoint-inbound sharding runs

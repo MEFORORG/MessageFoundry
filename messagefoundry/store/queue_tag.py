@@ -147,8 +147,13 @@ class QueueOpenFault(Exception):
 
 
 def queue_open_fault(exc: BaseException) -> QueueOpenFault:
-    """:class:`QueueOpenFault` naming ``exc`` by its type and its own text only."""
-    return QueueOpenFault(f"{type(exc).__name__}: {exc}")
+    """:class:`QueueOpenFault` naming ``exc`` by its type, and by its own text only where ``exc``
+    is a :class:`CipherError`, whose text never holds a value. Any other error, a failed store read
+    or dead-letter write, is named by its type alone: a driver's text can echo a statement, a key
+    or a truncated value, and the T17 path logs this fault at ERROR."""
+    if isinstance(exc, CipherError):
+        return QueueOpenFault(f"{type(exc).__name__}: {exc}")
+    return QueueOpenFault(type(exc).__name__)
 
 
 class _Releaser(Protocol):
@@ -287,6 +292,11 @@ _NO_VERDICT_HVAC_ERRORS: Final = frozenset(
 #: cause of any class, and before the cause's class.
 _REPLY_STATUS_ATTR: Final = "mefor_reply_status"
 
+#: The engine's own refusal of a hop's TLS settings, ``tls_policy.InsecureHopRefused``, which the
+#: strict Vault adapter raises as its subclass ``VaultHopRefused``. Named rather than imported, so
+#: this module adds no TLS-policy use to the crypto inventory.
+_HOP_REFUSED: Final = ("messagefoundry.config.tls_policy", "InsecureHopRefused")
+
 
 def _key_service_gave_no_verdict(exc: CipherError) -> bool:
     """Whether ``exc`` says nothing about the row, because the key service gave no verdict on it.
@@ -297,13 +307,15 @@ def _key_service_gave_no_verdict(exc: CipherError) -> bool:
     and failed (:class:`UnauthenticatedCipherError`). Everything else about reaching or
     authenticating to the key service gives no verdict, at least: a 401, 403 or 408; a 429 or any
     5xx; a connection failure, timeout, dropped connection or cut-off reply (an ``OSError`` cause,
-    which every ``requests`` error is); a TLS or certificate refusal; an ``UnexpectedError`` with
+    which every ``requests`` error is); a TLS or certificate refusal, the engine's own hop refusal
+    (``InsecureHopRefused``) among them; a reply the engine would not read (``EgressReplyError``,
+    which the strict Vault adapter raises unwrapped); an ``UnexpectedError`` with
     no recorded status; and a :class:`CipherUnavailableError`. A reply status the store's client
     recorded (:data:`_REPLY_STATUS_ATTR`) decides first, on a cause of any class.
 
     Any other cipher error keeps the classification it had before this rule, a verdict: one with
-    no cause, or whose cause none of the above names, such as a malformed reply's ``KeyError``, a
-    bare ``EgressReplyError`` or hvac's client-side ``ParamValidationError``.
+    no cause, or whose cause none of the above names, such as a malformed reply's ``KeyError`` or
+    hvac's client-side ``ParamValidationError``.
 
     Deliberately not :func:`~messagefoundry.store.crypto.gave_no_verdict` or
     :func:`~messagefoundry.store.keyprovider_vault.is_vault_timeout_reply`: other modules read
@@ -323,8 +335,13 @@ def _key_service_gave_no_verdict(exc: CipherError) -> bool:
         return status not in _VERDICT_STATUSES
     if type(cause).__module__.split(".")[0] == "hvac":
         return type(cause).__name__ in _NO_VERDICT_HVAC_ERRORS
-    # A cause that is not hvac's and not an OSError is unknown here: a verdict, as before this rule.
-    return isinstance(cause, OSError)
+    from messagefoundry.transports.bounded_read import EgressReplyError  # noqa: PLC0415
+
+    # The strict Vault adapter raises these itself, unwrapped: a hop it refused, and a reply it
+    # would not read. A cause none of the above names is unknown here: a verdict, as before.
+    return isinstance(cause, (OSError, EgressReplyError)) or any(
+        (kind.__module__, kind.__qualname__) == _HOP_REFUSED for kind in type(cause).__mro__
+    )
 
 
 def is_transient_open_failure(exc: BaseException) -> bool:

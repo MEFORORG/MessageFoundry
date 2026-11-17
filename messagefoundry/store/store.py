@@ -14814,9 +14814,11 @@ class MessageStore:
         rows in one ``UPDATE ... id IN (...)``, then **re-SELECT** them so each :class:`OutboxItem`
         carries the POST-increment ``attempts`` the G6 ceiling reads (mirrors the single claim's re-read).
 
-        Decryption happens AFTER the commit, off the lock; an undecryptable row is dead-lettered
-        standalone and DROPPED from the returned list (a poison interior row never stalls the lane and
-        never reorders the surviving tail), mirroring :meth:`claim_ready`.
+        Decryption happens AFTER the commit, off the lock; a row refused for its own content is
+        dead-lettered standalone and DROPPED from the returned list (a poison interior row never
+        stalls the lane and never reorders the surviving tail), mirroring :meth:`claim_ready`. A row
+        that could not be opened for a reason that is not the row (BACKLOG #5735) ends the list
+        instead, and it and every later claimed row are set aside (:meth:`_set_aside_claimed`).
         """
         now = time.time() if now is None else now
         # Lane column is a code-controlled literal (chosen by stage), never user input — same mapping as
@@ -14861,6 +14863,7 @@ class MessageStore:
         # Decrypt per row OUTSIDE the lock; a single undecryptable payload (corrupt blob / rotated key)
         # must not blow up the whole claim — dead-letter the bad row STANDALONE and deliver the rest
         # (the surviving tail keeps its order — mirrors claim_ready / the single claim's H-1 handling).
+        # A row that is not refused for its own content stops the list and is set aside (#5735).
         items: list[OutboxItem] = []
         ordered = list(claimed_rows)
         for i, row in enumerate(ordered):
@@ -14895,9 +14898,11 @@ class MessageStore:
         guarantee (cf. the Postgres/SQL Server probe-then-claim). Rows past the cutoff are never
         UPDATEd (``attempts`` untouched — probe-then-claim parity by construction).
 
-        Decryption happens AFTER the commit, off the lock; an undecryptable row is dead-lettered
-        standalone and DROPPED (a poison interior row never stalls the lane and never reorders the
-        surviving tail); a lane whose whole claimed prefix was consumed (H2/poison) joins ``rearm``."""
+        Decryption happens AFTER the commit, off the lock; a row refused for its own content is
+        dead-lettered standalone and DROPPED (a poison interior row never stalls the lane and never
+        reorders the surviving tail); a lane whose whole claimed prefix was consumed (H2/poison)
+        joins ``rearm``. A row that could not be opened for a reason that is not the row (BACKLOG
+        #5735) is returned with every later row of its lane, each carrying ``open_fault``."""
         now = time.time() if now is None else now
         # Lane column is a code-controlled literal (chosen by stage), never user input — same mapping
         # as claim_next_fifo.
@@ -14983,6 +14988,8 @@ class MessageStore:
             await self._commit()
         # Decrypt per row OUTSIDE the lock; a single undecryptable payload must not blow up the whole
         # claim — dead-letter the bad row STANDALONE and deliver the rest (mirrors the batch claim).
+        # A row that is not refused for its own content is returned with its lane's tail as unopened
+        # items for the dispatcher's T17 path (#5735).
         by_lane: dict[str, list[OutboxItem]] = {}
         try:
             for lane, lane_rows in claimed_by_lane.items():

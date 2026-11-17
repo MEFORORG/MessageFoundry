@@ -11033,8 +11033,9 @@ class SqlServerStore:
         directly on the candidate rows, matching the single claim's blocking exactly.
 
         Read with ``fetchall`` under the EF-6 ``_cursor`` close-before-release discipline (no-MARS), like
-        the single claim. An undecryptable row is dead-lettered and DROPPED (poison containment); the
-        surviving tail keeps its order. The outbound/delivery lane is never batched — callers pass an
+        the single claim. A row refused for its own content is dead-lettered and DROPPED (poison
+        containment); the surviving tail keeps its order. Any other open failure sets that row and
+        every later claimed row aside (BACKLOG #5735). The outbound/delivery lane is never batched — callers pass an
         ingress/routed ``stage`` (the H2 skip-and-complete that the single outbound claim runs in-txn is
         deliberately absent here; ingress/routed rows have ``destination_name`` NULL and never hit it)."""
         now = time.time() if now is None else now
@@ -11621,8 +11622,9 @@ class SqlServerStore:
                             )
                         raise
         # Group by lane and re-sort by `seq` in memory (OUTPUT order is not guaranteed — same as the
-        # shipped batch claim), then decrypt AFTER the commit: an undecryptable row is dead-lettered
-        # and DROPPED (poison containment); the surviving tail keeps its order.
+        # shipped batch claim), then decrypt AFTER the commit: a row refused for its own content is
+        # dead-lettered and DROPPED (poison containment); the surviving tail keeps its order. Any
+        # other open failure returns the row and its lane's tail as unopened items (#5735).
         by_lane_rows: dict[str, list[dict[str, Any]]] = {}
         for d in claimed_rows:
             by_lane_rows.setdefault(d[lane_col], []).append(d)
