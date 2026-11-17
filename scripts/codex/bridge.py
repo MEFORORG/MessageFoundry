@@ -18,6 +18,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# Hook mode's exit code for a hook's deliberate exit 2. invoke.ps1 ends its process with 2 for it,
+# since pwsh -Command reports a script's exit 2 as 1. Every other outcome exits as before.
+BLOCK_EXIT = 10
 EVENTS = (
     "SessionStart",
     "SessionEnd",
@@ -113,6 +116,10 @@ def sync_skills(
                 f"MISSING SOURCE: {target.relative_to(root)}; remove or rename this pointer"
             )
     return messages
+
+
+class HookBlocked(Exception):
+    """A hook exited 2, which Claude Code reads as a deliberate block."""
 
 
 def child_environment(root: Path, session_id: str) -> dict[str, str]:
@@ -243,7 +250,7 @@ def dispatch(root: Path, payload: dict) -> dict:
             if completed.stderr:
                 print(completed.stderr, file=sys.stderr, end="")
             if completed.returncode == 2:
-                raise PermissionError(completed.stderr or "Claude hook blocked this event")
+                raise HookBlocked(completed.stderr or "Claude hook blocked this event")
             completed.check_returncode()
             output = completed.stdout.strip()
             if not output:
@@ -331,6 +338,9 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except HookBlocked as exc:
+        print(f"Codex bridge: {exc}", file=sys.stderr)
+        sys.exit(BLOCK_EXIT)
     except (
         OSError,
         ValueError,

@@ -11,4 +11,8 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw 'Create this worktree''s .venv first; see docs/WORKTREES.md.'
 }
 & $python (Join-Path $PSScriptRoot 'bridge.py') @args
+# The bridge exits 10 (BLOCK_EXIT in bridge.py) for a hook's exit 2. Ending the process keeps it as
+# 2, which the caller's pwsh -Command would report as 1. Hook mode only, so a caller's window
+# survives `run`.
+if ($LASTEXITCODE -eq 10 -and $args[0] -eq 'hook') { [Environment]::Exit(2) }
 exit $LASTEXITCODE

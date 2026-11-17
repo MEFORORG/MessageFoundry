@@ -320,3 +320,122 @@ def test_registered_command_runs_from_a_subdirectory(tmp_path):
         timeout=20,
     )
     assert json.loads(completed.stdout) == {"probe": True}
+
+
+# --- The registered line, end to end: a hook's exit 2 reaches Codex as 2 where the outer shell
+# keeps it, and every fault path stays at least as blocking as on origin/main (a non-zero exit).
+
+_DENY = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}}
+_PAYLOAD = {"session_id": "x", "hook_event_name": "PreToolUse", "tool_name": "Bash"}
+
+
+def _py(source, **extra):
+    return {"type": "command", "command": sys.executable, "args": ["-c", source], **extra}
+
+
+def _outer_shells():
+    shells = ["pwsh"]
+    if os.name == "nt":
+        shells.append("cmd")
+    if shutil.which("sh"):
+        shells.append("sh")
+    return shells
+
+
+def _outer_argv(shell, command):
+    # cmd takes the line verbatim, as a string: Python's argv quoting escapes quotes in a way cmd
+    # does not read.
+    if shell == "cmd":
+        return f"cmd /d /c {command}"
+    if shell == "pwsh":
+        return ["pwsh", "-NoProfile", "-Command", command]
+    return [shutil.which("sh"), "-c", command]
+
+
+def _link_python(root):
+    """Give the copied launcher a .venv that reaches this test's own interpreter."""
+    if os.name == "nt":
+        if not (Path(sys.prefix) / "Scripts/python.exe").is_file():
+            pytest.skip("needs a virtualenv to junction on Windows")
+        link = ["cmd", "/c", "mklink", "/J", str(root / ".venv"), sys.prefix]
+        subprocess.run(link, check=True, capture_output=True)
+    else:
+        (root / ".venv/bin").mkdir(parents=True)
+        (root / ".venv/bin/python").symlink_to(sys.executable)
+
+
+def _run_registered(tmp_path, shell, settings_text, payload=_PAYLOAD, venv=True):
+    import tomllib
+
+    root = tmp_path / "repo"
+    scripts = root / "scripts/codex"
+    scripts.mkdir(parents=True)
+    for name in ("invoke.ps1", "bridge.py"):
+        shutil.copy2(ROOT / "scripts/codex" / name, scripts / name)
+    (root / ".claude").mkdir()
+    (root / ".claude/settings.json").write_text(settings_text, encoding="utf-8")
+    if venv:
+        _link_python(root)
+    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+    config = tomllib.loads((ROOT / ".codex/config.toml").read_text())
+    command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    stdin = payload if isinstance(payload, str) else json.dumps(payload)
+    return subprocess.run(
+        _outer_argv(shell, command),
+        cwd=scripts,
+        input=stdin,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def _hooks(*handlers):
+    return json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": list(handlers)}]}})
+
+
+_FAULTS = {
+    "hook-exits-1": (_hooks(_py("import sys; sys.exit(1)")), _PAYLOAD, True),
+    "hook-timeout": (_hooks(_py("import time; time.sleep(5)", timeout=0.5)), _PAYLOAD, True),
+    "unsupported-hook": (_hooks({"type": "prompt", "prompt": "review"}), _PAYLOAD, True),
+    "non-object-json": (_hooks(_py("print('[1]')")), _PAYLOAD, True),
+    "null-json": (_hooks(_py("print('null')")), _PAYLOAD, True),
+    "hooks-null": (
+        json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": None}]}}),
+        _PAYLOAD,
+        True,
+    ),
+    "unparseable-settings": ("{not json", _PAYLOAD, True),
+    "missing-session-id": (_hooks(_py("print('{}')")), {**_PAYLOAD, "session_id": ""}, True),
+    "unparseable-payload": (_hooks(_py("print('{}')")), "not json", True),
+    "no-venv": (_hooks(_py("print('{}')")), _PAYLOAD, False),
+}
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.parametrize("shell", _outer_shells())
+@pytest.mark.parametrize("fault", list(_FAULTS))
+def test_every_fault_path_is_at_least_as_blocking_as_main(tmp_path, shell, fault):
+    """On origin/main each of these exits non-zero through the registered line, never 0."""
+    settings_text, payload, venv = _FAULTS[fault]
+    completed = _run_registered(tmp_path, shell, settings_text, payload, venv)
+    assert completed.returncode != 0, (completed.stdout, completed.stderr)
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.parametrize("shell", _outer_shells())
+def test_a_hooks_exit_2_reaches_codex_where_the_outer_shell_keeps_it(tmp_path, shell):
+    completed = _run_registered(tmp_path, shell, _hooks(_py("import sys; sys.exit(2)")))
+    # pwsh -Command reports any exit 2 as 1; cmd and sh pass the launcher's 2 on.
+    assert completed.returncode == (1 if shell == "pwsh" else 2), completed.stderr
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.parametrize("shell", _outer_shells())
+def test_a_deny_and_a_clean_run_exit_0(tmp_path, shell):
+    deny = _run_registered(tmp_path / "deny", shell, _hooks(_py(f"print({json.dumps(_DENY)!r})")))
+    assert deny.returncode == 0, deny.stderr
+    assert json.loads(deny.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    clean = _run_registered(tmp_path / "clean", shell, _hooks(_py("print('{}')")))
+    assert clean.returncode == 0, clean.stderr
