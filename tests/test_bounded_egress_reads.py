@@ -974,13 +974,24 @@ def _smart_coded(ec_pem: str) -> SmartBackendTokenProvider:
 
 
 def _assert_coded_token_dead_letters(exc: BaseException) -> None:
-    """Step 4, owner ruling 2026-11-18: "Dead-letter, no retry". A retry would re-send the client
-    credential to an endpoint that answers the same way."""
+    """Step 4, owner ruling 2026-11-18: "Dead-letter, no retry"."""
     assert isinstance(exc, NegativeAckError)
     assert exc.permanent is True
     assert exc.code == TOKEN_REPLY_CODED_CODE
     assert "s3cr3t" not in str(exc)
     assert exc.__context__ is None
+
+
+def test_the_coded_token_refusal_names_the_hop_and_no_url(ec_pem: str) -> None:
+    """BACKLOG #2060: a refusal of a reply body names the hop by a fixed label, never the token
+    URL, redacted or not. The text reaches the row's last_error and a lookup's error."""
+    for provider in (_oauth2_coded(), _smart_coded(ec_pem)):
+        with pytest.raises(NegativeAckError) as err:
+            provider.access_token()
+        text = str(err.value)
+        assert "auth.example.com" not in text
+        assert "/token" not in text
+        assert "token endpoint answered in a content coding" in text
 
 
 def test_an_oauth2_token_reply_in_a_content_coding_is_a_permanent_refusal() -> None:

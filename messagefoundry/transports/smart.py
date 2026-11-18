@@ -157,8 +157,7 @@ def request_token(
 
     A reply in a content coding the engine does not decode is a permanent
     :class:`~messagefoundry.transports.base.NegativeAckError` coded
-    :data:`TOKEN_REPLY_CODED_CODE`, so the delivery dead-letters rather than retries: each retry
-    would re-send the client credential to an endpoint that answers the same way. Owner ruling
+    :data:`TOKEN_REPLY_CODED_CODE`, so the delivery dead-letters rather than retries. Owner ruling
     2026-11-18 on BACKLOG #5910 step 4: "Dead-letter, no retry"."""
     coded = False
     try:
@@ -171,9 +170,9 @@ def request_token(
         coded = True
     if coded:
         # Raised outside the handler, so no __context__ keeps the reply's frame alive. Fixed text:
-        # the endpoint label is the redacted URL, and no reply byte is read.
+        # the connector is the hop label, never a URL (BACKLOG #2060), and no reply byte is read.
         raise NegativeAckError(
-            f"{TOKEN_REPLY_CODED_CODE}. {endpoint} answered in a content coding the "
+            f"{TOKEN_REPLY_CODED_CODE}. {connector} answered in a content coding the "
             "engine does not decode",
             code=TOKEN_REPLY_CODED_CODE,
             permanent=True,
