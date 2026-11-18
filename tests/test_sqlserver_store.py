@@ -1036,8 +1036,8 @@ async def test_approval_repeats_racing_from_two_processes_file_one_request(store
         answers = await asyncio.to_thread(race_repeat_requests, "sqlserver", tmp_path, nonce)
         await assert_one_request_per_round(store, answers)
     finally:
-        # The fixture does not clear pending_approvals, so a run that fails anywhere, the race
-        # itself included, must not leave its open requests behind for a later test.
+        # A run that fails anywhere, the race itself included, must not leave its open requests
+        # behind for a later test; this does not rest on the fixture's table list.
         for approval_id in filed_for(nonce, await open_requests(store)):
             await store.decide_pending_approval(
                 approval_id, status="rejected", approver="race-cleanup", decided_at=1_100.0

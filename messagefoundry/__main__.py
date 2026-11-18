@@ -7241,18 +7241,17 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 f"{_sentence(codec_safe_str(extra))} Nothing was written.", as_json=args.json
             )
             return 2
-        # #1670: a path that is not a database, or a server the driver could not reach. An engine
-        # refusal, such as SchemaNotProvisionedError, is printed whole, so its remedy survives
-        # (BACKLOG #5633), as the transit-bound commands print one.
+        # #1670: a path that is not a database, or a server the driver could not reach. A refusal
+        # class the engine defines, such as SchemaNotProvisionedError, is printed whole, so its
+        # remedy survives, as the transit-bound commands print one (BACKLOG #5633). A plain
+        # RuntimeError keeps the redacted rendering, since its text is not the engine's own prose.
+        whole = type(extra) is not RuntimeError and _is_engine_refusal(extra)
         return _emit_store_open_error(
             extra,
             _store_label(settings.store),
             as_json=args.json,
-            text=_transit_store_error_text(extra),
+            text=_transit_store_error_text(extra) if whole else None,
         )
-    # A Transit row seal that could not be made or checked is not a busy store, so it is not
-    # given the busy store's remedy (BACKLOG #5633).
-    sealing = isinstance(extra, (RowSealUnverifiableError, TransitSealUnavailableError))
     if outcome in ("read-refused", "refused"):
         # Logged, so the cause can be found: WARNING names the class only, since a driver's
         # message can quote a stored value (ASVS 16.5.4); the traceback goes to DEBUG. A busy
@@ -7266,18 +7265,28 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
         log.debug("admin-unlock: the refusal's traceback", exc_info=extra)
     if outcome == "read-refused":
-        check = "that Vault transit is reachable" if sealing else "the store key and the database"
         return _emit_error(
             f"the store refused to read the account {wanted!r} ({type(extra).__name__}); "
-            f"nothing was written. Check {check}, then re-run",
+            "nothing was written. Check the store key and the database, then re-run",
             as_json=args.json,
         )
-    if outcome == "refused" and sealing:
+    # A Transit row seal is not a busy store, so neither gets the busy store's remedy (BACKLOG
+    # #5633 item 2). An outage clears when Vault answers; an unverifiable seal is Transit's
+    # answer, so a re-run meets it again.
+    if outcome == "refused" and isinstance(extra, TransitSealUnavailableError):
         return _emit_error(
             f"the store refused the unlock for {wanted!r} ({type(extra).__name__}): a row seal "
             "could not be made or checked through Vault transit. The clear and its audit row are "
             "one transaction, so neither was written. Check that Vault transit is reachable, then "
             "re-run",
+            as_json=args.json,
+        )
+    if outcome == "refused" and isinstance(extra, RowSealUnverifiableError):
+        return _emit_error(
+            f"the store refused the unlock for {wanted!r} ({type(extra).__name__}): Vault transit "
+            "would not check the account's row seal. The clear and its audit row are one "
+            "transaction, so neither was written. A re-run meets the same answer until Transit "
+            "checks that seal: check the Transit key's versions, then read the audit log",
             as_json=args.json,
         )
     if outcome == "refused":
@@ -12322,7 +12331,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "the store is refused on every read and no key re-seals it, so it does not hold this "
             "rotation open; recreate or remove it. A write an engine made during this run may be "
             "sound and still under the prior key: stop every engine using this store and re-run "
-            "before dropping that key."
+            "before dropping that key. If such a run counts the records again, treat them as "
+            "changed outside the store."
         )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under
@@ -14408,7 +14418,8 @@ def _emit_store_open_error(
     OSError, and its client errors, whose text ``safe_exc`` redacts by pattern only.
 
     ``text``, when given, replaces that rendering, for a caller that has already rendered the error
-    its own way: the transit-bound commands print an engine refusal whole (BACKLOG #2337).
+    its own way: the transit-bound commands print an engine refusal whole (BACKLOG #2337), and
+    ``admin-unlock`` a refusal class the engine defines (BACKLOG #5633).
     """
     message = f"cannot open the store at {path}: {_store_error_text(exc) if text is None else text}"
     if as_json:
