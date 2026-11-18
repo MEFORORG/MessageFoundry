@@ -1078,14 +1078,17 @@ def _lat(s: LatencySummary) -> dict[str, float | int]:
 def compare_to_baseline(current: object, baseline: object, *, tolerance: float) -> list[str]:
     """Return regression messages comparing a current report dict to a saved baseline dict. A
     regression is throughput below ``baseline*(1-tolerance)``, p99 above ``baseline*(1+tolerance)``,
-    errors, NAKs or dead letters per message sent above ``baseline*(1+tolerance)``, or a loss the
-    baseline did not have. Empty list = no regression.
+    errors, NAKs, timeouts or dead letters per message sent above ``baseline*(1+tolerance)``, or a
+    loss the baseline did not have. Empty list = no regression.
 
     It fails closed (BACKLOG #5439): a report that is not a JSON object, a baseline with no phases,
     a baseline phase the current run lacks, and a metric that is missing, boolean or not finite in
     either report each come back as a message rather than a pass or a traceback, because a
-    comparison that cannot be made is not evidence of no regression."""
+    comparison that cannot be made is not evidence of no regression. So is a tolerance outside
+    ``[0, 1)``: NaN passes every threshold, and 1.0 or more puts the throughput floor at zero."""
     out: list[str] = []
+    if not (isinstance(tolerance, (int, float)) and 0.0 <= tolerance < 1.0):
+        return [f"tolerance {tolerance!r} is not a fraction in [0, 1)"]
     if not isinstance(baseline, dict):
         return [f"baseline is not a JSON object (got {type(baseline).__name__})"]
     if not isinstance(current, dict):
@@ -1095,8 +1098,9 @@ def compare_to_baseline(current: object, baseline: object, *, tolerance: float) 
     if base_phases == {}:
         out.append("baseline has no phases to compare")
     if base_phases is not None and cur_phases is not None:
-        for name, bp in base_phases.items():
-            cp = cur_phases.get(name)
+        for key, bp in base_phases.items():
+            name = key[0] if key[1] == 1 else f"{key[0]} ({key[1]})"
+            cp = cur_phases.get(key)
             if cp is None:
                 out.append(f"{name}: phase is in the baseline but missing from the current run")
                 continue
@@ -1107,12 +1111,21 @@ def compare_to_baseline(current: object, baseline: object, *, tolerance: float) 
     for label, path in (
         ("errors", ("totals", "errors")),
         ("NAKs", ("totals", "nak")),
+        # Unconfirmed sends: the no-loss reconcile excuses them up to its budget, so a rise here
+        # can hide a loss that reconcile passes.
+        ("timeouts", ("totals", "timeouts")),
         ("dead letters", ("engine_side", "dead_letters")),
     ):
         counts = _pair(label, _get(baseline, *path), _get(current, *path), out)
-        if counts is None or sent is None or counts[1] <= 0:
+        if counts is None or sent is None:
             continue
         (b_n, c_n), (b_sent, c_sent) = counts, sent
+        if b_n < 0 or c_n < 0:
+            # A run delta below zero is a counter reset, and the real count is unknown.
+            out.append(f"{label}: negative count ({b_n:.0f} baseline, {c_n:.0f} current)")
+            continue
+        if c_n == 0:
+            continue
         if b_sent <= 0 or c_sent <= 0:
             out.append(f"{label}: {c_n:.0f} in the current run, and sent is not positive in both")
             continue
@@ -1123,12 +1136,14 @@ def compare_to_baseline(current: object, baseline: object, *, tolerance: float) 
     for which, flag in (("baseline", b_ok), ("current", c_ok)):
         if flag is None:
             out.append(f"{which} no_loss.ok is missing or not a boolean")
-    if b_ok is True and c_ok is False:
-        nl = current.get("no_loss")
-        if isinstance(nl, dict) and nl.get("inconclusive"):
-            out.append("no-loss regressed: baseline had no loss, current run is inconclusive")
-        else:
-            out.append("no-loss regressed: baseline had no loss, current run lost messages")
+    b_lost = b_ok is False and _get(baseline, "no_loss", "inconclusive") is not True
+    c_inconclusive = _get(current, "no_loss", "inconclusive") is True
+    if c_ok is False and not c_inconclusive and not b_lost:
+        # A proven loss is a regression against any baseline that did not itself lose messages,
+        # an INCONCLUSIVE one included.
+        out.append("no-loss regressed: baseline had no proven loss, current run lost messages")
+    elif b_ok is True and c_ok is False:
+        out.append("no-loss regressed: baseline had no loss, current run is inconclusive")
     return out
 
 
@@ -1159,14 +1174,15 @@ def _compare_phase(
 
 def _phases(
     which: str, report: dict[str, object], out: list[str]
-) -> dict[str, dict[str, object]] | None:
-    """The report's phases by name, or None after naming why they cannot be read. A profile may
-    repeat a phase name, so a repeat is keyed ``name (2)``, ``name (3)`` in run order."""
+) -> dict[tuple[str, int], dict[str, object]] | None:
+    """The report's phases keyed by (name, occurrence), or None after naming why they cannot be
+    read. A profile may repeat a phase name, so a repeat is matched by its place in run order; a
+    tuple key cannot collide with a phase whose own name looks like a numbered repeat."""
     raw = report.get("phases")
     if not isinstance(raw, list):
         out.append(f"{which} report has no phases list")
         return None
-    phases: dict[str, dict[str, object]] = {}
+    phases: dict[tuple[str, int], dict[str, object]] = {}
     seen: dict[str, int] = {}
     for p in raw:
         name = p.get("name") if isinstance(p, dict) else None
@@ -1174,7 +1190,7 @@ def _phases(
             out.append(f"{which} report has a phase with no name")
             return None
         seen[name] = seen.get(name, 0) + 1
-        phases[name if seen[name] == 1 else f"{name} ({seen[name]})"] = p
+        phases[(name, seen[name])] = p
     return phases
 
 

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -114,7 +114,7 @@ def test_multishard_clean_record_passes() -> None:
         ),
         pytest.param(
             {"per_engine": (_engine(0), _engine(1, failed_lanes=("IB_E1_CS_00000: bind",)))},
-            "ms-e1: 1 inbound lanes not listening",
+            "ms-e1: 1 inbound lanes not listening (IB_E1_CS_00000: bind)",
             id="failed-lanes",
         ),
         pytest.param({"drain_seconds": None}, "the drain timed out", id="drain-timeout"),
@@ -170,7 +170,7 @@ def _phase(name: str, *, rate: object = 100.0, p99: object = 20.0) -> dict[str, 
 def _load_report() -> dict[str, Any]:
     return {
         "phases": [_phase("warmup", rate=50.0), _phase("steady")],
-        "totals": {"sent": 1000, "errors": 0, "nak": 0},
+        "totals": {"sent": 1000, "errors": 0, "nak": 0, "timeouts": 0},
         "engine_side": {"dead_letters": 0},
         "no_loss": {"ok": True},
     }
@@ -304,3 +304,54 @@ def test_non_finite_baseline_metric_is_flagged() -> None:
     baseline = _with(("phases", 1, "achieved_msg_s"), float("nan"))
     regressions = compare_to_baseline(_load_report(), baseline, tolerance=0.1)
     assert any("baseline value nan is not a finite number" in r for r in regressions), regressions
+
+
+@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), 1.0, -0.1])
+def test_a_tolerance_outside_a_fraction_is_refused(tolerance: float) -> None:
+    # NaN answers every threshold False, and 1.0 puts the throughput floor at zero.
+    regressions = compare_to_baseline(_load_report(), _load_report(), tolerance=tolerance)
+    assert any("is not a fraction in [0, 1)" in r for r in regressions), regressions
+
+
+def test_a_loss_against_an_inconclusive_baseline_is_flagged() -> None:
+    baseline = _with(("no_loss",), {"ok": False, "inconclusive": True})
+    lost = _with(("no_loss",), {"ok": False, "inconclusive": False})
+    regressions = compare_to_baseline(lost, baseline, tolerance=0.1)
+    assert any("current run lost messages" in r for r in regressions), regressions
+    # The control: an inconclusive run against an inconclusive baseline is no worse.
+    assert compare_to_baseline(baseline, baseline, tolerance=0.1) == []
+
+
+def test_timeouts_and_negative_counters_are_flagged() -> None:
+    more = compare_to_baseline(_with(("totals", "timeouts"), 300), _load_report(), tolerance=0.1)
+    assert any("timeouts worsened" in r for r in more), more
+    reset = compare_to_baseline(
+        _with(("engine_side", "dead_letters"), -3), _load_report(), tolerance=0.1
+    )
+    assert any("dead letters: negative count" in r for r in reset), reset
+
+
+def test_a_phase_named_like_a_repeat_is_still_compared() -> None:
+    report = {**_load_report(), "phases": [_phase("a"), _phase("a (2)"), _phase("a")]}
+    assert compare_to_baseline(report, report, tolerance=0.1) == []
+    slow = _with(("phases", 1, "achieved_msg_s"), 1.0, report)
+    regressions = compare_to_baseline(slow, report, tolerance=0.1)
+    assert any(r.startswith("a (2): throughput regressed") for r in regressions), regressions
+
+
+def test_a_refused_attribution_sign_in_fails_the_step_not_the_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import harness.load.multishard as multishard
+    from harness.load.rigadmin import RigSignInRateLimited
+
+    def _refuse(url: str, *, cacert: object = None) -> object:
+        raise RigSignInRateLimited("429")
+
+    monkeypatch.setattr(multishard, "rig_client", _refuse)
+    node = cast(Any, type("Node", (), {"url": "https://n", "cacert": None, "node_id": "ms-e1"})())
+    (attribution,) = multishard._attribute_engines_sync([node], 1)
+    assert attribution.attribution_failed
+    record = _ms_record(per_engine=(_engine(0), attribution))
+    assert "ms-e1: /connections could not be read for attribution" in record.problems
+    assert not _ms_report(record).result_ok

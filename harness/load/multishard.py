@@ -227,7 +227,11 @@ class MultiShardRecord:
             if e.reads <= 0:
                 out.append(f"{e.node_id}: read nothing on its own lanes")
             if e.failed_lanes:
-                out.append(f"{e.node_id}: {len(e.failed_lanes)} inbound lanes not listening")
+                # The engine's own reasons, so a console reader can diagnose without the JSON.
+                out.append(
+                    f"{e.node_id}: {len(e.failed_lanes)} inbound lanes not listening "
+                    f"({'; '.join(e.failed_lanes)})"
+                )
         return tuple(out)
 
     def to_json_dict(self) -> dict[str, object]:
@@ -793,8 +797,6 @@ async def _attribute_engines(
 def _attribute_engines_sync(
     nodes: list[EngineNode], engine_index_base: int = 0
 ) -> list[EngineAttribution]:
-    from messagefoundry.apiclient import ApiError
-
     out: list[EngineAttribution] = []
     for k, node in enumerate(nodes):
         tag = f"E{k + engine_index_base}"
@@ -809,9 +811,10 @@ def _attribute_engines_sync(
                 reasons = _reveal_failed_reasons(client, rows)
             finally:
                 client.close()
-        except ApiError:
-            # A node unreachable at attribution time (already torn down / transient) surfaces as an
-            # empty attribution — the smoke asserts positive rows, so it won't silently pass.
+        except SIGN_IN_ERRORS:
+            # A node unreachable at attribution time (already torn down / transient), or a refused
+            # or rate-limited rig sign-in, surfaces as a failed attribution that fails the step
+            # (`MultiShardRecord.problems`) rather than ending the sweep and losing earlier steps.
             out.append(EngineAttribution(node.node_id, tag, 0, 0, 0, attribution_failed=True))
             continue
         failed: list[str] = []

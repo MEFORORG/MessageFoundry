@@ -46,8 +46,10 @@
                                                 concurrently-active `serve` engines against ONE shared
                                                 store (disjoint inbound/sink/API ports + disjoint
                                                 connection names), drive per-engine load, and read whether
-                                                one store is the aggregate ceiling. Exits 0 (zero-loss at
-                                                every N) / 1 (loss) / 2 (setup) / 3 (interrupted).
+                                                one store is the aggregate ceiling. Exits 0 (zero-loss and
+                                                lane isolation at every N) / 1 (a step's `problems`: loss,
+                                                a lane steal, an unattributed or idle engine, a timed-out
+                                                drain, nothing sent) / 2 (setup) / 3 (interrupted).
 ``python -m harness shardcert ...``   → run the N-active engine-shard SIZING bench (ADR 0073): N
                                                 `serve --shard` engines on ONE unified server store with
                                                 OVERLAPPING outbound destinations, driven at a single rate
