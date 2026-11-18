@@ -879,7 +879,8 @@ or compression library:
   type its extension names. A zip member's name must also pass the Windows name check,
   `windows_member_name_reason` in `parsing/sniff.py`, which refuses at least a colon, a component
   ending in a dot or space, a reserved device name such as `con.hl7`, and a character Windows
-  refuses in a name (BACKLOG #5369). Members come back as bytes in memory; this module writes no file.
+  refuses in a name (BACKLOG #5369). Members come back as bytes in memory; this module writes no
+  file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.
 - `parsing/dicom/_deps.py` imports `zlib` only to name `zlib.error` in the tuple of parse errors
@@ -891,7 +892,8 @@ or compression library:
   uncompressed tar, and both a member's declared size and the bytes actually read are capped. With
   `--config-to`, the restore writes the archive's config files under their own relative names. Each
   name must pass the archive-member safe-path check, `archive_member_name_reason`, and must resolve inside the destination.
-  The restore uses only that check: it does not run the Windows name check, `windows_member_name_reason`.
+  The restore uses only that check: it does not run the Windows name check,
+  `windows_member_name_reason`.
   A member-count cap and a total-size cap apply too. An encrypted backup must decrypt with a store
   key, and every block of it must authenticate, so a tampered one fails before anything is
   extracted. With a store key configured, a plaintext backup is refused; one restores only on a

@@ -19,8 +19,8 @@ Guards (all on by design — inbound HL7/XML is attacker-influenceable, CLAUDE.m
 * ``DOCTYPE`` rejection — :func:`parse_bytes` additionally **rejects any document carrying a DOCTYPE**
   (``etree.DOCSTRING``/``DTD`` in the tree), so a payload can't smuggle entity *definitions* even
   though references wouldn't be resolved — defense in depth, mirroring defusedxml's ``forbid_dtd``.
-  A document that fails to parse is refused the same way when its prolog opens a DOCTYPE in one of
-  the encodings :func:`_declares_doctype` reads.
+  A document that fails to parse is refused too, with a message of its own, when its prolog opens
+  a DOCTYPE in one of the encodings :func:`_declares_doctype` reads.
 * **No second decode** — for ``str`` input, :func:`parse_bytes` neutralizes the XML declaration's
   ``encoding=`` pseudo-attribute before encoding to UTF-8 (ASVS 1.5.3, see
   :func:`_without_declared_encoding`).
@@ -91,8 +91,8 @@ _DOCTYPE_REFUSAL = (
 
 #: The failed-parse arm's own text. Such a document opens a DOCTYPE in its prolog and the parser
 #: did not finish it: it may be malformed, or well-formed and stopped by a parser limit, as an
-#: entity-expansion bomb is. The parse did not say what the DOCTYPE defines (``<!DOCTYPE html>``
-#: defines nothing), so the text names the DOCTYPE and the failed parse, and no entity.
+#: entity-expansion bomb is. An unfinished parse reports nothing about what the DOCTYPE holds, so
+#: the text names the DOCTYPE and the failed parse, and no entity.
 _BROKEN_DOCTYPE_REFUSAL = (
     "refusing an XML document that opens a DOCTYPE in its prolog and that the parser did not finish"
 )
@@ -140,8 +140,8 @@ def parse_bytes(data: bytes | str) -> Any:
     (a DTD/entity-definition carrier), and, with a message of its own, when the document fails to
     parse but its prolog opens a DOCTYPE within its first 64 KiB (``_DOCTYPE_SCAN_BYTES``), read as
     latin-1 (which stands for every ASCII-compatible encoding, UTF-8 included) or as UTF-16 or
-    UTF-32 in either byte order (``_DOCTYPE_SCAN_CODECS``, which names encodings it does not read);
-    and :class:`XmlParseError` if it is not well-formed XML. Each
+    UTF-32 in either byte order (``_DOCTYPE_SCAN_CODECS``, whose comment names encodings the scan
+    does not read); and :class:`XmlParseError` if it is not well-formed XML. Each
     message is fixed text plus, for a parse error, the fault's line, column and libxml2 error code;
     none carries lxml's message, and none is chained from lxml's error (BACKLOG #5371). Requires
     the ``[xml]`` extra."""

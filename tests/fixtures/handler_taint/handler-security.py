@@ -207,10 +207,9 @@ def h_file_forms(msg, mode):
     with open("/tmp/e.log", "w") as fh2:
         # ok: mf-handler-phi-to-file
         fh2.write("processed")
-    # This rule reads the bytes written, so it does not flag a tainted fd with a constant payload,
-    # or a shutil call that writes no message bytes: shutil.which writes nothing, and shutil.move
-    # moves a constant source file, with the message only in the destination name, which this rule
-    # does not read.
+    # Not flagged: an os.write whose fd is tainted but whose payload is constant; shutil.which,
+    # which is not a sink; and a shutil.move from a constant source, since this rule's shutil sink
+    # reads the source argument and not the message-derived destination name.
     # ok: mf-handler-phi-to-file
     os.write(len(body), b"ok")
     # ok: mf-handler-phi-to-file
