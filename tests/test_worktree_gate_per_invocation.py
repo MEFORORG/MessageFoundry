@@ -363,16 +363,28 @@ def test_a_git_inside_a_substitution_is_still_judged(rig: SimpleNamespace) -> No
 @pytest.mark.parametrize(
     ("flags", "tool"),
     [
-        ("-c a.b=\\)", "Bash"),
+        (r"-c a.b=\)", "Bash"),
         ("-c a.b=`)", "PowerShell"),
         ("-c a.b=$(git rev-parse HEAD)", "Bash"),
+        # The other host's escape character is no escape (measured ALLOW on d55d420e018).
+        (r"-c a.b=$(echo C:\tmp\)", "PowerShell"),
+        ("-c a.b=$(echo `echo x`)", "Bash"),
+        # An even run of the host's escape is escaped escapes and a real `)` (measured ALLOW on
+        # d55d420e018 for the two-character runs).
+        (r"-c a.b=$(echo \\)", "Bash"),
+        ("-c a.b=$(echo ``)", "PowerShell"),
+        (r"-c a.b=$(echo \\\\)", "Bash"),
+        ("-c a.b=$(echo ````)", "PowerShell"),
+        # An odd run is still an escaped `)`.
+        (r"-c a.b=\\\)", "Bash"),
+        ("-c a.b=```)", "PowerShell"),
     ],
 )
 def test_a_closer_in_the_owning_gits_flags_does_not_hide_its_dash_C(
     rig: SimpleNamespace, flags: str, tool: str
 ) -> None:
-    """The first two are DENY on origin/main and were ALLOW when an escaped `)` read as a closed
-    group; the third, a git nested in the flags, is ALLOW on origin/main."""
+    """Each is DENY: the owning git's `-C <primary>` decides the relative victim. The escaped-`)`
+    rows are DENY on origin/main; the nested-git row is ALLOW there."""
     cmd = (
         f"git -C {rig.outside2.as_posix()} status ; "
         f"git -C {rig.primary.as_posix()} {flags} worktree remove ../Primary-wt2"

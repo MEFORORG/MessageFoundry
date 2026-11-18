@@ -775,16 +775,23 @@ function Get-OwnInvocationWindow([string]$Scan, [int]$At, [switch]$SeparatorInTo
 #   * A `)` with no opener in $Text: `echo $(git -C <d> log -1) worktree remove <wt>` closes the
 #     substitution git ran in, and the match belongs to `echo`. The FIRST reading still judges that
 #     line, so it is still refused for what it names.
-# A `(` or `)` escaped by the character before it (`\` or a backtick) is a literal and is not read, so
-# `-c a.b=\)` cannot pass for a closed group. A quoted one never reaches here: the scan blanks a quoted
-# span holding either. Braces are not read at all: `x{y` is an ordinary unquoted path, and a `{`
-# counted as an opener once let `git -C <d>/x{y worktree remove <wt>` skip the invocation.
-function Test-CrossesOwnGroup([string]$Text) {
+# A `(` or `)` escaped by the HOST'S escape character ($Escape, from Get-EscapeChar: `\` under a POSIX
+# shell, a backtick under PowerShell) is a literal and is not read, so `-c a.b=\)` cannot pass for a
+# closed group. It is escaped only after an ODD-length run of that character: `\\)` is an escaped
+# backslash and a real `)`. The other host's character is no escape: `C:\tmp\)` in PowerShell, and a
+# backtick substitution in bash, end in a real `)`. A quoted one never reaches here: the scan blanks a
+# quoted span holding either. Braces are not read at all: `x{y` is an ordinary unquoted path, and a
+# `{` counted as an opener once let `git -C <d>/x{y worktree remove <wt>` skip the invocation.
+function Test-CrossesOwnGroup([string]$Text, [char]$Escape) {
     $depth = 0
     for ($i = 0; $i -lt $Text.Length; $i++) {
         $c = $Text[$i]
         if ($c -ne '(' -and $c -ne ')') { continue }
-        if ($i -gt 0 -and ('\`'.Contains([string]$Text[$i - 1]))) { continue }
+        $run = 0
+        if ($Escape -ne [char]0) {
+            for ($j = $i - 1; $j -ge 0 -and $Text[$j] -eq $Escape; $j--) { $run++ }
+        }
+        if ($run % 2 -eq 1) { continue }
         if ($c -eq '(') { $depth++ }
         elseif ($depth -eq 0) { return $true }
         else { $depth-- }
@@ -4454,7 +4461,7 @@ What to do instead:
                     # goes on to the token before it, so in `git -C <p> -c a.b=$(git rev-parse HEAD)
                     # worktree remove <wt>` the inner git is passed over and the outer one, with its
                     # `-C`, owns the match.
-                    if (Test-CrossesOwnGroup $between) {
+                    if (Test-CrossesOwnGroup $between (Get-EscapeChar $seg.Conv)) {
                         $probeAt = $cand.Own.Index - 1
                         continue
                     }
@@ -4582,9 +4589,7 @@ What to do instead:
         #     blanks (an interpreter payload is recursed separately), one with no git token before it
         #     on its segment, one whose git token `$gitInvocation` does not recognise, and one behind a
         #     separator inside a substitution such as `$(cd x; pwd)`, one whose git word is not at
-        #     command position (`command git`, `sudo git`, a printed `echo git`), and one whose owning
-        #     git token is itself inside a substitution in its flags (`-c x=$(git rev-parse HEAD)`),
-        #     which then loses the outer `-C`. The FIRST reading still judges
+        #     command position (`command git`, `sudo git`, a printed `echo git`). The FIRST reading still judges
         #     whatever the line's first raw match is, a quoted mention included, so a mention can still
         #     be refused for what it names.
         #   * NOT FOLLOWED BY EITHER BASE, at least: a chdir on an EARLIER LINE of the command, a
