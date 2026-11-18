@@ -133,7 +133,7 @@ class RowSealError(Exception):
         self.subject = subject
 
     def __str__(self) -> str:
-        return f"a stored {self.kind} row failed its integrity check and was refused; nothing was written"
+        return f"a stored {self.kind} row failed its integrity check and was refused"
 
 
 class RevokedRowSealError(RowSealError):

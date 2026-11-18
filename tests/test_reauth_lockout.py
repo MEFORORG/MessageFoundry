@@ -23,6 +23,7 @@ All credentials and directory data here are synthetic.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -547,6 +548,38 @@ async def test_a_busy_account_whose_old_sessions_ended_is_not_revoked_on_its_fir
         assert not out.ok and not out.session_lost, "revoked on its first typo"
         assert service._session_reproof_failures(hash_token(token)) == 1
         assert all(h not in service._reproof_session_failures for h in ended)
+    finally:
+        await store.close()
+
+
+async def test_a_session_row_that_does_not_parse_keeps_its_count_at_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5505: the drop at the account's cap read a listing that leaves out a session row
+    that does not parse, so that unrevoked session's count was dropped and a cap slot opened.
+    Its count is kept, as every unrevoked row's is."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
+    path = tmp_path / "reproof-cap.db"
+    store = await MessageStore.open(path)
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        held: list[tuple[Identity, str]] = []
+        for _ in range(2):
+            identity, token = await _signed_in(service)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            held.append((identity, token))
+        bad = hash_token(held[0][1])
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("UPDATE sessions SET last_used_at='x' WHERE token_hash=?", (bad,))
+            conn.commit()
+        finally:
+            conn.close()
+        identity, token = held[1]
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+        assert service._session_reproof_failures(bad) == 1, "an unrevoked session's count went"
+        assert service._session_reproof_failures(hash_token(token)) == 2
     finally:
         await store.close()
 

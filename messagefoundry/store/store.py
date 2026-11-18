@@ -3174,7 +3174,8 @@ def _listed_user(d: Mapping[str, Any]) -> UserRecord:
 def listed_users(rows: Iterable[Mapping[str, Any]]) -> list[UserRecord]:
     """The accounts a list read returned, in order (BACKLOG #5505). An account whose row has a
     timestamp or counter cell that does not parse stays in the list as
-    :meth:`UserRecord.unreadable_row`, so the admin list shows it as failing. The read coerces the
+    :meth:`UserRecord.unreadable_row`, so the admin list shows it as failing, unless its id cell is
+    empty or not text, when it is left out. The read coerces the
     flag cells with ``bool()`` and copies the text cells, at least ``totp_recovery_codes`` and
     ``channel_scope``, without parsing them, so a bad value in one leaves the account listed as it
     reads. The single-row user readers raise :class:`RowSealError` for a row with such a
@@ -21232,11 +21233,16 @@ class MessageStore:
         return SessionRecord.from_mapping(dict(row)) if row else None
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        strict: bool = False,
     ) -> list[SessionRecord]:
         """A user's currently-**active** sessions (not revoked, not expired), most-recently-used
         first — the self-service session inventory (WP-10, ASVS 7.5.2). See
-        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
+        :meth:`AuthStore.list_sessions` for ``idle_seconds`` and ``strict``."""
         now = time.time() if now is None else now
         async with self._read() as db:
             if idle_seconds is None:
@@ -21251,7 +21257,10 @@ class MessageStore:
                     " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                     (user_id, now, now, float(idle_seconds)),
                 )
-            return decoded_rows(await cur.fetchall(), lambda r: SessionRecord.from_mapping(dict(r)))
+            rows = await cur.fetchall()
+        if strict:
+            return [SessionRecord.from_mapping(dict(r)) for r in rows]
+        return decoded_rows(rows, lambda r: SessionRecord.from_mapping(dict(r)))
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now

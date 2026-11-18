@@ -2998,8 +2998,8 @@ class LockableAccountCensus:
     #: and enrolling the app again for an enrolment this release refuses.
     reset_would_remove_a_passkey: tuple[str, ...] = ()
     #: Every account whose users row does not parse
-    #: (:func:`~messagefoundry.store.store.listed_users` says which), by its stored id (BACKLOG
-    #: #5505). Its record fails its integrity check, so whether it is lockable is unknown: it is
+    #: (:func:`~messagefoundry.store.store.listed_users` says which), by its stored id, but one
+    #: whose id cell is empty or not text, which the list read leaves out (BACKLOG #5505). Its record fails its integrity check, so whether it is lockable is unknown: it is
     #: named here and in no other list, since every other list would read fields the store could
     #: not read. The census does not parse the recovery-code cell.
     integrity_failed: tuple[str, ...] = ()
@@ -15188,10 +15188,17 @@ class AuthService:
         So a lapsed session's count is not judged here. It leaves at least when a re-proof on that
         session ends it (:meth:`_end_lapsed_reproof_session`), when the reaper purges its row and
         a later drop runs, or by the age prune. Until then it holds its place at the account's cap,
-        so a new session that finds no room is revoked on its first failure (fail closed)."""
+        so a new session that finds no room is revoked on its first failure (fail closed).
+
+        The read is ``strict``: a row that does not parse would otherwise be left out of it, and
+        its count dropped, so then every count is kept (BACKLOG #5505)."""
         if not self._reproof_counts_of(user_id, keep=keep):
             return
-        live = {s.token_hash for s in await self._store.list_sessions(user_id, now=0.0)}
+        try:
+            listed = await self._store.list_sessions(user_id, now=0.0, strict=True)
+        except RowSealError:
+            return
+        live = {s.token_hash for s in listed}
         self._forget_reproof_counts(
             h for h in self._reproof_counts_of(user_id, keep=keep) if h not in live
         )
@@ -20215,8 +20222,8 @@ class AuthService:
     ) -> None:
         """One :data:`GATE_ONLY_REVOKE_ACTION` row per account a custom-role edit or delete of
         ``role_id`` revoked although, read after the gate, it neither holds the role in its stored
-        role rows, nor has role rows that do not parse, nor a timestamp or counter cell that does
-        not parse (BACKLOG #5505). The gate names such an account because its integrity
+        role rows, nor has role rows that do not parse, nor a users row with a timestamp or counter
+        cell that does not parse (BACKLOG #5505). The gate names such an account because its integrity
         check failed, or because it held the role when the gate read it. The role's own row does
         not list the accounts it ended, so this is the row that names them. A refused write is
         logged, not raised: the change and the revoke have both happened."""

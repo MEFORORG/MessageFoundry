@@ -2558,7 +2558,8 @@ class AuthStore(Protocol):
         ...
 
     async def list_users(self) -> Sequence[UserRecord]:
-        """Every account. One whose row does not parse
+        """Every account but one whose row does not parse and whose id cell is empty or not text,
+        which is left out. Any other whose row does not parse
         (:func:`~messagefoundry.store.store.listed_users` says which) is listed as
         :meth:`~messagefoundry.store.store.UserRecord.unreadable_row`, whose fields other than the
         id are invented (BACKLOG #5505); the single-row user readers raise
@@ -3415,7 +3416,12 @@ class AuthStore(Protocol):
     async def get_session(self, token_hash: str) -> SessionRecord | None: ...
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        strict: bool = False,
     ) -> list[SessionRecord]:
         """A user's unrevoked sessions not past their absolute expiry, most recently used first.
 
@@ -3430,7 +3436,10 @@ class AuthStore(Protocol):
         This is deliberately not ``SessionRecord.is_live``: a row stamped ahead of ``now`` (a
         backward clock step) stays listed. Unless it is presented and revoked first, the validator
         accepts it again once the clock catches up, so hiding it would keep the user from seeing or
-        ending a session that can still come back."""
+        ending a session that can still come back.
+
+        A row that does not parse is left out (BACKLOG #5505); with ``strict`` it raises
+        :class:`~messagefoundry.store.row_seal.RowSealError` instead."""
         ...
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...

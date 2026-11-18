@@ -11564,10 +11564,15 @@ class PostgresStore:
         return SessionRecord.from_mapping(dict(d)) if d else None
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        strict: bool = False,
     ) -> list[SessionRecord]:
         """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
-        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
+        :meth:`AuthStore.list_sessions` for ``idle_seconds`` and ``strict``."""
         now = time.time() if now is None else now
         if idle_seconds is None:
             rows = await self._fetchall(
@@ -11584,6 +11589,8 @@ class PostgresStore:
                 now,
                 float(idle_seconds),
             )
+        if strict:
+            return [SessionRecord.from_mapping(dict(r)) for r in rows]
         return decoded_rows(rows, lambda r: SessionRecord.from_mapping(dict(r)))
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:

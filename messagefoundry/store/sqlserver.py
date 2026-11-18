@@ -16869,10 +16869,15 @@ class SqlServerStore:
         return SessionRecord.from_mapping(d) if d else None
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        strict: bool = False,
     ) -> list[SessionRecord]:
         """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
-        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
+        :meth:`AuthStore.list_sessions` for ``idle_seconds`` and ``strict``."""
         now = time.time() if now is None else now
         if idle_seconds is None:
             rows = await self._fetchall(
@@ -16886,6 +16891,8 @@ class SqlServerStore:
                 " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                 (user_id, now, now, float(idle_seconds)),
             )
+        if strict:
+            return [SessionRecord.from_mapping(r) for r in rows]
         return decoded_rows(rows, SessionRecord.from_mapping)
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
