@@ -1767,8 +1767,9 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered.
     A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
     alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). The count
-    includes an alert one transport delivered while another had not finished. The cut ends only
-    the asyncio side: a send in a worker thread runs on to its socket timeout."""
+    includes an alert one transport delivered while another had not finished. The cut does not
+    end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring say
+    which run on."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:
@@ -12713,9 +12714,8 @@ def create_managed_app(
                 "or the log when there are none."
             )
         # BACKLOG #5908: built in a worker thread, since the factory blocks on at least the SMTP
-        # password read through the secret provider (a Vault read, under [secrets]). Nothing of
-        # this lifespan's is running yet, but a blocked loop cannot take uvicorn's stop signal.
-        # start() stays on the loop below.
+        # password read through the secret provider (a Vault read, under [secrets]). start() stays
+        # on the loop below.
         try:
             notifier = (
                 await asyncio.to_thread(
