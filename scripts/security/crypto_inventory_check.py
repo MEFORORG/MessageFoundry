@@ -2321,11 +2321,21 @@ def judge_operations(
     modules: list[crypto_operations.ParsedModule], found: dict[str, frozenset[str]]
 ) -> dict[str, frozenset[str]]:
     """``found`` (the union-of-imports reading, :func:`crypto_operations.aggregate` of it) judged by
-    the scope-aware reading of the same ``modules``, per :func:`judge_tokens` (BACKLOG #5578)."""
+    the scope-aware reading of the same ``modules``, per :func:`judge_tokens` (BACKLOG #5578).
+
+    The scope-aware reading confirms a CALL, not its algorithm label. A found token whose callee
+    (the text before its ``[label]``) the scope-aware reading also gives in the file is confirmed,
+    so a real ``hmac.new`` whose union label names one binding's algorithm too many is not spelled
+    out of scope; that the union reading merges labels across bindings is its own open item. A TLS
+    posture value is part of its token's callee text, so an out-of-scope value is still marked."""
     scoped = crypto_operations.aggregate(
         crypto_operations.discover_operations_in_modules(modules, scope_aware=True)
     )
-    return judge_map(found, scoped, OUT_OF_SCOPE)
+    confirmed: dict[str, frozenset[str]] = {}
+    for path, tokens in found.items():
+        callees = {token.split("[", 1)[0] for token in scoped.get(path, ())}
+        confirmed[path] = frozenset(t for t in tokens if t.split("[", 1)[0] in callees)
+    return judge_map(found, confirmed, OUT_OF_SCOPE)
 
 
 def operations_self_test() -> list[str]:
@@ -2340,11 +2350,13 @@ def operations_self_test() -> list[str]:
         ]
     # The scope-aware reading must still tell a call it reaches from one it does not (#5578). If it
     # stopped, every token would read confirmed and an extra one could keep a row green again.
-    judged = judge_operations(modules, got)[_SELF_TEST_SCOPED_PATH]
-    if judged != _SELF_TEST_SCOPED_JUDGED:
+    # Every OTHER fixture must stay unmarked, or a reading that marks genuine calls would pass.
+    expected = {**_SELF_TEST_EXPECTED, _SELF_TEST_SCOPED_PATH: _SELF_TEST_SCOPED_JUDGED}
+    judged = judge_operations(modules, got)
+    if judged != expected:
         return [
             f"operation arm POSITIVE CONTROL for the scope-aware reading did not fire as planted: "
-            f"expected {sorted(_SELF_TEST_SCOPED_JUDGED)}, got {sorted(judged)}"
+            f"expected {expected}, got {judged}"
         ]
     return []
 
@@ -2430,7 +2442,7 @@ def find_violations(
 
 
 #: The suffix a TypeScript/JavaScript token takes when only the lexer view finds it and the lexer's
-#: verdict on its first character is not code (BACKLOG #5578). See :func:`judge_tokens`.
+#: verdict does not confirm it (BACKLOG #5578). :func:`_matches` states the rule.
 NOT_CODE = " (not code)"
 #: The suffix a Python operation token takes when only the union-of-imports reading gives it and the
 #: scope-aware reading does not (BACKLOG #5578). See :func:`judge_tokens`.
@@ -2488,7 +2500,7 @@ def _js_views(text: str) -> tuple[list[str], list[tuple[str, str]]]:
     views: the per-line view's old ones (a prose line inside a block comment that does not start
     with ``*``), and the lexer's (a comment-shaped line inside a template literal, or a real comment
     line kept after a literal misread). The lexer's are what :func:`judge_tokens` marks: a lexer
-    match counts as confirmed only where the lexer calls its first character code.
+    match counts as confirmed only where :func:`_matches` accepts the lexer's verdict on it.
 
     The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
     lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it
@@ -2600,7 +2612,7 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
     The file count is returned so the caller can PRINT what was scanned. An instrument that reports
     "clean" without saying what it read is indistinguishable from one that read nothing, which is the
     failure this arm exists to close for ASVS 11.5.1."""
-    violations = lexer_verdict_self_test()
+    violations = lexer_verdict_self_test("randomness")
     actual: dict[str, frozenset[str]] = {}
     verified: dict[str, frozenset[str]] = {}
     scanned = 0
@@ -2893,7 +2905,7 @@ def _pattern_tokens(
 ) -> set[str]:
     """Every ``class:name`` token the patterns find in one code line, as ``class:name[alg]`` when an
     ``alg`` group captured a literal and ``class:name[=ref]`` when a ``ref`` group captured a name.
-    With the lexer's ``verdicts`` for the line, only matches whose first character it calls code."""
+    With the lexer's ``verdicts`` for the line, only the matches :func:`_matches` confirms."""
     found: set[str] = set()
     for name, (pattern, op_class) in patterns.items():
         for match in _matches(pattern, line, verdicts, in_literal=name in _LITERAL_PATTERNS):
@@ -2990,22 +3002,23 @@ _VERDICT_SELF_TEST_OPERATIONS: dict[str, tuple[set[str], set[str]]] = {
 }
 
 
-def lexer_verdict_self_test() -> list[str]:
-    """Run the JS/TS views over the planted sources above. Returns violation lines: if the verdict
-    stops telling text from code, an extra token could keep a row green again, or a genuine find
-    could be marked, and the arm's clean result would mean nothing."""
+def lexer_verdict_self_test(arm: str) -> list[str]:
+    """Run one arm's JS/TS views (``"randomness"`` or ``"operations"``) over its planted sources
+    above. Returns violation lines: if the verdict stops telling text from code, an extra token
+    could keep a row green again, or a genuine find could be marked, and the arm's clean result
+    would mean nothing. Each arm runs only its own half, so neither depends on the other's patterns."""
     out: list[str] = []
-    for views, planted in (
-        (randomness_token_views, _VERDICT_SELF_TEST_RANDOMNESS),
-        (non_python_operation_token_views, _VERDICT_SELF_TEST_OPERATIONS),
-    ):
-        for source, expected in planted.items():
-            got = views(source)
-            if got != expected:
-                out.append(
-                    f"lexer verdict POSITIVE CONTROL did not fire as planted on {source!r}: "
-                    f"expected (found, verified) {expected}, got {got}"
-                )
+    views, planted = {
+        "randomness": (randomness_token_views, _VERDICT_SELF_TEST_RANDOMNESS),
+        "operations": (non_python_operation_token_views, _VERDICT_SELF_TEST_OPERATIONS),
+    }[arm]
+    for source, expected in planted.items():
+        got = views(source)
+        if got != expected:
+            out.append(
+                f"lexer verdict POSITIVE CONTROL did not fire as planted on {source!r}: "
+                f"expected (found, verified) {expected}, got {got}"
+            )
     return out
 
 
@@ -3019,7 +3032,7 @@ def check_non_python_operations(repo: Path) -> tuple[list[str], int, dict[str, f
         NON_PYTHON_OPERATION_INVENTORY,
         "TypeScript/JavaScript",
     )
-    return lexer_verdict_self_test() + violations, scanned, found
+    return lexer_verdict_self_test("operations") + violations, scanned, found
 
 
 # --------------------------------------------------------------------------------------------

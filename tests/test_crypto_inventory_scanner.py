@@ -1933,7 +1933,11 @@ def test_the_lexer_verdict_positive_control_reds_when_the_verdict_is_dead(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate = _gate()
-    assert gate.lexer_verdict_self_test() == []
+    assert (
+        gate.lexer_verdict_self_test("randomness")
+        == gate.lexer_verdict_self_test("operations")
+        == []
+    )
 
     real = gate.js_lexer.classify_js
 
@@ -1942,6 +1946,58 @@ def test_the_lexer_verdict_positive_control_reds_when_the_verdict_is_dead(
         return blanked, "".join(c if c == "\n" else gate.js_lexer.CODE for c in verdicts)
 
     monkeypatch.setattr(gate.js_lexer, "classify_js", every_character_is_code)
-    assert gate.lexer_verdict_self_test()
+    assert gate.lexer_verdict_self_test("randomness")
+    assert gate.lexer_verdict_self_test("operations")
     violations, _ = gate.check_non_python_randomness(_ROOT)
     assert any("lexer verdict POSITIVE CONTROL" in v for v in violations), violations
+
+
+def test_the_positive_control_reds_when_the_scope_aware_reading_marks_a_genuine_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control compares the whole judged map, so a scope-aware reading that loses a genuine
+    # call (here the bare sibling import under scripts/) reds it, not only the planted fixture.
+    gate = _gate()
+    ops = gate.crypto_operations
+    real = ops.discover_operations_in_modules
+
+    def drops_a_sibling(modules: list[object], scope_aware: bool = False) -> list[object]:
+        found = real(modules, scope_aware=scope_aware)
+        return [op for op in found if not (scope_aware and op.path == "scripts/st/user.py")]
+
+    monkeypatch.setattr(ops, "discover_operations_in_modules", drops_a_sibling)
+    assert gate.operations_self_test()
+
+
+def test_an_over_resolved_algorithm_label_does_not_mark_a_real_call() -> None:
+    # The scope-aware reading confirms the call; the union reading's label merges both bindings of
+    # ``alg``. A real hmac.new must not be spelled "(out of scope)" for that.
+    gate = _gate()
+    ops = gate.crypto_operations
+    source = (
+        "import hmac\n\n\ndef f(k, m):\n    from hashlib import md5 as alg\n"
+        "    return hmac.new(k, m, alg)\n\n\ndef g():\n    from hashlib import sha256 as alg\n"
+        "    return alg\n"
+    )
+    modules = ops.parse_sources({"messagefoundry/x.py": source})
+    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    assert found["messagefoundry/x.py"] == frozenset({"mac:hmac.new[md5,sha256]"})
+    assert gate.judge_operations(modules, found) == found
+
+
+def test_an_out_of_scope_tls_value_is_still_marked() -> None:
+    # A posture value is part of its token's callee text, so the label rule above does not cover it.
+    gate = _gate()
+    ops = gate.crypto_operations
+    source = (
+        "from ssl import CERT_NONE as mode\n\n\ndef f(ctx):\n"
+        "    from ssl import CERT_REQUIRED as mode\n    ctx.verify_mode = mode\n"
+    )
+    modules = ops.parse_sources({"messagefoundry/x.py": source})
+    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    assert gate.judge_operations(modules, found)["messagefoundry/x.py"] == frozenset(
+        {
+            "tls_context:.verify_mode = CERT_REQUIRED",
+            "tls_context:.verify_mode = CERT_NONE (out of scope)",
+        }
+    )

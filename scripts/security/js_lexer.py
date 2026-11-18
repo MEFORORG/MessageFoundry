@@ -72,14 +72,14 @@ def classify_js(source: str) -> tuple[str, str]:
     prev = ""
 
     def emit(text: str, kind: str) -> None:
-        if kind == COMMENT:
-            out.append("".join(c if c == "\n" else " " for c in text))
-        else:
-            out.append(text)
-        first, newline, rest = text.partition("\n")
+        if "\n" not in text:  # almost every segment: one run of one verdict
+            out.append(" " * len(text) if kind == COMMENT else text)
+            verdicts.append(kind * len(text))
+            return
+        lines = text.split("\n")
+        out.append("\n".join(" " * len(p) for p in lines) if kind == COMMENT else text)
         later = CONTINUED if kind == LITERAL else kind
-        verdicts.append(kind * len(first) + newline)
-        verdicts.append("".join(c if c == "\n" else later for c in rest))
+        verdicts.append("\n".join([kind * len(lines[0]), *(later * len(p) for p in lines[1:])]))
 
     while i < n:
         char, nxt = source[i], source[i + 1 : i + 2]

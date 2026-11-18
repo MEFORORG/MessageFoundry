@@ -65,11 +65,16 @@ seen:
 * for the TypeScript/JavaScript arms' per-token verdict (BACKLOG #5578): the lexer does not model a
   template literal's ``${}`` holes. A template nested inside a hole flips its string parity, so
   template text after it can read as code, and a mention there is confirmed as if it were a call.
-  Code inside a hole reads as template text, so a real call on a hole's later line is marked
-  ``(not code)``. The per-line view's own false positives (a trailing comment, a mention inside a
-  quoted string) are confirmed as before #5578;
-* for the scope-aware Python reading (BACKLOG #5578): a PEP 695 type-parameter scope, a walrus in a
-  comprehension, and a ``match`` capture are not modelled as bindings;
+  Code inside a hole reads as template text, so a real call in a hole that the per-line view does
+  not also see is marked ``(not code)``, and so is a real call the per-line view skips inside any
+  region the lexer misreads as a literal (the misreads listed above). The per-line view's own false
+  positives (a trailing comment, a mention inside a quoted string) are confirmed as before #5578.
+  A cipher-string word's mark follows the file's admission rule, not the word's own position, so
+  a real word is marked when the only suite that admits it is unconfirmed;
+* for the scope-aware Python reading (BACKLOG #5578), at least: a PEP 695 type-parameter scope
+  (names in it resolve to nothing), a walrus in a comprehension, and a ``match`` capture are not
+  modelled as bindings. A call only the scope-aware reading gives is not reported, because the
+  gate reports the union reading's tokens and only judges them;
 * a parameter or local assignment that shadows an imported name. Only imports are bindings, so a
   ``def go(sig): sig.verify(d)`` in a module that imports a first-party ``sig`` reads as a call to
   that first-party function and skips the method rule.
