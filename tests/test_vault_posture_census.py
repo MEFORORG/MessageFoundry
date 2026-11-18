@@ -364,7 +364,7 @@ _CENSUS: list[Row] = sorted(
         ("pipeline/dr_backup.py", "_full_open_check._open", "open_store", "posture"),
         ("pipeline/dr_backup.py", "_verify_archive_blocking", "_verify_in_staging", "posture"),
         ("pipeline/dr_backup.py", "_verify_in_staging", "_full_open_check", "posture"),
-        ("pipeline/dr_backup.py", "run_restore", "resolve_decrypt_keys", "-"),
+        ("pipeline/dr_backup.py", "run_restore", "resolve_decrypt_keys", "posture"),
         ("pipeline/dr_backup.py", "run_restore_verify", "_verify_archive_blocking", "posture"),
         ("pipeline/dr_backup.py", "run_restore_verify", "resolve_decrypt_keys", "posture"),
         ("pipeline/engine.py", "Engine.start", "BackupRunner", "self._hop_posture"),
