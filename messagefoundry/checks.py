@@ -65,7 +65,7 @@ its acknowledgement. It calls the function ``serve`` calls, so the refusal reads
 ``retention-overrides`` (vault BACKLOG #2368) is its graph half: it FAILS a connection's own
 ``messages_days = 0`` or ``dead_letter_days = 0`` that ``serve``'s registry guard refuses.
 
-``ruff`` and ``mypy`` are **advisory**: run only when installed for this interpreter, and never block —
+``ruff`` and ``mypy`` are **advisory**: run only where :func:`_tool_command` finds them, and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
 config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable — at
 least the f-string, ``+`` concatenation, ``%`` formatting and ``.format(...)`` spellings — the
@@ -4264,8 +4264,9 @@ def _tool_installed(module: str) -> bool:
 
 
 def _ruff_binary() -> str | None:
-    """The ``ruff`` program installed beside this interpreter, by absolute path: the scripts folder
-    of its environment, then of its base installation, then of the user scheme, three of the places
+    """The ``ruff`` program, by absolute path: the scripts folder of this interpreter's
+    environment, then of its base installation, then of the user scheme, which belongs to the user
+    rather than to this interpreter, three of the places
     ruff's own ``find_ruff_bin`` looks; a ruff installed with ``pip install --target`` or
     ``--prefix`` is not found here. ``None`` when none holds it. Run directly rather than
     as ``python -m ruff``, which on Windows starts the program as a grandchild that the timeout in
@@ -4302,8 +4303,9 @@ def _module_absent_in_child(module: str, stderr: str) -> bool:
 
 
 def _tool_command(module: str) -> list[str] | None:
-    """The command line that starts lint tool ``module``, or ``None`` when it is not installed for
-    this interpreter. Never a bare program name a ``PATH`` search resolves: on Windows that search
+    """The command line that starts lint tool ``module``, or ``None`` when it is not found: ``ruff``
+    in the three scripts folders :func:`_ruff_binary` reads, any other tool as a module this
+    interpreter can import outside the working directory. Never a bare program name a ``PATH`` search resolves: on Windows that search
     reads the working directory first, which can be the config repository under check (BACKLOG
     #5375). ``ruff`` is its program by absolute path (:func:`_ruff_binary`). Any other tool is
     ``python -m <module>`` by this interpreter's absolute path, through

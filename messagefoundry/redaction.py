@@ -1098,8 +1098,7 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 #: names the marker, such as ``missing mfb64:v1: marker``, is kept. Because the placeholder is a
 #: run unit, a second pass can extend a run over text glued after the padding, so
 #: :func:`redact_binary_carriage` repeats until nothing changes, for at most
-#: :data:`_CARRIAGE_ROUNDS` rounds, so two handlers that share one record write the same text
-#: unless more than ``_CARRIAGE_ROUNDS - 1`` pieces are glued after the padding.
+#: :data:`_CARRIAGE_ROUNDS` rounds.
 #:
 #: Residuals, at least these: a carriage broken by whitespace keeps every piece after the first
 #: break (``encode`` never writes one); a URL-safe (``-``/``_``) carriage keeps the part after its

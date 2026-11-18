@@ -162,7 +162,7 @@ def parse_bytes(data: bytes | str) -> Any:
     if fault is not None:
         # Raised outside the handler so lxml's error is on neither __cause__ nor __context__.
         if _declares_doctype(payload):
-            # A DTD that does not even parse is still a DTD: refuse it as one, not as a typo.
+            # A prolog DOCTYPE the parser did not finish is still refused, not reported as a typo.
             raise XmlSecurityError(_BROKEN_DOCTYPE_REFUSAL)
         raise XmlParseError(f"not well-formed XML at {fault}")
     # Defense in depth: refuse any DOCTYPE so entity *definitions* can't ride along (references are

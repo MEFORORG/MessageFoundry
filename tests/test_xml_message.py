@@ -86,7 +86,7 @@ def test_parse_error_carries_no_document_text(payload: bytes) -> None:
         b'<!DOCTYPE x [<!ENTITY a "b">',  # internal subset never closed
         b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]><x>&a;</x',  # body cut short
         b"<!DOCTYPE x [<!ENTITY bad>]><x/>",  # malformed entity declaration
-        b"<!doctype x><x/>",  # lower case: still refused, as a DTD rather than as a typo
+        b"<!doctype x><x/>",  # lower case: still a security refusal rather than a parse error
         b'\xef\xbb\xbf<?xml version="1.0"?>\n<!-- c --><?pi?> <!DOCTYPE x [<!ENTITY bad>]><x/>',
         '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-16"),  # wide encodings, with a BOM
         '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-16-be"),  # ...and without

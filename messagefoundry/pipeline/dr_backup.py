@@ -2124,7 +2124,8 @@ def _win_opens_another(path: Path) -> bool:
     as ``path.name`` (BACKLOG #2420).
 
     Win32 rewrites a path before it opens it. At least it drops a trailing dot or space from a name,
-    so ``a.tar.`` opens ``a.tar`` or nothing, and it opens a reserved device name as the device.
+    so ``a.tar.`` opens ``a.tar`` or nothing, and it opens a bare reserved device name as the
+    device.
     This asks the OS's own path rewrite (``os.path.abspath``, which is ``GetFullPathNameW``) rather
     than keep a list. A name it changes is reported: the open would reach some other object, and the
     listed file would keep its bytes while the report called it empty.
