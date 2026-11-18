@@ -5470,6 +5470,14 @@ def _supervise(args: argparse.Namespace) -> int:
     # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
     # supervisor (not only via each child re-anchoring a relative --db). --service-config is forwarded raw
     # and each child serve resolves it under the forwarded --project-root (same precedence as serve).
+    # BACKLOG #5926: the --db base is anchored here, before any settings load could refuse it, and
+    # each shard's path is derived from it, so test it the way [store].path is tested at load.
+    from messagefoundry.config.settings import store_path_refusal
+
+    db_refusal = store_path_refusal(args.db)
+    if db_refusal is not None:
+        print(f"error: {db_refusal}", file=sys.stderr)
+        return 2
     cwd = Path.cwd()
     root = resolve_project_root(args.project_root, cwd=cwd)
     config = anchor_under_root(args.config, root, cwd=cwd)

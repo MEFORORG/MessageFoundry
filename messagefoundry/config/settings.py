@@ -752,6 +752,24 @@ def _check_revocation_attestation_pair(
 _SCHEMA_LOCK_TIMEOUT_MAX: Final[float] = float((2**31 - 1) // 1000)
 
 
+def store_path_refusal(value: str) -> str | None:
+    """Why ``value`` cannot be a SQLite store path the project root anchors, or None if it can
+    (BACKLOG #5926): an empty path, or a Windows drive-qualified relative one such as ``C:mf.db``.
+    Off Windows a path has no drive, so ``C:mf.db`` is an ordinary relative file name there."""
+    if not value.strip():
+        return (
+            "[store].path is empty; name the SQLite file, e.g. 'messagefoundry.db' "
+            "(a relative path resolves under [environments].base_dir)"
+        )
+    p = Path(value)
+    if p.drive and not p.is_absolute():
+        return (
+            f"[store].path {value!r} is drive-relative; on Windows give a fully-qualified "
+            "path (e.g. 'C:/data/mf.db') or a plain relative one (e.g. 'mf.db')"
+        )
+    return None
+
+
 class StoreSettings(_Section):
     backend: StoreBackend = StoreBackend.SQLITE
 
@@ -1155,6 +1173,21 @@ class StoreSettings(_Section):
             "mode); use a SQL Server store with [store].auth='integrated'/'entra', or clear "
             "[store].require_managed_identity"
         )
+
+    @field_validator("path")
+    @classmethod
+    def _anchorable_store_path(cls, value: str) -> str:
+        # BACKLOG #5926 (and #5927's remaining harm): [store].path is joined under the project root
+        # (config/anchor.py) by serve and the offline store commands alike. An empty path joins to
+        # the root directory itself, which passes an exists() guard as if it were a store. A Windows
+        # drive-qualified relative path such as `C:mf.db` names no fixed file: it resolves against
+        # that drive's per-process current directory, or, joined under a root on another drive,
+        # drops the root. Refused here, at load, for every command that loads settings; supervise
+        # applies the same test to its own --db, which it anchors without them.
+        refusal = store_path_refusal(value)
+        if refusal is not None:
+            raise ValueError(refusal)
+        return value
 
     @field_validator("lease_ttl_seconds")
     @classmethod

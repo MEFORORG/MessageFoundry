@@ -700,6 +700,65 @@ def test_anchor_settings_store_path_tolerates_no_settings(tmp_path: Path) -> Non
     anchor_settings_store_path(None, cwd=tmp_path)  # support-bundle's unloaded case: no raise
 
 
+# BACKLOG #5926 closing steps 1 and 2 (step 1 is also #5927's remaining harm): a [store].path no
+# anchor can place is refused at load, so serve and every offline command see one refusal.
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_an_empty_store_path_is_refused_at_load(value: str) -> None:
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreSettings
+
+    # Joined under the root, an empty path names the root directory, which passes exists().
+    with pytest.raises(ValidationError, match=r"\[store\]\.path is empty"):
+        StoreSettings(path=value)
+
+
+def test_a_drive_qualified_relative_store_path_is_refused_on_windows() -> None:
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreSettings
+
+    if Path("C:mf.db").drive:  # Windows: a drive with no root, resolved per process and drive
+        with pytest.raises(ValidationError, match="drive-relative"):
+            StoreSettings(path="C:mf.db")
+    else:  # POSIX: `C:mf.db` is an ordinary relative file name and anchors under the root
+        assert StoreSettings(path="C:mf.db").path == "C:mf.db"
+    # A fully-qualified path and the in-memory sentinel stay accepted on every platform.
+    assert StoreSettings(path=":memory:").path == ":memory:"
+
+
+@pytest.mark.parametrize(("db", "why"), [("", "is empty"), ("C:mf.db", "drive-relative")])
+def test_an_offline_command_refuses_an_unanchorable_db(
+    away_from_root: tuple[Path, Path], capsys: pytest.CaptureFixture[str], db: str, why: str
+) -> None:
+    root, svc = away_from_root
+    if db and not Path(db).drive:
+        pytest.skip("drive-qualified relative paths exist only on Windows")
+    rc = main(["audit-verify", "--service-config", str(svc), "--db", db])
+    out = capsys.readouterr()
+    assert rc == 2, out.out + out.err
+    assert "[store].path" in out.out + out.err and why in out.out + out.err, out.out + out.err
+    assert not any(root.iterdir()), "a refused path must not create a store"
+
+
+@pytest.mark.parametrize(("db", "why"), [("", "is empty"), ("C:mf.db", "drive-relative")])
+def test_supervise_refuses_an_unanchorable_db(
+    away_from_root: tuple[Path, Path], capsys: pytest.CaptureFixture[str], db: str, why: str
+) -> None:
+    # supervise anchors its --db base before any settings load, and derives each shard's path
+    # from it, so it applies the load-time test itself.
+    root, svc = away_from_root
+    if db and not Path(db).drive:
+        pytest.skip("drive-qualified relative paths exist only on Windows")
+    rc = main(["supervise", "--service-config", str(svc), "--db", db])
+    out = capsys.readouterr()
+    assert rc == 2, out.out + out.err
+    assert "[store].path" in out.err and why in out.err, out.err
+    assert not any(root.iterdir())
+
+
 def _names(output: str, path: Path) -> bool:
     # A repr or a JSON string doubles a Windows backslash; undo that before the substring test.
     return str(path) in output.replace("\\\\", "\\")
