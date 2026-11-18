@@ -241,9 +241,9 @@ pausing an outbound retains its rows PENDING un-errored. Nothing is un-ACKed, lo
 delivered — fix the disk, reload, and the backlog drains, with at least these qualifications
 (BACKLOG #5704). Under the pooled claim mode, a router, transform or response lane that STOPPED
 while holding claimed rows whose re-pend never landed is not re-armed by the lift of the halt,
-which logs a WARNING. A recovery by reload re-arms it in the same pass, through the reload's
-`notify_work` broadcast, and it claims past those rows. Only a recovery that is not a reload leaves
-it STOPPED, and at least a service restart returns its rows to the queue first. Under per_lane, a worker that a content STOP ended during the halt
+which logs a WARNING. Any later `notify_work` broadcast re-arms such a lane, at least a reload, a
+replay, a resend, an inject or a dead-letter replay, and it then claims past the unlanded rows;
+until one arrives it stays STOPPED. At least a service restart returns its rows to the queue first. Under per_lane, a worker that a content STOP ended during the halt
 is respawned by the reload or restart that lifts its inbound's gate, and it retries that STOP's row.
 **Fix the disk first**: the reload re-arms
 only once the log accepts a record again (section 4), so on a still-broken disk the rows simply stay

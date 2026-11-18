@@ -6463,10 +6463,9 @@ class RegistryRunner:
         hold when it does. That covers at least a lane the halt's hand-back STOPPED at T17 or on
         leadership loss. A lane STOPPED with claimed rows still in flight
         (:meth:`StageDispatcher.stopped_holding_rows`) is not re-armed here, because a re-arm would
-        claim past them. That leaves it STOPPED only when the recovery is not a reload: a reload
-        calls this as it rebinds the listener, and its ``notify_work`` broadcast
-        (:meth:`_broadcast_to`) then re-arms that lane in the same pass, with the mark already
-        lifted, and the lane claims past those rows. Under per_lane the waiting workers are woken here, and the start that
+        claim past them; the WARNING says the pooled lane is kept STOPPED. Any later
+        ``notify_work`` broadcast (:meth:`_broadcast_to`), at least a reload, replay, resend or
+        inject, re-arms it, since the mark is lifted, and it claims past them. Under per_lane the waiting workers are woken here, and the start that
         called this respawns any that a STOP ended (:meth:`_ensure_inbound_workers`)."""
         self._log_halted.discard(name)
         if self._claim_mode != "pooled":
@@ -6481,10 +6480,9 @@ class RegistryRunner:
         kept = [stage for stage, d in lanes if d.stopped_holding_rows(name)]
         for stage in kept:
             log.warning(
-                "%s lane %r was not re-armed as the log halt lifted: it holds claimed rows whose "
-                "re-pend did not land, and a re-arm would claim past them. It stays STOPPED "
-                "unless this recovery is a reload, whose broadcast re-arms it and claims past "
-                "those rows; a service restart returns them to the queue first",
+                "%s pooled lane %r kept STOPPED: it holds claimed rows whose return to the queue "
+                "never landed; any later notify_work broadcast (at least a reload, replay, resend "
+                "or inject) re-arms it and claims past them",
                 stage.value,
                 name,
             )
