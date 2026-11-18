@@ -258,6 +258,39 @@ def test_driven_ceiling_rung_that_acknowledged_nothing_fails(
     assert lad.result_label == "FAIL"
 
 
+@pytest.mark.parametrize(
+    "deferrals",
+    [
+        pytest.param({}, id="offer-shortfall"),
+        pytest.param({"deferred_schedule": 500, "deferred_backpressure": 0}, id="drive-shortfall"),
+    ],
+)
+def test_short_rung_that_sent_some_and_acknowledged_none_fails(deferrals: dict[str, int]) -> None:
+    """Half the offer reached the engine and none of it was acknowledged. The rig fell short, but what it
+    did send arrived, so 'nothing acknowledged' is an engine fact, not a rig artifact: the waiver needs a
+    rung that sent nothing."""
+    rec = ShardCertStepRecord.from_report(
+        20.0,
+        _report(
+            sent=500,
+            acked=0,
+            achieved_intake=0,
+            offered=1000,
+            delivered_distinct=0,
+            sink_received=0,
+            lanes_observed=0,
+            **deferrals,
+        ),
+        hold_seconds=60.0,
+    )
+    assert rec.ceiling is True
+    assert rec.fidelity.not_driven is True
+    assert rec.correctness_ok is False
+    assert "nothing acknowledged" in rec.correctness_faults()
+    lad = ShardCertLadderReport(records=[rec])
+    assert lad.exit_code == 1
+
+
 def test_sustained_rung_still_needs_something_acknowledged() -> None:
     """The acked waiver is for ceiling rungs only: a sustained rung that acknowledged nothing still FAILs."""
     empty = ShardCertStepRecord(

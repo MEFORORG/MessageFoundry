@@ -2088,11 +2088,12 @@ class ShardCertStepRecord:
         ``in_pipeline_final`` is not carried, because ``no_loss`` requires the drain, which the poller only
         reports at an empty pipeline; and the two-lane FIFO bar applies to a SUSTAINED rung only, as on the
         two-box ladder, because a ceiling rung is a throughput measurement and a near-empty one may honestly
-        see one lane. The something-acknowledged bar is waived on a ceiling rung the rig did NOT drive
-        (:attr:`RungFidelity.not_driven`, e.g. DRIVE_SHORTFALL): nothing arrived, so nothing was acknowledged,
-        and the fidelity gate already reads that rung as SETUP_DEGRADED (exit 2). A DRIVEN rung that
-        acknowledged nothing (the engine took none of an offer that reached it) still fails. The ceiling terms
-        themselves (intake shortfall, filling) are not failures."""
+        see one lane. The something-acknowledged bar is waived only on a ceiling rung the rig did NOT drive
+        (:attr:`RungFidelity.not_driven`) AND that sent nothing (``sent <= 0``, ``-1`` = unrecorded): nothing
+        arrived, so nothing was acknowledged, and the fidelity gate already reads that rung as SETUP_DEGRADED
+        (exit 2). A rung where any of the offer reached the engine and none was acknowledged still fails,
+        whether it was driven or fell short. The ceiling terms themselves (intake shortfall, filling) are not
+        failures."""
         return _invariants_held(
             acked=self.achieved_intake,
             require_acked=not self._acked_waived,
@@ -2107,7 +2108,7 @@ class ShardCertStepRecord:
     @property
     def _acked_waived(self) -> bool:
         """The something-acknowledged bar does not apply: a ceiling rung whose offer never reached the engine."""
-        return self.ceiling and self.fidelity.not_driven
+        return self.ceiling and self.fidelity.not_driven and self.sent <= 0
 
     def correctness_faults(self) -> list[str]:
         """The terms of :attr:`correctness_ok` this rung broke, named for an operator note (empty when it
@@ -2603,7 +2604,7 @@ class ShardCertLadderReport:
             #
             # v4 (BACKLOG #5440, #5441): `ok`/`result`/`exit_code` hold each rung to the single-run pass bar
             # (duplicates, no dead letters at any stage, at least two lanes on a SUSTAINED rung, and
-            # something acknowledged unless the rung is a ceiling the rig did not drive). Per
+            # something acknowledged unless the rung is a ceiling the rig did not drive and sent nothing). Per
             # record: `lanes_observed`, `engine_dead`, `dead_total` and `correctness_ok` are new. A rung that
             # breaks that bar pins nothing (`pinned_rate` skips it) and stops the climb, so a v4 FAIL may
             # carry fewer records than a v3 one.
