@@ -47,7 +47,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination, bool_setting
-from messagefoundry.controlchars import has_control_char
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.redaction import json_loads_or_refusal, refuse_repeated_keys
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -74,6 +74,7 @@ from messagefoundry.transports.rest import (
     InsecureHopGuard,
     ProxyConfig,
     _insecure_opener,
+    _latin1_refusal_position,
     _no_redirect_opener,
     _redact_url,
     _shared_no_redirect_opener,
@@ -81,6 +82,7 @@ from messagefoundry.transports.rest import (
     auth_challenge_refused,
     egress_route_from_settings,
     enforce_outbound_length_limits,
+    hop_name_prefix,
     hop_reaches_a_proxy,
     http_credentials_sent,
     http_family_trust_anchor,
@@ -92,7 +94,7 @@ from messagefoundry.transports.rest import (
     url_scheme,
 )
 
-__all__ = ["DicomWebDestination"]
+__all__ = ["DicomWebDestination", "dicomweb_credential_problem"]
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +191,96 @@ def _reject_url_control_chars(value: str, field: str) -> None:
     ``check``/dry-run as a ``WiringError``) — PHI-safe (names the field, never the value)."""
     if has_control_char(value):
         raise ValueError(f"DICOMweb {field} contains an illegal control character")
+
+
+def _refuse_base_url_query_or_fragment(url: str, connection: str | None) -> None:
+    """Refuse a base ``url`` that carries a query or a fragment (vault BACKLOG #5358).
+
+    The STOW-RS target is DERIVED by appending ``/studies`` to the base, so a ``?`` would put the
+    appended path inside the query and a ``#`` would make it a fragment the client never sends: the
+    POST would go to an endpoint the operator did not name. Any ``?`` or ``#`` counts, an empty
+    query or fragment included, because the appended path lands after it either way. Names the
+    connection and the setting, never the value."""
+    if "?" in url or "#" in url:
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DICOMweb destination 'url' must be the service base URL with no query string or "
+            "fragment ('?' or '#'); the STOW-RS path is appended to it"
+        )
+
+
+def dicomweb_credential_problem(s: Mapping[str, Any]) -> str | None:
+    """Why a DICOMweb destination's credential settings refuse its build, or ``None`` (vault BACKLOG
+    #5359). The one test behind :func:`_refuse_ambiguous_credentials` and the
+    static-credential census; ``config.static_credentials._dicomweb_build_refused`` says when the
+    census leaves a hop out. ``s`` holds resolved values: an unresolved ``env()`` reference is the
+    caller's to resolve or to leave unjudged.
+
+    ``basic_user`` without ``basic_password``, or the reverse, would send no credential at all; a
+    ``bearer_token`` beside a Basic pair, or either beside an ``Authorization`` entry in the static
+    ``headers``, would have one silently replace the other or go out as a second header. A Basic
+    user-id may not hold a colon (RFC 7617 section 2: the first colon ends it, so the server would
+    split the pair somewhere else). No credential may hold a control character: RFC 7617 section 2
+    excludes control characters from the Basic user-id and password, and RFC 6750 section 2.1
+    admits none in a bearer token. A Basic half may not hold a lone surrogate, which
+    its UTF-8 encode cannot write, and the bearer token, which goes on the wire as written, may not
+    hold a character ``http.client``'s latin-1 header encode cannot write; either would otherwise
+    surface as an encoder error quoting part of the secret. A colon in the password is legal and
+    admitted. The reason names settings, never a value."""
+    # Lazy, as rest.py imports it: http_auth imports this package's siblings at its top.
+    from messagefoundry.transports.http_auth import is_authorization_header_name
+
+    token, user, password = s.get("bearer_token"), s.get("basic_user"), s.get("basic_password")
+    if bool(user) != bool(password):
+        return (
+            "basic_user and basic_password must be set together; one without the other "
+            "would send no HTTP Basic credential"
+        )
+    if token and user:
+        return (
+            "sets both bearer_token and basic_user/basic_password; set one credential, "
+            "since only one Authorization header can be sent"
+        )
+    extra = s.get("headers") or {}
+    if (
+        (token or user)
+        and isinstance(extra, dict)
+        and any(is_authorization_header_name(str(name)) for name in extra)
+    ):
+        return (
+            "sets an Authorization entry in headers beside bearer_token or "
+            "basic_user/basic_password; set the credential in one place"
+        )
+    for field, value in (
+        ("bearer_token", token),
+        ("basic_user", user),
+        ("basic_password", password),
+    ):
+        if not value:
+            continue
+        text = str(value)
+        if has_control_char(text):
+            return f"{field} contains an illegal control character"
+        # The bearer goes out as a raw header value; a Basic half is UTF-8 inside base64.
+        if (
+            _latin1_refusal_position(text) is not None
+            if field == "bearer_token"
+            else has_lone_surrogate(text)
+        ):
+            return f"{field} holds a character the request cannot encode"
+    if user and ":" in str(user):
+        return "basic_user may not contain a colon (RFC 7617 section 2)"
+    return None
+
+
+def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) -> None:
+    """Raise :class:`HttpAuthError` for what :func:`dicomweb_credential_problem` finds.
+
+    Called in the constructor, before any proxy or hop guard records a crossing for a
+    connection that will not build. Raises :class:`HttpAuthError`, as SOAP's half-pair refusal does,
+    naming the connection and the settings, never a value."""
+    problem = dicomweb_credential_problem(s)
+    if problem is not None:
+        raise HttpAuthError(f"{hop_name_prefix(connection)}DICOMweb destination {problem}")
 
 
 def _reply_is_empty(body: str) -> bool:
@@ -320,6 +412,8 @@ class DicomWebDestination(DestinationConnector):
                 f"DICOMweb destination 'url' must be http or https, got scheme {scheme!r}"
             )
         refuse_url_credentials(url, "DICOMweb destination 'url'")
+        _refuse_base_url_query_or_fragment(url, config.name)
+        _refuse_ambiguous_credentials(s, config.name)
         self.base_url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("DICOMweb", config.name)
@@ -458,12 +552,10 @@ class DicomWebDestination(DestinationConnector):
                 _reject_url_control_chars(str(v), f"header {str(k)!r} value")
             headers.update({str(k): str(v) for k, v in extra.items()})
         token = s.get("bearer_token")
-        if token:
-            # PHI/secret-safe: the helper names the field, never the value.
-            _reject_url_control_chars(str(token), "bearer_token")
-            headers["Authorization"] = f"Bearer {token}"
         user, password = s.get("basic_user"), s.get("basic_password")
-        if user and password:
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        elif user and password:
             raw = f"{user}:{password}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
         return headers

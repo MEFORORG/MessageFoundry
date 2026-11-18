@@ -1604,6 +1604,13 @@ TOKENS_PRESENT: bool = False
 #: real scan from a vacuous one, so a floor built on it would have inherited the same blindness.
 _SITE_PREFIXES: tuple[str, ...] = ()
 
+#: The width of a site prefix the anonymizer loads (``messagefoundry_toolkit/anon/surrogates.py``
+#: ``_load_site_prefixes``: a two-digit prefix plus four digits). A loaded prefix of another width
+#: still arms this scan, but the anonymizer drops it, so its site-code scrub and leak check match
+#: nothing for it while this gate counts it live. :func:`token_floor_failure` refuses such a source
+#: (BACKLOG #5366). ``tests/test_scan_forbidden_site_prefix_width.py`` holds the two widths together.
+_SITE_PREFIX_WIDTH = 2
+
 
 def _resolve_token_text() -> str | None:
     """The active token content, or ``None`` if no source is configured.
@@ -1801,6 +1808,15 @@ def _parse_tokens(
             # would compile into the site-code alternation and never match an ASCII site code.
             if line.isdigit() and line.isascii():
                 prefixes.append(line)
+                if len(line) != _SITE_PREFIX_WIDTH:
+                    # Kept, so this scan loses no detector, and named: the anonymizer drops it
+                    # (BACKLOG #5366). Position only, as below -- a site prefix is customer data.
+                    print(
+                        f"scan_forbidden: line {lineno}: [site_prefix] entry is not exactly "
+                        f"{_SITE_PREFIX_WIDTH} ASCII digits -- this scan matches it but the anonymizer "
+                        "cannot load it, so a required-token run refuses this source (content withheld)",
+                        file=sys.stderr,
+                    )
             else:
                 # Position only -- see the [names] branch above. A site prefix is customer data.
                 print(
@@ -1966,6 +1982,9 @@ def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> st
     * the total must meet ``min_detectors`` when given (catches loss WITHIN a section, e.g. 7 names
       down to 3, which the section check alone cannot see).
 
+    A source that passes both is still refused when a ``[site_prefix]`` entry is not two digits
+    (BACKLOG #5366). That check runs after the two above, so its reason names a source that loaded.
+
     The expected total is deliberately supplied from OUTSIDE the token source (CI env / CLI arg). An
     ``[expect]`` count carried inside the file would be destroyed by the very mangling it is meant to
     detect -- self-referential, and vacuous in exactly the way this function exists to prevent.
@@ -1999,6 +2018,19 @@ def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> st
                 f"({', '.join(f'{s}={counts[s]}' for s in _FLOOR_SECTIONS)}) — the token source is "
                 "incomplete. This is a FLOOR: adding tokens is free, losing them is not"
             )
+    wide = sum(len(p) != _SITE_PREFIX_WIDTH for p in _SITE_PREFIXES)
+    if wide:
+        # A count only, never the entry: a site prefix is customer data. This scan matches the entry,
+        # so the counts read it as live, but the anonymizer loads two-digit prefixes only and its
+        # site-code scrub and leak check would match nothing for it (BACKLOG #5366). Checked after
+        # the floors, so the anonymizer's refusal_advice, which finds this reason by
+        # surrogates.SITE_PREFIX_WIDTH_MARK, can read it as a source that loaded.
+        return (
+            f"{wide} [site_prefix] entr{'y is' if wide == 1 else 'ies are'} not exactly "
+            f"{_SITE_PREFIX_WIDTH} ASCII digits, and the anonymizer loads two-digit prefixes only "
+            "(surrogates.py), so its site-code scrub and leak check would not match what this gate "
+            "reports as loaded"
+        )
     return None
 
 

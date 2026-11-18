@@ -311,6 +311,73 @@ def test_from_settings_enabled_false_disables(ec_pem: str) -> None:
     assert signer_from_destination(dest) is None
 
 
+@pytest.mark.parametrize("key", ["", None])
+@pytest.mark.parametrize("enabled", [True, "true", 1, None])
+def test_from_settings_enabled_with_empty_key_refuses(key: str | None, enabled: object) -> None:
+    # BACKLOG #5364: signing asked for with no key must not read as "off" and deliver unsigned. An
+    # undecided (None) flag is refused too, as the model refuses it when a key is present.
+    settings = {"sign_enabled": enabled, "sign_private_key": key}
+    with pytest.raises(ValueError, match="sign_private_key is empty"):
+        OutboundSigning.from_settings(settings)
+    with pytest.raises(ValueError, match="sign_private_key is empty"):
+        signer_from_destination(Destination(name="OB", type=ConnectorType.REST, settings=settings))
+
+
+@pytest.mark.parametrize("key", ["", None])
+def test_with_signing_refuses_a_literal_empty_key(key: str | None) -> None:
+    # BACKLOG #5364: refused at authoring, so a config dir check cannot build still refuses it.
+    with pytest.raises(SigningError, match="private_key is empty"):
+        with_signing(Rest(url=REST_URL), private_key=key)
+    spec = with_signing(Rest(url=REST_URL), private_key=key, enabled=False)
+    assert OutboundSigning.from_settings(spec.settings) is None
+
+
+def test_env_key_resolving_empty_is_refused_naming_the_connection() -> None:
+    # BACKLOG #5364: the env() key resolves empty only at build; the refusal names the outbound and
+    # carries no settings value: the signing settings hold two probes that must not appear.
+    spec = with_signing(
+        Rest(url=env("u")),
+        private_key=env("k"),
+        private_key_password=env("p"),
+        algorithm="ES256",
+        key_id="kidprobe",
+    )
+    oc = OutboundConnection(name="OB_ACME", spec=spec)
+    values = {"u": REST_URL, "k": "", "p": "pwprobe"}
+    with pytest.raises(ValueError, match="sign_private_key is empty") as caught:
+        _dest_config(oc, values, None, EgressSettings(deny_by_default=False))
+    assert "outbound connection 'OB_ACME'" in str(caught.value)
+    assert spec.settings["sign_key_id"] == "kidprobe"  # positive control: the settings hold it
+    assert "kidprobe" not in str(caught.value)
+    assert "pwprobe" not in str(caught.value)
+
+
+def test_flag_named_with_key_absent_refuses() -> None:
+    with pytest.raises(ValueError, match="sign_private_key is empty"):
+        OutboundSigning.from_settings({"sign_enabled": True})
+
+
+@pytest.mark.parametrize("key", ["", None])
+def test_from_settings_named_empty_key_with_no_flag_refuses(key: str | None) -> None:
+    # The model's default for an absent flag is on, so a named but empty key is not "off".
+    with pytest.raises(ValueError, match="sign_private_key is empty"):
+        OutboundSigning.from_settings({"sign_private_key": key, "sign_key_id": "k1"})
+
+
+@pytest.mark.parametrize("enabled", [False, "false", "off", 0])
+def test_from_settings_empty_key_flag_false_stays_off(enabled: object) -> None:
+    assert OutboundSigning.from_settings({"sign_enabled": enabled, "sign_private_key": ""}) is None
+
+
+def test_from_settings_unreadable_flag_with_empty_key_names_the_setting_only() -> None:
+    # Raised outside the pydantic handler, so neither text, errors() nor chain holds the value.
+    with pytest.raises(ValueError, match="sign_enabled must be a boolean") as caught:
+        OutboundSigning.from_settings({"sign_enabled": "probe-7f3a", "sign_private_key": ""})
+    assert not isinstance(caught.value, ValidationError)
+    assert "probe-7f3a" not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
 def test_outbound_signing_forbids_unknown_field(ec_pem: str) -> None:
     with pytest.raises(ValidationError):
         OutboundSigning(private_key=ec_pem, algoritm="RS256")  # type: ignore[call-arg]  # typo

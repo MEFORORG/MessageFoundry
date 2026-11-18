@@ -105,6 +105,19 @@ class FhirResource:
             model = model_class.model_validate(data)
         except ValidationError as exc:
             summary = _safe_validation_summary(resource_type, version, exc)
+        except Exception as exc:
+            # Broad on purpose, and it wraps ONLY the model_validate call, as signature.verify does.
+            # fhir.resources resolves a nested resource (a Bundle
+            # entry, a `contained` item) by its untrusted resourceType outside pydantic's error
+            # collection: measured on 8.3.0, an unknown type escapes as a KeyError quoting it, a
+            # non-string one as a TypeError, and nesting deep enough to overflow the stack as a
+            # RecursionError (BACKLOG #5367). A list of types would let the next unmeasured one
+            # escape with its text. Name only the exception type, and raise outside the handler so
+            # neither chain holds the value. Nothing is swallowed: every failure still raises.
+            summary = (
+                f"FHIR {resource_type} ({version}) failed validation: the resource or a nested "
+                f"resource could not be validated ({type(exc).__name__})"
+            )
         if summary is not None:
             raise FhirValidationError(summary)
         return cls(model=model, version=version, resource_type=resource_type)

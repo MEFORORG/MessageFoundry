@@ -57,6 +57,131 @@ def test_non_wellformed_raises_parse_error() -> None:
         XmlMessage.parse(b"<root><unclosed></root>")
 
 
+_CANARY = "PHICANARYNAME"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        f"<root><{_CANARY}></root>".encode(),  # tag mismatch quotes the element name
+        f"<root>&{_CANARY};</root>".encode(),  # undefined entity quotes the entity name
+        f"<root>\n<y {_CANARY}='1' {_CANARY}='2'/></root>".encode(),  # duplicate attribute
+    ],
+    ids=["tag-mismatch", "undefined-entity", "duplicate-attribute"],
+)
+def test_parse_error_carries_no_document_text(payload: bytes) -> None:
+    """BACKLOG #5371: lxml's syntax-error text can quote the body, so the XmlParseError names only a
+    position and a code, and lxml's error is on neither exception chain."""
+    with pytest.raises(XmlParseError, match=r"at line \d+, column \d+ \(libxml2 error \d+\)") as ei:
+        parse_bytes(payload)
+    exc = ei.value
+    assert _CANARY not in str(exc) and _CANARY not in repr(exc)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'<!DOCTYPE x [<!ENTITY a "b">',  # internal subset never closed
+        b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]><x>&a;</x',  # body cut short
+        b"<!DOCTYPE x [<!ENTITY bad>]><x/>",  # malformed entity declaration
+        b"<!doctype x><x/>",  # lower case: still a security refusal rather than a parse error
+        b'\xef\xbb\xbf<?xml version="1.0"?>\n<!-- c --><?pi?> <!DOCTYPE x [<!ENTITY bad>]><x/>',
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-16"),  # wide encodings, with a BOM
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-16-be"),  # ...and without
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-32-le"),
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-32-be"),
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>',  # str input
+    ],
+    ids=[
+        "open-subset",
+        "truncated",
+        "bad-entity",
+        "lower-case",
+        "after-prolog-misc",
+        "utf-16",
+        "utf-16-be",
+        "utf-32-le",
+        "utf-32-be",
+        "str",
+    ],
+)
+def test_doctype_that_fails_to_parse_is_a_security_refusal(payload: bytes | str) -> None:
+    with pytest.raises(XmlSecurityError) as ei:
+        parse_bytes(payload)
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+def test_failed_parse_doctype_refusal_has_its_own_message() -> None:
+    # A malformed document opening `<!DOCTYPE html>` defines no entity, so its refusal names the
+    # DOCTYPE and the failed parse, not an entity-definition carrier; a well-formed DOCTYPE keeps
+    # the shared message.
+    with pytest.raises(XmlSecurityError) as ei:
+        parse_bytes(b"<!DOCTYPE html><html><body></html>")
+    assert str(ei.value) == (
+        "refusing an XML document that opens a DOCTYPE in its prolog and that the parser did not "
+        "finish"
+    )
+    with pytest.raises(XmlSecurityError, match=r"\(entity-definition carrier\)"):
+        parse_bytes(b"<!DOCTYPE x><x/>")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"<x><![CDATA[<!DOCTYPE html>]]><y></x>",
+        b"<x><!-- <!DOCTYPE html> --><y></x>",
+        b"<x a='<!DOCTYPE'><y></x>",
+        b"<x><y></x><!DOCTYPE x>",
+        # Not XML whitespace (S is space, tab, CR, LF): character data before the DOCTYPE.
+        b"\xa0<!DOCTYPE x><x>",  # U+00A0 as latin-1 reads it
+        (chr(0xA0) + "<!DOCTYPE x><x>").encode("utf-16"),
+        # Only one byte-order mark is a BOM; a second is character data.
+        b"\xef\xbb\xbf\xef\xbb\xbf<!DOCTYPE x><x>",
+        # CF BB BF is not a BOM, though EF case-folds to CF.
+        b"\xcf\xbb\xbf<!DOCTYPE x><x>",
+    ],
+    ids=[
+        "cdata",
+        "inner-comment",
+        "attribute",
+        "after-root",
+        "nbsp",
+        "nbsp-utf-16",
+        "double-bom",
+        "case-folded-bom",
+    ],
+)
+def test_doctype_text_outside_the_prolog_of_a_broken_document_is_a_parse_error(
+    payload: bytes,
+) -> None:
+    # Only a DOCTYPE in the prolog is one; a mention elsewhere leaves an ordinary parse error.
+    with pytest.raises(XmlParseError):
+        parse_bytes(payload)
+
+
+def test_doctype_scan_reads_only_a_bounded_prefix() -> None:
+    """A failed document's DOCTYPE scan reads only the first _DOCTYPE_SCAN_BYTES, so a large
+    malformed body costs one bounded pass per codec. A DOCTYPE inside the bound is refused as one;
+    the same DOCTYPE behind a longer prolog falls past it and is an ordinary parse error."""
+    from messagefoundry.parsing.xml import harden
+
+    tail = b'<!DOCTYPE x [<!ENTITY a "b">]><x>'
+    inside = b"<!--" + b"c" * (harden._DOCTYPE_SCAN_BYTES - 200) + b"-->" + tail
+    with pytest.raises(XmlSecurityError):
+        parse_bytes(inside)
+    past = b"<!--" + b"c" * harden._DOCTYPE_SCAN_BYTES + b"-->" + tail
+    with pytest.raises(XmlParseError):
+        parse_bytes(past)
+
+
+def test_doctype_text_in_a_wellformed_comment_still_parses() -> None:
+    # The DOCTYPE scan runs only after a parse failure, so a mention in a comment is not refused.
+    root = parse_bytes(b"<x><!-- <!DOCTYPE x> --></x>")
+    assert root.tag == "x"
+
+
 def test_xxe_value_never_resolves_even_if_doctype_slipped_through() -> None:
     # Defense in depth: resolve_entities=False means a custom entity reference is not expanded. Even a
     # doctype-free doc referencing an undefined entity must not pull in external content.

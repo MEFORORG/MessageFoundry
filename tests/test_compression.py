@@ -41,7 +41,7 @@ from messagefoundry.parsing.compression import (
     zip_compress,
     zip_decompress,
 )
-from messagefoundry.parsing.sniff import archive_member_name_reason
+from messagefoundry.parsing.sniff import archive_member_name_reason, windows_member_name_reason
 
 _BODY = b"MSH|^~\\&|SEND|FAC|RECV|FAC|20260717||ADT^A01|1|P|2.5\rPID|1||123^^^MRN\r" * 200
 
@@ -587,6 +587,86 @@ def test_zip_decompress_refuses_member_contradicting_its_extension() -> None:
         zip_decompress(_hostile_zip({"r.json": b"<Patient/>"}), max_output_bytes=None)
     with pytest.raises(CompressionError, match=r"does not match the \.pdf extension"):
         zip_decompress(_hostile_zip({"doc.pdf": _BODY}), max_output_bytes=None)
+
+
+@pytest.mark.parametrize(
+    ("name", "fragment"),
+    [
+        ("adt.hl7:stream", "colon"),  # an NTFS alternate data stream of adt.hl7
+        ("sub/adt.hl7:x.hl7", "colon"),
+        ("x/a:b.hl7", "colon"),  # ntpath.isreserved("a:b.hl7") is False: only the colon arm sees it
+        ("adt.hl7.", "dot or space"),  # Windows opens adt.hl7, and the extension reads as "."
+        ("adt.hl7 ", "dot or space"),
+        ("dir./adt.hl7", "dot or space"),  # a directory component, not only the leaf
+        ("NUL", "reserved"),
+        ("con.hl7", "reserved"),  # the stem before the first dot is what ntpath.isreserved matches
+        ("sub/COM1.txt", "reserved"),
+        ("CONIN$", "reserved"),
+        ("COM¹.hl7", "reserved"),  # a superscript-digit port
+        ("a?b.hl7", "refuses"),  # a character Windows refuses in a name
+    ],
+)
+def test_windows_member_name_reason_refuses_windows_name_shapes(name: str, fragment: str) -> None:
+    """BACKLOG #5369: a colon, a trailing dot or space, and a reserved device stem or refused
+    character are refused on every platform, and the reason does not echo the name."""
+    reason = windows_member_name_reason(name)
+    assert reason is not None and fragment in reason
+    assert name not in reason
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["CONFIG.hl7", "console.txt", "COM10.hl7", "nullable.hl7", "a. b.hl7", "auxiliary/x.hl7"],
+)
+def test_windows_member_name_reason_admits_near_miss_windows_names(name: str) -> None:
+    # The must-not-fire arm for BACKLOG #5369: a stem that only starts like a device, and a dot-space
+    # inside a component, are ordinary names.
+    assert windows_member_name_reason(name) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "refused"),
+    [
+        ("aux.py", False),  # a Windows-name shape: only windows_member_name_reason refuses it
+        ("C:evil.hl7", True),  # an earlier shape: drive-relative, still refused here
+    ],
+)
+def test_archive_member_name_reason_keeps_its_earlier_arms(name: str, refused: bool) -> None:
+    # BACKLOG #5369 adds the Windows-name arms in their own function, not in this shared guard,
+    # which the DR config restore also calls.
+    assert (archive_member_name_reason(name) is not None) is refused
+
+
+@pytest.mark.parametrize(
+    ("name", "fragment"),
+    [
+        ("aux.hl7", "reserved"),
+        ("CON/x.hl7", "reserved"),
+        ("adt.hl7:stream", "colon"),
+        ("x/a:b.hl7", "colon"),
+        ("adt.hl7.", "dot or space"),
+    ],
+)
+@pytest.mark.parametrize("ceiling", [None, 1], ids=["no-ceiling", "ceiling-below-body"])
+def test_zip_decompress_refuses_windows_name_shapes(
+    name: str, fragment: str, ceiling: int | None
+) -> None:
+    # End to end through the reader: each shape must survive zipfile's own name handling. Under a
+    # ceiling below the body the name is still the reason, so it is judged before any byte is read.
+    blob = _hostile_zip({name: _BODY})
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        assert zf.namelist() == [name]
+    with pytest.raises(CompressionError, match=fragment):
+        zip_decompress(blob, max_output_bytes=ceiling)
+
+
+def test_zip_decompress_checks_hl7v2_members_against_their_extension() -> None:
+    """BACKLOG #5369: ``.hl7v2`` is an HL7 extension the uploads allowlist names, so it is checked
+    as one rather than accepted unchecked."""
+    with pytest.raises(CompressionError, match=r"does not match the \.hl7v2 extension"):
+        zip_decompress(_hostile_zip({"adt.hl7v2": b"%PDF-1.7 not hl7"}), max_output_bytes=None)
+    entries = {"adt.HL7V2": _BODY}
+    assert zip_decompress(_hostile_zip(entries), max_output_bytes=None) == entries
 
 
 def test_zip_decompress_admits_members_matching_their_extension() -> None:

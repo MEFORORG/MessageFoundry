@@ -79,8 +79,11 @@ Not every function here is pure. At least these do more than read their argument
 :func:`apply_static_credential_gate` and the guard :func:`make_static_credential_guard` returns,
 which log, the guard also reading the ``env()`` values the engine sets around it; ``_digest``,
 which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529); ``_is_https``, which logs
-at debug a proxy target that does not parse; and ``_http_literal_static``, whose ``env()``
-resolution runs an operator ``cast`` as the build does (BACKLOG #5510).
+at debug a proxy target that does not parse; and ``_http_literal_static`` (BACKLOG #5510) and
+``_dicomweb_build_refused`` (vault BACKLOG #5359), whose ``env()`` resolution runs an operator
+``cast`` as the build does. A caller inherits its callee's effect: at least
+:func:`static_credential_hops` and :func:`run_static_credential_gate` can run an operator ``cast``
+and log, and :func:`http_hop_credentials` logs through ``_digest`` and resolves no ``env()``.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -205,7 +208,8 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
 
     A minted SMART or OAuth2 bearer replaces the ``Authorization`` header, so a static bearer or
     Basic credential configured beside it never leaves the engine. Basic needs both halves: SOAP
-    refuses to build on one, and REST, FHIR and DICOMweb send nothing on one. A WS-Security
+    and DICOMweb (vault BACKLOG #5359) refuse to build on one, and REST and FHIR send nothing on
+    one. A WS-Security
     UsernameToken rides in the SOAP body, so token auth does not displace it, but it is stamped only
     with ``ws_security`` on. Its user and password are ``ws_username`` and ``ws_password`` alone; they
     stopped falling back to the Basic pair in BACKLOG #5526. ``Soap()`` hoists ``body_secrets`` into
@@ -264,13 +268,15 @@ def _http_literal_static(
 
     A header counts when the redaction screen (``config.wiring._is_secret_header``) reads it as a
     credential, by name or by value, the test the off-box cleartext refusal applies, so at least a
-    ``Proxy-Authorization`` entry counts too. A static ``Authorization`` header does not count when
-    ``displaced``, because the connector then writes its own ``Authorization`` over it: SOAP drops
-    every spelling ``http_auth.is_authorization_header_name`` matches, and the other connectors set
-    the plain name, which replaces only a spelling urllib folds into it (any letter case, nothing
-    added). So a REST, FHIR or DICOMweb ``"Authorization "``, with a trailing space, still counts:
-    it goes on the wire beside the connector's own. A query parameter counts when
-    ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses.
+    ``Proxy-Authorization`` entry counts too. On at least SOAP, REST and FHIR a static
+    ``Authorization`` header does not count when ``displaced``, because the connector then writes
+    its own ``Authorization`` over it: SOAP drops every spelling
+    ``http_auth.is_authorization_header_name`` matches, and REST and FHIR set the plain name, which
+    replaces only a spelling urllib folds into it (any letter case, nothing added). So a REST or
+    FHIR ``"Authorization "``, with a trailing space, still counts: it goes on the wire beside the
+    connector's own. A query parameter counts when ``secretscrub.credential_query_params`` names
+    it, the reader ``query_credential_hops`` uses, except on a destination type in
+    ``URL_QUERY_REFUSED_DESTINATIONS``.
 
     A table counts only as a ``dict``, the one type every connector's header builder sends.
 
@@ -305,8 +311,14 @@ def _http_literal_static(
         for key, value in headers.items()
     ):
         out.append("a credential in the headers table")
+    from messagefoundry.transports.egress import URL_QUERY_REFUSED_DESTINATIONS
+
     url = _db_setting(settings, "url", None, values)
-    if isinstance(url, str) and credential_query_params(url):
+    if (
+        ctype not in URL_QUERY_REFUSED_DESTINATIONS
+        and isinstance(url, str)
+        and credential_query_params(url)
+    ):
         out.append("a credential in the url query")
     return out
 
@@ -337,6 +349,29 @@ def _http_hop(
     if token or (ctype is ConnectorType.SOAP and settings.get("client_cert_file")):
         return None
     return StaticCredentialHop(name, "none", f"presents no credential ({peer})", compliant_kind)
+
+
+def _dicomweb_build_refused(
+    settings: Mapping[str, Any], env_values: Mapping[str, Any] | None
+) -> bool:
+    """Whether ``dicomweb_credential_problem`` (vault BACKLOG #5359) refuses this connection's
+    ``bearer_token``, ``basic_user``, ``basic_password`` and ``headers``. When it does, the census
+    lists neither the connection nor its proxy hop, whichever build refusal fires first. No other
+    DICOMweb build refusal leaves the connection out, at least a credential, query or fragment in
+    its ``url``, cleartext credentials or ``verify_tls`` off. An ``env()`` value among the four
+    that this reading cannot resolve, which is every one without ``env_values``, returns False
+    whatever the others hold."""
+    # Lazy, like ``_smart``: the transport owns the refusal, and this reads it rather than
+    # restating it.
+    from messagefoundry.transports.dicomweb import dicomweb_credential_problem
+
+    view: dict[str, Any] = {}
+    for key in ("bearer_token", "basic_user", "basic_password", "headers"):
+        value = _db_setting(settings, key, None, env_values)
+        if value is _UNRESOLVED:
+            return False
+        view[key] = value
+    return dicomweb_credential_problem(view) is not None
 
 
 def _proxy_url_holds_credential(url: object) -> bool:
@@ -433,8 +468,8 @@ def _proxy_hop(
     credential never leaves the engine. A loopback address always bypasses it, with no entry in the
     list (vault BACKLOG #2579). The bypass list is the connection's own, else the inherited
     ``[egress].proxy_no_proxy`` (``site_no_proxy``, ``None`` when the caller has no settings). With no
-    ``targets`` the hop is reported, because nothing says it is bypassed. Nor is a Digest proxy that
-    never carries the credential to those targets (:func:`_digest_proxy_refused`).
+    ``targets`` the hop is reported, because nothing says it is bypassed. A Digest proxy that never
+    carries the credential to those targets is not a hop either (:func:`_digest_proxy_refused`).
 
     The credential is the ``proxy_user``/``proxy_password`` pair. A user or a password in the proxy
     URL itself (:func:`_proxy_url_holds_credential`) is not a hop: the connector's build refuses it.
@@ -587,6 +622,12 @@ def _graph_hops(
         if ic.deployed and ic.spec.type in _DIALLED_INBOUND
     ]
     for name, spec in dialled:
+        # A DICOMweb connection its credential refusal stops never builds, so neither it nor its
+        # proxy hop is listed (vault BACKLOG #5359).
+        if spec.type is ConnectorType.DICOMWEB and _dicomweb_build_refused(
+            spec.settings, env_values
+        ):
+            continue
         hop = _connection_hop(name, spec.type, spec.settings, env_values)
         if hop is not None:
             out.append(hop)
@@ -717,9 +758,11 @@ def static_credential_hops(
     and ``settings=None`` reads the connection graph only. A caller that passes ``None`` must say so in
     its own output. With both, the graph half also reads ``[egress].proxy_url`` and
     ``[egress].proxy_no_proxy`` to decide whether a connection's proxy credential is ever sent.
-    ``env_values``, when the caller has the running instance's, resolves a database hop's ``env()``
-    dialect as the build does (see ``static_credential_db_hops``), and an HTTP-family hop's
-    ``env()`` ``headers`` table or ``url`` (see ``_http_literal_static``)."""
+    ``env_values``, when the caller has the running instance's, resolves at least a database
+    hop's ``env()`` dialect as the build does (see ``static_credential_db_hops``), and an
+    HTTP-family hop's ``env()`` ``headers`` table or ``url`` (see ``_http_literal_static``), and
+    the DICOMweb settings ``_dicomweb_build_refused`` reads, whose docstring says when that leaves a
+    DICOMweb connection and its proxy hop out."""
     out: list[StaticCredentialHop] = []
     if registry is not None:
         site_proxy = None if settings is None else (settings.egress.proxy_url or "")
@@ -803,9 +846,9 @@ def run_static_credential_gate(
     ``configure_logging`` has installed any handler, so a line logged then reaches stderr only and
     never the log file or the forwarder; it holds the lines and logs them once logging is configured.
     ``registry=None`` judges the settings half; a registry judges that graph's hops only.
-    ``env_values`` are the values that graph resolves against, so a database hop's ``env()`` dialect
-    is judged as the build resolves it; with none it is read as unresolved (see
-    :func:`static_credential_hops`). Returns ``None`` without reading anything when the gate is off."""
+    ``env_values`` are the values that graph resolves against, so at least a database hop's
+    ``env()`` dialect is judged as the build resolves it (see :func:`static_credential_hops`).
+    Returns ``None`` without reading anything when the gate is off."""
     security = settings.security
     if not security.require_nonstatic_credentials:
         return None
@@ -872,10 +915,10 @@ def make_static_credential_guard(
     settings half, ``security_loosenings()`` and ``GET /security/posture``, which all keep the startup
     values, and with every other ``[security]`` switch, which is read once at start.
 
-    A database hop's ``env()`` dialect is judged against the values the graph resolves against,
-    which :meth:`~messagefoundry.pipeline.engine.Engine.guard_registry` sets around the call. Called
-    outside it, the guard has none and reads such a dialect as unresolved, listing the hop when
-    either arm would."""
+    At least a database hop's ``env()`` dialect is judged against the values the graph resolves
+    against, which :meth:`~messagefoundry.pipeline.engine.Engine.guard_registry` sets around the
+    call. Called outside it, the guard has none and reads such a dialect as unresolved, listing
+    the hop when either arm would."""
     if not settings.security.require_nonstatic_credentials:
         return None
 

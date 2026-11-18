@@ -122,6 +122,9 @@ __all__ = [
     "ech_sidecar_is_cleartext",
     "ech_sidecar_url_from_settings",
     "egress_route_from_settings",
+    # Re-exported for DICOMweb, which names its connection in a refusal without importing
+    # tls_policy itself (the crypto inventory lists that module per importer).
+    "hop_name_prefix",
     "proxy_auth_handler_from_settings",
     "proxy_config_from_settings",
     "enforce_outbound_length_limits",

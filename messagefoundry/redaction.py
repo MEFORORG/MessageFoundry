@@ -105,6 +105,7 @@ __all__ = [
     "prepare_log_record",
     "prints_a_codec_error",
     "redact",
+    "redact_binary_carriage",
     "redact_untrusted",
     "refuse_repeated_keys",
     "safe_error",
@@ -579,7 +580,7 @@ _NAME_DIGEST_CHARS = 12
 #: derived from engine code rather than from a list of plausible extensions:
 #:
 #: * ``parsing/sniff.py`` ``_EXTENSION_CONTENT_TYPE`` — the engine's own extension-to-``ContentType``
-#:   map for archive-member admission (ASVS 5.2.2): ``.hl7 .json .fhir .xml .dcm .edi .x12``.
+#:   map for archive-member admission (ASVS 5.2.2): ``.hl7 .hl7v2 .json .fhir .xml .dcm .edi .x12``.
 #: * ``parsing/sniff.py`` ``_EXTENSION_MAGIC`` — the container/attachment formats it admits by leading
 #:   magic bytes: ``.pdf .png .jpg .jpeg .gif .tif .tiff .zip .gz``.
 #: * ``uploads.py`` ``_ALLOWED_UPLOAD_EXTENSIONS`` / ``content_type_for`` — ``.hl7v2`` and ``.txt``.
@@ -1079,6 +1080,75 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
     # its own guard -- and re-cut it on every pass, which is what the first version of this shipped.
     head, dropped = _clamp(text, max(window - _CLAMP_MARKER_BUDGET, 0))
     return f"{head}\n{_clamp_marker(dropped)}"  # newline, not space: see _clamp_marker
+
+
+#: An ``mfb64:v1:`` binary-carriage value (ADR 0028; ``parsing/binary.py`` ``MARKER``) and the base64
+#: run after it (BACKLOG #5378). The run is a whole message body, PHI by design, and every pass in
+#: :func:`redact` reads it as one opaque token: no HL7 delimiter, no date, no second capitalized word.
+#: So a log record or traceback quoting a carriage reached every sink whole. The marker is written as
+#: a literal because this module is pure stdlib and must not import ``parsing``; a test pins it to
+#: ``MARKER``.
+#:
+#: **It runs LAST, after every label pass** -- the PHI passes here and the credential passes of the
+#: log chain -- through :func:`redact_binary_carriage`, never inside :func:`redact`. ``/``, ``+``
+#: and ``=`` are base64 characters, so a run read first took a label joined to it (``QUJD/MRN: 123``, ``QUJD+token=x``) and left its value with nothing to find it by.
+#: Read last, every labelled value is already hidden as it was before this pass existed, and the
+#: run then takes what is left. A placeholder an earlier pass wrote inside the run (a date-shaped
+#: piece between two ``/``) is read as part of the run, so the run is not cut there and its tail is
+#: taken too. So is a marker whose ``mfb64`` an earlier pass replaced: the MRN pass reads it as the
+#: value of ``MRN: mfb64:v1:...`` and writes ``[redacted]:v1:...``, and the run after that head is
+#: still a body.
+#:
+#: Beyond the literal form, the pattern reads a marker whose colons are percent-encoded (``%3A``) or
+#: JSON unicode-escaped (``\u003A``, also with the backslash doubled, as a ``repr`` writes it), and a
+#: run whose ``+``, ``/`` or ``=`` is percent-encoded or unicode-escaped, or whose ``/`` is
+#: JSON-escaped (``\/``), the escapes also with the backslash doubled. The marker and the escapes are
+#: case-insensitive; the run is ASCII only (``re.ASCII``), so the case fold takes no non-ASCII letter.
+#: The run ends at its padding, and before a unit that starts another marker, so a carriage glued
+#: straight after another is still read as its own. One run unit is required, so prose that merely
+#: names the marker, such as ``missing mfb64:v1: marker``, is kept. Because the placeholder is a
+#: run unit, a second pass can extend a run over text glued after the padding, so
+#: :func:`redact_binary_carriage` repeats until nothing changes, for at most
+#: :data:`_CARRIAGE_ROUNDS` rounds.
+#:
+#: Residuals, at least these: a carriage broken by whitespace keeps every piece after the first
+#: break (``encode`` never writes one); a URL-safe (``-``/``_``) carriage keeps the part after its
+#: first such character; a marker escaped any other way (``\x3a``) is not read at all; and a run
+#: character encoded a way the pattern does not read (a doubly escaped ``\\\\/``, ``%252F``,
+#: ``&#x2F;``) ends the run, and the rest of the body prints in the log chain, which has no
+#: long-base64 backstop. Text that never reaches a log handler, such as :func:`safe_text`,
+#: :func:`safe_exc` and :func:`safe_error` output, gets no carriage pass at all, and neither does
+#: the support bundle (``support/redact.py``), which keeps its own ``_MFB64`` pass, run first.
+_BINARY_CARRIAGE = re.compile(
+    r"(?i)((?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1(?::|%3A|\\u003A|\\\\u003A))"
+    r"(?:(?!(?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1)"
+    r"(?:[A-Z0-9+/]|%2[BF]|\\/|\\\\/|\\u002[BF]|\\\\u002[BF]|\[redacted\]|<redacted>))++"
+    r"(?:=|%3D|\\u003D|\\\\u003D){0,2}",
+    re.ASCII,
+)
+
+
+def redact_binary_carriage(text: str) -> str:
+    """``text`` with every ``mfb64:v1:`` carriage run replaced by the placeholder, the marker kept so a
+    reader can still see a binary body was withheld (BACKLOG #5378).
+
+    **Call it last**, after every label and credential pass over the same text, as
+    :data:`_BINARY_CARRIAGE` says. Every marker it reads, a replaced ``mfb64`` head included,
+    holds ``v1`` or ``V1``, so most text skips the case-insensitive search."""
+    if "v1" not in text and "V1" not in text:
+        return text
+    for _ in range(_CARRIAGE_ROUNDS):
+        scrubbed = _BINARY_CARRIAGE.sub(rf"\g<1>{_REDACTED}", text)
+        if scrubbed == text:
+            break
+        text = scrubbed
+    return text
+
+
+#: The most rounds :func:`redact_binary_carriage` runs. The first round replaces the run, and each
+#: later round extends it over at most one more piece glued after the padding, so at most
+#: ``_CARRIAGE_ROUNDS - 1`` glued pieces are taken; a piece past those is left as it was.
+_CARRIAGE_ROUNDS = 8
 
 
 def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:

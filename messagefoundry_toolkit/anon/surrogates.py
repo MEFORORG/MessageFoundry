@@ -139,16 +139,17 @@ def site_prefixes_loaded() -> bool:
 
 #: How the :func:`site_prefix_split` reason starts, so a caller can tell it from a floor failure.
 SITE_PREFIX_SPLIT_LEAD = "the site-code check uses"
+#: What the publish guard's width refusal says (scripts/security/scan_forbidden.py,
+#: ``token_floor_failure``), so a caller can tell it from a source that did not load.
+SITE_PREFIX_WIDTH_MARK = "the anonymizer loads two-digit prefixes only"
 
 
 def site_prefix_split(guard_prefixes: tuple[str, ...]) -> str | None:
     """Why the site-code check does not use the publish guard's ``[site_prefix]`` table, or
     ``None`` when it uses the same prefixes. ``guard_prefixes`` is the guard's own table. Its
-    entries are read as :func:`_load_site_prefixes` reads a source, two ASCII digits only, so one
-    token source loaded into both tables reads the same even when it holds an entry that is not
-    two digits. The two differ when one of them was reloaded and the other was not
-    (BACKLOG #5541). The reason gives counts only, never a prefix: the prefixes name a real
-    estate."""
+    entries are read as :func:`_load_site_prefixes` reads a source, two ASCII digits only. The
+    two differ when one of them was reloaded and the other was not (BACKLOG #5541). The reason
+    gives counts only, never a prefix: the prefixes name a real estate."""
     loaded = {p for p in guard_prefixes if p.isascii() and p.isdigit() and len(p) == 2}
     if loaded == set(_SITE_PREFIXES):
         return None
@@ -726,26 +727,46 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
     return text
 
 
-def read_message_seps(text: str) -> tuple[Seps, str] | None:
-    """The ``(component/repetition/escape/subcomponent, field)`` separators of an HL7 message, read
-    from its own MSH-1/MSH-2 (never hardcoded). Returns ``None`` when there is no MSH carrying the
-    **full four** encoding characters — a degenerate/absent MSH-2 — so BOTH adapters fail closed
-    identically (the engine's ``Message`` itself raises when MSH-2 has fewer than four chars).
-    Shared (parity)."""
+def _header_encoding(text: str) -> tuple[str, str] | None:
+    """MSH-1 and the four MSH-2 characters of the first MSH line that carries four, or ``None``."""
     for seg in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
         if seg[:3].upper() == "MSH" and len(seg) >= 5:
             field = seg[3]
             enc = seg[4:].split(field, 1)[0]
             if len(enc) >= 4:
-                seps = Seps(
-                    component=enc[0],
-                    repetition=enc[1],
-                    escape=enc[2],
-                    subcomponent=enc[3],
-                    field=field,
-                )
-                return seps, field
+                return field, enc[:4]
     return None
+
+
+def repeats_encoding_characters(text: str) -> bool:
+    """True when the header :func:`read_message_seps` reads repeats one of its four MSH-2
+    characters (BACKLOG #5374). MSH-2 is read up to the first MSH-1, so it never holds that one.
+    Shared (parity)."""
+    header = _header_encoding(text)
+    return header is not None and len(set(header[1])) != 4
+
+
+def read_message_seps(text: str) -> tuple[Seps, str] | None:
+    """The ``(component/repetition/escape/subcomponent, field)`` separators of an HL7 message, read
+    from its own MSH-1/MSH-2 (never hardcoded). Returns ``None`` when there is no MSH carrying the
+    **full four** encoding characters — a degenerate/absent MSH-2 — so BOTH adapters fail closed
+    identically (the engine's ``Message`` itself raises when MSH-2 has fewer than four chars).
+    Also ``None`` when that header repeats one of the four (:func:`repeats_encoding_characters`):
+    it cannot say which structure a character marks, so the surrogate rewriters and the leak check
+    would split fields at the wrong places. The anonymizer refuses such a message, and the
+    structural leak check reports it. Shared (parity)."""
+    header = _header_encoding(text)
+    if header is None or len(set(header[1])) != 4:
+        return None
+    field, enc = header
+    seps = Seps(
+        component=enc[0],
+        repetition=enc[1],
+        escape=enc[2],
+        subcomponent=enc[3],
+        field=field,
+    )
+    return seps, field
 
 
 #: The dotted formatting commands that write a break or spaces: ``.br``, ``.sp``, ``.ce``, ``.in``,

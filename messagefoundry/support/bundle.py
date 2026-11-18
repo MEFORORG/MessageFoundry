@@ -38,9 +38,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import stat
 import time
 import zipfile
 from dataclasses import dataclass
+from errno import ELOOP
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -67,8 +70,11 @@ def _diagnostic(code: str, exc: BaseException) -> str:
     * ``MF-BUNDLE-CFG-002`` -- loading the config raised something else.
     * ``MF-BUNDLE-DB-001`` -- the store could not be opened or queried. With ``StoreNotFoundError``
       no store exists at the configured path, and the bundle did not create one (BACKLOG #1780).
-    * ``MF-BUNDLE-LOG-001`` -- the configured ``[logging].log_dir`` could not be listed.
-    * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read.
+    * ``MF-BUNDLE-LOG-001`` -- the configured ``[logging].log_dir`` could not be listed, or a log
+      file in it could not be stat'd.
+    * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read. With ``_LogFileRefused``
+      it was, twice, no longer the plain regular file the listing saw when it was opened
+      (BACKLOG #5383).
 
     A type name is a class defined in this project or the standard library, so it is bounded input; an
     exception's ``str()`` is not, and the bundle is a file an operator hands outside the environment."""
@@ -203,10 +209,108 @@ async def _db_info(settings: ServiceSettings) -> Any:
     )
 
 
+#: The suffixes that count as an app-log file in ``log_dir``.
+_LOG_SUFFIXES = (".log", ".txt")
+
+#: The name-surrogate bit of a Windows reparse tag: set on a symbolic link and a junction, the
+#: reparse points that name another file. A file with another reparse tag, such as a OneDrive
+#: placeholder or a deduplicated file, holds its own content and is still read.
+_IO_REPARSE_TAG_NAME_SURROGATE = 0x20000000
+
+#: How many times the newest log is listed and opened. A second pass covers a rotation that
+#: replaced the file between listing and opening, which reads as a swap to the identity check.
+_LOG_READ_ATTEMPTS = 2
+
+
+class _LogFileRefused(OSError):
+    """The newest app-log file was not, once opened, the plain regular file the listing saw: a
+    different file or a special file swapped in at its name (BACKLOG #5383). A type of this
+    module, so :func:`_diagnostic` reports it by its bounded name."""
+
+
+def _is_plain_file(st: os.stat_result) -> bool:
+    """A regular file with one name, that is not a symbolic link or junction.
+
+    ``st`` comes from a call that did not follow links, so a link reads as a link here. A second
+    hard link is refused because it can name a file outside ``log_dir`` with nothing to show it."""
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return False
+    return not getattr(st, "st_reparse_tag", 0) & _IO_REPARSE_TAG_NAME_SURROGATE
+
+
+def _log_candidates(directory: Path) -> list[tuple[Path, os.stat_result]]:
+    """The app-log files directly under ``directory``, each with its own (not followed) stat. A
+    symbolic link, a junction, a hard link, a FIFO, a device, a socket or a directory with a log
+    suffix is left out, so the bundle copies no file through a link from outside ``log_dir``
+    (BACKLOG #5383). Raises :class:`OSError` when the directory cannot be listed or a candidate
+    cannot be read; one that is gone by then is left out."""
+    out: list[tuple[Path, os.stat_result]] = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if os.path.splitext(entry.name)[1] not in _LOG_SUFFIXES:
+                continue
+            try:
+                # os.lstat, not entry.stat: on Windows a DirEntry's stat leaves st_dev, st_ino and
+                # st_nlink zero, and they are what is checked here and in _read_log_file.
+                st = os.lstat(entry.path)
+            except FileNotFoundError:
+                continue  # gone between listing and stat; it is not the newest log any more
+            if _is_plain_file(st):
+                out.append((Path(entry.path), st))
+    return out
+
+
+def _read_log_file(path: Path, listed: os.stat_result) -> str:
+    """The text of ``path``, checked after the open to be the same plain regular file that was
+    listed (BACKLOG #5383): ``fstat`` on the new descriptor must report a regular file with the
+    device and file id the listing saw. The descriptor is closed on every path out.
+
+    On POSIX, ``O_NOFOLLOW`` makes the open fail with ``ELOOP`` when a symbolic link has been put
+    at the name, so the open never reaches another file through one. ``O_NONBLOCK`` makes the open
+    of a FIFO put at the name return at once instead of waiting for a writer; the descriptor is
+    made blocking again before the read. A directory put at the name opens there, and the check
+    after the open refuses it as :class:`_LogFileRefused`; on Windows its open fails with
+    :class:`PermissionError`.
+
+    Windows has neither flag. There the open follows a symbolic link or junction put at the name
+    after the listing, so the open itself reaches whatever the link names, and any effect of
+    opening that target happens: connecting to a named pipe the link points at, for one. What the
+    check after the open prevents is only the read: a target with another id is refused, and
+    none of its content enters the bundle. Raises :class:`OSError`, the identity refusal as
+    :class:`_LogFileRefused`."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    nonblocking = getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | nonblocking
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            listed.st_dev,
+            listed.st_ino,
+        ):
+            raise _LogFileRefused("the app-log file changed between listing and opening")
+        if nonblocking:
+            os.set_blocking(fd, True)
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
+        data = handle.read()
+    # Read tolerant of a legacy codepage; the redaction pass runs on the decoded text.
+    return data.decode("utf-8", errors="replace")
+
+
 def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
     """A redacted tail of the newest app-log file under ``log_dir`` (one level). ``None`` when no log
-    dir is configured or it holds no readable log file. **Never** raises — a log read problem is logged
-    into the tail text, not propagated.
+    dir is configured, it holds no readable log file, or ``lines`` is not positive (BACKLOG #5384: a
+    slice by zero or a negative count would carry the whole file, or most of it). **Never** raises —
+    a log read problem is logged into the tail text, not propagated.
+
+    Only a plain regular file with one name is read: a link, a hard link or a special file with a
+    log suffix is passed over (BACKLOG #5383), see :func:`_log_candidates` and
+    :func:`_read_log_file`. A file replaced between listing and opening, as a rotation does, is
+    listed and opened again once before the refusal is reported.
 
     EVERY returned string leaves through ``redact_log_text``, and that is what makes the manifest's
     ``phi_contract`` claim about this member true. The two failure branches used to ``return`` ahead of
@@ -216,21 +320,27 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
     step failed."""
     from messagefoundry.support.redact import redact_log_text, split_log_lines
 
-    if not log_dir:
+    if not log_dir or lines <= 0:
         return None
-    directory = Path(log_dir)
-    try:
-        files = [p for p in directory.iterdir() if p.is_file() and p.suffix in (".log", ".txt")]
-    except OSError as exc:
-        return redact_log_text(_diagnostic("MF-BUNDLE-LOG-001", exc))
-    if not files:
-        return None
-    newest = max(files, key=lambda p: p.stat().st_mtime)
-    try:
-        # Read tolerant of a legacy codepage; the redaction pass runs on the decoded text.
-        text = newest.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return redact_log_text(_diagnostic("MF-BUNDLE-LOG-002", exc))
+    text = ""
+    for attempt in range(_LOG_READ_ATTEMPTS):
+        try:
+            files = _log_candidates(Path(log_dir))
+        except OSError as exc:
+            return redact_log_text(_diagnostic("MF-BUNDLE-LOG-001", exc))
+        if not files:
+            return None
+        newest, listed = max(files, key=lambda item: item[1].st_mtime)
+        try:
+            text = _read_log_file(newest, listed)
+        except OSError as exc:
+            # A refusal, a file gone, or (POSIX) a link put at its name: each is what a rotation or
+            # a swap between listing and opening leaves, so list again once before reporting it.
+            changed = isinstance(exc, (_LogFileRefused, FileNotFoundError)) or exc.errno == ELOOP
+            if changed and attempt + 1 < _LOG_READ_ATTEMPTS:
+                continue
+            return redact_log_text(_diagnostic("MF-BUNDLE-LOG-002", exc))
+        break
     tail = split_log_lines(text)[-lines:]
     return redact_log_text("\n".join(tail))
 

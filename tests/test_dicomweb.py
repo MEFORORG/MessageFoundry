@@ -9,6 +9,7 @@ The opener is faked so nothing hits the network — and because the destination 
 
 from __future__ import annotations
 
+import base64
 import email.message
 import http.client
 import io
@@ -27,6 +28,7 @@ from messagefoundry.parsing import RawMessage
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
+from messagefoundry.transports.rest import HttpAuthError
 from tests._malformed_reply import MALFORMED_REPLIES, RefusedAndMalformed
 
 BASE = "https://pacs.example.org/dicom-web"
@@ -949,3 +951,294 @@ async def test_a_dicomweb_reply_refusal_that_is_also_an_httpexception_passes_thr
     with pytest.raises(DeliveryError) as ei:
         await _call_dicomweb(dest, call)
     assert ei.value is refusal
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"basic_user": "svc"},  # a user with no password would send no credential
+        {"basic_password": "pw"},  # and the reverse
+    ],
+)
+def test_dicomweb_half_basic_pair_refused(over: dict[str, str]) -> None:  # vault BACKLOG #5359
+    with pytest.raises(ValueError, match="must be set together"):
+        _dest(**over)
+
+
+def test_dicomweb_bearer_beside_basic_refused() -> None:  # vault BACKLOG #5359
+    """Basic used to overwrite the bearer silently; now the operator has to pick one."""
+    with pytest.raises(ValueError, match="both bearer_token and basic_user"):
+        _dest(bearer_token="t", basic_user="svc", basic_password="pw")
+
+
+@pytest.mark.parametrize(
+    ("over", "match"),
+    [
+        ({"basic_user": "svc:x", "basic_password": "pw"}, "may not contain a colon"),
+        ({"basic_user": "svc\r\nX-Evil: 1", "basic_password": "pw"}, "illegal control character"),
+        ({"basic_user": "svc", "basic_password": "p\x00w"}, "illegal control character"),
+    ],
+)
+def test_dicomweb_malformed_basic_credential_refused(
+    over: dict[str, str], match: str
+) -> None:  # vault BACKLOG #5359
+    with pytest.raises(ValueError, match=match) as exc:
+        _dest(**over)
+    assert "svc" not in str(exc.value) and "pw" not in str(exc.value)  # names, never values
+
+
+@pytest.mark.parametrize("name", ["Authorization", "authorization", "Authorization "])
+@pytest.mark.parametrize(
+    "over", [{"bearer_token": "t"}, {"basic_user": "svc", "basic_password": "pw"}]
+)
+def test_dicomweb_authorization_header_beside_a_credential_refused(
+    name: str, over: dict[str, str]
+) -> None:  # vault BACKLOG #5359
+    """A static Authorization entry was overwritten, or sent as a second header when spelled with
+    padding the overwrite missed."""
+    with pytest.raises(ValueError, match="Authorization entry in headers"):
+        _dest(headers={name: "x"}, **over)
+
+
+@pytest.mark.parametrize(
+    ("field", "char"),
+    [
+        ("bearer_token", "\udcff"),
+        ("bearer_token", "\u20ac"),  # latin-1 cannot write it, and the bearer goes out raw
+        ("basic_user", "\udcff"),
+        ("basic_password", "\udcff"),
+    ],
+)
+def test_dicomweb_unencodable_credential_refused(
+    field: str, char: str
+) -> None:  # vault BACKLOG #5359
+    """An unencodable character used to build and then raise UnicodeEncodeError, which names the
+    code point and its offset in the secret."""
+    over = {"basic_user": "svc", "basic_password": "pw"} if field != "bearer_token" else {}
+    over[field] = f"se{char}cret"
+    with pytest.raises(HttpAuthError, match=f"{field} holds a character the request cannot") as exc:
+        _dest(**over)
+    assert "cret" not in str(exc.value) and char not in str(exc.value)
+
+
+def test_dicomweb_non_ascii_basic_credential_still_constructs() -> None:  # vault BACKLOG #5359
+    """The control: a Basic half is UTF-8 inside base64, so a character latin-1 lacks is fine."""
+    basic = _dest(basic_user="svc", basic_password="p\u20acw")._headers["Authorization"]
+    assert basic == "Basic " + base64.b64encode("svc:p\u20acw".encode()).decode("ascii")
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{"basic_user": "svc"}, {"basic_user": "s\nvc", "basic_password": "pw"}],
+)
+def test_dicomweb_credential_refusal_names_the_connection(
+    over: dict[str, str],
+) -> None:  # vault BACKLOG #5359
+    with pytest.raises(HttpAuthError, match=r"^connection 'OB_DCMWEB'; DICOMweb destination "):
+        _dest(**over)
+
+
+@pytest.mark.parametrize("over", [{"basic_user": "svc"}, {"basic_password": "pw"}])
+def test_dicomweb_header_builder_sends_no_lone_basic_half(over: dict[str, str]) -> None:
+    """Past the constructor's screen, a lone half still sends nothing rather than ``svc:None``
+    (vault BACKLOG #5359)."""
+    headers = _dest()._build_headers(dict(over))
+    assert "Authorization" not in headers
+
+
+def test_dicomweb_single_credentials_still_construct() -> None:  # vault BACKLOG #5359
+    """Positive controls: each credential alone, and a colon in the password (RFC 7617 allows it)."""
+    assert _dest(bearer_token="t")._headers["Authorization"] == "Bearer t"
+    basic = _dest(basic_user="svc", basic_password="p:w")._headers["Authorization"]
+    assert basic == "Basic " + base64.b64encode(b"svc:p:w").decode("ascii")
+    assert "Authorization" not in _dest()._headers
+
+
+def _dest_at(url: str) -> DicomWebDestination:
+    d = build_destination(
+        Destination(name="OB", type=ConnectorType.DICOMWEB, settings=DICOMweb(url=url).settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert isinstance(d, DicomWebDestination)
+    return d
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"{BASE}?qq7=a",  # /studies would land inside the query
+        f"{BASE}?",  # an empty query still swallows the appended path
+        f"{BASE}#zz9",  # /studies would become a fragment the client never sends
+        f"{BASE}#",
+    ],
+)
+def test_dicomweb_base_url_query_or_fragment_refused(url: str) -> None:  # vault BACKLOG #5358
+    with pytest.raises(ValueError, match="no query string or fragment") as exc:
+        _dest_at(url)
+    assert "qq7" not in str(exc.value) and "zz9" not in str(exc.value)
+
+
+def test_dicomweb_plain_base_url_still_derives_studies() -> None:  # vault BACKLOG #5358
+    assert _dest_at(BASE)._target_url == f"{BASE}/studies"
+    assert _dest_at(f"{BASE}/")._target_url == f"{BASE}/studies"
+
+
+_QUERY_CREDENTIAL_URL = f"{BASE}?api_key=QQ7SECRET"
+
+
+def test_dicomweb_query_credential_is_not_reported_as_a_hop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:  # vault BACKLOG #5358
+    """The build refuses any url query, so these readers do not report a DICOMweb url-query
+    credential: ``_http_literal_static``'s url-query label, ``query_credential_hops`` and both
+    url-query WARNINGs. REST with the same url is the positive control for the label,
+    ``query_credential_hops`` and the build-time WARNING."""
+    from messagefoundry.config.static_credentials import _http_literal_static
+    from messagefoundry.config.wiring import (
+        Registry,
+        Rest,
+        build_outbound_connection,
+        query_credential_hops,
+    )
+    from messagefoundry.transports.egress import (
+        URL_QUERY_REFUSED_DESTINATIONS,
+        warn_url_query_credentials,
+        warn_url_query_credentials_before_build,
+    )
+
+    assert ConnectorType.DICOMWEB in URL_QUERY_REFUSED_DESTINATIONS
+    with pytest.raises(ValueError, match="no query string or fragment"):
+        _dest_at(_QUERY_CREDENTIAL_URL)
+
+    dicomweb = DICOMweb(url=_QUERY_CREDENTIAL_URL)
+    rest = Rest(url=_QUERY_CREDENTIAL_URL)
+    census = "a credential in the url query"
+    assert census not in _http_literal_static(
+        ConnectorType.DICOMWEB, dicomweb.settings, displaced=False, env_values=None
+    )
+    assert census in _http_literal_static(
+        ConnectorType.REST, rest.settings, displaced=False, env_values=None
+    )
+
+    registry = Registry()
+    registry.outbound["OB_DW"] = build_outbound_connection("OB_DW", dicomweb)
+    registry.outbound["OB_REST"] = build_outbound_connection("OB_REST", rest)
+    assert [name for name, _ in query_credential_hops(registry)] == ["OB_REST"]
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.egress"):
+        warn_url_query_credentials(
+            "outbound 'OB_DW'", dicomweb.settings, connector_type=ConnectorType.DICOMWEB
+        )
+        warn_url_query_credentials_before_build(
+            "outbound 'OB_DW'",
+            dicomweb.settings,
+            {},
+            connection="OB_DW",
+            connector_type=ConnectorType.DICOMWEB,
+        )
+        assert not caplog.records
+        warn_url_query_credentials(
+            "outbound 'OB_REST'", rest.settings, connector_type=ConnectorType.REST
+        )
+    assert [r for r in caplog.records if "OB_REST" in r.getMessage()]
+
+
+_REFUSED_CREDENTIALS: list[dict[str, object]] = [
+    {"basic_user": "svc"},
+    {"bearer_token": "t", "basic_user": "svc", "basic_password": "pw"},
+    {"bearer_token": "t", "headers": {"Authorization ": "Bearer x"}},
+    {"basic_user": "svc:x", "basic_password": "pw"},
+    {"bearer_token": "t\u20acn"},
+]
+
+
+def _census(**over: object) -> list[str]:
+    from messagefoundry.config.static_credentials import static_credential_hops
+    from messagefoundry.config.wiring import Registry, build_outbound_connection
+
+    registry = Registry()
+    registry.outbound["OB_DW"] = build_outbound_connection(
+        "OB_DW",
+        DICOMweb(url=BASE, **over),  # type: ignore[arg-type]
+    )
+    return [hop.name for hop in static_credential_hops(registry=registry, settings=None)]
+
+
+@pytest.mark.parametrize("over", _REFUSED_CREDENTIALS)
+def test_census_leaves_out_a_dicomweb_hop_its_build_refuses(
+    over: dict[str, object],
+) -> None:  # vault BACKLOG #5359
+    """The census reads the build's own refusal (``dicomweb_credential_problem``), so a hop that
+    cannot build is not listed for an operator to opt out."""
+    with pytest.raises(HttpAuthError):
+        _dest(**over)
+    assert _census(**over) == []
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"bearer_token": "t"},
+        {"basic_user": "svc", "basic_password": "pw"},
+        {},  # no credential at all is a listed hop too
+    ],
+)
+def test_census_still_lists_a_dicomweb_hop_that_builds(
+    over: dict[str, object],
+) -> None:  # vault BACKLOG #5359
+    _dest(**over)
+    assert _census(**over) == ["OB_DW"]
+
+
+def test_census_resolves_env_credentials_before_judging() -> None:  # vault BACKLOG #5359
+    """The serve guard and the posture route pass the instance's values; a refusal they resolve
+    leaves the hop out, and so does a literal ``default=``."""
+    from messagefoundry.config.static_credentials import static_credential_hops
+    from messagefoundry.config.wiring import Registry, build_outbound_connection, env
+
+    registry = Registry()
+    registry.outbound["OB_DW"] = build_outbound_connection(
+        "OB_DW", DICOMweb(url=BASE, bearer_token=env("tok"), basic_user="svc", basic_password="pw")
+    )
+    registry.outbound["OB_DEF"] = build_outbound_connection(
+        "OB_DEF",
+        DICOMweb(url=BASE, bearer_token=env("t2", default="t"), basic_user="s", basic_password="p"),
+    )
+    hops = static_credential_hops(registry=registry, settings=None, env_values={"tok": "t"})
+    assert [hop.name for hop in hops] == []
+    # The control: a token that resolves empty builds, as Basic alone, and is listed.
+    hops = static_credential_hops(registry=registry, settings=None, env_values={"tok": ""})
+    assert [hop.name for hop in hops] == ["OB_DW"]
+
+
+def test_census_with_no_values_leaves_an_env_credential_unjudged() -> None:  # vault BACKLOG #5359
+    """With no values, as ``messagefoundry check`` passes, an ``env()`` credential is not judged by
+    its ``default=``: the instance may override it. So the hop stays listed."""
+    from messagefoundry.config.static_credentials import static_credential_hops
+    from messagefoundry.config.wiring import Registry, build_outbound_connection, env
+
+    registry = Registry()
+    registry.outbound["OB_DEF"] = build_outbound_connection(
+        "OB_DEF",
+        DICOMweb(url=BASE, bearer_token=env("t2", default="t"), basic_user="s", basic_password="p"),
+    )
+    hops = static_credential_hops(registry=registry, settings=None, env_values=None)
+    assert [hop.name for hop in hops] == ["OB_DEF"]
+
+
+def test_census_leaves_out_the_proxy_hop_of_a_refused_dicomweb() -> None:  # vault BACKLOG #5359
+    over: dict[str, object] = {
+        "proxy": "http://proxy.example.org:8080",
+        "proxy_user": "u",
+        "proxy_password": "p",
+    }
+    assert _census(basic_user="svc", **over) == []
+    # The control: the same proxy beside a credential that builds is listed.
+    assert "proxy:OB_DW" in _census(bearer_token="t", **over)
+
+
+def test_census_lists_a_dicomweb_hop_it_cannot_resolve() -> None:  # vault BACKLOG #5359
+    """An env() credential with no values to resolve it is not judged, so the hop stays listed."""
+    from messagefoundry.config.wiring import env
+
+    assert _census(bearer_token=env("tok"), basic_user="svc", basic_password="pw") == ["OB_DW"]

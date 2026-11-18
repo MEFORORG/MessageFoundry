@@ -545,7 +545,36 @@ def test_the_verify_off_header_allowlist_is_pinned() -> None:
     assert pinned == VERIFY_OFF_STATIC_HEADER_ALLOWLIST
 
 
-@pytest.mark.parametrize("cell", _CELLS)
+#: The cells whose url may carry a query. A DICOMweb base url refuses any query at construction
+#: (vault BACKLOG #5358), before these refusals read it; ``test_a_dicomweb_url_query_is_refused_first``
+#: pins that it still refuses and still withholds the value.
+_QUERY_CELLS = [cell for cell in _CELLS if cell != "DICOMweb"]
+
+
+@pytest.mark.parametrize("query", ["api_key", "code", "a=1?api_key"])
+@pytest.mark.parametrize("cleartext", [False, True])
+def test_a_dicomweb_url_query_is_refused_first(query: str, cleartext: bool) -> None:
+    ctype, factory, url = (_CLEARTEXT if cleartext else _HTTPS)["DICOMweb"]
+    with pytest.raises(ValueError, match="no query string or fragment") as exc:
+        _build((ctype, factory, f"{url}?{query}={_SECRET}"))
+    assert "connection 'OB'" in str(exc.value)
+    assert _SECRET not in str(exc.value)
+
+
+def test_a_dicomweb_second_query_credential_over_verify_off_is_refused_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The BACKLOG #5353 verify-off case: for DICOMweb the query refusal wins over the credential
+    refusal, and still withholds the value."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    url = f"{_HTTPS['DICOMweb'][2]}?a=1?api_key={_SECRET}"
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match="no query string") as exc:
+        _build_raw("DICOMweb", {"verify_tls": False, "url": url})
+    assert "connection 'OB'" in str(exc.value)
+    assert _SECRET not in str(exc.value)
+
+
+@pytest.mark.parametrize("cell", _QUERY_CELLS)
 def test_a_url_query_credential_over_verify_off_is_refused(
     cell: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -559,7 +588,7 @@ def test_a_url_query_credential_over_verify_off_is_refused(
 
 
 @pytest.mark.parametrize("name", ["code", "CODE", "code1"])
-@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("cell", _QUERY_CELLS)
 def test_a_url_code_parameter_over_verify_off_is_refused(
     cell: str, name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -573,7 +602,7 @@ def test_a_url_code_parameter_over_verify_off_is_refused(
     _assert_credential_refusal(exc)
 
 
-@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("cell", _QUERY_CELLS)
 @pytest.mark.parametrize("declared", ["attested", "accepted"])
 def test_a_url_code_parameter_over_declared_cleartext_is_refused(
     cell: str, declared: str, monkeypatch: pytest.MonkeyPatch
@@ -621,10 +650,17 @@ def test_a_proxy_credential_or_a_cleartext_url_is_not_this_refusals_case() -> No
 
 
 @pytest.mark.parametrize(
-    "suffix",
-    [f";jsessionid={_SECRET}", f";jsessionid={_SECRET}/next", f"?a=1?api_key={_SECRET}"],
+    ("cell", "suffix"),
+    [
+        *[
+            (c, s)
+            for c in _CELLS
+            for s in (f";jsessionid={_SECRET}", f";jsessionid={_SECRET}/next")
+        ],
+        # A second ``?`` is a query, which a DICOMweb base url refuses first; see _QUERY_CELLS.
+        *[(c, f"?a=1?api_key={_SECRET}") for c in _QUERY_CELLS],
+    ],
 )
-@pytest.mark.parametrize("cell", _CELLS)
 def test_a_url_segment_credential_the_query_misses_is_refused_over_verify_off(
     cell: str, suffix: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

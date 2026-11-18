@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -569,14 +571,16 @@ def test_log_tail_unreadable_file_drops_the_name_and_the_exception_message(
 
     # Patched only after the settings are loaded, and only for the target file, so nothing else in the
     # bundle path is disturbed by it.
-    real_read_text = Path.read_text
+    from messagefoundry.support import bundle as bundle_mod
 
-    def boom(self: Path, *args: object, **kwargs: object) -> str:
-        if self.name == target.name:
+    real_read = bundle_mod._read_log_file
+
+    def boom(path: Path, listed: os.stat_result) -> str:
+        if path.name == target.name:
             raise OSError(_DB_PAYLOAD)
-        return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+        return real_read(path, listed)
 
-    monkeypatch.setattr(Path, "read_text", boom)
+    monkeypatch.setattr(bundle_mod, "_read_log_file", boom)
 
     out = tmp_path / "bundle.zip"
     build_bundle(out, config_dir=None, settings=settings)
@@ -585,3 +589,246 @@ def test_log_tail_unreadable_file_drops_the_name_and_the_exception_message(
         out, _LOG_FILE_PAYLOAD, "Jd6Fp8Lq4Vn", _DB_PAYLOAD, "Tr9Vb4Nm8Qz"
     )
     assert members["app-log.txt"] == "MF-BUNDLE-LOG-002 OSError"
+
+
+# --- BACKLOG #5383, #5384: the log tail reads only a plain regular file, and only a positive count --
+
+
+def _log_dir_settings(tmp_path: Path, log_dir: Path) -> object:
+    from messagefoundry.config.settings import load_settings
+
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text(f'[logging]\nlog_dir = "{log_dir.as_posix()}"\n', encoding="utf-8")
+    return load_settings(config_path=toml)
+
+
+def _tail_member(tmp_path: Path, log_dir: Path, **kwargs: object) -> str | None:
+    out = tmp_path / "bundle.zip"
+    build_bundle(out, config_dir=None, settings=_log_dir_settings(tmp_path, log_dir), **kwargs)  # type: ignore[arg-type]
+    return _members(out).get("app-log.txt")
+
+
+def test_log_tail_passes_over_a_symlink_to_a_file_outside_log_dir(tmp_path: Path) -> None:
+    """A link with a log suffix, newer than the real log, used to be followed: the outside file's
+    text was copied into ``app-log.txt`` (BACKLOG #5383)."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    real = log_dir / "engine.log"
+    real.write_text("2026-06-27 INFO engine started\n", encoding="utf-8")
+    outside = tmp_path / "outside-Kz7Wq2Lp9Xr.txt"
+    outside.write_text("OUTSIDE-Kz7Wq2Lp9Xr\n", encoding="utf-8")
+    link = log_dir / "zz-newest.log"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create a symbolic link")
+    os.utime(real, (1_000_000, 1_000_000))  # older than the link, so the link sorts newest
+
+    tail = _tail_member(tmp_path, log_dir)
+    assert tail is not None
+    assert "Kz7Wq2Lp9Xr" not in tail
+    assert "engine started" in tail
+
+
+def test_log_tail_passes_over_a_directory_with_a_log_suffix(tmp_path: Path) -> None:
+    """Kept by the new listing as the old ``is_file`` filter kept it."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "archive.log").mkdir()
+    assert _tail_member(tmp_path, log_dir) is None
+
+
+def test_log_tail_passes_over_a_hard_link_to_a_file_outside_log_dir(tmp_path: Path) -> None:
+    """A second hard link is a regular file to every check but the link count, and the listing
+    and the opened file agree on its id, so the count is what refuses it (BACKLOG #5383)."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    real = log_dir / "engine.log"
+    real.write_text("2026-06-27 INFO engine started\n", encoding="utf-8")
+    os.utime(real, (1_000_000, 1_000_000))
+    outside = tmp_path / "outside-Wb5Hs1Nq.txt"
+    outside.write_text("OUTSIDE-Wb5Hs1Nq\n", encoding="utf-8")
+    try:
+        os.link(outside, log_dir / "zz-newest.log")
+    except (OSError, NotImplementedError):
+        pytest.skip("this file system cannot create a hard link")
+
+    tail = _tail_member(tmp_path, log_dir)
+    assert tail is not None
+    assert "Wb5Hs1Nq" not in tail
+    assert "engine started" in tail
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX only")
+@pytest.mark.timeout(30)
+def test_read_log_file_does_not_block_on_a_fifo_swapped_in_after_the_listing(
+    tmp_path: Path,
+) -> None:
+    """The listing leaves a FIFO out, as the old ``is_file`` filter did; the race is a FIFO put at
+    the listed name before the open, which would block a plain open until a writer appeared
+    (BACKLOG #5383). ``O_NONBLOCK`` returns at once and the identity check refuses it."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    log = tmp_path / "engine.log"
+    log.write_text("first\n", encoding="utf-8")
+    listed = os.lstat(log)
+    log.unlink()
+    os.mkfifo(log)
+    with pytest.raises(bundle_mod._LogFileRefused):
+        bundle_mod._read_log_file(log, listed)
+
+
+def test_read_log_file_refuses_a_file_swapped_in_after_the_listing(tmp_path: Path) -> None:
+    """The check after the open holds where no open flag does (Windows): a different file at the
+    listed path is refused, as a link followed to another file would be."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    log = tmp_path / "engine.log"
+    log.write_text("first\n", encoding="utf-8")
+    listed = os.lstat(log)
+    other = tmp_path / "other.log"
+    other.write_text("SWAPPED-Vn3Qx8Rt\n", encoding="utf-8")
+    os.replace(other, log)
+    with pytest.raises(bundle_mod._LogFileRefused):
+        bundle_mod._read_log_file(log, listed)
+
+
+def _stale_listing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, times: int) -> list[int]:
+    """Make the first ``times`` listings carry another file's stat, as a swap or a rotation
+    between listing and opening would. Returns the call counter."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    real_candidates = bundle_mod._log_candidates
+    calls = [0]
+
+    def stale(directory: Path) -> list[tuple[Path, os.stat_result]]:
+        calls[0] += 1
+        found = real_candidates(directory)
+        if calls[0] > times:
+            return found
+        decoy = tmp_path / "decoy.log"
+        decoy.write_text("x\n", encoding="utf-8")
+        return [(p, os.lstat(decoy)) for p, _st in found]
+
+    monkeypatch.setattr(bundle_mod, "_log_candidates", stale)
+    return calls
+
+
+def test_log_tail_swapped_file_twice_reports_the_refusal_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_text("SWAPPED-Vn3Qx8Rt\n", encoding="utf-8")
+    calls = _stale_listing(monkeypatch, tmp_path, times=2)
+    assert _tail_member(tmp_path, log_dir) == "MF-BUNDLE-LOG-002 _LogFileRefused"
+    assert calls[0] == 2
+
+
+def test_log_tail_a_rotation_between_listing_and_opening_is_read_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_text("after rotation\n", encoding="utf-8")
+    calls = _stale_listing(monkeypatch, tmp_path, times=1)
+    assert _tail_member(tmp_path, log_dir) == "after rotation"
+    assert calls[0] == 2
+
+
+@pytest.mark.parametrize("lines", [0, -1, -400])
+def test_log_tail_not_positive_omits_the_app_log(tmp_path: Path, lines: int) -> None:
+    """``[-0:]`` is the whole list and ``[-(-1):]`` is all but the first line, so a count that is
+    not positive used to carry most or all of the newest log (BACKLOG #5384)."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    assert _tail_member(tmp_path, log_dir, log_tail_lines=lines) is None
+    assert _tail_member(tmp_path, log_dir, log_tail_lines=2) == "two\nthree"
+
+
+def test_cli_refuses_a_negative_log_tail_lines(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from messagefoundry.__main__ import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["support-bundle", "--out", str(tmp_path / "b.zip"), "--log-tail-lines", "-5"])
+    assert exc.value.code == 2
+    assert "zero or more lines" in capsys.readouterr().err
+    assert not (tmp_path / "b.zip").exists()
+
+
+def test_log_tail_a_file_gone_between_listing_and_opening_is_listed_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rotation renames the live file away before it creates the new one; an open in that gap
+    finds nothing, and the second listing reads the new file."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_text("after rotation\n", encoding="utf-8")
+    real_read = bundle_mod._read_log_file
+    calls = [0]
+
+    def gone_once(path: Path, listed: os.stat_result) -> str:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise FileNotFoundError(path.name)
+        return real_read(path, listed)
+
+    monkeypatch.setattr(bundle_mod, "_read_log_file", gone_once)
+    assert _tail_member(tmp_path, log_dir) == "after rotation"
+    assert calls[0] == 2
+
+
+def test_read_log_file_closes_the_descriptor_on_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.support import bundle as bundle_mod
+
+    log = tmp_path / "engine.log"
+    log.write_text("first\n", encoding="utf-8")
+    listed = os.lstat(log)
+    other = tmp_path / "other.log"
+    other.write_text("second\n", encoding="utf-8")
+    os.replace(other, log)
+    opened: list[int] = []
+    real_open = os.open
+
+    real_close = os.close
+    closed: list[int] = []
+
+    def recording_open(*args: Any, **kwargs: Any) -> int:
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def recording_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "close", recording_close)
+    with pytest.raises(bundle_mod._LogFileRefused):
+        bundle_mod._read_log_file(log, listed)
+    # The descriptor the read opened is the one it closed: compared by the values the two calls
+    # saw, never by asking the OS about a number another open may have reused since.
+    assert len(opened) == 1
+    assert closed == opened
+
+
+def test_read_log_file_refuses_a_directory_swapped_in(tmp_path: Path) -> None:
+    """POSIX opens a directory read-only, and the check refuses it as not a regular file; Windows
+    refuses the open itself."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    log = tmp_path / "engine.log"
+    log.write_text("first\n", encoding="utf-8")
+    listed = os.lstat(log)
+    log.unlink()
+    log.mkdir()
+    expected: type[OSError] = OSError if os.name == "nt" else bundle_mod._LogFileRefused
+    with pytest.raises(expected):
+        bundle_mod._read_log_file(log, listed)

@@ -3142,7 +3142,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. The full address rule, the domain's shape included, is in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). Its domain must be listed in `[egress].allowed_recipient_domains`, like a recipient's, because bounces and replies can carry the message body. |
 | `recipients` | list[str] / str / `env()` | — (required) | `To:` address(es). An `env()` may be the whole value; one inside the list is refused at load. An entry with a line break is refused at load too. |
 | `port` | int / `env()` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`). |
-| `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
+| `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). A C0 control character (TAB included), DEL, a Unicode line break (U+0085, U+2028, U+2029) or a lone surrogate is refused at load, and so is an encoded word that decodes to a C0 control character, DEL or one of those line breaks. |
 | `username` | str / `env()` / None | `None` | SMTP `AUTH` user — put the secret in `env()`. |
 | `password` | str / `env()` / None | `None` | SMTP `AUTH` password — `env()` only. AUTH is sent **over verified TLS only**: a login with `use_tls`, `tls_verify` or `tls_check_hostname` off is refused, whatever escape or declaration is set. |
 | `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated. **First, an opt-in**, and at least these pass it: this connection's `cleartext_accepted = true` with its mandatory `cleartext_reason` (per-hop, audited — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted), and prefer it); its [`tls_hop_attested`](#attesting-a-hop-secure-tls_hop_attested), for a hop secured by other means; or `MEFOR_ALLOW_INSECURE_TLS` on an instance at `[security].enforcement = warn` ([the escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says what it means). A loopback host does not pass it. **Then** the hop goes through the shared authority (#200, ADR 0092 as amended by ADR 0153): loopback ALLOWs, an attested hop ALLOWs, a `cleartext_accepted` hop **WARNs + audits** at every construction, a non-enforcing instance WARNs, everything else REFUSES — **no data label relaxes it**. SMTP AUTH over cleartext stays refused OUTRIGHT, by any route. The authority step is the one the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths take; those paths have no opt-in pre-check before it. |
@@ -3243,7 +3243,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target). Must carry an **RSA** key: the S/MIME envelope supports RSA key transport only, so any other key type (EC included) is refused at construction |
 | `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to, or the `recipient_cert` itself for a pinned self-signed correspondent. What the check refuses is under **Recipient trust** below |
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
-| `subject` | `""` | static `Subject` |
+| `subject` | `""` | static `Subject`, under the [Email outbound's `subject` rule](#email--smtp--email--smtp-outbound-send-adr-0029). |
 | `username` / `password` | — | optional SMTP `AUTH` credentials (secrets — via `env()`). Setting a `username` makes the relay a credential hop: to an off-box host it is then **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). With no `username` the relay carries no revocation gate |
 | `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set on an instance at `[security].enforcement = warn`, and SMTP `AUTH` over cleartext is **refused outright**. This is not the same posture as `Email(...)`: `Direct()` reads that clamped escape directly and does **not** route through the shared cleartext-hop authority, so `tls_hop_attested` and `cleartext_accepted` / `cleartext_reason` on the outbound are **not consulted** (declaring them changes nothing here). CORRECTED 2026-10-13: this row said the escape was read raw, so that an enforcing instance would not close the hop; the read has been clamped since #323. The S/MIME body stays signed + encrypted either way — but the SMTP envelope (sender, recipients, subject) does not. |
 | `timeout_seconds` | `30.0` | passed to the `smtplib` constructor (covers connect and each command) |
@@ -3263,7 +3263,7 @@ are the same types the XML signature check allows. Today an Ed25519 or Ed448 key
 `trust_anchor`: the signing library takes RSA and EC signers only, and the envelope takes RSA recipients only.
 The connector then signs and encrypts one fixed synthetic body.
 So a fault that would fail every S/MIME build also fails here. That covers at least a crypto library or
-OpenSSL build that refuses the algorithms, and a line break inside `subject`. It does not cover the SMTP hop:
+OpenSSL build that refuses the algorithms. It does not cover the SMTP hop:
 the relay can still refuse a `sender` or recipient at send time.
 
 **Recipient trust (BACKLOG #5631).** The issuance check is deliberately **one level**: the recipient cert
@@ -3920,9 +3920,9 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `url` | — (required) | the DICOMweb service **base** URL, e.g. `https://host/dicom-web` (`env()`-able) |
+| `url` | — (required) | the DICOMweb service **base** URL, e.g. `https://host/dicom-web` (`env()`-able). A `?` or `#` anywhere in it is **refused at construction**: the STOW-RS path is appended to the base, so a query or fragment would carry it off the path (vault BACKLOG #5358) |
 | `study_uid` | `None` → `POST {base}/studies` | when set, store into a known study (`POST {base}/studies/{study_uid}`) |
-| `bearer_token` / `basic_user` / `basic_password` | — | OAuth bearer or HTTP Basic (put secrets in `env()`) |
+| `bearer_token` / `basic_user` / `basic_password` | — | OAuth bearer or HTTP Basic (put secrets in `env()`). Set one credential: each of these is **refused at construction** (vault BACKLOG #5359): `basic_user` without `basic_password` or the reverse, `bearer_token` beside a Basic pair, either beside an `Authorization` entry in `headers`, a colon in `basic_user` (RFC 7617; a colon in the password is allowed), a control character in any of the three, a lone surrogate in a Basic half, and any character in `bearer_token` that latin-1 cannot encode (it goes on the wire as written) |
 | `headers` | `{}` | static extra headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `timeout_seconds` | `30.0` | request timeout |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default). **`DICOMweb()` has no `tls_allow_expired`** — it reuses the REST client but does not read that setting, so a DICOMweb hop always enforces certificate expiry |
@@ -4102,7 +4102,9 @@ openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600000 -in <old
 
 **A PKCS#12 bundle for `cert import`** passes in one of two shapes:
 
-- PBES2 bags at the floor, or unencrypted bags, with a **PBMAC1** MAC at the floor;
+- PBES2 bags at the floor, or unencrypted bags, with a **PBMAC1** MAC at the floor whose PBKDF2
+  keyLength is present and equals the HMAC's output size (32 octets for HMAC-SHA-256), as RFC 9579
+  asks and as the `openssl pkcs12 -pbmac1_pbkdf2` export writes;
 - unencrypted bags with no MAC at all (`openssl pkcs12 -export -keypbe NONE -certpbe NONE -nomac
   -in <cert> -inkey <key> -out <new pfx>`). Nothing in it comes from a password, so it needs no
   passphrase. **It also has no integrity check**: nothing detects a change to the file, the same as
@@ -4111,9 +4113,16 @@ openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600000 -in <old
 A MAC keyed by an empty passphrase passes at the floor too, but it checks no more than no MAC does:
 anyone can recompute it.
 
-Every other MAC is refused, unencrypted bags or not, because it runs the passphrase through the
-PKCS#12 KDF. That holds even over SHA-256, and it is what most exports carry, OpenSSL's default
-included. It also holds when the passphrase is empty, as in `cryptography`'s `NoEncryption` output.
+A MAC that is not PBMAC1 is refused, unencrypted bags or not, because it runs the passphrase
+through the PKCS#12 KDF. That holds even over SHA-256, and it is what most exports carry, OpenSSL's
+default included. It also holds when the passphrase is empty, as in `cryptography`'s
+`NoEncryption` output.
+
+A PBMAC1 MAC is refused too when its PBKDF2 keyLength is absent or is not the output size of the
+HMAC it keys (BACKLOG #5377). RFC 9579 requires keyLength and asks for that size. A short key
+could be found from the file's own MAC with no passphrase, and a MAC then forged over a changed
+file. A PBMAC1 MAC under the PBKDF2 floor, or over an HMAC weaker than HMAC-SHA-256, is refused as
+well.
 
 A key inside an encrypted part of the bundle is checked too (BACKLOG #1352). `cert import` opens
 each encrypted part with the passphrase and holds every key in it to the same floor before anything

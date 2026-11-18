@@ -111,9 +111,22 @@ class WsdlDefinition:
         """Validate a request ``envelope``'s SOAP body against ``operation``'s input element (ADR 0122).
 
         Returns an :class:`~messagefoundry.parsing.xml.schema.XmlSchemaResult` (``valid`` + PHI-safe
-        ``reasons``). Raises :class:`~messagefoundry.parsing.xml.errors.WsdlError` for an unknown operation
+        ``reasons``). The result is invalid unless the root is a SOAP 1.1 or 1.2 ``Envelope`` holding
+        an optional ``Header`` and then one ``Body``, and that ``Body`` holds exactly one element
+        child, and none of the three holds character data directly (BACKLOG #5373). ``valid=True``
+        says that one body element conforms to the schema; it does NOT cover at least header
+        blocks, attributes and namespace declarations on the Envelope, Header or Body, or comments
+        and processing instructions.
+
+        Raises :class:`~messagefoundry.parsing.xml.errors.WsdlError` for an unknown operation
         or an operation with no resolvable document/literal input element (rpc/encoded not supported for
-        validation)."""
+        validation). The envelope is parsed by
+        :func:`~messagefoundry.parsing.xml.harden.parse_bytes`, which raises at least
+        :class:`~messagefoundry.parsing.xml.errors.XmlParseError` for an envelope that is not
+        well-formed, :class:`~messagefoundry.parsing.xml.errors.XmlSecurityError` for one that
+        declares a DOCTYPE, and :class:`UnicodeEncodeError`, which is not an ``XmlError`` and
+        carries the document, for a ``str`` that UTF-8 cannot encode, such as one holding a lone
+        surrogate. :class:`RuntimeError` if the ``[xml]`` extra is absent."""
         return self._validate(envelope, operation, direction="input")
 
     def validate_response(self, envelope: str | bytes, operation: str) -> XmlSchemaResult:
@@ -134,9 +147,9 @@ class WsdlDefinition:
                 f"WSDL operation {operation!r} has no document/literal {direction} element to validate "
                 "against (rpc/encoded style is not supported for validation)"
             )
-        body_child = _soap_body_child(envelope)
-        if body_child is None:
-            return XmlSchemaResult(valid=False, reasons=("/: missing or empty SOAP Body",))
+        body_child, refusal = _soap_body_child(envelope)
+        if refusal is not None:
+            return XmlSchemaResult(valid=False, reasons=(refusal,))
         actual = _clark(body_child)
         if actual != expected:
             # PHI-safe: names the QNames, never the element content.
@@ -152,7 +165,8 @@ class WsdlDefinition:
                 "(a split/imported contract must be inlined locally — no-network, ADR 0122)"
             )
         etree = load_lxml()
-        child_bytes = bytes(etree.tostring(body_child, encoding="utf-8"))
+        # with_tail=False: the element alone, never the whitespace that follows it in the Body.
+        child_bytes = bytes(etree.tostring(body_child, encoding="utf-8", with_tail=False))
         return validate_against(child_bytes, schema)
 
 
@@ -363,15 +377,65 @@ def _operations(root: Any, messages: Mapping[str, list[WsdlPart]]) -> dict[str, 
     return operations
 
 
-def _soap_body_child(envelope: str | bytes) -> Any | None:
-    """The first element child of a SOAP (1.1 or 1.2) ``<Body>`` in ``envelope``, or ``None``. Parsed
-    through the hardened parser (untrusted instance body)."""
+#: XML's own whitespace (the S production). A bare str.strip() would also drop characters such as
+#: U+00A0 and U+3000, which XML treats as character data.
+_XML_SPACE = " \t\r\n"
+
+
+def _holds_character_data(elem: Any) -> bool:
+    """Whether ``elem`` holds text other than XML whitespace directly: before its first child, or
+    after any child, comments and processing instructions included (CDATA is text here)."""
+    return any(
+        text is not None and text.strip(_XML_SPACE)
+        for text in (elem.text, *(child.tail for child in elem))
+    )
+
+
+def _soap_body_child(envelope: str | bytes) -> tuple[Any, None] | tuple[None, str]:
+    """``(element, None)`` for the single element child of the ``<Body>`` of a SOAP (1.1 or 1.2)
+    ``envelope``, or ``(None, reason)`` with a PHI-safe reason when the envelope's structure fails
+    one of the checks below. Parsed through the hardened parser (untrusted instance body).
+
+    Checked: the root must be a SOAP ``Envelope`` whose element children are an optional
+    ``Header`` and then one ``Body``, both in its own namespace; that ``Body`` must hold exactly one
+    element child; and none of the Envelope, the Header or the Body may hold character data
+    directly. The operation names one body element, so a sibling element or text beside it would
+    otherwise reach the caller unvalidated under a valid result (BACKLOG #5373). That is stricter
+    than SOAP 1.1, which allows elements after the ``Body``.
+
+    NOT checked, so it can ride beside the validated element under a valid result, at least: the
+    Header's element children (header blocks, which SOAP leaves open), attributes and namespace
+    declarations on the Envelope, Header and Body, and comments and processing instructions
+    anywhere, which are skipped. Reasons name
+    only the SOAP grammar's own QNames and counts, never content."""
     root = parse_bytes(envelope)
-    for env_ns in (_SOAP11_ENV_NS, _SOAP12_ENV_NS):
-        body = root.find(f"{{{env_ns}}}Body")
-        if body is not None:
-            for child in body:
-                # skip comments / processing instructions — only element children
-                if isinstance(child.tag, str):
-                    return child
-    return None
+    env_ns = next(
+        (ns for ns in (_SOAP11_ENV_NS, _SOAP12_ENV_NS) if _clark(root) == f"{{{ns}}}Envelope"),
+        None,
+    )
+    if env_ns is None:
+        # The root's own name is the sender's text, so it is not echoed.
+        return None, "/: root is not a SOAP 1.1 or 1.2 Envelope"
+    header, body = f"{{{env_ns}}}Header", f"{{{env_ns}}}Body"
+    names = [_clark(child) for child in root if isinstance(child.tag, str)]
+    if body not in names:
+        return None, "/: missing or empty SOAP Body"
+    if names.count(body) > 1:
+        return None, f"/Envelope: {names.count(body)} SOAP Body elements; expected exactly one"
+    if names not in ([body], [header, body]):
+        return None, "/Envelope: elements other than an optional Header followed by one Body"
+    if _holds_character_data(root):
+        return None, "/Envelope: character data beside the Header and Body"
+    header_elem = root.find(header)
+    if header_elem is not None and _holds_character_data(header_elem):
+        return None, "/Envelope/Header: character data beside the header blocks"
+    body_elem = root.find(body)
+    # skip comments / processing instructions — only element children
+    children = [child for child in body_elem if isinstance(child.tag, str)]
+    if not children:
+        return None, "/: missing or empty SOAP Body"
+    if len(children) > 1:
+        return None, f"/Envelope/Body: {len(children)} element children; expected exactly one"
+    if _holds_character_data(body_elem):
+        return None, "/Envelope/Body: character data beside the body element"
+    return children[0], None

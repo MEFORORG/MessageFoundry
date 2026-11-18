@@ -1412,17 +1412,24 @@ def test_a_control_with_nothing_to_redact_keeps_the_actor() -> None:
 
 def test_scrub_log_text_is_the_handler_chain_without_the_control_scrub() -> None:
     """The field scrub stands for the filters, so it must be them: each value through
-    ``scrub_log_text`` reads as the three text filters leave a record's message. Synthetic."""
+    ``scrub_log_text`` reads as the text filters leave a record's message. Synthetic."""
     from messagefoundry.logging_setup import (
+        BinaryCarriageScrubFilter,
         CredentialQueryScrubFilter,
         CredentialScrubFilter,
         RedactionFilter,
         scrub_log_text,
     )
 
-    filters = (RedactionFilter(), CredentialQueryScrubFilter(), CredentialScrubFilter())
+    filters = (
+        RedactionFilter(),
+        CredentialQueryScrubFilter(),
+        CredentialScrubFilter(),
+        BinaryCarriageScrubFilter(),
+    )
     values = ["DOE JANE", "password=hunter2", "GET /cb?code=abc&state=x", "PID|1||123^^^H", "ok"]
     values += [f"{chr(0x01)}DOE JANE", "MRN 12345678 Bearer abcdefgh"]
+    values += ["body mfb64:v1:UElEfDF8fFNZTjEyMw==", "mfb64:v1:QUJD/password=hunter2"]
     for value in values:
         record = logging.LogRecord("t", logging.INFO, __file__, 1, value, None, None)
         for f in filters:

@@ -127,6 +127,7 @@ def test_the_engine_chain_is_still_the_one_this_filter_stands_in_for() -> None:
         "RedactionFilter",  # redact_untrusted, after the traceback is rendered
         "CredentialQueryScrubFilter",  # carve-out: see the tray.logscrub docstring
         "CredentialScrubFilter",  # scrub_credentials
+        "BinaryCarriageScrubFilter",  # redact_binary_carriage, after the label passes
         "ControlCharScrubFilter",  # scrub_control_chars, last
     ]
     assert installed == accounted, (

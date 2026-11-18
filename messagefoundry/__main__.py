@@ -241,6 +241,19 @@ def _positive_days(text: str) -> float:
     return days
 
 
+def _non_negative_int(text: str) -> int:
+    """``support-bundle --log-tail-lines``: a whole number of lines, zero or more. Zero omits the app
+    log; a negative count is refused, because a slice by it would carry most of the newest log file
+    rather than its tail (BACKLOG #5384)."""
+    try:
+        count = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a whole number of lines: {text!r}") from exc
+    if count < 0:
+        raise argparse.ArgumentTypeError(f"must be zero or more lines, not {text!r}")
+    return count
+
+
 def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     """Build the engine's argument parser, and return it with the dispatch map (ADR 0201 slice 1).
 
@@ -577,9 +590,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     support_bundle.add_argument(
         "--log-tail-lines",
-        type=int,
+        type=_non_negative_int,
         default=None,
-        help="number of trailing app-log lines to include (redacted); default 500",
+        help="number of trailing app-log lines to include (redacted); default 500; 0 omits the "
+        "app log",
     )
 
     sub.add_parser(

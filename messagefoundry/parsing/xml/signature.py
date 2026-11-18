@@ -18,9 +18,9 @@ content. A returned ``reason`` is the class name of the bad-signature exception 
 module's fixed names such as :data:`WEAK_SIGNING_KEY`. An
 :class:`XmlError` for a signature the libraries cannot process names only the class of the exception
 raised, which can come from signxml, lxml, ``cryptography`` or the standard library. The rule does
-NOT cover a document that fails before signature processing: at least a document that is not
-well-formed XML, and a ``str`` document UTF-8 cannot encode, raise errors that can carry document
-content. :func:`verify` says what each carries.
+NOT cover a document that fails before signature processing: at least a ``str`` document UTF-8
+cannot encode raises an error that carries document content. :func:`verify` says what each such
+failure carries.
 
 Pure: no engine imports.
 """
@@ -551,15 +551,16 @@ def verify(
     because several quote the document.
 
     A document :func:`~messagefoundry.parsing.xml.harden.parse_bytes` cannot parse fails there
-    instead, before any signature processing, and that path does NOT hold to the paragraph above.
-    It raises at least these:
+    instead, before any signature processing. Of the errors listed below, the
+    :class:`UnicodeEncodeError` carries the document's text; the other two carry no document text
+    and are not chained from lxml's error. It raises at least these:
 
-    - a document that declares a DOCTYPE: :class:`~messagefoundry.parsing.xml.errors.XmlSecurityError`
+    - a document that declares a DOCTYPE, and one that fails to parse after a prolog DOCTYPE
+      that function's scan reads: :class:`~messagefoundry.parsing.xml.errors.XmlSecurityError`
       with a fixed message;
     - a document that is not well-formed XML: :class:`~messagefoundry.parsing.xml.errors.XmlParseError`,
-      whose message carries lxml's syntax-error text and which is chained from lxml's
-      ``XMLSyntaxError``. That text can quote the document, such as an element or entity name or
-      the bytes at the fault;
+      whose message names only the fault's line, column and libxml2 error code, and which is not
+      chained from lxml's ``XMLSyntaxError`` (BACKLOG #5371);
     - a ``str`` document that UTF-8 cannot encode, such as one holding a lone surrogate:
       :class:`UnicodeEncodeError`, which is NOT an :class:`XmlError`, and whose ``object``
       attribute holds the whole document.

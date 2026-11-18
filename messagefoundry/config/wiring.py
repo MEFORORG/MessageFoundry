@@ -1647,9 +1647,10 @@ _SETTINGS_FACTORY_NAMES: Final = frozenset({"DatabaseLookup"})
 #: The boolean settings a ``with_*`` composer in another module writes under a key that is not its
 #: parameter's name (``with_smart_backend(enabled=)`` stores ``smart_enabled``), so the annotation
 #: scan cannot find them (vault BACKLOG #3234), each with what a resolved ``None`` reads as. SMART
-#: and OAuth2 read it as off, not the composer's default of on: their readers' documented rule is
-#: that a falsy flag is off (``smart_auth_configured``, ``oauth2_auth_configured``), and reading a
-#: ``None`` as on would start a token hop the author did not ask for. ``sign_enabled`` keeps
+#: and OAuth2 read it as off, not the composer's default of on: reading a ``None`` as on would start
+#: a token hop the author did not ask for. ``smart_auth_configured`` takes any falsy flag as off;
+#: ``oauth2_auth_configured`` reads a non-bool flag as off and the build refuses it (vault BACKLOG
+#: #5362), so this resolve is what lets an ``env()`` that resolves to ``None`` build as off. ``sign_enabled`` keeps
 #: ``None``: its reader, ``OutboundSigning``, refuses it, and off would silently stop signing.
 #: Listed rather than imported, so the first resolve does not load the composers' modules and
 #: ``cryptography``. ``tests/test_env_uncast_bool_setting.py`` pins the key set against the source.
@@ -2456,8 +2457,11 @@ def _names_a_credential(name: str) -> bool:
 
     A name that ends in a known non-secret (:data:`~messagefoundry.secretscrub._QUERY_NOT_CREDENTIAL_TAILS`,
     such as ``pageToken``) is not one, unless a credential word also sits outside that ending. The
-    ending is judged without a trailing index or digits, as the warning detector judges it, so
-    ``pageToken[0]`` is a cursor, while ``user[password]`` and ``pageToken[password]`` are not."""
+    ending is judged without one trailing index or digits, by :func:`_base_name`, so
+    ``pageToken[0]`` is a cursor, while ``user[password]`` and ``pageToken[password]`` are not.
+    The warning detector reads more (:func:`~messagefoundry.secretscrub._base_names`: every
+    trailing index, and bracket keys as segments), so it may call a name such as
+    ``pageToken[0][0]`` a cursor while this withholds it. That only over-masks."""
     squashed = _squash_name(name)
     if not any(word in squashed for word in _DISPLAY_CREDENTIAL_WORDS):
         return False
@@ -7711,13 +7715,18 @@ def query_credential_hops(
     neither is not read. A ``deployed=False`` outbound with an ``env()`` URL is skipped, as the
     DATABASE and ECH readers skip one: its values are never resolved and it is never built (ADR
     0111 AC-1). It touches nothing but the graph and the values, except that resolving runs an
-    ``env()`` URL's operator ``cast``, as the build does."""
+    ``env()`` URL's operator ``cast``, as the build does. An outbound whose type is in
+    ``transports.egress.URL_QUERY_REFUSED_DESTINATIONS`` is left off: its build refuses any url
+    query (vault BACKLOG #5358), so the hop never exists."""
+    from messagefoundry.transports.egress import URL_QUERY_REFUSED_DESTINATIONS
+
     out: list[tuple[str, str]] = []
     for name, settings in (
         *(
             (oc.name, oc.spec.settings)
             for oc in registry.outbound.values()
-            if oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef)
+            if (oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef))
+            and oc.spec.type not in URL_QUERY_REFUSED_DESTINATIONS
         ),
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
     ):

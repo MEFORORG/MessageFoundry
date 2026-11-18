@@ -124,9 +124,11 @@ def load_pkcs12(
     passphrase can never leak into stderr/logs.
 
     Before anything decrypts it, the bundle's MAC and bag encryption are checked (BACKLOG #1352,
-    #1171): a weak or unreadable wrap, a MAC that is not PBMAC1 at the floor even over unencrypted
-    bags, or a bundle that is encrypted or carries a MAC with no passphrase, raises
-    :class:`~messagefoundry.keywrap.KeyWrapRefused`, whose text is safe to show.
+    #1171). At least these raise :class:`~messagefoundry.keywrap.KeyWrapRefused`, whose text is
+    safe to show: a weak or unreadable wrap; a MAC, even over unencrypted bags, that is not PBMAC1
+    or is a PBMAC1 MAC off the terms :func:`~messagefoundry.keywrap.pkcs12_wrap_refusal` lists,
+    such as one under the PBKDF2 floor or with a keyLength that is absent or not its HMAC's output
+    size; and a bundle that is encrypted or carries a MAC with no passphrase.
 
     Then each encrypted part is opened here and the key bags inside it get the same check, before
     ``cryptography`` decrypts any key (BACKLOG #1352; why the part is opened rather than refused is
