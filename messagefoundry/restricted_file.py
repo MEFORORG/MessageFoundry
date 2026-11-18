@@ -75,6 +75,7 @@ from messagefoundry.auth.anchor_path import (
     WinHost,
     WinSecurity,
     WinTrust,
+    _strip_nt_target,
     _win_probe,
     describe_sid,
     evaluate_windows_object,
@@ -777,7 +778,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     link and ``subst`` drive on the way, or for a drive root the folder holding where it leads
     (none for a volume root), and its owner and entries are read there. Where the walk ends on a
     link back to a folder already on the path, ``full.parent`` is read by its path as written
-    instead (:func:`_windows_holder_as_written_problem`). On that walk each
+    instead (:func:`_windows_holder_as_written_problem`). Off a share, a folder holding ``path``
+    that is itself a junction or link is also read that way. On that walk each
     volume's drive type is read, not its file system, and a volume whose drive type cannot be read
     ends it and is refused. A UNC share or a mapped network drive (``GetDriveTypeW`` answers
     ``DRIVE_REMOTE``) stops it; what is then refused, and where the holder is read, is stated once
@@ -792,13 +794,13 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     # The path's own name is not walked, so a stream name, or a name ending in a dot or a space, is
     # not refused by the walk.
     walked = full if full.parent == full else full.parent
-    substituted: list[str] = []
+    substituted: dict[str, str] = {}
     remote: list[str] = []
 
     def drive_target(drive: str) -> str | None:
         answer = host.drive_target(drive)
         if answer is not None:
-            substituted.append(drive)
+            substituted[drive.upper()] = answer
         return answer
 
     def volume_cause(root: str) -> str | None:
@@ -891,14 +893,15 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             return problem
         if as_written:
             return _windows_holder_as_written_problem(Path(holder_path))
-        if (
-            cause is None
-            and walked not in (full, walked.parent)  # a drive root is not a junction
-            and _is_reparse_point(str(walked))
-        ):
-            # A junction or link holding the path: its own list is read too, as origin/main read
-            # it, so reading where it leads drops no refusal main made.
-            problem = _windows_holder_as_written_problem(walked)
+        own_list = None if cause is not None or walked == full else str(walked)
+        if own_list is not None and walked == walked.parent:
+            # A drive root: a subst drive's root is the folder it stands for, and a volume root is
+            # not a reparse point.
+            own_list = _strip_nt_target(substituted.get(walked.drive.upper(), "")) or None
+        if own_list is not None and _is_reparse_point(own_list):
+            # A junction or link holding the path: its own list is read by the holder rule too,
+            # as it was before the holder was read where the path resolves to.
+            problem = _windows_holder_as_written_problem(Path(own_list))
             if problem is not None:
                 return problem
         if cause is not None and _is_reparse_point(holder_path):

@@ -1619,9 +1619,9 @@ def test_windows_a_junction_at_the_holder_is_judged_where_it_points(
 def test_windows_a_junction_at_the_holder_is_also_judged_by_its_own_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grant: str
 ) -> None:
-    """origin/main read a junction standing in for the holder by its own access list, with the
-    holder rule, and refused one granting Users a replace right there. Reading where the junction
-    leads must not drop that read."""
+    """Before the holder was read where the path resolves to, a junction standing in for the holder
+    was read by its own access list, with the holder rule, and one granting Users a replace right
+    there was refused. Reading where the junction leads must not drop that read."""
     judge_links_only_under(monkeypatch, tmp_path)
     real = tmp_path / "real"
     real.mkdir()
@@ -1636,8 +1636,29 @@ def test_windows_a_junction_at_the_holder_is_also_judged_by_its_own_list(
     problem = restricted_file._windows_access_problem(
         holder, restricted_file._HOLDER_REPLACE_MASK, reach=restricted_file._HOLDER_REACH
     )
-    assert problem is not None  # main's own reader and rule refuse the junction's list
+    assert problem is not None  # the as-written reader and rule refuse the junction's list
     problem = str(broad_access_problem(tmp_path / "mine" / "store.key"))
+    assert f"Users ({_USERS}) can delete or replace a file in it" in problem
+
+
+@windows_only
+def test_windows_a_subst_root_onto_a_junction_is_also_judged_by_its_own_list(
+    tmp_path: Path,
+) -> None:
+    """The same junction's own list, reached as a ``subst`` drive root holding the key. The letter
+    is a stand-in: the readers answer it as ``subst`` would, so no drive is defined on the host."""
+    real = tmp_path / "real"
+    real.mkdir()
+    write_restricted_file(real / "store.key", b"KEY-MATERIAL-STAND-IN")
+    _junction(tmp_path / "mine", real)
+    target = "\\??\\" + str(tmp_path / "mine")
+    host = _host_judging_only_under(
+        tmp_path, drive_target=lambda d: target if d.upper() == "Q:" else None
+    )
+    surroundings = restricted_file._windows_surroundings_problem
+    assert surroundings(Path("Q:\\store.key"), host) is None  # the control
+    _icacls(tmp_path / "mine", "/L", "/grant", f"*{_USERS}:(DC)")  # the junction's own list
+    problem = str(surroundings(Path("Q:\\store.key"), host))
     assert f"Users ({_USERS}) can delete or replace a file in it" in problem
 
 
