@@ -538,7 +538,8 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
     A connection may override either PL-1 body window (ADR 0027): an inbound sets ``messages_days``,
     an outbound sets ``dead_letter_days``. ``None`` inherits the global window and a positive number
     bounds it. ``0`` keeps that connection's bodies forever, whatever the global window says, so it
-    is the same choice as a global ``0`` made for one connection. The global windows live in the
+    is the same choice as a global ``0`` made for one connection. Which bodies each kind reaches,
+    and which it does not, is stated once, on :func:`_override_scope`. The global windows live in the
     service settings, where :func:`unbounded_windows` reads them; these live in the graph, so the
     start gate cannot see them and a registry guard must (vault BACKLOG #2368).
 
@@ -560,6 +561,37 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
         [f"inbound {name!r} (messages_days = {days})" for name, days in inbound]
         + [f"outbound {name!r} (dead_letter_days = {days})" for name, days in outbound]
     )
+
+
+def _override_scope(kept: tuple[str, ...]) -> str:
+    """What the purge keeps forever for each kind of override in ``kept``, so the refusal and the
+    ``AUDIT:`` line promise no more than the store does (BACKLOG #5967).
+
+    An inbound's ``messages_days`` is the cutoff of ``purge_message_bodies``, keyed on the
+    message's receiving inbound. That purge also blanks the message's delivered and cancelled
+    outbound payloads, its event detail and its captured replies, and it leaves every dead row to
+    ``purge_dead_letters``. That purge keys on the dead row's outbound, so an ingress or routed dead
+    row, which names none, takes the global dead-letter window on every backend. An outbound's
+    ``dead_letter_days`` therefore reaches only its own dead rows, and a reply it captured follows
+    the receiving inbound's window. The store's purges are the record of this; the text here
+    follows them."""
+    parts = []
+    if any(entry.startswith("inbound ") for entry in kept):
+        parts.append(
+            "An inbound override keeps forever what the purge of message bodies holds for the "
+            "messages that inbound received: each stored body, its delivered and cancelled outbound "
+            "payloads, its event detail and the replies captured for it. Their dead-lettered rows "
+            "are not covered: an ingress or routed one is purged on the global "
+            "[retention].dead_letter_days window where that window is bounded, and an outbound one "
+            "on that outbound's own dead-letter window."
+        )
+    if any(entry.startswith("outbound ") for entry in kept):
+        parts.append(
+            "An outbound override keeps forever only that outbound's own dead-lettered delivery "
+            "payloads; a reply it captured is purged on the message-body window of the inbound "
+            "that received the message."
+        )
+    return " ".join(parts)
 
 
 def _keep_forever_remedy() -> str:
@@ -591,7 +623,7 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
     return (
         "a per-connection retention override keeps PHI message bodies indefinitely on a PHI "
         f"instance{where}: {'; '.join(kept)} (unbounded PHI at rest, ASVS 14.2.4/14.2.7). "
-        f"{_keep_forever_remedy()}"
+        f"{_override_scope(kept)} {_keep_forever_remedy()}"
     )
 
 
@@ -608,7 +640,7 @@ def _override_audit_line(
         f"AUDIT: the retention gate on a PHI instance{where} passed a graph "
         f"with per-connection unbounded data retention ({basis}; {'; '.join(kept)}) -- once that "
         "graph is live, these connections' PHI message bodies are retained INDEFINITELY "
-        f"({status})."
+        f"({status}). {_override_scope(kept)}"
     )
 
 

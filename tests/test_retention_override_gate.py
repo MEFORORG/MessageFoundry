@@ -173,6 +173,42 @@ def test_the_audit_line_names_no_environment_when_none_is_active(
     assert verdict.report is not None and "(environment" not in verdict.report
 
 
+@pytest.mark.parametrize(
+    ("inbound_days", "outbound_days", "inbound_named", "outbound_named"),
+    [(0, None, True, False), (None, 0, False, True), (0, 0, True, True)],
+)
+@pytest.mark.parametrize("acknowledged", [True, False])
+def test_the_override_text_states_what_the_purge_keeps(
+    tmp_path: Path,
+    acknowledged: bool,
+    inbound_days: int | None,
+    outbound_days: int | None,
+    inbound_named: bool,
+    outbound_named: bool,
+) -> None:
+    """BACKLOG #5967: an inbound ``messages_days = 0`` does not keep its dead-lettered rows, which
+    the dead-letter purge keys on the row's outbound, and an outbound ``dead_letter_days = 0`` does
+    not keep its captured replies, which the body purge keys on the receiving inbound. The refusal
+    and every AUDIT line say so, for the kinds of override the graph holds and no other.
+    ``tests/test_per_connection_retention.py`` pins the store behaviour these words describe."""
+    registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=acknowledged, enforcing=True, env_name="prod"
+    )
+    text = verdict.report if acknowledged else verdict.refusal
+    assert text is not None
+    inbound_scope = (
+        "Their dead-lettered rows are not covered: an ingress or routed one is purged on the "
+        "global [retention].dead_letter_days window"
+    )
+    outbound_scope = (
+        "An outbound override keeps forever only that outbound's own dead-lettered delivery "
+        "payloads; a reply it captured is purged on the message-body window of the inbound"
+    )
+    assert (inbound_scope in text) is inbound_named
+    assert (outbound_scope in text) is outbound_named
+
+
 def test_the_remedy_does_not_offer_an_unbounded_global_window_as_a_bound(tmp_path: Path) -> None:
     # Under warn a global 0 passes the start gate. Inheriting it keeps the bodies forever with the
     # line gone, so removing the override is the remedy only where the global window is bounded.

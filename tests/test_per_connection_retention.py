@@ -361,6 +361,31 @@ async def test_keep_forever_override_survives_a_global_purge_via_runner(
     assert await _raw(store, prune) == ""  # IB_SLOW inherits the global window — pruned
 
 
+async def test_an_inbound_keep_forever_override_leaves_its_dead_rows_to_the_dead_letter_window(
+    store: MessageStore,
+) -> None:
+    """BACKLOG #5967: what the keep-forever refusal and AUDIT line say an inbound override keeps.
+
+    ``messages_days = 0`` on IB_KEEP keeps its stored body, but a dead row of that message is purged
+    by the dead-letter window of the row's outbound, not by the inbound's override. The words in
+    ``retention_classification._override_scope`` state this; this pins the store behaviour they
+    describe, and ``test_the_override_text_states_what_the_purge_keeps`` pins the words."""
+    mid = await _dead(store, channel_id="IB_KEEP", dest="OB_SLOW", now=0.0, control="K-DEAD")
+
+    reg = _registry()
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(messages_days=1, dead_letter_days=1),
+        clock=lambda: 100 * DAY,
+        registry_source=lambda: reg,
+    )
+
+    await runner.run_once()
+
+    assert await _raw(store, mid) == RAW  # the inbound override keeps the stored body
+    assert await _payload(store, mid) == ""  # the dead row took OB_SLOW's (global) window
+
+
 async def test_runner_without_registry_is_global_only(store: MessageStore) -> None:
     """No registry_source wired → no overrides → a single global cutoff (byte-identical to the global
     runner), and the audit records empty override maps."""
