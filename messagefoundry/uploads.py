@@ -1166,7 +1166,7 @@ class UploadStore:
         act on the other upload. **A hard link is not refused:** it is a second name for the same
         file and resolves to itself. Nor is a symbolic link that loops back to itself, which
         resolves to itself too; it reaches no other file, and its own read fails. A refused pair
-        is left to an operator, and the prune logs each one it leaves, once per interval."""
+        is left to an operator."""
         blob, meta = self._paths_unfollowed(file_id)
         if blob.resolve() != blob or meta.resolve() != meta:
             raise UploadPathError(
@@ -1325,9 +1325,9 @@ class UploadStore:
 
         **A sidecar whose tag fails under a key the cipher holds is reported (BACKLOG #5553),**
         through the cipher's tag-failure hook, once per upload per hour, while a tag-failure hook
-        is armed (:meth:`_report_tag_failure`). That is a value sealed under this store's key for some other
-        place, such as another upload's sidecar moved under this id. A value under a key that is
-        not configured is a key fault, not that, and is only logged.
+        is armed (:meth:`_report_tag_failure`). That is a value sealed under this store's key for
+        some other place, such as another upload's sidecar moved under this id. A value under a key
+        that is not configured is a key fault, not that, and is only logged.
 
         **A sidecar that is a link, or is not a regular file, is not read (BACKLOG #5552).** It is
         skipped, and its log line is rate-limited per upload: a followed link read a file outside
