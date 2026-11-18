@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.18.1"
+$GateVersion = "2026.11.18.2"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -161,7 +161,7 @@ function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") 
 # one thing, "I could not resolve this", which rule 3c distinguishes from "git says this is not a repo".
 # IsPathFullyQualified, not IsPathRooted: on Windows `IsPathRooted("/tmp")` is true while
 # `GetFullPath(x, "/tmp")` still throws, and that throw is what the old catch was absorbing.
-function Get-FullPathRaw([string]$Path, [string]$Base) {
+function Get-FullPathRaw([string]$Path, [string]$Base, [switch]$Lexical) {
     if (-not $Path) { return "" }
     # THE NT-NAMESPACE PREFIX (BACKLOG #5454) is mapped onto `\\?\` here, on BOTH inputs, so every rule
     # gets it -- rules 3c and 3d hand this result to `git -C`, not only to Get-ComparablePath. GetFullPath
@@ -169,7 +169,13 @@ function Get-FullPathRaw([string]$Path, [string]$Base) {
     # came back as `<cwd-drive>:\??\C:\x`, a path git cannot enter, while git accepts `/??/C:/x` itself
     # (rc=0, measured 2026-11-18). The base matters because rule 3c resolves git's relative `.git` against
     # the `-C` value it asked about. Windows only: on POSIX `/??/x` is an ordinary absolute path.
-    if ($IsWindows) {
+    #
+    # NOT under the LEXICAL path form (-Lexical, or Set-PathForm below): there this function is the
+    # pre-#5454 resolver byte for byte, which is what lets every rule re-run its pre-#5454 decision.
+    # Read through Test-Path: a caller running these functions alone under Set-StrictMode has no such
+    # variable, and a bare read would throw there (tests/test_install_gate_allowlist_merge.py does that).
+    $formLexical = (Test-Path variable:script:PathFormLexical) -and $script:PathFormLexical
+    if ($IsWindows -and -not ($Lexical -or $formLexical)) {
         if ($Path -match '^[\\/]\?\?[\\/]') { $Path = '\\?\' + ($Path.Substring(4) -replace '/', '\') }
         if ($Base -match '^[\\/]\?\?[\\/]') { $Base = '\\?\' + ($Base.Substring(4) -replace '/', '\') }
     }
@@ -215,24 +221,31 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     on this rule that these spellings "need a SHELL command to set up" and are therefore out of reach.
     The device-prefix spellings below do not either.
 
-    THE DEVICE FOLD (BACKLOG #5454) maps each device spelling of a drive or UNC path onto that path:
-    `\\?\` and `\\.\` (and their `UNC\` forms), the NT-namespace `\??\`, and the namespace aliases
-    `Global\`, `GLOBALROOT\??\`, `GLOBALROOT\Global??\` and `GLOBALROOT\DosDevices\` behind either device
-    prefix. Measured 2026-11-18: git exits 0 on `\\.\`, `\??\`, `/??/`, `\\.\Global\`,
-    `\\.\GLOBALROOT\??\` and `\\.\GLOBALROOT\Global??\` in front of a worktree and names its real common
-    dir, with no setup, as it does for `\\?\`. The question-mark forms of the aliases gave git rc=128
-    "Invalid argument"; they are folded anyway, because a writer such as Node accepts them (the code
-    review of BACKLOG #5454 reported a file landing through `\\?\Global\`). The remainder is then
-    run through GetFullPath, so `.` and `..` segments, trailing dots and trailing spaces are normalised
-    the way git normalises them: `\\?\C:\<governed>.` and `\\?\C:\x\..\<governed>` both reach the
-    governed repo (git rc=0). For a WRITER the trailing-dot spelling is another directory (Node and .NET
-    keep `<governed>.` distinct), so rule 1 over-denies it; that is a tightening, kept on purpose.
+    THE DEVICE FOLD (BACKLOG #5454) maps at least these device spellings of a drive or UNC path onto
+    that path: `\\?\` and `\\.\` (and their `UNC\` forms), the NT-namespace `\??\`, and the namespace
+    aliases `Global\`, `GLOBALROOT\??\`, `GLOBALROOT\Global??\` and `GLOBALROOT\DosDevices\`, one alias
+    at most, behind either device prefix. Measured 2026-11-18: git exits 0 on `\\.\`, `\??\`, `/??/`,
+    `\\.\Global\`, `\\.\GLOBALROOT\??\` and `\\.\GLOBALROOT\Global??\` in front of a worktree and names
+    its real common dir, with no setup, as it does for `\\?\`. The question-mark forms of the aliases gave
+    git rc=128 "Invalid argument"; they are folded anyway, because a writer such as Node accepts them
+    (the code review of BACKLOG #5454 reported a file landing through `\\?\Global\`). The remainder is
+    then run through GetFullPath WITH THE DRIVE AS ITS ROOT, which collapses `.` and `..` segments,
+    trailing dots and trailing spaces. That is NOT always how git or a `\\?\` writer resolves the same
+    text, measured by the review of round 1850f169: they treat the device prefix as the root, so a `..`
+    can remove the drive segment and a later segment can name a drive again; a `\\?\` writer keeps
+    `<name>.` apart from `<name>`; and it creates a real file named `nul` where GetFullPath maps that
+    segment to the `\\.\nul` device.
 
-    WHAT THE FOLD CHANGES, BOTH WAYS. Most changed verdicts move ALLOW to DENY. At least one class moves
-    DENY to ALLOW: a `\\?\` path whose `..` climbs OUT of a governed root, `\\?\C:\<governed>\..\else`.
-    Before the fold it compared lexically as `c:/<governed>/../else` and matched the root; git and Node
-    resolve it to `c:/else`, and so does the fold. That was a false deny, not a governed path, and the
-    plain `C:\<governed>\..\else` spelling was already allowed.
+    SO THE FOLD IS NEVER THE ONLY ANSWER. Every governed-path decision runs under BOTH path forms and
+    DENIES IF EITHER DENIES (Set-PathForm, below): the LEXICAL form, Get-ComparablePathLexical, which is
+    this function as it stood before BACKLOG #5454, kept unchanged; and this FOLDED form. A path the
+    folded form reads wrongly in the allow direction, such as each case in the paragraph above, or a fold
+    that cannot resolve, is still judged by the lexical form, so nothing the pre-#5454 gate denied is
+    allowed. The construction keeps the pre-#5454 false denies too, among them a `\\?\` path whose `..`
+    climbs OUT of a governed root (`\\?\C:\<governed>\..\else`): it compared lexically as
+    `c:/<governed>/../else`, matched the root, and still does. Rules 3c and 3d also ask git for the
+    target's ABSOLUTE common dir (`rev-parse --path-format=absolute --git-common-dir`), which names the
+    real repository for at least the device spellings the review measured, and deny if that is governed.
 
     It runs at the shared comparison point, so a rule inherits it wherever that rule reaches this
     function. A rule that refuses a token BEFORE comparing it does not: rule 3c's Test-ShellLiteralPath
@@ -241,11 +254,21 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
 
     WHAT IT STILL DOES NOT COVER, at least: a JUNCTION or other reparse point, because a lexical resolver
     cannot follow one; an admin share reaching this machine by a name not in the list above (an FQDN, a
-    second IP); and a device path that names a VOLUME rather than a drive letter
-    (`\\.\Volume{<guid>}\`, `\\?\GLOBALROOT\Device\HarddiskVolume<n>\`). Those keep their prefix, so they
-    still compare as a path under `//./` or `//?/`. The code review of BACKLOG #5454 (2026-11-18) reported
-    git accepting the volume-GUID spelling with rc=0.
+    second IP); a device path that names a VOLUME rather than a drive letter (`\\.\Volume{<guid>}\`,
+    `\\?\GLOBALROOT\Device\HarddiskVolume<n>\`), which keeps its prefix and compares as a path under
+    `//./` or `//?/` (the review reported git accepting the volume-GUID spelling with rc=0); a device
+    path whose first segment after the prefix is not a drive, such as `\\?\X:\..\C:\<governed>`,
+    `\\?\.\C:\<governed>` or an empty segment; CHAINED aliases such as `\\.\Global\Global\C:\`. Neither
+    form folds those two classes onto the drive. Rule 3c denies at least the three just named, unquoted,
+    through the absolute common-dir query (tests/test_worktree_gate_dos_device.py), and rule 3d asks git
+    the same query; rules 1, 3 and 3b have no such query and do not. Also open: under the Bash tool, a
+    DOUBLE-QUOTED device spelling written with escaped backslashes, which the gate reads as written while
+    bash unescapes it; and the extra git call per candidate in rules 3c and 3d, which is not batched.
     #>
+    # Read through Test-Path, as in Get-FullPathRaw: a strict-mode caller of this function alone has no flag.
+    if ((Test-Path variable:script:PathFormLexical) -and $script:PathFormLexical) {
+        return (Get-ComparablePathLexical $Path $Base)
+    }
     # `\??\` reaches here already mapped onto `\\?\`: Get-FullPathRaw does it, for every rule.
     $full = Get-FullPathRaw $Path $Base
     if (-not $full) { return "" }
@@ -273,8 +296,13 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
         if ($rest -cmatch '(?s)^unc(?:[\\/](?<unc>.*))?\z') { $local = '\\' + $Matches['unc'] }
         elseif ($rest -cmatch '^[a-z]:\z') { $local = $rest + '\' }
         elseif ($rest -cmatch '^[a-z]:[\\/]') { $local = $rest }
+        # A remainder that does not resolve to a non-empty path KEEPS THE DEVICE FORM. `\\?\UNC` leaves
+        # `\\`, which GetFullPath refuses, and keeping that remainder made the result "", the "could not
+        # resolve" sentinel, where the pre-#5454 form was the non-empty `unc` (review round 1850f169).
         if ($local -and [System.IO.Path]::IsPathFullyQualified($local)) {
-            try { $full = [System.IO.Path]::GetFullPath($local) } catch { $full = $local }
+            $resolved = ""
+            try { $resolved = [System.IO.Path]::GetFullPath($local) } catch { $resolved = "" }
+            if ($resolved -replace '[\\/]', '') { $full = $resolved }
         }
     }
     $cmp = ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
@@ -284,6 +312,39 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
         }
     }
     $cmp
+}
+
+# THE LEXICAL PATH FORM: Get-ComparablePath as it stood before BACKLOG #5454, kept as its own function
+# and UNCHANGED, so every rule can re-run its pre-#5454 decision beside the folded one. Get-ComparablePath
+# calls it under Set-PathForm's lexical form. Placed AFTER Get-ComparablePath on purpose: the test helpers
+# find a function by `function <name>` prefix, and this name starts with that one.
+function Get-ComparablePathLexical([string]$Path, [string]$Base) {
+    $full = Get-FullPathRaw $Path $Base -Lexical
+    if (-not $full) { return "" }
+    $cmp = ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
+
+    # ORDER MATTERS: the extended-UNC form carries BOTH prefixes, so the `//?/unc/` case must reduce to a
+    # plain UNC path before the admin-share fold below can see it.
+    $cmp = $cmp -replace '^//\?/unc/', '//'
+    $cmp = $cmp -replace '^//\?/', ''
+    if ($cmp -match '^//([^/]+)/([a-z])\$(?=/|$)') {
+        if ($script:LocalHostSpellings -contains $Matches[1]) {
+            $cmp = $Matches[2] + ':' + $cmp.Substring($Matches[0].Length)
+        }
+    }
+    $cmp
+}
+
+# WHICH PATH FORM THE RESOLVERS ANSWER IN (BACKLOG #5454). $false, the default, is the FOLDED form: the
+# device fold in Get-ComparablePath and the NT-prefix mapping in Get-FullPathRaw. $true is the LEXICAL
+# form: both resolvers exactly as they stood before #5454, and $roots built from the lexical form of each
+# allowlist entry. A rule asks its governed question once under each form and denies if either denies, so
+# a fold that reads a governed path wrongly can add denies and never remove one. Every caller that sets
+# the lexical form sets the folded form back before its next step.
+$script:PathFormLexical = $false
+function Set-PathForm([bool]$Lexical) {
+    $script:PathFormLexical = $Lexical
+    $script:roots = @(if ($Lexical) { $script:rootsLexical } else { $script:rootsFolded })
 }
 
 # Fold a CALLER-SUPPLIED value before it goes into a deny REASON. Write-Deny already does exactly this for
@@ -2797,16 +2858,29 @@ if (-not $hookUnparseable -and -not $hook) { exit 0 }
 # Each root keeps BOTH forms: a casefolded/slash-normalized one to compare against (Windows paths are
 # case-insensitive), and the operator's original spelling to quote back in the deny message -- a message
 # that shouts `c:\users\<you>\...` at you looks broken even though the match is correct.
-$roots = @(
+#
+# ONE LIST PER PATH FORM (BACKLOG #5454): Set-PathForm swaps $roots between them, so a rule judging under
+# the lexical form compares against the roots exactly as the pre-#5454 gate built them. The gate is OFF
+# only when BOTH lists are empty; a root only one form resolves still governs under that form.
+$rootEntries = @(
     Get-Content -LiteralPath $ReposFile -ErrorAction SilentlyContinue |
         Where-Object { $_ -and -not $_.TrimStart().StartsWith("#") } |
-        ForEach-Object {
-            $raw = $_.Trim()
-            $cmp = Get-ComparablePath $raw
-            if ($cmp) { [pscustomobject]@{ Compare = $cmp; Display = $raw.TrimEnd('\', '/') } }
-        }
+        ForEach-Object { $_.Trim() }
 )
-if ($roots.Count -eq 0) { exit 0 }
+$rootsFolded = @(
+    foreach ($raw in $rootEntries) {
+        $cmp = Get-ComparablePath $raw
+        if ($cmp) { [pscustomobject]@{ Compare = $cmp; Display = $raw.TrimEnd('\', '/') } }
+    }
+)
+$rootsLexical = @(
+    foreach ($raw in $rootEntries) {
+        $cmp = Get-ComparablePathLexical $raw
+        if ($cmp) { [pscustomobject]@{ Compare = $cmp; Display = $raw.TrimEnd('\', '/') } }
+    }
+)
+Set-PathForm $false
+if ($rootsFolded.Count -eq 0 -and $rootsLexical.Count -eq 0) { exit 0 }
 
 if ($hookUnparseable) {
     # No tool name, cwd or path is known here, so the message names none. The receipt carries the
@@ -2980,6 +3054,20 @@ function Test-Governed([string]$Candidate) {
     return $null
 }
 
+# Test-Governed of a RAW path under BOTH path forms (BACKLOG #5454): the governed root either form names,
+# the lexical one first, or $null. A form that cannot resolve the path gives "" and Test-Governed "" is
+# $null, so an unresolvable form never removes the other form's deny. Leaves the folded form set.
+function Test-GovernedEitherForm([string]$Path, [string]$Base) {
+    $hit = $null
+    foreach ($lexical in @($true, $false)) {
+        Set-PathForm $lexical
+        $hit = Test-Governed (Get-ComparablePath $Path $Base)
+        if ($hit) { break }
+    }
+    Set-PathForm $false
+    $hit
+}
+
 # The COMMON DIR of a governed root, as a comparable path -- the object rule 3c actually governs
 # (BACKLOG #1067). Empty when the root is not a repository, or is not a repository's TOP LEVEL: an
 # allowlist entry may legitimately name a directory that merely CONTAINS checkouts, and a root that is a
@@ -2990,7 +3078,9 @@ function Test-Governed([string]$Candidate) {
 $rootCommonCache = @{}
 function Get-RootCommonDirCmp($Root) {
     $key = $Root.Compare
-    if ($rootCommonCache.ContainsKey($key)) { return $rootCommonCache[$key] }
+    # Keyed by PATH FORM as well (BACKLOG #5454): the answer is a comparable path, so each form has its own.
+    $cacheKey = "$([bool]$script:PathFormLexical)|$key"
+    if ($rootCommonCache.ContainsKey($cacheKey)) { return $rootCommonCache[$cacheKey] }
     $value = ""
     # The RAW spelling, never the Compare form: that one is lowercased, and this file warns twice that a
     # lowercased path handed to `git -C` passes on Windows and misses the real directory on a
@@ -3005,7 +3095,7 @@ function Get-RootCommonDirCmp($Root) {
         $common = "$(& git -C $where rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
         if ($LASTEXITCODE -eq 0 -and $common) { $value = Get-ComparablePath $common }
     }
-    $rootCommonCache[$key] = $value
+    $rootCommonCache[$cacheKey] = $value
     return $value
 }
 
@@ -3033,34 +3123,59 @@ function Get-RootCommonDirCmp($Root) {
 # BOTH `-eq` BELOW STAY CULTURE. A match governs the config and so denies; an ordinal-only equality
 # would stop matching a common dir that differs by an ignorable character, and allow a write this rule
 # denies today. The prefix halves are ordinal already.
-function Get-GovernedRootForCommon([string]$CommonCmp) {
+#
+# SEVERAL SPELLINGS OF ONE ANSWER (BACKLOG #5454): Get-CommonDirAnswer hands over git's relative answer
+# and its ABSOLUTE one, and a root that any of them names is the answer. The relative answer alone is the
+# pre-#5454 question, so the added spelling can only add a deny.
+function Get-GovernedRootForCommon([string[]]$CommonCmps) {
     foreach ($r in $roots) {
         $rootCommon = Get-RootCommonDirCmp $r
-        if (-not $rootCommon) {
-            # The root is not a repository's top level, so there is no identity to compare and the path
-            # test remains the only answer available. Unchanged deliberately: a root that merely contains
-            # checkouts must not start failing OPEN on a shape it used to catch.
-            if ($CommonCmp -eq $r.Compare -or
-                $CommonCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { return $r }
-            continue
+        foreach ($CommonCmp in $CommonCmps) {
+            if (-not $rootCommon) {
+                # The root is not a repository's top level, so there is no identity to compare and the
+                # path test remains the only answer available. Unchanged deliberately: a root that merely
+                # contains checkouts must not start failing OPEN on a shape it used to catch.
+                if ($CommonCmp -eq $r.Compare -or
+                    $CommonCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { return $r }
+                continue
+            }
+            if ($CommonCmp -eq $rootCommon -or
+                $CommonCmp.StartsWith("$rootCommon/", [System.StringComparison]::Ordinal)) { return $r }
         }
-        if ($CommonCmp -eq $rootCommon -or
-            $CommonCmp.StartsWith("$rootCommon/", [System.StringComparison]::Ordinal)) { return $r }
     }
     $null
 }
 
-# git's answer to "which common dir does this directory belong to", as a comparable path, or $null where
+# git's answer to "which common dir does this directory belong to", as comparable paths, or $null where
 # git does not answer. Cached per raw path, ORDINALLY (a PowerShell hashtable folds case, and two paths
 # differing only by case are two directories on Linux), so rule 3c's added reading does not ask git
 # again about a candidate its first chain already asked about (review round 3411eb8641).
+#
+# TWO SPELLINGS, in this order (BACKLOG #5454): git's own answer, which is relative (`.git`) from a
+# primary and is resolved against the `-C` value as written, exactly as before; then the ABSOLUTE answer
+# (`--path-format=absolute`, which Get-RootCommonDirCmp already asks for). That one is git's own
+# resolution of the value, so it names the real repository through at least some device spellings that
+# neither path form folds onto the drive (review round 1850f169 measured `\\?\X:\..\C:\<governed>` and
+# `\\?\.\C:\<governed>`). The git outputs are cached once; the comparable forms are built in the path
+# form current at the call.
 $commonDirAnswers = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Get-CommonDirAnswer([string]$CandRaw) {
-    if ($commonDirAnswers.ContainsKey($CandRaw)) { return $commonDirAnswers[$CandRaw] }
-    $common = "$(& git -C $CandRaw rev-parse --git-common-dir 2>$null)".Trim()
-    $answer = $(if ($LASTEXITCODE -ne 0 -or -not $common) { $null } else { [string](Get-ComparablePath $common $CandRaw) })
-    $commonDirAnswers[$CandRaw] = $answer
-    $answer
+    if (-not $commonDirAnswers.ContainsKey($CandRaw)) {
+        $common = "$(& git -C $CandRaw rev-parse --git-common-dir 2>$null)".Trim()
+        $git = $null
+        if ($LASTEXITCODE -eq 0 -and $common) {
+            $absolute = "$(& git -C $CandRaw rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+            if ($LASTEXITCODE -ne 0) { $absolute = "" }
+            $git = [pscustomobject]@{ Common = $common; Absolute = $absolute }
+        }
+        $commonDirAnswers[$CandRaw] = $git
+    }
+    $answer = $commonDirAnswers[$CandRaw]
+    if ($null -eq $answer) { return $null }
+    $forms = [System.Collections.Generic.List[string]]::new()
+    $forms.Add([string](Get-ComparablePath $answer.Common $CandRaw))
+    if ($answer.Absolute) { $forms.Add([string](Get-ComparablePath $answer.Absolute)) }
+    , $forms.ToArray()
 }
 
 # The governed root of the FIRST candidate git answers on, or $null -- rule 3c's first-answer rule
@@ -3548,7 +3663,8 @@ if ($tool -in @("Task", "Agent", "Workflow")) {
             exit 0
         }
     }
-    $root = Test-Governed $cwd
+    # Both path forms (BACKLOG #5454): Test-GovernedEitherForm.
+    $root = Test-GovernedEitherForm ([string]$hook.cwd) ""
     if ($root) {
         $display = Get-SafeForMessage $root.Display
         Write-Deny -Rule "2" -Detail "dispatch $tool" -Reason @"
@@ -4173,8 +4289,9 @@ if ($tool -in @("Bash", "PowerShell")) {
         #   * GIT FAILS ON A RESOLVED TARGET -- ALLOW, unchanged. That is git ANSWERING: the path is not a
         #     repository. test_a_non_repo_cwd_fails_open pins it, and the reason it pins it is that a
         #     guardrail which wedges on an unexpected shape gets uninstalled.
+        # Under BOTH path forms (BACKLOG #5454): unresolvable under either is refused.
         $whereRaw = Get-FullPathRaw $where[0] $cwdRaw
-        if (-not $whereRaw) {
+        if (-not $whereRaw -or -not (Get-FullPathRaw $where[0] $cwdRaw -Lexical)) {
             Write-Deny -Rule "3c" -Detail "git config $badKey (unresolvable target)" -Reason @"
 BLOCKED: this $(if ($viaWrite) { 'changes' } else { 'sets' }) '$badKey', and the gate cannot tell WHICH repository it would change it in.
 
@@ -4226,81 +4343,90 @@ What to do instead:
         # delay a DENY $where already reached; see Test-WindowChdirUsable's header.
         $chain = @($where)
         if ($denyFold) { $chain += @($denyFold) }
+        # UNDER BOTH PATH FORMS (BACKLOG #5454), the lexical one first: the chain and the added reading
+        # are asked once in the pre-#5454 form and once in the folded form, and a governed answer under
+        # either is the verdict. Each pass keeps the first-answer rule inside itself, so neither pass can
+        # search the other's candidates for a deny; the second pass only runs where the first found none.
         $govCfg = $null
-        $answered = $false
-        $candIndex = -1
-        foreach ($cand in $chain) {
-            $candIndex++
-            if ($answered -and $candIndex -lt $where.Count) { continue }
-            $candRaw = Get-FullPathRaw $cand $cwdRaw
-            if (-not $candRaw) { continue }
-            # git's answer, cached so the added reading below does not ask again (Get-CommonDirAnswer).
-            $commonCmp = Get-CommonDirAnswer $candRaw
-            if ($null -eq $commonCmp) { continue }
-            # Repository identity, not a path prefix: Get-GovernedRootForCommon says why. $govCfg is null
-            # whenever this line is reached, because the loop breaks as soon as it is set, so assigning
-            # the function's answer is the inline walk it replaced.
-            $govCfg = Get-GovernedRootForCommon $commonCmp
-            # THE FIRST CANDIDATE GIT ANSWERS ON DECIDES, GOVERNED OR NOT -- so this break is
-            # UNCONDITIONAL, and that is the load-bearing half. Reaching this line means `rev-parse`
-            # succeeded on $cand, so $cand IS a repository and the roots walk above has just given the
-            # final verdict for it. Breaking only on a hit would turn the chain into a SEARCH for a
-            # governed target: a later candidate -- a `-C` belonging to a different command in the same
-            # chain, or the cwd fallback -- could then manufacture a DENY the real target never earned,
-            # and the refusal would name a repository the write was never going to touch. That is the
-            # #1085 defect (a refusal that misdescribes what it blocked) reintroduced through a new door.
+        foreach ($configLexical in @($true, $false)) {
+            Set-PathForm $configLexical
+            $answered = $false
+            $candIndex = -1
+            foreach ($cand in $chain) {
+                $candIndex++
+                if ($answered -and $candIndex -lt $where.Count) { continue }
+                $candRaw = Get-FullPathRaw $cand $cwdRaw
+                if (-not $candRaw) { continue }
+                # git's answer, cached so the added reading below does not ask again (Get-CommonDirAnswer).
+                $commonCmp = Get-CommonDirAnswer $candRaw
+                if ($null -eq $commonCmp) { continue }
+                # Repository identity, not a path prefix: Get-GovernedRootForCommon says why. $govCfg is null
+                # whenever this line is reached, because the loop breaks as soon as it is set, so assigning
+                # the function's answer is the inline walk it replaced.
+                $govCfg = Get-GovernedRootForCommon $commonCmp
+                # THE FIRST CANDIDATE GIT ANSWERS ON DECIDES, GOVERNED OR NOT -- so this break is
+                # UNCONDITIONAL, and that is the load-bearing half. Reaching this line means `rev-parse`
+                # succeeded on $cand, so $cand IS a repository and the roots walk above has just given the
+                # final verdict for it. Breaking only on a hit would turn the chain into a SEARCH for a
+                # governed target: a later candidate -- a `-C` belonging to a different command in the same
+                # chain, or the cwd fallback -- could then manufacture a DENY the real target never earned,
+                # and the refusal would name a repository the write was never going to touch. That is the
+                # #1085 defect (a refusal that misdescribes what it blocked) reintroduced through a new door.
+                #
+                # The candidates that DID NOT answer are skipped by the `continue`s above and never reach
+                # here, which is the whole point: "git failed on this token" now moves to the next candidate
+                # instead of ending the rule, and that is the only behaviour this change adds.
+                if ($govCfg -or -not $denyFold -or $candIndex -ge $where.Count) { break }
+                $answered = $true
+            }
+            # THE ADDED READING (BACKLOG #5642, #5655), only where the chain above found nothing governed:
+            # the disarming invocation's own window, read off the scan, so a single-quoted `-C`, --git-dir
+            # or GIT_DIR names its path. The first candidate git answers on decides, as above, and only a
+            # governed answer is used, so this can add a deny and never remove one. See THE ADDED READINGS.
             #
-            # The candidates that DID NOT answer are skipped by the `continue`s above and never reach
-            # here, which is the whole point: "git failed on this token" now moves to the next candidate
-            # instead of ending the rule, and that is the only behaviour this change adds.
-            if ($govCfg -or -not $denyFold -or $candIndex -ge $where.Count) { break }
-            $answered = $true
+            # Its first window starts after the last separator before the last git word ahead of the disarm
+            # (a `git.EXE` or `GIT` the token pattern misses must not reach back over `;`). That word comes
+            # from Get-AnyGitWordBefore, which can match a `.git` path segment, the git in `--git-dir`, or a
+            # git inside a closed `$( )` that owns nothing, so this window is not always the owning
+            # invocation's. That makes false denies, and THE ADDED READINGS lists at least some of them,
+            # not all. For a `-c <key>=<v>` disarm it runs on over the global options that follow, so
+            # `git -c <key>=<v> -C <ungoverned> commit` reads that `-C` (review round b62475f26d). A
+            # `config` disarm has every global option before it.
+            if (-not $govCfg) {
+                $readTo = $dis.Index
+                if (-not $viaConfig) {
+                    $keyAt = $dis.Groups['key'].Index
+                    $globals = [regex]::Match($seg.Scan.Substring($keyAt),
+                        '^\S*(?:\s+(?:-[Cc]\s+\S+|--(?:git-dir|work-tree|namespace)(?:=\S+|\s+\S+)|--?[A-Za-z][\w-]*(?:=\S+)?))*')
+                    $readTo = $keyAt + $globals.Length
+                }
+                # THE OWNING GIT WORD IS READ AS WELL (BACKLOG #5655 step 1). The broad word answers the git
+                # inside a `$( )` that closes before the disarm, so `git -C '<p>' -c user.name=$(git log -1)
+                # config <key>` read no `-C`; the owning word skips a closed group. Its reading can only add
+                # a deny. It is searched for only after the last true separator before the disarm, so
+                # `git -C '<p>' log ; /usr/bin/git config <key>` cannot read the earlier command's `-C`
+                # (the owning-word search skips a path-qualified git). It is used only where the span from it
+                # to the disarm holds no more openers than closers (review round e9fa08d529), so `git -C
+                # '<p>' log $(/usr/bin/git config <key>)` does not read the outer `-C` either. That compares
+                # COUNTS, not nesting, so a span such as `x) $(...` passes.
+                $gitWords = @(Get-AnyGitWordBefore $seg.Scan $dis.Index)
+                $seps = [regex]::Matches($seg.Scan.Substring(0, $dis.Index), '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))')
+                $base = $(if ($seps.Count -gt 0) { $seps[$seps.Count - 1].Index + $seps[$seps.Count - 1].Length } else { 0 })
+                $ownAt = Get-GitWordBefore $seg.Scan.Substring($base) ($dis.Index - $base)
+                if ($ownAt -ge 0 -and $base + $ownAt -ne $gitWords[0]) {
+                    $span = $seg.Scan.Substring($base + $ownAt, $dis.Index - $base - $ownAt)
+                    if (([regex]::Matches($span, '[({]')).Count -le ([regex]::Matches($span, '[)}]')).Count) { $gitWords += $base + $ownAt }
+                }
+                $readings = foreach ($gw in $gitWords) { Get-InvocationReading $seg.Scan $readTo -GitAt $gw -Prior $seg.Prior }
+                foreach ($reading in @($readings)) {
+                    $govCfg = Find-FirstAnsweringRoot (Get-InvocationCandidates $reading $cwdRaw `
+                                  -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir) $cwdRaw
+                    if ($govCfg) { break }
+                }
+            }
+            if ($govCfg) { break }
         }
-        # THE ADDED READING (BACKLOG #5642, #5655), only where the chain above found nothing governed:
-        # the disarming invocation's own window, read off the scan, so a single-quoted `-C`, --git-dir
-        # or GIT_DIR names its path. The first candidate git answers on decides, as above, and only a
-        # governed answer is used, so this can add a deny and never remove one. See THE ADDED READINGS.
-        #
-        # Its first window starts after the last separator before the last git word ahead of the disarm
-        # (a `git.EXE` or `GIT` the token pattern misses must not reach back over `;`). That word comes
-        # from Get-AnyGitWordBefore, which can match a `.git` path segment, the git in `--git-dir`, or a
-        # git inside a closed `$( )` that owns nothing, so this window is not always the owning
-        # invocation's. That makes false denies, and THE ADDED READINGS lists at least some of them,
-        # not all. For a `-c <key>=<v>` disarm it runs on over the global options that follow, so
-        # `git -c <key>=<v> -C <ungoverned> commit` reads that `-C` (review round b62475f26d). A
-        # `config` disarm has every global option before it.
-        if (-not $govCfg) {
-            $readTo = $dis.Index
-            if (-not $viaConfig) {
-                $keyAt = $dis.Groups['key'].Index
-                $globals = [regex]::Match($seg.Scan.Substring($keyAt),
-                    '^\S*(?:\s+(?:-[Cc]\s+\S+|--(?:git-dir|work-tree|namespace)(?:=\S+|\s+\S+)|--?[A-Za-z][\w-]*(?:=\S+)?))*')
-                $readTo = $keyAt + $globals.Length
-            }
-            # THE OWNING GIT WORD IS READ AS WELL (BACKLOG #5655 step 1). The broad word answers the git
-            # inside a `$( )` that closes before the disarm, so `git -C '<p>' -c user.name=$(git log -1)
-            # config <key>` read no `-C`; the owning word skips a closed group. Its reading can only add
-            # a deny. It is searched for only after the last true separator before the disarm, so
-            # `git -C '<p>' log ; /usr/bin/git config <key>` cannot read the earlier command's `-C`
-            # (the owning-word search skips a path-qualified git). It is used only where the span from it
-            # to the disarm holds no more openers than closers (review round e9fa08d529), so `git -C
-            # '<p>' log $(/usr/bin/git config <key>)` does not read the outer `-C` either. That compares
-            # COUNTS, not nesting, so a span such as `x) $(...` passes.
-            $gitWords = @(Get-AnyGitWordBefore $seg.Scan $dis.Index)
-            $seps = [regex]::Matches($seg.Scan.Substring(0, $dis.Index), '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))')
-            $base = $(if ($seps.Count -gt 0) { $seps[$seps.Count - 1].Index + $seps[$seps.Count - 1].Length } else { 0 })
-            $ownAt = Get-GitWordBefore $seg.Scan.Substring($base) ($dis.Index - $base)
-            if ($ownAt -ge 0 -and $base + $ownAt -ne $gitWords[0]) {
-                $span = $seg.Scan.Substring($base + $ownAt, $dis.Index - $base - $ownAt)
-                if (([regex]::Matches($span, '[({]')).Count -le ([regex]::Matches($span, '[)}]')).Count) { $gitWords += $base + $ownAt }
-            }
-            $readings = foreach ($gw in $gitWords) { Get-InvocationReading $seg.Scan $readTo -GitAt $gw -Prior $seg.Prior }
-            foreach ($reading in @($readings)) {
-                $govCfg = Find-FirstAnsweringRoot (Get-InvocationCandidates $reading $cwdRaw `
-                              -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir) $cwdRaw
-                if ($govCfg) { break }
-            }
-        }
+        Set-PathForm $false
         if (-not $govCfg) { continue }
 
         # BACKLOG #1082: SAY WHAT IS TRUE OF THE SCOPE ACTUALLY BEING WRITTEN. A --global or --system
@@ -4609,45 +4735,57 @@ What to do instead:
         $at = [regex]::Match($seg.Raw, $gitInvocation)
         $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
         $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
-        $base = $(if ($where.Count -gt 0) { Get-FullPathRaw $where[0] $cwdRaw } else { "" })
-        if (-not $base) { $base = $cwdRaw }
-
-        # THE INVOCATION'S OWN BASE, TRIED SECOND (BACKLOG #5643). The base above comes from the FIRST
-        # `-C` on the line and the chdir before the FIRST git token, whichever command they belong to.
-        # This one is resolved from THIS invocation's window: its own `-C` tokens folded in order, over
-        # the single chdir before it, read off SCAN so a quoted mention is not a chdir. It is ADDED and
-        # tried after the first, so a victim either base names as governed is refused, and nothing
-        # the first base refused can pass. A window the resolver cannot read adds nothing.
-        $bases = @($base)
-        if ($wtTarget.Window) {
-            $ownWhere = @(Get-GitTargetCandidatesRaw $seg.Raw $wtTarget.Window.ScanPrefix $cwdRaw `
-                              -OwnWindow -DashCText $wtTarget.Window.DashCText)
-            $ownBase = $(if ($ownWhere.Count -gt 0) { Get-FullPathRaw $ownWhere[0] $cwdRaw } else { "" })
-            if ($ownBase -and -not [string]::Equals($ownBase, $base, [System.StringComparison]::Ordinal)) {
-                $bases += $ownBase
-            }
-        }
+        # UNDER BOTH PATH FORMS (BACKLOG #5454), the lexical one first: the bases, the rooted victim and
+        # its common dir are worked out once in the pre-#5454 form and once in the folded form, and a
+        # governed answer under either is the verdict. git is asked through Get-CommonDirAnswer, which
+        # also hands over the ABSOLUTE common dir git resolves, and caches both per rooted path.
         $govWt = $null
-        $triedAbs = @()
-        foreach ($tryBase in $bases) {
-            $victimAbs = Get-FullPathRaw $victimRaw $tryBase
-            if (-not $victimAbs) { $victimAbs = $victimRaw }
-            # An absolute victim resolves the same against both bases; ask git about it once.
-            if ($triedAbs -ccontains $victimAbs) { continue }
-            $triedAbs += $victimAbs
+        foreach ($victimLexical in @($true, $false)) {
+            Set-PathForm $victimLexical
+            $base = $(if ($where.Count -gt 0) { Get-FullPathRaw $where[0] $cwdRaw } else { "" })
+            if (-not $base) { $base = $cwdRaw }
 
-            $victimCommon = "$(& git -C $victimAbs rev-parse --git-common-dir 2>$null)".Trim()
-            if ($LASTEXITCODE -ne 0 -or -not $victimCommon) { continue }
-            $victimCmp = Get-ComparablePath $victimCommon $victimAbs
-            # CULTURE OR ORDINAL, as in Test-Governed: a match denies, so each half only adds denies. The
-            # ordinal half catches a combining mark after the slash, which the culture StartsWith misses.
-            # The continuation keeps its pre-#5643 indent: a test rebuilds this exact text as a control.
-            foreach ($r in $roots) {
-                if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/") -or
+            # THE INVOCATION'S OWN BASE, TRIED SECOND (BACKLOG #5643). The base above comes from the FIRST
+            # `-C` on the line and the chdir before the FIRST git token, whichever command they belong to.
+            # This one is resolved from THIS invocation's window: its own `-C` tokens folded in order, over
+            # the single chdir before it, read off SCAN so a quoted mention is not a chdir. It is ADDED and
+            # tried after the first, so a victim either base names as governed is refused, and nothing
+            # the first base refused can pass. A window the resolver cannot read adds nothing.
+            $bases = @($base)
+            if ($wtTarget.Window) {
+                $ownWhere = @(Get-GitTargetCandidatesRaw $seg.Raw $wtTarget.Window.ScanPrefix $cwdRaw `
+                                  -OwnWindow -DashCText $wtTarget.Window.DashCText)
+                $ownBase = $(if ($ownWhere.Count -gt 0) { Get-FullPathRaw $ownWhere[0] $cwdRaw } else { "" })
+                if ($ownBase -and -not [string]::Equals($ownBase, $base, [System.StringComparison]::Ordinal)) {
+                    $bases += $ownBase
+                }
+            }
+            $triedAbs = @()
+            foreach ($tryBase in $bases) {
+                $victimAbs = Get-FullPathRaw $victimRaw $tryBase
+                if (-not $victimAbs) { $victimAbs = $victimRaw }
+                # An absolute victim resolves the same against both bases; ask git about it once.
+                if ($triedAbs -ccontains $victimAbs) { continue }
+                $triedAbs += $victimAbs
+
+                $victimCommonCmps = Get-CommonDirAnswer $victimAbs
+                if ($null -eq $victimCommonCmps) { continue }
+                foreach ($victimCmp in $victimCommonCmps) {
+                    # CULTURE OR ORDINAL, as in Test-Governed: a match denies, so each half only adds
+                    # denies. The ordinal half catches a combining mark after the slash, which the culture
+                    # StartsWith misses. The continuation keeps its pre-#5643 indent: a test rebuilds this
+                    # exact text as a control.
+                    foreach ($r in $roots) {
+                        if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/") -or
                 $victimCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { $govWt = $r; break }
+                    }
+                    if ($govWt) { break }
+                }
+                if ($govWt) { break }
             }
             if ($govWt) { break }
         }
+        Set-PathForm $false
         if (-not $govWt) { continue }
 
         # Is the victim the tree THIS session is standing in? $victimCmp above is the shared COMMON git
@@ -4989,7 +5127,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
             if ($cands.Count -gt 0) { $targetRaw = $cands[0] }
         }
         foreach ($c in $cands) {
-            $hit = Test-Governed (Get-ComparablePath $c $cwdRaw)
+            $hit = Test-GovernedEitherForm $c $cwdRaw
             if ($hit) { $root = $hit ; $verb = $segVerb ; $verbLine = $seg.Raw ; $targetRaw = $c ; break }
         }
         if ($root) { break }
@@ -5033,7 +5171,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
                 $carriedHead = Resolve-CarriedGitDir ($seg.Prior + $seg.Scan.Substring(0, $vIdx))
                 if (-not ($ownRepoToken -or $carriedHead)) { continue }
                 foreach ($c in @(Get-GitTargetCandidatesRaw $seg.Raw $segPrefix $cwdRaw -RepositoryOnly -ExplicitFirst:$ownRepoToken -CarriedGitDir $carriedHead)) {
-                    $hit = Test-Governed (Get-ComparablePath $c $cwdRaw)
+                    $hit = Test-GovernedEitherForm $c $cwdRaw
                     if ($hit) { $headRoot = $hit ; $headVerb = $vGroup.Value ; break }
                 }
                 if ($headRoot) { break }
@@ -5046,7 +5184,9 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     # that NAMES a governed primary as targeting it -- but only where the target was inferred.
     if (-not $root -and $anyInferredTarget) {
         $normalized = ($cmd -replace '\\', '/').ToLowerInvariant()
-        foreach ($r in $roots) {
+        # Each root under BOTH path forms (BACKLOG #5454), the lexical one first, as the pre-#5454 gate
+        # spelled it; a match under either denies.
+        foreach ($r in @($rootsLexical) + @($rootsFolded)) {
             # Match the primary path only at a DIRECTORY BOUNDARY, never as a raw prefix substring. A
             # sibling worktree is named `<primary>-<task>`, so its path CONTAINS the primary's as a prefix
             # ('.../messagefoundry-ss-capture' starts with '.../messagefoundry'); a plain .Contains() then
@@ -5199,7 +5339,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
         })
         foreach ($addedRead in $addedReads) {
             foreach ($addedCand in $addedRead.Cands) {
-                $hit = Test-Governed (Get-ComparablePath $addedCand $cwdRaw)
+                $hit = Test-GovernedEitherForm $addedCand $cwdRaw
                 if ($hit) { $root = $hit ; $verb = $addedRead.Verb ; break }
             }
             if ($root) { break }
@@ -5207,7 +5347,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
         if (-not $root) {
             foreach ($addedRead in $addedReads) {
                 foreach ($addedCand in $addedRead.Repo) {
-                    $hit = Test-Governed (Get-ComparablePath $addedCand $cwdRaw)
+                    $hit = Test-GovernedEitherForm $addedCand $cwdRaw
                     if ($hit) { $headRoot = $hit ; $headVerb = $addedRead.Verb ; break }
                 }
                 if ($headRoot) { break }
@@ -5247,7 +5387,15 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
         # session cwd goes down too: 3b's class B needs to tell "another session's worktree" from "the
         # one I am standing in", and reading a script-scope variable inside the function would hide that
         # dependency from the reader of the call site.
-        Test-WorktreeHijack $verb $verbLine $targetRaw $cwdRaw
+        #
+        # UNDER BOTH PATH FORMS (BACKLOG #5454), the lexical one first: Test-WorktreeHijack exits on a
+        # deny, so a deny under either form is the verdict. Its git calls take raw paths and do not depend
+        # on the form; only its comparisons and the rooted trees below do.
+        $judgeKeyOf = {
+            param([string]$v, [string]$t, [string]$w)
+            $after = $(if ($hijackSwitchVerbs -contains $v) { $t -replace ('(?s)^.*?\b' + [regex]::Escape($v) + '\b'), '' })
+            "$v`n$after`n$w"
+        }
 
         # RULE 3b ON EVERY INVOCATION, the last of THE ADDED READINGS (computed above the HEAD-move
         # deny). Each reading's first candidate is the tree, as the first reading hands 3b $cands[0],
@@ -5260,28 +5408,29 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
         # THE KEY IS WHAT Test-WorktreeHijack READS: the verb, the tree, and for a branch switch the text
         # after the verb's first occurrence, which is all its destination parse sees. The first reading's
         # own judgement seeds the set where its tree is already absolute, so an ordinary command in a
-        # session's own worktree is not judged twice (review round b62475f26d).
-        $judgeKeyOf = {
-            param([string]$v, [string]$t, [string]$w)
-            $after = $(if ($hijackSwitchVerbs -contains $v) { $t -replace ('(?s)^.*?\b' + [regex]::Escape($v) + '\b'), '' })
-            "$v`n$after`n$w"
-        }
-        $judged = @()
-        if ($targetRaw -and [System.IO.Path]::IsPathRooted($targetRaw)) {
-            $seedTree = Get-FullPathRaw $targetRaw $cwdRaw
-            if ($seedTree -and [string]::Equals($seedTree, $targetRaw, [System.StringComparison]::Ordinal)) {
-                $judged += (& $judgeKeyOf $verb $verbLine $targetRaw)
+        # session's own worktree is not judged twice (review round b62475f26d). The set is per path form:
+        # the rooted tree is the form's own.
+        foreach ($hijackLexical in @($true, $false)) {
+            Set-PathForm $hijackLexical
+            Test-WorktreeHijack $verb $verbLine $targetRaw $cwdRaw
+            $judged = @()
+            if ($targetRaw -and [System.IO.Path]::IsPathRooted($targetRaw)) {
+                $seedTree = Get-FullPathRaw $targetRaw $cwdRaw
+                if ($seedTree -and [string]::Equals($seedTree, $targetRaw, [System.StringComparison]::Ordinal)) {
+                    $judged += (& $judgeKeyOf $verb $verbLine $targetRaw)
+                }
+            }
+            foreach ($addedRead in $addedReads) {
+                if ($addedRead.Cands.Count -eq 0) { continue }
+                $tree = Get-FullPathRaw $addedRead.Cands[0] $cwdRaw
+                if (-not $tree) { $tree = $addedRead.Cands[0] }
+                $judgeKey = & $judgeKeyOf $addedRead.Verb $addedRead.Text $tree
+                if ($judged -ccontains $judgeKey) { continue }
+                $judged += $judgeKey
+                Test-WorktreeHijack $addedRead.Verb $addedRead.Text $tree $cwdRaw
             }
         }
-        foreach ($addedRead in $addedReads) {
-            if ($addedRead.Cands.Count -eq 0) { continue }
-            $tree = Get-FullPathRaw $addedRead.Cands[0] $cwdRaw
-            if (-not $tree) { $tree = $addedRead.Cands[0] }
-            $judgeKey = & $judgeKeyOf $addedRead.Verb $addedRead.Text $tree
-            if ($judged -ccontains $judgeKey) { continue }
-            $judged += $judgeKey
-            Test-WorktreeHijack $addedRead.Verb $addedRead.Text $tree $cwdRaw
-        }
+        Set-PathForm $false
         exit 0
     }
 
@@ -5368,6 +5517,15 @@ if (-not [System.IO.Path]::IsPathRooted($target)) {
 # shell-guard-dispatch.ps1 is the only dispatcher whose proof the account's shell entry trusts, and
 # <account>/shell-guard-proof/ holds those proofs: a proof written there stands the entry down for that
 # call. install-gate.ps1 states the protocol.
+#
+# RULES 1a, 1b AND 1 RUN ONCE PER PATH FORM (BACKLOG #5454), the lexical one first, inside the loop
+# opened here and closed after rule 1's Test-Governed, so a deny under either form is the verdict and the
+# lexical pass is the pre-#5454 rule 1 exactly. Rule 1b's exemption ends one pass (`continue`) rather
+# than the hook. THE LOOP BODY IS NOT INDENTED, on purpose: it holds here-strings, whose closing `"@`
+# must start a line.
+$root = $null
+foreach ($rule1Lexical in @($true, $false)) {
+Set-PathForm $rule1Lexical
 $gateFiles = @(
     (Get-ComparablePath $ReposFile)
     (Get-ComparablePath (Join-Path (Split-Path -Parent $ReposFile) "worktree_gate.ps1"))
@@ -5746,7 +5904,9 @@ if ($coordMatch) {
     }
 
     # The local root's unarmed documents keep rule 1's exemption. The shared root never had one to keep.
-    if (-not $armed -and -not $coordMatch.Root.Shared) { exit 0 }
+    # `continue`, not `exit 0` (BACKLOG #5454): the exemption ends THIS path form's pass, and the other
+    # form still judges the write, so an exemption only one form reads cannot remove the other's deny.
+    if (-not $armed -and -not $coordMatch.Root.Shared) { continue }
 
     if ($armed) { Write-Deny -Rule "1b" -Detail $target -Reason @"
 BLOCKED: this writes $($armed.What), which $(if ($coordMatch.Root.Shared) { 'another gate, on this PC or on any other PC sharing this root,' } else { 'another gate on this machine' }) reads as AUTHORITY ($(Get-SafeForMessage $target)).
@@ -5772,6 +5932,10 @@ with a shell command; that only removes the record of which session did it.
 }
 
 $root = Test-Governed $targetCmp
+if ($root) { break }
+}
+# End of the rule 1 path-form loop opened above $gateFiles.
+Set-PathForm $false
 if (-not $root) { exit 0 }
 
 $display = Get-SafeForMessage $root.Display

@@ -10,9 +10,21 @@ NT-namespace prefix (backslash question-mark question-mark backslash) or the GLO
 any rule that compares through ``Get-ComparablePath``.
 
 MEASURED 2026-11-18 on Windows: ``git -C <spelling> rev-parse --git-common-dir`` exits 0 and names the
-real common dir for the dot-device, NT-namespace (either separator), dot-device ``Global`` and dot-device
-GLOBALROOT spellings of a worktree, and for an extended-length spelling with a trailing dot or a ``..``
-segment. None needs any setup.
+real common dir for at least the dot-device, NT-namespace (either separator), dot-device ``Global`` and
+dot-device GLOBALROOT spellings of a worktree, and for an extended-length spelling with a trailing dot or
+a ``..`` segment. None needs any setup.
+
+THE FOLD READS SOME GOVERNED PATHS AS UNGOVERNED, so it is never the only answer. Review round
+1850f169 measured five shapes the pre-#5454 gate denied and the fold allowed: ``\\\\?\\UNC\\?\\C:\\<gov>``, a
+``..`` climb past the drive that names the drive again, a final ``nul`` segment, a trailing dot that
+trims into an exemption, and a bare ``\\\\?\\UNC`` that folded to the "could not resolve" sentinel. Every
+governed-path decision now asks the folded form AND the pre-#5454 lexical form and denies if either
+does; rules 3c and 3d also ask git for the absolute common dir. The rows below pin each of the five as a
+DENY, with ungoverned ALLOW controls so a gate that denied every such spelling would fail them.
+
+WHAT THESE ROWS DO NOT SHOW, at least: that every device spelling is folded (``Get-ComparablePath``'s
+docstring lists the open classes), or anything about the double-quoted escaped spelling under the Bash
+tool.
 
 The comparison helper is imported from ``tests/test_worktree_gate_path_aliases.py``, so it runs the
 SHIPPED functions; the end-to-end rows drive the real hook through ``tests/test_worktree_gate.py``.
@@ -75,8 +87,12 @@ def test_the_device_fold_does_not_depend_on_the_current_culture() -> None:
     assert got == ["i:/repo"] * 3, got
 
 
-def test_an_extended_length_path_is_normalised_the_way_git_normalises_it() -> None:
-    """GetFullPath returns a question-mark-prefixed path verbatim: ``..``, ``.`` and a trailing dot."""
+def test_an_extended_length_path_is_normalised_with_the_drive_as_its_root() -> None:
+    """GetFullPath returns a question-mark-prefixed path verbatim: ``..``, ``.`` and a trailing dot.
+
+    The fold resolves them with the DRIVE as the root, which is not always how git or a writer does;
+    the rule 1 rows below pin the cases where the two differ.
+    """
     got = comparable(
         [
             dev("//?/", "C:/Other/../Repo"),
@@ -90,16 +106,27 @@ def test_an_extended_length_path_is_normalised_the_way_git_normalises_it() -> No
     assert got[3:] == ["c:/repo/src", "c:/repo"], got
 
 
-def test_a_dot_dot_that_climbs_OUT_of_the_root_resolves_where_git_lands() -> None:
-    """At least one class the fold moves from DENY to ALLOW, pinned so it stays a decision.
+def test_a_dot_dot_that_climbs_OUT_of_the_root_keeps_its_lexical_form() -> None:
+    """The fold resolves the climb; the lexical form keeps it, and the gate asks both.
 
-    Before the fold this compared lexically as ``c:/repo/../elsewhere`` and matched ``c:/repo``. git
-    resolves it to ``C:\\Elsewhere``, and the plain drive spelling already compared that way.
+    The lexical form is the pre-#5454 comparison, which matched ``c:/repo``, so the end-to-end row
+    below still denies: no verdict moves from DENY to ALLOW.
     """
-    got = comparable(
-        [dev("//?/", "C:/Repo/../Elsewhere"), "C:" + B + "Repo" + B + ".." + B + "Elsewhere"]
-    )
-    assert got == ["c:/elsewhere"] * 2, got
+    path = dev("//?/", "C:/Repo/../Elsewhere")
+    plain = "C:" + B + "Repo" + B + ".." + B + "Elsewhere"
+    assert comparable([path, plain]) == ["c:/elsewhere"] * 2
+    assert comparable([path], lexical=True) == ["c:/repo/../elsewhere"]
+
+
+def test_a_bare_extended_UNC_prefix_keeps_its_device_form_not_the_sentinel() -> None:
+    """Review round 1850f169: ``\\\\?\\UNC`` folded to "", the "could not resolve" sentinel.
+
+    The pre-#5454 form was the non-empty ``unc``; the lexical form still is, and the fold now keeps the
+    device form where its remainder does not resolve.
+    """
+    paths = [dev("//?/", "UNC"), dev("//?/", "UNC/")]
+    assert comparable(paths) == ["//?/unc"] * 2
+    assert comparable(paths, lexical=True) == ["unc"] * 2
 
 
 def test_a_device_path_to_a_REMOTE_admin_share_is_NOT_folded_onto_the_local_drive() -> None:
@@ -168,13 +195,90 @@ def test_an_edit_through_a_newline_segment_that_dot_dot_removes_is_denied(
     assert_denied(run_gate(edit(target, cwd=tmp_path / "Repo-alerts"), repos_file))
 
 
-@pytest.mark.parametrize("prefix", ["//./", "/??/", "//?/"])
+@pytest.mark.parametrize(
+    "prefix", ["//./", "/??/", "//?/", "//./GLOBALROOT/??/", "//?/Global/", "//./Global/"]
+)
 def test_an_edit_through_a_device_spelling_of_an_UNGOVERNED_path_is_allowed(
     tmp_path: Path, repos_file: Path, prefix: str
 ) -> None:
     """Control: a gate that denied every device spelling would pass the deny rows above."""
     target = prefix.replace("/", B) + str(tmp_path / "Elsewhere" / "app.py")
     assert run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file) is None
+
+
+def test_an_edit_through_an_UNGOVERNED_extended_length_dot_dot_spelling_is_allowed(
+    tmp_path: Path, repos_file: Path
+) -> None:
+    """Control for the ``..`` deny row: the same climb into a tree nobody governs passes."""
+    target = B + B + "?" + B + str(tmp_path / "Elsewhere" / "x" / ".." / "src" / "app.py")
+    assert run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file) is None
+
+
+def test_an_edit_through_an_UNGOVERNED_newline_segment_is_allowed(
+    tmp_path: Path, repos_file: Path
+) -> None:
+    """Control for the newline deny row: a newline segment under an ungoverned path passes."""
+    elsewhere = tmp_path / "Elsewhere" / "src"
+    target = B + B + "?" + B + str(elsewhere) + B + "a" + chr(10) + "b" + B + ".." + B + "app.py"
+    assert run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file) is None
+
+
+# ------------------------------------------- rule 1, the review round 1850f169 DENY-to-ALLOW rows
+#
+# Each row below was DENIED by the pre-#5454 gate and ALLOWED by the fold alone (measured by that review
+# against origin/main). Each is denied now because rule 1 asks the lexical form too.
+
+
+def test_a_dot_dot_that_climbs_OUT_of_the_primary_is_still_denied(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """The pre-#5454 gate denied it, and the gate only tightens."""
+    target = B + B + "?" + B + str(primary / ".." / "Elsewhere" / "app.py")
+    assert_denied(run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file))
+
+
+def test_a_dot_dot_climb_past_the_drive_that_names_the_drive_again_is_denied(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """The fold read ``c:/c:/<primary>/...``; a ``\\\\?\\`` writer lands in the primary's coord state."""
+    # One `..` per segment after the drive, and one more for the drive itself.
+    climb = (B + "..") * len(primary.parts)
+    claim = B.join([str(primary), ".git", "mefor-coord", "claims", "1.json"])
+    target = B + B + "?" + B + str(primary) + climb + B + claim
+    assert_denied(run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file))
+
+
+def test_a_final_nul_segment_in_the_primary_is_denied(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """The fold read ``//./nul``; a ``\\\\?\\`` writer creates a real file named nul in the primary."""
+    target = B + B + "?" + B + str(primary / "src" / "nul")
+    assert_denied(run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file))
+
+
+@pytest.mark.parametrize(
+    "tail", [[".claude", "worktrees.", "x", "a.py"], [".git", "mefor-coord.", "x.md"]]
+)
+def test_a_trailing_dot_beside_an_exemption_is_denied(
+    tmp_path: Path, primary: Path, repos_file: Path, tail: list[str]
+) -> None:
+    """The fold trimmed ``worktrees.`` and ``mefor-coord.`` into the exemptions.
+
+    A ``\\\\?\\`` writer keeps the trailing-dot name as a distinct sibling directory, inside the primary's
+    working tree or its .git, outside any exemption.
+    """
+    target = B + B + "?" + B + str(primary) + B + B.join(tail)
+    assert_denied(run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file))
+
+
+def test_the_trailing_dot_exemption_rows_have_a_real_exemption_beside_them(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """Control: without the dot each spelling IS exempt, so the deny above is the dot's."""
+    nested = B + B + "?" + B + str(primary / ".claude" / "worktrees" / "x" / "a.py")
+    coord = B + B + "?" + B + str(primary / ".git" / "mefor-coord" / "x.md")
+    assert run_gate(edit(nested, cwd=tmp_path / "Elsewhere"), repos_file) is None
+    assert run_gate(edit(coord, cwd=tmp_path / "Elsewhere"), repos_file) is None
 
 
 # --------------------------------------------------------------------------- rule 3c, end to end
@@ -207,6 +311,17 @@ DISARM_SPELLINGS = [
     B + B + "." + B + "Global" + B + "{b}",
     B + B + "." + B + "GLOBALROOT" + B + "Global??" + B + "{b}",
     B + B + "?" + B + "{b}.",
+    # Review round 1850f169: denied by the pre-#5454 gate, whose two replaces reduced it to the drive
+    # path, and allowed by the one-pass fold, which stopped at `//?/c:/...`. git enters it (rc=0).
+    B + B + "?" + B + "UNC" + B + "?" + B + "{b}",
+]
+
+# Spellings NEITHER path form folds onto the drive, which git still enters (review round 1850f169
+# measured rc=0 for each). Rule 3c denies them through git's ABSOLUTE common dir, not through the fold.
+ABSOLUTE_COMMON_DIR_SPELLINGS = [
+    B + B + "?" + B + "X:" + B + ".." + B + "{b}",
+    B + B + "?" + B + "." + B + "{b}",
+    B + B + "." + B + "Global" + B + "Global" + B + "{b}",
 ]
 
 
@@ -221,7 +336,28 @@ def test_an_unquoted_device_spelled_git_C_disarm_is_denied(
     assert "SHARED git configuration" in reason
 
 
-@pytest.mark.parametrize("spelling", DISARM_SPELLINGS[:3])
+@pytest.mark.parametrize("spelling", ABSOLUTE_COMMON_DIR_SPELLINGS)
+def test_a_git_C_disarm_neither_form_folds_is_denied_through_the_absolute_common_dir(
+    repo: SimpleNamespace, spelling: str
+) -> None:
+    """Rule 3c asks git for the absolute common dir, which names the governed repo behind these."""
+    target = spelling.format(b=str(repo.primary))
+    cmd = "git -C " + target + " config core.hooksPath x"
+    reason = assert_denied(run_gate(bash(cmd, repo.elsewhere, tool="PowerShell"), repo.repos))
+    assert "SHARED git configuration" in reason
+
+
+@pytest.mark.parametrize("spelling", ABSOLUTE_COMMON_DIR_SPELLINGS)
+def test_a_git_C_neither_form_folds_into_an_UNGOVERNED_repo_is_allowed(
+    repo: SimpleNamespace, spelling: str
+) -> None:
+    """Control: the absolute common dir of a repository nobody governs does not deny."""
+    target = spelling.format(b=str(repo.elsewhere))
+    cmd = "git -C " + target + " config core.hooksPath x"
+    assert run_gate(bash(cmd, repo.elsewhere, tool="PowerShell"), repo.repos) is None
+
+
+@pytest.mark.parametrize("spelling", DISARM_SPELLINGS[:3] + DISARM_SPELLINGS[-1:])
 def test_a_device_spelled_git_C_into_an_UNGOVERNED_repo_is_allowed(
     repo: SimpleNamespace, spelling: str
 ) -> None:
