@@ -10970,8 +10970,10 @@ class RegistryRunner:
         retried while this worker holds the lane, as the transform worker's voided STOP does. Only
         a landed hand-back goes on; a worker that returns otherwise leaves the rows in flight, and
         a respawn of it, the recovery restart's included, can claim past them, because the
-        restart's in-flight exception is pooled-only (:meth:`_lift_log_halt`). A worker on a node that lost leadership, or under another
-        lease, returns at once, leaving the rows to the successor's recovery.
+        restart's in-flight exception is pooled-only (:meth:`_lift_log_halt`). A worker on a node that does not
+        report ``is_leader`` returns at once, leaving the rows to the successor's recovery. The
+        first write checks only ``is_leader``, not the claim's lease, so a node leading again under
+        another lease still sends the release; only the fallback re-pend is fenced.
 
         A batch that passes this check runs whole, so a halt that latches while it runs meets the
         gate at the next claim, where the pooled adapters re-read it per row

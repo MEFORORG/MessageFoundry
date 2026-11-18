@@ -1072,7 +1072,8 @@ Recover by fixing the disk or permissions and then **restarting the affected con
 *and* outbounds — from the web console, or by restarting the service. Restarting an inbound the halt
 stopped also re-arms a router, transform or response lane of it that is STOPPED, for example one the
 infra-fault bound stopped while the log was down. Under the pooled claim mode only, a connection
-restart leaves STOPPED a lane that still holds claimed rows whose return to the queue never landed.
+restart leaves STOPPED a lane that still holds claimed rows whose return to the queue never landed;
+under per_lane the restart respawns such a worker, and it can claim past rows left in flight.
 A reload re-arms such a lane, and it would then claim past those rows; at least a service restart
 returns them to the queue first, because the engine does that as it starts, so restart the service
 to recover it.

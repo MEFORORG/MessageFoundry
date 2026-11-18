@@ -282,7 +282,8 @@ class _LaneState:
     # ADR 0070 fix B: consecutive zero-progress (i==0) T17 infra faults for this lane. Incremented on
     # each such fault, reset to 0 on clean drain / forward-progress-or-non-infra RETRY / the STOPPED→
     # READY notify_work or resume_lane resume (NEVER on a PARKED park-timer/sweep unpark — the sharp
-    # edge, §3). Reaches
+    # edge, §3). A zero-progress hand-back RETRY (LaneItemResult.hand_back, BACKLOG #5704) leaves it
+    # unchanged. Reaches
     # infra_fault_stop_after → STOP (stop policy). In-memory only; intentionally lost on restart.
     infra_error_streak: int = 0
     # ADR 0070 retry_forever: True once the throttled lane_stuck alert has fired for the current stuck
