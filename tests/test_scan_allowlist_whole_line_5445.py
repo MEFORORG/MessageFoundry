@@ -105,6 +105,13 @@ def test_every_allowlist_entry_excuses_only_a_whole_line(mod) -> None:
         r"^dungklose_\d{6}$": f"dungklose_{six}",
     }
     assert mod.ALLOWLIST, "the committed allowlist must load"
+    # Every committed entry, not just some: the loader's refusals must pass each one.
+    committed = [
+        ln.strip()
+        for ln in _ALLOWLIST_PATH.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    assert [p.pattern for p in mod.ALLOWLIST] == committed
     for pat in mod.ALLOWLIST:
         if pat.pattern.startswith("^openssl "):
             probe = re.sub(r"\[0\]\{3\}", "000", pat.pattern[1:-1])
@@ -135,7 +142,26 @@ def test_every_allowlist_entry_excuses_only_a_whole_line(mod) -> None:
         pytest.param(r"^# keep \\.* here$", False, id="a-literal-backslash-then-a-wildcard"),
         pytest.param(r"(?x)^\#\ keep\ . *\ here$", False, id="verbose-spaced-wildcard"),
         pytest.param(r"^# keep (?x:. *) here$", False, id="scoped-verbose-spaced-wildcard"),
+        # A comment group is no text: the source-text reader took ``.(?#c)*`` for ``.`` then a
+        # comment, but it compiles as ``.*``; the parse-tree walk sees what compiles.
+        pytest.param("^# keep .(?#c)* here$", False, id="comment-between-wildcard-and-quantifier"),
+        pytest.param("^# keep (?#[).* here$", False, id="comment-opening-a-class"),
+        pytest.param("^# keep (?:x.)+ here$", False, id="wildcard-inside-a-quantified-group"),
+        pytest.param("^# keep (?:.{0,4})+ here$", False, id="bounded-wildcard-in-unbounded-group"),
+        pytest.param("^# keep [^a]+ here$", False, id="one-member-negated-class"),
+        pytest.param("^# keep [ -~]+ here$", False, id="printable-ascii-range"),
+        pytest.param(r"^# keep [\x00-\uffff]+ here$", False, id="whole-plane-range"),
+        pytest.param("^# keep [ A-Za-z]+ here$", False, id="space-and-every-letter"),
+        pytest.param("^# keep [A-Za-z0-9]+ here$", False, id="every-letter-and-digit"),
+        pytest.param(r"^# keep [a-z\d]+ here$", False, id="every-letter-and-digit-category"),
+        pytest.param(r"^# keep [A-Mn-z\s]+ here$", False, id="every-letter-either-case-and-space"),
+        pytest.param(r"^# keep [\d\D]+ here$", False, id="digit-and-non-digit-class"),
         pytest.param(r"^# keep (?i:[a-z]+) here$", True, id="control-a-scoped-non-verbose-flag"),
+        pytest.param("^# keep [A-Z_]+ here$", True, id="control-every-letter-alone"),
+        pytest.param("^# keep [ a-m]+ here$", True, id="control-space-and-some-letters"),
+        pytest.param(r"^# keep [\s\d.]+ here$", True, id="control-space-digit-dot"),
+        pytest.param("^# keep .{1,40} here$", True, id="control-a-bounded-wildcard"),
+        pytest.param("^# keep (?#.*)x here$", True, id="control-a-wildcard-only-in-a-comment"),
         pytest.param("^# keep [a-z]+ here$", True, id="control-a-bounded-class"),
         pytest.param("^# keep [.*] here$", True, id="control-a-literal-class"),
         pytest.param(r"^# keep \.* here$", True, id="control-an-escaped-dot"),

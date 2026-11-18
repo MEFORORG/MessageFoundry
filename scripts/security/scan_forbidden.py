@@ -87,13 +87,15 @@ import errno
 import json
 import os
 import re
+import re._constants as _sre_constants
+import re._parser as _sre_parser
 import stat
 import subprocess
 import sys
 import unicodedata
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 # --------------------------------------------------------------------------------------------------
 # Structural detectors (NO customer data -- safe to commit). These run regardless of the token source.
@@ -2089,15 +2091,15 @@ def _load_allowlist() -> list[re.Pattern[str]]:
         # A whole-line match (``_allowlisted``) holds an entry to the line it was written for only
         # if no part of it can absorb arbitrary text: ``.*OIDC.*``, or ``^# keep .* here$``, excuses
         # a leak written inside the padding exactly as an unanchored entry did (BACKLOG #5445).
-        # This refuses the common spellings only; a quantified group, a positive class such as
-        # ``[0-9.]+`` or a bounded ``.{1,500}`` still passes it, and review is what stops those.
-        # A verbose entry, ``(?x)`` or a scoped ``(?x:...)``, may part a wildcard from its
-        # quantifier with whitespace (``. *``), which the piece-by-piece read below takes for a
-        # literal; refused outright.
+        # The parse-tree walk (``_absorbs_any_text``) refuses a wildcard, a negated class, an
+        # absorbing category or a wide class anywhere under an unbounded repeat; a narrow positive
+        # class such as ``[0-9.]+`` or a bounded ``.{1,500}`` still passes it, and review is what
+        # stops those. A verbose entry, ``(?x)`` or a scoped ``(?x:...)``, is refused outright.
         if _absorbs_any_text(line) or pat.flags & re.VERBOSE or _VERBOSE_FLAG.search(line):
             print(
                 f"scan_forbidden: scan-allowlist.txt line {lineno}: pattern has an unbounded wildcard "
-                "(at least ., \\S, \\W, \\D, \\w or a class holding one or negated, repeated without "
+                "(at least ., \\S, \\W, \\D, \\w, a negated class, a class holding one of those, or "
+                "a class covering every letter and a space or every digit, inside a repeat without "
                 "limit), or is verbose ((?x)), so a leak written inside the line it excuses would pass "
                 "every detector. IGNORED. Spell that part out.",
                 file=sys.stderr,
@@ -2107,48 +2109,125 @@ def _load_allowlist() -> list[re.Pattern[str]]:
     return out
 
 
-#: The escapes refused under an unbounded quantifier. ``\S`` absorbs any run without a space (a
-#: name, an IP, a site code), ``\D`` any run without a digit (a name), ``\w`` any word token.
-#: ``\W`` absorbs only spaces and punctuation, not a name; it is here so that ``[\w\W]``, which with
-#: ``\w`` matches anything, is caught, and as the conservative choice for a bare ``\W+``.
-_ABSORBING_ESCAPES = frozenset("SWDw")
+#: The class categories refused under an unbounded repeat. ``\S`` absorbs any run without a space (a
+#: name, an IP, a site code), ``\D`` any run without a digit (a name), ``\w`` any word token. ``\W``
+#: absorbs only spaces and punctuation, not a name; it is here so that ``[\w\W]``, which with ``\w``
+#: matches anything, is caught, and as the conservative choice for a bare ``\W+``. ``\s`` and ``\d``
+#: are not refused alone; a class holding them can still be wide (``_class_absorbs``).
+_ABSORBING_CATEGORIES = frozenset(
+    {
+        _sre_constants.CATEGORY_NOT_SPACE,
+        _sre_constants.CATEGORY_NOT_DIGIT,
+        _sre_constants.CATEGORY_WORD,
+        _sre_constants.CATEGORY_NOT_WORD,
+    }
+)
 #: An inline verbose flag, global (``(?x)``) or scoped (``(?ix:...)``); ``(?-x:...)`` turns it off.
 _VERBOSE_FLAG = re.compile(r"\(\?[aiLmsux]*x")
-#: A quantifier with no upper bound.
-_UNBOUNDED = re.compile(r"[*+]|\{\d*,\}")
+_REPEATS = frozenset(
+    {_sre_constants.MAX_REPEAT, _sre_constants.MIN_REPEAT, _sre_constants.POSSESSIVE_REPEAT}
+)
+#: Atoms the walk knows hold no sub-pattern. Any other opcode it does not open is refused, so a
+#: construct this walk was not written for cannot hide a wildcard inside it.
+_LEAVES = frozenset(
+    {
+        _sre_constants.LITERAL,
+        _sre_constants.NOT_LITERAL,
+        _sre_constants.ANY,
+        _sre_constants.IN,
+        _sre_constants.AT,
+        _sre_constants.GROUPREF,
+    }
+)
+_ASCII_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
-def _absorbs_any_text(pattern: str) -> bool:
-    r"""Whether ``pattern`` holds a piece that matches any text, repeated without limit: an unescaped
-    ``.``, an absorbing escape (``_ABSORBING_ESCAPES``), or a character class that is negated or
-    holds one of those escapes (``[\s\S]``, ``[\w\W]``), under ``*``, ``+`` or ``{n,}``. An allowlist
-    entry holding one is not tied to the one line it was written for. Read piece by piece, so a
-    literal class such as ``[.*]`` and an escaped ``\.`` are not wildcards, and a doubled backslash
-    is a literal backslash that escapes nothing after it. A quantified group is not looked into."""
-    i = 0
-    while i < len(pattern):
-        ch = pattern[i]
-        if ch == "\\":
-            absorbs = pattern[i + 1 : i + 2] in _ABSORBING_ESCAPES
-            i += 2
-        elif ch == "[":
-            j = i + 1
-            absorbs = pattern[j : j + 1] == "^"
-            j += absorbs
-            if pattern[j : j + 1] == "]":
-                j += 1  # A leading ``]`` is a literal member of the class.
-            while j < len(pattern) and pattern[j] != "]":
-                if pattern[j] == "\\":
-                    absorbs = absorbs or pattern[j + 1 : j + 2] in _ABSORBING_ESCAPES
-                    j += 1
-                j += 1
-            i = j + 1
+def _absorbs_any_text(pattern: str, flags: int = 0) -> bool:
+    r"""Whether ``pattern`` holds, anywhere inside a repeat with no upper bound (``*``, ``+``,
+    ``{n,}``, lazy or possessive, at any depth of groups, branches and bounded repeats within it),
+    an atom that absorbs a leak: ``.``, a negated class (``[^!]``, ``[^a]``), a class holding an
+    absorbing category (``_ABSORBING_CATEGORIES``), a positive class that is wide
+    (``_class_absorbs``), or a back reference. An allowlist entry holding one is not tied to the one
+    line it was written for.
+
+    Read from the PARSED pattern, ``re._parser.parse``, as ``re`` compiles it, never from its
+    source text: a comment group parts nothing (``.(?#c)*`` compiles as ``.*``, and ``(?#[).*``
+    opens no class), while a literal class such as ``[.*]`` and an escaped ``\.`` are still no
+    wildcard. An opcode the walk does not know is refused. A bounded ``.{1,500}`` outside every
+    unbounded repeat still passes, as does a narrow positive class such as ``[0-9.]+``; review is
+    what stops those."""
+    try:
+        parsed = _sre_parser.parse(pattern, flags)
+    except re.error:
+        return True  # The loader compiled it already; a parse that disagrees is refused.
+    return _seq_absorbs(parsed, unbounded=False)
+
+
+def _seq_absorbs(seq: Any, *, unbounded: bool) -> bool:
+    """``_absorbs_any_text`` over one parsed sequence; ``unbounded`` once inside an unbounded repeat."""
+    for op, arg in seq:
+        inner = unbounded
+        if op in _REPEATS:
+            children = [arg[2]]
+            inner = unbounded or arg[1] == _sre_constants.MAXREPEAT
+        elif op == _sre_constants.SUBPATTERN:
+            children = [arg[3]]
+        elif op == _sre_constants.ATOMIC_GROUP:
+            children = [arg]
+        elif op == _sre_constants.BRANCH:
+            children = list(arg[1])
+        elif op in (_sre_constants.ASSERT, _sre_constants.ASSERT_NOT):
+            children = [arg[1]]
+        elif op == _sre_constants.GROUPREF_EXISTS:
+            children = [option for option in arg[1:] if option is not None]
+        elif op in _LEAVES:
+            if unbounded and (
+                op in (_sre_constants.ANY, _sre_constants.NOT_LITERAL, _sre_constants.GROUPREF)
+                or (op == _sre_constants.IN and _class_absorbs(arg))
+            ):
+                return True
+            continue
         else:
-            absorbs = ch == "."
-            i += 1
-        if absorbs and _UNBOUNDED.match(pattern, i):
+            return True
+        if any(_seq_absorbs(child, unbounded=inner) for child in children):
             return True
     return False
+
+
+def _class_absorbs(items: Any) -> bool:
+    r"""Whether a parsed character class absorbs a leak: it is negated, holds an absorbing category
+    (``_ABSORBING_CATEGORIES``), or is WIDE. The rule for wide: the class covers every ASCII letter,
+    each in either case, AND covers a space or every ASCII digit. So ``[ -~]``, ``[\x00-\uffff]``,
+    ``[ A-Za-z]``, ``[A-Za-z0-9]`` and ``[a-z\d]`` are wide, while ``[A-Z_]`` (a letter run, the
+    DMV wait-type column), ``[ a-m]`` and ``[\s\d.]`` are not."""
+    literals: set[int] = set()
+    ranges: list[tuple[int, int]] = []
+    categories: set[Any] = set()
+    for op, arg in items:
+        if op == _sre_constants.NEGATE:
+            return True
+        if op == _sre_constants.LITERAL:
+            literals.add(arg)
+        elif op == _sre_constants.RANGE:
+            ranges.append(arg)
+        elif op == _sre_constants.CATEGORY:
+            if arg in _ABSORBING_CATEGORIES:
+                return True
+            categories.add(arg)
+        else:
+            return True  # A class member this does not know is refused, as the walk refuses one.
+
+    def covers(ch: str) -> bool:
+        code = ord(ch)
+        return (
+            code in literals
+            or any(low <= code <= high for low, high in ranges)
+            or (ch == " " and _sre_constants.CATEGORY_SPACE in categories)
+            or (ch.isdigit() and _sre_constants.CATEGORY_DIGIT in categories)
+        )
+
+    letters = all(covers(ch) or covers(ch.lower()) for ch in _ASCII_LETTERS)
+    return letters and (covers(" ") or all(covers(d) for d in "0123456789"))
 
 
 ALLOWLIST = _load_allowlist()
