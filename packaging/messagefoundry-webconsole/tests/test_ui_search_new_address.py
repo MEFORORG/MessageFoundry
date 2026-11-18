@@ -48,7 +48,7 @@ PRESETS = SEARCH + "/presets"
 DELETE = PRESETS + "/{preset_id}/delete"
 
 #: What one arm sends: the client and the id of a preset the session owns.
-Send = Callable[[httpx.AsyncClient, str], Awaitable[httpx.Response]]
+Sender = Callable[[httpx.AsyncClient, str], Awaitable[httpx.Response]]
 
 
 async def _search_form(c: httpx.AsyncClient, _pid: str) -> httpx.Response:
@@ -56,7 +56,8 @@ async def _search_form(c: httpx.AsyncClient, _pid: str) -> httpx.Response:
 
 
 async def _search_run(c: httpx.AsyncClient, _pid: str) -> httpx.Response:
-    return await c.post(SEARCH + "/run", data={"message_type": "ADT^A01"}, headers=SAME_ORIGIN)
+    # A content criterion, so the handler reaches the search itself rather than the bare form.
+    return await c.post(SEARCH + "/run", data={"content": "DOE"}, headers=SAME_ORIGIN)
 
 
 async def _save(c: httpx.AsyncClient, pid: str) -> httpx.Response:
@@ -74,23 +75,26 @@ async def _layered(c: httpx.AsyncClient, pid: str) -> httpx.Response:
 
 
 class Case(NamedTuple):
+    id: str
     path: str  # as mounted
     method: str
-    send: Send
+    send: Sender
     allowed: int  # the ALLOW arm's status
-    #: The REFUSE arm's ``next``, pinned exactly. None for the preset save: its refusal continues to
-    #: its own POST path, which /ui/reauth does not accept, an open finding this test does not pin.
-    next_path: str | None
+    #: The REFUSE arm's ``next``, pinned exactly so a refusal from some other gate does not pass.
+    next_path: str
 
 
 #: Every mounted /ui/messages/search* route: test_every_search_route_is_covered reads the live table.
 CASES = (
-    Case(SEARCH, "GET", _search_form, 200, SEARCH),
-    Case(SEARCH + "/run", "POST", _search_run, 200, SEARCH),
-    Case(PRESETS, "POST", _save, 303, None),
+    Case("form", SEARCH, "GET", _search_form, 200, SEARCH),
+    Case("run", SEARCH + "/run", "POST", _search_run, 200, SEARCH),
+    # The save passes no reauth_next, so its refusal continues to its own POST path, which
+    # /ui/reauth does not accept. That is an open finding, pinned as it stands: a fix changes this
+    # value, and should.
+    Case("save_preset", PRESETS, "POST", _save, 303, PRESETS),
     # A plain require_ui write lands on /ui after the re-auth: its body cannot be carried through.
-    Case(DELETE, "POST", _delete, 303, "/ui"),
-    Case(SEARCH + "/layered", "GET", _layered, 200, SEARCH + "/layered"),
+    Case("delete_preset", DELETE, "POST", _delete, 303, "/ui"),
+    Case("layered", SEARCH + "/layered", "GET", _layered, 200, SEARCH + "/layered"),
 )
 
 
@@ -103,9 +107,7 @@ async def _new_address_paths(engine: Engine) -> list[str]:
     ]
 
 
-@pytest.mark.parametrize(
-    "case", CASES, ids=["form", "run", "save_preset", "delete_preset", "layered"]
-)
+@pytest.mark.parametrize("case", CASES, ids=[case.id for case in CASES])
 async def test_a_search_route_refuses_a_session_from_a_new_address(
     engine: Engine, case: Case
 ) -> None:
@@ -140,12 +142,14 @@ async def test_a_search_route_refuses_a_session_from_a_new_address(
                 headers=SAME_ORIGIN,
             )
             assert (r.status_code, r.headers.get("location")) == (303, SEARCH), r.text
-        by_name = {p["name"]: p["id"] for p in await engine.store.list_search_presets(user.id)}
+        listed = await engine.store.list_search_presets(user.id)
+        by_name = {p["name"]: p["id"] for p in listed}
         allow_pid, refuse_pid = by_name["allow"], by_name["refuse"]
-        before = await preset_ids()
+        before = set(by_name.values())
 
         # ALLOW: the handler ran. The search pages render the form; the writes land back on it.
         ok = await case.send(home, allow_pid)
+        assert ok.request.method == case.method
         assert ok.status_code == case.allowed, (ok.status_code, ok.headers.get("location"))
         if case.allowed == 303:
             assert ok.headers["location"] == SEARCH
@@ -157,12 +161,10 @@ async def test_a_search_route_refuses_a_session_from_a_new_address(
     async with browser(ELSEWHERE) as away:
         away.cookies.set("mf_session", token)
         refused = await case.send(away, refuse_pid)
+    assert refused.request.method == case.method
     location = refused.headers.get("location", "")
     assert refused.status_code == 303, (refused.status_code, location)
-    if case.next_path is None:
-        assert location.startswith("/ui/reauth?next="), location
-    else:
-        assert location == f"/ui/reauth?next={case.next_path}", location
+    assert location == f"/ui/reauth?next={case.next_path}", location
     # The refusal was the address check, recorded for this route's request path.
     assert await _new_address_paths(engine) == [case.path.replace("{preset_id}", refuse_pid)]
     # The refused request changed nothing: no preset saved, none deleted.
