@@ -73,17 +73,35 @@ def test_the_well_formed_fixtures_load(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "control",
-    ["", "   ", "x*", "(?:)", "^", "a|"],
-    ids=["empty", "blank", "star", "empty-group", "caret", "empty-branch"],
+    ["", "   ", "x*", "(?:)", "^", "a|", ".", "\\w", "\\b", "(?=.)", "[\\s\\S]"],
+    ids=[
+        "empty",
+        "blank",
+        "star",
+        "empty-group",
+        "caret",
+        "empty-branch",
+        "dot",
+        "word-class",
+        "word-boundary",
+        "lookahead",
+        "any-class",
+    ],
 )
 def test_a_positive_control_that_matches_everything_is_refused(
     tmp_path: Path, control: str
 ) -> None:
-    """A control that matches the empty string matches every text, so it can never go quiet and the
-    BLIND check it exists for can never fire."""
+    """A control that matches the empty string, or any lone character of a class, is sighted in
+    almost every text, so it can never go quiet and the BLIND check can never fire."""
     body = _CELL + _ABSENCE.replace("positive_control = 'def '", f"positive_control = '{control}'")
     with pytest.raises(ScorecardError, match="positive_control"):
         _load(tmp_path, body)
+
+
+def test_a_one_character_literal_control_still_loads(tmp_path: Path) -> None:
+    """Control for the single-character probe: a literal is a token, however short."""
+    body = _CELL + _ABSENCE.replace("positive_control = 'def '", "positive_control = 'y'")
+    assert load_scorecard(_write(tmp_path, body))[0].absence[0].positive_control == "y"
 
 
 @pytest.mark.parametrize("pattern", ["", "x?", "|"], ids=["empty", "optional", "empty-branch"])
@@ -302,6 +320,11 @@ def test_the_well_formed_anchor_loads(tmp_path: Path) -> None:
 def test_an_empty_token_never_locates(text: str) -> None:
     """Before: the empty string occurs exactly once in an empty file, so it LOCATED there."""
     assert locate_anchor(text, "").status == ANCHOR_GONE
+
+
+def test_a_whitespace_token_never_locates() -> None:
+    """A run of spaces that occurs once is still not a token."""
+    assert locate_anchor("a   b", "   ").status == ANCHOR_GONE
 
 
 @pytest.mark.parametrize("expect", ["", "   ", "\n"], ids=["empty", "spaces", "newline"])
@@ -536,8 +559,8 @@ def test_a_repo_under_a_non_ascii_path_still_finds_its_fetch_head(tmp_path: Path
 def test_a_relative_path_is_stamped_against_the_tree_it_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A relative scorecard path must stamp the repository it names, not wherever git resolves a
-    relative `-C`."""
+    """Control, not a regression test: a relative path stamped the right tree before the path was
+    resolved too. It pins that resolving it changed nothing for a relative caller."""
     repo = _git_repo(tmp_path / "repo")
     (repo / "sc.toml").write_text("", encoding="utf-8")
     monkeypatch.chdir(tmp_path)

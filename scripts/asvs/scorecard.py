@@ -24,6 +24,7 @@ import datetime
 import io
 import re
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -192,11 +193,12 @@ def locate_anchor(text: str, expect: str) -> AnchorLocation:
     than by scanning lines: 42 of the roughly 1,980 recorded tokens span a newline, and a per-line
     scan finds none of them.
 
-    **An empty token locates nothing.** ``"".count("")`` is 1, so before BACKLOG #5459 an empty
-    ``expect`` LOCATED, uniquely, in any empty file, and certified nothing. It is GONE here for every
-    caller, and :func:`load_scorecard` refuses a blank one before it gets this far.
+    **A blank token locates nothing.** ``"".count("")`` is 1, so before BACKLOG #5459 an empty
+    ``expect`` LOCATED, uniquely, in any empty file, and a whitespace run located wherever it
+    happened to occur once; neither certified anything. Both are GONE here for every caller, and
+    :func:`load_scorecard` refuses a blank one before it gets this far.
     """
-    if not expect:
+    if not expect.strip():
         return AnchorLocation(ANCHOR_GONE, 0)
     occurrences = text.count(expect)
     if occurrences == 0:
@@ -740,7 +742,8 @@ def _tables(raw: Mapping[str, Any], key: str, where: str) -> list[dict[str, Any]
 
 
 def _regex(raw: Mapping[str, Any], key: str, where: str) -> str:
-    """A required regular expression that compiles and cannot match the empty string.
+    """A required regular expression that compiles and cannot match the empty string or a run of
+    lone characters.
 
     A pattern that matches the empty string matches EVERY text. As a ``positive_control`` that makes
     the BLIND check unable to fire, because the control is sighted in any corpus at all; as a
@@ -756,10 +759,15 @@ def _regex(raw: Mapping[str, Any], key: str, where: str) -> str:
         raise ScorecardError(
             f"{where}: `{key}` is not a valid regular expression ({exc.msg})"
         ) from None
-    if compiled.search("") is not None:
+    # The empty string, then single characters. A pattern that matches more than one LONE character
+    # -- `.`, `\w`, `\b`, a lookahead, a character class -- is sighted in almost any file, which is
+    # the same blindness by another route. A one-character literal still loads: it is a token,
+    # however short, and the test fixtures use them.
+    singles = sum(compiled.search(c) is not None for c in ("\n", *string.printable))
+    if compiled.search("") is not None or singles > 1:
         raise ScorecardError(
-            f"{where}: `{key}` matches the empty string, so it matches every text and can never go "
-            "quiet. Name a token that must actually be present"
+            f"{where}: `{key}` matches the empty string or many single characters, so it matches "
+            "almost every text and can never go quiet. Name a token that must actually be present"
         )
     return value
 
@@ -783,7 +791,9 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     cells: list[Cell] = []
     for raw in _tables(data, "cell", "the scorecard"):
-        where = f"cell {raw.get('id')!r}"
+        # A non-string id is named by its type, so the refusal that follows does not echo it.
+        rid = raw.get("id")
+        where = f"cell {rid!r}" if isinstance(rid, str) else "a cell with no string `id`"
         legacy = raw.get("reviewed_by")
         if historical and isinstance(legacy, str) and legacy.strip():
             raw = {k: v for k, v in raw.items() if k != "reviewed_by"}
@@ -921,9 +931,10 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
                     raise ValueError(checked_on)
                 datetime.date.fromisoformat(checked_on)
             except ValueError as exc:
+                # The value is not echoed: a refusal names the field, never the record's text.
                 raise ScorecardError(
-                    f"cell {raw.get('id')!r}: `blocker.checked_on` must be an ISO date "
-                    f"(YYYY-MM-DD), got {checked_on!r}"
+                    f"{where}: `blocker.checked_on` must be an ISO date, a real one written "
+                    "YYYY-MM-DD"
                 ) from exc
             recheck_days = rb["recheck_days"]
             if not isinstance(recheck_days, int) or isinstance(recheck_days, bool):
@@ -1127,10 +1138,14 @@ def load_reviewer_exceptions(path: Path) -> dict[str, str]:
         except tomllib.TOMLDecodeError:
             before = None
         if before is None or "cell" in before or before.get("reviewer_exception") != entries:
+            # Fails closed on a layout it cannot confirm, too: a first cell header in a quoted
+            # spelling, or a `[[cell]]` line inside a string above the exceptions. Both are valid
+            # TOML and both are refused, so the message says how to write a record that loads.
             raise ScorecardError(
                 "every [[reviewer_exception]] must come before the first [[cell]]: after it, "
                 "apply.py reads the table as part of the cell above and a rewrite of that cell "
-                "deletes it"
+                "deletes it. If they already do, write each cell header as a plain [[cell]] line "
+                "and keep any [[cell]] text out of strings above them, so the order can be read"
             )
     out: dict[str, str] = {}
     for e in entries:
@@ -1561,13 +1576,19 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     spans_cache: dict[Path, list[tuple[int, int]] | None] = {}
     ast_cache: dict[Path, ast.Module | None] = {}
     resolved_root = root.resolve()
+    inside_cache: dict[Path, bool] = {}
     for c in cells:
         for a in c.evidence:
             target = root / a.path
             # Resolved, so a symlink out of the tree is caught as well as a `..` or absolute path.
             # The loader refuses the last two; a Cell built in code does not pass through it, and
             # an anchor read outside the root certifies a tree nobody asked about (BACKLOG #5459).
-            if not _is_within_tree(a.path) or not target.resolve().is_relative_to(resolved_root):
+            # Cached per target like the text: the anchors concentrate onto few files.
+            if target not in inside_cache:
+                inside_cache[target] = _is_within_tree(a.path) and target.resolve().is_relative_to(
+                    resolved_root
+                )
+            if not inside_cache[target]:
                 findings.problems.append(
                     f"{c.id}: evidence path {a.path} resolves outside the root {root}, so it is "
                     "not evidence about the engine tree being checked"
@@ -2367,8 +2388,10 @@ def _run_node(scratch: Path, node_id: str, python: str, timeout: float) -> int:
                 node_id,
             ],
             cwd=scratch,
-            capture_output=True,
-            text=True,
+            # Only the exit code is read, so the output is discarded rather than decoded: decoding
+            # it in the locale code page could raise on a byte pytest printed (BACKLOG #5458).
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             check=False,
             timeout=timeout,
         )
@@ -3350,8 +3373,9 @@ def _freshness(repo: Path) -> tuple[str, str]:
 
 def repo_stamp(path: Path, *, now: float | None = None) -> RepoStamp:
     """Stamp the work tree containing `path`. Pure read: no fetch, no write, no network."""
-    # Absolute, so `git -C` and the FETCH_HEAD join below both name the tree `path` named, whatever
-    # the process's working directory is when they run (BACKLOG #5458).
+    # Resolved once, so every probe and the FETCH_HEAD join carry the same absolute path. A relative
+    # path already resolved against the same working directory in both git and Python, so this is
+    # hygiene against a later change of directory, not a fix of a measured fault.
     resolved = path.resolve()
     repo = resolved if resolved.is_dir() else resolved.parent
     sha = _git(repo, "rev-parse", "--short", "HEAD")
@@ -3710,9 +3734,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except Exception as exc:  # noqa: BLE001 - CLI boundary; reported by class, exit 2, see above
         print(
-            f"error: the scorecard run stopped on {type(exc).__name__}. Its message is withheld "
-            "because it can quote the record; rerun where the record lives to read it. Nothing was "
-            "measured, so this is exit 2, never a pass and never a finding",
+            f"error: the scorecard run stopped on {type(exc).__name__} before it completed. Its "
+            "message is withheld because it can quote the record. A run that did not complete is "
+            "exit 2: neither a pass nor a finding, whatever it printed before it stopped",
             file=sys.stderr,
         )
         return 2
