@@ -504,12 +504,12 @@ class _RaisingFilter(logging.Filter):
         raise ValueError("filter fault")
 
 
-def test_a_raising_log_filter_never_fails_the_switch_to_sending_alone(
+def test_a_raising_log_filter_does_not_stop_the_switch_to_sending_alone_except_out_of_memory(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """BACKLOG #6707: the warning that batching is off goes through :func:`_warn_quietly`, so a
     log filter that raises leaves every value opened and batching off, and is reported on
-    stderr."""
+    stderr, except out of memory or stack."""
     monkeypatch.setattr(crypto_transit, "_logged_at", {})
     transit = _BatchTransit()
     cipher = _cipher(transit)
