@@ -158,21 +158,17 @@ function Resolve-GitSubcommand([string[]]$Tokens) {
         # -A', with a ref named status) is suppressed, and any other value sends the arguments to the
         # blanked view, where a quoted '"-A"' is not seen. git 2.55.0 takes the value of
         # --config-env, --attr-source and --shallow-file as the next argument (measured), so they are
-        # listed. Keep this list equal to the one in afk-tripwire.ps1's Find-GitTripwires, which gains
-        # the same options under BACKLOG #5448.
-        if ($t -cmatch '^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix|--config-env|--attr-source|--shallow-file)$') {
-            $i++
-            # A QUOTED value is blanked to its quotes and spaces, so the split hands it over as two
-            # tokens ('"' and '"'). Skip to the token that closes the quote, or the closing half is
-            # read as the subcommand and the arguments go to the blanked view.
-            if ($i -lt $Tokens.Count) {
-                $quotes = [regex]::Matches($Tokens[$i], '["'']').Count
-                while ($quotes % 2 -eq 1 -and $i + 1 -lt $Tokens.Count) {
-                    $i++
-                    $quotes += [regex]::Matches($Tokens[$i], '["'']').Count
-                }
-            }
-        }
+        # listed. Keep this list equal to the one in afk-tripwire.ps1's Find-GitTripwires; BACKLOG
+        # #5448 brings that file's list to --config-env and --attr-source, and --shallow-file is not
+        # yet on it.
+        #
+        # STILL OPEN, at least: a QUOTED value ('git -C "x" add "-A"', '--config-env="a=B"') is
+        # blanked to its quotes and spaces, so the whitespace split hands over its closing quote as
+        # the subcommand and the arguments go to the blanked view. A skip-to-the-closing-quote loop
+        # was tried and reverted: the blanker ignores escapes, so the loop could skip past the real
+        # subcommand onto a read-only word, turning a deny into an allow. Closing this needs a
+        # quote-aware tokenizer.
+        if ($t -cmatch '^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix|--config-env|--attr-source|--shallow-file)$') { $i++ }
     }
     return $null
 }
