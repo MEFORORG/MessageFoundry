@@ -8,8 +8,8 @@ checks, and it consults a CRL.
 At least ``RevocationHopGuard.capture`` and the Vault and proxy legs in
 ``transports/strict_requests.py`` read it; until this change those two legs read
 ``context_checks_revocation`` alone. The leg tests below hand each leg a relaxed context. The guard
-words its record from the same reason. On a hop whose context does not verify the peer, the
-records the guard writes do not call the hop verified where the caller's words say "verified"
+words its record from the same reason. On a hop whose context's ``verify_mode`` is ``CERT_NONE``,
+the records the guard writes do not call the hop verified where the caller's words say "verified"
 (the tests below pin the shipped words and the punctuated shapes), and its default remedy offers
 no CRL. The AI broker words its own record from the guard's reason; its own test pins that. A remedy the
 caller passes is used as given, and can still offer one.
@@ -391,7 +391,7 @@ def test_a_guard_not_verifying_the_peer_cannot_be_built_crediting_a_crl() -> Non
     import dataclasses
 
     guard = _peer_not_verified_guard(False, ssl.CERT_NONE)
-    with pytest.raises(ValueError, match="does not verify the peer"):
+    with pytest.raises(ValueError, match="verify_mode is CERT_NONE"):
         dataclasses.replace(guard, crl_checked=True)
 
 

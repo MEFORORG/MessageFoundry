@@ -345,7 +345,8 @@ def _refuse_an_unrevoked_ai_hop(
     disposition = guard.disposition()
     enforcing = held.enforcing
     no_credit = guard.no_credit
-    # On NO_CRL the context verifies the peer, so stated_cell would keep "verified" as well.
+    # On NO_CRL the verify_mode is not CERT_NONE, or there is no context, so stated_cell would keep
+    # "verified" as well.
     cell = _AI_HOP_CELL if no_credit is CrlNoCredit.NO_CRL else guard.stated_cell
     sent = f"the AI endpoint {host!r} is sent [ai].api_key over https"
     if no_credit is CrlNoCredit.PEER_NOT_VERIFIED:

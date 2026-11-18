@@ -791,19 +791,18 @@ gone, and the guard decides on one field, `crl_checked`, which the disposition, 
 AI broker all read (vault BACKLOG #5086, owner ruling 2026-11-03). `capture()` sets it True only
 when the context checks a CRL, the context does not skip time validity, and the caller did not pass
 `expiry_relaxed=True`, so the flag can only take the credit away. [Note 2026-11-17, vault BACKLOG
-#4912: `capture()` also gives no credit to a context that does not verify the peer (`verify_mode`
-is `CERT_NONE`). It reads `crl_no_credit` in `config/tls_policy.py`, whose docstring states the
-conditions. On such a context an omitted `ways_across` becomes `PEER_NOT_VERIFIED_WAYS_ACROSS`, not
-the `EXPIRY_RELAXED_WAYS_ACROSS` this paragraph names below.] A CRL on a context that skips time
+#4912: `capture()` also gives no credit to a context whose `verify_mode` is `CERT_NONE`. It reads
+`crl_no_credit` in `config/tls_policy.py`, whose docstring states the conditions. On such a
+context, relaxed or not, the record is worded from `CrlNoCredit.PEER_NOT_VERIFIED` and an omitted
+`ways_across` becomes `PEER_NOT_VERIFIED_WAYS_ACROSS`. The relaxed words this paragraph names below,
+from `CrlNoCredit.EXPIRY_RELAXED` with `EXPIRY_RELAXED_WAYS_ACROSS`, apply to a relaxed hop with
+any other context or none.] A CRL on a context that skips time
 validity earns no credit with or without the flag, so such a hop is decided as one with no CRL:
 at least, off-box and unattested, it is refused under an enforcing posture, and warned on an
 instance that does not enforce unless `MEFOR_TLS_REVOCATION_ATTESTED` is set. Before it, a guard handed such a context without the flag
-admitted the hop on that CRL, the case §4.3's note of 2026-11-03 left open. A hop is relaxed when
-the flag is set or the context skips time validity. There, unless the context's `verify_mode` is
-`CERT_NONE`, the record takes the relaxed words, and a caller that passes no `ways_across` gets
-`EXPIRY_RELAXED_WAYS_ACROSS`. On a `CERT_NONE` context, relaxed or not, the record is worded from
-`CrlNoCredit.PEER_NOT_VERIFIED`, and an omitted `ways_across` becomes
-`PEER_NOT_VERIFIED_WAYS_ACROSS`. No shipped call site's
+admitted the hop on that CRL, the case §4.3's note of 2026-11-03 left open. A hop is relaxed for
+the record's words and for the remedy when the flag is set or the context skips time validity, so a
+caller that passes no `ways_across` there gets `EXPIRY_RELAXED_WAYS_ACROSS`. No shipped call site's
 disposition moved: MLLP, the DICOM SCU and FTPS pass their relaxed context with the flag (vault
 BACKLOG #5089), and at least REST, SOAP and FHIR hand the guard no context there. Tests in
 `tests/test_revocation_guard_census.py` pin the call sites as written:
