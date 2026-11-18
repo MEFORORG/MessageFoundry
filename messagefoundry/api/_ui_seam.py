@@ -923,8 +923,9 @@ from typing import Any
 #: their bounds. Re-derived with ``--write``, from ``bc56eed44a1590fd`` to ``f16ae6b198ad952b``.
 #:
 #: BACKLOG #5930: ``_resubmit_form`` now restores the line endings of a form with no ``eol``
-#: field too, to the style the new ``routes/core.py`` global ``missing_eol_style`` names (CR for
-#: an HL7 body), so the hashed closure changed. No engine surface changed. Re-derived with
+#: field too, to the style ``missing_eol_style`` names (CR for a body that starts with MSH). That
+#: helper is defined in ``pages/messages.py`` and imported as a ``routes/core.py`` global, so the
+#: hashed closure changed. No engine surface changed. Re-derived with
 #: ``--write``, from ``f16ae6b198ad952b`` to ``3ae6bcfdebbf1401``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
