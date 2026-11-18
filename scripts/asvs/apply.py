@@ -622,8 +622,17 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
     indented comment there belongs to the cell's last entry, so it stays in the span, where `main`
     refuses to drop it. Only a comment `_comment_lines` finds outside a string is trimmed, so a
     multi-line string's last line stays in.
+
+    A HEADER IS FOUND IN EVERY UNQUOTED SPELLING TOML ACCEPTS (BACKLOG #5455): leading or trailing
+    whitespace, spaces inside the brackets, and a trailing comment. The exact-line pattern this
+    replaced missed `[[cell]]` followed by a space, so the cell before it owned that cell's text and
+    a rewrite of it deleted both. A spelling still out of reach, such as a quoted `[["cell"]]`, is
+    caught by `main`, which refuses when these spans and the parsed record name different cells.
     """
-    starts = [m.start() for m in re.finditer(r"^\[\[cell\]\]$", text, re.M)]
+    starts = [
+        m.start()
+        for m in re.finditer(r"^[ \t]*\[\[[ \t]*cell[ \t]*\]\][ \t]*(?:#.*)?$", text, re.M)
+    ]
     spans: dict[str, tuple[int, int]] = {}
     for i, s in enumerate(starts):
         e = starts[i + 1] if i + 1 < len(starts) else len(text)
@@ -853,7 +862,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     live_text = SCORECARD.read_text(encoding="utf-8")
-    live_cells = {x["id"]: x for x in tomllib.loads(live_text)["cell"]}
+    live_list = tomllib.loads(live_text)["cell"]
+    live_cells = {x["id"]: x for x in live_list}
+    # Every cell the record holds, in order: the splice below must keep exactly this list.
+    live_ids = [x["id"] for x in live_list]
 
     problems: list[str] = []
     for c in payload:
@@ -1113,6 +1125,25 @@ def main(argv: list[str] | None = None) -> int:
     text = live_text
     spans = block_spans(text)
 
+    # THE SPANS MUST NAME EVERY CELL THE RECORD HOLDS, CHECKED BEFORE THE SPLICE (BACKLOG #5455). A
+    # header `block_spans` does not recognise leaves its cell inside the span of the cell before it,
+    # so rewriting that one deletes both. The count check after the splice compared against the
+    # SPANS, which had already lost the cell, so it agreed with the loss. Compare against TOML's own
+    # reading of the record instead.
+    if len(spans) != len(live_ids) or set(spans) != set(live_ids):
+        unseen = sorted(set(live_ids) - set(spans))
+        print(
+            f"REFUSING: the record holds {len(live_ids)} cells but the writer found "
+            f"{len(spans)} [[cell]] blocks; a rewrite could splice away a cell it cannot see"
+        )
+        if unseen:
+            print(f"  cells with no block of their own: {_printable(str(unseen))}")
+        print(
+            "  Write each such cell's header as a bare [[cell]] line, check no id repeats, then "
+            "re-run."
+        )
+        return 1
+
     # A COMMENT IN A CELL WOULD BE LOST, SO THE WRITE STOPS (BACKLOG #2865). `render` builds the
     # cell from its parsed form, which keeps no comment. Carrying them over is not attempted: a
     # person decides where each one belongs, and a loud stop beats a silent loss. Every commented
@@ -1198,8 +1229,13 @@ def main(argv: list[str] | None = None) -> int:
         if got != c["verdict"]:
             print(f"REFUSING: round-trip mismatch on {c['id']}: {got!r} != {c['verdict']!r}")
             return 1
-    if len(parsed["cell"]) != len(spans):
-        print(f"REFUSING: cell count changed {len(spans)} -> {len(parsed['cell'])}")
+    # The record's own cell list, not the span count: the spans are what could have lost a cell.
+    after_ids = [c["id"] for c in parsed["cell"]]
+    if after_ids != live_ids:
+        print(
+            f"REFUSING: the cells changed {len(live_ids)} -> {len(after_ids)}; "
+            f"lost {_printable(str(sorted(set(live_ids) - set(after_ids))))}"
+        )
         return 1
 
     # FIELD-PRESERVATION INVARIANT. A rewrite must never silently DROP a key, and the anchor gate
