@@ -7,7 +7,8 @@ directory cannot satisfy a scenario with an earlier run's output; a file written
 whether present at start or already recorded, is recorded again. "Unchanged" is the ``lstat``
 identity, file type, size and modification time, and a file that changes while it is read is
 recorded once it settles, not twice. The scan enters only what ``lstat`` reads as a plain
-directory, never a link or a junction on platforms with ``dir_fd``, and records each file's path relative to it
+directory, never a link or a junction, except in the Windows folder-swap race this module names
+as open, and records each file's path relative to it
 (``meta["relpath"]``) and whether its resolved path, symlinks followed, stays inside it
 (``meta["inside"]``). A link that cannot be resolved strictly (a loop, a dangling link, a race) is
 recorded as not inside, never as inside. A file written OUTSIDE the directory is not looked for
@@ -29,13 +30,14 @@ size and modification time), checked again after the read, so a file swapped for
 replaced, between the ``lstat`` and the open is not read under the old signature. A link found at
 the open and still at the path (refused by ``O_NOFOLLOW``, or on Windows followed by the open) is
 recorded as a link, unread; anything else is logged and left for the next scan. One scan stops at
-:attr:`FileSink.max_depth` folders deep and after :attr:`FileSink.max_entries` names listed in
-sub-folders, recording the :data:`WALK_BOUND` refusal once per sink, and enters each folder at most
-once (where the volume reports file ids), so a walk that escaped through a sub-folder cannot run
-unbounded.
+:attr:`FileSink.max_depth` folders deep, recording the :data:`WALK_BOUND` refusal once per sink,
+and enters each folder at most once (where the volume reports file ids), so a walk that escaped
+through a sub-folder cannot descend without end. The number of names a scan lists is not
+bounded: a large output directory starts and is polled whole.
 
 Reading is bounded the way the GUI's folder watcher is, through the same reader
-(:func:`harness.bounded_file.read_fd_capped`): regular files only, nothing read through a link on platforms with ``dir_fd``, each
+(:func:`harness.bounded_file.read_fd_capped`): regular files only, nothing read through a
+symbolic link or junction on platforms with ``dir_fd``, each
 capped at the engine's per-message cap, checked on the open handle, and an over-cap file (or one
 that grows past the cap while read) recorded with an empty payload and a ``refused`` reason rather
 than read. Only a plain directory is skipped: a symlink (``meta["symlink"]``), FIFO or device is
@@ -113,9 +115,8 @@ _LINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
 UNSAFE_NAME = "unsafe name"
 #: The ``refused`` reason for a scan that found the sink directory is no longer what it started on.
 ROOT_CHANGED = "the sink directory is not the plain directory the sink started on; not scanned"
-#: The ``refused`` reason for a scan that stopped at :attr:`FileSink.max_depth` or
-#: :attr:`FileSink.max_entries`.
-WALK_BOUND = "the scan reached its depth or entry bound; the rest was not scanned"
+#: The ``refused`` reason for a scan that stopped at :attr:`FileSink.max_depth`.
+WALK_BOUND = "the scan reached its depth bound; the rest was not scanned"
 
 #: Opens a listed file for reading, relative to its held folder or by its path.
 _Opener = Callable[[], int]
@@ -167,14 +168,13 @@ def _why(exc: OSError) -> str:
 class _Scan:
     """One scan's running state: the names it refused, what bounds it, and what it has entered.
     ``failed`` is set when the directory itself could not be opened or listed, so the scan says
-    nothing about what is there; ``partial`` when a folder or entry under it could not be."""
+    nothing about what is there. A folder or entry under it that could not be read is logged and
+    skipped."""
 
-    entries_left: int
     unsafe: list[tuple[Path, str]] = field(default_factory=list)
     entered: set[tuple[int, int]] = field(default_factory=set)
     bounded: bool = False
     failed: bool = False
-    partial: bool = False
 
 
 class FileSink(Sink):
@@ -182,11 +182,6 @@ class FileSink(Sink):
 
     #: The deepest a scan descends below the sink directory.
     max_depth = 32
-    #: The most names one scan lists in the sub-folders, across them all. The directory's own
-    #: listing is not counted: it is the directory the sink was given, checked on every scan, and
-    #: an output folder the engine keeps filling must not fail for its size. A walk that escapes
-    #: does so through a sub-folder, which this bounds.
-    max_entries = 100_000
 
     def __init__(self, directory: str | Path, *, pattern: str = "*") -> None:
         super().__init__()
@@ -214,7 +209,7 @@ class FileSink(Sink):
         self._root_id = _identity(st)
         seen: dict[Path, _Signature] = {}
         scan = self._scan(lambda path, st, _open: seen.__setitem__(path, _signature(st)))
-        if scan is None or scan.failed or scan.partial:
+        if scan is None or scan.failed:
             # Without a whole first scan, files already there would later read as new deliveries.
             raise NotADirectoryError(f"file sink directory {self.directory} could not be scanned")
         self._seen = seen
@@ -254,7 +249,7 @@ class FileSink(Sink):
         junction included, is a candidate whatever its name and is not entered. A path gone
         before its ``lstat``, or a folder gone before it is listed, is left out: nothing is there
         to record or to ignore."""
-        scan = _Scan(self.max_entries)
+        scan = _Scan()
         if _DIR_FD:
             try:
                 root_fd = os.open(self.directory, _DIR_FLAGS)
@@ -326,16 +321,10 @@ class FileSink(Sink):
     def _walk(self, held: int | Path, folder: Path, depth: int, visit: _Visit, scan: _Scan) -> bool:
         """List ``folder``, held as a directory handle where the OS has ``dir_fd`` and by its path
         otherwise, and visit or enter each entry under it. False when ``folder`` itself could not
-        be listed. Any other entry under it that could not be read marks the scan ``partial``."""
-        counted = depth > 0  # the directory's own listing is not bounded: see max_entries
+        be listed."""
         try:
             with os.scandir(held) as listing:
-                names: list[str] = []
-                for entry in listing:
-                    if counted and len(names) >= scan.entries_left:
-                        scan.bounded = True
-                        break
-                    names.append(entry.name)
+                names = [entry.name for entry in listing]
         except FileNotFoundError:
             return True  # gone: nothing there to record or to ignore
         except OSError as exc:
@@ -343,8 +332,6 @@ class FileSink(Sink):
                 "list", folder, "file sink: cannot list a folder, retried next scan (%s)", _why(exc)
             )
             return False
-        if counted:
-            scan.entries_left -= len(names)
         for name in sorted(names):
             if _unsafe_listed_name(name):
                 scan.unsafe.append((folder, name))
@@ -358,11 +345,6 @@ class FileSink(Sink):
             except FileNotFoundError:
                 continue
             except OSError as exc:
-                # With no lstat its type is unknown, so it is judged by its name alone: a name the
-                # file filters skip (a dot-file, an engine temp, one off the pattern) does not make
-                # the scan partial. A link or folder under such a name is then not counted.
-                if self._file_name(path, name):
-                    scan.partial = True
                 self._warn(
                     "lstat",
                     path,
@@ -399,18 +381,16 @@ class FileSink(Sink):
         scan: _Scan,
     ) -> None:
         """Walk the sub-folder ``name``. Under a held handle it is opened relative to that handle,
-        never through a link, and entered only if it is the folder its ``lstat`` saw. A folder not
-        entered for any reason but being gone marks the scan ``partial``."""
+        never through a link, and entered only if it is the folder its ``lstat`` saw. A folder that
+        cannot be entered or listed is logged once and skipped."""
         if not isinstance(held, int):
-            if not self._walk(path, path, depth + 1, visit, scan):
-                scan.partial = True
+            self._walk(path, path, depth + 1, visit, scan)
             return
         try:
             child = os.open(name, _DIR_FLAGS, dir_fd=held)
         except FileNotFoundError:
             return
         except OSError as exc:
-            scan.partial = True
             if exc.errno in _LINK_ERRNOS or exc.errno == errno.ENOTDIR:
                 said = "file sink: not entering a folder that is no longer a plain folder (%s)"
                 self._warn("enter-link", path, said, _why(exc))
@@ -420,14 +400,11 @@ class FileSink(Sink):
             return
         try:
             if _identity(os.fstat(child)) != _identity(st):
-                scan.partial = True
                 said = "file sink: not entering a folder replaced after its lstat"
                 self._warn("enter-swap", path, said)
                 return
-            if not self._walk(child, path, depth + 1, visit, scan):
-                scan.partial = True
+            self._walk(child, path, depth + 1, visit, scan)
         except OSError as exc:
-            scan.partial = True
             said = "file sink: cannot read a folder, retried next scan (%s)"
             self._warn("enter-read", path, said, _why(exc))
         finally:
