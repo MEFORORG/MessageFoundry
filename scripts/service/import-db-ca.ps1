@@ -24,24 +24,27 @@
     signature verifies under its own key as .NET's chain engine (X509Chain) reads it, goes into
     LocalMachine\Root. Any other CA in the file, such as an issuing CA in a .p7b chain, or a
     self-issued certificate another key signed, goes into the intermediate store
-    LocalMachine\CA. That store is not a trust anchor for SChannel or ODBC Driver 18 chain
-    building, so the SQL Server hop still checks the chain up to the root. It IS usable as a
-    trust anchor by the engine's Python TLS on Windows: CPython's ssl.create_default_context(),
-    which the PostgreSQL system-trust path calls, loads the CA and ROOT system stores, and Python
-    3.13 and later set partial-chain verification, so a chain that reaches a certificate in
-    LocalMachine\CA validates there without its root. So a file is
-    refused unless the chain engine, given every certificate in the file as extra certificates,
+    LocalMachine\CA. The Windows chain engine needs an authority key identifier to link a
+    self-issued certificate to its signer; without one it reads the certificate as self-signed
+    with a signature that fails, so the file is refused. LocalMachine\CA is not a trust anchor
+    for SChannel or ODBC Driver 18 chain building, so the SQL Server hop still checks the chain
+    up to the root. It IS usable as a trust anchor by the engine's Python TLS on Windows:
+    CPython's ssl.create_default_context(), which the PostgreSQL system-trust path calls, loads
+    the CA and ROOT system stores, and Python 3.13 and later set partial-chain verification, so a
+    chain that reaches a certificate in LocalMachine\CA validates there without its root. So a
+    file is refused unless the chain engine, given every certificate in the file as extra certificates,
     builds a chain from each certificate in it to a self-signed root in the same file, with no
     chain status other than an untrusted root or a time status. Where the .NET runtime has
     CustomRootTrust, only the file's own self-signed roots anchor that chain, so a root this
     machine already trusts cannot stand in for them; where it has not, as under Windows
-    PowerShell 5.1, the machine's stores take part, and a chain that ends at a root outside the
-    file is refused. Every self-signed root in the file must also be within its validity period.
-    The validity of any other CA is only warned of, and revocation is not checked. Where the
-    runtime has the DisableCertificateDownloads switch the script sets it; where it has not, as
-    under Windows PowerShell 5.1, the engine may fetch a missing issuer from a URL the
-    certificate names, so the same file can pass there and be refused under PowerShell 7. With
-    -Confirm the operator may still decline the root and accept another CA.
+    PowerShell 5.1, the machine's stores take part, and a chain that ends anywhere but at one of
+    the file's roots is refused. Every self-signed root in the file must also be within its
+    validity period. The validity of any other CA is only warned of, and revocation is not
+    checked. Where the runtime has the DisableCertificateDownloads switch the script sets it;
+    where it has not, as under Windows PowerShell 5.1, the engine may fetch a missing issuer
+    from a URL the certificate names, a network request the file decides, and the same file can
+    then pass there and be refused under PowerShell 7. With -Confirm the operator may still
+    decline the root and accept another CA.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
@@ -322,13 +325,16 @@ function Invoke-CaChainBuild {
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Bundle,
         [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Anchors
     )
-    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+    # The machine context, the one the service principal validates in, not the elevated
+    # operator's own CurrentUser stores.
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new($true)
     try {
         $policy = $chain.ChainPolicy
         $policy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
         [void]$policy.ExtraStore.AddRange($Bundle)
         # Where the runtime has the switch, the engine may not fetch a missing issuer from a URL
-        # the certificate names. Windows PowerShell 5.1's .NET Framework has none.
+        # the certificate names. Windows PowerShell 5.1's .NET Framework has none, so there a
+        # file's certificates can make this run reach out to a host they name.
         if ($policy.PSObject.Properties['DisableCertificateDownloads']) {
             $policy.DisableCertificateDownloads = $true
         }
@@ -361,7 +367,8 @@ function Invoke-CaChainBuild {
 # each store means. Every other certificate must chain to one of the file's roots. Where the
 # runtime has CustomRootTrust, only the file's roots anchor that chain, so a root the machine
 # already trusts cannot take the place of the file's own, as an older root of the same name would.
-# Without it (Windows PowerShell 5.1), a chain that ends at a root outside the file is refused.
+# Without it (Windows PowerShell 5.1, PowerShell 7.0), a chain that ends anywhere but at one of the
+# file's roots is refused.
 function Get-CaChainCheck {
     param(
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Bundle,
@@ -375,8 +382,6 @@ function Get-CaChainCheck {
         [int]$flagsType::NotTimeNested
     # Membership is by thumbprint: a collection's Contains matches on issuer and serial number
     # alone, which two different certificates can share.
-    $inFile = @{}
-    foreach ($cert in $Bundle) { $inFile[$cert.Thumbprint] = $true }
     $first = @{}
     $roots = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
     $rootThumbprints = @{}
@@ -403,8 +408,8 @@ function Get-CaChainCheck {
             $refusal = "the chain engine could not build its chain: $($built.Error)"
         } elseif ($built.Flags -band [int]$flagsType::PartialChain) {
             $refusal = 'it does not chain to a self-signed root in this file'
-        } elseif (-not $inFile.ContainsKey($built.Path[-1])) {
-            $refusal = "its chain ends at $($built.Path[-1]), a root that is not in this file"
+        } elseif (-not $rootThumbprints.ContainsKey($built.Path[-1])) {
+            $refusal = "its chain ends at $($built.Path[-1]), which is not a self-signed root in this file"
         } elseif ($built.Flags -band -bnot $ignored) {
             $refusal = "the chain engine reports $([System.Enum]::ToObject($flagsType, $built.Flags -band -bnot $ignored)) on its chain"
         } elseif ($isRoot -and $outside) {

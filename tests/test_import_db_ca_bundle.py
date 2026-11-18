@@ -168,6 +168,9 @@ def extra(chain: dict[str, tuple[x509.Certificate, _Key]]) -> dict[str, x509.Cer
             .not_valid_before(now - datetime.timedelta(days=1))
             .not_valid_after(now + datetime.timedelta(days=30))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            # OpenSSL reads a certificate with matching names and no subject key identifier as
+            # self-signed, so the re-key certificate needs one to be linked to its signer there.
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(public), False)  # type: ignore[arg-type]
         )
 
     rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -451,6 +454,7 @@ foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-D
                     'Read-CaBundle', 'Get-CaChainCheck')) {{
   $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
       $args[0].Name -eq $name }}, $true)
+  if (-not $def) {{ throw "missing function $name" }}
   . ([scriptblock]::Create($def.Extent.Text))
 }}
 $script:mode = $null
@@ -482,7 +486,7 @@ $out | ConvertTo-Json -Compress
     got = json.loads(proc.stdout.strip().splitlines()[-1])
     assert got["outside"] == {
         "root": None,
-        "inter": f"its chain ends at {outside}, a root that is not in this file",
+        "inter": f"its chain ends at {outside}, which is not a self-signed root in this file",
     }
     assert got["error"] == {
         "root": None,
