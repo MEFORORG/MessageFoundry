@@ -7,12 +7,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from tee import mllp
-from tee.relay import Endpoint, RelayConfig, TeeRelay, _MeforItem
+from tee.relay import _WORKER_STOP, Endpoint, RelayConfig, TeeRelay, _MeforItem
 
 SAMPLE = (
     b"MSH|^~\\&|EPIC|SENDFAC|MFOR|RECVFAC|20240101120000||ADT^A01|CTRL123|P|2.5.1\r"
@@ -28,6 +29,9 @@ class FakeMllpServer:
         self.drop = drop  # close without sending an ACK (simulates a half-broken peer)
         self.drop_first = drop_first  # drop the first N connections, then ACK (for retry tests)
         self.received: list[bytes] = []
+        # Each ACK waits on this, so a test can hold the relay mid-forward (set by default).
+        self.release = asyncio.Event()
+        self.release.set()
         self._conns = 0
         self._server: asyncio.Server | None = None
 
@@ -54,6 +58,7 @@ class FakeMllpServer:
                     self.received.append(message)
                     if drop_this:
                         return  # close the connection without an ACK (half-broken peer)
+                    await self.release.wait()
                     writer.write(mllp.frame(mllp.build_ack(message, code=self.ack_code)))
                     await writer.drain()
         except (OSError, asyncio.CancelledError):
@@ -523,3 +528,148 @@ async def test_capture_bodies_also_captures_copy(tmp_path: Path) -> None:
         await relay.stop()
         await corepoint.stop()
         await mefor.stop()
+
+
+async def _gated_server() -> FakeMllpServer:
+    """A downstream that withholds its ACK until ``release`` is set, so a test can hold the relay
+    mid-forward (the Epic ACK already sent) while it calls ``stop()``."""
+    server = await FakeMllpServer().start()
+    server.release.clear()
+    return server
+
+
+def _legs(db_path: Path) -> set[tuple[str, str, str]]:
+    with contextlib.closing(sqlite3.connect(db_path)) as db:
+        rows = db.execute("SELECT direction, leg, outcome FROM relay_log").fetchall()
+    return {(d, leg, o) for d, leg, o in rows}
+
+
+async def test_stop_waits_for_an_in_flight_epic_message(tmp_path: Path) -> None:
+    # BACKLOG #5975: stop() used to close the store under a handler that had already ACKed Epic
+    # and was still waiting on Corepoint, so that message's legs were never recorded.
+    corepoint = await _gated_server()
+    mefor = await FakeMllpServer().start()
+    db_path = tmp_path / "tee.db"
+    relay = TeeRelay(
+        RelayConfig(
+            listen_epic=("127.0.0.1", 0),
+            corepoint=corepoint.address,
+            mefor=mefor.address,
+            db_path=str(db_path),
+        )
+    )
+    await relay.start()
+    try:
+        ack = await _send_from_epic(relay.epic_address, SAMPLE)
+        assert mllp.parse_ack(ack)[0] == "AA"
+        await corepoint.wait_for(1)  # the handler is now parked mid-forward, after the ACK
+        stopping = asyncio.create_task(relay.stop())
+        await asyncio.sleep(0.1)
+        assert not stopping.done()  # stop() is waiting for the in-flight handler
+        corepoint.release.set()
+        async with asyncio.timeout(5.0):
+            await stopping
+        # The in-flight message finished both legs before the store closed, and the MEFOR copy it
+        # enqueued during the drain was forwarded ahead of the worker's stop sentinel.
+        assert mefor.received == [SAMPLE]
+        assert _legs(db_path) == {
+            ("epic_to_corepoint", "corepoint", "accepted"),
+            ("epic_to_corepoint", "mefor", "accepted"),
+        }
+    finally:
+        corepoint.release.set()
+        await relay.stop()
+        await corepoint.stop()
+        await mefor.stop()
+
+
+async def test_stop_closes_copy_listener_connections(tmp_path: Path) -> None:
+    # BACKLOG #5975: copy-listener connections were never tracked, so one outlived stop() and could
+    # ACK a message into a relay whose store and MEFOR worker were already gone.
+    corepoint = await FakeMllpServer().start()
+    mefor = await FakeMllpServer().start()
+    relay = TeeRelay(
+        RelayConfig(
+            listen_epic=("127.0.0.1", 0),
+            corepoint=corepoint.address,
+            mefor=mefor.address,
+            db_path=str(tmp_path / "tee.db"),
+            listen_corepoint_copy=("127.0.0.1", 0),
+        )
+    )
+    await relay.start()
+    copy_addr = relay.copy_address
+    assert copy_addr is not None
+    reader, writer = await asyncio.open_connection(*copy_addr)
+    try:
+        writer.write(mllp.frame(SAMPLE))
+        await writer.drain()
+        decoder = mllp.FrameDecoder()
+        acks: list[bytes] = []
+        async with asyncio.timeout(2.0):
+            while not acks:
+                chunk = await reader.read(4096)
+                assert chunk, "relay closed before ACK"
+                acks.extend(decoder.feed(chunk))
+        assert mllp.parse_ack(acks[0])[0] == "AA"
+        async with asyncio.timeout(5.0):
+            await relay.stop()
+        async with asyncio.timeout(2.0):
+            assert await reader.read(4096) == b""  # the relay closed the copy connection
+        assert not relay._handler_tasks  # noqa: SLF001 -- every handler finished
+    finally:
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+        await relay.stop()
+        await corepoint.stop()
+        await mefor.stop()
+
+
+async def test_stop_cancels_a_handler_past_the_grace(tmp_path: Path) -> None:
+    # A downstream that never ACKs must delay stop() by at most stop_grace, never hang it.
+    corepoint = await _gated_server()
+    mefor = await FakeMllpServer().start()
+    relay = TeeRelay(
+        RelayConfig(
+            listen_epic=("127.0.0.1", 0),
+            corepoint=corepoint.address,
+            mefor=mefor.address,
+            db_path=str(tmp_path / "tee.db"),
+            send_timeout=60.0,
+            stop_grace=0.2,
+        )
+    )
+    await relay.start()
+    try:
+        await _send_from_epic(relay.epic_address, SAMPLE)
+        await corepoint.wait_for(1)
+        async with asyncio.timeout(5.0):
+            await relay.stop()
+        assert not relay._handler_tasks  # noqa: SLF001
+    finally:
+        corepoint.release.set()
+        await relay.stop()
+        await corepoint.stop()
+        await mefor.stop()
+
+
+async def test_enqueue_never_displaces_the_stop_sentinel(caplog: pytest.LogCaptureFixture) -> None:
+    # With a full queue the drop-oldest path would evict the sentinel and leave the worker running
+    # forever; once stop() is queueing it, enqueues are refused (and logged) instead.
+    relay = TeeRelay(
+        RelayConfig(
+            listen_epic=("127.0.0.1", 0),
+            corepoint=("127.0.0.1", 1),
+            mefor=("127.0.0.1", 2),
+            db_path=":memory:",
+            mefor_queue_max=1,
+        )
+    )
+    relay._mefor_queue = asyncio.Queue(maxsize=1)  # noqa: SLF001
+    relay._mefor_closing = True  # noqa: SLF001 -- the state stop() sets before queueing it
+    relay._mefor_queue.put_nowait(_WORKER_STOP)  # noqa: SLF001
+    with caplog.at_level(logging.WARNING):
+        relay._enqueue_mefor(_MeforItem(SAMPLE, "C1", "ADT^A01", "epic_to_corepoint"))  # noqa: SLF001
+    assert relay._mefor_queue.get_nowait() is _WORKER_STOP  # noqa: SLF001
+    assert any("stopping; dropped copy" in r.getMessage() for r in caplog.records)
