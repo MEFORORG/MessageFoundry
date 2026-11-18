@@ -541,11 +541,12 @@ def scoped_bindings(
             elif at.kind == "function" and node.id in at.nonlocals:
                 at = enclosing_function(at)
                 continue
-            if node.id in at.imports:
-                resolved[id(node)] = list(at.imports[node.id])
+            hit = at.imports.get(node.id)
+            if hit:
+                resolved[id(node)] = list(hit)
             if at is module:
                 module_reach.add(id(node))
-            if node.id in at.imports or at is module:
+            if hit or at is module:
                 break
             at = at.parent
     return resolved, module_reach, {k: list(v) for k, v in module.imports.items()}

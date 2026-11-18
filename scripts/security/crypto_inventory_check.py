@@ -2237,6 +2237,9 @@ def discover(package: Path) -> dict[str, frozenset[str]]:
     return out
 
 
+#: The positive control file the scope-aware reading is checked on (BACKLOG #5578).
+_SELF_TEST_SCOPED_PATH = "selftest/scoped.py"
+
 #: The operation arm's POSITIVE CONTROL, run on every gate invocation before the tree is read. A
 #: fixture that never touches the disk and exercises AT LEAST these matchers: an exact rule, a
 #: prefix rule, an algorithm carried by an ARGUMENT, a method rule, a TLS posture assignment with its
@@ -2279,12 +2282,11 @@ _SELF_TEST_SOURCES: dict[str, str] = {
     ),
     # BACKLOG #5578: the same shape with a call in other(). The union reading gives hashlib.sha1
     # there; the scope-aware reading knows other()'s hashlib is mylib's, so the token is marked.
-    "selftest/scoped.py": (
+    _SELF_TEST_SCOPED_PATH: (
         "import hashlib\n\n\ndef a(b):\n    return hashlib.md5(b)\n\n\n"
         "def other(b):\n    from mylib import thing as hashlib\n    return hashlib.sha1(b)\n"
     ),
 }
-_SELF_TEST_SCOPED_PATH = "selftest/scoped.py"
 _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "selftest/seam.py": frozenset(
         {
@@ -2323,11 +2325,7 @@ def judge_operations(
     scoped = crypto_operations.aggregate(
         crypto_operations.discover_operations_in_modules(modules, scope_aware=True)
     )
-    judged = {
-        path: judge_tokens(found.get(path, ()), scoped.get(path, ()), OUT_OF_SCOPE)
-        for path in found.keys() | scoped.keys()
-    }
-    return {path: tokens for path, tokens in judged.items() if tokens}
+    return judge_map(found, scoped, OUT_OF_SCOPE)
 
 
 def operations_self_test() -> list[str]:
@@ -2458,6 +2456,17 @@ def judge_tokens(found: Iterable[str], verified: Iterable[str], mark: str) -> fr
     return confirmed | {token + mark for token in found if token not in confirmed}
 
 
+def judge_map(
+    found: dict[str, frozenset[str]], verified: dict[str, frozenset[str]], mark: str
+) -> dict[str, frozenset[str]]:
+    """:func:`judge_tokens` per path, over every path either reading names; empty results dropped."""
+    judged = {
+        path: judge_tokens(found.get(path, ()), verified.get(path, ()), mark)
+        for path in found.keys() | verified.keys()
+    }
+    return {path: tokens for path, tokens in judged.items() if tokens}
+
+
 def _js_views(text: str) -> tuple[list[str], list[tuple[str, str]]]:
     """The code of a TypeScript/JavaScript source, read two ways: ``(per-line view, lexer view)``.
 
@@ -2520,9 +2529,15 @@ def _js_token_views(
     return found, verified
 
 
+_RANDOMNESS_PATTERNS = {**STRONG_RANDOMNESS_PATTERNS, **WEAK_RANDOMNESS_PATTERNS}
+
+
 def _randomness_line_tokens(line: str, verdicts: str | None) -> set[str]:
-    patterns = {**STRONG_RANDOMNESS_PATTERNS, **WEAK_RANDOMNESS_PATTERNS}
-    return {token for token, pattern in patterns.items() if _matches(pattern, line, verdicts)}
+    return {
+        token
+        for token, pattern in _RANDOMNESS_PATTERNS.items()
+        if _matches(pattern, line, verdicts)
+    }
 
 
 def randomness_token_views(text: str) -> tuple[set[str], set[str]]:
@@ -2553,10 +2568,9 @@ def _discover_non_python_views(
     verified: dict[str, frozenset[str]] = {}
     for path in non_python_sources(root):
         tokens, confirmed = randomness_token_views(path.read_text(encoding="utf-8"))
-        rel = path.relative_to(repo).as_posix()
-        if tokens:
+        if tokens:  # ``confirmed`` is a subset of ``tokens``
+            rel = path.relative_to(repo).as_posix()
             found[rel] = frozenset(tokens)
-        if confirmed:
             verified[rel] = frozenset(confirmed)
     return found, verified
 
@@ -2610,15 +2624,12 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
                 " Draw from node:crypto instead - ide/src/cspNonce.ts is the worked example"
             )
 
-    strong_judged: dict[str, frozenset[str]] = {}
-    for path, tokens in actual.items():
-        judged = judge_tokens(
-            tokens - weak_tokens, verified.get(path, frozenset()) - weak_tokens, NOT_CODE
-        )
-        if judged:
-            strong_judged[path] = judged
     undocumented, stale = find_violations(
-        strong_judged,
+        judge_map(
+            {path: tokens - weak_tokens for path, tokens in actual.items()},
+            {path: tokens - weak_tokens for path, tokens in verified.items()},
+            NOT_CODE,
+        ),
         NON_PYTHON_INVENTORY,
         check_stale=True,
         noun="randomness",
