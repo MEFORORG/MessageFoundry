@@ -368,7 +368,7 @@ class CertExpiryRunner:
         # check must never take the engine down). Cooperatively cancellable via _stop.
         while not self._stop.is_set():
             try:
-                self.run_once()
+                await self._pass()
             except Exception:
                 log.exception("cert expiry scan failed; will retry next interval")
             await self._sleep(self._settings.check_interval_seconds)
@@ -384,20 +384,49 @@ class CertExpiryRunner:
 
     def run_once(self, now: float | None = None) -> list[CertCheck]:
         """Inspect every served cert for ``now`` (default: the injected clock), emitting a
-        ``cert_expiry`` alert for each expired or within-window cert. Synchronous (a few small file
-        reads); returns one :class:`CertCheck` per cert it could judge. An unreadable or missing file
+        ``cert_expiry`` alert for each expired or within-window cert. Synchronous, so a single
+        deterministic pass (tests); the supervised loop runs :meth:`_pass` instead. Returns one :class:`CertCheck` per cert it could judge. An unreadable or missing file
         is logged, and skipped unless it is a CRL a live TLS context still holds a copy of, which is
         then judged by that copy (BACKLOG #299). A typo'd path must not silence the others."""
         now = self._clock() if now is None else now
+        checks, said = self._collect(now, list(self._cert_source()))
+        self._emit(checks, said)
+        return checks
+
+    async def _pass(self) -> None:
+        """One supervised pass: the blocking half in a worker thread, the alerts on the loop.
+
+        Vault BACKLOG #5885: the collection (``gc.collect``, the cert and CRL file reads, parsing,
+        the CRL staging) ran on the event loop, stalling message processing and a cluster leader's
+        heartbeat for its length. The cert source reads the live registry, which a reload swaps on
+        the loop, so it is read here. The alert sinks are loop-bound (a notifier enqueues onto an
+        ``asyncio.Queue``), so they are called back here too. A cancel while the thread runs
+        abandons its result, so a stopped pass raises no alert."""
+        now = self._clock()
+        rows = list(self._cert_source())
+        checks, said = await asyncio.to_thread(self._collect, now, rows)
+        self._emit(checks, said)
+
+    def _collect(
+        self, now: float, rows: list[MonitoredCert]
+    ) -> tuple[list[CertCheck], _HeldCopyLog]:
+        """The blocking half of a pass: judge ``rows`` and the unlisted held CRLs, alerting nothing.
+
+        It touches only the files, per-pass state and the held-CRL registry, which holds its own
+        lock, so it is safe in a worker thread."""
         held = self._held_snapshot()
-        checks: list[CertCheck] = []
-        rows = self._rows(held)
+        rows = self._rows(held, rows)
         said = _HeldCopyLog.for_rows(rows)
+        checks: list[CertCheck] = []
         for cert in rows:
             check = self._inspect(cert, now, held, said=said)
-            if check is None:
-                continue
-            checks.append(check)
+            if check is not None:
+                checks.append(check)
+        return checks, said
+
+    def _emit(self, checks: Sequence[CertCheck], said: _HeldCopyLog) -> None:
+        """Raise an alert for each check expired or within the window, on the loop thread."""
+        for check in checks:
             if check.days_remaining <= self._settings.warn_days:
                 if check.kind == "crl":
                     try:
@@ -428,7 +457,6 @@ class CertExpiryRunner:
                     )
                 except Exception:
                     log.warning("cert_expiry alert sink failed for %r", check.label, exc_info=True)
-        return checks
 
     def _held_snapshot(self) -> HeldCrlSnapshot:
         """One snapshot of the CRL copies live contexts hold, taken once per pass (BACKLOG #299).
@@ -444,13 +472,12 @@ class CertExpiryRunner:
             log.error("cert_expiry: could not read the CRL copies live hops hold", exc_info=True)
             return HeldCrlSnapshot(())
 
-    def _rows(self, held: HeldCrlSnapshot) -> list[MonitoredCert]:
-        """The injected rows, plus one per CRL file a live context holds that no row names.
+    def _rows(self, held: HeldCrlSnapshot, rows: list[MonitoredCert]) -> list[MonitoredCert]:
+        """The injected ``rows``, plus one per CRL file a live context holds that no row names.
 
         BACKLOG #299: a hop can load a CRL from a path the rows cannot spell, such as an inbound
         ``tls_crl_file`` given as a deferred ``env()`` value, which :func:`certs_from_registry`
         skips. Without a row, that copy could lapse and refuse every peer with no alert."""
-        rows = list(self._cert_source())
         if not self._watch_unlisted_held_crls:
             return rows
         unwatched = held.unwatched(row.path for row in rows if row.kind == "crl")
