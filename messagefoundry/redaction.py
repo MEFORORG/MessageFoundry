@@ -1316,10 +1316,9 @@ class _Anchors(NamedTuple):
 
     #: Label spans, sorted, disjoint and merged.
     spans: list[tuple[int, int]]
-    #: Where the content of a vocabulary XML element starts, straight after its start tag's ``>``.
-    content: frozenset[int]
-    #: The same positions, sorted, to find one inside a token.
-    content_sorted: list[int]
+    #: Where the content of a vocabulary XML element starts, straight after its start tag's ``>``,
+    #: sorted.
+    content: list[int]
 
 
 def _xml_start_tag_anchors(text: str, pos: int, spans: list[tuple[int, int]]) -> int | None:
@@ -1357,9 +1356,8 @@ def _label_anchors(text: str) -> _Anchors:
     (:data:`_XML_PHI_END`, :data:`_XML_PHI_END_OPEN`). Read off the passes' own patterns, so a label
     they learn is kept here too. An MRN label is not among them: :data:`_MRN_LABELLED` lets only a
     ``[`` stand between the label and its number, which opens a frame, so a number after a label in
-    the walk is in the walk too. One linear search
-    per pattern over the whole text, made once per :func:`_redact_json_fields` call and only once a
-    walk turns malformed."""
+    the walk is in the walk too. One linear search per pattern over the whole text, made once per
+    :func:`_redact_json_fields` call and only once a walk turns malformed."""
     spans = [
         found.span()
         for pattern in (_DICOM_PHI_LABEL, _XML_PHI_END, _XML_PHI_END_OPEN)
@@ -1379,14 +1377,14 @@ def _label_anchors(text: str) -> _Anchors:
             merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
         elif start < end:
             merged.append((start, end))
-    return _Anchors(merged, frozenset(content), sorted(content))
+    return _Anchors(merged, sorted(content))
 
 
 #: A run of word characters, the part of a token outside a label that a malformed walk scrubs.
 _WORD_RUN = re.compile(r"\w++")
 
 
-def _scrub_gap(text: str, lo: int, hi: int, content: frozenset[int]) -> str:
+def _scrub_gap(text: str, lo: int, hi: int, content: list[int]) -> str:
     """``text[lo:hi]``, a part of a token outside every label, with each word run scrubbed. A run that
     is a literal :data:`_JSON_LITERALS` keeps stays, ``redacted`` among them, so a scrubbed run stays
     as it is on a second pass. A run that opens a vocabulary XML element's content becomes the bare
@@ -1400,7 +1398,9 @@ def _scrub_gap(text: str, lo: int, hi: int, content: frozenset[int]) -> str:
         if word.group() in _JSON_LITERALS:
             out.append(word.group())
         else:
-            out.append(_REDACTED[1:-1] if word.start() in content else _REDACTED)
+            opens = bisect_left(content, word.start())
+            at_content = opens < len(content) and content[opens] == word.start()
+            out.append(_REDACTED[1:-1] if at_content else _REDACTED)
         pos = word.end()
     out.append(text[pos:hi])
     return "".join(out)
@@ -1423,8 +1423,8 @@ def _malformed_scalar(match: re.Match[str], anchors: _Anchors, widened: bool) ->
         if hi > start:
             kept.append((max(lo, start), min(hi, end)))
         index += 1
-    opens = bisect_left(anchors.content_sorted, start)
-    holds_content = opens < len(anchors.content_sorted) and anchors.content_sorted[opens] < end
+    opens = bisect_left(anchors.content, start)
+    holds_content = opens < len(anchors.content) and anchors.content[opens] < end
     if not kept and not holds_content:
         return _json_scalar(match, _LEAF, widened)
     text = match.string
@@ -1457,11 +1457,17 @@ def _scrub_json_value(
     frames: list[tuple[bool, int, str]] = []
     #: Set by a closer of another kind than the open frame's, which ends nothing. From then on every
     #: data token is scrubbed as LEAF, keys and callable names included, until the walk's own frames
-    #: close or the text ends, except a label a later pass reads (:func:`_malformed_scalar`). Ending
-    #: a frame early would hand what follows to a parent frame or a later key that may keep it, and
-    #: keeping the walk as it was would keep what an INHERIT frame holds. It covers only this walk: a
-    #: value the walk has already returned from is outside it.
+    #: close or the text ends, except a label a later pass reads past ``loose`` below
+    #: (:func:`_malformed_scalar`). Ending a frame early would hand what follows to a parent frame or
+    #: a later key that may keep it, and keeping the walk as it was would keep what an INHERIT frame
+    #: holds. It covers only this walk: a value the walk has already returned from is outside it.
     malformed = False
+    #: The frames the walk would hold if any closer ended the open one, as it did before BACKLOG
+    #: #5814, and whether that count has reached zero, where that walk returned. Before that point the
+    #: older walk scrubbed every label too, and a kept one could end a value a later pass scrubs, so a
+    #: label is kept only after it, where the older walk left the text as written for the later passes.
+    loose_depth = 0
+    loose = False
     pending = policy
     n = len(text)
     while pos < n:
@@ -1481,6 +1487,11 @@ def _scrub_json_value(
                 break  # the key had no value: nothing to scrub, and nothing consumed
             pos = match.end()
             out.append(token)
+            if punct in "{[(":
+                loose_depth += 1
+            elif punct in "}])" and loose_depth:
+                loose_depth -= 1
+                loose = loose_depth == 0
             if punct == "{":
                 leaf = pending in (_LEAF, _STRUCTURE_ONLY)
                 frames.append((True, _LEAF if leaf else _INHERIT, "}"))
@@ -1501,6 +1512,9 @@ def _scrub_json_value(
             continue
         pos = match.end()
         if malformed:
+            if not loose:
+                out.append(_json_scalar(match, _LEAF, widened))
+                continue
             if not anchors:
                 anchors.append(_label_anchors(text))
             out.append(_malformed_scalar(match, anchors[0], widened))
@@ -2070,7 +2084,7 @@ def redact(text: str) -> str:
     54,280 (342 through :func:`safe_exc` then :func:`safe_text`): a JSON ``name`` value that took a
     following ``PatientID=`` or ``<given value=`` with it, leaving that label's value to walk
     through. So the #1711 passes run to their fixed point first, and the widened passes then run over
-    their output. Every step only ever replaces text with the placeholder.
+    their output.
 
     **The two stages protect #1711's labels, not each other's.** Inside the widened stage one widened
     scrub can still swallow another widened label: ``{"name": OtherPatientIDs= "x"}`` keeps ``"x"``.
@@ -2152,8 +2166,9 @@ def _needs_widened_stage(text: str) -> bool:
     * a widened DICOM keyword, and the widened value terminator (which only differs before one): a
       :data:`_DICOM_PHI_LABEL` match outside :data:`_DICOM_KEYWORDS_1711`, behind the word screen.
 
-    No stage-1 scrub can CREATE one of these, since every scrub inserts the placeholder, so the stage-1
-    output is screened. ``tests/test_redaction_structured_shapes.py`` holds the property: on text the
+    No stage-1 scrub can CREATE one of these, since every scrub inserts the placeholder, or after a
+    mismatched JSON closer the bare word ``redacted`` (:func:`_scrub_gap`), so the stage-1 output is
+    screened. ``tests/test_redaction_structured_shapes.py`` holds the property: on text the
     screen skips, every pass gives the same output in both stages."""
     if any(word in text for word in _WIDENED_KEY_WORDS) and _WIDENED_JSON_KEY.search(text):
         return True

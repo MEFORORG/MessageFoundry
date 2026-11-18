@@ -150,9 +150,30 @@ def test_the_label_is_kept_and_what_surrounds_it_in_the_token_is_not(
 ) -> None:
     """The kept label is only the label: a name glued before it, or a value after it in the same
     token, is scrubbed with the rest of the walk."""
-    out = scrub(f'{{"family": [{{"x" ] {FAMILY}<given>{GIVEN}</given> {FAMILY}/PatientID=Qmrnxq')
+    out = scrub(f'{{"family": ["x" ) {FAMILY}<given>{GIVEN}</given> {FAMILY}/PatientID=Qmrnxq ]')
     assert FAMILY not in out and GIVEN not in out and "Qmrnxq" not in out, out
     assert "<given>" in out and "PatientID=" in out, out
+
+
+@pytest.mark.parametrize("scrub", SCRUBBERS)
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The walk before BACKLOG #5814 scrubbed these labels, since the stray `)` left it inside
+        # the outer array. Kept, each would end a value a later pass scrubs before `Qmrnxq`: an end
+        # tag closes the element, a `;` or a `Label=` ends a DICOM label's value.
+        '<given>Zq {"family": [["x" ) </given> ]] Qmrnxq',
+        '<given>Zq {"family": [["x" ) </given junk> ]] Qmrnxq',
+        'PatientName=Zq {"family": [["x" ) PatientID=a;b ]] Qmrnxq',
+        'PatientName=Zq {"family": [["x" ) "PatientID=a;b" ]] Qmrnxq',
+        'PatientName=Zq {"family": [["x" ) <telecom value=1/> ]] Qmrnxq',
+    ],
+)
+def test_a_label_the_older_walk_scrubbed_is_still_scrubbed(
+    scrub: Callable[[str], str], text: str
+) -> None:
+    out = scrub(text)
+    assert "Qmrnxq" not in out, out
 
 
 #: Labels a later pass reads, each followed by the value it scrubs. ``{}`` is the secret.
@@ -209,8 +230,10 @@ def _labelled_case(rng: random.Random, serial: int) -> tuple[str, list[str]]:
     split = rng.choice([None, *_SPLIT_LABELLED])
     if split is not None:
         # The label inside the walk and its value past the walk's end, where only the pass that
-        # reads the label scrubs it.
-        parts.extend((rng.choice(stray), " ", split[0]))
+        # reads the label scrubs it. One stray closer per container first, so the label lies past
+        # the point where a walk that let any closer end a container returned.
+        parts.extend(rng.choice(stray) for _ in openers)
+        parts.extend((" ", split[0]))
     parts.extend(closers)
     if split is not None:
         parts.append(split[1].format(secret()))
@@ -228,7 +251,7 @@ def test_fuzz_labels_in_and_after_an_outer_closed_malformed_walk() -> None:
     inside the walk and after it. Asserting that no secret survives is a floor at least as high as
     origin/main's, whatever main's :func:`redact` removed of them, without importing main here.
     Measured against origin/main's module on 2026-11-18: of this seed's 400 cases main leaked a
-    secret in 191, and in 0 did a secret main removed survive here. The result is also a fixed
+    secret in 81, and in 0 did a secret main removed survive here. The result is also a fixed
     point of :func:`safe_text`."""
     rng = random.Random(58141)
     for serial in range(400):
