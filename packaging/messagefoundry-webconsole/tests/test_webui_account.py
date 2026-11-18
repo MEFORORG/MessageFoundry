@@ -24,7 +24,11 @@ from _webui_support import (
 from messagefoundry.api import create_app
 from messagefoundry.api.security import is_route_gate
 from messagefoundry.auth import Role, totp
-from messagefoundry.auth.service import STEP_UP_ACTION_MFA_CONFIRM, AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_MFA_CONFIRM,
+    AuthService,
+    EnrolmentCodeRefused,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -309,6 +313,8 @@ async def test_first_enrolment_code_is_accepted_after_the_confirm_reauth(engine:
         assert r.status_code == 303 and r.headers["location"] == "/ui/account/mfa/confirm"
         r = await c.get("/ui/account/mfa/confirm")
         assert r.status_code == 200 and 'action="/ui/account/mfa/verify"' in r.text
+        # The confirm page carries the code field itself, not only a form posting to verify.
+        assert 'name="code"' in r.text
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
         assert secret is not None
@@ -371,6 +377,77 @@ async def test_enrolment_still_takes_two_separate_single_use_proofs(engine: Engi
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
         user = await service.store.get_user(uid)
         assert user is not None and not user.totp_enabled
+
+
+async def test_a_refused_enrolment_code_rerenders_the_continue_under_the_default(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0207's refusal re-render on the verify route, under the default action binding: a 400
+    carrying the refusal, and the Continue to a fresh re-auth in the form's place, because the gate
+    spent the confirm proof before the service refused the enrolment code (BACKLOG #5931).
+
+    RED when: the refusal branch renders the code form while no confirm proof is held, so the next
+    code would post into a gate that drops it, or the refusal is not answered on the confirm page."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+
+    async def refuse(*_args: object, **_kwargs: object) -> None:
+        raise EnrolmentCodeRefused
+
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/account/mfa/enroll")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", refuse)
+        await _mint_action(c, "/ui/account/mfa/confirm")
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "123456", "enrolment_code": "not-the-code"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400
+        assert "Confirm enrollment" in r.text and "needs a one-time enrolment code" in r.text
+        assert ">Continue<" in r.text and 'name="code"' not in r.text
+        assert 'name="enrolment_code"' not in r.text
+
+
+async def test_a_refused_enrolment_code_rerenders_both_fields_under_the_opt_out(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``[auth].require_action_step_up = false`` no proof was spent, so the refusal re-render
+    keeps the code form, and with it the enrolment-code field, for a retry (ADR 0207, BACKLOG
+    #5931).
+
+    RED when: the refusal branch drops the enrolment-code field or the code form."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            require_action_step_up=False,
+            admin_write_min_interval_seconds=0,
+            mfa_verify_min_elapsed_seconds=0,
+        ),
+    )
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+
+    async def refuse(*_args: object, **_kwargs: object) -> None:
+        raise EnrolmentCodeRefused
+
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", refuse)
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "123456", "enrolment_code": "not-the-code"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400 and "needs a one-time enrolment code" in r.text
+        assert 'name="code"' in r.text and 'name="enrolment_code"' in r.text
+        assert ">Continue<" not in r.text
 
 
 async def test_empty_code_continue_with_a_held_grant_spends_nothing(
