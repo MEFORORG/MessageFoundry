@@ -4720,8 +4720,11 @@ leave no row and no log line. A refusal of the composed layers writes no such ro
 has `refused` in its detail, which tells it from a search that ran. A NULL, empty or non-text
 criteria cell is refused by the store itself, which logs a WARNING and writes the
 `integrity.preset_tag_failed` row on every store, and on a keyed store raises the
-`integrity_drift` alert, as for a moved preset. The WARNING and the alert fire once per row and
-refusal class per hour. The row is written once per row and refusal class per hour too, but that
+`integrity_drift` alert, as for a moved preset. The store logs the WARNING and raises the alert at
+most once per hour per row and refusal class. The notifying AlertSink's re-alert cooldown then
+applies per alert type and subject (`[alerts].realert_seconds`, or a matching rule's cooldown), and
+every preset refusal, a moved preset's included, shares one subject, `search_presets-tag`, so fewer
+notifications may reach the operator than the store raised. The row is written once per row and refusal class per hour too, but that
 hour starts only when a write succeeds, so a failed write is tried again at the next refusal.
 Every once-per-hour limit in this paragraph is held in memory by each engine process, so N engine
 shards can each log, alert and write once in the same hour, and a restart starts every window
