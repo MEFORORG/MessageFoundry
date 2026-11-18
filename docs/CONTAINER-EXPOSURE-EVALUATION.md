@@ -58,7 +58,7 @@ operational notes.
 | Reverse-proxy trust (WP-15) | `ApiSettings.tls_terminated_upstream` / `trusted_proxies`; `forwarded_allow_ips`, built by `uvicorn_trusted_hosts` in [`__main__.py`](../messagefoundry/__main__.py) `_serve` | The model validator **requires** `trusted_proxies` to be set with `tls_terminated_upstream`. `forwarded_allow_ips` trusts XFF/XFP only from the named proxies (empty = trust nothing). When `serve` accepts a plaintext proxy-to-engine hop: [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop). What the engine serves on that hop: [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md). |
 | TOTP MFA (WP-14) | ADR 0002 §3; `[security].require_mfa`; console flow in [`apiclient/client.py`](../messagefoundry/apiclient/client.py) | Native RFC 6238 TOTP; access gate on every authorized route; admin reset; recovery codes. Built 2026-06-17. |
 | Cert-expiry monitor | [`pipeline/cert_expiry.py`](../messagefoundry/pipeline/cert_expiry.py); `[cert_monitor]` in [`config/settings.py`](../messagefoundry/config/settings.py) | Engine-owned asyncio task (started in `Engine.start`). `certs_from_registry` watches the `[api]` cert + every connection `tls_cert_file`; reads `notAfter` only (never the key); `warn_days` default 30, 12 h cadence; raises a `cert_expiry` AlertSink event. |
-| Console transport guard | [`apiclient/client.py`](../messagefoundry/apiclient/client.py) `_assert_safe_transport` | `https` always allowed; loopback host allowed; non-loopback `http` **refused** unless `--insecure` (then warned). `httpx.Client(cert=...)` carries a client cert for mTLS via `--client-cert`/`--client-key`. |
+| Console transport guard | [`apiclient/client.py`](../messagefoundry/apiclient/client.py) `_assert_safe_transport` | Refuses, in at least these cases, a base URL httpx cannot parse, a scheme other than `http`/`https`, a URL with no host, and a URL carrying userinfo, for `https` too. Past those: `https` allowed; loopback `http` allowed; non-loopback `http` **refused** unless `--insecure` (then warned, and no credential is sent over it). For mTLS, the `EngineClient` arguments `tls_client_cert`/`tls_client_key` are loaded into the `ssl.SSLContext` that `_build_verify_context` builds, and that context reaches httpx as `verify=`; httpx's deprecated `cert=` keyword is not used. |
 | At-rest PHI cipher | `[store].encryption_key` (`MEFOR_STORE_ENCRYPTION_KEY`), `require_encryption` | AES-256-GCM on PHI columns; a start with no key is refused by default, and `require_encryption=true` keeps that refusal when the audited opt-out (`[security].allow_unencrypted_phi`) is set ([PHI.md](PHI.md) §3); rotation via `messagefoundry rotate-key` + `encryption_keys_retired`. |
 
 **No Dockerfile / compose exists in the repo** (confirmed via glob). ADR 0017 decision 7 lists the
@@ -340,13 +340,15 @@ The console stays a **host-side process**; only its target URL changes.
 
 - **Same-host (recommended for an operator on the container host):** publish the API to
   `-p 127.0.0.1:8443:8443` and point the console at `https://localhost:8443`.
-  `_assert_safe_transport` allows `https` unconditionally, so this is clean. **Friction to document:**
+  `_assert_safe_transport` allows a well-formed `https` URL with a host and no userinfo, so this
+  is clean. **Friction to document:**
   `httpx` verifies the server cert by default, so the cert's SAN must include `localhost` (or the host
   name used) and the console host must trust the issuing CA — a self-signed cert needs the CA in the
   trust store. Provide a CA bundle or a properly-SAN'd cert in the runbook.
 - **Remote (operator elsewhere on the trusted network):** `https://<engine-host>:8443`. For mTLS, the
-  API sets `tls_client_ca_file` (→ `CERT_REQUIRED`) and the console presents a client cert via
-  `--client-cert`/`--client-key` (threaded into `httpx.Client(cert=…)`).
+  API sets `tls_client_ca_file` (→ `CERT_REQUIRED`) and the client presents a client cert: the
+  `EngineClient` arguments `tls_client_cert`/`tls_client_key` are loaded into the `ssl.SSLContext`
+  that `_build_verify_context` builds, which reaches httpx as `verify=` (httpx's `cert=` is unused).
 - **Plaintext-refuse holds (confirmed):** `_assert_safe_transport` refuses `http` to a non-loopback
   host unless `--insecure` (which then warns). So a remote console **cannot** silently send the bearer
   token + PHI in cleartext — it must be `https`, or the operator must consciously opt into the

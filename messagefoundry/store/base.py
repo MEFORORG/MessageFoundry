@@ -28,7 +28,15 @@ import logging
 import sys
 import threading
 import weakref
-from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
@@ -80,6 +88,7 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.row_seal import AnyRowSealer, ResealOutcome
 from messagefoundry.store.store import (
     ANY_CLAIM_OWNER,
+    OPEN_STORE_HOOK,
     OPEN_STORE_PIN,
     OPEN_STORE_PIN_CHECK,
     UPLOAD_RESERVATION_STALE_AFTER,
@@ -617,6 +626,20 @@ class QueueStore(StoreLifecycle, Protocol):
         metrics column, no longer an ordering key (and no longer per-lane-clamped). ``None`` when nothing
         is pending or the head isn't due.
 
+        **A head the claim cannot open** is settled after the claim commits, and the call returns
+        ``None``. A cipher refusal of the row itself is dead-lettered standalone (a queue tag
+        failure is also audited and alerted, BACKLOG #2593). A failure that is not the row's
+        (BACKLOG #5735) is not dead-lettered: at least a key service that gave no verdict, a failed
+        read of the store (SQLite), and a dead-letter write that fails. The row is set aside, back
+        to ``pending`` with ``attempts`` undone and ``next_attempt_at`` five seconds past the fault
+        (:meth:`reschedule_claimed`), and is retried no sooner than that, for as long as the
+        failure lasts, with no cap and no alert of its own. A tag failure whose dead-letter write
+        failed is still alerted, and its audit row attempted. On the server backends, which contain only
+        ``CipherError``, any other error propagates and leaves the row ``inflight`` until
+        :meth:`reset_stale_inflight` or, on Postgres, its lease expiry re-pends it; the SQLite
+        claims dead-letter it as an unopenable row. :meth:`claim_ready` and
+        :meth:`claim_next_fifo_batch` settle a row the same way.
+
         On the Postgres backend (active-passive HA) the claim also reclaims this lane's stranded head —
         a crashed/fenced prior leader's expired-lease ``inflight`` row — in the same transaction before
         the head SELECT, so per-lane FIFO order survives failover. SQLite/SQL Server are single active
@@ -649,7 +672,11 @@ class QueueStore(StoreLifecycle, Protocol):
         (UPDLOCK, ROWLOCK)`` (no ``READPAST`` — a locked head blocks) with a contiguous-due-prefix
         cutoff CTE (its ``LOCK_ESCALATION=DISABLE`` + ``ROWLOCK`` + bounded ``limit`` keep it to N row
         locks, no escalation). Default OFF: ``[store].fifo_claim_batch == 1`` means the workers call the
-        single claim and this is never invoked."""
+        single claim and this is never invoked.
+
+        A row it cannot open is settled as :meth:`claim_next_fifo` says. A row set aside takes every
+        later row of the claimed prefix with it, so the list stops before it and the lane never
+        delivers past it (BACKLOG #5735)."""
         ...
 
     async def claim_fifo_heads(
@@ -694,7 +721,15 @@ class QueueStore(StoreLifecycle, Protocol):
         DONE in place (never returned, never re-sent) and its lane is reported in
         ``ClaimedHeads.rearm`` so the caller re-queues it immediately. Decryption happens after
         commit; an undecryptable row is dead-lettered standalone and dropped, and a lane whose whole
-        claimed prefix was consumed (H2/poison) also joins ``rearm``.
+        claimed prefix was consumed (H2/poison) also joins ``rearm``. A row that could not be opened
+        for a reason that is not the row (BACKLOG #5735) is returned, with every later row of its
+        lane, as an item whose ``open_fault`` is set and whose ``payload`` is empty and must not be
+        read: the caller treats it as an infra fault at that item (ADR 0070 T17). The claim writes
+        nothing for it, except where the row failed its queue tag and the dead-letter write then
+        failed: that tag failure is still alerted, and its audit row attempted. An ``Exception``
+        that escapes the decode releases every claimed row back to ``pending`` before it is
+        re-raised; a cancellation leaves them ``inflight`` (``queue_tag.release_unreturned`` says
+        why).
 
         **The lane set is always explicit** (the caller's ready-lane subset, registry-intersected).
         There is deliberately no all-lanes-of-stage claim form: disjoint-inbound sharding runs
@@ -758,7 +793,9 @@ class QueueStore(StoreLifecycle, Protocol):
         an already-resolved row (dead-lettered / re-pended / done / unknown id) is left untouched —
         idempotent. Never touches the retry/``attempts`` ledger beyond undoing the claim's +1, so the
         G6 poison ceiling is unaffected (a T17 fault is *not* the message's fault). Chunked <=500 ids
-        per statement, one commit for the call."""
+        per statement, one commit for the call. The per-lane claims also call it, to set aside a row
+        they could not open for a reason that is not the row (BACKLOG #5735; see
+        :meth:`claim_next_fifo`)."""
         ...
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -4768,6 +4805,7 @@ async def open_store(
     refusal_hook: UnmarkedRefusalHook | None = None,
     custody: HostBlob | None = None,
     recovery_wrap: bytes = b"",
+    before_first_write: Callable[[Any], Awaitable[None]] | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
@@ -4851,6 +4889,12 @@ async def open_store(
     Every custody refusal is a :class:`~messagefoundry.store.keyprovider.KeyProviderError`, with a
     fixed text and no cause or context; :func:`_host_custody_for_open` says which errors on the
     custody path are replaced (BACKLOG #4882).
+
+    ``before_first_write`` (BACKLOG #4936) is awaited with the half-opened backend store on every
+    writable open, right after the pin check: the schema is in place, and nothing has yet bound a
+    salt, reserved a cipher block, sealed a row or written an audit row. ``rotate-key`` opens its
+    rotation record there. The schema step before it can already have run its DDL or a migration.
+    A read-only open does not run it. What it raises fails the open, with the handle closed.
     """
     if create and read_only:
         raise ValueError("open_store: create and read_only exclude each other")
@@ -4903,6 +4947,7 @@ async def open_store(
     # The batch failures a backend typed itself, and the pin refusals, are re-raised as they are.
     check = PinCheck() if minting_open() and settings.backend is not StoreBackend.SQLITE else None
     checking = OPEN_STORE_PIN_CHECK.set(check)
+    hooked = OPEN_STORE_HOOK.set(before_first_write)
     try:
         store = await _open_backend(
             settings,
@@ -4919,6 +4964,7 @@ async def open_store(
             raise
         raise StoreCreateBatchFailedBeforeKeyUse(exc) from exc
     finally:
+        OPEN_STORE_HOOK.reset(hooked)
         OPEN_STORE_PIN_CHECK.reset(checking)
         OPEN_STORE_PIN.reset(pinned)
     if keyless_chain_refusal is not None and audit_mac_key is None and audit_mac_fn is None:

@@ -84,7 +84,12 @@ from messagefoundry.redaction import (
 # one place so the write-time filters here and the read-time support-bundle redactor cannot disagree
 # about what a credential looks like. Stdlib ``re`` only, so no cycle. Deliberately NOT the engine's
 # credential REGISTRIES, which ``config/settings.py`` holds -- that module imports LOG_LEVELS from
-# here, so the dependency must not go the other way.
+# here, so the dependency must not go the other way. The query-string keys the query filter below
+# hides are secretscrub's tuple too, re-exported, so the widened DSN reading there stops at the keys
+# this filter hides (BACKLOG #5386); the BACKLOG #1184 ruling is on the tuple there.
+from messagefoundry.secretscrub import (
+    _CREDENTIAL_QUERY_KEYS as _CREDENTIAL_QUERY_KEYS,
+)
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 
 __all__ = [
@@ -94,6 +99,8 @@ __all__ = [
     "configure_stderr_logging",
     "ensure_logger_sink",
     "install_filtered_last_resort",
+    "scrub_log_text",
+    "sink_readings",
     "set_runtime_level",
     "current_log_level",
     "LogLevelRefused",
@@ -244,9 +251,9 @@ class RedactionFilter(logging.Filter):
     The "never put PHI in an exception message" convention binds only the engine's own authors, Router
     and Handler authors included, in text they write themselves, and never a remote peer, a library or the runtime (docs/PHI.md
     section 7, *Who the exception-message convention binds*).
-    A message escaped before it reaches this filter is another residual: the audit tee's
-    ``json.dumps`` escapes the C0 controls first, and a name or date beside one can pass. See
-    :func:`~messagefoundry.store.audit_tee.emit_audit_tee`.
+    A message escaped before it reaches this filter is another residual: a name or date beside an
+    escape can pass. :func:`~messagefoundry.store.audit_tee.emit_audit_tee` says what the audit
+    tee does about that.
 
     **EVERY FIELD IS BOUNDED BEFORE IT IS SCANNED (BACKLOG #1576).** This filter had no ceiling at all,
     and it is the worst place in the engine not to have one: a ``logging.Filter`` is synchronous by the
@@ -310,22 +317,12 @@ class RedactionFilter(logging.Filter):
         return True
 
 
-#: Query-string parameters that carry a credential and must never reach a log line. ``code`` and
-#: ``state`` arrive on the OIDC callback's URL (ADR 0142 pins ``response_mode=query``), and uvicorn's
-#: access logger emits the full request line *including* the query string.
-#:
-#: **``content`` and ``field_value`` are deliberately absent, and this tuple sits two tokens from
-#: containing them** (BACKLOG #1184, ASVS 14.2.1). That is a ruled state, not an omission; the ruling
-#: and its reasoning are ``docs/PHI.md`` §7 and this comment does not restate them. What stops the
-#: two-token edit landing quietly is
-#: ``tests/test_logging.py::test_an_undeclared_phi_needle_is_not_scrubbed_from_the_access_line``.
-#: **Cite the ruling, not this sentence.**
-_CREDENTIAL_QUERY_KEYS = ("code", "state", "id_token", "access_token", "token", "session_state")
-
 #: The label words ``secretscrub`` redacts a value under: its credential, token and key-material
-#: words. A COPY, because those tuples are private to that module. ``tests/test_logging.py`` holds
-#: this copy, the ``MEFOR_`` prefix and the label prefix below to their sources there, so a change
-#: made there and not here goes red.
+#: words. A COPY, though nothing forces one: this module already imports ``secretscrub``'s
+#: underscore-named ``_CREDENTIAL_QUERY_KEYS`` above, so those tuples are reachable from here too.
+#: ``tests/test_logging.py``
+#: holds this copy, the ``MEFOR_`` prefix and the label prefix below to their sources there, so a
+#: change made there and not here goes red.
 _QUERY_STOP_WORDS = (
     "password",
     "passwd",
@@ -469,6 +466,25 @@ def _shipped_reading(line: str) -> str | None:
     if out is not None and "\t" in out:
         out = _settled_reading(out.replace("\t", " "), filters)
     return out
+
+
+#: The most handlers :func:`configure_logging` installs: stdout, the file and the forwarder.
+SHIPPED_HANDLER_COUNT = 3
+
+
+def sink_readings(text: str, *, sinks: int = SHIPPED_HANDLER_COUNT) -> list[str]:
+    """the Nth item is what N passes of the installed filters leave, since each handler runs the
+    whole chain over the one shared record, as :func:`_settled_reading` models. For a
+    caller that must hold a line to a bar on every sink, not just the first, as the audit tee
+    does (BACKLOG #3045)."""
+    filters = _shipped_filters()
+    record = logging.LogRecord(__name__, logging.WARNING, __file__, 0, "%s", (text,), None)
+    readings = []
+    for _ in range(sinks):
+        for log_filter in filters:
+            log_filter.filter(record)
+        readings.append(record.getMessage())
+    return readings
 
 
 def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | None:
@@ -1099,9 +1115,10 @@ def _refuse_forward_revocation(forward: SyslogForward, ctx: ssl.SSLContext) -> N
 
     **Known limit, recorded rather than left for the next reader to find.** The WARN arm on a
     non-enforcing instance logs *after* ``configure_logging`` has set the root level, so it is
-    filtered out at ``[logging].level`` above WARNING -- unlike its #200 sibling, which logs before
-    that and survives on the filtered ``lastResort`` ``main()`` installs
-    (:func:`install_filtered_last_resort`).
+    filtered out at ``[logging].level`` above WARNING -- unlike its #200 sibling's AUDIT record,
+    which ``serve`` and ``supervise`` write after ``configure_logging`` through a path ``[logging].level``
+    does not filter (``__main__._write_start_audit``, BACKLOG #5390, #5391), with a stderr warning at the
+    decision.
     The REFUSE arm is unaffected (it raises).
     Measured 2026-09-22 at ``WARNING`` and ``ERROR``.
 
@@ -1196,6 +1213,16 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     handler.addFilter(CredentialQueryScrubFilter())  # OIDC code/state in a URL (ADR 0142 AC-10)
     handler.addFilter(CredentialScrubFilter())  # credential labels + values (BACKLOG #1478)
     handler.addFilter(ControlCharScrubFilter())  # log-injection defense (16.4.1)
+
+
+def scrub_log_text(text: str) -> str:
+    """``text`` through the three text passes :func:`_install_phi_filters` installs, in its order:
+    PHI redaction (bounded), the credential query scrub, then the credential scrub. The control
+    scrub, which runs last on a handler, is left out, so a control character stays as it is.
+
+    For a caller that must filter a value before it is encoded, as the audit tee does (BACKLOG
+    #3045). A handler still runs its chain over the encoded line afterwards."""
+    return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
 
 
 def _build_syslog_handler(
@@ -1641,8 +1668,9 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         """Report new spool read faults at most once per :data:`_FORWARD_DROP_REPORT_INTERVAL`
         (BACKLOG #2278).
 
-        :meth:`LogSpool.peek` keeps every file when a read fails for a reason other than a missing
-        file, and returns ``None``, which is also what a drained spool returns. Without this report
+        :meth:`LogSpool.peek` retires nothing when a read fails for a reason other than a missing
+        segment file, a missing spool directory included, and returns ``None``, which is also what
+        a drained spool returns. Without this report
         the only sign was the "spool is full" drop warning, long after and naming the wrong cause.
         The line carries a count and a directory, never a record. It is rate limited for the same
         reason as :meth:`_report_spool_drop`: it comes back through this listener, and every pass
@@ -1659,9 +1687,10 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         batch, self._spool_read_errors_reported = total - self._spool_read_errors_reported, total
         _log.warning(
             "off-box log forwarding could not read its on-disk spool at %s: %d read(s) failed (%d "
-            "since this process started), for a reason other than a missing file. The segments are "
-            "kept, and what they hold is not sent until a read succeeds. Newer records are sent "
-            "ahead of them meanwhile.",
+            "since this process started), for a reason other than a missing segment file; a "
+            "missing spool directory counts. No segment is retired for it, and what the spool "
+            "holds is not sent until a read succeeds. Newer records can be sent ahead of it "
+            "meanwhile.",
             self.spool.directory,
             batch,
             total,
@@ -2094,7 +2123,8 @@ class ForwarderStatus:
     spool_dropped: int = 0
     #: Spooled records skipped as torn or malformed, and segments found gone before they were sent.
     spool_skipped: int = 0
-    #: Spool reads that failed for a reason other than a missing file. Held, not lost.
+    #: Spool reads that failed for a reason other than a missing segment file, a missing spool
+    #: directory included. Nothing is retired for them.
     spool_read_errors: int = 0
     #: Whether the last spool read failed that way.
     spool_read_faulted: bool = False

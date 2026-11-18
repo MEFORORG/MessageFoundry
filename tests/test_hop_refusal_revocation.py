@@ -231,6 +231,8 @@ def test_the_authority_takes_no_egress_terminator_input() -> None:
         "crl_checked",
         # Descriptive only: the record's wording reads it, no disposition does (vault BACKLOG #5086).
         "expiry_relaxed",
+        # Descriptive only too: a context that does not verify the peer (vault BACKLOG #4912).
+        "peer_not_verified",
         "ways_across",
         "attested_reason",
         "connection",
@@ -852,35 +854,12 @@ def test_email_cleartext_refuses_via_settings_not_revocation(
 @pytest.fixture(scope="module")
 def crl_bundle(tmp_path_factory: pytest.TempPathFactory) -> str:
     """A throwaway CA bundled with its own fresh CRL -- the shape harden_crl_check loads. Synthetic."""
-    import datetime
+    from cryptography.hazmat.primitives import serialization
 
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
+    from tests._crl_pki import empty_crl, throwaway_ca
 
-    now = datetime.datetime.now(datetime.UTC)
-    day = datetime.timedelta(days=1)
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-299-ca")])
-    ca = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - day)
-        .not_valid_after(now + 365 * day)
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .sign(key, hashes.SHA256())
-    )
-    crl = (
-        x509.CertificateRevocationListBuilder()
-        .issuer_name(ca.subject)
-        .last_update(now - 2 * day)
-        .next_update(now + 30 * day)
-        .sign(key, hashes.SHA256())
-    )
+    key, ca = throwaway_ca("mefor-299-ca")
+    crl = empty_crl(key, ca)
     directory = tmp_path_factory.mktemp("crl299")
     path = directory / "ca_and_crl.pem"
     path.write_bytes(

@@ -178,15 +178,22 @@ from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
+    PROGRAMMING_ERRORS,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
+    TRANSIENT_OPEN_BACKOFF_SECONDS,
+    QueueOpenFault,
     QueueTagError,
     alert_queue_tag_failure,
+    is_transient_open_failure,
     open_queue_cell,
+    queue_open_fault,
     queue_payload_aad,
     queue_row_aad,
+    release_unreturned,
     report_queue_tag_failure,
     reseal_unless_tag_failure,
+    set_aside_deadline,
 )
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
@@ -1172,6 +1179,13 @@ class OutboxItem:
     # (ADR 0082 #134 — the batch delivery body needs the head's created_at for BHS-7 / the coalescing
     # deadline).
     created_at: float | None = None
+    # Set only by ``claim_fifo_heads``, on a row whose body could not be opened for a reason that
+    # is not the row (a key service that gave no verdict, a failed store read, a failed dead-letter
+    # write), and on every later row of its lane; ``payload`` is then empty and must not be read.
+    # The pooled dispatcher checks it before the item's body runs and, finding it set, never runs
+    # the body and never raises it: it hands a fresh, never-raised copy of it to the ADR 0070 T17
+    # infra-fault path (BACKLOG #5735, #6706). Never set on an item any other claim returns.
+    open_fault: QueueOpenFault | None = field(default=None, compare=False, repr=False)
 
     @classmethod
     def from_row(cls, row: aiosqlite.Row, payload: str) -> OutboxItem:
@@ -6891,14 +6905,33 @@ class StoreCreateBatchFailedBeforeKeyUse(Exception):
 #: construction; ``None`` for every open that is not under the ``host`` key provider.
 OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
 
+#: The ``before_first_write`` hook of the store open in progress, set by ``store.base.open_store``
+#: around the backend open and run by :func:`run_open_store_hook` (BACKLOG #4936). A context
+#: variable for :data:`OPEN_STORE_PIN`'s reason; ``None`` for an open that passes no hook.
+OPEN_STORE_HOOK: ContextVar[Callable[[Any], Awaitable[None]] | None] = ContextVar(
+    "mefor_open_store_hook", default=None
+)
+
+
+async def run_open_store_hook(host: object) -> None:
+    """Run the open's ``before_first_write`` hook on the half-opened ``host`` (BACKLOG #4936). Each
+    backend's writable open calls this right after :func:`check_open_store_pin`, so once the schema
+    is in place and before it binds a salt, reserves a cipher block, seals a row or writes an audit
+    row. A read-only open never calls it. A no-op when no hook is set. What the hook raises fails
+    the open, which closes the handle."""
+    hook = OPEN_STORE_HOOK.get()
+    if hook is not None:
+        await hook(host)
+
 
 class PinCheck:
-    """Whether the open in progress has passed its store id pin check (:func:`check_open_store_pin`),
-    the last step before its first write under the store key. Under ``auto`` schema management the
-    open may already have committed its schema, and on SQL Server altered the database's options,
-    before it; neither is under the key. A mutable cell rather than a flag in a context variable,
-    so a pass recorded under a copied context still reaches the open that set it (vault BACKLOG
-    #8119 item 2)."""
+    """Whether the open in progress has passed its store id pin check (:func:`check_open_store_pin`).
+    The open's ``before_first_write`` hook (:func:`run_open_store_hook`, BACKLOG #4936) runs after
+    the pin check, and the open's first write under the store key after both. Under ``auto``
+    schema management the open may already have committed its schema, and on SQL Server altered
+    the database's options, before the pin check; neither is under the key. A mutable cell rather
+    than a flag in a context variable, so a pass recorded under a copied context still reaches the
+    open that set it (vault BACKLOG #8119 item 2)."""
 
     __slots__ = ("passed",)
 
@@ -11569,6 +11602,7 @@ class MessageStore:
                 # has not bound, a failure before the bind included (BACKLOG #5720).
                 store._cipher_foreign = True
                 await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
+                await run_open_store_hook(store)  # BACKLOG #4936: after the pin, before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
@@ -14570,7 +14604,8 @@ class MessageStore:
             except Exception as exc:
                 # STANDALONE: this runs post-claim-commit; force an immediate inline commit so it never
                 # tries to join a group batch (Hazard A — a claim's dead-letter must not group).
-                await self._dead_letter_unopenable(row, exc)
+                if await self._dead_letter_unopenable(row, exc) is not None:
+                    await self._set_aside_claimed([row], now)
         return items
 
     async def _outbox_item_from_row(self, row: aiosqlite.Row) -> OutboxItem:
@@ -14615,15 +14650,62 @@ class MessageStore:
         # Deref'd shared body — bound to the shared_body content-address cell, not this queue row.
         return self._cipher.decrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
 
-    async def _dead_letter_unopenable(self, row: aiosqlite.Row, exc: Exception) -> None:
+    async def _dead_letter_unopenable(
+        self, row: aiosqlite.Row, exc: Exception
+    ) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened, standalone (Hazard A: this
         runs after the claim committed, so it must never join a group batch). A row that failed its
         queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
-        (BACKLOG #2593). The lane moves on either way."""
+        (BACKLOG #2593). Returns ``None`` then.
+
+        A failure that says nothing about the row is returned instead, with nothing written
+        (BACKLOG #5735): a key service that gave no verdict (:func:`is_transient_open_failure`) or
+        a failed read of the store. So is the error of a dead-letter write that fails, after a tag
+        failure is still reported; an error in the engine's own code (:data:`PROGRAMMING_ERRORS`)
+        propagates. The caller keeps the row from being delivered past: ``claim_fifo_heads`` hands
+        it to the dispatcher's T17 path, and the other claims set it aside
+        (:meth:`_set_aside_claimed`)."""
+        if is_transient_open_failure(exc) or isinstance(exc, (sqlite3.OperationalError, OSError)):
+            return queue_open_fault(exc)
         log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-        await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
+        try:
+            await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
+        except PROGRAMMING_ERRORS:
+            raise
+        except Exception as failed:  # noqa: BLE001 -- a store fault, which the caller contains
+            log.warning(
+                "could not dead-letter queue row %s (%s); it is retried",
+                row["id"],
+                type(failed).__name__,
+            )
+            if isinstance(exc, QueueTagError):
+                await report_queue_tag_failure(
+                    self, self._cipher, row, outcome="could not be dead-lettered"
+                )
+            return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
+        return None
+
+    async def _set_aside_claimed(self, tail: Sequence[aiosqlite.Row], now: float | None) -> None:
+        """Re-pend claimed rows with a durable backoff (BACKLOG #5735): ``attempts`` loses the
+        claim's increment, as for any fault that is not the message's, and ``next_attempt_at``
+        moves :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault (:func:`set_aside_deadline`),
+        so a sweep does not re-claim them at once. The single-lane claims (``claim_ready``,
+        ``claim_next_fifo``, ``claim_next_fifo_batch``) call it, and they run under either claim
+        mode: under ``"pooled"`` at least an unordered lane and a batch window's extra members
+        are claimed through them. None of their callers binds ``infra_fault_policy``, so such a
+        row is retried for as long as the fault lasts, with no cap or alert; only
+        ``claim_fifo_heads`` hands a fault to T17. If this write fails too,
+        its error propagates out of the claim and the rows stay ``inflight`` until
+        ``reset_stale_inflight`` at the next start."""
+        log.warning(
+            "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
+            " dead-lettered, for a reason the claim could not settle",
+            len(tail),
+            TRANSIENT_OPEN_BACKOFF_SECONDS,
+        )
+        await self.reschedule_claimed([r["id"] for r in tail], set_aside_deadline(now))
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
         # SQLite is single active node: there is no second writer to fence, so the H1 epoch guard is a
@@ -14745,7 +14827,8 @@ class MessageStore:
             # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its row tag
             # is audited and alerted too (BACKLOG #2593).
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
-            await self._dead_letter_unopenable(claimed, exc)
+            if await self._dead_letter_unopenable(claimed, exc) is not None:
+                await self._set_aside_claimed([claimed], now)
             return None
 
     async def claim_next_fifo_batch(
@@ -14771,9 +14854,11 @@ class MessageStore:
         rows in one ``UPDATE ... id IN (...)``, then **re-SELECT** them so each :class:`OutboxItem`
         carries the POST-increment ``attempts`` the G6 ceiling reads (mirrors the single claim's re-read).
 
-        Decryption happens AFTER the commit, off the lock; an undecryptable row is dead-lettered
-        standalone and DROPPED from the returned list (a poison interior row never stalls the lane and
-        never reorders the surviving tail), mirroring :meth:`claim_ready`.
+        Decryption happens AFTER the commit, off the lock; a row refused for its own content is
+        dead-lettered standalone and DROPPED from the returned list (a poison interior row never
+        stalls the lane and never reorders the surviving tail), mirroring :meth:`claim_ready`. A row
+        that could not be opened for a reason that is not the row (BACKLOG #5735) ends the list
+        instead, and it and every later claimed row are set aside (:meth:`_set_aside_claimed`).
         """
         now = time.time() if now is None else now
         # Lane column is a code-controlled literal (chosen by stage), never user input — same mapping as
@@ -14818,12 +14903,16 @@ class MessageStore:
         # Decrypt per row OUTSIDE the lock; a single undecryptable payload (corrupt blob / rotated key)
         # must not blow up the whole claim — dead-letter the bad row STANDALONE and deliver the rest
         # (the surviving tail keeps its order — mirrors claim_ready / the single claim's H-1 handling).
+        # A row that is not refused for its own content stops the list and is set aside (#5735).
         items: list[OutboxItem] = []
-        for row in claimed_rows:
+        ordered = list(claimed_rows)
+        for i, row in enumerate(ordered):
             try:
                 items.append(await self._outbox_item_from_row(row))
             except Exception as exc:
-                await self._dead_letter_unopenable(row, exc)
+                if await self._dead_letter_unopenable(row, exc) is not None:
+                    await self._set_aside_claimed(ordered[i:], now)
+                    break  # set aside with the rest of the lane: never deliver past it (#5735)
         return items
 
     async def claim_fifo_heads(
@@ -14849,9 +14938,11 @@ class MessageStore:
         guarantee (cf. the Postgres/SQL Server probe-then-claim). Rows past the cutoff are never
         UPDATEd (``attempts`` untouched — probe-then-claim parity by construction).
 
-        Decryption happens AFTER the commit, off the lock; an undecryptable row is dead-lettered
-        standalone and DROPPED (a poison interior row never stalls the lane and never reorders the
-        surviving tail); a lane whose whole claimed prefix was consumed (H2/poison) joins ``rearm``."""
+        Decryption happens AFTER the commit, off the lock; a row refused for its own content is
+        dead-lettered standalone and DROPPED (a poison interior row never stalls the lane and never
+        reorders the surviving tail); a lane whose whole claimed prefix was consumed (H2/poison)
+        joins ``rearm``. A row that could not be opened for a reason that is not the row (BACKLOG
+        #5735) is returned with every later row of its lane, each carrying ``open_fault``."""
         now = time.time() if now is None else now
         # Lane column is a code-controlled literal (chosen by stage), never user input — same mapping
         # as claim_next_fifo.
@@ -14937,18 +15028,34 @@ class MessageStore:
             await self._commit()
         # Decrypt per row OUTSIDE the lock; a single undecryptable payload must not blow up the whole
         # claim — dead-letter the bad row STANDALONE and deliver the rest (mirrors the batch claim).
+        # A row that is not refused for its own content is returned with its lane's tail as unopened
+        # items for the dispatcher's T17 path (#5735).
         by_lane: dict[str, list[OutboxItem]] = {}
-        for lane, lane_rows in claimed_by_lane.items():
-            items: list[OutboxItem] = []
-            for row in lane_rows:
-                try:
-                    items.append(await self._outbox_item_from_row(row))
-                except Exception as exc:
-                    await self._dead_letter_unopenable(row, exc)
-            if items:
-                by_lane[lane] = items
-            else:
-                rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        try:
+            for lane, lane_rows in claimed_by_lane.items():
+                items: list[OutboxItem] = []
+                for i, row in enumerate(lane_rows):
+                    try:
+                        items.append(await self._outbox_item_from_row(row))
+                    except Exception as exc:
+                        fault = await self._dead_letter_unopenable(row, exc)
+                        if fault is not None:
+                            # The dispatcher's ADR 0070 T17 path takes it from here (#5735).
+                            items.extend(
+                                replace(OutboxItem.from_row(r, ""), open_fault=fault)
+                                for r in lane_rows[i:]
+                            )
+                            break
+                if items:
+                    by_lane[lane] = items
+                else:
+                    rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        except Exception:
+            # Nothing is returned, so no lane's claimed rows may stay inflight behind the error, a
+            # bug or any other escaping error (#5735). A cancellation is not caught, so it leaves
+            # them inflight; release_unreturned says why.
+            await release_unreturned(self, claimed_by_lane.values())
+            raise
         return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm))
 
     async def list_fifo_lanes(

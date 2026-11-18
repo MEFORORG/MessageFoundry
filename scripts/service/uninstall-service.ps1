@@ -39,7 +39,14 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ServiceName = "MessageFoundry",
+    # The name install-service.ps1 accepts, and no other (BACKLOG #5402). It feeds Get-Service,
+    # which expands wildcards in -Name, and the service's registry path, so the pattern refuses a
+    # wildcard character such as "*" before either is read. The pattern is a literal copy,
+    # pinned to messagefoundry/service_status.py by tests/test_net_helper_install_scripts.py.
+    # THE PATTERN IS NOT THE WHOLE GUARD. It allows a space, so a DISPLAY name such as
+    # 'Windows Time' passes it, and -Name matches a display name too. The exact-name filter below,
+    # and the one in Stop-ServiceAndConfirm, are what keep that from resolving to another service.
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$ServiceName = "MessageFoundry",
     [string]$DataDir = "C:\ProgramData\MessageFoundry",
     # Opt-in: take the "Log on as a service" right back off the run-as account. Default OFF because
     # a SHARED account (a gMSA running several services, a dedicated user reused elsewhere) needs
@@ -69,8 +76,10 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Removing a Windows service requires an elevated (Administrator) PowerShell."
 }
 
-# Detect via Get-Service (no stderr/Stop pitfalls like `nssm status` on a missing service).
-if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+# Detect via Get-Service (no stderr/Stop pitfalls like `nssm status` on a missing service), keeping
+# only the service whose NAME is $ServiceName: -Name also matches a display name (BACKLOG #5402).
+if (-not (@(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+        Where-Object { $_.Name -eq $ServiceName })) {
     Write-Host "Service '$ServiceName' is not installed - nothing to do."
     return
 }
@@ -80,7 +89,8 @@ if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
 function Stop-ServiceAndConfirm {
     <#
       Stop the service and CONFIRM from the SCM that it actually stopped. Returns $true when the
-      service is Stopped (or gone); $false when it is still running.
+      service is Stopped (or gone); $false when it is still running. Throws when the SCM cannot be
+      read, since that says neither.
 
       Neither half of this existed before (BACKLOG #1558), and neither half is enough on its own.
 
@@ -127,6 +137,27 @@ function Stop-ServiceAndConfirm {
         [string]$NssmPath,
         [int]$TimeoutSeconds = 30
     )
+    # EXACTLY THIS SERVICE, NEVER ONE WHOSE DISPLAY NAME IS $ServiceName (BACKLOG #5402). Get-Service
+    # and Stop-Service -Name also match a service's DISPLAY name, and the name pattern every caller
+    # validates against allows a space, so 'Windows Time' passes it and -Name resolves it to W32Time.
+    # The pattern keeps wildcards out; only this filter keeps a display name out. -eq and not -ceq,
+    # because the SCM compares service names without case. What is stopped is the object this
+    # returned (-InputObject), never a name a cmdlet resolves again.
+    #
+    # ONLY "NO SUCH SERVICE" READS AS GONE. Any other failure to read the SCM throws: it says nothing
+    # about whether the service still runs, and the caller would reconfigure or remove it as stopped.
+    $exact = {
+        try { $found = @(Get-Service -Name $ServiceName -ErrorAction Stop) } catch {
+            if ("$($_.FullyQualifiedErrorId)" -like 'NoServiceFoundForGivenName,*') { return }
+            throw ("Could not read '$ServiceName' from the SCM ($($_.Exception.Message)), so " +
+                "whether it is still running is not known. Nothing was changed after this read.")
+        }
+        $found | Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    }
+    $target = & $exact
+    # Nothing by that exact name means nothing to stop, so neither nssm nor the SCM is asked to stop
+    # anything: each would resolve the name again, and either can take it as a display name.
+    if (-not $target) { return $true }
     if ($NssmPath) {
         $launched = $true
         $global:LASTEXITCODE = $null
@@ -134,24 +165,24 @@ function Stop-ServiceAndConfirm {
             $launched = $false
             Write-Warning ("Could not run '$NssmPath' to stop '$ServiceName' " +
                 "($($_.Exception.Message)). Falling back to the SCM.")
-            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+            Stop-Service -InputObject $target -Force -ErrorAction SilentlyContinue
         }
         $exit = $LASTEXITCODE
         if ($launched -and $null -eq $exit) {
             $launched = $false
             Write-Warning ("'$NssmPath' left no exit code, so nssm never ran and '$ServiceName' was " +
                 "not stopped by it. Falling back to the SCM.")
-            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+            Stop-Service -InputObject $target -Force -ErrorAction SilentlyContinue
         } elseif ($launched -and $exit -ne 0) {
             Write-Warning ("nssm stop '$ServiceName' exited $exit (its message is above). " +
                 "The service may still be running; the status is checked below.")
         }
     } else {
-        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        Stop-Service -InputObject $target -Force -ErrorAction SilentlyContinue
     }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ($true) {
-        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        $svc = & $exact
         if (-not $svc) { return $true }
         if ($svc.Status -eq "Stopped") { return $true }
         if ((Get-Date) -ge $deadline) {
@@ -425,16 +456,20 @@ function New-SeceditWorkDirectory {
       the Windows folder's Temp. The Windows folder is asked of the system, not read from
       $env:SystemRoot: the user can set that variable for their own processes.
 
-      WHAT IS CHECKED ON THE PARENT, before anything is made, and nothing more. It must be a folder
-      that is not a reparse point. Its owner must be SYSTEM, Administrators, TrustedInstaller or
-      $OwnerSid. No allow entry that applies to the parent itself may give anyone else
-      delete-child, a DACL change, ownership or GENERIC_ALL; OWNER RIGHTS counts as the owner and
-      CREATOR OWNER is not judged. A parent that fails is refused. DELETE on the parent itself is
-      not checked, and neither is any folder above it.
+      WHAT IS CHECKED, before anything is made, and nothing more. The parent must be a folder, and
+      neither it nor any folder above it, up to the root, may be a reparse point. On each of those
+      folders the owner must be SYSTEM, Administrators, TrustedInstaller or $OwnerSid, and no allow
+      entry that applies to that folder itself may give anyone else delete, delete-child, a DACL
+      change, ownership or GENERIC_ALL; OWNER RIGHTS counts as that folder's owner and CREATOR
+      OWNER is not judged. Conditional (callback) access entries are not read. A parent that fails, or that has a folder above it that fails, is
+      refused. The folders above the parent are walked by name.
 
-      $Parent and $OwnerSid are parameters so the unelevated tests can make a folder they own.
+      $Parent, $OwnerSid and $CheckedUpTo are parameters so the unelevated tests can make a folder
+      they own. $CheckedUpTo ends the walk at that folder, which must be the parent or a folder
+      above it; a user's own profile folders can grant full control to an app's capability SID, so
+      the tests stop at their own temporary folder. No caller in either script passes it.
     #>
-    param([string]$Parent, [string]$OwnerSid = "S-1-5-32-544")
+    param([string]$Parent, [string]$OwnerSid = "S-1-5-32-544", [string]$CheckedUpTo)
     if (-not $Parent) { $Parent = Join-Path ([Environment]::GetFolderPath("Windows")) "Temp" }
     # CREATOR OWNER (S-1-3-0) matches no one outside an inherited entry, so it is listed here.
     $trusted = @(
@@ -445,27 +480,41 @@ function New-SeceditWorkDirectory {
     if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         throw "'$Parent' is not a plain folder"
     }
-    # Who could rename a folder made here: its owner (WRITE_DAC grants the rest), and anyone the
-    # folder itself gives delete-child, a DACL change, ownership or GENERIC_ALL. Inherit-only entries
-    # apply to what is made inside, which this folder's own DACL replaces. OWNER RIGHTS (S-1-3-4)
-    # names the parent's owner, so the owner arm judges it.
-    $acl = Get-Acl -LiteralPath $Parent -ErrorAction Stop
+    # Who could move a folder made here away: whoever can rename it out of the parent, and whoever
+    # can rename the parent, or any folder above it, with it inside (BACKLOG #8239 item 13). So each
+    # folder from the parent up to the root is judged: its owner (WRITE_DAC grants the rest), and
+    # anyone that folder itself gives delete, delete-child, a DACL change, ownership or GENERIC_ALL.
+    # Inherit-only entries apply to what is made inside, not to the folder. OWNER RIGHTS (S-1-3-4)
+    # names the folder's owner, so the owner arm judges it.
     $rights = [System.Security.AccessControl.FileSystemRights]
-    $renameMask = [int]($rights::DeleteSubdirectoriesAndFiles -bor $rights::ChangePermissions -bor
-        $rights::TakeOwnership) -bor 0x10000000
+    $renameMask = [int]($rights::Delete -bor $rights::DeleteSubdirectoriesAndFiles -bor
+        $rights::ChangePermissions -bor $rights::TakeOwnership) -bor 0x10000000
     $open = @()
-    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    if ($trusted -notcontains $owner) { $open += "$owner (owner)" } else { $trusted += @("S-1-3-4") }
-    foreach ($rule in $acl.Access) {
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-        if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
-        if (([int]$rule.FileSystemRights -band $renameMask) -eq 0) { continue }
-        $sid = "$($rule.IdentityReference)"
-        try { $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { }
-        if ($trusted -notcontains $sid) { $open += "$sid ($($rule.FileSystemRights))" }
+    $stop = if ($CheckedUpTo) { (Get-Item -LiteralPath $CheckedUpTo -Force -ErrorAction Stop).FullName.TrimEnd('\') }
+    for ($dir = $item; $dir; $dir = $dir.Parent) {
+        # A junction or link above the parent would make this walk judge the wrong folders.
+        if ($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "'$Parent' sits under '$($dir.FullName)', a reparse point"
+        }
+        $acl = Get-Acl -LiteralPath $dir.FullName -ErrorAction Stop
+        $judged = $trusted
+        $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($trusted -notcontains $owner) { $open += "'$($dir.FullName)' $owner (owner)" }
+        else { $judged = @($trusted) + @("S-1-3-4") }
+        # Read as SIDs, so no rule needs a name lookup.
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+            if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+            if (([int]$rule.FileSystemRights -band $renameMask) -eq 0) { continue }
+            $sid = $rule.IdentityReference.Value
+            if ($judged -notcontains $sid) { $open += "'$($dir.FullName)' $sid ($($rule.FileSystemRights))" }
+        }
+        if ($stop -and $dir.FullName.TrimEnd('\') -eq $stop) { break }
     }
+    # Past the root without meeting $CheckedUpTo: it named no folder on this path.
+    if ($stop -and -not $dir) { throw "'$CheckedUpTo' is not '$Parent' or a folder above it" }
     if ($open) {
-        throw ("'$Parent' lets another account rename a folder made in it: " +
+        throw ("'$Parent' lets another account rename a folder made in it, or a folder above it: " +
             (($open | Select-Object -Unique) -join ', '))
     }
     $path = Join-Path $Parent ("mefor-secedit-" + [guid]::NewGuid().ToString("N"))
@@ -539,10 +588,8 @@ function Remove-ServiceLogonRight {
     try {
         # $LASTEXITCODE is session-wide and a failed LAUNCH never writes it, so it is cleared before
         # each call and a $null afterwards is treated as "secedit did not run" - the rule the nssm
-        # calls in both scripts follow. NOTE: install-service.ps1's Set-ServiceLogonRight runs the
-        # same two secedit calls WITHOUT this clear, so it can read the previous native command's
-        # code. That is a pre-existing gap in the grant path, not fixed here; filing it is the
-        # maintainer's, and this comment exists so the asymmetry is not read as parity.
+        # calls in both scripts follow. install-service.ps1's Set-ServiceLogonRight clears it the
+        # same way before its two secedit calls (BACKLOG #5401).
         $global:LASTEXITCODE = $null
         & secedit /export /areas USER_RIGHTS /cfg $inf | Out-Null
         if ($null -eq $LASTEXITCODE -or $LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $inf)) {
@@ -645,14 +692,14 @@ $appStdout = ""
 $secretsDir = ""
 $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 try {
-    $objectName = [string](Get-ItemProperty -Path $svcKey -Name ObjectName -ErrorAction Stop).ObjectName
+    $objectName = [string](Get-ItemProperty -LiteralPath $svcKey -Name ObjectName -ErrorAction Stop).ObjectName
 } catch {
     $unreadable += ("the run-as account of '$ServiceName' ($($_.Exception.Message)) - check " +
         "'$DataDir' and your config directory for an orphaned entry, and secpol.msc for a stray " +
         "'Log on as a service' grant")
 }
 try {
-    $params = Get-ItemProperty -Path (Join-Path $svcKey "Parameters") -ErrorAction Stop
+    $params = Get-ItemProperty -LiteralPath (Join-Path $svcKey "Parameters") -ErrorAction Stop
     $appParameters = [string]$params.AppParameters
     $appExe = [string]$params.Application
     $appStdout = [string]$params.AppStdout
@@ -693,7 +740,7 @@ if (-not $PSBoundParameters.ContainsKey('DataDir')) {
 # removal, because the registration is where the path lives.
 $cachedNssm = ""
 try {
-    $imagePath = [string](Get-ItemProperty -Path $svcKey -Name ImagePath -ErrorAction Stop).ImagePath
+    $imagePath = [string](Get-ItemProperty -LiteralPath $svcKey -Name ImagePath -ErrorAction Stop).ImagePath
     $imageExe = if ($imagePath.Trim().StartsWith('"')) { ($imagePath.Trim() -split '"')[1] }
                 else { $imagePath.Trim() }
     if ($imageExe -and (Test-Path -LiteralPath $imageExe)) { $cachedNssm = $imageExe }

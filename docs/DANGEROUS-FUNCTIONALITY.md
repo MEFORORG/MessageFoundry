@@ -551,7 +551,10 @@ pure-Python equivalent:
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
   `transports/database.py`, which calls `GetDriveTypeW` and `QueryDosDeviceW` as inputs to the
-  best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705)
+  best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705). And
+  `restricted_file.py`, which on Windows asks `kernel32`'s `GetDriveTypeW` whether a volume the
+  walk of a key file's path reaches is a mapped network drive, and may load `mpr` to ask
+  `WNetGetConnectionW` which share such a drive is mapped to (vault BACKLOG #5657)
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
   only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and
@@ -596,7 +599,8 @@ loads no new library. One load takes a computed path: `tray/branding.py` opens t
 launcher with `LoadLibraryExW`, but as a data file, to read its version resource, so none of that
 file's code runs. Most sites declare argument and return types before the call, so a wrong-width
 argument fails at the boundary rather than corrupting the stack. Not all do: at least `service.py`,
-`service_status.py` and `store/crypto.py` make some calls without declared types.
+`service_status.py` and `store/crypto.py` make some calls without declared types, and so does
+`restricted_file.py` for `GetDriveTypeW`.
 
 ---
 
@@ -754,6 +758,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `messagefoundry_toolkit/corepoint_import.py` |
 | A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
 | A config digest in the shared cluster store | Unsigned JSON in `cluster_config.config_digest`, which a node writes when it bumps the shared config version. A convergence reload reads it back through `shared_digest_of`, which caps its length before parsing and checks its keys and the types of its values. Nothing authenticates it. | `config/fingerprint.py` |
+| The off-box audit tee line | An audit record's fields, which carry outside text such as a typed sign-in name, and its `detail`, which can carry an exception's text. For the C0 field scrub (vault BACKLOG #3045), the tee parses the `detail` and modelled sink readings of the tee line as JSON in some cases. The `emit_audit_tee` and `_tee_line` docstrings state the rules. | `store/audit_tee.py` |
 
 **Parse sites left out, and why.**
 

@@ -289,7 +289,7 @@ FAMILIES: tuple[Family, ...] = (
         name="dsn_inline_password",
         line="store dsn postgres://svc:wt-D5n_Pass-61@db.invalid:5432/mefor",
         secret="wt-D5n_Pass-61",
-        patterns=("_DSN_PASSWORD",),
+        patterns=("_DSN_PASSWORD", "_WIDE_DSN_PASSWORD"),
     ),
     Family(
         # A COMMA-JOINED list (``store/keyprovider.py::_split_retired``). The sentinel is the LAST

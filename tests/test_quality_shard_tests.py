@@ -10,6 +10,7 @@ would report it, because the combined coverage.xml still lists every source file
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -94,15 +95,30 @@ def test_main_prints_one_shard_and_refuses_an_out_of_range_index(
 # --- the engine suite (BACKLOG #5247) -------------------------------------------------------------
 
 
+def _engine_shards() -> int:
+    """ci.yml's engine suite shard count, read from its shard jobs' run lines, so this file grades
+    the split those jobs run. tests/test_ci_engine_suite_shards.py holds each `--of` there to its
+    own count of shard jobs."""
+    text = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    counts = set(
+        re.findall(r'shard_tests\.py --suite engine --shard "\$TEST_SHARD" --of (\d+)', text)
+    )
+    assert len(counts) == 1, f"ci.yml's engine shard jobs disagree on --of: {sorted(counts)}"
+    return int(counts.pop())
+
+
+_ENGINE_SHARDS = _engine_shards()
+
+
 @pytest.fixture(scope="module")
 def engine(mod: ModuleType) -> dict[int, list[str]]:
-    return mod.partition(2, "engine")
+    return mod.partition(_ENGINE_SHARDS, "engine")
 
 
 def test_the_test_shards_partition_the_engine_step_s_file_set(
     mod: ModuleType, files: list[str], engine: dict[int, list[str]]
 ) -> None:
-    """Every file the engine step runs, in exactly one of the two shards: testpaths, less the
+    """Every file the engine step runs, in exactly one of the shards: testpaths, less the
     tooling tier and the web console package. This half reads this file's own walk of testpaths;
     ci.yml's guard step compares the same split with pytest's real collection."""
     tooling = mod.tooling_files()
@@ -111,11 +127,13 @@ def test_the_test_shards_partition_the_engine_step_s_file_set(
         for f in files
         if f not in tooling and not f.startswith("packaging/messagefoundry-webconsole/")
     )
-    listed = engine[1] + engine[2]
-    print(f"[shards] engine: shard 1 {len(engine[1])}, shard 2 {len(engine[2])} files")
+    assert sorted(engine) == list(range(1, _ENGINE_SHARDS + 1))
+    listed = [f for shard in sorted(engine) for f in engine[shard]]
+    sizes = ", ".join(f"shard {n} {len(engine[n])}" for n in sorted(engine))
+    print(f"[shards] engine: {sizes} files")
     assert sorted(listed) == expected
-    assert len(set(listed)) == len(listed), "a file is in both test shards"
-    assert engine[1] and engine[2], "a test shard is empty"
+    assert len(set(listed)) == len(listed), "a file is in two test shards"
+    assert all(engine.values()), "a test shard is empty"
 
 
 def test_the_engine_suite_leaves_the_console_package_out_and_the_coverage_suite_keeps_it(
@@ -131,14 +149,17 @@ def test_the_engine_suite_leaves_the_console_package_out_and_the_coverage_suite_
 
 def test_the_connscale_smoke_is_held_in_shard_one(mod: ModuleType) -> None:
     """scripts/connscale_harvest.py joins its readings to the `test (...)` jobs, and only that job
-    sets MEFOR_CONNSCALE_LEG. Its hash puts it in shard 2, so the hold is doing real work.
+    sets MEFOR_CONNSCALE_LEG. Its hash puts it in shard 3 of 3, so the hold is doing real work.
 
     Falsified by emptying ENGINE_SUITE_SHARD_ONE: RED on the first assertion. Restored."""
     smoke = "tests/test_connscale_smoke.py"
     assert (_ROOT / smoke).is_file()
-    assert mod.assign(smoke, 2, "engine") == 1
-    assert mod.shard_of(smoke, 2) == 2, "the hold is no longer load-bearing; re-read why it exists"
-    assert mod.assign(smoke, 2, "coverage") == 2, "the hold must not move the coverage split"
+    assert mod.assign(smoke, _ENGINE_SHARDS, "engine") == 1
+    by_hash = mod.shard_of(smoke, _ENGINE_SHARDS)
+    assert by_hash != 1, "the hold is no longer load-bearing; re-read why it exists"
+    assert mod.assign(smoke, _ENGINE_SHARDS, "coverage") == by_hash, (
+        "the hold must not move the coverage split"
+    )
 
 
 def test_the_collection_reader_takes_node_ids_and_nothing_else(mod: ModuleType) -> None:
@@ -189,11 +210,11 @@ def test_check_collection_exits_by_what_pytest_collected(
             out = "".join(f"{path}::test_x\n" for path in files)
             return subprocess.CompletedProcess(args=[], returncode=code, stdout=out, stderr="")
 
-        result: int = mod.check_collection(2, "engine", ["-m", "x"], run=run)
+        result: int = mod.check_collection(_ENGINE_SHARDS, "engine", ["-m", "x"], run=run)
         assert not queue, "the stub was asked fewer times than expected"
         return result
 
-    every = engine[1] + engine[2]
+    every = [f for shard in sorted(engine) for f in engine[shard]]
     quiet, rest = every[0], every[1:]
     assert check((every, 0)) == 0
     assert check(([*every, "tests/test_nowhere.py"], 0)) == 1

@@ -51,8 +51,10 @@ Token-file format (sectioned; ``#`` comments and blank lines ignored):
   [site_prefix]  one numeric prefix per line; the detector matches PREFIX + four digits.
 
 Usage:
-  scan_forbidden.py [FILE ...]      # scan the given files (how pre-commit invokes it)
-  scan_forbidden.py --path DIR      # scan every text file under DIR
+  scan_forbidden.py [FILE ...]      # scan the given files; after a ``--`` every argument is a path,
+                                    #   never an option (how pre-commit invokes it)
+  scan_forbidden.py --path DIR      # scan the files under DIR, less the build and environment
+                                    #   directories ``_walk`` prunes
   scan_forbidden.py --show-context ...  # FIRST argument only; also print the matched line/value (NEVER used in CI -- a hit
                                     #   means the content already sits in a tracked file, so echoing
                                     #   it would copy the leak into public CI logs; default is
@@ -85,8 +87,10 @@ import errno
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -784,21 +788,18 @@ _PR_INLINE_TAG = re.compile(
 #: GitHub ``blob/8.1.8/CHANGES.rst`` link is a version and a path, never a map.
 #: Starts only at the first digit of a run, so a long run of digits is read once, not once per digit.
 _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
-#: The baseline reading's patterns, kept as origin/main had them before BACKLOG #5582 changed the
-#: reading. The baseline is one pass of :func:`scan_pr_body`, so the scan reads every line as that
-#: reading did: the rewrites above found more, and missed some main caught, three review rounds
-#: running. Do not tighten them: a change here is a change to the floor. The pass runs this module's
+#: The floor. The baseline reading is one pass of :func:`scan_pr_body` and reads every line as
+#: origin/main did before BACKLOG #5582 changed the reading: the rewrites above found more, and missed
+#: some main caught, three review rounds running. It takes the quote marker out with the pattern below,
+#: as main did, and reads links and splits sentences with :func:`_pr_base_link_sub` and
+#: :func:`_pr_base_split_spans`, which give the output of main's link and split patterns in linear
+#: time; those patterns backtrack on a long run, and tests/test_scan_forbidden.py keeps them as its
+#: oracles and pins the two functions equal to them. Do not
+#: tighten any of the three: a change to one is a change to the floor. The pass runs this module's
 #: table model, whose loose reading keeps a table's ASVS columns wherever main kept them
 #: (_pr_loose_columns).
-_PR_BASE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
 _PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
-_PR_BASE_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
-#: The longest line, and paragraph, the baseline reads with the patterns above. Their link and split
-#: backtrack on a long run (`[` with no `]`, whitespace with no tag after it, `<x` with no `>`), so past
-#: this the baseline runs :func:`_pr_base_link_sub` and :func:`_pr_base_split_spans` instead, which give
-#: the same output in linear time (a test checks them against the patterns). Nothing is cut.
-_PR_BASE_CAP = 2000
-#: The lookahead class of the full-stop split, as ``_PR_BASE_SENTENCE_SPLIT`` spells it.
+#: The lookahead class of main's full-stop split.
 _PR_BASE_SPLIT_LOOKAHEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ*`[(\"'#>-")
 PR_BODY_REASONS = {
     "verdict": "requirement verdict (a requirement id beside its verdict)",
@@ -890,8 +891,7 @@ def _pr_units(lines: list[str], delete_invisible: bool, reading: _PrReading) -> 
     read without its `>` markers, so a wrapped quote is one paragraph too. Each unit carries
     (offset, line) marks so a hit can be reported at the line its identifier sits on. ``reading`` is
     one of the three readings: the baseline takes the first `>` run of a line out wherever it sits
-    and reads a link as its text, with the link pattern's linear-time equal on a long line (see
-    ``_PR_BASE_CAP``); the other two take only a leading quote marker out and read the line through
+    and reads a link as its text (see ``_PR_BASE_QUOTE``); the other two take only a leading quote marker out and read the line through
     :func:`_pr_inline`, where a line that held only inline tags is transparent. The units, their
     lines and their kinds are the same with delete_invisible or without it; only the text differs,
     with its default-ignorable characters deleted.
@@ -912,10 +912,7 @@ def _pr_units(lines: list[str], delete_invisible: bool, reading: _PrReading) -> 
         # one is not empty.
         if reading == _PR_BASE:
             unquoted = _PR_BASE_QUOTE.sub("", raw.strip(), count=1).strip()
-            if len(unquoted) <= _PR_BASE_CAP:
-                structure = _PR_BASE_MD_LINK.sub(r"\1", unquoted)
-            else:
-                structure = _pr_base_link_sub(unquoted)
+            structure = _pr_base_link_sub(unquoted)
         else:
             unquoted = _PR_QUOTE.sub("", raw.strip(), count=1).strip()
             structure = _pr_inline(unquoted, reading == _PR_TARGETS).strip()
@@ -946,10 +943,12 @@ def _pr_next(stops: list[int], at: int, end: int) -> int:
 
 
 def _pr_base_link_sub(line: str) -> str:
-    r"""``_PR_BASE_MD_LINK.sub(r"\1", line)``, in linear time. Each part of the pattern stops at the first
-    character it cannot take, and backtracking cannot make a shorter run end on the character the next
-    part needs, so a match is found by lookups: the next `]` or newline, then `(`, then the next `)` or
-    whitespace, which must be `)`."""
+    r"""The output of main's link pattern substituted by ``\1`` (``_MAIN_MD_LINK`` in
+    tests/test_scan_forbidden.py), in linear time. Each part of the pattern stops at the first character it cannot take, and backtracking
+    cannot make a shorter run end on the character the next part needs, so a match is found by lookups:
+    the next `]` or newline, then `(`, then the next `)` or whitespace, which must be `)`."""
+    if "[" not in line:
+        return line
     n = len(line)
     text_ends = [i for i, c in enumerate(line) if c in "]\n"]
     target_ends = [i for i, c in enumerate(line) if c == ")" or c.isspace()]
@@ -969,7 +968,8 @@ def _pr_base_link_sub(line: str) -> str:
 
 
 def _pr_base_split_spans(unit: str) -> list[tuple[int, int]]:
-    """The (start, end) of every ``_PR_BASE_SENTENCE_SPLIT`` match in ``unit``, in linear time. Each
+    """The (start, end) of every match in ``unit`` of main's split pattern (``_MAIN_SENTENCE_SPLIT`` in
+    tests/test_scan_forbidden.py), in linear time. Each
     alternative's whitespace run ends where the run does, since a shorter run leaves whitespace where
     the lookahead or the `<` must be; the tag runs to the next `>`."""
     n = len(unit)
@@ -1009,14 +1009,10 @@ def _pr_base_split_spans(unit: str) -> list[tuple[int, int]]:
 
 
 def _pr_base_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
-    """:func:`_pr_sentences` with origin/main's split: the pattern itself up to ``_PR_BASE_CAP``, and
-    its linear-time equal past it."""
+    """:func:`_pr_sentences` with origin/main's split, read by :func:`_pr_base_split_spans`."""
     if is_row:
         return [(0, unit)]
-    if len(unit) <= _PR_BASE_CAP:
-        spans = [(m.start(), m.end()) for m in _PR_BASE_SENTENCE_SPLIT.finditer(unit)]
-    else:
-        spans = _pr_base_split_spans(unit)
+    spans = _pr_base_split_spans(unit)
     sentences, start = [], 0
     for begin, end in spans:
         sentences.append((start, unit[start:begin]))
@@ -1324,8 +1320,7 @@ def scan_pr_body(body: str) -> list[str]:
     restate a verdict on the same line report it once, rather than storming.
 
     Read three times, and the hits are the union (BACKLOG #5582). The baseline reads the lines as
-    origin/main did before BACKLOG #5582 (``_PR_BASE_QUOTE``, ``_PR_BASE_MD_LINK``,
-    ``_PR_BASE_SENTENCE_SPLIT``). The second reads each link as its text and each inline tag as no
+    origin/main did before BACKLOG #5582 (see ``_PR_BASE_QUOTE``). The second reads each link as its text and each inline tag as no
     edge, and the third keeps each link's target beside it, so a code path only a target names is
     seen; from the third only a map counts. Each reading builds its own units from one line model
     (:func:`_pr_lines`), so every reading keeps each line where it was and the hits merge by (line,
@@ -1486,8 +1481,8 @@ _SITE_SKIP_NAMES = {
 
 #: Directories a ``--path`` WALK skips: tool caches, virtual environments and build output that sit
 #: untracked in a working tree, where a whole-tree scan would otherwise read third-party code. Applied
-#: in ``--path`` mode only. A tracked or staged file is content git already holds, whatever directory it
-#: sits in, so the tracked and staged scans read it (BACKLOG #5585).
+#: in ``--path`` mode only, as ``_walk`` describes; there a tracked file is pruned too where git
+#: cannot list the tracked files. The tracked and staged scans prune no directory (BACKLOG #5585).
 SKIP_DIRS = {
     ".git",
     ".venv",
@@ -2104,19 +2099,152 @@ reload_tokens()
 # --------------------------------------------------------------------------------------------------
 
 
+def _ls_files(root: Path, *, keep_location: bool = False) -> list[str]:
+    """``git ls-files`` in ``root``, NUL-separated so a name git would C-quote (non-ASCII, a quote, a
+    control byte) comes back as itself rather than as a path that does not exist. Raises on failure.
+
+    Fixed argv, no shell, ``root`` a separate argument. Every call passes two ``-c`` settings, which
+    outrank any config file. ``safe.bareRepository=explicit`` makes git refuse a bare repository it
+    finds by searching rather than one ``GIT_DIR`` names, so a directory of committed files shaped
+    like a bare repository is not taken as one and the config a commit wrote there is not read.
+    ``core.fsmonitor=false`` stops git running a file-system monitor command that a repository's
+    config names: ``ls-files`` runs that command when it reads the index. Any other setting in that
+    config is still read.
+
+    ``keep_location`` passes on ``GIT_DIR``, ``GIT_INDEX_FILE`` and the other location variables, so
+    the tracked scan lists the index a hook names (a temporary one included), as a bare ``git
+    ls-files`` does. The ``--path`` walk drops them, because with them git keys the list from another
+    directory and the paths would not be relative to ``root``."""
+    env = (
+        None
+        if keep_location
+        else {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_ENV}
+    )
+    out = subprocess.run(  # nosec B603 B607
+        ["git", *_GIT_SAFETY, "-C", str(root), "ls-files", "-z"],
+        capture_output=True,
+        check=True,
+        env=env,
+    ).stdout
+    return [p for p in out.decode("utf-8", errors="surrogateescape").split("\0") if p]
+
+
+#: The ``-c`` settings every git call this module makes passes; ``_ls_files`` says what each does.
+_GIT_SAFETY = ("-c", "safe.bareRepository=explicit", "-c", "core.fsmonitor=false")
+
+
+_GIT_LOCATION_ENV = frozenset(
+    {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_NAMESPACE"}
+)
+
+#: The errnos that mean a path is not there. POSIX gives ENOTDIR, not ENOENT, for ``a/b.md`` when
+#: ``a`` is a regular file, as it is when a tracked directory was replaced by a file.
+_GONE = frozenset({errno.ENOENT, errno.ENOTDIR})
+
+
+def _path_key(rel: str) -> str:
+    """A root-relative path as the walk compares it with git's list: NFC and case-folded, because a
+    case-insensitive or normalizing filesystem can spell a tracked path differently from the index.
+    Folding only ever counts more paths as tracked, so more is read, never less."""
+    return unicodedata.normalize("NFC", rel).casefold()
+
+
 def _git_tracked() -> list[str]:
-    # Fixed literal argv ["git", "ls-files"]: no shell, no user input.
-    return subprocess.run(  # nosec B603 B607
-        ["git", "ls-files"], capture_output=True, text=True, check=True
-    ).stdout.splitlines()
+    return _ls_files(Path("."), keep_location=True)
 
 
-def _candidate_files(argv: list[str]) -> list[tuple[Path, str]]:
-    # Returns (openable path, scan-root-RELATIVE posix). The relative posix is what all skip decisions
-    # and hit reports key on, so the logic is identical whether we scan tracked files (already
-    # repo-relative) or a --path snapshot in an arbitrary directory.
-    if argv and argv[0] == "--path":
-        if len(argv) < 2:
+def _tracked_under(root: Path) -> set[str] | None:
+    """The files git tracks under ``root``, relative to it, possibly none, or ``None``.
+
+    ``None`` when no directory from ``root`` up holds a ``.git`` entry, and git is then not run: a
+    pushed commit's snapshot written outside any work tree is such a root, and ``None`` prunes
+    nothing (BACKLOG #5595). A snapshot inside a work tree is not told apart from the work tree. An
+    empty set when git tracks no file under ``root``, and when git is not on PATH or fails, such as
+    when it refuses the directory: the walk then prunes SKIP_DIRS by name, as it did before git was
+    asked, and in the failure case tracked files are pruned with them."""
+    resolved = root.resolve()
+    if not root.is_dir() or not any((d / ".git").exists() for d in (resolved, *resolved.parents)):
+        return None
+    try:
+        tracked = {_path_key(p) for p in _ls_files(root)}
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(
+            f"scan_forbidden: git could not list the tracked files under {root} ({type(exc).__name__}),"
+            " so the walk skips the build and environment directories there by name, tracked or not.",
+            file=sys.stderr,
+        )
+        return set()
+    return tracked
+
+
+#: How a --path hit for a named root that does not exist ends. ``main`` leaves such a hit out of the
+#: summary's unread count, since nothing was there to be set aside.
+_NO_ROOT = "does not exist, so its files were not scanned (fail closed)"
+
+
+def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
+    """Every file under the directory ``raw``, keyed by its root-relative posix path (BACKLOG #5585).
+    SKIP_DIRS is pruned as ``_tracked_under`` answers: where git lists the tracked files, only for
+    files it does not list, so by name under a root git tracks nothing under; where git cannot list
+    them, by name, tracked files included; outside a work tree, not at all. ``.git`` is always
+    pruned. A directory the walk cannot list is reported in ``errors``, where ``rglob`` used to drop
+    it without a word, except one below the root whose listing raises ENOENT or ENOTDIR, which is
+    passed over as removed since it was listed, whatever the cause of that errno."""
+    root = Path(raw)
+    tracked = _tracked_under(root)
+    tracked_dirs = {
+        "/".join(p.split("/")[:i]) for p in tracked or () for i in range(1, p.count("/") + 1)
+    }
+
+    def refused(exc: OSError) -> None:
+        # Root-relative, as a content hit is: the absolute form can carry a user-home path. The root
+        # itself is named as the caller wrote it.
+        try:
+            name = Path(os.fsdecode(exc.filename)).relative_to(root).as_posix()
+        except (TypeError, ValueError):
+            name = "."
+        if name != "." and exc.errno in _GONE:
+            return  # Removed after it was listed (a cache cleared mid-walk): nothing left to read.
+        name = raw if name == "." else name
+        if exc.errno == errno.ENOENT:
+            errors.append(f"{name}/:0: {_NO_ROOT}")
+            return
+        why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
+        errors.append(f"{name}:0: unreadable ({why}), so its content was not scanned (fail closed)")
+
+    for top, dirs, files in os.walk(root, onerror=refused):
+        rel_top = Path(top).relative_to(root).as_posix()
+        prefix = "" if rel_top == "." else rel_top + "/"
+        in_skip_dir = bool(set(Path(prefix).parts) & SKIP_DIRS)
+        # Under a skipped directory only the paths leading to tracked files are walked at all.
+        dirs[:] = [
+            d
+            for d in dirs
+            if d != ".git"
+            and (
+                tracked is None
+                or _path_key(prefix + d) in tracked_dirs
+                or (d not in SKIP_DIRS and not in_skip_dir)
+            )
+        ]
+        for name in files:
+            rel = prefix + name
+            if name == ".git" or (
+                in_skip_dir and tracked is not None and _path_key(rel) not in tracked
+            ):
+                continue
+            out.append((Path(top) / name, rel))
+
+
+def _candidate_files(
+    paths: list[str], *, path_mode: bool
+) -> tuple[list[tuple[Path, str]], list[str]]:
+    # Returns (openable path, scan-root-RELATIVE posix) pairs, and an unreadable-directory hit for each
+    # directory a --path walk could not list. The relative posix is what all skip decisions and hit
+    # reports key on, so the logic is identical whether we scan tracked files (already repo-relative) or
+    # a --path snapshot in an arbitrary directory.
+    if path_mode:
+        if not paths:
             print("scan_forbidden: --path requires at least one file or directory", file=sys.stderr)
             sys.exit(2)
         # EVERY path after --path is scanned, and a FILE is scanned as itself. Both used to be silent
@@ -2126,18 +2254,21 @@ def _candidate_files(argv: list[str]) -> list[tuple[Path, str]]:
         # paths exited 0 and read as "all of these are clean". Measured 2026-08-04: a four-path audit
         # reported clean having examined one of the four.
         out: list[tuple[Path, str]] = []
-        for raw in argv[1:]:
+        errors: list[str] = []
+        for raw in paths:
             root = Path(raw)
             if root.is_file():
-                # rel is the bare name, matching the directory case's intent: components of the path the
-                # caller NAMED must not themselves trigger a SKIP_DIRS short-circuit.
-                out.append((root, root.name))
+                # rel is the bare name, matching the directory case, where the rel path starts below
+                # the root the caller NAMED. So the path the caller wrote is not judged: a file named
+                # under docs/security/ earns no location hit here, as on origin/main.
+                if root.name != ".git":
+                    out.append((root, root.name))
                 continue
-            out.extend((p, p.relative_to(root).as_posix()) for p in root.rglob("*") if p.is_file())
-        return out
-    if argv:
-        return [(Path(a), Path(a).as_posix()) for a in argv]
-    return [(Path(p), Path(p).as_posix()) for p in _git_tracked()]
+            _walk(raw, out, errors)
+        return out, errors
+    if paths:
+        return [(Path(a), Path(a).as_posix()) for a in paths], []
+    return [(Path(p), Path(p).as_posix()) for p in _git_tracked()], []
 
 
 #: Byte-order marks, longest first: a UTF-32-LE mark begins with the UTF-16-LE one. The wide entries of
@@ -2178,28 +2309,38 @@ def _wide_shape(body: bytes, codec: str, bom: bytes) -> bool:
     return len(nuls) >= 3 and nuls.count(0) * 10 >= len(nuls) * 9
 
 
-def _read_text(path: Path) -> str | None:
-    """The file's text, or ``None`` for binary. Raises ``OSError`` when the file cannot be read, which
+def _read_text(path: Path) -> list[str] | None:
+    """The file's readings as text, one unless the bytes disagree with a byte-order mark, or ``None``
+    for binary. Raises ``OSError`` when the file cannot be read, which
     ``scan_file`` reports as a hit: an unread file is not a clean one (BACKLOG #5583).
 
     A NUL near the start used to mean binary outright, so UTF-16 and UTF-32 text, which a Windows tool
     writes routinely, went unscanned. A byte-order mark or the UTF-16 shape now decodes it first."""
-    data = path.read_bytes()
-    head = data[:_HEAD_BYTES]
-    for bom, codec in _BOMS:
-        if not data.startswith(bom):
-            continue
+    # The head alone decides binary, so a large binary is not read whole only to be set aside.
+    with path.open("rb") as f:
+        head = f.read(_HEAD_BYTES)
+        bom_codec = next(((bom, codec) for bom, codec in _BOMS if head.startswith(bom)), None)
+        wide = None
+        if bom_codec is None and b"\x00" in head:
+            wide = _bomless_utf16(head)
+            if wide is None:
+                return None
+        data = head + f.read()
+    if bom_codec is not None:
+        bom, codec = bom_codec
         wide_text = data.decode(codec, errors="replace")
         if _wide_shape(head[len(bom) :], codec, bom):
-            return wide_text
+            return [wide_text]
         # The bytes disagree with the mark: a UTF-8 body behind a stray mark, or wide text mostly above
         # U+00FF (box drawing, CJK). Neither reading can be ruled out, so both are scanned: picking one
-        # hid every token of the other (fail closed).
-        return wide_text + "\n" + data.decode("utf-8", errors="replace")
-    if b"\x00" not in head:
-        return data.decode("utf-8", errors="replace")
-    wide = _bomless_utf16(head)
-    return data.decode(wide, errors="replace") if wide is not None else None
+        # hid every token of the other (fail closed). A UTF-32 mark is also UTF-16 text whose first
+        # character is U+0000 (FF FE 00 00 in little-endian), so that reading is scanned too.
+        readings = [wide_text, data.decode("utf-8", errors="replace")]
+        if codec == "utf-32":
+            utf16 = "utf-16-le" if bom == codecs.BOM_UTF32_LE else "utf-16-be"
+            readings.append(data.decode(utf16, errors="replace"))
+        return readings
+    return [data.decode(wide or "utf-8", errors="replace")]
 
 
 def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = False) -> list[str]:
@@ -2210,6 +2351,119 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     trimmed line -- for local triage only, never CI.
     """
     return _scan_file(path, rel_posix, show_context=show_context)[0]
+
+
+def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
+    """The hits a file earns by its path and name alone, and whether its content is not to be read.
+    Judged whatever its bytes are. ``_scan_file`` keeps them when the content cannot be read, and the
+    non-file branch of ``main`` keeps them beside any does-not-exist or unreadable hit.
+
+    A location hit names ``path``, the root the caller wrote joined to ``posix``, so in a scan of
+    several roots it names the root (the branch leak scan's commit directory). Under an absolute root
+    that path can carry a user-home path."""
+    if reason := forbidden_path_reason(posix):
+        return [f"{path.as_posix()}:0: {reason}"], True
+    hits: list[str] = []
+    # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
+    # filename, and a module need not repeat its own name in its text. Placed before the binary
+    # early-return for the same reason the location rule above is -- a DICOM or PDF sample named with
+    # a site code is exactly as much of a leak as the .py beside it, and _read_text drops binaries
+    # unread. Line 0 because the finding is the file, not a location inside it. Unlike a location-rule
+    # hit this does NOT stop the scan: the content still has to be judged.
+    #
+    # This one hit necessarily carries the offending string, because the string is the path and every
+    # hit names its path. That is not a new disclosure -- by the time CI scans it the file is already
+    # in the public tree and in the PR's file list, and at pre-commit time nothing is public yet -- but
+    # it is why the remedy is renaming the file, not an ALLOWLIST line: the allowlist is a per-line
+    # content veto and cannot reach this, exactly as it cannot reach the location rule.
+    if _ESTATE_ID_SHAPE.search(posix):
+        hits.append(f"{posix}:0: {_ESTATE_ID_REASON}, in the file NAME")
+    return hits, False
+
+
+def _line_hits(text: str, posix: str, path: Path, show_context: bool) -> list[tuple[int, str, str]]:
+    """Content hits in one reading of a file, as (line, key, hit). The key is the hit, what it matched
+    (the value, or the name pattern) and its count on that line, so the same finding on the same line
+    in another reading is one hit, and two different findings of one kind stay two."""
+    ip_scan = path.suffix not in _IP_SKIP_SUFFIXES and path.name not in _IP_SKIP_NAMES
+    site_scan = path.suffix not in _SITE_SKIP_SUFFIXES and path.name not in _SITE_SKIP_NAMES
+    out: list[tuple[int, str, str]] = []
+    # How many times each (hit, matched) pair has been seen, so counting the nth costs one lookup.
+    counts: dict[str, int] = {}
+    for lineno, line in enumerate(text.splitlines(), 1):
+
+        def add(reason: str, matched: str, extra: str = "", lineno: int = lineno) -> None:
+            hit = f"{posix}:{lineno}: {reason}"
+            # The nth such finding on this line: two on one line stay two, as they always were.
+            key = f"{hit}\0{matched}"
+            nth = counts.get(key, 0)
+            counts[key] = nth + 1
+            out.append((lineno, f"{key}\0{nth}", hit + extra))
+
+        if any(a.search(line) for a in ALLOWLIST):
+            continue
+        ctx = f": {line.strip()[:120]}" if show_context else ""
+        before = len(out)
+        # ``_`` is a WORD character, so a \b-anchored name pattern cannot see its token inside an
+        # identifier: ``\bTOKEN\b`` does not match ``OB_TOKEN_ORU``. That blindness has hidden real
+        # leaks in this repo more than once, and the estate set only covers it for tokens that happen
+        # to appear in BOTH lists. Scanning a shadow copy with identifier separators neutralised closes
+        # it for EVERY name pattern rather than for the instances someone remembered to duplicate.
+        # Substitution preserves length, so offsets and ``show_context`` stay meaningful.
+        unwrapped = _IDENT_SEP.sub(" ", line)
+        for pat, reason in FORBIDDEN:
+            if _name_matches(pat, line, unwrapped):
+                add(reason, pat.pattern, ctx)
+        if site_scan:
+            for m in _SITE_CODE_FILE.finditer(line):
+                value = f" ({m.group(0)})" if show_context else ""
+                add("site code", m.group(0), f"{value}{ctx}")
+            if lit := _SITE_CODE_PATTERN_LITERAL.search(line):
+                add("site-code pattern written out", lit.group(0), ctx)
+        if ip_scan:
+            for m in _IPV4.finditer(line):
+                ip = m.group(0)
+                if not _ALLOWED_IP.match(ip):
+                    value = f" ({ip})" if show_context else ""
+                    add("routable IP address", ip, f"{value}{ctx}")
+        # Internal-environment disclosure. Reason-only, never the value: the slug or account name IS
+        # the disclosure, so echoing it into a public CI log would publish what the hit is reporting.
+        if (slug := _first_match(_WORKTREE_SLUG_DETECTORS, line)) is not None:
+            add("worktree/branch slug (internal project name)", slug)
+        if home := _HOME_PATH.search(line):
+            add("absolute user-home path (OS account name)", home.group(0))
+        # Reason-only, and NOT ctx-appended even under show_context. The other reason-only detectors
+        # withhold the value because it NAMES someone; this one withholds it because the URL IS the
+        # access. Echoing it into a public CI log would hand out the capability the hit reports.
+        if url := _ARTIFACT_URL.search(line):
+            add("private artifact URL (the link itself grants access)", url.group(0))
+        # Security-record content (BACKLOG #1337). REASON-ONLY, never the value, for the same reason
+        # as the slug above: the identifier-verdict pair IS the disclosure, so echoing it into a
+        # public CI log would publish exactly what the hit reports.
+        if (pair := _first_match(_RECORD_PAIR, line)) is not None:
+            add("security-record content (requirement id beside a verdict)", pair)
+        # Reason-only for the same reason as the two above, and NOT ``ctx``-appended even under
+        # show_context: the identifier IS the disclosure.
+        if shape := _ESTATE_ID_SHAPE.search(line):
+            add(f"{_ESTATE_ID_REASON} (the ported-estate site-code shape)", shape.group(0))
+        # Estate substrings run LAST and only on a line nothing else flagged: the sets overlap (the
+        # customer name is typically in [names] AND [estate]), and double-reporting one line adds noise
+        # rather than information. What this adds is the case no other detector can reach -- a token
+        # butted against word characters, e.g. ``OB_<TOKEN>_ORU``.
+        if len(out) == before:
+            for token, estate_pat in _ESTATE_FILE_RES:
+                if estate_pat.search(line):
+                    add("estate token", token, ctx)
+                    break
+    return out
+
+
+def _first_match(patterns: tuple[re.Pattern[str], ...], line: str) -> str | None:
+    """The text the first of ``patterns`` to match ``line`` matched, or ``None``."""
+    for p in patterns:
+        if m := p.search(line):
+            return m.group(0)
+    return None
 
 
 #: What ``_scan_file`` did with a file's content: read it as text, set it aside unread (binary, or
@@ -2231,94 +2485,28 @@ def _scan_file(
     # exactly as much of a leak as the markdown beside it. Reported at line 0 because the finding is
     # the path itself and there is no line to point at -- the reason names the file, not a location
     # inside it. Scanning stops here; content hits on a file that must not exist add nothing.
-    if reason := forbidden_path_reason(posix):
-        return [f"{path}:0: {reason}"], "unread"
-    hits: list[str] = []
-    # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
-    # filename, and a module need not repeat its own name in its text. Placed before the binary
-    # early-return for the same reason the location rule above is -- a DICOM or PDF sample named with
-    # a site code is exactly as much of a leak as the .py beside it, and _read_text drops binaries
-    # unread. Line 0 because the finding is the file, not a location inside it. Unlike a location-rule
-    # hit this does NOT stop the scan: the content still has to be judged.
-    #
-    # This one hit necessarily carries the offending string, because the string is the path and every
-    # hit names its path. That is not a new disclosure -- by the time CI scans it the file is already
-    # in the public tree and in the PR's file list, and at pre-commit time nothing is public yet -- but
-    # it is why the remedy is renaming the file, not an ALLOWLIST line: the allowlist is a per-line
-    # content veto and cannot reach this, exactly as it cannot reach the location rule.
-    if _ESTATE_ID_SHAPE.search(posix):
-        hits.append(f"{posix}:0: {_ESTATE_ID_REASON}, in the file NAME")
+    hits, stop = _name_hits(path, posix)
+    if stop:
+        return hits, "unread"
     try:
-        text = _read_text(path)
+        texts = _read_text(path)
     except OSError as exc:
         # The errno name only: the message can carry the path's absolute form, a user-home path.
         why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
         hits.append(f"{posix}:0: unreadable ({why}), so its content was not scanned (fail closed)")
         return hits, "unreadable"
-    if text is None:
+    if texts is None:
         return hits, "unread"
-    ip_scan = path.suffix not in _IP_SKIP_SUFFIXES and path.name not in _IP_SKIP_NAMES
-    site_scan = path.suffix not in _SITE_SKIP_SUFFIXES and path.name not in _SITE_SKIP_NAMES
-    for lineno, line in enumerate(text.splitlines(), 1):
-        if any(a.search(line) for a in ALLOWLIST):
-            continue
-        ctx = f": {line.strip()[:120]}" if show_context else ""
-        before = len(hits)
-        # ``_`` is a WORD character, so a \b-anchored name pattern cannot see its token inside an
-        # identifier: ``\bTOKEN\b`` does not match ``OB_TOKEN_ORU``. That blindness has hidden real
-        # leaks in this repo more than once, and the estate set only covers it for tokens that happen
-        # to appear in BOTH lists. Scanning a shadow copy with identifier separators neutralised closes
-        # it for EVERY name pattern rather than for the instances someone remembered to duplicate.
-        # Substitution preserves length, so offsets and ``show_context`` stay meaningful.
-        unwrapped = _IDENT_SEP.sub(" ", line)
-        for pat, reason in FORBIDDEN:
-            if _name_matches(pat, line, unwrapped):
-                hits.append(f"{posix}:{lineno}: {reason}{ctx}")
-        if site_scan:
-            for m in _SITE_CODE_FILE.finditer(line):
-                value = f" ({m.group(0)})" if show_context else ""
-                hits.append(f"{posix}:{lineno}: site code{value}{ctx}")
-            if _SITE_CODE_PATTERN_LITERAL.search(line):
-                hits.append(f"{posix}:{lineno}: site-code pattern written out{ctx}")
-        if ip_scan:
-            for m in _IPV4.finditer(line):
-                ip = m.group(0)
-                if not _ALLOWED_IP.match(ip):
-                    value = f" ({ip})" if show_context else ""
-                    hits.append(f"{posix}:{lineno}: routable IP address{value}{ctx}")
-        # Internal-environment disclosure. Reason-only, never the value: the slug or account name IS
-        # the disclosure, so echoing it into a public CI log would publish what the hit is reporting.
-        if any(p.search(line) for p in _WORKTREE_SLUG_DETECTORS):
-            hits.append(f"{posix}:{lineno}: worktree/branch slug (internal project name)")
-        if _HOME_PATH.search(line):
-            hits.append(f"{posix}:{lineno}: absolute user-home path (OS account name)")
-        # Reason-only, and NOT ctx-appended even under show_context. The other reason-only detectors
-        # withhold the value because it NAMES someone; this one withholds it because the URL IS the
-        # access. Echoing it into a public CI log would hand out the capability the hit reports.
-        if _ARTIFACT_URL.search(line):
-            hits.append(f"{posix}:{lineno}: private artifact URL (the link itself grants access)")
-        # Security-record content (BACKLOG #1337). REASON-ONLY, never the value, for the same reason
-        # as the slug above: the identifier-verdict pair IS the disclosure, so echoing it into a
-        # public CI log would publish exactly what the hit reports.
-        if any(p.search(line) for p in _RECORD_PAIR):
-            hits.append(
-                f"{posix}:{lineno}: security-record content (requirement id beside a verdict)"
-            )
-        # Reason-only for the same reason as the two above, and NOT ``ctx``-appended even under
-        # show_context: the identifier IS the disclosure.
-        if _ESTATE_ID_SHAPE.search(line):
-            hits.append(
-                f"{posix}:{lineno}: {_ESTATE_ID_REASON} (the ported-estate site-code shape)"
-            )
-        # Estate substrings run LAST and only on a line nothing else flagged: the sets overlap (the
-        # customer name is typically in [names] AND [estate]), and double-reporting one line adds noise
-        # rather than information. What this adds is the case no other detector can reach -- a token
-        # butted against word characters, e.g. ``OB_<TOKEN>_ORU``.
-        if len(hits) == before:
-            for _token, estate_pat in _ESTATE_FILE_RES:
-                if estate_pat.search(line):
-                    hits.append(f"{posix}:{lineno}: estate token{ctx}")
-                    break
+    # Each reading is numbered on its own, so a hit names a line of that reading, never one past
+    # its end, and a finding two readings share on one line is reported once (BACKLOG #8244).
+    seen: set[str] = set()
+    found: list[tuple[int, str]] = []
+    for text in texts:
+        for lineno, key, hit in _line_hits(text, posix, path, show_context):
+            if key not in seen:
+                seen.add(key)
+                found.append((lineno, hit))
+    hits.extend(hit for _, hit in sorted(found, key=lambda f: f[0]))
     return hits, "read"
 
 
@@ -2846,15 +3034,23 @@ def main(argv: list[str]) -> int:
 
     # First only, for the reason the terminal modes above are whole-line only: taken from anywhere, a
     # staged file named ``--show-context`` was dropped unscanned and switched on value echoing.
-    # Anywhere else ``_parse_require_flag`` refuses it. A staged file named ``--path`` still switches
-    # the run to path mode; that needs a ``--`` separator from pre-commit (BACKLOG #5585, remainder).
+    # Anywhere else ``_parse_require_flag`` refuses it.
     show_context = bool(argv) and argv[0] == "--show-context"
     rest = argv[1:] if show_context else list(argv)
+    # Everything after the first ``--`` is a path operand, never an option, so a staged
+    # file named ``--path`` or ``--require-tokens`` is scanned rather than read as the flag. pre-commit
+    # passes ``--`` ahead of the staged names for that reason (BACKLOG #5585).
+    operands: list[str] = []
+    if "--" in rest:
+        cut = rest.index("--")
+        rest, operands = rest[:cut], rest[cut + 1 :]
     try:
         flag_require, minimum, rest = _parse_require_flag(rest)
     except ValueError as exc:
         print(f"scan_forbidden: {exc}", file=sys.stderr)
         return 2
+    path_mode = bool(rest) and rest[0] == "--path"
+    paths = (rest[1:] if path_mode else rest) + operands
 
     # Announce what loaded BEFORE any refusal, so a failure shows the counts that CAUSED it. Exit 0
     # alone cannot distinguish "scanned with the real tables and found nothing" from "loaded nothing
@@ -2901,25 +3097,70 @@ def main(argv: list[str]) -> int:
             print(f"scan_forbidden: {why} (fail closed).", file=sys.stderr)
             return 2
 
-    path_mode = bool(rest) and rest[0] == "--path"
-    hits: list[str] = []
     # Only a file whose content was read as text counts as scanned. A binary file is judged by its name
     # and location only, and an unreadable one fails the run with exit 2; counting either as scanned let
-    # a run whose files were all unread report coverage it did not have (BACKLOG #5583).
+    # a run whose files were all unread report coverage it did not have (BACKLOG #5583). A directory the
+    # --path walk could not list is unreadable in the same way.
+    try:
+        candidates, hits = _candidate_files(paths, path_mode=path_mode)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # 2, not a traceback's 1: git could not list the tracked files, so nothing was scanned.
+        print(
+            f"scan_forbidden: cannot list the tracked files ({type(exc).__name__})", file=sys.stderr
+        )
+        return 2
     scanned = 0
-    unread = 0
-    unreadable = 0
-    for abs_path, rel in _candidate_files(rest):
-        # SKIP_DIRS is evaluated on the RELATIVE parts, so a scan-root path component that happens to be
-        # named build/venv/dist/… can no longer short-circuit the scan of every file. It applies to the
-        # --path walk only, so the tracked and staged scans read such a file; the CI --path scans still
-        # skip it, because the walk cannot tell tracked from untracked (BACKLOG #5585, remainder). Only
-        # the DIRECTORY parts count: a file named ``build`` is not a build directory. A ``.git`` FILE is
-        # a worktree's pointer to its git directory, and is skipped as that directory is.
-        if not abs_path.is_file() or _is_skipped(rel):
+    # A walk hit for a directory the walk could not list is counted as unread; one for a named root
+    # that does not exist is not, since nothing was there. Both still fail the run as unreadable.
+    unread = sum(not h.endswith(_NO_ROOT) for h in hits)
+    unreadable = len(hits)
+    for abs_path, rel in candidates:
+        # SKIP_DIRS is applied by the --path walk alone (_walk); the tracked and staged scans prune no
+        # directory.
+        if _is_skipped(rel):
             continue
-        posix_rel = Path(rel)
-        if path_mode and (set(posix_rel.parent.parts) & SKIP_DIRS or posix_rel.name == ".git"):
+        if not abs_path.is_file():
+            # Not a regular file, or one is_file() could not stat (it hides that error). In every mode,
+            # an lstat of the entry itself that fails other than ENOENT or ENOTDIR (_GONE) fails the
+            # run. In staged mode (any path named on the command line, with or without ``--``, outside
+            # --path) a directory, a link to a directory, a link whose target cannot be stat'ed, or a
+            # missing name also fails the run. _GONE is passed over in the --path walk (removed since
+            # it was listed) and in the tracked scan (deleted in the work tree, or under a directory
+            # replaced by a file). Anything else whose lstat
+            # succeeds, such as a FIFO, or outside staged mode a dangling link, is judged by its path
+            # and name only; the walk never lists a link to a directory, so that is not judged. Every
+            # entry that reaches the hits is also judged by its path and name.
+            try:
+                st_mode = abs_path.lstat().st_mode
+                reason = None
+                if paths and not path_mode:
+                    if stat.S_ISDIR(st_mode):
+                        reason = "a directory, not a file"
+                    elif stat.S_ISLNK(st_mode):
+                        try:
+                            if stat.S_ISDIR(abs_path.stat().st_mode):
+                                reason = "a link to a directory, not a file"
+                        except OSError as link_exc:
+                            why = errno.errorcode.get(link_exc.errno or 0, type(link_exc).__name__)
+                            reason = f"a link whose target cannot be stat'ed ({why})"
+            except OSError as exc:
+                # Gone since it was listed, or a tracked file deleted in the work tree.
+                if exc.errno in _GONE and (path_mode or not paths):
+                    continue
+                reason = (
+                    "does not exist"
+                    if exc.errno in _GONE
+                    else f"unreadable ({errno.errorcode.get(exc.errno or 0, type(exc).__name__)})"
+                )
+            unread += 1
+            # The path alone decides a location or name hit, so it is kept for every entry that gets
+            # here: an unstatable name under docs/security/, or in staged mode a missing one, still
+            # exits 1, not 2. A gone entry passed over above earns no hit.
+            hits.extend(_name_hits(abs_path, rel)[0])
+            if reason is None:
+                continue
+            hits.append(f"{rel}:0: {reason}, so its content was not scanned (fail closed)")
+            unreadable += 1
             continue
         file_hits, state = _scan_file(abs_path, rel, show_context=show_context)
         hits.extend(file_hits)
@@ -2935,19 +3176,20 @@ def main(argv: list[str]) -> int:
     # having to suspect it.
     if path_mode:
         print(
-            f"scan_forbidden: examined {scanned} file(s) across {len(rest) - 1} named path(s); "
-            f"{unread} more were binary, unreadable or under a forbidden path, so their content "
-            "was not scanned.",
+            f"scan_forbidden: examined {scanned} file(s) across {len(paths)} named path(s); "
+            f"{unread} more were binary, not regular files, unreadable or under a forbidden path, "
+            "so their content was not scanned.",
             file=sys.stderr,
         )
 
-    # A --path scan that examined ZERO files is not a pass: it means the whole tree was skipped (a
-    # SKIP_DIRS component in the path, or an empty/wrong tree). Refuse rather than report a vacuous clean.
+    # A --path scan that examined ZERO files is not a pass: an empty or wrong tree, all-binary content,
+    # or every file under a directory the walk skipped. Refuse rather than report a vacuous clean.
     # A hit outranks the refusal: a run whose only file sits under a forbidden path still reports it.
     if path_mode and scanned == 0 and not hits:
         print(
             "scan_forbidden: --path examined ZERO files (all skipped or unread, or empty tree) — refusing "
-            "(fail closed). Check the scan path for a SKIP_DIRS component (build/venv/dist/…).",
+            "(fail closed). Check that the path names the tree meant: an empty or all-binary tree, or one "
+            "whose every file sits under a skipped build/venv/dist/… directory, scans nothing.",
             file=sys.stderr,
         )
         return 2
@@ -2959,7 +3201,8 @@ def main(argv: list[str]) -> int:
         _report_hits(
             "UNREADABLE FILES -- their content was not scanned (fail closed):",
             hits,
-            "Fix the file's permissions or lock, then scan again. Any content hit above still applies.",
+            "Fix the permissions or lock, or name a file that exists, then scan again. Any content "
+            "hit above still applies.",
         )
         return 2
 

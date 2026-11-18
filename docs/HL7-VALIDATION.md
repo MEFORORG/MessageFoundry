@@ -85,7 +85,9 @@ with its position, as it lists a Z-segment, though only when the comparison runs
 `hl7apy` parsed but an earlier check refused lists its Z-segments alone, and a size, segment-cap
 or parse refusal lists nothing. A dropped segment ID the version does not define is still
 refused, and so is a dropped bare defined ID with no field separator (a lone `ORC` line in
-`MFN_M01`); a bare line `hl7apy` placed is not. Every dropped segment is refused where MSH-9.3
+`MFN_M01`); a bare line `hl7apy` placed is not. A dropped `MSH`, `DSC`, `MSA`, `ERR`, `QAK` or
+`MFA` line is refused too. A batch or file envelope line (`BHS`, `BTS`, `FHS`, `FTS`) is exempted like any other
+defined segment, because batch splitting can leave one on a message. Every dropped segment is refused where MSH-9.3
 borrows a slot-bearing structure under another message code (`ADT^A01^MFN_M01`); a structure
 borrowed under the same message code (`MFN^M02^MFN_M01`) still gets the exemption, since MSH-9.2
 is not compared. Where the slot is required and its group is present, `hl7apy`'s own check

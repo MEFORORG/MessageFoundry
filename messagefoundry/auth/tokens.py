@@ -36,6 +36,10 @@ _ENROLMENT_CODE_CHARS = 32
 _ENROLMENT_CODE_GROUP = 4
 _BASE32_ALPHABET = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
 _ENROLMENT_CODE_SEPARATORS = re.compile(r"[\s-]+")
+#: The longest text, as presented, a binding step reads an enrolment code from (BACKLOG #5399). The
+#: JSON ``MfaConfirmRequest`` refuses a longer one as a 422; the service refuses it as a refused
+#: code. A real code, grouped and hyphenated, is 39 characters.
+ENROLMENT_CODE_MAX = 64
 
 
 def mint_enrolment_code() -> str:

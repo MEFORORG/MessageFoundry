@@ -56,6 +56,16 @@ def test_keyless_warning_and_audit_name_the_switch_that_was_set(
     absent: list[str],
 ) -> None:
     _keyless(tmp_path, monkeypatch, 'security.enforcement = "warn"\n' + switches)
+    # The AUDIT record is logged after configure_logging (BACKLOG #5391), which replaces the root
+    # handlers, caplog's among them, so put caplog's back once it has run.
+    from messagefoundry.logging_setup import configure_logging as real_configure
+
+    def configure(*args: object, **kwargs: object) -> bool:
+        live = real_configure(*args, **kwargs)  # type: ignore[arg-type]
+        logging.getLogger().addHandler(caplog.handler)
+        return live
+
+    monkeypatch.setattr("messagefoundry.__main__.configure_logging", configure)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.__main__"):
         assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]) == 0
     warning = next(

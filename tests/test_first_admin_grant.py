@@ -36,6 +36,7 @@ from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.password_bounds import PASSWORD_MAX
 from messagefoundry.store import store as store_module
 from messagefoundry.store.store import (
     LOGIN_ADDRESS_RESET_MARKER,
@@ -689,3 +690,34 @@ async def test_a_password_beside_another_runs_totp_is_never_granted(
     outcome = await _provision(service, "site-admin")
     assert outcome.repaired is True
     assert await enabled_admins(store) == {row.id}
+
+
+# --- BACKLOG #5397: a password no sign-in accepts is refused at set time ----------------------------
+
+
+async def test_a_password_over_the_sign_in_bound_is_refused_and_one_at_it_is_provisioned(
+    store: MessageStore,
+) -> None:
+    """The sign-in surfaces refuse a password over ``PASSWORD_MAX``, so provisioning one would make
+    an Administrator nobody can sign in as. One character over is refused before any write; exactly
+    at the bound is the paired control and is provisioned."""
+    service = AuthService(store, AuthSettings())
+    await service.initialize()
+    stem = (_PASSWORD + "-") * (PASSWORD_MAX // len(_PASSWORD) + 1)
+    with pytest.raises(FirstAdministratorRefused, match=f"be at most {PASSWORD_MAX} characters"):
+        await service.provision_first_administrator(
+            username="site-admin",
+            password=stem[: PASSWORD_MAX + 1],
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **provision_totp(),
+        )
+    assert await enabled_admins(store) == set()
+    await service.provision_first_administrator(
+        username="site-admin",
+        password=stem[:PASSWORD_MAX],
+        notify_email=PROVISION_EMAIL,
+        actor="test",
+        **provision_totp(),
+    )
+    assert len(await enabled_admins(store)) == 1

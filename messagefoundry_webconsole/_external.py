@@ -255,7 +255,7 @@ _THIS_NETWORK = ipaddress.IPv4Network("0.0.0.0/8")
 
 def _is_one_host(entry: str) -> bool:
     """Whether the IPv4 ``entry`` is one host's address. This console's copy of what settings
-    refuse at load, ``_not_a_host_address`` in ``config/settings.py``, kept here for the reason
+    refuse at load, ``not_a_host_address`` in ``netaddr.py``, kept here for the reason
     :func:`_is_ipv4` gives; ``tests/test_domain_shape.py`` compares the two on a ``/16`` grid."""
     address = ipaddress.IPv4Address(entry)
     return not (address in _THIS_NETWORK or address.is_multicast or address.is_reserved)

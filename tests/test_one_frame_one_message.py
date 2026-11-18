@@ -604,6 +604,17 @@ async def test_a_shadow_outbound_records_what_a_live_send_would(
 # --- the reply path: a listener's reply is one frame, and framing it never raises ---------------
 
 
+@pytest.fixture(autouse=True)
+def _fresh_reply_warning_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test starts with empty warn-once sets, and its additions are discarded after it. The
+    sets are module state, so a test counting warnings read whatever an earlier test, or an earlier
+    run of itself in the same process, had added (PR 2975's open finding on BACKLOG #5799).
+    Mutation: drop this fixture and add the connection to the fallback set before the run. Red:
+    the fallback warning test sees no warning."""
+    monkeypatch.setattr(framing_mod, "_reply_fallback_logged", set())
+    monkeypatch.setattr(framing_mod, "_reply_replacement_logged", set())
+
+
 def test_frame_reply_neutralises_a_frame_byte_instead_of_raising() -> None:
     reply = MSH + CR + "MSA|AA|C" + SB + "1" + EB + CR
     wire = frame_reply(MLLP_CODEC, reply, "utf-8")
@@ -646,7 +657,7 @@ def test_frame_reply_still_raises_when_a_usable_charset_cannot_hold_the_reply() 
 
 @pytest.mark.parametrize("encoding", ["ascii", "latin-1", "cp1252"])
 def test_frame_reply_replaces_what_a_narrow_charset_cannot_hold(
-    encoding: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    encoding: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5799: the listener replies after the commit, so a raise here closed the connection
     unanswered and the sender resent a message already stored. The reply now stays in its declared
@@ -654,8 +665,7 @@ def test_frame_reply_replaces_what_a_narrow_charset_cannot_hold(
     UnicodeEncodeError in frame_reply. Red: the call raises."""
     reply = MSH + CR + "MSA|AA|CTRL1|中文" + CR
     connection = f"IB_NARROW_{encoding.upper()}"
-    # The warn-once set is module state; a fresh one makes the test independent of run order.
-    monkeypatch.setattr(framing_mod, "_reply_replacement_logged", set())
+    # The warn-once sets are module state, emptied for each test by _fresh_reply_warning_state.
     with caplog.at_level("WARNING", logger="messagefoundry.transports.framing"):
         wire = frame_reply(MLLP_CODEC, reply, encoding, connection=connection)
         # A narrow charset meets the same characters on every message, so a second reply adds no

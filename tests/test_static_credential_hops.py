@@ -26,6 +26,7 @@ from messagefoundry.config.static_credentials import (
     static_credential_hops,
 )
 from messagefoundry.config.wiring import (
+    EnvRef,
     Registry,
     _peer_label,
     load_config,
@@ -744,6 +745,77 @@ def test_url_userinfo_is_no_hop_whatever_proxy_auth_type_says() -> None:
         "proxy_auth_type": " Digest ",
     }
     hop = _proxy_hop("OB", keyed, "")
+    assert hop is not None and "forward-proxy digest credential" in hop.detail
+
+
+_DIGEST_PROXY = {
+    "proxy_url": "http://proxy.example.invalid:3128",
+    "proxy_user": "pu",
+    "proxy_password": "pp",
+    "proxy_auth_type": "digest",
+}
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        ["https://partner.example.invalid/x"],
+        # A bearer may cross cleartext http only to a loopback host, which is never proxied, so
+        # only the token hop sends through the proxy. This shape builds with a Basic credential.
+        ["http://127.0.0.1:9/x", "https://auth.example.invalid/token"],
+        # Refused at build for the bearer over cleartext http, whatever the proxy.
+        ["http://partner.example.invalid/x", "https://auth.example.invalid/token"],
+        [EnvRef("DEST_URL"), "https://auth.example.invalid/token"],
+    ],
+    ids=["https-destination", "https-token-endpoint", "off-box-http-bearer", "url-from-env"],
+)
+def test_a_digest_proxy_the_build_never_uses_is_no_hop(targets: list[object]) -> None:
+    """Vault BACKLOG #2989 item 28. The build refuses a Digest web proxy on an https destination
+    (ADR 0126 AC-6) and on an https token endpoint the proxy meets (ADR 0095 B.1), and a connection
+    that mints a bearer has no other hop the proxy could carry, so no hop is listed."""
+    from messagefoundry.config.static_credentials import _proxy_hop
+
+    assert _proxy_hop("OB", _DIGEST_PROXY, "", targets=targets) is None
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        ["https://partner.example.invalid/x"],
+        ["http://127.0.0.1:9/x", "https://auth.example.invalid/token"],
+    ],
+    ids=["https-destination", "https-token-endpoint"],
+)
+def test_a_basic_proxy_on_the_same_targets_is_a_hop(targets: list[object]) -> None:
+    """THE CONTROL for the arm above: a Basic credential on the same targets builds and is listed."""
+    from messagefoundry.config.static_credentials import _proxy_hop
+
+    basic = {**_DIGEST_PROXY, "proxy_auth_type": "basic"}
+    hop = _proxy_hop("OB", basic, "", targets=targets)
+    assert hop is not None and "forward-proxy basic credential" in hop.detail
+
+
+@pytest.mark.parametrize(
+    ("targets", "extra"),
+    [
+        (["http://partner.example.invalid/x"], {}),
+        (["http://partner.example.invalid/x", EnvRef("TOKEN_URL")], {}),
+        (
+            ["http://partner.example.invalid/x", "https://auth.example.invalid/token"],
+            {"oauth2_enabled": EnvRef("OAUTH2_ON")},
+        ),
+    ],
+    ids=["no-bearer", "token-url-from-env", "switch-from-env"],
+)
+def test_a_digest_proxy_that_may_carry_the_credential_is_still_a_hop(
+    targets: list[object], extra: dict[str, object]
+) -> None:
+    """THE CONTROLS: a connection that mints no bearer may send through the proxy, and where
+    ``env()`` decides the token URL or the provider's switch the reader cannot tell, so the hop is
+    listed as before."""
+    from messagefoundry.config.static_credentials import _proxy_hop
+
+    hop = _proxy_hop("OB", {**_DIGEST_PROXY, **extra}, "", targets=targets)
     assert hop is not None and "forward-proxy digest credential" in hop.detail
 
 

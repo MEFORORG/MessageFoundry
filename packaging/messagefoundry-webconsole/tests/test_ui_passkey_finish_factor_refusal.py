@@ -34,7 +34,7 @@ from _ui_clients import (
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
-from messagefoundry.auth.tokens import hash_token
+from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX, hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
@@ -156,6 +156,40 @@ async def test_the_route_refuses_a_finish_after_the_account_gained_a_factor(
     assert paths == ["finish_webauthn_registration"]
 
 
+async def test_a_factor_refused_finish_with_an_oversized_enrolment_code_is_still_the_factor_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5399. RED when: an enrolment-code bound answers a factor-refused finish ahead of
+    the service, so the ceremony is not ended and the refusal is not audited. The code goes on
+    uncut."""
+    service = await _service(engine)
+    identity, token = await _sign_in(service)
+    seen: list[object] = []
+    real = service.finish_webauthn_registration
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("enrolment_code"))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(service, "finish_webauthn_registration", spy)
+    body = await _staged_body(service, identity, token)
+    await _enrol_totp_elsewhere(service)
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        oversized = "e" * (ENROLMENT_CODE_MAX + 1)
+        refused = await c.post(
+            _VERIFY, json={**body, "enrolment_code": oversized}, headers=SAME_ORIGIN
+        )
+        assert refused.status_code == 400, refused.text
+        assert "already has a second factor" in refused.json()["error"], refused.text
+    assert seen == [oversized]
+    paths = [
+        json.loads(r["detail"])["path"]
+        for r in await service.store.list_audit(action="auth.mfa_denied")
+    ]
+    assert paths == ["finish_webauthn_registration"]
+
+
 async def test_a_finish_the_route_left_uncharged_never_completes(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -258,5 +292,26 @@ async def test_the_routes_429_sends_the_ceremony_retry_after(
         assert await service.store.list_webauthn_credentials(identity.user_id) == []
 
         monkeypatch.setattr(service, "allow_reauth_attempt", real)
+        served = await c.post(_VERIFY, json=body, headers=SAME_ORIGIN)
+    assert served.status_code == 200 and served.json()["ok"] is True, served.text
+
+
+async def test_a_body_nested_past_jsons_depth_is_a_malformed_request(engine: Engine) -> None:
+    """RED when: the passkey finish answers a body nested too deep for json's stack with a 500
+    (BACKLOG #5341). Its label cannot be read, so it is the route's malformed-body refusal, which
+    leaves the ceremony in flight: the real response still finishes after it."""
+    service = await _service(engine)
+    identity, token = await _sign_in(service)
+    body = await _staged_body(service, identity, token)
+    depth = 200_000
+    deep = b'{"label": "key", "response": ' + b"[" * depth + b"]" * depth + b"}"
+
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        refused = await c.post(
+            _VERIFY, content=deep, headers={**SAME_ORIGIN, "Content-Type": "application/json"}
+        )
+        assert refused.status_code == 400, refused.text
+        assert refused.json() == {"ok": False, "error": "malformed request"}
         served = await c.post(_VERIFY, json=body, headers=SAME_ORIGIN)
     assert served.status_code == 200 and served.json()["ok"] is True, served.text

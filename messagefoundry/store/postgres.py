@@ -181,15 +181,22 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
+    PROGRAMMING_ERRORS,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
+    TRANSIENT_OPEN_BACKOFF_SECONDS,
+    QueueOpenFault,
     QueueTagError,
     alert_queue_tag_failure,
+    is_transient_open_failure,
     open_queue_cell,
+    queue_open_fault,
     queue_payload_aad,
     queue_row_aad,
+    release_unreturned,
     report_queue_tag_failure,
     reseal_unless_tag_failure,
+    set_aside_deadline,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -388,6 +395,7 @@ from messagefoundry.store.store import (
     roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
+    run_open_store_hook,
     scope_if_source,
     scope_withdrawal,
     seal_approval_async,
@@ -1757,8 +1765,9 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
     # that flag rather than the setting. The pool builds a fresh context per connection through the
-    # same builder (`_per_connection_ssl_connect`), and that builder either sets the flag or raises,
-    # so the verdict reached here holds for every connection the pool opens.
+    # same builder (`_per_connection_ssl_connect`). With ssl_crl_file set it either sets the flag or
+    # raises; unset, it leaves the flag clear. Either way the verdict reached here holds for every
+    # connection the pool opens.
     _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
     return ctx
 
@@ -1863,7 +1872,12 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
     The one builder for both verifying branches. :func:`_build_ssl` calls it once at pool open, to run
     the refusals against a real context. The pool's ``connect`` hook calls it again for EVERY new
     connection (BACKLOG #300), so each handshake reads the trust store and the CRL file as they are
-    then, which is what asyncpg's own ``ssl=True`` did for the system trust store."""
+    then, which is what asyncpg's own ``ssl=True`` did for the system trust store.
+
+    With ``[store].ssl_crl_file`` set, it loads that CRL and sets ``VERIFY_CRL_CHECK_LEAF``
+    (``harden_crl_check``), or raises. Unset, it leaves that flag clear, so the
+    context checks no revocation and the store's revocation guard credits it nothing
+    (:func:`_refuse_store_revocation`)."""
     if settings.ssl_root_cert:
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
@@ -2007,12 +2021,15 @@ def _refuse_store_revocation(
     reviewer can check one named hop against that hop's PKI, and a claim the operator can set without
     naming what was reviewed is the blanket env wearing a different key.
 
-    ``context`` is a real :class:`ssl.SSLContext`, so :func:`context_checks_revocation` reads
-    ``VERIFY_CRL_CHECK_LEAF`` off an object rather than off the presence of a setting. ``_build_ssl``
+    ``context`` is a real :class:`ssl.SSLContext`, so ``capture`` reads it through
+    :func:`~messagefoundry.config.tls_policy.crl_no_credit`, the rule
+    :func:`~messagefoundry.config.tls_policy.crl_credited` answers yes or no, off an object rather than off the
+    presence of a setting. ``_build_ssl``
     supplies it on both verifying branches. It is built at pool open and not handshaken on: the pool
     builds each connection's context afresh (:func:`_per_connection_ssl_connect`). Both come from
-    :func:`_verifying_context` with the same settings, and that builder either sets the flag or
-    raises, so this verdict holds for every connection. Before BACKLOG #300 the default branch
+    :func:`_verifying_context` with the same settings. With ``[store].ssl_crl_file`` set, that
+    builder either sets ``VERIFY_CRL_CHECK_LEAF`` or raises; unset, it leaves that flag clear, so
+    the guard credits none. Either way this verdict holds for every connection. Before BACKLOG #300 the default branch
     returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
     nowhere to load."""
     RevocationHopGuard.capture(
@@ -2214,6 +2231,7 @@ class PostgresStore:
             await store._ensure_schema(create=create, read_only=read_only)
             if not read_only:
                 await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
+                await run_open_store_hook(store)  # BACKLOG #4936: after the pin, before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
@@ -5123,7 +5141,8 @@ class PostgresStore:
             try:
                 items.append(self._outbox_item(row))
             except CipherError as exc:
-                await self._dead_letter_unopenable(row, exc)
+                if await self._dead_letter_unopenable(row, exc) is not None:
+                    await self._set_aside_claimed([row], now)
         return items
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -5272,7 +5291,8 @@ class PostgresStore:
                         )
                         await self._maybe_finalize_message(conn, row["message_id"], now)
                         row = None
-        return await self._fifo_item_or_dead_letter(row)
+        item, _set_aside = await self._fifo_item_or_dead_letter(row, tail=[row], now=now)
+        return item
 
     async def claim_next_fifo_batch(
         self,
@@ -5375,8 +5395,10 @@ class PostgresStore:
         # dead-lettered (its own txn) and dropped; the surviving tail keeps its order.
         ordered = sorted(rows, key=lambda r: r["seq"])
         items: list[OutboxItem] = []
-        for row in ordered:
-            item = await self._fifo_item_or_dead_letter(row)
+        for i, row in enumerate(ordered):
+            item, set_aside = await self._fifo_item_or_dead_letter(row, tail=ordered[i:], now=now)
+            if set_aside:
+                break  # set aside with the rest of the lane: never deliver past it (#5735)
             if item is not None:
                 items.append(item)
         return items
@@ -5552,23 +5574,44 @@ class PostgresStore:
                         continue
                 kept_rows.append(row)
         # Group by lane and sort by `seq` in memory (RETURNING does not guarantee order), then
-        # decode AFTER the claim txn: an undecryptable row is dead-lettered (its own txn) and
-        # DROPPED; the surviving tail keeps its order.
+        # decode AFTER the claim txn: a row refused for its own content is dead-lettered (its own
+        # txn) and DROPPED; the surviving tail keeps its order. Any other open failure returns the
+        # row and its lane's tail as unopened items (#5735).
         by_lane_rows: dict[str, list[Any]] = {}
         for row in kept_rows:
             by_lane_rows.setdefault(row[lane_col], []).append(row)
-        by_lane: dict[str, list[OutboxItem]] = {}
-        for lane, lane_rows in by_lane_rows.items():
-            items: list[OutboxItem] = []
-            for row in sorted(lane_rows, key=lambda r: r["seq"]):
-                item = await self._fifo_item_or_dead_letter(row)
-                if item is not None:
-                    items.append(item)
-            if items:
-                by_lane[lane] = items
-            else:
-                rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        by_lane = await self._open_claimed_heads(by_lane_rows, rearm)
         return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm), head_skipped=head_skipped)
+
+    async def _open_claimed_heads(
+        self, by_lane_rows: dict[str, list[Any]], rearm: set[str]
+    ) -> dict[str, list[OutboxItem]]:
+        """Open each lane's committed ``claim_fifo_heads`` rows, oldest first (see the caller)."""
+        by_lane: dict[str, list[OutboxItem]] = {}
+        try:
+            for lane, lane_rows in by_lane_rows.items():
+                items: list[OutboxItem] = []
+                in_order = sorted(lane_rows, key=lambda r: r["seq"])
+                for i, row in enumerate(in_order):
+                    try:
+                        items.append(self._outbox_item(row))
+                    except CipherError as exc:
+                        fault = await self._dead_letter_unopenable(row, exc)
+                        if fault is not None:
+                            # The dispatcher's ADR 0070 T17 path takes it from here (#5735).
+                            items.extend(self._unopened_item(r, fault) for r in in_order[i:])
+                            break
+                if items:
+                    by_lane[lane] = items
+                else:
+                    rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        except Exception:
+            # Nothing is returned, so no lane's claimed rows may stay inflight behind the error, a
+            # bug or any other escaping error (#5735). A cancellation is not caught, so it leaves
+            # them inflight; release_unreturned says why.
+            await release_unreturned(self, by_lane_rows.values())
+            raise
+        return by_lane
 
     async def list_fifo_lanes(
         self,
@@ -5656,27 +5699,68 @@ class PostgresStore:
                     OutboxStatus.INFLIGHT.value,
                 )
 
-    async def _fifo_item_or_dead_letter(self, row: Any) -> OutboxItem | None:
+    async def _fifo_item_or_dead_letter(
+        self, row: Any, *, tail: Sequence[Any], now: float | None
+    ) -> tuple[OutboxItem | None, bool]:
         """Decode a claimed FIFO head into an :class:`OutboxItem`, or dead-letter an undecryptable head
         and return ``None`` so the lane advances on the next poll (mirrors SQLite). Runs AFTER the claim
-        txn so the dead-letter is its own transaction."""
+        txn so the dead-letter is its own transaction. The flag is ``True`` when the row was set
+        aside with ``tail`` instead (BACKLOG #5735), so the caller stops at it."""
         if row is None:
-            return None  # nothing pending, or the head is backing off — block the lane
+            return None, False  # nothing pending, or the head is backing off — block the lane
         try:
-            return self._outbox_item(row)
+            return self._outbox_item(row), False
         except CipherError as exc:
             # An undecryptable head must not stall the lane — dead-letter it and let the next poll
             # advance, rather than raising into the worker (mirrors SQLite).
-            await self._dead_letter_unopenable(row, exc)
-            return None
+            if await self._dead_letter_unopenable(row, exc) is None:
+                return None, False
+            await self._set_aside_claimed(tail, now)
+            return None, True
 
-    async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> None:
+    async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
-        tag is also audited and alerted (BACKLOG #2593). The lane moves on either way."""
+        tag is also audited and alerted (BACKLOG #2593). Returns ``None`` then.
+
+        A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
+        the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
+        error of a dead-letter write that fails, after a tag failure is still reported. An error in
+        the engine's own code (:data:`PROGRAMMING_ERRORS`) propagates. The SQLite twin says what
+        the caller does with it."""
+        if is_transient_open_failure(exc):
+            return queue_open_fault(exc)
         log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-        await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+        try:
+            await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+        except PROGRAMMING_ERRORS:
+            raise
+        except Exception as failed:  # noqa: BLE001 -- a store fault, which the caller contains
+            log.warning(
+                "could not dead-letter queue row %s (%s); it is retried",
+                row["id"],
+                type(failed).__name__,
+            )
+            if isinstance(exc, QueueTagError):
+                await report_queue_tag_failure(
+                    self, self._cipher, row, outcome="could not be dead-lettered"
+                )
+            return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
+        return None
+
+    async def _set_aside_claimed(self, tail: Sequence[Any], now: float | None) -> None:
+        """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault
+        (:func:`set_aside_deadline`, BACKLOG #5735), for a per-lane claim. If this write fails
+        too, its error propagates out of the claim; the rows'
+        lease and startup recovery re-pend them."""
+        log.warning(
+            "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
+            " dead-lettered, for a reason the claim could not settle",
+            len(tail),
+            TRANSIENT_OPEN_BACKOFF_SECONDS,
+        )
+        await self.reschedule_claimed([r["id"] for r in tail], set_aside_deadline(now))
 
     async def _open_queue_body(self, conn: Any, row: Any, *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite
@@ -5716,6 +5800,23 @@ class PostgresStore:
             stage=row["stage"],
             handler_name=row["handler_name"],
             created_at=row["created_at"],  # claim RETURNING q.* includes it (ingest-time, ADR 0009)
+        )
+
+    @staticmethod
+    def _unopened_item(row: Any, fault: QueueOpenFault) -> OutboxItem:
+        """A claimed row whose body was not opened, carrying ``fault`` for the pooled dispatcher's
+        T17 path (BACKLOG #5735). ``payload`` is empty and must not be read."""
+        return OutboxItem(
+            id=row["id"],
+            message_id=row["message_id"],
+            channel_id=row["channel_id"],
+            destination_name=row["destination_name"],
+            payload="",
+            attempts=row["attempts"],
+            stage=row["stage"],
+            handler_name=row["handler_name"],
+            created_at=row["created_at"],
+            open_fault=fault,
         )
 
     def _open_inline_payload(self, row: Any) -> str:

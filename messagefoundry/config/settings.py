@@ -112,6 +112,18 @@ from messagefoundry.domainshape import (
     upn_suffix_key,
 )
 from messagefoundry.logging_setup import LOG_LEVELS
+
+# Moved to netaddr, the neutral leaf, so the HTTP listener reads them without importing private
+# config names (BACKLOG #5525); the old private names stay bound for this module's callers.
+from messagefoundry.netaddr import IPV4_MAPPED as _IPV4_MAPPED
+from messagefoundry.netaddr import IPV4_MAPPED_BASE as _IPV4_MAPPED_BASE
+from messagefoundry.netaddr import ipv4_meaning as _ipv4_meaning
+from messagefoundry.netaddr import not_a_host_address as _not_a_host_address
+from messagefoundry.password_bounds import (
+    PASSWORD_MAX,
+    PASSWORD_MIN_LENGTH_MAX,
+    TEMPORARY_PASSWORD_CLASS_SUFFIX,
+)
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import (
     REMOTE_DEBUG_ACCEPTANCE_LOOSENING,
@@ -1464,9 +1476,16 @@ _ZONED_HOP_CAVEAT = (
     "that costs."
 )
 
-#: The IPv4-mapped block. An entry inside it names IPv4 hosts in their IPv6 spelling (BACKLOG #3042).
-_IPV4_MAPPED = ipaddress.IPv6Network("::ffff:0:0/96")
-_IPV4_MAPPED_BASE = int(_IPV4_MAPPED.network_address)
+
+class TrustedProxyRefusal(ValueError):
+    """What :func:`_parse_trusted_proxy` raises. ``reason`` names the refused form in words that
+    never quote the entry, so a caller whose own refusal may not echo a configured value, such as
+    the ``Http()`` factory, reads the parse's own decision rather than classify the entry again
+    (BACKLOG #5525)."""
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _matching_form(parsed: _TrustedProxy) -> _TrustedProxy | None:
@@ -1488,19 +1507,6 @@ def _matching_form(parsed: _TrustedProxy) -> _TrustedProxy | None:
     if isinstance(parsed, ipaddress.IPv6Network) and parsed.network_address.scope_id is not None:
         return ipaddress.IPv6Network((int(parsed.network_address), parsed.prefixlen))
     return None
-
-
-def _ipv4_meaning(
-    network: ipaddress.IPv4Network | ipaddress.IPv6Network,
-) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
-    """``network`` as the IPv4 range it names when it sits inside the mapped block, else itself, so
-    ``::ffff:0:0/96`` counts as the whole IPv4 family it trusts (BACKLOG #3042)."""
-    # Every caller passes a zoneless network: a zoned entry is refused, or stripped of its zone.
-    if isinstance(network, ipaddress.IPv6Network) and network.subnet_of(_IPV4_MAPPED):
-        return ipaddress.IPv4Network(
-            (int(network.network_address) & 0xFFFF_FFFF, network.prefixlen - _IPV4_MAPPED.prefixlen)
-        )
-    return network
 
 
 def _trusts_every_ipv4_host(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
@@ -1544,27 +1550,33 @@ def _parse_trusted_proxy(entry: str) -> _TrustedProxy:
     ``ip_address``. Whatever fails either becomes a literal that matches no peer, which would
     collapse every client source IP to the proxy and degrade the audit source IP, the per-IP login
     limiter and the new-client-IP step-up signal. ``'*'`` trusts every peer. Each raises
-    ``ValueError`` with its own message, and so does a form :func:`_matching_form` names."""
+    :class:`TrustedProxyRefusal` with its own message, and so does a form :func:`_matching_form`
+    names."""
     if entry == "*":
-        raise ValueError(_TRUST_ALL_PROXIES_REFUSAL)
+        raise TrustedProxyRefusal(_TRUST_ALL_PROXIES_REFUSAL, "is '*', which trusts every peer")
     parsed: _TrustedProxy
     try:
         parsed = ipaddress.ip_network(entry) if "/" in entry else ipaddress.ip_address(entry)
     except ValueError as exc:
-        raise ValueError(_trusted_proxy_refusal(entry, exc)) from exc
+        raise _trusted_proxy_refusal(entry, exc) from exc
     form = _matching_form(parsed)
     if form is not None:
-        why = _ZONED_NETWORK if isinstance(form, ipaddress.IPv6Network) else _ZONED_HOST
+        if isinstance(form, ipaddress.IPv6Network):
+            why = _ZONED_NETWORK
+            reason = "is an IPv6 network with a zone, whose prefix would be trusted on every link"
+        else:
+            why = _ZONED_HOST
+            reason = "is an IPv6 address with a zone, which no peer address carries"
         if isinstance(form, ipaddress.IPv6Network) and form.num_addresses > 1:
             fix = _span_wording(form)  # a range is named, never recommended
         else:
             host = form.network_address if isinstance(form, ipaddress.IPv6Network) else form
             fix = f"List '{host}' instead. {_ZONED_HOP_CAVEAT.format(host=host)}"
-        raise ValueError(f"[api].trusted_proxies entry {entry!r} is {why} {fix}")
+        raise TrustedProxyRefusal(f"[api].trusted_proxies entry {entry!r} is {why} {fix}", reason)
     return parsed
 
 
-def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
+def _trusted_proxy_refusal(entry: str, exc: ValueError) -> TrustedProxyRefusal:
     """The message for an ``[api].trusted_proxies`` entry that uvicorn's own parse refuses.
 
     A host-bits CIDR such as ``10.0.0.1/24`` gets its own message naming the single proxy address
@@ -1575,21 +1587,23 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
     try:
         network = ipaddress.ip_network(entry, strict=False)
     except ValueError:
-        return (
+        return TrustedProxyRefusal(
             f"[api].trusted_proxies entry {entry!r} is not a valid IP address or CIDR network: "
             f"{exc} (uvicorn would silently treat it as a literal that never matches, "
-            "collapsing every client source IP to the proxy)"
+            "collapsing every client source IP to the proxy)",
+            "is not a valid IP address or CIDR network",
         )
     written = ipaddress.ip_address(entry.partition("/")[0])
     host = _as_matched(written)
     spanned = ipaddress.ip_network(_as_matched(network))  # a network's matching form is a network
     # A zoned entry gets the zoned-hop caveat here too: the advice is the same zoneless host.
     caveat = f" {_ZONED_HOP_CAVEAT.format(host=host)}" if host != written else ""
-    return (
+    return TrustedProxyRefusal(
         f"[api].trusted_proxies entry {entry!r} has host bits set. uvicorn parses a CIDR strictly, "
         "so it would treat this entry as a literal that never matches, collapsing every client "
         f"source IP to the proxy. List the proxy's own address '{host}'.{caveat} "
-        f"{_span_wording(spanned)}"
+        f"{_span_wording(spanned)}",
+        "has host bits set; list the proxy's own address, or the range's network address",
     )
 
 
@@ -4141,6 +4155,26 @@ class AuthSettings(_Section):
             )
         return self
 
+    @field_validator("password_min_length")
+    @classmethod
+    def _check_password_min_length(cls, value: int) -> int:
+        # BACKLOG #5397: at least the JSON sign-in, step-up and password-change requests and the
+        # console's sign-in, step-up and password forms refuse a password longer than PASSWORD_MAX.
+        # A temporary password is minted at least this long, plus a class suffix when a class rule
+        # is on and the random part misses a class, so a higher floor could mint a credential those
+        # surfaces refuse. The cap assumes the suffix whether or not a class rule is on. Refused at
+        # load rather than lowered.
+        if value > PASSWORD_MIN_LENGTH_MAX:
+            raise ValueError(
+                f"password_min_length must be at most {PASSWORD_MIN_LENGTH_MAX}: an engine-issued "
+                "temporary password is at least that long, plus a "
+                f"{len(TEMPORARY_PASSWORD_CLASS_SUFFIX)}-character suffix when a character-class "
+                "rule is on and the random part misses a class, and the sign-in and "
+                f"password-change requests accept no password over {PASSWORD_MAX} characters; "
+                "the cap holds whether or not a class rule is on"
+            )
+        return value
+
     @field_validator("mfa_recovery_code_count")
     @classmethod
     def _check_recovery_count(cls, value: int) -> int:
@@ -5313,25 +5347,6 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
         # the new arm 3, which occupies exactly the pre-0153 arm-4 slot, so this is byte-identical.
         cleartext_accepted=hop_insecure_escape_downgrades(enforcing=posture.enforcing),
     )
-
-
-#: RFC 1122's "this network" block. ``ipaddress`` names only its first address, as unspecified: it
-#: reads the rest, such as ``0.1.2.3``, as neither unspecified nor reserved (BACKLOG #3765).
-_THIS_NETWORK = ipaddress.IPv4Network("0.0.0.0/8")
-
-
-def _not_a_host_address(text: str) -> bool:
-    """Whether the canonical IPv4 ``text`` is not one host's address: at least the whole
-    ``0.0.0.0/8`` block, a multicast group, and the reserved class E range, which holds the limited
-    broadcast ``255.255.255.255`` (BACKLOG #3075, #3765). No identity provider or link is served
-    from one, and some browsers route ``0.0.0.0`` to the local machine. This does not refuse
-    loopback: a ``127.0.0.1`` entry still loads, as ``localhost`` does.
-
-    The console keeps its own copy, ``_is_one_host`` in ``messagefoundry_webconsole/_external.py``,
-    for an entry that reaches it another way. ``tests/test_domain_shape.py`` compares the two on a
-    ``/16`` grid."""
-    address = ipaddress.IPv4Address(text)
-    return address in _THIS_NETWORK or address.is_multicast or address.is_reserved
 
 
 def _bare_domain_entries(
@@ -7159,9 +7174,9 @@ class IntegritySettings(_Section):
     # in-place security hotfix (the documented vendored-parser patch contingency) would itself trip a
     # RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Opt in for hard
     # enforcement on a locked-down instance.
-    # It ALSO refuses when attestation verified NOTHING — no baseline, a RECORD stripped of its package
-    # rows, or the package loaded from outside the install root (BACKLOG #1679). A pass that compared
-    # zero files cannot say the bytes are clean, and stripping the baseline is easier for the stated
+    # It ALSO refuses when attestation verified NOTHING (BACKLOG #1679); `UnattestedReason` in
+    # messagefoundry/integrity.py names the shapes. A pass that verified no
+    # file cannot say the bytes are clean, and stripping the baseline is easier for the stated
     # adversary than editing a module. An install that declares itself editable is still exempt.
     fail_closed_on_drift: bool = False
     # When true, the engine re-walks the tamper-evident audit hash-chain once at startup (#190). This is
@@ -10366,7 +10381,7 @@ def security_loosenings(
     remote_debug: RemoteDebugPosture | None,
     startup: StartupPosture | None,
     service_env: ServiceEnvPosture | None,
-    listener_trusted_proxy_hops: Sequence[str] = (),
+    listener_trusted_proxy_hops: Sequence[str],
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -10539,8 +10554,8 @@ def security_loosenings(
     ``ech_cleartext_sidecar_hops`` is a ``REST`` outbound whose ECH sidecar is an ``http://`` URL
     (ADR 0139), and ``listener_trusted_proxy_hops`` is an inbound ``Http()`` listener with a
     non-empty ``trusted_proxies`` (BACKLOG #5525), read by ``listener_trusted_proxy_hops``, which
-    walks the ``HTTP`` inbounds. That one alone has a default, empty, so the callers that have no
-    graph need not name it; every caller with a graph passes it. They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    walks the ``HTTP`` inbounds. Like its siblings it has no default, so a caller with no graph
+    passes it empty. They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;

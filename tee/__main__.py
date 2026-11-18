@@ -878,11 +878,13 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             failed += 1  # it is a count, not a leak (LeakError, or anything else)
             continue
         # The id is read from the anonymized body, with the reader the relay used for row.control_id,
-        # so it follows the rules; it is None when that body has no MSH-10. received_at is the
-        # relay's real receive time, which no MSH-7 rule touches (BACKLOG #2994). The text was
-        # decoded from latin-1, so this encode fails only on a character an anonymizer pass wrote
-        # that latin-1 cannot hold, and no pass is known to write one. It runs outside the catch
-        # above, so if one ever did, the id would be None rather than the run ending.
+        # so it follows the rules (the store then cuts an over-long row.control_id to
+        # `_MAX_IDENTIFIER`, tee/store.py, and this id is not cut); it is None when that body has
+        # no MSH-10. received_at is the relay's real receive time, which no MSH-7 rule touches
+        # (BACKLOG #2994). The text was decoded from latin-1, so this encode fails only on a
+        # character an anonymizer pass wrote that latin-1 cannot hold, and no pass is known to
+        # write one. It runs outside the catch above, so if one ever did, the id would be None
+        # rather than the run ending.
         try:
             control_id, _ = mllp.peek_fields(anon.encode("latin-1"))
         except UnicodeEncodeError:

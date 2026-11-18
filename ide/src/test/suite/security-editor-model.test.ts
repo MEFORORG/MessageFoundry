@@ -9,11 +9,13 @@ import * as path from "path";
 import {
   ShownFile,
   saveUpdatesProblem,
+  securityConfigInput,
   securityConfigTarget,
   securitySetArgs,
   securityShowArgs,
 } from "../../securityEditorModel";
 import { FIELDS } from "../../securityEditorWebview";
+import { containedPathSetting, type PathSettingScopes } from "../../workspaceContainment";
 import { unlinkLinks } from "../unlinkLinks";
 
 // BACKLOG #5411: the Security Settings editor's host-side checks, run vscode-free. The editor writes
@@ -120,6 +122,36 @@ suite("security editor host checks", () => {
     for (const setting of [undefined, null, 5, ["messagefoundry.toml"]]) {
       assert.strictEqual(securityConfigTarget(ws, setting, { fromWorkspace: true, trusted: true }, real).ok, false, `${JSON.stringify(setting)} was accepted`);
     }
+  });
+
+  test("a value cli.ts's containment dropped is refused, not swapped for the file used in its place (BACKLOG #5404)", () => {
+    // The editor's own pipeline: inspect() -> containedPathSetting -> securityConfigInput -> securityConfigTarget.
+    const judge = (seen: PathSettingScopes) => {
+      const { value, fromWorkspace } = securityConfigInput(seen, containedPathSetting(seen, ws, "messagefoundry.toml"));
+      return securityConfigTarget(ws, value, { fromWorkspace, trusted: true }, real);
+    };
+    const userFile = path.join(ws, "mine.toml");
+    // A workspace value outside the folder, with a usable user value and default below it.
+    const dropped = judge({ defaultValue: "messagefoundry.toml", globalValue: userFile, workspaceValue: path.join(outside, "x.toml") });
+    assert.strictEqual(dropped.ok, false, "the dropped workspace value was swapped for the user's");
+    assert.match(dropped.ok ? "" : dropped.problem, /set in workspace settings, names a path outside/);
+    // A user value that is not text, with a usable default below it.
+    const notText = judge({ defaultValue: "messagefoundry.toml", globalValue: 5 });
+    assert.strictEqual(notText.ok, false, "the non-text user value was swapped for the default");
+    assert.match(notText.ok ? "" : notText.problem, /blank or is not text/);
+    // Controls: nothing dropped, so the value used is the one judged.
+    assert.deepStrictEqual(judge({ defaultValue: "messagefoundry.toml", globalValue: userFile }), { ok: true, path: userFile });
+    assert.deepStrictEqual(judge({ defaultValue: "messagefoundry.toml", workspaceValue: "conf/a.toml" }), {
+      ok: true,
+      path: path.join(ws, "conf", "a.toml"),
+    });
+    // The workspace scope is reported for a workspace value, so rule 2 applies to it.
+    assert.deepStrictEqual(securityConfigInput({ workspaceValue: "a.toml" }, containedPathSetting({ workspaceValue: "a.toml" }, ws, "d")), {
+      value: "a.toml",
+      fromWorkspace: true,
+    });
+    // An unread scope counts as the workspace's.
+    assert.strictEqual(securityConfigInput(undefined, containedPathSetting(undefined, ws, "d")).fromWorkspace, true);
   });
 
   test("rule 3: a user-set path outside the workspace folder is accepted as written, with no file-system call", () => {

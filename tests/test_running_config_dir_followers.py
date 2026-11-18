@@ -423,6 +423,9 @@ async def test_a_graph_built_in_code_falls_back_to_the_configured_source(tmp_pat
         outbound=loaded.outbound,
         routers=loaded.routers,
         handlers=loaded.handlers,
+        # Names no directory, but carries the loaded digest: a worker mode beside a config dir
+        # refuses a graph with none at start (BACKLOG #5334).
+        code_digest=loaded.code_digest,
     )
     store = await MessageStore.open(tmp_path / "s.db")
     policy = SandboxPolicy(mode=SandboxMode.SUBPROCESS)

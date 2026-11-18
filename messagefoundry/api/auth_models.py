@@ -18,20 +18,26 @@ from pydantic import AfterValidator, BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
+    SIGN_IN_NAME_PATTERN,
     ChannelScopeEntry,
     PermissionId,
     RoleId,
 )
+from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
 from messagefoundry.auth.usernames import username_refusal
+from messagefoundry.password_bounds import PASSWORD_MAX as _PASSWORD_MAX
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.
 # The ITEM rules for the id-shaped lists below live in `api/validation.py`, with the rest of the
 # operator API's input rules (BACKLOG #1108, docs/API-INPUT-VALIDATION.md).
 _NAME_MAX = 256
-_PASSWORD_MAX = 1024
 _GROUP_MAX = 512
+#: A TOTP code or a single-use recovery code (``MfaVerifyRequest.code``).
+_MFA_CODE_MAX = 64
+#: A TOTP code confirming a staged enrolment (``MfaConfirmRequest.code``).
+_CONFIRM_CODE_MAX = 16
 # A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
 _TOKEN_MAX = 256
 
@@ -55,6 +61,8 @@ class CredentialReply(BaseModel):
 
 
 class LoginRequest(RequestModel):
+    # A NUL in ``username`` (vault BACKLOG #5342): behaviour pinned by
+    # tests/test_api_auth.py::test_login_answers_a_nul_username_as_an_audited_unknown_name.
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
@@ -321,7 +329,9 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    username: str = Field(min_length=1, max_length=_NAME_MAX)
+    # vault BACKLOG #5342. Pinned by tests/test_auth_federated_identity_routes.py::
+    # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory.
+    username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 
@@ -462,7 +472,7 @@ class PasswordResetResponse(CredentialReply):
 class MfaVerifyRequest(RequestModel):
     """Satisfy a session's second factor with a TOTP code **or** a single-use recovery code."""
 
-    code: str = Field(max_length=64)
+    code: str = Field(max_length=_MFA_CODE_MAX)
 
 
 class MfaEnrollResponse(CredentialReply):
@@ -476,10 +486,10 @@ class MfaEnrollResponse(CredentialReply):
 class MfaConfirmRequest(RequestModel):
     """Confirm a staged enrollment by proving a live TOTP code from the authenticator app."""
 
-    code: str = Field(max_length=16)
+    code: str = Field(max_length=_CONFIRM_CODE_MAX)
     #: ADR 0207: the issued enrolment code, which a directory account's first
     #: factor needs on a session not stamped MFA-verified. Ignored where none is owed.
-    enrolment_code: str | None = Field(default=None, max_length=64)
+    enrolment_code: str | None = Field(default=None, max_length=ENROLMENT_CODE_MAX)
 
 
 class MfaConfirmResponse(CredentialReply):

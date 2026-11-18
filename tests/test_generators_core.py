@@ -55,3 +55,13 @@ def test_write_corpus_only_clears_its_own_generated_files(tmp_path: Path) -> Non
     _core.write_corpus("ADT", triggers=["A01"], count=1, out=tmp_path)
     assert keep.exists()  # scoped delete left the user's file alone (GEN-1)
     assert (trigger_dir / "0001.hl7").exists()
+
+
+@pytest.mark.parametrize("count", [0, -3, _core.MAX_CORPUS_COUNT + 1])
+def test_write_corpus_refuses_a_count_out_of_range_before_clearing(
+    tmp_path: Path, count: int
+) -> None:
+    _core.write_corpus("ADT", triggers=["A01"], count=1, out=tmp_path)
+    with pytest.raises(ValueError, match="count must be between 1 and"):
+        _core.write_corpus("ADT", triggers=["A01"], count=count, out=tmp_path)
+    assert (tmp_path / "A01" / "0001.hl7").exists()
