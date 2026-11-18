@@ -666,7 +666,7 @@ def test_windows_powershell_is_refused_before_anything_is_read(files: dict[str, 
     if exe is None or sys.platform != "win32":
         pytest.skip("SKIP (nothing run): no Windows PowerShell 5.1 here")
     proc = subprocess.run(
-        [exe, "-NoProfile", "-NonInteractive", "-File", str(_SCRIPT)]
+        [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(_SCRIPT)]
         + ["-CaPath", str(files["p7b_der"]), "-WhatIf"],
         capture_output=True,
         text=True,

@@ -212,9 +212,7 @@ function Read-DerHeader {
 # (or its legacy spelling X509 CERTIFICATE) or PKCS7, in ASCII, UTF-8 or UTF-16 with a byte-order
 # mark. A DER value that does not end where its bytes end, or a control character other than tab,
 # CR or LF outside PEM blocks, refuses the file; other text outside the blocks is ignored. The PEM
-# is parsed here because
-# Windows PowerShell 5.1's .NET Framework has no ImportFromPem, which would in any case skip a
-# private-key block silently. At least a PKCS#12 (.pfx) and a well-formed PEM block with another
+# is parsed here because ImportFromPem would skip a private-key block silently. At least a PKCS#12 (.pfx) and a well-formed PEM block with another
 # label, such as PRIVATE KEY, are refused before any of it is parsed, so no private key is loaded:
 # a key has no place in a trust-store import, and such a file is usually a server certificate
 # handed over by mistake. A certificate the file holds twice is kept once.
@@ -499,11 +497,7 @@ if ($refusals.Count -gt 0) {
         (($refusals | ForEach-Object { "$($_.Thumbprint) ($($_.Why))" }) -join '; ') + ".")
 }
 if (-not ($entries | Where-Object { $_.Target -eq $stores['Root'] })) {
-    # Get-CaChainCheck has already refused any certificate whose chain does not end at a root in
-    # this file, so a file that reaches here holds one. This second check keeps a rootless file
-    # out even if a platform's chain engine ever reported a chain without that root: an issuing
-    # CA alone validates nothing over SChannel, and over the engine's Python TLS it would be
-    # trusted with no root over it (the help's "Where each CA goes").
+    # Defensive: not expected to fire.
     throw ("Nothing was imported. The file holds no self-signed root. Give this script the root " +
         "the CA chains to, alone or in the same .p7b chain.")
 }
