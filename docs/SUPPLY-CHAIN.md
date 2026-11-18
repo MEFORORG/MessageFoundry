@@ -380,10 +380,11 @@ have not, the document says nothing about that CVE and your scanner's finding st
   `ide/package-lock.json`: vsce pulls in picomatch, which has no patched release, so vsce in that
   lock would turn npm-audit red. The owner ruled on 2026-11-17 that the change taking vsce out of
   that lock should merge before the pin. The npx route also runs the fetched packages' install
-  scripts, for example `@vscode/vsce-sign`'s. Read 2026-11-17 with `npm audit` on a lock-only
-  resolve of `@vscode/vsce@4.1.0`, the tree npx resolves for vsce carries that advisory and
-  [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249) (minimatch); its
-  unlocked dependencies can change between runs. The generator itself, and the jscpd clone report
+  scripts, for example `@vscode/vsce-sign`'s. Read 2026-11-17 with `npm audit` on a fresh lock-only
+  resolve of `@vscode/vsce@4.1.0`, that resolve's tree carries that advisory and
+  [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249) (minimatch). That is not
+  a reading of the tree npx runs, which may come from its cache, and the unlocked dependencies can
+  change between runs. The generator itself, and the jscpd clone report
   in `quality-advisory.yml`, install from a separate committed lock,
   `ci/npm-tools/package-lock.json` (vault BACKLOG #2793). **No blocking audit lane reads that lock**;
   Dependabot watches it. Read 2026-11-06, with the `overrides`
