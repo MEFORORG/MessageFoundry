@@ -28,6 +28,7 @@ from messagefoundry.store.cell_tag import (
     MESSAGE_TAG_CELLS,
     MESSAGE_TAG_FAILED_ACTION,
     PRESET_TAG_FAILED_ACTION,
+    BlankCellError,
     CellTagError,
     CorruptCellError,
     UnmarkedCellError,
@@ -35,6 +36,7 @@ from messagefoundry.store.cell_tag import (
     dead_letters_on_cell_tag,
     message_cell_aad,
     open_message_cell,
+    open_preset_criteria,
     open_tagged_cell,
     preset_criteria_aad,
     report_cell_tag_failure,
@@ -717,6 +719,35 @@ def test_transit_batch_decrypt_names_an_aead_refusal_as_decrypt_does() -> None:
     )
     assert isinstance(first, UnauthenticatedCipherError)
     assert isinstance(second, CipherError) and not isinstance(second, UnauthenticatedCipherError)
+
+
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
+def test_a_blank_or_non_text_preset_criteria_cell_is_refused_at_the_store(
+    keyed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5523: the store never writes NULL, empty or non-text criteria. A blank cell read as
+    ``{}`` would drop a narrowing preset out of a layered search, so ``open_preset_criteria``
+    refuses it on every store: a blank cell is drift (alerted, and audited by the store), a
+    non-text one is corrupt. Control: sealed criteria open."""
+    monkeypatch.setattr(cell_tag, "_reported", {})  # an earlier report must not mute this one
+    cipher = make_cipher(generate_key() if keyed else None, write_v2=True)
+    seen: list[tuple[str, str]] = []
+    setter = getattr(cipher, "set_tag_failure_hook", None)
+    if setter is not None:
+        setter(lambda table, reason: seen.append((table, reason)))
+    aad = preset_criteria_aad(preset_id="pblank", owner_user_id="u1")
+    sealed = cipher.encrypt('{"channel_id": "ch2"}', aad=aad)
+    opened = open_preset_criteria(cipher, sealed, preset_id="pblank", owner_user_id="u1")
+    assert opened == '{"channel_id": "ch2"}'  # control
+    for stored in (None, ""):
+        with pytest.raises(BlankCellError) as blank:
+            open_preset_criteria(cipher, stored, preset_id="pblank", owner_user_id="u1")
+        assert blank.value.drift and blank.value.table == "search_presets"
+    with pytest.raises(CorruptCellError) as corrupt:
+        open_preset_criteria(cipher, b"{}", preset_id="pblank", owner_user_id="u1")
+    assert not corrupt.value.drift
+    if setter is not None:  # once per interval: two blank refusals of one row, one alert
+        assert [t for t, reason in seen if "blank" in reason] == ["search_presets"]
 
 
 def test_a_failed_cell_is_reported_once_per_interval() -> None:
