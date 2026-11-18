@@ -280,12 +280,14 @@ jobs:
     name: npm-audit (ide dependency vulnerabilities)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # HARD-FAILING: the ide/ npm tree (the VS Code extension's build-time toolchain) audits clean today, so a
-    # newly-disclosed advisory in a pinned npm dep now turns CI red — the same forcing function as
-    # pip-audit, extended to the extension's supply chain (previously only pip + github-actions were
-    # watched). `overrides` in ide/package.json is where a triaged transitive advisory gets pinned out.
-    # NOT COVERED: @vscode/vsce, which packages the .vsix. It is not in the lock; `npm run package`
-    # fetches it with npx, so this job never reads it.
+    # HARD-FAILING: the locked ide/ npm tree (the VS Code extension's build-time toolchain, less vsce)
+    # audits clean today, so a newly-disclosed advisory in a locked npm dep now turns CI red — the same
+    # forcing function as pip-audit, extended to the extension's supply chain (previously only pip +
+    # github-actions were watched). `overrides` in ide/package.json is where a triaged transitive
+    # advisory gets pinned out.
+    # NOT COVERED: @vscode/vsce, which packages the .vsix, and its dependencies. They are not in the
+    # lock; `npm run package` fetches vsce with npx at a pinned top-level version whose dependencies
+    # are not locked, so this job never reads them.
     defaults:
       run:
         working-directory: ide
@@ -618,8 +620,10 @@ jobs:
         run: |
           # --package-lock-only reads package-lock.json directly (no `npm install`), matching the npm-audit
           # job's install-free posture. The extension has NO runtime npm dependencies (esbuild bundles the
-          # payload), so we capture the FULL tree — the build toolchain (esbuild/typescript/…) is the npm
-          # supply chain worth inventorying, and this mirrors npm-audit's full-tree scan.
+          # payload), so we capture the full locked tree — the locked build toolchain
+          # (esbuild/typescript/…), less vsce, is the npm supply chain inventoried here, and this mirrors
+          # npm-audit's scan of the same lock. The lock does not hold @vscode/vsce, which
+          # `npm run package` fetches with npx, so this SBOM does not list vsce or its dependencies.
           # THE TOOL installs from its own committed lock, not with npx; why is the description in
           # ci/npm-tools/package.json (vault BACKLOG #2793). That is the tool's tree, not the
           # extension's, so the install-free posture above still holds for what is scanned. Retried,

@@ -197,8 +197,9 @@ separators raw).
   `tests/test_one_frame_one_message.py::test_P10_mllp_in_edit_mllp_out_is_one_frame`
   *(Note 2026-11-13, vault BACKLOG #5928: `convert_case` keeps an escape as sent, so it does not
   hand the leaf escaper a control decoded from one. Each probe still edits with it first. The two
-  P2 probes then check that the escape is kept, by its wire form. P10 checks only that the edited
-  message frames as one frame, which does not show that the escape was kept. Each probe then writes
+  P2 probes then check that the escape is kept, by its wire form. P10 checks that the edited
+  message frames as one frame and, at its end, that both components read back the decoded value;
+  neither check reads the wire form, so P10 does not show that the escape was kept. Each probe then writes
   the decoded value back as data twice, through `_write_back_decoded`: first with `copy_field` from
   the escaped component into another one, then with a component `msg.set` of the decoded read onto
   the component that arrived with the escape. The `msg.set` write does not depend on how
@@ -214,8 +215,8 @@ separators raw).
   `tests/test_one_frame_one_message.py::test_the_structural_escapes_are_unchanged`
   *(Note 2026-11-13, vault BACKLOG #5928: `convert_case` now edits the wire text and keeps a
   `\X0D\` escape as sent, so it no longer raises on one. The second test above now asserts that
-  the edit keeps the escape and writes no raw CR, and that a decoded CR written as data is still
-  refused with the message unchanged: by `msg.set` on a component, once with a value that holds a
+  the edit keeps the escape and writes no raw CR, and that a CR written as data, typed or decoded,
+  is still refused with the message unchanged: by `msg.set` on a component, once with a value that holds a
   CR typed into it and once with the value a read of the component returns, whose CR is decoded
   from the component's own `\X0D\`; by `copy_field` from a
   component whose `\X0D\` decodes to a CR; and by `replace_literal` when a match would write a

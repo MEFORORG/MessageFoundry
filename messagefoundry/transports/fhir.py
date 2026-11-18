@@ -1204,6 +1204,7 @@ class FhirDestination(DestinationConnector):
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
             connection=config.name,
+            builds_token_hop=True,  # bearer_provider_from_settings, below
         )
         proxy_dest = self._proxy.for_host(self.base_url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()

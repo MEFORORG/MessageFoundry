@@ -34,7 +34,7 @@ from _ui_clients import (
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
-from messagefoundry.auth.tokens import hash_token
+from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX, hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
@@ -149,6 +149,40 @@ async def test_the_route_refuses_a_finish_after_the_account_gained_a_factor(
     # only the service's row for the refusal that ended the ceremony, so a flood cannot grow it.
     warned = [r for r in caplog.records if "factor-refused passkey-enroll" in r.getMessage()]
     assert [r.levelname for r in warned] == ["WARNING"] * 3
+    paths = [
+        json.loads(r["detail"])["path"]
+        for r in await service.store.list_audit(action="auth.mfa_denied")
+    ]
+    assert paths == ["finish_webauthn_registration"]
+
+
+async def test_a_factor_refused_finish_with_an_oversized_enrolment_code_is_still_the_factor_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5399. RED when: an enrolment-code bound answers a factor-refused finish ahead of
+    the service, so the ceremony is not ended and the refusal is not audited. The code goes on
+    uncut."""
+    service = await _service(engine)
+    identity, token = await _sign_in(service)
+    seen: list[object] = []
+    real = service.finish_webauthn_registration
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("enrolment_code"))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(service, "finish_webauthn_registration", spy)
+    body = await _staged_body(service, identity, token)
+    await _enrol_totp_elsewhere(service)
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        oversized = "e" * (ENROLMENT_CODE_MAX + 1)
+        refused = await c.post(
+            _VERIFY, json={**body, "enrolment_code": oversized}, headers=SAME_ORIGIN
+        )
+        assert refused.status_code == 400, refused.text
+        assert "already has a second factor" in refused.json()["error"], refused.text
+    assert seen == [oversized]
     paths = [
         json.loads(r["detail"])["path"]
         for r in await service.store.list_audit(action="auth.mfa_denied")

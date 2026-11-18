@@ -334,9 +334,10 @@ would be exactly the thing it exists to prevent.
 
 `CI gate` `needs:` the individual legs, runs with `if: always()`, and fails on a `failure` or
 `cancelled` leg. A **`skipped`** leg counts as a **pass** — that is what lets a path-gated leg stay off
-an unrelated PR without turning the gate red. **One exception:** `test-shard2`, the engine suite's
-second shard (BACKLOG #5247), must SUCCEED wherever a `test` leg runs its suite (a code pull request,
-a push, a dispatch or a queue entry), so a skip there is a red too.
+an unrelated PR without turning the gate red. **One exception:** `test-shards`, the
+engine suite's second and third test shards in one matrix job (BACKLOG #5247), must SUCCEED
+wherever a `test` leg runs its suite (a code pull request, a push, a dispatch or a queue entry), so
+a skip there is a red too.
 
 **The Windows Postgres leg is deliberately outside the roll-up.** `postgres store (windows-2022)`
 and `postgres store (windows-2025)` (job `postgres-store-windows` in `ci.yml`) run the same Postgres
@@ -402,12 +403,12 @@ Two limits, stated so nobody reads more into a green than it carries:
   `zizmor.yml` (which is already paths-filtered). The hook is the load-bearing half —
   `zizmor.yml` is not a required check.
 - **A step's wall-clock cap is now checked against the step, and a low margin reds the leg** on
-  every event, the engine suite's `test` and `test-shard2` included. Until BACKLOG #5247 item 9 the
+  every event, the engine suite's `test` and `test-shards` included. Until BACKLOG #5247 item 9 the
   engine legs only warned in `merge_group`, under the owner ruling of 2026-10-29, and from
   2026-10-30, decided under the owner's delegation, warned on `pull_request` down to 1.20x. The
   test shard pools of 2026-11-09 in `scripts/ci/step_margin_baseline.toml` ended both. The ruling
   of 2026-10-29 also moved the recurring timing tests listed in `tests/timing_quarantine.txt` off the engine legs into the advisory `timing-quarantine` job
-  (BACKLOG #4773). Each gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
+  (BACKLOG #4773); that file quotes this ruling and the later one, of 2026-11-18, that added to it. Each gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
   them: it times the **step** (not the job — the job runs minutes longer under its own cap, and
   misreading one for the other has produced published-then-retracted numbers here more than once),
   keys on that step's **own** `outcome`, and reds below 1.30x. It
@@ -419,13 +420,18 @@ Two limits, stated so nobody reads more into a green than it carries:
   `RE-DERIVE` or `RE-SIZE`, and never changes the exit code. It puts a rotting record on the run page
   and the checks tab instead of only the step log (BACKLOG #1842). The grades, and the limits of
   that warning, are defined once in `record_escalation` in `scripts/ci/step_margin.py`.
-  **The engine suite now runs as two test shards, in `test` and `test-shard2`, and each shard keeps
-  the whole-suite cap and the whole-suite baseline row.** A shard does about half the work, so until
-  the caps and rows are re-sized from test shard pools (deferred to BACKLOG #5247), the 1.30x floor
-  is met against a cap sized for twice a test shard's work: the margin gate is about half as
-  sensitive to a test shard slowing down. The test shard pools were measured on 2026-11-09 and are
-  recorded beside the rows; no row or cap moved with them. The `RE-DERIVE` and `RE-SIZE` warning stays inert
-  on both shards for the same reason, since a shard run is not expected to reach a whole-suite row.
+  **The engine suite now runs as three test shards, shard 1 in `test` and shards 2 and 3 in
+  `test-shards`, and each test shard keeps the whole-suite cap and the whole-suite baseline row.** No
+  row or cap moved with the two-shard pools measured on 2026-11-09, which are recorded beside the
+  rows, nor with the third test shard, whose ruling the `test` job's `Tests (pytest)` note in
+  `ci.yml` dates. So the gate is far from the step it guards: the 1.30x floor fires only past 54:37
+  on Windows (a 71:00 cap) and 35:23 on ubuntu (46:00), while a two-shard step ran a median of
+  27:48, 27:25 and 21:56 on windows-2022, windows-2025 and ubuntu, and a three-shard step is
+  expected to run about two thirds of that. A test shard step must therefore grow to about two to
+  three times its own length before this gate reds; it catches a hang or a gross regression, not a
+  drift. Re-sizing the caps and rows from test shard pools is deferred to BACKLOG #5247. The
+  `RE-DERIVE` and `RE-SIZE` warning stays inert on every test shard for the same reason, since a
+  test shard run is not expected to reach a whole-suite row.
   **A red here is not a request to raise the cap:** the cap is sized against the work in `ci.yml`,
   and the underlying Windows slowness is its own backlog item.
 - **Pass matrix/expression values through `env:`, don't inline them in `run:`.** A dynamic

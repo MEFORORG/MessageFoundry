@@ -24,9 +24,11 @@ pairs, key material (``private_key=``, ``encryption_key=``), an inline DSN passw
 run as the backstop. A credential label may carry a dotted/underscored/hyphenated prefix
 (``client_secret=``, ``bearer_token=``) — see ``_LABEL_PREFIX``.
 
-**The credential stage is two layers**: this module's own copy of the credential patterns, then
-:func:`messagefoundry.secretscrub.scrub_credentials` (BACKLOG #2694). What that buys, what it does not,
-and why the copy stays, are stated once, above :func:`redact_log_line`.
+**The credential stage reads two vocabularies**: this module's own copy of the credential patterns,
+then :func:`messagefoundry.secretscrub.scrub_credentials` (BACKLOG #2694). What that buys, what it
+does not, and why the copy stays, are stated once, above :func:`redact_log_line`. Two more of
+secretscrub's own patterns then run over the whole line, its connection-string member mask (BACKLOG
+#5030) and its widened DSN reading (BACKLOG #5386); :func:`redact_log_line` states the order.
 
 **The credential VOCABULARY is derived from the engine, not hand-chosen here.**
 ``tests/test_log_redaction_secret_domain.py`` reads the engine's own registry of credential settings —
@@ -56,6 +58,8 @@ from messagefoundry.secretscrub import (
     _mask_member,
     scrub_credentials,
 )
+from messagefoundry.secretscrub import _DSN_PASSWORD as _SHARED_NARROW_DSN_PASSWORD
+from messagefoundry.secretscrub import _WIDE_DSN_PASSWORD as _SHARED_DSN_PASSWORD
 
 __all__ = [
     "redact_log_line",
@@ -405,8 +409,11 @@ _MEFOR_SECRET = re.compile(
 # a later label -- falls back to the plain class, which carries the stop and is otherwise the old one.
 #
 # THE FRAGMENTS ARE RESTATED RATHER THAN IMPORTED: ``_LABEL_PREFIX``, ``_BEARER``, ``_MEFOR_SECRET``,
-# ``_CREDENTIAL_KV``, ``_KEY_MATERIAL``, ``_DSN_PASSWORD`` and ``_NOT_BEFORE_QUOTED_LABEL`` are stated
-# in both files. This module DOES call ``secretscrub`` now, as a second layer after this copy (BACKLOG
+# ``_CREDENTIAL_KV``, ``_KEY_MATERIAL`` and ``_NOT_BEFORE_QUOTED_LABEL`` are stated in both files;
+# both DSN readings are secretscrub's own objects, imported (BACKLOG #5386). The narrow one uses no
+# shared fragment or case fold; the widened one is built from secretscrub's query keys and label
+# words under its global fold, so a word added there reaches the bundle's last DSN pass too. This
+# module DOES call ``secretscrub`` now, as a second layer after this copy (BACKLOG
 # #2694), but it does not build this copy from that one's fragments. Doing so would change this
 # copy's case fold, and that change is what the comment above ``redact_log_line`` records as
 # printing values. The fragments themselves sit above ``_BEARER``, because every label pattern uses
@@ -520,7 +527,30 @@ _KEY_MATERIAL = re.compile(
 # one. And
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
-_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
+#
+# THIS FIRST PASS STAYS NARROW: a user, and a password that stops at its first "@". The widened reading,
+# an empty user and a password holding an "@" (BACKLOG #5386), is secretscrub's
+# ``_WIDE_DSN_PASSWORD``, and :func:`redact_log_line` runs it last of the credential passes, after the
+# member mask and before only the long-base64 sweep, over the whole line. Run here, first, a review
+# measured its run after the password reach past a glued ``\ndbPassword=`` label and print that
+# value's tail on every glue it tried. After the shared
+# vocabulary a value it hid is a placeholder, and the widened reading crosses one only where it is
+# the whole first segment of a password with a user, which is where the narrow pass above writes
+# its own: the run after the password stops at "[" and "]", and that first segment otherwise stops
+# at a bracket or an angle too (round 9). Nor does any segment of it cross a label: each stops
+# where a key of the write-time query filter or a label word secretscrub reads starts, followed by
+# ":" or "=", and where a ``MEFOR_`` name starts, with no separator required after it
+# (``_DSN_RUN_STOP`` and ``_DSN_USER_FIRST_SEGMENT`` there say how, and why). So a value such a
+# label holds is left to
+# the pass that reads it, as the narrow pass alone left it, including one this function never hides,
+# such as a ``state=`` query value, which the write-time query filter hides on the store error path.
+# What the reading still crosses is a label that no pass reads, and there it hides more than the
+# narrow pass did, never less.
+#
+#: Both DSN readings are secretscrub's own objects, not copies. Assigned, not only imported, so
+#: strict mypy lets a test name each on this module; a test disables each here by that name.
+_DSN_PASSWORD = _SHARED_NARROW_DSN_PASSWORD
+_WIDE_DSN_PASSWORD = _SHARED_DSN_PASSWORD
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
 _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")
@@ -541,7 +571,8 @@ _LEADING_TS = re.compile(
 )
 
 
-# WHY THE CREDENTIAL STAGE IS TWO LAYERS, AND WHY THE SHARED ONE RUNS LAST (BACKLOG #2694).
+# WHY THE CREDENTIAL STAGE IS TWO LAYERS, AND WHY THE SHARED ONE RUNS AFTER THE PHI PASS
+# (BACKLOG #2694).
 #
 # The goal was one vocabulary: call ``secretscrub.scrub_credentials`` and delete the copy above. That
 # was built, and it printed values this copy hid. Measured 2026-10-06 against this module at
@@ -607,7 +638,8 @@ def redact_log_line(line: str) -> str:
     (:func:`messagefoundry.secretscrub.scrub_credentials`) runs over the text between the placeholders
     so far, or over the whole line when the line arrived holding the placeholder text (BACKLOG
     #2694); its last pass masks the words of a connection-string member's value. Then that member
-    mask runs once more over the whole joined line (BACKLOG #5030). A final long-base64 sweep catches
+    mask runs once more over the whole joined line (BACKLOG #5030), then secretscrub's widened DSN
+    reading, over the whole line too (BACKLOG #5386). A final long-base64 sweep catches
     any residual key/token run.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —
@@ -631,13 +663,21 @@ def redact_log_line(line: str) -> str:
         scrub_credentials(piece, placeholder=REDACTION_PLACEHOLDER) for piece in pieces
     )
     # A connection-string member, its value's words masked to the next ";" (BACKLOG #5030).
-    # secretscrub's own pattern and mask, not a copy, run LAST of the credential passes: after the PHI
-    # pass and the second layer, so it reads what they left, and over the whole joined body, since
-    # this module's placeholder can sit inside the value (``;PWD=[REDACTED] kx,Pw&mv;``), where the
-    # split above cut it. It masks words only, so the PHI pass and the labels of a later redaction of
+    # secretscrub's own pattern and mask, not a copy, run after the PHI pass and the second layer and
+    # before only the widened DSN pass and the long-base64 sweep below, so it reads what they left,
+    # and over the whole joined body, since this module's placeholder can sit inside the value
+    # (``;PWD=[REDACTED] kx,Pw&mv;``), where the split above cut it. It masks words only, so the PHI pass and the labels of a later redaction of
     # this line read the same separators; secretscrub's comment on the pattern says why that matters.
     if ";" in body:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
+    # The widened DSN reading, last and over the whole line (BACKLOG #5386): a password-only DSN, or
+    # a password holding an "@" that the narrow copy above cut at its first one. A value the passes
+    # above hid is a placeholder by now, and the reading reaches past one only where it is a user's
+    # whole first password segment, which is where the narrow copy wrote its own. Nor past a
+    # label a pass reads, a query key the write-time filter hides included, whether or not a pass
+    # above hid its value; the comment on _DSN_PASSWORD says which labels.
+    if "@" in body and "://" in body:
+        body = _WIDE_DSN_PASSWORD.sub(_keep_dsn_user, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
     return prefix + body
 

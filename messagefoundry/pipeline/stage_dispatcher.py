@@ -224,16 +224,24 @@ class LaneItemResult:
     ``reschedule_claimed`` (the ADR 0070 fix A machinery-fault primitive, which ADR 0189's delivery
     halt gate reuses) undoes the claim's ``attempts`` increment and spends none. The dispatcher reads
     ``retry_until`` only as a park deadline and cannot tell them apart, so a body may return either —
-    but a caller reasoning about the poison ceiling must ask which one ran."""
+    but a caller reasoning about the poison ceiling must ask which one ran.
+
+    ``hand_back`` marks a RETRY that hands back a head the lane never ran, because a claim gate shut
+    after the claim (the #122 log-write halt, BACKLOG #5704). It is neither a fault nor a sign the
+    lane is healthy, so at a zero-progress head it leaves the infra-fault streak and the
+    ``lane_stuck`` latch as they were rather than resetting them."""
 
     kind: LaneResultKind
     retry_until: float | None = None
+    hand_back: bool = False
 
     def __post_init__(self) -> None:
         # retry_until is meaningful iff RETRY (the park deadline). Guard the contract so a mis-built
         # result fails loudly in tests rather than silently parking forever / not at all.
         if (self.kind is LaneResultKind.RETRY) != (self.retry_until is not None):
             raise ValueError("retry_until must be set iff kind is RETRY")
+        if self.hand_back and self.kind is not LaneResultKind.RETRY:
+            raise ValueError("hand_back is meaningful only on a RETRY")
 
 
 class _LanePhase(Enum):
@@ -274,7 +282,8 @@ class _LaneState:
     # ADR 0070 fix B: consecutive zero-progress (i==0) T17 infra faults for this lane. Incremented on
     # each such fault, reset to 0 on clean drain / forward-progress-or-non-infra RETRY / the STOPPED→
     # READY notify_work or resume_lane resume (NEVER on a PARKED park-timer/sweep unpark — the sharp
-    # edge, §3). Reaches
+    # edge, §3). A zero-progress hand-back RETRY (LaneItemResult.hand_back, BACKLOG #5704) leaves it
+    # unchanged. Reaches
     # infra_fault_stop_after → STOP (stop policy). In-memory only; intentionally lost on restart.
     infra_error_streak: int = 0
     # ADR 0070 retry_forever: True once the throttled lane_stuck alert has fired for the current stuck
@@ -305,6 +314,12 @@ class _LaneState:
     # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
     # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
     claimer_deaths: int = 0
+    # BACKLOG #5704: while the lane is STOPPED, whether the STOP that set it left claimed rows whose
+    # re-pend did not land, so they are still in flight. _to_stopped writes it on every STOP, and
+    # _run_lane's RETRY branch also writes it before _apply_retry, which passes it to a T17 STOP;
+    # so on a lane that is not STOPPED it can hold a stale value. Read by _apply_retry, for that
+    # T17 STOP, and by StageDispatcher.stopped_holding_rows, which checks the phase.
+    unlanded: bool = False
 
 
 @dataclass
@@ -364,6 +379,8 @@ class _LaneOutcome:
     # (i > 0): the prefix made forward progress (>=1 item RESOLVED) before the fault, so this is NOT a
     # head-of-line-blocked zero-progress fault — it resets the streak rather than accruing it.
     made_progress: bool = False
+    # LaneItemResult.hand_back, carried to _apply_retry (BACKLOG #5704).
+    hand_back: bool = False
 
 
 # Timer scheduler seam (injectable for deterministic tests). Mirrors loop.call_later's shape.
@@ -1600,6 +1617,7 @@ class StageDispatcher:
             if exhausted:
                 # _apply_retry adds this fault, which reaches infra_fault_stop_after.
                 st.infra_error_streak = max(st.infra_error_streak, self._infra_fault_stop_after - 1)
+            st.unlanded = bool(unlanded)  # what a T17 STOP in _apply_retry records
             self._apply_retry(lane, st, outcome)
         else:  # T16 STOP (content-policy STOP — the InternalErrorPolicy path, untouched by ADR 0070)
             # S_lane DROP: a STOPped lane rendered no completed service either. Occupancy.
@@ -1619,7 +1637,9 @@ class StageDispatcher:
             if not unlanded and self._stop_voided(lane):
                 self._to_ready(lane, woken=True)  # as the reload's notify_work would have
             else:
-                self._to_stopped(lane, st, f"{self._stage.value} lane stopped")
+                self._to_stopped(
+                    lane, st, f"{self._stage.value} lane stopped", unlanded=bool(unlanded)
+                )
 
     def _apply_retry(self, lane: str, st: _LaneState, outcome: _LaneOutcome) -> None:
         """Apply a RETRY outcome under the ADR 0070 infra-fault bound (fix B). A T17 zero-progress
@@ -1628,7 +1648,8 @@ class StageDispatcher:
         **no** store write since fix A already re-pended the head PENDING); under ``retry_forever`` it
         never STOPs (throttled ``lane_stuck`` alert past the horizon). Every OTHER RETRY — a
         forward-progress (``i>0``) infra fault or a content (non-infra) body RETRY — **resets** the
-        streak and parks normally."""
+        streak and parks normally, except a zero-progress hand-back (``LaneItemResult.hand_back``),
+        which leaves it as it was."""
         if outcome.is_infra_fault and not outcome.made_progress:
             # Zero-progress head-of-line-blocked machinery fault: the escalation-less spin case.
             st.infra_error_streak += 1
@@ -1643,6 +1664,7 @@ class StageDispatcher:
                     st,
                     f"{self._stage.value} lane stopped after {st.infra_error_streak} consecutive "
                     f"infra faults (ADR 0070 T17)",
+                    unlanded=st.unlanded,
                 )
                 self._report_own_stop(lane)
                 return
@@ -1651,8 +1673,10 @@ class StageDispatcher:
             self._park(lane, st, outcome.park_until)  # T15 — retry the head at capped backoff
         else:
             # Forward-progress infra fault (i>0) OR a content (non-infra) body RETRY: reset the streak.
-            st.infra_error_streak = 0
-            st.lane_stuck_alerted = False
+            # A zero-progress hand-back ran nothing, so it says nothing about the lane's health.
+            if not (outcome.hand_back and not outcome.made_progress):
+                st.infra_error_streak = 0
+                st.lane_stuck_alerted = False
             self._park(lane, st, outcome.park_until)  # T15
 
     def _maybe_lane_stuck_alert(self, lane: str, st: _LaneState) -> None:
@@ -1859,7 +1883,10 @@ class StageDispatcher:
                 if result.kind is LaneResultKind.RETRY:
                     return (
                         _LaneOutcome(
-                            LaneResultKind.RETRY, result.retry_until, made_progress=made_progress
+                            LaneResultKind.RETRY,
+                            result.retry_until,
+                            made_progress=made_progress,
+                            hand_back=result.hand_back,
                         ),
                         tail,
                         None,  # the body already re-pended the head itself; no reschedule here
@@ -1924,12 +1951,16 @@ class StageDispatcher:
         st.gated = False
         self._fire_paused(lane)
 
-    def _to_stopped(self, lane: str, st: _LaneState, detail: str) -> None:
-        """STOP a lane and raise ``connection_stopped``. Re-armed only by reload, ``resume_lane``
+    def _to_stopped(
+        self, lane: str, st: _LaneState, detail: str, *, unlanded: bool = False
+    ) -> None:
+        """STOP a lane and raise ``connection_stopped``. ``unlanded`` records whether this STOP
+        left claimed rows in flight (:meth:`stopped_holding_rows`). Re-armed only by reload, ``resume_lane``
         (#5700) or ``notify_work`` (:meth:`_unpark`), never by a wake or the sweep. The phase is set first and
         a raising sink is logged, not propagated, as the runner guards the same call: a stop must
         not also kill the claimer or serializer that reached it."""
         st.phase = _LanePhase.STOPPED
+        st.unlanded = unlanded
         try:
             self._alert_sink.connection_stopped(lane, detail=detail)
         except Exception:  # noqa: BLE001 — an alert failure must not undo or escalate the stop
@@ -2422,6 +2453,13 @@ class StageDispatcher:
         (``RegistryRunner.outbound_stop_held`` says why). False for an unknown lane."""
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.STOPPED
+
+    def stopped_holding_rows(self, key: str) -> bool:
+        """Whether ``key`` is STOPPED by an episode that ended with claimed rows still in flight,
+        whose re-pend did not land (BACKLOG #5704). A re-arm of such a lane would claim past them,
+        so the log halt's recovery restart leaves it STOPPED. False for an unknown lane."""
+        st = self._states.get(key)
+        return st is not None and st.phase is _LanePhase.STOPPED and st.unlanded
 
     def is_dirty(self, key: str) -> bool:
         st = self._states.get(key)

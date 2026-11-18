@@ -32,15 +32,16 @@ by an AST walk. The walk reads only the modules directly under ``transports/`` (
 ``pipeline/wiring_runner.py``, and only a string literal in one of these shapes: the first argument
 of an ``_emit_event`` call, a ``kind=`` keyword on an ``_emit_event``,
 ``_enqueue_connection_event``, ``HttpRequestError`` or ``Refusal`` call, or the kind argument of a
-``_quarantine`` call in ``transports/file.py``, the FILE source's reject path. That helper forwards
-its kind to ``_emit_event`` as a variable, so a kind it forwards that was never declared would be
-missing from both sides of the equality. So in that file the walk fails on any ``_quarantine``
-reference it can see that is not a direct call with a string-literal kind, such as an alias or a
-``functools.partial``. A new emit site in those shapes fails CI until its kind is added here. Any
-other emit site is invisible to it, such as a kind forwarded through a variable by any other
-helper, a ``getattr`` call, a direct ``on_connection_event`` call, or a module elsewhere; the
-run-time refusals above are what catch those. ``docs/PHI.md`` section 7 row 7 says what each kind
-means and must name every one, which CI also asserts.
+call to a forwarder: a ``def`` that passes one of its own parameters to ``_emit_event`` as the
+kind, as the FILE source's ``_quarantine`` does. A kind a forwarder passes on that was never
+declared would be missing from both sides of the equality, so the walk fails on a forwarder use it
+can see but not read, such as a kind that is not a string literal, an alias or a
+``functools.partial``. A new emit site in those shapes fails CI until its kind is added here. Other
+emit sites are invisible to it, at least: an ``_emit_event`` call outside a forwarder whose kind
+is a variable, ``_emit_event`` itself reached through a lambda or ``getattr``,
+a direct ``on_connection_event`` call, and a module elsewhere. The run-time refusals above are what
+catch those. ``docs/PHI.md`` section 7 row 7 says what each kind means and must name every one,
+which CI also asserts.
 """
 
 from __future__ import annotations
