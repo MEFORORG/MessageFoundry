@@ -122,7 +122,7 @@ the outcome, the ACK code (MSA-1), the control id (MSH-10), the message type (MS
 `detail` (the MSA-3 reason or an error string), stored as [PHI.md section 7, the tee relay
 paragraph](PHI.md#7-logging--phi-redaction) says. The ACK code, control id and message type, and
 `relay_capture`'s control id, are each cut to `_MAX_IDENTIFIER` characters (`tee/store.py`), which
-no conformant value exceeds. **Message bodies are never logged**;
+no conformant ASCII value without escapes exceeds. **Message bodies are never logged**;
 they are persisted only to a separate `relay_capture` table, and only when `--capture-bodies` is set.
 
 `python -m tee naks` prints the recent NAKs (`AE`/`AR`/`CE`/`CR`) and transport errors — the otherwise-

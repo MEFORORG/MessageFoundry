@@ -96,11 +96,11 @@ async def test_detail_is_bounded_and_scrubbed(tmp_path: Path) -> None:
 
 async def test_identifiers_are_bounded_before_they_are_stored(tmp_path: Path) -> None:
     # BACKLOG #5637: MSH-10, MSH-9 and MSA-1 come from partner bytes, so a huge value must not be stored
-    # whole for every `naks` read to load and escape. A conformant identifier is kept as sent.
+    # whole for every `naks` read to load and escape. A conformant ASCII identifier is kept as sent.
     huge_id = "9" * 1_000_000
     huge_type = "ADT^" * 250_000
     bound = tee_store._MAX_IDENTIFIER  # noqa: SLF001 - the bound under test
-    assert bound >= 199  # MSH-10's longest conformant length, which the docs say is never cut
+    assert bound >= 199  # MSH-10's longest conformant length (ASCII, no escapes)
     store = await _open(tmp_path)
     try:
         await store.record_leg(

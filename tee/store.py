@@ -42,8 +42,9 @@ _MAX_DETAIL = 500
 # Bound the stored identifiers and ACK code too. MSH-10, MSH-9 and MSA-1 come from partner bytes, and
 # a frame may be as large as --max-frame-bytes allows (16 MiB by default), so an unbounded field
 # would be stored whole and every `naks` or `export` read would load it. 199 is the longest MSH-10
-# recent HL7 v2 versions allow, the longest of the three fields, so no conformant value is cut. Cut,
-# not escaped: `naks` escapes what it prints.
+# recent HL7 v2 versions allow, the longest of the three fields, so no conformant ASCII value
+# without escapes is cut. The count is of latin-1 characters, that is bytes (peek_fields decodes
+# latin-1), so a non-ASCII or escaped id can be. Cut, not escaped: `naks` escapes what it prints.
 _MAX_IDENTIFIER = 199
 
 _SCHEMA = """
@@ -56,7 +57,7 @@ CREATE TABLE IF NOT EXISTS relay_log (
     message_type TEXT,                       -- MSH-9  (identifier, not PHI)
     size_bytes   INTEGER NOT NULL,
     outcome      TEXT    NOT NULL,           -- 'accepted' | 'nak' | 'transport_error'
-    ack_code     TEXT,                       -- AA/AE/AR/CA/CE/CR or NULL
+    ack_code     TEXT,                       -- for example AA/AE/AR/CA/CE/CR, or NULL
     detail       TEXT                        -- sanitized MSA-3 / error string (bounded); never a body
 );
 CREATE INDEX IF NOT EXISTS ix_relay_at  ON relay_log(at);
