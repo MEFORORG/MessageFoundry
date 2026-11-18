@@ -12,11 +12,13 @@ import {
   LEGACY_AI_POLICY_KEY,
   aiPolicyCacheKey,
   assistantState,
+  brokeredNoReplyNotice,
   cachedPolicyOffline,
   carryDeniesOffline,
   carryDeniesOnline,
   heldAuthoritativeAnswer,
   mergeAuthoritativePolicy,
+  narrowMode,
   pickOfflinePolicy,
   type AiPolicy,
   type PolicyStore,
@@ -142,6 +144,46 @@ suite("mergeAuthoritativePolicy (BACKLOG #330 — a degraded read must not upgra
     });
     assert.strictEqual(merged.assistPermitted, null);
     assert.ok("assistPermitted" in merged, "the key is present, not dropped");
+  });
+});
+
+// BACKLOG #5406 — the gate is an allow-list. A mode it does not name, from a newer engine or a
+// malformed answer, must disable assistance rather than fall through to the local model.
+suite("assistantState fails closed on a mode it does not name (BACKLOG #5406)", () => {
+  test("G1: an unrecognized mode disables assistance, whatever the permission says", () => {
+    for (const mode of ["managed_future", "BYO", "", "unrecognized"]) {
+      for (const assistPermitted of [true, null]) {
+        const state = assistantState(policy({ mode, assistPermitted }));
+        assert.strictEqual(state.enabled, false, `${JSON.stringify(mode)} permitted=${assistPermitted}`);
+        assert.ok((state.message ?? "").length > 0, "the gate says why");
+      }
+    }
+  });
+
+  test("G2: the two enabling modes still enable (the allow-list is not a blanket deny)", () => {
+    for (const mode of ["byo", "managed_endpoint"]) {
+      assert.strictEqual(assistantState(policy({ mode, assistPermitted: true })).enabled, true, mode);
+      assert.strictEqual(assistantState(policy({ mode, assistPermitted: null })).enabled, true, mode);
+      assert.strictEqual(assistantState(policy({ mode, assistPermitted: false })).enabled, false, mode);
+    }
+  });
+
+  test("G3: a fresh answer with a missing or non-string mode disables assistance through the merge", () => {
+    for (const bad of [undefined, null, 7, true, {}, ["byo"]]) {
+      const fresh = { ...policy({ assistPermitted: true }), mode: bad as unknown as string };
+      assert.strictEqual(assistantState(mergeAuthoritativePolicy(null, fresh)).enabled, false, JSON.stringify(bad));
+      // The wire boundary narrows it to a string, so "Show AI Policy" cannot print ["byo"] as byo.
+      const narrowed = narrowMode(bad);
+      assert.strictEqual(narrowed, "unrecognized", JSON.stringify(bad));
+      assert.strictEqual(assistantState(policy({ mode: narrowed, assistPermitted: true })).enabled, false);
+    }
+  });
+
+  test("G4: a cached answer in an unrecognized mode disables assistance offline, however old", () => {
+    const cached = { ...policy({ mode: "managed_future", assistPermitted: true }), cachedAt: 0 };
+    for (const now of [0, CACHED_PERMIT_MAX_AGE_MS * 10]) {
+      assert.strictEqual(assistantState(cachedPolicyOffline(cached, now)).enabled, false, `now=${now}`);
+    }
   });
 });
 
@@ -469,7 +511,7 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
       { mode: 7 },
       { assistPermitted: false },
       { mode: "byo", assistPermitted: true },
-      // A deny by isPolicyDeny that the gate would still enable: a mode it does not know.
+      // A deny in a mode the gate does not know (which the gate disables since BACKLOG #5406).
       { mode: "bogus", assistPermitted: false },
     ]) {
       const label = JSON.stringify(bad);
@@ -638,6 +680,31 @@ suite("aiPolicy.ts reads the target engine's policy, and keys its cache (BACKLOG
     assert.ok(read >= 0, "resolveAiPolicy must read whether an engine has answered from globalState");
     assert.ok(read < code.search(/return carryDeniesOffline\(/), "it must be read before the carrier runs");
     assert.ok(/targetConfigured: engineTargetIsSet,/.test(code), "the production io must read the settings");
+  });
+});
+
+suite("chat.ts no-reply notice for an engine-brokered request (BACKLOG #5407)", () => {
+  test("before the request goes out, it says nothing was sent", () => {
+    const notice = brokeredNoReplyNotice(false);
+    assert.ok(notice.includes("Nothing was sent"), notice);
+  });
+
+  test("after the request went out and a re-sign-in was cancelled, it says the request was sent", () => {
+    const notice = brokeredNoReplyNotice(true);
+    assert.ok(!notice.includes("Nothing was sent"), notice);
+    assert.ok(notice.includes("was sent to the MessageFoundry engine"), notice);
+    assert.ok(notice.includes("your prompt and any code attached to it"), notice);
+  });
+
+  test("chat.ts marks the request sent inside the call withAuth makes, and names that in the notice", () => {
+    // chat.ts imports vscode, so test:unit cannot run it; the flag's placement is what decides.
+    const chat = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "chat.ts"), "utf8");
+    assert.ok(
+      /withAuth\(context, url, \(token\) => \{\s*sent = true;\s*return postJson<AiChatReply>\(/.test(chat),
+      "the flag must be set inside the call, before the POST",
+    );
+    assert.ok(/brokeredNoReplyNotice\(sent\)/.test(chat));
+    assert.ok(!chat.includes("Nothing was sent"), "the notice text lives in aiPolicyModel.ts only");
   });
 });
 

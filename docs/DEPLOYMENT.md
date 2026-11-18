@@ -443,8 +443,12 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   this gate judges only that mode, and the allow-list is not consulted here. The listener still
   refuses a peer outside `source_ip_allowlist` on every connection. With `intake_auth = none`, the
   default, a `source_ip_allowlist` counts when every entry is /8 or narrower for IPv4, or /32 or
-  narrower for IPv6. `tls_ca_file` alone does not count, because it accepts any certificate that CA
-  ever signed.
+  narrower for IPv6. An IPv6 entry inside a prefix the gate reads as carrying IPv4 addresses, at
+  least the IPv4-mapped `::ffff:0:0/96`, the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`,
+  and Teredo's `2001::/32`, must also be /104 or narrower, which fixes at least 8 bits of the IPv4
+  address, so `::ffff:0:0/96` does not count. An IPv6 entry that holds one of those prefixes does
+  not count at any width, so `64:ff9b::/32` does not count either, though it meets the /32 floor.
+  `tls_ca_file` alone does not count, because it accepts any certificate that CA ever signed.
   `--allow-insecure-bind` does not waive this gate.
 
 ---

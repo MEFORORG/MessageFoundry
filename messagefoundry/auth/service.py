@@ -138,6 +138,7 @@ from messagefoundry.auth.policy import (
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import (
     CREDENTIAL_ID_HASH_SCHEME,
+    ENROLMENT_CODE_MAX,
     credential_id_hash_is_current,
     credential_id_hash_scheme,
     enrolment_code_digest,
@@ -168,6 +169,7 @@ from messagefoundry.credential import constant_time_equal
 from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.logging_setup import redacted_log_field
+from messagefoundry.password_bounds import TEMPORARY_PASSWORD_CLASS_SUFFIX
 from messagefoundry.store.base import (
     AdminStore,
     audit_write_errors,
@@ -1774,7 +1776,7 @@ def generate_policy_password(
         token = secrets.token_urlsafe(length)[:chars]
         # The bare token first. The suffixed form is screened like the token: a site term can sit
         # inside it too.
-        candidates = (token, token + "aA1!") if class_rules else (token,)
+        candidates = (token, token + TEMPORARY_PASSWORD_CLASS_SUFFIX) if class_rules else (token,)
         # THE ONE PLACE THIS REASONING IS WRITTEN OUT (BACKLOG #1447). The candidate is a 192-bit
         # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
         # contain it -- the breach clause is inert on this input by construction. Honouring
@@ -3100,7 +3102,7 @@ def _storable_actor(username: str) -> str:
         return username
     escaped = scrub_log_argument(username)
     # Never fewer units than characters, so an escape longer than the bound in characters is cut
-    # without the full UTF-16 encode, which the console form's uncapped username would make large.
+    # without first encoding the whole escape to UTF-16.
     if len(escaped) <= _AUDIT_ACTOR_MAX and utf16_units(escaped) <= _AUDIT_ACTOR_MAX:
         return escaped
     # surrogatepass, so a lone surrogate cannot make the digest raise.
@@ -18491,13 +18493,19 @@ class AuthService:
     ) -> str:
         """The digest of ``presented`` when it matches the code on ``user``'s row, has not expired
         and the account is enabled; otherwise the refusal (:meth:`_refuse_enrolment_code`). ``user``
-        is the row the directory lookup returned (Amendment A, A3). Spends nothing."""
+        is the row the directory lookup returned (Amendment A, A3). Spends nothing. A ``presented``
+        longer than :data:`ENROLMENT_CODE_MAX` is refused as a wrong code without being normalised
+        or hashed, never cut (BACKLOG #5399)."""
         if presented is None or not presented.strip():
             await self._refuse_enrolment_code(
                 identity, "not_presented", ceremony=ceremony, client=client
             )
         expires_at = user.enrolment_code_expires_at
-        digest = enrolment_code_matches(user.enrolment_code_digest, presented)
+        digest = (
+            None
+            if len(presented) > ENROLMENT_CODE_MAX
+            else enrolment_code_matches(user.enrolment_code_digest, presented)
+        )
         if (
             digest is not None
             and expires_at is not None

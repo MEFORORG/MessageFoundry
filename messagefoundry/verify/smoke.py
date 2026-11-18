@@ -36,7 +36,13 @@ from messagefoundry.config.tls_policy import (
     narrow_to_approved_suites,
 )
 from messagefoundry.mllpcodec import FrameEncodeError, FramePayloadError, frame_checked
-from messagefoundry.verify.model import CheckResult, Status
+from messagefoundry.verify.model import (
+    DRIVER_DETAIL_LIMIT,
+    CheckResult,
+    Status,
+    safe_detail_text,
+    safe_exc_detail,
+)
 
 if TYPE_CHECKING:
     # Annotation only. A runtime import here would pull ``store.store`` (and so ``aiosqlite``) into
@@ -200,7 +206,7 @@ def smoke_self(
         UnknownInboundError,
         dry_run,
     )
-    from messagefoundry.redaction import safe_error, safe_exc
+    from messagefoundry.redaction import codec_safe_str
 
     try:
         if graph is None:
@@ -212,13 +218,26 @@ def smoke_self(
             # allow_empty comes to suppress.
             reg.validate()
     except WiringError as exc:
-        return CheckResult(rid, title, Status.FAIL, f"config failed to load: {exc}")
+        # The engine's own wiring diagnostic, so no type prefix. It wraps whatever a config module
+        # raised, so it takes the config-load arms' bound and the same square-bracket path as the
+        # other config-load and dry-run arms (BACKLOG #5395); before that it printed the exception
+        # text raw and unbounded.
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"config failed to load: {safe_detail_text(codec_safe_str(exc))}",
+        )
     except (OSError, ImportError, SyntaxError, ValueError, SystemExit) as exc:
         # What the hop census reads as an unknown load, so the shared load's failure ends this row
         # rather than the verify run; a config module that exits at import is one (BACKLOG #3803).
-        return CheckResult(rid, title, Status.FAIL, f"config failed to load: {safe_exc(exc)}")
+        return CheckResult(
+            rid, title, Status.FAIL, f"config failed to load: {safe_exc_detail(exc)}"
+        )
     except Exception as exc:  # the run's shared load keeps whatever it raised; never crash the run
-        return CheckResult(rid, title, Status.FAIL, f"config failed to load: {safe_exc(exc)}")
+        return CheckResult(
+            rid, title, Status.FAIL, f"config failed to load: {safe_exc_detail(exc)}"
+        )
     msg = synthetic_message()  # a module constant since #1192 — cannot fail
     try:
         result = dry_run(reg, msg, inbound=inbound, snapshot_on_send=snapshot_on_send)
@@ -235,7 +254,7 @@ def smoke_self(
         return CheckResult(rid, title, Status.FAIL, str(exc))
     except Exception as exc:
         # Raised while the message was in flight, so its text can quote the message (BACKLOG #1779).
-        return CheckResult(rid, title, Status.ERROR, f"dry-run raised: {safe_exc(exc)}")
+        return CheckResult(rid, title, Status.ERROR, f"dry-run raised: {safe_exc_detail(exc)}")
 
     summary = (
         f"inbound={result.inbound}, disposition={result.disposition.value}, "
@@ -246,7 +265,10 @@ def smoke_self(
         # tickets, and the error quotes a Router/Handler's own `raise` (BACKLOG #1779). No `show_phi`
         # opt-in, on purpose, for the reason the `check` gate refuses one: both write their output
         # somewhere it is kept and passed on, so an opt-in would put PHI there on request.
-        return CheckResult(rid, title, Status.FAIL, f"{summary} — {safe_error(result.error)}")
+        # The credential pass too (BACKLOG #5395): a Handler's `raise` can quote a DSN as easily as
+        # a field value.
+        shown = safe_detail_text(result.error)
+        return CheckResult(rid, title, Status.FAIL, f"{summary} — {shown}")
     # Gate on what the run PRODUCED, never on "the call returned" (BACKLOG #1707). A postcondition
     # over the disposition the pipeline already computed cannot drift out of step with the pipeline;
     # re-deriving "did it deliver" here from the counts would be a second classifier to keep in sync.
@@ -349,14 +371,16 @@ def smoke_live(
             "smoke.live",
             "Live smoke (MLLP + ACK)",
             Status.FAIL,
-            f"TLS handshake with the engine inbound at {host}:{port} failed: {exc}",
+            f"TLS handshake with the engine inbound at {host}:{port} failed: "
+            f"{safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)}",
         )
     except OSError as exc:
         return CheckResult(
             "smoke.live",
             "Live smoke (MLLP + ACK)",
             Status.FAIL,
-            f"could not reach the engine inbound at {host}:{port}: {exc}",
+            f"could not reach the engine inbound at {host}:{port}: "
+            f"{safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)}",
         )
     code = _ack_code(reply)
     if code == "AA":
@@ -496,7 +520,8 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
             rid,
             title,
             Status.FAIL,
-            f"{store.backend.value} store failed to open: {exc}",
+            f"{store.backend.value} store failed to open: "
+            f"{safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)}",
         )
     caveat = (
         "NOT proof that this login can write it, that serve will accept it, or that the NSSM "
@@ -653,5 +678,7 @@ def check_smoke_disposition(
     try:
         status = run_guarded(_poll())
     except Exception as exc:  # any driver/connection failure — surface, never crash the verify run
-        return CheckResult(rid, title, Status.ERROR, f"could not read the store disposition: {exc}")
+        shown = safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
+        detail = f"could not read the store disposition: {shown}"
+        return CheckResult(rid, title, Status.ERROR, detail)
     return _classify_disposition(status, control_id=control_id, timeout=timeout)

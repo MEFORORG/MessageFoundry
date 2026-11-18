@@ -689,12 +689,23 @@ _UNSCANNABLE_RE_PATTERNS = {
     # camelCase fragments swapped back for what ``origin/main`` held there, so it compiles exactly the
     # patterns this file scanned before #5545; ``tests/test_secretscrub_camelcase_label.py`` holds
     # each to carrying none of those fragments.
+    #
+    # Since the round-5 review of BACKLOG #5386 ``_WIDE_DSN_PASSWORD`` splices ``_DSN_RUN_STOP``, a
+    # negative lookahead over an alternation of ``_CREDENTIAL_QUERY_KEYS`` and the label words, built
+    # by ``_alternation`` so it stays derived from them. The lookahead holds no repetition. Each
+    # repeated group is that lookahead and ONE character class, so no quantifier nests under
+    # another: the empty user's segment is possessive, and the run after it backs off one
+    # character at a time to its last "@", as the literal form it replaced did. Since round 9 the
+    # user's first segment is ``_DSN_USER_FIRST_SEGMENT``, an atomic group of three alternatives
+    # that start on disjoint characters: a bracketed word, an angled word, or a possessive run of
+    # that lookahead and one class holding neither bracket nor angle.
     "messagefoundry/secretscrub.py": (
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')'",
         "'(?i)' + _LABEL_START + '(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')'",
+        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*):(?:(?<=//:)(?:' + _DSN_RUN_STOP + '[^\\\\s/@?#&=;,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22])*+|(?<!//:)' + _DSN_USER_FIRST_SEGMENT + ')(?:' + _DSN_RUN_STOP + '[^\\\\s/;?#&,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22])*@'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
         "source",
     ),

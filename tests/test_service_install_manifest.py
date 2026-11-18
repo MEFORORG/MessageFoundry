@@ -501,12 +501,20 @@ def _stop_arms(
     states: list[str],
     timeout: int = 1,
     chatter: str = "",
+    service: str = "MessageFoundry",
+    found_name: str | None = None,
+    lookup_error: str | None = None,
 ) -> dict:
     """Run Stop-ServiceAndConfirm with Get-Service and Stop-Service shadowed.
 
     ``states`` is what the shadowed Get-Service reports on successive calls (the last value repeats);
     an empty list means the service is absent. ``nssm_exit`` of None runs the no-nssm branch, which
     is uninstall-service.ps1's third stop site. ``chatter`` makes the stub print to STDOUT.
+
+    ``service`` is the -ServiceName passed. ``found_name`` is the Name the shadowed Get-Service
+    reports for it, ``service`` itself when None: a different one is how the real cmdlet answers a
+    DISPLAY name (BACKLOG #5402). ``lookup_error`` makes it throw an error with that
+    FullyQualifiedErrorId instead, and ``threw`` then holds what the helper threw, if anything.
 
     ``outputs`` counts the non-warning objects the helper emitted. It is reported rather than
     collapsed because the COUNT is the defect: the callers test one boolean.
@@ -521,28 +529,43 @@ def _stop_arms(
     prelude = _stub_control(stub, nssm_exit) if nssm_exit is not None else ""
     nssm_arg = _psq(str(stub)) if nssm_exit is not None else "''"
     states_ps = "@(" + ", ".join(_psq(s) for s in states) + ")"
+    found_ps = _psq(found_name) if found_name is not None else "$null"
+    error_ps = _psq(lookup_error) if lookup_error is not None else "$null"
     body = (
         prelude
         + rf"""
   $script:StopServiceCalls = 0
   $script:GetServiceCalls = 0
   $script:States = {states_ps}
+  $script:FoundName = {found_ps}
+  $script:LookupError = {error_ps}
+  $script:StopTargets = @()
   function Get-Service {{
     param([string]$Name, $ErrorAction)
     $script:GetServiceCalls++
+    if ($null -ne $script:LookupError) {{
+      throw [System.Management.Automation.ErrorRecord]::new(
+        [Exception]::new('synthetic lookup failure'), $script:LookupError, 'NotSpecified', $Name)
+    }}
     if ($script:States.Count -eq 0) {{ return $null }}
     $i = [Math]::Min($script:GetServiceCalls - 1, $script:States.Count - 1)
-    return [pscustomobject]@{{ Status = $script:States[$i] }}
+    $found = if ($null -ne $script:FoundName) {{ $script:FoundName }} else {{ $Name }}
+    return [pscustomobject]@{{ Name = $found; Status = $script:States[$i] }}
   }}
   function Stop-Service {{
-    param([string]$Name, [switch]$Force, $ErrorAction)
+    param([string]$Name, $InputObject, [switch]$Force, $ErrorAction)
     $script:StopServiceCalls++
+    $script:StopTargets += $(if ($Name) {{ "name:$Name" }} else {{ "object:$($InputObject.Name)" }})
   }}
   $warnings = @()
   $result = $null
-  $emitted = & {{
-    {_STOP_FN} -ServiceName 'MessageFoundry' -NssmPath {nssm_arg} -TimeoutSeconds {timeout}
-  }} 3>&1
+  $threw = ''
+  $emitted = @()
+  try {{
+    $emitted = & {{
+      {_STOP_FN} -ServiceName {_psq(service)} -NssmPath {nssm_arg} -TimeoutSeconds {timeout}
+    }} 3>&1
+  }} catch {{ $threw = "$_" }}
   $outputs = 0
   foreach ($o in @($emitted)) {{
     if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
@@ -554,6 +577,8 @@ def _stop_arms(
     warnings         = @($warnings)
     stopServiceCalls = $script:StopServiceCalls
     getServiceCalls  = $script:GetServiceCalls
+    stopTargets      = @($script:StopTargets)
+    threw            = $threw
   }} | ConvertTo-Json -Depth 4 -Compress
 """
     )
@@ -572,6 +597,27 @@ def test_a_clean_stop_is_reported_clean(tmp_path: Path) -> None:
     arms = _stop_arms(tmp_path, nssm_exit=0, states=["Stopped"])
     assert arms["result"] is True, "a clean stop must report success"
     assert arms["warnings"] == [], f"a clean stop must warn about nothing; got {arms['warnings']}"
+
+
+@pytest.mark.parametrize("nssm_exit", [0, None])
+def test_an_scm_read_that_fails_is_not_taken_as_gone(tmp_path: Path, nssm_exit: int | None) -> None:
+    """Only "no such service" means gone (BACKLOG #5402). Any other failed read says nothing about
+    whether the service still runs, so the helper throws rather than report it stopped, and stops
+    nothing it could not identify."""
+    failed = _stop_arms(
+        tmp_path, nssm_exit=nssm_exit, states=["Running"], lookup_error="RpcServerUnavailable"
+    )
+    assert "Could not read 'MessageFoundry' from the SCM" in failed["threw"], failed
+    assert failed["stopServiceCalls"] == 0, failed
+    # The control: the cmdlet's own "no such service" error is an absent service, as before.
+    gone = _stop_arms(
+        tmp_path,
+        nssm_exit=nssm_exit,
+        states=["Running"],
+        lookup_error="NoServiceFoundForGivenName,Microsoft.PowerShell.Commands.GetServiceCommand",
+    )
+    assert gone["threw"] == "" and gone["result"] is True, gone
+    assert gone["stopServiceCalls"] == 0, gone
 
 
 def test_a_nonzero_nssm_exit_is_no_longer_swallowed(tmp_path: Path) -> None:
@@ -646,6 +692,37 @@ def test_the_scm_fallback_stop_is_confirmed_too(tmp_path: Path) -> None:
         f"the no-nssm branch must still stop the service via the SCM (got {arms['stopServiceCalls']})"
     )
     assert arms["result"] is False, "the SCM fallback must confirm the stop, not assume it"
+    assert arms["stopTargets"] == ["object:MessageFoundry"], (
+        "the SCM stop must take the service object the exact-name lookup found, never a name "
+        f"Stop-Service resolves again (BACKLOG #5402); got {arms['stopTargets']}"
+    )
+
+
+@pytest.mark.parametrize("nssm_exit", [3, None], ids=["nssm", "scm"])
+def test_a_display_name_never_stops_the_service_it_names(
+    tmp_path: Path, nssm_exit: int | None
+) -> None:
+    """``-ServiceName 'Windows Time'`` passes the name pattern, and Get-Service -Name answers it
+    with W32Time, the service whose DISPLAY name it is (BACKLOG #5402). Nothing may be stopped:
+    not through the SCM, and not through nssm, which would warn about its exit 3 if it ran.
+
+    The positive control is the SCM-fallback arm above, which stops a service the lookup found
+    under its own name.
+    """
+    arms = _stop_arms(
+        tmp_path,
+        nssm_exit=nssm_exit,
+        states=["Running"],
+        service="Windows Time",
+        found_name="W32Time",
+    )
+    assert arms["stopServiceCalls"] == 0, (
+        f"a display name stopped the service it names: {arms['stopTargets']}"
+    )
+    assert arms["warnings"] == [], (
+        f"nssm was asked to stop a display name, or a warning fired: {arms['warnings']}"
+    )
+    assert arms["result"] is True, "no service by that exact name means nothing is left running"
 
 
 def test_no_unchecked_stop_site_survives_in_either_script(tmp_path: Path) -> None:
@@ -2990,7 +3067,8 @@ def _workdir_seam(parent: Path) -> str:
         return rf"""
   $script:RealWorkDir = ${{function:{_WORKDIR_FN}}}
   $script:WorkOwner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  function {_WORKDIR_FN} {{ & $script:RealWorkDir -Parent {_psq(str(parent))} -OwnerSid $script:WorkOwner }}
+  function {_WORKDIR_FN} {{ & $script:RealWorkDir -Parent {_psq(str(parent))} -OwnerSid $script:WorkOwner `
+    -CheckedUpTo {_psq(str(parent.parent))} }}
 """
     return rf"""
   function {_WORKDIR_FN} {{
@@ -3139,6 +3217,98 @@ def test_a_right_the_account_does_not_hold_is_a_no_op(tmp_path: Path) -> None:
     assert got["configureCalls"] == 0, "the policy must not be rewritten when nothing changes"
 
 
+def _grant_configured(
+    tmp_path: Path, row: str | None, *, configure_runs: bool = True, section: bool = True
+) -> str:
+    """The policy install-service.ps1's Set-ServiceLogonRight hands ``secedit /configure`` when the
+    export holds ``row`` (``None``: no SeServiceLogonRight row at all), granting the right to
+    BUILTIN\\Administrators (S-1-5-32-544). secedit is a stub; nothing is configured.
+
+    With ``configure_runs=False`` the configure call sets no exit code, as a command that never
+    ran, and what the function said is returned instead of the policy."""
+    runs = "$true" if configure_runs else "$false"
+    assert _SCRIPT is not None
+    parent = tmp_path / "grant-parent"
+    parent.mkdir(exist_ok=True)
+    inf = ["[Unicode]", "Unicode=yes", *(["[Privilege Rights]"] if section else [])]
+    if row is not None:
+        inf.append(row)
+    inf.append("[Version]")
+    inf_ps = "@(" + ", ".join(_psq(line) for line in inf) + ")"
+    body = rf"""
+{_workdir_seam(parent)}
+  $script:Configured = ''
+  function secedit {{
+    $a = @($args)
+    $cfg = $a[[array]::IndexOf($a, '/cfg') + 1]
+    if ($a -contains '/export') {{ Set-Content -LiteralPath $cfg -Value {inf_ps} -Encoding Unicode }}
+    elseif ($a -contains '/configure') {{
+      $script:Configured = ((Get-Content -LiteralPath $cfg) -join ' | ')
+      if (-not {runs}) {{ return }}
+    }}
+    $global:LASTEXITCODE = 0
+  }}
+  $said = @(Set-ServiceLogonRight -Account 'BUILTIN\Administrators' 3>&1 6>&1 |
+    ForEach-Object {{ "$_" }})
+  if ({runs}) {{ 'OUT=' + $script:Configured }} else {{ 'OUT=' + ($said -join ' / ') }}
+"""
+    out = _ok(_extract(_SCRIPT, ["Set-ServiceLogonRight", _WORKDIR_FN], body), tmp_path)
+    return out.strip().splitlines()[-1].removeprefix("OUT=")
+
+
+@_windows_only
+@pytest.mark.parametrize(
+    "row", ["SeServiceLogonRight =", "SeServiceLogonRight =   ", "SeServiceLogonRight = ,"]
+)
+def test_the_grant_to_an_empty_exported_row_has_no_leading_comma(tmp_path: Path, row: str) -> None:
+    """BACKLOG #5401: an exported SeServiceLogonRight row can be present and empty. Appending
+    ``,*SID`` to it wrote a value that starts with a comma."""
+    configured = _grant_configured(tmp_path, row)
+    assert "SeServiceLogonRight = *S-1-5-32-544 |" in configured, configured
+    assert "=," not in configured.replace(" ", ""), configured
+
+
+@_windows_only
+def test_the_grant_keeps_every_holder_and_a_dollar_in_a_held_name(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the row above: a row with holders keeps them, in order, with the SID
+    appended, and a ``$`` in a held account name is written as itself. ``$0`` and ``$&`` are
+    what a regex replacement would expand into the whole matched row."""
+    configured = _grant_configured(
+        tmp_path, "SeServiceLogonRight = *S-1-5-80-4001,CONTOSO\\svc$0,CONTOSO\\svc$&"
+    )
+    want = "SeServiceLogonRight = *S-1-5-80-4001,CONTOSO\\svc$0,CONTOSO\\svc$&,*S-1-5-32-544 |"
+    assert want in configured, configured
+
+
+@_windows_only
+def test_the_grant_after_a_trailing_comma_writes_no_empty_holder(tmp_path: Path) -> None:
+    configured = _grant_configured(tmp_path, "SeServiceLogonRight = *S-1-5-80-4001,")
+    assert "SeServiceLogonRight = *S-1-5-80-4001,*S-1-5-32-544 |" in configured, configured
+
+
+@_windows_only
+def test_a_configure_that_never_ran_is_not_reported_as_a_grant(tmp_path: Path) -> None:
+    """The stub's export left ``$LASTEXITCODE`` at 0 and its configure sets none. Read uncleared,
+    that stale 0 reports a grant that never happened."""
+    said = _grant_configured(tmp_path, "SeServiceLogonRight = *S-1-5-80-4001", configure_runs=False)
+    assert "granted SeServiceLogonRight" not in said, said
+    assert "secedit configure did not run" in said, said
+
+
+@_windows_only
+def test_the_grant_with_no_privilege_rights_section_adds_one(tmp_path: Path) -> None:
+    """An export with no ``[Privilege Rights]`` line left the policy unchanged, and the re-import
+    of it was still reported as a grant."""
+    configured = _grant_configured(tmp_path, None, section=False)
+    assert "[Privilege Rights] | SeServiceLogonRight = *S-1-5-32-544" in configured, configured
+
+
+@_windows_only
+def test_the_grant_with_no_exported_row_adds_one(tmp_path: Path) -> None:
+    configured = _grant_configured(tmp_path, None)
+    assert "[Privilege Rights] | SeServiceLogonRight = *S-1-5-32-544 |" in configured, configured
+
+
 # --- the secedit files live in a folder only administrators can change (BACKLOG #5563) -------------
 # The export and the database sat at $env:TEMP\mefor-secedit-remove-<PID>.inf/.sdb. The uninstaller
 # runs elevated, but the user's TEMP belongs to the user, so a same-user process at medium integrity
@@ -3176,24 +3346,46 @@ def test_the_secedit_files_sit_in_a_fresh_folder_only_administrators_can_change(
 
 
 @_windows_only
-def test_the_work_folder_is_refused_under_a_parent_others_can_delete_in(tmp_path: Path) -> None:
-    """A parent folder that lets another account delete its children lets that account rename the
-    private folder away and substitute its own, so the helper refuses it."""
+@pytest.mark.parametrize(
+    ("where", "grant"),
+    [
+        # A parent that lets another account delete its children lets that account rename the
+        # private folder away and substitute its own. Delete-child alone, so this case still fails
+        # if the check stops judging FILE_DELETE_CHILD.
+        ("parent-children", "*S-1-5-32-545:(DC)"),
+        # Modify holds DELETE on the parent itself but no FILE_DELETE_CHILD, so the parent, with
+        # the private folder inside, can be renamed away and a planted one put at its name.
+        ("parent", "*S-1-5-32-545:M"),
+        # Delete-child alone on the folder ABOVE the parent, on that folder only: it renames the
+        # parent away, though the parent's own DACL grants nothing.
+        ("above", "*S-1-5-32-545:(DC)"),
+        # An entry that applies to the parent and is also inherited still applies to the parent.
+        ("parent-inheritable", "*S-1-5-32-545:(OI)(CI)F"),
+    ],
+)
+def test_the_work_folder_is_refused_when_the_parent_or_a_folder_above_can_be_renamed(
+    tmp_path: Path, where: str, grant: str
+) -> None:
+    """The helper refuses a parent whose children, or which itself, or any folder above which,
+    another account can rename. BACKLOG #8239 item 13 added the last two."""
     assert _UNINSTALL is not None
-    parent = tmp_path / "open-parent"
-    parent.mkdir()
+    above = tmp_path / "above"
+    parent = above / "parent"
+    parent.mkdir(parents=True)
+    target = above if where == "above" else parent
     body = rf"""
   $parent = {_psq(str(parent))}
+  $top = {_psq(str(tmp_path))}
+  $target = {_psq(str(target))}
   $me = [Security.Principal.WindowsIdentity]::GetCurrent()
-  # F, not M: Modify holds no FILE_DELETE_CHILD, and that is the right that renames a child.
-  & icacls $parent /grant '*S-1-5-32-545:(OI)(CI)F' | Out-Null
+  & icacls $target /grant {_psq(grant)} | Out-Null
   $made = $null
   $refusal = ''
-  try {{ $made = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value }}
+  try {{ $made = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value -CheckedUpTo $top }}
   catch {{ $refusal = $_.Exception.Message }}
   $clean = $null
-  & icacls $parent /remove:g '*S-1-5-32-545' | Out-Null
-  try {{ $clean = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value }} catch {{ $clean = "ERR $_" }}
+  & icacls $target /remove:g '*S-1-5-32-545' | Out-Null
+  try {{ $clean = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value -CheckedUpTo $top }} catch {{ $clean = "ERR $_" }}
   [pscustomobject]@{{ made = $made; refusal = $refusal; clean = $clean
     left = @(Get-ChildItem -LiteralPath $parent -Force | ForEach-Object {{ $_.Name }}) }} |
     ConvertTo-Json -Compress
@@ -3201,9 +3393,12 @@ def test_the_work_folder_is_refused_under_a_parent_others_can_delete_in(tmp_path
     got = json.loads(
         _ok(_extract(_UNINSTALL, [_WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
     )
-    assert got["made"] is None, f"a folder was made under an open parent: {got['made']}"
+    assert got["made"] is None, f"a folder was made though {where} can be renamed: {got['made']}"
     assert "S-1-5-32-545" in got["refusal"] or "Users" in got["refusal"], got["refusal"]
-    # POSITIVE CONTROL: the same parent without the grant is accepted.
+    assert f"'{target}' S-1-5-32-545" in got["refusal"], (
+        f"the refusal does not name {target} as the open folder: {got['refusal']}"
+    )
+    # POSITIVE CONTROL: the same chain without the grant is accepted.
     assert got["clean"] and not str(got["clean"]).startswith("ERR"), got["clean"]
     assert got["left"] == [Path(got["clean"]).name], (
         f"the refused attempt left a folder behind: {got['left']}"
@@ -3266,6 +3461,49 @@ def test_the_secedit_folder_defaults_to_the_windows_temp_not_the_users(tmp_path:
         "the user can set SystemRoot and windir for their own processes, so neither may name the "
         "trusted parent"
     )
+
+
+def test_no_caller_cuts_the_secedit_folder_walk_short() -> None:
+    """STATIC. The walk to the root is the production check; -CheckedUpTo, which ends it early, is
+    a test seam, so neither script names it outside the helper's own definition."""
+    assert _SCRIPT is not None and _UNINSTALL is not None
+    for script in (_SCRIPT, _UNINSTALL):
+        text = script.read_text(encoding="utf-8-sig")
+        start = text.index(f"function {_WORKDIR_FN} {{")
+        end = text.index("\nfunction ", start)
+        rest = text[:start] + text[end:]
+        assert "CheckedUpTo" not in rest, f"{script.name} cuts the ancestor walk short"
+
+
+@_windows_only
+def test_the_work_folder_is_refused_under_a_reparse_point_above_the_parent(tmp_path: Path) -> None:
+    """A junction above the parent makes the walk read the junction's own ACL, not the folders that
+    hold the parent, so the helper refuses it."""
+    assert _UNINSTALL is not None
+    real = tmp_path / "real"
+    (real / "parent").mkdir(parents=True)
+    link = tmp_path / "link"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(real)], capture_output=True, text=True
+    )
+    assert made.returncode == 0, made.stdout + made.stderr
+    body = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $out = [ordered]@{{}}
+  foreach ($p in @({_psq(str(link / "parent"))}, {_psq(str(real / "parent"))})) {{
+    try {{ $out[$p] = {_WORKDIR_FN} -Parent $p -OwnerSid $me.User.Value -CheckedUpTo {_psq(str(tmp_path))} }}
+    catch {{ $out[$p] = "ERR $($_.Exception.Message)" }}
+  }}
+  [pscustomobject]$out | ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_UNINSTALL, [_WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
+    )
+    through_link = got[str(link / "parent")]
+    assert str(through_link).startswith("ERR") and "reparse point" in through_link, through_link
+    # POSITIVE CONTROL: the same parent reached by its real path is accepted.
+    direct = got[str(real / "parent")]
+    assert direct and not str(direct).startswith("ERR"), direct
 
 
 def test_both_scripts_carry_the_same_secedit_folder_helper(tmp_path: Path) -> None:
