@@ -3135,7 +3135,8 @@ class RegistryRunner:
 
     def _note_lane_unhealthy(self, name: str, message_id: str, exc: BaseException) -> None:
         """Edge-trigger ``connection_lost`` + a throttled ``connection_error`` alert on the FIRST
-        transport ``DeliveryError`` after the lane was healthy (#46) — not per retry. No-op when capture
+        transport ``DeliveryError`` after the lane was healthy (#46) — not per retry — or the first
+        permanent ``NegativeAckError`` marked ``lane_wide``, which every queued row would meet. No-op when capture
         is off (byte-identical) or the lane is already marked down."""
         if not self._connection_events or not self._lane_healthy.get(name, True):
             return
@@ -11436,8 +11437,11 @@ class RegistryRunner:
                     item.message_id,
                 )
                 # A refusal every queued row would meet (the transport's own marker, never its
-                # code) also marks the lane down, so the drain into the DLQ alerts once.
-                if getattr(exc, "lane_fault", False):
+                # code) also marks the lane down, so the drain into the DLQ alerts once. Not from a
+                # connector a reload retired: as the success arm, it says nothing of the new one.
+                if getattr(exc, "lane_wide", False) and not self._connector_retired(
+                    name, connector
+                ):
                     self._note_lane_unhealthy(name, item.id, exc)
             else:
                 failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
@@ -11920,7 +11924,10 @@ class RegistryRunner:
                     len(ids),
                     ids[0],
                 )
-                if getattr(exc, "lane_fault", False):  # as the single row
+                # As the single row, retired connector included.
+                if getattr(exc, "lane_wide", False) and not self._connector_retired(
+                    name, connector
+                ):
                     self._note_lane_unhealthy(name, ids[0], exc)
             else:
                 failed = await self._mark_batch_failed_and_arm(

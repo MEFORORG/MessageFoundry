@@ -480,7 +480,7 @@ def test_the_table_forgets_only_pairs_that_carry_nothing(
 # A token endpoint answering in a content coding refuses every row the lane holds, permanently, so
 # each row dead-letters (owner ruling 2026-11-18 on BACKLOG #5910 step 4). Before the hold's fix
 # nothing paged: the permanent arm never marked the lane down. The refusal carries the transport's
-# own lane_fault marker, and the worker reads that marker, never the refusal's code.
+# own lane_wide marker, and the worker reads that marker, never the refusal's code.
 
 _CODED_TOKEN_REPLY = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
 
@@ -606,6 +606,8 @@ async def test_the_lane_alert_resolves_on_the_next_successful_delivery(
     try:
         (inbox / "1.hl7").write_bytes(_adt(1).encode("utf-8"))
         await _until_dead(store, 1)
+        # The DEAD row can be read before the worker resumes from the commit to note the lane.
+        await until(lambda: sink.errors != [], "the lane alert")
         assert sink.errors == [(OUT, "connection_lost", "NegativeAckError")]
         runner._destinations[OUT] = file_out  # the endpoint is fixed
         (inbox / "2.hl7").write_bytes(_adt(2).encode("utf-8"))
@@ -623,3 +625,35 @@ async def test_a_lane_wide_batch_refusal_alerts_the_lane_once(store: MessageStor
 
     assert await store.count_dead(allowed_channels=None) == 3
     assert sink.errors == [(OUT, "connection_lost", "NegativeAckError")]
+
+
+async def test_a_lane_wide_refusal_from_a_retired_connector_does_not_alert_the_new_lane(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # A reload that swaps the connector mid-send may be the fix, so the old connector's refusal says
+    # nothing of the new lane: no page against it. The row still dead-letters, as any refusal kept.
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    sink = _RecordsLaneAlerts()
+    runner = RegistryRunner(
+        _registry(inbox, outdir),
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    file_out = runner._destinations[OUT]
+
+    class _RetiredMidSend(_MintsThroughACodedTokenEndpoint):
+        async def send(self, payload: str) -> None:
+            runner._destinations[OUT] = file_out  # the reload lands while the mint runs
+            await super().send(payload)
+
+    runner._destinations[OUT] = cast(DestinationConnector, _RetiredMidSend())
+    try:
+        (inbox / "1.hl7").write_bytes(_adt(1).encode("utf-8"))
+        await _until_dead(store, 1)
+    finally:
+        await runner.stop()
+    assert sink.errors == []

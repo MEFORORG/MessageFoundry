@@ -420,10 +420,11 @@ class AlertSink(Protocol):
         not send it off the box (BACKLOG #5021).
         ``error_class`` is the failing exception's class name (BACKLOG #3210). A partner *rejection*
         (``NegativeAckError``) is NOT a connection error and does not fire this, with one exception:
-        a permanent one carrying ``lane_fault``, which every queued row would meet (at least a token
-        endpoint's reply in a content coding the engine does not decode), fires it once as its row
-        dead-letters, edge-triggered like a transport failure, with ``error_class``
-        ``NegativeAckError``. A lane-stopping credential or configuration fault never fires this."""
+        a permanent one a send raises carrying ``lane_wide``, which every queued row would meet (at
+        least a token endpoint's reply in a content coding the engine does not decode). It marks the
+        lane down as its row dead-letters, edge-triggered like a transport failure, so it fires this
+        with ``error_class`` ``NegativeAckError`` only when the lane was healthy. A lane-stopping
+        credential or configuration fault never fires this."""
         ...
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
