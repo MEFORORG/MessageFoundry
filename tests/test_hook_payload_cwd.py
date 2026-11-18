@@ -407,7 +407,8 @@ def _resolve_bytes(repo: Path, tmp_path: Path, stdin: bytes, flags: str = "") ->
         (b'{"cwd": ["C:\\\\"], "session_id": "s1"}', "not a string"),
         (b'{"cwd": {"path": "C:\\\\"}, "session_id": "s1"}', "not a string"),
         (b'{"cwd": 5, "session_id": "s1"}', "not a string"),
-        # #5586 item 2: a key this file reads, named twice in different case, is ambiguous.
+        # #5586 item 2: a top-level key named twice in different case is ambiguous. Callers read
+        # top-level keys beside these four: seat-unlock reads `reason`.
         (
             b'{"cwd": "C:\\\\", "CWD": "D:\\\\", "session_id": "s1"}',
             "names cwd in keys that differ",
@@ -418,6 +419,12 @@ def _resolve_bytes(repo: Path, tmp_path: Path, stdin: bytes, flags: str = "") ->
             b'{"cwd": "C:\\\\", "hook_event_name": "Stop", "Hook_Event_Name": "x"}',
             "hook_event_name",
         ),
+        (b'{"cwd": "C:\\\\", "reason": "clear", "REASON": "x"}', "names reason in keys"),
+        (b'{"cwd": "C:\\\\", "a": 1, "A": 2}', "names a in keys"),
+        # A cast would read a one-element array as its element: an array event became SessionStart.
+        (b'{"cwd": "C:\\\\", "hook_event_name": ["SessionStart"]}', "hook_event_name that is not"),
+        (b'{"cwd": "C:\\\\", "session_id": ["s1"]}', "session_id that is not a string"),
+        (b'{"cwd": "C:\\\\", "source": 1}', "source that is not a string"),
         # Still not JSON, even through -AsHashtable.
         (b'{"a": 1, "A": 2', "not readable JSON"),
         (b'[{"a": 1, "A": 2}]', "not a JSON object"),
@@ -442,15 +449,20 @@ def test_an_object_with_no_cwd_is_still_no_fault(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "extra",
     [
-        '"a": 1, "A": 2',
         '"": 1',
+        '"psobject": 1',
+        '"ToString": 5, "": 1',
+        '"Keys": ["zz"], "": 1',
+        '"tool_input": {"Keys": ["zz"], "a": 1, "A": 2}',
         '"tool_input": {"path": "x", "PATH": "y"}',
         '"tool_input": {"list": [{"k": 1, "K": 2}]}',
     ],
 )
 def test_json_that_only_convertfrom_json_refuses_is_still_read(tmp_path: Path, extra: str) -> None:
-    """#5586 item 2: keys that differ only in case, or an empty key, are valid JSON, and a tool's own
-    input can hold either. They made ConvertFrom-Json throw, and read as "not readable JSON"."""
+    """#5586 item 2: keys below the top level that differ only in case, an empty key, or a reserved
+    member name are valid JSON, and a tool's own input can hold any of them. They made
+    ConvertFrom-Json throw, and read as "not readable JSON". A key named `Keys` must not stand in for
+    the key list when the object is rebuilt."""
     repo, _ = _primary_with(tmp_path, "linked")
     sub = repo / "sub"
     sub.mkdir()
@@ -558,20 +570,61 @@ def _junction(link: Path, target: Path) -> None:
 
 def test_a_cd_inside_a_start_folder_outside_every_checkout_is_not_a_fault(tmp_path: Path) -> None:
     """#5586 item 1: started in no checkout, only a `cwd` spelled exactly as the start directory was
-    taken, so a `cd` into a subfolder, or a junction or 8.3 spelling of it, was a fault and
-    steer-inject in a non-git project stopped delivering."""
+    taken, so a `cd` into a subfolder, or a junction spelling of it, was a fault and steer-inject in
+    a non-git project stopped delivering."""
     base = Path(os.path.realpath(tmp_path))
-    start = base / "no repo long name"
+    start = base / "start"
     sub = start / "deeper" / "still"
     sub.mkdir(parents=True)
     _junction(base / "jn", start)
-    taken = [sub, start / "deeper", base / "jn", base / "jn" / "deeper"]
-    short = _short_name(start)
-    if short and short.lower() != str(start).lower():
-        taken += [Path(short), Path(short) / "deeper"]
-    for cwd in taken:
+    for cwd in (sub, start / "deeper", base / "jn", base / "jn" / "deeper"):
         got = _resolve(start, tmp_path, {"cwd": str(cwd), "session_id": "s1"})
         assert got["Reason"] == "" and got["Dir"] is None, (cwd, got)
+
+
+def test_an_8dot3_spelling_of_a_start_folder_outside_every_checkout_is_not_a_fault(
+    tmp_path: Path,
+) -> None:
+    """#5586 item 1, the short-name half, and the only test that runs GetLongPathName."""
+    base = Path(os.path.realpath(tmp_path))
+    start = base / "no repo long name"
+    (start / "deeper").mkdir(parents=True)
+    short = _short_name(start)
+    if not short or short.lower() == str(start).lower():
+        pytest.skip("this volume keeps no 8.3 names, so the short-name branch cannot run here")
+    assert "~" in Path(short).name, short
+    for cwd in (Path(short), Path(short) / "deeper"):
+        got = _resolve(start, tmp_path, {"cwd": str(cwd), "session_id": "s1"})
+        assert got["Reason"] == "" and got["Dir"] is None, (cwd, got)
+
+
+def test_a_cd_inside_a_start_folder_below_an_unreadable_git_is_not_a_fault(tmp_path: Path) -> None:
+    """A start below a `.git` this file cannot read (a removed worktree's) is in no checkout it can
+    read, and a `cd` into a subfolder there is the same folder, not a move (review round 1)."""
+    base = Path(os.path.realpath(tmp_path))
+    stale = base / "stale-wt"
+    start = stale / "start"
+    (start / "sub").mkdir(parents=True)
+    (stale / ".git").write_text("gitdir: C:/nonexistent/worktrees/x\n", encoding="utf-8")
+    got = _resolve(start, tmp_path, {"cwd": str(start / "sub"), "session_id": "s1"})
+    assert got["Reason"] == "" and got["Dir"] is None, got
+    # The control: a sibling of the start inside the same stale folder is still a move.
+    (stale / "other").mkdir()
+    moved = _resolve(start, tmp_path, {"cwd": str(stale / "other"), "session_id": "s1"})
+    assert "in no checkout this hook can read" in moved["Reason"], moved
+
+
+def test_a_rooted_relative_link_target_resolves_against_the_drive_root(tmp_path: Path) -> None:
+    """Windows reads a symlink target `\\x` against the link's drive root, not its folder."""
+    base = Path(os.path.realpath(tmp_path))
+    link = base / "l"
+    leaf = f"mefor-no-such-{base.name}"
+    try:
+        os.symlink("\\" + leaf, link, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"this account may not create a symlink: {exc}")
+    got = _helper(tmp_path, f"@{{ Real = ConvertTo-CcxRealPath '{link}' }}", _raw({}))
+    assert got["Real"].lower() == (base.anchor + leaf).lower(), got
 
 
 def test_a_cwd_that_leaves_a_start_folder_outside_every_checkout_is_still_a_fault(
