@@ -754,7 +754,7 @@ _SCHEMA_LOCK_TIMEOUT_MAX: Final[float] = float((2**31 - 1) // 1000)
 
 
 def store_path_refusal(
-    value: str, *, name: str = "[store].path (from the settings file or --db)"
+    value: str, *, name: str = "[store].path (from the settings file, MEFOR_STORE_PATH or --db)"
 ) -> str | None:
     """Why ``value`` cannot be a SQLite store path the project root anchors, or None if it can
     (BACKLOG #5926). ``name`` is the setting or flag the refusal names.
@@ -762,17 +762,19 @@ def store_path_refusal(
     It refuses at least these shapes, by their spelling; it cannot see whether a plain name such
     as ``data`` is an existing directory. A path whose last part is empty, ``.`` or ``..`` (an
     empty or blank path, ``data/``, ``data/..``) names a directory, which passes an exists() guard
-    as if it were a store. On Windows, a last part ending in a dot or a space (Win32 trims it, so
-    ``...`` is the working directory), and a colon anywhere but a drive letter: ``C:mf.db`` is
+    as if it were a store. On Windows, where a backslash also separates parts, a last part ending
+    in a dot or a space (Win32 trims it, so ``...`` is the working directory), and a colon
+    anywhere except right after the drive letter of a fully-qualified path: ``C:mf.db`` is
     drive-relative, resolved against that drive's per-process current directory, and
     ``mf.db:x`` names an NTFS alternate data stream. SQLite's ``:memory:`` is not a file and is
     accepted. Off Windows those Windows spellings are ordinary file names. The value is withheld
     from the refusal, as the file source's path refusals withhold theirs."""
     if value == ":memory:":
         return None
-    last = re.split(r"[\\/]", value.rstrip())[-1]
     windows = os.name == "nt"
-    if last in ("", ".", "..") or (windows and last != last.rstrip(". ")):
+    # The last part as written: Win32 trims a trailing dot or space, so it is tested unstripped.
+    last = re.split(r"[\\/]" if windows else "/", value)[-1]
+    if not value.strip() or last in ("", ".", "..") or (windows and last != last.rstrip(". ")):
         return (
             f"{name} names no file (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
         )

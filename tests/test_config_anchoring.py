@@ -710,7 +710,7 @@ _DRIVE = "drive-relative"
 
 
 @pytest.mark.parametrize(
-    "value", ["", "   ", ".", "./", "..", "site-dir/..", "site-dir/", "site-dir/.", "site-dir/ "]
+    "value", ["", "   ", ".", "./", "..", "site-dir/..", "site-dir/", "site-dir/."]
 )
 def test_a_store_path_naming_no_file_is_refused_at_load(value: str) -> None:
     from pydantic import ValidationError
@@ -730,6 +730,10 @@ def test_a_store_path_naming_no_file_is_refused_at_load(value: str) -> None:
         ("/C:site-store.db", _DRIVE),  # the anchor strips the slash, leaving C:site-store.db
         ("site-store.db:x", "file stream"),  # an NTFS alternate data stream
         ("site-store...", _NO_FILE),  # Win32 trims the dots
+        ("site-store.db ", _NO_FILE),  # and a trailing space, so this is site-store.db
+        ("site-store ", _NO_FILE),
+        ("site-store/ ", _NO_FILE),  # a last part of one space names site-store itself
+        ("site-store\\..", _NO_FILE),  # a backslash separates parts on Windows
     ],
 )
 def test_a_windows_only_store_path_shape_is_refused_on_windows(value: str, why: str) -> None:
@@ -742,6 +746,15 @@ def test_a_windows_only_store_path_shape_is_refused_on_windows(value: str, why: 
             StoreSettings(path=value)
         assert "site-store" not in settings_error_detail(exc.value)  # the value is withheld
     else:  # POSIX: each is an ordinary file name and anchors under the root
+        assert StoreSettings(path=value).path == value
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX spelling rules")
+def test_backslash_and_trailing_blank_are_ordinary_file_names_on_posix() -> None:
+    from messagefoundry.config.settings import StoreSettings
+
+    # As on main: neither is a directory on POSIX, so neither is refused.
+    for value in ("store\\..", "data/ ", "mf.db ", "mf.db."):
         assert StoreSettings(path=value).path == value
 
 
