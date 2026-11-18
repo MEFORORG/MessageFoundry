@@ -767,12 +767,11 @@ def store_path_refusal(
     (BACKLOG #5926). ``name`` is the setting or flag the refusal names.
 
     It refuses at least these shapes, by their spelling; it cannot see whether a plain name such
-    as ``data`` is an existing directory. A value of only whitespace is refused as a mistake, under
-    its own reason, since on POSIX it is a legal file name. A path whose last part is empty, ``.`` or ``..`` (an empty path,
-    ``data/``, ``data/..``) names a directory, which passes an exists() guard as if it were a
-    store. On Windows, where a backslash also separates parts, a last part ending in a dot or a
-    space (Win32 trims it, so ``...`` is the working directory), and a colon
-    anywhere except right after the drive letter of a fully-qualified path: ``C:mf.db`` is
+    as ``data`` is an existing directory. A value ``str.isspace`` accepts is refused under its own
+    reason. A path whose last part is empty, ``.`` or ``..`` (an empty path, ``data/``,
+    ``data/..``) names a directory, which passes an exists() guard as if it were a store. On
+    Windows, where a backslash also separates parts, a last part ending in a dot or a space (Win32
+    trims it, so ``...`` is the working directory), and a colon anywhere except right after the drive letter of a fully-qualified path: ``C:mf.db`` is
     drive-relative, resolved against that drive's per-process current directory, and
     ``mf.db:x`` names an NTFS alternate data stream. SQLite's ``:memory:`` is not a file and is
     accepted. Off Windows those Windows spellings are ordinary file names. The value is withheld
@@ -781,10 +780,11 @@ def store_path_refusal(
         return None
     if value.isspace():
         # Taken as a mistake, such as an env var set to spaces. Not "names no file": on POSIX
-        # such a value is a legal file name, so that reason would be false there.
+        # such a value is a legal file name, so that reason would be false there. isspace also
+        # accepts the separators U+001C to U+001F and U+0085, so the reason names them too.
         return (
-            f"{name} holds only whitespace (value withheld); name the SQLite file, e.g. "
-            "'messagefoundry.db'"
+            f"{name} holds only whitespace or separator characters (value withheld); name the "
+            "SQLite file, e.g. 'messagefoundry.db'"
         )
     windows = os.name == "nt"
     # The last part as written: Win32 trims a trailing dot or space, so it is tested unstripped.

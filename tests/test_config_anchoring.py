@@ -722,21 +722,23 @@ def test_a_store_path_naming_no_file_is_refused_at_load(value: str) -> None:
     assert "site-dir" not in settings_error_detail(exc.value)  # the value is withheld
 
 
-@pytest.mark.parametrize("value", ["   ", " ", "\t ", "\n"])
+_WHITESPACE = "holds only whitespace or separator characters (value withheld)"
+
+
+@pytest.mark.parametrize("value", ["   ", " ", "\t ", "\n", "\x1f"])
 def test_a_blank_store_path_is_refused_as_blank_not_as_naming_no_file(value: str) -> None:
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreSettings, store_path_refusal
 
-    # On POSIX such a value is a legal file name, so "names no file" would be false there.
     with pytest.raises(ValidationError) as exc:
         StoreSettings(path=value)
     text = str(exc.value)
-    assert "[store].path" in text and "holds only whitespace (value withheld)" in text, text
+    assert "[store].path" in text and _WHITESPACE in text, text
     assert _NO_FILE not in text, text
-    # The raw --db check that serve and supervise run gives the same reason.
+    # store_path_refusal names whatever setting or flag it is given.
     refusal = store_path_refusal(value, name="--db")
-    assert refusal is not None and refusal.startswith("--db holds only whitespace"), refusal
+    assert refusal is not None and refusal.startswith(f"--db {_WHITESPACE}"), refusal
 
 
 @pytest.mark.parametrize(
