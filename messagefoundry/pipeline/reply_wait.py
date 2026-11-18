@@ -128,7 +128,7 @@ class ReplyRendezvous:
 
         Always a child of the root, so a scope's ``scope()`` is a sibling, not a nested scope.
         """
-        root = self._parent or self
+        root = self._parent if self._parent is not None else self
         child = ReplyRendezvous(max_waiters=root._max_waiters)
         child._waiters = root._waiters
         child._parent = root
@@ -136,7 +136,11 @@ class ReplyRendezvous:
 
     @property
     def waiters(self) -> int:
-        """Currently armed waiters. Tested to return to zero — see :meth:`arm`."""
+        """Currently armed waiters, runner-wide. Tested to return to zero — see :meth:`arm`.
+
+        On a :meth:`scope` this is still the total across every scope of the root, because the scopes
+        share one waiter table; it is what the cap in :meth:`arm` is checked against.
+        """
         return sum(len(group) for group in self._waiters.values())
 
     @contextmanager

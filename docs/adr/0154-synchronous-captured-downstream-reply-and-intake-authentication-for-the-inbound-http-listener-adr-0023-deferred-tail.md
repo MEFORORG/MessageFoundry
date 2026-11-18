@@ -2,10 +2,6 @@
 
 - **Status:** **Accepted (2026-07-31) — owner-ratified at revision 5. BOTH increments are now authorised, built and merged: increment A 2026-08-01 (`f2ef0ea9`, PR #109), increment B 2026-08-01 (PR #119). `AC-18` was deliberately deferred and remains outstanding — see the note below.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-30 (rev 1–4), 2026-07-31 (rev 5, ratified)
-- **Amended 2026-11-18 (BACKLOG #5893):** D5's pre-close drain reaches only the stopping listener's
-  own turns, and its draining flag refuses only that listener's later arms. D5 keeps its original
-  text, with a dated note in place. See
-  [Amendment 2026-11-18](#amendment-2026-11-18-the-drain-is-scoped-to-one-listener-start).
 - **Amended 2026-09-26 (BACKLOG #1960, owner ruling):** a body the receipt handler refuses at ingress
   is now answered **`422`** on the `202` receipt path too, not only on the sync path. D5's note on the
   `None` return and **AC-8** said the receipt path kept its "`202` without a `message_id`". Both keep
@@ -40,6 +36,10 @@
   all the same Cannot Understand (`0xC000`). The 2026-10-30 table and the 2026-11-01 note
   keep their text, with a dated note in place. See
   [Amendment 2026-11-04](#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal).
+- **Amended 2026-11-18 (BACKLOG #5893):** D5's pre-close drain reaches only the stopping listener's
+  own turns, and its draining flag refuses only that listener's later arms. D5 keeps its original
+  text, with a dated note in place. See
+  [Amendment 2026-11-18](#amendment-2026-11-18-the-drain-is-scoped-to-one-listener-start).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
   start*. Here it was **scoped**, because rev 4 split the build and that split is part of what was
   ratified. **Both halves have since been authorised and built** — the split below is retained as the
@@ -1802,3 +1802,5 @@ still runs before any client writer is closed, as D5 requires.
 
 The fresh state comes from the runner building a new source, and so a new scope, on every start.
 A restart of the same source instance would keep its drained scope; the runner does not do that.
+
+`tests/test_b616_5893_reply_drain_per_listener.py` pins this amendment.
