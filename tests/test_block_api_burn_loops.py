@@ -18,6 +18,7 @@ helpers of tests/test_api_burn_guard.py.
 from __future__ import annotations
 
 import shutil
+import time
 
 import pytest
 
@@ -62,6 +63,10 @@ MUST_DENY = [
     pytest.param(
         "do { $r = gh pr view 1 --json state; Start-Sleep 30 } while ($true)",
         id="powershell-do-while-assignment",
+    ),
+    pytest.param(
+        "$prs | ForEach-Object { $r = gh pr view $_; Start-Sleep 1 }",
+        id="foreach-object-body-with-assignment",
     ),
     pytest.param("gh pr checks 5 -R 'o/r' --watch; echo done", id="watch-after-a-quoted-argument"),
     pytest.param('gh pr checks 5 --repo "o/r" --watch&& echo done', id="watch-after-quoted-repo"),
@@ -152,8 +157,33 @@ MUST_ALLOW = [
     pytest.param('for (;;) { Write-Host "(gh pr view 1)" }', id="gh-quoted-in-a-forever-body"),
     pytest.param('gh pr checks 5 --watch="false"', id="watch-quoted-false"),
     pytest.param("gh pr checks 5 --watch=no", id="watch-value-gh-refuses"),
+    # Review round c59759fa: allowed on origin/main and newly denied by 3cfc17cd0f5.
+    pytest.param(
+        "do { Start-Sleep 5 } until (Test-Path flag); $r = gh pr view 1",
+        id="do-until-tail-is-not-a-loop-opener",
+    ),
+    pytest.param(
+        "do { Start-Sleep 5 } while (-not (Test-Path flag)); $r = gh pr view 1; Start-Sleep 1",
+        id="do-while-tail-is-not-a-loop-opener",
+    ),
+    pytest.param(
+        "$prs | foreach Number; $s = gh pr view 5; Start-Sleep 2",
+        id="foreach-member-name-has-no-body",
+    ),
+    pytest.param(
+        "$prs | ForEach-Object Name; $s = gh pr view 5; if ($s) { Start-Sleep 2 }",
+        id="foreach-object-member-name-borrows-no-brace",
+    ),
+]
+
+# Rows read under the PowerShell tool, whose double-quoted strings escape with a backtick only.
+MUST_ALLOW_POWERSHELL = [
     pytest.param(
         'Write-Host "a `"x; $r = gh run watch 5`" b"', id="escaped-quote-inside-one-string"
+    ),
+    # A backslash escapes nothing in PowerShell, so the path's closing quote ends the string.
+    pytest.param(
+        'Write-Host "C:\\x\\" "; $r = gh run watch 5"', id="backslash-before-a-closing-quote"
     ),
 ]
 
@@ -166,6 +196,22 @@ def test_polling_shape_is_denied(command: str) -> None:
 @pytest.mark.parametrize("command", MUST_ALLOW)
 def test_ordinary_gh_work_is_still_allowed(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
+
+
+@pytest.mark.parametrize("command", MUST_ALLOW_POWERSHELL)
+def test_ordinary_powershell_work_is_still_allowed(command: str) -> None:
+    assert_allowed(run_guard(bash(command, tool="PowerShell")))
+
+
+def test_tied_rules_are_bounded_and_fail_closed() -> None:
+    # 8000 repeats took 28.5 s through the untimed tied rules. The bound must end the work, and a
+    # tripped bound denies rather than allows.
+    command = "echo" + " do gh x" * 8000
+    started = time.monotonic()
+    result = run_guard(bash(command))
+    elapsed = time.monotonic() - started
+    assert elapsed < 20, f"guard took {elapsed:.1f} s"
+    assert "too large" in assert_denied(result)
 
 
 def test_powershell_backtick_continuation_is_joined() -> None:
