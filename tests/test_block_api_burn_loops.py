@@ -18,7 +18,6 @@ helpers of tests/test_api_burn_guard.py.
 from __future__ import annotations
 
 import shutil
-import time
 
 import pytest
 
@@ -67,6 +66,14 @@ MUST_DENY = [
     pytest.param(
         "$prs | ForEach-Object { $r = gh pr view $_; Start-Sleep 1 }",
         id="foreach-object-body-with-assignment",
+    ),
+    pytest.param(
+        "$prs | ForEach-Object -Process { $r = gh pr view $_; Start-Sleep 1 }",
+        id="foreach-object-named-process-body",
+    ),
+    pytest.param(
+        "1..9 | ForEach-Object -ThrottleLimit 3 -Parallel { $r = gh pr view 1; Start-Sleep 5 }",
+        id="foreach-object-parallel-body",
     ),
     pytest.param("gh pr checks 5 -R 'o/r' --watch; echo done", id="watch-after-a-quoted-argument"),
     pytest.param('gh pr checks 5 --repo "o/r" --watch&& echo done', id="watch-after-quoted-repo"),
@@ -204,14 +211,11 @@ def test_ordinary_powershell_work_is_still_allowed(command: str) -> None:
 
 
 def test_tied_rules_are_bounded_and_fail_closed() -> None:
-    # 8000 repeats took 28.5 s through the untimed tied rules. The bound must end the work, and a
-    # tripped bound denies rather than allows.
+    # 8000 repeats took 28.5 s through the untimed tied rules and were then allowed. Only the
+    # spent budget gives the "too large" reason, so it shows the bound ended the work and denied.
+    # No wall-clock assertion: run_guard's time includes the shared spawn lock's wait.
     command = "echo" + " do gh x" * 8000
-    started = time.monotonic()
-    result = run_guard(bash(command))
-    elapsed = time.monotonic() - started
-    assert elapsed < 20, f"guard took {elapsed:.1f} s"
-    assert "too large" in assert_denied(result)
+    assert "too large" in assert_denied(run_guard(bash(command)))
 
 
 def test_powershell_backtick_continuation_is_joined() -> None:

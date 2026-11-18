@@ -117,29 +117,42 @@ try {
     $cont = if ($ps) { '`\r?\n' } else { '\\\r?\n' }
     $lines = (($cmd -replace $cont, ' ') -replace '\r?\n', " $([char]1) " -replace '\s+', ' ').Trim()
 
-    # EVERY RULE ADDED FOR BACKLOG #5449 RUNS UNDER ONE TIME BUDGET, AND RUNNING OUT DENIES. Their
+    # THE RULES ADDED FOR BACKLOG #5449 SHARE ONE TIME BUDGET, AND RUNNING OUT DENIES. Their
     # quote-aware patterns can rescan the line once per gh, so 8000 repeats of ` do gh x` took
-    # 28.5 s where origin/main's rules took 2.6 s. Each tied match gets what is left of the budget
-    # as its regex timeout; when it runs out the command is denied (see the catch below), never
-    # allowed, so a command too large to read is never let through by the bound. origin/main's
-    # own whole-line rules, which run first in each test, stay untimed, so their verdict stands.
+    # 28.5 s where origin/main's rules took 2.6 s. $clock runs only while one of those matches
+    # runs, and each match takes what is left as its regex timeout; when it runs out the command
+    # is denied (see the catch below) rather than allowed. origin/main's own rules, the `$wide`
+    # half of each test, stay untimed and run first, so a DENY from them stands as it did; an
+    # ALLOW from them does not, since the timed rules after them can still run out and deny.
+    # This bounds only time. The 32-keyword cap in Test-LoopPoll is a separate bound, and it
+    # still fails open.
     $opt = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-    $BUDGET = 3.0
-    $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    function New-Tied([string]$Pattern) {
+    $BUDGET = 4.0
+    $clock = [System.Diagnostics.Stopwatch]::new()
+    function Invoke-Tied([string]$Pattern, [scriptblock]$Use) {
         $left = $BUDGET - $clock.Elapsed.TotalSeconds
-        if ($left -le 0) { throw [System.Text.RegularExpressions.RegexMatchTimeoutException]::new('budget spent') }
-        [regex]::new($Pattern, $opt, [timespan]::FromSeconds($left))
+        # Below a millisecond the timeout could round to zero ticks, which the constructor refuses
+        # with an error the fail-open catch would turn into an allow.
+        if ($left -lt 0.001) { throw [System.Text.RegularExpressions.RegexMatchTimeoutException]::new('budget spent') }
+        $re = [regex]::new($Pattern, $opt, [timespan]::FromSeconds($left))
+        $clock.Start()
+        try { & $Use $re } finally { $clock.Stop() }
+    }
+    function Test-Tied([string]$Pattern, [string]$Text, [int]$At = 0) {
+        Invoke-Tied $Pattern { param($re) $re.IsMatch($Text, $At) }
+    }
+    function Find-Tied([string]$Pattern, [string]$Text, [int]$At = 0) {
+        Invoke-Tied $Pattern { param($re) , $re.Match($Text, $At) }
     }
     try {
-    if (-not $wide -and -not (New-Tied $GHQ).IsMatch($lines)) { exit 0 }
+    if (-not $wide -and -not (Test-Tied $GHQ $lines)) { exit 0 }
     # From gh to its own flag: no separator, bracket, comment, backtick or line end, and a quoted
     # argument whole, so `-R 'o/r' --watch;` is read and `--body "never --watch"` is not.
     $SPAN = "(?:[^`"'``;&|(){}#\x01]|$DQ|'[^']*')*?"
 
     # `gh run watch` -- the measured 1200/hr offender.
     if (($wide -and $c -match ($GH0 + '.*\brun\s+watch\b')) -or
-        (New-Tied ($GHQ + $SPAN + '\brun\s+watch\b')).IsMatch($lines)) {
+        (Test-Tied ($GHQ + $SPAN + '\brun\s+watch\b') $lines)) {
         Deny ("BLOCKED: `gh run watch` polls every 3 seconds, about 1200 of the 5000 hourly GitHub API " +
               "requests, and every seat in this fleet shares ONE budget as the same identity. Use a " +
               "single-shot read instead: `gh run view <run-id>` for status now, or " +
@@ -162,9 +175,9 @@ try {
     # `$(gh ... --watch)` and `(gh ... --watch)`, because a `)` is not a delimiter here, and a
     # redirect such as `2>&1` between gh and the flag, because its `&` ends $SPAN.
     if (($wide -and $c -match '(^|\s)--watch(\s|$)') -or
-        (New-Tied ("$INTERP" + 'gh(?:\.exe)?\s[^"'']*\s--watch["'']')).IsMatch($c) -or
-        (New-Tied ($GHQ + $SPAN +
-            '\s--watch(?=$|[\s;&|}<>`\x01]|=["'']?(?:true|t|1)["'']?(?:$|[\s;&|}<>`\x01]))')).IsMatch($lines)) {
+        $c -match ("$INTERP" + 'gh(?:\.exe)?\s[^"'']*\s--watch["'']') -or
+        (Test-Tied ($GHQ + $SPAN +
+            '\s--watch(?=$|[\s;&|}<>`\x01]|=["'']?(?:true|t|1)["'']?(?:$|[\s;&|}<>`\x01]))') $lines)) {
         Deny ("BLOCKED: a `--watch` flag on a `gh` command polls in a loop and draws on the fleet's " +
               "shared 5000/hr GitHub API budget. Drop `--watch` and read once. For a run: " +
               "`gh run view <run-id>`. For a PR's checks: `gh pr checks <N>` or " +
@@ -193,7 +206,7 @@ try {
     # and `for`, a `do ... done` behind a header that crosses no separator but a last `;` or line
     # break before the `do`. When the body opens there but does not close, the loop runs to the end
     # of the line. A keyword with no body of its own, such as `ForEach-Object Name` or
-    # `foreach Prop`, is no loop region, so it borrows no later brace and no rest of the command.
+    # `foreach Prop`, is no loop region (`ForEach-Object -Process { }` has one), so it borrows no later brace and no rest of the command.
     # Nor is the `} while (...)` or `} until (...)` tail of a `do { }` body, which belongs to the
     # do loop. A region is a poll when it holds a gh outside quotes and either a sleep or a forever
     # spelling, including `do { } while (1)` or `while ($true)` after a `do` body. So reading a PR
@@ -209,39 +222,36 @@ try {
     $BRACE = "\{(?:(?>\}(?<-d>)|\{(?<d>)|$DQ|'[^']*'|[^`"'{}]+))*?(?(d)(?!))\}"
     $DODONE = "\bdo\b(?:(?>\bdone\b(?<-d>)|\bdo\b(?<d>)|$DQ|'[^']*'|[^`"']))*?(?(d)(?!))\bdone\b"
     $PAREN = "\((?:(?>\)(?<-p>)|\((?<p>)|$DQ|'[^']*'|[^`"'()]+))*?(?(p)(?!))\)"
-    # The keyword's own header: one optional ( ) before a brace body, or bash's text before `do`.
-    $HEADBRACE = "[\s\x01]*(?:$PAREN[\s\x01]*)?"
+    # The keyword's own header: named parameters such as `-Process` or `-Parallel`, each with at
+    # most one value, then one optional ( ) before a brace body; or bash's text before `do`.
+    $PARAMS = "(?:-\w+[\s\x01]+(?:[^-\s\x01{}();|&`"'][^\s\x01{}();|&`"']*[\s\x01]+)?)*"
+    $HEADBRACE = "[\s\x01]*$PARAMS(?:$PAREN[\s\x01]*)?"
     $HEADDO = "(?:$DQ|'[^']*'|$PAREN|[^`"'(){};\x01])*?(?:[;\x01]\s*|\s)(?=do\b)"
     function Test-LoopPoll {
-        $reGh = New-Tied ($Q + $GHN)
-        $reSleep = New-Tied ($Q + '\b(?:sleep|Start-Sleep)\b')
-        $reOutside = New-Tied "^$QSPAN`$"
-        $reTail = New-Tied '\G\s*while\s*\(\s*(?:\$true|1)\s*\)'
-        $reForever = New-Tied $FOREVER_ANY
         $doEnds = @{}
         $seen = 0
-        foreach ($m in (New-Tied $LOOP).Matches($lines)) {
+        foreach ($m in (Invoke-Tied $LOOP { param($re) @($re.Matches($lines)) })) {
             if (++$seen -gt 32) { break }
-            if (-not $reOutside.IsMatch($lines.Substring(0, $m.Index))) { continue }
+            if (-not (Test-Tied "^$QSPAN`$" $lines.Substring(0, $m.Index))) { continue }
             # The `} while (...)` / `} until (...)` tail of a do body is that loop's, not a new one.
             if ($m.Value.StartsWith('}') -and $doEnds.ContainsKey($m.Index + 1)) { continue }
             $braceOnly = $m.Value -match '(?:\bdo|%)\s*$|foreach|ForEach-Object'
             $head = if ($braceOnly) { "\G$HEADBRACE" } else { "\G(?:$HEADBRACE(?=\{)|$HEADDO)" }
             $from = $m.Index + $m.Length
-            $body = (New-Tied ($head + "(?:$BRACE|$DODONE)")).Match($lines, $from)
+            $body = Find-Tied ($head + "(?:$BRACE|$DODONE)") $lines $from
             if ($body.Success) {
                 $end = $body.Index + $body.Length
                 if ($m.Value -match '\bdo\s*$') { $doEnds[$end] = $true }
-            } elseif ((New-Tied ($head + '(?:\{|\bdo\b)')).IsMatch($lines, $from)) {
+            } elseif (Test-Tied ($head + '(?:\{|\bdo\b)') $lines $from) {
                 $end = $lines.Length
             } else {
                 continue
             }
             $region = $lines.Substring($m.Index, $end - $m.Index)
-            if (-not $reGh.IsMatch($region)) { continue }
-            $forever = $reForever.IsMatch($lines.Substring($m.Index)) -or
-                       ($body.Success -and $reTail.IsMatch($lines, $end))
-            if ($forever -or $reSleep.IsMatch($region)) { return $true }
+            if (-not (Test-Tied ($Q + $GHN) $region)) { continue }
+            $forever = (Test-Tied $FOREVER_ANY $lines.Substring($m.Index)) -or
+                       ($body.Success -and (Test-Tied '\G\s*while\s*\(\s*(?:\$true|1)\s*\)' $lines $end))
+            if ($forever -or (Test-Tied ($Q + '\b(?:sleep|Start-Sleep)\b') $region)) { return $true }
         }
         return $false
     }
@@ -263,6 +273,7 @@ try {
 
     exit 0
 } catch {
-    # Fail open, always. A broken guard must not wedge every gh call in the fleet.
+    # Fail open on every other error. A broken guard must not wedge every gh call in the fleet.
+    # The spent time budget is the one exception, denied by the inner catch above.
     exit 0
 }
