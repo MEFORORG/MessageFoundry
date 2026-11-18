@@ -3114,7 +3114,16 @@ class LoggingSettings(_Section):
         # Vault BACKLOG #2375. Before this, such text raised out of the #1966 gate, or passed it
         # and then raised out of the forwarder's own socket call, so the start died with a
         # traceback either way.
-        return _checked_host_text(value, "[logging].forward_host")
+        checked = _checked_host_text(value, "[logging].forward_host")
+        # BACKLOG #5923: the IPv4 limited broadcast address names no collector. The forwarder never
+        # sets SO_BROADCAST, so the OS refuses each UDP send there (EACCES on Linux) and a spool
+        # would hold every record behind it; a stream connect to it fails too. A directed subnet
+        # broadcast cannot be told from a host address without the netmask, so it is not read here.
+        if checked is not None and _host_ip_literal(_bare_host(checked)) == _LIMITED_BROADCAST:
+            raise ValueError(
+                "[logging].forward_host is the broadcast address, which names no collector"
+            )
+        return checked
 
     @field_validator("ntp_peer")
     @classmethod
@@ -5197,6 +5206,10 @@ def _fail_open_note(note: str) -> None:
         _log.warning("%s", note)
     else:
         held.append(note)
+
+
+#: The IPv4 limited broadcast address (RFC 919), which ``[logging].forward_host`` refuses (BACKLOG #5923).
+_LIMITED_BROADCAST = ipaddress.IPv4Address("255.255.255.255")
 
 
 def _host_ip_literal(h: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
