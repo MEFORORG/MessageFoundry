@@ -26,9 +26,11 @@ through -- but the write fails for the same reason, so nothing is exposed. Both 
 together. The fold below closes the case exactly when git will answer, which is exactly when the write
 becomes possible.
 
-**THE FOLD IS ADDITIVE**: it makes more spellings resolve onto a governed root, so every verdict it
-changes moves ALLOW to DENY. It sits at the single shared comparison point, so rules 3, 3b, 3c and 3d
-inherit it together instead of drifting apart.
+**THE FOLD MOSTLY ADDS DENIES**: it makes more spellings resolve onto a governed root. Since BACKLOG
+#5454 it also resolves ``..`` behind the extended-length prefix, which moves one class from DENY to
+ALLOW -- a ``..`` that climbs out of a governed root, a false deny that git does not share.
+``Get-ComparablePath``'s docstring states it, and ``tests/test_worktree_gate_dos_device.py`` pins it. The
+fold sits at the shared comparison point, so a rule inherits it wherever that rule reaches it.
 """
 
 from __future__ import annotations

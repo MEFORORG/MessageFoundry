@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.17.10"
+$GateVersion = "2026.11.18.1"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -203,45 +203,63 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     THE ITEM FILES THE UNC SPELLING AND THAT IS THE CONDITIONAL ONE. The extended-length prefix needs no
     setup at all -- no share, no junction, no configuration -- which also answers the objection recorded
     on this rule that these spellings "need a SHELL command to set up" and are therefore out of reach.
-    The two device-prefix drive spellings do not.
+    The device-prefix spellings below do not either.
 
-    THE FOLD IS ADDITIVE: it makes MORE spellings resolve onto a governed root, so a verdict it changes
-    moves ALLOW to DENY. It runs at the shared comparison point, so a rule inherits it wherever that rule
-    reaches this function. A rule that refuses a token BEFORE comparing it does not: rule 3c's
-    Test-ShellLiteralPath refuses a `-C` value that is quoted or starts with two separators, so a quoted
+    THE DEVICE FOLD (BACKLOG #5454) maps each device spelling of a drive or UNC path onto that path:
+    `\\?\` and `\\.\` (and their `UNC\` forms), the NT-namespace `\??\`, and `\\?\GLOBALROOT\??\` or
+    `\\.\GLOBALROOT\??\`. Measured 2026-11-18: git exits 0 on `\\.\`, `\??\` and `\\.\GLOBALROOT\??\` in
+    front of a worktree and names its real common dir, with no setup, as it does for `\\?\`
+    (`\\?\GLOBALROOT\??\` gave rc=128 "Invalid argument"; it is folded anyway). The remainder is then
+    run through GetFullPath, so `.` and `..` segments, trailing dots and trailing spaces are normalised
+    the way git normalises them: `\\?\C:\<governed>.` and `\\?\C:\x\..\<governed>` both reach the
+    governed repo (git rc=0).
+
+    WHAT THE FOLD CHANGES, BOTH WAYS. Most changed verdicts move ALLOW to DENY. ONE CLASS MOVES DENY TO
+    ALLOW: a `\\?\` path whose `..` climbs OUT of a governed root, `\\?\C:\<governed>\..\elsewhere`. Before
+    the fold it compared lexically as `c:/<governed>/../elsewhere` and matched the root; git resolves it
+    to `c:/elsewhere`, and so does the fold. That was a false deny, not a governed path, and the plain
+    `C:\<governed>\..\elsewhere` spelling was already allowed.
+
+    It runs at the shared comparison point, so a rule inherits it wherever that rule reaches this
+    function. A rule that refuses a token BEFORE comparing it does not: rule 3c's Test-ShellLiteralPath
+    refuses a `-C` value that is quoted, holds a `?`, or starts with two separators, so a quoted
     `git -C '\\.\C:\<governed>' ...` never reaches this fold.
 
     WHAT IT STILL DOES NOT COVER, at least: a JUNCTION or other reparse point, because a lexical resolver
     cannot follow one; an admin share reaching this machine by a name not in the list above (an FQDN, a
-    second IP); a volume-GUID or GLOBALROOT device path (`\\.\Volume{<guid>}\`, `\\.\GLOBALROOT\??\C:\`);
-    and the NT-namespace prefix `\??\C:\`, which GetFullPath reads as root-relative. The code review of
-    BACKLOG #5454 (2026-11-18) reported git accepting each of the last three with rc=0.
+    second IP); and a device path that names a VOLUME rather than a drive letter
+    (`\\.\Volume{<guid>}\`, `\\?\GLOBALROOT\Device\HarddiskVolume<n>\`). Those keep their prefix, so they
+    still compare as a path under `//./` or `//?/`. The code review of BACKLOG #5454 (2026-11-18) reported
+    git accepting the volume-GUID spelling with rc=0.
     #>
+    # The NT-namespace prefix is mapped on BOTH raw inputs, onto `\\?\`. GetFullPath keeps `\??\` verbatim
+    # but reads `/??/` as root-relative (`/??/C:/x` comes back as `<cwd-drive>:\??\C:\x`), and git accepts
+    # both (rc=0, measured 2026-11-18). The base matters too: rule 3c resolves git's relative `.git`
+    # against the `-C` value it asked about.
+    if ($Path -match '^[\\/]\?\?[\\/]') { $Path = '\\?\' + $Path.Substring(4) }
+    if ($Base -match '^[\\/]\?\?[\\/]') { $Base = '\\?\' + $Base.Substring(4) }
     $full = Get-FullPathRaw $Path $Base
     if (-not $full) { return "" }
-    $cmp = ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
 
-    # ORDER MATTERS: the extended-UNC form carries BOTH prefixes, so the `//?/unc/` case must reduce to a
-    # plain UNC path before the admin-share fold below can see it.
+    # GetFullPath keeps a device prefix. It returns a `\\?\` path VERBATIM, and it normalises a `\\.\`
+    # path with `\\.\` (or `\\.\<device>\`) as the root, so neither comes back in drive-letter form. Take
+    # the remainder of a DRIVE or UNC device path and resolve it as an ordinary path. ORDER MATTERS: the
+    # UNC result must exist before the admin-share fold below can see it.
     #
-    # THE DOS-DEVICE PREFIX `\\.\` FOLDS THE SAME WAY (BACKLOG #5454). GetFullPath returns it unchanged,
-    # and git accepts it: measured 2026-11-18, `git -C '\\.\D:\<worktree>' rev-parse --git-common-dir`
-    # exits 0 and names the real common dir. So `\\.\C:\<governed>` reaches a governed root with no setup,
-    # exactly as `\\?\C:\` does. `\\.\UNC\localhost\C$\<governed>` is the conditional UNC case, the same
-    # as `\\localhost\C$` in the table above (rc=128 "dubious ownership", measured 2026-11-18).
-    #
-    # The `\\.\` strip is held to a DRIVE-LETTER device. Any other device (`\\.\pipe\x`) keeps its prefix,
-    # so it never reads as a relative path and no rule's leading-slash match stops seeing it.
-    $prefixed = $cmp -match '^//[?.]/'
-    $cmp = $cmp -replace '^//[?.]/unc/', '//'
-    $cmp = $cmp -replace '^//\?/', ''
-    $cmp = $cmp -replace '^//\./(?=[a-z]:(/|$))', ''
-    # GetFullPath returns a `\\?\` path VERBATIM, `.` and `..` segments included, so `\\?\C:\x\..\<governed>`
-    # compared as `c:/x/../<governed>` (git accepts it, rc=0). Once the prefix is gone, resolve the rest.
-    # IsPathFullyQualified keeps this off a POSIX host, where `c:/x` is a relative path.
-    if ($prefixed -and $cmp -match '(^|/)\.\.?(/|$)' -and [System.IO.Path]::IsPathFullyQualified($cmp)) {
-        $cmp = ([System.IO.Path]::GetFullPath($cmp) -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
+    # A device that is not a drive or UNC path (`\\.\pipe\x`, `\\?\Volume{<guid>}\x`) keeps its prefix, so
+    # it never reads as a relative path. IsPathFullyQualified keeps the resolution off a POSIX host, where
+    # `C:\x` is a relative path; a POSIX GetFullPath never returns a leading `\\` anyway.
+    if ($full -match '^[\\/]{2}[?.][\\/](?:GLOBALROOT[\\/]\?\?[\\/])?(?<rest>.*)$') {
+        $rest = $Matches['rest']
+        $local = $null
+        if ($rest -match '^UNC(?:[\\/](?<unc>.*))?$') { $local = '\\' + $Matches['unc'] }
+        elseif ($rest -match '^[a-z]:$') { $local = $rest + '\' }
+        elseif ($rest -match '^[a-z]:[\\/]') { $local = $rest }
+        if ($local -and [System.IO.Path]::IsPathFullyQualified($local)) {
+            try { $full = [System.IO.Path]::GetFullPath($local) } catch { $full = $local }
+        }
     }
+    $cmp = ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
     if ($cmp -match '^//([^/]+)/([a-z])\$(?=/|$)') {
         if ($script:LocalHostSpellings -contains $Matches[1]) {
             $cmp = $Matches[2] + ':' + $cmp.Substring($Matches[0].Length)
