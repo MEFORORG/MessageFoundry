@@ -985,11 +985,15 @@ class BackupRunner:
             except sqlite3.Error as exc:
                 # A SQLite fault the verify judged not to be the archive's (`_check_snapshot`):
                 # like the staging refusal, not a verdict on it, so the same handling.
-                raise BackupError(
-                    "write",
+                message = (
                     f"archive written but not verified, left at {staging_path.name}: "
-                    f"{_sqlite_error_reason(exc)}",
-                ) from exc
+                    f"{_sqlite_error_reason(exc)}"
+                )
+                # A verify staging directory its teardown could not clear rides on the exception
+                # as a note. It may hold decrypted bytes, so it leads, as `_do_backup` puts it.
+                for note in reversed(getattr(exc, "__notes__", None) or []):
+                    message = join_before_checks(str(note), "; ", message)
+                raise BackupError("write", message) from exc
             if not verify.ok:
                 # A verify FAIL means the archive is unusable, so it never earns the canonical name
                 # (AC-6). Skipping only THIS run's prune — what this path used to do — does not
@@ -4215,19 +4219,15 @@ def _verify_in_staging(
     # (3) integrity_check (the fuller PRAGMA integrity_check, off the hot path).
     # A store.db that will not read is a FAIL here, not an escaping sqlite3 error (`_check_snapshot`).
     check = _check_snapshot(snap)
-    integrity_ok, integrity_msg, row_counts = (
-        check.integrity_ok,
-        check.integrity_msg,
-        check.row_counts,
-    )
+    row_counts = check.row_counts
     manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
-    if not integrity_ok:
+    if not check.integrity_ok:
         return VerifyResult(
             "FAIL",
             integrity_ok=False,
             row_counts=row_counts,
             manifest_counts=manifest_counts,
-            reason=f"integrity_check failed: {integrity_msg}",
+            reason=f"integrity_check failed: {check.integrity_msg}",
         )
     if check.count_error is not None:
         # integrity_check passed, so the result says so; it is the count that failed.
@@ -4438,9 +4438,14 @@ def _integrity_check(db_path: Path) -> tuple[bool, str]:
 
 
 #: SQLite primary result codes that are a verdict on the snapshot's own bytes: a file that is not a
-#: database, or a corrupt one. Every other code is the volume's, the process's or this code's, so a
-#: read that fails with one says nothing about the archive and is never turned into a verdict on it.
-_SNAPSHOT_FAULT_CODES = frozenset({sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT})
+#: database, a corrupt one, or a schema this engine cannot read. ``SQLITE_ERROR`` is in the list
+#: because the reads here run fixed SQL on a read-only file, so what raises it is the file's schema:
+#: an unsupported file format, a collation or virtual-table module nobody registered, or a malformed
+#: schema row. Every other code is the volume's, the process's or this code's, so a read that fails
+#: with one says nothing about the archive and is never turned into a verdict on it.
+_SNAPSHOT_FAULT_CODES = frozenset(
+    {sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_ERROR}
+)
 
 #: The text of the decode error the sqlite3 module raises for a TEXT value that is not UTF-8. It is a
 #: Python-side error, so it carries no result code, and it is the snapshot's bytes.
@@ -4449,9 +4454,9 @@ _DECODE_ERROR_PREFIX = "Could not decode to UTF-8"
 
 def _is_snapshot_fault(exc: sqlite3.Error) -> bool:
     """Whether a read of a snapshot failed because of the snapshot's own bytes: a file that is not a
-    database, a corrupt one, or text that does not decode. An allowlist, so a code nobody listed is
-    a volume or engine fault and cannot quarantine a good archive. A ``ProgrammingError`` is this
-    code's fault, not the file's."""
+    database, a corrupt one, a schema it cannot read, or text that does not decode. An allowlist
+    (:data:`_SNAPSHOT_FAULT_CODES`), so a code nobody listed is a volume or engine fault and cannot
+    quarantine a good archive. A ``ProgrammingError`` is this code's fault, not the file's."""
     if not isinstance(exc, sqlite3.DatabaseError) or isinstance(exc, sqlite3.ProgrammingError):
         return False
     code = getattr(exc, "sqlite_errorcode", None)
@@ -4473,27 +4478,40 @@ class _SnapshotCheck(NamedTuple):
     count_error: str | None = None
 
 
+#: The reason for a ``UnicodeDecodeError`` from a snapshot read. CPython raises one, not a
+#: ``sqlite3.Error``, when SQLite's own error message quotes schema bytes that are not UTF-8; the
+#: bytes are the file's, so the reason quotes none of them.
+_UNDECODABLE_SCHEMA = "UnicodeDecodeError: its schema holds text that is not UTF-8"
+
+
 def _check_snapshot(snap: Path) -> _SnapshotCheck:
     """:func:`_integrity_check` then :func:`_count_tables` on a snapshot. A snapshot whose bytes
-    cannot be read fails the check rather than raising (:func:`_is_snapshot_fault`); the counts are
-    empty when they could not be taken. A failed ``integrity_check`` stays the verdict whatever the
-    count then raises. Any other SQLite error still raises."""
+    cannot be read fails the check rather than raising (:func:`_is_snapshot_fault`, and a schema
+    that does not decode); the counts are empty when they could not be taken. A failed
+    ``integrity_check`` stays the verdict whatever the count then raises, and the count's error is
+    logged. Any other SQLite error still raises."""
     try:
         ok, msg = _integrity_check(snap)
+    except UnicodeDecodeError:
+        return _SnapshotCheck(False, f"the file could not be read: {_UNDECODABLE_SCHEMA}", {})
     except sqlite3.Error as exc:
         if not _is_snapshot_fault(exc):
             raise
         return _SnapshotCheck(False, f"the file could not be read: {_sqlite_error_reason(exc)}", {})
     try:
         return _SnapshotCheck(ok, msg, _count_tables(snap))
-    except sqlite3.Error as exc:
-        if not ok:
-            return _SnapshotCheck(False, msg, {})
-        if not _is_snapshot_fault(exc):
-            raise
-        return _SnapshotCheck(
-            True, msg, {}, f"its tables could not be counted: {_sqlite_error_reason(exc)}"
+    except (sqlite3.Error, UnicodeDecodeError) as exc:
+        reason = (
+            _sqlite_error_reason(exc) if isinstance(exc, sqlite3.Error) else _UNDECODABLE_SCHEMA
         )
+        if not ok:
+            # integrity_check already judged the file, so that verdict stands; the count's error
+            # goes to the log rather than nowhere.
+            log.warning("snapshot row count failed after a failed integrity_check: %s", reason)
+            return _SnapshotCheck(False, msg, {})
+        if isinstance(exc, sqlite3.Error) and not _is_snapshot_fault(exc):
+            raise
+        return _SnapshotCheck(True, msg, {}, f"its tables could not be counted: {reason}")
 
 
 def _full_open_check(

@@ -183,6 +183,12 @@ def test_restore_reports_a_store_member_that_is_not_a_database_as_a_verify_error
     [
         (_coded(sqlite3.DatabaseError, "file is not a database", sqlite3.SQLITE_NOTADB), True),
         (_coded(sqlite3.DatabaseError, "malformed", sqlite3.SQLITE_CORRUPT), True),
+        # The file's schema: an unsupported format, an unknown collation (an extended code).
+        (_coded(sqlite3.OperationalError, "unsupported file format", sqlite3.SQLITE_ERROR), True),
+        (
+            _coded(sqlite3.OperationalError, "no such collation", sqlite3.SQLITE_ERROR | 1 << 8),
+            True,
+        ),
         # An extended code is read by its primary family (SQLITE_CORRUPT_VTAB = CORRUPT | 1 << 8).
         (_coded(sqlite3.DatabaseError, "vtab", sqlite3.SQLITE_CORRUPT | (1 << 8)), True),
         (sqlite3.OperationalError("Could not decode to UTF-8 column 'name'"), True),
@@ -254,7 +260,13 @@ async def test_a_volume_fault_in_a_backups_verify_fails_the_run_naming_the_archi
 ) -> None:
     """The verify re-raises the fault; the run turns it into its typed error naming the `.part`
     archive it left unpublished, as it does a staging refusal."""
-    monkeypatch.setattr(dr_backup, "_verify_archive_blocking", lambda **_kw: _io_error())
+
+    def _faulted_verify(**_kw: object) -> object:
+        exc = _coded(sqlite3.OperationalError, "disk I/O error", sqlite3.SQLITE_IOERR)
+        exc.add_note("staging directory mefor-verify-x could not be removed")
+        raise exc
+
+    monkeypatch.setattr(dr_backup, "_verify_archive_blocking", _faulted_verify)
     runner = BackupRunner(
         cast(Any, None),
         BackupSettings(enabled=True, destination=str(tmp_path / "dest"), verify_after_backup=True),
@@ -273,4 +285,65 @@ async def test_a_volume_fault_in_a_backups_verify_fails_the_run_naming_the_archi
     assert caught.value.kind == "write"
     assert "left at a.mfbak.part" in str(caught.value)
     assert "disk I/O error" in str(caught.value)
+    # The directory the verify's teardown left, which may hold decrypted bytes, leads the message.
+    assert str(caught.value).startswith("staging directory mefor-verify-x could not be removed; ")
     assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+
+
+def _schema_format_5(tmp_path: Path) -> bytes:
+    """A real store.db whose header names a schema format SQLite does not support (offset 44)."""
+    db = tmp_path / "format5.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE messages (id INTEGER)")
+    conn.commit()
+    conn.close()
+    data = bytearray(db.read_bytes())
+    data[44:48] = (5).to_bytes(4, "big")
+    return bytes(data)
+
+
+def _undecodable_schema(tmp_path: Path) -> bytes:
+    """A real store.db with a schema row whose name is not UTF-8, so SQLite's own error message
+    quotes bytes CPython cannot decode."""
+    db = tmp_path / "badname.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE messages (id INTEGER)")
+    conn.commit()
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute(
+        "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql) VALUES ('table', "
+        "CAST(x'ff41' AS TEXT), CAST(x'ff41' AS TEXT), 0, "
+        "CAST(x'435245415445205441424c45202241ff22202861293b' AS TEXT))"
+    )
+    conn.commit()
+    conn.close()
+    return db.read_bytes()
+
+
+@pytest.mark.parametrize("standalone", [False, True], ids=["backup-staging", "standalone"])
+@pytest.mark.parametrize("build", [_schema_format_5, _undecodable_schema], ids=["format", "decode"])
+def test_a_real_schema_the_engine_cannot_read_is_a_fail_on_the_archive(
+    tmp_path: Path, standalone: bool, build: Any
+) -> None:
+    archive = _plaintext_archive(tmp_path / "bad.mfbak", build(tmp_path))
+    result = _verify(archive, tmp_path, standalone=standalone)
+    assert result.status == "FAIL"
+    assert result.integrity_ok is False
+    assert result.reason is not None
+    assert result.reason.startswith("integrity_check failed: the file could not be read: ")
+    assert "not a fault in the archive" not in result.reason
+
+
+def test_restore_reports_a_schema_that_will_not_decode_as_a_verify_error(tmp_path: Path) -> None:
+    archive = _plaintext_archive(tmp_path / "bad.mfbak", _undecodable_schema(tmp_path))
+    dest = tmp_path / "restored" / "store.db"
+    with pytest.raises(BackupError) as caught:
+        dr_backup._restore_blocking(
+            archive_path=archive,
+            dest_store_path=dest,
+            config_dest=None,
+            keys=[],
+            max_age_seconds=None,
+        )
+    assert caught.value.kind == "verify"
+    assert not dest.exists()
