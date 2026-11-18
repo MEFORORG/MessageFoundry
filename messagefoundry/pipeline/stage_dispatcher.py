@@ -224,10 +224,16 @@ class LaneItemResult:
     ``reschedule_claimed`` (the ADR 0070 fix A machinery-fault primitive, which ADR 0189's delivery
     halt gate reuses) undoes the claim's ``attempts`` increment and spends none. The dispatcher reads
     ``retry_until`` only as a park deadline and cannot tell them apart, so a body may return either —
-    but a caller reasoning about the poison ceiling must ask which one ran."""
+    but a caller reasoning about the poison ceiling must ask which one ran.
+
+    ``hand_back`` marks a RETRY that hands back a head the lane never ran, because a claim gate shut
+    after the claim (the #122 log-write halt, BACKLOG #5704). It is neither a fault nor a sign the
+    lane is healthy, so at a zero-progress head it leaves the infra-fault streak and the
+    ``lane_stuck`` latch as they were rather than resetting them."""
 
     kind: LaneResultKind
     retry_until: float | None = None
+    hand_back: bool = False
 
     def __post_init__(self) -> None:
         # retry_until is meaningful iff RETRY (the park deadline). Guard the contract so a mis-built
@@ -364,6 +370,8 @@ class _LaneOutcome:
     # (i > 0): the prefix made forward progress (>=1 item RESOLVED) before the fault, so this is NOT a
     # head-of-line-blocked zero-progress fault — it resets the streak rather than accruing it.
     made_progress: bool = False
+    # LaneItemResult.hand_back, carried to _apply_retry (BACKLOG #5704).
+    hand_back: bool = False
 
 
 # Timer scheduler seam (injectable for deterministic tests). Mirrors loop.call_later's shape.
@@ -1628,7 +1636,8 @@ class StageDispatcher:
         **no** store write since fix A already re-pended the head PENDING); under ``retry_forever`` it
         never STOPs (throttled ``lane_stuck`` alert past the horizon). Every OTHER RETRY — a
         forward-progress (``i>0``) infra fault or a content (non-infra) body RETRY — **resets** the
-        streak and parks normally."""
+        streak and parks normally, except a zero-progress hand-back (``LaneItemResult.hand_back``),
+        which leaves it as it was."""
         if outcome.is_infra_fault and not outcome.made_progress:
             # Zero-progress head-of-line-blocked machinery fault: the escalation-less spin case.
             st.infra_error_streak += 1
@@ -1651,8 +1660,10 @@ class StageDispatcher:
             self._park(lane, st, outcome.park_until)  # T15 — retry the head at capped backoff
         else:
             # Forward-progress infra fault (i>0) OR a content (non-infra) body RETRY: reset the streak.
-            st.infra_error_streak = 0
-            st.lane_stuck_alerted = False
+            # A zero-progress hand-back ran nothing, so it says nothing about the lane's health.
+            if not (outcome.hand_back and not outcome.made_progress):
+                st.infra_error_streak = 0
+                st.lane_stuck_alerted = False
             self._park(lane, st, outcome.park_until)  # T15
 
     def _maybe_lane_stuck_alert(self, lane: str, st: _LaneState) -> None:
@@ -1859,7 +1870,10 @@ class StageDispatcher:
                 if result.kind is LaneResultKind.RETRY:
                     return (
                         _LaneOutcome(
-                            LaneResultKind.RETRY, result.retry_until, made_progress=made_progress
+                            LaneResultKind.RETRY,
+                            result.retry_until,
+                            made_progress=made_progress,
+                            hand_back=result.hand_back,
                         ),
                         tail,
                         None,  # the body already re-pended the head itself; no reschedule here
