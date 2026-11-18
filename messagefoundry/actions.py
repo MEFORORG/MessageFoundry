@@ -35,9 +35,10 @@ from datetime import datetime, timedelta
 from typing import Literal
 
 from messagefoundry.parsing import _builtin_hl7
+from messagefoundry.parsing._builtin_hl7 import _HEX_ESCAPED_CONTROLS
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import parse_path
-from messagefoundry.timezone import _offset_to_timedelta, parse_hl7_timestamp
+from messagefoundry.timezone import _TIME_PRECISIONS, _offset_to_timedelta, parse_hl7_timestamp
 
 __all__ = [
     "copy_field",
@@ -63,9 +64,29 @@ _UNSET: object = object()
 
 def _writer(msg: Message, src: str) -> Callable[[str, str], None]:
     """The write for a value read from ``src``: :meth:`Message.set_data` when ``src`` is a component
-    or subcomponent, whose read is decoded (ADR 0206 rule 1), otherwise :meth:`Message.set`, which
-    takes a whole field's raw text as the structure it already is."""
-    return msg.set_data if parse_path(src)[2] is not None else msg.set
+    or subcomponent, whose read is decoded (ADR 0206 rule 1). A whole field's read is raw text: it
+    goes into a whole-field destination through :meth:`Message.set`, as the structure it already
+    is. A component write would escape it, escape sequences included, a second time (BACKLOG
+    #5821), so a component or subcomponent destination gets it as one leaf's raw text instead
+    (:func:`_as_one_leaf`), spliced into the field. Either way, a
+    component or subcomponent of field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` is refused."""
+    from_leaf = parse_path(src)[2] is not None
+
+    def write(dst: str, value: str) -> None:
+        seg, fld, comp, sub = parse_path(dst)
+        if comp is not None:
+            _refuse_delimiter_field(seg, fld, dst)
+        if from_leaf:
+            msg.set_data(dst, value)
+        elif comp is None:
+            msg.set(dst, value)
+        else:
+            seps = _seps(msg)
+            whole = _whole_field(dst)
+            leaf = _as_one_leaf(value, seps)
+            msg.set(whole, _splice_part(msg.field(whole) or "", comp, sub, leaf, seps))
+
+    return write
 
 
 def copy_field(msg: Message, src: str, dst: str) -> None:
@@ -74,7 +95,14 @@ def copy_field(msg: Message, src: str, dst: str) -> None:
     An absent/empty ``src`` copies an empty value (clearing ``dst``). A component or subcomponent
     ``src`` is read decoded, so it is written as data at every ``dst`` level, a whole field included:
     a value carrying a ``^``, ``~`` or ``&`` rides across as data, not new structure (ADR 0206). A
-    whole-field ``src`` is raw text, structure and all, and is copied as it is."""
+    whole-field ``src`` is raw text, structure and all, and is copied as it is into a whole-field
+    ``dst``. Into a component or subcomponent ``dst`` it is written as one leaf that reads back as
+    the field's leaves, each decoded, joined by its separators read as data: a field sent as
+    ``O\\S\\Brien`` reads back as ``O^Brien``, not as its escape sequence, and one sent as ``A^B``
+    reads back as ``A^B``. An escape sequence holding a raw control character that decodes to a CR
+    or LF, which no component carries, reads back as sent instead. A component or subcomponent
+    ``dst`` in field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` raises :class:`ValueError`, whatever
+    ``src`` is."""
     _writer(msg, src)(dst, msg.field(src) or "")
 
 
@@ -86,8 +114,24 @@ def set_field(msg: Message, path: str, value: str) -> None:
 def append_to_field(msg: Message, path: str, suffix: str) -> None:
     """Append ``suffix`` to the current value at ``path`` (Corepoint ``ItemAppend``).
 
-    An absent field is treated as empty, so the result is just ``suffix``."""
-    msg.set(path, (msg.field(path) or "") + suffix)
+    An absent field is treated as empty, so the result is just ``suffix``. On a component or
+    subcomponent path ``suffix`` is written as data after the value's last leaf, and the value's
+    escape sequences are kept as sent rather than decoded and written back (BACKLOG #5928). On a
+    whole-field path ``suffix`` is appended to the raw text, as the structure a whole-field
+    :meth:`Message.set` takes. A component or subcomponent path raises :class:`ValueError` on field
+    1 or 2 of ``MSH``, ``BHS`` or ``FHS``."""
+    seg, fld, comp, _sub = parse_path(path)
+    if comp is not None:
+        _refuse_delimiter_field(seg, fld, path)
+    current = msg.field(path)
+    if current is not None and not suffix:
+        return
+    if current is None or comp is None:
+        msg.set(path, (current or "") + suffix)
+        return
+    _edit_value(
+        msg, path, lambda value, seps: _append_after_last_leaf(value, suffix, seps), scope="value"
+    )
 
 
 def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title"]) -> None:
@@ -105,7 +149,7 @@ def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title
     if mode not in tuple(_CASE_CONVERTERS):
         raise ValueError(f"convert_case mode must be 'upper', 'lower', or 'title', got {mode!r}")
     convert = _CASE_CONVERTERS[mode]
-    _edit_value(msg, path, lambda raw, seps: _case_leaf(raw, convert, seps), whole_value=False)
+    _edit_value(msg, path, lambda raw, seps: _case_leaf(raw, convert, seps), scope="leaves")
 
 
 # Each converter also takes whether the decoded character before the run is cased. Only title case
@@ -144,7 +188,9 @@ def split_field(msg: Message, src: str, sep: str, dests: Sequence[str]) -> None:
     Positional: piece *i* goes to ``dests[i]``. Fewer pieces than destinations clears the trailing
     ``dests`` (written empty); extra pieces beyond ``dests`` are dropped. An absent ``src`` clears every
     destination. Pieces of a component or subcomponent ``src`` are decoded data, so each is written as
-    data at every destination level, as :func:`copy_field` does (ADR 0206)."""
+    data at every destination level, as :func:`copy_field` does (ADR 0206). A whole-field ``src`` is
+    split as raw text, and each piece is written as :func:`copy_field` writes a whole-field
+    ``src``."""
     write = _writer(msg, src)
     parts = (msg.field(src) or "").split(sep)
     for i, dest in enumerate(dests):
@@ -177,11 +223,19 @@ def code_lookup(
 def trim_field(msg: Message, path: str) -> None:
     """Strip leading/trailing whitespace from the value at ``path`` (Corepoint ``ItemConvert`` trim).
 
-    A no-op on an absent field; the trimmed value re-encodes structurally."""
-    value = msg.field(path)
-    if value is None:
+    Whitespace is read from the **decoded** value, at the start of its first leaf and the end of its
+    last, so a whole-field or component path keeps its structure. An escape sequence wholly inside
+    the stripped whitespace, such as a trailing ``\\.br\\``, goes with it, and one the strip cuts,
+    such as a leading ``\\X2041\\`` (a space and an ``A``), is written as the data it keeps, or kept
+    whole, as sent, when that data holds a CR or LF. Every
+    other escape is kept as sent rather than decoded and written back (BACKLOG #5928), and one that
+    decodes to nothing, such as ``\\.fi\\``, is kept wherever it sits unless the leaf is left empty.
+    A no-op where a read of ``path`` returns ``None``, as it does for field 1 or 2 of an absent
+    ``BHS`` or ``FHS``. Otherwise raises :class:`ValueError` on field 1 or 2 of ``MSH``, ``BHS`` or
+    ``FHS``."""
+    if msg.field(path) is None:
         return
-    msg.set(path, value.strip())
+    _edit_value(msg, path, _trim_value, scope="value")
 
 
 def substring_field(msg: Message, path: str, start: int, end: int | None = None) -> None:
@@ -204,9 +258,9 @@ def substring_field(msg: Message, path: str, start: int, end: int | None = None)
         # nothing is left for it to apply to.
         if lo == hi:
             return ""
-        return leaf.zero_width(0, lo) + leaf.span(lo, hi) + leaf.zero_width(hi, leaf.total + 1)
+        return leaf.keep(lo, hi)
 
-    _edit_value(msg, path, cut, whole_value=True)
+    _edit_value(msg, path, cut, scope="leaf")
 
 
 def pad_field(
@@ -234,11 +288,11 @@ def pad_field(
         if not padding:
             return raw
         # Rebuilt rather than ``raw``, so an unclosed trailing escape cannot pair with the filler.
-        body = leaf.span(0, leaf.total) + leaf.zero_width(leaf.total, leaf.total + 1)
+        body = leaf.keep(0, leaf.total)
         filler = _escape_data(padding, seps)
         return filler + body if side == "left" else body + filler
 
-    _edit_value(msg, path, pad, whole_value=True)
+    _edit_value(msg, path, pad, scope="leaf")
 
 
 def replace_literal(msg: Message, path: str, old: str, new: str) -> None:
@@ -259,7 +313,7 @@ def replace_literal(msg: Message, path: str, old: str, new: str) -> None:
     such as ``\\.sp2\\`` so that a bare CR or LF would remain. An escape that decodes to nothing,
     such as ``\\.fi\\``, is kept even inside a match, just before ``new``, unless the leaf is left
     empty."""
-    _edit_value(msg, path, lambda raw, seps: _replace_leaf(raw, old, new, seps), whole_value=False)
+    _edit_value(msg, path, lambda raw, seps: _replace_leaf(raw, old, new, seps), scope="leaves")
 
 
 def arith_field(
@@ -319,12 +373,17 @@ def date_diff_field(
 
     A whole-field path reads the field's **first component**, so a composite ``TS`` such as
     ``20260101120000^S`` (HL7 v2.3's time plus degree of precision) reads as its time; when that
-    component is empty the whole field is read, as :meth:`Message.age` does, so ``^D`` or
-    ``~20270101`` raises as an unparseable timestamp. A whole field raises :class:`ValueError` when
-    it holds more than one repetition, or anything in component 2 but the degree-of-precision code
-    of its own time (``20260101120000^D`` and a range ``20260101^20260201`` both raise), and a
-    component path raises when the field has a second repetition: a timestamp field holds one
-    value.
+    component is empty its whole first repetition is read, as :meth:`Message.age` reads the whole
+    field, so ``^D`` raises as an unparseable timestamp. A degree-of-precision code coarser than the time is
+    the precision the time holds, so ``198807050000^D`` is read as the date ``19880705``; a
+    component path reads only the component it names, with no code. A whole field raises
+    :class:`ValueError` when component 2 holds anything but a degree-of-precision code no finer than
+    its time, or a later component is not empty (``20260101^S`` and a range ``20260101^20260201``
+    both raise); trailing empty components are ignored. Once both fields are present, either path
+    raises when its field holds more than one repetition, ignoring trailing ones that hold nothing
+    but component or subcomponent separators, so
+    ``~20270101`` and ``20260101~~20270101`` raise and ``20260101~`` reads as ``20260101``: a
+    timestamp field holds one value.
 
     Every ``±HHMM`` offset present is validated. ``"years"`` counts on each stamp's own stated date,
     as an age does (a birthday is a local date), offsets or not. ``"days"``, ``"hours"`` and
@@ -349,14 +408,22 @@ def date_diff_field(
         raise ValueError(
             f"date_diff_field unit must be 'days', 'years', 'hours', or 'minutes', got {unit!r}"
         )
+    fields = {path: msg.repetitions(_whole_field(path)) for path in (start_path, end_path)}
+    if not all(fields.values()):
+        return
+    for path, reps in fields.items():
+        if _held_repetitions(reps, _seps(msg)) > 1:
+            raise ValueError(
+                f"date_diff_field: {_whole_field(path)} repeats; a timestamp field holds one value"
+            )
     start_raw = _timestamp_value(msg, start_path)
     end_raw = _timestamp_value(msg, end_path)
     if not start_raw or not end_raw:
         return
     start_dt, start_prec, start_off = parse_hl7_timestamp(start_raw)
     end_dt, end_prec, end_off = parse_hl7_timestamp(end_raw)
-    _check_ts_field(msg, start_path, start_prec)
-    _check_ts_field(msg, end_path, end_prec)
+    start_dt, start_prec = _check_ts_field(msg, start_path, start_dt, start_prec)
+    end_dt, end_prec = _check_ts_field(msg, end_path, end_dt, end_prec)
     start_shift = None if start_off is None else _offset_shift(start_off)
     end_shift = None if end_off is None else _offset_shift(end_off)
     both_dates = start_prec not in _TIME_PRECISIONS and end_prec not in _TIME_PRECISIONS
@@ -391,10 +458,6 @@ def date_diff_field(
     msg.set(dst, str(sign * interval))
 
 
-#: The :func:`parse_hl7_timestamp` precision tokens of a stamp that carries a time of day.
-_TIME_PRECISIONS = ("hour", "minute", "second")
-
-
 def _offset_shift(offset: str) -> timedelta:
     """An HL7 ``±HHMM`` offset as a :class:`timedelta`, refusing minutes of 60 or more (the shared
     parser's rule) and a magnitude of a day or more, which no zone has."""
@@ -404,13 +467,28 @@ def _offset_shift(offset: str) -> timedelta:
     return shift
 
 
+def _whole_field(path: str) -> str:
+    seg, fld, _comp, _sub = parse_path(path)
+    return f"{seg}-{fld}"
+
+
+def _held_repetitions(reps: list[str | None], seps: _Seps) -> int:
+    """How many repetitions count, ignoring trailing ones that hold nothing but separators."""
+    empty = seps[1] + seps[3]
+    count = len(reps)
+    while count and not (reps[count - 1] or "").strip(empty):
+        count -= 1
+    return count
+
+
 def _timestamp_value(msg: Message, path: str) -> str | None:
     """The timestamp text at ``path``: a component path as read; a whole field's first component,
     so a composite ``TS`` (``time^degree-of-precision``) parses rather than being refused whole,
-    falling back to the whole field when that is empty, as :meth:`Message.age` does."""
+    falling back to the first repetition's whole text when that is empty, as :meth:`Message.age`
+    falls back to the whole field."""
     if parse_path(path)[2] is not None:
         return msg.field(path)
-    return msg.field(f"{path}.1") or msg.field(path)
+    return msg.field(f"{path}.1") or msg.field(path, repetition=1)
 
 
 #: HL7 v2.3 ``TS`` degree-of-precision codes (component 2), as :func:`parse_hl7_timestamp`'s tokens.
@@ -423,42 +501,57 @@ _DEGREE_OF_PRECISION = {
     "S": "second",
 }
 
+#: :func:`parse_hl7_timestamp`'s precision tokens, coarsest first.
+_PRECISIONS = tuple(_DEGREE_OF_PRECISION.values())
 
-def _check_ts_field(msg: Message, path: str, precision: str) -> None:
-    """Raise unless the field ``path`` addresses holds one timestamp, rather than silently reading a
-    part of it. A whole field may hold only one repetition (main refused any repetition separator
-    there, as unparseable), and only its time plus, in component 2, the degree-of-precision code
-    of that time's own precision: a range (``start^end``) or a code that disagrees with the stamp
-    (``20260101120000^D``) raises. A component path is refused when the field has a second
-    repetition."""
-    seg, fld, comp, _sub = parse_path(path)
-    field = f"{seg}-{fld}"
-    repeats = (
-        len(msg.repetitions(field)) > 1
-        if comp is None
-        else msg.field(field, repetition=2) is not None
+
+def _check_ts_field(
+    msg: Message, path: str, stamp_dt: datetime, precision: str
+) -> tuple[datetime, str]:
+    """Raise unless the whole field ``path`` addresses holds one timestamp, rather than silently
+    reading a part of it, and return the stamp and its precision as the field's degree-of-precision
+    code states them. The caller has refused a second repetition already.
+
+    A whole field may hold only its time plus, in component 2, a degree-of-precision code, with any
+    trailing empty components dropped (``20260101^`` reads as ``20260101``, BACKLOG #5822). A range
+    (``start^end``) raises, and so does a code finer than the stamp (``20260101^S``). A code
+    coarser than the stamp is the precision HL7 v2.3 says the stamp holds, so ``198807050000^D`` is
+    read as the date ``19880705``. A component path is returned as it is."""
+    if parse_path(path)[2] is not None:
+        return stamp_dt, precision
+    # The raw text must be exactly the time, or the time, one separator and the code: nothing in a
+    # later component, and no escape sequence, which decoding would otherwise hide (main parsed the
+    # raw field, so it refused both).
+    raw = (msg.field(path, repetition=1) or "").rstrip(_seps(msg)[1])
+    stamp = msg.field(f"{path}.1") or ""
+    degree = msg.field(f"{path}.2")
+    exact = (
+        raw == stamp
+        if degree is None
+        else len(raw) == len(stamp) + 1 + len(degree)
+        and raw.startswith(stamp)
+        and raw.endswith(degree)
     )
-    if repeats:
-        raise ValueError(f"date_diff_field: {field} repeats; a timestamp field holds one value")
-    if comp is None:
-        # The raw field must be exactly the time, or the time, one separator and the code: nothing in
-        # a later component, and no escape sequence, which decoding would otherwise hide (main
-        # parsed the raw field, so it refused both).
-        raw = msg.field(path) or ""
-        stamp = msg.field(f"{path}.1") or ""
-        degree = msg.field(f"{path}.2")
-        exact = (
-            raw == stamp
-            if degree is None
-            else len(raw) == len(stamp) + 1 + len(degree)
-            and raw.startswith(stamp)
-            and raw.endswith(degree)
+    stated = precision if degree is None else _DEGREE_OF_PRECISION.get(degree)
+    if not exact or stated is None or _PRECISIONS.index(stated) > _PRECISIONS.index(precision):
+        raise ValueError(
+            f"date_diff_field: {path} holds more than a timestamp and a degree of precision no "
+            "finer than its time"
         )
-        if not exact or (degree is not None and _DEGREE_OF_PRECISION.get(degree) != precision):
-            raise ValueError(
-                f"date_diff_field: {path} holds more than a timestamp and the degree of precision "
-                "of its time"
-            )
+    if stated == precision:
+        return stamp_dt, precision
+    # Keep the stated fields and reset the rest to their floor, as parse_hl7_timestamp fills them.
+    keep = _PRECISIONS.index(stated)
+    return (
+        datetime(
+            stamp_dt.year,
+            stamp_dt.month if keep >= 1 else 1,
+            stamp_dt.day if keep >= 2 else 1,
+            stamp_dt.hour if keep >= 3 else 0,
+            stamp_dt.minute if keep >= 4 else 0,
+        ),
+        stated,
+    )
 
 
 def copy_segment(
@@ -512,8 +605,6 @@ def _segment_line(msg: Message, segment_id: str, occurrence: int) -> str | None:
 # field's raw text, which Message.set takes as the structure it already is.
 
 #: Separators in the ``_builtin_hl7`` order, ``(field, component, repetition, subcomponent, escape)``.
-#: ``Message._encoding_chars`` puts the escape before the subcomponent separator; :func:`_seps` swaps
-#: them.
 _Seps = tuple[str, str, str, str, str]
 
 #: One piece of a leaf: its raw text, what it decodes to, and its kind. ``"lit"`` is literal text
@@ -523,22 +614,78 @@ _Unit = tuple[str, str, Literal["lit", "esc", "open"]]
 
 
 def _seps(msg: Message) -> _Seps:
-    field_sep, comp_sep, rep_sep, esc, sub_sep = msg._encoding_chars()
-    return field_sep, comp_sep, rep_sep, sub_sep, esc
+    """The separators a :meth:`Message.field` read decodes a value with: the first header line's,
+    which are a ``BHS`` or ``FHS`` header's in a batch, so an edit decodes a value as a read of it
+    does (BACKLOG #5928). :meth:`Message.set` and the repetition split of a read still use
+    ``MSH-2``'s, so a batch whose header's encoding characters differ from ``MSH-2``'s is still read
+    and written with two sets."""
+    return _builtin_hl7.separators(msg._m)
+
+
+def _refuse_delimiter_field(seg: str, fld: int, path: str) -> None:
+    if seg in ("MSH", "BHS", "FHS") and fld in (1, 2):
+        raise ValueError(f"cannot transform {path}: fields 1 and 2 hold the delimiters themselves")
+
+
+def _splice_part(text: str, comp: int, sub: int | None, part: str, seps: _Seps) -> str:
+    """The field text ``text`` with the first repetition's component ``comp`` (or its subcomponent
+    ``sub``) replaced by the raw text ``part``, padding absent ones as :meth:`Message.set` does."""
+    _field_sep, comp_sep, rep_sep, sub_sep, _esc = seps
+    reps = text.split(rep_sep) if text else [""]
+    comps = reps[0].split(comp_sep) if reps[0] else []
+    comps += [""] * (comp - len(comps))
+    if sub is None:
+        comps[comp - 1] = part
+    else:
+        subs = comps[comp - 1].split(sub_sep) if comps[comp - 1] else []
+        subs += [""] * (sub - len(subs))
+        subs[sub - 1] = part
+        comps[comp - 1] = sub_sep.join(subs)
+    reps[0] = comp_sep.join(comps)
+    return rep_sep.join(reps)
+
+
+def _as_one_leaf(raw: str, seps: _Seps) -> str:
+    """A whole field's raw text as one leaf's raw text that reads back as the field's leaves, each
+    decoded, joined by its separators read as data. An escape sequence is kept as sent unless it
+    holds a control character: a component write never carries a raw control (ADR 0205 rule 2), and
+    a hex escape cannot sit inside another sequence, so such a sequence is written as the data it
+    decodes to, or, where that holds a CR or LF, which no component carries, as its raw text
+    written as data, so it reads back as sent. Literal text, the separators between leaves and an
+    unclosed trailing escape character are written as data, with their control characters
+    hex-escaped."""
+    out: list[str] = []
+    for index, token in enumerate(_split_leaves(raw, seps)):
+        if index % 2:
+            out.append(_escape_data(token, seps))
+            continue
+        for unit_raw, decoded, kind in _leaf_units(token, seps):
+            if kind == "esc" and not any(ch in unit_raw for ch in _HEX_ESCAPED_CONTROLS):
+                out.append(unit_raw)
+            elif kind == "esc" and ("\r" in decoded or "\n" in decoded):
+                out.append(_escape_data(unit_raw, seps))
+            else:
+                out.append(_escape_data(decoded, seps))
+    return "".join(out)
 
 
 def _edit_value(
-    msg: Message, path: str, edit: Callable[[str, _Seps], str], *, whole_value: bool
+    msg: Message,
+    path: str,
+    edit: Callable[[str, _Seps], str],
+    *,
+    scope: Literal["leaf", "leaves", "value"],
 ) -> None:
     """Apply ``edit`` to the raw text of the value at ``path`` and write the field back.
 
     The value is the part a :meth:`Message.field` read of ``path`` returns, from the first repetition
-    for a component or subcomponent path. With ``whole_value`` the value must be one leaf, and
-    ``edit`` gets it whole. Otherwise ``edit`` gets each leaf in turn, and the separators between
-    them are kept. A no-op when the value is absent or empty, or when nothing changed."""
+    for a component or subcomponent path. With ``scope="leaf"`` the value must be one leaf, and
+    ``edit`` gets it whole. With ``"leaves"`` ``edit`` gets each leaf in turn, and the separators
+    between them are kept. With ``"value"`` ``edit`` gets the whole value, separators and all, and
+    :func:`_split_leaves` finds its leaves. A no-op when the value is absent or empty, or when
+    nothing changed."""
     seg, fld, comp, sub = parse_path(path)
-    if seg in ("MSH", "BHS", "FHS") and fld in (1, 2):
-        raise ValueError(f"cannot transform {path}: fields 1 and 2 hold the delimiters themselves")
+    _refuse_delimiter_field(seg, fld, path)
     seps = _seps(msg)
     _field_sep, comp_sep, rep_sep, sub_sep, _esc = seps
     whole = f"{seg}-{fld}"
@@ -548,7 +695,6 @@ def _edit_value(
     # The read side's own split: the first repetition, then the component, then the subcomponent.
     reps = text.split(rep_sep)
     comps = reps[0].split(comp_sep)
-    subs: list[str] = []
     splitters: tuple[str, ...]
     if comp is None:
         value, splitters = text, (rep_sep, comp_sep, sub_sep)
@@ -563,7 +709,7 @@ def _edit_value(
         value, splitters = subs[sub - 1], ()
     if not value:
         return
-    if whole_value:
+    if scope == "leaf":
         held = [sep for sep in (comp_sep, rep_sep, sub_sep) if sep in value]
         if held:
             raise ValueError(
@@ -573,21 +719,13 @@ def _edit_value(
         if not _builtin_hl7.unescape(value, seps):
             return  # decodes to nothing, so a read of it is None: nothing to cut or pad
         edited = edit(value, seps)
+    elif scope == "value":
+        edited = edit(value, seps)
     else:
         edited = _map_leaves(value, splitters, lambda leaf: edit(leaf, seps))
     if edited == value:
         return
-    if comp is None:
-        new_text = edited
-    else:
-        if sub is None:
-            comps[comp - 1] = edited
-        else:
-            subs[sub - 1] = edited
-            comps[comp - 1] = sub_sep.join(subs)
-        reps[0] = comp_sep.join(comps)
-        new_text = rep_sep.join(reps)
-    msg.set(whole, new_text)
+    msg.set(whole, edited if comp is None else _splice_part(text, comp, sub, edited, seps))
 
 
 def _map_leaves(text: str, splitters: tuple[str, ...], edit: Callable[[str], str]) -> str:
@@ -597,6 +735,65 @@ def _map_leaves(text: str, splitters: tuple[str, ...], edit: Callable[[str], str
     return splitters[0].join(
         _map_leaves(part, splitters[1:], edit) for part in text.split(splitters[0])
     )
+
+
+def _split_leaves(value: str, seps: _Seps) -> list[str]:
+    """``value``'s leaves with the separators between them, ``[leaf, sep, leaf, ...]``.
+
+    A value read at any level holds only the separators below that level, so splitting on all
+    three finds its leaves wherever it was read from."""
+    _field_sep, comp_sep, rep_sep, sub_sep, _esc = seps
+    tokens: list[str] = []
+    start = 0
+    for pos, char in enumerate(value):
+        if char in (comp_sep, rep_sep, sub_sep):
+            tokens += [value[start:pos], char]
+            start = pos + 1
+    tokens.append(value[start:])
+    return tokens
+
+
+def _trim_value(value: str, seps: _Seps) -> str:
+    """``value`` with the decoded whitespace at the start of its first leaf and the end of its
+    last stripped, as :meth:`str.strip` strips the decoded value: a separator is not whitespace, so
+    the strip stops at the first leaf that holds anything else."""
+    tokens = _split_leaves(value, seps)
+    tokens[0] = _strip_leaf(tokens[0], seps, left=True, right=len(tokens) == 1)
+    if len(tokens) > 1:
+        tokens[-1] = _strip_leaf(tokens[-1], seps, left=False, right=True)
+    return "".join(tokens)
+
+
+def _strip_leaf(raw: str, seps: _Seps, *, left: bool, right: bool) -> str:
+    """One leaf with its decoded whitespace stripped at the ends asked for, as :meth:`str.strip`
+    strips the decoded leaf. An escape sequence the strip cuts, such as ``\\X2041\\`` (a space and
+    an ``A``), is written as the data it keeps, so ``\\X2041\\`` at the start becomes ``A``, unless
+    that data holds a CR or LF, which no data write carries: that sequence is kept whole, as sent."""
+    leaf = _Leaf(raw, seps)
+    decoded = _decoded(leaf.units)
+    lo = len(decoded) - len(decoded.lstrip()) if left else 0
+    hi = len(decoded.rstrip()) if right else leaf.total
+    for (_raw, unit_text, kind), unit_lo, unit_hi in zip(
+        leaf.units, leaf.los, leaf.his, strict=True
+    ):
+        cut = unit_lo < lo < unit_hi or unit_lo < hi < unit_hi
+        kept = unit_text[max(lo, unit_lo) - unit_lo : min(hi, unit_hi) - unit_lo]
+        if kind == "esc" and cut and ("\r" in kept or "\n" in kept):
+            lo, hi = min(lo, unit_lo), max(hi, unit_hi)
+    if (lo, hi) == (0, leaf.total):
+        return raw
+    if lo >= hi:
+        return ""
+    return leaf.keep(lo, hi)
+
+
+def _append_after_last_leaf(value: str, suffix: str, seps: _Seps) -> str:
+    """``value`` with ``suffix`` written as data after its last leaf, which is rebuilt so an
+    unclosed trailing escape cannot pair with the suffix."""
+    tokens = _split_leaves(value, seps)
+    leaf = _Leaf(tokens[-1], seps)
+    tokens[-1] = leaf.keep(0, leaf.total) + _escape_data(suffix, seps)
+    return "".join(tokens)
 
 
 def _leaf_units(raw: str, seps: _Seps) -> list[_Unit]:
@@ -679,6 +876,14 @@ class _Leaf:
             else:
                 out.append(_escape_data(decoded[cut_lo - lo : cut_hi - lo], self.seps))
         return "".join(out)
+
+    def keep(self, start: int, end: int) -> str:
+        """Raw text that decodes to ``decoded[start:end]``, with every escape that decodes to
+        nothing kept wherever it sits. ``keep(0, total)`` is the leaf rebuilt, so an unclosed
+        trailing escape is written as data and text placed after it cannot pair with it."""
+        return (
+            self.zero_width(0, start) + self.span(start, end) + self.zero_width(end, self.total + 1)
+        )
 
     def zero_width(self, start: int, end: int) -> str:
         """The escapes that decode to nothing and start in ``[start, end)``, as sent. A cut or a

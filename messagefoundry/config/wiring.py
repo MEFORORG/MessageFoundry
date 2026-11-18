@@ -109,15 +109,18 @@ from messagefoundry.config.snapshot import (
     _UNREACHABLE_WINERRORS,
     ConfigDirMissing,
     ConfigSnapshot,
+    _is_module_rel,
     config_py_files,
     is_missing_directory,
     read_config_snapshot,
 )
 from messagefoundry.connection_names import (
     CONNECTION_NAME_PATTERN,
+    db_lookup_record_name,
     fhir_lookup_record_name,
     inbound_record_name,
     is_connection_name,
+    reference_record_name,
 )
 from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import QUALIFIED_CERT_NAME, unmatchable_san_reason
@@ -630,7 +633,10 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
     :func:`resolve_env_settings` does reach it, and it resolves to the real table before the connector
     runs. Measured: ``resolve_env_settings({"headers": env("all_headers")}, ...)`` returns the table.
     Only a reference INSIDE the table is unresolvable, so only that is refused. Such a reference's
-    own ``default=`` is judged when it is made, in :class:`EnvRef`, so it is not walked here.
+    own ``default=`` is what an unset key resolves to, handed to the connector unchanged, so it is
+    held to this function's table rule: a default that is not a table is refused, and one that is
+    is checked as a literal table would be (BACKLOG #5328). An ``env()`` inside a default is also
+    refused when the reference is made, in :class:`EnvRef`.
 
     A non-mapping ``headers`` is refused here too, not merely skipped. ``connections.toml`` is untyped
     input, so ``headers = "not-a-table"`` reaches this function; iterating it raises ``AttributeError``,
@@ -645,7 +651,21 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
     This refuses rather than resolves, which is the row's other option. Recursive resolution would have
     to reach into every nested settings shape and would undercut the top-level-only ruling the two
     functions named above already depend on."""
-    if headers is None or isinstance(headers, EnvRef):
+    if headers is None:
+        return
+    if isinstance(headers, EnvRef):
+        # The default is held to the table rule (BACKLOG #5328); None is no headers, as a literal is.
+        default = headers.default
+        if default is _UNSET or default is None:
+            return
+        # A dict, the one table type every connector's header builder sends.
+        if not isinstance(default, dict):
+            raise WiringError(
+                f"{factory} headers is an env() reference whose default= is not a table but "
+                f"{type(default).__name__} (value withheld). The default is sent as the headers "
+                "wherever the key is unset, so give it a table of header name to value, or none."
+            )
+        _reject_envref_headers(f"{factory} (the env() default= of its headers)", default)
         return
     if not isinstance(headers, Mapping):
         raise WiringError(
@@ -668,6 +688,27 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
             "fields (env-resolved and secret-redacted); headers carries only static, non-secret "
             "names and values."
         )
+
+
+def _resolved_headers_problem(value: object) -> str | None:
+    """Why the environment value a whole-table ``headers`` reference resolved to cannot be sent,
+    or ``None``: the table rule :func:`_reject_envref_headers` holds its ``default=`` to (BACKLOG
+    #5328).
+
+    The text names only the kind of problem. It does not reuse :func:`_reject_envref_headers`'
+    message, because that one lists the offending header names and env keys, and here every one of
+    them comes from the environment value, which :func:`resolve_env_settings` never shows any part
+    of (BACKLOG #1183). The scan is the same one, entry by entry over both axes, so a table whose
+    header names happen to be ``env`` is not read as a marker, and each value is scanned to the
+    same depth."""
+    if not isinstance(value, dict):
+        return f"value is not a table but {type(value).__name__} (value withheld)"
+    if any(_is_nested_envref(name) or _contains_envref(item) for name, item in value.items()):
+        return (
+            "the table holds an env() reference, which is never resolved inside a table and would "
+            "reach the partner as its repr (names and value withheld)"
+        )
+    return None
 
 
 def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
@@ -866,10 +907,38 @@ def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool
     return settings_hop_attestation(settings, where)
 
 
+#: The connection types whose ``tls`` off builds no TLS context in either direction, so a
+#: ``tls_ca_file`` beside it is never read, by the factory name a refusal gives.
+_UNREAD_CA_ON_TLS_OFF: Final = MappingProxyType(
+    {ConnectorType.MLLP: "MLLP", ConnectorType.HTTP: "Http", ConnectorType.DIMSE: "DICOM"}
+)
+
+
+def _tls_off_reason(tls: object) -> str | None:
+    """Why a CA beside this ``tls`` is never read, or ``None``: the one predicate the factories and
+    :func:`refuse_resolved_verify_off` share (``unread_ca_reason``'s ``tls`` arm). An ``env()``
+    ``tls`` is truthy, so it reads as on until it resolves."""
+    from messagefoundry.auth.trust_anchors import unread_ca_reason
+
+    return unread_ca_reason({"tls": tls})
+
+
+def _check_listener_ca(type_: ConnectorType, tls: object, ca: object, pin: object) -> None:
+    """The ``tls_ca_file`` and ``tls_ca_pin`` checks of a factory in :data:`_UNREAD_CA_ON_TLS_OFF`
+    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, since the unread
+    reason reads it by truthiness."""
+    factory = _UNREAD_CA_ON_TLS_OFF[type_]
+    if ca is not None:
+        _refuse_bool_literals({"tls": tls}, factory)
+    _check_tls_ca_file(factory, ca, unread=None if ca is None else _tls_off_reason(tls))
+    _check_tls_ca_pin(factory, pin, ca)
+
+
 def refuse_resolved_verify_off(
     type_: ConnectorType, settings: Mapping[str, Any], where: str
 ) -> None:
-    """Re-run the DICOMweb factory's unread-CA refusal on RESOLVED settings.
+    """Re-run a factory's unread-CA refusal on RESOLVED settings: DICOMweb's, Ftp's, and the
+    ``tls``-off one of the factories in :data:`_UNREAD_CA_ON_TLS_OFF`.
 
     The factory refuses ``tls_ca_file`` with a falsy literal ``verify_tls``, because nothing would
     read the CA. An ``env()`` reference is truthy there, so it passes. Once it resolves, it can be
@@ -877,9 +946,17 @@ def refuse_resolved_verify_off(
     the same test runs here, on the value the connector will read. SOAP needs no copy: its
     connector refuses a client cert with verification off when it is built.
 
-    ``Ftp()`` is the other factory with such a refusal: a CA beside a literal ``tls=False``. An
-    ``env()`` ``tls`` resolves into ``protocol`` (vault BACKLOG #3234), so a resolved plain ``ftp``
-    with a CA is refused here, in either direction, with or without a pin."""
+    ``Ftp()`` has such a refusal too: a CA beside a literal ``tls=False``. An ``env()`` ``tls``
+    resolves into ``protocol`` (vault BACKLOG #3234), so a resolved plain ``ftp`` with a CA is
+    refused here, in either direction, with or without a pin. So do ``MLLP()``, ``Http()`` and
+    ``DICOM()`` (BACKLOG #5329, #5331): with ``tls`` off they build no TLS context, so a CA beside
+    a ``tls`` that resolved off is refused here."""
+    label = _UNREAD_CA_ON_TLS_OFF.get(type_)
+    if label is not None:
+        reason = _tls_off_reason(settings.get("tls"))
+        if settings.get("tls_ca_file") and reason is not None:
+            raise WiringError(f"{where}: {label} tls_ca_file would never be read: {reason}.")
+        return
     if type_ is ConnectorType.REMOTEFILE:
         if remote_file_protocol(settings) == "ftp" and settings.get("tls_ca_file"):
             raise WiringError(
@@ -1805,6 +1882,7 @@ def resolve_env_settings(
     blank: list[str] = []
     bool_defaults = _bool_settings().defaults
     bad_defaults: list[str] = []
+    owner = f" of connection {connection!r}" if connection else ""
     for name, value in settings.items():
         if isinstance(value, EnvRef):
             if value.key in values:
@@ -1868,15 +1946,24 @@ def resolve_env_settings(
                 # A default is written in the config, so it is reported apart from the
                 # environment values, whose advice would send the author to the wrong place.
                 if source == "default":
-                    owner = f" of connection {connection!r}" if connection else ""
                     bad_defaults.append(problem.replace(" (env ", f"{owner} (env ", 1))
                 else:
                     bad.append(problem)
                 continue
             resolved[name] = got
+            # A whole-table headers reference's environment value is held to the rule its
+            # default= is held to at the factory (BACKLOG #5328): every connector's header builder
+            # sends only a dict, and silently drops anything else.
+            if (
+                name == "headers"
+                and source == "value"
+                and got is not None
+                and (problem_text := _resolved_headers_problem(got))
+            ):
+                bad.append(f"setting {name!r}{owner} (env {value.key!r}): {problem_text}")
+                continue
             if name in _NON_BLANK_ENV_SETTINGS and isinstance(got, str) and not got.strip():
                 # No ":" or "=" after the name: the log scrubber reads "LABEL: value" as a secret.
-                owner = f" of connection {connection!r}" if connection else ""
                 blank.append(f"setting {name!r}{owner} (env {value.key!r}) pins nothing")
         else:
             # A literal is NOT read here, even on a bool setting: every pre-resolve reader (the
@@ -2949,6 +3036,7 @@ def MLLP(
         # Only here: elsewhere inbound()/outbound() refuse it, naming the connection.
         refuse_bool_literals({"tls": tls}, "MLLP")
     client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
+    _check_listener_ca(ConnectorType.MLLP, tls, tls_ca_file, tls_ca_pin)
     return ConnectionSpec(
         ConnectorType.MLLP,
         {
@@ -3455,6 +3543,7 @@ def Http(
     body, ``503``, ``413`` or ``422`` for a refused one); every knob above is inert without it, and setting one alone is
     refused rather than silently ignored."""
     subjects = _intake_subjects_by_issuer(intake_client_subjects)
+    _check_listener_ca(ConnectorType.HTTP, tls, tls_ca_file, tls_ca_pin)
     settings: dict[str, Any] = {
         "port": port,
         "encoding": encoding,
@@ -3500,7 +3589,7 @@ def Http(
     written: Any = trusted_proxies
     if isinstance(trusted_proxies, EnvRef):
         written = None if trusted_proxies.default is _UNSET else trusted_proxies.default
-    from messagefoundry.transports.http_listener import trusted_proxy_networks
+    from messagefoundry.config.listener_proxies import trusted_proxy_networks
 
     refusal: str | None = None
     try:
@@ -4690,6 +4779,7 @@ def DICOM(
         presentation_contexts=presentation_contexts,
         calling_ae_allowlist=calling_ae_allowlist,
     )
+    _check_listener_ca(ConnectorType.DIMSE, tls, tls_ca_file, tls_ca_pin)
     settings: dict[str, Any] = {
         "ae_title": ae_title,
         "host": host,
@@ -6653,6 +6743,21 @@ def _require_connection_name(conn: InboundConnection | OutboundConnection, kind:
     )
 
 
+def case_twins(names: Iterable[str]) -> Iterator[tuple[str, str]]:
+    """Each pair of ``names`` that differ only in case, as (first declared, later one) (BACKLOG
+    #5392). A SQL Server store with a case-insensitive default collation compares the queue,
+    response and scope rows a connection name keys without case, so two such connections would
+    share them there while SQLite and Postgres keep them apart. A connection or FHIR lookup name is
+    ASCII (the name rule), so ``casefold`` is exactly that collation's comparison for it; trailing
+    spaces and width, which SQL Server also ignores, cannot occur in one. Per table: an inbound and
+    an outbound may share a name, as they may exactly."""
+    seen: dict[str, str] = {}
+    for name in names:
+        first = seen.setdefault(name.casefold(), name)
+        if first != name:
+            yield first, name
+
+
 @dataclass
 class Registry:
     """The wired graph produced by loading config modules."""
@@ -6733,9 +6838,9 @@ class Registry:
     # not the startup dir (vault BACKLOG #3094). Carried with the graph, so it swaps atomically.
     source_dir: Path | None = None
     # A digest of the config modules' bytes as this load read them
-    # (:func:`config_code_digest`), or
-    # None for a graph built in code or a module that could not be read. The engine refuses a
-    # sandbox worker whose digest differs (vault BACKLOG #2724).
+    # (:func:`config_code_digest`), or None for a graph built in code: a load refuses when it has
+    # no digest (BACKLOG #5334). The engine refuses a sandbox worker whose digest differs (vault
+    # BACKLOG #2724).
     code_digest: str | None = None
     # The one read of the directory this graph was loaded from, whose bytes it ran (vault BACKLOG
     # #2596), or None for a graph built in code. Its fingerprint is the reload's audit digest, and a
@@ -6862,6 +6967,17 @@ class Registry:
         # Before the other rules: some read the same literals laxly, and validate raises only the
         # first problem, so a symptom would hide the bad literal (vault BACKLOG #3234).
         yield from self.bool_literal_problems()
+        for kind, table in (
+            ("inbound connection", self.inbound),
+            ("outbound connection", self.outbound),
+            ("fhir lookup", self.fhir_lookups),
+        ):
+            for first, second in case_twins(table):
+                yield (
+                    f"duplicate {kind} name: {second!r} differs only in case from {first!r}, and "
+                    "a SQL Server store column that compares without case, at least the alert "
+                    "and event columns, would read the two as one"
+                )
         for conn in self.inbound.values():
             if conn.router not in self.routers:
                 yield f"inbound connection {conn.name!r} references unknown router {conn.router!r}"
@@ -7352,8 +7468,11 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
             (fhir_lookup_record_name(s.name), s.settings, s.cleartext_accepted)
             for s in registry.fhir_lookups.values()
         ),
-        *((f"db_lookup:{s.name}", s.settings, False) for s in registry.lookups.values()),
-        *((f"reference:{r.name}", r.source.settings, False) for r in registry.references.values()),
+        *((db_lookup_record_name(s.name), s.settings, False) for s in registry.lookups.values()),
+        *(
+            (reference_record_name(r.name), r.source.settings, False)
+            for r in registry.references.values()
+        ),
     ]
     out += [
         AttestedHop(
@@ -7864,7 +7983,7 @@ def listener_trusted_proxy_hops(
     never left off. A ``deployed=False`` listener with an ``env()`` value is skipped, as
     :func:`ech_cleartext_sidecar_hops` skips one, since its values are never resolved. A value the
     build would refuse is skipped too: no listener is built from it."""
-    from messagefoundry.transports.http_listener import trusted_proxy_networks
+    from messagefoundry.config.listener_proxies import trusted_proxy_networks
 
     out: list[tuple[str, str]] = []
     for ic in registry.inbound.values():
@@ -8293,13 +8412,17 @@ def static_credential_db_hops(
     for spec in registry.lookups.values():
         reason = kind(spec.settings)
         if reason is not None:
-            out.append((f"db_lookup:{spec.name}", f"{reason} ({_peer_label(spec.settings)})"))
+            out.append(
+                (db_lookup_record_name(spec.name), f"{reason} ({_peer_label(spec.settings)})")
+            )
     for ref in registry.references.values():
         if ref.source.kind != "database":
             continue
         reason = kind(ref.source.settings)
         if reason is not None:
-            out.append((f"reference:{ref.name}", f"{reason} ({_peer_label(ref.source.settings)})"))
+            out.append(
+                (reference_record_name(ref.name), f"{reason} ({_peer_label(ref.source.settings)})")
+            )
     return sorted(out)
 
 
@@ -8604,20 +8727,45 @@ def _check_metadata(name: str, metadata: Mapping[str, Any] | None) -> None:
         raise WiringError(f"connection {name!r}: metadata must be a table (key/value mapping)")
 
 
+#: What ``source_ip_allowlist`` takes: a list, a tuple or a single-pass iterator of entries. Not
+#: ``Iterable[str]``, which a bare ``str`` satisfies, so mypy still catches that mistake.
+SourceIpAllowlist = list[str] | tuple[str, ...] | Iterator[str]
+
+
 def _check_source_ip_allowlist(
-    name: str, listens: bool, allowlist: list[str] | None
+    name: str, listens: bool, allowlist: SourceIpAllowlist | None
 ) -> tuple[str, ...] | None:
     """Validate an inbound peer-IP allowlist and freeze it to a tuple. Each entry must parse as an IP
-    address or a CIDR network; the allowlist is only meaningful for an MLLP/TCP/X12/DIMSE **listen**
-    source. ``None``/empty = no restriction (the ``[egress]`` allowlist convention)."""
-    if not allowlist:
+    address or a CIDR network; the allowlist is only meaningful for an MLLP/TCP/X12/DIMSE/HTTP
+    **listen** source, which ``None`` or an empty one leaves unrestricted (the ``[egress]``
+    allowlist convention). Any allowlist on another source is refused, an empty one included.
+
+    It is read once, so a generator is not consumed by validation and frozen empty, which a
+    listener would read as no restriction (BACKLOG #5333)."""
+    if allowlist is None:
         return None
+    if isinstance(allowlist, EnvRef):
+        raise WiringError(
+            f"inbound connection {name!r}: source_ip_allowlist does not take an env() reference; "
+            "write the list of IP addresses or CIDR networks"
+        )
+    # A set would freeze in hash order, so the stored tuple and a refusal's entry index would
+    # differ between processes.
+    refused = (str, bytes, Mapping, set, frozenset)
+    if isinstance(allowlist, refused) or not isinstance(allowlist, Iterable):
+        raise WiringError(
+            f"inbound connection {name!r}: source_ip_allowlist must be a list of IP addresses or "
+            f"CIDR networks, not {type(allowlist).__name__}"
+        )
+    entries = tuple(allowlist)
     if not listens:
         raise WiringError(
             f"inbound connection {name!r}: source_ip_allowlist is only valid for an "
-            "MLLP/TCP/X12/DIMSE listen source"
+            "MLLP/TCP/X12/DIMSE/HTTP listen source"
         )
-    for position, entry in enumerate(allowlist):
+    if not entries:
+        return None
+    for position, entry in enumerate(entries):
         if not isinstance(entry, str) or not entry.strip():
             raise WiringError(
                 f"inbound connection {name!r}: source_ip_allowlist entries must be non-empty strings"
@@ -8627,7 +8775,7 @@ def _check_source_ip_allowlist(
                 f"inbound connection {name!r}: source_ip_allowlist entry {position} is not a valid "
                 "IP address or CIDR network (value withheld)"
             )
-    return tuple(allowlist)
+    return entries
 
 
 def _is_ip_or_network(entry: str) -> bool:
@@ -8680,7 +8828,7 @@ def build_inbound_connection(
     schedule: Schedule | None = None,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
-    source_ip_allowlist: list[str] | None = None,
+    source_ip_allowlist: SourceIpAllowlist | None = None,
     capture_ack: bool | None = None,
     capture_connection_errors: bool | None = None,
     messages_days: int | None = None,
@@ -8961,7 +9109,7 @@ def inbound(
     schedule: Schedule | None = None,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
-    source_ip_allowlist: list[str] | None = None,
+    source_ip_allowlist: SourceIpAllowlist | None = None,
     capture_ack: bool | None = None,
     capture_connection_errors: bool | None = None,
     messages_days: int | None = None,
@@ -9477,7 +9625,8 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
     The loader records it on the graph, and a sandbox worker's load records its own; the engine
     refuses a worker whose digest differs. Python modules only: ``connections.toml`` changes the
     graph's names, which are compared anyway, and the worker serves the code sets the engine hands
-    it. None when a module cannot be read, which is logged.
+    it. None when a module cannot be read, which is logged; a load refuses before it gets here
+    (:func:`_require_loadable`), and :func:`load_snapshot` refuses a None digest too.
 
     Kept here rather than built on :mod:`messagefoundry.config.fingerprint`: importing that module
     would give every importer of the loader its comparison and hash operations in the crypto
@@ -9487,12 +9636,13 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
     snapshot = (
         source if isinstance(source, ConfigSnapshot) else read_config_snapshot(source, strict=False)
     )
-    unread = [rel for rel in snapshot.unreadable if rel == "." or rel.lower().endswith(".py")]
+    # Only an unread module, or the unlistable directory, takes the digest away, as only those are
+    # what a load refuses: a suffix test also caught a value file named ``*.py`` (BACKLOG #5334).
+    unread = [rel for rel in snapshot.unreadable if rel == "." or _is_module_rel(rel)]
     if unread:
         # A module it could not read is not described by the rest.
         _logger.warning(
-            "config module digest unavailable for %s, so a sandbox worker's config code is not "
-            "compared with this load's: could not read %s",
+            "config module digest unavailable for %s: could not read %s",
             scrub_log_argument(str(snapshot.directory)),
             scrub_log_argument(", ".join(unread)),
         )
@@ -10183,9 +10333,16 @@ def load_snapshot(
     one boot frame does not carry each table twice."""
     _require_loadable(snapshot)
     directory = snapshot.directory
+    code_digest = config_code_digest(snapshot)
+    if code_digest is None:
+        # The sandbox compares a worker's digest only when the engine has one (BACKLOG #5334).
+        raise WiringError(
+            f"{_CONFIG_SOURCE_LEAD} {directory}: the config modules' digest could not be "
+            "computed, so a sandbox worker's config code could not be compared with it"
+        )
     registry = Registry(
         source_dir=source_dir if source_dir is not None else directory,
-        code_digest=config_code_digest(snapshot),
+        code_digest=code_digest,
         config_snapshot=snapshot,
     )
     # Load the bundle's reference tables (codesets/ relative to the config dir) BEFORE importing the

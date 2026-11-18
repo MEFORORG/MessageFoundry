@@ -1248,6 +1248,7 @@ def _names(remote_debug: RemoteDebugPosture | None) -> list[str]:
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
             ech_cleartext_sidecar_hops=(),
+            listener_trusted_proxy_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),

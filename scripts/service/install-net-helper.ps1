@@ -321,8 +321,7 @@ function Set-ServiceAccount {
     )
     $fail = {
         param([string]$Why)
-        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
-        throw "$Why '$ServiceName' was set to Disabled so it cannot start as the wrong account."
+        throw "$Why $(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it cannot start as the wrong account')"
     }
     $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
         Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
@@ -368,6 +367,35 @@ function Set-ServiceAccount {
     if (($stored -replace '^\.\\', '') -ne ($Account -replace '^\.\\', '')) {
         & $fail ("'$ServiceName' runs as '$stored', not '$Account', although Win32_Service.Change " +
             "reported success.")
+    }
+}
+
+function Disable-RefusedService {
+    <#
+      Set $ServiceName to Disabled after a refusal, and return the sentence that says what happened:
+      that it was set to Disabled, so $Consequence, or that it could not be and must be disabled by
+      hand before the next boot. The refusal message reports this, rather than assuming it.
+
+      ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Set-Service -Name also takes a
+      DISPLAY name, so the service is found by Name and disabled as the object (-InputObject); a name
+      that matches no service exactly is reported as not disabled. A failed SCM read is
+      reported with its own message, not as a missing service. The hand advice names sc.exe,
+      which opens a service by its name only.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Consequence)
+    try {
+        try { $found = @(Get-Service -Name $ServiceName -ErrorAction Stop) } catch {
+            if ("$($_.FullyQualifiedErrorId)" -notlike 'NoServiceFoundForGivenName,*') { throw }
+            $found = @()
+        }
+        $exact = $found | Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+        if (-not $exact) { throw "no service is named exactly '$ServiceName'" }
+        Set-Service -InputObject $exact -StartupType Disabled -ErrorAction Stop
+        return "'$ServiceName' was set to Disabled so $Consequence."
+    } catch {
+        return ("WARNING: '$ServiceName' could NOT be set to Disabled ($($_.Exception.Message)), so " +
+            "it may start at the next boot. Disable it by hand: sc.exe config `"$ServiceName`" " +
+            "start= disabled.")
     }
 }
 # END pinned-hash check
@@ -669,13 +697,20 @@ $LogPath = Join-Path $InstallDir "net-helper.log"
 # function is the cost this avoids; what it must not cost is the property, so this loop does the
 # same two things that function exists to do: it issues the stop and then CONFIRMS from the SCM
 # rather than assuming (BACKLOG #1558).
-$serviceExists = [bool](Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)
+#
+# ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Get-Service and Stop-Service -Name
+# also match a DISPLAY name, which the name pattern cannot keep out because it allows a space, so
+# the lookup filters on Name and the stop takes the object it found (-InputObject).
+$exactService = { @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+    Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1 }
+$existingService = & $exactService
+$serviceExists = [bool]$existingService
 if ($serviceExists) {
     Write-Host "  Service '$ServiceName' exists - stopping it before the files are replaced."
-    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    Stop-Service -InputObject $existingService -Force -ErrorAction SilentlyContinue
     $deadline = (Get-Date).AddSeconds(30)
     while ($true) {
-        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        $svc = & $exactService
         if (-not $svc -or $svc.Status -eq "Stopped") { break }
         if ((Get-Date) -ge $deadline) {
             throw ("'$ServiceName' is still '$($svc.Status)' 30 seconds after the stop. Its image " +
@@ -736,8 +771,7 @@ if ($problem) {
     if ($left.Count -gt 0) {
         $outcome = "Could not delete $($left -join ' and ')."
         if ($serviceExists) {
-            Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
-            $outcome += " '$ServiceName' was set to Disabled so the registration cannot start them."
+            $outcome += " $(Disable-RefusedService -ServiceName $ServiceName -Consequence 'the registration cannot start them')"
         }
     }
     throw ("An installed copy failed its check: $problem. $outcome Nothing was started. Re-run from " +
@@ -808,9 +842,9 @@ Set-ServiceAccount -ServiceName $ServiceName -Account LocalSystem
 try {
     Set-ServiceImage -ServiceName $ServiceName -Path $TargetNssm
 } catch {
-    Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
-    throw ("$($_.Exception.Message) '$ServiceName' was set to Disabled. Remove it with " +
-        ".\uninstall-net-helper.ps1 and re-run.")
+    throw ("$($_.Exception.Message) " +
+        "$(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it cannot start') " +
+        "Remove it with .\uninstall-net-helper.ps1 and re-run.")
 }
 
 # --- report -------------------------------------------------------------------------------------

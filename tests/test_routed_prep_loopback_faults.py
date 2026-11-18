@@ -1036,6 +1036,8 @@ async def test_a_pooled_stop_whose_tail_release_did_not_land_stays_stopped(
         assert statuses == {OutboxStatus.PENDING.value}
     else:
         assert dispatcher.stopped(LOOP), f"{end}: a lane holding rows in flight was re-armed"
+        # BACKLOG #5704: the log halt's recovery restart reads this, and leaves the lane STOPPED.
+        assert dispatcher.stopped_holding_rows(LOOP), f"{end}: the STOP did not record its rows"
         assert asked == [], f"{end}: the runner's STOP record was taken for a lane left stopped"
         assert statuses == {OutboxStatus.INFLIGHT.value}
 

@@ -81,8 +81,8 @@ def is_canonical_ipv4(text: str) -> bool:
     The one form besides a domain that ``[security].organization_domains`` and
     ``external_link_allowlist`` accept, and that the console matches exactly rather than on a
     label boundary. A short, octal or hexadecimal form is not canonical. Settings also refuse a
-    canonical address that is not one host's, such as ``0.0.0.0`` (``config/settings.py``,
-    ``_not_a_host_address``)."""
+    canonical address that is not one host's, such as ``0.0.0.0`` (``netaddr.py``,
+    ``not_a_host_address``)."""
     try:
         return str(ipaddress.IPv4Address(text)) == text
     except ValueError:

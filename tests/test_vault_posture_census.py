@@ -523,7 +523,7 @@ _DERIVATIONS = sorted(
         ("__main__.py", "_offline_security_notifier", "settings.security.enforcement"),
         ("__main__.py", "_provision_admin", "settings.security.enforcement"),
         ("__main__.py", "_renew_api_tls_before_spawning", "settings.security.enforcement"),
-        ("__main__.py", "_start_logging", "settings.security.enforcement"),
+        ("__main__.py", "_start_logging_gates", "settings.security.enforcement"),
         ("__main__.py", "_store_provision_schema", "settings.security.enforcement"),
         # At warn, the store-opening commands' PostgreSQL revocation WARNING (BACKLOG #2532).
         ("__main__.py", "_warn_on_an_unrevoked_store_hop", "settings.security.enforcement"),

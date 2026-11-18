@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import email.message
+import http.client
 import io
 import json
 import struct
 import tarfile
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -106,7 +109,7 @@ from messagefoundry_toolkit.corepoint_import import (
     parse_export,
 )
 from messagefoundry_toolkit.lens import LensParseError, parse_module, rewrite_module
-from tests.test_ai_broker import _managed_ai
+from tests.test_ai_broker import _managed_ai, _raising_broker
 from tests.test_builtin_hl7_hardening import _hl7_registry
 from tests.test_config_anchoring import _NO_ENV_GRAPH, _config_dir
 from tests.test_crypto_transit import _FakeTransit, _use_fake
@@ -389,6 +392,52 @@ def test_an_unparseable_ai_reply_keeps_it_off_the_chain() -> None:
         broker._extract_text("{" + _PLANTED)
     assert "returned an unparseable response" in str(caught.value)
     _assert_bare(caught.value)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(http.client.InvalidURL(_PLANTED), id="invalid-url"),
+        pytest.param(ValueError(f"Invalid header value b'{_PLANTED}\\n'"), id="request-value"),
+        pytest.param(http.client.BadStatusLine(_PLANTED), id="bad-status-line"),
+        pytest.param(http.client.LineTooLong(_PLANTED), id="line-too-long"),
+        pytest.param(
+            urllib.error.HTTPError(
+                "https://ai.internal/v1",
+                500,
+                _PLANTED,
+                email.message.Message(),
+                io.BytesIO(_PLANTED.encode()),
+            ),
+            id="http-error",
+        ),
+    ],
+)
+def test_an_ai_call_refusal_keeps_the_key_and_provider_bytes_off_the_chain(
+    exc: Exception,
+) -> None:
+    """Vault BACKLOG #5356. The request-value text can quote the api_key, and the malformed-reply
+    and HTTPError exceptions hold the provider's bytes. Mutation: raise inside any of the three
+    arms, with or without ``from exc``. Red: that parameter."""
+    with pytest.raises(AiBrokerError) as caught:
+        _raising_broker(exc).chat("synthetic prompt")
+    _assert_bare(caught.value)
+
+
+def test_an_ai_call_that_succeeds_still_returns_its_reply() -> None:
+    """Control for the test above: a provider reply is still read and returned."""
+
+    class _Reply(io.BytesIO):
+        def __enter__(self) -> _Reply:
+            return self
+
+    class _ReplyingOpener:
+        def open(self, req: object, timeout: float | None = None) -> _Reply:
+            return _Reply(json.dumps({"content": [{"type": "text", "text": "hello"}]}).encode())
+
+    broker = _raising_broker(ValueError("unused"))
+    broker._opener = _ReplyingOpener()  # type: ignore[assignment]
+    assert broker.chat("synthetic prompt") == "hello"
 
 
 def test_an_unparseable_database_payload_keeps_it_off_the_chain() -> None:

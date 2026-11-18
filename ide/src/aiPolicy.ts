@@ -3,8 +3,8 @@
 // AI-assistance policy resolution for the IDE. The policy is centrally governed by the engine; the
 // IDE reads it (never sets it) and gates the @messagefoundry chat assistant accordingly. Resolution
 // is authoritative-engine-first, falling back, when the engine is unreachable, to that engine's
-// cached answer, and to the local CLI (which reads messagefoundry.toml) only where pickOfflinePolicy
-// allows it.
+// cached answer, and to the local CLI (which reads `messagefoundry.serviceConfig`, BACKLOG #5405)
+// only where pickOfflinePolicy allows it.
 //
 // The policy has TWO halves and they are answered differently:
 //   - `mode` is identity-INDEPENDENT, so a central "off" is honored even by a tokenless client;
@@ -22,9 +22,11 @@ import {
   evaluatedPermission,
   heldAuthoritativeAnswer,
   mergeAuthoritativePolicy,
+  narrowMode,
   pickOfflinePolicy,
 } from "./aiPolicyModel";
-import { engineTargetIsSet, engineUrl, environments, runJson, workspaceDir } from "./cli";
+import { engineTargetIsSet, engineUrl, environments, runJson, workspaceDir, writerCheckSetting } from "./cli";
+import { aiPolicyCliPlan } from "./engineControlModel";
 import { getJson } from "./engineClient";
 import { ASSIST_GATE_PLAN, resolveEngineStatusTarget } from "./engineStatusModel";
 import { assertTargetAllowed } from "./engineTarget";
@@ -65,7 +67,7 @@ export interface AiPolicyWire {
  */
 function fromWire(w: AiPolicyWire): AiPolicy {
   return {
-    mode: w.mode,
+    mode: narrowMode(w.mode),
     dataScope: w.data_scope,
     environment: w.environment,
     assistPermitted: evaluatedPermission(w.assist_permitted),
@@ -119,7 +121,17 @@ export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
   url: aiPolicyEngineUrl,
   readToken: peekToken,
   getPolicy: (url, route, token) => getJson<AiPolicyWire>(url, route, token),
-  getCliPolicy: () => runJson<AiPolicyWire>(["ai-policy"], workspaceDir()),
+  getCliPolicy: () => {
+    // A value the containment dropped gives no plan, as a writer refuses one (BACKLOG #5404): the
+    // policy of the file used in its place is not the one the operator named, so it must not
+    // enable assistance. Nothing dropped, the setting is set exactly when it is not the default.
+    const s = writerCheckSetting("serviceConfig");
+    const plan = s.dropped === false ? aiPolicyCliPlan(s.value, s.source !== "default", workspaceDir()) : undefined;
+    // A rejection is "no CLI answer", which resolveAiPolicy turns into the unverified policy.
+    return plan === undefined
+      ? Promise.reject(new Error("no usable messagefoundry.serviceConfig for the offline AI policy"))
+      : runJson<AiPolicyWire>(plan.args, plan.cwd);
+  },
   targetConfigured: engineTargetIsSet,
 };
 
@@ -127,7 +139,7 @@ export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
  * Resolve the effective AI policy. Order: (a) the running engine [authoritative — includes the
  * identity-dependent `assist_permitted`; cached on success, per engine]; (b) when the engine is
  * unreachable, that engine's last cached authoritative policy; (c) the local CLI [reads
- * messagefoundry.toml], only where {@link pickOfflinePolicy} allows it; (d) a fail-closed "unverified" policy (assistance disabled) so a central "off" can't be bypassed
+ * `messagefoundry.serviceConfig`, and a missing file fails closed], only where {@link pickOfflinePolicy} allows it; (d) a fail-closed "unverified" policy (assistance disabled) so a central "off" can't be bypassed
  * by going offline or retargeting.
  * Every result passes through the deny carrier, so a deny any engine issued reaches a target that
  * has no authoritative answer of its own.

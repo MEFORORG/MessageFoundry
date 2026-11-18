@@ -4,15 +4,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import contextvars
+import gc
 import re
+import sys
+import threading
 import time
+import tracemalloc
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
 from messagefoundry.api import multipart
 from messagefoundry.api.multipart import (
     _MAX_PART_HEADER_BYTES,
+    FilePart,
     MultipartError,
+    MultipartForm,
     MultipartTooLargeError,
     parse_boundary,
     parse_multipart_form,
@@ -186,11 +197,12 @@ def _parse_seconds(reps: int) -> float:
 def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
     """A Content-Disposition line of many word chars and no ``="`` must not blow up quadratically.
 
-    The header block is attacker-supplied, and one regex scan holds the GIL even in the worker
-    thread the upload route parses in, so a quadratic scan here is a whole-engine denial of service,
-    not a slow request. ``_MAX_PART_HEADER_BYTES`` bounds the input as well, but the two controls
-    are independent on purpose: the cap is a size policy someone could reasonably raise, while this
-    bounds what the scan costs at the size the cap admits today.
+    The header block is attacker-supplied, and the worker thread the upload route parses in does
+    not spare the event loop a scan (``multipart.parse_upload_off_loop`` says why), so a quadratic
+    scan here is a whole-engine denial of service, not a slow request. ``_MAX_PART_HEADER_BYTES``
+    bounds the input as well, but the two controls are independent on purpose: the cap is a size
+    policy someone could reasonably raise, while this bounds what the scan costs at the size the cap
+    admits today.
 
     **This replaced a growth-ratio assertion, and the ratio is why BACKLOG #1385 has this row.** The
     old arm timed the bare regex at n and 4n and required the quotient under 8.0, reasoning that
@@ -208,8 +220,7 @@ def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
     """
     seconds = _parse_seconds(5)
     assert seconds < _SCAN_BUDGET_SECONDS, (
-        f"the hostile header cost {seconds:.4f}s of the event loop against a "
-        f"{_SCAN_BUDGET_SECONDS}s budget"
+        f"the hostile header scan cost {seconds:.4f}s against a {_SCAN_BUDGET_SECONDS}s budget"
     )
 
 
@@ -253,8 +264,8 @@ def test_oversized_part_header_is_refused_not_parsed(monkeypatch: pytest.MonkeyP
 
     The per-part ``max_file_bytes`` cap applies to a part's *content*, and only AFTER its header has
     been parsed — so without this bound the header scan's input is the whole request body (25 MiB by
-    default, 512 MiB at the ceiling) on the asyncio event loop. A real client never approaches it: a
-    Content-Disposition plus a Content-Type is a couple hundred bytes.
+    default, 512 MiB at the ceiling). A real client never approaches it: a Content-Disposition plus
+    a Content-Type is a couple hundred bytes.
 
     **"Before" is the whole claim, so it is asserted rather than described.** A sentinel stands in for
     the pattern and raises if the scan reaches it, so the refusal has to arrive with the header
@@ -323,18 +334,6 @@ def _parts(n: int) -> list[bytes]:
     return [_FILE_PART] + [_field(f"f{i}", b"v") for i in range(n - 1)]
 
 
-class _SplitRecorder(bytes):
-    """A body that records the ``maxsplit`` every ``split`` on it was given."""
-
-    maxsplits: list[int]
-
-    def split(  # type: ignore[override]
-        self, sep: bytes | None = None, maxsplit: int = -1
-    ) -> list[bytes]:
-        self.maxsplits.append(maxsplit)
-        return super().split(sep, maxsplit)
-
-
 def test_too_many_parts_is_refused_before_any_part_is_parsed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -368,16 +367,240 @@ def test_the_part_parse_sentinel_fires_when_a_part_is_parsed(
         )
 
 
-def test_the_split_is_bounded_so_many_parts_never_build_a_long_list() -> None:
-    """The cap exists to stop a body of millions of tiny parts from building a segment per part. A
-    refusal reached after an unbounded ``split`` would pass the arms above while that list came
-    back, so the split's own bound is pinned here."""
-    body = _SplitRecorder(_body(_parts(multipart._MAX_PARTS * 4)))
-    body.maxsplits = []
+def _peak_allocated(func: Callable[[], object]) -> int:
+    """Bytes ``func`` allocated at its peak, over what was allocated when it started."""
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        base, _ = tracemalloc.get_traced_memory()
+        with contextlib.suppress(MultipartError):
+            func()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        if not was_tracing:
+            tracemalloc.stop()
+    return peak - base
+
+
+_BIG = 4 * 1024 * 1024
+
+
+class _FindCounter(bytes):
+    """A body that counts the ``find`` calls made on it."""
+
+    finds = 0
+
+    def find(self, *args: Any) -> int:
+        self.finds += 1
+        return super().find(*args)
+
+
+def test_the_walk_stops_at_the_first_part_over_the_cap() -> None:
+    """The part cap bounds the walk itself, not only the answer: a body of thousands of empty parts
+    is refused after about ``_MAX_PARTS`` parts' worth of ``find`` calls, so a refusal reached only
+    after walking every part (and the per-part cost the cap exists to bound) shows here."""
+    delim = f"--{_B}".encode()
+    body = _FindCounter(
+        _body(_parts(multipart._MAX_PARTS))[: -len(delim) - 4] + (delim + b"\r\n") * 10_000
+    )
     with pytest.raises(MultipartError, match="more parts than the limit"):
         parse_multipart_form(f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024)
-    assert body.maxsplits, "the parser did not split the body"
-    assert all(0 <= m <= multipart._MAX_PARTS + 2 for m in body.maxsplits), body.maxsplits
+    assert 0 < body.finds <= 3 * (multipart._MAX_PARTS + 2), body.finds
+
+
+def test_a_part_with_no_header_block_is_bounded_too() -> None:
+    """A part with no blank line after its headers is skipped, and is bounded like a nameless field
+    rather than by the body cap alone."""
+    junk = b"x" * (multipart._MAX_FIELD_BYTES + 1)
+    with pytest.raises(MultipartError, match="no header block") as caught:
+        parse_single_file_upload(
+            f"multipart/form-data; boundary={_B}", _body([_FILE_PART, junk]), max_file_bytes=1024
+        )
+    assert type(caught.value) is MultipartError  # 400: the size is not the cause to fix
+    small = b"x" * multipart._MAX_FIELD_BYTES
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}", _body([_FILE_PART, small]), max_file_bytes=1024
+    )
+    assert file.data == b"MSH|body"
+
+
+def test_an_admitted_file_part_is_copied_once() -> None:
+    """BACKLOG #5522 / #5520 item 20: the parse copies the file part it returns, once, and nothing
+    else of the body. The old walk split, sliced, partitioned and trimmed each part, about four
+    copies alive at once, so its peak was several times the body."""
+    body = _body(
+        [b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\n' + b"x" * _BIG]
+    )
+    ct = f"multipart/form-data; boundary={_B}"
+    peak = _peak_allocated(lambda: parse_single_file_upload(ct, body, max_file_bytes=2 * _BIG))
+    assert _BIG <= peak < 1.5 * _BIG, (
+        f"the parse allocated {peak} bytes at its peak for a {_BIG}-byte part"
+    )
+
+
+def test_a_too_many_parts_refusal_copies_nothing_of_the_body() -> None:
+    """#5520 item 21: the refusal must not copy the unsplit remainder of the body. The large part is
+    the one past the cap, so a walk that copied it on the way to the count would show here."""
+    parts = _parts(multipart._MAX_PARTS) + [_field("tail", b"x" * _BIG)]
+    body = _body(parts)
+    ct = f"multipart/form-data; boundary={_B}"
+    with pytest.raises(MultipartError, match="more parts than the limit"):
+        parse_multipart_form(ct, body, max_file_bytes=1024)
+    peak = _peak_allocated(lambda: parse_multipart_form(ct, body, max_file_bytes=1024))
+    assert peak < _BIG // 4, f"the refusal allocated {peak} bytes for a {len(body)}-byte body"
+
+
+def test_an_oversized_field_refusal_copies_nothing_of_the_field() -> None:
+    """The field cap is checked on the part's length, before any of its content is copied."""
+    body = _body([_FILE_PART, _field("note", b"x" * _BIG)])
+    ct = f"multipart/form-data; boundary={_B}"
+    with pytest.raises(MultipartTooLargeError):
+        parse_multipart_form(ct, body, max_file_bytes=1024)
+    peak = _peak_allocated(lambda: parse_multipart_form(ct, body, max_file_bytes=1024))
+    assert peak < _BIG // 4, f"the refusal allocated {peak} bytes for a {len(body)}-byte body"
+
+
+def test_a_trailing_delimiter_line_without_a_close_marker_is_not_a_part() -> None:
+    """#5520 item 22: a body at the part cap that ends with a delimiter line but no ``--`` close
+    marker parses, as it did before the cap. That last line has no part after it to count."""
+    delim = f"--{_B}".encode()
+    body = b"".join(delim + b"\r\n" + p + b"\r\n" for p in _parts(multipart._MAX_PARTS))
+    form = parse_multipart_form(
+        f"multipart/form-data; boundary={_B}", body + delim + b"\r\n", max_file_bytes=1024
+    )
+    assert len(form.files) == 1
+    assert len(form.fields) == multipart._MAX_PARTS - 1
+
+
+def test_a_part_with_neither_name_nor_filename_is_bounded_too() -> None:
+    """#5520 item 23: the field cap applies to every non-file part. A part with neither ``name=``
+    nor ``filename=`` used to be copied whole and then skipped, bounded only by the body cap."""
+    nameless = b"Content-Disposition: form-data\r\n\r\n" + b"x" * (multipart._MAX_FIELD_BYTES + 1)
+    with pytest.raises(MultipartTooLargeError, match="text field"):
+        parse_single_file_upload(
+            f"multipart/form-data; boundary={_B}",
+            _body([_FILE_PART, nameless]),
+            max_file_bytes=1024,
+        )
+    under = b"Content-Disposition: form-data\r\n\r\n" + b"x" * multipart._MAX_FIELD_BYTES
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}", _body([_FILE_PART, under]), max_file_bytes=1024
+    )
+    assert file.data == b"MSH|body"
+
+
+def test_a_file_sent_as_a_plain_field_names_the_cause_at_any_size() -> None:
+    """#5520 item 25, its message half: under the field cap, the "no file part" refusal now gives the
+    same hint the over-cap refusal gives, so the client hears the cause either way."""
+    with pytest.raises(MultipartError, match="no file part.*plain filename parameter"):
+        parse_single_file_upload(
+            f"multipart/form-data; boundary={_B}",
+            _body([_field("file", b"MSH|body")]),
+            max_file_bytes=1024,
+        )
+
+
+def test_a_second_file_part_is_refused() -> None:
+    """#5520 item 9: the single-file parse used to admit up to ``_MAX_PARTS`` file parts and return
+    the first, dropping the rest unread. A body with two is refused with the 400 base error."""
+    with pytest.raises(MultipartError, match="2 file parts") as caught:
+        parse_single_file_upload(
+            f"multipart/form-data; boundary={_B}",
+            _body([_FILE_PART, _FILE_PART]),
+            max_file_bytes=1024,
+        )
+    assert type(caught.value) is MultipartError
+
+
+def test_the_single_file_parse_does_not_decode_text_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#5520 item 33: the single-file parse keeps no field, so it builds no ``MultipartForm`` and
+    decodes no field value."""
+
+    def no_form(*args: object, **kwargs: object) -> MultipartForm:
+        raise AssertionError("the single-file parse built a whole form")
+
+    monkeypatch.setattr(multipart, "parse_multipart_form", no_form)
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}",
+        _body([_FILE_PART, _field("note", b"v")]),
+        max_file_bytes=1024,
+    )
+    assert file.data == b"MSH|body"
+
+
+_PROBE: contextvars.ContextVar[str] = contextvars.ContextVar("multipart_probe", default="unset")
+
+
+async def test_the_off_loop_parse_carries_the_callers_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#5520 item 26: ``run_in_executor`` alone runs the parse with an empty context, unlike
+    ``asyncio.to_thread``. The parse must see the caller's context variables."""
+    real = multipart.parse_single_file_upload
+    seen: list[str] = []
+
+    def parse(*args: Any, **kwargs: Any) -> FilePart:
+        seen.append(_PROBE.get())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(multipart, "parse_single_file_upload", parse)
+    token = _PROBE.set("caller")
+    try:
+        file = await multipart.parse_upload_off_loop(
+            f"multipart/form-data; boundary={_B}", _body([_FILE_PART]), max_file_bytes=1024
+        )
+    finally:
+        _PROBE.reset(token)
+    assert file.data == b"MSH|body"
+    assert seen == ["caller"]
+
+
+async def test_a_cancelled_queued_parse_lets_go_of_its_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#5520 item 24: a request cancelled while its parse waits for a worker must not leave its body
+    referenced by the work item queued on the executor until a worker reaches it. Both workers are
+    held busy, a third parse is queued and cancelled, and the body's reference count must fall back
+    to what this test alone holds."""
+    real = multipart.parse_single_file_upload
+    release = threading.Event()
+    started = threading.Semaphore(0)
+
+    def blocking(*args: Any, **kwargs: Any) -> FilePart:
+        started.release()
+        release.wait(timeout=30)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(multipart, "parse_single_file_upload", blocking)
+    ct = f"multipart/form-data; boundary={_B}"
+    busy = [
+        asyncio.ensure_future(
+            multipart.parse_upload_off_loop(ct, _body([_FILE_PART]), max_file_bytes=1024)
+        )
+        for _ in range(2)
+    ]
+    try:
+        for _ in range(2):
+            assert await asyncio.to_thread(started.acquire, True, 10), "a worker never started"
+        body = _body([_FILE_PART]) + b"unique"
+        base = sys.getrefcount(body)
+        queued = asyncio.ensure_future(
+            multipart.parse_upload_off_loop(ct, body, max_file_bytes=1024)
+        )
+        await asyncio.sleep(0.05)
+        queued.cancel()
+        # Waited on rather than awaited: an awaited CancelledError's traceback would keep the
+        # parse's frame, and so the body, alive in this test's own frame.
+        await asyncio.wait([queued])
+        assert queued.cancelled()
+        del queued
+        gc.collect()
+        assert sys.getrefcount(body) == base, "the queued work item still holds the body"
+    finally:
+        release.set()
+        await asyncio.gather(*busy)
 
 
 def test_an_unterminated_body_over_the_part_cap_is_refused() -> None:

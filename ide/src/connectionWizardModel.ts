@@ -168,7 +168,9 @@ export function buildConnObj(state: WizardState): WizardConnObj {
  * A set setting that is not blank is always passed, whether or not its file exists, even where it
  * spells the default name. The CLI then refuses a missing file and names it, rather than checking the edit against a
  * file the setting did not name. A non-string setting, which only a hand edit produces, is passed
- * as an empty string, and `connection` refuses it as blank.
+ * as an empty string, and `connection` refuses it as blank. From the IDE's own readers no value
+ * reaches here as a non-string: cli.ts's containment drops one at either scope for the default,
+ * and every writer refuses a dropped value before it calls this (writerConfigTarget, BACKLOG #5404).
  *
  * An unset setting leaves the flag off, and so does a blank or whitespace-only one: clearing the
  * Settings box stores "", which VS Code still reports as set (BACKLOG #5566). The default names

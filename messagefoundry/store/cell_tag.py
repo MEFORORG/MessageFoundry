@@ -40,7 +40,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
-from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Final, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Final, Protocol, cast
 
 import annotationlib
 
@@ -64,9 +64,11 @@ __all__ = [
     "MESSAGE_TAG_FAILED_ACTION",
     "PRESET_TAG_COLUMNS",
     "PRESET_TAG_FAILED_ACTION",
+    "BlankCellError",
     "CellTagError",
     "CellTagSink",
     "CorruptCellError",
+    "NonTextCellError",
     "UnmarkedCellError",
     "audits_cell_tag",
     "dead_letter_on_cell_tag",
@@ -217,6 +219,10 @@ class CellTagError(CipherError):
             " under its own row's tag"
         )
 
+    def alert_reason(self) -> str:
+        """The ``integrity_drift`` alert's reason: the cell and a row-id prefix, never a value."""
+        return f"a {self.table}.{self.column} cell failed its integrity tag (row {self.row_ref})"
+
 
 class CorruptCellError(CellTagError):
     """A cell under a key this process holds that no tag check can judge, because the row is corrupt:
@@ -254,6 +260,46 @@ class UnmarkedCellError(CellTagError):
         return (
             f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} holds an"
             " unmarked value, which a keyed writer does not write"
+        )
+
+
+class BlankCellError(CellTagError):
+    """A preset's ``criteria`` cell holds NULL or an empty string (BACKLOG #5523). The store never
+    writes either, keyed or keyless, and a keyed cipher passes a blank value through unopened, so a
+    blank cell was written outside the store. Read as an empty filter it would drop a narrowing
+    preset out of a layered search and widen it, so it is refused.
+
+    It counts as drift: it writes the tag-failed audit row and, on a keyed store, raises the
+    ``integrity_drift`` alert, as a moved cell does. A keyless store's cipher has no alert hook."""
+
+    def _describe(self) -> str:
+        return (
+            f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} is blank, which"
+            " the store never writes"
+        )
+
+    def alert_reason(self) -> str:
+        return (
+            f"a {self.table}.{self.column} cell is blank, which the store never writes"
+            f" (row {self.row_ref})"
+        )
+
+
+class NonTextCellError(CellTagError):
+    """A preset's ``criteria`` cell holds a value that is not text, a planted BLOB say (BACKLOG
+    #5523). The store writes criteria as text only, so this was written outside the store. A keyed
+    cipher handed it would fail with a ``TypeError``. Drift, as :class:`BlankCellError` is."""
+
+    def _describe(self) -> str:
+        return (
+            f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} is not text,"
+            " which the store never writes"
+        )
+
+    def alert_reason(self) -> str:
+        return (
+            f"a {self.table}.{self.column} cell is not text, which the store never writes"
+            f" (row {self.row_ref})"
         )
 
 
@@ -341,17 +387,34 @@ def open_message_cell(
 
 
 def open_preset_criteria(
-    cipher: Cipher, stored: str | None, *, preset_id: str, owner_user_id: str
-) -> str | None:
-    """Open a preset's ``criteria`` under the tag its row's id and owner build."""
-    return open_tagged_cell(
-        cipher,
-        stored,
-        preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
-        table="search_presets",
-        column="criteria",
-        row_id=preset_id,
-    )
+    cipher: Cipher, stored: object, *, preset_id: str, owner_user_id: str
+) -> str:
+    """Open a preset's ``criteria`` under the tag its row's id and owner build.
+
+    The store writes every preset's criteria as non-blank text, so a NULL or empty cell raises
+    :class:`BlankCellError` and a value that is not text, a planted BLOB say, raises
+    :class:`NonTextCellError`, on a keyed and a keyless store alike (BACKLOG #5523). Both are drift:
+    logged here, alerted here on a keyed store only, and audited by the store's read, before the
+    caller reads the cell or stamps the preset as used. The store's whole-surface cell walks do not run this check."""
+    if stored is None or stored == "":
+        refused: CellTagError = BlankCellError("search_presets", "criteria", preset_id, None)
+    elif not isinstance(stored, str):
+        refused = NonTextCellError("search_presets", "criteria", preset_id, None)
+    else:
+        # open_tagged_cell returns None only for a None cell, refused above.
+        return cast(
+            str,
+            open_tagged_cell(
+                cipher,
+                stored,
+                preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
+                table="search_presets",
+                column="criteria",
+                row_id=preset_id,
+            ),
+        )
+    _alert(cipher, refused)
+    raise refused
 
 
 def withhold_message_cells(
@@ -440,7 +503,7 @@ def _alert(cipher: object, err: CellTagError) -> None:
         # The text, not the error: a record keeps its args, and the error's chain reaches PHI.
         _log.warning("%s; the read was refused", str(err))
         return
-    reason = f"a {err.table}.{err.column} cell failed its integrity tag (row {err.row_ref})"
+    reason = err.alert_reason()
     _log.warning("%s; the read was refused", reason)
     report = getattr(cipher, "report_tag_failure", None)
     if callable(report):

@@ -52,6 +52,7 @@ from messagefoundry.config.wiring import (
     refuse_unresolved_hop_flags,
     resolve_env_settings,
 )
+from messagefoundry.connection_names import reference_record_name
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
@@ -133,7 +134,7 @@ def reference_connection_name(name: str) -> str:
     ``reference:<name>``. One spelling, so an alert and the hop record it relates to name the set
     the same way. Reference names are not checked against ``CONNECTION_NAME_PATTERN``, so a name
     holding a credential-shaped ``key=`` can still be scrubbed out of a record."""
-    return f"reference:{name}"
+    return reference_record_name(name)
 
 
 #: The settings that name the login a DATABASE source dials, and which the role probe is remembered

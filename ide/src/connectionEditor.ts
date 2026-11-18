@@ -6,9 +6,9 @@
 // A connection authored in .py is read-only here (it isn't in `connection list`) — the gear opens its
 // source instead. After a save the graph refreshes and a Promote is offered.
 import * as vscode from "vscode";
-import { configDir, runJson, serviceConfig, serviceConfigIsSet, workspaceDir } from "./cli";
+import { configDir, writerConfigTarget, runJson, workspaceDir } from "./cli";
 import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
-import { connectionRemoveArgs, connectionServiceConfig, connectionUpsertArgs } from "./connectionWizardModel";
+import { connectionRemoveArgs, connectionUpsertArgs } from "./connectionWizardModel";
 import { type FieldGroup, buildForm } from "./connectionForm";
 import { connectionSchema } from "./connectionSchema";
 import { STARTUP_BANNERS, openChannel, postToSameRender, postToWebview, requestToken } from "./webviewMessaging";
@@ -178,9 +178,13 @@ async function save(
   // with configEditors.ts via planSave) so non-rendered keys (schedule, shard, allowlist, …) survive
   // an edit AND a clone. A list failure aborts the save: upserting the bare post would re-strip
   // every non-rendered key, so failing closed is the only non-destructive option.
+  const target = writerConfigTarget();
+  if (target === undefined) {
+    return;
+  }
   let entries: ConnObj[];
   try {
-    entries = await runJson<ConnObj[]>(["connection", "list", "--config", configDir()], ws);
+    entries = await runJson<ConnObj[]>(["connection", "list", "--config", target.configDir], ws);
   } catch (e) {
     postToWebview(current.webview, {
       command: "error",
@@ -198,7 +202,7 @@ async function save(
     return;
   }
   try {
-    await runJson(connectionUpsertArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), plan.conn), ws);
+    await runJson(connectionUpsertArgs(target.configDir, target.serviceConfig, plan.conn), ws);
   } catch (e) {
     // Surface the validation/egress error inline so the user can fix the form (file was not changed).
     postToWebview(current.webview, { command: "error", message: String(e) });
@@ -220,6 +224,10 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
   if (!ws) {
     return;
   }
+  const target = writerConfigTarget();
+  if (target === undefined) {
+    return;
+  }
   const confirm = await vscode.window.showWarningMessage(
     `Remove connection "${name}" from connections.toml?`,
     { modal: true },
@@ -229,7 +237,7 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
     return;
   }
   try {
-    await runJson(connectionRemoveArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), name), ws);
+    await runJson(connectionRemoveArgs(target.configDir, target.serviceConfig, name), ws);
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
     return;
