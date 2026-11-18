@@ -265,7 +265,8 @@ class Absence:
 
     Both fields default empty, and their absence means **"not yet proven by execution"** — never
     "proven vacuous". They are opt-in per claim because a live proof spawns a pytest subprocess per
-    claim; a claim with neither field is reported as SKIPPED, not failed.
+    claim; a claim with neither field is reported as SKIPPED, not failed. A pass where EVERY claim
+    is skipped measured nothing, and ``--prove-absences`` exits 2 for it (BACKLOG #5461).
 
     Honest limits of the proving mode, stated so they are not overclaimed:
 
@@ -3694,10 +3695,11 @@ def _run_prove_absences(scorecard: Path, root: Path) -> int:
         print(f"  FAIL {p}", file=sys.stderr)
     # A pass where every claim was SKIPPED raised no problem, so `ok` held and it exited 0 with
     # `proved 0`, which a CI step reads as every claim proved (BACKLOG #5461). It measured nothing.
+    # A pass that screened but proved none still exits 0: a screen is a measurement, if not a proof.
     if findings.skipped_absences == findings.checked_absences:
         print(
             "error: every absence claim was skipped because none names a mutation_path, so this "
-            "run proved nothing; a run that proved nothing is not a pass",
+            "run neither proved nor screened any claim; a run that measured nothing is not a pass",
             file=sys.stderr,
         )
         return 2  # could not measure — never 0, never confused with "clean"

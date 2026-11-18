@@ -614,7 +614,25 @@ def test_prove_absences_prints_the_provenance_header(
     assert "prove-absences: saw 1 absence claim(s);" in captured.out
     assert "1 static-screened" in captured.out
     assert "no absence claims" not in captured.err
-    assert "proved nothing" not in captured.err
+    assert "every absence claim was skipped" not in captured.err
+
+
+def test_prove_absences_does_not_refuse_a_run_that_skipped_only_some_claims(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The boundary of the skipped-only refusal: one claim skipped beside one screened is a
+    measurement, so it exits 0. Pins the guard against widening to `any claim skipped`, which would
+    refuse every partly adopted record."""
+    root = tmp_path / "engine"
+    root.mkdir()
+    (root / "m.py").write_text("X = 1\n", encoding="utf-8")
+    body = _CELL + _ABSENCE + '  mutation_path = "m.py"\n' + _ABSENCE
+    record = _prove_record(tmp_path, body)
+    assert main(["--scorecard", str(record), "--root", str(root), "--prove-absences"]) == 0
+    captured = capsys.readouterr()
+    assert "saw 2 absence claim(s);" in captured.out
+    assert "1 static-screened; 1 skipped;" in captured.out
+    assert "every absence claim was skipped" not in captured.err
 
 
 def test_prove_absences_refuses_a_run_where_every_claim_was_skipped(
@@ -628,9 +646,10 @@ def test_prove_absences_refuses_a_run_where_every_claim_was_skipped(
     record = _prove_record(tmp_path, _CELL + _ABSENCE)
     assert main(["--scorecard", str(record), "--root", str(root), "--prove-absences"]) == 2
     captured = capsys.readouterr()
+    assert captured.out.startswith("# asvs-prove-absences scorecard=")
     assert "prove-absences: saw 1 absence claim(s);" in captured.out
     assert "every absence claim was skipped" in captured.err
-    assert "proved nothing" in captured.err
+    assert "measured nothing is not a pass" in captured.err
 
 
 def test_prove_absences_refuses_cells_with_no_absence_claim(
