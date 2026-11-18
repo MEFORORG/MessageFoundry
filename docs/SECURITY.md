@@ -4713,22 +4713,17 @@ unconditional dedicated rows (`message_view`, `message_search`) regardless, and 
 `GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do
 `GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
 `GET /search/layered` also tries to write its `preset.layered_search` row when it refuses a
-stored preset while loading it, naming the preset id, the status and the error class (BACKLOG
-#5523). The write is best effort: a failed write does not change the answer, and it is logged at
-ERROR at most once per hour per preset, cause and failure class, so later failures in that window
-leave no row and no log line. A refusal of the composed layers writes no such row. A refusal row
-has `refused` in its detail, which tells it from a search that ran. A NULL, empty or non-text
-criteria cell is refused by the store itself, which logs a WARNING and writes the
+stored preset while loading it, naming the preset id, the status and the refusal cause, an error
+class name or `malformed` (BACKLOG #5523). The write is best effort: a failed write does not change
+the answer, and it is logged at ERROR. A refusal of the composed layers writes no such row. A
+refusal row has `refused` in its detail, which tells it from a search that ran. A NULL, empty or
+non-text criteria cell is refused by the store itself, which logs a WARNING and writes the
 `integrity.preset_tag_failed` row on every store, and on a keyed store raises the
-`integrity_drift` alert, as for a moved preset. The store logs the WARNING and raises the alert at
-most once per hour per row and refusal class. The notifying AlertSink's re-alert cooldown then
-applies per alert type and subject (`[alerts].realert_seconds`, or a matching rule's cooldown), and
-every preset refusal, a moved preset's included, shares one subject, `search_presets-tag`, so fewer
-notifications may reach the operator than the store raised. The row is written once per row and refusal class per hour too, but that
-hour starts only when a write succeeds, so a failed write is tried again at the next refusal.
-Every once-per-hour limit in this paragraph is held in memory by each engine process, so N engine
-shards can each log, alert and write once in the same hour, and a restart starts every window
-afresh.
+`integrity_drift` alert, as for a moved preset. The store rate-limits its WARNING, alert and
+`integrity.preset_tag_failed` row for a repeated refusal, and the route rate-limits some of its
+refusal logs, including the failed-write ERROR. These limits are best effort and held in memory per
+engine process, and the AlertSink's per-subject re-alert cooldown applies on top, so the operator
+may see fewer notifications than refusals.
 
 **Roles and visibility.** `messages:view_raw` is **not** a superset of `messages:view_summary` —
 `Identity.has()` is a flat membership check. The built-in roles happen to grant them nested
