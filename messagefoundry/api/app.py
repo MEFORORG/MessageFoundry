@@ -506,6 +506,7 @@ from messagefoundry.pipeline.wiring_runner import (
     DrParkedError,
     NotDeployedError,
     RegistryRunner,
+    RunnerLeaseLostError,
     RunnerNotRunningError,
     ShardLaneOwnershipError,
 )
@@ -761,6 +762,14 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
         return (
             f"outbound {name!r} is not running because this engine's graph is not running "
             "(stopped, or a demoted node); resend through the engine that runs the graph"
+        )
+    if not rr.coordinator.is_leader():
+        # BACKLOG #5906: a cluster node that lost its lease still reads running until
+        # _stop_graph runs, and its start door refuses with RunnerLeaseLostError, so "start it
+        # before resending" would point at a refused control.
+        return (
+            f"outbound {name!r} is not running and this node no longer holds the cluster lease, so "
+            "it starts no connection; resend through the leader"
         )
     if rr.outbound_status(name) == "log_halted":
         return (
@@ -1080,9 +1089,16 @@ async def _alert_restart(
     restart: Callable[[str], Awaitable[None]], action: str, target: str
 ) -> None:
     """``restart(target)``, logged at INFO and not raised when the runner's graph is down, as on a
-    demoted follower (BACKLOG #5702), where the leader, if there is one, acts on its own alert."""
+    demoted follower (BACKLOG #5702), or when this cluster node lost its lease while its graph
+    still runs (BACKLOG #5906). Either way the leader, if there is one, acts on its own alert."""
     try:
         await restart(target)
+    except RunnerLeaseLostError:
+        _log.info(
+            "alert control_action %s for %r not run: this node no longer holds the cluster lease",
+            action,
+            target,
+        )
     except RunnerNotRunningError:
         _log.info(
             "alert control_action %s for %r not run: this engine's graph is not running",
@@ -6009,8 +6025,10 @@ def create_app(
                 raise HTTPException(409, str(exc)) from None
             except RunnerNotRunningError as exc:
                 # BACKLOG #5702: the graph is down, as on a demoted follower whose API still serves,
-                # so a start would bind a listener outside the engine lifecycle. 503, as no runner
-                # is, and audited below as every refused inbound start or restart is.
+                # so a start would bind a listener outside the engine lifecycle. Its subclass
+                # RunnerLeaseLostError (BACKLOG #5906) is a node that lost its lease while its graph
+                # still runs, and carries its own text. 503, as no runner is, and audited below as
+                # every refused inbound start or restart is.
                 refused = HTTPException(503, str(exc))
             except TrustAnchorError as exc:
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
@@ -6088,7 +6106,9 @@ def create_app(
                 raise HTTPException(409, str(exc)) from None
             except RunnerNotRunningError as exc:
                 # BACKLOG #5702: the graph is down, so a start would spawn a delivery worker outside
-                # the engine lifecycle and a stop would record a pause a later start inherits.
+                # the engine lifecycle and a stop would record a pause a later start inherits. Its
+                # subclass RunnerLeaseLostError (BACKLOG #5906) refuses a start or restart on a node
+                # that lost its lease while its graph still runs, with its own text.
                 out_refused = HTTPException(503, str(exc))
             if out_refused is not None:
                 await _record_refused_control_audit(
