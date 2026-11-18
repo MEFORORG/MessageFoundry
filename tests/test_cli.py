@@ -3927,8 +3927,12 @@ def test_admin_unlock_reports_a_defect_rather_than_a_refusal(
         raise NotImplementedError("a defect")
 
     monkeypatch.setattr(MessageStore, "clear_lockout", bug)
-    main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"])
+    # The dispatch floor's exit 1, never the success code; and the lock still stands (#5633 item 8).
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
     assert "refused the unlock" not in capsys.readouterr().out
+    monkeypatch.undo()
+    assert _read_lock(db)[0] is not None
+    assert _unlock_audit_details(db) == []
 
 
 def test_admin_unlock_names_the_os_user_before_any_write(
@@ -4001,6 +4005,107 @@ def test_admin_unlock_reports_a_row_changed_under_the_clear(
     assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
     error = json.loads(capsys.readouterr().out)["error"]
     assert "removed or changed" in error and "nothing was written" in error
+
+
+def test_admin_unlock_does_not_send_a_transit_seal_refusal_to_stop_the_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633 item 2: a Transit row seal that could not be made is not a busy store, so
+    its text names Vault transit rather than telling the operator to stop the engine."""
+    import time
+
+    from messagefoundry.store.row_seal import TransitSealUnavailableError
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-transit.db"
+    _seed_locked(db, locked_until=time.time() + 86_400)
+
+    async def outage(*_a: object, **_k: object) -> bool:
+        raise TransitSealUnavailableError
+
+    monkeypatch.setattr(MessageStore, "clear_lockout", outage)
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "TransitSealUnavailableError" in error and "Vault transit is reachable" in error
+    assert "stop it" not in error
+    monkeypatch.undo()
+    assert _read_lock(db)[0] is not None
+    assert _unlock_audit_details(db) == []
+
+
+def test_admin_unlock_names_vault_transit_for_a_read_it_could_not_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633 item 2: the read's arm names Vault transit too, not the store key."""
+    from messagefoundry.store.row_seal import RowSealUnverifiableError
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-unverifiable.db"
+    _seed_locked(db, locked_until=None)
+
+    async def unverifiable(*_a: object, **_k: object) -> object:
+        raise RowSealUnverifiableError("user")
+
+    monkeypatch.setattr(MessageStore, "get_user_by_username", unverifiable)
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "RowSealUnverifiableError" in error and "Vault transit is reachable" in error
+    assert "store key" not in error
+
+
+def test_admin_unlock_prints_an_engine_refusal_at_open_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633 items 5 and 15: an engine refusal at the open keeps its remedy, as the
+    transit-bound commands print one, rather than being cut short."""
+    import messagefoundry.store.base as store_base
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.store.base import PROVISION_SCHEMA_COMMAND, SchemaNotProvisionedError
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-unprovisioned.db"
+    _seed_locked(db, locked_until=None)
+
+    async def unprovisioned(*_a: object, **_k: object) -> object:
+        raise SchemaNotProvisionedError(StoreBackend.POSTGRES, "mefor", "a" * 64)
+
+    monkeypatch.setattr(store_base, "open_store", unprovisioned)
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("cannot open the store at ")
+    assert PROVISION_SCHEMA_COMMAND in error and "then start again" in error
+
+
+def test_admin_unlock_names_the_stored_username(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633 item 7: a server whose collation ignores case finds the account under a name
+    typed in another case. The output names the stored username, as the audit row does."""
+    import time
+
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-case.db"
+    _seed_locked(db, locked_until=time.time() + 86_400)
+    by_name = MessageStore.get_user_by_username
+
+    async def case_blind(self: MessageStore, username: str) -> object:
+        return await by_name(self, username.lower())
+
+    monkeypatch.setattr(MessageStore, "get_user_by_username", case_blind)
+    assert main(["admin-unlock", "--username", "ADMIN", "--db", str(db), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["username"] == "admin"
+    assert main(["admin-unlock", "--username", "ADMIN", "--db", str(db)]) == 0
+    assert "cleared lockout for 'admin'" in capsys.readouterr().out
+    monkeypatch.undo()
+    assert [d["username"] for d in _unlock_audit_details(db)] == ["admin", "admin"]
 
 
 def test_audit_verify_exits_2_on_a_file_that_is_not_a_database(tmp_path: Path) -> None:

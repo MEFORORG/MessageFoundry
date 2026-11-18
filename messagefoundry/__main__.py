@@ -7188,8 +7188,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 return ("no-such-user", None)
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
             # ADR 0197: both old expiries and both cycle counts, read before the clear so they are
-            # what the clear replaced. The engine is stopped for this command (ADR 0171).
+            # what the clear replaced. The engine is stopped for this command (ADR 0171). The
+            # stored username, which the output names too, not the argument as typed (#5633).
             report: dict[str, Any] = {
+                "username": user.username,
                 "was_locked_until": user.locked_until,
                 "was_second_step_locked_until": user.second_step_locked_until,
                 "lock_cycles": user.lock_cycles,
@@ -7201,7 +7203,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             audit = AuditAppend(
                 ADMIN_UNLOCKED_ACTION,
                 actor=actor,
-                detail=json.dumps({"username": user.username, **report}),
+                detail=json.dumps(report),
             )
             try:
                 cleared = await store.clear_lockout(
@@ -7239,8 +7241,18 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 f"{_sentence(codec_safe_str(extra))} Nothing was written.", as_json=args.json
             )
             return 2
-        # #1670: a path that is not a database, or a server the driver could not reach.
-        return _emit_store_open_error(extra, _store_label(settings.store), as_json=args.json)
+        # #1670: a path that is not a database, or a server the driver could not reach. An engine
+        # refusal, such as SchemaNotProvisionedError, is printed whole, so its remedy survives
+        # (BACKLOG #5633), as the transit-bound commands print one.
+        return _emit_store_open_error(
+            extra,
+            _store_label(settings.store),
+            as_json=args.json,
+            text=_transit_store_error_text(extra),
+        )
+    # A Transit row seal that could not be made or checked is not a busy store, so it is not
+    # given the busy store's remedy (BACKLOG #5633).
+    sealing = isinstance(extra, (RowSealUnverifiableError, TransitSealUnavailableError))
     if outcome in ("read-refused", "refused"):
         # Logged, so the cause can be found: WARNING names the class only, since a driver's
         # message can quote a stored value (ASVS 16.5.4); the traceback goes to DEBUG. A busy
@@ -7254,9 +7266,18 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
         log.debug("admin-unlock: the refusal's traceback", exc_info=extra)
     if outcome == "read-refused":
+        check = "that Vault transit is reachable" if sealing else "the store key and the database"
         return _emit_error(
             f"the store refused to read the account {wanted!r} ({type(extra).__name__}); "
-            "nothing was written. Check the store key and the database, then re-run",
+            f"nothing was written. Check {check}, then re-run",
+            as_json=args.json,
+        )
+    if outcome == "refused" and sealing:
+        return _emit_error(
+            f"the store refused the unlock for {wanted!r} ({type(extra).__name__}): a row seal "
+            "could not be made or checked through Vault transit. The clear and its audit row are "
+            "one transaction, so neither was written. Check that Vault transit is reachable, then "
+            "re-run",
             as_json=args.json,
         )
     if outcome == "refused":
@@ -7277,7 +7298,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         return _emit_error(f"no local account named {wanted!r}", as_json=args.json)
     report = cast("dict[str, Any]", extra)
     if args.json:
-        print(json.dumps({"ok": True, "username": wanted, **report}))
+        print(json.dumps({"ok": True, **report}))
     else:
 
         def _state(label: str, until: float | None) -> str:
@@ -7297,7 +7318,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
         kept = "reset to 0" if report["cycles_reset"] else "kept"
         print(
-            f"OK: cleared lockout for {wanted!r} ({states}; {cycles}, {kept}); "
+            f"OK: cleared lockout for {report['username']!r} ({states}; {cycles}, {kept}); "
             "the password is UNCHANGED"
         )
     return 0
@@ -12947,9 +12968,10 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     is host access, as for ``admin-unlock``, whose docstring says why that gate is a real one.
     It keeps no session: the shell that runs it holds none.
 
-    The audit row is written after the revoke, as ``admin-unlock`` writes its own, and the audit
-    append is checked for a refusal before the revoke, so a refused row cannot follow a change
-    that already landed."""
+    The audit row is written after the revoke, and the audit append is checked for a refusal
+    before the revoke, so a refused row cannot follow a change that already landed.
+    ``admin-unlock`` no longer works this way: its row commits in the clear's own transaction
+    (BACKLOG #5633)."""
     import getpass
 
     from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
@@ -14224,8 +14246,9 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
 
 
 async def _close_store_quietly(store: Store) -> None:
-    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``store attest-transit-bound`` or
-    ``store withdraw-transit-bound`` has its result. A close that fails prints a warning naming its
+    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``admin-unlock``,
+    ``cipher-audit``, ``store attest-transit-bound`` or ``store withdraw-transit-bound`` has its
+    result. A close that fails prints a warning naming its
     class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()
