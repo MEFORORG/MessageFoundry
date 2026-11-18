@@ -539,7 +539,9 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   `False`, since these flags take no `env()` reference. A raw `tls_hop_attested` written into a
   connection's transport settings before the declaration is refused there as not a transport
   setting, whatever its value. Written after the declaration, the load refuses only a value that
-  is not a `bool`, and the connection's build refuses the key whatever its value. The
+  is not a `bool`, and the connection's build refuses the key whatever its value.
+  `cleartext_accepted`, `tls_revocation_attested` and their reasons are refused in a connection's
+  transport settings too, at the declaration and, written after it, at the build. The
   flags `inbound()` and `outbound()` take themselves, such as
   `simulate`, `deployed`, `auto_start`, `strict` and `capture_ack`, must be a real `True` or
   `False` as well. Any other value there, such as a string or a number, stops the load when the
@@ -549,13 +551,13 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   already refused anything but `true` or `false` for the ones it takes. Not every reading is
   covered. The rule covers the settings a connection, lookup or reference factory takes and the
   composers' `enabled` flags, in a graph the loader validates, and the flags `inbound()` and
-  `outbound()` take, whenever a connection is declared. A check inside a factory that reads one
-  of the factory's own settings before this one does can stop the load with an error about the
-  flag's effect instead. `MLLP`, `DICOMweb` and `Http` refuse a non-bool `tls` or `verify_tls`
-  before such a check of theirs reads it, naming the factory and not the connection. At least some checks
-  read a setting before `env()` resolves, so they see the reference and not its value. A cast you
-  write yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a
-  boolean `cast=bool`.
+  `outbound()` take, whenever a connection is declared. At least a connection's, lookup's and
+  reference set's build refuses such a literal too, so one in a graph built in code, or written
+  after the load, is refused there. At start a connection's refusal fails its own lane; `check`
+  or a reload refuses the graph. Some checks that run before a build still read such a literal as
+  written. At least some checks read a setting before `env()` resolves, so they see the reference
+  and not its value. A cast you write yourself runs first, so `cast=lambda s: bool(s)` still keeps
+  the builtin's trap. Give a boolean `cast=bool`.
 - **A `default=` is static.** Only one `env()` link is resolved, so a default that holds another
   `env()` reference, directly or inside a table or list, would never resolve. Such a default stops
   the load, in a code-first module and in `connections.toml`, and the error names the key and
