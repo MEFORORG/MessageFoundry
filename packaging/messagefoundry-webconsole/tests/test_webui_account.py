@@ -46,6 +46,26 @@ NEW_PW = "another-strong-test-passphrase"
 HEADERLESS = {HEADERLESS_UI_REQUEST: True}
 
 
+async def _opt_out_service(engine: Engine) -> AuthService:
+    """The suite's service under ``[auth].require_action_step_up = false``."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            require_action_step_up=False,
+            admin_write_min_interval_seconds=0,
+            mfa_verify_min_elapsed_seconds=0,
+        ),
+    )
+    await service.initialize()
+    return service
+
+
+async def _refuse_enrolment_code(*_args: object, **_kwargs: object) -> None:
+    """A ``confirm_mfa_enrollment`` stand-in that refuses the enrolment code (ADR 0207)."""
+    raise EnrolmentCodeRefused
+
+
 async def test_account_page_renders(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
@@ -391,15 +411,12 @@ async def test_a_refused_enrolment_code_rerenders_the_continue_under_the_default
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
 
-    async def refuse(*_args: object, **_kwargs: object) -> None:
-        raise EnrolmentCodeRefused
-
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
         await _mint_action(c, "/ui/account/mfa/enroll")
         r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200
-        monkeypatch.setattr(service, "confirm_mfa_enrollment", refuse)
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _refuse_enrolment_code)
         await _mint_action(c, "/ui/account/mfa/confirm")
         r = await c.post(
             "/ui/account/mfa/verify",
@@ -420,34 +437,54 @@ async def test_a_refused_enrolment_code_rerenders_both_fields_under_the_opt_out(
     #5931).
 
     RED when: the refusal branch drops the enrolment-code field or the code form."""
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            require_mfa=False,
-            require_action_step_up=False,
-            admin_write_min_interval_seconds=0,
-            mfa_verify_min_elapsed_seconds=0,
-        ),
-    )
-    await service.initialize()
+    service = await _opt_out_service(engine)
     await _add(service, "op", Role.OPERATOR)
-
-    async def refuse(*_args: object, **_kwargs: object) -> None:
-        raise EnrolmentCodeRefused
 
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
         r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200
-        monkeypatch.setattr(service, "confirm_mfa_enrollment", refuse)
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _refuse_enrolment_code)
         r = await c.post(
             "/ui/account/mfa/verify",
             data={"code": "123456", "enrolment_code": "not-the-code"},
             headers={"Sec-Fetch-Site": "same-origin"},
         )
         assert r.status_code == 400 and "needs a one-time enrolment code" in r.text
+        assert "Confirm enrollment" in r.text
         assert 'name="code"' in r.text and 'name="enrolment_code"' in r.text
         assert ">Continue<" not in r.text
+
+
+async def test_the_confirm_page_offers_continue_while_no_confirm_proof_is_held(
+    engine: Engine,
+) -> None:
+    """BACKLOG #5931 closing step 1: the confirm GET, reached with a fresh session window but no
+    confirm proof held (here Back after a refused code spent it), offers the Continue to a fresh
+    re-auth rather than a code form whose code the gate would drop. Once the re-auth mints the
+    proof, the same page carries the code form.
+
+    RED when: the confirm GET renders the code form without peeking the confirm proof."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/account/mfa/enroll")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+        await _mint_action(c, "/ui/account/mfa/confirm")
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "badcod"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400  # the refused code spent the confirm proof
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and "Confirm enrollment" in r.text
+        assert ">Continue<" in r.text and 'name="code"' not in r.text
+        await _mint_action(c, "/ui/account/mfa/confirm")
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and 'name="code"' in r.text and ">Continue<" not in r.text
 
 
 async def test_empty_code_continue_with_a_held_grant_spends_nothing(
@@ -587,16 +624,7 @@ async def test_an_empty_code_under_the_opt_out_is_checked_as_before(engine: Engi
     """Under ``[auth].require_action_step_up = false`` there is no grant to spend, so an empty code
     is not sent to the re-auth: the route checks it and answers "Invalid code." as main does
     (BACKLOG #5931)."""
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            require_mfa=False,
-            require_action_step_up=False,
-            admin_write_min_interval_seconds=0,
-            mfa_verify_min_elapsed_seconds=0,
-        ),
-    )
-    await service.initialize()
+    service = await _opt_out_service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
@@ -612,16 +640,7 @@ async def test_enroll_page_keeps_the_code_form_under_the_opt_out(engine: Engine)
     """Under ``[auth].require_action_step_up = false`` the confirm gate is the session window, which
     the enroll re-auth left fresh, so the enroll page keeps its code form and the first code turns
     TOTP on with no second re-auth (BACKLOG #5931)."""
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            require_mfa=False,
-            require_action_step_up=False,
-            admin_write_min_interval_seconds=0,
-            mfa_verify_min_elapsed_seconds=0,
-        ),
-    )
-    await service.initialize()
+    service = await _opt_out_service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
