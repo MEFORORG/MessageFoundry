@@ -3349,9 +3349,9 @@ def _serve(args: argparse.Namespace) -> int:
     # the ADR 0173 revocation attestation with its reason, where it suppresses a refusal; at least the
     # bind gates' and raw-TCP guard's tls_hop_attested line, and the database weakened-TLS line that a
     # DatabaseRef source also writes, without the reason),
-    # and all of them completely by GET /security/posture, which has the graph. `messagefoundry
-    # check` has it too and reports all but an HTTP listener's trusted_proxies (BACKLOG #5525),
-    # whose ranges the listener logs as it is built.
+    # and all of them completely by GET /security/posture, which has the graph, and by `messagefoundry
+    # check`, which has it too; an HTTP listener's trusted_proxies (BACKLOG #5525) is also logged
+    # by the listener as it is built, where the list holds a range.
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
     # preflight's own log line + audit row once the lifespan opens the store, and completely by
@@ -3376,6 +3376,7 @@ def _serve(args: argparse.Namespace) -> int:
         revocation_attested_hops=(),
         path_form_fhir_hops=(),
         ech_cleartext_sidecar_hops=(),
+        listener_trusted_proxy_hops=(),
         api=settings.api,
         approvals=settings.approvals,
         cert_monitor=settings.cert_monitor,
@@ -3399,7 +3400,7 @@ def _serve(args: argparse.Namespace) -> int:
             "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173), FHIR update_url_form "
             "and http ECH sidecar (ADR 0139) declarations, and an HTTP listener's trusted_proxies, "
             "are NOT in this list — the graph is not loaded yet; they are "
-            "reported by GET /security/posture, all but the last by `messagefoundry check`, and "
+            "reported by GET /security/posture and by `messagefoundry check`, and "
             "most also by the connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
             len(_loosenings),
@@ -13877,6 +13878,7 @@ def _security(args: argparse.Namespace) -> int:
                 revocation_attested_hops=(),
                 path_form_fhir_hops=(),
                 ech_cleartext_sidecar_hops=(),
+                listener_trusted_proxy_hops=(),
                 api=full.api,
                 approvals=full.approvals,
                 cert_monitor=full.cert_monitor,

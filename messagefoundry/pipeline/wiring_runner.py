@@ -412,9 +412,9 @@ class _IntakeRateLimiter:
     def check_peer(self, peer: str) -> bool:
         return self._per_peer.would_allow(peer)
 
-    def charge_failure(self, peer: str) -> None:
+    def charge_failure(self, peer: str, *, charge_global: bool = True) -> None:
         self._per_peer.allow(peer)
-        if self._global is not None:
+        if charge_global and self._global is not None:
             self._global.allow(peer)
 
     def note_success(self, peer: str) -> None:

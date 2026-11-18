@@ -454,6 +454,9 @@ def run_checks(
         # ADR 0139: every REST outbound whose ECH sidecar hop is cleartext http on this host. No hop
         # gate refuses it, because it is loopback. Advisory -- see the check.
         _check_ech_cleartext_sidecar(config_dir),
+        # BACKLOG #5525: every HTTP listener that keys its failed-attempt budget on the address a
+        # listed proxy writes. A named loosening the load allows. Advisory -- see the check.
+        _check_listener_trusted_proxies(config_dir),
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
@@ -3147,6 +3150,50 @@ def _check_ech_cleartext_sidecar(config_dir: str | Path) -> CheckResult:
             f"is cleartext http, or may where marked possibly — {listed}. That hop carries the "
             "body and every request header, any credential included; an https sidecar listener "
             "encrypts it (ADR 0139)"
+        ),
+    )
+
+
+def _check_listener_trusted_proxies(config_dir: str | Path) -> CheckResult:
+    """Name every inbound ``Http()`` listener with a non-empty ``trusted_proxies`` (BACKLOG #5525).
+
+    The set and its ``env()`` case are in
+    :func:`~messagefoundry.config.wiring.listener_trusted_proxy_hops`, the reader
+    ``GET /security/posture`` names as ``listener_trusted_proxies``; what it loosens is in
+    ``docs/SECURITY-LOOSENING.md``. Advisory (``required=False``): the load already refuses a list
+    too wide to keep, and a listener behind a proxy needs one.
+
+    SKIPs when the graph will not load, the same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, listener_trusted_proxy_hops, load_config
+
+    name = "listener-trusted-proxies"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    found = listener_trusted_proxy_hops(registry)
+    if not found:
+        return CheckResult(
+            name,
+            ok=True,
+            required=False,
+            detail="no HTTP listener trusts X-Forwarded-For from a listed proxy",
+        )
+    listed = "; ".join(f"{conn} ({note})" if note else conn for conn, note in found)
+    return CheckResult(
+        name,
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(found)} HTTP listener(s) key the failed-attempt budget on the client address a "
+            f"listed proxy writes in X-Forwarded-For: {listed}. Each listed proxy, and every host "
+            "inside a listed range (marked range), may key the budget on any address it writes. "
+            "Guessing through it is then bounded by the global budget, plus the per-peer budget "
+            "of each address it writes that authenticated recently, which the global budget "
+            "exempts; writing a partner's address also spends that partner's budget. A listener "
+            "marked possibly has an env() list this could not resolve"
         ),
     )
 
