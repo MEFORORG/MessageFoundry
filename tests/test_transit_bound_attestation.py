@@ -2022,7 +2022,6 @@ def test_a_fault_escaping_the_unconfirmed_warning_keeps_the_label_and_frees_the_
     def report_fails(*_a: Any, **_kw: Any) -> None:
         raise fault
 
-    monkeypatch.setattr(crypto_transit, "_logged_at", {})
     caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
     raising = _RaisingFilter()
     crypto_transit.log.addFilter(raising)

@@ -150,8 +150,8 @@ _NO_ERRORS_LIST = "it carries no errors list"
 _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
 #: The failures caught while a 400 is read, which then picks the unconfirmed label, and while that
-#: label's warning is made and logged (BACKLOG #6707): a step short of memory or stack. Anything else the read
-#: raises propagates. No reply is known to cause either: a body past
+#: label's warning is made and logged (BACKLOG #6707): a step short of memory or stack. Anything
+#: else the read raises propagates. No reply is known to cause either: a body past
 #: :data:`_REPARSED_BODY_MAX_CHARS` is not read, and the parser,
 #: :func:`~messagefoundry.redaction.json_loads_or_refusal`, returns its ``RecursionError`` refusal
 #: rather than raising it. Out of memory or stack, a fault on the unconfirmed label's path can still
@@ -326,8 +326,8 @@ def _names_aead_failure(exc: Exception) -> bool:
     return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
 
 
-#: The seconds within which each :func:`_warn_when_due` warning, and each :func:`_report_unlogged`
-#: line, is logged at most once per process (BACKLOG #5650, #6707). A proxy can cause one on every
+#: The seconds within which each :func:`_warn_when_due` warning is logged at most once per process,
+#: and :func:`_report_unlogged`'s rate limit (BACKLOG #5650, #6707). A proxy can cause one on every
 #: read or every row; once is the signal.
 _WARNING_LOG_INTERVAL_S = 3600.0
 #: When each such warning, by kind, was last logged.
@@ -956,7 +956,7 @@ class TransitCipher(_UnmarkedPolicy):
             # writes a fixed literal on stderr in place of the warning. A fault in _READ_FAULTS
             # escaping the warning or that write is dropped, unreported, so the label and the
             # row's break survive it; reporting it would need the memory or stack that ran out.
-            try:  # noqa: SIM105 -- constructing contextlib.suppress can itself raise here
+            try:
                 try:
                     kind, build = _unconfirmed_warning(self._audit_key, version, reason, raised)
                 except _READ_FAULTS:
