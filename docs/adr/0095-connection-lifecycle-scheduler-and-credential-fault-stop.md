@@ -577,6 +577,12 @@ through that endpoint before it is sent, so every row would meet the same refusa
 A.1 route: under `credential_fault_policy="stop"` the lane stops and the claimed rows go back to
 PENDING un-errored; under `"dead_letter"` the row, or every member of a batch, dead-letters.
 
+Under `"dead_letter"` a configuration fault now also marks the lane down, through the same
+edge-triggered `_note_lane_unhealthy` a transport failure uses, so `connection_error` fires once
+rather than per row, and the next delivery that succeeds clears it. That holds for every
+configuration fault, not only `token-reply-coded`: the worker reads `config_fault`, never the code.
+Owner ruling 2026-11-18 on PR 3069: "Yes, keep one connection_error alert on that path."
+
 This widens A.1's definition. The refusal is not of the connection's own settings: the engine sends
 `Accept-Encoding: identity`, so the coding comes from the token endpoint, or from a proxy in front
 of it that ignores that header. From this amendment a configuration fault is a permanent refusal

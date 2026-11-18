@@ -118,9 +118,15 @@ class _RecordsStops(LoggingAlertSink):
     def __init__(self) -> None:
         super().__init__()
         self.stopped: list[tuple[str, str]] = []
+        self.errors: list[tuple[str, str | None]] = []
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         self.stopped.append((name, detail))
+
+    def connection_error(
+        self, name: str, *, kind: str, detail: str | None = None, error_class: str | None = None
+    ) -> None:
+        self.errors.append((name, error_class))
 
 
 async def _outbound_rows(store: MessageStore) -> list[tuple[str, int, str | None]]:
@@ -303,6 +309,7 @@ async def test_a_batch_keeps_every_member_on_a_coded_token_reply_and_dead_letter
         else:
             assert await store.count_dead(allowed_channels=None) == 3
             assert sink.stopped == []
+            assert sink.errors == []  # an ordinary reject is no connection error
     finally:
         await runner.stop()
 
@@ -312,31 +319,34 @@ async def test_under_the_dead_letter_policy_a_coded_token_reply_dead_letters_as_
     store: MessageStore, batched: bool
 ) -> None:
     # credential_fault_policy = "dead_letter" opts every configuration fault back into the
-    # fail-fast dead-letter, and the coded token reply follows it: the lane does not stop. This
-    # pins the built behaviour; whether it should also alert is with the owner.
+    # fail-fast dead-letter, and the coded token reply follows it: the lane does not stop. It marks
+    # the lane down, so connection_error fires once across every row, not per row (owner ruling
+    # 2026-11-18 on PR 3069: "Yes, keep one connection_error alert on that path.").
     sink = _RecordsStops()
     connector = _MintsThroughACodedTokenEndpoint()
+    if batched:
+        # Two batches, of two members and then one, so the edge trigger is tested across sends.
+        runner = _batch_runner(store, connector, sink, policy="dead_letter")
+        runner._batch[OUT] = BatchConfig(max_count=2, max_wait_ms=1)
+    else:
+        runner = _runner(store, connector, sink, policy="dead_letter")
+    await _enqueue(store, 3)
     try:
         if batched:
-            runner = _batch_runner(store, connector, sink, policy="dead_letter")
-            await _enqueue(store, 3)
-            await run_one_batch(runner, OUT)  # closes the connector
-            dead = 3
+            await run_one_batch(runner, OUT)
+            await run_one_batch(runner, OUT)
         else:
-            runner = _runner(store, connector, sink, policy="dead_letter")
-            await _enqueue(store, 1)
-            item = await store.claim_next_fifo(OUT)
-            assert item is not None
-            await runner._process_delivery_item(OUT, item)
-            dead = 1
-        try:
-            assert connector.sends == 1
-            assert await store.count_dead(allowed_channels=None) == dead
-            assert sink.stopped == []
-            assert not runner.outbound_stop_held(OUT)
-        finally:
-            await runner.stop()
+            for _ in range(3):
+                item = await store.claim_next_fifo(OUT)
+                assert item is not None
+                await runner._process_delivery_item(OUT, item)
+        assert connector.sends == (2 if batched else 3)
+        assert await store.count_dead(allowed_channels=None) == 3
+        assert sink.stopped == []
+        assert not runner.outbound_stop_held(OUT)
+        assert sink.errors == [(OUT, "NegativeAckError")]  # exactly one, for the lane
     finally:
+        await runner.stop()
         await connector.aclose()
 
 

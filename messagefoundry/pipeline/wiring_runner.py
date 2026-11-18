@@ -2265,7 +2265,8 @@ class RegistryRunner:
         # Per-outbound-lane health (#46), for the edge-triggered connection_lost/restored events. True
         # (or unset) = healthy; flipped on the FIRST transport DeliveryError and back on the next
         # success, so a retry storm emits one transition pair, not one per delivery. A partner reject
-        # (NegativeAckError) is not a transport failure and never flips it.
+        # (NegativeAckError) is not a transport failure and does not flip it, except a configuration
+        # fault that dead-letters under credential_fault_policy = "dead_letter".
         self._lane_healthy: dict[str, bool] = {}
         # Connections that FAILED to build/bind at start ((kind, name) → FailedLine). A failed connection is
         # isolated, never fatal — the rest of the graph still comes up (a failed connection must not
@@ -3135,7 +3136,8 @@ class RegistryRunner:
 
     def _note_lane_unhealthy(self, name: str, message_id: str, exc: BaseException) -> None:
         """Edge-trigger ``connection_lost`` + a throttled ``connection_error`` alert on the FIRST
-        transport ``DeliveryError`` after the lane was healthy (#46) — not per retry. No-op when capture
+        transport ``DeliveryError`` after the lane was healthy (#46) — not per retry — or the first
+        configuration fault that dead-letters (:meth:`_config_fault_lane_down`). No-op when capture
         is off (byte-identical) or the lane is already marked down."""
         if not self._connection_events or not self._lane_healthy.get(name, True):
             return
@@ -11422,6 +11424,11 @@ class RegistryRunner:
                 await self._stop_lane_retaining(name, [item.id], exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
+                # A configuration fault reaches here only under credential_fault_policy =
+                # "dead_letter": every queued row meets it, so the lane is marked down and
+                # connection_error fires once, not per row (owner ruling 2026-11-18 on PR 3069).
+                # Read before the await, and never for a connector a reload retired.
+                lane_down = self._config_fault_lane_down(name, connector, exc)
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
                 # BACKLOG #3043: this arm used to dead-letter with no log line at all. Class name
                 # and code only, never the text: see _RefusalLog for why, and for the throttle.
@@ -11435,6 +11442,8 @@ class RegistryRunner:
                     item.id,
                     item.message_id,
                 )
+                if lane_down:
+                    self._note_lane_unhealthy(name, item.id, exc)
             else:
                 failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
                 retry_until = failed.retry_at
@@ -11903,6 +11912,7 @@ class RegistryRunner:
                 await self._stop_lane_retaining(name, ids, exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
+                lane_down = self._config_fault_lane_down(name, connector, exc)  # as the single row
                 await self.store.dead_letter_batch(ids, safe_exc(exc))
                 # BACKLOG #3043, the batch twin of the single-row line. `ids` is never empty here:
                 # a send only happens with a member kept, and an earlier refusal keeps every id.
@@ -11916,6 +11926,8 @@ class RegistryRunner:
                     len(ids),
                     ids[0],
                 )
+                if lane_down:
+                    self._note_lane_unhealthy(name, ids[0], exc)
             else:
                 failed = await self._mark_batch_failed_and_arm(
                     name, ids, _member_error(safe_exc(exc), current), retry
@@ -12092,6 +12104,18 @@ class RegistryRunner:
         if getattr(exc, "config_fault", False):
             return "configuration"
         return None
+
+    def _config_fault_lane_down(
+        self, name: str, connector: DestinationConnector, exc: NegativeAckError
+    ) -> bool:
+        """Whether a permanent refusal that is about to dead-letter marks lane ``name`` down: a
+        configuration fault, which every queued row would meet, from a connector a reload has not
+        retired. Under the default ``credential_fault_policy`` such a fault stops the lane before
+        it gets here, so this is the ``"dead_letter"`` policy's path. ``getattr`` because a
+        connector may raise a subclass built without the marker."""
+        return bool(getattr(exc, "config_fault", False)) and not self._connector_retired(
+            name, connector
+        )
 
     async def _stop_lane_retaining(
         self, name: str, ids: Sequence[str], exc: NegativeAckError, fault: _LaneFault
