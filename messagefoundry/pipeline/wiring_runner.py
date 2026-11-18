@@ -6454,7 +6454,8 @@ class RegistryRunner:
     def _lift_log_halt(self, name: str) -> None:
         """Lift the #122 halt's mark on inbound ``name`` and re-arm its internal lanes, as the
         restart that rebinds its listener did before the halt became a claim gate, when the halt
-        paused them and this resumed them (BACKLOG #5704). Sync and await-free. A restart of an
+        paused them and this resumed them (BACKLOG #5704), except a pooled lane kept STOPPED
+        because it holds claimed rows whose return to the queue never landed. Sync and await-free. A restart of an
         inbound the halt never gated does not come here, and under pooled re-arms no STOP.
 
         Under pooled each lane the pre-claim gate parked is released
@@ -11026,7 +11027,8 @@ class RegistryRunner:
         hand-back cannot land returns with no STOP and no hold, leaving its rows in flight
         (:meth:`_log_gate_after_claim`). Clearing the latch does not
         itself re-arm such a STOP; the rebind of the inbound's listener that lifts its mark does
-        (:meth:`_lift_log_halt`)."""
+        (:meth:`_lift_log_halt`), except a pooled lane kept STOPPED because it holds claimed rows
+        whose return to the queue never landed."""
         # A mark gates only an inbound still in the graph: a removed inbound's worker must reach
         # its claim, see the inbound gone and return, rather than wait on a mark nothing lifts. A
         # re-add finds the mark again.
