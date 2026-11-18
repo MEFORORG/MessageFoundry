@@ -2051,8 +2051,7 @@ class FhirLookupExecutor:
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
             # arrives in these settings, mirrored from the spec's typed fields by
             # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
-            # BACKLOG #5911: the destination's static-settings screen, at this sibling too (#1241),
-            # and like it before any hop gate audits a crossing.
+            # BACKLOG #5911: the destination's static-settings screen, at this sibling too (#1241).
             refuse_unsendable_static_request(
                 url, self._build_headers(s), setting=f"FhirLookup {cname!r}"
             )
