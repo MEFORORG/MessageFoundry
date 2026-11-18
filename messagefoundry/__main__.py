@@ -5502,9 +5502,13 @@ def _supervise(args: argparse.Namespace) -> int:
     # `--env` goes into the settings as `serve` puts it (BACKLOG #2356), so one validated value
     # names the environment for every gate below, and a name `serve` refuses at load is refused
     # here. Each engine shard is still started with the flag itself.
-    settings, detail = _load_service_settings(
-        service_config, cli={"ai": {"environment": args.env}} if args.env is not None else None
-    )
+    # --db goes in as [store].path, as the offline commands merge it (BACKLOG #5926): every engine
+    # shard is started with a --db derived from it, which overrides the file's value, so the load
+    # judges the path the shards use rather than one none of them reads.
+    supervise_cli: dict[str, dict[str, object]] = {"store": {"path": args.db}}
+    if args.env is not None:
+        supervise_cli["ai"] = {"environment": args.env}
+    settings, detail = _load_service_settings(service_config, cli=supervise_cli)
     if settings is None:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)

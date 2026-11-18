@@ -868,6 +868,28 @@ def test_a_server_backend_db_with_a_colon_is_not_refused(
     assert "--db" not in capsys.readouterr().err
 
 
+def test_supervise_judges_its_db_not_an_unused_file_store_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Every engine shard is started with a --db derived from supervise's, which overrides the
+    # file's [store].path, so a bad file value with a valid --db must not refuse the fleet.
+    import messagefoundry.__main__ as cli_main
+
+    reached: list[bool] = []
+
+    def _stop(*args: object, **kwargs: object) -> object:
+        reached.append(True)
+        raise _PastTheDbCheck
+
+    for name in _OFFLINE_AT_REST_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(cli_main, "_floor_or_refusal", _stop)  # the step after the --db check
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[store]\npath = "data/"\n', encoding="utf-8")  # names a directory
+    main(["supervise", "--service-config", str(svc), "--db", str(tmp_path / "mf.db")])
+    assert reached == [True], capsys.readouterr().err
+
+
 def _names(output: str, path: Path) -> bool:
     # A repr or a JSON string doubles a Windows backslash; undo that before the substring test.
     return str(path) in output.replace("\\\\", "\\")
