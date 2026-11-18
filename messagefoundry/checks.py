@@ -3182,8 +3182,10 @@ def _check_listener_trusted_proxies(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(found)} HTTP listener(s) key the failed-attempt budget on the client address a "
             f"listed proxy writes in X-Forwarded-For: {listed}. Each listed proxy, and every host "
-            "inside a listed range (marked range), may key the budget on any address it writes, "
-            "so the global budget is the only bound on guessing across its clients. A listener "
+            "inside a listed range (marked range), may key the budget on any address it writes. "
+            "Guessing through it is then bounded by the global budget, plus the per-peer budget "
+            "of each address it writes that authenticated recently, which the global budget "
+            "exempts; writing a partner's address also spends that partner's budget. A listener "
             "marked possibly has an env() list this could not resolve"
         ),
     )

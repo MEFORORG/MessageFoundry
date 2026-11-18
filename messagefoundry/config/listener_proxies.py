@@ -49,7 +49,7 @@ IPV6_KEY_PREFIX = 64
 _PROXY_SPAN_LIMIT = 1 << 16
 
 #: How many validated lists :func:`read_trusted_proxies` keeps. A list the span limit admits may
-#: hold 65,536 entries, so the bound is far below the 64 it was: posture and audit read every
+#: hold 65,536 entries, so the bound is half the 64 it was: posture and audit read every
 #: listener's list in turn, so a config with more distinct lists than this re-parses them on each
 #: read, and lists a reload replaced stay pinned until evicted, at most this many.
 _CACHED_LISTS = 32
@@ -87,8 +87,11 @@ class TrustedProxies:
 
 
 def _collapsed(networks: tuple[ProxyNetwork, ...]) -> dict[int, list[ProxyNetwork]]:
-    v4 = [n for n in networks if isinstance(n, ipaddress.IPv4Network)]
-    v6 = [n for n in networks if isinstance(n, ipaddress.IPv6Network)]
+    # A mapped range is matched as the IPv4 range it names, the form every hop and peer is read
+    # in, so a caller that builds TrustedProxies from raw networks still matches it.
+    meant = [ipv4_meaning(n) for n in networks]
+    v4 = [n for n in meant if isinstance(n, ipaddress.IPv4Network)]
+    v6 = [n for n in meant if isinstance(n, ipaddress.IPv6Network)]
     return {
         4: list(ipaddress.collapse_addresses(v4)),
         6: list(ipaddress.collapse_addresses(v6)),

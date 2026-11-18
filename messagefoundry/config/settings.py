@@ -10529,8 +10529,8 @@ def security_loosenings(
     ``ech_cleartext_sidecar_hops`` is a ``REST`` outbound whose ECH sidecar is an ``http://`` URL
     (ADR 0139), and ``listener_trusted_proxy_hops`` is an inbound ``Http()`` listener with a
     non-empty ``trusted_proxies`` (BACKLOG #5525), read by ``listener_trusted_proxy_hops``, which
-    walks the ``HTTP`` inbounds. That one alone has a default, empty, so the callers that have no
-    graph need not name it; every caller with a graph passes it. They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    walks the ``HTTP`` inbounds. Like its siblings it has no default, so a caller with no graph
+    passes it empty. They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;

@@ -982,12 +982,14 @@ def test_a_validated_list_parses_each_entry_once(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(reader, "_parse_trusted_proxy", counting)
     monkeypatch.setattr(reader, "_classify_proxy_entries", refused)
     reader._validated.cache_clear()
-    entries = ["10.9.0.5", "10.9.1.0/24"]
-    proxies = reader.read_trusted_proxies(entries)
-    assert calls == entries
-    assert ipaddress.ip_address("10.9.1.7") in proxies
-    assert ipaddress.ip_address("10.9.2.7") not in proxies
-    reader._validated.cache_clear()  # drop the entry built under the patch
+    try:
+        entries = ["10.9.0.5", "10.9.1.0/24"]
+        proxies = reader.read_trusted_proxies(entries)
+        assert calls == entries
+        assert ipaddress.ip_address("10.9.1.7") in proxies
+        assert ipaddress.ip_address("10.9.2.7") not in proxies
+    finally:
+        reader._validated.cache_clear()  # drop the entry built under the patch
 
 
 def test_the_cache_holds_fewer_lists() -> None:
@@ -996,7 +998,14 @@ def test_the_cache_holds_fewer_lists() -> None:
     import messagefoundry.config.listener_proxies as reader
 
     maxsize = reader._validated.cache_info().maxsize
-    assert maxsize is not None and maxsize <= 32
+    assert maxsize is not None and 1 <= maxsize <= 32  # still a cache, never switched off
+
+
+def test_a_matcher_built_from_a_mapped_range_matches_its_ipv4_hosts() -> None:
+    """Every hop and peer is read as IPv4 where it is mapped, so a matcher built from raw networks
+    reads a mapped range the same way."""
+    proxies = TrustedProxies((ipaddress.ip_network("::ffff:10.0.0.5/128"),))
+    assert ipaddress.ip_address("10.0.0.5") in proxies
 
 
 @pytest.mark.parametrize("entry", ["::fffe:0:0/95", "::ff00:0:0/88", "::8000:0:0/81"])
