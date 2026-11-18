@@ -107,13 +107,20 @@ def test_a_folder_swapped_for_a_link_after_its_lstat_is_not_listed_or_read(
     assert [(r.meta["relpath"], r.meta.get("symlink")) for r in records] == [("sub", "true")]
 
 
+def _is_unread_link(record: Record) -> bool:
+    return record.payload == b"" and record.meta.get("symlink") == "true"
+
+
+@pytest.mark.parametrize("restore", [True, False], ids=["swapped-back", "left-swapped"])
 def test_a_file_swapped_for_a_link_between_lstat_and_open_is_not_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore: bool
 ) -> None:
-    """``a.hl7`` is swapped for a link to a file outside right as it is opened, and swapped back
-    once the open returns, so a later ``lstat`` of the path sees the original file again. Where the
-    open follows the link (Windows has no ``O_NOFOLLOW``) the handle is the outside file, which is
-    not the file the ``lstat`` saw, so it is not read; the next scan reads the real file."""
+    """``a.hl7`` is swapped for a link to a file outside right as it is opened, and either swapped
+    back once the open returns, so a later ``lstat`` of the path sees the original file again, or
+    left a link. Nothing outside is read either way. Where the OS has ``O_NOFOLLOW`` the open
+    refuses the link and it is recorded as a link. Where the open follows it (Windows), the handle
+    is the outside file, not the file the ``lstat`` saw: a link still there is recorded as a link,
+    and one swapped back leaves the real file for the next scan to read."""
     outside = tmp_path / "secret.hl7"
     outside.write_bytes(_SECRET)
     out = tmp_path / "out"
@@ -134,8 +141,9 @@ def test_a_file_swapped_for_a_link_between_lstat_and_open_is_not_read(
         try:
             return real_open(path, flags, *args, **kwargs)
         finally:
-            target.unlink()
-            kept.rename(target)
+            if restore:
+                target.unlink()
+                kept.rename(target)
 
     with FileSink(out) as sink:
         target.write_bytes(_BODY)
@@ -143,16 +151,22 @@ def test_a_file_swapped_for_a_link_between_lstat_and_open_is_not_read(
         sink.records()
         records = sink.records()
     assert fired, "the hook never fired: the swap was not staged"
-    assert [r.payload for r in records] == [_BODY]
+    assert records and all(r.payload != _SECRET for r in records)
+    assert all(r.payload == _BODY or _is_unread_link(r) for r in records)
+    if not restore:
+        assert [r.meta["relpath"] for r in records if _is_unread_link(r)] == ["a.hl7"]
 
 
+@pytest.mark.parametrize("restore", [True, False], ids=["swapped-back", "left-swapped"])
 def test_the_by_path_walk_still_refuses_a_file_swapped_for_a_link_at_its_open(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore: bool
 ) -> None:
     """The by-path walk (Windows, or any OS without ``dir_fd``) is exercised on every OS: the
     handle check refuses the swap there too."""
     monkeypatch.setattr(file_sink, "_DIR_FD", False)
-    test_a_file_swapped_for_a_link_between_lstat_and_open_is_not_read(tmp_path, monkeypatch)
+    test_a_file_swapped_for_a_link_between_lstat_and_open_is_not_read(
+        tmp_path, monkeypatch, restore
+    )
 
 
 # --- step 2: the root, and the bound -----------------------------------------------------------
@@ -364,7 +378,58 @@ def test_listing_lstat_and_open_errors_are_logged(
         monkeypatch.setattr(os, "lstat", lstat_)
         with caplog.at_level(logging.WARNING, logger="harness.sinks.file"):
             assert sink.records() == []
-    logged = caplog.text
-    assert "cannot list" in logged and "locked" in logged
-    assert "cannot lstat" in logged and "b.hl7" in logged
-    assert "cannot open" in logged and "c.hl7" in logged
+            assert sink.records() == []  # a fault that persists is logged once, not every poll
+    messages = [r.getMessage() for r in caplog.records]
+    for said in ("cannot list a folder", "cannot lstat an entry", "cannot open a file"):
+        assert len([m for m in messages if said in m]) == 1, (said, messages)
+    # A File outbound can render a name from HL7 fields, so no listed name reaches the log.
+    assert not any(name in caplog.text for name in ("locked", "b.hl7", "c.hl7"))
+
+
+@pytest.mark.parametrize("by_path", [False, True], ids=["native-walk", "by-path-walk"])
+def test_a_directory_that_cannot_be_listed_is_retried_not_reported_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, by_path: bool
+) -> None:
+    """A permissions or handle fault on the sink directory itself is a failed scan, retried on
+    the next one; it is not the ``ROOT_CHANGED`` refusal, which says the directory was replaced.
+    At start it is an error, since without a whole first scan files already there would later
+    read as new deliveries."""
+    if by_path:
+        monkeypatch.setattr(file_sink, "_DIR_FD", False)
+    real_scandir = os.scandir
+    denied: list[bool] = [False]
+
+    def scandir(target: Any = ".") -> Any:
+        if denied[0]:
+            raise PermissionError(13, "denied")
+        return real_scandir(target)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    denied[0] = True
+    with pytest.raises(NotADirectoryError):
+        FileSink(tmp_path).start()
+    denied[0] = False
+    with FileSink(tmp_path) as sink:
+        (tmp_path / "a.hl7").write_bytes(_BODY)
+        denied[0] = True
+        assert sink.records() == []
+        denied[0] = False
+        records = sink.records()
+    assert [r.payload for r in records] == [_BODY]
+
+
+def test_verify_sink_fails_on_an_incomplete_file_scan() -> None:
+    scenario = Scenario("s", "", "ADT", "A01", 1, sink="file", sink_endpoint="file_out")
+    fake = _Fake()
+    fake._add(Record(_BODY))
+    fake._add(Record(b"", {"name": "out", "folder": ".", "inside": "false", "refused": WALK_BOUND}))
+    result = _verify_sink(scenario, fake, ["X1"], 0.2, "p")
+    assert not result.ok and "scan was incomplete" in result.detail
+
+
+def test_a_volume_with_no_file_id_gives_no_identity() -> None:
+    """``st_ino`` 0 (a volume with no file id) is no identity, so two folders that both report it
+    are not taken for one already entered, and a root that reports it is not compared."""
+    zero = os.stat_result((0o040755, 0, 7, 1, 0, 0, 0, 0, 0, 0))
+    assert file_sink._identity(zero) is None
+    assert file_sink._identity(os.stat_result((0o040755, 5, 7, 1, 0, 0, 0, 0, 0, 0))) == (7, 5)

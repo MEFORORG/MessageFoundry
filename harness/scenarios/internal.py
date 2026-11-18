@@ -38,7 +38,7 @@ from harness.scenarios._core import (
     ScenarioResult,
     _send_error_suffix,
     control_id_of,
-    linked_records,
+    sink_faults,
 )
 from harness.sinks.mllp import MLLPSink
 from messagefoundry.apiclient import ApiError, EngineClient
@@ -88,7 +88,7 @@ class TimerScenario(BaseScenario):
                     break
                 time.sleep(0.2)
         others = sorted({s for s in statuses if s in _TERMINAL and s != _PROCESSED})
-        links = linked_records(records)
+        links = sink_faults(records)
         ok = processed >= self.arrivals and delivered >= self.arrivals and not others and not links
         detail = (
             f"{processed}/{self.arrivals} timer messages since start reached {_PROCESSED!r} on "
