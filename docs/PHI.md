@@ -2060,7 +2060,7 @@ budget before a smaller one is read.
   and so does a dataclass or a list that holds such an object. A dataclass or a `SimpleNamespace`
   whose own `__str__` or `__repr__` prints an attribute of a plain exception it holds can print
   an error too: only an exception's own code makes the walk read what it holds that deeply.
-- **An argument that renders differently the second time.** The three later filters render the
+- **An argument that renders differently the second time.** The four later filters render the
   message again, so an object whose `__repr__` changes or raises on a later call can still raise
   from the log call, or print what the first step did not see.
 - **A file path in an `OSError`.** The path prints whole. A caller that knows the name is
