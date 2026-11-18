@@ -1181,14 +1181,16 @@ class SoapDestination(DestinationConnector):
         except urllib.error.HTTPError as exc:
             # BACKLOG #5881: the HTTPError owns the final response; the status is all a probe reads,
             # so close it on both arms. The 401/403 DeliveryError chains it, which would otherwise
-            # keep that socket open as long as the error lives. A Digest challenge response urllib
-            # retried past is not closed here.
+            # keep that socket open as long as the error lives. Only this final response: at least a
+            # Digest challenge response urllib retried past, and a refused challenge, are not closed.
             try:
                 exc.close()
-            except OSError as close_exc:
-                # A teardown fault must not replace the verdict the status already gives.
-                logger.debug(
-                    "SOAP probe: closing the HTTP %s response failed: %s", exc.code, close_exc
+            except Exception as close_exc:  # noqa: BLE001 - a teardown fault must not replace the verdict
+                logger.warning(
+                    "%s probe: closing the HTTP %s response failed (%s)",
+                    self._hop,
+                    exc.code,
+                    type(close_exc).__name__,
                 )
             if exc.code in (401, 403):
                 raise DeliveryError(

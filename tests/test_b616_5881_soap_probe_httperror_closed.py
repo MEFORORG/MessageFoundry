@@ -74,3 +74,27 @@ def test_a_reachable_status_closes_the_http_error(code: int) -> None:
     d._opener = opener  # type: ignore[assignment]
     d._probe()  # the host answered: reachable
     assert opener.body.closed
+
+
+class _FaultyCloseBody(io.BytesIO):
+    def close(self) -> None:
+        super().close()
+        raise OSError("synthetic teardown fault")
+
+
+@pytest.mark.parametrize("code", [401, 404])
+def test_a_close_fault_keeps_the_status_verdict(
+    code: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    d = _dest()
+    opener = _RaisingOpener(code)
+    opener.body = _FaultyCloseBody(b"synthetic fault body")
+    d._opener = opener  # type: ignore[assignment]
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.soap"):
+        if code == 401:
+            with pytest.raises(DeliveryError, match="check credentials"):
+                d._probe()
+        else:
+            d._probe()  # still reachable
+    assert "closing the HTTP" in caplog.text
+    assert "OSError" in caplog.text
