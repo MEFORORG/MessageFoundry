@@ -17,7 +17,6 @@
   `Content-Length: 0` reply and a reply to `HEAD`. (`BACKLOG #5910`)
 - **Under `credential_fault_policy = "dead_letter"`, a configuration fault that dead-letters now
   marks the outbound lane down.** With `[diagnostics].connection_events` on, its default, one
-  `connection_error` alert fires for the lane, where before none fired, and the next delivery
-  that succeeds clears it. This covers every configuration fault a send raises, `token-reply-coded`
-  among them, with the exceptions ADR 0095 Amendment B.2 names (owner ruling 2026-11-18 on PR
-  3069).
+  `connection_error` alert fires for the lane, and the next delivery
+  that succeeds clears it. This covers configuration faults a send raises, `token-reply-coded`
+  among them (ADR 0095 Amendment B.2).

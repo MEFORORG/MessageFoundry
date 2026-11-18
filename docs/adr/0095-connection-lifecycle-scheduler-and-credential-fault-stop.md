@@ -580,11 +580,10 @@ PENDING un-errored; under `"dead_letter"` the row, or every member of a batch, d
 Under `"dead_letter"` a configuration fault a send raises now also marks the lane down, through
 the same edge-triggered `_note_lane_unhealthy` a transport failure uses. With
 `[diagnostics].connection_events` on, its default, `connection_error` fires once for the lane,
-where before no alert fired, and the next delivery that succeeds clears it. The worker reads
+and the next delivery that succeeds clears it. The worker reads
 `config_fault`, never the code, so this is not only `token-reply-coded`. It does not mark the lane
-down for a configuration fault from a connector a reload has retired, for a batch member refused
+down at least for a configuration fault from a connector a reload has retired, for a batch member refused
 alone by its re-attach or frame check, or for a `credential_fault`, which it does not read.
-Owner ruling 2026-11-18 on PR 3069: "Yes, keep one connection_error alert on that path."
 
 This widens A.1's definition. The refusal is not of the connection's own settings: the engine sends
 `Accept-Encoding: identity`, so the coding comes from the token endpoint, or from a proxy in front

@@ -11426,8 +11426,7 @@ class RegistryRunner:
             if exc.permanent:
                 # A configuration fault reaches here only under credential_fault_policy =
                 # "dead_letter": every queued row meets it, so the lane is marked down and, with
-                # connection events on, connection_error fires once for the lane (owner ruling
-                # 2026-11-18 on PR 3069).
+                # connection events on, connection_error fires once for the lane.
                 # Read before the await, and never for a connector a reload retired.
                 lane_down = self._config_fault_lane_down(name, connector, exc)
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
