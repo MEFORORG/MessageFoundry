@@ -757,8 +757,14 @@ def _regex(raw: Mapping[str, Any], key: str, where: str) -> str:
         compiled = re.compile(value)
     except re.error as exc:
         # The position, not `exc.msg`: the message can quote the pattern, a group name for one.
+        at_char = "" if exc.pos is None else f" (error at character {exc.pos})"
         raise ScorecardError(
-            f"{where}: `{key}` is not a valid regular expression (error at character {exc.pos})"
+            f"{where}: `{key}` is not a valid regular expression{at_char}"
+        ) from None
+    except OverflowError:
+        # `re.compile` raises this, not `re.error`, for a repeat count past the engine's limit.
+        raise ScorecardError(
+            f"{where}: `{key}` is not a valid regular expression (a repeat count is too large)"
         ) from None
     # The empty string, then single characters. A pattern that matches more than one LONE character
     # -- `.`, `\w`, `\b`, a lookahead, a character class -- is sighted in almost any file, which is
@@ -949,6 +955,15 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
                     f"cell {raw.get('id')!r}: `blocker.recheck_days` must be >= 1; a cadence of "
                     "zero or less never comes due, which is the same as having none"
                 )
+            # The deadline `Blocker.days_overdue` computes must be a date, or every reader of the
+            # record that renders it stops on OverflowError instead of naming the field.
+            try:
+                datetime.date.fromisoformat(checked_on) + datetime.timedelta(days=recheck_days)
+            except OverflowError:
+                raise ScorecardError(
+                    f"{where}: `blocker.recheck_days` puts the next re-probe past the last date "
+                    "the calendar can hold, so it never comes due"
+                ) from None
             blocker = Blocker(
                 blocked_by=text["blocked_by"],
                 reason=text["reason"],

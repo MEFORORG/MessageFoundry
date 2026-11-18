@@ -3688,7 +3688,7 @@ def test_prove_absences_summary_prints_the_population_before_the_parts(
     assert "proved 1 by mutation" in out
 
 
-def test_prove_absences_summary_negative_control_an_empty_run_says_saw_zero(
+def test_prove_absences_summary_negative_control_an_empty_run_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The negative control: a scorecard with NO absence claims must say so, not print four zeroes

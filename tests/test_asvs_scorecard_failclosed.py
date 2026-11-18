@@ -328,8 +328,23 @@ _LEAK_CELL = _CELL.replace('"1.1.1"', f'"{_LEAK}"')
         # The regex engine's own message quotes a group name, so the sentinel arrives through it
         # even when the cell id is clean.
         (_CELL + _ABSENCE.replace("'eval\\('", f"'(?P<{_LEAK}>x)'"), "pattern"),
+        # `re.compile` raises OverflowError, not re.error, for this: it used to escape the loader.
+        (_LEAK_CELL + _ABSENCE.replace("'eval\\('", "'a{4294967296}'"), "pattern"),
+        # A deadline past the calendar used to load, then stop every renderer on OverflowError.
+        (_LEAK_CELL + _BLOCKER.replace("30", "99999999"), "blocker.recheck_days"),
     ],
-    ids=["level", "residual", "checked_on", "recheck_days", "path", "expect", "control", "regex"],
+    ids=[
+        "level",
+        "residual",
+        "checked_on",
+        "recheck_days",
+        "path",
+        "expect",
+        "control",
+        "regex",
+        "regex-overflow",
+        "recheck-overflow",
+    ],
 )
 def test_a_refusal_names_the_field_not_the_record_value(
     tmp_path: Path, body: str, field: str
@@ -585,7 +600,16 @@ def test_verify_refuses_a_root_that_is_not_a_directory(
 
 def _git_repo(path: Path) -> Path:
     path.mkdir(parents=True)
-    ident = ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid"]
+    # Signing off, as test_asvs_scorecard's _GIT_ID does: a global commit.gpgsign would fail the
+    # fixture commit, or wait on a pinentry prompt, for a reason unrelated to the code under test.
+    ident = [
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+    ]
     subprocess.run(["git", "-C", str(path), "init", "--quiet"], check=True, capture_output=True)
     (path / "a.txt").write_text("a\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(path), "add", "a.txt"], check=True, capture_output=True)
