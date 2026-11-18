@@ -270,7 +270,7 @@ def _delete_user_form(user_id: str) -> Markup:
     )
 
 
-def users_page(users: Sequence[UserListEntry]) -> Markup:
+def users_page(users: Sequence[UserListEntry], *, can_delete: bool = False) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms.
 
     The Lock column appears only when the engine disclosed lock state, which it does only to a
@@ -284,7 +284,8 @@ def users_page(users: Sequence[UserListEntry]) -> Markup:
     An account whose record fails its integrity seal arrives as an :class:`IntegrityFailedUser`, its
     id alone (BACKLOG #5520). Its row names the id and says the check failed, and every other cell
     is blank: the engine sent nothing else of it, so nothing here may read as its name or roles. Its
-    Status cell offers the delete, the one action the console takes on it (BACKLOG #5559)."""
+    Status cell offers the delete, the one action the console takes on it (BACKLOG #5559), when
+    ``can_delete`` says the caller holds users:manage, which the delete route requires."""
     summaries = [u for u in users if isinstance(u, UserSummary)]
     show_lock = any(u.lock_state is not None for u in summaries)
     show_scope = any(not u.channel_scope_withheld for u in summaries)
@@ -301,8 +302,10 @@ def users_page(users: Sequence[UserListEntry]) -> Markup:
             # is offered here instead, as the engine keeps the account listed so it can be removed.
             failed: list[object] = [""] * len(headers)
             failed[0] = u.id
-            failed[headers.index("Status")] = el(
-                "div", el("p", "integrity check failed"), _delete_user_form(u.id)
+            failed[headers.index("Status")] = (
+                el("div", el("p", "integrity check failed"), _delete_user_form(u.id))
+                if can_delete
+                else "integrity check failed"
             )
             rows.append(failed)
             continue

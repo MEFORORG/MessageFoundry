@@ -331,7 +331,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> HTMLResponse:
         users = await admin.list_users(service=service, identity=identity)
         # Each summary says whether its scope was withheld from this caller (BACKLOG #3189).
-        return HTMLResponse(pages.users_page(users))
+        return HTMLResponse(
+            pages.users_page(users, can_delete=identity.has(Permission.USERS_MANAGE))
+        )
 
     # Declared BEFORE /ui/users/{user_id} so the literal segment wins the route match.
     @app.get("/ui/users/new", response_class=HTMLResponse)
@@ -1012,11 +1014,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 return await _user_detail(
                     user_id, service, identity, error=str(exc.detail), status_code=400
                 )
-            except HTTPException as page_exc:
+            except HTTPException:
                 # BACKLOG #5559: the users list offers the delete for a record that fails its
-                # seal, whose detail page answers 423. The delete's own refusal is the answer.
-                if page_exc.status_code != status.HTTP_423_LOCKED:
-                    raise
+                # seal, whose detail page answers 423. The delete's own refusal is the answer, and
+                # it stays the answer when the page's read is refused for any other reason (a 503
+                # Vault Outage, an account gone since), which would otherwise replace it.
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc.detail)) from exc
         return RedirectResponse("/ui/users", status_code=303)
 

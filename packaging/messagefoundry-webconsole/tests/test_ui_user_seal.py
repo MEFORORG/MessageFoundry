@@ -173,6 +173,28 @@ async def test_a_failing_account_is_listed_with_its_delete_and_the_delete_remove
     assert await engine.store.get_user(intact) is not None
 
 
+async def test_the_list_offers_a_failing_account_s_delete_only_to_a_users_manage_holder(
+    keyed: tuple[Engine, Path],
+) -> None:
+    """The delete route requires users:manage, so a users:read-only reader's list names the
+    failing account and says its check failed, with no delete button. The control is the
+    administrator's list in the test above."""
+    engine, path = keyed
+    service, _alerts, _intact, victim = await _setup(engine)
+    role = await service.create_custom_role(
+        display_name="User reader", description=None, permissions=["users:read"], actor="test"
+    )
+    await provision(service, "reader", [role.id])
+    _tamper(path, victim)
+    async with _client(engine, service) as c:
+        await cookie_login(c, "reader")
+        listed = await c.get("/ui/users")
+    assert listed.status_code == 200
+    assert victim in listed.text and "integrity check failed" in listed.text
+    assert f'action="/ui/users/{victim}/delete"' not in listed.text
+    assert _PLANTED not in listed.text
+
+
 async def test_a_refused_delete_of_a_failing_account_answers_its_own_refusal(
     keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -197,6 +219,33 @@ async def test_a_refused_delete_of_a_failing_account_answers_its_own_refusal(
     assert _PLANTED not in r.text
     assert ok.status_code == 400 and refusal in ok.text and "User: intact" in ok.text  # control
     assert await engine.store.get_user(victim) is not None
+
+
+async def test_a_refused_delete_keeps_its_own_refusal_when_the_page_read_is_unavailable(
+    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused delete re-renders the detail page. When that page's checked read answers 503 (a
+    Vault transit Outage), the delete's own refusal is still the answer rather than the 503. The
+    control is the 423 case in the test above."""
+    from messagefoundry.store.row_seal import TransitSealUnavailableError
+
+    engine, _path = keyed
+    service, _alerts, intact, _victim = await _setup(engine)
+    refusal = "stand-in: this would leave no enabled administrator"
+
+    async def refused(user_id: str, *, actor: str) -> None:
+        raise LastAdministratorRefused(refusal)
+
+    async def outage(user_id: str) -> None:
+        raise TransitSealUnavailableError()
+
+    monkeypatch.setattr(service, "delete_user", refused)
+    monkeypatch.setattr(service, "checked_user", outage)
+    async with _client(engine, service) as c:
+        await cookie_login(c, "root")
+        r = await c.post(f"/ui/users/{intact}/delete", headers=SAME_ORIGIN)
+    assert r.status_code == 400 and refusal in r.text
+    assert await engine.store.get_user(intact) is not None
 
 
 @pytest.mark.parametrize(
