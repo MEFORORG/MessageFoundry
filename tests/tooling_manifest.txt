@@ -142,7 +142,6 @@ tests/test_coord_unbacked_check.py
 tests/test_coord_usage.py
 tests/test_cutover_slug_rot.py
 tests/test_dast_claims.py
-tests/test_dast_policy_shape_5443.py
 tests/test_defaulted_credential_lint.py
 tests/test_dep1_lock_resync_lockstep.py
 tests/test_dependabot_automerge_guardrails.py

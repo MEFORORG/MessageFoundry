@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import http.client
 import json
 import os
 import re
@@ -80,7 +81,15 @@ def _http_json(url: str, timeout: float) -> Any:
         # message-derived or caller-supplied, so no file:/custom scheme is reachable here.
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310
             return json.loads(resp.read())
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+    # ValueError covers a non-JSON body and a body that is not UTF-8; HTTPException a truncated
+    # or garbled response. Each is a feed that could not be read (BACKLOG #5447).
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        ValueError,
+        http.client.HTTPException,
+    ) as exc:
         print(f"warning: GET {url} failed: {exc}", file=sys.stderr)
         return None
 
@@ -132,9 +141,11 @@ def kev_cves(timeout: float) -> set[str] | None:
     vulns = data.get("vulnerabilities") if isinstance(data, dict) else None
     if not isinstance(vulns, list) or not vulns:
         return None
-    return {
+    ids = {
         v["cveID"].upper() for v in vulns if isinstance(v, dict) and isinstance(v.get("cveID"), str)
     }
+    # Entries none of which carries a cveID (a renamed field) are a catalog not shaped as one.
+    return ids or None
 
 
 def epss_scores(cves: set[str], timeout: float) -> dict[str, float] | None:
@@ -150,11 +161,16 @@ def epss_scores(cves: set[str], timeout: float) -> dict[str, float] | None:
         rows = data.get("data") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             return None
+        parsed = 0
         for row in rows:
             try:
                 out[row["cve"].upper()] = float(row["epss"])
             except (KeyError, ValueError, TypeError, AttributeError):
                 continue
+            parsed += 1
+        # Rows none of which parses (renamed fields, an error shape) are not an EPSS answer.
+        if rows and not parsed:
+            return None
     return out
 
 
@@ -178,7 +194,6 @@ def adopter_lag(
     adopter_repos: list[str],
     now: datetime,
     timeout: float,
-    failures: list[str] | None = None,
 ) -> str:
     """Max days the newest engine release has been out that an adopter isn't yet pinned to.
 
@@ -191,10 +206,6 @@ def adopter_lag(
     rel = _gh(
         ["api", f"repos/{repo}/releases/latest", "--jq", "{tag: .tag_name, at: .published_at}"]
     )
-    if rel is None:
-        if failures is not None:
-            failures.append(f"gh could not read {repo}'s latest release")
-        return "n/a: gh could not read the latest engine release"
     if not isinstance(rel, dict) or not rel.get("tag"):
         return "n/a: no engine release to compare against"
     latest = _norm_ver(rel["tag"])
@@ -205,8 +216,6 @@ def adopter_lag(
         answer = _gh(["api", f"repos/{ar}/contents/requirements.txt"])
         content = answer.get("content") if isinstance(answer, dict) else None
         if not isinstance(content, str) or not content:
-            if failures is not None:
-                failures.append(f"gh could not read {ar}/requirements.txt")
             return f"n/a: can't read {ar}/requirements.txt (cross-repo access?)"
         text = base64.b64decode(content).decode("utf-8", "replace")
         match = re.search(r"messagefoundry==([\w.\-]+)", text)
@@ -263,7 +272,8 @@ def compute(
     seen_cves: set[str] = set()
     for p in sec:
         seen_cves |= _cves_in(p)
-    kev = kev_cves(timeout)
+    # No CVE seen, nothing to look up: KEV cannot change a metric then, as EPSS is not asked.
+    kev = kev_cves(timeout) if seen_cves else set()
     if kev is None:
         _unread("the CISA KEV catalog", _KEV_METRICS)
         kev = set()
@@ -311,7 +321,7 @@ def compute(
         m["epss_ge_0_7_count"] = "0"
 
     # 5. adopter patch-lag — days the newest release has been out that an adopter isn't yet pinned to.
-    m["adopter_patch_lag_days"] = adopter_lag(repo, adopter_repos, now, timeout, failed)
+    m["adopter_patch_lag_days"] = adopter_lag(repo, adopter_repos, now, timeout)
 
     # 6. auto-merge health — share of Dependabot PRs that merged + median time-to-merge (hours).
     if closed:
@@ -326,7 +336,7 @@ def compute(
 
     m["dependabot_prs_window"] = str(len(prs))
     m["security_prs_window"] = str(len(sec))
-    m.update((name, why) for name, why in unread.items())
+    m.update(unread)
     return m
 
 

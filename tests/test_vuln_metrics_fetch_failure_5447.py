@@ -161,3 +161,57 @@ def test_a_failed_epss_fetch_is_not_zero_coverage(
     assert row["epss_coverage_pct"].startswith("n/a"), row
     assert row["epss_ge_0_7_count"].startswith("n/a"), row
     assert row["kev_exposure_max_age_days"] == "10.0", "an EPSS outage must not blank KEV"
+
+
+def test_a_kev_catalog_with_renamed_fields_is_unread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A catalog whose entries carry no cveID answered, but not as KEV: not zero exposure."""
+    mod = _load()
+    _stub(monkeypatch, mod)
+    real = mod.urllib.request.urlopen
+
+    def urlopen(req: Any, timeout: float = 0) -> _Resp:
+        if req.full_url == mod.KEV_URL:
+            return _Resp(json.dumps({"vulnerabilities": [{"cveId": _CVE_KEV}]}).encode())
+        return real(req, timeout)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
+    code, row = _main(mod, tmp_path)
+    assert code == 2, row
+    assert row["kev_exposure_max_age_days"].startswith("n/a"), row
+
+
+def test_epss_rows_with_renamed_fields_are_unread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mod = _load()
+    _stub(monkeypatch, mod)
+    real = mod.urllib.request.urlopen
+
+    def urlopen(req: Any, timeout: float = 0) -> _Resp:
+        if req.full_url.startswith(mod.EPSS_URL):
+            return _Resp(json.dumps({"data": [{"cve_id": _CVE_KEV, "score": "0.9"}]}).encode())
+        return real(req, timeout)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
+    code, row = _main(mod, tmp_path)
+    assert code == 2, row
+    assert row["epss_ge_0_7_count"].startswith("n/a"), row
+
+
+def test_control_a_kev_outage_with_no_cve_seen_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Control: with no security PR citing a CVE, KEV is not asked, so its outage cannot red the run."""
+    mod = _load()
+    _stub(monkeypatch, mod, kev_ok=False)
+
+    def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        plain = [{**p, "title": "Bump libz", "labels": []} for p in _prs()]
+        return subprocess.CompletedProcess(argv, 0, json.dumps(plain), "")
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    code, row = _main(mod, tmp_path)
+    assert code == 0, row
+    assert row["kev_exposure_max_age_days"] == "0"

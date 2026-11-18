@@ -360,6 +360,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # change, and on no queue run for any change. It spawns no subprocess, so staying on the
         # engine legs costs them almost nothing.
         "test_windows_lock_install.py",
+        # Imports its receipt and policy helpers from tests/test_dast_auth_sweep.py, an engine-tier
+        # test that reads messagefoundry/api/** through the sweep (BACKLOG #5443). A change to
+        # those helpers arrives as a test diff the tooling path gate does not see.
+        "test_dast_policy_shape_5443.py",
     }
 )
 

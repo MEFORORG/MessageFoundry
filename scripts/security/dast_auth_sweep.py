@@ -78,6 +78,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from collections.abc import Coroutine, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -206,6 +207,14 @@ def load_policy(path: Path) -> dict[str, Any]:
                 raise PolicyError(
                     f"the policy at {path} has {key}.{name} as {value!r}, not a whole number >= 0"
                 )
+    placeholder = parsed.get("path_param_placeholder", "dast-probe")
+    # Substituted into every path parameter: an empty or slashed value probes another route, and
+    # its answers would read as findings, exit 1.
+    if not isinstance(placeholder, str) or not re.fullmatch(r"[A-Za-z0-9._~-]+", placeholder):
+        raise PolicyError(
+            f"the policy at {path} has 'path_param_placeholder' as {placeholder!r}, not one "
+            "non-empty path segment"
+        )
     for key in ("max_unexplained_unreached", "max_write_session_rebuilds"):
         if key in parsed and not _is_count(parsed[key]):
             raise PolicyError(
@@ -1150,17 +1159,21 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        code, errors = _report(receipt, policy, args.canary, args.summary)
+        code = _report(receipt, policy, args.canary, args.summary)
     except Exception as exc:  # noqa: BLE001 - deliberate catch-all; see below
         # The same reason as the sweep's catch-all above (BACKLOG #5443): load_policy checks the
         # policy's shape, but whatever still raises while judging or reporting the receipt must exit 2,
         # not CPython's 1, which the canary loop would read as a detection.
+        # Escaped as a workflow-command value, so a message with a newline stays one annotation.
+        why = str(exc).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
         print(
             f"::error::{_PREFIX}: judging or reporting the sweep failed "
-            f"({type(exc).__name__}: {exc}). Refusing to report a result (fail closed).",
+            f"({type(exc).__name__}: {why}). Refusing to report a result (fail closed).",
             file=sys.stderr,
         )
-        return 2
+        # The measured counts are still evidence: the receipt is written, marked as such.
+        receipt["verdict"] = "COULD NOT MEASURE (fail closed)"
+        code = 2
 
     if args.receipt is not None:
         try:
@@ -1176,9 +1189,10 @@ def main(argv: list[str] | None = None) -> int:
 
 def _report(
     receipt: dict[str, Any], policy: dict[str, Any], canary: str | None, summary: Path | None
-) -> tuple[int, list[str]]:
-    """Judge ``receipt``, record the verdict and floors in it, and emit the receipt lines and the
-    annotations. ``main`` runs it under one handler, so nothing here can exit 1 by raising."""
+) -> int:
+    """Judge ``receipt``, record the verdict and floors in it, emit the receipt lines and the
+    annotations, and return the exit code. ``main`` runs it under one handler, so nothing here
+    can exit 1 by raising."""
     code, errors = evaluate(receipt, policy)
     verdict = {0: "PASS", 1: "FINDINGS", 2: "COULD NOT MEASURE (fail closed)"}[code]
     receipt["verdict"] = verdict
@@ -1205,7 +1219,7 @@ def _report(
     level = annotation_level(canary=canary, code=code)
     for error in errors:
         print(f"::{level}::{_PREFIX}: {error}", file=sys.stderr)
-    return code, errors
+    return code
 
 
 if __name__ == "__main__":

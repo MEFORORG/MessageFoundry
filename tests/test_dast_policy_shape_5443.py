@@ -160,3 +160,53 @@ def test_a_reporting_crash_after_the_sweep_is_could_not_measure(
     monkeypatch.setattr(sweep, "receipt_lines", broken)
     assert _main(tmp_path, policy) == 2
     assert "fail closed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("placeholder", ["", "a/b", 7])
+def test_a_path_placeholder_that_is_not_one_segment_cannot_measure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, placeholder: object
+) -> None:
+    """Substituted into every path parameter, a bad placeholder probes other routes: findings, 1."""
+    policy = _policy()
+    _stub_sweep(monkeypatch, _receipt(policy))
+    policy["path_param_placeholder"] = placeholder
+    assert _main(tmp_path, policy) == 2
+
+
+def test_control_a_detecting_canary_still_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control for the canary arm above: with the shipped policy, a canary receipt carrying a
+    finding exits 1, so the 2s there are the malformed policy's and not the canary's."""
+    policy = _policy()
+    receipt = _receipt(policy)
+    receipt.update(canary="bfla", bfla_violations=19, write_bfla_violations=52)
+    receipt["findings"] = [
+        {
+            "pass_name": "bfla",
+            "method": "GET",
+            "path": "/synthetic",
+            "observed_status": 200,
+            "expected": "403",
+        }
+    ]
+    _stub_sweep(monkeypatch, receipt)
+    assert _main(tmp_path, policy, "--canary", "bfla") == 1
+
+
+def test_a_reporting_crash_still_writes_the_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The measured counts are evidence, so the receipt is written, marked could-not-measure."""
+    policy = _policy()
+    _stub_sweep(monkeypatch, _receipt(policy))
+
+    def broken(*_: object) -> list[str]:
+        raise KeyError("synthetic\nsecond line")
+
+    monkeypatch.setattr(sweep, "receipt_lines", broken)
+    out = tmp_path / "receipt.json"
+    assert _main(tmp_path, policy, "--receipt", str(out)) == 2
+    written = json.loads(out.read_text(encoding="utf-8"))
+    assert written["verdict"] == "COULD NOT MEASURE (fail closed)"
+    assert written["gated_http_rows"] == 99
