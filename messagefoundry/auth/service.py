@@ -13078,12 +13078,11 @@ class AuthService:
     async def _session_seal_failed(self, token_hash: str, *, key_changed: bool = False) -> None:
         """End a session row that failed its integrity seal, and report it (BACKLOG #2592).
 
-        The row is revoked, which blanks its seal and needs no key, so the next presentation is
-        refused quietly as a revoked row. With ``key_changed`` the row carries a genuine seal made
-        under a retired store key: the store key changed without ``rotate-key`` ending the sessions,
-        so it is logged at INFO and nothing more. Otherwise it is an integrity failure: a WARNING,
-        an :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row and an ``integrity_drift`` alert. The
-        caller denies; the engine keeps running.
+        The row is revoked, which blanks its seal and needs no key. With ``key_changed`` the row
+        carries a genuine seal made under a retired store key: the store key changed without
+        ``rotate-key`` ending the sessions, so it is logged at INFO and nothing more. Otherwise it
+        is an integrity failure: a WARNING, an :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row and an
+        ``integrity_drift`` alert. The caller denies; the engine keeps running.
 
         Reports are rate-limited per row, once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`,
         for a row the revoke could not end. Each names the row by a short prefix of its token hash,
@@ -14623,9 +14622,8 @@ class AuthService:
         """A user's active sessions — the self-service session inventory. Idle-expired rows are
         hidden too, since the validator refuses them on presentation (BACKLOG #2096). So is a row
         that fails its integrity seal (BACKLOG #2592): it resolves to nothing, so it is not one of
-        the user's sessions, and it is handled as :meth:`_load_session` handles one. So is a row
-        minted under an older session epoch than the account's, or an older global one than the
-        store's (BACKLOG #5091), which the validator refuses."""
+        the user's sessions. So is a row minted under an older session epoch than the account's, or
+        an older global one than the store's (BACKLOG #5091), which the validator refuses."""
         rows = await self._store.list_sessions(user_id, idle_seconds=self.session_idle_seconds)
         if not rows:
             return []
@@ -21154,11 +21152,10 @@ class AuthService:
         as long as it stayed alive, which the requirement's first arm ("applied immediately") does
         not allow and which no mitigating control covered.
 
-        **Scoped to directory accounts, and deliberately not narrowed further.** Resolving which
-        principals a map edit actually affects would mean re-binding to the directory, and both a
-        removed mapping and an added one change an outcome, so the affected set is not derivable
-        from the entries alone. A local account reads neither map, and one whose row parses and
-        whose integrity check passed at the gate is left alone.
+        Resolving which principals a map edit actually affects would mean re-binding to the
+        directory, and both a removed mapping and an added one change an outcome, so the affected set
+        is not derivable from the entries alone. A local account reads neither map, and one whose row
+        parses and whose integrity check passed at the gate is left alone.
 
         Each account's unrevoked rows are revoked with the store's ``revoke_user_sessions``, so this
         needs no schema change on any backend. The count it returns includes rows already past their
