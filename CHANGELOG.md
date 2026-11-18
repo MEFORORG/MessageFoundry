@@ -23,6 +23,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   external provider. (`BACKLOG #2595`)
 
 ### Changed
+- **On Windows, a key file's read grant may name a computer account, and more well-known groups
+  count as broad.** `protect-key --grant-account` takes a name Windows resolves as a computer
+  account, as a group managed service account may resolve; a plain computer account passes too.
+  An owner given by name must still resolve to a user or a well-known account.
+  The key-file broad-group screen now also counts S-1-18-3 to S-1-18-6, Other Organization
+  (S-1-5-1000), This Organization Certificate (S-1-5-65-1) and Window Manager Group (S-1-5-90-0),
+  so a read grant naming one is refused and a key file one of them can read is reported.
+  (`BACKLOG #5929`)
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
   other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or

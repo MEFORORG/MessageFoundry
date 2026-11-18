@@ -1074,8 +1074,8 @@ def check_handoff_writable(service_account: str, *, enforcing: bool = True) -> s
             service_sid = resolve_sid(service_account)
         else:
             # A name is resolved without the key-file grant's kind gate, so a name and its SID
-            # literal are judged alike, by handoff_grantee_problem, and every refusal names the
-            # account through describe_sid rather than the typed name (see below).
+            # literal are judged alike, by handoff_grantee_problem, and a refusal of a resolved
+            # account names its SID rather than the typed name (see below).
             found = lookup_account_name(service_account)
             if found is None:
                 raise RestrictedFileError(f"the account {service_account!r} could not be resolved")
