@@ -2573,19 +2573,23 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         try:
             await super().aclose()
         finally:
-            if drain is not None and not drain.done():
-                drain.cancel()
-                self._task = None
-                await asyncio.gather(drain, return_exceptions=True)
-            pending = [task for task in self._control_tasks if not task.done()]
-            for task in pending:
-                task.cancel()
-            if pending:
-                log.warning(
-                    "%d alert control_action task(s) still running at shutdown were cancelled",
-                    len(pending),
-                )
-                await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                if drain is not None and not drain.done():
+                    drain.cancel()
+                    self._task = None
+                    await asyncio.gather(drain, return_exceptions=True)
+            finally:
+                # BACKLOG #5907 step 3: in a finally of its own, so a second cancel during the
+                # drain's wait still reaches every control task.
+                pending = [task for task in self._control_tasks if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    log.warning(
+                        "%d alert control_action task(s) still running at shutdown were cancelled",
+                        len(pending),
+                    )
+                    await asyncio.gather(*pending, return_exceptions=True)
 
     def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> None:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget
