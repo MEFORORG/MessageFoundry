@@ -30,7 +30,8 @@ def test_an_icacls_read_that_times_out_is_undeterminable(
 
     def _run(argv: list[str], **kw: object) -> object:
         seen.append(kw.get("timeout"))
-        # What subprocess.run raises once the timeout passes; it has killed the child by then.
+        # What subprocess.run raises once the timeout passes. Faked, so this proves the bound is
+        # passed and how running out is answered, not that a real stalled child is reaped.
         raise subprocess.TimeoutExpired(argv, ta._ICACLS_TIMEOUT_S)
 
     monkeypatch.setattr(subprocess, "run", _run)  # the module object trust_anchors calls

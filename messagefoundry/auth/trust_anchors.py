@@ -1233,10 +1233,18 @@ def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool | None:
     return True
 
 
-#: How long :func:`dacl_is_owner_only` lets ``icacls`` run. A local read answers in well under a
-#: second; one that has not answered by then is reading through a stalled share or filter driver,
-#: and every caller would otherwise wait on it with no bound (vault BACKLOG #5901). Running out is
-#: an undeterminable read, ``None``, never a pass.
+#: How long :func:`dacl_is_owner_only` lets ``icacls`` run (vault BACKLOG #5901). A local read
+#: answers in well under a second, and with no bound a stall in icacls held its caller forever.
+#: Running out answers ``None``, the undeterminable verdict, which ``enforce`` refuses unless a pin
+#: matches and ``warn`` warns about and loads, as for every other ``None``.
+#:
+#: It bounds icacls only, and not fully. :func:`evaluate_anchor` reads the anchor's bytes and its
+#: path in-process before this runs, with no bound, so a share that stalls those reads still holds
+#: the caller. And ``subprocess.run`` kills the child on the timeout, then on Windows waits for its
+#: pipes with no bound, so a child that cannot be terminated, for example one held in a
+#: non-cancellable I/O request, still holds it. A caller on the event loop should run the
+#: evaluation in a worker thread, as the lane check, the audited preflight and the connector
+#: builds do (engine PR 2815), so such a stall holds that thread and not the loop.
 _ICACLS_TIMEOUT_S = 30.0
 
 
@@ -1248,8 +1256,9 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     refuses the anchor unless a configured SHA-256 pin matches the bytes read, and under ``warn`` it
     warns and loads.
 
-    These make it undeterminable on Windows, and all answer ``None``: ``icacls`` could not be run,
-    it did not finish within :data:`_ICACLS_TIMEOUT_S`, it exited non-zero, it returned no output, or (BACKLOG #1142) the parser answered ``None``. That
+    At least these make it undeterminable on Windows, and answer ``None``: ``icacls`` could not be
+    run, it did not finish within :data:`_ICACLS_TIMEOUT_S`, it exited non-zero, it returned no
+    output, or (BACKLOG #1142) the parser answered ``None``. That
     last covers three causes the warning names together: no ACE it could attribute to a principal,
     a write grant to a bare principal name it does not recognise, or a write grant on line 1 whose
     principal could not be split from the echoed path.
@@ -1283,7 +1292,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
             )
         except subprocess.TimeoutExpired:
             log.warning(
-                "icacls did not read the DACL of %r within %s seconds; the DACL could not be "
+                "icacls did not read the DACL of %r within %.0f seconds; the DACL could not be "
                 "determined",
                 name,
                 _ICACLS_TIMEOUT_S,
