@@ -41,6 +41,8 @@ MUST_DENY = [
     pytest.param("gh pr checks 5 --watch; echo done", id="watch-before-semicolon"),
     pytest.param("gh pr checks 5 --watch&& echo done", id="watch-before-and"),
     pytest.param("gh pr checks 5 --watch=true", id="watch-with-value"),
+    pytest.param("s=`gh pr checks 5 --watch`", id="watch-closed-by-a-backtick"),
+    pytest.param("gh pr checks 5 --watch>out.txt", id="watch-before-a-redirect"),
     pytest.param("while (1) { gh pr view 1 --json state }", id="powershell-while-1"),
     pytest.param("while(1){gh pr view 1}", id="powershell-while-1-unspaced"),
     pytest.param("for (;;) { gh pr view 1 --json state }", id="powershell-for-ever"),
@@ -55,6 +57,20 @@ MUST_ALLOW = [
     pytest.param('gh pr comment 5 --body "never --watch"', id="quoted-watch-mention"),
     pytest.param("gh pr checks 5; echo --watch-later", id="other-flag-prefix"),
     pytest.param("for (;;) { echo tick }", id="forever-without-gh"),
+    # Each reaches the widened patterns and must not be denied by them.
+    pytest.param(
+        "gh pr view 1; for ($i = 0; $i -lt 3; $i++) { echo x }", id="bounded-for-is-not-forever"
+    ),
+    pytest.param("git commit -m 'Replace `gh run watch` with one read'", id="backticked-mention"),
+    pytest.param("git log --grep=gh run watch", id="option-value-is-not-an-assignment"),
+    pytest.param(
+        'gh pr comment 5 --body "do not use --watch; read once"', id="watch-in-quoted-prose"
+    ),
+    pytest.param(
+        'gh pr comment 5 --body "polling (gh pr checks --watch) burns budget"',
+        id="watch-in-parenthesised-prose",
+    ),
+    pytest.param("gh pr checks 5 --watch=false", id="watch-explicitly-off"),
     pytest.param("for ($i = 0; $i -lt 3; $i++) { gh pr view $i }", id="bounded-powershell-for"),
 ]
 

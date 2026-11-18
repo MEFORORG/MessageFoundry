@@ -76,10 +76,12 @@ try {
     $INTERP = '(?:\b(?:ba|z|da)?sh(?:\.exe)?\s+(?:-\w+\s+)*(?-i:-[a-z]*c)|\b(?:pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+)*-(?:c|Command)|\bcmd(?:\.exe)?\s+/[ck])\s+["'']?'
     # A loop or conditional keyword may sit in front: `until gh pr merge 5; do :; done`.
     #
-    # SO MAY AN ASSIGNMENT, AND THE PROGRAM MAY CARRY .exe (BACKLOG #5449). `$r = gh ...` and
-    # `` s=`gh ...` `` run gh exactly as a bare call does, and `gh.exe` is the same program; each was
-    # never in command position here, so a poll loop around one passed. `==` and `-eq` are not one.
-    $ASSIGN = '(?:(?<![=!<>])=\s*|`)'
+    # SO MAY AN ASSIGNMENT (BACKLOG #5449). `$r = gh ...` and `` s=`gh ...` `` run gh exactly as a
+    # bare call does, and neither was in command position here, so a poll loop around one passed.
+    # Only a variable assignment counts: `--grep=gh`, `a == gh` and a backticked MENTION of a gh
+    # command in prose are not one. And the program may carry .exe: the pattern required `gh` and
+    # whitespace, so `gh.exe` was never gh.
+    $ASSIGN = '(?:(?:^|[\s;&|(){}])[A-Za-z_]\w*=`?|\$[\w:.]+\s*=\s*)'
     $GH = "(?:$POS(?:(?:while|until|if|!)\s+)?|$INTERP|$ASSIGN)gh(?:\.exe)?\s"
     if ($c -notmatch $GH) { exit 0 }
 
@@ -95,9 +97,12 @@ try {
     # `--watch` on any gh subcommand is the same loop wearing a flag.
     # Behind an interpreter the closing quote ends the flag too, so `pwsh -Command 'gh pr checks 5
     # --watch'` is caught; elsewhere a quote after it is a mention, as in `--body "never --watch"`.
-    # A shell delimiter or an `=value` ends the flag too (BACKLOG #5449): `--watch;` is the flag.
-    if ($c -match '(^|\s)--watch(?=$|[\s;&|)=])' -or
-        $c -match ("$INTERP" + 'gh(?:\.exe)?\s[^"'']*\s--watch["'']')) {
+    # A shell delimiter, a redirect or an `=value` other than false ends the flag too, where no
+    # quote sits between gh and the flag, so it is not prose in a quoted body (BACKLOG #5449). A `)`
+    # is not one: `"polling (gh pr checks --watch)"` is prose, so `$(gh pr checks --watch)` passes.
+    if ($c -match '(^|\s)--watch(\s|$)' -or
+        $c -match ("$INTERP" + 'gh(?:\.exe)?\s[^"'']*\s--watch["'']') -or
+        $c -match ($GH + '[^"''`]*?\s--watch(?=$|[;&|}>`]|=(?!false\b))')) {
         Deny ("BLOCKED: a `--watch` flag on a `gh` command polls in a loop and draws on the fleet's " +
               "shared 5000/hr GitHub API budget. Drop `--watch` and read once. For a run: " +
               "`gh run view <run-id>`. For a PR's checks: `gh pr checks <N>` or " +
