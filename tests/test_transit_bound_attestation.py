@@ -2039,8 +2039,8 @@ def test_a_raising_report_of_an_escaped_warning_fault_keeps_the_label(
 def test_repeated_escapes_from_the_unconfirmed_warning_report_once_per_interval(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #6707: five faults escaping the unconfirmed warning within one interval write at
-    most one stderr line."""
+    """BACKLOG #6707: five faults escaping the unconfirmed warning within one interval write one
+    stderr line."""
     from messagefoundry.store import crypto_transit
 
     def short_of_memory(*_a: Any, **_kw: Any) -> None:
@@ -2050,7 +2050,7 @@ def test_repeated_escapes_from_the_unconfirmed_warning_report_once_per_interval(
     for _ in range(5):
         _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
     lines = [line for line in capsys.readouterr().err.splitlines() if "could not be" in line]
-    assert len(lines) <= 1, lines
+    assert len(lines) == 1, lines
 
 
 @pytest.mark.parametrize("fault", [MemoryError, RecursionError])
