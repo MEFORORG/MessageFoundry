@@ -8189,9 +8189,9 @@ cannot vouch for its own hop.** Item 11 of the
 can hide, and which checks refuse there and which warn with an audited row instead.
 
 **The PostgreSQL `[store].ssl_root_cert` CA is checked in `serve` too, at least at start, reload and
-DR activation, but only after the store has opened with it** (vault BACKLOG #4203). It takes at least the permission, path and change
-checks, the private-key refusal and a refusal of a file larger than 16 MiB, its own cap, not the SQL Server pin's certificate checks. Under `enforce`, a
-file or folder a broad principal can write, or one whose permissions the engine cannot read,
+DR activation, but only after the store has opened with it** (vault BACKLOG #4203). It takes at
+least the permission, path and change checks, the private-key refusal and a refusal of a file
+larger than 16 MiB. Under `enforce`, a file or folder a broad principal can write, or one whose permissions the engine cannot read,
 refuses the start, the reload or the DR activation. The store runs none of these
 checks when it opens, so a start may already have trusted the file and sent the store login, and a
 command that opens the store without this check does not check the file at all. Item 11 of

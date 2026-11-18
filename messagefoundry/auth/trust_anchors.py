@@ -255,7 +255,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     (a dry-run reload runs no settings preflight), with no pin. It reads at most its own cap,
     :data:`POSTGRES_CA_MAX_BYTES` (16 MiB, not the pin's), and one byte more, and refuses a
     longer file, with a ``pem_refused`` row, written once per fingerprint and outcome as for the
-    pin. Unlike the SQL Server pin, the store runs none of these checks when it opens. At a
+    pin. For a longer file, the fingerprint in its rows covers only the bytes read, not the
+    whole file. Unlike the SQL Server pin, the store runs none of these checks when it opens. At a
     start the store has already been opened with this file when this check runs, so its
     connections may have trusted the file and sent the store login. A command that opens the
     store and runs no preflight does not check the file at all. What the paragraphs above say of the pin's audit riding its own hop, and of a refused reload
@@ -735,13 +736,13 @@ def _server_pin_warning(data: bytes, spec: AnchorSpec) -> str | None:
 
     cert = pinned_server_certificate(data, raise_memory_error=True)
     if isinstance(cert, str):
-        return f"{spec.setting} {spec.path!r} {cert}. The next store open refuses it."
+        return f"{spec.setting} {spec.path!r} {cert}."
     moment = _clock()
     not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
     if moment > not_after.timestamp():
         return (
             f"{spec.setting} {spec.path!r}: the pinned certificate expired at "
-            f"{log_timestamp(not_after)}. The next store open refuses it. Pin the server's "
+            f"{log_timestamp(not_after)}. Pin the server's "
             "renewed certificate."
         )
     if moment < not_before.timestamp():
@@ -759,7 +760,8 @@ _STORE_ANCHOR_LABELS = frozenset({"store_sqlserver_pin", "store_postgres_ca"})
 #: The last content outcome audited for each store anchor, keyed by label and path: the
 #: fingerprint of the bytes read and the outcome's text, a ``pin_content_warning`` or
 #: ``pem_refused`` reason. A check whose fingerprint and outcome both match it writes no further
-#: row for that outcome, so retries, such as a convergence retry's, add none (module item 11).
+#: row for that outcome, so retries, such as a convergence retry's, add no content row; their
+#: ACL and path rows are still written (module item 11).
 _STORE_CONTENT_RECORDED: dict[tuple[str, str], tuple[str, str]] = {}
 
 
