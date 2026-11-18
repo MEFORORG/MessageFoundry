@@ -21,6 +21,11 @@ Sources, no extra secrets: the GitHub API via `gh` (Dependabot PRs are GITHUB_TO
 (public JSON), FIRST EPSS (public API). Metrics needing an input this script can't derive from the repo
 alone (adopter patch-lag, reachability ratio) are emitted as `n/a` with the reason + the hook to fill
 them, rather than faked.
+
+A source that could not be READ is not a source that answered nothing (BACKLOG #5447). A failed `gh`
+call, or a failed CISA KEV or FIRST EPSS fetch, leaves the metrics it feeds as `n/a` naming the
+source, never `0`, and the run exits 2 after writing the CSV and summary, so the weekly job goes red
+rather than recording a feed outage as zero exposure.
 """
 
 from __future__ import annotations
@@ -47,7 +52,8 @@ _USER_AGENT = "messagefoundry-vuln-metrics"
 
 
 def _gh(args: list[str]) -> Any:
-    """Run a `gh` command that emits JSON; return the parsed value ([] on failure)."""
+    """Run a `gh` command that emits JSON; return the parsed value, or ``None`` when the call failed
+    or its output was not JSON. ``None`` and an empty list are different answers (BACKLOG #5447)."""
     try:
         out = subprocess.run(  # nosec B603 B607 - fixed argv (`gh`), no shell, args are literals
             ["gh", *args],
@@ -59,12 +65,12 @@ def _gh(args: list[str]) -> Any:
         ).stdout
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         print(f"warning: gh {' '.join(args)} failed: {exc}", file=sys.stderr)
-        return []
+        return None
     try:
         return json.loads(out) if out and out.strip() else []
     except json.JSONDecodeError as exc:
         print(f"warning: gh {' '.join(args)} returned non-JSON: {exc}", file=sys.stderr)
-        return []
+        return None
 
 
 def _http_json(url: str, timeout: float) -> Any:
@@ -88,7 +94,8 @@ def _parse_dt(value: str | None) -> datetime | None:
         return None
 
 
-def dependabot_prs(repo: str, limit: int) -> list[dict[str, Any]]:
+def dependabot_prs(repo: str, limit: int) -> list[dict[str, Any]] | None:
+    """The window's Dependabot PRs, or ``None`` when ``gh`` could not list them."""
     data = _gh(
         [
             "pr",
@@ -105,7 +112,7 @@ def dependabot_prs(repo: str, limit: int) -> list[dict[str, Any]]:
             "number,title,body,state,createdAt,mergedAt,labels",
         ]
     )
-    return data if isinstance(data, list) else []
+    return data if isinstance(data, list) else None
 
 
 def _is_security_pr(pr: dict[str, Any]) -> bool:
@@ -118,14 +125,21 @@ def _cves_in(pr: dict[str, Any]) -> set[str]:
     return {m.upper() for m in _CVE_RE.findall(pr.get("title", "") + " " + (pr.get("body") or ""))}
 
 
-def kev_cves(timeout: float) -> set[str]:
+def kev_cves(timeout: float) -> set[str] | None:
+    """The CVE ids on CISA KEV, or ``None`` when the catalog could not be read or is not shaped as
+    one: an empty catalog would score every open PR as off KEV."""
     data = _http_json(KEV_URL, timeout)
-    if not isinstance(data, dict):
-        return set()
-    return {v["cveID"].upper() for v in data.get("vulnerabilities", []) if v.get("cveID")}
+    vulns = data.get("vulnerabilities") if isinstance(data, dict) else None
+    if not isinstance(vulns, list) or not vulns:
+        return None
+    return {
+        v["cveID"].upper() for v in vulns if isinstance(v, dict) and isinstance(v.get("cveID"), str)
+    }
 
 
-def epss_scores(cves: set[str], timeout: float) -> dict[str, float]:
+def epss_scores(cves: set[str], timeout: float) -> dict[str, float] | None:
+    """EPSS scores for ``cves``, or ``None`` when any chunk could not be fetched or is not shaped as
+    an EPSS answer: a partial or empty answer would understate the coverage."""
     if not cves:
         return {}
     out: dict[str, float] = {}
@@ -133,12 +147,14 @@ def epss_scores(cves: set[str], timeout: float) -> dict[str, float]:
     for i in range(0, len(ordered), 100):  # EPSS API caps the cve list per call
         chunk = ordered[i : i + 100]
         data = _http_json(f"{EPSS_URL}?cve={','.join(chunk)}", timeout)
-        if isinstance(data, dict):
-            for row in data.get("data", []):
-                try:
-                    out[row["cve"].upper()] = float(row["epss"])
-                except (KeyError, ValueError, TypeError):
-                    continue
+        rows = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            try:
+                out[row["cve"].upper()] = float(row["epss"])
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
     return out
 
 
@@ -157,7 +173,13 @@ def _reachability_ratio(spec: str | None) -> str:
         return f"n/a: bad --reachability '{spec}' (want R/T)"
 
 
-def adopter_lag(repo: str, adopter_repos: list[str], now: datetime, timeout: float) -> str:
+def adopter_lag(
+    repo: str,
+    adopter_repos: list[str],
+    now: datetime,
+    timeout: float,
+    failures: list[str] | None = None,
+) -> str:
     """Max days the newest engine release has been out that an adopter isn't yet pinned to.
 
     Best-effort: needs read access to the adopter repos (a CI GITHUB_TOKEN is scoped to one repo, so this
@@ -169,20 +191,44 @@ def adopter_lag(repo: str, adopter_repos: list[str], now: datetime, timeout: flo
     rel = _gh(
         ["api", f"repos/{repo}/releases/latest", "--jq", "{tag: .tag_name, at: .published_at}"]
     )
+    if rel is None:
+        if failures is not None:
+            failures.append(f"gh could not read {repo}'s latest release")
+        return "n/a: gh could not read the latest engine release"
     if not isinstance(rel, dict) or not rel.get("tag"):
         return "n/a: no engine release to compare against"
     latest = _norm_ver(rel["tag"])
     published = _parse_dt(rel.get("at"))
     lags: list[float] = []
     for ar in adopter_repos:
-        content = _gh(["api", f"repos/{ar}/contents/requirements.txt", "--jq", ".content"])
+        # The whole JSON answer, not `--jq .content`: jq prints a string raw, which is not JSON.
+        answer = _gh(["api", f"repos/{ar}/contents/requirements.txt"])
+        content = answer.get("content") if isinstance(answer, dict) else None
         if not isinstance(content, str) or not content:
+            if failures is not None:
+                failures.append(f"gh could not read {ar}/requirements.txt")
             return f"n/a: can't read {ar}/requirements.txt (cross-repo access?)"
         text = base64.b64decode(content).decode("utf-8", "replace")
         match = re.search(r"messagefoundry==([\w.\-]+)", text)
         if match and _norm_ver(match.group(1)) != latest and published:
             lags.append((now - published).total_seconds() / 86400)
     return f"{max(lags):.1f}" if lags else "0"
+
+
+#: The metrics each source feeds, so a source that could not be read blanks exactly these.
+_PR_METRICS = (
+    "dep_mttr_days",
+    "dep_mttr_kev_days",
+    "kev_exposure_max_age_days",
+    "epss_coverage_pct",
+    "epss_ge_0_7_count",
+    "automerge_merged_rate_pct",
+    "automerge_median_hours",
+    "dependabot_prs_window",
+    "security_prs_window",
+)
+_KEV_METRICS = ("dep_mttr_kev_days", "kev_exposure_max_age_days")
+_EPSS_METRICS = ("epss_coverage_pct", "epss_ge_0_7_count")
 
 
 def compute(
@@ -192,8 +238,22 @@ def compute(
     now: datetime,
     adopter_repos: list[str],
     reachability: str | None,
+    failures: list[str] | None = None,
 ) -> dict[str, str]:
-    prs = dependabot_prs(repo, limit)
+    """The metrics row. Each source that could not be read is appended to ``failures`` and leaves
+    the metrics it feeds as ``n/a`` naming it, never a zero computed over nothing (BACKLOG #5447)."""
+    failed: list[str] = [] if failures is None else failures
+    unread: dict[str, str] = {}
+
+    def _unread(source: str, metrics: tuple[str, ...]) -> None:
+        failed.append(f"{source} could not be read")
+        for name in metrics:
+            unread.setdefault(name, f"n/a: {source} could not be read")
+
+    fetched = dependabot_prs(repo, limit)
+    if fetched is None:
+        _unread("the Dependabot PR list (gh)", _PR_METRICS)
+    prs = fetched or []
     closed = [p for p in prs if p.get("state") in {"MERGED", "CLOSED"}]
     merged = [p for p in prs if p.get("mergedAt")]
     sec = [p for p in prs if _is_security_pr(p)]
@@ -204,7 +264,13 @@ def compute(
     for p in sec:
         seen_cves |= _cves_in(p)
     kev = kev_cves(timeout)
+    if kev is None:
+        _unread("the CISA KEV catalog", _KEV_METRICS)
+        kev = set()
     epss = epss_scores(seen_cves, timeout)
+    if epss is None:
+        _unread("the FIRST EPSS API", _EPSS_METRICS)
+        epss = {}
 
     m: dict[str, str] = {"date": now.date().isoformat()}
 
@@ -245,7 +311,7 @@ def compute(
         m["epss_ge_0_7_count"] = "0"
 
     # 5. adopter patch-lag — days the newest release has been out that an adopter isn't yet pinned to.
-    m["adopter_patch_lag_days"] = adopter_lag(repo, adopter_repos, now, timeout)
+    m["adopter_patch_lag_days"] = adopter_lag(repo, adopter_repos, now, timeout, failed)
 
     # 6. auto-merge health — share of Dependabot PRs that merged + median time-to-merge (hours).
     if closed:
@@ -260,6 +326,7 @@ def compute(
 
     m["dependabot_prs_window"] = str(len(prs))
     m["security_prs_window"] = str(len(sec))
+    m.update((name, why) for name, why in unread.items())
     return m
 
 
@@ -294,7 +361,10 @@ def main(argv: list[str] | None = None) -> int:
 
     now = _parse_dt(args.now) or datetime.now(UTC)
     adopter_repos = [r.strip() for r in args.adopter_repos.split(",") if r.strip()]
-    row = compute(args.repo, args.limit, args.timeout, now, adopter_repos, args.reachability)
+    failures: list[str] = []
+    row = compute(
+        args.repo, args.limit, args.timeout, now, adopter_repos, args.reachability, failures
+    )
 
     csv_path = Path(args.csv)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,7 +396,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as fh:
             fh.write(summary)
-    return 0
+    # 2, not 0: the row above is written with each unread source's metrics as n/a, and the run goes red
+    # so a feed outage is never recorded as a clean week (BACKLOG #5447).
+    for why in failures:
+        print(f"::error::vuln-metrics: {why}; its metrics are n/a, not 0", file=sys.stderr)
+    return 2 if failures else 0
 
 
 if __name__ == "__main__":
