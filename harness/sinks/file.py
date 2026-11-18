@@ -7,38 +7,61 @@ directory cannot satisfy a scenario with an earlier run's output; a file written
 whether present at start or already recorded, is recorded again. "Unchanged" is the ``lstat``
 identity, file type, size and modification time, and a file that changes while it is read is
 recorded once it settles, not twice. The scan enters only what ``lstat`` reads as a plain
-directory, never a link or a junction (a folder swapped for a link during the scan is an open race,
-see :meth:`FileSink._entries`), and records each file's path relative to it
+directory, never a link or a junction, and records each file's path relative to it
 (``meta["relpath"]``) and whether its resolved path, symlinks followed, stays inside it
 (``meta["inside"]``). A link that cannot be resolved strictly (a loop, a dangling link, a race) is
-recorded as not inside, never as inside. A file written OUTSIDE the directory is by construction not
-seen here; a scenario that tests for an escape must look where it would land, and a link the sink
+recorded as not inside, never as inside. A file written OUTSIDE the directory is not looked for
+here; a scenario that tests for an escape must look where it would land, and a link the sink
 records unread carries no control id, so a scenario must check ``meta["symlink"]`` itself.
 
+**The walk, and the race it closes where the OS allows.** The sink directory itself must be a plain
+directory, not a link or a junction: :meth:`FileSink.start` refuses one, and a scan that finds it
+swapped for another directory or a link records the :data:`ROOT_CHANGED` refusal once and scans
+nothing. Where the OS lets a directory be opened and listed by handle (``dir_fd``, at least Linux
+and macOS), the walk holds each folder open: a sub-folder is opened by name relative to its parent's
+handle with ``O_NOFOLLOW`` and checked to be the one its ``lstat`` saw, and each file is opened
+the same way, so a folder or file swapped for a link during the scan is not followed. Windows has
+no ``dir_fd``: there each folder is listed by path, so a folder swapped for a link or junction
+between its ``lstat`` and its listing is still listed and its files read. That is an open race on
+Windows. On every platform a file's open handle must be the file its ``lstat`` saw (identity, type,
+size and modification time), checked again after the read, so a file swapped for a link, or
+replaced, between the ``lstat`` and the open is not read under the old signature; the next scan
+sees what is there now. One scan stops at :attr:`FileSink.max_depth` folders deep and after
+:attr:`FileSink.max_entries` listed names, recording the :data:`WALK_BOUND` refusal once, and
+enters each folder at most once, so a walk that escaped cannot run unbounded.
+
 Reading is bounded the way the GUI's folder watcher is, through the same reader
-(:func:`harness.bounded_file.read_capped`): regular files only, a symlink as the last path
-component not followed, each capped at the engine's per-message cap, checked again on the open
-handle, and an over-cap file (or one that grows past the cap while read) recorded with an empty
-payload and a ``refused`` reason rather than read. Only a plain directory is skipped: a symlink (``meta["symlink"]``), FIFO or device is recorded
-unread with the :data:`~harness.bounded_file.NOT_REGULAR` reason, so a link out of the directory
-reads as an escape, not as nothing. A listed name that :func:`_unsafe_listed_name` refuses is
-never joined onto its folder: it is recorded once, unread, with the :data:`UNSAFE_NAME` reason, its
-folder's relative path (``meta["folder"]``) and no ``path`` or ``relpath``.
+(:func:`harness.bounded_file.read_fd_capped`): regular files only, a symlink not followed, each
+capped at the engine's per-message cap, checked on the open handle, and an over-cap file (or one
+that grows past the cap while read) recorded with an empty payload and a ``refused`` reason rather
+than read. Only a plain directory is skipped: a symlink (``meta["symlink"]``), FIFO or device is
+recorded unread with the :data:`~harness.bounded_file.NOT_REGULAR` reason, so a link out of the
+directory reads as an escape, not as nothing. A listed name that :func:`_unsafe_listed_name` refuses
+is never joined onto its folder: it is recorded once, unread, with the :data:`UNSAFE_NAME` reason,
+its folder's relative path (``meta["folder"]``) and no ``path`` or ``relpath``. A folder that cannot
+be listed, an entry that cannot be ``lstat``-ed and a file that cannot be opened are logged at
+WARNING and retried on the next scan; an entry gone before its ``lstat`` is skipped unlogged.
 """
 
 from __future__ import annotations
 
+import functools
+import logging
 import ntpath
 import os
 import stat
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from harness.bounded_file import NOT_REGULAR, read_capped
+from harness.bounded_file import NOT_REGULAR, read_fd_capped
 from harness.endpoints import Endpoints
 from harness.sinks import Record, Sink
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
 KIND = "file"
+
+_log = logging.getLogger(__name__)
 
 #: The engine's File destination writes a ``mkstemp`` temp with one of these suffixes and then
 #: renames it; a scan that lands mid-write must not record the temp as a delivery.
@@ -57,8 +80,36 @@ _NAME_SURROGATE = 0x20000000
 #: Whether the Windows name rules apply. A module flag, so a test can exercise either set anywhere.
 _WINDOWS = os.name == "nt"
 
+#: Whether the walk holds each folder open and opens what is under it relative to that handle. A
+#: module flag, so a test can exercise the by-path walk where the OS has ``dir_fd`` too.
+_DIR_FD = (
+    {os.open, os.stat} <= os.supports_dir_fd
+    and os.scandir in os.supports_fd
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+)
+
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+#: A folder: never through a link as its last component.
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC
+#: A file: non-blocking so a FIFO swapped in after the ``lstat`` cannot hang the open.
+_FILE_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0) | _NOFOLLOW | _CLOEXEC
+)
+
 #: The ``refused`` reason for a listed name :func:`_unsafe_listed_name` refuses.
 UNSAFE_NAME = "unsafe name"
+#: The ``refused`` reason for a scan that found the sink directory is no longer what it started on.
+ROOT_CHANGED = "the sink directory is not the plain directory the sink started on; not scanned"
+#: The ``refused`` reason for a scan that stopped at :attr:`FileSink.max_depth` or
+#: :attr:`FileSink.max_entries`.
+WALK_BOUND = "the scan reached its depth or entry bound; the rest was not scanned"
+
+#: Opens a listed file for reading, relative to its held folder or by its path.
+_Opener = Callable[[], int]
+#: Called with each candidate's path, its ``lstat`` and how to open it, while its folder is held.
+_Visit = Callable[[Path, os.stat_result, _Opener], None]
 
 
 def _signature(st: os.stat_result) -> _Signature:
@@ -89,8 +140,23 @@ def _unsafe_listed_name(name: str) -> bool:
     return _WINDOWS and (":" in name or ntpath.isreserved(name))
 
 
+@dataclass
+class _Scan:
+    """One scan's running state: the names it refused, what bounds it, and what it has entered."""
+
+    entries_left: int
+    unsafe: list[tuple[Path, str]] = field(default_factory=list)
+    entered: set[tuple[int, int]] = field(default_factory=set)
+    bounded: bool = False
+
+
 class FileSink(Sink):
     kind = KIND
+
+    #: The deepest a scan descends below the sink directory.
+    max_depth = 32
+    #: The most listed names one scan takes, across every folder.
+    max_entries = 100_000
 
     def __init__(self, directory: str | Path, *, pattern: str = "*") -> None:
         super().__init__()
@@ -99,63 +165,189 @@ class FileSink(Sink):
         self._seen: dict[Path, _Signature] = {}
         #: Listed names refused unjoined, as ``(folder, name)``: each is recorded once.
         self._seen_unsafe: set[tuple[Path, str]] = set()
+        #: Scan-wide refusals (:data:`ROOT_CHANGED`, :data:`WALK_BOUND`) already recorded.
+        self._reported: set[str] = set()
+        #: The sink directory's ``(st_dev, st_ino)`` as :meth:`start` found it.
+        self._root_id: tuple[int, int] | None = None
         #: The most one file may hold and still be read: the engine's per-message cap.
         self.max_file_bytes = DEFAULT_MAX_MESSAGE_BYTES
 
     def start(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        found, unsafe = self._entries()
-        self._seen = {path: _signature(st) for path, st in found}
-        self._seen_unsafe = set(unsafe)
+        st = self.directory.lstat()
+        if _is_link(st) or not stat.S_ISDIR(st.st_mode):
+            raise NotADirectoryError(
+                f"file sink directory {self.directory} is a link, a junction or not a directory"
+            )
+        self._root_id = (st.st_dev, st.st_ino)
+        seen: dict[Path, _Signature] = {}
+        scan = self._scan(lambda path, st, _open: seen.__setitem__(path, _signature(st)))
+        self._seen = seen
+        self._seen_unsafe = set(scan.unsafe) if scan is not None else set()
 
-    def _entries(self) -> tuple[list[tuple[Path, os.stat_result]], list[tuple[Path, str]]]:
-        """``(path, lstat)`` for each candidate under the directory, sorted by path, and
-        ``(folder, name)`` for each listed name :func:`_unsafe_listed_name` refused before the join.
+    def _matches(self, path: Path) -> bool:
+        """Whether ``path`` matches :attr:`pattern`, relative to the directory. Right-anchored, so
+        ``*`` matches a file at any depth, as it always has; or matched whole, so ``**/*.hl7``
+        matches a top-level file too (``**`` is zero or more folders there)."""
+        relative = path.relative_to(self.directory)
+        return relative.match(self.pattern) or relative.full_match(self.pattern)
 
-        Each listed name is checked before it is joined onto its folder. The walk enters only entries that ``lstat`` reads as plain directories. A link, a junction
-        included, is a candidate whatever its name and is not entered. A folder swapped for a link
-        after that ``lstat`` is not refused: at least from its listing until each file under it is
-        read in :meth:`records`, paths under it go through the link, so a file outside the
-        directory can be read and recorded. That is an open race. A path gone before its ``lstat``,
-        or a folder gone before it is listed, is left out: nothing is there to record or to
-        ignore."""
-        found: list[tuple[Path, os.stat_result]] = []
-        unsafe: list[tuple[Path, str]] = []
-        pending = [self.directory]
-        while pending:
-            folder = pending.pop()
+    def _scan(self, visit: _Visit) -> _Scan | None:
+        """Walk the directory, calling ``visit`` for each candidate while its folder is held, and
+        return the scan's state; or None, with nothing visited, when the directory is no longer the
+        plain directory :meth:`start` found. Each listed name is checked before it is joined onto
+        its folder. A link, a junction included, is a candidate whatever its name and is not
+        entered. A path gone before its ``lstat``, or a folder gone before it is listed, is left
+        out: nothing is there to record or to ignore."""
+        scan = _Scan(self.max_entries)
+        if _DIR_FD:
             try:
-                with os.scandir(folder) as listing:
-                    names = [entry.name for entry in listing]
-            except OSError:
+                root_fd = os.open(self.directory, _DIR_FLAGS)
+            except OSError as exc:
+                _log.warning("file sink: cannot open %s: %s", self.directory, exc)
+                return None
+            try:
+                st = os.fstat(root_fd)
+                if not self._root_is(st):
+                    return None
+                scan.entered.add((st.st_dev, st.st_ino))
+                self._walk(root_fd, self.directory, 0, visit, scan)
+            finally:
+                os.close(root_fd)
+            return scan
+        try:
+            st = self.directory.lstat()
+        except OSError as exc:
+            _log.warning("file sink: cannot lstat %s: %s", self.directory, exc)
+            return None
+        if _is_link(st) or not stat.S_ISDIR(st.st_mode) or not self._root_is(st):
+            return None
+        scan.entered.add((st.st_dev, st.st_ino))
+        self._walk(self.directory, self.directory, 0, visit, scan)
+        return scan
+
+    def _root_is(self, st: os.stat_result) -> bool:
+        """Whether ``st`` is the directory :meth:`start` found (or, unstarted, take it as that)."""
+        if self._root_id is None:
+            self._root_id = (st.st_dev, st.st_ino)
+        if (st.st_dev, st.st_ino) == self._root_id:
+            return True
+        _log.warning("file sink: %s is no longer the directory it started on", self.directory)
+        return False
+
+    def _walk(self, held: int | Path, folder: Path, depth: int, visit: _Visit, scan: _Scan) -> None:
+        """List ``folder``, held as a directory handle where the OS has ``dir_fd`` and by its path
+        otherwise, and visit or enter each entry under it."""
+        try:
+            with os.scandir(held) as listing:
+                names: list[str] = []
+                for entry in listing:
+                    if len(names) >= scan.entries_left:
+                        scan.bounded = True
+                        break
+                    names.append(entry.name)
+        except OSError as exc:
+            if not isinstance(exc, FileNotFoundError):
+                _log.warning("file sink: cannot list %s: %s", folder, exc)
+            return
+        scan.entries_left -= len(names)
+        for name in sorted(names):
+            if _unsafe_listed_name(name):
+                scan.unsafe.append((folder, name))
                 continue
-            for name in names:
-                if _unsafe_listed_name(name):
-                    unsafe.append((folder, name))
-                    continue
-                path = folder / name
-                try:
+            path = folder / name
+            try:
+                if isinstance(held, int):
+                    st = os.stat(name, dir_fd=held, follow_symlinks=False)
+                else:
                     st = path.lstat()
-                except OSError:
-                    continue
-                link = _is_link(st)
-                if stat.S_ISDIR(st.st_mode) and not link:
-                    pending.append(path)
-                elif link or (
-                    path.relative_to(self.directory).match(self.pattern)
-                    and not name.startswith(".")
-                    and path.suffix not in _ENGINE_TEMP_SUFFIXES
-                ):
-                    # A link is never an engine temp, so no name or pattern keeps one out.
-                    found.append((path, st))
-        return sorted(found, key=lambda item: item[0]), sorted(unsafe)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                _log.warning("file sink: cannot lstat %s: %s", path, exc)
+                continue
+            link = _is_link(st)
+            if stat.S_ISDIR(st.st_mode) and not link:
+                if depth + 1 > self.max_depth:
+                    scan.bounded = True
+                elif (st.st_dev, st.st_ino) not in scan.entered:
+                    scan.entered.add((st.st_dev, st.st_ino))
+                    self._enter(held, name, path, st, depth, visit, scan)
+            elif link or (
+                self._matches(path)
+                and not name.startswith(".")
+                and path.suffix not in _ENGINE_TEMP_SUFFIXES
+            ):
+                # A link is never an engine temp, so no name or pattern keeps one out.
+                if isinstance(held, int):
+                    opener = functools.partial(os.open, name, _FILE_FLAGS, dir_fd=held)
+                else:
+                    opener = functools.partial(os.open, path, _FILE_FLAGS)
+                visit(path, st, opener)
+
+    def _enter(
+        self,
+        held: int | Path,
+        name: str,
+        path: Path,
+        st: os.stat_result,
+        depth: int,
+        visit: _Visit,
+        scan: _Scan,
+    ) -> None:
+        """Walk the sub-folder ``name``. Under a held handle it is opened relative to that handle,
+        never through a link, and entered only if it is the folder its ``lstat`` saw."""
+        if not isinstance(held, int):
+            self._walk(path, path, depth + 1, visit, scan)
+            return
+        try:
+            child = os.open(name, _DIR_FLAGS, dir_fd=held)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            _log.warning("file sink: not entering %s, no longer a plain folder: %s", path, exc)
+            return
+        try:
+            opened = os.fstat(child)
+            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                _log.warning("file sink: not entering %s, replaced after its lstat", path)
+                return
+            self._walk(child, path, depth + 1, visit, scan)
+        finally:
+            os.close(child)
+
+    def _read(self, path: Path, opener: _Opener, signature: _Signature) -> tuple[bytes, str] | None:
+        """``(data, refused)`` for the file its ``lstat`` saw, or None to retry on the next scan:
+        the open failed, or the open handle is not that file (swapped for a link's target, replaced,
+        or written to) before or during the read. Judged on the handle, so a file replaced at its
+        path right after the read is still recorded as what was read."""
+        try:
+            fd = opener()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            _log.warning("file sink: cannot open %s, retried next scan: %s", path, exc)
+            return None
+        try:
+            if _signature(os.fstat(fd)) != signature:
+                return None  # not the file its lstat saw: the next scan lstats what is there now
+            data, refused = read_fd_capped(fd, self.max_file_bytes)
+            if _signature(os.fstat(fd)) != signature:
+                return None  # changed while read: the next scan records what it settled to, once
+        except OSError as exc:
+            _log.warning("file sink: cannot read %s, retried next scan: %s", path, exc)
+            return None
+        finally:
+            os.close(fd)
+        return data, refused
 
     def _inside(self, path: Path, link: bool, root: Path) -> bool:
         """Whether ``path`` resolves inside ``root``; False where that cannot be shown. A link is
         resolved strictly, so a loop or a dangling link is not inside. A file is judged by its folder,
         which the walk reached through what ``lstat`` read as plain directories, so a file that
-        vanishes after its read is not mistaken for an escape. A folder swapped for a link and back
-        during the scan defeats this check: the open race in :meth:`_entries`."""
+        vanishes after its read is not mistaken for an escape. Where the walk lists by path (Windows),
+        a folder swapped for a link and back during the scan defeats this check: the open race in
+        the module docstring."""
         try:
             if link:
                 return path.resolve(strict=True).is_relative_to(root)
@@ -163,43 +355,31 @@ class FileSink(Sink):
         except OSError:
             return False
 
+    def _report(self, reason: str) -> None:
+        """Record a scan-wide refusal, once."""
+        if reason in self._reported:
+            return
+        self._reported.add(reason)
+        meta = {"name": self.directory.name, "folder": ".", "inside": "false", "refused": reason}
+        self._add(Record(b"", meta))
+
     def records(self) -> list[Record]:
         root = self.directory.resolve()
-        found, unsafe = self._entries()
-        for folder, name in unsafe:
-            if (folder, name) in self._seen_unsafe:
-                continue  # no lstat to tell a rewrite from the same entry, so recorded once
-            self._seen_unsafe.add((folder, name))
-            meta = {
-                "name": name,
-                "folder": folder.relative_to(self.directory).as_posix(),
-                "inside": "false",
-                "refused": UNSAFE_NAME,
-            }
-            self._add(Record(b"", meta))
-        for path, st in found:
+        found: list[tuple[Path, Record]] = []
+
+        def visit(path: Path, st: os.stat_result, opener: _Opener) -> None:
             signature = _signature(st)
             if self._seen.get(path) == signature:
-                continue
+                return
             link = _is_link(st)
-            if link:
-                data, refused = b"", NOT_REGULAR  # never read through a link
+            if link or not stat.S_ISREG(st.st_mode):
+                data, refused = b"", NOT_REGULAR  # never opened: not through a link, not a FIFO
             else:
-                try:
-                    # O_NOFOLLOW on the open, where the OS has it, catches a link swapped in now
-                    # as the file itself, not as a folder above it.
-                    data, refused = read_capped(path, self.max_file_bytes, follow_symlinks=False)
-                except OSError:
-                    continue  # vanished or locked mid-write: the next scan retries it
+                read = self._read(path, opener, signature)
+                if read is None:
+                    return
+                data, refused = read
             inside = self._inside(path, link, root)
-            try:
-                settled = _signature(path.lstat()) == signature
-            except FileNotFoundError:
-                settled = True  # gone after a whole read: what was read is the delivery
-            except OSError:
-                settled = False
-            if not settled:
-                continue  # changed while read: the next scan records what it settled to, once
             self._seen[path] = signature
             meta = {
                 "path": str(path),
@@ -211,7 +391,28 @@ class FileSink(Sink):
                 meta["symlink"] = "true"
             if refused:
                 meta["refused"] = refused
-            self._add(Record(data, meta))
+            found.append((path, Record(data, meta)))
+
+        scan = self._scan(visit)
+        if scan is None:
+            self._report(ROOT_CHANGED)
+            return super().records()
+        for folder, name in sorted(scan.unsafe):
+            if (folder, name) in self._seen_unsafe:
+                continue  # no lstat to tell a rewrite from the same entry, so recorded once
+            self._seen_unsafe.add((folder, name))
+            meta = {
+                "name": name,
+                "folder": folder.relative_to(self.directory).as_posix(),
+                "inside": "false",
+                "refused": UNSAFE_NAME,
+            }
+            self._add(Record(b"", meta))
+        for _path, record in sorted(found, key=lambda item: item[0]):
+            self._add(record)
+        if scan.bounded:
+            _log.warning("file sink: the scan of %s reached its bound", self.directory)
+            self._report(WALK_BOUND)
         return super().records()
 
 

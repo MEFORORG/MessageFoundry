@@ -445,13 +445,15 @@ SITES: dict[str, Site] = {
         "harness/sinks/_sftp_server.py::_confined",
         called=True,
     ),
-    "harness/sinks/file.py::FileSink._entries": Site(
+    "harness/sinks/file.py::FileSink._walk": Site(
         1,
         GUARDED,
         "A name from listing the sink's directory, which the engine under test writes, or a "
         "folder under it, checked by `_unsafe_listed_name` before the join; see its docstring. "
-        "Folders are entered only if `_is_link` reads their `lstat` as not a link. At least the "
-        "folder-swap race stays open, as the `_entries` docstring states (BACKLOG #5426).",
+        "Folders are entered only if `_is_link` reads their `lstat` as not a link. Where the OS "
+        "has `dir_fd` the joined path is not opened: each entry is opened by name relative to its "
+        "held folder. On Windows, which lists and opens by path, the folder-swap race stays open, "
+        "as the module docstring states (BACKLOG #5426).",
         "harness/sinks/file.py::_unsafe_listed_name",
         called=True,
     ),
@@ -459,8 +461,8 @@ SITES: dict[str, Site] = {
         1,
         REVIEWED,
         "A listed file's name onto its folder's strict resolution, built only to compare against "
-        "the root; nothing is opened through it. Under the `_entries` race a file read through a "
-        "link can still read as inside: see the `_inside` docstring.",
+        "the root; nothing is opened through it. Under the Windows folder-swap race a file read "
+        "through a link can still read as inside: see the `_inside` docstring.",
     ),
     # --- messagefoundry/ ---
     "messagefoundry/__main__.py::_cert_import": Site(3, OPERATOR, _CERT_OUT),

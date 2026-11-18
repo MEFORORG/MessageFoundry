@@ -286,4 +286,19 @@ def _verify_sink(
     records = sink.wait_for(lambda rs: arrived(rs) >= wanted, timeout)
     got = arrived(records)
     detail = f"{prior}; {len(got)}/{len(wanted)} delivered to the {scenario.sink} sink"
+    links = linked_records(records)
+    if links:
+        return ScenarioResult(scenario, False, f"{detail}; {links}")
     return ScenarioResult(scenario, got >= wanted, detail)
+
+
+def linked_records(records: Iterable[sinks.Record]) -> str:
+    """A failure note naming the records a sink took as a link (``meta["symlink"]``), or "" when
+    there are none. A link is recorded unread, so it carries no control id and would otherwise be
+    invisible to a check that counts control ids."""
+    links = [
+        r.meta.get("relpath", r.meta.get("name", "?"))
+        for r in records
+        if r.meta.get("symlink") == "true"
+    ]
+    return f"a link appeared in the sink ({', '.join(links)})" if links else ""
