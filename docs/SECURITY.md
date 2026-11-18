@@ -4704,13 +4704,13 @@ alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `Ale
 **Audit.** At least five of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
 census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`, and
 `/search/layered` since BACKLOG #5523), so a scripted bulk read cannot harvest the patient census
-unaudited. The rest do **not** call the coalescer — they write their own dedicated audit rows
+unaudited. At least these do **not** call the coalescer — they write their own dedicated audit rows
 instead (`response.read` for `GET /messages/{id}/responses`, a `connection_event_reveal` or `alert_reveal`
 row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
 each per-connection reveal on `GET /connections` and `GET /connections/{name}/metadata`; those
 five write nothing on a masked load). The census surfaces are audited **only when a
 gated property is actually returned** — `count_exposed()` and `count_masked()` are computed
-*post*-redaction and the coalescer is called under `if exposed or masked:`, so a display-masked row
+*post*-redaction and the coalescer counts nothing when both are zero, so a display-masked row
 counts (vault BACKLOG #1187) — so a fully-redacted list read by a caller without
 `messages:view_summary` (a Viewer paging `GET /messages` or `GET /dead-letters`) writes **no audit row
 at all**. That is accepted: those reads carry no PHI, and auditing them would let an unprivileged
@@ -4718,6 +4718,18 @@ caller amplify into unbounded `audit_log` growth. `GET /messages/{id}` and `GET 
 unconditional dedicated rows (`message_view`, `message_search`) regardless, and so does the body fetch
 `GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do
 `GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
+`GET /search/layered` also tries to write its `preset.layered_search` row when it refuses a
+stored preset while loading it, naming the preset id, the status and the refusal cause, an error
+class name or `malformed` (BACKLOG #5523). The write is best effort: a failed write does not change
+the answer, and it is logged at ERROR. A refusal of the composed layers writes no such row. A
+refusal row has `refused` in its detail, which tells it from a search that ran. A NULL, empty or
+non-text criteria cell is refused by the store itself, which logs a WARNING and writes the
+`integrity.preset_tag_failed` row on every store, and on a keyed store raises the
+`integrity_drift` alert, as for a moved preset. The store rate-limits its WARNING, alert and
+`integrity.preset_tag_failed` row for a repeated refusal, and the route rate-limits some of its
+refusal logs, including the failed-write ERROR. These limits are best effort and held in memory per
+engine process, and the AlertSink's per-subject re-alert cooldown applies on top, so the operator
+may see fewer notifications than refusals.
 
 **Roles and visibility.** `messages:view_raw` is **not** a superset of `messages:view_summary` —
 `Identity.has()` is a flat membership check. The built-in roles happen to grant them nested

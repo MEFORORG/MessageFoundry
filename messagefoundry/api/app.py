@@ -533,7 +533,7 @@ from messagefoundry.store.base import (
     audit_write_errors,
     build_store_cipher,
 )
-from messagefoundry.store.cell_tag import CellTagError
+from messagefoundry.store.cell_tag import BlankCellError, CellTagError, NonTextCellError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -9836,6 +9836,24 @@ def create_app(
         )
         return SearchPresetDeleteResult(id=preset_id, deleted=True)
 
+    # BACKLOG #5523: when the layered search last logged each (preset, cause) refusal. One record per
+    # pair per interval, as the store's tag-failure WARNING is; the route's audit row is written for
+    # each refusal, best effort. Touched on the event loop only.
+    _layered_refusals_logged: dict[tuple[str, str], float] = {}
+    _LAYERED_REFUSAL_LOG_INTERVAL_S = 3600.0
+    _LAYERED_REFUSAL_LOG_MAX = 4096
+
+    def _first_layered_refusal(preset_id: str, cause: str) -> bool:
+        key, now = (preset_id, cause), time.monotonic()
+        last = _layered_refusals_logged.pop(key, None)
+        if last is not None and now - last < _LAYERED_REFUSAL_LOG_INTERVAL_S:
+            _layered_refusals_logged[key] = last
+            return False
+        _layered_refusals_logged[key] = now
+        while len(_layered_refusals_logged) > _LAYERED_REFUSAL_LOG_MAX:
+            _layered_refusals_logged.pop(next(iter(_layered_refusals_logged)))
+        return True
+
     @app.get("/search/layered", response_model=MessageSearchResults)
     async def layered_search(
         request: Request,
@@ -9857,18 +9875,82 @@ def create_app(
             raise HTTPException(400, "provide at least one preset id")
         if len(ids) > _MAX_PRESET_LAYERS:
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
+
+        async def refuse(preset_id: str, refusal: HTTPException, cause: str) -> HTTPException:
+            # BACKLOG #5523: a refused recall of a stored preset writes the route's own audit row,
+            # naming the caller, the preset, the status and the error class, never a cipher text or
+            # a criterion. A drift refusal also has the store's tag-failed row; this one records
+            # who asked. The caller raises the refusal, after any except clause has ended. Best
+            # effort, as the store's tag-failed row is: on a Vault Transit store the audit MAC is
+            # Transit's, so during the outage the 503 arm answers, this write fails too, and the
+            # refusal must still be the answer, not a 500.
+            try:
+                await engine.store.record_audit(
+                    "preset.layered_search",
+                    actor=identity.username,
+                    detail=json.dumps(
+                        {
+                            "presets": len(ids),
+                            "refused": preset_id,
+                            "status": refusal.status_code,
+                            "cause": cause,
+                        }
+                    ),
+                    client=client_ip(request),
+                )
+            except audit_write_errors() as exc:
+                # The store-refusal set the other fail-soft audit writes catch. Defects
+                # (AUDIT_WRITE_DEFECTS) are not re-raised: a raise would replace the refusal owed
+                # with a 500, the case write_audit_soft's docstring says to pass defects=() for.
+                # write_audit_soft itself is not used: it logs the traceback, whose frames reach
+                # the route frame's decrypted `criterias`. Names the refusal's own status and
+                # cause, which the row would have held, at most once per preset, cause and failure
+                # class per interval: an outage fails every write. Later failures in that window
+                # leave no row and no log line.
+                failed = type(exc).__name__
+            except Exception as exc:  # noqa: BLE001 -- a defect must not replace the refusal owed
+                # A backstop for a fault outside that set, a defect in the chain seal say: logged
+                # the same way, by type name only, with no exc_info and no message text, so no
+                # audit-write failure changes the 423, 503 or 400 answer.
+                failed = f"defect {type(exc).__name__}"
+            else:
+                return refusal
+            if _first_layered_refusal(preset_id, f"audit:{cause}:{failed}"):
+                _log.error(
+                    "layered search could not audit its refusal of preset %s (%s %s; %s)",
+                    preset_id,
+                    str(refusal.status_code),
+                    cause,
+                    failed,
+                )
+            return refusal
+
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
             refusal: HTTPException | None = None
+            cause = ""
             try:
                 row = await engine.store.get_search_preset(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
-            except CellTagError:
+            except (BlankCellError, NonTextCellError) as exc:
+                # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, which
+                # it never writes (audited and logged there, and alerted on a keyed store), so it
+                # never reads as an empty filter that would widen the search. Its own text: a
+                # keyless store has no integrity tag for such a cell to fail.
+                cause = type(exc).__name__
+                shape = "blank" if isinstance(exc, BlankCellError) else "non-text"
+                refusal = HTTPException(
+                    423,
+                    f"preset {preset_id} has {shape} criteria, written outside the store, and"
+                    " cannot be used",
+                )
+            except CellTagError as exc:
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
                 # unmarked value (audited; the cipher alerted, BACKLOG #5650) or are corrupt
                 # (logged); the store refused. The caller's own preset exists, so a refusal, never
                 # a 500. Caught before CipherError, which it subclasses.
+                cause = type(exc).__name__
                 refusal = HTTPException(
                     423, f"preset {preset_id} failed its integrity check and cannot be used"
                 )
@@ -9877,6 +9959,7 @@ def create_app(
                 # so a later try may succeed. Its text goes to the log only, as in uploads, and as
                 # a str: the exception's traceback would reach this frame's decrypted `criterias`.
                 _log.warning("layered search answered 503 on preset %s: %s", preset_id, str(exc))
+                cause = type(exc).__name__
                 refusal = HTTPException(
                     503,
                     f"the store's key service could not open preset {preset_id}. Try again shortly",
@@ -9886,11 +9969,16 @@ def create_app(
                 # BACKLOG #5523: a key or format problem the cipher raises as is, for example a
                 # retired key that is not supplied, or a Vault Transit refusal other than the
                 # value's AEAD tag (a key-version refusal, a 403). It answered 500. The type name
-                # only: the text is the cipher's, not this route's. ERROR: it is neither audited
-                # nor alerted, so this is the engine's only record of it. Transit's AEAD refusal of
+                # only: the cipher's text can echo fields cut from the stored value, and this cell
+                # may have been written outside the store. ERROR, once per preset and error class
+                # per interval. refuse() tries to write the route's audit row for each refusal; a
+                # write that fails leaves no row, and its own ERROR is logged at most once per
+                # preset, cause and failure class per interval. Transit's AEAD refusal of
                 # a cell planted across owners is a CellTagError above (BACKLOG #5650). The outage
                 # above is a WARNING: it says nothing about the cell.
-                _log.error("layered search refused preset %s: %s", preset_id, type(exc).__name__)
+                cause = type(exc).__name__
+                if _first_layered_refusal(preset_id, cause):
+                    _log.error("layered search refused preset %s: %s", preset_id, cause)
                 refusal = HTTPException(
                     423,
                     f"preset {preset_id} cannot be opened with the store's keys and cannot be used;"
@@ -9900,30 +9988,26 @@ def create_app(
             if refusal is not None:
                 # Raised after the handler, so the refusal chains nothing (BACKLOG #1796): `from
                 # None` would still leave the store's and the cipher's errors on __context__.
-                raise refusal
+                raise await refuse(preset_id, refusal, cause)
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
-            if not row["criteria"]:
-                # BACKLOG #5523: the store never writes blank criteria, and a keyed store passes a
-                # blank cell through unopened, so NULL or "" was written outside the store. Read as
-                # `{}` it would drop out of the compose and widen the search, so refuse it. Logged,
-                # since only the caller would learn of it otherwise.
-                _log.warning(
-                    "layered search refused preset %s: its criteria cell is blank", preset_id
-                )
-                # Its own text: a keyless store has no integrity tag for it to fail.
-                raise HTTPException(
-                    423,
-                    f"preset {preset_id} has blank criteria, written outside the store, and cannot"
-                    " be used",
-                )
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
-            # arm is gone: get_search_preset returns the criteria through the cipher as a str, or
-            # None for a NULL cell, and the blank-cell refusal above has already refused None.
+            # arm is gone: get_search_preset returns the criteria through the cipher as a
+            # non-blank str, and refuses a NULL, blank or non-text cell itself (BACKLOG #5523).
             criteria, refused = json_loads_or_refusal(row["criteria"])
             if refused is not None or not isinstance(criteria, dict):
-                raise HTTPException(400, f"preset {preset_id} has malformed criteria")
+                # BACKLOG #5523: the store writes criteria as a JSON object, so this was written
+                # outside it. Logged, once per preset per interval, and audited each time.
+                if _first_layered_refusal(preset_id, "malformed"):
+                    _log.warning(
+                        "layered search refused preset %s: its criteria are malformed", preset_id
+                    )
+                raise await refuse(
+                    preset_id,
+                    HTTPException(400, f"preset {preset_id} has malformed criteria"),
+                    "malformed",
+                )
             criterias.append(criteria)
         spec, meta = _compose_preset_layers(criterias)
         # Re-clamp the scan against the request bound (the composed spec used make_spec's default).
@@ -9960,17 +10044,15 @@ def create_app(
         )
         # BACKLOG #5523: coalesced into summary_access after the route's own row, as
         # /messages/search does, so a layered recall is no way round the harvest signal (review
-        # M-5). Counted post-redaction.
-        exposed, masked = count_exposed(messages), count_masked(messages)
-        if exposed or masked:
-            await request.app.state.summary_auditor.note(
-                engine.store,
-                identity.username,
-                meta["channel_id"],
-                exposed,
-                time.time(),
-                masked=masked,
-            )
+        # M-5). Counted post-redaction; note() writes nothing when both counts are zero.
+        await request.app.state.summary_auditor.note(
+            engine.store,
+            identity.username,
+            meta["channel_id"],
+            count_exposed(messages),
+            time.time(),
+            masked=count_masked(messages),
+        )
         return MessageSearchResults(
             messages=messages,
             scanned=result.scanned,
