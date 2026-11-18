@@ -254,21 +254,27 @@ def _record(tmp_path: Path, body: bytes) -> Path:
 
 @pytest.mark.parametrize("mode", _MODES)
 @pytest.mark.parametrize(
-    "body",
+    ("body", "cls"),
     [
-        f'[[cell]\nid = "{_LEAK}"\n'.encode(),
-        f'[[cell]]\nid = "{_LEAK}"\nverd'.encode() + b'\xff\xfeict = "pass"\n',
+        (f'[[cell]\nid = "{_LEAK}"\n'.encode(), "TOMLDecodeError"),
+        (
+            f'[[cell]]\nid = "{_LEAK}"\nverd'.encode() + b'\xff\xfeict = "pass"\n',
+            "UnicodeDecodeError",
+        ),
     ],
     ids=["not-toml", "not-utf8"],
 )
 def test_an_unreadable_record_exits_2_in_every_mode(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: str, body: bytes
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: str, body: bytes, cls: str
 ) -> None:
     """Before: TOMLDecodeError or UnicodeDecodeError escaped `main` as a traceback and exit 1, a
-    code --status promises never to return and verify reserves for findings."""
+    code --status promises never to return and verify reserves for findings. The guard's own
+    message is asserted too, so the exit 2 is attributable to it and not to some earlier refusal."""
     assert main(_mode_argv(mode, _record(tmp_path, body), tmp_path)) == 2
     captured = capsys.readouterr()
     assert _LEAK not in captured.out + captured.err
+    assert f"the scorecard run stopped on {cls} before it completed" in captured.err
+    assert "message is withheld" in captured.err
 
 
 class _Unlisted(Exception):
@@ -596,15 +602,35 @@ def test_prove_absences_prints_the_provenance_header(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Before: no line said which trees the proof was measured against. The record carries one
-    absence claim, so the run gets past every refusal and the header is read off a completed run."""
+    absence claim that names a mutation_path, so the run gets past every refusal, the skipped-only
+    one included, and the header is read off a completed run."""
     root = tmp_path / "engine"
     root.mkdir()
-    record = _prove_record(tmp_path, _CELL + _ABSENCE)
+    (root / "m.py").write_text("X = 1\n", encoding="utf-8")
+    record = _prove_record(tmp_path, _CELL + _ABSENCE + '  mutation_path = "m.py"\n')
     assert main(["--scorecard", str(record), "--root", str(root), "--prove-absences"]) == 0
     captured = capsys.readouterr()
     assert captured.out.startswith("# asvs-prove-absences scorecard=")
     assert "prove-absences: saw 1 absence claim(s);" in captured.out
+    assert "1 static-screened" in captured.out
     assert "no absence claims" not in captured.err
+    assert "proved nothing" not in captured.err
+
+
+def test_prove_absences_refuses_a_run_where_every_claim_was_skipped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Before: a claim with no mutation_path is skipped, a skip raises no problem, so a pass that
+    skipped every claim exited 0 printing `proved 0`, which a CI step reads as every claim proved.
+    It refuses, exit 2, naming the reason in words; the summary still prints first."""
+    root = tmp_path / "engine"
+    root.mkdir()
+    record = _prove_record(tmp_path, _CELL + _ABSENCE)
+    assert main(["--scorecard", str(record), "--root", str(root), "--prove-absences"]) == 2
+    captured = capsys.readouterr()
+    assert "prove-absences: saw 1 absence claim(s);" in captured.out
+    assert "every absence claim was skipped" in captured.err
+    assert "proved nothing" in captured.err
 
 
 def test_prove_absences_refuses_cells_with_no_absence_claim(

@@ -2844,13 +2844,16 @@ def test_main_summary_says_RESOLVED_not_VERIFIED_and_carries_the_form_split(
     assert "1 of 2 (50.0%) resolve into prose or a non-Python file" in out
 
 
-def test_main_verify_without_corpus_returns_exit_2(tmp_path: Path) -> None:
+def test_main_verify_without_corpus_returns_exit_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """Verify mode needs the corpus; omitting `--corpus` (without `--prove-absences`) must exit 2 --
     could-not-measure, never confused with a clean 0. Proves the argparse-independent guard in `main`.
 
-    Falsified by deleting the `if args.corpus is None: ... return 2` branch in `main`: it then falls
-    through to `verify(...)` with `corpus=None`, raising instead of returning 2, and this test's
-    `rc == 2` goes RED. Restored.
+    Falsified by deleting the `if args.corpus is None: ... return 2` branch in `_dispatch`: it then
+    falls through to `verify(...)` with `corpus=None`, which raises. `main`'s catch-all maps that to
+    exit 2 as well (BACKLOG #5462), so `rc == 2` alone stays green; the guard's own message is what
+    goes RED. Restored.
     """
     sc = tmp_path / "sc.toml"
     sc.write_text(
@@ -2868,6 +2871,7 @@ def test_main_verify_without_corpus_returns_exit_2(tmp_path: Path) -> None:
     engine.mkdir()
     rc = main(["--scorecard", str(sc), "--root", str(engine)])
     assert rc == 2
+    assert "--corpus is required to verify the scorecard" in capsys.readouterr().err
 
 
 # --- provenance and `--status`: a count is a fact about a (file x ref) PAIR -----------------------

@@ -3639,7 +3639,8 @@ def _run_prove_absences(scorecard: Path, root: Path) -> int:
     Held to verify's footing (BACKLOG #5461): the root must be a directory that does not hold the
     record (:func:`check_root`), the provenance header names both trees before anything is read,
     and a record with no cells, or with cells but no absence claim, is refused rather than reported
-    as a clean pass over nothing.
+    as a clean pass over nothing. So is a pass where every claim was skipped for want of a
+    ``mutation_path``: it proved nothing, so it exits 2 rather than 0.
     """
     try:
         check_root(scorecard, root)
@@ -3691,6 +3692,15 @@ def _run_prove_absences(scorecard: Path, root: Path) -> int:
         print(f"  NOTE {a}", file=sys.stderr)
     for p in findings.problems:
         print(f"  FAIL {p}", file=sys.stderr)
+    # A pass where every claim was SKIPPED raised no problem, so `ok` held and it exited 0 with
+    # `proved 0`, which a CI step reads as every claim proved (BACKLOG #5461). It measured nothing.
+    if findings.skipped_absences == findings.checked_absences:
+        print(
+            "error: every absence claim was skipped because none names a mutation_path, so this "
+            "run proved nothing; a run that proved nothing is not a pass",
+            file=sys.stderr,
+        )
+        return 2  # could not measure — never 0, never confused with "clean"
     return 0 if findings.ok else 1
 
 
