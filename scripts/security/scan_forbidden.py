@@ -1992,17 +1992,6 @@ def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> st
             "scripts/security/scan-tokens.local.txt) — refusing to run structural-only"
         )
     counts = loaded_token_counts()
-    wide = sum(len(p) != _SITE_PREFIX_WIDTH for p in _SITE_PREFIXES)
-    if wide:
-        # A count only, never the entry: a site prefix is customer data. This scan matches the entry,
-        # so the counts read it as live, but the anonymizer loads two-digit prefixes only and its
-        # site-code scrub and leak check would match nothing for it (BACKLOG #5366).
-        return (
-            f"{wide} [site_prefix] entr{'y is' if wide == 1 else 'ies are'} not exactly "
-            f"{_SITE_PREFIX_WIDTH} ASCII digits, and the anonymizer loads two-digit prefixes only "
-            "(surrogates.py), so its site-code scrub and leak check would not match what this gate "
-            "reports as loaded"
-        )
     empty = [s for s in _FLOOR_SECTIONS if not counts[s]]
     if empty:
         return (
@@ -2026,6 +2015,19 @@ def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> st
                 f"({', '.join(f'{s}={counts[s]}' for s in _FLOOR_SECTIONS)}) — the token source is "
                 "incomplete. This is a FLOOR: adding tokens is free, losing them is not"
             )
+    wide = sum(len(p) != _SITE_PREFIX_WIDTH for p in _SITE_PREFIXES)
+    if wide:
+        # A count only, never the entry: a site prefix is customer data. This scan matches the entry,
+        # so the counts read it as live, but the anonymizer loads two-digit prefixes only and its
+        # site-code scrub and leak check would match nothing for it (BACKLOG #5366). Checked after
+        # the floors, so the anonymizer's refusal_advice, which finds this reason by
+        # surrogates.SITE_PREFIX_WIDTH_MARK, can read it as a source that loaded.
+        return (
+            f"{wide} [site_prefix] entr{'y is' if wide == 1 else 'ies are'} not exactly "
+            f"{_SITE_PREFIX_WIDTH} ASCII digits, and the anonymizer loads two-digit prefixes only "
+            "(surrogates.py), so its site-code scrub and leak check would not match what this gate "
+            "reports as loaded"
+        )
     return None
 
 

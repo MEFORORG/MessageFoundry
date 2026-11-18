@@ -147,10 +147,8 @@ SITE_PREFIX_WIDTH_MARK = "the anonymizer loads two-digit prefixes only"
 def site_prefix_split(guard_prefixes: tuple[str, ...]) -> str | None:
     """Why the site-code check does not use the publish guard's ``[site_prefix]`` table, or
     ``None`` when it uses the same prefixes. ``guard_prefixes`` is the guard's own table. Its
-    entries are read as :func:`_load_site_prefixes` reads a source, two ASCII digits only, so one
-    token source loaded into both tables reads the same even when it holds an entry that is not
-    two digits. The two differ when one of them was reloaded and the other was not
-    (BACKLOG #5541). The reason gives counts only, never a prefix: the prefixes name a real
+    entries are read as :func:`_load_site_prefixes` reads a source, two ASCII digits only. The
+    two differ when one of them was reloaded and the other was not (BACKLOG #5541). The reason gives counts only, never a prefix: the prefixes name a real
     estate."""
     loaded = {p for p in guard_prefixes if p.isascii() and p.isdigit() and len(p) == 2}
     if loaded == set(_SITE_PREFIXES):
