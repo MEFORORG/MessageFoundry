@@ -13,13 +13,22 @@ import copy
 import dataclasses
 import json
 import pickle
+import sys
 from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
 import pytest
 
-from messagefoundry.config.code_sets import CodeSet, CodeSetError, parse_code_set
+from messagefoundry.config.code_sets import (
+    _MAX_FREEZE_DEPTH,
+    CodeSet,
+    CodeSetError,
+    _FrozenDict,
+    _FrozenList,
+    parse_code_set,
+    parse_policy,
+)
 from messagefoundry.pipeline._sandbox_codec import _Blobs, _Reader, dec_code_sets, enc_code_sets
 
 _CSV = b"code,display,system\nM,Male,HL7\nF,Female,HL7\n"
@@ -121,6 +130,47 @@ def test_a_value_nested_past_the_recursion_limit_is_a_code_set_error() -> None:
         deep = "a." + deep
     with pytest.raises(CodeSetError, match="nested too deeply"):
         parse_code_set("deep.toml", ("[K]\n" + deep + "\n").encode())
+
+
+def _nested(levels: int) -> Any:
+    value: Any = 1
+    for i in range(levels):
+        value = [value] if i % 2 else {"k": value}
+    return value
+
+
+def test_a_value_exactly_at_the_freeze_bound_loads() -> None:
+    # Positive control for the test below: 256 containers deep is the bound and still loads.
+    cs = CodeSet("edge", {"K": _nested(_MAX_FREEZE_DEPTH)})
+    inner: Any = cs["K"]
+    for _ in range(_MAX_FREEZE_DEPTH):
+        assert type(inner) in (_FrozenDict, _FrozenList)
+        inner = inner["k"] if isinstance(inner, dict) else inner[0]
+    assert inner == 1
+    assert cs["K"] == _nested(_MAX_FREEZE_DEPTH)
+
+
+def test_a_value_at_the_bound_loads_from_a_deep_caller_stack() -> None:
+    # The walk is iterative, so a caller already deep in its stack can still load the table.
+    def descend(remaining: int) -> CodeSet:
+        if remaining:
+            return descend(remaining - 1)
+        return CodeSet("edge", {"K": _nested(_MAX_FREEZE_DEPTH)})
+
+    assert len(descend(sys.getrecursionlimit() - 100)) == 1
+
+
+def test_a_value_one_past_the_freeze_bound_is_a_code_set_error() -> None:
+    with pytest.raises(CodeSetError, match="nested too deeply"):
+        CodeSet("edge", {"K": _nested(_MAX_FREEZE_DEPTH + 1)})
+
+
+def test_a_policy_sidecar_nested_past_tomllibs_limit_is_a_code_set_error() -> None:
+    deep = "1"
+    for _ in range(2000):
+        deep = "[" + deep + "]"
+    with pytest.raises(CodeSetError, match="invalid TOML"):
+        parse_policy("deep.policy.toml", ("v = " + deep + "\n").encode())
 
 
 def test_a_toml_file_nested_past_tomllibs_limit_is_a_code_set_error() -> None:

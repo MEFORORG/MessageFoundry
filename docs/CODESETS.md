@@ -22,8 +22,9 @@ code sets); the directory is created on the first `upsert`.
   the grid; the CLI never *writes* TOML. (A TOML-in-grid editor is a fast-follow.)
 
 **Rows are read-only.** A multi-column row, a nested TOML table and a TOML array come back from a
-lookup read-only: an edit such as `row["display"] = ...` raises `TypeError`, because one loaded table
-serves every message until reload. Take `copy.deepcopy(row)` to get a copy you can change;
+lookup read-only: an ordinary edit such as `row["display"] = ...` raises `TypeError`, because one
+loaded table serves every message until reload. The guard stops an accidental edit, not every write:
+a C-level writer such as `heapq.heappush` or an unbound `list.append(row, ...)` still gets through. Take `copy.deepcopy(row)` to get a copy you can change;
 `dict(row)` is shallow, so its nested values stay read-only.
 
 Both editors — a hand edit and a GUI save — write the same `codesets/<name>.csv`, so they are

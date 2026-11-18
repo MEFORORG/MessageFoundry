@@ -335,8 +335,8 @@ def _drain_capture(buffer: UnmappedCapture, message_id: str | None) -> None:
 # --- code set ----------------------------------------------------------------
 
 
-#: How deep :func:`_freeze` walks. A fixed bound, the sandbox codec's ``_MAX_DEPTH``, so whether a
-#: table loads does not depend on how deep the caller's stack already is.
+#: How many containers deep :func:`_freeze` walks, the sandbox codec's ``_MAX_DEPTH``. The walk keeps
+#: its own stack, so whether a table loads does not depend on how deep the caller's stack already is.
 _MAX_FREEZE_DEPTH = 256
 
 
@@ -408,24 +408,49 @@ class _FrozenList(list[Any]):
 _FREEZABLE: frozenset[type] = frozenset({dict, list, tuple})
 
 
-def _freeze(value: Any, depth: int = 0) -> Any:
-    """Freeze a loaded value recursively, once at construction, so a lookup returns the stored
+def _freeze(name: str, value: Any) -> Any:
+    """Freeze a loaded value all the way down, once at construction, so a lookup returns the stored
     object at no per-call cost and the table it came from refuses an ordinary edit (BACKLOG #5897).
 
     A plain dict or list becomes its read-only subclass and a tuple is rebuilt from frozen members.
-    Past :data:`_MAX_FREEZE_DEPTH` it raises :class:`RecursionError`, which :class:`CodeSet` reports
-    as a :class:`CodeSetError`."""
-    kind = type(value)
-    if kind not in _FREEZABLE:
+    The walk keeps its own stack rather than recursing, so it spends no interpreter frame per level.
+    A value nesting more than :data:`_MAX_FREEZE_DEPTH` containers raises :class:`CodeSetError`
+    naming code set ``name``."""
+    if type(value) not in _FREEZABLE:
         return value
-    if depth >= _MAX_FREEZE_DEPTH:
-        raise RecursionError
-    depth += 1
-    if kind is dict:
-        return _FrozenDict((k, _freeze(v, depth)) for k, v in value.items())
-    if kind is list:
-        return _FrozenList(_freeze(v, depth) for v in value)
-    return tuple(_freeze(v, depth) for v in value)
+    # One frame per open container: its type, an iterator over its (key, child) pairs (key None for
+    # a list or tuple), the frozen pairs built so far, and the container's own key in its parent.
+    stack: list[tuple[type, Iterator[tuple[Any, Any]], list[tuple[Any, Any]], Any]] = [
+        (type(value), _pairs(value), [], None)
+    ]
+    while True:
+        kind, pairs, built, own_key = stack[-1]
+        for key, child in pairs:
+            if type(child) in _FREEZABLE:
+                if len(stack) >= _MAX_FREEZE_DEPTH:
+                    raise CodeSetError(f"code set {name!r}: a value is nested too deeply to load")
+                stack.append((type(child), _pairs(child), [], key))
+                break
+            built.append((key, child))
+        else:
+            stack.pop()
+            frozen: Any
+            if kind is dict:
+                frozen = _FrozenDict(built)
+            elif kind is list:
+                frozen = _FrozenList(v for _, v in built)
+            else:
+                frozen = tuple(v for _, v in built)
+            if not stack:
+                return frozen
+            stack[-1][2].append((own_key, frozen))
+
+
+def _pairs(container: Any) -> Iterator[tuple[Any, Any]]:
+    """A container's children as ``(key, child)``: a dict's items, else ``(None, child)``."""
+    if type(container) is dict:
+        return iter(container.items())
+    return ((None, child) for child in container)
 
 
 class CodeSet(Mapping[str, Any]):
@@ -449,15 +474,11 @@ class CodeSet(Mapping[str, Any]):
         # Rows are frozen here, not copied per lookup: a Handler that mutated a returned row would
         # otherwise alter the table shared by every later message until reload (BACKLOG #5897).
         # One pass over the values at load; only container values are rebuilt.
+        # A value nested past the freeze's bound raises CodeSetError, which every loader catches.
         frozen: dict[str, Any] = dict(data)
-        try:
-            for key, value in frozen.items():
-                if type(value) in _FREEZABLE:
-                    frozen[key] = _freeze(value)
-        except RecursionError:
-            # Nested past the freeze's bound (or the interpreter's): fail loud as a code-set error,
-            # which every loader catches, rather than escape as a bare RecursionError.
-            raise CodeSetError(f"code set {name!r}: a value is nested too deeply to load") from None
+        for key, value in frozen.items():
+            if type(value) in _FREEZABLE:
+                frozen[key] = _freeze(name, value)
         self._data = frozen
         self._policy: UnmappedPolicy = policy if policy is not None else UnmappedPolicy()
 
@@ -620,7 +641,8 @@ def parse_policy(sidecar_name: str, data: bytes) -> UnmappedPolicy:
     snapshot load."""
     try:
         raw = tomllib.loads(data.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, RecursionError) as exc:
+        # RecursionError: tomllib's own bound on a deeply nested array, table or dotted key.
         invalid: str | None = (
             f"policy sidecar {sidecar_name!r}: invalid TOML — {codec_safe_str(exc)}"
         )
