@@ -39,6 +39,12 @@ __all__ = ["RelayStore", "NakRow", "CaptureRow", "PurgeIncompleteError"]
 # back. What is escaped is stated once, in docs/PHI.md, section 7, the tee relay paragraph.
 _MAX_DETAIL = 500
 
+# Bound the stored identifiers too. MSH-10 and MSH-9 come from partner bytes, and a frame may be up
+# to the relay's 16 MiB limit, so an unbounded field would be stored whole and every `naks` read
+# would load and escape it. 199 is MSH-10's length in HL7 v2.7 and later, the longer of the two
+# fields, so no conformant identifier is cut. Cut, not escaped: `naks` escapes what it prints.
+_MAX_IDENTIFIER = 199
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS relay_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,6 +180,11 @@ def _clean_detail(detail: str | None) -> str | None:
         pieces.append(piece)
         used += len(piece)
     return "".join(pieces)
+
+
+def _bound_identifier(value: str | None) -> str | None:
+    """An MSH-10 or MSH-9 value kept to at most ``_MAX_IDENTIFIER`` characters, or ``None``."""
+    return None if value is None else value[:_MAX_IDENTIFIER]
 
 
 def _iso(at: float) -> str:
@@ -322,8 +333,8 @@ class RelayStore:
                     time.time(),
                     direction,
                     leg,
-                    control_id,
-                    message_type,
+                    _bound_identifier(control_id),
+                    _bound_identifier(message_type),
                     size_bytes,
                     outcome,
                     ack_code,
@@ -337,7 +348,7 @@ class RelayStore:
         async with self._lock:
             await self._db.execute(
                 "INSERT INTO relay_capture (at, direction, control_id, raw) VALUES (?,?,?,?)",
-                (time.time(), direction, control_id, raw),
+                (time.time(), direction, _bound_identifier(control_id), raw),
             )
             await self._db.commit()
 

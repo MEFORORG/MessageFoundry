@@ -118,7 +118,8 @@ fail-closed), `--connect-timeout` / `--send-timeout`, `--max-frame-bytes` (frame
 ## The SQLite log
 
 The relay's only store is SQLite. It records **one row per forwarding leg** (`corepoint` / `mefor`) with
-the outcome, the ACK code, the control id (MSH-10), the message type (MSH-9), the size, and a
+the outcome, the ACK code, the control id (MSH-10) and the message type (MSH-9), each cut to 199
+characters, the size, and a
 `detail` (the MSA-3 reason or an error string), stored as [PHI.md section 7, the tee relay
 paragraph](PHI.md#7-logging--phi-redaction) says. **Message bodies are never logged**;
 they are persisted only to a separate `relay_capture` table, and only when `--capture-bodies` is set.
