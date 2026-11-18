@@ -1966,7 +1966,8 @@ def redact(text: str) -> str:
     and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
 
     **A JSON value with a mismatched closer makes the whole text redacted (BACKLOG #5814)**: the
-    result is the placeholder alone."""
+    result is the placeholder alone. The JSON pass reads what the passes before it left, so this
+    holds for a closer that pass still sees as mismatched."""
     try:
         return _redact_unguarded(text)
     except _MismatchedJsonCloser:
