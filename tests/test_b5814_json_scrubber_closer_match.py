@@ -44,6 +44,27 @@ def test_a_mismatched_closer_does_not_end_the_scrub(scrub: Callable[[str], str],
 
 
 @pytest.mark.parametrize("scrub", SCRUBBERS)
+@pytest.mark.parametrize(
+    "text",
+    [
+        # An INHERIT frame (the kept members of an identifier) still ends on any closer, so the
+        # identifier's value after it, and the keys after the identifier, are scrubbed as on main.
+        '{"identifier": {"system": [1, 2), "value": "Qmrnxq"}}',
+        '{"identifier": [{"system": "x" ] "Qmrnxq"}]',
+        f'{{"identifier": {{"system": [1, 2)}}, "family": "{FAMILY}", "birthDate": "Qmrnxq"}}',
+        f'{{"telecom": [{{"use": f(]}}], "given": "{GIVEN}", "family": "{FAMILY}"}}',
+    ],
+)
+def test_a_mismatched_closer_never_lowers_the_scrub_level(
+    scrub: Callable[[str], str], text: str
+) -> None:
+    out = scrub(text)
+    assert "Qmrnxq" not in out
+    assert FAMILY not in out
+    assert GIVEN not in out
+
+
+@pytest.mark.parametrize("scrub", SCRUBBERS)
 def test_a_matched_closer_still_ends_the_value(scrub: Callable[[str], str]) -> None:
     """Negative control: text after a properly closed PHI value is outside it and stays as written."""
     text = f'{{"family": ["{FAMILY}"], "status": "Kept-{GIVEN}"}}'
@@ -64,5 +85,21 @@ def test_fuzz_stray_closers_never_end_a_never_closed_array() -> None:
         for scrub in SCRUBBERS:
             out = scrub(text)
             assert FAMILY not in out and GIVEN not in out, (text, out)
-        once = safe_text(text)
-        assert safe_text(once) == once, text
+        once = safe_text(text, limit=10_000)  # no cut: the cut note is a known exception
+        assert safe_text(once, limit=10_000) == once, text
+
+
+def test_fuzz_identifier_array_never_closed_scrubs_every_value() -> None:
+    """An identifier's kept (INHERIT) objects meet stray closers too. While its array is never
+    closed by ``]``, every ``value`` in it is scrubbed, whichever closer ends an object, and a fixed
+    point holds."""
+    rng = random.Random(58140)
+    pieces = ['"system": "x"', '"value": "Qmrnxq"', ",", " ", ")", "}", "{"]
+    for _ in range(300):
+        body = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 16)))
+        text = f'{{"identifier": [{{{body}'
+        for scrub in SCRUBBERS:
+            out = scrub(text)
+            assert "Qmrnxq" not in out, (text, out)
+        once = safe_text(text, limit=10_000)  # no cut: the cut note is a known exception
+        assert safe_text(once, limit=10_000) == once, text

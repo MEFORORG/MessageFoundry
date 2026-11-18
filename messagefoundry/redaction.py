@@ -1321,9 +1321,13 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
     callable's name (``date(``, ``frozenset(``) and is kept too; its arguments are the value."""
     out: list[str] = []
     #: One frame per open container: ``(is_object, policy, closer)``. An object's policy is LEAF or
-    #: INHERIT (searched); an array's or a call's is the policy its elements take. ``closer`` is the one
-    #: delimiter that ends the frame: a closer of another kind is data inside the value, so a stray
-    #: ``)`` in a PHI-keyed array cannot end its scrubbing early (BACKLOG #5814).
+    #: INHERIT (searched); an array's or a call's is the policy its elements take. ``closer`` is the
+    #: delimiter that ends a frame that scrubs: a closer of another kind is data inside the value, so a
+    #: stray ``)`` in a PHI-keyed array cannot end its scrubbing early (BACKLOG #5814). An INHERIT
+    #: frame still ends on any closer, as before: it keeps what it holds, so staying open would LOWER
+    #: the scrub level of what follows, and INHERIT is the least strict policy, so popping one never
+    #: does. A mismatched closer therefore never lowers the level. Under a scrubbing frame the
+    #: value runs to the end of the text, the fail-closed rule an unclosed structure already follows.
     frames: list[tuple[bool, int, str]] = []
     pending = policy
     n = len(text)
@@ -1352,7 +1356,7 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
                 closer = "]" if punct == "[" else ")"
                 frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending, closer))
                 pending = frames[-1][1]
-            elif punct == frames[-1][2]:
+            elif punct == frames[-1][2] or (punct in "}])" and frames[-1][1] == _INHERIT):
                 frames.pop()
                 if not frames:
                     return "".join(out), pos
