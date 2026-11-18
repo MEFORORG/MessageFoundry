@@ -455,6 +455,59 @@ def test_start_refuses_a_first_scan_that_missed_a_sub_folder(
         FileSink(tmp_path).start()
 
 
+@pytest.mark.parametrize("by_path", [False, True], ids=["native-walk", "by-path-walk"])
+def test_start_ignores_a_lstat_fault_on_an_entry_it_would_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, by_path: bool
+) -> None:
+    """An engine temp the sink never records (here ``x.part``, e.g. delete-pending on Windows)
+    whose lstat fails does not make the first scan partial, so start() succeeds."""
+    if by_path:
+        monkeypatch.setattr(file_sink, "_DIR_FD", False)
+    (tmp_path / "x.part").write_bytes(b"half")
+    real_stat, real_lstat = os.stat, os.lstat
+
+    def stat_(target: Any, *args: Any, **kwargs: Any) -> Any:
+        if _named(target, "x.part"):
+            raise PermissionError(13, "denied")
+        return real_stat(target, *args, **kwargs)
+
+    def lstat_(target: Any, *args: Any, **kwargs: Any) -> Any:
+        if _named(target, "x.part"):
+            raise PermissionError(13, "denied")
+        return real_lstat(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat_)
+    monkeypatch.setattr(os, "lstat", lstat_)
+    with FileSink(tmp_path) as sink:
+        (tmp_path / "a.hl7").write_bytes(_BODY)
+        records = sink.records()
+    assert [r.payload for r in records] == [_BODY]
+
+
+def test_an_over_cap_file_is_refused_from_its_lstat_and_never_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened: list[str] = []
+    real_open = os.open
+
+    def open_(target: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if isinstance(target, (str, os.PathLike)):
+            opened.append(Path(os.fspath(target)).name)
+        return real_open(target, flags, *args, **kwargs)
+
+    with FileSink(tmp_path) as sink:
+        sink.max_file_bytes = len(_BODY)
+        (tmp_path / "ok.hl7").write_bytes(_BODY)
+        (tmp_path / "big.hl7").write_bytes(_BODY + b"X")
+        monkeypatch.setattr(os, "open", open_)
+        records = sink.records()
+    by_name = {r.meta["name"]: r for r in records}
+    assert by_name["big.hl7"].payload == b""
+    assert by_name["big.hl7"].meta["refused"].endswith(f"over the {len(_BODY)}-byte cap; not read")
+    assert "ok.hl7" in opened, "the spy saw no open: the test proves nothing"
+    assert "big.hl7" not in opened
+
+
 def test_verify_sink_fails_on_a_non_file_entry_in_the_sink() -> None:
     scenario = Scenario("s", "", "ADT", "A01", 1, sink="file", sink_endpoint="file_out")
     fake = _Fake()

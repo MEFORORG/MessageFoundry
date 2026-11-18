@@ -7,7 +7,7 @@ directory cannot satisfy a scenario with an earlier run's output; a file written
 whether present at start or already recorded, is recorded again. "Unchanged" is the ``lstat``
 identity, file type, size and modification time, and a file that changes while it is read is
 recorded once it settles, not twice. The scan enters only what ``lstat`` reads as a plain
-directory, never a link or a junction, and records each file's path relative to it
+directory, never a link or a junction on platforms with ``dir_fd``, and records each file's path relative to it
 (``meta["relpath"]``) and whether its resolved path, symlinks followed, stays inside it
 (``meta["inside"]``). A link that cannot be resolved strictly (a loop, a dangling link, a race) is
 recorded as not inside, never as inside. A file written OUTSIDE the directory is not looked for
@@ -35,7 +35,7 @@ once (where the volume reports file ids), so a walk that escaped through a sub-f
 unbounded.
 
 Reading is bounded the way the GUI's folder watcher is, through the same reader
-(:func:`harness.bounded_file.read_fd_capped`): regular files only, nothing read through a link, each
+(:func:`harness.bounded_file.read_fd_capped`): regular files only, nothing read through a link on platforms with ``dir_fd``, each
 capped at the engine's per-message cap, checked on the open handle, and an over-cap file (or one
 that grows past the cap while read) recorded with an empty payload and a ``refused`` reason rather
 than read. Only a plain directory is skipped: a symlink (``meta["symlink"]``), FIFO or device is
@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from harness.bounded_file import NOT_REGULAR, read_fd_capped
+from harness.bounded_file import _over as over_cap
 from harness.endpoints import Endpoints
 from harness.sinks import Record, Sink
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -235,6 +236,15 @@ class FileSink(Sink):
         relative = path.relative_to(self.directory)
         return relative.match(self.pattern) or relative.full_match(self.pattern)
 
+    def _file_name(self, path: Path, name: str) -> bool:
+        """Whether a file of this name is a candidate: on the pattern, not a dot-file, and not one
+        of the engine's temps."""
+        return (
+            self._matches(path)
+            and not name.startswith(".")
+            and path.suffix not in _ENGINE_TEMP_SUFFIXES
+        )
+
     def _scan(self, visit: _Visit) -> _Scan | None:
         """Walk the directory, calling ``visit`` for each candidate while its folder is held, and
         return the scan's state; or None, with nothing visited, when the directory is no longer the
@@ -348,7 +358,11 @@ class FileSink(Sink):
             except FileNotFoundError:
                 continue
             except OSError as exc:
-                scan.partial = True
+                # With no lstat its type is unknown, so it is judged by its name alone: a name the
+                # file filters skip (a dot-file, an engine temp, one off the pattern) does not make
+                # the scan partial. A link or folder under such a name is then not counted.
+                if self._file_name(path, name):
+                    scan.partial = True
                 self._warn(
                     "lstat",
                     path,
@@ -365,11 +379,7 @@ class FileSink(Sink):
                     if identity is not None:
                         scan.entered.add(identity)
                     self._enter(held, name, path, st, depth, visit, scan)
-            elif link or (
-                self._matches(path)
-                and not name.startswith(".")
-                and path.suffix not in _ENGINE_TEMP_SUFFIXES
-            ):
+            elif link or self._file_name(path, name):
                 # A link is never an engine temp, so no name or pattern keeps one out.
                 if isinstance(held, int):
                     opener = functools.partial(os.open, name, _FILE_FLAGS, dir_fd=held)
@@ -520,6 +530,9 @@ class FileSink(Sink):
             link = _is_link(st)
             if link or not stat.S_ISREG(st.st_mode):
                 data, refused = b"", NOT_REGULAR  # never opened: not through a link, not a FIFO
+            elif st.st_size > self.max_file_bytes:
+                # Refused from the lstat size, never opened, as read_capped refuses it.
+                data, refused = b"", over_cap(st.st_size, self.max_file_bytes)
             else:
                 read = self._read(path, opener, signature)
                 if read is None:
