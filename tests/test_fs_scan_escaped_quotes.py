@@ -17,6 +17,7 @@ escaping the quote after it, or read a backtick in a comment or a single-quoted 
 from __future__ import annotations
 
 import shutil
+import time
 
 import pytest
 
@@ -120,3 +121,59 @@ def test_powershell_prose_naming_a_walk_is_still_allowed(command: str) -> None:
 @pytest.mark.parametrize("command", TOKEN_START_ALLOW)
 def test_a_hash_inside_a_bareword_is_not_a_comment(command: str) -> None:
     assert_allowed(run_guard(bash(command, tool="PowerShell")))
+
+
+# AN EXPRESSION READS `#` AS A COMMENT AFTER ANY OF ITS TOKENS, not only its first: after a
+# variable, a number, a member, a closing parenthesis, and a hashtable key's `=`, each checked
+# against Parser::ParseInput. A comment left unread there kept its backtick as an escape, so the
+# apostrophe after it opened a span the plain toggle closed, and the `;` inside the comment split a
+# walk out of it. A parenthesis, `$(`, `@(` and `{` open a statement of their own, so `$b#` at
+# their start is a comment too, and the reading after their close is the reading before it.
+EXPRESSION_COMMENT_ALLOW = [
+    pytest.param("$x = $y# don`'t; find /proc'", id="comment-after-a-variable"),
+    pytest.param('$x = 1# use `"; find /proc', id="comment-after-a-number"),
+    pytest.param("$h = @{ a =# x`'; find /proc }", id="comment-after-a-hashtable-equals"),
+    pytest.param("$x = $y.Foo(1).Bar# it`'s; find /proc'", id="comment-after-a-call-and-member"),
+    pytest.param("Write-Output ($b# it`'s; find /proc\n)", id="comment-at-a-parenthesis-start"),
+    pytest.param("5# it`'s; find /proc'", id="comment-after-a-number-statement"),
+]
+
+# THE OTHER DIRECTION: a token PowerShell reads as a generic word keeps its `#` literal, so the
+# quote after it still spans the lines that follow. `7z` and `1_000` are not numbers, a bareword
+# after an operator is a command, and `a@{` in an argument is a word and a script block.
+EXPRESSION_GENERIC_ALLOW = [
+    pytest.param("$x = 7z -a=#'\nfind /proc\n'", id="digit-led-command-after-assignment"),
+    pytest.param("$x = 1_000#'\nfind /proc\n'", id="digit-led-word-is-not-a-number"),
+    pytest.param("$x = 7.Foo#'\nfind /proc\n'", id="digit-dot-letter-is-not-a-number"),
+    pytest.param("$x = $a -eq b#'\nfind /proc\n'", id="bareword-after-an-operator"),
+    pytest.param("Write-Output (gci)a#'\nfind /proc\n'", id="word-glued-after-a-parenthesis"),
+    pytest.param("Write-Output a@{ b =#'\nfind /proc\n' }", id="glued-at-brace-is-a-script-block"),
+]
+
+EXPRESSION_COMMENT_DENY = [
+    pytest.param("$x = 5# it's\ngrep -r x /proc", id="comment-after-a-number-hides-nothing"),
+    pytest.param("$h = @{ a =# it's\n}\ngrep -r x /proc", id="comment-in-a-hashtable"),
+    pytest.param("($x =# it's\n)\ngrep -r x /proc", id="comment-in-a-parenthesised-assignment"),
+]
+
+
+@pytest.mark.parametrize("command", EXPRESSION_COMMENT_ALLOW + EXPRESSION_GENERIC_ALLOW)
+def test_an_expression_reads_its_comments_and_words_as_powershell_does(command: str) -> None:
+    assert_allowed(run_guard(bash(command, tool="PowerShell")))
+
+
+@pytest.mark.parametrize("command", EXPRESSION_COMMENT_DENY)
+def test_an_apostrophe_in_an_expression_comment_hides_no_walk(command: str) -> None:
+    assert_denied(run_guard(bash(command, tool="PowerShell")))
+
+
+def test_a_run_of_unclosed_braced_variables_is_read_in_linear_time() -> None:
+    """Each unclosed `${` once scanned to the end of the command, so a run of them was quadratic.
+
+    Measured on the unfixed reading, 16 KB took about 11 s against 0.55 s on origin/main. 32 KB is
+    past 40 s there; the bound is generous so a loaded runner does not flake.
+    """
+    command = "Write-Output " + "${" * 16000 + " find /proc"
+    started = time.perf_counter()
+    run_guard(bash(command, tool="PowerShell"))
+    assert time.perf_counter() - started < 25
