@@ -2,18 +2,18 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5646 -- every /ui message-search route refuses a session presented from a new address.
 
-The search routes gate with ``require_ui_step_up`` (and the preset delete with ``require_ui``) and
-pass no ``phi=True``, so the new-address refusal ``require_ui`` asks for a PHI read never runs for
-them. The step-up factory asks the same question itself, through ``flag_new_client_ip``; the delete
-is a write, which ``require_ui`` asks for. Nothing drove a search route from a second address, so a
-change that dropped either call would have stayed green.
+Four search routes gate with ``require_ui_step_up``, which builds its ``require_ui`` base with
+``new_address_check=False`` and asks the question itself, through ``flag_new_client_ip``. The preset
+delete gates with plain ``require_ui``, which asks it for a write. Nothing drove a search route from
+a second address, so a change that dropped either call would have stayed green.
 
-**Each route has a REFUSE and an ALLOW arm differing ONLY in the client address.** One session,
-signed in at :data:`SIGN_IN`, is presented from :data:`SIGN_IN` (ALLOW: the handler runs) and from
-:data:`ELSEWHERE` (REFUSE: a 303 to ``/ui/reauth`` and the handler does not run). The step-up
-window, the permission and the budgets are the same for both, so only the address check can tell
-them apart. Each REFUSE arm also requires the ``auth.new_address_reverify_required`` audit row for
-its path, so a refusal for some other reason does not pass.
+**Each route has a REFUSE and an ALLOW arm built the same way.** One session, signed in at
+:data:`SIGN_IN`, is sent from :data:`SIGN_IN` (ALLOW: the handler runs) and then from
+:data:`ELSEWHERE` (REFUSE: a 303 to ``/ui/reauth``, and the handler does not run), through one app.
+The step-up window and the permission are the same for both, so the address is what decides. The
+arms are not otherwise identical: they run in turn, and a delete or layered arm names its own
+preset. Each REFUSE arm also requires the ``auth.new_address_reverify_required`` audit row for its
+request path, so a refusal for some other reason does not pass.
 
 Mutants, run by hand when this landed: replacing the ``flag_new_client_ip`` call in
 ``require_ui_step_up`` with ``False`` failed the four step-up routes' cases; making
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
+from typing import NamedTuple
 
 import httpx
 import pytest
@@ -34,7 +35,6 @@ from fastapi.routing import APIRoute
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
-from messagefoundry.auth.service import AuthService
 from messagefoundry.pipeline import Engine
 
 #: The address the session signs in from, and so has verified.
@@ -43,47 +43,20 @@ SIGN_IN = "10.0.0.1"
 ELSEWHERE = "10.9.9.9"
 
 SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
-PRESETS = "/ui/messages/search/presets"
-MARKER = PRESETS + "/"
-
-
-def _client_from(engine: Engine, service: AuthService, ip: str) -> httpx.AsyncClient:
-    """A browser at ``ip``. The app is the shipped mount; only the peer address varies."""
-    app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
-    transport = httpx.ASGITransport(app=app, client=(ip, 51000))
-    return httpx.AsyncClient(transport=transport, base_url="http://t")
-
-
-async def _preset_ids(c: httpx.AsyncClient) -> set[str]:
-    """The ids of the session's presets, read from the search page's delete forms."""
-    page = (await c.get("/ui/messages/search")).text
-    return {chunk.split("/delete", 1)[0] for chunk in page.split(MARKER)[1:]}
-
-
-async def _save_preset(c: httpx.AsyncClient, name: str) -> str:
-    before = await _preset_ids(c)
-    r = await c.post(
-        PRESETS,
-        data={"name": name, "content": "DOE", "message_type": "ADT^A01"},
-        headers=SAME_ORIGIN,
-    )
-    assert (r.status_code, r.headers.get("location")) == (303, "/ui/messages/search"), r.text
-    (pid,) = await _preset_ids(c) - before
-    return pid
-
+SEARCH = "/ui/messages/search"
+PRESETS = SEARCH + "/presets"
+DELETE = PRESETS + "/{preset_id}/delete"
 
 #: What one arm sends: the client and the id of a preset the session owns.
 Send = Callable[[httpx.AsyncClient, str], Awaitable[httpx.Response]]
 
 
 async def _search_form(c: httpx.AsyncClient, _pid: str) -> httpx.Response:
-    return await c.get("/ui/messages/search")
+    return await c.get(SEARCH)
 
 
 async def _search_run(c: httpx.AsyncClient, _pid: str) -> httpx.Response:
-    return await c.post(
-        "/ui/messages/search/run", data={"message_type": "ADT^A01"}, headers=SAME_ORIGIN
-    )
+    return await c.post(SEARCH + "/run", data={"message_type": "ADT^A01"}, headers=SAME_ORIGIN)
 
 
 async def _save(c: httpx.AsyncClient, pid: str) -> httpx.Response:
@@ -93,21 +66,31 @@ async def _save(c: httpx.AsyncClient, pid: str) -> httpx.Response:
 
 
 async def _delete(c: httpx.AsyncClient, pid: str) -> httpx.Response:
-    return await c.post(f"{PRESETS}/{pid}/delete", headers=SAME_ORIGIN)
+    return await c.post(DELETE.replace("{preset_id}", pid), headers=SAME_ORIGIN)
 
 
 async def _layered(c: httpx.AsyncClient, pid: str) -> httpx.Response:
-    return await c.get("/ui/messages/search/layered", params={"presets": pid})
+    return await c.get(SEARCH + "/layered", params={"presets": pid})
 
 
-#: (route path as mounted, method, request, the ALLOW status). Every mounted /ui/messages/search*
-#: route must appear here: test_every_search_route_is_covered reads the live route table.
-CASES: tuple[tuple[str, str, Send, int], ...] = (
-    ("/ui/messages/search", "GET", _search_form, 200),
-    ("/ui/messages/search/run", "POST", _search_run, 200),
-    (PRESETS, "POST", _save, 303),
-    (PRESETS + "/{preset_id}/delete", "POST", _delete, 303),
-    ("/ui/messages/search/layered", "GET", _layered, 200),
+class Case(NamedTuple):
+    path: str  # as mounted
+    method: str
+    send: Send
+    allowed: int  # the ALLOW arm's status
+    #: The REFUSE arm's ``next``, pinned exactly. None for the preset save: its refusal continues to
+    #: its own POST path, which /ui/reauth does not accept, an open finding this test does not pin.
+    next_path: str | None
+
+
+#: Every mounted /ui/messages/search* route: test_every_search_route_is_covered reads the live table.
+CASES = (
+    Case(SEARCH, "GET", _search_form, 200, SEARCH),
+    Case(SEARCH + "/run", "POST", _search_run, 200, SEARCH),
+    Case(PRESETS, "POST", _save, 303, None),
+    # A plain require_ui write lands on /ui after the re-auth: its body cannot be carried through.
+    Case(DELETE, "POST", _delete, 303, "/ui"),
+    Case(SEARCH + "/layered", "GET", _layered, 200, SEARCH + "/layered"),
 )
 
 
@@ -121,50 +104,72 @@ async def _new_address_paths(engine: Engine) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("path", "method", "send", "allowed"), CASES, ids=[f"{m} {p}" for p, m, _, _ in CASES]
+    "case", CASES, ids=["form", "run", "save_preset", "delete_preset", "layered"]
 )
 async def test_a_search_route_refuses_a_session_from_a_new_address(
-    engine: Engine, path: str, method: str, send: Send, allowed: int
+    engine: Engine, case: Case
 ) -> None:
     """RED when: a /ui message-search route serves a session presented from an address it never
     verified from (BACKLOG #5646). The ALLOW arm is the same session from its sign-in address."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
+    user = await service.store.get_user_by_username("op")
+    assert user is not None
     await _seed(engine)
-    async with _client_from(engine, service, SIGN_IN) as home:
+
+    async def preset_ids() -> set[str]:
+        # Read from the store, not a gated page, so a refused or throttled read cannot pass for
+        # "no presets".
+        return {p["id"] for p in await engine.store.list_search_presets(user.id)}
+
+    app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
+
+    def browser(ip: str) -> httpx.AsyncClient:
+        transport = httpx.ASGITransport(app=app, client=(ip, 51000))
+        return httpx.AsyncClient(transport=transport, base_url="http://t")
+
+    async with browser(SIGN_IN) as home:
         assert (await _cookie_login(home, "op")).status_code == 303
         token = home.cookies.get("mf_session")
         assert token is not None
         # Two presets, so the delete arms each have one to remove and the layered arms one to run.
-        allow_pid = await _save_preset(home, "allow")
-        refuse_pid = await _save_preset(home, "refuse")
-        before = await _preset_ids(home)
+        for name in ("allow", "refuse"):
+            r = await home.post(
+                PRESETS,
+                data={"name": name, "content": "DOE", "message_type": "ADT^A01"},
+                headers=SAME_ORIGIN,
+            )
+            assert (r.status_code, r.headers.get("location")) == (303, SEARCH), r.text
+        by_name = {p["name"]: p["id"] for p in await engine.store.list_search_presets(user.id)}
+        allow_pid, refuse_pid = by_name["allow"], by_name["refuse"]
+        before = await preset_ids()
 
-        # ALLOW: the handler ran. The search pages render the search form; the writes land back on it.
-        ok = await send(home, allow_pid)
-        assert ok.status_code == allowed, (ok.status_code, ok.headers.get("location"))
-        if allowed == 303:
-            assert ok.headers["location"] == "/ui/messages/search"
+        # ALLOW: the handler ran. The search pages render the form; the writes land back on it.
+        ok = await case.send(home, allow_pid)
+        assert ok.status_code == case.allowed, (ok.status_code, ok.headers.get("location"))
+        if case.allowed == 303:
+            assert ok.headers["location"] == SEARCH
         else:
             assert "Saved presets" in ok.text
         assert await _new_address_paths(engine) == []
-        after_allow = await _preset_ids(home)
+        after_allow = await preset_ids()
 
-    async with _client_from(engine, service, ELSEWHERE) as away:
+    async with browser(ELSEWHERE) as away:
         away.cookies.set("mf_session", token)
-        refused = await send(away, refuse_pid)
-        assert refused.status_code == 303, refused.status_code
-        assert refused.headers["location"].startswith("/ui/reauth?next="), refused.headers
+        refused = await case.send(away, refuse_pid)
+    location = refused.headers.get("location", "")
+    assert refused.status_code == 303, (refused.status_code, location)
+    if case.next_path is None:
+        assert location.startswith("/ui/reauth?next="), location
+    else:
+        assert location == f"/ui/reauth?next={case.next_path}", location
     # The refusal was the address check, recorded for this route's request path.
-    assert await _new_address_paths(engine) == [path.replace("{preset_id}", refuse_pid)]
-
-    async with _client_from(engine, service, SIGN_IN) as home:
-        home.cookies.set("mf_session", token)
-        # The refused write changed nothing: no preset saved, none deleted.
-        assert await _preset_ids(home) == after_allow
-    if method == "POST" and path == PRESETS:
+    assert await _new_address_paths(engine) == [case.path.replace("{preset_id}", refuse_pid)]
+    # The refused request changed nothing: no preset saved, none deleted.
+    assert await preset_ids() == after_allow
+    if case.path == PRESETS:
         assert len(after_allow) == len(before) + 1  # the ALLOW save did add one
-    if path.endswith("/delete"):
+    if case.path == DELETE:
         assert after_allow == before - {allow_pid}
         assert refuse_pid in after_allow
 
@@ -176,11 +181,11 @@ async def test_every_search_route_is_covered(engine: Engine) -> None:
     mounted = {
         (route.path, method)
         for route in app.routes
-        if isinstance(route, APIRoute) and route.path.startswith("/ui/messages/search")
+        if isinstance(route, APIRoute) and route.path.startswith(SEARCH)
         for method in route.methods or ()
         if method != "HEAD"
     }
-    covered = {(path, method) for path, method, _, _ in CASES}
+    covered = {(case.path, case.method) for case in CASES}
     # The control: the walk found the routes it exists for, so an empty set is not a pass.
-    assert ("/ui/messages/search", "GET") in mounted, mounted
+    assert (SEARCH, "GET") in mounted, mounted
     assert mounted == covered, mounted ^ covered
