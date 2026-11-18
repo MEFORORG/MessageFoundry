@@ -2859,6 +2859,7 @@ def _serve(args: argparse.Namespace) -> int:
         insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
+        store_path_refusal,
         uvicorn_trusted_hosts,
     )
     from messagefoundry.config.tls_policy import (
@@ -2931,6 +2932,14 @@ def _serve(args: argparse.Namespace) -> int:
         # Rendered, not stringified: under NSSM this stream is a file (see _load_service_settings).
         print(f"error: {detail}", file=sys.stderr)
         return 2
+    # BACKLOG #5926: the load saw --db already joined under the root, and an empty --db joined
+    # there is the root itself, so the raw flag is tested here, once the backend is known: a
+    # server backend opens no file at this path.
+    if args.db is not None and settings.store.backend == StoreBackend.SQLITE:
+        db_refusal = store_path_refusal(args.db, name="--db")
+        if db_refusal is not None:
+            print(f"error: {db_refusal}", file=sys.stderr)
+            return 2
 
     # BACKLOG #1120: the class uvicorn is handed when a cert-identity map is set. Measured here, as
     # soon as the settings can say it is wanted, so this refusal too comes before the TLS mint.
@@ -5495,13 +5504,27 @@ def _supervise(args: argparse.Namespace) -> int:
     # `--env` goes into the settings as `serve` puts it (BACKLOG #2356), so one validated value
     # names the environment for every gate below, and a name `serve` refuses at load is refused
     # here. Each engine shard is still started with the flag itself.
-    settings, detail = _load_service_settings(
-        service_config, cli={"ai": {"environment": args.env}} if args.env is not None else None
-    )
+    # --db goes in as [store].path, as the offline commands merge it (BACKLOG #5926): every engine
+    # shard is started with a --db derived from it, which overrides the file's value, so the load
+    # judges the path the shards use rather than one none of them reads.
+    supervise_cli: dict[str, dict[str, object]] = {"store": {"path": args.db}}
+    if args.env is not None:
+        supervise_cli["ai"] = {"environment": args.env}
+    settings, detail = _load_service_settings(service_config, cli=supervise_cli)
     if settings is None:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
         return 2
+    # BACKLOG #5926: each engine shard's store path is derived from the --db base, so test it the
+    # way [store].path is tested at load. A SQLite store only: a server backend opens no file at
+    # that path.
+    from messagefoundry.config.settings import StoreBackend, store_path_refusal
+
+    if settings.store.backend == StoreBackend.SQLITE:
+        db_refusal = store_path_refusal(args.db, name="--db")
+        if db_refusal is not None:
+            print(f"error: {db_refusal}", file=sys.stderr)
+            return 2
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
     # below: every shard would refuse, and the supervisor would only restart them.

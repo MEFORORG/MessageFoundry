@@ -465,6 +465,32 @@ async def test_direct_edit_resend_keeps_crlf_terminators(engine: Engine, tmp_pat
     assert stored == crlf
 
 
+async def test_direct_edit_resend_with_no_terminator_field_restores_hl7_cr(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # A form the editor did not render (stale, or hand-built) carries no eol: an HL7 body still
+    # goes out with HL7's CR terminators, not the browser's CRLF.
+    submitted = EDITED.replace("\r", "\r\n")
+    stored = await _direct_resend_body(engine, tmp_path, original=ADT, form={"raw": submitted})
+    assert stored == EDITED
+
+
+async def test_direct_edit_resend_with_no_terminator_field_keeps_a_non_hl7_body(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # The control: nothing says what a non-HL7 original used, so its breaks go out as sent.
+    submitted = _LF_JSON_EDITED.replace("\n", "\r\n")
+    stored = await _direct_resend_body(engine, tmp_path, original=_LF_JSON, form={"raw": submitted})
+    assert stored == submitted
+
+
+def test_style_for_a_form_with_no_terminator_field() -> None:
+    from messagefoundry_webconsole.pages.messages import missing_eol_style
+
+    assert missing_eol_style("MSH|^~\\&|S\r\nPID|1\r\n") == "cr"
+    assert missing_eol_style('{\r\n"id": 1}') is None  # not HL7: kept as sent
+
+
 def test_terminator_style_chosen_for_each_original() -> None:
     from messagefoundry_webconsole.pages.messages import _eol_style, restore_eol
 

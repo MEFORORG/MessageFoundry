@@ -171,6 +171,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "store_path_refusal",
     "settings_file_path",
     "settings_error_detail",
     "keyless_opt_out_refusal",
@@ -759,6 +760,54 @@ def _check_revocation_attestation_pair(
 _SCHEMA_LOCK_TIMEOUT_MAX: Final[float] = float((2**31 - 1) // 1000)
 
 
+def store_path_refusal(
+    value: str, *, name: str = "[store].path (from the settings file, MEFOR_STORE_PATH or --db)"
+) -> str | None:
+    """Why ``value`` cannot be a SQLite store path the project root anchors, or None if it can
+    (BACKLOG #5926). ``name`` is the setting or flag the refusal names.
+
+    It refuses at least these shapes, by their spelling; it cannot see whether a plain name such
+    as ``data`` is an existing directory. A value ``str.isspace`` accepts is refused under its own
+    reason. A path whose last part is empty, ``.`` or ``..`` (an empty path, ``data/``,
+    ``data/..``) names a directory, which passes an exists() guard as if it were a store. On
+    Windows, where a backslash also separates parts, a last part ending in a dot or a space (Win32
+    trims it, so ``...`` is the working directory), and a colon anywhere except right after the drive letter of a fully-qualified path: ``C:mf.db`` is
+    drive-relative, resolved against that drive's per-process current directory, and
+    ``mf.db:x`` names an NTFS alternate data stream. SQLite's ``:memory:`` is not a file and is
+    accepted. Off Windows those Windows spellings are ordinary file names. The value is withheld
+    from the refusal, as the file source's path refusals withhold theirs."""
+    if value == ":memory:":
+        return None
+    if value.isspace():
+        # Taken as a mistake, such as an env var set to spaces. Not "names no file": on POSIX
+        # such a value is a legal file name, so that reason would be false there. isspace also
+        # accepts the separators U+001C to U+001F and U+0085, so the reason names them too.
+        return (
+            f"{name} holds only whitespace or separator characters (value withheld); name the "
+            "SQLite file, e.g. 'messagefoundry.db'"
+        )
+    windows = os.name == "nt"
+    # The last part as written: Win32 trims a trailing dot or space, so it is tested unstripped.
+    last = re.split(r"[\\/]", value)[-1] if windows else value.split("/")[-1]
+    if last in ("", ".", ".."):
+        return (
+            f"{name} names no file (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
+        )
+    if windows and last != last.rstrip(". "):
+        return (
+            f"{name} ends in a dot or a space, which Windows trims from a file name (value "
+            "withheld)"
+        )
+    drive = Path(value).drive
+    if (windows and ":" in value[len(drive) :]) or (drive and not Path(value).is_absolute()):
+        return (
+            f"{name} is drive-relative or names a file stream (value withheld); on Windows use a "
+            "colon only after the drive letter of a fully-qualified path (e.g. 'C:/data/mf.db'), "
+            "or give a plain relative path (e.g. 'mf.db')"
+        )
+    return None
+
+
 class StoreSettings(_Section):
     backend: StoreBackend = StoreBackend.SQLITE
 
@@ -1162,6 +1211,22 @@ class StoreSettings(_Section):
             "mode); use a SQL Server store with [store].auth='integrated'/'entra', or clear "
             "[store].require_managed_identity"
         )
+
+    @field_validator("path")
+    @classmethod
+    def _anchorable_store_path(cls, value: str, info: ValidationInfo) -> str:
+        # BACKLOG #5926 (and #5927's remaining harm): [store].path is joined under the project root
+        # (config/anchor.py) by serve and the offline store commands alike; store_path_refusal
+        # says which values no anchor can place. Refused here, at load, for every command that
+        # loads settings. serve anchors its --db before the load, so it applies the same test to
+        # the flag after it. Server backends are not checked here. `backend` is
+        # declared first, so it is in info.data once it validated.
+        if info.data.get("backend", StoreBackend.SQLITE) != StoreBackend.SQLITE:
+            return value
+        refusal = store_path_refusal(value)
+        if refusal is not None:
+            raise ValueError(refusal)
+        return value
 
     @field_validator("lease_ttl_seconds")
     @classmethod
