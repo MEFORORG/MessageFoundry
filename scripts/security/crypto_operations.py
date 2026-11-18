@@ -72,7 +72,7 @@ Stdlib only, like the gate that imports it.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 #: The operation taxonomy, in the ASVS 11.1.3 verb's own vocabulary plus the two classes a real
@@ -378,6 +378,34 @@ def _resolve_relative(mod: str, is_init: bool, level: int, target: str | None) -
     return base
 
 
+def _import_bindings(node: ast.AST, mod: str, is_init: bool) -> list[tuple[str, str]]:
+    """``(local name, fully qualified target)`` for every name one import statement binds."""
+    out: list[tuple[str, str]] = []
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if alias.asname:
+                out.append((alias.asname, alias.name))
+            else:
+                head = alias.name.split(".", 1)[0]
+                out.append((head, head))
+    elif isinstance(node, ast.ImportFrom):
+        source = (
+            _resolve_relative(mod, is_init, node.level, node.module)
+            if node.level
+            else (node.module or "")
+        )
+        for alias in node.names:
+            if alias.name != "*":
+                out.append((alias.asname or alias.name, f"{source}.{alias.name}"))
+    return out
+
+
+def _bind(table: dict[str, list[str]], local: str, target: str) -> None:
+    targets = table.setdefault(local, [])
+    if target not in targets:
+        targets.append(target)
+
+
 def import_aliases(nodes: list[ast.AST], mod: str, is_init: bool) -> dict[str, list[str]]:
     """Local name -> EVERY fully qualified target an import anywhere in the module binds it to.
 
@@ -389,33 +417,138 @@ def import_aliases(nodes: list[ast.AST], mod: str, is_init: bool) -> dict[str, l
     taken under every IMPORT binding, so one import binding does not mask another's operation; a
     parameter or assignment is not a binding here (see THE RESIDUAL). That can over-resolve
     a shadowed name into a token for an API the call does not reach, which is the direction meant:
-    a spurious row costs a review, a hidden call costs the inventory."""
+    a spurious row costs a review, a hidden call costs the inventory. The gate judges each token
+    this reading gives by the scope-aware one, :func:`scoped_bindings` (BACKLOG #5578)."""
     aliases: dict[str, list[str]] = {}
-
-    def bind(local: str, target: str) -> None:
-        targets = aliases.setdefault(local, [])
-        if target not in targets:
-            targets.append(target)
-
     for node in nodes:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.asname:
-                    bind(alias.asname, alias.name)
-                else:
-                    head = alias.name.split(".", 1)[0]
-                    bind(head, head)
-        elif isinstance(node, ast.ImportFrom):
-            source = (
-                _resolve_relative(mod, is_init, node.level, node.module)
-                if node.level
-                else (node.module or "")
-            )
-            for alias in node.names:
-                if alias.name == "*":
-                    continue
-                bind(alias.asname or alias.name, f"{source}.{alias.name}")
+        for local, target in _import_bindings(node, mod, is_init):
+            _bind(aliases, local, target)
     return aliases
+
+
+class _Scope:
+    """One Python name scope: the module, a function (a lambda or a comprehension counts as one),
+    or a class body. Only its import bindings are recorded, as in :func:`import_aliases`."""
+
+    def __init__(self, kind: str, parent: _Scope | None) -> None:
+        self.kind = kind
+        self.parent = parent
+        self.imports: dict[str, list[str]] = {}
+        self.globals: set[str] = set()
+        self.nonlocals: set[str] = set()
+
+
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def scoped_bindings(
+    tree: ast.Module, mod: str, is_init: bool
+) -> tuple[dict[int, list[str]], set[int], dict[str, list[str]]]:
+    """The scope-aware reading of every name in a module (BACKLOG #5578).
+
+    Returns ``(names, module_reach, module_aliases)``: ``id(Name node) -> the import targets that
+    reach it``; the ids of the names whose lookup reaches module scope, where a module-level ``def``
+    can answer too; and the module-scope import bindings alone, which are what another module
+    reaches through this one.
+
+    Python's own rule, for imports: an import binds its name in the scope it runs in, so a
+    function-local ``from x import y as hashlib`` makes ``hashlib`` local to that whole function.
+    The module-level ``hashlib`` does not reach a call inside it, and the local one reaches no
+    other function. A class body does not enclose the functions nested in it. ``global`` and
+    ``nonlocal`` move an import's binding to the module or to the enclosing function. Within one
+    scope every binding is kept, because which one runs depends on control flow (a ``try`` import
+    and its ``except ImportError`` fallback). A parameter or assignment is still not a binding, as
+    in :func:`import_aliases`, so a name that only a parameter shadows reads as the enclosing
+    import."""
+    module = _Scope("module", None)
+    pending: list[tuple[_Scope, str, str]] = []
+    names: list[tuple[ast.Name, _Scope]] = []
+
+    def visit(node: ast.AST, scope: _Scope) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            # Defaults, decorators and annotations run in the enclosing scope; the body in its own.
+            args = node.args
+            outer: list[ast.AST] = [*args.defaults, *(d for d in args.kw_defaults if d)]
+            body: list[ast.AST] = [node.body] if isinstance(node, ast.Lambda) else [*node.body]
+            if not isinstance(node, ast.Lambda):
+                every = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+                every += [a for a in (args.vararg, args.kwarg) if a]
+                outer += [*node.decorator_list, *(a.annotation for a in every if a.annotation)]
+                outer += [node.returns] if node.returns else []
+            for child in outer:
+                visit(child, scope)
+            inner = _Scope("function", scope)
+            for child in body:
+                visit(child, inner)
+            return
+        if isinstance(node, ast.ClassDef):
+            for child in [*node.decorator_list, *node.bases, *node.keywords]:
+                visit(child, scope)
+            inner = _Scope("class", scope)
+            for child in node.body:
+                visit(child, inner)
+            return
+        if isinstance(node, _COMPREHENSIONS):
+            # The first iterable runs in the enclosing scope; everything else in the comprehension.
+            first, *rest = node.generators
+            visit(first.iter, scope)
+            inner = _Scope("function", scope)
+            parts: list[ast.AST] = [first.target, *first.ifs]
+            for gen in rest:
+                parts += [gen.target, gen.iter, *gen.ifs]
+            parts += [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+            for child in parts:
+                visit(child, inner)
+            return
+        if isinstance(node, ast.Global):
+            scope.globals.update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            scope.nonlocals.update(node.names)
+        elif isinstance(node, ast.Name):
+            names.append((node, scope))
+        for local, target in _import_bindings(node, mod, is_init):
+            pending.append((scope, local, target))
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    for top in tree.body:
+        visit(top, module)
+
+    def enclosing_function(scope: _Scope) -> _Scope:
+        outer = scope.parent
+        while outer is not None and outer.kind == "class":
+            outer = outer.parent
+        return outer or module
+
+    # A declaration applies to its whole scope, so imports are placed once every one is read.
+    for scope, local, target in pending:
+        if scope.kind != "module" and local in scope.globals:
+            scope = module
+        elif scope.kind == "function" and local in scope.nonlocals:
+            scope = enclosing_function(scope)
+        _bind(scope.imports, local, target)
+
+    resolved: dict[int, list[str]] = {}
+    module_reach: set[int] = set()
+    for node, start in names:
+        at: _Scope | None = start
+        while at is not None:
+            if at is not start and at.kind == "class":
+                at = at.parent  # a class body does not enclose what is nested in it
+                continue
+            if at.kind != "module" and node.id in at.globals:
+                at = module
+            elif at.kind == "function" and node.id in at.nonlocals:
+                at = enclosing_function(at)
+                continue
+            if node.id in at.imports:
+                resolved[id(node)] = list(at.imports[node.id])
+            if at is module:
+                module_reach.add(id(node))
+            if node.id in at.imports or at is module:
+                break
+            at = at.parent
+    return resolved, module_reach, {k: list(v) for k, v in module.imports.items()}
 
 
 def dotted(
@@ -456,9 +589,31 @@ class ParsedModule:
     aliases: dict[str, list[str]]
     local_defs: set[str]
     functions: set[str]
+    #: The scope-aware reading (BACKLOG #5578); :func:`scoped_bindings` says what each holds.
+    scope_names: dict[int, list[str]] = field(default_factory=dict)
+    module_reach: set[int] = field(default_factory=set)
+    module_aliases: dict[str, list[str]] = field(default_factory=dict)
+    #: When set, :meth:`resolve` reads a name through its scope, not through every import.
+    scope_aware: bool = False
 
     def resolve(self, expr: ast.expr) -> list[str]:
-        return dotted(expr, self.aliases, self.mod, self.local_defs)
+        if not self.scope_aware:
+            return dotted(expr, self.aliases, self.mod, self.local_defs)
+        if isinstance(expr, ast.Name):
+            out = list(self.scope_names.get(id(expr), ()))
+            local = f"{self.mod}.{expr.id}"
+            if id(expr) in self.module_reach and expr.id in self.local_defs and local not in out:
+                out.append(local)
+            return out
+        if isinstance(expr, ast.Attribute):
+            return [f"{base}.{expr.attr}" for base in self.resolve(expr.value)]
+        return []
+
+    @property
+    def exports(self) -> dict[str, list[str]]:
+        """The import bindings another module reaches through this one: every one for the union
+        reading, the module-scope ones for the scope-aware reading."""
+        return self.module_aliases if self.scope_aware else self.aliases
 
 
 def _parse(relpath: str, source: str) -> ParsedModule:
@@ -470,6 +625,7 @@ def _parse(relpath: str, source: str) -> ParsedModule:
         node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+    scope_names, module_reach, module_aliases = scoped_bindings(tree, mod, is_init)
     return ParsedModule(
         path=relpath,
         mod=mod,
@@ -478,17 +634,22 @@ def _parse(relpath: str, source: str) -> ParsedModule:
         aliases=import_aliases(nodes, mod, is_init),
         local_defs=functions | classes,
         functions=functions,
+        scope_names=scope_names,
+        module_reach=module_reach,
+        module_aliases=module_aliases,
     )
 
 
 def _resolve_siblings(modules: list[ParsedModule]) -> None:
-    """Rewrite a bare sibling import under :data:`SIBLING_IMPORT_ROOTS` to its real module path."""
+    """Rewrite a bare sibling import under :data:`SIBLING_IMPORT_ROOTS` to its real module path, in
+    the union reading and the scope-aware one alike."""
     known = {m.mod for m in modules}
     for m in modules:
         if not m.mod.startswith(SIBLING_IMPORT_ROOTS):
             continue
         package = m.mod.rpartition(".")[0]
-        for targets in m.aliases.values():
+        tables = (m.aliases, m.module_aliases, m.scope_names)
+        for targets in (t for table in tables for t in table.values()):
             for i, target in enumerate(targets):
                 head = target.split(".", 1)[0]
                 # The SIBLING module must exist as a file. Accepting any known prefix instead would
@@ -496,7 +657,7 @@ def _resolve_siblings(modules: list[ParsedModule]) -> None:
                 # first-party name and silently drop every operation in the file.
                 if head not in known and f"{package}.{head}" in known:
                     targets[i] = f"{package}.{target}"
-            # Two imports can rewrite to one target; keep the list unique, as ``bind`` does.
+            # Two imports can rewrite to one target; keep the list unique, as ``_bind`` does.
             targets[:] = dict.fromkeys(targets)
 
 
@@ -731,12 +892,20 @@ def discover_operations_in(sources: dict[str, str]) -> list[Operation]:
     return discover_operations_in_modules(parse_sources(sources))
 
 
-def discover_operations_in_modules(modules: list[ParsedModule]) -> list[Operation]:
-    """:func:`discover_operations` over modules already parsed by :func:`parse_sources`."""
+def discover_operations_in_modules(
+    modules: list[ParsedModule], *, scope_aware: bool = False
+) -> list[Operation]:
+    """:func:`discover_operations` over modules already parsed by :func:`parse_sources`.
+
+    ``scope_aware`` reads every name through its scope (:func:`scoped_bindings`) rather than
+    through every import in its file. The gate runs both readings and judges each token of the
+    union reading by the scope-aware one (BACKLOG #5578)."""
+    if scope_aware:
+        modules = [replace(m, scope_aware=True) for m in modules]
     # Module-level re-exports: ``pkg.name -> target`` for every name a module binds by import.
     reexports: dict[str, list[str]] = {}
     for m in modules:
-        for local, targets in m.aliases.items():
+        for local, targets in m.exports.items():
             reexports.setdefault(f"{m.mod}.{local}", []).extend(targets)
     # Every first-party module-level function: the only things that can become providers.
     known_functions = {f"{m.mod}.{name}" for m in modules for name in m.functions}
