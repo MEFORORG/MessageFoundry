@@ -2273,7 +2273,7 @@ async def test_an_intact_package_directory_linked_out_is_attested_nothing_and_re
                     match=rf"^{noun} integrity attestation verified nothing \({_LINKED_OUT}\): "
                     rf"loaded {noun} path {pkg} links out of the install root, so files read "
                     r"through a link out are not counted as verified; install the package under "
-                    r"the install root, or accept that this pass verifies nothing",
+                    r"the install root\. Left linked, this warning repeats on every start",
                 ):
                     await run_startup_attestation(store, sink, fail_closed_on_drift=True)
             else:
@@ -2459,6 +2459,8 @@ async def test_a_nested_path_entry_linked_out_is_named(
     assert row["linked_out_paths"] == [f"{_CONSOLE_PKG}/static"]
     assert row["read_through_link"] == 2 and console.checked == 4
     assert row["checked"] == 0
+    # The drift the docstring says a real pass reports, before it is stripped below.
+    assert _drift(console) == [(f"{_CONSOLE_PKG}/static", "missing")]
 
     store = await open_store(
         sqlite_settings(str(tmp_path / "nested.db")), create=True, keyless_chain_refusal=None

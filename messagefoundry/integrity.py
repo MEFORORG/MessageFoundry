@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard
 
 from messagefoundry.audit_write import write_audit_soft
+from messagefoundry.controlchars import scrub_log_argument
 
 if TYPE_CHECKING:
     from messagefoundry.pipeline.alerts import AlertSink
@@ -248,8 +249,8 @@ class AttestationResult:
     ``drift`` list on its own cannot tell **attested clean** from **attested nothing**, and the second
     shape is what a competent in-place edit leaves behind."""
 
-    #: True only when a real RECORD baseline was compared against. The audit row's ``attested`` key is
-    #: narrower: :meth:`audit_detail` writes it ``False`` for a pass that is :attr:`attested_nothing`.
+    #: True when a real RECORD baseline was read, whether or not any file was then verified against
+    #: it. The audit row's ``attested`` key is not this field; :meth:`audit_detail` says what it is.
     attested: bool
     editable: bool
     no_record: bool
@@ -264,7 +265,7 @@ class AttestationResult:
     #: empty otherwise.
     linked_out_paths: tuple[str, ...] = ()
     #: How many of the ``checked`` files were read through a package directory linked out of the
-    #: install root; ``0`` for every other shape.
+    #: install root; ``0`` when ``linked_out_paths`` is empty.
     read_through_link: int = 0
 
     @property
@@ -301,11 +302,11 @@ class AttestationResult:
         """A PHI-free JSON-able summary for the ``startup_integrity`` audit detail / alert payload.
 
         The row must not read as a verified pass when the pass verified nothing (BACKLOG #5376), so
-        here ``attested`` is ``False`` whenever :attr:`attested_nothing` holds, and ``checked`` counts
-        only verified files: ``0`` for a pass with an ``unattested_reason``, drift or not. A pass with
-        a package directory linked out of the install root names it under ``linked_out_paths`` and
-        counts the files it read through it under ``read_through_link``; no other shape carries
-        either key."""
+        here ``attested`` is ``False`` whenever :attr:`attested_nothing` holds, and ``checked``, the
+        count of files compared, is written ``0`` for a pass with an ``unattested_reason``, drift or
+        not. A pass with a package directory linked out of the install root names it under
+        ``linked_out_paths`` and counts the files it read through it under ``read_through_link``;
+        both keys are written only when ``linked_out_paths`` is non-empty."""
         unverified = self.attested_nothing
         detail: dict[str, object] = {
             "attested": self.attested and not unverified,
@@ -1092,7 +1093,7 @@ async def _act_on(
         reason = result.unattested_reason or "unknown"
         if reason == "package_directory_links_out_of_install_root":
             # Files were compared here, through the link, so "no file was compared" would be false.
-            paths = result.linked_out_paths
+            paths = tuple(scrub_log_argument(path) for path in result.linked_out_paths)
             named = (
                 f"path {paths[0]} links"
                 if len(paths) == 1
@@ -1100,9 +1101,9 @@ async def _act_on(
             )
             what = (
                 f"loaded {arm.noun} {named} out of the install root, so files read through a link "
-                "out are not counted as verified; install the package under the install root, or "
-                "accept that this pass verifies nothing, which [integrity].fail_closed_on_drift "
-                "refuses to start on"
+                "out are not counted as verified; install the package under the install root. Left "
+                "linked, this warning repeats on every start, and [integrity].fail_closed_on_drift "
+                "refuses to start"
             )
             log.warning(
                 "startup integrity: attestation verified NOTHING (%s) — %s (fail_closed=%s)",
