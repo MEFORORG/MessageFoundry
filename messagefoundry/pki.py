@@ -365,7 +365,8 @@ def judge_every_crl(
     **So do two shapes OpenSSL fails closed on** (vault BACKLOG #5896): a CRL whose Issuing
     Distribution Point means OpenSSL never judges a certificate by it (:func:`_out_of_scope`),
     and one carrying a critical extension OpenSSL does not handle, on the CRL or on an entry
-    (:func:`_unhandled_critical`), which refuses every peer OpenSSL judges by it. Both started
+    whose extensions ``cryptography`` reads (:func:`_unhandled_critical`; an entry whose
+    extensions do not read is skipped), which refuses every peer OpenSSL judges by it. Both started
     clean before, and the handshake error does not name the file."""
     blocks = list(_crl_blocks(pem))
     # Refused, never skipped, even when the uncounted marker is only text in a comment line and
@@ -417,7 +418,8 @@ def judge_every_crl(
                     "'unhandled critical CRL extension'. Give a CRL whose only critical "
                     "extensions are the issuing distribution point and the authority key "
                     "identifier, and whose entries' only critical extension is the certificate "
-                    "issuer"
+                    "issuer, or remove this CRL from the file: it refuses the whole file, even "
+                    "beside a usable CRL from the same issuer"
                 )
             judged.append(
                 (
@@ -479,7 +481,8 @@ def _out_of_scope(read: _CrlExtensions) -> str | None:
         f"its issuing distribution point says it {shape}, and the engine turns on no extended "
         "CRL support, so OpenSSL never judges a certificate by it, and refuses each peer whose "
         "issuer has no other CRL. Give a base CRL whose issuing distribution point, if it has "
-        "one, does not do that"
+        "one, does not do that, or remove this CRL from the file: it refuses the whole file, "
+        "even beside a usable CRL from the same issuer"
     )
 
 
@@ -1154,8 +1157,8 @@ UNCONFIRMED_SIGNATURE: dict[CrlSignatureState, str] = {
     ),
 }
 
-#: What a start's refusal says of a CRL whose :attr:`CrlSignature.without_crl_sign` is set,
-#: after the block (vault BACKLOG #5896).
+#: What a whole-chain start's refusal, and a leaf start's WARNING, say of a CRL whose
+#: :attr:`CrlSignature.without_crl_sign` is set, after the block (vault BACKLOG #5896).
 NO_CRL_SIGN = (
     "is signed by a CA certificate this hop trusts whose key usage does not include cRLSign. A "
     "handshake whose chain runs through that CA and that OpenSSL judges by this CRL fails with "
@@ -1215,8 +1218,9 @@ def crl_signature_finding(pem: bytes, ca_ders: Iterable[bytes]) -> CrlSignatureF
     after a CA renews its key. Before #3506 the reload read one flag that folded those three
     states together.
 
-    **It does not hold back a CRL from a CA without cRLSign**, which a start refuses (vault
-    BACKLOG #5896, :attr:`CrlSignature.without_crl_sign`): that CRL reads ``verified`` here.
+    **It does not hold back a CRL from a CA without cRLSign**, which a start refuses on a
+    whole-chain hop and only warns of on a leaf hop (vault BACKLOG #5896,
+    :attr:`CrlSignature.without_crl_sign`): that CRL reads ``verified`` here.
 
     **Otherwise it holds back more than a start refuses (vault BACKLOG #2905).** A start refuses only
     ``bad``, the proven case, and loads ``unproven`` and ``uncheckable`` with a warning. So the

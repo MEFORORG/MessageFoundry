@@ -321,6 +321,29 @@ def test_a_crl_from_a_ca_without_crl_sign_refuses_a_whole_chain_start(
         _handshake(pki.raw_hop(crl), pki.server())
 
 
+def test_the_leaf_hop_crl_sign_warning_logs_once_per_file_version(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Postgres store builds a context per connection and an AD bind one per bind, so the
+    leaf-hop warning is logged once per version of the file, not once per build."""
+    pki = _Pki(tmp_path, crl_sign=False)
+    crl = pki.crl_file(_crl(pki.key))
+
+    def warned() -> int:
+        return sum(NO_CRL_SIGN in r.getMessage() for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry"):
+        for _ in range(3):
+            pki.hop(crl)
+        assert warned() == 1
+        assert any("the file is loaded" in r.getMessage() for r in caplog.records)
+        # Control: a new version of the file logs again.
+        # an ECDSA signature differs per signing, so these bytes are new
+        crl.write_bytes(_crl(pki.key))
+        pki.hop(crl)
+        assert warned() == 2
+
+
 def test_a_crl_from_a_ca_with_crl_sign_loads(tmp_path: Path) -> None:
     pki = _Pki(tmp_path, crl_sign=True)
     pem = _crl(pki.key)

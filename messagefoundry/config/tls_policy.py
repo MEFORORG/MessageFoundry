@@ -386,9 +386,12 @@ def harden_crl_check(
     with one warning for the file.
 
     Since vault BACKLOG #5896, :func:`judge_crl_bytes` also refuses a CRL OpenSSL never judges a
-    certificate by and one with a critical extension OpenSSL does not handle, and the signature
-    check refuses a CRL from a CA whose key usage lacks ``cRLSign``, after a proven bad signature
-    and before the refusal below.
+    certificate by, and one with a critical extension OpenSSL does not handle on the CRL or on an
+    entry whose extensions ``cryptography`` reads. With ``chain`` only, the signature check also
+    refuses a CRL whose signature verifies only with listed CAs whose key usage lacks
+    ``cRLSign``, after a proven bad signature and before the refusal below. Without ``chain`` that
+    CRL is not refused: the file loads, with one WARNING per version of the file
+    (:attr:`~messagefoundry.pki.CrlSignature.without_crl_sign`).
 
     A seventh, with ``chain`` only, since vault BACKLOG #5627 and #5511: a loaded CA with no CRL of
     its own in the file (:func:`messagefoundry.pki.own_crl_reason`). It is the last refusal. It
@@ -640,9 +643,11 @@ def _check_crl_signatures(
     :attr:`~messagefoundry.pki.CrlSignature.without_crl_sign` is set refuses too, after that,
     with ``chain`` only: OpenSSL refuses to take a CRL from a CA whose key usage lacks
     ``cRLSign`` (vault BACKLOG #5896). A whole-chain check judges each listed CA by its own CRL,
-    so that CRL is always read there. Without ``chain`` it is logged at WARNING instead: a root
-    that signs only intermediates is never judged by its own CRL on a leaf check, so such a file
-    can pass every handshake.
+    so that CRL is always read there. Without ``chain`` it is logged at WARNING instead, once per
+    version of the file through
+    :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature`: a root that signs only
+    intermediates is never judged by its own CRL on a leaf check, so such a file can pass every
+    handshake.
     OpenSSL checks a CRL's signature only at the handshake. Before this, such a file started clean
     and then failed every handshake it judged, with a TLS error that does not name the CRL. An
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
@@ -730,13 +735,18 @@ def _check_crl_signatures(
         )
         if chain:
             raise ValueError(f"{label}: {unable.where} {NO_CRL_SIGN}. {remedy}")
-        logger.warning(
-            "%s: %s %s, where OpenSSL judges a peer by it, as for a CA that issues leaves. %s",
-            label,
-            unable.where,
-            NO_CRL_SIGN,
-            remedy,
-        )
+        # Once per version of the file, as the unconfirmed warning below: the Postgres store
+        # builds a context per connection, and an AD bind one per bind.
+        if first_unconfirmed_signature(crl_file, fingerprint, ("no-crl-sign", unable.where)):
+            logger.warning(
+                "%s: the file is loaded and revocation checking is on, but %s %s. This hop checks "
+                "only the peer's own certificate, so it fails only peers that CA issued directly; "
+                "a CA that signs only intermediates fails none. %s",
+                label,
+                unable.where,
+                NO_CRL_SIGN,
+                remedy,
+            )
     if refusal is not None:
         raise ValueError(f"{label}: {refusal}")
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
