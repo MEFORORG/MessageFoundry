@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.17.6"
+$GateVersion = "2026.11.17.7"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -825,13 +825,12 @@ function Get-ScanRawIndexMap($Seg) {
 # (Test-ShellLiteralPath); a chdir the resolver cannot follow (popd, a chdir in parentheses, two
 # chdirs, a relative chdir after an earlier line's) where the invocation's `-C` does not make that
 # directory irrelevant -- an absolute `-C` is read past such a chdir, under the conditions in
-# Get-InvocationReading and the resolver's -OwnWindow branch; git options after the verb; and a git
-# word the token pattern ($gitInvocation) misses, such as `git.EXE` or `GIT` on Windows. Rule 3
-# reads a `git.EXE` invocation only where some line of the command holds both a recognised git token
-# and a rule-3 verb-hunt hit (the first reading exits on `-not $verb` otherwise), and never reads
-# `GIT`, `Git.EXE` or any spelling not starting with lowercase `git`, because the verb hunt is
-# case-sensitive; rule 3c judges a disarm only where the disarm's own line holds a recognised git
-# token. Elsewhere such a command is allowed (origin/main's gap too). Also, at least: any line after
+# Get-InvocationReading and the resolver's -OwnWindow branch; and git options after the verb.
+# Rules 3 and 3c do not reliably read a git word spelled other than lowercase `git`, such as
+# `git.EXE` or `GIT`. Whether such a command is refused depends on the other git words in its
+# segment. At least these are ALLOWED from the primary (measured at 62167dfb331): `git.EXE reset
+# --hard` and `git.EXE config core.hooksPath /nope` under Bash, and `GIT reset --hard` and `GIT
+# config core.hooksPath /nope` under the PowerShell tool. Also, at least: any line after
 # an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
 # nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
 # dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the
@@ -849,7 +848,13 @@ function Get-ScanRawIndexMap($Seg) {
 # --hard` is allowed (fail-open, f0e49f45c5c has it too). And a `config` disarm whose first `config`
 # word sits in a closed `$( )` (`git -C '<p>' -c user.name=$(git config user.name) config <key>`):
 # rule 3c's added reading reads only the inner invocation, so it is allowed from outside (fail-open,
-# f0e49f45c5c has it too).
+# f0e49f45c5c has it too). And, at least, these fail-opens of rule 3c's owning-word reading, each
+# measured ALLOW from outside at 62167dfb331. A repository token in the owning window is not
+# promoted when the first chain's window starts inside the `$( )`: `git --git-dir='<p>/.git' -c
+# user.name=$( git log -1) config <key>` and `GIT_DIR='<p>/.git' git -c user.name=$( git log -1)
+# config <key>`. And the owning-word search skips a path-qualified or escaped outer git:
+# `/usr/bin/git -C '<p>' -c user.name=$(git log -1) config <key>` and `\git -C '<p>' -c
+# user.name=$(git log -1) config <key>`.
 #
 # KNOWN FALSE DENIES OF THESE READINGS, left open, at least these. Each one with an example command
 # here is pinned as a DENY row in tests/test_worktree_gate_quoted_and_every_invocation.py,
