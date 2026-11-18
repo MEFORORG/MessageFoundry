@@ -156,13 +156,23 @@ def test_every_allowlist_entry_excuses_only_a_whole_line(mod) -> None:
         pytest.param(r"^# keep [a-z\d]+ here$", False, id="every-letter-and-digit-category"),
         pytest.param(r"^# keep [A-Mn-z\s]+ here$", False, id="every-letter-either-case-and-space"),
         pytest.param(r"^# keep [\d\D]+ here$", False, id="digit-and-non-digit-class"),
+        # The union of one repeat's body, not each class alone: three narrow alternatives that
+        # together take a name, an IP and the spaces between them.
+        pytest.param(
+            "^# keep (?:[A-Za-z]+|[0-9.]+| )+ here$", False, id="narrow-alternatives-union-wide"
+        ),
+        pytest.param("^# keep (?:[a-z]| )+ here$", False, id="class-and-literal-union-wide"),
+        # A bound past _MAX_BOUND absorbs as much as no bound.
+        pytest.param(r"^# keep \S{1,4294967294} here$", False, id="huge-finite-bound"),
+        pytest.param("^# keep .{0,33} here$", False, id="bound-just-past-the-limit"),
+        # Refused only by the verbose check: the walk alone would load it.
+        pytest.param(r"(?x)^\#\ keep\ [a-z]+\ here$", False, id="verbose-without-a-wildcard"),
         pytest.param(r"^# keep (?i:[a-z]+) here$", True, id="control-a-scoped-non-verbose-flag"),
         pytest.param("^# keep [A-Z_]+ here$", True, id="control-every-letter-alone"),
         pytest.param("^# keep [ a-m]+ here$", True, id="control-space-and-some-letters"),
-        pytest.param(r"^# keep [\s\d.]+ here$", True, id="control-space-digit-dot"),
-        pytest.param("^# keep .{1,40} here$", True, id="control-a-bounded-wildcard"),
+        pytest.param("^# keep .{1,32} here$", True, id="control-a-short-bounded-wildcard"),
         pytest.param("^# keep (?#.*)x here$", True, id="control-a-wildcard-only-in-a-comment"),
-        pytest.param("^# keep [a-z]+ here$", True, id="control-a-bounded-class"),
+        pytest.param("^# keep [a-z]+ here$", True, id="control-a-letter-class"),
         pytest.param("^# keep [.*] here$", True, id="control-a-literal-class"),
         pytest.param(r"^# keep \.* here$", True, id="control-an-escaped-dot"),
     ],
