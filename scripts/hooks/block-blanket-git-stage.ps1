@@ -153,8 +153,13 @@ function Resolve-GitSubcommand([string[]]$Tokens) {
         if ($t -notlike '-*') { return $t }
         # Global options that take a SEPARATE value. Skipping the value is what stops
         # 'git -C <path> add -A' resolving its subcommand to <path>. An option missing from this
-        # list only ever mis-resolves toward a non-subcommand, which falls through to a deny.
-        if ($t -cmatch '^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix)$') { $i++ }
+        # list does NOT only fall through to a deny (BACKLOG #5450): its value is read as the
+        # subcommand, so a value that names a read-only subcommand ('git --attr-source status add
+        # -A', with a ref named status) is suppressed, and any other value sends the arguments to the
+        # blanked view, where a quoted '"-A"' is not seen. git 2.55.0 takes the value of
+        # --config-env and --attr-source as the next argument (measured), so both are listed.
+        # Keep this list equal to the one in afk-tripwire.ps1's Find-GitTripwires.
+        if ($t -cmatch '^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix|--config-env|--attr-source)$') { $i++ }
     }
     return $null
 }
