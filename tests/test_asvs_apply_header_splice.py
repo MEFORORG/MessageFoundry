@@ -338,4 +338,20 @@ def test_a_write_that_a_later_run_could_not_read_is_refused(
     before = rec.read_bytes()
     assert main([str(payload), "--scorecard", str(rec), "--apply"]) == 1
     assert rec.read_bytes() == before
-    assert "a later run reads" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "a later run reads" in out
+    assert "has no id" in out
+
+
+def test_an_array_of_arrays_does_not_end_the_id_search(tmp_path: Path) -> None:
+    """An element line of a multi-line array of arrays opens with `[` like a table header does.
+    Taken as one, it ended the id search above an id written below it, and every write refused."""
+    body = _SECOND_BODY.replace('id = "99.1.2"\n', "matrix = [\n  [1, 2],\n]\n").replace(
+        "level = 1\n", 'level = 1\nid = "99.1.2"\n'
+    )
+    assert body.index("matrix") < body.index('id = "99.1.2"')
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_HEAD + _FIRST + "[[cell]]\n" + body, encoding="utf-8")
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 0
+    cells = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert cells["99.1.2"]["matrix"] == [[1, 2]]

@@ -624,9 +624,11 @@ _HEADER_RE = re.compile(r"^\[\[cell\]\][ \t]*(?:#.*)?$", re.M)
 _ID_RE = re.compile(
     r"""^[ \t]*(?:id|"id"|'id')[ \t]*=[ \t]*(?:"([^"\\\n]+)"|'([^'\n]+)')[ \t]*(?:#.*)?$""", re.M
 )
-#: Any table header line, a cell's own sub-tables included. A cell's id is read only above the
-#: first one, so an `id` key in an evidence or absence entry never stands in for the cell's own.
-_TABLE_RE = re.compile(r"^[ \t]*\[", re.M)
+#: A header of a cell's own sub-table, such as `[[cell.evidence]]`. A cell's id is read only above
+#: the first one, so an `id` key in an evidence or absence entry never stands in for the cell's own.
+#: It names `cell.` because a bare `[` also opens an element line of a multi-line array of arrays,
+#: and no array element can begin `[cell.`, since a bare word is not a TOML value.
+_SUBTABLE_RE = re.compile(r"""^[ \t]*\[\[?[ \t]*(?:cell|"cell"|'cell')[ \t]*\.""", re.M)
 
 
 def _lines_in_strings(text: str) -> set[int]:
@@ -709,11 +711,14 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
     spans: dict[str, tuple[int, int]] = {}
     for i, s in enumerate(starts):
         e = starts[i + 1] if i + 1 < len(starts) else len(text)
-        # The cell's own keys end at its first table header after its own. Searched to `e`, an
-        # entry's `id` keyed a cell whose own id was unreadable, and the refusal named the wrong fix.
+        # The cell's own keys end at its first sub-table header. Searched to `e`, an entry's `id`
+        # keyed a cell whose own id was unreadable, and the refusal named the wrong fix.
         body = text.find("\n", s, e)
         own_end = (
-            next((x.start() for x in _TABLE_RE.finditer(text, body, e) if structural(x.start())), e)
+            next(
+                (x.start() for x in _SUBTABLE_RE.finditer(text, body, e) if structural(x.start())),
+                e,
+            )
             if body >= 0
             else e
         )
@@ -1347,11 +1352,14 @@ def main(argv: list[str] | None = None) -> int:
     # no escaped id. TOML reads the written id as the same one, so every check above agreed, and the
     # next run then refused every write to the record.
     try:
-        unreadable = list(block_spans(new_text)) != live_ids
-    except BlockSpanError:
-        unreadable = True
-    if unreadable:
-        drift.append("the cell blocks a later run reads, which would no longer name every cell")
+        fault = "" if list(block_spans(new_text)) == live_ids else "they name other cells"
+    except BlockSpanError as exc:
+        fault = str(exc)
+    if fault:
+        drift.append(
+            f"the cell blocks a later run reads ({_printable(fault)}); a payload id with a "
+            "backslash or a quote is written escaped, which the writer cannot read back"
+        )
     drift += [
         f"untouched cell {_printable(str(x['id']))}"
         for x in live_list
