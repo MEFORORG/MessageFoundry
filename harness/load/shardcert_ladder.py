@@ -1605,6 +1605,16 @@ class RungOutcome:
         }
 
 
+def _store_truth_invalidated(payload: Mapping[str, Any] | None) -> bool:
+    """Whether an engine coord payload (ENGINE_DRAINED or ENGINE_RUNG_REPORT) marks its own store-truth
+    INVALID: ``aborted`` true or ``valid`` false, the B3 marker for a rung the drive tore down mid-delivery.
+    A payload that carries neither key (an older engine) is not invalidated; any truthy ``aborted`` or falsy
+    ``valid`` it does carry invalidates it, so a malformed marker fails toward INCONCLUSIVE."""
+    if payload is None:
+        return False
+    return bool(payload.get("aborted", False)) or ("valid" in payload and not payload["valid"])
+
+
 def build_rung_outcome(
     rung: LadderRung,
     drive: ShardCertDriveReport,
@@ -1623,11 +1633,28 @@ def build_rung_outcome(
     is classified INCONCLUSIVE (a coord glitch, never a fabricated collapse)."""
     notes: list[str] = list(drive.notes)
     truth = gate if gate is not None else report  # prefer the reliable drain gate for store-truth
-    engine_reported = truth is not None
+    # BACKLOG #5442: the engine marks a rung whose drive tore its sinks down mid-delivery `aborted` /
+    # `valid: false`. Its store-truth is a teardown artifact (engine_ok false, counts unread), which the
+    # classifier would score COLLAPSED and let bracket a ceiling. It is not a confirmed store-truth.
+    invalidated = _store_truth_invalidated(gate) or _store_truth_invalidated(report)
+    engine_reported = truth is not None and not invalidated
     engine_drain_seconds: float | None = (
         None  # D1: the RELIABLE engine drain (gate/report) for the rate
     )
-    if truth is None:
+    if invalidated:
+        engine_ok = False
+        engine_drained = False
+        engine_stranded = -1
+        engine_dead_total = -1
+        engine_in_pipeline_final = -1
+        engine_ingress_stranded = -1
+        engine_routed_stranded = -1
+        engine_outbound_stranded = -1
+        notes.append(
+            "engine store-truth INVALID (the engine marked this rung aborted: the drive tore its sinks down "
+            "mid-delivery) — rung is INCONCLUSIVE, NOT a proven collapse (excluded from the ceiling bracket)"
+        )
+    elif truth is None:
         engine_ok = False
         engine_drained = False
         engine_stranded = -1
@@ -1684,12 +1711,20 @@ def build_rung_outcome(
             notes.append(f"engine: {note}")
     elif engine_reported:
         notes.append("engine phase timing / soak slope absent (ENGINE_RUNG_REPORT not read)")
+    # BACKLOG #5442: the engine posts the pool on the RELIABLE drain gate too, so a rung whose report was
+    # lost still carries its pool evidence. Reading it only from the report left the tripwire unable to fire
+    # on exactly the rungs the gate exists for, and a pool-bound ladder could exit 0 as PASS.
+    if not pool.measured and gate is not None:
+        gate_pool_raw = gate.get("store_pool")
+        if isinstance(gate_pool_raw, Mapping):
+            pool = PoolStats.from_json_dict(gate_pool_raw)
     # ARTIFACT 2: an unmeasured pool is UNKNOWN, never innocent — say so, because the whole point of the
     # tripwire is that a pool bind is otherwise indistinguishable from the claim wall it would be blamed on.
     if not pool.measured:
         notes.append(
-            "store pool NOT MEASURED for this rung (no ENGINE_RUNG_REPORT store_pool block) — a pool bind "
-            "cannot be ruled out from this rung's data, and it is column-for-column identical to a claim wall"
+            "store pool NOT MEASURED for this rung (no store_pool block on ENGINE_RUNG_REPORT or the drain "
+            "gate) — a pool bind cannot be ruled out from this rung's data, and it is column-for-column "
+            "identical to a claim wall"
         )
     elif pool.tripped and pool.trip_reason is not None:
         notes.append(pool.trip_reason)
@@ -2991,7 +3026,13 @@ class ConsolidatedLadderReport:
             # row) are charged D each, where v8 charged them 1 at H == D and nothing at H > D; (3) when the
             # drive tallied behind the drain gate, a sink more than the tolerance short of A*D against a clean
             # store-truth is INCONCLUSIVE, not FROZEN_TAIL.
-            "schema_version": 9,
+            #
+            # v10 (BACKLOG #5442) — no new key; two SCORING changes, each only ever moves a run away from PASS:
+            # (1) a rung whose engine payload says `aborted` / `valid: false` is INCONCLUSIVE with
+            # `engine.reported` false (v9 scored it COLLAPSED, so it could bracket a ceiling); (2) a rung
+            # whose ENGINE_RUNG_REPORT was lost reads `store_pool` from the drain gate (v9 left it unmeasured,
+            # so the pool tripwire could not fire and a pool-bound run could exit 0).
+            "schema_version": 10,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,
             "exit_code": self.exit_code,
