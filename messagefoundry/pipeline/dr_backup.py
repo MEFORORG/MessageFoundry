@@ -1888,7 +1888,9 @@ def _verify_archive_blocking(
                     secure=secure,
                     posture=posture,
                 )
-        except (BackupCodecError, OSError, tarfile.TarError) as exc:
+        # sqlite3.Error: a store.db member that is not a database, or is too damaged to read, is a
+        # verdict on the archive like any other, so a backup's own verify still quarantines it.
+        except (BackupCodecError, OSError, tarfile.TarError, sqlite3.Error) as exc:
             result = _verify_failure(exc)
     except BaseException as exc:
         # Unexpected, an interrupt, or a fault while mapping an expected one. The teardown still
@@ -4195,16 +4197,13 @@ def _verify_in_staging(
 
     # (3) integrity_check (the fuller PRAGMA integrity_check, off the hot path).
     integrity_ok, integrity_msg = _integrity_check(snap)
+    if not integrity_ok:
+        # Before the count: a snapshot that fails integrity_check may not count at all.
+        return VerifyResult(
+            "FAIL", integrity_ok=False, reason=f"integrity_check failed: {integrity_msg}"
+        )
     row_counts = _count_tables(snap)
     manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
-    if not integrity_ok:
-        return VerifyResult(
-            "FAIL",
-            integrity_ok=False,
-            row_counts=row_counts,
-            manifest_counts=manifest_counts,
-            reason=f"integrity_check failed: {integrity_msg}",
-        )
     # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot, and a compare that
     # read nothing); :func:`_compare_row_counts` says why it is keyed off the manifest's tables.
     if count_refusal is not None:
@@ -5989,11 +5988,19 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
     """``integrity_check`` + the manifest row-count compare (:func:`_compare_row_counts`) on the
     extracted ``store.db``, run on the exact file about to be placed. Same two checks (and the same
     helpers) as :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore
-    summary."""
-    integrity_ok, integrity_msg = _integrity_check(snap)
-    if not integrity_ok:
-        raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
-    row_counts = _count_tables(snap)
+    summary. A ``store.db`` that is not a database, or is too damaged to read, is a ``verify``
+    refusal too."""
+    try:
+        integrity_ok, integrity_msg = _integrity_check(snap)
+        if not integrity_ok:
+            raise BackupError(
+                "verify", f"the archive's store failed integrity_check: {integrity_msg}"
+            )
+        row_counts = _count_tables(snap)
+    except sqlite3.Error as exc:
+        raise BackupError(
+            "verify", f"the archive's store could not be read: {safe_exc(exc)}"
+        ) from exc
     _manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
     if count_refusal is not None:
         raise BackupError("verify", count_refusal)
