@@ -760,20 +760,20 @@ function Get-TargetClaimsDirs {
 # Test-ConfirmedGoneOrThrow decides by listing the nearest folder above it, so a registry under a dead
 # link or an unreachable share is not "no records". The nightly also requires the folder above to be
 # there (Test-RegistryPresentOrThrow); this does not, because a clone that never used coordination has
-# no such folder. $true when it is there as a plain directory, a throw when a link is there.
-# A FILE THERE RETURNS $true, as Test-PresentOrThrow did before, so the caller's own listing refuses it
-# with "Could not list ..." and tests/test_worktree_remove_in_use.py's planted file drives the real
-# readers (Read-ClaimFiles, the allocation walk), the fallback the two ACL tests there lean on. A link
-# is refused from its own attributes, without being followed. A clone with no coordination folder at
-# all still reads as absent, because its git dir lists without it.
+# no such folder. A clone with no coordination folder at all still reads as absent, because its git dir
+# lists without it. $true means "there; list it", and the caller MUST list through Get-EntriesOrThrow:
+# a plain FILE there returns $true so that listing refuses it with "Could not list ..."
+# (test_a_registry_path_whose_listing_throws_refuses). Anything carrying a reparse point (a junction,
+# a symlink of either kind, a mount point or a cloud placeholder) is refused from its own attributes
+# at the time of this read, without being followed.
 function Test-RegistryDirPresent([string]$Dir, [string]$What) {
-    if (Test-ConfirmedGoneOrThrow $Dir $What -Plain) { return $false }
     $item = Get-ItemOrThrow $Dir $What
     if (-not $item) {
-        throw "$What ('$Dir') was there and then could not be found, so what it holds is unknown. Nothing was removed."
+        if (Test-ConfirmedGoneOrThrow $Dir $What -Plain) { return $false }
+        throw "$What ('$Dir') appeared while it was being read, so what it holds is unknown. Nothing was removed."
     }
-    if ($item -is [System.IO.DirectoryInfo] -and -not (Test-PlainDirectoryItem $item)) {
-        throw "$What ('$Dir') is a link, not a plain directory, so what it holds is unknown. Nothing was removed."
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "$What ('$Dir') is a link or another reparse point, not a plain directory, so what it holds is unknown. Nothing was removed."
     }
     return $true
 }
