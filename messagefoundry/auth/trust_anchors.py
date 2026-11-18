@@ -1233,6 +1233,13 @@ def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool | None:
     return True
 
 
+#: How long :func:`dacl_is_owner_only` lets ``icacls`` run. A local read answers in well under a
+#: second; one that has not answered by then is reading through a stalled share or filter driver,
+#: and every caller would otherwise wait on it with no bound (vault BACKLOG #5901). Running out is
+#: an undeterminable read, ``None``, never a pass.
+_ICACLS_TIMEOUT_S = 30.0
+
+
 def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     """Whether the anchor is writable only by its owner (+ the always-trusted SYSTEM/Administrators),
     i.e. no group/world principal can modify it. READ-ONLY: it never changes the file's ACL (unlike
@@ -1242,7 +1249,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     warns and loads.
 
     These make it undeterminable on Windows, and all answer ``None``: ``icacls`` could not be run,
-    it exited non-zero, it returned no output, or (BACKLOG #1142) the parser answered ``None``. That
+    it did not finish within :data:`_ICACLS_TIMEOUT_S`, it exited non-zero, it returned no output, or (BACKLOG #1142) the parser answered ``None``. That
     last covers three causes the warning names together: no ACE it could attribute to a principal,
     a write grant to a bare principal name it does not recognise, or a write grant on line 1 whose
     principal could not be split from the echoed path.
@@ -1272,7 +1279,16 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
                 # errors="replace" keeps a stray byte from ever making the read crash.
                 encoding="oem",
                 errors="replace",
+                timeout=_ICACLS_TIMEOUT_S,
             )
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "icacls did not read the DACL of %r within %s seconds; the DACL could not be "
+                "determined",
+                name,
+                _ICACLS_TIMEOUT_S,
+            )
+            return None
         except OSError as exc:
             log.warning("icacls could not read the DACL of %r: %s", name, exc)
             return None
