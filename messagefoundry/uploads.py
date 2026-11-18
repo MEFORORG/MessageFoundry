@@ -236,20 +236,24 @@ _TAG_REF_LEN = 12
 
 
 class _OncePerInterval:
-    """Which keys were reported within ``interval_s``, remembering at most ``max_keys``. Scans
-    run on worker threads, so the read-modify-write holds a lock."""
+    """Which keys were reported within ``interval_s``, remembering at most ``max_keys``, on the
+    ``clock`` given. Scans run on worker threads, so the read-modify-write holds a lock."""
 
     def __init__(
-        self, interval_s: float = _REPORT_INTERVAL_S, max_keys: int = _REPORTED_MAX
+        self,
+        interval_s: float = _REPORT_INTERVAL_S,
+        max_keys: int = _REPORTED_MAX,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._interval_s = interval_s
         self._max_keys = max_keys
+        self._clock = clock
         self._seen: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def first(self, key: str) -> bool:
         """Whether ``key`` has not been reported within the interval; records it."""
-        now = time.monotonic()
+        now = self._clock()
         with self._lock:
             last = self._seen.get(key)
             if last is not None and now - last < self._interval_s:
@@ -1409,19 +1413,21 @@ class UploadStore:
         its refusal is the value's own tag. The reason names a prefix of the upload id, as
         ``cell_tag`` names a row: the id is random and carries no PHI, and the WARNING the scan logs
         beside it names the whole id."""
+        cipher = self._cipher
+        report = getattr(cipher, "report_tag_failure", None)
+        # A report with no hook armed goes nowhere, so it must not use up the upload's slot: a hook
+        # armed later in the interval would then never hear of it. A cipher with no such attribute,
+        # such as one forwarding to an inner cipher, is taken as armed, as before. Checked first, as
+        # the cheapest test.
+        if not callable(report) or getattr(cipher, "_tag_failure_hook", True) is None:
+            return
         if not isinstance(exc, UnauthenticatedCipherError) or gave_no_verdict(exc):
             return
-        cipher = self._cipher
         if not cipher.is_encrypted(stored):
             return
         holds = getattr(cipher, "holds_key_for", None)
         held = holds(stored) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
-        report = getattr(cipher, "report_tag_failure", None)
-        # A report with no hook armed goes nowhere, so it must not use up the upload's slot: a hook
-        # armed later in the interval would then never hear of it. A cipher with no such attribute,
-        # such as one forwarding to an inner cipher, is taken as armed, as before.
-        armed = getattr(cipher, "_tag_failure_hook", True) is not None
-        if not (held and callable(report) and armed and _tag_reported.first(fid)):
+        if not (held and _tag_reported.first(fid)):
             return
         report(
             "uploaded_file",

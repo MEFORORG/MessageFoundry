@@ -1887,6 +1887,22 @@ async def test_a_sidecar_that_is_not_read_is_logged_once_per_interval(
     assert sum(fid in r.getMessage() for r in caplog.records) == 1
 
 
+async def test_a_sidecar_link_is_logged_once_per_interval(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5552 item 5 (a), the link reason: a sidecar link was logged on every scan."""
+    store = _store(tmp_path, key=False)
+    await store.save(data=b"kept\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    fid = "9b" * 16
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    _link(tmp_path / "uploads" / f"{fid}.meta", outside)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        await store.list_files()
+        await store.list_files()
+    assert sum(fid in r.getMessage() and "link" in r.getMessage() for r in caplog.records) == 1
+
+
 async def test_a_pair_holding_a_link_is_logged_once_by_the_prune(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1905,18 +1921,13 @@ async def test_a_pair_holding_a_link_is_logged_once_by_the_prune(
     assert await store.read_bytes(other.file_id) == _BATCH.encode()
 
 
-def test_the_once_per_interval_memo_forgets_a_key_after_the_interval(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_the_once_per_interval_memo_forgets_a_key_after_the_interval() -> None:
     """BACKLOG #5552 items 5 (a) and 6 (b): the memo mutes a key for the interval only, so a pair
     still left, or a tag failure still there, is named again once it passes."""
-    import types
-
-    from messagefoundry import uploads
+    from messagefoundry.uploads import _OncePerInterval
 
     clock = [1000.0]
-    monkeypatch.setattr(uploads, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
-    memo = uploads._OncePerInterval(interval_s=60.0, max_keys=2)
+    memo = _OncePerInterval(interval_s=60.0, max_keys=2, clock=lambda: clock[0])
     assert memo.first("a") is True
     assert memo.first("a") is False
     clock[0] += 59.0
