@@ -360,6 +360,34 @@ def test_a_git_inside_a_substitution_is_still_judged(rig: SimpleNamespace) -> No
     assert "worktree remove" in reason, reason
 
 
+@pytest.mark.parametrize(
+    ("flags", "tool"),
+    [
+        ("-c a.b=\\)", "Bash"),
+        ("-c a.b=`)", "PowerShell"),
+        ("-c a.b=$(git rev-parse HEAD)", "Bash"),
+    ],
+)
+def test_a_closer_in_the_owning_gits_flags_does_not_hide_its_dash_C(
+    rig: SimpleNamespace, flags: str, tool: str
+) -> None:
+    """The first two are DENY on origin/main and were ALLOW when an escaped `)` read as a closed
+    group; the third, a git nested in the flags, is ALLOW on origin/main."""
+    cmd = (
+        f"git -C {rig.outside2.as_posix()} status ; "
+        f"git -C {rig.primary.as_posix()} {flags} worktree remove ../Primary-wt2"
+    )
+    reason = assert_denied(run_gate(shell(cmd, rig.outside2, tool=tool), rig.repos))
+    assert "worktree remove" in reason, reason
+
+
+def test_a_printed_remove_in_a_powershell_paren_group_is_not_judged(rig: SimpleNamespace) -> None:
+    """ALLOW on origin/main; `( ... )` runs a pipeline in PowerShell's argument mode, so the printed
+    words are not the outer git's subcommand."""
+    cmd = f"git -C {rig.primary.as_posix()} log -- (echo git worktree remove ../Primary-wt2)"
+    assert run_gate(shell(cmd, rig.outside2, tool="PowerShell"), rig.repos) is None
+
+
 @pytest.mark.parametrize("leaf", ["x{y", "x}y", "x{y}"])
 def test_a_brace_in_an_unquoted_dash_C_path_does_not_hide_the_invocation(
     rig: SimpleNamespace, leaf: str

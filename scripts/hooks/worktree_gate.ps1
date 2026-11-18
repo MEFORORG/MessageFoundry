@@ -768,27 +768,28 @@ function Get-OwnInvocationWindow([string]$Scan, [int]$At, [switch]$SeparatorInTo
 
 # Does $Text, the flags between a git token and a `worktree remove|move` (rule 3d, BACKLOG #5643, a
 # finding left open by its first PR), cross the edge of the git command's own group? Two shapes do:
-#   * A `$(` (or PowerShell's `@(`) still open at its end: `git log $(echo worktree remove <wt>)` puts
-#     the match inside a substitution `echo` runs, while `git -c x.y=$(echo z) worktree remove <wt>`
-#     closes its substitution first, and the match is still git's.
+#   * A `(` still open at its end: `git log $(echo worktree remove <wt>)` puts the match inside a
+#     substitution `echo` runs, while `git -c x.y=$(echo z) worktree remove <wt>` closes its
+#     substitution first, and the match is still git's. A bare `(` counts too: in PowerShell's argument
+#     mode `( ... )` runs a pipeline as `$(` does.
 #   * A `)` with no opener in $Text: `echo $(git -C <d> log -1) worktree remove <wt>` closes the
 #     substitution git ran in, and the match belongs to `echo`. The FIRST reading still judges that
 #     line, so it is still refused for what it names.
-# A bare `(` is tracked only so that its `)` is not read as the second shape. Braces are not read at
-# all: `x{y` is an ordinary unquoted path, and a `{` counted as an opener once let `git -C <d>/x{y
-# worktree remove <wt>` skip the invocation.
+# A `(` or `)` escaped by the character before it (`\` or a backtick) is a literal and is not read, so
+# `-c a.b=\)` cannot pass for a closed group. A quoted one never reaches here: the scan blanks a quoted
+# span holding either. Braces are not read at all: `x{y` is an ordinary unquoted path, and a `{`
+# counted as an opener once let `git -C <d>/x{y worktree remove <wt>` skip the invocation.
 function Test-CrossesOwnGroup([string]$Text) {
-    $stack = [System.Collections.Generic.Stack[bool]]::new()  # $true for a substitution opener
+    $depth = 0
     for ($i = 0; $i -lt $Text.Length; $i++) {
         $c = $Text[$i]
-        if ($c -eq '(') {
-            $stack.Push(($i -gt 0) -and ('$@'.Contains([string]$Text[$i - 1])))
-        } elseif ($c -eq ')') {
-            if ($stack.Count -eq 0) { return $true }
-            [void]$stack.Pop()
-        }
+        if ($c -ne '(' -and $c -ne ')') { continue }
+        if ($i -gt 0 -and ('\`'.Contains([string]$Text[$i - 1]))) { continue }
+        if ($c -eq '(') { $depth++ }
+        elseif ($depth -eq 0) { return $true }
+        else { $depth-- }
     }
-    $stack.Contains($true)
+    $depth -gt 0
 }
 
 # SCAN INDEX -> RAW INDEX for one segment (BACKLOG #5643). Remove-QuotedSpans does not preserve length,
@@ -4448,9 +4449,15 @@ What to do instead:
                     if ($ownEnd -gt $sm.Index) { break }
                     $between = $seg.Scan.Substring($ownEnd, $sm.Index - $ownEnd)
                     if ($between -match '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))') { break }
-                    # NOR ONE ACROSS THE EDGE OF THE git COMMAND'S OWN GROUP: in `git log $(echo
-                    # worktree remove <wt>)` it is `echo`'s argument (Test-CrossesOwnGroup).
-                    if (Test-CrossesOwnGroup $between) { break }
+                    # NOR IS THIS TOKEN THE OWNER ACROSS THE EDGE OF ITS OWN GROUP (Test-CrossesOwnGroup):
+                    # in `git log $(echo worktree remove <wt>)` the match is `echo`'s argument. The walk
+                    # goes on to the token before it, so in `git -C <p> -c a.b=$(git rev-parse HEAD)
+                    # worktree remove <wt>` the inner git is passed over and the outer one, with its
+                    # `-C`, owns the match.
+                    if (Test-CrossesOwnGroup $between) {
+                        $probeAt = $cand.Own.Index - 1
+                        continue
+                    }
                     # AND THE git WORD MUST START ITS COMMAND (review round cfbde907): `git worktree
                     # remove <o>/nope ; echo git worktree remove <wt>` read the printed `git` as an
                     # invocation and refused the line for what it named. Between the window start and the
@@ -4486,9 +4493,9 @@ What to do instead:
                 # THE CUT IS FOUND ON SCAN AND MAPPED BACK (BACKLOG #5643, a finding left open by its
                 # first PR). Cut on RAW, `git worktree remove "<tmp>/Primary-wt2 (2)"` ended at the `)`
                 # inside the quotes, the victim scan read the governed `<tmp>/Primary-wt2` off the front,
-                # and an ungoverned directory was refused. The scan blanks a quoted span holding
-                # whitespace under the host's own escape rules. A quoted span holding ONE bare word is
-                # unquoted there, so a closer inside it is still a cut.
+                # and an ungoverned directory was refused. The scan, under the host's own escape
+                # rules, blanks a quoted span holding whitespace or any of the split's characters, so
+                # a closer inside quotes is not a cut.
                 $tailAt = $sm.Index + $sm.Length
                 $cut = [regex]::Match($seg.Scan.Substring($tailAt), $wtVictimSplit)
                 $rawStop = $(if ($cut.Success) { $map[$tailAt + $cut.Index] } else { $seg.Raw.Length })
@@ -4604,8 +4611,7 @@ What to do instead:
         #     `(?:&&|\|\||;|\|)`, so a quoted victim path containing `;` or `&&` is truncated before the
         #     quote-aware scan runs. The added reading splits with $wtVictimSplit, defined above the
         #     segment loop, which also cuts at a `}`, `)` or lone `&`. It finds the cut on the scan,
-        #     so a quoted span holding whitespace is not cut there; a quoted span holding one bare
-        #     word still is, and only the first reading judges it.
+        #     which blanks a quoted span holding any of those, so a quoted victim is not cut there.
         #
         # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
         # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.
