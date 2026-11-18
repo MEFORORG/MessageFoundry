@@ -806,39 +806,27 @@ def test_the_anchored_opener_is_held_across_requests(pki: _Pki) -> None:
     assert _broker(posture=_ENFORCING, policy=pinned)._opener is third._opener
 
 
-def test_an_anchor_that_stops_narrowing_empties_the_held_slot(pki: _Pki) -> None:
-    """Once the anchor narrows nothing the broker dials the shared opener, and the slot no longer
-    holds the anchored one, so its context is not kept as a live hop nothing dials. Red on the
-    parent commit: the slot kept the old opener for the rest of the process."""
-    first = _broker(posture=_ENFORCING, policy=TrustAnchorPolicy(crl_file=pki.crl_file))
-    assert ai_broker_mod._anchored_opener is not None
-    assert ai_broker_mod._anchored_opener[1] is first._opener
-    second = _broker(posture=_WARN, policy=TrustAnchorPolicy())
-    assert second._opener is _shared_no_redirect_opener()
-    assert ai_broker_mod._anchored_opener is None
-
-
-def test_control_a_policy_that_never_narrowed_leaves_the_slot_empty() -> None:
-    assert _broker(posture=_WARN, policy=None)._opener is _shared_no_redirect_opener()
-    assert ai_broker_mod._anchored_opener is None
-
-
-@pytest.mark.parametrize(
-    ("crl_reachable", "lever"),
-    [(True, "_AI_CRL_LEVER"), (False, "_AI_ATTESTATION_LEVER")],
-    ids=["crl-reachable", "no-policy"],
-)
-def test_each_remedy_is_a_constant_as_written(crl_reachable: bool, lever: str) -> None:
-    """The remedy the refusal prints is one of the module's constants verbatim, so the logged
-    sentence can be found in the source. Red on the parent commit: the no-CRL remedy was built by
-    upper-casing the first character of a constant that read "set ...", and the CRL remedy was
-    two constants joined."""
-    text = ai_broker_mod._revocation_lever(
-        crl_reachable=crl_reachable, no_credit=CrlNoCredit.NO_CRL
+def test_an_anchor_that_narrows_nothing_leaves_the_held_opener_held(pki: _Pki) -> None:
+    """What the ``_endpoint_opener`` docstring states: a non-narrowing anchor dials the shared
+    opener and leaves the slot as it is, so the narrowing anchor's opener is reused after it."""
+    crl = TrustAnchorPolicy(crl_file=pki.crl_file)
+    first = _broker(posture=_ENFORCING, policy=crl)
+    assert _broker(posture=_WARN, policy=TrustAnchorPolicy())._opener is (
+        _shared_no_redirect_opener()
     )
-    assert text == getattr(ai_broker_mod, lever)
-    assert text.startswith("Set ")
-    assert _PAIR in text
+    assert _broker(posture=_ENFORCING, policy=crl)._opener is first._opener
+
+
+def test_each_remedy_is_printed_as_its_constants_are_written() -> None:
+    """The remedy the refusal prints is the module's constants verbatim, never re-cased, so the
+    logged sentence can be found in the source. Red on the parent commit: the no-CRL remedy was
+    built by upper-casing the first character of a constant that read "set ..."."""
+    alone = ai_broker_mod._revocation_lever(crl_reachable=False, no_credit=CrlNoCredit.NO_CRL)
+    assert alone == ai_broker_mod._AI_ATTESTATION_LEVER
+    both = ai_broker_mod._revocation_lever(crl_reachable=True, no_credit=CrlNoCredit.NO_CRL)
+    assert both == f"{ai_broker_mod._AI_CRL_LEVER} {ai_broker_mod._AI_ATTESTATION_LEVER}"
+    assert alone.startswith("Set ") and both.startswith("Set ")
+    assert _PAIR in alone
 
 
 def test_a_tls_file_that_cannot_be_loaded_is_the_brokers_own_error(tmp_path: Path) -> None:

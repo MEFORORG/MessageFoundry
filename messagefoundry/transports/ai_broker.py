@@ -24,8 +24,8 @@ the vetted network call.
   endpoint that is not loopback. :func:`_endpoint_opener` says which opener that gives.
 * **Off the event loop.** :meth:`AiBroker.chat` blocks (a provider POST), and so can construction,
   which builds rest.py's shared opener on first use (BACKLOG #2484), or reads the CA and CRL files
-  when it builds the anchored opener :func:`_endpoint_opener` holds. The API route runs the build and :meth:`AiBroker.chat` each through
-  :func:`asyncio.to_thread`.
+  when it builds the anchored opener :func:`_endpoint_opener` holds. The API route runs the build
+  and :meth:`AiBroker.chat` each through :func:`asyncio.to_thread`.
 * **Revocation (BACKLOG #2193 slice (e), BACKLOG #5527).** The endpoint's certificate is verified,
   and stdlib ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]``
   policy is handed in, and the endpoint is not loopback. So an
@@ -125,13 +125,12 @@ _AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 #: ``create_app`` whose embedder set no ``app.state.tls_settings``, setting it would change
 #: nothing. No connection's attestation is offered either:
 #: the endpoint is not a connection. Naming either would be a remedy the operator cannot perform.
-#: Each lever is a whole sentence as the refusal prints it, so the logged text can be found here.
+#: Each lever is printed as written, never re-cased, so the logged text can be found here; where
+#: both are offered, :func:`_revocation_lever` joins them with a space.
 _AI_CRL_LEVER = (
     "Set [tls].crl_file to a CRL file that covers the issuer of the AI endpoint's certificate (it "
     "is instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that file, "
-    "or its handshake fails), or set [ai].endpoint_revocation_attested = true with an "
-    "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
-    "endpoint's certificate, or use an endpoint on this machine."
+    "or its handshake fails). Or instead:"
 )
 _AI_ATTESTATION_LEVER = (
     "Set [ai].endpoint_revocation_attested = true with an "
@@ -148,7 +147,7 @@ def _revocation_lever(*, crl_reachable: bool, no_credit: CrlNoCredit | None) -> 
     if no_credit is CrlNoCredit.PEER_NOT_VERIFIED:
         return PEER_NOT_VERIFIED_WAYS_ACROSS
     if crl_reachable and no_credit is CrlNoCredit.NO_CRL:
-        return _AI_CRL_LEVER
+        return f"{_AI_CRL_LEVER} {_AI_ATTESTATION_LEVER}"
     return _AI_ATTESTATION_LEVER
 
 
@@ -202,12 +201,12 @@ def _endpoint_opener(
     compare an opener to it by identity to learn that.
 
     **The anchored opener is held across requests**, though the broker is built for each one: one
-    slot, keyed on the resolved anchor, so a changed ``[tls]`` policy builds a new one in its place,
-    and an anchor that stops narrowing empties the slot. Either way the slot no longer refers to
-    the old opener; ``loaded_crls`` holds its context weakly, so the record goes once the opener
-    is collected. Held, its context is a live hop as every connection's is, so ``loaded_crls`` records the
-    CRL it holds, the expiry monitor judges that copy, and ``crl_reload`` brings it current when
-    the file is replaced. Built per request, it would read and judge the CA and CRL files on every
+    slot, keyed on the resolved anchor, so a narrowing anchor that differs builds a new one in its
+    place. An anchor that narrows nothing leaves the slot as it is, so an opener held before stays
+    held. A replaced opener is no longer held here, but ``loaded_crls`` keeps its context's record
+    until the opener is garbage-collected. Held, its context is a live hop as every connection's
+    is, so ``loaded_crls`` records the CRL it holds, the expiry monitor judges that copy, and
+    ``crl_reload`` brings it current when the file is replaced. Built per request, it would read and judge the CA and CRL files on every
     assist call, and record a held copy for each throwaway context.
 
     Raises ``ValueError`` or ``OSError`` for a file that cannot be loaded or a CRL that
@@ -215,17 +214,11 @@ def _endpoint_opener(
     anchor = http_family_trust_anchor(
         {}, url=endpoint, trust_anchor_policy=policy, cell="[ai].endpoint"
     )
-    global _anchored_opener
     if not anchor.narrows:
-        # Empty the slot, or the old context would stay a live hop that the expiry monitor judges
-        # and crl_reload reloads though nothing dials it (BACKLOG #5527). Checked unlocked first so
-        # the common case, no anchored opener ever built, takes no lock.
-        if _anchored_opener is not None:
-            with _anchored_opener_lock:
-                _anchored_opener = None
         return _shared_no_redirect_opener()
     # Read without the lock first, as the shared opener's getter does: a hit, every request after
     # the first, takes no lock. The tuple is replaced whole, never mutated.
+    global _anchored_opener
     held = _anchored_opener
     if held is not None and held[0] == anchor:
         return held[1]
