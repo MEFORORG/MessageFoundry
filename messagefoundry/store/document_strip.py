@@ -53,8 +53,8 @@ at least :data:`OUTAGE_MIN_ROWS` rows of one batch reached the key service and n
 The retention pass then skips the rest of its strip phase, and the strip logs the early end at
 WARNING. An outage alone is not counted as work for the pass's audit row, so it does not also send
 that row through the failing key service; a failed read is a database fault, not a key-service one,
-so it is counted, and the audit row records it. A failed write is recorded in the audit row when the
-pass writes one, but is not itself work: the faults that fail every write would fail that row too.
+so it is counted, and the audit row records it. How the pass treats ``write_failed`` is stated on
+``RetentionPass`` in :mod:`messagefoundry.pipeline.retention`.
 """
 
 from __future__ import annotations
@@ -99,8 +99,9 @@ STRIP_BATCH_ROWS = 200
 OUTAGE_MIN_ROWS = 3
 
 #: How many batches in a row must fail an attempted write before the call ends early, flagged
-#: ``write_failed``; a batch with nothing to write neither counts nor resets the run. A fault that hits every write, such as a full disk or a read-only store, then
-#: stops the strip instead of being met once per batch for the whole scan (BACKLOG #5651).
+#: ``write_failed``; a batch with nothing to write neither counts nor resets the run. A fault that
+#: hits every write, such as a full disk or a read-only store, then stops the strip instead of being
+#: met once per batch for the whole scan (BACKLOG #5651).
 WRITE_FAILURE_MAX_BATCHES = 2
 
 

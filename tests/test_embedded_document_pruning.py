@@ -407,8 +407,12 @@ async def _run_sql_on_server(store: Any, sql: str, params: tuple[Any, ...]) -> N
             await cur.execute(sql, params)
             await conn.commit()
         except BaseException:
-            with contextlib.suppress(Exception):  # the writer's own error is the one to report
+            try:
                 await conn.rollback()
+            except Exception as rollback_exc:  # the writer's own error is the one to raise
+                logging.getLogger(__name__).warning(
+                    "the concurrent writer's rollback failed too: %r", rollback_exc
+                )
             raise
         finally:
             await cur.close()
@@ -1220,6 +1224,42 @@ def _registry(min_bytes: int | None = None) -> Registry:
     )
     reg.add_inbound(build_inbound_connection("IB_KEEP", MLLP(port=2701), router="r"))  # never
     return reg
+
+
+async def test_a_failed_strip_write_reaches_the_audit_row_across_threshold_groups(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: ``write_failed`` from any strip call of the pass, not only the last, reaches
+    the pass result and the audit row it writes."""
+    parts = iter(
+        [StripResult(messages_stripped=1, documents_stripped=1, write_failed=True), StripResult()]
+    )
+
+    async def strip(**_kwargs: Any) -> StripResult:
+        return next(parts)
+
+    monkeypatch.setattr(store, "strip_embedded_documents", strip)
+    reg = Registry()
+    for port, (name, min_bytes) in enumerate((("IB_A", 0), ("IB_B", 10)), start=2702):
+        reg.add_inbound(
+            build_inbound_connection(
+                name,
+                MLLP(port=port),
+                router="r",
+                prune_documents_after=1,
+                prune_documents_min_bytes=min_bytes,
+            )
+        )
+    runner = RetentionRunner(
+        store, RetentionSettings(), clock=lambda: 5 * DAY, registry_source=lambda: reg
+    )
+
+    result = await runner.run_once()
+
+    assert result.documents_strip_write_failed
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    assert len(audit) == 1
+    assert json.loads(audit[0]["detail"])["documents_strip_write_failed"] is True
 
 
 async def test_audit_records_strip_counts(store: MessageStore) -> None:
