@@ -259,9 +259,10 @@ def _name_kind_problem(principal: str, kind: int, *, as_owner: bool) -> str | No
         )
     return (
         f"Windows resolves {principal!r} to {what}, and a key file is granted by name only to a "
-        "user account, a computer account, or a well-known account such as SYSTEM or a virtual "
-        "service account. Name the one account the engine runs as, such as a virtual service "
-        "account or a group managed service account"
+        "user account, a computer account, or a name Windows reports as well-known, such as "
+        "SYSTEM or a virtual service account, less at least the known broad groups. Name the "
+        "one account the engine runs as, such as a virtual service account or a group managed "
+        "service account"
     )
 
 
@@ -480,13 +481,17 @@ _MORE_BROAD_GROUP_SIDS: frozenset[str] = frozenset(
         "S-1-5-65-1",  # This Organization Certificate
         "S-1-5-90-0",  # Window Manager\Window Manager Group
         "S-1-5-9",  # Enterprise Domain Controllers
+        "S-1-5-22",  # Enterprise Read-only Domain Controllers
+        "S-1-5-32-554",  # BUILTIN\Pre-Windows 2000 Compatible Access
+        "S-1-5-64-36",  # Cloud Account Authentication
         "S-1-5-83-0",  # NT VIRTUAL MACHINE\Virtual Machines
         "S-1-5-84-0-0-0-0-0",  # USER MODE DRIVERS
-        "S-1-5-96-0",  # Font Driver Host
     }
 )
-#: The relative id of Domain Computers, in any domain: every machine account holds it.
-_DOMAIN_COMPUTERS_RID = "515"
+#: The relative ids of groups of machine accounts, in any domain: Domain Computers (515), which
+#: every machine account holds, Domain Controllers (516), Read-only Domain Controllers (521) and
+#: Enterprise Read-only Domain Controllers (498).
+_DOMAIN_MACHINE_GROUP_RIDS = frozenset({"515", "516", "521", "498"})
 
 
 def _is_broad_group(sid: str) -> bool:
@@ -499,7 +504,7 @@ def _is_broad_group(sid: str) -> bool:
 
     if _is_broad_sid(sid.lower()) or sid in _MORE_BROAD_GROUP_SIDS:
         return True
-    return sid.startswith("S-1-5-21-") and sid.rsplit("-", 1)[-1] == _DOMAIN_COMPUTERS_RID
+    return sid.startswith("S-1-5-21-") and sid.rsplit("-", 1)[-1] in _DOMAIN_MACHINE_GROUP_RIDS
 
 
 #: APPLICATION PACKAGE AUTHORITY: every AppContainer package SID and capability SID starts here.

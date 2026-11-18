@@ -479,7 +479,12 @@ def test_a_broad_account_that_can_read_is_a_problem(ace: tuple[int, int, str], n
         "S-1-5-9",  # Enterprise Domain Controllers
         "S-1-5-83-0",  # Virtual Machines
         "S-1-5-84-0-0-0-0-0",  # USER MODE DRIVERS
-        "S-1-5-96-0",  # Font Driver Host
+        "S-1-5-22",  # Enterprise Read-only Domain Controllers
+        "S-1-5-32-554",  # Pre-Windows 2000 Compatible Access
+        "S-1-5-64-36",  # Cloud Account Authentication
+        "S-1-5-21-9-9-9-516",  # Domain Controllers
+        "S-1-5-21-9-9-9-521",  # Read-only Domain Controllers
+        "S-1-5-21-9-9-9-498",  # Enterprise Read-only Domain Controllers
     ],
 )
 def test_more_well_known_groups_are_broad(sid: str) -> None:
@@ -1331,8 +1336,8 @@ def test_a_grant_name_may_resolve_to_a_computer_account(
             # on to its SID literal: not a dead account, nor a domain, a label or a logon session.
             assert ("by its SID" in problem) == (as_owner and kind in (2, 4, 9))
             if not as_owner and kind not in (6, 7, 8):
-                # A grant refusal does not read as admitting a group by name.
-                assert "or group" not in problem.split(" and a key file ")[1]
+                # A grant refusal says the broad groups among well-known names are refused.
+                assert "less at least the known broad groups" in problem
 
 
 @windows_only
