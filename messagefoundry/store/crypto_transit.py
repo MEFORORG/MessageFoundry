@@ -955,7 +955,7 @@ class TransitCipher(_UnmarkedPolicy):
             # Making the warning's closures runs outside _warn_when_due's guard, so a fault there
             # writes a fixed literal on stderr in place of the warning. A fault in _READ_FAULTS
             # escaping the warning or that write gets one attempt at a stderr line naming its
-            # class; the label and the row's break survive a second fault in that attempt.
+            # class; the label and the row's break survive a second such fault in that attempt.
             try:
                 try:
                     kind, build = _unconfirmed_warning(self._audit_key, version, reason, raised)

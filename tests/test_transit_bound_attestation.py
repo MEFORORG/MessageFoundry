@@ -1996,7 +1996,8 @@ def test_a_fault_inside_warn_when_due_is_not_reported_as_unbuilt(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """BACKLOG #6707: a fault in :data:`_READ_FAULTS` escaping :func:`_warn_when_due` keeps the
-    unconfirmed label, and is not written as the warning that could not be built."""
+    unconfirmed label, and is written on stderr by its class, not as the warning that could not
+    be built."""
     from messagefoundry.store import crypto_transit
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
@@ -2006,7 +2007,9 @@ def test_a_fault_inside_warn_when_due_is_not_reported_as_unbuilt(
     monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
     refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
-    assert crypto_transit._WARNING_UNBUILT not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert crypto_transit._WARNING_UNBUILT not in err
+    assert f"{crypto_transit._WARNING_UNLOGGED} ('MemoryError')" in err
 
 
 def test_a_raising_report_of_an_escaped_warning_fault_keeps_the_label(
