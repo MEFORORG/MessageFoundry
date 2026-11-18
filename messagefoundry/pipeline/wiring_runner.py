@@ -10962,9 +10962,10 @@ class RegistryRunner:
 
         The batch goes back through :meth:`_release_tail_on_stop`, which spends no attempt. If
         that release fails, the rows are re-pended through :meth:`_repend_claimed_on_fault`,
-        retried while this worker holds the lane, as the transform worker's voided STOP does, so a
-        worker that returns never leaves them in flight for a respawn to claim past. Only a
-        landed hand-back goes on. A worker on a node that lost leadership, or under another
+        retried while this worker holds the lane, as the transform worker's voided STOP does. Only
+        a landed hand-back goes on; a worker that returns otherwise leaves the rows in flight, and
+        a respawn of it, the recovery restart's included, can claim past them, because the
+        restart's in-flight exception is pooled-only (:meth:`_lift_log_halt`). A worker on a node that lost leadership, or under another
         lease, returns at once, leaving the rows to the successor's recovery.
 
         A batch that passes this check runs whole, so a halt that latches while it runs meets the
