@@ -816,6 +816,58 @@ def test_serve_and_supervise_refuse_an_unanchorable_db_under_a_root(
     assert not any(root.iterdir())
 
 
+# A server backend opens no file at [store].path or --db; the path places at least the generated
+# TLS pair, so a directory is a fair value and the SQLite refusals do not apply.
+
+#: Synthetic connection fields a server backend requires at load; nothing connects in these tests.
+_SERVER = {"server": "db.example.invalid", "database": "mf", "username": "mefor"}
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+@pytest.mark.parametrize("value", ["state/", "C:/mefor/state/", ""])
+def test_a_server_backend_store_path_naming_a_directory_loads(backend: str, value: str) -> None:
+    from messagefoundry.config.settings import StoreSettings
+
+    store = StoreSettings.model_validate({"backend": backend, "path": value, **_SERVER})
+    assert store.path == value
+
+
+class _PastTheDbCheck(Exception):
+    """Raised by the first step after the --db check, so the command stops there."""
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_a_server_backend_db_with_a_colon_is_not_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # supervise derives each engine shard's --db as <stem>_<shard tag>.db, and a shard tag may hold
+    # a colon, which the SQLite rules refuse on Windows. On a server backend it names no file.
+    import messagefoundry.__main__ as cli_main
+
+    reached: list[str] = []
+
+    def _stop(*args: object, **kwargs: object) -> object:
+        reached.append(command)
+        raise _PastTheDbCheck
+
+    for name in _OFFLINE_AT_REST_ENV:
+        monkeypatch.delenv(name, raising=False)
+    # The first step each command takes after its --db check.
+    target = "_client_cert_shim_wanted" if command == "serve" else "_floor_or_refusal"
+    monkeypatch.setattr(cli_main, target, _stop)
+    svc = tmp_path / "messagefoundry.toml"
+    fields = "".join(f'{key} = "{value}"\n' for key, value in _SERVER.items())
+    svc.write_text(f'[store]\nbackend = "postgres"\n{fields}', encoding="utf-8")
+    db = str(tmp_path / "messagefoundry_east:1.db")
+    # main's last-resort guard turns the stop into a failing exit; what matters is that it ran.
+    main([command, "--service-config", str(svc), "--db", db])
+    assert reached == [command], capsys.readouterr().err
+    assert "--db" not in capsys.readouterr().err
+
+
 def _names(output: str, path: Path) -> bool:
     # A repr or a JSON string doubles a Windows backslash; undo that before the substring test.
     return str(path) in output.replace("\\\\", "\\")

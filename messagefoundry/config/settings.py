@@ -1199,12 +1199,16 @@ class StoreSettings(_Section):
 
     @field_validator("path")
     @classmethod
-    def _anchorable_store_path(cls, value: str) -> str:
+    def _anchorable_store_path(cls, value: str, info: ValidationInfo) -> str:
         # BACKLOG #5926 (and #5927's remaining harm): [store].path is joined under the project root
         # (config/anchor.py) by serve and the offline store commands alike; store_path_refusal
         # says which values no anchor can place. Refused here, at load, for every command that
         # loads settings. serve and supervise anchor their --db before the load, so they apply the
-        # same test to the flag first.
+        # same test to the flag after it. A SQLite store only: a server backend opens no file
+        # here, and its path may name the directory that holds the generated TLS pair. `backend`
+        # is declared first, so it is in info.data once it validated.
+        if info.data.get("backend", StoreBackend.SQLITE) != StoreBackend.SQLITE:
+            return value
         refusal = store_path_refusal(value)
         if refusal is not None:
             raise ValueError(refusal)

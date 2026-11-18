@@ -2911,12 +2911,6 @@ def _serve(args: argparse.Namespace) -> int:
     # Only pass flags the user actually supplied so they override env/file but an unset flag doesn't.
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
-        # BACKLOG #5926: tested before the join, since the anchored result is what the settings
-        # load sees, and an empty --db joined under the root is the root itself.
-        db_refusal = store_path_refusal(args.db, name="--db")
-        if db_refusal is not None:
-            print(f"error: {db_refusal}", file=sys.stderr)
-            return 2
         # A relative --db follows the root; an absolute one is honored as-is (AC-7). Resolved here so
         # it lands in [store].path the same way a file-set relative path is anchored below.
         anchored_db = anchor_under_root(args.db, root, cwd=cwd)
@@ -2938,6 +2932,14 @@ def _serve(args: argparse.Namespace) -> int:
         # Rendered, not stringified: under NSSM this stream is a file (see _load_service_settings).
         print(f"error: {detail}", file=sys.stderr)
         return 2
+    # BACKLOG #5926: the load saw --db already joined under the root, and an empty --db joined
+    # there is the root itself, so the raw flag is tested here, once the backend is known: a
+    # server backend opens no file at this path.
+    if args.db is not None and settings.store.backend == StoreBackend.SQLITE:
+        db_refusal = store_path_refusal(args.db, name="--db")
+        if db_refusal is not None:
+            print(f"error: {db_refusal}", file=sys.stderr)
+            return 2
 
     # BACKLOG #1120: the class uvicorn is handed when a cert-identity map is set. Measured here, as
     # soon as the settings can say it is wanted, so this refusal too comes before the TLS mint.
@@ -5477,15 +5479,6 @@ def _supervise(args: argparse.Namespace) -> int:
     # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
     # supervisor (not only via each child re-anchoring a relative --db). --service-config is forwarded raw
     # and each child serve resolves it under the forwarded --project-root (same precedence as serve).
-    # BACKLOG #5926: the --db base is anchored here, before any settings load could refuse it, and
-    # each engine shard's store path is derived from it, so test it the way [store].path is tested
-    # at load.
-    from messagefoundry.config.settings import store_path_refusal
-
-    db_refusal = store_path_refusal(args.db, name="--db")
-    if db_refusal is not None:
-        print(f"error: {db_refusal}", file=sys.stderr)
-        return 2
     cwd = Path.cwd()
     root = resolve_project_root(args.project_root, cwd=cwd)
     config = anchor_under_root(args.config, root, cwd=cwd)
@@ -5516,6 +5509,16 @@ def _supervise(args: argparse.Namespace) -> int:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
         return 2
+    # BACKLOG #5926: each engine shard's store path is derived from the --db base, which no
+    # settings load here sees, so test it the way [store].path is tested at load. A SQLite store
+    # only: a server backend opens no file at that path.
+    from messagefoundry.config.settings import StoreBackend, store_path_refusal
+
+    if settings.store.backend == StoreBackend.SQLITE:
+        db_refusal = store_path_refusal(args.db, name="--db")
+        if db_refusal is not None:
+            print(f"error: {db_refusal}", file=sys.stderr)
+            return 2
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
     # below: every shard would refuse, and the supervisor would only restart them.
