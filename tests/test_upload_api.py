@@ -469,8 +469,8 @@ async def test_upload_parse_runs_in_a_worker_thread(
     wrapped to record the thread it ran on; the test body runs on the loop, so its thread is the one
     to avoid. The upload must still succeed, which shows the wrapper was reached on the real path.
 
-    This pins where the per-part Python work runs, not that the loop never stalls: each whole-body
-    ``split``, slice and ``partition`` is one C call that holds the GIL wherever it runs."""
+    This pins where the per-part Python work runs, not that the loop never stalls; what still holds
+    the loop is stated once, in ``multipart.parse_upload_off_loop``."""
     pytest.importorskip("psutil")
     import threading
 
@@ -579,9 +579,11 @@ async def test_the_new_multipart_caps_answer_400_and_413(engine: Engine, tmp_pat
         many = body_of([file_part] + [field(i, 1) for i in range(multipart._MAX_PARTS)])
         r = await c.post("/uploads", content=many, headers=h)
         assert r.status_code == 400, r.text
+        assert "more parts than the limit" in r.json()["detail"], r.text
         big = body_of([file_part, field(0, multipart._MAX_FIELD_BYTES + 1)])
         r = await c.post("/uploads", content=big, headers=h)
         assert r.status_code == 413, r.text
+        assert "multipart text field is" in r.json()["detail"], r.text
         assert (await c.get("/uploads", headers=h)).json()["files"] == []
 
 
