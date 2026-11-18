@@ -20214,9 +20214,9 @@ class AuthService:
         self, gate_only: frozenset[str], *, role_id: str, actor: str
     ) -> None:
         """One :data:`GATE_ONLY_REVOKE_ACTION` row per account a custom-role edit or delete of
-        ``role_id`` revoked although, read after the gate, its stored role rows neither hold the
-        role nor fail to parse and its stored row has no timestamp or counter cell that does not
-        parse (BACKLOG #5505). The gate names such an account because its integrity
+        ``role_id`` revoked although, read after the gate, it neither holds the role in its stored
+        role rows nor has role rows or a timestamp or counter cell that do not parse
+        (BACKLOG #5505). The gate names such an account because its integrity
         check failed, or because it held the role when the gate read it. The role's own row does
         not list the accounts it ended, so this is the row that names them. A refused write is
         logged, not raised: the change and the revoke have both happened."""
@@ -21171,7 +21171,7 @@ class AuthService:
 
         Resolving which principals a map edit actually affects would mean re-binding to the
         directory, and both a removed mapping and an added one change an outcome, so the affected set
-        is not derivable from the entries alone. A local account reads neither map.
+        is not derivable from the entries alone.
 
         Each account's unrevoked rows are revoked with the store's ``revoke_user_sessions``, so this
         needs no schema change on any backend. The count it returns includes rows already past their
