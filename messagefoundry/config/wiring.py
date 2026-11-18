@@ -1707,9 +1707,11 @@ def _bool_settings() -> _BoolSettings:
     defaults: dict[str, set[object]] = {}
     other_names: set[str] = set()
     factories: set[str] = set()
-    # A snapshot: a module global bound mid-scan, by another thread or a call the scan makes, would
-    # otherwise raise "dictionary changed size during iteration" out of the live dict.
-    for obj in tuple(globals().values()):
+    # A snapshot, so a global bound or removed mid-scan cannot raise "dictionary changed size during
+    # iteration". One writer: a warning attributed to a frame of this module, even an ignored
+    # ResourceWarning from a finalizer, adds __warningregistry__ here. list(), not tuple(): CPython
+    # copies a dict view into a list under the dict's lock, and steps a tuple's source item by item.
+    for obj in list(globals().values()):
         if not inspect.isfunction(obj) or obj.__module__ != __name__:
             continue
         if (
