@@ -121,9 +121,10 @@ def _ci_gate_job() -> dict[str, Any]:
 
 
 #: The `needs.*.result` values a leg can report. The roll-up must fire on the first two and stay
-#: quiet on the last two -- see the two tests below, which are opposite halves of one property. One
-#: need is the exception, test-shard2's skip where the engine suite runs (BACKLOG #5247); the
-#: `_DEFAULT_CONTEXT` below holds it at success so these vector tests grade the other needs.
+#: quiet on the last two -- see the two tests below, which are opposite halves of one property. Two
+#: needs are the exception, test-shard2's and test-shard3's skip where the engine suite runs
+#: (BACKLOG #5247); the `_DEFAULT_CONTEXT` below holds both at success so these vector tests grade
+#: the other needs.
 _LEG_RESULTS = ("failure", "cancelled", "skipped", "success")
 
 
@@ -155,12 +156,13 @@ def _rollup_fail_conditions() -> list[tuple[str, str]]:
 
 
 #: The context a condition naming ONE need, the `changes` output or the event is evaluated in, unless a
-#: test passes its own. The default is an ordinary code pull request whose test shard 2 passed, so
-#: the BACKLOG #5247 step stays quiet and the vector tests below grade the two arms alone.
+#: test passes its own. The default is an ordinary code pull request whose test shards 2 and 3
+#: passed, so the BACKLOG #5247 steps stay quiet and the vector tests below grade the two arms alone.
 _DEFAULT_CONTEXT: dict[str, str] = {
     "code": "true",
     "event": "pull_request",
     "need_test_shard2": "success",
+    "need_test_shard3": "success",
 }
 
 
@@ -312,11 +314,13 @@ def test_the_ci_gate_rollup_stays_green_when_every_gated_leg_skipped() -> None:
     """
     assert not _gate_fires(["skipped"] * 6)
     assert not _gate_fires(["success"] * 6)
-    # BACKLOG #5247 is the one need whose skip is NOT always a pass. On a docs-only PR it skips with
-    # the rest and the gate stays green; on a code PR its skip reds the gate.
-    docs_only = dict(_DEFAULT_CONTEXT, code="false", need_test_shard2="skipped")
-    assert not _gate_fires(["skipped"] * 7, docs_only)
-    assert _gate_fires(["skipped"] * 7, dict(docs_only, code="true"))
+    # BACKLOG #5247's shard jobs are the needs whose skip is NOT always a pass. On a docs-only PR
+    # they skip with the rest and the gate stays green; on a code PR their skip reds the gate.
+    docs_only = dict(
+        _DEFAULT_CONTEXT, code="false", need_test_shard2="skipped", need_test_shard3="skipped"
+    )
+    assert not _gate_fires(["skipped"] * 8, docs_only)
+    assert _gate_fires(["skipped"] * 8, dict(docs_only, code="true"))
     assert not _gate_fires(["success", "skipped", "skipped", "success", "skipped"])
 
 
@@ -393,35 +397,50 @@ def test_the_rollup_steps_partition_and_each_one_exits_nonzero() -> None:
     )
 
 
-def _shard2_step() -> str:
-    """The `ci-gate` step for test shard 2's own result (BACKLOG #5247), found by what it reads."""
-    found = [cond for _, cond in _rollup_fail_conditions() if "needs['test-shard2'].result" in cond]
-    assert len(found) == 1, f"expected one ci-gate step reading test-shard2's result, found {found}"
+#: The engine suite's shard jobs ci-gate judges by their own result (BACKLOG #5247; the third shard,
+#: owner ruling 2026-11-18). `test`, shard 1, is a required context and needs no such step.
+_SHARD_JOBS = ("test-shard2", "test-shard3")
+
+
+def _shard_step(job: str) -> str:
+    """The `ci-gate` step for one shard job's own result (BACKLOG #5247), found by what it reads."""
+    found = [cond for _, cond in _rollup_fail_conditions() if f"needs['{job}'].result" in cond]
+    assert len(found) == 1, f"expected one ci-gate step reading {job}'s result, found {found}"
     return found[0]
 
 
 _SUITE_EVENTS = ("push", "workflow_dispatch", "merge_group")
 
 
+def test_every_shard_job_ci_gate_needs_has_a_step_of_its_own() -> None:
+    """The list above is what the two tests below parametrize over, so a shard job ci-gate needs and
+    the list leaves out would be graded by nothing. Falsified by dropping `test-shard3` from
+    `_SHARD_JOBS`: RED. Restored."""
+    needs = {str(n) for n in _ci_gate_job().get("needs", [])}
+    assert {n for n in needs if n.startswith("test-shard")} == set(_SHARD_JOBS)
+
+
+@pytest.mark.parametrize("job", _SHARD_JOBS)
 @pytest.mark.parametrize("result", ["skipped", "success", "failure", "cancelled"])
 @pytest.mark.parametrize(
     ("code", "event"),
     [("true", "pull_request"), ("false", "pull_request"), ("false", "schedule")]
     + [("false", event) for event in _SUITE_EVENTS],
 )
-def test_the_shard2_step_fires_on_a_skip_only_where_the_engine_suite_runs(
-    code: str, event: str, result: str
+def test_the_shard_step_fires_on_a_skip_only_where_the_engine_suite_runs(
+    code: str, event: str, result: str, job: str
 ) -> None:
     """A skipped need is a pass to the two arms above, and that is right for a path-gated leg and
-    wrong for half the engine suite. This step closes that, and only that: a FAILED or CANCELLED
+    wrong for a third of the engine suite. Each step closes that, and only that: a FAILED or CANCELLED
     shard is the arms' to name, and a docs-only pull request or a cron run, where `test` skips its
     suite too, must stay green.
 
     Falsified by dropping the event bracket (a docs-only PR goes red) and by dropping either leading
     guard (a failed or cancelled shard fires two steps): RED each time. Restored.
     """
-    condition = _shard2_step()
-    context = dict(_DEFAULT_CONTEXT, code=code, event=event, need_test_shard2=result)
+    condition = _shard_step(job)
+    context = dict(_DEFAULT_CONTEXT, code=code, event=event)
+    context["need_" + job.replace("-", "_")] = result
     vector = ["success", "skipped", result]
     suite_runs = code == "true" or event in _SUITE_EVENTS
     assert _evaluate(condition, vector, context) is (suite_runs and result == "skipped")
@@ -432,12 +451,13 @@ def test_the_shard2_step_fires_on_a_skip_only_where_the_engine_suite_runs(
     assert len(fired) == expected, fired
 
 
-def test_the_shard2_step_reads_the_condition_the_shard2_job_runs_on() -> None:
+@pytest.mark.parametrize("job", _SHARD_JOBS)
+def test_the_shard_step_reads_the_condition_the_shard_job_runs_on(job: str) -> None:
     """The bracket in the step and the job's own `if:` are one condition written twice. If they
     drift, the step either reds a run where the job rightly skipped or stays quiet where it wrongly
     did. Falsified by dropping `merge_group` from the job's `if:`: RED. Restored."""
-    job_if = str(jobs_of("ci.yml")["test-shard2"]["if"])
-    flat = " ".join(_shard2_step().split())
+    job_if = str(jobs_of("ci.yml")[job]["if"])
+    flat = " ".join(_shard_step(job).split())
     assert f"({job_if}) &&" in flat, (job_if, flat)
 
 

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The engine suite's two shards in ci.yml, held to one another (BACKLOG #5247).
+"""The engine suite's three shards in ci.yml, held to one another (BACKLOG #5247).
 
-The suite runs as the `test` job's `Tests (pytest)` step and the `test-shard2` job's step of the same
-name. Every property below is one the split can lose SILENTLY: a second copy that drifts from the
-first runs half the suite under different belts, a shard number or count that disagrees drops or
+The suite runs as the `test` job's `Tests (pytest)` step and the `test-shard2` and `test-shard3`
+jobs' steps of the same name; the third shard is the owner ruling of 2026-11-18. Every property
+below is one the split can lose SILENTLY: a copy that drifts from the first runs a third of the
+suite under different belts, a shard number or count that disagrees drops or
 doubles files, and a guard step whose selection differs from the suite's compares the shards with
 the wrong collection. Each test reads the workflow, so a drift fails here, not on a hosted runner.
 The selector's own logic is tests/test_quality_shard_tests.py's; the ci-gate step's condition is
@@ -25,8 +26,10 @@ import yaml
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 _STEP = "Tests (pytest)"
-_SHARD_JOBS = {"test": "1", "test-shard2": "2"}
-#: The env the shard-1 step carries and shard 2 does not, each with its reason. MEFOR_CONNSCALE_LEG
+_SHARD_JOBS = {"test": "1", "test-shard2": "2", "test-shard3": "3"}
+#: The jobs that run nothing but their shard of the suite, and carry the partition guard.
+_EXTRA_SHARD_JOBS = ("test-shard2", "test-shard3")
+#: The env the shard-1 step carries and the other shards do not, each with its reason. MEFOR_CONNSCALE_LEG
 #: arms the connscale herd floor, and the selector holds that smoke in shard 1.
 _SHARD_ONE_ONLY_ENV = {"MEFOR_CONNSCALE_LEG"}
 
@@ -71,18 +74,45 @@ def _selection(argv: list[str]) -> list[str]:
     return picked + [word for word in argv if word.startswith("--ignore-glob")]
 
 
-def test_both_shards_run_one_body_under_one_condition_and_one_cap() -> None:
-    """A second copy that drifts runs half the suite under different flags or belts.
+def test_every_shard_runs_one_body_under_one_condition_and_one_cap() -> None:
+    """A copy that drifts runs a third of the suite under different flags or belts.
 
-    Falsified by dropping `--max-worker-restart=0` from shard 2's run line: RED. Restored."""
-    one, two = (_step(job, _STEP) for job in _SHARD_JOBS)
-    for key in ("id", "if", "timeout-minutes", "run"):
-        assert one.get(key) == two.get(key), f"the two shards' {_STEP!r} steps differ in {key!r}"
-    env_one, env_two = dict(one["env"]), dict(two["env"])
+    Falsified by dropping `--max-worker-restart=0` from shard 2's run line, then shard 3's: RED
+    each time. Restored."""
+    one, *others = (_step(job, _STEP) for job in _SHARD_JOBS)
+    env_one = dict(one["env"])
     for name in _SHARD_ONE_ONLY_ENV:
         env_one.pop(name)
-    assert {env_one.pop("TEST_SHARD"), env_two.pop("TEST_SHARD")} == {"1", "2"}
-    assert env_one == env_two, "the two shards' env differ beyond TEST_SHARD"
+    shards = {env_one.pop("TEST_SHARD")}
+    for other in others:
+        for key in ("id", "if", "timeout-minutes", "run"):
+            assert one.get(key) == other.get(key), f"the shards' {_STEP!r} steps differ in {key!r}"
+        env_other = dict(other["env"])
+        shards.add(env_other.pop("TEST_SHARD"))
+        assert env_one == env_other, "the shards' env differ beyond TEST_SHARD"
+    assert shards == set(_SHARD_JOBS.values())
+
+
+def test_the_extra_shard_jobs_differ_only_in_their_shard() -> None:
+    """`test-shard3` is `test-shard2` with its shard number and names changed. Compared as parsed
+    YAML, so the comments, which name their own job, are not part of it; the per-property tests in
+    this file still read every job on its own.
+
+    Falsified by setting `PYTEST_WORKERS` to a literal in shard 3 alone: RED. Restored."""
+    jobs = _jobs()
+
+    def normalised(job: str) -> str:
+        shard = _SHARD_JOBS[job]
+        text = yaml.safe_dump(jobs[job], sort_keys=True)
+        text = text.replace(f"TEST_SHARD: '{shard}'", "TEST_SHARD: N")
+        text = text.replace(f"test shard {shard} (", "test shard N (")
+        text = text.replace(f"junit (shard {shard})", "junit (shard N)")
+        return text.replace(f"junit-test-shard-{shard}-", "junit-test-shard-N-")
+
+    first, *rest = _EXTRA_SHARD_JOBS
+    assert rest, "only one extra shard job, so this compares nothing"
+    for job in rest:
+        assert normalised(job) == normalised(first), job
 
 
 def test_each_job_runs_its_own_shard_of_the_count_there_are_shards() -> None:
@@ -100,22 +130,24 @@ def test_each_job_runs_its_own_shard_of_the_count_there_are_shards() -> None:
         assert _pytest_argv(run)[-1] == "@out/test-shard/files.txt"
 
 
-def test_shard_two_carries_the_suite_s_belts() -> None:
+@pytest.mark.parametrize("job", _EXTRA_SHARD_JOBS)
+def test_each_extra_shard_carries_the_suite_s_belts(job: str) -> None:
     """The job-level belts: the caps, runner, matrix and needs, from the same keys as `test`. The
     step's own belts are the identical-body test's, and test_ci_faulthandler_belts.py's and
-    test_ci_retry_native_crash.py's, which read both shards."""
+    test_ci_retry_native_crash.py's, which read every shard."""
     jobs = _jobs()
     for key in ("timeout-minutes", "runs-on", "strategy", "needs", "defaults"):
-        assert jobs["test-shard2"][key] == jobs["test"][key], key
+        assert jobs[job][key] == jobs["test"][key], key
 
 
-def test_shard_two_runs_exactly_where_shard_one_runs_its_suite() -> None:
-    """The job-level `if:` is what keeps shard 2 off a docs-only PR, and it must not keep it off
-    anything else. Falsified by dropping `merge_group` from it: RED. Restored."""
-    assert _jobs()["test-shard2"]["if"] == _step("test", _STEP)["if"]
+@pytest.mark.parametrize("job", _EXTRA_SHARD_JOBS)
+def test_each_extra_shard_runs_exactly_where_shard_one_runs_its_suite(job: str) -> None:
+    """The job-level `if:` is what keeps a shard off a docs-only PR, and it must not keep it off
+    anything else. Falsified by dropping `merge_group` from shard 3's: RED. Restored."""
+    assert _jobs()[job]["if"] == _step("test", _STEP)["if"]
 
 
-def test_both_shards_install_the_same_project() -> None:
+def test_every_shard_installs_the_same_project() -> None:
     def install(job: str) -> str:
         found = [
             str(s["run"]) for s in _jobs()[job]["steps"] if "uv pip install" in str(s.get("run"))
@@ -123,25 +155,26 @@ def test_both_shards_install_the_same_project() -> None:
         assert len(found) == 1, (job, found)
         return found[0].strip().splitlines()[-1]
 
-    assert install("test") == install("test-shard2")
+    assert {install(job) for job in _SHARD_JOBS} == {install("test")}
 
 
-def test_both_shards_judge_their_margin_with_the_same_check() -> None:
-    """The 2026-10-29 ruling's softening and its revert apply to the engine suite, which is now two
-    steps; one copy reverted without the other would leave the shards on different floors."""
-    one, two = (_margin(job) for job in _SHARD_JOBS)
-    assert one["run"] == two["run"]
-    assert one["env"] == two["env"]
-    assert one.get("if") == two.get("if") == "always()"
+def test_every_shard_judges_its_margin_with_the_same_check() -> None:
+    """The 2026-10-29 ruling's softening and its revert apply to the engine suite, which is now three
+    steps; one copy reverted without the others would leave the shards on different floors."""
+    one, *others = (_margin(job) for job in _SHARD_JOBS)
+    for other in others:
+        assert one["run"] == other["run"]
+        assert one["env"] == other["env"]
+        assert one.get("if") == other.get("if") == "always()"
 
 
-def test_the_partition_guard_reads_the_suite_s_own_selection() -> None:
-    """A guard that collects under another `-m` compares the shards with the wrong suite.
+@pytest.mark.parametrize("job", _EXTRA_SHARD_JOBS)
+def test_the_partition_guard_reads_the_suite_s_own_selection(job: str) -> None:
+    """A guard that collects under another `-m` compares the shards with the wrong suite, and one
+    that checks another `--of` proves a partition no job runs.
 
     Falsified by changing the guard's `-m` to `'not tooling'`: RED. Restored."""
-    guard = [
-        s for s in _jobs()["test-shard2"]["steps"] if "--check-collection" in str(s.get("run"))
-    ]
+    guard = [s for s in _jobs()[job]["steps"] if "--check-collection" in str(s.get("run"))]
     assert len(guard) == 1, guard
     argv = shlex.split(str(guard[0]["run"]))
     assert argv[argv.index("--of") + 1] == str(len(_SHARD_JOBS))
@@ -205,17 +238,19 @@ def test_each_shard_uploads_its_junit_under_a_name_no_other_job_uses(job: str) -
     assert name not in others
 
 
-def test_shard_two_still_gates_a_merge() -> None:
+@pytest.mark.parametrize("name", _EXTRA_SHARD_JOBS)
+def test_each_extra_shard_still_gates_a_merge(name: str) -> None:
     """`continue-on-error` on the job, or on a step that runs the suite, the margin check or the
-    guard, would make `needs['test-shard2'].result` read success on a red run, so no ci-gate step
-    fires and half the engine suite stops blocking merges with every test here still green. The same
-    holds if ci-gate stops needing the job.
+    guard, would make `needs['<job>'].result` read success on a red run, so no ci-gate step fires
+    and a third of the engine suite stops blocking merges with every test here still green. The
+    same holds if ci-gate stops needing the job.
 
     Falsified by `continue-on-error: true` on test-shard2's `Tests (pytest)` step, then on the job,
-    then by dropping `test-shard2` from ci-gate's `needs:`: RED each time. Restored."""
+    then by dropping `test-shard2` from ci-gate's `needs:`, then the same three on test-shard3: RED
+    each time. Restored."""
     jobs = _jobs()
-    job = jobs["test-shard2"]
-    assert "continue-on-error" not in job, "the test-shard2 job carries continue-on-error"
+    job = jobs[name]
+    assert "continue-on-error" not in job, f"the {name} job carries continue-on-error"
     gating = [
         s
         for s in job["steps"]
@@ -224,10 +259,10 @@ def test_shard_two_still_gates_a_merge() -> None:
         )
     ]
     # First, so it is the precondition the lint asks for rather than an echo of the subset check below.
-    assert gating, "no test-shard2 step runs the suite, the margin check or the guard"
+    assert gating, f"no {name} step runs the suite, the margin check or the guard"
     names = [str(s.get("name")) for s in gating]
     assert {_STEP, "Step margin -- engine suite"} <= set(names), names
     assert any("--check-collection" in str(s.get("run")) for s in gating), names
     softened = [str(s.get("name")) for s in gating if "continue-on-error" in s]
-    assert not softened, f"test-shard2 steps carry continue-on-error: {softened}"
-    assert "test-shard2" in jobs["ci-gate"]["needs"]
+    assert not softened, f"{name} steps carry continue-on-error: {softened}"
+    assert name in jobs["ci-gate"]["needs"]

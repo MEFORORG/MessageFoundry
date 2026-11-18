@@ -1095,7 +1095,7 @@ jobs:
           # smoke arms the predicted herd floor only on the legs its harvest cleared, and this is
           # the one place a leg is named; a run that does not set it is never graded.
           MEFOR_CONNSCALE_LEG: ${{ matrix.os }}-py${{ matrix.python-version }}
-          # BACKLOG #5247: which half of the engine suite this job runs; see the note above the run line.
+          # BACKLOG #5247: which third of the engine suite this job runs; see the note above the run line.
           TEST_SHARD: "1"
         # `--ignore-glob` subtracts the web console package, which runs as its OWN step below. BACKLOG
         # #1027 added that package to the root `testpaths` so a bare local `pytest` stops silently
@@ -1178,9 +1178,15 @@ jobs:
         # `retry-native-crash.sh` cannot help here either: under `-n` a worker segfault surfaces as a
         # controller-side node-down, not as exit 139, so the wrapper never sees it.
         #
-        # THE SUITE RUNS IN TWO SHARDS, THIS JOB'S AND `test-shard2`'s (BACKLOG #5247; owner ruling
-        # 2026-11-02 on #3515, "Split/speed suite"). One runner's step was growing into its cap with
-        # the per-test cost flat and no file long enough to attack. scripts/quality/shard_tests.py
+        # THE SUITE RUNS IN THREE SHARDS, THIS JOB'S, `test-shard2`'s AND `test-shard3`'s (BACKLOG
+        # #5247; owner ruling 2026-11-02 on #3515, "Split/speed suite"). One runner's step was growing
+        # into its cap with the per-test cost flat and no file long enough to attack.
+        # It was two shards until the owner ruling of 2026-11-18 ("Build after R5 lapses", then the R5
+        # freeze revoked). The Manager's reading of 50 merge_group runs, 2026-11-17T03:30Z to
+        # 2026-11-18T02:26Z, put a windows-2022 shard job on the long pole in 25 of 35 green runs, at
+        # a median of 30.7 to 33.6 minutes, and a windows-2025 one in 8 of the other 10, with a cycle
+        # p50 of 34.5 minutes. Every leg takes the third shard, ubuntu included, so
+        # the three jobs share one matrix, one `--of` and one body. scripts/quality/shard_tests.py
         # `--suite engine` assigns each whole file to one shard, the split quality-advisory.yml's
         # `coverage-shard` uses; that job's header says why a hash and not a durations table. The file
         # list reaches pytest as an `@file` argument, so its length never meets the Windows
@@ -1191,14 +1197,14 @@ jobs:
         # the step before the split. pytest does not apply it to a path named on the command line
         # (measured 2026-11-03: a glob matching a named file still collected all of its tests). The
         # list is now what keeps the console tests from running twice. The flag stays because the
-        # guard step in `test-shard2` collects WITHOUT a list, where it does prune, and the two
-        # selections are held equal. `test-shard2` runs this same body, and that guard compares both
-        # lists with pytest's own collection.
-        # tests/test_ci_engine_suite_shards.py holds the two jobs' bodies identical.
+        # guard step in `test-shard2` and `test-shard3` collects WITHOUT a list, where it does prune,
+        # and the two selections are held equal. `test-shard2` and `test-shard3` run this same body,
+        # and that guard compares all three lists with pytest's own collection.
+        # tests/test_ci_engine_suite_shards.py holds the three jobs' bodies identical.
         run: |
           mkdir -p out/test-shard
-          python scripts/quality/shard_tests.py --suite engine --shard "$TEST_SHARD" --of 2 > out/test-shard/files.txt
-          echo "engine suite, test shard $TEST_SHARD of 2: $(wc -l < out/test-shard/files.txt) test files"
+          python scripts/quality/shard_tests.py --suite engine --shard "$TEST_SHARD" --of 3 > out/test-shard/files.txt
+          echo "engine suite, test shard $TEST_SHARD of 3: $(wc -l < out/test-shard/files.txt) test files"
           bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40 --junitxml="out/junit/test-shard-$TEST_SHARD.xml" @out/test-shard/files.txt
 
       # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
@@ -1227,8 +1233,14 @@ jobs:
       # scripts/ci/step_margin_baseline.toml, put every leg far over 1.30x against the caps in force,
       # and the softening was reverted on that reading; the baseline file says why no row or cap
       # moved with it.
-      # `test-shard2` carries the same body, and tests/test_ci_engine_suite_shards.py holds the two
-      # identical; tests/test_ci_step_margin.py pins that a LOW margin reds on every event.
+      #
+      # THE THIRD SHARD MOVED NO CAP EITHER. `step_timeout` and `job_timeout` are still sized from
+      # whole-suite pools, so they still bound a shard doing about a third of that work: a shorter
+      # step needs no larger cap, and a smaller one would be a guess until third-shard pools exist.
+      # What that does to the gate's sensitivity is stated in docs/CI.md beside the step-margin gate.
+      # `test-shard2` and `test-shard3` carry the same body, and tests/test_ci_engine_suite_shards.py
+      # holds the three identical; tests/test_ci_step_margin.py pins that a LOW margin reds on every
+      # event.
       - name: Step margin -- engine suite
         if: always()
         env:
@@ -1304,13 +1316,14 @@ jobs:
           --expected-count "$PR_COMMITS" --fetch-remote origin
 
   # THE ENGINE SUITE'S SECOND SHARD (BACKLOG #5247). The note above the `test` job's
-  # `Tests (pytest)` run line says why the suite is split; this job is the other half of it.
+  # `Tests (pytest)` run line says why the suite is split; this job and `test-shard3` are the rest
+  # of it.
   #
   # IT RIDES `ci-gate` RATHER THAN TAKING A REQUIRED CONTEXT, as `webconsole` does and for the same
   # reason: a new required context is a branch-protection change and wedges every open pull request
   # until it lands. `ci-gate` fails on its `failure` or `cancelled`, and it also fails when this job
   # did not SUCCEED on an event where `test` runs its suite, because a skipped need is otherwise a
-  # pass there and a wrong `if:` below would silently drop half the suite.
+  # pass there and a wrong `if:` below would silently drop a third of the suite.
   #
   # THE JOB-LEVEL `if:` IS THE `test` JOB'S PYTEST-STEP CONDITION, so a docs-only pull request does not
   # start three runners to skip every step. It carries the same steps the suite needs from `test`,
@@ -1359,7 +1372,7 @@ jobs:
             pyproject.toml
             requirements.lock
 
-      # The same install line as `test`'s, so both shards run against one resolution of the lock.
+      # The same install line as `test`'s, so every shard runs against one resolution of the lock.
       - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
         run: |
@@ -1384,8 +1397,8 @@ jobs:
           TEST_SHARD: "2"
         run: |
           mkdir -p out/test-shard
-          python scripts/quality/shard_tests.py --suite engine --shard "$TEST_SHARD" --of 2 > out/test-shard/files.txt
-          echo "engine suite, test shard $TEST_SHARD of 2: $(wc -l < out/test-shard/files.txt) test files"
+          python scripts/quality/shard_tests.py --suite engine --shard "$TEST_SHARD" --of 3 > out/test-shard/files.txt
+          echo "engine suite, test shard $TEST_SHARD of 3: $(wc -l < out/test-shard/files.txt) test files"
           bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40 --junitxml="out/junit/test-shard-$TEST_SHARD.xml" @out/test-shard/files.txt
 
       # The `test` job's margin check, byte for byte. Its note there covers this copy too.
@@ -1405,9 +1418,10 @@ jobs:
           exit $rc
 
       # THE PARTITION GUARD (BACKLOG #5247). It runs pytest's own collection under the engine step's
-      # selection and fails if a collected file is in neither shard or a file is in both. The split is
-      # a pure function of the tree, so one leg answers for all three. After the margin check, so its
-      # collection is not timed as part of the suite.
+      # selection and fails if a collected file is in no shard or a file is in two. The split is a
+      # pure function of the tree, so one leg answers for all three. `test-shard3` carries the same
+      # guard, so a shard 2 that failed or was cancelled does not leave the partition unchecked.
+      # After the margin check, so its collection is not timed as part of the suite.
       # Only after a passing suite: after one killed at its cap, the guard's minutes could push the job
       # past `job_timeout`, and a hang would then report as a cancellation.
       - name: Test shards partition pytest's collection
@@ -1415,13 +1429,129 @@ jobs:
         timeout-minutes: 6
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python scripts/quality/shard_tests.py --suite engine --of 2 --check-collection -- -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*'
+        run: python scripts/quality/shard_tests.py --suite engine --of 3 --check-collection -- -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*'
 
       - name: Upload engine suite junit (shard 2)
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: junit-test-shard-2-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: out/junit/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # THE ENGINE SUITE'S THIRD SHARD (owner ruling 2026-11-18, under BACKLOG #5247's split). It is
+  # `test-shard2` with the shard number, the check name, the junit artifact name and two comments
+  # changed, and nothing else: the notes in that job cover this one, and tests/test_ci_engine_suite_shards.py
+  # holds the two jobs equal on that basis. `ci-gate` needs it and judges it as it judges
+  # `test-shard2`, so a failed, cancelled or wrongly skipped third shard reds the gate.
+  test-shard3:
+    name: test shard 3 (${{ matrix.os }}, py${{ matrix.python-version }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    runs-on: ${{ matrix.hosted }}
+    timeout-minutes: ${{ matrix.job_timeout }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: ci/python-version
+
+      - name: Install Qt offscreen system libraries
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update && sudo timeout 180 apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3; then
+              exit 0
+            fi
+            echo "::warning::apt attempt ${attempt}/3 failed or timed out; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt-get failed 3 times. This is the UBUNTU RUNNER MIRROR, not the change under test."
+          exit 1
+
+      - name: Set up uv
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      # The same install line as `test`'s, so every shard runs against one resolution of the lock.
+      - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+        run: |
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp]" -e packaging/messagefoundry-webconsole
+
+      - name: Step margin -- start the clock
+        if: always()
+        run: python scripts/ci/step_margin.py --mark before-tests
+
+      - name: Tests (pytest)
+        id: tests
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+        timeout-minutes: ${{ matrix.step_timeout }}
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONFAULTHANDLER: "1"
+          FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
+          PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
+          PYTEST_WORKERS: ${{ matrix.pytest_workers }}
+          RETRY_NATIVE_CRASH_CAUSE: ""
+          MEFOR_REQUIRE_SFTP_EXTRA: "1"
+          TEST_SHARD: "3"
+        run: |
+          mkdir -p out/test-shard
+          python scripts/quality/shard_tests.py --suite engine --shard "$TEST_SHARD" --of 3 > out/test-shard/files.txt
+          echo "engine suite, test shard $TEST_SHARD of 3: $(wc -l < out/test-shard/files.txt) test files"
+          bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40 --junitxml="out/junit/test-shard-$TEST_SHARD.xml" @out/test-shard/files.txt
+
+      # The `test` job's margin check, byte for byte. Its note there covers this copy too.
+      - name: Step margin -- engine suite
+        if: always()
+        env:
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          STEP_CAP: ${{ matrix.step_timeout }}
+          LEG: ${{ matrix.os }}
+        run: |
+          rc=0
+          # `|| rc=$?` OUTSIDE the command, so a non-zero exit is captured rather than swallowed by
+          # `set -e` or absorbed into a pipeline.
+          python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
+            --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
+            --since before-tests --until now || rc=$?
+          exit $rc
+
+      # THE PARTITION GUARD (BACKLOG #5247). It runs pytest's own collection under the engine step's
+      # selection and fails if a collected file is in no shard or a file is in two. The split is a
+      # pure function of the tree, so one leg answers for all three. `test-shard2` carries the same
+      # guard, so a shard 3 that failed or was cancelled does not leave the partition unchecked.
+      # After the margin check, so its collection is not timed as part of the suite.
+      # Only after a passing suite: after one killed at its cap, the guard's minutes could push the job
+      # past `job_timeout`, and a hang would then report as a cancellation.
+      - name: Test shards partition pytest's collection
+        if: ${{ !cancelled() && steps.tests.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 6
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python scripts/quality/shard_tests.py --suite engine --of 3 --check-collection -- -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*'
+
+      - name: Upload engine suite junit (shard 3)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-test-shard-3-${{ matrix.os }}-py${{ matrix.python-version }}
           path: out/junit/
           if-no-files-found: ignore
           retention-days: 14
@@ -3170,20 +3300,20 @@ jobs:
           # `webconsole` name merge_group in their own step `if:` (so `code` here is belt-and-braces
           # for them), and sqlserver-store, postgres-store, load-test, load-test-sqlserver and
           # windows-service-smoke name it in their JOB `if:`, which is why `serverdb=false` here does
-          # not stop them. timing-quarantine and test-shard2 name it in their JOB `if:` beside a
-          # `code` arm, so `code` is belt-and-braces for them too, and ci-gate, an `always()` job,
-          # names both in the step that judges test-shard2's own result. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME merge_group NOWHERE are
+          # not stop them. timing-quarantine, test-shard2 and test-shard3 name it in their JOB `if:`
+          # beside a `code` arm, so `code` is belt-and-braces for them too, and ci-gate, an `always()`
+          # job, names both in the steps that judge test-shard2's and test-shard3's own results. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME merge_group NOWHERE are
           # decided by that output and by nothing else -- docker-smoke, ide, tooling,
           # packaging-build and postgres-store-windows, via `docker`, `ide`, `tooling`, `packaging`
           # and `serverdb` below. So `serverdb=false` DOES keep postgres-store-windows out of the
           # queue, which is intended: that leg is advisory, and in the queue it could stop nothing.
           #
           # BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING, because dropping either changes the
-          # answer. "Names merge_group nowhere" ALONE is true of SEVEN of this file's 17 jobs -- it
+          # answer. "Names merge_group nowhere" ALONE is true of SEVEN of this file's 18 jobs -- it
           # also takes in `changes` and `crypto-operations`, which have no `if:` at all. Neither is
-          # decided by anything emitted here. Scanned over all 17 job blocks rather than sampled, and
+          # decided by anything emitted here. Scanned over all 18 job blocks rather than sampled, and
           # tests/test_ci_merge_group_gate.py pins the sides of that scan BY MEMBERSHIP, not by count:
-          # the TEN jobs whose own job-level or step-level `if:` names merge_group, the SEVEN of
+          # the ELEVEN jobs whose own job-level or step-level `if:` names merge_group, the SEVEN of
           # this paragraph, and the FIVE named above.
           # THE COUNTS IN THIS PARAGRAPH ARE NOT WHAT IS PINNED -- that module held a count until
           # 2026-09-22 and a count sits at six while a job key is renamed underneath it. It also
@@ -6880,14 +7010,17 @@ jobs:
       # `contains(needs.*.result, ...)` check below -- which is the behaviour wanted, with the
       # same merge_group caveat the `tooling` note states.
       - packaging-build
-      # `test-shard2` is half of the engine suite (BACKLOG #5247). Unlike the path-gated needs above,
-      # a skip there is never acceptable where `test` runs its suite, so the step before `Gated legs
-      # OK` fails on any result but `success` under that condition.
+      # `test-shard2` and `test-shard3` are two thirds of the engine suite (BACKLOG #5247; the third
+      # shard, owner ruling 2026-11-18). Unlike the path-gated needs above, a skip there is never
+      # acceptable where `test` runs its suite, so the two steps before `Gated legs OK` fail on any
+      # result but `success` under that condition, one step per shard.
       - test-shard2
+      - test-shard3
     runs-on: ubuntu-latest
     steps:
       # BACKLOG #5247 added a THIRD failing step, after these two, for the one need whose skip is not a
-      # pass: test-shard2 where the engine suite runs. The note below is about the first two.
+      # pass: test-shard2 where the engine suite runs. The third shard added a FOURTH, its copy for
+      # test-shard3. The note below is about the first two.
       #
       # TWO failing steps, not one, and the predicates PARTITION the old single condition -- their
       # union is identical and their intersection is empty, so this gate's BEHAVIOUR is unchanged and
@@ -6935,6 +7068,7 @@ jobs:
               "tooling": "repo harness tests (*)",
               "packaging-build": "packaging-build",
               "test-shard2": "test shard 2 (*, py*)",
+              "test-shard3": "test shard 3 (*, py*)",
           }
 
 
@@ -6996,6 +7130,7 @@ jobs:
               "tooling": "repo harness tests (*)",
               "packaging-build": "packaging-build",
               "test-shard2": "test shard 2 (*, py*)",
+              "test-shard3": "test shard 3 (*, py*)",
           }
 
 
@@ -7025,10 +7160,11 @@ jobs:
           exit 1
 
       # BACKLOG #5247. The bracketed condition is `test-shard2`'s own job `if:`, which is the `test`
-      # job's pytest-step condition, so this fails exactly where half the engine suite should have run
-      # and did not report a pass. The two arms above already name a failure or a cancellation, and
-      # the leading guards keep this one out of their way; it is for the `skipped` they let through.
-      # tests/test_merge_gate_controls.py pins the match and grades the step.
+      # job's pytest-step condition, so this fails exactly where a third of the engine suite should
+      # have run and did not report a pass. The two arms above already name a failure or a
+      # cancellation, and the leading guards keep this one out of their way; it is for the `skipped`
+      # they let through. The next step is the same check for `test-shard3`.
+      # tests/test_merge_gate_controls.py pins the match and grades both steps.
       - name: Fail -- engine suite shard 2 did not succeed
         if: >-
           !contains(needs.*.result, 'failure') &&
@@ -7039,7 +7175,20 @@ jobs:
         env:
           SHARD2_RESULT: ${{ needs['test-shard2'].result }}
         run: |
-          echo "::error::CI gate failed: test-shard2 (check list: \"test shard 2 (*, py*)\") reported '${SHARD2_RESULT}' on an event where the engine suite runs. Half of that suite did not report a pass."
+          echo "::error::CI gate failed: test-shard2 (check list: \"test shard 2 (*, py*)\") reported '${SHARD2_RESULT}' on an event where the engine suite runs. A third of that suite did not report a pass."
+          exit 1
+
+      - name: Fail -- engine suite shard 3 did not succeed
+        if: >-
+          !contains(needs.*.result, 'failure') &&
+          !contains(needs.*.result, 'cancelled') &&
+          (needs.changes.outputs.code == 'true' || github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') &&
+          needs['test-shard3'].result != 'success'
+        env:
+          SHARD3_RESULT: ${{ needs['test-shard3'].result }}
+        run: |
+          echo "::error::CI gate failed: test-shard3 (check list: \"test shard 3 (*, py*)\") reported '${SHARD3_RESULT}' on an event where the engine suite runs. A third of that suite did not report a pass."
           exit 1
 
       - name: Gated legs OK
