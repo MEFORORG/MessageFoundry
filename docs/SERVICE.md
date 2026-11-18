@@ -1071,7 +1071,8 @@ alert.
 Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
 *and* outbounds — from the web console, or by restarting the service. Restarting an inbound the halt
 stopped also re-arms a router, transform or response lane of it that is STOPPED, for example one the
-infra-fault bound stopped while the log was down.
+infra-fault bound stopped while the log was down, unless that lane still holds claimed rows
+whose return to the queue never landed.
 **Fix the disk first — the restart is refused while the log is still unwritable.** The engine
 re-checks by writing a real record to each dead sink at the moment you ask, so a restart issued
 against a still-broken disk leaves the connection halted (and its listener down) and raises another

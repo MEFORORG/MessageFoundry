@@ -2870,8 +2870,13 @@ async def test_an_ownership_check_that_raises_still_unbinds_and_pauses_that_outb
     # then delivered with no operator start once a later probe cleared the latch, while every
     # sibling the halt paused waited for one. The halt is fail-closed, so the lane is paused,
     # counted and alerted with the rest. MEASURED on main: it was left out of all three.
+    # The pooled dispatcher's lane is paused too, and reads quiesced: the pause path's own
+    # ownership read raised again and left it claiming, with the lane "stopping" for good.
     sink = _RecordingSink()
     runner, source = _graph(store, sink)
+    dispatcher = runner._make_dispatcher(Stage.OUTBOUND)
+    runner._dispatchers[Stage.OUTBOUND] = dispatcher
+    dispatcher.mark_ready(OUTBOUND)
 
     def raises(name: str) -> bool:
         raise RuntimeError("boom")
@@ -2881,11 +2886,16 @@ async def test_an_ownership_check_that_raises_still_unbinds_and_pauses_that_outb
 
     assert source.stopped is True
     assert OUTBOUND in runner._outbound_paused and runner._delivery_halted
+    assert dispatcher.phase(OUTBOUND) is stage_dispatcher._LanePhase.PAUSED
+    assert runner._outbound_quiesced[OUTBOUND].is_set()
     assert sink.log_failures == [("file", "unwritable", "disk full", 2)]
     assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
-    # The latch clearing does not resume it: it waits for an operator start like its siblings.
-    runner._log_write_stopped = False
+    # A probe that clears the latch does not resume it: it waits for an operator start, like
+    # every sibling the halt paused.
+    monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: None)
+    assert runner._log_recovery_ok() and not runner._log_write_stopped
     assert OUTBOUND in runner._outbound_paused
+    assert dispatcher.phase(OUTBOUND) is stage_dispatcher._LanePhase.PAUSED
 
 
 def test_a_start_into_a_dead_log_pauses_an_outbound_whose_ownership_check_raises(
@@ -3442,9 +3452,10 @@ async def test_a_claim_gate_that_raises_once_with_no_halt_lets_the_lane_drain(
 
 
 def test_lifting_the_gate_releases_only_gate_parked_lanes(store: MessageStore) -> None:
-    # BACKLOG #5704: lifting the gate unparks a lane the gate parked, and nothing else. A lane a
-    # backing-off head parked keeps its park, and a STOPPED lane keeps its STOP: release_gated is
-    # not the recovery broadcast, which re-arms STOPPED lanes and releases holds.
+    # BACKLOG #5704: release_gated, which a latch clearing runs, unparks a lane the gate parked,
+    # and nothing else. A lane a backing-off head parked keeps its park, and a STOPPED lane keeps
+    # its STOP: release_gated is not the recovery broadcast, which re-arms STOPPED lanes and
+    # releases holds. An inbound's own lift at its restart is tested below.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
     dispatcher = runner._make_dispatcher(Stage.ROUTED)
@@ -3602,5 +3613,83 @@ async def test_a_per_lane_batch_claimed_as_the_halt_latches_is_handed_back_unrun
         if stage is Stage.INGRESS:
             fetched = await store.get_message(message_id)
             assert fetched is not None and fetched["status"] == MessageStatus.RECEIVED.value
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("in_flight", [False, True])
+def test_an_inbounds_lift_re_arms_its_stopped_pooled_lane_unless_rows_are_in_flight(
+    store: MessageStore, in_flight: bool
+) -> None:
+    # BACKLOG #5704 (ledger items 2 and 8): the lift at an inbound's restart re-arms its STOPPED
+    # pooled internal lane and lifts the hold, except a lane whose STOP left claimed rows in
+    # flight, which a re-arm would claim past (the T16 STOP branch's own rule in _run_lane).
+    # MEASURED on main: the lift left every STOPPED lane STOPPED.
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    dispatcher = runner._make_dispatcher(Stage.ROUTED)
+    runner._dispatchers[Stage.ROUTED] = dispatcher
+    dispatcher.mark_ready(INBOUND)
+    st = dispatcher._states[INBOUND]
+    st.phase = stage_dispatcher._LanePhase.STOPPED
+    st.unlanded = in_flight
+    runner._hold_for_operator(INBOUND, "inbound", Stage.ROUTED)
+    runner._log_halted.add(INBOUND)
+
+    runner._lift_log_halt(INBOUND)
+
+    assert INBOUND not in runner._log_halted
+    assert dispatcher.stopped(INBOUND) is in_flight
+    assert (("inbound", INBOUND) in runner._stop_held) is in_flight
+
+
+async def test_a_per_lane_hand_back_whose_release_fails_re_pends_the_batch_and_goes_on(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704 review: when the post-claim hand-back's release fails, the worker must not
+    # return with the batch in flight, where the recovery restart's respawn would claim past it.
+    # It re-pends the rows while it holds the lane, and once they land goes on to wait at its gate.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "per_lane")
+    real_claim = store.claim_next_fifo
+    tripped: list[str] = []
+
+    async def claim_then_latch(*args: Any, **kwargs: Any) -> Any:
+        item = await real_claim(*args, **kwargs)
+        if item is not None and not tripped:
+            tripped.append(item.id)
+            runner._log_write_stopped = True
+        return item
+
+    async def release_fails(ids: list[str]) -> None:
+        raise RuntimeError("store full")
+
+    monkeypatch.setattr(store, "claim_next_fifo", claim_then_latch)
+    monkeypatch.setattr(store, "release_claimed", release_fails)
+    await runner.start()
+    try:
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        runner._wake_lane(Stage.INGRESS, INBOUND)
+        assert await _until(lambda: bool(tripped)), "the claim never ran"
+
+        async def re_pended() -> bool:
+            async with store._read() as db:
+                cur = await db.execute(
+                    "SELECT status FROM queue WHERE message_id=? AND stage=?",
+                    (message_id, Stage.INGRESS.value),
+                )
+                rows = list(await cur.fetchall())
+            return len(rows) == 1 and rows[0]["status"] == "pending"
+
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not await re_pended():
+            assert asyncio.get_running_loop().time() < deadline, "the batch stayed in flight"
+            await asyncio.sleep(0.02)
+        worker = runner._router_workers[INBOUND]
+        await asyncio.sleep(0.2)
+        assert not worker.done(), "the worker returned instead of waiting at its gate"
+        assert await store.outbox_for(message_id) == []
     finally:
         await runner.stop()

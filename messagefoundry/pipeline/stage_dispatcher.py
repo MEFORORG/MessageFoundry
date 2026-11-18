@@ -240,6 +240,8 @@ class LaneItemResult:
         # result fails loudly in tests rather than silently parking forever / not at all.
         if (self.kind is LaneResultKind.RETRY) != (self.retry_until is not None):
             raise ValueError("retry_until must be set iff kind is RETRY")
+        if self.hand_back and self.kind is not LaneResultKind.RETRY:
+            raise ValueError("hand_back is meaningful only on a RETRY")
 
 
 class _LanePhase(Enum):
@@ -311,6 +313,9 @@ class _LaneState:
     # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
     # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
     claimer_deaths: int = 0
+    # BACKLOG #5704: the lane's last episode ended with claimed rows whose re-pend did not land, so
+    # they are still in flight. Read through :meth:`StageDispatcher.stopped_holding_rows`.
+    unlanded: bool = False
 
 
 @dataclass
@@ -1570,6 +1575,8 @@ class StageDispatcher:
         if st is None:  # torn down under us: stop() already returned every slot, nothing to book
             return
         self._release_lane_slot(st)
+        # Whether this episode ended holding rows in flight, read only if it ends STOPPED.
+        st.unlanded = bool(unlanded)
         # Consume the stamp UNCONDITIONALLY: whichever branch runs below, this episode is over, and a
         # stamp that survived it could be mis-booked onto the lane's NEXT episode.
         _episode_start_ns = st.episode_start_ns
@@ -2436,6 +2443,13 @@ class StageDispatcher:
         (``RegistryRunner.outbound_stop_held`` says why). False for an unknown lane."""
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.STOPPED
+
+    def stopped_holding_rows(self, key: str) -> bool:
+        """Whether ``key`` is STOPPED by an episode that ended with claimed rows still in flight,
+        whose re-pend did not land (BACKLOG #5704). A re-arm of such a lane would claim past them,
+        so the log halt's recovery restart leaves it STOPPED. False for an unknown lane."""
+        st = self._states.get(key)
+        return st is not None and st.phase is _LanePhase.STOPPED and st.unlanded
 
     def is_dirty(self, key: str) -> bool:
         st = self._states.get(key)
