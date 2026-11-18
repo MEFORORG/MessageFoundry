@@ -395,13 +395,13 @@ def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = N
 
 def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
     """:func:`_warn_quietly`, unless the warning ``kind()`` was logged in the last
-    :data:`_WARNING_LOG_INTERVAL_S`. The slot is taken before the warning, so concurrent callers
-    emit it at most once. When building or logging the warning fails, or a fault escapes it, the
-    slot is given back, to the time it held before or to empty, unless a later caller has taken it
-    since; when giving it back fails too, the slot stays taken for the interval. A failure building
-    the key, or in the slot's bookkeeping, is reported by :func:`_report_unlogged` naming that
-    step, and the warning is then not logged. Where :func:`_report_unlogged` itself raises, out of
-    memory or stack, the exception propagates."""
+    :data:`_WARNING_LOG_INTERVAL_S` and logging it did not raise. The slot is taken before the
+    warning, so concurrent callers emit it at most once. When building or logging the warning fails,
+    or a fault escapes it, the slot is given back, to the time it held before or to empty, unless a
+    later caller has taken it since; when giving it back fails too, the slot stays taken for the
+    interval. A failure building the key, or in the slot's bookkeeping, is reported by
+    :func:`_report_unlogged` naming that step, and the warning is then not logged. Where
+    :func:`_report_unlogged` itself raises, out of memory or stack, the exception propagates."""
     try:
         key = kind()
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
