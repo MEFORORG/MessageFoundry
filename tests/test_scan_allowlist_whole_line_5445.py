@@ -133,6 +133,7 @@ def test_every_allowlist_entry_excuses_only_a_whole_line(mod) -> None:
         pytest.param(r"^# keep [\w\W]+ here$", False, id="word-and-non-word-class"),
         pytest.param(r"^# keep \w+ here$", False, id="word-escape"),
         pytest.param(r"^# keep \\.* here$", False, id="a-literal-backslash-then-a-wildcard"),
+        pytest.param(r"(?x)^\#\ keep\ . *\ here$", False, id="verbose-spaced-wildcard"),
         pytest.param("^# keep [a-z]+ here$", True, id="control-a-bounded-class"),
         pytest.param("^# keep [.*] here$", True, id="control-a-literal-class"),
         pytest.param(r"^# keep \.* here$", True, id="control-an-escaped-dot"),

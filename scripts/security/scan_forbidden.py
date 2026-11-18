@@ -2091,12 +2091,14 @@ def _load_allowlist() -> list[re.Pattern[str]]:
         # a leak written inside the padding exactly as an unanchored entry did (BACKLOG #5445).
         # This refuses the common spellings only; a quantified group, a positive class such as
         # ``[0-9.]+`` or a bounded ``.{1,500}`` still passes it, and review is what stops those.
-        if _absorbs_any_text(line):
+        # A verbose entry, ``(?x)``, may part a wildcard from its quantifier with whitespace
+        # (``. *``), which the piece-by-piece read below takes for a literal; refused outright.
+        if _absorbs_any_text(line) or pat.flags & re.VERBOSE:
             print(
                 f"scan_forbidden: scan-allowlist.txt line {lineno}: pattern has an unbounded wildcard "
                 "(at least ., \\S, \\W, \\D, \\w or a class holding one or negated, repeated without "
-                "limit), so a leak written inside the line it excuses would pass every detector. "
-                "IGNORED. Spell that part out.",
+                "limit), or is verbose ((?x)), so a leak written inside the line it excuses would pass "
+                "every detector. IGNORED. Spell that part out.",
                 file=sys.stderr,
             )
             continue
@@ -2242,41 +2244,26 @@ def _tracked_under(root: Path) -> set[str] | None:
 
 
 #: A file to judge: its openable path, its scan-root-relative posix path, and in ``--path`` mode
-#: where it is (``_locations``), which the location rule judges too; empty elsewhere, where the
-#: relative path is already relative to the repository.
+#: where it is (``_locations``), which the location rule judges too; empty elsewhere. The staged and
+#: tracked scans judge only the path they were given, which is relative to the working directory, so
+#: run from a subdirectory they do not see a ``docs/security`` above it (a known open gap).
 _Candidate = tuple[Path, str, tuple[str, ...]]
-
-
-def _tree_relative(path: Path) -> str:
-    """``path`` relative to the outermost work tree holding it, or whole outside any work tree; NFC
-    and case-folded as ``_path_key`` folds. Empty for the top. Relative to the work tree, so a
-    file's location carries no directory above the clone. The OUTERMOST work tree, so a nested clone
-    or submodule does not strip the prefix above it. A ``.git`` entry at or below a ``docs/security``
-    directory is no work-tree boundary at all (BACKLOG #5446): a commit snapshot written outside any
-    work tree that carries one would otherwise make that directory the top and drop the prefix the
-    location rule keys on. So a clone that itself sits under some ``docs/security`` directory is a
-    hit on every file it holds: fail closed."""
-    tops = [
-        top
-        for top in (path, *path.parents)
-        if (top / ".git").exists()
-        and forbidden_path_reason(_path_key(top.as_posix()) + "/") is None
-    ]
-    if not tops:
-        return _path_key(path.as_posix())
-    rel = path.relative_to(tops[-1]).as_posix()
-    return "" if rel == "." else _path_key(rel)
 
 
 def _locations(path: Path) -> tuple[str, ...]:
     """Where ``path`` is, as the location rule judges it in ``--path`` mode (BACKLOG #5446): both its
-    path as named, made absolute, and its real path, each by ``_tree_relative``. A file is a hit if
-    EITHER falls under docs/security. The real path, so a link, junction or subst drive into
-    docs/security, a root named from inside ``docs``, or one reached by ``..``, is judged where it
-    lands, in its on-disk case where the platform reports one. The named path, so a link that sits
-    under docs/security and points out of it is judged where it sits as well."""
-    named = _tree_relative(Path(os.path.abspath(path)))
-    real = _tree_relative(Path(os.path.realpath(path)))
+    path as named, made absolute, and its real path, whole, NFC and case-folded as ``_path_key``
+    folds. A file is a hit if EITHER falls under a docs/security directory. The real path, so a
+    link, junction or subst drive into docs/security, a root named from inside ``docs``, or one
+    reached by ``..``, is judged where it lands. The named path, so a link that sits under
+    docs/security and points out of it is judged where it sits as well.
+
+    Whole, not relative to a work tree: no ``.git`` entry, planted in a commit snapshot at ``docs``,
+    at ``docs/security`` or below it, can strip the prefix the rule keys on. The cost is that a
+    tree which itself sits under some ``docs/security`` directory is a hit on every file it holds:
+    fail closed."""
+    named = _path_key(Path(os.path.abspath(path)).as_posix())
+    real = _path_key(Path(os.path.realpath(path)).as_posix())
     return (named,) if named == real else (named, real)
 
 
@@ -2341,7 +2328,7 @@ def _walk(raw: str, out: list[_Candidate], errors: list[str]) -> None:
             # Every file by the root's locations joined to its path, which is where it sits; a link
             # inside the root (a file link, or a junction the walk descended) where it lands too.
             key = _path_key(rel)
-            where = tuple(f"{at}/{key}" if at else key for at in at_root)
+            where = tuple(f"{at}/{key}" for at in at_root)
             if os.path.realpath(path) != os.path.abspath(path):
                 where += _locations(path)
             out.append((path, rel, where))

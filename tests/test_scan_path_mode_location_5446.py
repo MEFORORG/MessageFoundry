@@ -6,8 +6,8 @@
 detector (``docs/security/``, the vault-only security corpus) used to judge only that relative key.
 So naming the directory itself, a file inside it, or its parent (``docs``) dropped the
 ``docs/security/`` prefix from the key, and the run exited 0 over a private security document. The
-detector now also judges ``_locations``: the file's path as named and its real path, each relative
-to the outermost work tree holding it, and a file is a hit if either falls under docs/security.
+detector now also judges ``_locations``: the file's path as named and its real path, each whole and
+absolute, and a file is a hit if either falls under docs/security.
 
 The other half of the row, a nonexistent path named beside a real one exiting 0, was fixed under
 BACKLOG #5585 (the ``_NO_ROOT`` refusal); the last test pins it.
@@ -179,32 +179,35 @@ def test_a_work_tree_under_a_docs_security_directory_fails_closed(
 
 
 @pytest.mark.parametrize(
-    "planted",
+    ("planted", "held"),
     [
-        pytest.param(("docs", "security"), id="at-docs-security"),
-        pytest.param(("docs", "security", "sub"), id="below-docs-security"),
+        pytest.param(("docs",), ("docs", "security"), id="at-docs"),
+        pytest.param(("docs", "security"), ("docs", "security"), id="at-docs-security"),
+        pytest.param(("docs", "security", "sub"), ("docs", "security", "sub"), id="below"),
     ],
 )
 @pytest.mark.parametrize("as_dir", [False, True], ids=["git-file", "git-dir"])
-def test_a_planted_git_entry_under_docs_security_does_not_strip_the_prefix(
+def test_a_planted_git_entry_does_not_strip_the_prefix(
     mod,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     planted: tuple[str, ...],
+    held: tuple[str, ...],
     as_dir: bool,
 ) -> None:
-    """A commit snapshot written outside any work tree, carrying a ``.git`` entry at or below
-    docs/security, must not make that directory the top of a work tree: it would drop the prefix
-    the rule keys on, and naming the directory read clean (BACKLOG #5446)."""
+    """A commit snapshot written outside any work tree, carrying a ``.git`` entry at ``docs``, at
+    docs/security or below it, must not make that directory the top of a work tree: it would drop
+    the prefix the rule keys on, and naming the directory read clean (BACKLOG #5446)."""
     snap = tmp_path / "snap"
-    where = snap.joinpath(*planted)
+    where = snap.joinpath(*held)
     where.mkdir(parents=True)
     (where / "notes.md").write_text("plain prose\n", encoding="utf-8")
+    git = snap.joinpath(*planted, ".git")
     if as_dir:
-        (where / ".git").mkdir()
+        git.mkdir()
     else:
-        (where / ".git").write_text("gitdir: nowhere\n", encoding="utf-8")
-    for named in (where, where / "notes.md"):
+        git.write_text("gitdir: nowhere\n", encoding="utf-8")
+    for named in (where, where / "notes.md", snap / "docs"):
         code, out = _run(mod, capsys, str(named))
         assert code == 1, (named, out)
         assert _REASON in out
