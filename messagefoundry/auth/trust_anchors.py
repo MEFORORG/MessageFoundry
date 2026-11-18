@@ -242,11 +242,11 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     PEM label refuses, with a ``pem_refused`` row (BACKLOG #3745). Other content problems the
     store open would refuse, the pin's size and validity period included
     (:func:`_server_pin_warning`), **warn and do not refuse**: a WARNING and a
-    ``pin_content_warning`` row whose ``reason`` is the warning. Each of those rows is written once per fingerprint
-    and outcome in each engine process (:data:`_STORE_CONTENT_RECORDED`). ACL, path and unreadable
-    findings behave as for every anchor (items 1, 3 and 4; the spec has no pin). The store open
-    refuses as before. At ``warn`` the start logs the pin's ACL or path warning once: the
-    preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
+    ``pin_content_warning`` row whose ``reason`` is the warning. A repeat with unchanged
+    fingerprint and outcome writes no further row (:data:`_STORE_CONTENT_RECORDED`). ACL, path
+    and unreadable findings behave as for every anchor (items 1, 3 and 4; the spec has no pin).
+    The store open refuses as before. At ``warn`` the start logs the pin's ACL or path warning
+    once: the preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
 
     **The PostgreSQL ``ssl_root_cert``** (vault BACKLOG #4203) is a CA bundle the store loads by
     path at each new connection. :func:`collect_anchor_specs` adds it under the label
@@ -305,7 +305,6 @@ import shlex
 import ssl
 import stat
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
-import sys
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -461,20 +460,14 @@ class AnchorSpec:
     :func:`anchor_cadata` already.
 
     ``server_pin`` gives a ``False`` spec the SQL Server pin's content checks, the ones the store
-    runs at open; module item 11 says which of them warn and which refuse. A server pin reads the
-    whole file, so its private-key refusal, its size and its fingerprint cover every byte.
+    runs at open; module item 11 says which of them warn and which refuse.
 
     ``max_bytes`` bounds the read of a ``False`` spec: :func:`evaluate_anchor` reads at most that
     many bytes and one more, and the settings preflight's content checks
     (:func:`_refuse_by_path_content`) refuse a longer file. :func:`enforced_anchor`,
     :func:`enforce_anchor` and :func:`anchor_refusal` run no content check, so they pass a longer
     file, and the bytes and fingerprint they judge stop at that bound. ``None``, the default,
-    reads the whole file.
-
-    Refused at construction, in this order: a ``max_bytes`` below 1; ``server_pin`` with
-    ``loads_verified_bytes`` True, whose checks would never run; ``server_pin`` with a
-    ``max_bytes``; ``max_bytes`` with ``loads_verified_bytes`` True; and ``server_pin`` with
-    ``refuses_encryption_header``."""
+    reads the whole file."""
 
     label: str
     setting: str
@@ -1340,13 +1333,9 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
     what was hashed rather than open the file again (BACKLOG #1142, slice 2). It reads only a
     regular file (:func:`_read_regular_file`), so a pipe never makes the check wait. A spec with
     ``max_bytes`` set is read to at most that many bytes and one more (vault BACKLOG #3714,
-    #4203), so the content checks can judge a longer file without reading it whole. A server pin
-    is read to the size its open file reports and one byte more (:func:`read_if_regular`), not to
-    a cap, so its private-key refusal, its fingerprint and its oversize judge the whole file."""
+    #4203), so the content checks can judge a longer file without reading it whole."""
     if spec.max_bytes is not None:
         data = _read_regular_file(spec.path, spec.max_bytes + 1)
-    elif spec.server_pin:
-        data = _read_regular_file(spec.path, sys.maxsize)  # lowered to the file's size plus one
     else:
         data = _read_regular_file(spec.path)
     fingerprint = anchor_digest_hex(ANCHOR_DIGEST, data)
