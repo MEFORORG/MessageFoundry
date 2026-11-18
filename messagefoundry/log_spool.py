@@ -89,6 +89,10 @@ _DIRECTORY_GONE_ERRNOS = frozenset(
 #: them from one bad argument; ``winerror`` can.
 _DIRECTORY_GONE_WINERRORS = frozenset({64, 59})
 
+#: Windows error codes Python raises as ``FileNotFoundError`` for a network path out of reach,
+#: not a file gone: ``ERROR_BAD_NETPATH`` (53) and ``ERROR_BAD_NET_NAME`` (67).
+_NETWORK_NOT_FOUND_WINERRORS = frozenset({53, 67})
+
 
 def _directory_unreachable(exc: OSError) -> bool:
     """Whether a read's ``OSError`` says the spool directory is gone or out of reach, rather than
@@ -100,6 +104,14 @@ def _directory_unreachable(exc: OSError) -> bool:
         or exc.errno in _DIRECTORY_GONE_ERRNOS
         or getattr(exc, "winerror", None) in _DIRECTORY_GONE_WINERRORS
     )
+
+
+def _says_file_gone(exc: FileNotFoundError) -> bool:
+    """Whether a ``FileNotFoundError`` says the file itself is gone, rather than a network path
+    or the spool directory being out of reach."""
+    return getattr(
+        exc, "winerror", None
+    ) not in _NETWORK_NOT_FOUND_WINERRORS and not _directory_unreachable(exc)
 
 
 _SEGMENT_PREFIX = "spool-"
@@ -455,7 +467,7 @@ class LogSpool:
                 entry = self._peek()
                 self.read_faulted = False
                 return entry
-            except FileNotFoundError:
+            except FileNotFoundError as exc:
                 if not self.directory.is_dir():
                     # The whole spool is out of reach, not one segment gone: retiring would drop
                     # every segment from the order and the cap while the files may still exist.
@@ -469,7 +481,7 @@ class LogSpool:
                     return None
                 # Only opening a segment's file raises this, so there is a first segment.
                 seq = self._segments[0]
-                if not self._segment_confirmed_missing(seq):
+                if not (_says_file_gone(exc) and self._segment_confirmed_missing(seq)):
                     # The open said ENOENT but the file is there, or cannot be checked: a
                     # transient fault (an SMB share reconnecting), never a reason to retire and
                     # unlink records still undelivered.
@@ -481,7 +493,9 @@ class LogSpool:
                 # Each pass retires one, so the loop ends with the segments.
                 if seq == self._write_seq:
                     self._close_writer()
-                self._retire(seq)
+                # Not unlinked: its file is confirmed gone, and a delete that later succeeded
+                # through reclaim() could only ever destroy a file the confirmation missed.
+                self._retire(seq, unlink=False)
             except OSError as exc:
                 self.read_errors += 1
                 self.read_faulted = True
@@ -493,13 +507,13 @@ class LogSpool:
                 return None
 
     def _segment_confirmed_missing(self, seq: int) -> bool:
-        """Whether segment ``seq``'s own file is confirmed gone: its ``lstat`` raises
-        ``FileNotFoundError``. Any other answer, including another ``OSError``, is not a
-        confirmation."""
+        """Whether segment ``seq``'s own file is confirmed gone: its ``lstat`` raises a
+        ``FileNotFoundError`` that :func:`_says_file_gone`. Any other answer, including another
+        ``OSError``, is not a confirmation."""
         try:
             self._path(seq).lstat()
-        except FileNotFoundError:
-            return True
+        except FileNotFoundError as exc:
+            return _says_file_gone(exc)
         except OSError:
             return False
         return False
@@ -559,14 +573,16 @@ class LogSpool:
         self._reader = open(self._path(seq), "rb")  # noqa: SIM115 - held across calls on purpose
         self._read_seq = seq
 
-    def _retire(self, seq: int) -> None:
+    def _retire(self, seq: int, *, unlink: bool = True) -> None:
+        """Drop segment ``seq`` from the order. With ``unlink`` False its file is left alone and
+        never queued for :meth:`reclaim`."""
         if self._reader is not None and self._read_seq == seq:
             with contextlib.suppress(OSError):
                 self._reader.close()
             self._reader = None
             self._read_seq = None
         self._segments.remove(seq)
-        if self._unlink(seq):
+        if not unlink or self._unlink(seq):
             self._sizes.pop(seq, None)
         else:
             # Still on disk, so still counted. Dropping its size here would let the directory

@@ -891,6 +891,85 @@ def test_a_transient_file_not_found_on_a_segment_still_there_retires_nothing(
         spool.close()
 
 
+def _network_not_found(winerror: int) -> FileNotFoundError:
+    """A ``FileNotFoundError`` as Windows raises it for a network path out of reach. Built by hand
+    so the case runs on every platform."""
+    exc = FileNotFoundError(errno.ENOENT, "network path not found")
+    setattr(exc, "winerror", winerror)  # noqa: B010 - typeshed declares it on win32 only
+    return exc
+
+
+@pytest.mark.parametrize("winerror", [53, 67, 64])
+def test_a_network_file_not_found_is_no_confirmation_and_retires_nothing(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    """When the open and the segment's own lstat both raise a FileNotFoundError that names a
+    network path (53, 67) or a share out of reach (64), the segment is not confirmed gone:
+    nothing is retired or unlinked. NEGATIVE CONTROL: on d02d8b8f3e every head segment was
+    retired."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        used = spool.bytes_used
+        real_open, real_path = spool._open_reader, spool._path
+
+        class _UnreachablePath:
+            def lstat(self) -> None:
+                raise _network_not_found(winerror)
+
+        def refuse(seq: int) -> None:
+            raise _network_not_found(winerror)
+
+        monkeypatch.setattr(spool, "_open_reader", refuse)
+        monkeypatch.setattr(spool, "_path", lambda seq: _UnreachablePath())
+        assert spool.peek() is None
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        monkeypatch.setattr(spool, "_open_reader", real_open)
+        monkeypatch.setattr(spool, "_path", real_path)
+        assert _segments(spool_dir) == segments
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.close()
+
+
+def test_a_segment_confirmed_gone_is_never_unlinked_or_reclaimed(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A segment retired as confirmed missing is not unlinked and not queued for reclaim(), so a
+    file the confirmation missed is never deleted. NEGATIVE CONTROL: on d02d8b8f3e the retire
+    unlinked it, and a failed unlink queued it for reclaim()."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        first = _segments(spool_dir)[0]
+        held = first.read_bytes()
+        first.unlink()
+        unlinked: list[int] = []
+        real_unlink = spool._unlink
+
+        def failing_unlink(seq: int) -> bool:
+            unlinked.append(seq)
+            return False
+
+        monkeypatch.setattr(spool, "_unlink", failing_unlink)
+        assert spool.peek() is not None
+        assert spool.unreadable == 1
+        assert unlinked == []
+        monkeypatch.setattr(spool, "_unlink", real_unlink)
+        # The file the confirmation called gone turns out to be there after all.
+        first.write_bytes(held)
+        spool.reclaim()
+        assert first.read_bytes() == held
+    finally:
+        spool.close()
+
+
 def test_two_segments_gone_in_a_row_are_both_passed_over(spool_dir: Path) -> None:
     """One peek walks past every missing segment at the head, however many, to the oldest one left."""
     spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
