@@ -557,7 +557,7 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   or a reload refuses the graph. Some checks that run before a build still read such a literal as
   written. A check inside a factory that reads one
   of the factory's own settings before this one does can stop the load with an error about the
-  flag's effect instead. `MLLP`, `DICOMweb`, `Http` and `Ftp` refuse a non-bool `tls` or `verify_tls`
+  flag's effect instead. `MLLP`, `DICOM`, `DICOMweb`, `Http` and `Ftp` refuse a non-bool `tls` or `verify_tls`
   before such a check of theirs reads it, naming the factory and not the connection. At least some checks
   read a setting before `env()` resolves, so they see the reference and not its value. A cast you
   write yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a

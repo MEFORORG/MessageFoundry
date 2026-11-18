@@ -3033,7 +3033,6 @@ def MLLP(
     and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
     if tls_client_subjects is not None:
         # The subjects check reads tls by truthiness, so 0 would be refused as "needs tls=True".
-        # Only here: elsewhere inbound()/outbound() refuse it, naming the connection.
         refuse_bool_literals({"tls": tls}, "MLLP")
     client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
     _check_listener_ca(ConnectorType.MLLP, tls, tls_ca_file, tls_ca_pin)
@@ -7061,7 +7060,7 @@ class Registry:
         refused graph never runs. Here and not only in the factories, because a ``with_*`` composer
         writes its ``enabled`` flag onto a spec after its factory returns, a ``FhirLookup`` already
         registered. ``inbound()``/``outbound()`` refuse a connection's literals at declaration, and
-        ``MLLP``, ``DICOMweb`` and ``Http`` refuse the one flag a check of their own reads first
+        ``MLLP``, ``DICOM``, ``DICOMweb`` and ``Http`` refuse the one flag a check of their own reads first
         (:func:`refuse_bool_literals`), as ``Ftp`` refuses its ``tls``, ``None`` included, by its
         own check; this pass sees the rest, a lookup's and a composer's
         included. ``None`` passes where the setting has one default on every factory: there an
