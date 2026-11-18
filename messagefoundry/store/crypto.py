@@ -2287,6 +2287,18 @@ def _decode_key(key_b64: str, name: str) -> bytearray:
     return bytearray(decoded)
 
 
+#: Why a keyring with retired keys and no active key is refused (BACKLOG #5310, #5308). The text
+#: reads only which settings are set, never a key. :func:`make_cipher` raises it, and the store's
+#: key seam (``store.base.resolve_decrypt_keys`` and ``build_store_cipher``) raises the same text by
+#: the same rule, so a DR restore and the store open cannot disagree about this configuration.
+RETIRED_WITHOUT_ACTIVE = (
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED is set but no active store key resolved "
+    "(MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the [store].key_provider); "
+    "refusing the identity (plaintext) cipher, which would write new rows unencrypted. Set the "
+    "active key; a store meant to run keyless lists no retired keys"
+)
+
+
 def make_cipher(
     key_b64: str | None,
     retired_b64: Sequence[str] = (),
@@ -2295,23 +2307,40 @@ def make_cipher(
     allow_unmarked: bool = False,
 ) -> Cipher:
     """Build the store cipher. ``key_b64`` is the active key (base64 32-byte); ``retired_b64`` are
-    decrypt-only keys to keep available during a rotation window. Empty active key → identity cipher
-    (backward-compatible default). ``write_v2`` selects the cell-bound writer, ``mfenc:v4`` under the
-    store data sub-key since ADR 0196; ``open_store`` passes ``[store].aad_bind``, which defaults ON.
-    Off here, the frozen v1 writer (CRYPTO-1: v1 byte-identical). ``allow_unmarked`` is
-    ``[store].allow_unmarked_ciphertext``: off, a keyed cipher refuses a non-blank unmarked value."""
+    decrypt-only keys to keep available during a rotation window. No active key and no retired key →
+    identity cipher (the keyless store). No active key WITH a retired key raises ``ValueError``
+    (:data:`RETIRED_WITHOUT_ACTIVE`, BACKLOG #5310): that is a rotation missing its new key, and the
+    identity cipher would write new rows unencrypted. ``write_v2`` selects the cell-bound writer,
+    ``mfenc:v4`` under the store data sub-key since ADR 0196; ``open_store`` passes
+    ``[store].aad_bind``, which defaults ON. Off here, the frozen v1 writer (CRYPTO-1: v1
+    byte-identical). ``allow_unmarked`` is ``[store].allow_unmarked_ciphertext``: off, a keyed cipher
+    refuses a non-blank unmarked value."""
+    retired_set = [k for k in retired_b64 if k]
     if not key_b64:
+        if retired_set:
+            raise ValueError(RETIRED_WITHOUT_ACTIVE)
         return IdentityCipher()
-    # Named by role, not by one variable: the active key may come from MEFOR_STORE_ENCRYPTION_KEY,
-    # a DPAPI key file or another provider, and an error naming only the variable sends an operator
-    # to a source that is not set (vault BACKLOG #3054, item 8).
-    active = _decode_key(
-        key_b64,
-        "the active store key (MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the "
-        "[store].key_provider)",
-    )
-    retired = [_decode_key(k, "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED") for k in retired_b64 if k]
-    return AesGcmCipher(active, retired, write_v2=write_v2, allow_unmarked=allow_unmarked)
+    # Every key decoded so far is wiped if a later one fails to decode (BACKLOG #5310): the cipher
+    # that wipes them on success is never built then, so nothing else would.
+    keys: list[bytearray] = []
+    try:
+        # Named by role, not by one variable: the active key may come from
+        # MEFOR_STORE_ENCRYPTION_KEY, a DPAPI key file or another provider, and an error naming only
+        # the variable sends an operator to a source that is not set (vault BACKLOG #3054, item 8).
+        keys.append(
+            _decode_key(
+                key_b64,
+                "the active store key (MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or "
+                "the [store].key_provider)",
+            )
+        )
+        for k in retired_set:
+            keys.append(_decode_key(k, "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"))
+    except BaseException:
+        for buf in keys:
+            _secure_zero(buf)
+        raise
+    return AesGcmCipher(keys[0], keys[1:], write_v2=write_v2, allow_unmarked=allow_unmarked)
 
 
 def generate_key() -> str:

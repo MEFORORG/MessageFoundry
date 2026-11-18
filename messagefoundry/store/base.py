@@ -70,6 +70,7 @@ from messagefoundry.store.content_search import (
     make_spec,
 )
 from messagefoundry.store.crypto import (
+    RETIRED_WITHOUT_ACTIVE,
     AuditMacFn,
     Cipher,
     CipherError,
@@ -3829,7 +3830,10 @@ def resolve_decrypt_keys(
     *any* value the store could read — e.g. the DR restore-verify checking a backup taken under a
     now-retired key after a rotation (ADR 0049 AC-5: "incl. retired keys") — uses this, not just the
     active key. Order is active-first; duplicates and empties are dropped; an unset active key yields an
-    empty list (identity cipher). ``posture`` is as on :func:`resolve_active_key`.
+    empty list (identity cipher), and an unset active key beside a retired one is refused as
+    ``make_cipher`` refuses it (:func:`_refuse_retired_without_active`, BACKLOG #5308), so a DR
+    restore never decrypts under a keyring the store itself would not open under. ``posture`` is as
+    on :func:`resolve_active_key`.
 
     The three refusals there apply here too, and here also to the key check (BACKLOG #4882): an
     error from the provider or the key check that has a codec error on it, whose chain cannot be
@@ -3844,6 +3848,7 @@ def resolve_decrypt_keys(
             active = _checked_active_key(provider.active_key(), settings)
             # Copied here, so a provider whose sequence reads as it is iterated is refused here too.
             retired_keys = list(provider.retired_keys())
+            _refuse_retired_without_active(active, retired_keys)
         except Exception as exc:
             # The traceback of whatever leaves keeps this frame, the judgement's own escape
             # included, so the key the provider answered is dropped first; assigned rather than
@@ -3861,6 +3866,15 @@ def resolve_decrypt_keys(
             del caught, refusal
     finally:
         _flush_unjudged()
+
+
+def _refuse_retired_without_active(active: str | None, retired_keys: Sequence[str]) -> None:
+    """Refuse a retired key with no active key, by ``make_cipher``'s rule and with its text
+    (BACKLOG #5310, #5308), as a recorded :class:`StoreCipherConfigError`, so the key seam's
+    refusal keeps that text rather than a fixed one. :func:`resolve_decrypt_keys` and the cipher
+    build both call it, so the DR restore's keyring and the store's cipher cannot diverge here."""
+    if not active and any(retired_keys):
+        raise _recorded(StoreCipherConfigError(RETIRED_WITHOUT_ACTIVE), RETIRED_WITHOUT_ACTIVE)
 
 
 def _keyring(active: str | None, retired_keys: Sequence[str]) -> list[str]:
@@ -4347,8 +4361,10 @@ def _build_store_cipher(
             "(expected 'aesgcm' or 'vault_transit')"
         )
     retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
+    active = host_key if host_key is not None else resolve_active_key(settings, posture=posture)
+    _refuse_retired_without_active(active, retired)
     return make_cipher(
-        host_key if host_key is not None else resolve_active_key(settings, posture=posture),
+        active,
         retired,
         write_v2=settings.aad_bind,
         allow_unmarked=settings.allow_unmarked_ciphertext,
