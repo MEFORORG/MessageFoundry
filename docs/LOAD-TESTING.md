@@ -243,8 +243,8 @@ tracking. `--baseline run.json --tolerance 0.1` flags regressions (throughput be
 `baseline*(1−tol)`, p99 above `baseline*(1+tol)`, errors, NAKs, timeouts or dead letters per
 message sent above `baseline*(1+tol)`, or a loss the baseline did not have). It fails closed: a
 baseline phase the current run lacks, a phase whose e2e histogram is empty where the baseline's was
-not, a malformed report, a negative counter, a tolerance outside `[0, 1)`, and a metric that is
-missing, boolean or not finite are each flagged as a regression.
+not, a malformed report, a negative counter, and a metric that is missing, boolean or not finite
+are each flagged as a regression. A `--tolerance` outside `[0, 1)` refuses before the run, exit 2.
 
 **No-loss reconciliation** (the headline check) asserts, within a small in-flight tolerance:
 

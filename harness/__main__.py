@@ -562,7 +562,7 @@ def _run_load(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from harness.load.profile import LoadProfileError, get_profile
-    from harness.load.report import compare_to_baseline
+    from harness.load.report import compare_to_baseline, tolerance_problem
     from harness.load.runner import PreflightError, run_load
     from messagefoundry.apiclient import ApiError
 
@@ -570,6 +570,12 @@ def _run_load(args: argparse.Namespace) -> int:
         profile = get_profile(args.load)
     except LoadProfileError as exc:
         print(f"bad profile: {exc}", file=sys.stderr)
+        return 2
+    # Before the run, not after it: the comparison would refuse this value only once a full run
+    # had been spent.
+    bad_tolerance = tolerance_problem(args.tolerance) if args.baseline else None
+    if bad_tolerance is not None:
+        print(f"bad --tolerance: {bad_tolerance}", file=sys.stderr)
         return 2
 
     # A run-scoped, ASCII-alnum control-id prefix so a re-run can't collide with a prior run's ids in

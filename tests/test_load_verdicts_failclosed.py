@@ -16,6 +16,7 @@ Synthetic metrics only; no message bodies.
 
 from __future__ import annotations
 
+import argparse
 import copy
 import dataclasses
 from typing import Any, cast
@@ -327,6 +328,39 @@ def test_a_tolerance_outside_a_fraction_is_refused(tolerance: float) -> None:
     # NaN answers every threshold False, and 1.0 puts the throughput floor at zero.
     regressions = compare_to_baseline(_load_report(), _load_report(), tolerance=tolerance)
     assert any("is not a fraction in [0, 1)" in r for r in regressions), regressions
+
+
+@pytest.mark.parametrize("tolerance", [float("nan"), 1.0, -0.1])
+def test_a_bad_tolerance_refuses_before_the_run(
+    tolerance: float, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A bad --tolerance refuses as a setup error at once, not after a full load run.
+    import harness.__main__ as cli
+    import harness.load.runner as runner
+
+    def _no_run(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the load run started with a bad --tolerance")
+
+    monkeypatch.setattr(runner, "run_load", _no_run)
+    args = argparse.Namespace(
+        load="reference",
+        baseline="b.json",
+        tolerance=tolerance,
+        engine="https://127.0.0.1:1",
+        token=None,
+        sink_port=None,
+        sink_ports=None,
+        db_backend=None,
+        skip_preflight=True,
+        shard_engine=None,
+        cacert=None,
+    )
+    assert cli._run_load(args) == 2
+    assert "is not a fraction in [0, 1)" in capsys.readouterr().err
+    # The control: a good tolerance reaches the run, so the refusal above is the tolerance's doing.
+    args.tolerance = 0.1
+    with pytest.raises(AssertionError, match="the load run started"):
+        cli._run_load(args)
 
 
 def test_a_loss_against_an_inconclusive_baseline_is_flagged() -> None:

@@ -1075,6 +1075,14 @@ def _lat(s: LatencySummary) -> dict[str, float | int]:
 # --- baseline comparison -----------------------------------------------------
 
 
+def tolerance_problem(tolerance: object) -> str | None:
+    """Why ``tolerance`` cannot be a baseline tolerance, or None when it is a fraction in
+    ``[0, 1)``. The CLI asks before the run so a bad value refuses at once (BACKLOG #5439)."""
+    if isinstance(tolerance, (int, float)) and 0.0 <= tolerance < 1.0:
+        return None
+    return f"tolerance {tolerance!r} is not a fraction in [0, 1)"
+
+
 def compare_to_baseline(current: object, baseline: object, *, tolerance: float) -> list[str]:
     """Return regression messages comparing a current report dict to a saved baseline dict. A
     regression is throughput below ``baseline*(1-tolerance)``, p99 above ``baseline*(1+tolerance)``,
@@ -1087,8 +1095,9 @@ def compare_to_baseline(current: object, baseline: object, *, tolerance: float) 
     comparison that cannot be made is not evidence of no regression. So is a tolerance outside
     ``[0, 1)``: NaN passes every threshold, and 1.0 or more puts the throughput floor at zero."""
     out: list[str] = []
-    if not (isinstance(tolerance, (int, float)) and 0.0 <= tolerance < 1.0):
-        return [f"tolerance {tolerance!r} is not a fraction in [0, 1)"]
+    bad_tolerance = tolerance_problem(tolerance)
+    if bad_tolerance is not None:
+        return [bad_tolerance]
     if not isinstance(baseline, dict):
         return [f"baseline is not a JSON object (got {type(baseline).__name__})"]
     if not isinstance(current, dict):
