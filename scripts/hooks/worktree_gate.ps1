@@ -203,16 +203,19 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     THE ITEM FILES THE UNC SPELLING AND THAT IS THE CONDITIONAL ONE. The extended-length prefix needs no
     setup at all -- no share, no junction, no configuration -- which also answers the objection recorded
     on this rule that these spellings "need a SHELL command to set up" and are therefore out of reach.
-    One of them does not.
+    The two device-prefix drive spellings do not.
 
-    THE FOLD IS ADDITIVE AND CANNOT OPEN A HOLE: it makes MORE spellings resolve onto a governed root, so
-    every verdict it changes moves ALLOW to DENY. It runs at the single shared comparison point, so rules
-    3, 3b, 3c and 3d inherit it together rather than drifting apart.
+    THE FOLD IS ADDITIVE: it makes MORE spellings resolve onto a governed root, so a verdict it changes
+    moves ALLOW to DENY. It runs at the shared comparison point, so a rule inherits it wherever that rule
+    reaches this function. A rule that refuses a token BEFORE comparing it does not: rule 3c's
+    Test-ShellLiteralPath refuses a `-C` value that is quoted or starts with two separators, so a quoted
+    `git -C '\\.\C:\<governed>' ...` never reaches this fold.
 
-    WHAT IT STILL DOES NOT COVER, STATED RATHER THAN IMPLIED: a JUNCTION or other reparse point is not
-    de-aliased, because a lexical resolver cannot follow one; and an admin share reaching this machine by
-    a name not in the list above -- an FQDN, a second IP -- is not folded. Both remain open, and the
-    second is an enumeration, which CLAUDE.md is right to distrust.
+    WHAT IT STILL DOES NOT COVER, at least: a JUNCTION or other reparse point, because a lexical resolver
+    cannot follow one; an admin share reaching this machine by a name not in the list above (an FQDN, a
+    second IP); a volume-GUID or GLOBALROOT device path (`\\.\Volume{<guid>}\`, `\\.\GLOBALROOT\??\C:\`);
+    and the NT-namespace prefix `\??\C:\`, which GetFullPath reads as root-relative. The code review of
+    BACKLOG #5454 (2026-11-18) reported git accepting each of the last three with rc=0.
     #>
     $full = Get-FullPathRaw $Path $Base
     if (-not $full) { return "" }
@@ -223,10 +226,22 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     #
     # THE DOS-DEVICE PREFIX `\\.\` FOLDS THE SAME WAY (BACKLOG #5454). GetFullPath returns it unchanged,
     # and git accepts it: measured 2026-11-18, `git -C '\\.\D:\<worktree>' rev-parse --git-common-dir`
-    # exits 0 and names the real common dir. So `\\.\C:\<governed>` and `\\.\UNC\localhost\C$\<governed>`
-    # reach a governed root with no setup, exactly as the `\\?\` forms do, and must compare as that root.
+    # exits 0 and names the real common dir. So `\\.\C:\<governed>` reaches a governed root with no setup,
+    # exactly as `\\?\C:\` does. `\\.\UNC\localhost\C$\<governed>` is the conditional UNC case, the same
+    # as `\\localhost\C$` in the table above (rc=128 "dubious ownership", measured 2026-11-18).
+    #
+    # The `\\.\` strip is held to a DRIVE-LETTER device. Any other device (`\\.\pipe\x`) keeps its prefix,
+    # so it never reads as a relative path and no rule's leading-slash match stops seeing it.
+    $prefixed = $cmp -match '^//[?.]/'
     $cmp = $cmp -replace '^//[?.]/unc/', '//'
-    $cmp = $cmp -replace '^//[?.]/', ''
+    $cmp = $cmp -replace '^//\?/', ''
+    $cmp = $cmp -replace '^//\./(?=[a-z]:(/|$))', ''
+    # GetFullPath returns a `\\?\` path VERBATIM, `.` and `..` segments included, so `\\?\C:\x\..\<governed>`
+    # compared as `c:/x/../<governed>` (git accepts it, rc=0). Once the prefix is gone, resolve the rest.
+    # IsPathFullyQualified keeps this off a POSIX host, where `c:/x` is a relative path.
+    if ($prefixed -and $cmp -match '(^|/)\.\.?(/|$)' -and [System.IO.Path]::IsPathFullyQualified($cmp)) {
+        $cmp = ([System.IO.Path]::GetFullPath($cmp) -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
+    }
     if ($cmp -match '^//([^/]+)/([a-z])\$(?=/|$)') {
         if ($script:LocalHostSpellings -contains $Matches[1]) {
             $cmp = $Matches[2] + ':' + $cmp.Substring($Matches[0].Length)
@@ -5390,6 +5405,9 @@ turned off and I need you to do it." Do not disable it yourself.
 # docstring already says this gate cannot see, so neither is an escalation and neither argues for widening
 # or narrowing the exemption. Closing them means folding both prefixes in Get-ComparablePath, which moves
 # rules 3/3b/3c/3d too and belongs in its own change with its own tests.
+# UPDATED 2026-11-18: that fold has since landed (BACKLOG #1071) and now covers the DOS-device `\\.\C:\`
+# spelling too (BACKLOG #5454), so the two prefix spellings above compare as the drive-letter path. The
+# reparse point stays open; Get-ComparablePath's docstring lists what else the fold does not cover.
 #
 # IT LIVES IN RULE 1 AND NOT IN Test-Governed, even though its shape is identical to the
 # .claude/worktrees/ exemption already sitting there. Rule 3 feeds the SESSION'S cwd through

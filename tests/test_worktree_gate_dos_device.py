@@ -12,65 +12,23 @@ MEASURED 2026-11-18 on Windows: ``git -C '\\\\.\\D:\\<worktree>' rev-parse --git
 names the real common dir, so the spelling reaches the repository with no setup at all, the same as the
 extended-length prefix the gate already folds.
 
-The comparison helper is the one in ``tests/test_worktree_gate_path_aliases.py``, restated here so this
-row's PR edits no shared test file; it runs the SHIPPED functions, never a copy of their logic.
+The comparison helper is imported from ``tests/test_worktree_gate_path_aliases.py``, so it runs the
+SHIPPED functions; two end-to-end rows drive the real hook through ``tests/test_worktree_gate.py``.
 """
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-GATE_SOURCE = ROOT / "scripts" / "hooks" / "worktree_gate.ps1"
+from tests.test_worktree_gate import assert_denied, edit, run_gate
+
+# The pwsh and Windows gates come with the helper: GetFullPath applies HOST path rules, so on POSIX
+# every row here would be a relative path. Imported by name, so this module carries them too.
+from tests.test_worktree_gate_path_aliases import comparable, pytestmark  # noqa: F401
+
 B = chr(92)
-
-# Same two gates, for the same reasons, as tests/test_worktree_gate_path_aliases.py: GetFullPath applies
-# HOST path rules, so on POSIX every row here is a relative path and nothing would be folded.
-pytestmark = [
-    pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH"),
-    pytest.mark.skipif(
-        os.name != "nt",
-        reason="[System.IO.Path]::GetFullPath applies HOST path rules; DOS-device paths are Windows-only",
-    ),
-]
-
-
-def _brace_block(src: str, name: str) -> str:
-    start = src.index("function " + name)
-    depth = 0
-    i = src.index("{", start)
-    while True:
-        if src[i] == "{":
-            depth += 1
-        elif src[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-        i += 1
-
-
-def comparable(paths: list[str]) -> list[str]:
-    """Run the SHIPPED ``Get-ComparablePath`` (and the host list it reads) over each path."""
-    src = GATE_SOURCE.read_text(encoding="utf-8")
-    marker = "$script:LocalHostSpellings"
-    var_start = src.index(marker)
-    var = src[var_start : src.index("function Get-ComparablePath", var_start)]
-    block = var + "\n".join(_brace_block(src, n) for n in ("Get-FullPathRaw", "Get-ComparablePath"))
-    body = "\n".join(f"Get-ComparablePath '{p}'" for p in paths)
-    proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", block + "\n" + body],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=60,
-    )
-    assert proc.returncode == 0, proc.stderr
-    return proc.stdout.strip().splitlines()
 
 
 def test_the_dos_device_spellings_of_a_local_path_compare_equal() -> None:
@@ -92,10 +50,48 @@ def test_a_dos_device_path_to_a_REMOTE_admin_share_is_NOT_folded_onto_the_local_
     Passes on the gate with and without the fold, so a failure here is the fold over-reaching.
     """
     (got,) = comparable([B + B + "." + B + "UNC" + B + "otherbox" + B + "C$" + B + "Repo"])
-    assert not got.startswith("c:"), got
+    assert got == "//otherbox/c$/repo"
 
 
 def test_a_dos_device_path_to_a_non_drive_device_stays_distinct() -> None:
-    """Control: a device that is not a drive letter must not fold onto a drive path."""
-    (got,) = comparable([B + B + "." + B + "PhysicalDrive0"])
-    assert not got.startswith("c:"), got
+    """Control: a device that is not a drive letter keeps its prefix, so it never reads as relative."""
+    got = comparable([B + B + "." + B + "PhysicalDrive0", B + B + "." + B + "pipe" + B + "x"])
+    assert got == ["//./physicaldrive0", "//./pipe/x"], got
+
+
+def test_a_dot_dot_segment_behind_the_extended_length_prefix_is_resolved() -> None:
+    """GetFullPath returns a question-mark-prefixed path verbatim, ``..`` included."""
+    got = comparable(
+        [
+            B + B + "?" + B + "C:" + B + "Other" + B + ".." + B + "Repo",
+            B + B + "?" + B + "C:" + B + "Repo" + B + "." + B + "x" + B + "..",
+        ]
+    )
+    assert got == ["c:/repo"] * 2, got
+
+
+def test_an_edit_through_the_dos_device_spelling_of_the_primary_is_denied(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """End to end: rule 1 sees the governed primary behind the device prefix."""
+    target = B + B + "." + B + str(primary / "src" / "app.py")
+    assert_denied(run_gate(edit(target, cwd=tmp_path / "Repo-alerts"), repos_file))
+
+
+def test_an_edit_through_an_extended_length_dot_dot_spelling_is_denied(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    target = B + B + "?" + B + str(tmp_path / "Repo-alerts" / ".." / "Repo" / "src" / "app.py")
+    assert_denied(run_gate(edit(target, cwd=tmp_path / "Repo-alerts"), repos_file))
+
+
+@pytest.fixture
+def primary(tmp_path: Path) -> Path:
+    return tmp_path / "Repo"
+
+
+@pytest.fixture
+def repos_file(tmp_path: Path, primary: Path) -> Path:
+    f = tmp_path / "repos.txt"
+    f.write_text("# governed" + chr(10) + str(primary) + chr(10), encoding="utf-8")
+    return f
