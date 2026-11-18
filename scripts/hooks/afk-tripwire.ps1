@@ -22,7 +22,8 @@
 
     WHAT IT DETECTS, at least:
       * a hook bypass: `--no-verify` on any git subcommand, `-n` on `git commit`,
-        `git -c core.hooksPath=...`, and pre-commit's `SKIP=` in front of a command;
+        `git -c core.hooksPath=...` or `git --config-env core.hooksPath=...`, and pre-commit's `SKIP=`
+        in front of a command;
       * a force push: `--force`, `-f`, `--force-with-lease`, `--mirror`, or a `+` refspec;
       * a ref deletion by push: `--delete`, `-d`, `--prune`, or a `:<branch>` refspec;
       * `git reset --hard`;
@@ -210,8 +211,17 @@ function Find-GitTripwires($Argv, $Hits) {
         if ($Argv[$k].T -ceq '-c' -and $k + 1 -lt $Argv.Count -and $Argv[$k + 1].T -match '^core\.hooksPath=') {
             $Hits.Add('git -c core.hooksPath (hook bypass)')
         }
+        # --config-env is the same override with the value read from an environment variable, in both
+        # spellings git accepts (BACKLOG #5448; measured on git 2.55.0): `--config-env=<key>=<var>` and
+        # `--config-env <key>=<var>`. -match folds case, as git does for the key.
+        if (($Argv[$k].T -ceq '--config-env' -and $k + 1 -lt $Argv.Count -and $Argv[$k + 1].T -match '^core\.hooksPath=') -or
+            $Argv[$k].T -match '^--config-env=core\.hooksPath=') {
+            $Hits.Add('git --config-env core.hooksPath (hook bypass)')
+        }
         # The list Resolve-GitSubcommand in block-blanket-git-stage.ps1 uses; keep the two equal.
-        if ($Argv[$k].T -cin @('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix')) { $k++ }
+        # --config-env and --attr-source also take their value as the next argument (BACKLOG #5448).
+        if ($Argv[$k].T -cin @('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix',
+                '--config-env', '--attr-source')) { $k++ }
         $k++
     }
     if ($k -ge $Argv.Count) { return }
