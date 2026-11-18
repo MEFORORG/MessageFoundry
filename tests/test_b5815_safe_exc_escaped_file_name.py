@@ -4,12 +4,14 @@
 
 An ``OSError`` renders its path with ``repr()``, so a name holding a control character, a
 non-printable character or an apostrophe appears ESCAPED in ``str(exc)``. Replacing only the raw
-basename matched nothing there, and the name reached a stored ``last_error``, a connection event or a
-log line past the control built to hide it. Every name here is synthetic.
+basename matched nothing there, so in the shipped code the name would reach a stored ``last_error``,
+a connection event or a log line past the control built to hide it. Every name here is synthetic.
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -59,3 +61,23 @@ def test_a_plain_name_still_renders_as_before() -> None:
         out
         == f"FileNotFoundError: [Errno 2] No such file or directory: 'C:/drops/{safe_name(name)}'"
     )
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_a_bytes_path_in_an_oserror_is_swapped_out(name: str) -> None:
+    """A bytes path renders as ``b'...'`` with the name's UTF-8 bytes escaped."""
+    exc = FileNotFoundError(2, "No such file or directory", f"C:/drops/{name}".encode())
+    out = safe_exc(exc, file_name=name)
+    assert "MRN4455667" not in out and "Zqxdoe" not in out, out
+    assert safe_name(name) in out
+
+
+@pytest.mark.parametrize("name", [*NAMES, "MRN4455667_Zqxdo\u00e9.hl7"])
+@pytest.mark.parametrize("render", [ascii, json.dumps])
+def test_an_ascii_or_json_rendering_is_swapped_out(name: str, render: Callable[[str], str]) -> None:
+    """A message that quotes the path through ``ascii()`` or as a JSON string escapes a non-ASCII
+    character repr() would leave alone, such as an accented letter."""
+    exc = RuntimeError(f"drop refused: {render(f'C:/drops/{name}')}")
+    out = safe_exc(exc, file_name=name)
+    assert "MRN4455667" not in out and "Zqxdoe" not in out, out
+    assert safe_name(name) in out

@@ -2631,9 +2631,11 @@ def safe_exc(
     (BACKLOG #1748), so swapping :func:`safe_name` in has to happen where the name is known. Without
     it, routing a file source's error arm through this function would keep the OS diagnostic and leak
     the name anyway: a control that reports success while the hole stays open. The basename is
-    replaced wherever it appears, as written or in a form ``repr()`` escapes, so a full path is
-    covered;the directory part is operator
-    configuration, not partner-chosen, and stays.
+    replaced as written and in at least the forms one level of ``repr()``, ``ascii()``, a bytes
+    ``repr()`` or a JSON string renders it as (:func:`_escaped_name_forms`), so a full path is
+    covered; the directory part is operator configuration, not partner-chosen, and stays. A name
+    escaped twice, as ``repr(str(oserror))`` renders it, or encoded any other way, is NOT replaced,
+    and only :func:`safe_text`'s patterns stand between it and the output.
 
     A ``UnicodeError`` never reaches :func:`redact` as text (vault BACKLOG #3033). Its ``str()`` quotes
     the character or byte it failed on, which is a character of the message, and no pattern can tell
@@ -2658,27 +2660,32 @@ def safe_exc(
         # An OSError quotes its path with repr(), so a name holding a control, a non-printable or a
         # quote character appears escaped and the raw name alone matches nothing (BACKLOG #5815).
         # The escaped forms go first: none of them is a substring the label could produce.
-        for form in (*_repr_escaped_forms(base), base):
+        for form in (*_escaped_name_forms(base), base):
             raw = raw.replace(form, label)
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
 
 
-def _repr_escaped_forms(text: str) -> list[str]:
-    """The bodies ``repr()`` can render ``text`` as inside a longer quoted string, other than
-    ``text`` itself. ``repr()`` escapes character by character, so each character's own repr is its
-    escape, except the quote: repr quotes with ``'`` and escapes it, unless the WHOLE string holds
-    ``'`` and no ``"``, when it quotes with ``"`` and escapes neither. The whole string is the path,
-    so a directory can make either choice for the same basename, and both forms are returned. Longest
-    first, so a form never shadows a longer one it is a prefix of."""
-    forms: set[str] = set()
-    for escape_apostrophe in (True, False):
-        body = "".join(
-            "\\'" if ch == "'" and escape_apostrophe else ch if ch in "'\"" else repr(ch)[1:-1]
-            for ch in text
-        )
-        if body != text:
-            forms.add(body)
+def _escaped_name_forms(text: str) -> list[str]:
+    """The bodies other than ``text`` itself that one level of ``repr()``, ``ascii()``, a bytes
+    ``repr()`` or a JSON string can render ``text`` as inside a longer quoted string. repr picks its
+    quote from the WHOLE string, a path whose directory the name does not decide: it quotes with
+    ``'`` and escapes it, unless the string holds ``'`` and no ``"``, when it quotes with ``"`` and
+    escapes neither. Appending ``"`` forces the first choice, so both forms are read off the
+    interpreter itself rather than reimplemented. Longest first, so a form never shadows a longer one
+    it is a prefix of."""
+    encoded = text.encode("utf-8", "surrogateescape")
+    forms = {
+        repr(text)[1:-1],
+        repr(text + '"')[1:-2],
+        ascii(text)[1:-1],
+        ascii(text + '"')[1:-2],
+        repr(encoded)[2:-1],
+        repr(encoded + b'"')[2:-2],
+        json.dumps(text)[1:-1],
+        json.dumps(text, ensure_ascii=False)[1:-1],
+    }
+    forms.discard(text)
     return sorted(forms, key=len, reverse=True)
 
 
