@@ -53,6 +53,7 @@ def _report(**over: object) -> ShardCertReport:
         "handlers": 8,
         "delivering": 8,
         "acked_copies_missing": 0,
+        "dead_total": 0,
     }
     base.update(over)
     return ShardCertReport(**base)  # type: ignore[arg-type]

@@ -925,6 +925,33 @@ def _copies_missing(tracker: FailoverTracker, *, routing: str, dests: int, deliv
     )
 
 
+def _invariants_held(
+    *,
+    acked: int,
+    lossless: bool,
+    lane_inversions: int,
+    duplicates_ok: bool,
+    engine_dead: int,
+    dead_total: int,
+    stranded_nonterminal: int,
+    require_acked: bool = True,
+) -> bool:
+    """The correctness terms the single-run verdict (:attr:`ShardCertReport.ok`) and the co-located
+    ladder's per-rung bar (:attr:`ShardCertStepRecord.correctness_ok`) share, kept in ONE place so a new
+    term reaches both (BACKLOG #5441: the ladder bar had drifted to three of them). Something was
+    acknowledged (unless ``require_acked`` is false), nothing was lost, per-lane FIFO held, no duplicate the
+    caller does not excuse, no dead letter at any stage (``-1`` = not measured fails), and no stranded row."""
+    return (
+        (acked > 0 or not require_acked)
+        and lossless
+        and lane_inversions == 0
+        and duplicates_ok
+        and engine_dead == 0
+        and dead_total == 0
+        and stranded_nonterminal == 0
+    )
+
+
 @dataclass
 class ShardCertReport:
     """The certification outcome — sink/drain-derived, plus store diagnostics."""
@@ -1015,6 +1042,11 @@ class ShardCertReport:
     #: :attr:`copies_ok`: ``acked_not_delivered`` counts DISTINCT messages, so one copy of each clears it
     #: and a fan-out run that lost most of its copies would otherwise certify PASS.
     acked_copies_missing: int = -1
+    #: Dead-lettered rows at EVERY stage, from the store (BACKLOG #5440). Must be 0. ``engine_dead`` is the
+    #: OUTBOUND-scoped ``/stats`` count, so a handler whose transform dead-lettered at the routed stage left
+    #: it at 0, and a filtering handler's lost work never shows in the sink copy check either. ``-1`` = NOT
+    #: MEASURED, which FAILS :attr:`ok`, as :attr:`acked_copies_missing` does.
+    dead_total: int = -1
 
     @property
     def inbound_bands(self) -> int:
@@ -1037,18 +1069,21 @@ class ShardCertReport:
     @property
     def ok(self) -> bool:
         """Pass bar: :attr:`lossless` (every ACKed message delivered to each of its expected
-        destinations, drained pipeline), per-lane FIFO (non-vacuous), no dead-letters, no stranded
-        non-terminal rows. Duplicates are allowed only across a kill."""
+        destinations, drained pipeline), per-lane FIFO (non-vacuous), no dead-letters at any stage, no
+        stranded non-terminal rows. Duplicates are allowed only across a kill."""
         dup_ok = self.lane_repeats == 0 if self.killed_shard is None else True
         return (
-            self.acked > 0
-            and self.lossless
+            _invariants_held(
+                acked=self.acked,
+                lossless=self.lossless,
+                lane_inversions=self.lane_inversions,
+                duplicates_ok=dup_ok,
+                engine_dead=self.engine_dead,
+                dead_total=self.dead_total,
+                stranded_nonterminal=self.stranded_nonterminal,
+            )
             and self.in_pipeline_final == 0
-            and self.engine_dead == 0
-            and self.lane_inversions == 0
             and self.lanes_observed >= 2
-            and self.stranded_nonterminal == 0
-            and dup_ok
         )
 
     def render(self) -> str:
@@ -1065,7 +1100,8 @@ class ShardCertReport:
             f"  engine done={self.engine_done} dead={self.engine_dead} "
             f"in_pipeline_final={self.in_pipeline_final} drained={self.drained} "
             f"drain_s={self.drain_seconds}",
-            f"  stranded_nonterminal_rows={self.stranded_nonterminal}",
+            f"  stranded_nonterminal_rows={self.stranded_nonterminal} "
+            f"dead_total(all stages)={self.dead_total}",
             "  ownership: "
             + " ".join(f"{s}->[{','.join(self.owned[s]) or '-'}]" for s in self.shards),
             f"  {self.queue_breakdown}",
@@ -1101,7 +1137,11 @@ class ShardCertReport:
             # v5 (BACKLOG #5575) — the PASS bar CHANGED: `correctness.acked_copies_missing` is new and gated.
             # A v4 PASS checked only that each ACKed message reached SOME sink, so a fan-out run that lost
             # most of its copies could PASS; a v5 PASS also requires every expected copy to have arrived.
-            "schema_version": 5,
+            #
+            # v6 (BACKLOG #5440) — the PASS bar CHANGED: `correctness.dead_total` is new and gated. A v5 PASS
+            # checked only the outbound-scoped `engine_dead`, so work dead-lettered at the routed stage could
+            # PASS; a v6 PASS also requires no dead row at any stage.
+            "schema_version": 6,
             "kind": "shardcert",
             "verdict": "PASS" if self.ok else "FAIL",
             "shards": list(self.shards),
@@ -1141,6 +1181,7 @@ class ShardCertReport:
                 "lane_repeats": self.lane_repeats,
                 "stranded_nonterminal": self.stranded_nonterminal,
                 "engine_dead": self.engine_dead,
+                "dead_total": self.dead_total,
             },
             "throughput": {
                 "in_pipeline_peak": self.in_pipeline_peak,
@@ -1852,12 +1893,12 @@ async def run_shardcert(
         drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
         final = poller.final
 
-        # Store-truth: stranded non-terminal rows + stage/status breakdown. (Single-box gates no-loss
-        # on the SINK truth -- `acked_copies_missing==0` and `acked_not_delivered==0` -- so the all-stage
-        # dead total is surfaced in the
-        # breakdown but not separately gated here — see ShardCertEngineReport for the two-box rationale.)
+        # Store-truth: stranded non-terminal rows, the all-stage dead total, and the stage/status breakdown.
+        # BACKLOG #5440: the dead total is GATED (ShardCertReport.ok), as ShardCertEngineReport.ok gates it.
+        # The sink checks cannot see a dead routed row whose handler delivers nothing, and `engine_dead` is
+        # outbound-scoped, so without it routed-stage dead letters certified PASS.
         _qb = await _queue_breakdown(node_env)
-        stranded, breakdown = _qb.nonterminal, _qb.summary
+        stranded, dead_total, breakdown = _qb.nonterminal, _qb.dead_total, _qb.summary
 
     finally:
         if peak_task is not None and not peak_task.done():
@@ -1914,13 +1955,15 @@ async def run_shardcert(
         lanes_observed=tracker.lanes_observed,
         lane_repeats=tracker.lane_repeats,
         engine_done=(final.done if final else 0),
-        engine_dead=(final.dead if final else 0),
+        # -1 = no poller sample, so an unmeasured dead count fails the pass bars rather than reading clean.
+        engine_dead=(final.dead if final else -1),
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This value
         # feeds ShardCertReport.ok/drained, unlike the advisory drive-side poller cross-checks (left as N×).
         in_pipeline_final=(final.in_pipeline // max(1, len(ids_list)) if final else -1),
         drained=drain_s is not None,
         drain_seconds=drain_s,
         stranded_nonterminal=stranded,
+        dead_total=dead_total,
         queue_breakdown=breakdown,
         offered=round(aggregate_rate * hold_seconds),
         achieved_intake=ctr.acked,
@@ -2037,6 +2080,59 @@ class ShardCertStepRecord:
     lanes_per_shard: int = 1
     shard_count: int = 0
     pool: PoolStats = EMPTY_POOL_STATS
+    #: BACKLOG #5441: the rest of the single-run pass bar, carried so the LADDER verdict can hold each rung
+    #: to it (:attr:`correctness_ok`). ``-1`` = NOT RECORDED, which fails that bar: a record that never
+    #: carried these must not read as a rung with one lane and no dead letters.
+    lanes_observed: int = -1
+    engine_dead: int = -1
+    dead_total: int = -1
+
+    @property
+    def correctness_ok(self) -> bool:
+        """The rung held the invariants :attr:`ShardCertReport.ok` also checks (:func:`_invariants_held`),
+        with no duplicate delivery (a ladder rung never kills an engine shard). Two terms differ, on purpose:
+        ``in_pipeline_final`` is not carried, because ``no_loss`` requires the drain, which the poller only
+        reports at an empty pipeline; and the two-lane FIFO bar applies to a SUSTAINED rung only, as on the
+        two-box ladder, because a ceiling rung is a throughput measurement and a near-empty one may honestly
+        see one lane. The something-acknowledged bar is waived only on a ceiling rung the rig did NOT drive
+        (:attr:`RungFidelity.not_driven`) AND that sent nothing (``sent <= 0``, ``-1`` = unrecorded): nothing
+        arrived, so nothing was acknowledged, and the fidelity gate already reads that rung as SETUP_DEGRADED
+        (exit 2). A rung where any of the offer reached the engine and none was acknowledged still fails,
+        whether it was driven or fell short. The ceiling terms themselves (intake shortfall, filling) are not
+        failures."""
+        return _invariants_held(
+            acked=self.achieved_intake,
+            require_acked=not self._acked_waived,
+            lossless=self.no_loss,
+            lane_inversions=self.lane_inversions,
+            duplicates_ok=self.lane_repeats == 0,
+            engine_dead=self.engine_dead,
+            dead_total=self.dead_total,
+            stranded_nonterminal=self.stranded_nonterminal,
+        ) and (self.ceiling or self.lanes_observed >= 2)
+
+    @property
+    def _acked_waived(self) -> bool:
+        """The something-acknowledged bar does not apply: a ceiling rung whose offer never reached the engine."""
+        return self.ceiling and self.fidelity.not_driven and self.sent <= 0
+
+    def correctness_faults(self) -> list[str]:
+        """The terms of :attr:`correctness_ok` this rung broke, named for an operator note (empty when it
+        held). Kept beside the predicate so a note never shows only the clean values."""
+        terms = [
+            ("loss or undrained pipeline", not self.no_loss),
+            ("nothing acknowledged", not self._acked_waived and self.achieved_intake <= 0),
+            (f"lane_inversions={self.lane_inversions}", self.lane_inversions != 0),
+            (f"lane_repeats={self.lane_repeats}", self.lane_repeats != 0),
+            (f"engine_dead={self.engine_dead}", self.engine_dead != 0),
+            (f"dead_total={self.dead_total}", self.dead_total != 0),
+            (f"stranded={self.stranded_nonterminal}", self.stranded_nonterminal != 0),
+            (
+                f"lanes_observed={self.lanes_observed}",
+                not self.ceiling and self.lanes_observed < 2,
+            ),
+        ]
+        return [label for label, broken in terms if broken]
 
     @property
     def inbound_bands(self) -> int:
@@ -2189,6 +2285,10 @@ class ShardCertStepRecord:
             lanes_per_shard=report.lanes_per_shard,
             shard_count=len(report.shards),
             pool=report.pool,
+            # BACKLOG #5441: the rest of the single-run pass bar, for the ladder verdict.
+            lanes_observed=report.lanes_observed,
+            engine_dead=report.engine_dead,
+            dead_total=report.dead_total,
         )
 
     def to_json_dict(self) -> dict[str, object]:
@@ -2233,6 +2333,11 @@ class ShardCertStepRecord:
             "lane_inversions": self.lane_inversions,
             "lane_repeats": self.lane_repeats,
             "stranded_nonterminal": self.stranded_nonterminal,
+            # BACKLOG #5441: the rest of the pass bar the ladder verdict now holds each rung to.
+            "lanes_observed": self.lanes_observed,
+            "engine_dead": self.engine_dead,
+            "dead_total": self.dead_total,
+            "correctness_ok": self.correctness_ok,
             # Filling (2026-07-13): surfaced so a rung stopped by FILLING is distinguishable from one
             # stopped by loss/intake. Without it a filling ceiling reads as `no_loss=true, ceiling=true` —
             # inexplicable. `e2e_fill_ratio: null` = ABSTAINED (thin data / not measured), NOT "steady".
@@ -2270,6 +2375,7 @@ class ShardCertStepRecord:
             f"delivered={self.delivered} | in_pipeline_peak={self.in_pipeline_peak} "
             f"ack p50/p99={self.ack_p50_ms:.1f}/{self.ack_p99_ms:.1f}ms drain={drain} | "
             f"no_loss={loss} inversions={self.lane_inversions} repeats={self.lane_repeats} "
+            f"lanes={self.lanes_observed} dead={self.engine_dead}/{self.dead_total} "
             f"stranded={self.stranded_nonterminal} fill={fill}"
             + ("  <= FILLING" if self.filling else "")
             + ("  <= CEILING" if self.ceiling else "")
@@ -2291,7 +2397,7 @@ class ShardCertStepRecord:
 class ShardCertLadderReport:
     """The ascending rate-ladder sweep — one :class:`ShardCertStepRecord` per hold step, stopping at
     the first step that fails to SUSTAIN the offered load (:attr:`ShardCertStepRecord.ceiling` — a
-    non-draining/lossy step or a materially-short intake).
+    non-draining/lossy step or a materially-short intake), or that breaks correctness (BACKLOG #5441).
 
     ARTIFACT 4: ``ceiling_rate`` is now ADMISSIBILITY-GATED, exactly as the two-box ladder's pinned ceiling
     is. :func:`_is_ceiling` fires on ``achieved_intake < offered * 0.95`` — which is EXACTLY what a DRIVE
@@ -2315,15 +2421,15 @@ class ShardCertLadderReport:
 
     @property
     def _records_ok(self) -> bool:
-        return all(
-            r.no_loss and r.lane_inversions == 0 and r.stranded_nonterminal == 0
-            for r in self.records
-        )
+        # BACKLOG #5441: the full single-run pass bar per rung. This checked only no_loss, inversions and
+        # stranded rows, so a ladder whose rungs duplicated deliveries, saw one lane, dead-lettered or
+        # acknowledged nothing passed.
+        return all(r.correctness_ok for r in self.records)
 
     @property
     def ok(self) -> bool:
-        """Every step held the correctness invariants WHILE climbing (no acknowledged loss, per-lane
-        FIFO, no stranded rows). The ceiling itself is a MEASUREMENT, not a failure."""
+        """Every step held the correctness invariants WHILE climbing
+        (:attr:`ShardCertStepRecord.correctness_ok`). The ceiling itself is a MEASUREMENT, not a failure."""
         return bool(self.records) and self._records_ok
 
     @property
@@ -2412,7 +2518,8 @@ class ShardCertLadderReport:
     def pinned_record(self) -> ShardCertStepRecord | None:
         """The highest-rate rung that both SUSTAINED (not a ceiling) and was actually DRIVEN — the honest
         FLOOR this climb proved. ``None`` when nothing sustained admissibly."""
-        held = [r for r in self.admissible_records if not r.ceiling]
+        # BACKLOG #5441: a rung that broke correctness pins nothing, even on a ladder already reading FAIL.
+        held = [r for r in self.admissible_records if not r.ceiling and r.correctness_ok]
         return max(held, key=lambda r: r.aggregate_rate) if held else None
 
     @property
@@ -2500,7 +2607,14 @@ class ShardCertLadderReport:
             # v3 (BACKLOG #5575, #5576): per-record `no_loss` now also requires every expected copy of every
             # ACKed message (a fan-out rung that lost copies was `no_loss: true` in v2), and the new
             # `aborted_reason` names a climb a failed store reset stopped (exit 2, the rungs before it kept).
-            "schema_version": 3,
+            #
+            # v4 (BACKLOG #5440, #5441): `ok`/`result`/`exit_code` hold each rung to the single-run pass bar
+            # (duplicates, no dead letters at any stage, at least two lanes on a SUSTAINED rung, and
+            # something acknowledged unless the rung is a ceiling the rig did not drive and sent nothing). Per
+            # record: `lanes_observed`, `engine_dead`, `dead_total` and `correctness_ok` are new. A rung that
+            # breaks that bar pins nothing (`pinned_rate` skips it) and stops the climb, so a v4 FAIL may
+            # carry fewer records than a v3 one.
+            "schema_version": 4,
             "kind": "shardcert_ladder",
             "result": self.result_label,
             "exit_code": self.exit_code,
@@ -2594,6 +2708,12 @@ class ShardCertLadderReport:
             lines.append(
                 f"  ceiling: NONE PUBLISHED — the climb stopped on a rung that FAILED FIDELITY "
                 f"({self.ceiling_void_reason}). It is not an engine ceiling; fix the rig and re-run."
+            )
+        elif self.records and not self.records[-1].correctness_ok:
+            # BACKLOG #5441: the climb stopped early on a correctness break, so it was not exhausted.
+            lines.append(
+                "  ceiling: NONE — the climb STOPPED on a rung that broke correctness "
+                f"({', '.join(self.records[-1].correctness_faults())}). Fix that before raising the ladder."
             )
         else:
             lines.append("  no ceiling reached across the ladder (raise the top rate)")
@@ -2693,7 +2813,9 @@ async def run_shardcert_ladder(
     (:attr:`ShardCertStepRecord.ceiling` — a non-draining/lossy step, or an intake that fell materially
     short of offered). Each step is a fresh fleet + fresh store (mirrors ``multishard``'s per-step
     isolation), so the recorded intake/delivered/backlog are clean per rate. Correctness is asserted per
-    step via :attr:`ShardCertLadderReport.ok` — the ceiling is a measurement, not a failure."""
+    step via :attr:`ShardCertLadderReport.ok` — the ceiling is a measurement, not a failure. A step that
+    breaks correctness (:attr:`ShardCertStepRecord.correctness_ok`) also stops the climb (BACKLOG #5441):
+    the verdict is already FAIL."""
     report = ShardCertLadderReport()
     ordered = sorted(dict.fromkeys(float(r) for r in rates))  # ascending, de-duplicated
     if not ordered:
@@ -2746,6 +2868,12 @@ async def run_shardcert_ladder(
             #     UNATTRIBUTED one, must never read as a clean PASS with a confident number.
             #   * DRIVEN (ENGINE_INTAKE_BIND / BACKPRESSURE_BIND) -> a REAL engine finding: the drive offered
             #     the rate and the ENGINE would not absorb it. It KEEPS its ceiling_rate, and it is NAMED.
+            if not rec.correctness_ok:
+                # BACKLOG #5441: name the break, so a ceiling read off a FAIL ladder carries its cause.
+                report.notes.append(
+                    f"{rate:g} msg/s: the ceiling rung also broke correctness "
+                    f"({', '.join(rec.correctness_faults())}); the ladder FAILs"
+                )
             fid = rec.fidelity
             if fid.not_driven:
                 report.ceiling_void_reason = _CEILING_VOID_REASONS[fid]
@@ -2768,6 +2896,14 @@ async def run_shardcert_ladder(
             report.notes.append(
                 f"ceiling at {rate:g} msg/s ({fid.value}): intake {rec.achieved_intake} of offered "
                 f"{rec.offered} (no_loss={rec.no_loss}; sustain bar = offered*(1-{_INTAKE_TOL:g}))"
+            )
+            break
+        if not rec.correctness_ok:
+            # BACKLOG #5441: the ladder already reads FAIL on this rung, so every higher rung is a full fresh
+            # fleet spent on a run that cannot pass.
+            report.notes.append(
+                f"CLIMB STOPPED at {rate:g} msg/s: the rung broke correctness "
+                f"({', '.join(rec.correctness_faults())})"
             )
             break
     return report

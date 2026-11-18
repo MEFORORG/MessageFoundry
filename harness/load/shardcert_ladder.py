@@ -1291,6 +1291,10 @@ class RungOutcome:
     #: did not show its deliveries, so a soak in this state still reads SOAK_NOT_SUSTAINED, as the
     #: FROZEN_TAIL it used to be did, never the weaker SOAK_UNCONFIRMED.
     gated_shortfall: bool = False
+    #: BACKLOG #5442: the engine marked this rung's store-truth INVALID (``aborted`` / ``valid: false``: the
+    #: drive tore its sinks down mid-delivery). The rung is INCONCLUSIVE with ``engine_reported`` false, and
+    #: this says why, apart from a payload that never arrived.
+    engine_invalidated: bool = False
 
     #: WHICH SHAPE served this rung (from the drive report, which learned it from SHARDS_READY). Load-bearing
     #: for reading `handlers`/`delivering`: under `partitioned` they are the DERIVED accounting pair (1, 1),
@@ -1590,6 +1594,7 @@ class RungOutcome:
                 "in_pipeline_final": self.engine_in_pipeline_final,
                 "drain_gated": self.drain_gated,  # v9 (#5577): sinks tallied behind the drain gate
                 "gated_shortfall": self.gated_shortfall,  # v9 (#5577): A4b trigger (c) fired
+                "invalidated": self.engine_invalidated,  # v10 (#5442): engine marked the rung aborted
             },
             "in_pipeline_slope": self.in_pipeline_slope,
             "phase_timing": self.phase.to_json_dict(),
@@ -1603,6 +1608,16 @@ class RungOutcome:
             "store_pool": self.pool.to_json_dict(),
             "notes": list(self.notes),
         }
+
+
+def _store_truth_invalidated(payload: Mapping[str, Any] | None) -> bool:
+    """Whether an engine coord payload (ENGINE_DRAINED or ENGINE_RUNG_REPORT) marks its own store-truth
+    INVALID: ``aborted`` true or ``valid`` false, the B3 marker for a rung the drive tore down mid-delivery.
+    A payload that carries neither key (an older engine) is not invalidated; any truthy ``aborted`` or falsy
+    ``valid`` it does carry invalidates it, so a malformed marker fails toward INCONCLUSIVE."""
+    if payload is None:
+        return False
+    return bool(payload.get("aborted", False)) or ("valid" in payload and not payload["valid"])
 
 
 def build_rung_outcome(
@@ -1619,15 +1634,35 @@ def build_rung_outcome(
     fragile ``report`` (ENGINE_RUNG_REPORT, posted only after fleet teardown + node-log aggregation). This is
     the fix for the false-ceiling defect: a late/lost ENGINE_RUNG_REPORT no longer looks like a store-truth
     collapse — the verdict rests on the drain gate, and ENGINE_RUNG_REPORT only ADDS the phase-timing + soak
-    slope. Store-truth is ``engine_reported`` only if AT LEAST ONE of the two arrived; with neither, the rung
-    is classified INCONCLUSIVE (a coord glitch, never a fabricated collapse)."""
+    slope. Store-truth is ``engine_reported`` only if AT LEAST ONE of the two arrived and NEITHER marks itself
+    invalid (``aborted`` / ``valid: false``, BACKLOG #5442); otherwise the rung is classified INCONCLUSIVE (a
+    coord glitch or a torn-down rung, never a fabricated collapse)."""
     notes: list[str] = list(drive.notes)
     truth = gate if gate is not None else report  # prefer the reliable drain gate for store-truth
-    engine_reported = truth is not None
+    # BACKLOG #5442: the engine marks a rung whose drive tore its sinks down mid-delivery `aborted` /
+    # `valid: false`. Its store-truth is a teardown artifact (engine_ok false, counts unread), which the
+    # classifier would score COLLAPSED and let bracket a ceiling. It is not a confirmed store-truth. The
+    # live drive breaks on its own abort path before calling this, so the guard covers a late or replayed
+    # payload and any other caller.
+    invalidated = _store_truth_invalidated(gate) or _store_truth_invalidated(report)
+    engine_reported = truth is not None and not invalidated
     engine_drain_seconds: float | None = (
         None  # D1: the RELIABLE engine drain (gate/report) for the rate
     )
-    if truth is None:
+    if invalidated:
+        engine_ok = False
+        engine_drained = False
+        engine_stranded = -1
+        engine_dead_total = -1
+        engine_in_pipeline_final = -1
+        engine_ingress_stranded = -1
+        engine_routed_stranded = -1
+        engine_outbound_stranded = -1
+        notes.append(
+            "engine store-truth INVALID (the engine marked this rung aborted: the drive tore its sinks down "
+            "mid-delivery) — rung is INCONCLUSIVE, NOT a proven collapse (excluded from the ceiling bracket)"
+        )
+    elif truth is None:
         engine_ok = False
         engine_drained = False
         engine_stranded = -1
@@ -1665,7 +1700,8 @@ def build_rung_outcome(
     claim = _EMPTY_CLAIM_TIMING
     episode = _EMPTY_EPISODE_TIMING
     pool = EMPTY_POOL_STATS
-    if report is not None:
+    # An invalidated rung's report extras (slope, timings, pool) were sampled at teardown: not evidence.
+    if report is not None and not invalidated:
         raw_slope = report.get("in_pipeline_slope")
         slope = None if raw_slope is None else float(raw_slope)
         phase_raw = report.get("phase_timing")
@@ -1684,12 +1720,20 @@ def build_rung_outcome(
             notes.append(f"engine: {note}")
     elif engine_reported:
         notes.append("engine phase timing / soak slope absent (ENGINE_RUNG_REPORT not read)")
+    # BACKLOG #5442: the engine posts the pool on the RELIABLE drain gate too, so a rung whose report was
+    # lost still carries its pool evidence. Reading it only from the report left the tripwire unable to fire
+    # on exactly the rungs the gate exists for, and a pool-bound ladder could exit 0 as PASS.
+    if not pool.measured and gate is not None and not invalidated:
+        gate_pool_raw = gate.get("store_pool")
+        if isinstance(gate_pool_raw, Mapping):
+            pool = PoolStats.from_json_dict(gate_pool_raw)
     # ARTIFACT 2: an unmeasured pool is UNKNOWN, never innocent — say so, because the whole point of the
     # tripwire is that a pool bind is otherwise indistinguishable from the claim wall it would be blamed on.
     if not pool.measured:
         notes.append(
-            "store pool NOT MEASURED for this rung (no ENGINE_RUNG_REPORT store_pool block) — a pool bind "
-            "cannot be ruled out from this rung's data, and it is column-for-column identical to a claim wall"
+            "store pool NOT MEASURED for this rung (no store_pool block on ENGINE_RUNG_REPORT or the drain "
+            "gate) — a pool bind cannot be ruled out from this rung's data, and it is column-for-column "
+            "identical to a claim wall"
         )
     elif pool.tripped and pool.trip_reason is not None:
         notes.append(pool.trip_reason)
@@ -1700,7 +1744,8 @@ def build_rung_outcome(
             "processes; this run's pool is NOT the one it claims"
         )
 
-    drain_gated = gate is not None and drive.tallied_behind_gate
+    # An invalidated gate is not a completed drain barrier, so the sinks did not tally behind one.
+    drain_gated = gate is not None and not invalidated and drive.tallied_behind_gate
     verdict = classify_rung(
         engine_reported=engine_reported,
         engine_ok=engine_ok,
@@ -1826,6 +1871,7 @@ def build_rung_outcome(
         engine_outbound_stranded=engine_outbound_stranded,
         drain_gated=drain_gated,
         gated_shortfall=gated_shortfall,
+        engine_invalidated=invalidated,
         engine_in_pipeline_final=engine_in_pipeline_final,
         in_pipeline_slope=slope,
         phase=phase,
@@ -2431,7 +2477,8 @@ class ConsolidatedLadderReport:
         (``lanes_observed >= 2``). The ceiling/collapse is a throughput MEASUREMENT, not a verdict failure —
         so the non-vacuity gate is NOT applied to a COLLAPSED/FROZEN_TAIL rung (a near-zero-delivery collapse
         legitimately observes <2 lanes; failing the verdict on it would mislabel a throughput ceiling as a
-        correctness break). Mirrors the single-box ShardCertLadderReport.ok, which never gates on lanes."""
+        correctness break). Mirrors the single-box ShardCertLadderReport.ok, which since BACKLOG #5441 gates
+        lanes on its sustained (non-ceiling) rungs only, for the same reason."""
         recs = self.all_records
         if not recs:
             return False
@@ -2446,8 +2493,9 @@ class ConsolidatedLadderReport:
         inconsistent (A4b — the store-truth and the DRIVE sink count contradicted, or a required collector
         read zero on a non-zero-volume run). Like a rendezvous abort, either is a DEGRADATION, not a clean
         bench result — nothing was certified — so it must NOT read as a PASS. (A soak-only inconclusive is
-        supplementary and does not trip this — the climb still pinned the ceiling.) The JSON key name is kept
-        for schema_version 3 back-compat even though it now also covers the cross-observer cause."""
+        supplementary and does not trip this — the climb still pinned the ceiling.) Since BACKLOG #5442 a third
+        cause counts too: the engine marked the rung's store-truth INVALID (``engine.invalidated``). The JSON
+        key name is kept for schema_version 3 back-compat even though it now covers all three causes."""
         return any(r.verdict is RungVerdict.INCONCLUSIVE for r in self.climb)
 
     @property
@@ -2562,10 +2610,32 @@ class ConsolidatedLadderReport:
         deliberate, but it is a trap for an exit-code-gated harness: a run that saturated still exits 0.
         Automation that wants "did the offered operating point hold?" must read :attr:`soak_ok` /
         :attr:`soak_not_sustained` (or the ``result`` field, which no longer says ``PASS`` in that case) —
-        never the exit code alone."""
-        if self.setup_degraded:
+        never the exit code alone.
+
+        A pool bind that is the ONLY degradation does not outrank a correctness break: the break is exit 1
+        (BACKLOG #5442 made a gate-only rung's pool readable, which would otherwise relabel a FIFO break as
+        a pool-sizing setup issue). Nor does a SOAK degradation outrank a break on a CLIMB rung: that break
+        was measured before the soak ran, so an aborted or un-driven soak must not hide it behind exit 2."""
+        if self.setup_degraded and not self._break_outranks_degradation:
             return 2
         return 0 if self.ok else 1
+
+    @property
+    def _climb_broken(self) -> bool:
+        """A CLIMB rung broke correctness: the same terms :attr:`correctness_ok` applies, read on the climb
+        alone, so the soak's state cannot touch it."""
+        return any(r.verdict is RungVerdict.CORRECTNESS_FAIL for r in self.climb) or any(
+            r.lanes_observed < 2 for r in self.climb if r.verdict is RungVerdict.SUSTAINED
+        )
+
+    @property
+    def _break_outranks_degradation(self) -> bool:
+        """Correctness broke and no CLIMB-side degradation (a climb rendezvous abort, an unconfirmed climb
+        store-truth) leaves the break unproven. Then the break is the answer when the only other degradation
+        is the pool tripwire, or when the break is on a climb rung, whatever the soak's state."""
+        if self.ok or self.climb_aborted or self.store_truth_unconfirmed:
+            return False
+        return self._climb_broken or not (self.soak_aborted or self.soak_drive_shortfall)
 
     @property
     def result_label(self) -> str:
@@ -2593,7 +2663,8 @@ class ConsolidatedLadderReport:
           column, from the pooled-claim wall it would have been blamed on).
         * ``PASS`` — correctness held, and the soak either sustained (DRIVEN, and the engine took it) or was
           legitimately skipped."""
-        if self.setup_degraded:
+        # A correctness break that outranks the degradation is FAIL (see :attr:`exit_code`).
+        if self.setup_degraded and not self._break_outranks_degradation:
             # POOL_BOUND is NAMED rather than flattened into SETUP_DEGRADED — but only when it is the SOLE
             # degradation. An abort / unconfirmed store-truth / un-driven soak means NOTHING was measured,
             # and that dominates: attributing a ceiling to the pool on a run that never produced one would
@@ -2806,7 +2877,9 @@ class ConsolidatedLadderReport:
                 f"RESOURCE bind, NOT the engine's ceiling; raise --store-pool-size and re-run) "
                 f"-> exit {self.exit_code}"
             )
-        elif self.setup_degraded:
+        elif self.exit_code == 2:
+            # Keyed on the exit code, not on `setup_degraded`: a correctness break outranks a pool bind
+            # (exit 1), and that run must print FAIL below, never a SETUP-DEGRADED reason beside "exit 1".
             if self.climb_aborted:
                 reason = "two-box rendezvous/timeout broke mid-run"
             elif self.soak_aborted:
@@ -2991,7 +3064,17 @@ class ConsolidatedLadderReport:
             # row) are charged D each, where v8 charged them 1 at H == D and nothing at H > D; (3) when the
             # drive tallied behind the drain gate, a sink more than the tolerance short of A*D against a clean
             # store-truth is INCONCLUSIVE, not FROZEN_TAIL.
-            "schema_version": 9,
+            #
+            # v10 (BACKLOG #5442) — one new key, per-rung `engine.invalidated`, and these SCORING changes:
+            # (1) a rung whose engine payload says `aborted` / `valid: false` is INCONCLUSIVE with
+            # `engine.reported` false and its report extras unread (v9's classifier scored it COLLAPSED;
+            # run_drive_ladder breaks on its own abort path before building the outcome, so only a late or
+            # replayed payload reached it), and such a soak counts as `soak_aborted`; (2) a rung whose
+            # ENGINE_RUNG_REPORT was lost reads `store_pool` from the drain gate (v9 left it unmeasured, so the
+            # pool tripwire could not fire and a pool-bound run could exit 0); (3) a correctness break whose
+            # only companion degradation is a pool bind, or a break on a CLIMB rung whatever the soak's state,
+            # is FAIL / exit 1, not POOL_BOUND or SETUP_DEGRADED / exit 2.
+            "schema_version": 10,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,
             "exit_code": self.exit_code,
@@ -3235,7 +3318,8 @@ class ConsolidatedLadderReport:
             # v6: `soak_ok` now carries a FIDELITY term — a soak nobody drove, or one the engine short-took,
             # cannot certify the ceiling. See `fidelity.soak_*`.
             "soak_ok": self.soak_ok,
-            "soak_drive_shortfall": self.soak_drive_shortfall,  # a RIG failure ⇒ setup_degraded (exit 2)
+            # A RIG failure means setup_degraded: exit 2, unless a climb rung broke correctness (exit 1).
+            "soak_drive_shortfall": self.soak_drive_shortfall,
             "soak_engine_intake_bind": self.soak_engine_intake_bind,  # a real PRODUCT finding
             "climb": [r.to_json_dict() for r in self.climb],
             "notes": self.notes,
@@ -3284,7 +3368,9 @@ def build_consolidated_report(
         soak=soak,
         notes=list(notes),
         climb_aborted=climb_aborted,
-        soak_aborted=soak_aborted,
+        # BACKLOG #5442: a soak the ENGINE marked aborted is the same torn-down rung the drive's own abort
+        # flag names, so it reads SETUP_DEGRADED (exit 2), never the exit-0 SOAK_UNCONFIRMED.
+        soak_aborted=soak_aborted or (soak is not None and soak.engine_invalidated),
     )
 
 

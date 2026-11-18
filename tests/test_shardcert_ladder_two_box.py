@@ -747,7 +747,7 @@ def test_collapsed_soak_reports_soak_not_sustained_not_pass() -> None:
     assert js["soak_not_sustained"] is True
     assert js["exit_code"] == 0
     assert (
-        js["schema_version"] == 9
+        js["schema_version"] == 10
     )  # v8 (#229): +the per-stage strand split for the sound H>D A4b permit
     assert "SOAK NOT SUSTAINED" in rep.render()
 
@@ -1823,7 +1823,7 @@ def test_cross_observer_inconclusive_propagates_to_ladder_result_and_json() -> N
     assert js["result"] == "SETUP_DEGRADED"
     assert js["store_truth_unconfirmed"] is True
     assert (
-        js["schema_version"] == 9
+        js["schema_version"] == 10
     )  # v9 (#5577): per-stage permit at H == D, residual rows, gated shortfall
     assert js["climb"][1]["verdict"] == "inconclusive"  # the enum value carries into the JSON
 
@@ -2625,7 +2625,7 @@ def test_rung_json_carries_the_shape_and_schema_v5() -> None:
     assert rung_js["outbound_expected"] == out.acked * 4  # A * D, never A * dests
 
     assert (
-        js["schema_version"] == 9
+        js["schema_version"] == 10
     )  # v9 (#5577): per-stage permit at H == D, residual rows, gated shortfall
     topo = js["topology"]
     assert isinstance(topo, dict)
