@@ -280,3 +280,32 @@ async def test_a_coded_token_reply_on_a_batch_stops_the_lane_and_keeps_every_mem
     else:
         assert await store.count_dead(allowed_channels=None) == 3
         assert sink.stopped == []
+
+
+async def test_under_the_dead_letter_policy_a_coded_token_reply_dead_letters_as_any_config_fault(
+    store: MessageStore,
+) -> None:
+    # credential_fault_policy = "dead_letter" opts every configuration fault back into the
+    # fail-fast dead-letter, and the coded token reply follows it: the lane does not stop.
+    sink = _RecordsStops()
+    runner = RegistryRunner(
+        Registry(),
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        credential_fault_policy="dead_letter",
+        egress=EgressSettings(deny_by_default=False),
+    )
+    connector = _MintsThroughACodedTokenEndpoint()
+    runner._destinations[OUT] = cast(DestinationConnector, connector)
+    runner._retry[OUT] = RetryPolicy()
+    runner._simulate[OUT] = False
+    body = _adt(1)
+    await store.enqueue_message(channel_id="c1", raw=body, deliveries=[(OUT, body)], now=101.0)
+    item = await store.claim_next_fifo(OUT)
+    assert item is not None
+    await runner._process_delivery_item(OUT, item)
+
+    assert await store.count_dead(allowed_channels=None) == 1
+    assert sink.stopped == []
+    assert not runner.outbound_stop_held(OUT)
