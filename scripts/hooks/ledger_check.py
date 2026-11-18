@@ -353,6 +353,7 @@ class Ledger:
         # Measured 2026-09-10 on this box: a `git` spawn is 53-315 ms whatever it does, and the
         # retired per-ref item sweep was five spawns plus two full parses of a 30k-line file per ref.
         self._parents: list[str] | None = None
+        self._renames: dict[str, str] | None = None
 
     def _resolve_alloc(self) -> None:
         if self._alloc_resolved:
@@ -413,9 +414,26 @@ class Ledger:
             return _paths(git("diff", *self._ADDED, self.base, "HEAD"))
         return _paths(git("diff", "--cached", *self._ADDED))
 
-    def in_head(self, path: str) -> bool:
-        """Does the path exist in the tree this change produces (the index locally, HEAD in CI)?"""
-        return _obj_exists(f"HEAD:{path}" if self.ci else f":{path}")
+    def renamed_from(self) -> dict[str, str]:
+        """New path -> old path, for each pair git itself calls a RENAME in this change.
+
+        Only the WORDING of a refusal, and the ownership arm for a number the parent already carries,
+        read this. A file is still an add to every rule (added_files). A pair needs the old path in
+        the parent tree and a similar body, so a stale base's number or an unrelated file replacing a
+        deleted ADR is never one. A git failure raises, as everywhere in this gate.
+        """
+        args = ("-z", "--name-status", "-M", "--diff-filter=R")
+        out = git("diff", *args, self.base, "HEAD") if self.ci else git("diff", "--cached", *args)
+        parts = _paths(out)
+        return {parts[i + 2]: parts[i + 1] for i in range(0, len(parts) - 2, 3)}
+
+    def same_number_source(self, path: str, number: str) -> str | None:
+        """The ADR this added path was renamed FROM, when that ADR has the same number; else None."""
+        if self._renames is None:
+            self._renames = self.renamed_from()
+        src = self._renames.get(path)
+        m = ADR_FILE.match(src) if src else None
+        return src if m and m.group(1) == number else None
 
     def head_text(self, path: str) -> str:
         """The file as it will exist after this commit — the INDEX, not the working tree."""
@@ -780,29 +798,34 @@ class Ledger:
                 # names the companion. ADR 0013 is exactly this and is CORRECT. Only an UNdeclared reuse
                 # is a collision.
                 if not row_names_file(first_rows.get(number, ""), basename):
-                    if not self.in_head(f"docs/adr/{base_adrs[number]}"):
-                        # The base's file for this number is gone from this change, so this is a
-                        # RENAME of that ADR (BACKLOG #5453), not a second session's reuse. It
-                        # allocates nothing; what it owes is a row that links the new name.
+                    src = self.same_number_source(path, number)
+                    if src is not None:
+                        # git pairs this file with an ADR of the SAME number that this change
+                        # removes, so it is a RENAME of that ADR (BACKLOG #5453), not a second
+                        # session's reuse. It allocates nothing; it owes a row linking the new name.
                         self.fail(
                             f"ADR {number} was renamed from "
-                            f"{_safe_for_message(base_adrs[number])}, and its row in "
+                            f"{_safe_for_message(src.rsplit('/', 1)[-1])}, and its row in "
                             "docs/adr/README.md does not link the new file",
                             "The index row would keep linking a file that no longer exists, and "
                             "the renamed ADR would be invisible in the index.",
                             "make the row link the renamed file in THIS commit; keep the number",
                         )
-                        continue
-                    self.fail(
-                        f"ADR {number} already exists on {self.base} as "
-                        f"{_safe_for_message(base_adrs[number])}",
-                        "Two sessions picking the same number create DIFFERENT filenames, merge CLEAN, and "
-                        "silently corrupt the ledger. This has happened 3x (d1d0a5a, 5b7d046, 9f3483d).",
-                        'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind adr -Title "<title>"'
-                        "   # then rename your file to the number it prints",
-                    )
+                    else:
+                        self.fail(
+                            f"ADR {number} already exists on {self.base} as "
+                            f"{_safe_for_message(base_adrs[number])}",
+                            "Two sessions picking the same number create DIFFERENT filenames, merge "
+                            "CLEAN, and silently corrupt the ledger. This has happened 3x (d1d0a5a, "
+                            "5b7d046, 9f3483d).",
+                            'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind adr -Title "<title>"'
+                            "   # then rename your file to the number it prints",
+                        )
             elif (
                 not self.ci
+                # A same-number rename of an ADR the parent already carries allocates nothing. The
+                # gate before BACKLOG #5453 never saw one, so this keeps that, and no more.
+                and self.same_number_source(path, number) is None
                 and not self.owns("adr", number)
                 and not self._carried_by_a_merge_parent(path)
             ):

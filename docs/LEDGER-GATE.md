@@ -191,9 +191,11 @@ It blocks a commit that:
 5. leaves **duplicate index rows** for one number.
 
 A file that arrives by **rename or copy** onto an ADR path is an added ADR to every rule above: the gate
-turns git's rename detection off, so a `git mv` cannot hide it (BACKLOG #5453). Renaming an ADR's own
-file under the same number allocates nothing, but its row must link the new name in the same commit;
-the gate says so rather than calling it a reuse.
+turns git's rename detection off, so a `git mv` cannot hide it (BACKLOG #5453). Where git itself pairs
+the new file with a removed ADR of the same number, the change is a rename: it allocates nothing, so
+the ownership rule does not refuse it, but its row must link the new name in the same commit, and the
+refusal says so rather than calling it a reuse. Any other file under a base number, including an
+unrelated file replacing a deleted ADR, is still refused as a reuse.
 
 In every rule above, and in the corpus check, "names" and "links" mean the same thing. The file must be
 the target of a Markdown link in the row, not a substring of it (BACKLOG #2001). The gate reads one link

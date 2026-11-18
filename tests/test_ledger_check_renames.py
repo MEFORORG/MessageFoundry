@@ -157,3 +157,110 @@ def test_a_slug_rename_whose_row_still_links_the_old_name_is_refused_as_a_rename
     assert "ADR 0001 was renamed from 0001-first.md" in out
     assert "already exists" not in out
     assert "alloc.ps1" not in out
+
+
+def test_the_rename_wording_holds_in_CI_mode(repo: Path) -> None:
+    git(repo, "mv", "docs/adr/0001-first.md", "docs/adr/0001-renamed.md")
+    git(repo, "commit", "-qm", "rename ADR 0001 without relinking its row")
+
+    code, out = run_check(repo, "--ci")
+    assert code == 1, out
+    assert "ADR 0001 was renamed from 0001-first.md" in out
+
+
+def test_a_rename_that_also_drops_the_row_reports_the_missing_row_too(repo: Path) -> None:
+    git(repo, "mv", "docs/adr/0001-first.md", "docs/adr/0001-renamed.md")
+    write(repo, "docs/adr/README.md", README_HEAD)
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 was renamed" in out
+    assert "has no row in docs/adr/README.md" in out
+
+
+def test_a_renamed_COMPANION_gets_the_rename_wording(repo: Path) -> None:
+    write(repo, "docs/adr/0001-second.md", BODY.replace("synthetic", "companion"))
+    row = "| [0001](0001-first.md) and [companion](0001-second.md) | First | Accepted |"
+    write(repo, "docs/adr/README.md", README_HEAD + row + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "declare a companion")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    git(repo, "mv", "docs/adr/0001-second.md", "docs/adr/0001-third.md")
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 was renamed from 0001-second.md" in out
+    assert "already exists" not in out
+
+
+def test_a_STALE_BASE_collision_is_still_a_reuse_not_a_rename(repo: Path) -> None:
+    """The number arrived on the base after this branch was cut. Nothing here removed a file, so
+    nothing is renamed, and the remedy stays: allocate a fresh number."""
+    git(repo, "switch", "-q", "-c", "stale")
+    git(repo, "switch", "-q", "main")
+    write(repo, "docs/adr/0002-alpha.md", "# Alpha\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="alpha", title="Alpha")
+        + "\n",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "another session takes 0002")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "switch", "-q", "stale")
+
+    write(repo, "docs/adr/0002-beta.md", "# Beta\n")
+    git(repo, "add", "-A")
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 already exists" in out
+    assert "alloc.ps1" in out
+    assert "renamed" not in out
+
+
+def test_an_UNRELATED_file_replacing_a_deleted_adr_is_still_a_reuse(repo: Path) -> None:
+    git(repo, "rm", "-q", "docs/adr/0001-first.md")
+    write(repo, "docs/adr/0001-unrelated.md", "# A different decision\n\nNothing in common.\n")
+    git(repo, "add", "-A")
+    assert "R" not in [line[:1] for line in _staged_status(repo).splitlines()], _staged_status(repo)
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 already exists" in out
+    assert "renamed" not in out
+
+
+def test_a_same_number_rename_of_a_BRANCH_adr_needs_no_allocation(repo: Path) -> None:
+    """The number is on this branch, not the base, and this tree did not allocate it. Renaming the
+    file allocates nothing, which the gate before BACKLOG #5453 let through by not seeing it."""
+    write(repo, "docs/adr/0002-x.md", BODY.replace("synthetic", "branch"))
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="x", title="X")
+        + "\n",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the branch carries 0002")
+
+    git(repo, "mv", "docs/adr/0002-x.md", "docs/adr/0002-y.md")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="y", title="X")
+        + "\n",
+    )
+    git(repo, "add", "-A")
+    code, out = run_check(repo)
+    assert code == 0, out
