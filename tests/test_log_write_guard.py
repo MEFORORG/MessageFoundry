@@ -2862,13 +2862,21 @@ async def test_a_raise_from_the_first_page_still_unbinds_and_pauses(
     assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
 
 
-async def test_an_ownership_check_that_raises_still_unbinds_and_holds_delivery(
+async def test_an_ownership_check_that_raises_still_unbinds_and_pauses_that_outbound(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A raise from the ownership check must not abort the halt with the latch set over bound
-    # listeners: the listener still goes down, and the outbound whose check raised is skipped.
+    # listeners: the listener still goes down. BACKLOG #5704: nor may it skip the outbound, which
+    # then delivered with no operator start once a later probe cleared the latch, while every
+    # sibling the halt paused waited for one. The halt is fail-closed, so the lane is paused,
+    # counted and alerted with the rest. MEASURED on main: it was left out of all three.
+    # The pooled dispatcher's lane is paused too, and reads quiesced: the pause path's own
+    # ownership read raised again and left it claiming, with the lane "stopping" for good.
     sink = _RecordingSink()
     runner, source = _graph(store, sink)
+    dispatcher = runner._make_dispatcher(Stage.OUTBOUND)
+    runner._dispatchers[Stage.OUTBOUND] = dispatcher
+    dispatcher.mark_ready(OUTBOUND)
 
     def raises(name: str) -> bool:
         raise RuntimeError("boom")
@@ -2877,10 +2885,33 @@ async def test_an_ownership_check_that_raises_still_unbinds_and_holds_delivery(
     await runner._stop_all_for_log_failure(sink="file", reason="disk full")
 
     assert source.stopped is True
-    # Not paused, so another engine shard's lane is never paused here, and still held: the
-    # ADR 0189 claim gate reads the latch.
-    assert OUTBOUND not in runner._outbound_paused and runner._delivery_halted
-    assert sink.log_failures == [("file", "unwritable", "disk full", 1)]
+    assert OUTBOUND in runner._outbound_paused and runner._delivery_halted
+    assert dispatcher.phase(OUTBOUND) is stage_dispatcher._LanePhase.PAUSED
+    assert runner._outbound_quiesced[OUTBOUND].is_set()
+    assert sink.log_failures == [("file", "unwritable", "disk full", 2)]
+    assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
+    # A probe that clears the latch does not resume it: it waits for an operator start, like
+    # every sibling the halt paused.
+    monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: None)
+    assert runner._log_recovery_ok() and not runner._log_write_stopped
+    assert OUTBOUND in runner._outbound_paused
+    assert dispatcher.phase(OUTBOUND) is stage_dispatcher._LanePhase.PAUSED
+
+
+def test_a_start_into_a_dead_log_pauses_an_outbound_whose_ownership_check_raises(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704: the start-time sibling of the halt read ownership unguarded, so one raising
+    # check aborted the whole delivery-tier park. MEASURED on main: RuntimeError out of the park.
+    runner, _source = _graph(store, _RecordingSink())
+
+    def raises(name: str) -> bool:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner, "_owns_destination", raises)
+    runner._park_delivery_for_log_failure()
+
+    assert OUTBOUND in runner._outbound_paused
 
 
 def test_the_rebind_gate_refuses_and_marks_an_unmarked_inbound_while_the_log_is_dead(
@@ -3136,8 +3167,9 @@ async def test_a_reload_during_the_halt_re_arms_a_stopped_lane_whose_sibling_sta
     # A lane STOPPED with no hold of its own is re-armed by the reload during the halt and gate-
     # parked, so the recovery restart releases it: the end state main reaches, where the halt
     # paused it and the restart resumed it. The sibling whose STOP is held stays STOPPED and keeps
-    # the hold, the gap against main the test below pins. MEASURED 2026-11-14: keyed by the inbound
-    # alone, the reload left the unheld lane STOPPED.
+    # the hold through the reload, and the recovery restart then re-arms it and releases the hold,
+    # as the test below pins. MEASURED 2026-11-14: keyed by the inbound alone, the reload left the
+    # unheld lane STOPPED.
     outdir, logdir = tmp_path / "out", tmp_path / "logs"
     outdir.mkdir()
     logdir.mkdir()
@@ -3168,7 +3200,8 @@ async def test_a_reload_during_the_halt_re_arms_a_stopped_lane_whose_sibling_sta
         assert not runner._log_write_stopped and INBOUND not in runner._log_halted
         assert not unheld.stopped(INBOUND), "the recovery restart left the unheld lane STOPPED"
         assert not unheld._states[INBOUND].gated, "the recovery restart left the lane gate-parked"
-        assert held.stopped(INBOUND), "the recovery restart re-armed the held STOP"
+        assert not held.stopped(INBOUND), "the recovery restart left the held STOP in place"
+        assert ("inbound", INBOUND) not in runner._stop_held, "the restart kept the hold"
     finally:
         await runner.stop()
 
@@ -3216,16 +3249,14 @@ async def test_an_unheld_stopped_pooled_lane_runs_after_a_halt_reload_and_the_re
 
 
 @pytest.mark.parametrize("held", [True, False])
-async def test_a_stopped_pooled_lane_stays_stopped_after_the_recovery_restart_until_a_reload(
+async def test_a_pooled_lane_stopped_under_the_halt_is_re_armed_by_the_recovery_restart(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: bool
 ) -> None:
-    # BACKLOG #5704: what the recovery records say about a pooled internal lane that STOPped while
-    # the log was down. The restart lifts the gate and re-arms no STOP, held (a T17 bound) or not
-    # (a leadership-loss hand-back). It also measures that a reload after that restart re-arms the
-    # lane and releases any hold: a measurement, not a remedy, so no record names it. This pins a
-    # known gap against main, where the halt paused the lane and the restart resumed it; a fix that
-    # makes the restart re-arm the lane should flip the first assertion after the restart, and the
-    # records with it.
+    # BACKLOG #5704 (ledger items 2 and 8): a pooled internal lane that STOPped while the log was
+    # down, held (a T17 bound) or not (a leadership-loss hand-back), is re-armed by the recovery
+    # restart, and its hold released, as before the halt became a claim gate, when the halt paused
+    # the lane and the restart resumed it. MEASURED on main: the restart only released gate-parked
+    # lanes, so the lane stayed STOPPED until a reload.
     outdir, logdir = tmp_path / "out", tmp_path / "logs"
     outdir.mkdir()
     logdir.mkdir()
@@ -3248,12 +3279,11 @@ async def test_a_stopped_pooled_lane_stays_stopped_after_the_recovery_restart_un
         await runner.restart_inbound(INBOUND)
         await runner.start_outbound(OUTBOUND)
         assert not runner._log_write_stopped and INBOUND not in runner._log_halted
-        assert routed.stopped(INBOUND), "the recovery restart re-armed the STOPPED lane"
-        assert (("inbound", INBOUND) in runner._stop_held) is held
-
-        await runner.reload(_e2e_registry(outdir))
-        assert not routed.stopped(INBOUND), "a reload after the recovery left the lane STOPPED"
+        assert not routed.stopped(INBOUND), "the recovery restart left the lane STOPPED"
         assert ("inbound", INBOUND) not in runner._stop_held
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until(lambda: any(outdir.iterdir())), "the re-armed lane never drained"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
     finally:
         await runner.stop()
 
@@ -3422,9 +3452,10 @@ async def test_a_claim_gate_that_raises_once_with_no_halt_lets_the_lane_drain(
 
 
 def test_lifting_the_gate_releases_only_gate_parked_lanes(store: MessageStore) -> None:
-    # BACKLOG #5704: lifting the gate unparks a lane the gate parked, and nothing else. A lane a
-    # backing-off head parked keeps its park, and a STOPPED lane keeps its STOP: release_gated is
-    # not the recovery broadcast, which re-arms STOPPED lanes and releases holds.
+    # BACKLOG #5704: release_gated, which a latch clearing runs, unparks a lane the gate parked,
+    # and nothing else. A lane a backing-off head parked keeps its park, and a STOPPED lane keeps
+    # its STOP: release_gated is not the recovery broadcast, which re-arms STOPPED lanes and
+    # releases holds. An inbound's own lift at its restart is tested below.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
     dispatcher = runner._make_dispatcher(Stage.ROUTED)
@@ -3481,8 +3512,209 @@ async def test_a_row_claimed_before_the_gate_shut_is_released_when_leadership_is
     result = await runner._refuse_log_halted(item)
 
     if leader:
-        assert result.kind is LaneResultKind.RETRY
+        assert result.kind is LaneResultKind.RETRY and result.hand_back
         assert (released, rescheduled) == ([], [[item.id]])
     else:
         assert result.kind is LaneResultKind.STOP
         assert (released, rescheduled) == ([[item.id]], [])
+
+
+@pytest.mark.parametrize("hand_back", [True, False])
+async def test_a_hand_back_leaves_the_lanes_infra_fault_count_as_it_was(
+    store: MessageStore, hand_back: bool
+) -> None:
+    # BACKLOG #5704 (ledger item 3): the pooled hand-back of a row claimed before the gate shut is a
+    # RETRY the lane never ran, so it must not reset the lane's T17 streak or its lane_stuck latch,
+    # as a content RETRY does. MEASURED on main: the hand-back read as a content RETRY and reset
+    # both. Control: a content RETRY (hand_back False) still resets them.
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    dispatcher = runner._make_dispatcher(Stage.INGRESS)
+    await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+    claimed = await store.claim_fifo_heads(Stage.INGRESS.value, [INBOUND], now=time.time() + 1)
+    (item,) = claimed.by_lane[INBOUND]
+    park_until = time.time() + 60
+
+    async def body(lane: str, it: object) -> stage_dispatcher.LaneItemResult:
+        return stage_dispatcher.LaneItemResult(
+            LaneResultKind.RETRY, park_until, hand_back=hand_back
+        )
+
+    dispatcher._process_item = body
+    dispatcher._call_later = asyncio.get_running_loop().call_later
+    outcome, _tail, _resched = await dispatcher._drain_lane(INBOUND, [item])
+    dispatcher.mark_ready(INBOUND)
+    st = dispatcher._states[INBOUND]
+    st.infra_error_streak = 2
+    st.lane_stuck_alerted = True
+    try:
+        dispatcher._apply_retry(INBOUND, st, outcome)
+        if hand_back:
+            assert (st.infra_error_streak, st.lane_stuck_alerted) == (2, True)
+        else:
+            assert (st.infra_error_streak, st.lane_stuck_alerted) == (0, False)
+        assert dispatcher.phase(INBOUND) is stage_dispatcher._LanePhase.PARKED
+    finally:
+        dispatcher._cancel_timer(INBOUND)
+
+
+async def _until_stage_pending(
+    store: MessageStore, message_id: str, stage: Stage, timeout: float = 5.0
+) -> bool:
+    """Whether ``message_id``'s ``stage`` row reads PENDING with no attempt spent in the window."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        async with store._read() as db:
+            cur = await db.execute(
+                "SELECT status, attempts FROM queue WHERE message_id=? AND stage=?",
+                (message_id, stage.value),
+            )
+            rows = list(await cur.fetchall())
+        if len(rows) == 1 and rows[0]["status"] == "pending":
+            assert rows[0]["attempts"] == 0, "the hand-back spent an attempt"
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+@pytest.mark.parametrize("stage", [Stage.INGRESS, Stage.ROUTED])
+async def test_a_per_lane_batch_claimed_as_the_halt_latches_is_handed_back_unrun(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: Stage
+) -> None:
+    # BACKLOG #5704 (ledger closing step 3): a per_lane router or transform worker read the claim
+    # gate only at its loop top, so a batch whose claim was in flight when the halt latched ran
+    # whole. Its worker now reads the gate again once the claim returns and hands the batch back
+    # unrun, with no attempt spent. MEASURED on main: the row was routed (INGRESS) or transformed
+    # (ROUTED) under the latch.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "per_lane")
+    real_claim = store.claim_next_fifo
+    tripped: list[str] = []
+
+    async def claim_then_latch(*args: Any, **kwargs: Any) -> Any:
+        item = await real_claim(*args, **kwargs)
+        if item is not None and kwargs.get("stage") == stage.value and not tripped:
+            tripped.append(item.id)
+            runner._log_write_stopped = True  # the halt latched while this claim was in flight
+        return item
+
+    monkeypatch.setattr(store, "claim_next_fifo", claim_then_latch)
+    await runner.start()
+    try:
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        runner._wake_lane(Stage.INGRESS, INBOUND)
+        assert await _until(lambda: bool(tripped)), "the claim never ran"
+        assert await _until_stage_pending(store, message_id, stage), "the batch was not handed back"
+        await asyncio.sleep(0.3)
+        assert await store.outbox_for(message_id) == [], "the batch ran under the latch"
+        assert list(outdir.iterdir()) == []
+        if stage is Stage.INGRESS:
+            fetched = await store.get_message(message_id)
+            assert fetched is not None and fetched["status"] == MessageStatus.RECEIVED.value
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("in_flight", [False, True])
+def test_an_inbounds_lift_re_arms_its_stopped_pooled_lane_unless_rows_are_in_flight(
+    store: MessageStore, in_flight: bool
+) -> None:
+    # BACKLOG #5704 (ledger items 2 and 8): the lift at an inbound's restart re-arms its STOPPED
+    # pooled internal lane and lifts the hold, except a lane whose STOP left claimed rows in
+    # flight, which a re-arm would claim past (the T16 STOP branch's own rule in _run_lane).
+    # MEASURED on main: the lift left every STOPPED lane STOPPED.
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    dispatcher = runner._make_dispatcher(Stage.ROUTED)
+    runner._dispatchers[Stage.ROUTED] = dispatcher
+    dispatcher.mark_ready(INBOUND)
+    st = dispatcher._states[INBOUND]
+    st.phase = stage_dispatcher._LanePhase.STOPPED
+    st.unlanded = in_flight
+    runner._hold_for_operator(INBOUND, "inbound", Stage.ROUTED)
+    runner._log_halted.add(INBOUND)
+
+    runner._lift_log_halt(INBOUND)
+
+    assert INBOUND not in runner._log_halted
+    assert dispatcher.stopped(INBOUND) is in_flight
+    assert (("inbound", INBOUND) in runner._stop_held) is in_flight
+
+
+def test_an_inbounds_lift_keeps_the_shared_hold_while_a_sibling_lane_holds_rows(
+    store: MessageStore,
+) -> None:
+    # BACKLOG #5704 review: one ("inbound", name) hold covers every internal stage. When the lift
+    # keeps one stage STOPPED for its rows in flight, re-arming a sibling must not release that
+    # hold, or a later window open brings the listener up over the kept lane (BACKLOG #2072).
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    phase = stage_dispatcher._LanePhase
+    for stage in (Stage.INGRESS, Stage.ROUTED):
+        d = runner._make_dispatcher(stage)
+        runner._dispatchers[stage] = d
+        d.mark_ready(INBOUND)
+        d._states[INBOUND].phase = phase.STOPPED
+    runner._dispatchers[Stage.ROUTED]._states[INBOUND].unlanded = True
+    runner._hold_for_operator(INBOUND, "inbound", Stage.ROUTED)
+    runner._log_halted.add(INBOUND)
+
+    runner._lift_log_halt(INBOUND)
+
+    assert not runner._dispatchers[Stage.INGRESS].stopped(INBOUND)
+    assert runner._dispatchers[Stage.ROUTED].stopped(INBOUND)
+    assert ("inbound", INBOUND) in runner._stop_held
+
+
+async def test_a_per_lane_hand_back_whose_release_fails_re_pends_the_batch_and_goes_on(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704 review: when the post-claim hand-back's release fails, the worker must not
+    # return with the batch in flight, where the recovery restart's respawn would claim past it.
+    # It re-pends the rows while it holds the lane, and once they land goes on to wait at its gate.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "per_lane")
+    real_claim = store.claim_next_fifo
+    tripped: list[str] = []
+
+    async def claim_then_latch(*args: Any, **kwargs: Any) -> Any:
+        item = await real_claim(*args, **kwargs)
+        if item is not None and not tripped:
+            tripped.append(item.id)
+            runner._log_write_stopped = True
+        return item
+
+    async def release_fails(ids: list[str]) -> None:
+        raise RuntimeError("store full")
+
+    monkeypatch.setattr(store, "claim_next_fifo", claim_then_latch)
+    monkeypatch.setattr(store, "release_claimed", release_fails)
+    await runner.start()
+    try:
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        runner._wake_lane(Stage.INGRESS, INBOUND)
+        assert await _until(lambda: bool(tripped)), "the claim never ran"
+
+        async def re_pended() -> bool:
+            async with store._read() as db:
+                cur = await db.execute(
+                    "SELECT status FROM queue WHERE message_id=? AND stage=?",
+                    (message_id, Stage.INGRESS.value),
+                )
+                rows = list(await cur.fetchall())
+            return len(rows) == 1 and rows[0]["status"] == "pending"
+
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not await re_pended():
+            assert asyncio.get_running_loop().time() < deadline, "the batch stayed in flight"
+            await asyncio.sleep(0.02)
+        worker = runner._router_workers[INBOUND]
+        await asyncio.sleep(0.2)
+        assert not worker.done(), "the worker returned instead of waiting at its gate"
+        assert await store.outbox_for(message_id) == []
+    finally:
+        await runner.stop()
