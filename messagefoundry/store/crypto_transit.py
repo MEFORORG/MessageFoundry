@@ -394,12 +394,12 @@ def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = N
 
 
 def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
-    """Log the warning ``kind()`` builds, rate-limited per kind by :data:`_WARNING_LOG_INTERVAL_S`,
-    with the exceptions the body states. The slot is taken before the warning, so concurrent
-    callers emit it at most once. When building or logging the warning fails,
-    or a fault escapes it, the slot is given back, to the time it held before or to empty, unless a
-    later caller has taken it since; when giving it back fails too, the slot stays taken for the
-    interval. A failure building the key, or in the slot's bookkeeping, is reported by
+    """Log the warning ``build`` makes, rate-limited per key ``kind()`` returns by
+    :data:`_WARNING_LOG_INTERVAL_S`, with at least the exceptions below. The slot is taken before
+    the warning, so concurrent callers emit it at most once. When building or logging the warning
+    fails, or a fault escapes it, the slot is given back, to the time it held before or to empty,
+    unless a later caller has taken it since; when giving it back fails too, the slot stays taken
+    for the interval. A failure building the key, or in the slot's bookkeeping, is reported by
     :func:`_report_unlogged` naming that step, and the warning is then not logged. Where
     :func:`_report_unlogged` itself raises, out of memory or stack, the exception propagates."""
     try:
