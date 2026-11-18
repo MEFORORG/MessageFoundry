@@ -6,7 +6,8 @@
 detector (``docs/security/``, the vault-only security corpus) used to judge only that relative key.
 So naming the directory itself, a file inside it, or its parent (``docs``) dropped the
 ``docs/security/`` prefix from the key, and the run exited 0 over a private security document. The
-detector now also judges ``_location``: the file's real path, relative to the work tree holding it.
+detector now also judges ``_locations``: the file's path as named and its real path, each relative
+to the outermost work tree holding it, and a file is a hit if either falls under docs/security.
 
 The other half of the row, a nonexistent path named beside a real one exiting 0, was fixed under
 BACKLOG #5585 (the ``_NO_ROOT`` refusal); the last test pins it.
@@ -162,16 +163,105 @@ def test_control_a_parent_dot_dot_out_of_docs_security_is_not_a_hit(
     assert _REASON not in out
 
 
-def test_control_a_work_tree_under_a_docs_security_directory_is_not_a_hit(
+def test_a_work_tree_under_a_docs_security_directory_fails_closed(
     mod, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Control: the location is relative to the work tree, so a clone that itself sits under some
-    ``docs/security`` directory is not a hit on every file it holds."""
+    """A ``.git`` at or below a docs/security directory is no work-tree boundary, so a clone that
+    itself sits under one is a hit on every file it holds. This was a control that read clean; it
+    is indistinguishable from a planted ``.git`` below docs/security, so it now fails closed."""
     clone = tmp_path / "docs" / "security" / "clone"
     (clone / "src").mkdir(parents=True)
     (clone / ".git").write_text("gitdir: nowhere\n", encoding="utf-8")
     (clone / "src" / "app.py").write_text("plain prose\n", encoding="utf-8")
     code, out = _run(mod, capsys, str(clone))
+    assert code == 1, out
+    assert _REASON in out
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        pytest.param(("docs", "security"), id="at-docs-security"),
+        pytest.param(("docs", "security", "sub"), id="below-docs-security"),
+    ],
+)
+@pytest.mark.parametrize("as_dir", [False, True], ids=["git-file", "git-dir"])
+def test_a_planted_git_entry_under_docs_security_does_not_strip_the_prefix(
+    mod,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    planted: tuple[str, ...],
+    as_dir: bool,
+) -> None:
+    """A commit snapshot written outside any work tree, carrying a ``.git`` entry at or below
+    docs/security, must not make that directory the top of a work tree: it would drop the prefix
+    the rule keys on, and naming the directory read clean (BACKLOG #5446)."""
+    snap = tmp_path / "snap"
+    where = snap.joinpath(*planted)
+    where.mkdir(parents=True)
+    (where / "notes.md").write_text("plain prose\n", encoding="utf-8")
+    if as_dir:
+        (where / ".git").mkdir()
+    else:
+        (where / ".git").write_text("gitdir: nowhere\n", encoding="utf-8")
+    for named in (where, where / "notes.md"):
+        code, out = _run(mod, capsys, str(named))
+        assert code == 1, (named, out)
+        assert _REASON in out
+
+
+def _link(target: Path, link: Path, *, is_dir: bool = False) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=is_dir)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create a link here ({type(exc).__name__})")
+
+
+def test_a_link_under_docs_security_pointing_out_is_judged_where_it_sits(
+    mod, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file link that sits under docs/security and points outside it is a hit, by the path it
+    was walked or named at, though where it lands is clean (BACKLOG #5446)."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "plain.md").write_text("plain prose\n", encoding="utf-8")
+    sec = tmp_path / "snap" / "docs" / "security"
+    sec.mkdir(parents=True)
+    _link(outside / "plain.md", sec / "notes.md")
+    for named in (sec, sec / "notes.md", sec.parent):
+        code, out = _run(mod, capsys, str(named))
+        assert code == 1, (named, out)
+        assert _REASON in out
+
+
+def test_a_docs_security_that_is_itself_a_link_out_is_judged_where_it_sits(
+    mod, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Naming a docs/security directory that is a link to a clean directory elsewhere."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "plain.md").write_text("plain prose\n", encoding="utf-8")
+    docs = tmp_path / "snap" / "docs"
+    docs.mkdir(parents=True)
+    _link(outside, docs / "security", is_dir=True)
+    for named in (docs / "security", docs / "security" / "plain.md"):
+        code, out = _run(mod, capsys, str(named))
+        assert code == 1, (named, out)
+        assert _REASON in out
+
+
+def test_control_a_link_out_of_a_clean_directory_stays_clean(
+    mod, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Control: the same link one directory over from docs/security is not a hit, so the rule
+    above is where the link sits."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "plain.md").write_text("plain prose\n", encoding="utf-8")
+    other = tmp_path / "snap" / "docs" / "other"
+    other.mkdir(parents=True)
+    _link(outside / "plain.md", other / "notes.md")
+    code, out = _run(mod, capsys, str(other))
     assert code == 0, out
     assert _REASON not in out
 

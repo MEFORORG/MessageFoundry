@@ -2209,26 +2209,42 @@ def _tracked_under(root: Path) -> set[str] | None:
 
 
 #: A file to judge: its openable path, its scan-root-relative posix path, and in ``--path`` mode
-#: where it really is (``_location``), which the location rule judges too; ``None`` elsewhere, where
-#: the relative path is already relative to the repository.
-_Candidate = tuple[Path, str, str | None]
+#: where it is (``_locations``), which the location rule judges too; empty elsewhere, where the
+#: relative path is already relative to the repository.
+_Candidate = tuple[Path, str, tuple[str, ...]]
 
 
-def _location(path: Path) -> str:
-    """Where ``path`` really is, as the location rule judges it in ``--path`` mode (BACKLOG #5446):
-    its real path, relative to the work tree holding it, or whole outside any work tree; NFC and
-    case-folded as ``_path_key`` folds. Real, so a link, junction or subst drive into docs/security,
-    a root named from inside ``docs``, or one reached by ``..``, is judged where it lands, in its
-    on-disk case where the platform reports one. Relative to the work tree, so a clone that itself
-    sits under some ``docs/security`` directory is not a hit on every file. The OUTERMOST work
-    tree, so a nested clone or submodule under ``docs/security`` does not strip that prefix.
-    Empty for the top."""
-    real = Path(os.path.realpath(path))
-    tops = [top for top in (real, *real.parents) if (top / ".git").exists()]
+def _tree_relative(path: Path) -> str:
+    """``path`` relative to the outermost work tree holding it, or whole outside any work tree; NFC
+    and case-folded as ``_path_key`` folds. Empty for the top. Relative to the work tree, so a
+    file's location carries no directory above the clone. The OUTERMOST work tree, so a nested clone
+    or submodule does not strip the prefix above it. A ``.git`` entry at or below a ``docs/security``
+    directory is no work-tree boundary at all (BACKLOG #5446): a commit snapshot written outside any
+    work tree that carries one would otherwise make that directory the top and drop the prefix the
+    location rule keys on. So a clone that itself sits under some ``docs/security`` directory is a
+    hit on every file it holds: fail closed."""
+    tops = [
+        top
+        for top in (path, *path.parents)
+        if (top / ".git").exists()
+        and forbidden_path_reason(_path_key(top.as_posix()) + "/") is None
+    ]
     if not tops:
-        return _path_key(real.as_posix())
-    rel = real.relative_to(tops[-1]).as_posix()
+        return _path_key(path.as_posix())
+    rel = path.relative_to(tops[-1]).as_posix()
     return "" if rel == "." else _path_key(rel)
+
+
+def _locations(path: Path) -> tuple[str, ...]:
+    """Where ``path`` is, as the location rule judges it in ``--path`` mode (BACKLOG #5446): both its
+    path as named, made absolute, and its real path, each by ``_tree_relative``. A file is a hit if
+    EITHER falls under docs/security. The real path, so a link, junction or subst drive into
+    docs/security, a root named from inside ``docs``, or one reached by ``..``, is judged where it
+    lands, in its on-disk case where the platform reports one. The named path, so a link that sits
+    under docs/security and points out of it is judged where it sits as well."""
+    named = _tree_relative(Path(os.path.abspath(path)))
+    real = _tree_relative(Path(os.path.realpath(path)))
+    return (named,) if named == real else (named, real)
 
 
 #: How a --path hit for a named root that does not exist ends. ``main`` leaves such a hit out of the
@@ -2245,7 +2261,7 @@ def _walk(raw: str, out: list[_Candidate], errors: list[str]) -> None:
     it without a word, except one below the root whose listing raises ENOENT or ENOTDIR, which is
     passed over as removed since it was listed, whatever the cause of that errno."""
     root = Path(raw)
-    at = _location(root)
+    at_root = _locations(root)
     tracked = _tracked_under(root)
     tracked_dirs = {
         "/".join(p.split("/")[:i]) for p in tracked or () for i in range(1, p.count("/") + 1)
@@ -2289,12 +2305,12 @@ def _walk(raw: str, out: list[_Candidate], errors: list[str]) -> None:
             ):
                 continue
             path = Path(top) / name
-            # A link inside the root (a file link, or a junction the walk descended) is judged
-            # where it lands; everything else by the root's location joined to its path.
+            # Every file by the root's locations joined to its path, which is where it sits; a link
+            # inside the root (a file link, or a junction the walk descended) where it lands too.
+            key = _path_key(rel)
+            where = tuple(f"{at}/{key}" if at else key for at in at_root)
             if os.path.realpath(path) != os.path.abspath(path):
-                where = _location(path)
-            else:
-                where = f"{at}/{_path_key(rel)}" if at else _path_key(rel)
+                where += _locations(path)
             out.append((path, rel, where))
 
 
@@ -2320,16 +2336,16 @@ def _candidate_files(paths: list[str], *, path_mode: bool) -> tuple[list[_Candid
             root = Path(raw)
             if root.is_file():
                 # rel is the bare name, matching the directory case, where the rel path starts below
-                # the root the caller NAMED. Its location (_location) is judged too, so a regular
-                # file named under docs/security/ is still a hit (BACKLOG #5446).
+                # the root the caller NAMED. Its locations (_locations) are judged too, so a file
+                # named under docs/security/ is still a hit (BACKLOG #5446).
                 if root.name != ".git":
-                    out.append((root, root.name, _location(root)))
+                    out.append((root, root.name, _locations(root)))
                 continue
             _walk(raw, out, errors)
         return out, errors
     if paths:
-        return [(Path(a), Path(a).as_posix(), None) for a in paths], []
-    return [(Path(p), Path(p).as_posix(), None) for p in _git_tracked()], []
+        return [(Path(a), Path(a).as_posix(), ()) for a in paths], []
+    return [(Path(p), Path(p).as_posix(), ()) for p in _git_tracked()], []
 
 
 #: Byte-order marks, longest first: a UTF-32-LE mark begins with the UTF-16-LE one. The wide entries of
@@ -2414,7 +2430,7 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     return _scan_file(path, rel_posix, show_context=show_context)[0]
 
 
-def _name_hits(path: Path, posix: str, where: str | None = None) -> tuple[list[str], bool]:
+def _name_hits(path: Path, posix: str, where: tuple[str, ...] = ()) -> tuple[list[str], bool]:
     """The hits a file earns by its path and name alone, and whether its content is not to be read.
     Judged whatever its bytes are. ``_scan_file`` keeps them when the content cannot be read, and the
     non-file branch of ``main`` keeps them beside any does-not-exist or unreadable hit.
@@ -2423,14 +2439,13 @@ def _name_hits(path: Path, posix: str, where: str | None = None) -> tuple[list[s
     several roots it names the root (the branch leak scan's commit directory). Under an absolute root
     that path can carry a user-home path.
 
-    ``where`` is where the file really is, from ``_location``, and the location rule judges it beside
+    ``where`` is where the file is, from ``_locations``, and the location rule judges each beside
     ``posix`` (BACKLOG #5446). In ``--path`` mode ``posix`` starts below the root the caller named, so
     naming ``docs/security`` itself, a file in it, or its parent ``docs`` dropped the prefix the rule
     keys on, and a private document read clean."""
     # Case-folded in every mode, so the staged and tracked scans agree with --path on Docs/Security.
-    if reason := forbidden_path_reason(_path_key(posix)) or (
-        where and forbidden_path_reason(where)
-    ):
+    judged = (_path_key(posix), *where)
+    if reason := next(filter(None, map(forbidden_path_reason, judged)), None):
         return [f"{path.as_posix()}:0: {reason}"], True
     hits: list[str] = []
     # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
@@ -2545,7 +2560,7 @@ def _scan_file(
     rel_posix: str | None = None,
     *,
     show_context: bool = False,
-    where: str | None = None,
+    where: tuple[str, ...] = (),
 ) -> tuple[list[str], _FileState]:
     """``scan_file``'s hits, and what became of the file's content. A binary file is judged by its name
     and location only, so the run must not count it as scanned, and an unreadable one is an instrument
