@@ -10,7 +10,7 @@ reaches the app serving ``POST /ai/chat``, and the endpoint is not loopback
 enforcing or unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested``
 is set with its reason. Since BACKLOG #5527 the broker resolves the instance ``[tls]`` policy, so
 ``[tls].internal_ca_file`` under ``augment`` or ``pinned`` and ``[tls].crl_file`` reach its
-opener; the last section pins that.
+opener; the section "the [tls] policy reaches the broker's opener" pins that.
 All endpoints, keys, certificates and CRLs here are synthetic.
 """
 
@@ -22,6 +22,7 @@ import json
 import re
 import ssl
 import urllib.request
+import weakref
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import NamedTuple
@@ -55,6 +56,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
+    CrlNoCredit,
     HopPosture,
     TrustAnchorPolicy,
 )
@@ -76,13 +78,15 @@ _LOGGER = "messagefoundry.transports.ai_broker"
 
 @pytest.fixture(autouse=True)
 def _fresh_crossings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Each test starts with no crossing logged, no anchored opener held and no process-wide
-    attestation set."""
+    """Each test starts with no crossing logged, no anchored opener held, no held CRL copy
+    recorded and no process-wide attestation set. Each is restored after the test."""
     # raising=False only so this file fails on its assertions, not in setup, where the set is
     # absent; the once-per-process tests below go red if it is renamed.
     monkeypatch.setattr(ai_broker_mod, "_LOGGED_CROSSINGS", set(), raising=False)
     # raising=True: a renamed slot must fail here, or held openers would leak across tests.
     monkeypatch.setattr(ai_broker_mod, "_anchored_opener", None, raising=True)
+    # The anchored contexts these tests build are recorded here; other suites reset it the same way.
+    monkeypatch.setattr(loaded_crls, "_HELD", weakref.WeakKeyDictionary(), raising=True)
     monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
     yield
 
@@ -800,6 +804,41 @@ def test_the_anchored_opener_is_held_across_requests(pki: _Pki) -> None:
     third = _broker(posture=_ENFORCING, policy=pinned)
     assert third._opener is not first._opener
     assert _broker(posture=_ENFORCING, policy=pinned)._opener is third._opener
+
+
+def test_an_anchor_that_stops_narrowing_empties_the_held_slot(pki: _Pki) -> None:
+    """Once the anchor narrows nothing the broker dials the shared opener, and the slot no longer
+    holds the anchored one, so its context is not kept as a live hop nothing dials. Red on the
+    parent commit: the slot kept the old opener for the rest of the process."""
+    first = _broker(posture=_ENFORCING, policy=TrustAnchorPolicy(crl_file=pki.crl_file))
+    assert ai_broker_mod._anchored_opener is not None
+    assert ai_broker_mod._anchored_opener[1] is first._opener
+    second = _broker(posture=_WARN, policy=TrustAnchorPolicy())
+    assert second._opener is _shared_no_redirect_opener()
+    assert ai_broker_mod._anchored_opener is None
+
+
+def test_control_a_policy_that_never_narrowed_leaves_the_slot_empty() -> None:
+    assert _broker(posture=_WARN, policy=None)._opener is _shared_no_redirect_opener()
+    assert ai_broker_mod._anchored_opener is None
+
+
+@pytest.mark.parametrize(
+    ("crl_reachable", "lever"),
+    [(True, "_AI_CRL_LEVER"), (False, "_AI_ATTESTATION_LEVER")],
+    ids=["crl-reachable", "no-policy"],
+)
+def test_each_remedy_is_a_constant_as_written(crl_reachable: bool, lever: str) -> None:
+    """The remedy the refusal prints is one of the module's constants verbatim, so the logged
+    sentence can be found in the source. Red on the parent commit: the no-CRL remedy was built by
+    upper-casing the first character of a constant that read "set ...", and the CRL remedy was
+    two constants joined."""
+    text = ai_broker_mod._revocation_lever(
+        crl_reachable=crl_reachable, no_credit=CrlNoCredit.NO_CRL
+    )
+    assert text == getattr(ai_broker_mod, lever)
+    assert text.startswith("Set ")
+    assert _PAIR in text
 
 
 def test_a_tls_file_that_cannot_be_loaded_is_the_brokers_own_error(tmp_path: Path) -> None:
