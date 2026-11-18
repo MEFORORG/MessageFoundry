@@ -272,6 +272,10 @@ async def run_strip_pass(
                 if batch.updates:
                     try:
                         landed = await write(batch.updates)
+                    except CipherError:
+                        # Store-wide, as from the transform: raise it, so its instruction reaches
+                        # the operator.
+                        raise
                     except Exception as exc:
                         # The batch rolled back whole and counts nothing; the keyset goes on past
                         # it, so a fault on particular rows cannot stop the rows after the failing

@@ -977,6 +977,18 @@ async def test_two_adjacent_batches_whose_writes_fail_do_not_stop_the_rows_after
     assert not any("SECRET-TEXT" in r.getMessage() for r in caplog.records)
 
 
+async def test_a_cipher_error_from_a_batch_write_propagates() -> None:
+    """BACKLOG #5651: a store-wide :class:`CipherError` raised by a backend's write is not passed
+    over as a failed write: it propagates, so its instruction reaches the operator."""
+    from messagefoundry.store.crypto import CipherError
+
+    async def sealing_write(_updates: Any) -> list[Any]:
+        raise CipherError("AES-GCM invocation ceiling reached; rotate the store key")
+
+    with pytest.raises(CipherError, match="rotate the store key"):
+        await _run_pass(_keyset_fetch(_plain_rows(2)), sealing_write, _no_report)
+
+
 async def test_a_failed_batch_write_is_flagged_but_is_not_audited_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
