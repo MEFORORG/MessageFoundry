@@ -6,6 +6,9 @@ The existing suites are run through a single ``python -m pytest … --junitxml``
 JUnit parsing — no extra dependency, no pytest re-entrancy) and each row's verdict is aggregated from
 its file(s). Server-DB suites self-skip off-server via their ``MEFOR_TEST_*`` gates, so a row backed
 by ``test_postgres_store.py`` reports ``SKIP`` on a box without Postgres rather than failing.
+A server suite counts as exercised when its gated file has at least one PASS: each file in
+:data:`~harness.acceptance.matrix.SERVER_SUITE_GATES` is checked to skip whole while its gate is
+closed, so a pass there means the gate was open. A file that ran partly reads ``PASS`` with its counts beside it.
 
 ``HARNESS`` and ``MANUAL`` rows are reported ``MANUAL`` with the command / instruction — never
 auto-passed.
@@ -17,6 +20,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +39,34 @@ _PYTEST_TESTS_FAILED = 1
 _COLLECTION_FAILURE = "collection failure"
 
 
+@dataclass(frozen=True)
+class FileCounts:
+    """How many of one file's JUnit testcases fell into each outcome.
+
+    These count ``<testcase>`` elements as pytest wrote them, so a test that fails and then errors
+    in teardown counts twice. ``errored`` is a collection failure (the file's ``ERROR`` verdict);
+    any other JUnit error counts as ``failed``. An xfail reads ``SKIP`` for the verdict but is kept
+    out of ``skipped``, so ``skipped`` holds only tests that did not run.
+    """
+
+    passed: int = 0
+    skipped: int = 0
+    xfailed: int = 0
+    failed: int = 0
+    errored: int = 0
+
+
+#: The verdict each :class:`FileCounts` field feeds; within a file FAIL > ERROR > PASS > SKIP.
+_KIND_STATUS: dict[str, Status] = {
+    "passed": Status.PASS,
+    "skipped": Status.SKIP,
+    "xfailed": Status.SKIP,
+    "failed": Status.FAIL,
+    "errored": Status.ERROR,
+}
+_FILE_ORDER = (Status.FAIL, Status.ERROR, Status.PASS, Status.SKIP)
+
+
 @dataclass
 class PytestRun:
     """What one pytest run reported: each requested file's :class:`Status`, plus a run-level error.
@@ -46,6 +78,8 @@ class PytestRun:
 
     by_file: dict[str, Status] = field(default_factory=dict)
     run_error: str = ""
+    #: Each file's testcase counts, shown beside its verdict; the verdict itself is ``by_file``.
+    counts: dict[str, FileCounts] = field(default_factory=dict)
 
 
 #: A pytest runner runs the requested node-ids (files) once and reports a :class:`PytestRun`.
@@ -66,18 +100,20 @@ def _normalize(path: str) -> str:
     return path.replace("\\", "/")
 
 
-def _parse_junit_by_file(junit_path: Path) -> tuple[dict[str, Status], list[str]]:
+def _parse_junit_by_file(
+    junit_path: Path,
+) -> tuple[dict[str, Status], list[str], dict[str, FileCounts]]:
     """Aggregate a pytest JUnit XML into one :class:`Status` per source file.
 
-    Also returns the names of failing testcases that carry no ``file`` attribute (a
-    collection error in a file outside the repo root, say), which no row can own. Raises
-    :class:`ElementTree.ParseError` on truncated XML and :class:`OSError` on an unreadable file.
+    Also returns each file's :class:`FileCounts`, and the names of failing testcases that carry no
+    ``file`` attribute (a collection error in a file outside the repo root, say), which no row can
+    own. Raises :class:`ElementTree.ParseError` on truncated XML and :class:`OSError` on an
+    unreadable file.
     """
     if not junit_path.is_file():
-        return {}, []
+        return {}, [], {}
     tree = ElementTree.parse(junit_path)
-    # Collect each file's testcase outcomes; precedence within a file: FAIL > ERROR > PASS > SKIP.
-    per_file: dict[str, set[Status]] = {}
+    per_file: defaultdict[str, Counter[str]] = defaultdict(Counter)
     unattributed: list[str] = []
     for case in tree.iter("testcase"):
         failed = case.find("failure") is not None or case.find("error") is not None
@@ -88,27 +124,24 @@ def _parse_junit_by_file(junit_path: Path) -> tuple[dict[str, Status], list[str]
             continue
         key = _normalize(file_attr)
         error = case.find("error")
+        skipped = case.find("skipped")
         if error is not None and error.get("message") == _COLLECTION_FAILURE:
-            outcome = Status.ERROR  # the module did not import: the check broke, not the product
+            kind = "errored"  # the module did not import: the check broke, not the product
         elif failed:
-            outcome = Status.FAIL
-        elif case.find("skipped") is not None:
-            outcome = Status.SKIP
+            kind = "failed"
+        elif skipped is not None:
+            kind = "xfailed" if skipped.get("type") == "pytest.xfail" else "skipped"
         else:
-            outcome = Status.PASS
-        per_file.setdefault(key, set()).add(outcome)
+            kind = "passed"
+        per_file[key][kind] += 1
 
     result: dict[str, Status] = {}
-    for key, outcomes in per_file.items():
-        if Status.FAIL in outcomes:
-            result[key] = Status.FAIL
-        elif Status.ERROR in outcomes:
-            result[key] = Status.ERROR
-        elif Status.PASS in outcomes:
-            result[key] = Status.PASS
-        else:  # only skips collected
-            result[key] = Status.SKIP
-    return result, unattributed
+    counts: dict[str, FileCounts] = {}
+    for key, kinds in per_file.items():
+        seen = {_KIND_STATUS[kind] for kind in kinds}
+        result[key] = next(status for status in _FILE_ORDER if status in seen)
+        counts[key] = FileCounts(**kinds)
+    return result, unattributed, counts
 
 
 def _judge_run(
@@ -176,10 +209,11 @@ def default_pytest_runner(node_ids: Sequence[str], *, timeout: float = 1800.0) -
         except subprocess.TimeoutExpired:
             return PytestRun({}, f"pytest timed out after {timeout:g}s")
         try:
-            by_file, unattributed = _parse_junit_by_file(junit)
+            by_file, unattributed, counts = _parse_junit_by_file(junit)
         except (ElementTree.ParseError, OSError) as exc:
             return PytestRun({}, f"unreadable JUnit XML ({exc})")
-        return PytestRun(by_file, _judge_run(node_ids, proc.returncode, by_file, unattributed))
+        error = _judge_run(node_ids, proc.returncode, by_file, unattributed)
+        return PytestRun(by_file, error, counts)
 
 
 _ONCE_ORDER = (Status.FAIL, Status.ERROR, Status.PASS, Status.SKIP)
@@ -202,6 +236,24 @@ def _aggregate(statuses: Iterable[Status], *, per_db: bool = False) -> Status | 
     return None
 
 
+def _partial_note(counts: FileCounts | None) -> str:
+    """`` (n passed, k skipped)`` for a file that ran partly, so its skips show beside its verdict."""
+    if counts is None or not counts.skipped:
+        return ""
+    if not (counts.passed or counts.xfailed or counts.failed or counts.errored):
+        return ""  # skipped whole: the verdict already says SKIP
+    extra = "".join(
+        f", {n} {label}"
+        for n, label in (
+            (counts.xfailed, "xfailed"),
+            (counts.failed, "failed"),
+            (counts.errored, "errored"),
+        )
+        if n
+    )
+    return f" ({counts.passed} passed, {counts.skipped} skipped{extra})"
+
+
 def _pytest_row_result(row: MatrixRow, run: PytestRun) -> RowResult:
     parts: list[str] = []
     statuses: list[Status] = []
@@ -211,7 +263,7 @@ def _pytest_row_result(row: MatrixRow, run: PytestRun) -> RowResult:
         if status is None:
             status = Status.ERROR  # requested but not collected (missing file / collection error)
         statuses.append(status)
-        parts.append(f"{Path(key).name}={status.value}")
+        parts.append(f"{Path(key).name}={status.value}{_partial_note(run.counts.get(key))}")
     if run.run_error:
         # The run broke somewhere the per-file map cannot show, so no row of it may PASS or SKIP.
         statuses.append(Status.ERROR)
