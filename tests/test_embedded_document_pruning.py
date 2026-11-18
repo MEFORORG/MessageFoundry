@@ -989,6 +989,24 @@ async def test_a_cipher_error_from_a_batch_write_propagates() -> None:
         await _run_pass(_keyset_fetch(_plain_rows(2)), sealing_write, _no_report)
 
 
+async def test_a_write_that_returns_none_is_passed_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5651: a backend write that returns something malformed is passed over like any
+    other failed batch, and the scan goes on, rather than failing the whole pass."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    writes: list[int] = []
+
+    async def none_once(updates: Any) -> Any:
+        writes.append(len(updates))
+        return None if len(writes) == 1 else list(updates)
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(3)), none_once, _no_report)
+
+    assert len(writes) == 3
+    assert (result.messages_stripped, result.ended_early) == (2, False)
+
+
 async def test_a_failed_batch_write_is_flagged_but_is_not_audited_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

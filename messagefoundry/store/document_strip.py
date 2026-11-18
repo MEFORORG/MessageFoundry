@@ -44,7 +44,7 @@ refused cells the batch had found before it are still audited. A batch whose tra
 anything else counts nothing, is logged (its type at WARNING, its traceback at DEBUG), and the
 keyset moves past it; its rows are tried again on the next pass. A batch whose write raises is
 rolled back whole and passed over the same way, but logged at ERROR, and the call is flagged
-``write_failed``.
+``write_failed``, except a CipherError, which propagates.
 
 A strip call ends early, flagged ``ended_early`` with what its batches committed, in two cases: a
 batch read fails (``read_failed`` is then set too), or at least :data:`OUTAGE_MIN_ROWS` rows of one
@@ -197,9 +197,9 @@ async def run_strip_pass(
     transaction. Only the rows ``write`` reports changed are counted. The module docstring states
     how a failed row, a failed batch and an outage are handled.
 
-    A store-wide :class:`CipherError` from a batch's transform, a cancellation, or a failure of
-    ``report`` itself, is re-raised after a WARNING with the committed counts, which no audit row
-    then records. The refused cells every batch's transform found are collected as the transform
+    A store-wide :class:`CipherError` from a batch's transform or from its ``write``, a
+    cancellation, or a failure of ``report`` itself, is re-raised after a WARNING with the
+    committed counts, which no audit row then records. The refused cells every batch's transform found are collected as the transform
     finds them, even when that transform then raises; the unreadable rows are collected as each
     transform returns, even when that batch's write then fails. They are audited by one
     ``report`` call and logged by one :func:`log_unreadable_skips` call, after the loop (or, for the
@@ -290,10 +290,23 @@ async def run_strip_pass(
                         )
                         log.debug("document strip batch write failure", exc_info=True)
                     else:
-                        for done in landed:
-                            messages += 1
-                            documents += done.documents
-                            reclaimed += done.reclaimed
+                        try:
+                            # Totalled first, so a malformed return adds nothing.
+                            landed_counts = [(d.documents, d.reclaimed) for d in landed]
+                        except Exception as exc:
+                            # A write that returned something malformed is passed over, as any
+                            # other failed batch is: the type at WARNING, the traceback at DEBUG.
+                            log.warning(
+                                "document strip passed over a batch that failed (%s); it goes on "
+                                "past it",
+                                type(exc).__name__,
+                            )
+                            log.debug("document strip batch failure", exc_info=True)
+                        else:
+                            for n_docs, n_bytes in landed_counts:
+                                messages += 1
+                                documents += n_docs
+                                reclaimed += n_bytes
             finally:
                 failures.extend(refused)
             if len(rows) < limit:
