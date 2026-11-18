@@ -561,6 +561,19 @@ def test_a_dicomweb_url_query_is_refused_first(query: str, cleartext: bool) -> N
     assert _SECRET not in str(exc.value)
 
 
+def test_a_dicomweb_second_query_credential_over_verify_off_is_refused_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The BACKLOG #5353 verify-off case: for DICOMweb the query refusal wins over the credential
+    refusal, and still withholds the value."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    url = f"{_HTTPS['DICOMweb'][2]}?a=1?api_key={_SECRET}"
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match="no query string") as exc:
+        _build_raw("DICOMweb", {"verify_tls": False, "url": url})
+    assert "connection 'OB'" in str(exc.value)
+    assert _SECRET not in str(exc.value)
+
+
 @pytest.mark.parametrize("cell", _QUERY_CELLS)
 def test_a_url_query_credential_over_verify_off_is_refused(
     cell: str, monkeypatch: pytest.MonkeyPatch
