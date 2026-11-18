@@ -1089,9 +1089,9 @@ _QUERY_CREDENTIAL_URL = f"{BASE}?api_key=QQ7SECRET"
 def test_dicomweb_query_credential_is_not_reported_as_a_hop(
     caplog: pytest.LogCaptureFixture,
 ) -> None:  # vault BACKLOG #5358
-    """The build refuses any url query, so the query-credential readers do not list a DICOMweb hop
-    that cannot exist: the census, ``query_credential_hops`` and the pre-build WARNING. REST with
-    the same url is the positive control for each reader."""
+    """The build refuses any url query, so these readers do not report a DICOMweb url-query
+    credential: the census's url-query label, ``query_credential_hops`` and the pre-build WARNING.
+    REST with the same url is the positive control for each reader."""
     from messagefoundry.config.static_credentials import _http_literal_static
     from messagefoundry.config.wiring import (
         Registry,
