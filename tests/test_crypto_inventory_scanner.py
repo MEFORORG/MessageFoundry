@@ -678,7 +678,7 @@ def test_non_python_operation_patterns_map_into_the_taxonomy() -> None:
     for tokens in gate.NON_PYTHON_OPERATION_INVENTORY.values():
         for token in tokens:
             cls, _, name = token.partition(":")
-            name = name.split("[", 1)[0]
+            name = name.removesuffix(gate.NOT_CODE).split("[", 1)[0]
             assert cls in classes and name in gate.NON_PYTHON_OPERATION_PATTERNS, token
 
 

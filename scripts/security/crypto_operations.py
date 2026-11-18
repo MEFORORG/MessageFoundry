@@ -75,6 +75,9 @@ seen:
   (names in it resolve to nothing), a walrus in a comprehension, and a ``match`` capture are not
   modelled as bindings. A call only the scope-aware reading gives is not reported, because the
   gate reports the union reading's tokens and only judges them;
+* A union token is confirmed by its callee before ``[`` file-wide, so an out-of-scope label
+  variant of a callee confirmed in scope elsewhere in the same file stays confirmed; per-site
+  judgment would close it.
 * a parameter or local assignment that shadows an imported name. Only imports are bindings, so a
   ``def go(sig): sig.verify(d)`` in a module that imports a first-party ``sig`` reads as a call to
   that first-party function and skips the method rule.

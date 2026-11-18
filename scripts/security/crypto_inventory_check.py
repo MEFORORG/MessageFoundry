@@ -69,7 +69,8 @@ RESIDUAL. Read it there; every arm's green reads "at least" because of it.
 
 **Each token carries a verdict (BACKLOG #5578).** The Python operation arm and the TypeScript/
 JavaScript arms find tokens by a wide reading, and a token only that reading gives is spelled with a
-mark, so it cannot keep a plain inventory row green on its own. :func:`judge_tokens` says how.
+mark, so it cannot keep a plain inventory row green on its own, except a label variant of a callee
+the stricter reading confirms elsewhere in the same file. :func:`judge_tokens` says how.
 
 **A SECOND ARM COVERS THE NON-PYTHON TREE (BACKLOG #1172, ASVS 11.5.1).** Everything above is an
 ``import ast`` walk of ``*.py``, so it is Python-only *by construction* and cannot see a randomness
