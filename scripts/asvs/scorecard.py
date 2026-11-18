@@ -695,6 +695,69 @@ def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
     return _name_field(raw, "reviewed_by")
 
 
+def _refuse_type(where: str, key: str, want: str, value: object) -> ScorecardError:
+    """The refusal for a TOML value of the wrong type. It names the type, never the value, so a
+    mistyped field holding record text does not echo that text (BACKLOG #5457, #5462)."""
+    return ScorecardError(f"{where}: `{key}` must be {want}, got {type(value).__name__}")
+
+
+def _str(raw: Mapping[str, Any], key: str, where: str, default: str | None = None) -> str:
+    """A string field. ``default`` None makes it required. Never ``str()``-coerced: ``str(false)``
+    is the truthy ``"False"`` and ``str(1)`` is a non-blank rationale (BACKLOG #5457)."""
+    if key not in raw:
+        if default is None:
+            raise ScorecardError(f"{where}: `{key}` is required")
+        return default
+    value = raw[key]
+    if not isinstance(value, str):
+        raise _refuse_type(where, key, "a string", value)
+    return value
+
+
+def _int(raw: Mapping[str, Any], key: str, where: str) -> int:
+    """A required integer. A bool is refused although Python counts it an int, and so is a float or
+    a numeric string, which ``int()`` would have truncated or parsed (BACKLOG #5457)."""
+    if key not in raw:
+        raise ScorecardError(f"{where}: `{key}` is required")
+    value = raw[key]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise _refuse_type(where, key, "an integer", value)
+    return value
+
+
+def _tables(raw: Mapping[str, Any], key: str, where: str) -> list[dict[str, Any]]:
+    """An array of tables, empty when absent. Anything else is refused rather than iterated."""
+    value = raw.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(t, dict) for t in value):
+        raise _refuse_type(where, key, "an array of tables", value)
+    return value
+
+
+def _regex(raw: Mapping[str, Any], key: str, where: str) -> str:
+    """A required regular expression that compiles and cannot match the empty string.
+
+    A pattern that matches the empty string matches EVERY text. As a ``positive_control`` that makes
+    the BLIND check unable to fire, because the control is sighted in any corpus at all; as a
+    ``pattern`` it makes the claim false everywhere and its mutation check vacuous. A pattern that
+    does not compile used to escape as ``re.error`` from the check that first used it (BACKLOG #5457).
+    """
+    value = _str(raw, key, where)
+    if not value.strip():
+        raise ScorecardError(f"{where}: `{key}` is blank, so it names nothing to search for")
+    try:
+        compiled = re.compile(value)
+    except re.error as exc:
+        raise ScorecardError(
+            f"{where}: `{key}` is not a valid regular expression ({exc.msg})"
+        ) from None
+    if compiled.search("") is not None:
+        raise ScorecardError(
+            f"{where}: `{key}` matches the empty string, so it matches every text and can never go "
+            "quiet. Name a token that must actually be present"
+        )
+    return value
+
+
 def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
     """The record's cells, refusing anything malformed.
 
@@ -713,7 +776,8 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
         )
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     cells: list[Cell] = []
-    for raw in data.get("cell", []):
+    for raw in _tables(data, "cell", "the scorecard"):
+        where = f"cell {raw.get('id')!r}"
         legacy = raw.get("reviewed_by")
         if historical and isinstance(legacy, str) and legacy.strip():
             raw = {k: v for k, v in raw.items() if k != "reviewed_by"}
@@ -722,15 +786,24 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
             # alone for `_text_field` to refuse.
             if notes is None or (isinstance(notes, str) and not notes.strip()):
                 raw["review_notes"] = legacy
-        verdict = str(raw.get("verdict", "")).lower()
+        verdict = _str(raw, "verdict", where, "").lower()
         if verdict not in VERDICTS:
             raise ScorecardError(
                 f"cell {raw.get('id')!r}: verdict {verdict!r} not one of {sorted(VERDICTS)}"
             )
+        # Every scalar is read TYPED, never `str()`-coerced: `residual = 1` used to pass the `na`
+        # rationale check below as "1", `last_verified = false` read as the truthy "False", and
+        # `decision_closed = "true"` skipped the closure pin (BACKLOG #5457).
+        cell_id = _str(raw, "id", where)
+        level = _int(raw, "level", where)
+        residual = _str(raw, "residual", where, "")
+        decision_closed = raw.get("decision_closed", False)
+        if not isinstance(decision_closed, bool):
+            raise _refuse_type(where, "decision_closed", "true or false", decision_closed)
         # ASVS 5.0's assessment chapter is "should" throughout with exactly ONE "must": a
         # non-applicable requirement must be noted with its reason. So an `na` without a rationale is
         # not a lax entry — it is the single thing the standard actually requires, omitted.
-        if verdict == "na" and not str(raw.get("residual", "")).strip():
+        if verdict == "na" and not residual.strip():
             raise ScorecardError(
                 f"cell {raw.get('id')!r}: verdict 'na' requires a written rationale in `residual` — "
                 "recording the reason for non-applicability is the one MUST in ASVS 5.0's assessment "
@@ -746,8 +819,9 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
         # cost of a silent re-score is a posture document that disagrees with the record and is
         # discovered months later by a reader — which has already happened here, four times in
         # eighteen days on the one cell this rule was written for.
-        if raw.get("decision_closed") is True:
-            pinned = str(raw.get("decision_closed_verdict", "")).lower()
+        decision_closed_on = _str(raw, "decision_closed_on", where, "")
+        if decision_closed:
+            pinned = _str(raw, "decision_closed_verdict", where, "").lower()
             if not pinned:
                 raise ScorecardError(
                     f"cell {raw.get('id')!r}: `decision_closed = true` without "
@@ -764,8 +838,10 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
                     "the pin in the SAME commit and say so in the message; if you do not, revert the "
                     "verdict. See `decision_reopen_requires` on the cell"
                 )
-        for a in raw.get("absence", []):
-            if not str(a.get("mutation", "")).strip():
+        absences: list[Absence] = []
+        for i, a in enumerate(_tables(raw, "absence", where)):
+            at = f"{where} absence[{i}]"
+            if not _str(a, "mutation", at, "").strip():
                 raise ScorecardError(
                     # NO LITERAL CODE EXAMPLE HERE. This module is inside the corpus that absence
                     # patterns are searched over, so an illustrative call in this string becomes a
@@ -781,106 +857,120 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
                     "the thing came back; do NOT derive it from the pattern, which makes the check "
                     "vacuous. See the Absence docstring for a worked example"
                 )
+            absences.append(
+                Absence(
+                    pattern=_regex(a, "pattern", at),
+                    positive_control=_regex(a, "positive_control", at),
+                    # No default. A missing mutation must be authored, not inferred — see the
+                    # Absence docstring on why deriving one from the pattern is worse than none.
+                    mutation=_str(a, "mutation", at),
+                    # Optional, and deliberately NOT refused at load. A hard requirement here would
+                    # void every already-authored absence claim (none carry these yet), and their
+                    # re-authoring is out of this script's reach (ADR 0156 §7). Absent means "not
+                    # yet proven by execution", surfaced by --prove-absences, not "proven vacuous".
+                    mutation_path=_str(a, "mutation_path", at, ""),
+                    observable=_str(a, "observable", at, ""),
+                )
+            )
         # A blocker record is admissible ONLY as a complete set. A partial one -- a reason with no
         # probe, or a probe with no date -- reads as diligence and carries none: it is exactly the
         # "compensating control resting on a false premise" shape, arriving through the fix. So every
-        # field is required, and the two computable ones are type-checked here rather than at the
-        # point of use, where a bad value would surface as a traceback in a renderer.
+        # field is required and typed: a mistyped one used to be `str()`- or `int()`-coerced, so an
+        # integer `20260801` passed the date check and `"30"` passed as a cadence (BACKLOG #5457).
         blocker: Blocker | None = None
         if (rb := raw.get("blocker")) is not None:
+            if not isinstance(rb, dict):
+                raise _refuse_type(where, "blocker", "a table", rb)
             if verdict != "fail":
                 raise ScorecardError(
                     f"cell {raw.get('id')!r}: a `blocker` is only meaningful on verdict 'fail' (got "
                     f"{verdict!r}). A blocked PARTIAL is a real thing, but admitting one here needs "
                     "its own ruling -- widening this is a decision, not a default"
                 )
-            missing = [
-                k
-                for k in (
-                    "blocked_by",
-                    "reason",
-                    "evidence",
-                    "unblock_signal",
-                    "unblock_probe",
-                    "checked_on",
-                    "recheck_days",
-                )
-                if not str(rb.get(k, "")).strip()
-            ]
+            text_keys = (
+                "blocked_by",
+                "reason",
+                "evidence",
+                "unblock_signal",
+                "unblock_probe",
+                "checked_on",
+            )
+            missing = [k for k in (*text_keys, "recheck_days") if k not in rb]
+            missing += [k for k in text_keys if isinstance(rb.get(k), str) and not rb[k].strip()]
             if missing:
                 raise ScorecardError(
                     f"cell {raw.get('id')!r}: `blocker` is missing {missing} -- a partial blocker "
                     "record is a comment, not a control. The unblock half is the whole point: a "
                     "signal nobody can probe, or a probe with no date, cannot go stale visibly"
                 )
+            text: dict[str, str] = {}
+            for k in text_keys:
+                if not isinstance(value := rb[k], str):
+                    raise _refuse_type(where, f"blocker.{k}", "a string", value)
+                text[k] = value
+            checked_on = text["checked_on"]
             try:
-                datetime.date.fromisoformat(str(rb["checked_on"]))
+                # The shape check runs first: `fromisoformat` also accepts `20260801`.
+                if not _DATE_RE.fullmatch(checked_on):
+                    raise ValueError(checked_on)
+                datetime.date.fromisoformat(checked_on)
             except ValueError as exc:
                 raise ScorecardError(
                     f"cell {raw.get('id')!r}: `blocker.checked_on` must be an ISO date "
-                    f"(YYYY-MM-DD), got {rb['checked_on']!r}"
+                    f"(YYYY-MM-DD), got {checked_on!r}"
                 ) from exc
-            if int(rb["recheck_days"]) < 1:
+            recheck_days = rb["recheck_days"]
+            if not isinstance(recheck_days, int) or isinstance(recheck_days, bool):
+                raise _refuse_type(where, "blocker.recheck_days", "an integer", recheck_days)
+            if recheck_days < 1:
                 raise ScorecardError(
                     f"cell {raw.get('id')!r}: `blocker.recheck_days` must be >= 1; a cadence of "
                     "zero or less never comes due, which is the same as having none"
                 )
             blocker = Blocker(
-                blocked_by=str(rb["blocked_by"]),
-                reason=str(rb["reason"]),
-                evidence=str(rb["evidence"]),
-                unblock_signal=str(rb["unblock_signal"]),
-                unblock_probe=str(rb["unblock_probe"]),
-                checked_on=str(rb["checked_on"]),
-                recheck_days=int(rb["recheck_days"]),
+                blocked_by=text["blocked_by"],
+                reason=text["reason"],
+                evidence=text["evidence"],
+                unblock_signal=text["unblock_signal"],
+                unblock_probe=text["unblock_probe"],
+                checked_on=checked_on,
+                recheck_days=recheck_days,
+            )
+        evidence: list[Anchor] = []
+        for i, e in enumerate(_tables(raw, "evidence", where)):
+            at = f"{where} evidence[{i}]"
+            evidence.append(
+                Anchor(
+                    path=_str(e, "path", at),
+                    line=_int(e, "line", at),
+                    expect=_str(e, "expect", at),
+                    # Absent stays None, deliberately: an empty string is the assertion "module
+                    # level" / "unnested", so defaulting to it would turn every un-backfilled anchor
+                    # into that claim overnight and light up every anchor that is legitimately
+                    # inside a function.
+                    sym=_str(e, "sym", at) if "sym" in e else None,
+                    ctx=_str(e, "ctx", at) if "ctx" in e else None,
+                )
             )
         cells.append(
             Cell(
-                id=str(raw["id"]),
-                level=int(raw["level"]),
+                id=cell_id,
+                level=level,
                 verdict=verdict,  # type: ignore[arg-type]
                 blocker=blocker,
-                residual=str(raw.get("residual", "")),
-                posture=str(raw.get("posture", "single")),
-                decision_closed=raw.get("decision_closed") is True,
-                decision_closed_on=str(raw.get("decision_closed_on", "")),
+                residual=residual,
+                posture=_str(raw, "posture", where, "single"),
+                decision_closed=decision_closed,
+                decision_closed_on=decision_closed_on,
                 decision_closed_by=_name_field(raw, "decision_closed_by") or "",
-                last_verified=str(raw.get("last_verified", "")),
-                verified_at=str(raw.get("verified_at", "")),
+                last_verified=_str(raw, "last_verified", where, ""),
+                verified_at=_str(raw, "verified_at", where, ""),
                 # Membership, not `.get(..., "")`: TOML has no null, so `in` is the only way to keep
                 # an absent key distinguishable from a blank one (BACKLOG #1889).
                 reviewed_by=_reviewed_by_field(raw),
                 review_notes=_text_field(raw, "review_notes"),
-                evidence=tuple(
-                    Anchor(
-                        path=str(e["path"]),
-                        line=int(e["line"]),
-                        expect=str(e["expect"]),
-                        # `.get(...)` WITHOUT a "" default, deliberately: absent must stay None. An
-                        # empty string is the assertion "module level" / "unnested", so defaulting to
-                        # it would turn all 1,980 un-backfilled anchors into that claim overnight and
-                        # light up every anchor that is legitimately inside a function.
-                        sym=None if e.get("sym") is None else str(e["sym"]),
-                        ctx=None if e.get("ctx") is None else str(e["ctx"]),
-                    )
-                    for e in raw.get("evidence", [])
-                ),
-                absence=tuple(
-                    Absence(
-                        pattern=str(a["pattern"]),
-                        positive_control=str(a["positive_control"]),
-                        # No default. A missing mutation must be authored, not inferred — see the
-                        # Absence docstring on why deriving one from the pattern is worse than none.
-                        mutation=str(a["mutation"]),
-                        # Optional, and deliberately NOT refused at load. A hard requirement here would
-                        # void every already-authored absence claim (none carry these yet), and their
-                        # re-authoring is out of this script's reach (ADR 0156 §7). Absent means "not
-                        # yet proven by execution", surfaced by --prove-absences, not "proven vacuous".
-                        mutation_path=str(a.get("mutation_path", "")),
-                        observable=str(a.get("observable", "")),
-                    )
-                    for a in raw.get("absence", [])
-                ),
+                evidence=tuple(evidence),
+                absence=tuple(absences),
             )
         )
     return cells
