@@ -421,9 +421,20 @@ class Ledger:
         read this. A file is still an add to every rule (added_files). A pair needs the old path in
         the parent tree and a similar body, so a stale base's number or an unrelated file replacing a
         deleted ADR is never one. A git failure raises, as everywhere in this gate.
+
+        THE PATHSPEC AND -l0 KEEP THE PAIRING FROM DEPENDING ON THE REST OF THE CHANGE. Past
+        diff.renameLimit git pairs only EXACT renames, and every rename in the diff counts toward it,
+        so a change carrying many renames elsewhere cost an edited ADR rename its pairing: the wording
+        fell back to a reuse, and a branch ADR's rename to an ownership refusal. Only docs/adr/ can
+        hold a same-number source, so only it is searched, with no limit on that small set.
         """
-        args = ("-z", "--name-status", "-M", "--diff-filter=R")
-        out = git("diff", *args, self.base, "HEAD") if self.ci else git("diff", "--cached", *args)
+        args = ("-z", "--name-status", "-M", "-l0", "--diff-filter=R")
+        adr = ("--", "docs/adr/")
+        out = (
+            git("diff", *args, self.base, "HEAD", *adr)
+            if self.ci
+            else git("diff", "--cached", *args, *adr)
+        )
         parts = _paths(out)
         return {parts[i + 2]: parts[i + 1] for i in range(0, len(parts) - 2, 3)}
 
@@ -803,14 +814,17 @@ class Ledger:
                         # git pairs this file with an ADR of the SAME number that this change
                         # removes, so it is a RENAME of that ADR (BACKLOG #5453), not a second
                         # session's reuse. It allocates nothing; it owes a row linking the new name.
-                        self.fail(
-                            f"ADR {number} was renamed from "
-                            f"{_safe_for_message(src.rsplit('/', 1)[-1])}, and its row in "
-                            "docs/adr/README.md does not link the new file",
-                            "The index row would keep linking a file that no longer exists, and "
-                            "the renamed ADR would be invisible in the index.",
-                            "make the row link the renamed file in THIS commit; keep the number",
-                        )
+                        # With no row left at all, the index-row rule below refuses it and names
+                        # that remedy, so this wording, about the row that stays, is not printed.
+                        if number in rows:
+                            self.fail(
+                                f"ADR {number} was renamed from "
+                                f"{_safe_for_message(src.rsplit('/', 1)[-1])}, and its row in "
+                                "docs/adr/README.md does not link the new file",
+                                "The row still points away from the renamed file, so the ADR under "
+                                "its new name would be invisible in the index.",
+                                "make the row link the renamed file in THIS commit; keep the number",
+                            )
                     else:
                         self.fail(
                             f"ADR {number} already exists on {self.base} as "

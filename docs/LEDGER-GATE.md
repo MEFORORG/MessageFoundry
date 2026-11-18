@@ -194,8 +194,13 @@ A file that arrives by **rename or copy** onto an ADR path is an added ADR to ev
 turns git's rename detection off, so a `git mv` cannot hide it (BACKLOG #5453). Where git itself pairs
 the new file with a removed ADR of the same number, the change is a rename: it allocates nothing, so
 the ownership rule does not refuse it, but its row must link the new name in the same commit, and the
-refusal says so rather than calling it a reuse. Any other file under a base number, including an
-unrelated file replacing a deleted ADR, is still refused as a reuse.
+refusal says so rather than calling it a reuse. The gate asks git for that pairing over `docs/adr/`
+alone, so renames elsewhere in the change cannot push it past git's rename limit. A rename onto a
+different number is a new number and owes an allocation like any other.
+
+Any other file added under a base number falls to rule 1: it passes when the number's row links it, as
+a declared companion, and is refused as a reuse when the row does not. That includes an unrelated file
+replacing a deleted ADR: relink the row to it and it passes, as it did before BACKLOG #5453.
 
 In every rule above, and in the corpus check, "names" and "links" mean the same thing. The file must be
 the target of a Markdown link in the row, not a substring of it (BACKLOG #2001). The gate reads one link

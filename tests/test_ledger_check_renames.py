@@ -175,8 +175,11 @@ def test_a_rename_that_also_drops_the_row_reports_the_missing_row_too(repo: Path
 
     code, out = run_check(repo)
     assert code == 1, out
-    assert "ADR 0001 was renamed" in out
-    assert "has no row in docs/adr/README.md" in out
+    assert "ADR 0001 (0001-renamed.md) has no row in docs/adr/README.md" in out
+    # There is no row left to keep linking the old name, so the rename refusal must not claim one,
+    # and the change is still not a reuse.
+    assert "points away" not in out
+    assert "already exists" not in out
 
 
 def test_a_renamed_COMPANION_gets_the_rename_wording(repo: Path) -> None:
@@ -262,5 +265,116 @@ def test_a_same_number_rename_of_a_BRANCH_adr_needs_no_allocation(repo: Path) ->
         + "\n",
     )
     git(repo, "add", "-A")
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_a_renumber_by_rename_still_needs_an_allocation(repo: Path) -> None:
+    """A `git mv` onto a DIFFERENT number is not a same-number rename: the new number is a fresh
+    one, so it owes an allocation like any other new ADR, and the refusal must not call it a
+    rename."""
+    git(repo, "mv", "docs/adr/0001-first.md", "docs/adr/0002-first.md")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD + ROW.format(n="0002", slug="first", title="First") + "\n",
+    )
+    git(repo, "add", "-A")
+    assert _staged_status(repo).startswith("R"), _staged_status(repo)
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002" in out
+    assert "renamed" not in out
+    assert "already exists" not in out
+
+
+# PAST diff.renameLimit, git gives up pairing anything but exact renames. The renames elsewhere in
+# the change must not cost an ADR rename its pairing, so the rename probe only looks at docs/adr/.
+# Each file below is edited as it moves: an EXACT rename is paired whatever the limit, so an
+# unedited move would pass this test for the wrong reason.
+OTHER = "# Unrelated note {name}\n\n" + "Unrelated filler line about {name}.\n" * 20
+
+
+def _many_renames_elsewhere(repo: Path) -> None:
+    """Base two non-ADR notes, then set a limit their renames alone exceed."""
+    for name in ("a", "b"):
+        write(repo, f"docs/other/{name}.md", OTHER.format(name=name))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "two unrelated notes")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "config", "diff.renameLimit", "1")
+
+
+def _rename_the_others(repo: Path) -> None:
+    for name in ("a", "b"):
+        git(repo, "mv", f"docs/other/{name}.md", f"docs/other/{name}-moved.md")
+        write(repo, f"docs/other/{name}-moved.md", OTHER.format(name=name) + "Edited.\n")
+
+
+def test_a_branch_adr_rename_past_the_rename_limit_needs_no_allocation(repo: Path) -> None:
+    _many_renames_elsewhere(repo)
+    write(repo, "docs/adr/0002-x.md", BODY.replace("synthetic", "branch"))
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="x", title="X") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the branch carries 0002")
+
+    _rename_the_others(repo)
+    git(repo, "mv", "docs/adr/0002-x.md", "docs/adr/0002-y.md")
+    write(repo, "docs/adr/0002-y.md", BODY.replace("synthetic", "branch") + "Edited.\n")
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="y", title="X") + "\n")
+    git(repo, "add", "-A")
+    # The premise: with the limit in force, git pairs NOTHING in the whole change.
+    assert not any(line.startswith("R") for line in _staged_status(repo).splitlines()), (
+        _staged_status(repo)
+    )
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_a_base_adr_rename_past_the_rename_limit_keeps_the_rename_wording(repo: Path) -> None:
+    _many_renames_elsewhere(repo)
+    _rename_the_others(repo)
+    git(repo, "mv", "docs/adr/0001-first.md", "docs/adr/0001-renamed.md")
+    write(repo, "docs/adr/0001-renamed.md", BODY + "Edited.\n")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 was renamed from 0001-first.md" in out
+    assert "already exists" not in out
+    assert "alloc.ps1" not in out
+
+
+def test_a_base_adr_rename_past_the_rename_limit_keeps_the_rename_wording_in_CI_mode(
+    repo: Path,
+) -> None:
+    _many_renames_elsewhere(repo)
+    _rename_the_others(repo)
+    git(repo, "mv", "docs/adr/0001-first.md", "docs/adr/0001-renamed.md")
+    write(repo, "docs/adr/0001-renamed.md", BODY + "Edited.\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "rename ADR 0001 among other renames")
+
+    code, out = run_check(repo, "--ci")
+    assert code == 1, out
+    assert "ADR 0001 was renamed from 0001-first.md" in out
+    assert "already exists" not in out
+
+
+def test_CONTROL_an_unrelated_replacement_whose_row_links_it_passes(repo: Path) -> None:
+    """The declared-companion rule covers it: the row links the new file, so nothing is unindexed
+    and nothing is a second session's reuse. docs/LEDGER-GATE.md says so; this pins it."""
+    git(repo, "rm", "-q", "docs/adr/0001-first.md")
+    write(repo, "docs/adr/0001-unrelated.md", "# A different decision\n\nNothing in common.\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD + ROW.format(n="0001", slug="unrelated", title="First") + "\n",
+    )
+    git(repo, "add", "-A")
+
     code, out = run_check(repo)
     assert code == 0, out
