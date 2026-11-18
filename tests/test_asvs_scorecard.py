@@ -3674,11 +3674,14 @@ def test_prove_absences_summary_prints_the_population_before_the_parts(
     Falsified by deleting the `saw ... absence claim(s);` term from `_run_prove_absences`: both
     assertions go RED. Restored.
     """
-    _module(tmp_path, "scanner.py", _SCANNER)
-    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    # The record sits beside the tree, not in it: a root that holds the record is refused (#5461).
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    _module(tree, "scanner.py", _SCANNER)
+    _obs_test(tree, "test_scanner.py", _OBS_TEST)
     sc = tmp_path / "sc.toml"
     _biting_scorecard(sc, "scanner.py")
-    rc = main(["--scorecard", str(sc), "--root", str(tmp_path), "--prove-absences"])
+    rc = main(["--scorecard", str(sc), "--root", str(tree), "--prove-absences"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "prove-absences: saw 1 absence claim(s);" in out
@@ -3695,7 +3698,9 @@ def test_prove_absences_summary_negative_control_an_empty_run_says_saw_zero(
         '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n',
         encoding="utf-8",
     )
-    rc = main(["--scorecard", str(sc), "--root", str(tmp_path), "--prove-absences"])
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    rc = main(["--scorecard", str(sc), "--root", str(tree), "--prove-absences"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "saw 0 absence claim(s)" in out

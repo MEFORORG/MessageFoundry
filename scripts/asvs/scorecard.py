@@ -2793,6 +2793,26 @@ def check_pinning(scorecard: Path, corpus: Path) -> list[str]:
     return problems
 
 
+def check_root(scorecard: Path, root: Path) -> None:
+    """Refuse a ``root`` that cannot be the engine tree: not a directory, or one holding the record.
+
+    Shared by :func:`verify` and the ``--prove-absences`` entry point, which skipped both checks
+    and so could prove claims against a missing tree or the vault's own stale engine copy and
+    report success (BACKLOG #5461). See :func:`verify` for why containment, not "same repository".
+    """
+    if not root.is_dir():
+        raise ScorecardError(
+            f"--root {root} is not a directory, so there is no engine tree to measure. Pass the "
+            "engine checkout"
+        )
+    if scorecard.resolve().is_relative_to(root.resolve()):
+        raise ScorecardError(
+            f"--root {root} CONTAINS the scorecard {scorecard}, so the evidence anchors would be "
+            "resolved against the tree that holds the record instead of the engine. That produces a "
+            "self-consistent, wrong answer. Pass the engine checkout as the root."
+        )
+
+
 def verify(scorecard: Path, corpus: Path, root: Path) -> Findings:
     # THE ROOT IS PART OF THE MEASUREMENT, so the refusal lives here rather than in `main`, where only
     # the CLI would get it. A scorecard sitting INSIDE the tree being checked means the anchors are
@@ -2808,13 +2828,9 @@ def verify(scorecard: Path, corpus: Path, root: Path) -> Findings:
     # workspace, so a same-repo test would refuse the sanctioned run and the gate would fail closed
     # forever on its own correct invocation. `vault/engine` does not CONTAIN
     # `vault/docs/security/asvs-scorecard.toml`, so containment passes it and still catches the
-    # default-to-cwd case.
-    if scorecard.resolve().is_relative_to(root.resolve()):
-        raise ScorecardError(
-            f"--root {root} CONTAINS the scorecard {scorecard}, so the evidence anchors would be "
-            "resolved against the tree that holds the record instead of the engine. That produces a "
-            "self-consistent, wrong answer. Pass the engine checkout as the root."
-        )
+    # default-to-cwd case. A root that is not a directory is refused by the same check: every anchor
+    # would read as GONE, a red about the record when the fault is the invocation (BACKLOG #5461).
+    check_root(scorecard, root)
     findings = Findings()
     cells = load_scorecard(scorecard)
     findings.problems.extend(check_pinning(scorecard, corpus))
@@ -3544,12 +3560,33 @@ def form_summary(findings: Findings) -> list[str]:
 
 def _run_prove_absences(scorecard: Path, root: Path) -> int:
     """The ``--prove-absences`` entry point: execute-prove every absence claim (see
-    :func:`prove_absences`). Needs no corpus — it applies mutations, it does not grep for patterns."""
+    :func:`prove_absences`). Needs no corpus — it applies mutations, it does not grep for patterns.
+
+    Held to verify's footing (BACKLOG #5461): the root must be a directory that does not hold the
+    record (:func:`check_root`), the provenance header names both trees before anything is read,
+    and a record with no cells is refused rather than reported as a clean pass over nothing.
+    """
+    try:
+        check_root(scorecard, root)
+    except ScorecardError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2  # could not measure — never 0, never confused with "clean"
+    for line in provenance_from(
+        repo_stamp(scorecard), repo_stamp(root), label="asvs-prove-absences"
+    ):
+        print(line)
     try:
         cells = load_scorecard(scorecard)
     except ScorecardError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2  # could not measure — never 0, never confused with "clean"
+    if not cells:
+        print(
+            f"error: the scorecard {scorecard} holds no cells, so there is nothing to prove; an "
+            "empty record is not a clean one",
+            file=sys.stderr,
+        )
+        return 2
     findings = prove_absences(cells, root)
     # `saw N` is the denominator, and it comes FIRST because the parts are unreadable without it: a
     # run over 276 claims and a run over zero otherwise print counter sets that look equally
@@ -3618,7 +3655,8 @@ def main(argv: list[str] | None = None) -> int:
         "--root",
         type=Path,
         default=None,
-        help="tree the evidence anchors point into (REQUIRED to verify; defaults to cwd elsewhere)",
+        help="tree the evidence anchors point into (REQUIRED to verify and to prove absences; "
+        "--status defaults to cwd)",
     )
     ap.add_argument("--render", type=Path, help="write the generated CURRENT.md here")
     # A separate, opt-in mode: prove each absence claim BITES by applying its mutation to a scratch
@@ -3676,19 +3714,22 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.status:
         return _run_status(args.scorecard, args.root or Path.cwd())
 
-    if args.prove_absences:
-        return _run_prove_absences(args.scorecard, args.root or Path.cwd())
-
-    # VERIFY MODE ONLY from here. The anchors are claims about a specific tree, so a verify pass that
-    # did not name one is not a measurement of anything in particular.
+    # VERIFY AND PROVE-ABSENCES from here. The anchors and the mutations are claims about a specific
+    # tree, so a pass that did not name one is not a measurement of anything in particular. Prove
+    # mode defaulted to the working directory until BACKLOG #5461: run from the vault, it proved
+    # claims against the vault's own stale engine copy and reported success.
     if args.root is None:
         print(
-            "error: --root is required to verify -- the anchors are claims about a specific tree, "
-            "and an unnamed tree makes the result unattributable. Pass the engine checkout "
-            "explicitly. (--status and --prove-absences still default to the working directory.)",
+            "error: --root is required to verify or to prove absences -- the anchors and mutations "
+            "are claims about a specific tree, and an unnamed tree makes the result unattributable. "
+            "Pass the engine checkout explicitly. (--status still defaults to the working "
+            "directory.)",
             file=sys.stderr,
         )
         return 2  # could not measure — never 0, never confused with "clean"
+
+    if args.prove_absences:
+        return _run_prove_absences(args.scorecard, args.root)
 
     # The containment refusal is NOT here: it moved into `verify`, which every caller reaches. The
     # `except ScorecardError` below already maps it to exit 2, so the CLI behaviour is unchanged.

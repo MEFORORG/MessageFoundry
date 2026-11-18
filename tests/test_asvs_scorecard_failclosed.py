@@ -402,3 +402,78 @@ def test_an_exception_after_a_cell_header_spelled_another_way_is_refused(tmp_pat
     body = _CELL.replace("[[cell]]", "[[ cell ]]") + "\n" + _exception("1.1.1")
     with pytest.raises(ScorecardError, match="before the first"):
         load_reviewer_exceptions(_write(tmp_path, body))
+
+
+# --- BACKLOG #5461: --prove-absences measures a named engine tree, as verify does ----------------
+
+
+def _prove_record(tmp_path: Path, body: str = _CELL) -> Path:
+    record = tmp_path / "record" / "sc.toml"
+    record.parent.mkdir(exist_ok=True)
+    record.write_text(body, encoding="utf-8")
+    return record
+
+
+def test_prove_absences_requires_a_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before: no --root meant the working directory, so a run from the vault proved its claims
+    against the vault's own stale engine copy and reported success."""
+    monkeypatch.chdir(tmp_path)
+    assert main(["--scorecard", str(_prove_record(tmp_path)), "--prove-absences"]) == 2
+    assert "--root is required" in capsys.readouterr().err
+
+
+def test_prove_absences_refuses_a_root_that_holds_the_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _prove_record(tmp_path)
+    assert main(["--scorecard", str(record), "--root", str(tmp_path), "--prove-absences"]) == 2
+    assert "CONTAINS the scorecard" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_prove_absences_refuses_a_root_that_is_not_a_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], kind: str
+) -> None:
+    root = tmp_path / "engine"
+    if kind == "file":
+        root.write_text("not a tree\n", encoding="utf-8")
+    record = _prove_record(tmp_path)
+    assert main(["--scorecard", str(record), "--root", str(root), "--prove-absences"]) == 2
+    assert "not a directory" in capsys.readouterr().err
+
+
+def test_prove_absences_refuses_a_record_with_no_cells(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Before: an empty record scanned zero claims and exited 0, a pass over nothing."""
+    root = tmp_path / "engine"
+    root.mkdir()
+    record = _prove_record(tmp_path, "[scorecard]\n")
+    assert main(["--scorecard", str(record), "--root", str(root), "--prove-absences"]) == 2
+    assert "no cells" in capsys.readouterr().err
+
+
+def test_prove_absences_prints_the_provenance_header(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Before: no line said which trees the proof was measured against."""
+    root = tmp_path / "engine"
+    root.mkdir()
+    record = _prove_record(tmp_path)
+    assert main(["--scorecard", str(record), "--root", str(root), "--prove-absences"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("# asvs-prove-absences scorecard=")
+    assert "prove-absences: saw 0 absence claim(s);" in out
+
+
+def test_verify_refuses_a_root_that_is_not_a_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same refusal in verify, which shares the root check."""
+    record = _prove_record(tmp_path)
+    argv = _mode_argv("verify", record, tmp_path)
+    argv[argv.index("--root") + 1] = str(tmp_path / "no-such-engine")
+    assert main(argv) == 2
+    assert "not a directory" in capsys.readouterr().err
