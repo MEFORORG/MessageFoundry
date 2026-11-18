@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from scripts.asvs.scorecard import ScorecardError, load_scorecard
+import scripts.asvs.scorecard as scorecard_module
+from scripts.asvs.scorecard import ScorecardError, load_scorecard, main
 
 #: One loadable cell. Each test appends or substitutes the one field it is about.
 _CELL = '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "fail"\nresidual = "why"\n'
@@ -187,3 +188,88 @@ def test_a_mistyped_table_is_refused(tmp_path: Path, body: str) -> None:
     """Before: AttributeError or TypeError, a traceback rather than a refusal."""
     with pytest.raises(ScorecardError):
         _load(tmp_path, body)
+
+
+# --- BACKLOG #5462: every entry point maps an unreadable record to exit 2, with no traceback ------
+
+#: Planted in each malformed record and in each injected failure. Seeing it in output is a leak.
+_LEAK = "ZZ-RECORD-TEXT-SENTINEL"
+
+_MODES = ["status", "prove", "verify"]
+
+
+def _mode_argv(mode: str, record: Path, tmp_path: Path) -> list[str]:
+    root = tmp_path / "engine"
+    root.mkdir(exist_ok=True)
+    argv = ["--scorecard", str(record), "--root", str(root)]
+    if mode == "status":
+        return [*argv, "--status"]
+    if mode == "prove":
+        return [*argv, "--prove-absences"]
+    corpus = tmp_path / "corpus.json"
+    corpus.write_text('{"requirements": [{"req_id": "V1.1.1", "L": "1"}]}', encoding="utf-8")
+    return [*argv, "--corpus", str(corpus)]
+
+
+def _record(tmp_path: Path, body: bytes) -> Path:
+    """The record sits OUTSIDE the engine root, as the vault's own CI lays them out."""
+    record = tmp_path / "record" / "sc.toml"
+    record.parent.mkdir()
+    record.write_bytes(body)
+    return record
+
+
+@pytest.mark.parametrize("mode", _MODES)
+@pytest.mark.parametrize(
+    "body",
+    [
+        f'[[cell]\nid = "{_LEAK}"\n'.encode(),
+        f'[[cell]]\nid = "{_LEAK}"\nverd'.encode() + b'\xff\xfeict = "pass"\n',
+    ],
+    ids=["not-toml", "not-utf8"],
+)
+def test_an_unreadable_record_exits_2_in_every_mode(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: str, body: bytes
+) -> None:
+    """Before: TOMLDecodeError or UnicodeDecodeError escaped `main` as a traceback and exit 1, a
+    code --status promises never to return and verify reserves for findings."""
+    assert main(_mode_argv(mode, _record(tmp_path, body), tmp_path)) == 2
+    captured = capsys.readouterr()
+    assert _LEAK not in captured.out + captured.err
+
+
+class _Unlisted(Exception):
+    """A failure class no `except` list could name in advance."""
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_an_unexpected_failure_exits_2_and_withholds_its_message(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """The message of an exception nobody anticipated can quote the record, so only its class
+    crosses to the output. Before: it escaped as a traceback carrying the message."""
+
+    def _boom(*_a: object, **_k: object) -> object:
+        raise _Unlisted(f"cell {_LEAK!r}: the grading words of the record")
+
+    monkeypatch.setattr(scorecard_module, "load_scorecard", _boom)
+    record = _record(tmp_path, _CELL.encode())
+    assert main(_mode_argv(mode, record, tmp_path)) == 2
+    captured = capsys.readouterr()
+    assert _LEAK not in captured.out + captured.err
+    assert "_Unlisted" in captured.err
+
+
+def test_an_interrupt_is_not_swallowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control for the breadth: the catch is for failures, not for an operator's Ctrl-C."""
+
+    def _interrupt(*_a: object, **_k: object) -> object:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(scorecard_module, "load_scorecard", _interrupt)
+    record = _record(tmp_path, _CELL.encode())
+    with pytest.raises(KeyboardInterrupt):
+        main(_mode_argv("status", record, tmp_path))

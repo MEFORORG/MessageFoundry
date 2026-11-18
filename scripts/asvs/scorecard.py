@@ -3594,7 +3594,33 @@ def main(argv: list[str] | None = None) -> int:
     # rendered file differ on every run, so the drift check could never pass: a gate that cannot go
     # green is as useless as one that cannot go red, and this one shipped that way.
     args = ap.parse_args(argv)
+    # ONE GUARD AROUND EVERY MODE (BACKLOG #5462). Each entry point caught `ScorecardError` alone, so
+    # a record that is not TOML or not UTF-8, or any failure nobody listed, escaped as a traceback on
+    # exit 1: a code --status promises never to return, and one verify reserves for findings. The
+    # traceback also carried the exception's message, which can quote the record onto a CI log.
+    #
+    # BROAD ON PURPOSE, and it is not a swallow: the failure is reported and the run exits 2, "could
+    # not measure". A list of classes written from the failures seen so far is exactly the gap this
+    # closes. Only the CLASS of an unexpected failure crosses to the output; a `ScorecardError` is
+    # this module's own refusal and keeps its message. `KeyboardInterrupt` and `SystemExit` are not
+    # `Exception`, so they still propagate.
+    try:
+        return _dispatch(args)
+    except ScorecardError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - CLI boundary; reported by class, exit 2, see above
+        print(
+            f"error: the scorecard run stopped on {type(exc).__name__}. Its message is withheld "
+            "because it can quote the record; rerun where the record lives to read it. Nothing was "
+            "measured, so this is exit 2, never a pass and never a finding",
+            file=sys.stderr,
+        )
+        return 2
 
+
+def _dispatch(args: argparse.Namespace) -> int:
+    """Every mode after argument parsing. :func:`main` guards it, so whatever escapes is exit 2."""
     # `--status` is the one-second answer to "what does the record say" and needs NO engine tree, so
     # it keeps the cwd default. Making it required here would put an engine checkout between a person
     # and the only fast, correct read of the record -- which is the other half of the problem.
