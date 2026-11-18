@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -66,6 +67,8 @@ def repo_skill_directories(root: Path) -> tuple[Path, ...]:
             ["git", "-C", str(root), *query],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=True,
         ).stdout.splitlines()
@@ -165,7 +168,8 @@ def outer_timeout(root: Path, event: str) -> float:
     """The smallest timeout .codex/config.toml gives this event, or the default without one."""
     try:
         config = tomllib.loads((root / ".codex/config.toml").read_text(encoding="utf-8-sig"))
-    except FileNotFoundError:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        # The bridge never needed this file before; an unreadable one must not fail every event.
         return DEFAULT_OUTER_TIMEOUT
     timeouts = [
         float(hook["timeout"])
@@ -187,10 +191,11 @@ def find_bash() -> str:
     if configured := os.environ.get("CLAUDE_CODE_GIT_BASH_PATH"):
         candidates.append(Path(configured))
     if git := shutil.which("git"):
-        # The candidate order of tests/_bash_resolver.py: git.exe sits at several depths, and
-        # usr/bin/bash.exe is the real shell, where bin/bash.exe is a wrapper that rewrites PATH.
+        # git.exe sits at several depths. bin/bash.exe first: it is the wrapper Git for Windows
+        # launches, which puts /usr/bin on PATH. usr/bin/bash.exe started directly does not, so a
+        # hook's own `bash` or coreutils could then resolve elsewhere, WSL's bash.exe included.
         for parent in Path(git).resolve().parents:
-            candidates += [parent / "usr/bin/bash.exe", parent / "bin/bash.exe"]
+            candidates += [parent / "bin/bash.exe", parent / "usr/bin/bash.exe"]
     # System32's and WindowsApps' bash.exe launch WSL, which does not see this environment.
     if found and not re.search(r"[\\/](system32|windowsapps)[\\/]", found, re.IGNORECASE):
         candidates.append(Path(found))
@@ -218,6 +223,44 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
     if shell is None:
         return ["sh", "-c", command]
     raise ValueError(f"Unsupported Claude hook shell: {shell}")
+
+
+def run_hook(
+    argv: list[str], payload: dict, root: Path, env: dict[str, str], timeout: float | None
+) -> subprocess.CompletedProcess[str]:
+    """subprocess.run, except a timeout kills the hook's whole process tree.
+
+    subprocess.run kills only the direct child, then waits with no limit for any grandchild still
+    holding the pipes, so a hung grandchild would outlast the budget and Codex's own timeout.
+    """
+    with subprocess.Popen(  # nosec B603 - trusted repo hook; event data is stdin only
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=root,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=os.name != "nt",
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(json.dumps(payload), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                subprocess.run(  # nosec B603 B607 - fixed command, our own child's pid
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.kill()
+            process.communicate()
+            raise
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
 def child_environment(root: Path, session_id: str) -> dict[str, str]:
@@ -272,7 +315,7 @@ def dispatch(root: Path, payload: dict) -> dict:
     if config.get("disableAllHooks"):
         return {}
     result: dict = {}
-    deadline = time.monotonic() + outer_timeout(root, event) - OUTER_TIMEOUT_MARGIN
+    deadline: float | None = None
     if event == "SessionStart":
         unknown = set(config.get("hooks", {})) - set(EVENTS)
         context = (
@@ -316,34 +359,33 @@ def dispatch(root: Path, payload: dict) -> dict:
                 raise ValueError(
                     f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
                 )
+            if deadline is None:
+                # Read only once a hook will run, so an event with none skips the file. The margin
+                # never takes more than half the budget, or a short cap would run nothing.
+                cap = outer_timeout(root, event)
+                deadline = time.monotonic() + cap - min(OUTER_TIMEOUT_MARGIN, cap / 2)
             try:
                 argv = hook_argv(root, hook)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(argv, 0)
-                completed = subprocess.run(  # nosec B603 - trusted repo hook; event data is stdin only
-                    argv,
-                    input=json.dumps(payload),
-                    cwd=root,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=min(hook.get("timeout", 30), remaining),
-                    check=False,
+                limit = hook.get("timeout", 30)
+                completed = run_hook(
+                    argv, payload, root, env, remaining if limit is None else min(limit, remaining)
                 )
                 if completed.stderr:
                     print(completed.stderr, file=sys.stderr, end="")
                 if completed.returncode == 2:
                     raise HookBlocked(completed.stderr or "Claude hook blocked this event")
                 completed.check_returncode()
-            except (OSError, subprocess.SubprocessError) as exc:
-                # A failed SessionStart hook is a non-blocking error in Claude Code, and the session
-                # starts with every other hook's context. Elsewhere a failure still fails closed.
+            except (OSError, ValueError, subprocess.SubprocessError, HookBlocked) as exc:
+                # A failed SessionStart hook, exit 2 included, is a non-blocking error in Claude
+                # Code: the session starts with every other hook's context. Elsewhere a failure
+                # still fails closed.
                 if event != "SessionStart":
                     raise
-                message = f"Codex bridge: SessionStart hook {hook['command']!r} failed: {exc}"
+                label = " ".join(str(part) for part in (hook["command"], *hook.get("args", [])))
+                message = f"Codex bridge: SessionStart hook {label!r} failed: {exc}"
                 print(message, file=sys.stderr)
                 merge_output(result, {"systemMessage": message})
                 continue

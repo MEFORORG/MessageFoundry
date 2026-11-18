@@ -45,6 +45,14 @@ def _skill(directory: Path, name: str, description: str) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def _no_inherited_git_repository(monkeypatch):
+    # A git hook running this suite exports these, and both the fixture's git and the bridge's own
+    # query would then act on that repository instead of the disposable one.
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def linked(tmp_path):
     primary = tmp_path / "primary"
@@ -95,6 +103,16 @@ def test_sync_in_a_linked_worktree_writes_pointers_for_primary_skills(bridge, li
     assert not [m for m in messages if m.startswith("MISSING SOURCE")]
     assert "Primary batch" in (worktree / ".agents/skills/batch/SKILL.md").read_text()
     assert "Worktree local" in (worktree / ".agents/skills/local/SKILL.md").read_text()
+
+
+def test_sync_takes_the_worktree_skill_over_the_primary_one(bridge, linked, tmp_path):
+    primary, worktree = linked
+    _skill(primary / ".claude/skills", "both", "Primary both")
+    _skill(worktree / ".claude/skills", "both", "Worktree both")
+    bridge.sync_skills(worktree, user_skills=tmp_path / "no-user-skills")
+    pointer = (worktree / ".agents/skills/both/SKILL.md").read_text()
+    assert "Worktree both" in pointer
+    assert "Primary both" not in pointer
 
 
 def test_the_primary_checkout_reads_only_its_own_skills(bridge, linked):

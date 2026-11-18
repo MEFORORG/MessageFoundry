@@ -118,24 +118,67 @@ def _cap(root: Path, event: str, seconds: int) -> None:
 
 
 def test_a_hook_timeout_above_the_outer_cap_is_clamped(bridge, tmp_path):
-    # Budget = cap - margin = 1 second, far below the hook's own 300.
+    # A cap of margin + 1 leaves at most half of it, far below the hook's own 300.
     _cap(tmp_path, "PreToolUse", int(bridge.OUTER_TIMEOUT_MARGIN) + 1)
-    _settings(tmp_path, "PreToolUse", [_py("import time; time.sleep(8)", timeout=300)])
+    _settings(tmp_path, "PreToolUse", [_py("import time; time.sleep(40)", timeout=300)])
     started = time.monotonic()
     with pytest.raises(subprocess.TimeoutExpired):
         bridge.dispatch(tmp_path, _PRE_TOOL)
-    assert time.monotonic() - started < 6
+    assert time.monotonic() - started < 20
 
 
 def test_hooks_share_one_budget(bridge, tmp_path):
-    _cap(tmp_path, "SessionStart", int(bridge.OUTER_TIMEOUT_MARGIN) + 2)
-    slow = _py("import time; time.sleep(8)", timeout=300)
+    _cap(tmp_path, "SessionStart", int(bridge.OUTER_TIMEOUT_MARGIN) + 6)
+    slow = _py("import time; time.sleep(30)", timeout=300)
     _settings(tmp_path, "SessionStart", [_context("first"), slow, slow])
     started = time.monotonic()
     result = bridge.dispatch(tmp_path, _SESSION_START)
-    assert time.monotonic() - started < 6
+    assert time.monotonic() - started < 20
     assert "first" in result["hookSpecificOutput"]["additionalContext"]
     assert result["systemMessage"].count("SessionStart hook") == 2
+
+
+def test_a_timeout_kills_a_grandchild_holding_the_pipes(bridge, tmp_path):
+    # The hook starts a child that inherits its stdout and outlives it; subprocess.run alone would
+    # wait for that child after killing the hook.
+    spawn = (
+        "import subprocess, sys, time; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(40)']); time.sleep(40)"
+    )
+    _settings(tmp_path, "PreToolUse", [_py(spawn, timeout=2)])
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        bridge.dispatch(tmp_path, _PRE_TOOL)
+    assert time.monotonic() - started < 25
+
+
+def test_session_start_exit_2_and_a_bad_shell_do_not_drop_context(bridge, tmp_path):
+    blocked = _py("import sys; sys.exit(2)")
+    bad_shell = {"type": "command", "shell": "fish", "command": "true"}
+    _settings(tmp_path, "SessionStart", [_context("earlier"), blocked, bad_shell])
+    result = bridge.dispatch(tmp_path, _SESSION_START)
+    assert "earlier" in result["hookSpecificOutput"]["additionalContext"]
+    assert result["systemMessage"].count("SessionStart hook") == 2
+
+
+def test_a_null_timeout_runs_within_the_budget(bridge, tmp_path):
+    _settings(tmp_path, "SessionStart", [{**_context("ran"), "timeout": None}])
+    result = bridge.dispatch(tmp_path, _SESSION_START)
+    assert "ran" in result["hookSpecificOutput"]["additionalContext"]
+
+
+def test_an_unparseable_codex_config_falls_back_to_the_default(bridge, tmp_path):
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex/config.toml").write_text("[not toml", encoding="utf-8")
+    assert bridge.outer_timeout(tmp_path, "PreToolUse") == bridge.DEFAULT_OUTER_TIMEOUT
+
+
+def test_a_cap_at_or_below_the_margin_still_runs_hooks(bridge, tmp_path):
+    _cap(tmp_path, "SessionStart", int(bridge.OUTER_TIMEOUT_MARGIN))
+    _settings(tmp_path, "SessionStart", [_context("ran")])
+    result = bridge.dispatch(tmp_path, _SESSION_START)
+    assert "ran" in result["hookSpecificOutput"]["additionalContext"]
+    assert "systemMessage" not in result
 
 
 def test_the_live_sources_fit_the_bridge(bridge):
