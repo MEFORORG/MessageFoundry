@@ -169,7 +169,13 @@ def test_every_allowlist_entry_excuses_only_a_whole_line(mod) -> None:
         pytest.param(r"(?x)^\#\ keep\ [a-z]+\ here$", False, id="verbose-without-a-wildcard"),
         pytest.param(r"^# keep (?i:[a-z]+) here$", True, id="control-a-scoped-non-verbose-flag"),
         pytest.param("^# keep [A-Z_]+ here$", True, id="control-every-letter-alone"),
-        pytest.param("^# keep [ a-m]+ here$", True, id="control-space-and-some-letters"),
+        # Nested bounds multiply, and a bounded outer repeat is judged whole.
+        pytest.param("^# keep (?:.{0,32}){0,32} here$", False, id="nested-bounds-multiply"),
+        pytest.param("^# keep (?:[A-Za-z]+ ){0,32}here$", False, id="bounded-outer-union-wide"),
+        # Leaving out a rare letter does not make a class narrow.
+        pytest.param("^# keep [ A-Ya-y]+ here$", False, id="all-but-one-letter-and-space"),
+        pytest.param("^# keep [ -Y]+ here$", False, id="space-digits-and-most-capitals"),
+        pytest.param("^# keep [ a-f]+ here$", True, id="control-space-and-some-letters"),
         pytest.param("^# keep .{1,32} here$", True, id="control-a-short-bounded-wildcard"),
         pytest.param("^# keep (?#.*)x here$", True, id="control-a-wildcard-only-in-a-comment"),
         pytest.param("^# keep [a-z]+ here$", True, id="control-a-letter-class"),
