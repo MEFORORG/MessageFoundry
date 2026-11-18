@@ -147,11 +147,15 @@ def test_the_shard_matrix_is_every_leg_once_per_shard(
     unchanged, once per shard, on this repository and on a fork. A leg dropped there drops two
     thirds of the suite on that leg, and the job-level checks below cannot see it.
 
-    Falsified by changing the loop to `for shard in 2; do`: RED. Restored."""
+    Falsified by dropping `"$W25"` from ci.yml's repository `LEGS=(...)`: RED on this repository.
+    Restored. Also by changing the loop to `for shard in 2; do` in the script this test writes
+    only: RED. Restored. The same change made in ci.yml leaves this test GREEN, because
+    `_matrix_shards` reads that loop too; test_the_shards_are_numbered_one_to_n catches it."""
     script = tmp_path / "matrix.sh"
     script.write_text(_matrix_snippet(), encoding="utf-8", newline="\n")
     out = tmp_path / "output.txt"
-    # probe_env gives the child the utilities that ship beside the interpreter (BACKLOG #1373).
+    # The PATH the resolver approved the interpreter under, so the child runs where it was probed;
+    # it also supplies utilities if these lines ever call one (BACKLOG #1373).
     env = probe_env(Path(bash_path), dict(os.environ))
     env.update(GITHUB_REPOSITORY=repo, GITHUB_OUTPUT=str(out))
     proc = subprocess.run(
@@ -159,7 +163,9 @@ def test_the_shard_matrix_is_every_leg_once_per_shard(
         cwd=str(tmp_path),
         env=env,
         capture_output=True,
-        timeout=60,
+        # Under the per-test cap (pyproject's 60 seconds, the lowest a leg sets), so this clean
+        # error fires before pytest-timeout ends the process.
+        timeout=30,
         check=False,
     )
     assert proc.returncode == 0, (
@@ -167,6 +173,7 @@ def test_the_shard_matrix_is_every_leg_once_per_shard(
         + "\n"
         + proc.stderr.decode("utf-8", "replace")
     )
+    assert out.is_file(), "the matrix lines exited 0 and wrote no GITHUB_OUTPUT"
     outputs = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
     legs = json.loads(outputs["matrix"])["include"]
     sharded = json.loads(outputs["shard_matrix"])["include"]
