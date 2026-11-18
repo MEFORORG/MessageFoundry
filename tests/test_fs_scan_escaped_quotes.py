@@ -44,6 +44,16 @@ POWERSHELL_DENY = [
     pytest.param("$x =# it's\ngrep -r x /proc", id="comment-right-after-an-operator"),
     pytest.param("$x +=# it's\ngrep -r x /proc", id="comment-right-after-a-compound-operator"),
     pytest.param("$x.Count# it's\ngrep -r x /proc", id="comment-ending-an-expression-first-token"),
+    pytest.param("$x=# it's\ngrep -r x /proc", id="comment-after-a-glued-operator"),
+    pytest.param("$m='done'# it's\ngrep -r x /proc", id="comment-after-a-glued-quote"),
+    pytest.param("[int]$x =# it's\ngrep -r x /proc", id="comment-in-a-typed-assignment"),
+    pytest.param("Get-ChildItem `\n#it's\ngrep -r x /proc", id="comment-after-a-continuation"),
+    pytest.param(
+        "Get-ChildItem `\r\n#it's\r\ngrep -r x /proc", id="comment-after-a-crlf-continuation"
+    ),
+    # A command with no backtick, `#` or `@` still takes the PowerShell reading for its `${`.
+    pytest.param("Write-Output ${it's}; grep -r x /proc", id="apostrophe-in-a-braced-variable"),
+    pytest.param("Write-Output ${a`}'}; grep -r x /proc", id="escaped-brace-in-a-braced-variable"),
 ]
 
 POWERSHELL_ALLOW = [
@@ -66,9 +76,10 @@ POWERSHELL_ALLOW = [
 # tokenizer reads each of these as one argument, the quote spanning the lines after it. A reading
 # that took the `#` for a comment blanked the opening quote and exposed the walk the quote holds.
 # `=` at a token start is an operator only in an expression statement, so among a command's
-# arguments (`x =#`), and after `(`, `&` or an escaped statement start, it starts a bareword too.
-# `${#x}` is a variable name. The last row is the other direction: a `$x#` comment left unread
-# exposed its `;` once the line above was read right.
+# arguments (`x =#`), after `(`, `&` or an escaped statement start, and after the command an
+# assignment runs (`$x = Get-ChildItem *#`), it starts a bareword too. `${#x}` is a variable name.
+# The `$x#` row is the other direction: a comment left unread exposed its `;` once the line above
+# was read right.
 TOKEN_START_ALLOW = [
     pytest.param("Write-Output a^#'\nfind /proc\n'", id="hash-after-caret"),
     pytest.param("Write-Output a=#'\nfind /proc\n'", id="hash-after-equals-in-a-word"),
@@ -82,6 +93,17 @@ TOKEN_START_ALLOW = [
     pytest.param("$x = 1; `n =#'\nfind /proc\n'", id="equals-after-an-escaped-statement-start"),
     pytest.param("Write-Output ${#x} '\nfind /proc\n'", id="hash-in-a-braced-variable-name"),
     pytest.param("# don't\n$x#; find /proc", id="comment-ending-an-expression-first-token"),
+    pytest.param("$x = Get-ChildItem *#'\nfind /proc\n'", id="star-in-a-command-after-assignment"),
+    pytest.param("$x = foo /#'\nfind /proc\n'", id="slash-in-a-command-after-assignment"),
+    pytest.param(
+        "$null = Write-Output =#'\nfind /proc\n'", id="equals-in-a-command-after-assignment"
+    ),
+    pytest.param(
+        "$x = gci *#*.txt; Write-Output 'it''s\nfind /proc'", id="star-hash-glob-after-assignment"
+    ),
+    pytest.param(
+        "Write-Output a `\r\n$b#'\r\nfind /proc\r\n'", id="hash-in-a-word-after-a-crlf-continuation"
+    ),
 ]
 
 
@@ -97,14 +119,4 @@ def test_powershell_prose_naming_a_walk_is_still_allowed(command: str) -> None:
 
 @pytest.mark.parametrize("command", TOKEN_START_ALLOW)
 def test_a_hash_inside_a_bareword_is_not_a_comment(command: str) -> None:
-    assert_allowed(run_guard(bash(command, tool="PowerShell")))
-
-
-# STILL A FALSE DENY. The reading tells an expression statement from a command by the statement's
-# first character only, so after `$null = Write-Output` it still takes `=#` for an operator and a
-# comment, where PowerShell reads a bareword. Allowing it means reading the statement grammar;
-# dropping the `=` rule instead would lose the comment-right-after-an-operator deny row.
-@pytest.mark.xfail(strict=True, reason="expression mode is read from the first character only")
-def test_equals_hash_among_arguments_after_an_assignment() -> None:
-    command = "$null = Write-Output =#'\nfind /proc\n'"
     assert_allowed(run_guard(bash(command, tool="PowerShell")))
