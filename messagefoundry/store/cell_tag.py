@@ -40,7 +40,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
-from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Final, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Final, Protocol, cast
 
 import annotationlib
 
@@ -396,19 +396,23 @@ def open_preset_criteria(
     :class:`NonTextCellError`, on a keyed and a keyless store alike (BACKLOG #5523). Both are drift,
     alerted here and audited by the store's read, before the caller reads the cell or stamps the
     preset as used. The store's whole-surface cell walks do not run this check."""
-    if isinstance(stored, str) and stored:
-        opened = open_tagged_cell(
-            cipher,
-            stored,
-            preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
-            table="search_presets",
-            column="criteria",
-            row_id=preset_id,
+    if stored is None or stored == "":
+        refused: CellTagError = BlankCellError("search_presets", "criteria", preset_id, None)
+    elif not isinstance(stored, str):
+        refused = NonTextCellError("search_presets", "criteria", preset_id, None)
+    else:
+        # open_tagged_cell returns None only for a None cell, refused above.
+        return cast(
+            str,
+            open_tagged_cell(
+                cipher,
+                stored,
+                preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
+                table="search_presets",
+                column="criteria",
+                row_id=preset_id,
+            ),
         )
-        if opened is not None:  # always: a str in gives a str out
-            return opened
-    kind = BlankCellError if stored is None or stored == "" else NonTextCellError
-    refused = kind("search_presets", "criteria", preset_id, None)
     _alert(cipher, refused)
     raise refused
 

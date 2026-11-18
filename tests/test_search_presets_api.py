@@ -535,7 +535,9 @@ async def test_a_planted_unmarked_criteria_cell_is_an_audited_integrity_refusal(
             side.commit()
             r = await c.get("/search/layered", params={"presets": pid}, headers=h)
         assert r.status_code == 423, r.text
-        assert r.json()["detail"] == f"preset {pid} failed its integrity check and cannot be used"
+        assert r.json()["detail"] == (
+            f"preset {pid} has non-text criteria, written outside the store, and cannot be used"
+        )
         assert sorted(d["cause"] for d in await _refusal_audits(keyed)) == [
             "BlankCellError",
             "NonTextCellError",
@@ -649,7 +651,8 @@ async def test_an_outage_answers_503_when_the_refusal_audit_cannot_be_written(
     assert "Retry-After" in r.headers
     assert (
         logging.ERROR,
-        f"layered search could not audit its refusal of preset {pid} (CipherUnavailableError)",
+        f"layered search could not audit its refusal of preset {pid}"
+        " (503 CipherUnavailableError; CipherUnavailableError)",
     ) in [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)]
 
 

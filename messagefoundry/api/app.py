@@ -533,7 +533,7 @@ from messagefoundry.store.base import (
     audit_write_errors,
     build_store_cipher,
 )
-from messagefoundry.store.cell_tag import BlankCellError, CellTagError
+from messagefoundry.store.cell_tag import BlankCellError, CellTagError, NonTextCellError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -9814,9 +9814,9 @@ def create_app(
         )
         return SearchPresetDeleteResult(id=preset_id, deleted=True)
 
-    # BACKLOG #5523: when the layered search last logged each (preset, error class) refusal at ERROR.
-    # One ERROR per pair per interval, as the store's tag-failure WARNING is; the route's audit row
-    # still records every refusal. Touched on the event loop only.
+    # BACKLOG #5523: when the layered search last logged each (preset, cause) refusal. One record per
+    # pair per interval, as the store's tag-failure WARNING is; the route's audit row is written for
+    # each refusal, best effort. Touched on the event loop only.
     _layered_refusals_logged: dict[tuple[str, str], float] = {}
     _LAYERED_REFUSAL_LOG_INTERVAL_S = 3600.0
     _LAYERED_REFUSAL_LOG_MAX = 4096
@@ -9877,20 +9877,18 @@ def create_app(
                     client=client_ip(request),
                 )
             except Exception as exc:  # noqa: BLE001 -- the refusal stands whatever the audit does
-                _log.error(
-                    "layered search could not audit its refusal of preset %s (%s)",
-                    preset_id,
-                    type(exc).__name__,
-                )
+                # Names the refusal's own status and cause, which the row would have held, once
+                # per preset and failure per interval: an outage fails every write.
+                failed = type(exc).__name__
+                if _first_layered_refusal(preset_id, f"audit:{cause}:{failed}"):
+                    _log.error(
+                        "layered search could not audit its refusal of preset %s (%s %s; %s)",
+                        preset_id,
+                        str(refusal.status_code),
+                        cause,
+                        failed,
+                    )
             return refusal
-
-        def blank(preset_id: str) -> HTTPException:
-            # Its own text: a keyless store has no integrity tag for a blank cell to fail.
-            return HTTPException(
-                423,
-                f"preset {preset_id} has blank criteria, written outside the store, and cannot be"
-                " used",
-            )
 
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
@@ -9900,17 +9898,23 @@ def create_app(
                 row = await engine.store.get_search_preset(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
-            except BlankCellError:
-                # BACKLOG #5523: the store refused a NULL or empty criteria cell, which it never
-                # writes (audited, alerted and logged there), so it never reads as an empty filter
-                # that would widen the search.
-                cause, refusal = "BlankCellError", blank(preset_id)
+            except (BlankCellError, NonTextCellError) as exc:
+                # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, which
+                # it never writes (audited, alerted and logged there), so it never reads as an
+                # empty filter that would widen the search. Its own text: a keyless store has no
+                # integrity tag for such a cell to fail.
+                cause = type(exc).__name__
+                shape = "blank" if isinstance(exc, BlankCellError) else "non-text"
+                refusal = HTTPException(
+                    423,
+                    f"preset {preset_id} has {shape} criteria, written outside the store, and"
+                    " cannot be used",
+                )
             except CellTagError as exc:
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
-                # unmarked value (audited; the cipher alerted, BACKLOG #5650), are not text
-                # (alerted and audited, BACKLOG #5523) or are corrupt (logged); the store refused.
-                # The caller's own preset exists, so a refusal, never a 500. Caught before
-                # CipherError, which it subclasses.
+                # unmarked value (audited; the cipher alerted, BACKLOG #5650) or are corrupt
+                # (logged); the store refused. The caller's own preset exists, so a refusal, never
+                # a 500. Caught before CipherError, which it subclasses.
                 cause = type(exc).__name__
                 refusal = HTTPException(
                     423, f"preset {preset_id} failed its integrity check and cannot be used"
@@ -9950,24 +9954,18 @@ def create_app(
                 raise await refuse(preset_id, refusal, cause)
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
-            if not row["criteria"]:
-                # A backstop: the store refuses a blank cell itself (BlankCellError above), so
-                # only a store that did not would reach this.
-                _log.warning(
-                    "layered search refused preset %s: its criteria cell is blank", preset_id
-                )
-                raise await refuse(preset_id, blank(preset_id), "BlankCellError")
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
-            # arm is gone: get_search_preset returns the criteria through the cipher as a str, and
-            # refuses a NULL or blank cell itself.
+            # arm is gone: get_search_preset returns the criteria through the cipher as a
+            # non-blank str, and refuses a NULL, blank or non-text cell itself (BACKLOG #5523).
             criteria, refused = json_loads_or_refusal(row["criteria"])
             if refused is not None or not isinstance(criteria, dict):
                 # BACKLOG #5523: the store writes criteria as a JSON object, so this was written
-                # outside it. Logged and audited, not only answered.
-                _log.warning(
-                    "layered search refused preset %s: its criteria are malformed", preset_id
-                )
+                # outside it. Logged, once per preset per interval, and audited each time.
+                if _first_layered_refusal(preset_id, "malformed"):
+                    _log.warning(
+                        "layered search refused preset %s: its criteria are malformed", preset_id
+                    )
                 raise await refuse(
                     preset_id,
                     HTTPException(400, f"preset {preset_id} has malformed criteria"),
