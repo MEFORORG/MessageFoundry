@@ -1058,6 +1058,11 @@ it — the engine refuses to start otherwise, naming the collision.
    `connection_stopped` alert per halted connection naming the log as the cause, and `GET /status`'s
    `log_sinks` block, which is read from memory and still answers when the disk does not.
 
+A record the sink cannot format is not by itself a write failure. What happens to it, including
+the case where the formatter cannot format even the guard's own notice and the sink counts as
+unwritable, is stated in [ADR 0162](adr/0162-fail-closed-application-log-write-guard-detect-roll-and-stop.md)
+amendment C, *A record that cannot be formatted is not a sink failure*.
+
 **Every outbound reads `log_halted` on `/connections` while this is in force** (ADR 0189), not
 `stopped`. The difference is the one that decides what you do next: `stopped` means the lane is
 waiting for you to press start, and `log_halted` means it is waiting for a writable disk — pressing
@@ -1085,8 +1090,10 @@ against a still-broken disk leaves the connection halted (and its listener down)
 `log_write_failed` naming the refusal, rather than quietly resuming with no log. That is deliberate:
 otherwise "restart it again" would be a way around the control.
 `GET /status` may report a flapping sink `unwritable` even when nothing was halted: from the roll
-that trips the flap bound until a roll more than 60 s after its last roll or failure, or until the
-engine re-validates the log, which it does at least on a restart (ADR 0162 amendment B).
+that trips the flap bound until a roll more than 60 s after its last roll or failure, or until a
+re-validation of the log releases it (ADR 0162 amendments B and C say when one does). The engine
+re-validates at least when it starts and when a recovery action tries to lift a log-write halt; a
+recovery action with no halt in force does not re-validate.
 A `/config/reload` on its own is **not enough**: it re-arms the inbounds it re-binds, so messages
 start being routed again, but it deliberately never resumes a paused **outbound** (that is an
 operator decision), so the backlog moves one stage and stops. Restarting the service does both.
