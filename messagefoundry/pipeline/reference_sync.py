@@ -48,6 +48,7 @@ from messagefoundry.config.wiring import (
     DEFAULT_REFERENCE_MAX_ROWS,
     ReferenceSpec,
     WiringError,
+    refuse_bool_literals,
     refuse_unresolved_hop_flags,
     resolve_env_settings,
 )
@@ -578,11 +579,14 @@ class ReferenceSyncRunner:
         # flag is refused first, while still raw, as build_check does (vault BACKLOG #2232).
         try:
             refuse_unresolved_hop_flags(spec.source.settings, f"reference set {spec.name!r}")
+            # Vault BACKLOG #3234: a non-bool literal on a boolean setting, as the load refuses it.
+            refuse_bool_literals(spec.source.settings, f"reference set {spec.name!r}")
         except WiringError as exc:
             # Vault BACKLOG #3139: sync_all logs only the error class, since a source error can hold
-            # a reference key. This refusal's text is config only: the set's name, the flag and a
-            # type name, never a value or the reason. So it is logged whole, or the operator learns
-            # nothing beyond "WiringError".
+            # a reference key. These refusals' text is config only: the set's name, the setting, a
+            # type name and a remedy chosen by the setting and the value's type, which may say a
+            # quoted string is a false spelling but never which. Never a value or the reason. So it
+            # is logged whole, or the operator learns nothing beyond "WiringError".
             # The text already leads with "reference set '<name>': ", so it is not repeated.
             log.error("%s (not synced)", exc)
             raise

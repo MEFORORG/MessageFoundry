@@ -2256,7 +2256,8 @@ class Engine:
             # the clustered branch, where the reference runner starts on every node before leadership.
             self._check_reference_backend_supported()
             # Vault BACKLOG #3139: serve runs no build check, so a reference set's raw hop flag is
-            # refused here, before any sync, rather than surfacing later as a failed sync.
+            # refused here, before any sync, rather than surfacing later as a failed sync, and so
+            # is a non-bool literal on a boolean source setting (vault BACKLOG #3234).
             refuse_reference_hop_flags(self._registry_runner.registry)
             if not self._coordinator.is_clustered():
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as

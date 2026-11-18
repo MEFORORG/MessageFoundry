@@ -4970,7 +4970,7 @@ class PostgresStore:
                 # SetMeta (ADR 0081, #150): merge the user bag under messages.metadata."user" in THIS
                 # same transaction — crash before commit leaves no metadata; a re-run re-derives it.
                 if meta_ops:
-                    merged = merge_user_metadata(pmeta_json, meta_ops)
+                    merged = merge_user_metadata(pmeta_json, meta_ops, row_id=message_id)
                     await conn.execute(
                         "UPDATE messages SET metadata=$1 WHERE id=$2",
                         self._enc(
@@ -6538,7 +6538,8 @@ class PostgresStore:
                             r["destination_name"],
                             r["response_seq"],
                         ),
-                    )
+                    ),
+                    row_id=r["message_id"],
                 ),
             )
             for r in rows

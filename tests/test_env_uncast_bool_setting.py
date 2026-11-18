@@ -46,6 +46,7 @@ from messagefoundry.pipeline.wiring_runner import (
     _dest_config,
     build_check_registry,
     check_http_sync_reply,
+    refuse_reference_hop_flags,
 )
 from messagefoundry.transports.http_auth import oauth2_auth_configured
 from messagefoundry.transports.smart import smart_auth_configured
@@ -145,7 +146,9 @@ def test_a_none_on_a_bool_setting_takes_the_setting_default(key: str, want: bool
 def test_a_literal_is_not_read_here() -> None:
     # Every pre-resolve reader (the loosening registers, the build-time capture checks) reads the
     # spec's literal, so reading it differently in the resolved copy would split one setting. A
-    # literal that is not a bool is refused at load instead (the tests below).
+    # literal that is not a bool is refused at load, and at each carrier's build, instead (the
+    # tests below). The resolver stays a resolver: some callers resolve a few keys and skip on
+    # any WiringError.
     out = resolve_env_settings({"tls_allow_expired": "false", "verify_tls": None}, {})
     assert out == {"tls_allow_expired": "false", "verify_tls": None}
 
@@ -371,6 +374,170 @@ def test_a_raw_hop_attestation_in_transport_settings_gets_its_own_refusal(
     msg = str(ei.value)
     assert "tls_hop_attested is not a transport setting" in msg
     assert "must be true or false" not in msg
+
+
+_RAW_DECLARATION_KEYS: list[tuple[str, object]] = [
+    ("cleartext_accepted", True),
+    ("cleartext_reason", "synthetic reason"),
+    ("tls_revocation_attested", True),
+    ("tls_revocation_attested_reason", "synthetic reason"),
+]
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+@pytest.mark.parametrize(("key", "value"), _RAW_DECLARATION_KEYS)
+def test_a_raw_cleartext_or_revocation_key_in_transport_settings_is_refused(
+    tmp_path: Path, direction: str, key: str, value: object
+) -> None:
+    # Vault BACKLOG #8253 item 2: these loaded clean and the build stripped them, so the author's
+    # declaration did nothing and nothing said so. Refused as tls_hop_attested is.
+    module = _RAW_HOP_MODULES[direction].replace("tls_hop_attested", key)
+    (tmp_path / "cfg.py").write_text(module.format(value=repr(value)), encoding="utf-8")
+    with pytest.raises(WiringError) as ei:
+        load_config(tmp_path, allow_empty=True)
+    assert f"{key} is not a transport setting" in str(ei.value)
+
+
+def _loaded_rest_outbound(tmp_path: Path) -> Any:
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_X', Rest(url='https://partner.example.org/in'))\n",
+        encoding="utf-8",
+    )
+    return load_config(tmp_path, allow_empty=True)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        *_RAW_DECLARATION_KEYS,
+        ("tls_hop_attested", True),
+        # Not a bool: still named as a misplaced key, not as a bad value.
+        ("tls_hop_attested", "yes"),
+        ("cleartext_accepted", "yes"),
+        ("tls_revocation_attested", env("unset_key")),
+    ],
+)
+def test_a_raw_declaration_key_written_after_the_declaration_is_refused_at_build(
+    tmp_path: Path, key: str, value: object
+) -> None:
+    # Vault BACKLOG #8253 items 2 and 10: written into the settings after outbound() returned, the
+    # key never meets the declaration's refusal; the build refuses it rather than strip it.
+    reg = _loaded_rest_outbound(tmp_path)
+    reg.outbound["OB_X"].spec.settings[key] = value
+    with pytest.raises(WiringError) as ei:
+        _dest(reg, "OB_X", {})
+    assert f"outbound connection 'OB_X': {key} is not a transport setting" in str(ei.value)
+    assert "must be true or false" not in str(ei.value)
+
+
+def test_a_raw_declaration_key_on_an_inbound_after_the_declaration_is_refused_at_build() -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config
+
+    ic = build_inbound_connection("IB_X", MLLP(port=0), router="r")
+    _source_config(ic, "127.0.0.1", {})  # the control builds
+    ic.spec.settings["tls_revocation_attested"] = True
+    with pytest.raises(WiringError, match="tls_revocation_attested is not a transport setting"):
+        _source_config(ic, "127.0.0.1", {})
+
+
+def test_a_non_bool_literal_written_after_the_load_is_refused_at_build(tmp_path: Path) -> None:
+    # #3234 added step 8: the load's Registry.bool_literal_problems never saw it, and the
+    # connector reads tls_allow_expired by truthiness, so "false" would have read as on.
+    reg = _loaded_rest_outbound(tmp_path)
+    reg.outbound["OB_X"].spec.settings["tls_allow_expired"] = "false"
+    with pytest.raises(WiringError) as ei:
+        _dest(reg, "OB_X", {})
+    assert (
+        "outbound connection 'OB_X': setting 'tls_allow_expired' must be true or false, not str"
+        in str(ei.value)
+    )
+
+
+def test_a_registry_built_in_code_meets_the_literal_rule_at_build() -> None:
+    # #3234 added step 8: a Registry assembled by hand is never validated, so its build is where
+    # the rule applies, on an inbound too, named as every sibling build refusal names it.
+    from messagefoundry.pipeline.wiring_runner import _source_config
+
+    registry = wiring.Registry()
+    spec = Rest(url="https://partner.example.org/in")
+    registry.add_outbound(build_outbound_connection("OB_X", spec))
+    assert _dest(registry, "OB_X", {})["tls_allow_expired"] is False  # the control builds
+    spec.settings["tls_allow_expired"] = "no"
+    with pytest.raises(WiringError, match="setting 'tls_allow_expired' must be true or false"):
+        _dest(registry, "OB_X", {})
+    ic = build_inbound_connection("IB_X", MLLP(port=0), router="r")
+    ic.spec.settings["persistent"] = "false"
+    with pytest.raises(WiringError, match="^inbound connection 'IB_X': setting 'persistent'"):
+        _source_config(ic, "127.0.0.1", {})
+
+
+def test_a_lookup_and_a_reference_set_meet_the_literal_rule_at_build(tmp_path: Path) -> None:
+    # #3234 added step 8, on the carriers that are not connections, each named in the refusal.
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import DatabaseLookup, DatabaseRef, Reference\n"
+        "DatabaseLookup('pt', server='db.example.org', database='d')\n"
+        "Reference('codes', source=DatabaseRef(server='db.example.org', database='d', "
+        "statement='SELECT code FROM t', key_column='code'))\n",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+    reg.lookups["pt"].settings["trust_server_certificate"] = "yes"
+    reg.references["codes"].source.settings["encrypt"] = "false"
+
+    def check() -> str:
+        with pytest.raises(WiringError) as ei:
+            build_check_registry(
+                reg,
+                inbound_bind_host="127.0.0.1",
+                env_values={},
+                egress=EgressSettings(deny_by_default=False),
+            )
+        return str(ei.value)
+
+    assert "database lookup 'pt': setting 'trust_server_certificate' must be" in check()
+    del reg.lookups["pt"].settings["trust_server_certificate"]
+    assert "reference set 'codes': setting 'encrypt' must be" in check()
+    # Engine.start's gate, which runs no build check, refuses it too.
+    with pytest.raises(WiringError, match="reference set 'codes': setting 'encrypt'"):
+        refuse_reference_hop_flags(reg)
+
+
+def test_a_fhir_lookup_meets_the_literal_rule_at_build_and_in_the_census(tmp_path: Path) -> None:
+    from messagefoundry.pipeline.wiring_runner import _fhir_lookup_settings
+
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        "FhirLookup('fh', url='https://fhir.example.org/fhir', tls_hop_attested=True, "
+        "tls_hop_attested_reason='synthetic reason')\n",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+    spec = reg.fhir_lookups["fh"]
+    egress = EgressSettings(deny_by_default=False)
+    _fhir_lookup_settings(spec, {}, egress)  # the control builds
+    assert [h.refused for h in wiring.attested_secure_hop_records(reg)] == [False]
+    spec.settings["verify_tls"] = "false"
+    with pytest.raises(WiringError, match="fhir lookup 'fh': setting 'verify_tls' must be"):
+        _fhir_lookup_settings(spec, {}, egress)
+    assert [h.refused for h in wiring.attested_secure_hop_records(reg)] == [True]
+
+
+def test_the_attested_hop_census_marks_a_literal_the_build_refuses() -> None:
+    # The census answers "does the build refuse this hop", and the build now refuses a non-bool
+    # literal, so the census must say so too.
+    reg = wiring.Registry()
+    spec = Rest(url="https://partner.example.org/in")
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_X", spec, tls_hop_attested=True, tls_hop_attested_reason="synthetic reason"
+        )
+    )
+    (before,) = wiring.attested_secure_hop_records(reg)
+    assert before.refused is False
+    spec.settings["tls_allow_expired"] = "no"
+    (after,) = wiring.attested_secure_hop_records(reg)
+    assert after.refused is True
 
 
 _FACTORY_CASES = [

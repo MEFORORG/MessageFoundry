@@ -286,6 +286,22 @@ class TestRefuses:
         self._assert_refused(proc, rp, raw)
         assert "reads UNREADABLE" in proc.stderr, proc.stderr
 
+    def test_a_liveness_lookup_that_throws_is_refused(self, repo: Path, home: Path) -> None:
+        """An unevaluated fence is not a passed fence. The lookup is made to throw in the sandbox's
+        own copy of session-registry.ps1, so the real one is untouched (BACKLOG #5491)."""
+        rp = declare_dangling(repo)
+        raw = rp.read_text(encoding="utf-8-sig")
+        reg = repo / "scripts" / "coord" / "session-registry.ps1"
+        reg.write_text(
+            reg.read_text(encoding="utf-8")
+            + "\nfunction Get-SessionLiveness { throw 'fence-broke-5491' }\n",
+            encoding="utf-8",
+        )
+        proc = clear(repo, home, rp.parent.name, rp.stem)
+        self._assert_refused(proc, rp, raw)
+        assert f"the liveness lookup for session {DEAD} failed" in proc.stderr, proc.stderr
+        assert "fence-broke-5491" in proc.stderr, proc.stderr
+
     def test_an_unparsable_registry_file_vetoes_the_clear(self, repo: Path, home: Path) -> None:
         """A file caught mid-write may be the very session being fenced."""
         rp = declare_dangling(repo)

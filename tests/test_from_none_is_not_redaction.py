@@ -896,7 +896,7 @@ _BODY_ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "the decode input is the kept PEM text of a trust-anchor file: public certificates",
     ),
     _Allowed(
-        "messagefoundry/store/content_search.py::make_spec::HL7PeekError::ContentSearchError",
+        "messagefoundry/store/content_search.py::SearchSpec.__post_init__::HL7PeekError::ContentSearchError",
         _SAFE + "parse_path quotes only the operator's own field path, and the new error's text is "
         "that same string",
     ),

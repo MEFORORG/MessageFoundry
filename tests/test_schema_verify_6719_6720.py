@@ -24,6 +24,7 @@ import pytest
 
 from messagefoundry.store import MessageStore
 from messagefoundry.store.schema_verify import (
+    _ORDINARY_TABLE,
     SchemaMismatchError,
     is_schema_step_error,
     live_schema_differences,
@@ -194,10 +195,15 @@ async def test_a_counted_store_whose_salt_is_a_readable_foreign_object_gets_the_
 
 
 #: Every table with a flag saying whether it is virtual, so one walk both counts the tables it saw
-#: and finds the virtual ones (a virtual table's ``type`` is ``table`` too).
+#: and finds the virtual ones (a virtual table's ``type`` is ``table`` too). The flag is the module's
+#: own predicate, so the pin and the reads it guards cannot disagree (BACKLOG #6719 item 9).
 _TABLES_FLAGGED_VIRTUAL = (
-    "SELECT name, sql LIKE 'CREATE VIRTUAL TABLE%' FROM sqlite_master WHERE type = 'table'"
+    f"SELECT m.name, NOT ({_ORDINARY_TABLE}) FROM sqlite_master AS m WHERE m.type = 'table'"
 )
+#: Every schema object with a flag saying whether it is a view, so one walk both counts what it saw
+#: and finds the views (a view query alone returns nothing on the built schema, so it cannot show it
+#: ran). The flag is in the SQL, so the negative control below pins the same predicate.
+_OBJECTS_FLAGGED_VIEW = "SELECT name, type = 'view' FROM sqlite_master"
 
 
 async def test_the_expected_shape_holds_no_virtual_table() -> None:
@@ -209,11 +215,79 @@ async def test_the_expected_shape_holds_no_virtual_table() -> None:
         await MessageStore._migrate(db)
         async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
             tables = [tuple(r) for r in await cur.fetchall()]
+        async with db.execute(_OBJECTS_FLAGGED_VIEW) as cur:
+            objects = [tuple(r) for r in await cur.fetchall()]
     # Positive control: the walk saw the built schema (40 tables when this floor was set), so the
     # absence below cannot pass on an empty walk.
     assert len(tables) >= 30, f"the scratch schema holds only {len(tables)} tables"
+    # The view walk's own floor (105 objects when it was set: 40 tables, 65 indexes). The tables are
+    # among these objects, so it adds nothing to the floor above beyond catching a query narrowed to
+    # fewer than 30 rows, such as a views-only one; the vacuous-absence lint needs it on this walk.
+    assert len(objects) >= 30, f"the scratch schema holds only {len(objects)} objects"
     virtual = [name for name, is_virtual in tables if is_virtual]
     assert virtual == []
+    # The reads skip views too, so a view this build created would never be verified either
+    # (BACKLOG #6719 item 10).
+    views = [name for name, is_view in objects if is_view]
+    assert views == []
+
+
+async def test_the_virtual_table_probe_finds_one_without_fts5(tmp_path: Path) -> None:
+    # Negative control for the pin above that needs no fts5 (BACKLOG #6719 item 8): a planted
+    # virtual table is flagged, an ordinary one is not, and the view flag marks a view.
+    path = tmp_path / "probe.db"
+    _sql(path, "CREATE TABLE plain (a)", "CREATE VIEW v AS SELECT 1")
+    _plant_unloaded_virtual_table(path, "planted")
+    async with _connected(path) as db:
+        async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
+            rows = {r[0]: bool(r[1]) for r in await cur.fetchall()}
+        async with db.execute(_OBJECTS_FLAGGED_VIEW) as cur:
+            views = [name for name, is_view in await cur.fetchall() if is_view]
+    assert rows == {"plain": False, "planted": True}
+    assert views == ["v"]
+
+
+async def test_a_planted_ordinary_table_with_rootpage_zero_is_not_skipped(tmp_path: Path) -> None:
+    # A rootpage of 0 does not make a row virtual: its stored SQL is an ordinary CREATE TABLE, so
+    # the reads do not skip it, and reading the salt table it names fails as corrupt.
+    path = tmp_path / "rootless.db"
+    _sql(path, "CREATE TABLE cipher_meta (key_id TEXT)", "INSERT INTO cipher_meta VALUES ('k')")
+    _sql(
+        path,
+        "PRAGMA writable_schema = ON",
+        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES ('table',"
+        " 'store_salt', 'store_salt', 0, 'CREATE TABLE store_salt (salt BLOB)')",
+    )
+    from messagefoundry.store.schema_verify import _counts_under_a_dek
+
+    async with _connected(path) as db:
+        shape = await read_schema_shape(db)
+        assert set(shape.columns) == {"cipher_meta", "store_salt"}
+        with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+            await _counts_under_a_dek(db)
+
+
+@pytest.mark.parametrize(
+    "cipher_meta",
+    [
+        "CREATE TABLE cipher_meta (key_id TEXT, invocations INTEGER)",
+        "CREATE VIEW cipher_meta AS SELECT 'k' AS key_id, 1 AS invocations",
+    ],
+    ids=["ordinary-table", "view"],
+)
+async def test_a_readable_count_leans_to_the_new_key_remedy(
+    tmp_path: Path, cipher_meta: str
+) -> None:
+    # A readable count, whatever object holds the name, picks the remedy that cannot zero a DEK's
+    # count. Pinned so the store_salt ordinary-table rule is not copied onto cipher_meta unread.
+    from messagefoundry.store.schema_verify import _counts_under_a_dek
+
+    path = tmp_path / "count.db"
+    _sql(path, cipher_meta)
+    if cipher_meta.startswith("CREATE TABLE"):
+        _sql(path, "INSERT INTO cipher_meta VALUES ('k', 1)")
+    async with _connected(path) as db:
+        assert await _counts_under_a_dek(db) is True
 
 
 @_NEEDS_FTS5

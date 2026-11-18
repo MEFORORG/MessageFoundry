@@ -316,8 +316,11 @@ param(
     # `-IdleHours 0.5`, typed for "half an hour",
     # released every worktree on this repo and printed no warning at all.
     [double]$IdleHours = 72,
-    # Liveness fence tolerance, passed through to the shared fence.
-    [int]$StartSkewMinutes = 15,
+    # Liveness fence tolerance, passed through to the shared fence. Unbounded by default, as in
+    # remove.ps1 (vault BACKLOG #2985, item 9 and added item 4): the registry's own default of 15 reads a
+    # record as STALE, which vetoes nothing, when its live process started more than 15 minutes before
+    # the session registered. Only a process started after the record then reads as a reused pid.
+    [int]$StartSkewMinutes = [int]::MaxValue,
     # The ref a branch must be merged into.
     [string]$MainRef = 'origin/main'
 )
@@ -909,7 +912,9 @@ function Get-TranscriptIndex {
     $rootsSeen = @()
     if ($ConfigRoot) { $rootsSeen = @($ConfigRoot) }
     else {
-        $rootsSeen = @(Get-ChildItem -Path $env:USERPROFILE -Directory -Filter '.claude*' -Force -EA SilentlyContinue |
+        # -LiteralPath: a profile folder whose name holds [ or ] is not a pattern (vault BACKLOG #2985,
+        # added item 2).
+        $rootsSeen = @(Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter '.claude*' -Force -EA SilentlyContinue |
                 ForEach-Object { $_.FullName })
     }
     $withProjects = @()

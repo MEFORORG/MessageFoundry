@@ -7806,7 +7806,7 @@ class SqlServerStore:
                 # SetMeta (ADR 0081, #150): merge the user bag under messages.metadata."user" in THIS
                 # same transaction — crash before commit leaves no metadata; a re-run re-derives it.
                 if meta_ops:
-                    merged = merge_user_metadata(pmeta_dec, meta_ops)
+                    merged = merge_user_metadata(pmeta_dec, meta_ops, row_id=message_id)
                     await cur.execute(
                         _SQL_UPDATE_METADATA,
                         (
@@ -8016,7 +8016,7 @@ class SqlServerStore:
                 self._inherit_attachments_sync(cur, message_id, inherits)
             # SetMeta (ADR 0081, #150): merge the user bag under messages.metadata."user" in THIS txn.
             if meta_ops:
-                merged = merge_user_metadata(pmeta_dec, meta_ops)
+                merged = merge_user_metadata(pmeta_dec, meta_ops, row_id=message_id)
                 cur.execute(
                     _SQL_UPDATE_METADATA,
                     (
@@ -8300,7 +8300,8 @@ class SqlServerStore:
                         ),
                     )
                     if r["resp_headers"] is not None
-                    else None
+                    else None,
+                    row_id=r["message_id"],
                 ),
             )
             for r in rows

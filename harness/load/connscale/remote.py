@@ -41,7 +41,7 @@ from datetime import UTC, datetime
 
 from harness.load.connscale.driver import ConnScaleDriver
 from harness.load.connscale.report import HOLD_BRACKET_RATE_WINDOW, NoLoss
-from harness.load.connscale.runner import ConnScaleError, _Excusal, _excusal, _reconcile
+from harness.load.connscale.runner import ConnScaleError, _Excusal, _reconcile_judged
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import (
     SIGN_IN_ERRORS,
@@ -406,15 +406,13 @@ async def run_connscale_remote(
         c = metrics.counters.snapshot()
         base_sample, final_sample = poller.baseline, poller.final
         counter_reset = _counter_reset(poller)
-        # One budget argument for both, so the published stranding arm is the one `_reconcile`
-        # judged. No reload probe runs here, so nothing is excused as reload stranding.
-        unconfirmed_budget = n * count
-        stranding = _excusal(c, unconfirmed_budget=unconfirmed_budget)
-        no_loss = _reconcile(
+        # The published stranding arm is the excusal this verdict judged, returned with it. No
+        # reload probe runs here, so nothing is excused as reload stranding.
+        no_loss, stranding = _reconcile_judged(
             c,
             base_sample,
             final_sample,
-            unconfirmed_budget=unconfirmed_budget,
+            unconfirmed_budget=n * count,
             drain_seconds=drain_seconds,
             counter_reset=counter_reset,
         )

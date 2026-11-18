@@ -1332,8 +1332,8 @@ _BACKEND_OPEN_OUTSIDE_THE_SEAM = {
     ("messagefoundry/pipeline/engine.py", "Engine.create"),
     # the load harness resetting a synthetic server store between runs
     ("harness/load/connscale/runner.py", "_reset_server_store"),
-    ("harness/load/shardcert.py", "_reset_store"),
-    ("harness/load/shardcert.py", "_queue_breakdown"),
+    # the shard-cert rig's one opener, shared by its store reset and its queue breakdown
+    ("harness/load/shardcert.py", "_open_rig_store"),
 }
 
 #: The CLI commands that open the store. Each passes the shared verdict, except ``rotate-key``, which

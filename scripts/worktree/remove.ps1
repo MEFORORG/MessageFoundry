@@ -35,9 +35,7 @@
       * a target that CONTAINS another registered worktree, since the removal would delete that
         checkout too and leave it registered with no directory;
       * a target git has locked, which is git's own in-use flag;
-      * a DETACHED target whose HEAD commit is held by no ref, and a target whose HEAD reflog or own
-        per-worktree refs (refs/worktree, refs/bisect, refs/rewritten) hold a commit no shared ref
-        holds. The removal deletes that reflog and those refs, so nothing would reach the commits;
+      * a DETACHED target whose HEAD commit is held by no ref;
       * a target the session registry records a session in, or any target at all when the registry
         cannot be read (scripts/coord/occupancy.ps1 says why an unreadable fence must refuse). A
         registry that was read and holds no record at all clears the target. The registry is every
@@ -55,8 +53,17 @@
       * any run with GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE set, since each makes
         `git -C <path>` answer for a different checkout. -List refuses it too. -Name since BACKLOG
         #5648; before that it refused only under -Discard;
+      * any run with GIT_CONFIG or a GIT_CONFIG_<anything> variable set, worktree-gates.ps1's list,
+        since config carried in the environment steers every git read. -List refuses it too
+        (vault BACKLOG #8225 item 2);
       * the target you are standing in, and a target that holds the copy of this script being run
-        (-Name since BACKLOG #5648);
+        (-Name since BACKLOG #5648). Each side is matched by its spelling and, where git can place
+        it, by the real path git resolves, so a junction or 8.3 alias is caught (vault
+        BACKLOG #8225 item 8);
+      * a target whose HEAD reflog or own per-worktree refs (refs/worktree, refs/bisect,
+        refs/rewritten) hold a commit no shared ref holds. The removal deletes that reflog and those
+        refs, so nothing would reach the commits. -Name since vault BACKLOG #8225 item 9; there,
+        without -DeleteBranch, a commit the kept branch's own reflog holds does not count;
       * a target that still holds a work claim (claim.ps1), or any target when a claim file cannot
         be read, parses to something other than one record, or names no worktree. The registry is
         found the way claim.ps1 finds it, mefor.claimsRoot included;
@@ -139,8 +146,9 @@
     the branch stays. Work a session wrote into the target by absolute path from another directory
     is seen only if it left the tree dirty, or wrote where the activity signal below reads.
 
-    -Name KEEPS ITS OLD RULES OTHERWISE. Of the -Path-only refusals it shares only the detached HEAD
-    one: tracked changes refuse without -Force, and so do files flagged skip-worktree or
+    -Name KEEPS ITS OLD RULES OTHERWISE. It shares at least the detached HEAD, nested worktree and
+    reflog-only refusals above; docs/WORKTREES.md lists what -Name refuses. Tracked changes refuse
+    without -Force, and so do files flagged skip-worktree or
     assume-unchanged (BACKLOG #5648), which git status does not read. -Force overrides both, and the
     run names the flagged files it lets go. Untracked files older than six hours and ignored
     files other than the repositories named above go with the worktree, and there is no occupancy
@@ -299,14 +307,37 @@ function Test-UnderManagedSegment([string]$Path) {
 # The caller's cwd, or the copy of this script being run, inside the target. On both routes (-Name
 # since BACKLOG #5648). Standing in it, git's own removal fails part-way, after it has deleted what it
 # could; the copy being run would be deleted part-way through its own run. -Force overrides neither.
+#
+# THE SPELLING IS NOT THE ONLY COMPARISON (vault BACKLOG #8225 item 8). A junction or 8.3 alias of the
+# target is a different string, so each side is also read through git, which resolves both (measured
+# 2026-11-17 on Git for Windows: `rev-parse --show-toplevel` through a junction and through an 8.3 name
+# prints the real path). A subst drive was not measured. A directory git cannot place in a repository
+# falls back to its spelling alone; the target itself is a worktree, so a directory inside it is one
+# git can place.
+function Get-ResolvedGitDir([string]$Dir) {
+    $top = "$(& git -C $Dir rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $top) { return '' }
+    $prefix = "$(& git -C $Dir rev-parse --show-prefix 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0) { return '' }
+    # Concatenated, not Join-Path, which asks the provider for a drive and throws on a root it lacks.
+    return ConvertTo-Norm $(if ($prefix) { "$top/$prefix" } else { $top })
+}
 function Assert-NotInsideTarget([string]$Target, [string]$Remedy) {
-    $there = ConvertTo-Norm $Target
-    $here = ConvertTo-Norm $PWD.ProviderPath
-    if ($here -eq $there -or $here.StartsWith("$there/")) {
+    $there = @(ConvertTo-Norm $Target)
+    $realThere = Get-ResolvedGitDir $Target
+    if ($realThere) { $there += $realThere }
+    $inside = {
+        param([string]$Dir)
+        $mine = @(ConvertTo-Norm $Dir)
+        $real = Get-ResolvedGitDir $Dir
+        if ($real) { $mine += $real }
+        foreach ($t in $there) { foreach ($m in $mine) { if ($m -eq $t -or $m.StartsWith("$t/")) { return $true } } }
+        return $false
+    }
+    if (& $inside $PWD.ProviderPath) {
         throw "You are standing inside '$Target'. Run this from another checkout. Nothing was removed."
     }
-    $scriptDir = ConvertTo-Norm $PSScriptRoot
-    if ($scriptDir -eq $there -or $scriptDir.StartsWith("$there/")) {
+    if (& $inside $PSScriptRoot) {
         throw "This copy of remove.ps1 lives inside '$Target'. $Remedy Nothing was removed."
     }
 }
@@ -326,6 +357,15 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
 # Test-PresentOrThrow, Get-EntriesOrThrow and $REGENERABLE_IGNORED_PATTERN, shared with the nightly
 # .claude/worktrees removal so its claim, allocation and nested-checkout reads fail closed the same way.
 . "$PSScriptRoot\worktree-gates.ps1"
+# GIT_CONFIG CARRIERS REFUSE ON EVERY ROUTE TOO (vault BACKLOG #5648, #8225 item 2), for the reason the
+# redirects above do: config carried in the environment steers every `git -C <path>` read below, for
+# example through a core.fsmonitor hook. The list is worktree-gates.ps1's, which the nightly removal
+# and the hygiene report read, so the three cannot disagree on what a carrier is. Before any git call.
+$gitCarriers = @(Get-GitConfigCarriers)
+if ($gitCarriers.Count -gt 0) {
+    throw ("$($gitCarriers -join ', ') is set, so git would read config the operator did not set up " +
+        "for this clone. Unset it and re-run. Nothing was removed.")
+}
 if ($byPath -or $listing) {
     # Every registered worktree, primary first. FAIL CLOSED: an unreadable list is the same empty
     # answer as a clone with none, and must never read as permission.
@@ -494,12 +534,14 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
-if ($byPath) {
+# ON BOTH ROUTES (-Name since vault BACKLOG #5648, #8225 item 9).
+& {
     # THE HEAD REFLOG GOES WITH THE WORKTREE, and the check above reads only the commit HEAD is on now.
     # A commit made on a detached HEAD before switching back to a branch is held by that reflog alone.
-    # The vault copy documents this as a gap; this route refuses it, because it reaches checkouts the
-    # caller did not make. -Force does not override it. A commit a branch's own reflog still holds,
-    # an amended one for example, is counted here too: this cannot tell the two apart, so it refuses.
+    # The vault copy documents this as a gap; both routes refuse it. -Force does not override it. A
+    # commit a branch's own reflog still holds, an amended one for example, is counted here too: this
+    # cannot tell the two apart, so it refuses. A script block rather than an `if`, so its variables
+    # stay inside it.
     $logTips = @(& git -C $WorktreePath reflog show --format=%H HEAD 2>$null |
             Where-Object { $_ -match '\A[0-9a-f]{40,64}\z' })
     if ($LASTEXITCODE -ne 0) {
@@ -521,8 +563,21 @@ if ($byPath) {
         throw ("The HEAD reflog and per-worktree refs of '$WorktreePath' name $($logTips.Count) commits, " +
             "more than this route checks. Nothing was removed.")
     }
+    # ON -Name WITHOUT -DeleteBranch THE BRANCH STAYS, and its own reflog lives in the common dir, so
+    # a commit that reflog holds (an amend, a rebase) survives the removal and is not counted. -Path is
+    # unchanged: it reaches checkouts the caller did not make. A branch reflog that cannot be read, or
+    # is longer than the cap, is used as far as it goes, which only makes this stricter. The cap is
+    # 100, not 400, because these ride on the same command line as up to 400 tips below.
+    $branchKept = @()
+    if (-not $byPath -and -not $DeleteBranch) {
+        $ownBranch = "$(& git -C $WorktreePath symbolic-ref -q HEAD 2>$null)".Trim()
+        if ($LASTEXITCODE -eq 0 -and $ownBranch -like 'refs/heads/*') {
+            $branchKept = @(& git -C $GitRoot reflog show --format=%H $ownBranch 2>$null |
+                    Where-Object { $_ -match '\A[0-9a-f]{40,64}\z' } | Select-Object -Unique -First 100)
+        }
+    }
     if ($logTips.Count -gt 0) {
-        $looseCommits = @(& git -C $GitRoot rev-list @logTips --not @transientRefExcludes --glob=refs/* 2>$null)
+        $looseCommits = @(& git -C $GitRoot rev-list @logTips --not @transientRefExcludes --glob=refs/* @branchKept 2>$null)
         if ($LASTEXITCODE -ne 0) {
             throw ("Could not tell whether a ref holds the commits in the HEAD reflog and per-worktree " +
                 "refs of '$WorktreePath'. Nothing was removed.")
@@ -535,7 +590,9 @@ if ($byPath) {
             throw "Removing it would delete that reflog and leave those commits in no ref. Nothing was removed."
         }
     }
+}
 
+if ($byPath) {
     # The occupancy fence. The registry is found under $env:USERPROFILE, and CLAUDE_CONFIG_DIR below,
     # which is how the tests point it at a fixture.
     #
@@ -698,10 +755,33 @@ function Get-TargetClaimsDirs {
     return @($dirs | Sort-Object -Unique { ConvertTo-Norm $_ })
 }
 
+# A claims or allocation registry, read with the nightly removal's readers but not its exact rule
+# (vault BACKLOG #2985, added item 1): $false only when it is CONFIRMED absent, which
+# Test-ConfirmedGoneOrThrow decides by listing the nearest folder above it, so a registry under a dead
+# link or an unreachable share is not "no records". The nightly also requires the folder above to be
+# there (Test-RegistryPresentOrThrow); this does not, because a clone that never used coordination has
+# no such folder. A clone with no coordination folder at all still reads as absent, because its git dir
+# lists without it. $true means "there; list it", and the caller MUST list through Get-EntriesOrThrow:
+# a plain FILE there returns $true so that listing refuses it with "Could not list ..."
+# (test_a_registry_path_whose_listing_throws_refuses). Anything carrying a reparse point (a junction,
+# a symlink of either kind, a mount point or a cloud placeholder) is refused from its own attributes
+# at the time of this read, without being followed.
+function Test-RegistryDirPresent([string]$Dir, [string]$What) {
+    $item = Get-ItemOrThrow $Dir $What
+    if (-not $item) {
+        if (Test-ConfirmedGoneOrThrow $Dir $What -Plain) { return $false }
+        throw "$What ('$Dir') appeared while it was being read, so what it holds is unknown. Nothing was removed."
+    }
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "$What ('$Dir') is a link or another reparse point, not a plain directory, so what it holds is unknown. Nothing was removed."
+    }
+    return $true
+}
+
 # Every claim file in every registry this target's claims can be in, or none.
 function Read-TargetClaims {
     foreach ($d in $claimsDirs) {
-        if (Test-PresentOrThrow $d 'the claims directory') { Read-ClaimFiles $d }
+        if (Test-RegistryDirPresent $d 'the claims directory') { Read-ClaimFiles $d }
     }
 }
 
@@ -1171,7 +1251,7 @@ function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     return $null
 }
 
-if (Test-PresentOrThrow $allocDirRoot 'the allocation directory') {
+if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
     $atRisk = @()
     $allocUnreadable = @()
     foreach ($f in @(Get-EntriesOrThrow $allocDirRoot 'allocations' '*.json' -Recurse -FilesOnly | Sort-Object FullName)) {
@@ -1356,14 +1436,33 @@ if ($removeCode -ne 0 -and $parkedRef) {
 # 2.55.0.windows.5 with one inside node_modules; nothing outside the tree was deleted). Either way
 # the leftover is no longer a worktree, so no route here can reach it again, and the run says so
 # rather than reporting a clean removal.
-# Not Test-Path, which reads a directory it may not see as gone.
-try { $leftover = Test-PresentOrThrow $WorktreePath 'the removed directory' } catch { $leftover = $true }
+# Not Test-Path, which reads a directory it may not see as gone. Gone means CONFIRMED gone, the nightly
+# removal's rule (Test-ConfirmedGoneOrThrow; vault BACKLOG #2985, added item 1): a not-found under a
+# folder that cannot be listed is not a removal.
+# Two states, kept apart so a warning never presumes a leftover the check could not see: there, or
+# not confirmed gone (the check itself failed, so the directory may or may not be there, and
+# $leftoverWhy holds the reason on one line).
+$leftoverThere = $false
+$leftoverWhy = ''
+try { $leftoverThere = -not (Test-ConfirmedGoneOrThrow $WorktreePath 'the removed directory') }
+catch {
+    $leftoverWhy = (($_.Exception.Message -replace '[\r\n]+', ' ') -replace '\s*Nothing was removed\.\s*\z', '').Trim().TrimEnd('.')
+    if (-not $leftoverWhy) { $leftoverWhy = 'the check gave no reason' }
+}
+$leftover = $leftoverThere -or [bool]$leftoverWhy
 if ($removeCode -ne 0) {
     $after = @(Get-RepoWorktrees $GitRoot)
     if ($leftover -and $after.Count -gt 0 -and -not ($after | Where-Object { $targetNorms -contains (ConvertTo-Norm $_.Path) })) {
-        Write-Host ("WARNING: git dropped the registration of '$WorktreePath' but could not delete all of it; " +
-            "something may hold a file open there. What is left is no longer a worktree. Delete it by " +
-            "hand once nothing uses it.") -ForegroundColor Yellow
+        if ($leftoverThere) {
+            Write-Host ("WARNING: git dropped the registration of '$WorktreePath' but could not delete all of it; " +
+                "something may hold a file open there. What is left is no longer a worktree. Delete it by " +
+                "hand once nothing uses it.") -ForegroundColor Yellow
+        }
+        else {
+            Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and failed, and its directory " +
+                "could not be confirmed gone ($leftoverWhy). If anything is still there, it is no longer a " +
+                "worktree; look, and delete it by hand once nothing uses it.") -ForegroundColor Yellow
+        }
     }
     throw "git worktree remove failed (exit $removeCode)"
 }
@@ -1427,9 +1526,16 @@ if ($DeleteBranch) {
 }
 
 if ($leftover) {
-    Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and exited 0, but the directory is " +
-        "still there. What is left is no longer a worktree; a junction inside it is one known cause. Look " +
-        "at it, then delete it by hand.") -ForegroundColor Yellow
+    if ($leftoverThere) {
+        Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and exited 0, but the directory is " +
+            "still there. What is left is no longer a worktree; a junction inside it is one known cause. Look " +
+            "at it, then delete it by hand.") -ForegroundColor Yellow
+    }
+    else {
+        Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and exited 0, but the directory " +
+            "could not be confirmed gone ($leftoverWhy). If anything is still there, it is no longer a " +
+            "worktree; look, and delete it by hand if so.") -ForegroundColor Yellow
+    }
 }
 else { Write-Host "Removed worktree '$WorktreePath'." -ForegroundColor Green }
 if ($keptBranch) {

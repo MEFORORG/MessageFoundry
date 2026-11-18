@@ -809,6 +809,13 @@ class _FuseArm:
     #: ``drain_seconds_worst``.
     drain_timeouts: int
     drainless_unsent: int
+    #: Of ``drain_timeouts``, how many read rows still in the pipeline at the end (a final backlog
+    #: above 0). Only those show a strand; a backlog of 0, or the -1 a band that could not read
+    #: ``/stats`` reports, does not (BACKLOG #5574).
+    stranded_reads: int
+    #: Trials that recorded no traffic, a failed cell's placeholder among them. Their 0.0 rate is no
+    #: measurement, so an arm with any is no reference for a lift (BACKLOG #5574).
+    unsent_trials: int
     delivered_offered: float | None  # mean sink_received/sent across trials (None if no sent)
     zero_loss_ok: bool  # every trial held the at-least-once reconcile
     #: The arm did not hold zero-loss and no trial PROVED a loss: every failing trial's reconcile was
@@ -859,6 +866,12 @@ class _FuseArm:
             drainless_unsent=sum(
                 1 for r in recs if r.drain_seconds is None and r.no_loss.sent <= 0
             ),
+            stranded_reads=sum(
+                1
+                for r in recs
+                if r.drain_seconds is None and r.no_loss.sent > 0 and r.no_loss.backlog > 0
+            ),
+            unsent_trials=sum(1 for r in recs if r.no_loss.sent <= 0),
             delivered_offered=statistics.fmean(ratios) if ratios else None,
             zero_loss_ok=all(r.no_loss.ok for r in recs) and bool(recs),
             zero_loss_inconclusive=(
@@ -1393,6 +1406,14 @@ def _fuse_verdict(
             "B1 could not clear zero-loss and proved no loss (its reconcile was INCONCLUSIVE) -- "
             "the run fails closed until a clean measurement clears it"
         )
+    if base.unsent_trials:
+        # A B0 trial that recorded no traffic (a failed cell's 0.0 placeholder) drags B0's mean
+        # intake down and, with no drain time, passes B1's drain guard, so B0 is no reference for
+        # a GO (BACKLOG #5574). A B0 that ran and failed zero-loss is still a measurement.
+        return FUSE_INCONCLUSIVE, (
+            f"{base.unsent_trials} B0 trial(s) recorded no traffic (a failed cell's placeholder, "
+            "or a step that sent nothing) -- B0's intake and drain are no sound reference for a lift"
+        )
     if lift_pct is None:
         return FUSE_INCONCLUSIVE, "B0 baseline intake ~0 -- no sound lift to measure"
     if not significant:
@@ -1416,8 +1437,9 @@ def _fuse_verdict(
 def _undrained_reason(cand: _FuseArm) -> str:
     """Why a B1 arm with no drain time did not drain, told by what each undrained trial carries.
 
-    A trial that recorded traffic and no drain time is a real ``await_drain`` timeout and keeps
-    its specific reason (BACKLOG #5574). One that recorded none is not asserted to have stalled:
+    A trial that recorded traffic and no drain time is a real ``await_drain`` timeout. Rows are
+    called stranded only where such a trial read a final backlog above 0 (BACKLOG #5574). One
+    that recorded no traffic is not asserted to have stalled:
     a batch cell whose drive or aggregation failed (batchbox ``_failed_cell_record``) carries a
     placeholder ``sent`` of 0 whatever its fleet drove, and a step that sent nothing may still have
     timed out on rows it did not send; its reconcile detail says which.
@@ -1429,6 +1451,14 @@ def _undrained_reason(cand: _FuseArm) -> str:
     )
     if cand.drain_timeouts:
         also = f"; {unread}" if cand.drainless_unsent else ""
+        if not cand.stranded_reads:
+            # A timeout that read no rows left at the end shows no strand: a backlog of 0, or the -1
+            # of a band that could not read /stats (BACKLOG #5574).
+            return (
+                "B1 pipeline did not fully drain (await_drain timed out, and no timed-out trial read "
+                "rows left in the pipeline at the end -- a backlog of 0, or -1 from a band that could "
+                f"not read /stats -- so no strand is asserted) -- no ceiling lift is measured{also}"
+            )
         return (
             "B1 pipeline did not fully drain (await_drain timed out -- the whole-pipeline in_pipeline "
             "gauge never reached 0, rows stranded in ingress/routed/outbound) -- the higher intake "
