@@ -359,6 +359,15 @@ def test_a_refusal_names_the_field_not_the_record_value(
     assert _LEAK not in message, message
 
 
+def test_a_checked_on_refusal_does_not_carry_the_value_on_its_chain(tmp_path: Path) -> None:
+    """Before: the refusal text left the value out, but the ValueError it was raised `from` held it,
+    so any traceback or logger walking `__cause__` printed the record's text."""
+    with pytest.raises(ScorecardError) as exc:
+        _load(tmp_path, _CELL + _BLOCKER.replace('"2026-08-01"', f'"{_LEAK}"'))
+    assert exc.value.__cause__ is None
+    assert exc.value.__suppress_context__
+
+
 # --- BACKLOG #5459: an anchor must name a token, and must stay inside the engine root ------------
 
 _ANCHOR = '  [[cell.evidence]]\n  path = "mod.py"\n  line = 1\n  expect = "TOKEN"\n'
@@ -402,6 +411,14 @@ def test_a_backslash_dotdot_path_is_refused_at_load(tmp_path: Path) -> None:
     """A Windows separator must not hide a `..` from a check that splits on `/` only."""
     body = _CELL + _ANCHOR.replace('path = "mod.py"', "path = '..\\outside.py'")
     with pytest.raises(ScorecardError, match="path"):
+        _load(tmp_path, body)
+
+
+def test_a_path_with_a_control_character_is_refused_at_load(tmp_path: Path) -> None:
+    """Before: a NUL loaded, then `Path.resolve` raised ValueError in check_anchors on POSIX and the
+    run stopped on the class name instead of a refusal naming the field."""
+    body = _CELL + _ANCHOR.replace('path = "mod.py"', 'path = "mod\\u0000.py"')
+    with pytest.raises(ScorecardError, match="printable"):
         _load(tmp_path, body)
 
 

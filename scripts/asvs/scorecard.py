@@ -939,14 +939,15 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
             try:
                 # The shape check runs first: `fromisoformat` also accepts `20260801`.
                 if not _DATE_RE.fullmatch(checked_on):
-                    raise ValueError(checked_on)
+                    raise ValueError("not YYYY-MM-DD")
                 datetime.date.fromisoformat(checked_on)
-            except ValueError as exc:
-                # The value is not echoed: a refusal names the field, never the record's text.
+            except ValueError:
+                # The value is not echoed: a refusal names the field, never the record's text, and
+                # `from None` keeps `fromisoformat`'s message, which quotes it, off the chain too.
                 raise ScorecardError(
                     f"{where}: `blocker.checked_on` must be an ISO date, a real one written "
                     "YYYY-MM-DD"
-                ) from exc
+                ) from None
             recheck_days = rb["recheck_days"]
             if not isinstance(recheck_days, int) or isinstance(recheck_days, bool):
                 raise _refuse_type(where, "blocker.recheck_days", "an integer", recheck_days)
@@ -980,10 +981,16 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
             # located in any empty file, and a `..` or absolute path read a file outside the tree
             # being measured, so each is refused here rather than resolved (BACKLOG #5459).
             anchor_path = _str(e, "path", at)
-            if not anchor_path.strip() or not _is_within_tree(anchor_path):
+            # Printable too: a NUL makes `Path.resolve` raise ValueError on POSIX, which stopped
+            # check_anchors on the class name instead of naming the field.
+            if (
+                not anchor_path.strip()
+                or not anchor_path.isprintable()
+                or not _is_within_tree(anchor_path)
+            ):
                 raise ScorecardError(
-                    f"{at}: `path` must be a non-empty path relative to the engine root, with no "
-                    "drive, no leading separator and no `..`"
+                    f"{at}: `path` must be a non-empty, printable path relative to the engine "
+                    "root, with no drive, no leading separator and no `..`"
                 )
             line = _int(e, "line", at)
             if line < 1:
@@ -1135,7 +1142,8 @@ def load_reviewer_exceptions(path: Path) -> dict[str, str]:
     A malformed entry fails closed, because it must not quietly waive a refusal. That covers a
     missing field, an id that is not a bare requirement id, a cell named twice, and a table placed
     after the first ``[[cell]]``. ``apply.py`` treats everything from a ``[[cell]]`` header to the
-    next one as that cell's block, so rewriting the cell would silently delete a table sitting there.
+    next one as that cell's block, so it refuses to rewrite a record with a table sitting there
+    rather than delete the table.
     """
     text = path.read_text(encoding="utf-8")
     data = tomllib.loads(text)
@@ -1163,8 +1171,8 @@ def load_reviewer_exceptions(path: Path) -> dict[str, str]:
             # TOML and both are refused, so the message says how to write a record that loads.
             raise ScorecardError(
                 "every [[reviewer_exception]] must come before the first [[cell]]: after it, "
-                "apply.py reads the table as part of the cell above and a rewrite of that cell "
-                "deletes it. If they already do, write each cell header as a plain [[cell]] line "
+                "apply.py reads the table as part of the cell above and refuses to rewrite the "
+                "record. If they already do, write each cell header as a plain [[cell]] line "
                 "and keep any [[cell]] text out of strings above them, so the order can be read"
             )
     out: dict[str, str] = {}
@@ -1605,7 +1613,7 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
             # Resolved, so a symlink out of the tree is caught as well as a `..` or absolute path.
             # The loader refuses the last two; a Cell built in code does not pass through it, and
             # an anchor read outside the root certifies a tree nobody asked about (BACKLOG #5459).
-            # Cached per target like the text: the anchors concentrate onto few files.
+            # Cached, keyed as said above: the anchors concentrate onto few files.
             if a.path not in inside_cache:
                 inside_cache[a.path] = _is_within_tree(a.path) and target.resolve().is_relative_to(
                     resolved_root
