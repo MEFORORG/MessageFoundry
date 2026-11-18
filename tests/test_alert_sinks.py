@@ -365,6 +365,9 @@ async def test_a_second_cancel_during_the_drain_wait_still_cancels_control_tasks
         sink.connection_stopped("IB_TEST_ADT", detail="probe")
         await asyncio.wait_for(stubborn.entered.wait(), 5.0)
         sink.connection_stopped("IB_TEST_ORU", detail="probe")  # fills the queue
+        # The premise: the close's sentinel waits on the put, not on the drain. With room for it,
+        # the first cancel reaches the drain through the close's own wait, and main passes too.
+        assert sink._queue.full()
 
         # The first cancel lands on the sentinel's put, so the close cuts the drain and waits.
         close = asyncio.create_task(sink.aclose())

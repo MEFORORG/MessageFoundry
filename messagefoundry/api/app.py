@@ -12633,9 +12633,8 @@ def create_managed_app(
             )
         # BACKLOG #5908: built in a worker thread, since the factory blocks on at least the SMTP
         # password read through the secret provider (a Vault read, under [secrets]). Nothing of
-        # this lifespan's is running yet, and uvicorn acts on a stop signal only once startup has
-        # ended, so the thread does not let a stop in sooner: it keeps the read off the loop,
-        # which must not block (CLAUDE.md section 6). start() stays on the loop below.
+        # this lifespan's is running yet; the thread keeps the read off the loop, which must not
+        # block (CLAUDE.md section 6). start() stays on the loop below.
         try:
             notifier = (
                 await asyncio.to_thread(
