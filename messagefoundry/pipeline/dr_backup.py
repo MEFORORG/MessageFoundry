@@ -56,7 +56,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import Any, BinaryIO, NamedTuple, cast
 
 from messagefoundry import file_lock
 from messagefoundry.config import atomic_edit
@@ -982,6 +982,14 @@ class BackupRunner:
                     "write",
                     f"archive written but not verified, left at {staging_path.name}: {exc}",
                 ) from exc
+            except sqlite3.Error as exc:
+                # A SQLite fault the verify judged not to be the archive's (`_check_snapshot`):
+                # like the staging refusal, not a verdict on it, so the same handling.
+                raise BackupError(
+                    "write",
+                    f"archive written but not verified, left at {staging_path.name}: "
+                    f"{_sqlite_error_reason(exc)}",
+                ) from exc
             if not verify.ok:
                 # A verify FAIL means the archive is unusable, so it never earns the canonical name
                 # (AC-6). Skipping only THIS run's prune — what this path used to do — does not
@@ -1891,9 +1899,11 @@ def _verify_archive_blocking(
         except (BackupCodecError, OSError, tarfile.TarError) as exc:
             result = _verify_failure(exc)
         except sqlite3.Error as exc:
-            # What reaches here is a volume fault, never the snapshot's bytes (`_check_snapshot`).
-            # A backup's own verify re-raises it, so it cannot quarantine a good archive; a
-            # standalone verify reports it as the volume's, as it does a staging refusal above.
+            # `_check_snapshot` turns the snapshot's own bytes into a FAIL, so what reaches here is
+            # a SQLite error it judged not to be one (a volume, process or engine fault), or one
+            # from another read in `_verify_in_staging` that maps none. A backup's own verify
+            # re-raises it, so it cannot quarantine a good archive; a standalone verify reports it
+            # as not the archive's, as it does a staging refusal above.
             if not standalone:
                 raise
             result = VerifyResult(
@@ -4204,7 +4214,12 @@ def _verify_in_staging(
 
     # (3) integrity_check (the fuller PRAGMA integrity_check, off the hot path).
     # A store.db that will not read is a FAIL here, not an escaping sqlite3 error (`_check_snapshot`).
-    integrity_ok, integrity_msg, row_counts = _check_snapshot(snap)
+    check = _check_snapshot(snap)
+    integrity_ok, integrity_msg, row_counts = (
+        check.integrity_ok,
+        check.integrity_msg,
+        check.row_counts,
+    )
     manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
     if not integrity_ok:
         return VerifyResult(
@@ -4213,6 +4228,15 @@ def _verify_in_staging(
             row_counts=row_counts,
             manifest_counts=manifest_counts,
             reason=f"integrity_check failed: {integrity_msg}",
+        )
+    if check.count_error is not None:
+        # integrity_check passed, so the result says so; it is the count that failed.
+        return VerifyResult(
+            "FAIL",
+            integrity_ok=True,
+            row_counts=row_counts,
+            manifest_counts=manifest_counts,
+            reason=f"the row-count check failed: {check.count_error}",
         )
     # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot, and a compare that
     # read nothing); :func:`_compare_row_counts` says why it is keyed off the manifest's tables.
@@ -4413,52 +4437,63 @@ def _integrity_check(db_path: Path) -> tuple[bool, str]:
     return ok, "ok" if ok else "; ".join(results)[:500]
 
 
-#: SQLite primary result codes that describe the volume or the process, not the snapshot's bytes. A
-#: read that fails with one says nothing about the archive, so it is never turned into a verdict on it.
-_VOLUME_FAULT_CODES = frozenset(
-    {
-        sqlite3.SQLITE_IOERR,
-        sqlite3.SQLITE_BUSY,
-        sqlite3.SQLITE_LOCKED,
-        sqlite3.SQLITE_CANTOPEN,
-        sqlite3.SQLITE_FULL,
-        sqlite3.SQLITE_NOMEM,
-        sqlite3.SQLITE_PERM,
-        sqlite3.SQLITE_READONLY,
-    }
-)
+#: SQLite primary result codes that are a verdict on the snapshot's own bytes: a file that is not a
+#: database, or a corrupt one. Every other code is the volume's, the process's or this code's, so a
+#: read that fails with one says nothing about the archive and is never turned into a verdict on it.
+_SNAPSHOT_FAULT_CODES = frozenset({sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT})
+
+#: The text of the decode error the sqlite3 module raises for a TEXT value that is not UTF-8. It is a
+#: Python-side error, so it carries no result code, and it is the snapshot's bytes.
+_DECODE_ERROR_PREFIX = "Could not decode to UTF-8"
 
 
 def _is_snapshot_fault(exc: sqlite3.Error) -> bool:
     """Whether a read of a snapshot failed because of the snapshot's own bytes: a file that is not a
-    database, a corrupt one, or text that does not decode. A Python-side error such as the decode
-    error carries no result code at all. A ``ProgrammingError`` is this code's fault, not the file's."""
+    database, a corrupt one, or text that does not decode. An allowlist, so a code nobody listed is
+    a volume or engine fault and cannot quarantine a good archive. A ``ProgrammingError`` is this
+    code's fault, not the file's."""
     if not isinstance(exc, sqlite3.DatabaseError) or isinstance(exc, sqlite3.ProgrammingError):
         return False
     code = getattr(exc, "sqlite_errorcode", None)
+    if code is None:
+        return isinstance(exc, sqlite3.OperationalError) and str(exc).startswith(
+            _DECODE_ERROR_PREFIX
+        )
     # The low byte is the primary code, so an extended code is read by its family.
-    return code is None or code & 0xFF not in _VOLUME_FAULT_CODES
+    return code & 0xFF in _SNAPSHOT_FAULT_CODES
 
 
-def _check_snapshot(snap: Path) -> tuple[bool, str, dict[str, int]]:
-    """:func:`_integrity_check` then :func:`_count_tables` on a snapshot, as ``(integrity_ok,
-    message, row_counts)``. A snapshot whose bytes cannot be read fails the check rather than
-    raising (:func:`_is_snapshot_fault`); the counts are empty when they could not be taken. Any
-    other SQLite error still raises."""
+class _SnapshotCheck(NamedTuple):
+    """What :func:`_check_snapshot` found. ``count_error`` is set, and ``row_counts`` empty, when
+    ``integrity_check`` passed but the tables could not be counted."""
+
+    integrity_ok: bool
+    integrity_msg: str
+    row_counts: dict[str, int]
+    count_error: str | None = None
+
+
+def _check_snapshot(snap: Path) -> _SnapshotCheck:
+    """:func:`_integrity_check` then :func:`_count_tables` on a snapshot. A snapshot whose bytes
+    cannot be read fails the check rather than raising (:func:`_is_snapshot_fault`); the counts are
+    empty when they could not be taken. A failed ``integrity_check`` stays the verdict whatever the
+    count then raises. Any other SQLite error still raises."""
     try:
         ok, msg = _integrity_check(snap)
     except sqlite3.Error as exc:
         if not _is_snapshot_fault(exc):
             raise
-        return False, f"the file could not be read: {_sqlite_error_reason(exc)}", {}
+        return _SnapshotCheck(False, f"the file could not be read: {_sqlite_error_reason(exc)}", {})
     try:
-        return ok, msg, _count_tables(snap)
+        return _SnapshotCheck(ok, msg, _count_tables(snap))
     except sqlite3.Error as exc:
+        if not ok:
+            return _SnapshotCheck(False, msg, {})
         if not _is_snapshot_fault(exc):
             raise
-        if not ok:
-            return False, msg, {}
-        return False, f"its tables could not be counted: {_sqlite_error_reason(exc)}", {}
+        return _SnapshotCheck(
+            True, msg, {}, f"its tables could not be counted: {_sqlite_error_reason(exc)}"
+        )
 
 
 def _full_open_check(
@@ -6057,11 +6092,18 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
     summary. A store whose bytes will not read is a ``verify`` refusal (:func:`_check_snapshot`), and
     a volume fault while reading it a ``restore`` one, as the restore's later reads report theirs."""
     try:
-        integrity_ok, integrity_msg, row_counts = _check_snapshot(snap)
+        check = _check_snapshot(snap)
     except sqlite3.Error as exc:
         raise BackupError("restore", _sqlite_error_reason(exc)) from exc
-    if not integrity_ok:
-        raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
+    if not check.integrity_ok:
+        raise BackupError(
+            "verify", f"the archive's store failed integrity_check: {check.integrity_msg}"
+        )
+    if check.count_error is not None:
+        raise BackupError(
+            "verify", f"the archive's store failed the row-count check: {check.count_error}"
+        )
+    row_counts = check.row_counts
     _manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
     if count_refusal is not None:
         raise BackupError("verify", count_refusal)
