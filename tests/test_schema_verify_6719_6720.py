@@ -200,9 +200,10 @@ async def test_a_counted_store_whose_salt_is_a_readable_foreign_object_gets_the_
 _TABLES_FLAGGED_VIRTUAL = (
     f"SELECT m.name, NOT ({_ORDINARY_TABLE}) FROM sqlite_master AS m WHERE m.type = 'table'"
 )
-#: Every schema object with its type, so a test counts the whole walk before it picks out the views
-#: (a view query alone returns nothing on the built schema, so it cannot show it ran).
-_OBJECTS = "SELECT name, type FROM sqlite_master"
+#: Every schema object with a flag saying whether it is a view, so one walk both counts what it saw
+#: and finds the views (a view query alone returns nothing on the built schema, so it cannot show it
+#: ran). The flag is in the SQL, so the negative control below pins the same predicate.
+_OBJECTS_FLAGGED_VIEW = "SELECT name, type = 'view' FROM sqlite_master"
 
 
 async def test_the_expected_shape_holds_no_virtual_table() -> None:
@@ -214,32 +215,33 @@ async def test_the_expected_shape_holds_no_virtual_table() -> None:
         await MessageStore._migrate(db)
         async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
             tables = [tuple(r) for r in await cur.fetchall()]
-        async with db.execute(_OBJECTS) as cur:
+        async with db.execute(_OBJECTS_FLAGGED_VIEW) as cur:
             objects = [tuple(r) for r in await cur.fetchall()]
     # Positive control: the walk saw the built schema (40 tables when this floor was set), so the
     # absence below cannot pass on an empty walk.
     assert len(tables) >= 30, f"the scratch schema holds only {len(tables)} tables"
-    # The same control for the view walk, which reads every object: tables alone pass the floor.
+    # The view walk's own floor. The tables are among these objects, so it adds nothing to the floor
+    # above beyond catching a narrowed query; the vacuous-absence lint needs it on this walk.
     assert len(objects) >= 30, f"the scratch schema holds only {len(objects)} objects"
     virtual = [name for name, is_virtual in tables if is_virtual]
     assert virtual == []
     # The reads skip views too, so a view this build created would never be verified either
     # (BACKLOG #6719 item 10).
-    views = [name for name, kind in objects if kind == "view"]
+    views = [name for name, is_view in objects if is_view]
     assert views == []
 
 
 async def test_the_virtual_table_probe_finds_one_without_fts5(tmp_path: Path) -> None:
     # Negative control for the pin above that needs no fts5 (BACKLOG #6719 item 8): a planted
-    # virtual table is flagged, an ordinary one is not, and the view query sees a view.
+    # virtual table is flagged, an ordinary one is not, and the view flag marks a view.
     path = tmp_path / "probe.db"
     _sql(path, "CREATE TABLE plain (a)", "CREATE VIEW v AS SELECT 1")
     _plant_unloaded_virtual_table(path, "planted")
     async with _connected(path) as db:
         async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
             rows = {r[0]: bool(r[1]) for r in await cur.fetchall()}
-        async with db.execute(_OBJECTS) as cur:
-            views = [name for name, kind in await cur.fetchall() if kind == "view"]
+        async with db.execute(_OBJECTS_FLAGGED_VIEW) as cur:
+            views = [name for name, is_view in await cur.fetchall() if is_view]
     assert rows == {"plain": False, "planted": True}
     assert views == ["v"]
 
