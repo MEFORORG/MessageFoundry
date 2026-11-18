@@ -538,9 +538,11 @@ async def test_a_planted_unmarked_criteria_cell_is_an_audited_integrity_refusal(
         assert r.json()["detail"] == f"preset {pid} failed its integrity check and cannot be used"
         assert sorted(d["cause"] for d in await _refusal_audits(keyed)) == [
             "BlankCellError",
-            "CorruptCellError",
+            "NonTextCellError",
             "UnmarkedCellError",
         ]
+        # Each is drift, so each also wrote the store's tag-failed row.
+        assert len(await store.list_audit(action=PRESET_TAG_FAILED_ACTION)) == 3
     finally:
         side.close()
         await keyed.stop()
@@ -552,11 +554,13 @@ async def _layered_with_decrypt_raising(
     caplog: pytest.LogCaptureFixture,
     exc: CipherError,
     recalls: int = 1,
+    audit_raises: bool = False,
 ) -> tuple[httpx.Response, list[StarletteHTTPException], str]:
     """``recalls`` layered recalls of a fresh preset whose criteria ``decrypt`` raises ``exc``: the
     last response, the HTTP exceptions the app raised, and the preset id. Control: the same preset
-    recalls with 200 before ``decrypt`` is patched. Vault Transit's cipher has no
-    ``holds_key_for``, so ``open_tagged_cell`` keeps its errors as they are, except its
+    recalls with 200 before ``decrypt`` is patched. With ``audit_raises``, the route's own audit
+    write raises ``exc`` too, as a Transit store's audit MAC does in an outage. Vault Transit's
+    cipher has no ``holds_key_for``, so ``open_tagged_cell`` keeps its errors as they are, except its
     ``UnauthenticatedCipherError`` and ``UnmarkedCipherError`` (BACKLOG #5650). The keyless store's
     cipher has none either, so its ``decrypt`` stands in for Transit's, and the error takes the
     store's real path."""
@@ -592,6 +596,15 @@ async def _layered_with_decrypt_raising(
             patched.setattr(cipher, "is_encrypted", lambda _stored: True)
             # And it declares, as Transit does, that it cannot name its keys.
             patched.setattr(cipher, "names_no_keys", True, raising=False)
+            if audit_raises:
+                record_audit = engine.store.record_audit
+
+                async def _audit_raise(action: str, *a: Any, **kw: Any) -> None:
+                    if action == "preset.layered_search":
+                        raise exc
+                    await record_audit(action, *a, **kw)  # the sign-in's own rows still land
+
+                patched.setattr(engine.store, "record_audit", _audit_raise)
             for _ in range(recalls):
                 r = await c.get("/search/layered", params={"presets": pid}, headers=h)
     return r, raised, pid
@@ -622,34 +635,47 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
     ]
 
 
+async def test_an_outage_answers_503_when_the_refusal_audit_cannot_be_written(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5523: on a Vault Transit store the audit MAC is Transit's, so the outage that
+    answers 503 fails the route's refusal audit too. The refusal still answers 503 with
+    Retry-After, not a 500, and the failed write is logged by type name."""
+    outage = CipherUnavailableError("Transit unreachable for key mf-store-secret")
+    r, _raised, pid = await _layered_with_decrypt_raising(
+        engine, monkeypatch, caplog, outage, audit_raises=True
+    )
+    assert r.status_code == 503, r.text
+    assert "Retry-After" in r.headers
+    assert (
+        logging.ERROR,
+        f"layered search could not audit its refusal of preset {pid} (CipherUnavailableError)",
+    ) in [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)]
+
+
 async def test_a_transit_refusal_on_the_criteria_is_logged_at_error(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5523: a Transit refusal that is not the value's AEAD tag, a key-version refusal say,
     stays a plain ``CipherError``, not a ``CellTagError``, so it writes no integrity audit row and
     raises no alert. It is a 423, and the route writes its own ``preset.layered_search`` row for
-    each refused recall. It is logged at ERROR, once per preset and error class per interval, with
-    the type name and the cipher's own text, which names the key id an operator needs and never a
-    value: no exception object and no criteria. The cipher raises the error by hand, so this pins
-    the route's arm, not how ``TransitCipher`` classifies a refusal. Transit's AEAD refusal takes
-    the integrity arm (BACKLOG #5650; the next test)."""
-    refusal = CipherError("Transit decrypt failed (key='mf-store-key'): Forbidden")
+    each refused recall. It is logged at ERROR with the type name alone, once per preset and error
+    class per interval: no exception object, cipher text or criteria. The cipher raises the error
+    by hand, so this pins the route's arm, not how ``TransitCipher`` classifies a refusal.
+    Transit's AEAD refusal takes the integrity arm (BACKLOG #5650; the next test)."""
+    refusal = CipherError("Transit decrypt refused (key='mf-store-secret'): MRN999")
     r, raised, pid = await _layered_with_decrypt_raising(
         engine, monkeypatch, caplog, refusal, recalls=2
     )
     assert r.status_code == 423, r.text
-    assert "mf-store-key" not in r.text and "Forbidden" not in r.text
+    assert "mf-store-secret" not in r.text and "MRN999" not in r.text
     assert r.json()["detail"].startswith(f"preset {pid} cannot be opened with the store's keys")
     assert raised[-1].__context__ is None and raised[-1].__cause__ is None
-    assert "mf-store-key" not in repr(raised[-1].args)
+    assert "mf-store-secret" not in repr(raised[-1].args) and "MRN999" not in repr(raised[-1].args)
     # _layered_refusal_log also checks no record carries exc_info or a non-str arg. Two refusals,
     # one ERROR: the second falls inside the interval.
     assert [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)] == [
-        (
-            logging.ERROR,
-            f"layered search refused preset {pid}: CipherError: Transit decrypt failed"
-            " (key='mf-store-key'): Forbidden",
-        )
+        (logging.ERROR, f"layered search refused preset {pid}: CipherError")
     ]
     refused = {"presets": 1, "refused": pid, "status": 423, "cause": "CipherError"}
     assert await _refusal_audits(engine) == [refused, refused]

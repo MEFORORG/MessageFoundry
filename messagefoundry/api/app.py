@@ -9858,21 +9858,39 @@ def create_app(
             # BACKLOG #5523: a refused recall of a stored preset writes the route's own audit row,
             # naming the caller, the preset, the status and the error class, never a cipher text or
             # a criterion. A drift refusal also has the store's tag-failed row; this one records
-            # who asked. The caller raises the refusal, after any except clause has ended.
-            await engine.store.record_audit(
-                "preset.layered_search",
-                actor=identity.username,
-                detail=json.dumps(
-                    {
-                        "presets": len(ids),
-                        "refused": preset_id,
-                        "status": refusal.status_code,
-                        "cause": cause,
-                    }
-                ),
-                client=client_ip(request),
-            )
+            # who asked. The caller raises the refusal, after any except clause has ended. Best
+            # effort, as the store's tag-failed row is: on a Vault Transit store the audit MAC is
+            # Transit's, so during the outage the 503 arm answers, this write fails too, and the
+            # refusal must still be the answer, not a 500.
+            try:
+                await engine.store.record_audit(
+                    "preset.layered_search",
+                    actor=identity.username,
+                    detail=json.dumps(
+                        {
+                            "presets": len(ids),
+                            "refused": preset_id,
+                            "status": refusal.status_code,
+                            "cause": cause,
+                        }
+                    ),
+                    client=client_ip(request),
+                )
+            except Exception as exc:  # noqa: BLE001 -- the refusal stands whatever the audit does
+                _log.error(
+                    "layered search could not audit its refusal of preset %s (%s)",
+                    preset_id,
+                    type(exc).__name__,
+                )
             return refusal
+
+        def blank(preset_id: str) -> HTTPException:
+            # Its own text: a keyless store has no integrity tag for a blank cell to fail.
+            return HTTPException(
+                423,
+                f"preset {preset_id} has blank criteria, written outside the store, and cannot be"
+                " used",
+            )
 
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
@@ -9885,18 +9903,14 @@ def create_app(
             except BlankCellError:
                 # BACKLOG #5523: the store refused a NULL or empty criteria cell, which it never
                 # writes (audited, alerted and logged there), so it never reads as an empty filter
-                # that would widen the search. Its own text: a keyless store has no tag to fail.
-                cause = "BlankCellError"
-                refusal = HTTPException(
-                    423,
-                    f"preset {preset_id} has blank criteria, written outside the store, and cannot"
-                    " be used",
-                )
+                # that would widen the search.
+                cause, refusal = "BlankCellError", blank(preset_id)
             except CellTagError as exc:
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
-                # unmarked value (audited; the cipher alerted, BACKLOG #5650) or are corrupt
-                # (logged); the store refused. The caller's own preset exists, so a refusal, never
-                # a 500. Caught before CipherError, which it subclasses.
+                # unmarked value (audited; the cipher alerted, BACKLOG #5650), are not text
+                # (alerted and audited, BACKLOG #5523) or are corrupt (logged); the store refused.
+                # The caller's own preset exists, so a refusal, never a 500. Caught before
+                # CipherError, which it subclasses.
                 cause = type(exc).__name__
                 refusal = HTTPException(
                     423, f"preset {preset_id} failed its integrity check and cannot be used"
@@ -9915,17 +9929,15 @@ def create_app(
             except CipherError as exc:
                 # BACKLOG #5523: a key or format problem the cipher raises as is, for example a
                 # retired key that is not supplied, or a Vault Transit refusal other than the
-                # value's AEAD tag (a key-version refusal, a 403). It answered 500. Logged with the
-                # cipher's own text, which names the key id and never a value, so an operator can
-                # tell a retired key from a policy denial; as a str, as above. ERROR, once per
-                # preset and error class per interval; the route's audit row records each one.
-                # Transit's AEAD refusal of a cell planted across owners is a CellTagError above
-                # (BACKLOG #5650). The outage above is a WARNING: it says nothing about the cell.
+                # value's AEAD tag (a key-version refusal, a 403). It answered 500. The type name
+                # only: the cipher's text can echo fields cut from the stored value, and this cell
+                # may have been written outside the store. ERROR, once per preset and error class
+                # per interval; the route's audit row records each one. Transit's AEAD refusal of
+                # a cell planted across owners is a CellTagError above (BACKLOG #5650). The outage
+                # above is a WARNING: it says nothing about the cell.
                 cause = type(exc).__name__
                 if _first_layered_refusal(preset_id, cause):
-                    _log.error(
-                        "layered search refused preset %s: %s: %s", preset_id, cause, str(exc)
-                    )
+                    _log.error("layered search refused preset %s: %s", preset_id, cause)
                 refusal = HTTPException(
                     423,
                     f"preset {preset_id} cannot be opened with the store's keys and cannot be used;"
@@ -9944,15 +9956,7 @@ def create_app(
                 _log.warning(
                     "layered search refused preset %s: its criteria cell is blank", preset_id
                 )
-                raise await refuse(
-                    preset_id,
-                    HTTPException(
-                        423,
-                        f"preset {preset_id} has blank criteria, written outside the store, and"
-                        " cannot be used",
-                    ),
-                    "blank",
-                )
+                raise await refuse(preset_id, blank(preset_id), "BlankCellError")
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
             # arm is gone: get_search_preset returns the criteria through the cipher as a str, and

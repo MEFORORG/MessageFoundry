@@ -4695,10 +4695,10 @@ each nested `OutboxInfo` / `EventInfo` individually, because the redactor keys o
 dashboard `GET /connections`, and `GET /connections/{name}/metadata` (all BACKLOG #2443). Its `/ws/stats` push redacts the same rows. The four
 alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `AlertInstanceInfo` too.
 
-**Audit.** Five of the surfaces named above additionally feed the **coalesced per-actor/hour PHI-summary exposure
+**Audit.** At least five of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
 census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`, and
 `/search/layered` since BACKLOG #5523), so a scripted bulk read cannot harvest the patient census
-unaudited. The others named above do **not** call the coalescer — they write their own dedicated audit rows
+unaudited. At least these do **not** call the coalescer — they write their own dedicated audit rows
 instead (`response.read` for `GET /messages/{id}/responses`, a `connection_event_reveal` or `alert_reveal`
 row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
 each per-connection reveal on `GET /connections` and `GET /connections/{name}/metadata`; those
@@ -4713,8 +4713,9 @@ unconditional dedicated rows (`message_view`, `message_search`) regardless, and 
 `GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do
 `GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
 `GET /search/layered` also writes its `preset.layered_search` row when it refuses a stored preset,
-naming the preset id, the status and the error class (BACKLOG #5523). A NULL or empty criteria
-cell is refused by the store itself, which logs a WARNING and writes the
+naming the preset id, the status and the error class (BACKLOG #5523); a failed write of that row
+is logged and does not change the answer. A NULL, empty or non-text criteria cell is refused by
+the store itself, which logs a WARNING and writes the
 `integrity.preset_tag_failed` row on every store, and on a keyed store raises the
 `integrity_drift` alert, as for a moved preset. A keyless store's cipher has no alert hook.
 

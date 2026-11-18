@@ -68,6 +68,7 @@ __all__ = [
     "CellTagError",
     "CellTagSink",
     "CorruptCellError",
+    "NonTextCellError",
     "UnmarkedCellError",
     "audits_cell_tag",
     "dead_letter_on_cell_tag",
@@ -284,6 +285,24 @@ class BlankCellError(CellTagError):
         )
 
 
+class NonTextCellError(CellTagError):
+    """A preset's ``criteria`` cell holds a value that is not text, a planted BLOB say (BACKLOG
+    #5523). The store writes criteria as text only, so this was written outside the store. A keyed
+    cipher handed it would fail with a ``TypeError``. Drift, as :class:`BlankCellError` is."""
+
+    def _describe(self) -> str:
+        return (
+            f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} is not text,"
+            " which the store never writes"
+        )
+
+    def alert_reason(self) -> str:
+        return (
+            f"a {self.table}.{self.column} cell is not text, which the store never writes"
+            f" (row {self.row_ref})"
+        )
+
+
 def _tag_failure_kind(cipher: Cipher, stored: str, exc: CipherError) -> type[CellTagError] | None:
     """The :class:`CellTagError` class a failed open of ``stored`` raises, or ``None`` to keep the
     cipher's own error: an outage, a key or a format problem."""
@@ -374,9 +393,9 @@ def open_preset_criteria(
 
     The store writes every preset's criteria as non-blank text, so a NULL or empty cell raises
     :class:`BlankCellError` and a value that is not text, a planted BLOB say, raises
-    :class:`CorruptCellError`, on a keyed and a keyless store alike (BACKLOG #5523). Each is
-    refused here, before the caller reads it or stamps the preset as used. ``open_queue_cell``
-    refuses a blank queue cell the same way."""
+    :class:`NonTextCellError`, on a keyed and a keyless store alike (BACKLOG #5523). Both are drift,
+    alerted here and audited by the store's read, before the caller reads the cell or stamps the
+    preset as used. The store's whole-surface cell walks do not run this check."""
     if isinstance(stored, str) and stored:
         opened = open_tagged_cell(
             cipher,
@@ -388,7 +407,7 @@ def open_preset_criteria(
         )
         if opened is not None:  # always: a str in gives a str out
             return opened
-    kind = BlankCellError if stored is None or stored == "" else CorruptCellError
+    kind = BlankCellError if stored is None or stored == "" else NonTextCellError
     refused = kind("search_presets", "criteria", preset_id, None)
     _alert(cipher, refused)
     raise refused

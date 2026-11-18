@@ -31,6 +31,7 @@ from messagefoundry.store.cell_tag import (
     BlankCellError,
     CellTagError,
     CorruptCellError,
+    NonTextCellError,
     UnmarkedCellError,
     dead_letter_on_cell_tag,
     dead_letters_on_cell_tag,
@@ -727,8 +728,8 @@ def test_a_blank_or_non_text_preset_criteria_cell_is_refused_at_the_store(
 ) -> None:
     """BACKLOG #5523: the store never writes NULL, empty or non-text criteria. A blank cell read as
     ``{}`` would drop a narrowing preset out of a layered search, so ``open_preset_criteria``
-    refuses it on every store: a blank cell is drift (alerted, and audited by the store), a
-    non-text one is corrupt. Control: sealed criteria open."""
+    refuses it on every store. Both are drift: alerted here, and audited by the store's read.
+    Control: sealed criteria open."""
     monkeypatch.setattr(cell_tag, "_reported", {})  # an earlier report must not mute this one
     cipher = make_cipher(generate_key() if keyed else None, write_v2=True)
     seen: list[tuple[str, str]] = []
@@ -743,11 +744,12 @@ def test_a_blank_or_non_text_preset_criteria_cell_is_refused_at_the_store(
         with pytest.raises(BlankCellError) as blank:
             open_preset_criteria(cipher, stored, preset_id="pblank", owner_user_id="u1")
         assert blank.value.drift and blank.value.table == "search_presets"
-    with pytest.raises(CorruptCellError) as corrupt:
+    with pytest.raises(NonTextCellError) as non_text:
         open_preset_criteria(cipher, b"{}", preset_id="pblank", owner_user_id="u1")
-    assert not corrupt.value.drift
+    assert non_text.value.drift
     if setter is not None:  # once per interval: two blank refusals of one row, one alert
-        assert [t for t, reason in seen if "blank" in reason] == ["search_presets"]
+        assert [t for t, reason in seen if "is blank" in reason] == ["search_presets"]
+        assert [t for t, reason in seen if "not text" in reason] == ["search_presets"]
 
 
 def test_a_failed_cell_is_reported_once_per_interval() -> None:
