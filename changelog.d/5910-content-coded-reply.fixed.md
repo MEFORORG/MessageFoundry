@@ -10,8 +10,14 @@
   the SMART and OAuth2 token reads raise a permanent configuration fault with the code
   `token-reply-coded`: a delivery that mints its bearer does not retry, and under the default
   `credential_fault_policy` stops the lane and keeps the queue (owner ruling "Stop the lane",
-  2026-11-18, on PR 3069); under `credential_fault_policy = "dead_letter"` the rows dead-letter
-  and one `connection_error` alert fires; and a
+  2026-11-18, on PR 3069); under `credential_fault_policy = "dead_letter"` the rows dead-letter;
+  and a
   probe that mints one fails. The replies the
   coding check skips are listed on `reply_framing_fault`; they include at least a `204`, a
   `Content-Length: 0` reply and a reply to `HEAD`. (`BACKLOG #5910`)
+- **Under `credential_fault_policy = "dead_letter"`, a configuration fault that dead-letters now
+  marks the outbound lane down.** With `[diagnostics].connection_events` on, its default, one
+  `connection_error` alert fires for the lane, where before none fired, and the next delivery
+  that succeeds clears it. This covers every configuration fault a send raises, `token-reply-coded`
+  among them, with the exceptions ADR 0095 Amendment B.2 names (owner ruling 2026-11-18 on PR
+  3069).

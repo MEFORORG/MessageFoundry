@@ -421,8 +421,9 @@ class AlertSink(Protocol):
         ``error_class`` is the failing exception's class name (BACKLOG #3210). A partner *rejection*
         (``NegativeAckError``) is NOT a connection error and does not fire this. A permanent
         ``NegativeAckError`` marked ``config_fault`` that dead-letters, under
-        ``credential_fault_policy = "dead_letter"``, does: it marks the lane down on the same edge, so
-        it fires once, with ``error_class`` ``NegativeAckError``, until a delivery succeeds."""
+        ``credential_fault_policy = "dead_letter"``, does, with ``[diagnostics].connection_events``
+        on: it marks the lane down on the same edge, so it fires once, with ``error_class``
+        ``NegativeAckError``, until a delivery succeeds."""
         ...
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
