@@ -16,13 +16,14 @@ refuses an ECH connection even under ``[security].block_unlisted_outbound = fals
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.settings import EgressSettings, ServiceSettings, load_settings
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.transports.egress import check_egress_allowed, http_dial_port
 from messagefoundry.transports.rest import RestDestination
@@ -338,3 +339,29 @@ def test_the_connector_still_refuses_a_bad_sidecar_on_its_own(sidecar: str, matc
     directly, so it cannot go away unseen behind the gate."""
     with pytest.raises(ValueError, match=match):
         RestDestination(_ech(sidecar))
+
+
+# --- the environment variable, through the real loader -----------------------------------------
+
+
+def _load_env(tmp_path: Path, value: str) -> ServiceSettings:
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text("", encoding="utf-8")
+    return load_settings(config_path=cfg, environ={"MEFOR_EGRESS_ALLOWED_ECH_SIDECAR": value})
+
+
+def test_the_env_variable_reaches_the_list_through_the_loader(tmp_path: Path) -> None:
+    """``MEFOR_EGRESS_ALLOWED_ECH_SIDECAR`` is read comma-separated by ``load_settings``, as the
+    settings comment and CONFIGURATION.md say, and the loaded list gates the hop."""
+    settings = _load_env(tmp_path, "127.0.0.1:8123,[::1]:9000")
+    assert settings.egress.allowed_ech_sidecar == ["127.0.0.1:8123", "[::1]:9000"]
+    egress = settings.egress.model_copy(update={"allowed_http": ["partner.example.org"]})
+    check_egress_allowed(_ech("http://127.0.0.1:8123"), egress)
+    with pytest.raises(WiringError, match=r"allowed_ech_sidecar"):
+        check_egress_allowed(_ech("http://127.0.0.1:6379"), egress)
+
+
+def test_an_env_entry_with_no_port_is_refused_at_load(tmp_path: Path) -> None:
+    """The load-time validator runs on the environment's value too, not only on the file's."""
+    with pytest.raises(ValueError, match=r"allowed_ech_sidecar"):
+        _load_env(tmp_path, "127.0.0.1")

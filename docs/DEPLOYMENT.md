@@ -987,6 +987,8 @@ does not resolve to a listed `host:port` makes the config **fail at load / reloa
 | `[egress].allowed_direct` | **Direct S/MIME HISP relay destinations** (deliberately separate from `allowed_smtp` — a distinct trust relationship) |
 | `[egress].allowed_file_dirs` | File destination directories |
 | `[egress].allowed_syslog` | the off-box log forwarder's collector (`[logging].forward_host`). Checked at start, not at config load; see [CONFIGURATION.md](CONFIGURATION.md#egress) |
+| `[egress].allowed_proxy` | the **forward proxy** an http-family connection dials through. An intermediary, not a destination: **deny-by-default even under the opt-out**; see [CONFIGURATION.md](CONFIGURATION.md#egress) |
+| `[egress].allowed_ech_sidecar` | the loopback **ECH sidecar** port a `REST` connection with `ech_egress` sends through. An intermediary, not a destination: **deny-by-default even under the opt-out**; see [CONFIGURATION.md](CONFIGURATION.md#egress) |
 
 **The alert sinks are *not* on this table and are not covered by `[egress]`.** The webhook and SMTP
 *alert* sinks carry no message-body field, though some alerts carry free-text detail (the
