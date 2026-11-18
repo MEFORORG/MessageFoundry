@@ -1320,9 +1320,11 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
     PHI as its keys (``{"name": {"DOE": 1}}``) is a residual. A bare token straight before ``(`` is a
     callable's name (``date(``, ``frozenset(``) and is kept too; its arguments are the value."""
     out: list[str] = []
-    #: One frame per open container: ``(is_object, policy)``. An object's policy is LEAF or INHERIT
-    #: (searched); an array's or a call's is the policy its elements take.
-    frames: list[tuple[bool, int]] = []
+    #: One frame per open container: ``(is_object, policy, closer)``. An object's policy is LEAF or
+    #: INHERIT (searched); an array's or a call's is the policy its elements take. ``closer`` is the one
+    #: delimiter that ends the frame: a closer of another kind is data inside the value, so a stray
+    #: ``)`` in a PHI-keyed array cannot end its scrubbing early (BACKLOG #5814).
+    frames: list[tuple[bool, int, str]] = []
     pending = policy
     n = len(text)
     while pos < n:
@@ -1344,12 +1346,13 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
             out.append(token)
             if punct == "{":
                 leaf = pending in (_LEAF, _STRUCTURE_ONLY)
-                frames.append((True, _LEAF if leaf else _INHERIT))
+                frames.append((True, _LEAF if leaf else _INHERIT, "}"))
                 pending = frames[-1][1]
             elif punct in "[(":
-                frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending))
+                closer = "]" if punct == "[" else ")"
+                frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending, closer))
                 pending = frames[-1][1]
-            elif punct in "}])":
+            elif punct == frames[-1][2]:
                 frames.pop()
                 if not frames:
                     return "".join(out), pos
