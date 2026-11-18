@@ -26,9 +26,15 @@ adapter; alias matching alone cannot translate an edit payload.
 
 New event types appear as unmapped at startup. Unsupported handler types and
 failed commands report errors. The bridge does not silently claim they ran.
-Command-only hooks use PowerShell on Windows and `sh` elsewhere; structured
-`command` and `args` avoid shell parsing. Codex's documentation does not say
-which shell runs a hook command.
+A failed SessionStart hook is reported in `systemMessage` and the other hooks'
+context is kept, as in Claude Code; on every other event a failure fails closed.
+A command-only hook runs in the shell its `shell` key names: `bash` (Git Bash on
+Windows, never the WSL launcher) or `powershell`. With no `shell`, it uses
+PowerShell on Windows and `sh` elsewhere. Structured `command` and `args` avoid
+shell parsing. Codex's documentation does not say which shell runs a hook command.
+Codex stops the bridge at the event's timeout in `.codex/config.toml`, so every
+hook of one event shares that budget, less a margin; a longer hook timeout is
+cut to what remains.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

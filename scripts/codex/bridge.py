@@ -13,8 +13,11 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +38,11 @@ EVENTS = (
     "SubagentStop",
 )
 POINTER_MARKER = "<!-- codex-claude-skill-pointer -->"
+# Codex kills the whole bridge at its own per-event timeout (.codex/config.toml), and the bridge runs
+# an event's hooks one after another, so they all share that one budget. The margin leaves time for
+# the launcher, the interpreter and the reply.
+DEFAULT_OUTER_TIMEOUT = 90.0
+OUTER_TIMEOUT_MARGIN = 10.0
 
 
 def user_skill_directory() -> Path:
@@ -122,6 +130,64 @@ class HookBlocked(Exception):
     """A hook exited 2."""
 
 
+def outer_timeout(root: Path, event: str) -> float:
+    """The smallest timeout .codex/config.toml gives this event, or the default without one."""
+    try:
+        config = tomllib.loads((root / ".codex/config.toml").read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return DEFAULT_OUTER_TIMEOUT
+    timeouts = [
+        float(hook["timeout"])
+        for group in config.get("hooks", {}).get(event, [])
+        for hook in group.get("hooks", [])
+        if isinstance(hook.get("timeout"), int | float)
+    ]
+    return min(timeouts, default=DEFAULT_OUTER_TIMEOUT)
+
+
+def find_bash() -> str:
+    """Claude Code runs a `shell: bash` hook under Git Bash on Windows; find that one, never WSL's."""
+    found = shutil.which("bash")
+    if os.name != "nt":
+        if found:
+            return found
+        raise FileNotFoundError("bash not found for a shell: bash hook")
+    candidates = []
+    if os.environ.get("CLAUDE_CODE_GIT_BASH_PATH"):
+        candidates.append(Path(os.environ["CLAUDE_CODE_GIT_BASH_PATH"]))
+    git = shutil.which("git")
+    if git:
+        # Git for Windows keeps git.exe in cmd/ or bin/, and bash.exe in bin/.
+        candidates += [Path(git).parent.parent / "bin/bash.exe", Path(git).parent / "bash.exe"]
+    # System32's and WindowsApps' bash.exe launch WSL, which does not see this environment.
+    if found and not re.search(r"[\\/](system32|windowsapps)[\\/]", found, re.IGNORECASE):
+        candidates.append(Path(found))
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    raise FileNotFoundError("Git Bash not found for a shell: bash hook")
+
+
+def hook_argv(root: Path, hook: dict) -> list[str]:
+    command = hook["command"]
+    if "args" in hook:
+        return [
+            command,
+            *[str(arg).replace("${CLAUDE_PROJECT_DIR}", str(root)) for arg in hook["args"]],
+        ]
+    # A command-only source runs in the shell it names, as in Claude Code; with none, in the current
+    # platform's shell. Environment expansion belongs to that shell.
+    shell = hook.get("shell")
+    if shell == "bash":
+        return [find_bash(), "-c", command]
+    if shell == "powershell" or (shell is None and os.name == "nt"):
+        command = command.replace("${CLAUDE_PROJECT_DIR}", "$env:CLAUDE_PROJECT_DIR")
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
+    if shell is None:
+        return ["sh", "-c", command]
+    raise ValueError(f"Unsupported Claude hook shell: {shell}")
+
+
 def child_environment(root: Path, session_id: str) -> dict[str, str]:
     if not session_id:
         raise ValueError("Codex session id missing; pass --session-id or set CODEX_THREAD_ID")
@@ -174,6 +240,7 @@ def dispatch(root: Path, payload: dict) -> dict:
     if config.get("disableAllHooks"):
         return {}
     result: dict = {}
+    deadline = time.monotonic() + outer_timeout(root, event) - OUTER_TIMEOUT_MARGIN
     if event == "SessionStart":
         unknown = set(config.get("hooks", {})) - set(EVENTS)
         context = (
@@ -217,41 +284,37 @@ def dispatch(root: Path, payload: dict) -> dict:
                 raise ValueError(
                     f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
                 )
-            command = hook["command"]
-            if "args" in hook:
-                argv = [
-                    command,
-                    *[str(arg).replace("${CLAUDE_PROJECT_DIR}", str(root)) for arg in hook["args"]],
-                ]
-            else:
-                # Command-only sources use the current platform's shell. Environment expansion
-                # belongs to that shell; structured args above need no shell parsing.
-                command = command.replace(
-                    "${CLAUDE_PROJECT_DIR}",
-                    "$env:CLAUDE_PROJECT_DIR" if os.name == "nt" else "${CLAUDE_PROJECT_DIR}",
+            try:
+                argv = hook_argv(root, hook)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, 0)
+                completed = subprocess.run(  # nosec B603 - trusted repo hook; event data is stdin only
+                    argv,
+                    input=json.dumps(payload),
+                    cwd=root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=min(hook.get("timeout", 30), remaining),
+                    check=False,
                 )
-                argv = (
-                    ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
-                    if os.name == "nt"
-                    else ["sh", "-c", command]
-                )
-            completed = subprocess.run(  # nosec B603 - trusted repo hook; event data is stdin only
-                argv,
-                input=json.dumps(payload),
-                cwd=root,
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=hook.get("timeout", 30),
-                check=False,
-            )
-            if completed.stderr:
-                print(completed.stderr, file=sys.stderr, end="")
-            if completed.returncode == 2:
-                raise HookBlocked(completed.stderr or "Claude hook blocked this event")
-            completed.check_returncode()
+                if completed.stderr:
+                    print(completed.stderr, file=sys.stderr, end="")
+                if completed.returncode == 2:
+                    raise HookBlocked(completed.stderr or "Claude hook blocked this event")
+                completed.check_returncode()
+            except (OSError, subprocess.SubprocessError) as exc:
+                # A failed SessionStart hook is a non-blocking error in Claude Code, and the session
+                # starts with every other hook's context. Elsewhere a failure still fails closed.
+                if event != "SessionStart":
+                    raise
+                message = f"Codex bridge: SessionStart hook {hook['command']!r} failed: {exc}"
+                print(message, file=sys.stderr)
+                merge_output(result, {"systemMessage": message})
+                continue
             output = completed.stdout.strip()
             if not output:
                 continue
