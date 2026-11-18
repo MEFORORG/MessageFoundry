@@ -144,15 +144,16 @@ $READ_ONLY_SUBCOMMANDS = @(
     'whatchanged', 'worktree'
 )
 
-# Global options that take a SEPARATE value. Skipping the value is what stops
+# Global options whose next word the resolver skips as their value. Skipping it is what stops
 # 'git -C <path> add -A' resolving its subcommand to <path>. An option missing from this list does
 # NOT only fall through to a deny (BACKLOG #5450): its value is read as the subcommand, so a value
 # that names a read-only subcommand ('git --attr-source status add -A', with a ref named status) is
 # suppressed, and any other value sends the arguments to the blanked view, where a quoted '"-A"' is
 # not seen. git 2.55.0 takes the value of --config-env, --attr-source and --shallow-file as the next
-# argument (measured), so they are listed. Keep this list equal to the one in afk-tripwire.ps1's
-# Find-GitTripwires; BACKLOG #5448 brings that file's list to --config-env and --attr-source, and
-# --shallow-file is not yet on it.
+# argument (measured), so they are listed. --exec-path is the exception: git's documentation says
+# the bare option prints the exec path and exits, so skipping its next word can cost only a false
+# deny. Keep the wide list equal to the one in afk-tripwire.ps1's Find-GitTripwires; BACKLOG #5448
+# brings that file's list to --config-env and --attr-source, and --shallow-file is not yet on it.
 #
 # THE LIST BEFORE BACKLOG #5450 IS KEPT, AND THE LOOP BELOW JUDGES A SEGMENT UNDER BOTH. Widening
 # the list moves some resolutions from a non-subcommand to a read-only word: 'git --attr-source HEAD
@@ -161,11 +162,8 @@ $READ_ONLY_SUBCOMMANDS = @(
 # is denied when either reading denies it. Delete the narrow list only with a measurement that every
 # reading it denies is also denied by the wide one.
 #
-# STILL OPEN, at least: a QUOTED value ('git -C "x" add "-A"', '--config-env="a=B"') is blanked to
-# its quotes and spaces, so the whitespace split hands over its closing quote as the subcommand and
-# the arguments go to the blanked view. A skip-to-the-closing-quote loop was tried and reverted: the
-# blanker ignores escapes, so the loop could skip past the real subcommand onto a read-only word,
-# turning a deny into an allow. Closing this needs a quote-aware tokenizer.
+# A QUOTED value is not read past by either list; docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5.1
+# says what that lets through and why it is still open.
 $GLOBAL_VALUE_OPTIONS_NARROW = '^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix)$'
 $GLOBAL_VALUE_OPTIONS = '^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix|--config-env|--attr-source|--shallow-file)$'
 
@@ -438,10 +436,8 @@ while ($true) {
     # $s is trimmed and starts with git, so the split yields no empty token to filter out.
     $tokens = @($s -split '\s+')
 
-    # BOTH READINGS ARE JUDGED, AND EITHER ONE DENYING DENIES (BACKLOG #5450). The wide skip list
-    # is read first; the narrow one, the list before the widening, is read too when it resolves a
-    # different subcommand, so widening the list cannot remove a deny. $GLOBAL_VALUE_OPTIONS says
-    # why. A reading that is suppressed as read-only moves on to the next reading, never to allow.
+    # BOTH READINGS ARE JUDGED, AND EITHER ONE DENYING DENIES; $GLOBAL_VALUE_OPTIONS says why. The
+    # narrow reading runs only when it resolves a different subcommand from the wide one.
     $subs = @(Resolve-GitSubcommand $tokens $GLOBAL_VALUE_OPTIONS)
     $narrowSub = Resolve-GitSubcommand $tokens $GLOBAL_VALUE_OPTIONS_NARROW
     if ($narrowSub -cne $subs[0]) { $subs += $narrowSub }
