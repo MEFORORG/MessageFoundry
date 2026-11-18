@@ -40,6 +40,7 @@ __all__ = [
     "message_resend_unknown",
     "message_search",
     "messages",
+    "missing_eol_style",
     "parse_tree_page",
     "parse_tree_too_large",
     "parse_tree_unavailable",
@@ -81,6 +82,17 @@ def _eol_style(raw: str) -> str | None:
     style, top = max(counts.items(), key=lambda kv: kv[1])  # the first of a tie, in that order
     if top:
         return style
+    return missing_eol_style(raw)
+
+
+def missing_eol_style(raw: str) -> str | None:
+    """The style to restore a submitted ``raw`` to when its form carried no ``eol`` field, or None
+    to keep it as sent.
+
+    The editor leaves the field out only for an original with no line break that is not HL7
+    (:func:`_eol_style`). So a missing field on an HL7 body came from a form the editor did not
+    render, and HL7's own CR terminator applies rather than the browser's CRLF (BACKLOG #5930).
+    Another body keeps its breaks as sent, since nothing says what its original used."""
     return "cr" if starts_with_msh(raw) else None
 
 

@@ -891,7 +891,7 @@ from typing import Any
 #: BACKLOG #5930: the console's edit-resend form parser ``_resubmit_form`` now restores the
 #: original's line endings through ``restore_eol`` and reads the body through ``_form_pairs``. Both
 #: are globals of ``routes/core.py``, so the snapshot hashes their bodies with the closure's. It
-#: does not hash the ``EDIT_EOL_TERMINATORS`` mapping, which is module data, or the route's refusal
+#: does not hash at least the ``EDIT_EOL_TERMINATORS`` mapping, which is module data, or the route's refusal
 #: of an unknown ``eol``, which sits in the endpoint body. No engine surface changed.
 #: Re-derived with ``--write``, on the branch from ``4b5769ef2c675677`` to ``8386df80553a4313``,
 #: and over the merge with #5931 from ``6737556a16ce6d15`` to ``c537067c6952d93c``.
@@ -921,12 +921,17 @@ from typing import Any
 #: ``messagefoundry_webconsole/routes/core.py``. The digest records the models' field names, not
 #: their bounds. Re-derived with ``--write``, from ``bc56eed44a1590fd`` to ``f16ae6b198ad952b``.
 #:
+#: BACKLOG #5930: ``_resubmit_form`` now restores the line endings of a form with no ``eol``
+#: field too, to the style the new ``routes/core.py`` global ``missing_eol_style`` names (CR for
+#: an HL7 body), so the hashed closure changed. No engine surface changed. Re-derived with
+#: ``--write``, from ``f16ae6b198ad952b`` to ``3ae6bcfdebbf1401``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "f16ae6b198ad952b"
+ENGINE_UI_SEAM: str = "3ae6bcfdebbf1401"
 
 
 @dataclass(frozen=True, slots=True)
