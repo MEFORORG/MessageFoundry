@@ -359,13 +359,34 @@ def test_a_refusal_names_the_field_not_the_record_value(
     assert _LEAK not in message, message
 
 
-def test_a_checked_on_refusal_does_not_carry_the_value_on_its_chain(tmp_path: Path) -> None:
+@pytest.mark.parametrize("value", [_LEAK, "2026-13-01"], ids=["bad-shape", "bad-date"])
+def test_a_checked_on_refusal_does_not_carry_the_value_on_its_chain(
+    tmp_path: Path, value: str
+) -> None:
     """Before: the refusal text left the value out, but the ValueError it was raised `from` held it,
-    so any traceback or logger walking `__cause__` printed the record's text."""
+    so any traceback or logger walking `__cause__` printed the record's text. Then `from None`
+    cleared `__cause__` and left the ValueError on `__context__`, which hides nothing."""
     with pytest.raises(ScorecardError) as exc:
-        _load(tmp_path, _CELL + _BLOCKER.replace('"2026-08-01"', f'"{_LEAK}"'))
+        _load(tmp_path, _CELL + _BLOCKER.replace('"2026-08-01"', f'"{value}"'))
     assert exc.value.__cause__ is None
-    assert exc.value.__suppress_context__
+    assert exc.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["unclosed(", "x{99999999999}", "(" * 2000 + "x" + ")" * 2000],
+    ids=["re-error", "overflow", "deep-nesting"],
+)
+def test_a_regex_refusal_does_not_carry_the_pattern_on_its_chain(
+    tmp_path: Path, pattern: str
+) -> None:
+    """Before: the refusal was raised `from None` inside the handler, so the `re.error` holding the
+    pattern on `.pattern` stayed on `__context__`; a deeply nested pattern escaped as RecursionError."""
+    body = _CELL + _ABSENCE.replace("pattern = 'eval\\('", f"pattern = '{pattern}'")
+    with pytest.raises(ScorecardError, match="pattern.*not a valid regular expression") as exc:
+        _load(tmp_path, body)
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
 
 
 # --- BACKLOG #5459: an anchor must name a token, and must stay inside the engine root ------------

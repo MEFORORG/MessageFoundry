@@ -753,19 +753,24 @@ def _regex(raw: Mapping[str, Any], key: str, where: str) -> str:
     value = _str(raw, key, where)
     if not value.strip():
         raise ScorecardError(f"{where}: `{key}` is blank, so it names nothing to search for")
+    # Each handler keeps only a content-free detail and the refusal is raised after the `try`:
+    # `re.error` holds the pattern on `.pattern`, and a raise inside the handler, even `from None`,
+    # would leave it reachable on `__context__`.
+    compiled: re.Pattern[str] | None = None
+    detail = ""
     try:
         compiled = re.compile(value)
     except re.error as exc:
         # The position, not `exc.msg`: the message can quote the pattern, a group name for one.
-        at_char = "" if exc.pos is None else f" (error at character {exc.pos})"
-        raise ScorecardError(
-            f"{where}: `{key}` is not a valid regular expression{at_char}"
-        ) from None
+        detail = "" if exc.pos is None else f" (error at character {exc.pos})"
     except OverflowError:
         # `re.compile` raises this, not `re.error`, for a repeat count past the engine's limit.
-        raise ScorecardError(
-            f"{where}: `{key}` is not a valid regular expression (a repeat count is too large)"
-        ) from None
+        detail = " (a repeat count is too large)"
+    except RecursionError:
+        # Deep nesting exhausts the parser's recursion instead of raising `re.error`.
+        detail = " (it nests too deeply)"
+    if compiled is None:
+        raise ScorecardError(f"{where}: `{key}` is not a valid regular expression{detail}")
     # The empty string, then single characters. A pattern that matches more than one LONE character
     # -- `.`, `\w`, `\b`, a lookahead, a character class -- is sighted in almost any file, which is
     # the same blindness by another route. A one-character literal still loads: it is a token,
@@ -936,18 +941,21 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
                     raise _refuse_type(where, f"blocker.{k}", "a string", value)
                 text[k] = value
             checked_on = text["checked_on"]
-            try:
-                # The shape check runs first: `fromisoformat` also accepts `20260801`.
-                if not _DATE_RE.fullmatch(checked_on):
-                    raise ValueError("not YYYY-MM-DD")
-                datetime.date.fromisoformat(checked_on)
-            except ValueError:
-                # The value is not echoed: a refusal names the field, never the record's text, and
-                # `from None` keeps `fromisoformat`'s message, which quotes it, off the chain too.
+            # The shape check runs first: `fromisoformat` also accepts `20260801`.
+            is_date = _DATE_RE.fullmatch(checked_on) is not None
+            if is_date:
+                try:
+                    datetime.date.fromisoformat(checked_on)
+                except ValueError:
+                    is_date = False
+            if not is_date:
+                # The value is not echoed: a refusal names the field, never the record's text. It is
+                # raised outside the handler, because `fromisoformat`'s message can quote the value
+                # and a raise inside it, even `from None`, would keep that on `__context__`.
                 raise ScorecardError(
                     f"{where}: `blocker.checked_on` must be an ISO date, a real one written "
                     "YYYY-MM-DD"
-                ) from None
+                )
             recheck_days = rb["recheck_days"]
             if not isinstance(recheck_days, int) or isinstance(recheck_days, bool):
                 raise _refuse_type(where, "blocker.recheck_days", "an integer", recheck_days)
