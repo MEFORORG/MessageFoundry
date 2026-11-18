@@ -32,13 +32,16 @@
     LocalMachine\CA validates there without its root. So a file is
     refused unless the chain engine, given every certificate in the file as extra certificates,
     builds a chain from each certificate in it to a self-signed root in the same file, with no
-    chain status other than an untrusted root or a time status; a chain that ends at a root
-    outside the file is refused too. Every self-signed root in the file must also be within its
-    validity period. The validity of any other CA is only warned of, and revocation is not
-    checked. Where the .NET runtime has the DisableCertificateDownloads switch, as PowerShell 7's
-    does, the script sets it; under Windows PowerShell 5.1, which has none, the engine may fetch
-    a missing issuer from a URL the certificate names. With -Confirm the operator may still
-    decline the root and accept another CA.
+    chain status other than an untrusted root or a time status. Where the .NET runtime has
+    CustomRootTrust, only the file's own self-signed roots anchor that chain, so a root this
+    machine already trusts cannot stand in for them; where it has not, as under Windows
+    PowerShell 5.1, the machine's stores take part, and a chain that ends at a root outside the
+    file is refused. Every self-signed root in the file must also be within its validity period.
+    The validity of any other CA is only warned of, and revocation is not checked. Where the
+    runtime has the DisableCertificateDownloads switch the script sets it; where it has not, as
+    under Windows PowerShell 5.1, the engine may fetch a missing issuer from a URL the
+    certificate names, so the same file can pass there and be refused under PowerShell 7. With
+    -Confirm the operator may still decline the root and accept another CA.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
@@ -174,7 +177,7 @@ function ConvertTo-PrintableText {
 
 # The header of the DER element at $Offset: its tag, where its content starts, its content length,
 # and where the element ends. $null when it is not a definite-length element that fits in $Bytes.
-# Only the single-byte tags this script reads (SEQUENCE, INTEGER, BIT STRING) are handled.
+# Only a single-byte tag is handled; this script reads it for where a SEQUENCE ends.
 function Read-DerHeader {
     param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes, [int]$Offset = 0)
     if ($Offset -lt 0 -or $Offset + 2 -gt $Bytes.Length) { return $null }
@@ -306,60 +309,114 @@ function Read-CaBundle {
     return , $unique
 }
 
-# What the chain engine makes of one certificate in the file: the store it belongs in, and why it
-# must not be trusted, or $null when it may be. The chain is built by .NET's X509Chain, the Windows
-# chain engine on Windows, with every certificate in the file in ChainPolicy.ExtraStore, so the
-# engine, not this script, matches each issuer to its signer and verifies each signature, in every
-# signature algorithm it supports. A certificate is a root when the chain built for it is that
-# certificate alone and its signature verifies under its own key; it goes into Root, and any other
-# CA into CertificateAuthority (the intermediate store). The help's "Where each CA goes" says what
-# each store means. Revocation is not checked: the file is being imported to become trusted.
-function Get-CaChainCheck {
+# One chain, built by .NET's X509Chain (the Windows chain engine on Windows) with every certificate
+# in the file in ChainPolicy.ExtraStore, so the engine, not this script, matches each issuer to its
+# signer and verifies each signature, in every signature algorithm it supports. Revocation is not
+# checked: the file is being imported to become trusted. With -Anchors, only those certificates
+# anchor the chain (CustomRootTrust); without, the machine's own trust stores do. Returns the
+# statuses the engine set, OR-ed together, and the chain's thumbprints from the certificate up, or
+# the engine's error when it could not build one.
+function Invoke-CaChainBuild {
     param(
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Bundle,
-        [Parameter(Mandatory = $true)][datetime]$Now
+        [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Anchors
     )
-    $flagsType = [System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]
     $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
     try {
         $policy = $chain.ChainPolicy
         $policy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
         [void]$policy.ExtraStore.AddRange($Bundle)
-        # PowerShell 7's .NET can keep the engine from fetching a missing issuer from a URL the
-        # certificate names; Windows PowerShell 5.1's .NET Framework has no such switch.
+        # Where the runtime has the switch, the engine may not fetch a missing issuer from a URL
+        # the certificate names. Windows PowerShell 5.1's .NET Framework has none.
         if ($policy.PSObject.Properties['DisableCertificateDownloads']) {
             $policy.DisableCertificateDownloads = $true
         }
-        # Build's own verdict is not used: the file's roots are not trusted yet, which it reports
-        # as UntrustedRoot. Each status the engine set is read instead.
-        [void]$chain.Build($Certificate)
+        if ($Anchors) {
+            $policy.TrustMode = [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+            [void]$policy.CustomTrustStore.AddRange($Anchors)
+        }
+        # Build's own verdict is not used: without -Anchors the file's roots are not trusted yet,
+        # which it reports as UntrustedRoot. Each status the engine set is read instead.
+        try {
+            [void]$chain.Build($Certificate)
+        } catch [System.Management.Automation.MethodInvocationException] {
+            return @{ Error = $_.Exception.InnerException.Message }
+        }
         $flags = 0
         foreach ($status in $chain.ChainStatus) { $flags = $flags -bor [int]$status.Status }
-        $elements = $chain.ChainElements
-        $top = $elements[$elements.Count - 1].Certificate
-        $unlinked = [int]$flagsType::PartialChain -bor [int]$flagsType::NotSignatureValid
-        $isRoot = $elements.Count -eq 1 -and -not ($flags -band $unlinked)
-        $store = if ($isRoot) { 'Root' } else { 'CertificateAuthority' }
-        # UntrustedRoot is expected before the import. Validity is judged below for a root, and
-        # only warned of for any other CA, so the engine's time statuses are set aside here.
-        $ignored = [int]$flagsType::UntrustedRoot -bor [int]$flagsType::NotTimeValid -bor
-            [int]$flagsType::NotTimeNested
-        $other = $flags -band -bnot $ignored
-        $refusal = $null
-        if ($flags -band [int]$flagsType::PartialChain) {
-            $refusal = 'it does not chain to a self-signed root in this file'
-        } elseif (-not $Bundle.Contains($top)) {
-            $refusal = "its chain ends at $($top.Thumbprint), a root that is not in this file"
-        } elseif ($other) {
-            $refusal = "the chain engine reports $([System.Enum]::ToObject($flagsType, $other)) on its chain"
-        } elseif ($isRoot -and ($Certificate.NotAfter -lt $Now -or $Certificate.NotBefore -gt $Now)) {
-            $refusal = 'it is a self-signed root outside its validity period'
-        }
-        return @{ Store = $store; Refusal = $refusal }
+        $path = @(foreach ($element in $chain.ChainElements) { $element.Certificate.Thumbprint })
+        if ($path.Count -eq 0) { return @{ Error = 'the chain engine built no chain' } }
+        return @{ Flags = $flags; Path = $path }
     } finally {
         $chain.Dispose()
     }
+}
+
+# What the chain engine makes of each certificate in the file, keyed by thumbprint: the store it
+# belongs in, why it must not be trusted ($null when it may be), and whether it is outside its
+# validity period at $Now, a UTC time. A certificate is a root when the chain built for it is that
+# certificate alone and its signature verifies under its own key; it goes into Root, and any other
+# CA into CertificateAuthority (the intermediate store). The help's "Where each CA goes" says what
+# each store means. Every other certificate must chain to one of the file's roots. Where the
+# runtime has CustomRootTrust, only the file's roots anchor that chain, so a root the machine
+# already trusts cannot take the place of the file's own, as an older root of the same name would.
+# Without it (Windows PowerShell 5.1), a chain that ends at a root outside the file is refused.
+function Get-CaChainCheck {
+    param(
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Bundle,
+        [Parameter(Mandatory = $true)][datetime]$Now
+    )
+    $flagsType = [System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]
+    $unlinked = [int]$flagsType::PartialChain -bor [int]$flagsType::NotSignatureValid
+    # UntrustedRoot is expected before the import. Validity is judged here for a root, and only
+    # warned of for any other CA, so the engine's time statuses are set aside.
+    $ignored = [int]$flagsType::UntrustedRoot -bor [int]$flagsType::NotTimeValid -bor
+        [int]$flagsType::NotTimeNested
+    # Membership is by thumbprint: a collection's Contains matches on issuer and serial number
+    # alone, which two different certificates can share.
+    $inFile = @{}
+    foreach ($cert in $Bundle) { $inFile[$cert.Thumbprint] = $true }
+    $first = @{}
+    $roots = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+    $rootThumbprints = @{}
+    foreach ($cert in $Bundle) {
+        $built = Invoke-CaChainBuild -Certificate $cert -Bundle $Bundle
+        $first[$cert.Thumbprint] = $built
+        if (-not $built.Error -and $built.Path.Count -eq 1 -and -not ($built.Flags -band $unlinked)) {
+            [void]$roots.Add($cert)
+            $rootThumbprints[$cert.Thumbprint] = $true
+        }
+    }
+    $custom = $roots.Count -gt 0 -and
+        [System.Security.Cryptography.X509Certificates.X509ChainPolicy]::new().PSObject.Properties['TrustMode']
+    $checks = @{}
+    foreach ($cert in $Bundle) {
+        $isRoot = $rootThumbprints.ContainsKey($cert.Thumbprint)
+        $built = $first[$cert.Thumbprint]
+        if ($custom -and -not $isRoot) {
+            $built = Invoke-CaChainBuild -Certificate $cert -Bundle $Bundle -Anchors $roots
+        }
+        $outside = $cert.NotAfter.ToUniversalTime() -lt $Now -or $cert.NotBefore.ToUniversalTime() -gt $Now
+        $refusal = $null
+        if ($built.Error) {
+            $refusal = "the chain engine could not build its chain: $($built.Error)"
+        } elseif ($built.Flags -band [int]$flagsType::PartialChain) {
+            $refusal = 'it does not chain to a self-signed root in this file'
+        } elseif (-not $inFile.ContainsKey($built.Path[-1])) {
+            $refusal = "its chain ends at $($built.Path[-1]), a root that is not in this file"
+        } elseif ($built.Flags -band -bnot $ignored) {
+            $refusal = "the chain engine reports $([System.Enum]::ToObject($flagsType, $built.Flags -band -bnot $ignored)) on its chain"
+        } elseif ($isRoot -and $outside) {
+            $refusal = 'it is a self-signed root outside its validity period'
+        }
+        $checks[$cert.Thumbprint] = @{
+            Store = $(if ($isRoot) { 'Root' } else { 'CertificateAuthority' })
+            Refusal = $refusal
+            Outside = $outside
+        }
+    }
+    return $checks
 }
 
 # Why the certificate must not be trusted as a CA, or $null when it may be. A certificate whose basic
@@ -406,11 +463,11 @@ try {
 }
 
 Write-Host "The file holds $($bundle.Count) certificate(s):"
-$now = [datetime]::Now
+$checks = Get-CaChainCheck -Bundle $bundle -Now ([datetime]::UtcNow)
 $refusals = [System.Collections.Generic.List[object]]::new()
 # The store each certificate is shown with is the one it is offered for and written to.
 $entries = @(foreach ($cert in $bundle) {
-    $check = Get-CaChainCheck -Certificate $cert -Bundle $bundle -Now $now
+    $check = $checks[$cert.Thumbprint]
     $target = $stores[$check.Store]
     Write-Host ""
     Write-Host "  Subject    : $(ConvertTo-PrintableText $cert.Subject)"
@@ -419,7 +476,7 @@ $entries = @(foreach ($cert in $bundle) {
     # 'u' writes a 'Z' suffix whatever the DateTime's kind, so the time must be UTC.
     Write-Host "  Not after  : $($cert.NotAfter.ToUniversalTime().ToString('u'))"
     Write-Host "  Store      : $($target.Label)"
-    if ($cert.NotAfter -lt $now -or $cert.NotBefore -gt $now) {
+    if ($check.Outside) {
         Write-Warning "$($cert.Thumbprint) is outside its validity period; a chain through it will not validate."
     }
     $why = Get-CaRefusal -Certificate $cert

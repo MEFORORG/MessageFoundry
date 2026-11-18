@@ -152,8 +152,9 @@ def chain() -> dict[str, tuple[x509.Certificate, _Key]]:
 
 @pytest.fixture(scope="module")
 def extra(chain: dict[str, tuple[x509.Certificate, _Key]]) -> dict[str, x509.Certificate]:
-    """An RSA self-signed root, and a re-key certificate: self-issued (its subject and issuer are
-    the root's name) but signed by the root's old key, so it is not self-signed."""
+    """An RSA self-signed root, the same key's root signed with RSA-PSS, and a re-key
+    certificate: self-issued (its subject and issuer are the root's name) but signed by the root's
+    old key, so it is not self-signed."""
     root, root_key = chain["root"]
     now = datetime.datetime.now(datetime.UTC)
 
@@ -277,14 +278,14 @@ def _psq(value: str) -> str:
 
 
 def _read_all(tmp_path: Path, paths: dict[str, Path]) -> dict[str, dict[str, object]]:
-    """Each file through ``Read-CaBundle``, then ``Get-CaRefusal`` and ``Get-CaStoreName``, as the
+    """Each file through ``Read-CaBundle``, then ``Get-CaRefusal`` and ``Get-CaChainCheck``, as the
     script does."""
     script = f"""
 $ErrorActionPreference = 'Stop'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     {_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
 foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-DerHeader',
-                    'Read-CaBundle', 'Get-CaRefusal', 'Get-CaChainCheck')) {{
+                    'Read-CaBundle', 'Get-CaRefusal', 'Invoke-CaChainBuild', 'Get-CaChainCheck')) {{
   $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
       $args[0].Name -eq $name }}, $true)
   if (-not $def) {{ throw "missing function $name" }}
@@ -295,8 +296,9 @@ $out = @{{}}
 foreach ($k in $paths.Keys) {{
   try {{
     $bundle = Read-CaBundle -Bytes ([System.IO.File]::ReadAllBytes($paths[$k]))
+    $checks = Get-CaChainCheck -Bundle $bundle -Now ([datetime]::UtcNow)
     $out[$k] = @{{ certs = @(foreach ($c in $bundle) {{
-      $check = Get-CaChainCheck -Certificate $c -Bundle $bundle -Now ([datetime]::Now)
+      $check = $checks[$c.Thumbprint]
       $why = Get-CaRefusal -Certificate $c
       if (-not $why) {{ $why = $check.Refusal }}
       @{{ thumb = $c.Thumbprint; refusal = $why; store = $check.Store }} }}) }}
@@ -432,7 +434,65 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert "control character outside its PEM blocks" in error("der_then_pem")
 
 
-def _run_whatif(ca_path: Path) -> subprocess.CompletedProcess[str]:
+def test_a_chain_ending_outside_the_file_or_unbuilt_is_refused(
+    tmp_path: Path, chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
+) -> None:
+    # A chain the engine ends at a root the machine already trusts, or cannot build at all, needs a
+    # machine store this test must not write. So Get-CaChainCheck is run over a stand-in for
+    # Invoke-CaChainBuild that reports those chains, and the verdict is read.
+    outside = "F" * 40
+    root = _thumb(chain["root"][0])
+    inter = _thumb(chain["intermediate"][0])
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    {_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
+foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-DerHeader',
+                    'Read-CaBundle', 'Get-CaChainCheck')) {{
+  $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+      $args[0].Name -eq $name }}, $true)
+  . ([scriptblock]::Create($def.Extent.Text))
+}}
+$script:mode = $null
+function Invoke-CaChainBuild {{
+  param($Certificate, $Bundle, $Anchors)
+  if ($Certificate.Thumbprint -eq {_psq(root)}) {{ return @{{ Flags = 32; Path = @({_psq(root)}) }} }}
+  if ($script:mode -eq 'error') {{ return @{{ Error = 'stand-in failure' }} }}
+  return @{{ Flags = 0; Path = @({_psq(inter)}, {_psq(outside)}) }}
+}}
+$bundle = Read-CaBundle -Bytes ([System.IO.File]::ReadAllBytes({_psq(str(files["pem_bundle"]))}))
+$out = @{{}}
+foreach ($m in 'outside', 'error') {{
+  $script:mode = $m
+  $checks = Get-CaChainCheck -Bundle $bundle -Now ([datetime]::UtcNow)
+  $out[$m] = @{{ root = $checks[{_psq(root)}].Refusal; inter = $checks[{_psq(inter)}].Refusal }}
+}}
+$out | ConvertTo-Json -Compress
+"""
+    f = tmp_path / f"dbca-{uuid.uuid4().hex}.ps1"
+    f.write_text(script, encoding="utf-8")
+    proc = subprocess.run(
+        [_pwsh(), "-NoProfile", "-NonInteractive", "-File", str(f)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"harness failed: {proc.stdout}\n{proc.stderr}"
+    got = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert got["outside"] == {
+        "root": None,
+        "inter": f"its chain ends at {outside}, a root that is not in this file",
+    }
+    assert got["error"] == {
+        "root": None,
+        "inter": "the chain engine could not build its chain: stand-in failure",
+    }
+
+
+def _run_whatif(
+    ca_path: Path, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     if _elevated():
         pytest.skip("SKIP (nothing run): elevated session; the script is run only unelevated")
     return subprocess.run(
@@ -450,6 +510,7 @@ def _run_whatif(ca_path: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         encoding="utf-8",
         timeout=120,
+        env=env,
     )
 
 
@@ -508,19 +569,9 @@ def test_not_after_is_printed_in_utc(
 ) -> None:
     # The 'u' format writes a 'Z' suffix whatever the time's kind, so a local time printed with it
     # reads as a UTC time that is wrong by the zone's offset. TZ sets the zone for .NET on Linux and
-    # macOS; on Windows the host's own zone stands, and the check is only as strong as its offset.
-    env = dict(os.environ, TZ="Pacific/Chatham")
-    if _elevated():
-        pytest.skip("SKIP (nothing run): elevated session; the script is run only unelevated")
-    proc = subprocess.run(
-        [_pwsh(), "-NoProfile", "-NonInteractive", "-File", str(_SCRIPT)]
-        + ["-CaPath", str(files["der"]), "-WhatIf"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=120,
-        env=env,
-    )
+    # macOS. Windows ignores it and uses the host's own zone, so on a Windows host running in UTC,
+    # as hosted runners do, this test cannot fail for the bug it guards; the Linux leg guards it.
+    proc = _run_whatif(files["der"], dict(os.environ, TZ="Pacific/Chatham"))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     want = chain["root"][0].not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%SZ")
     assert f"  Not after  : {want}" in proc.stdout.splitlines(), proc.stdout

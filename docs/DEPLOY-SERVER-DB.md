@@ -570,7 +570,11 @@ partial-chain verification, so a chain that reaches a certificate in `LocalMachi
 there without its root. So the helper refuses a file unless the chain engine, given every
 certificate in the file, builds a chain from each one to a self-signed root in the same file with
 every signature verifying and no fault reported but an untrusted root or a time status, and every
-self-signed root in it is within its validity period. It warns
+self-signed root in it is within its validity period. Under PowerShell 7.1 and later only the
+file's own roots anchor that chain, and no missing issuer is fetched from the network. Under
+Windows PowerShell 5.1 the machine's stores take part, a chain that ends at a root outside the file
+is refused, and the engine may fetch a missing issuer from a URL the certificate names, so the same
+file can pass there and be refused under PowerShell 7. It warns
 of, but does not refuse, an expired issuing CA, and it does not check revocation. With `-Confirm`
 you may still decline the root and accept another CA, so give it the root of the CA you mean to
 trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
