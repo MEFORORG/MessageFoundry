@@ -406,9 +406,13 @@ def test_every_server_suite_skips_whole_on_its_own_gate(ref: str) -> None:
 def test_no_other_per_db_file_gates_a_test_on_a_server_backend() -> None:
     # The no-mixed-file invariant: a file outside the registry that gated some tests on a server
     # backend would read PASS on its SQLite tests alone, with the server tests skipped.
+    unregistered = sorted(_per_db_pytest_refs() - SERVER_SUITE_GATES.keys())
+    # A floor, so an empty scan cannot read as no offenders: 15 unregistered Per-DB pytest refs
+    # when this was written. Lower it only when a ref moves into SERVER_SUITE_GATES.
+    assert len(unregistered) >= 15, unregistered
     offenders = {
         ref: hits
-        for ref in sorted(_per_db_pytest_refs() - SERVER_SUITE_GATES.keys())
+        for ref in unregistered
         if (hits := server_gates((_REPO_ROOT / ref).read_text(encoding="utf-8")))
     }
     assert offenders == {}
