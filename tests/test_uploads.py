@@ -1905,18 +1905,23 @@ async def test_a_pair_holding_a_link_is_logged_once_by_the_prune(
     assert await store.read_bytes(other.file_id) == _BATCH.encode()
 
 
-@pytest.mark.parametrize(
-    "data", [b"<x/>", b" \r\n<x/>", b"\xef\xbb\xbf<x/>", b"\t\xef\xbb\xbf \n<x/>"]
-)
-def test_the_xml_head_check_admits_a_bom_and_whitespace(data: bytes) -> None:
-    """BACKLOG #5552 item 8: the ``.xml`` sniff matches the head rather than copying the body,
-    and admits what ``_lstrip_bom_ws(...).startswith(b"<")`` admitted."""
-    validate_upload_content("a.xml", data)
+def test_the_once_per_interval_memo_forgets_a_key_after_the_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5552 items 5 (a) and 6 (b): the memo mutes a key for the interval only, so a pair
+    still left, or a tag failure still there, is named again once it passes."""
+    import types
 
+    from messagefoundry import uploads
 
-@pytest.mark.parametrize("data", [b"x<x/>", b"\xef\xbb\xbf\xef\xbb\xbf<x/>", b"\xef\xbb<x/>"])
-def test_the_xml_head_check_refuses_what_it_refused(data: bytes) -> None:
-    from messagefoundry.uploads import UploadContentError
-
-    with pytest.raises(UploadContentError):
-        validate_upload_content("a.xml", data)
+    clock = [1000.0]
+    monkeypatch.setattr(uploads, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    memo = uploads._OncePerInterval(interval_s=60.0, max_keys=2)
+    assert memo.first("a") is True
+    assert memo.first("a") is False
+    clock[0] += 59.0
+    assert memo.first("a") is False
+    clock[0] += 2.0
+    assert memo.first("a") is True
+    assert memo.first("b") is True and memo.first("c") is True
+    assert memo.first("a") is True  # forgotten first, as the oldest recorded

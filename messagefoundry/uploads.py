@@ -57,7 +57,7 @@ from messagefoundry.controlchars import (
     strip_control_chars,
 )
 from messagefoundry.parsing.peek import HL7PeekError, Peek
-from messagefoundry.parsing.sniff import _LEADING_WS, _looks_like_hl7, nontext_upload_reason
+from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws, nontext_upload_reason
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.redaction import codec_safe_str, json_loads_or_refusal
 from messagefoundry.store.content_search import SearchSpec, row_matches
@@ -228,18 +228,22 @@ def _is_inflight(name: str) -> bool:
 
 #: How long one upload's report is given once (BACKLOG #5552, #5553). Every listing, quota check and
 #: prune meets the same sidecar, so without this each would raise the alert, or log the line, again.
-_TAG_REPORT_INTERVAL_S = 3600.0
-#: The most upload ids one memo remembers; the oldest is forgotten first.
-_TAG_REPORTED_MAX = 4096
+_REPORT_INTERVAL_S = 3600.0
+#: The most keys one memo remembers; the oldest recorded is forgotten first.
+_REPORTED_MAX = 4096
 #: How much of an upload id a tag-failure alert names, as ``store/cell_tag.py`` names a row.
 _TAG_REF_LEN = 12
 
 
 class _OncePerInterval:
-    """Which upload ids were reported within :data:`_TAG_REPORT_INTERVAL_S`, bounded to
-    :data:`_TAG_REPORTED_MAX`. Scans run on worker threads, so the read-modify-write holds a lock."""
+    """Which keys were reported within ``interval_s``, remembering at most ``max_keys``. Scans
+    run on worker threads, so the read-modify-write holds a lock."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, interval_s: float = _REPORT_INTERVAL_S, max_keys: int = _REPORTED_MAX
+    ) -> None:
+        self._interval_s = interval_s
+        self._max_keys = max_keys
         self._seen: dict[str, float] = {}
         self._lock = threading.Lock()
 
@@ -248,17 +252,17 @@ class _OncePerInterval:
         now = time.monotonic()
         with self._lock:
             last = self._seen.get(key)
-            if last is not None and now - last < _TAG_REPORT_INTERVAL_S:
+            if last is not None and now - last < self._interval_s:
                 return False
             self._seen.pop(key, None)
             self._seen[key] = now
-            while len(self._seen) > _TAG_REPORTED_MAX:
+            while len(self._seen) > self._max_keys:
                 self._seen.pop(next(iter(self._seen)))
         return True
 
 
-#: Upload ids whose sidecar tag failure was reported (BACKLOG #5553). Process-wide, as the cipher's
-#: hook is.
+#: Upload ids whose sidecar tag failure was reported (BACKLOG #5553). One memo for the process,
+#: whichever cipher instance reported.
 _tag_reported = _OncePerInterval()
 
 
@@ -788,13 +792,6 @@ def content_type_for(filename: str) -> str:
 _ALLOWED_UPLOAD_EXTENSIONS = (".hl7", ".hl7v2", ".txt", ".xml")
 
 
-#: ``_lstrip_bom_ws(data).startswith(b"<")`` as a match, so a whole body is not copied to read its
-#: head: leading whitespace, then an optional UTF-8 BOM and more whitespace, then ``<``.
-_XML_HEAD = re.compile(
-    rb"[%s]*(?:\xef\xbb\xbf[%s]*)?<" % (re.escape(_LEADING_WS), re.escape(_LEADING_WS))
-)
-
-
 def validate_upload_content(display: str, data: bytes) -> None:
     """Text-only check, extension allowlist and content-vs-extension sniff for an uploaded file.
 
@@ -828,7 +825,7 @@ def validate_upload_content(display: str, data: bytes) -> None:
         raise UploadContentError(
             display, "is not HL7 (no MSH/FHS/BHS header) despite its extension"
         )
-    if ctype == "xml" and _XML_HEAD.match(data) is None:
+    if ctype == "xml" and not _lstrip_bom_ws(data).startswith(b"<"):
         raise UploadContentError(display, "is not XML (no leading '<') despite its extension")
 
 
@@ -1100,8 +1097,8 @@ class UploadStore:
         self._body_checks: dict[str, tuple[tuple[int, int], bool]] = {}
         # The running UploadRetentionRunner's wake, or None (BACKLOG #3184). See wake_retention.
         self._retention_wake: Callable[[], bool] | None = None
-        # Upload ids whose link or non-regular file the scan or the prune logged (BACKLOG #5552),
-        # so a pair left for an operator is named once per interval, not on every pass.
+        # The scan's and the prune's lines for a pair left for an operator, keyed by upload id and
+        # reason, so each is not logged on every pass (BACKLOG #5552).
         self._link_logged = _OncePerInterval()
 
     def wake_retention(self) -> bool:
@@ -1329,9 +1326,9 @@ class UploadStore:
         not configured is a key fault, not that, and is only logged.
 
         **A sidecar that is a link, or is not a regular file, is not read (BACKLOG #5552).** It is
-        skipped, and logged once per upload per interval: a followed link read a file outside the root, or another upload's
-        sidecar, and a FIFO would block the scan, and the ``_quota_lock`` a save holds over it, for
-        good. One planted between that check and the read is still opened."""
+        skipped, and its log line is rate-limited per upload: a followed link read a file outside
+        the root, or another upload's sidecar, and a FIFO would block the scan, and the
+        ``_quota_lock`` a save holds over it, for good. One planted between that check and the read is still opened."""
         out: list[UploadedFileMeta] = []
         sink = held if self._refuses_plaintext else None
         bodies: set[str] = set()
@@ -1340,7 +1337,7 @@ class UploadStore:
                 bodies.add(f"{fid}{_BLOB_SUFFIX}")
             refused = _not_a_plain_file(entry)
             if refused is not None:
-                if self._link_logged.first(fid):
+                if self._link_logged.first(f"scan {fid} {refused}"):
                     _log.warning("uploaded-file sidecar %s: %s, so it was not read", fid, refused)
                 continue
             classify = False
@@ -1405,9 +1402,9 @@ class UploadStore:
 
     def _report_tag_failure(self, fid: str, stored: str, exc: CipherError) -> None:
         """Raise the cipher's tag-failure alert for sidecar ``fid`` when ``exc`` is its AEAD tag
-        failing under a key the cipher holds, once per upload per :data:`_TAG_REPORT_INTERVAL_S`
-        and only while its hook is armed (BACKLOG #5553). The tests are ``store/cell_tag.py``'s ``_tag_failure_kind``, inlined
-        because that module imports beyond this leaf's set: a verdict was given, a cipher that names
+        failing under a key the cipher holds, once per upload per :data:`_REPORT_INTERVAL_S`
+        and only while its hook is armed (BACKLOG #5553). The tests are ``store/cell_tag.py``'s
+        ``_tag_failure_kind``, inlined because that module imports beyond this leaf's set: a verdict was given, a cipher that names
         its keys holds the one the marker names, and one that cannot (Vault Transit) declares that
         its refusal is the value's own tag. The reason names a prefix of the upload id, as
         ``cell_tag`` names a row: the id is random and carries no PHI, and the WARNING the scan logs
@@ -1421,8 +1418,9 @@ class UploadStore:
         held = holds(stored) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
         report = getattr(cipher, "report_tag_failure", None)
         # A report with no hook armed goes nowhere, so it must not use up the upload's slot: a hook
-        # armed later in the interval would then never hear of it.
-        armed = getattr(cipher, "_tag_failure_hook", None) is not None
+        # armed later in the interval would then never hear of it. A cipher with no such attribute,
+        # such as one forwarding to an inner cipher, is taken as armed, as before.
+        armed = getattr(cipher, "_tag_failure_hook", True) is not None
         if not (held and callable(report) and armed and _tag_reported.first(fid)):
             return
         report(
@@ -3126,7 +3124,7 @@ class UploadStore:
         try:
             blob_path, meta_path = self._paths(meta.file_id)
         except UploadPathError:
-            if self._link_logged.first(meta.file_id[:40]):
+            if self._link_logged.first(f"prune {meta.file_id[:40]}"):
                 _log.warning(
                     "uploaded-logs prune left %r for an operator: its id fails the path guard or "
                     "its pair holds a link",
