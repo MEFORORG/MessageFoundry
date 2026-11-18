@@ -1074,9 +1074,16 @@ parked by the DR run-profile, or is `deployed = false` keeps showing `failed` / 
 alert.
 
 Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
-*and* outbounds — from the web console, or by restarting the service. Under the pooled claim mode, a
-router, transform or response lane that is STOPPED when you restart a connection stays STOPPED
-after that restart.
+*and* outbounds — from the web console, or by restarting the service. Restarting an inbound the halt
+stopped also re-arms a router, transform or response lane of it that is STOPPED, for example one the
+infra-fault bound stopped while the log was down, except a pooled lane kept STOPPED because it
+holds claimed rows whose return to the queue never landed. Under the pooled claim mode only, a connection
+restart leaves STOPPED a lane that still holds claimed rows whose return to the queue never landed;
+under per_lane the restart respawns such a worker, and it can claim past rows left in flight.
+Any later notify_work broadcast re-arms such a lane, at least a reload, a replay, a resend, an
+inject or a dead-letter replay, and it then claims past the unlanded rows; until one arrives it
+stays STOPPED. At least a service restart returns them to the queue first, because the engine does that as it starts, so restart the service
+to recover it.
 **Fix the disk first — the restart is refused while the log is still unwritable.** The engine
 re-checks by writing a real record to each dead sink at the moment you ask, so a restart issued
 against a still-broken disk leaves the connection halted (and its listener down) and raises another

@@ -10,7 +10,8 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { logChecks, showChecks } from "./checksChannel";
 import { baselineBypassRecord } from "./checksLog";
-import { configDir, messageSetsDir, run, workspaceDir } from "./cli";
+import { configDir, run, workspaceDir, writerPathSetting } from "./cli";
+import { committedRelativePath } from "./workspaceContainment";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { sourceControlScript } from "./sourceControlWebview";
@@ -21,6 +22,9 @@ import {
   HOOK_REL,
   HOOKS_DIR,
   PRE_COMMIT_TEMPLATE,
+  setupText,
+  type HookState,
+  type SetupText,
 } from "./sourceControlTemplates";
 
 const DISMISS_KEY = "messagefoundry.scPromptDismissed";
@@ -102,6 +106,11 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
     void vscode.window.showWarningMessage(UNTRUSTED_SETUP_MESSAGE);
     return;
   }
+  // Read before git init, so a refusal leaves nothing half set up.
+  const hookPaths = hookPathValues(ws);
+  if (hookPaths === undefined) {
+    return;
+  }
 
   const bin = await findGit();
   if (!bin) {
@@ -134,17 +143,27 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
   const notes: string[] = [];
   notes.push(`.gitignore: ${await scaffoldGitignore(ws)}`);
   notes.push(`.gitattributes: ${await scaffoldGitattributes(ws)}`);
-  notes.push(`hook: ${await scaffoldHook(bin, ws)}`);
-  notes.push(`core.hooksPath: ${await wireHooksPath(bin, ws)}`);
+  // Checks run on commit only once the hook is both written AND wired: a hook git is not pointed at
+  // never runs, so the text below claims checks only when both happened.
+  let hookState: HookState = "none";
+  if (hookPaths.hook === undefined) {
+    notes.push("hook: not written (a path setting names a folder outside the workspace)");
+  } else {
+    notes.push(`hook: ${await scaffoldHook(bin, ws, hookPaths.hook)}`);
+    const wiring = await wireHooksPath(bin, ws);
+    notes.push(`core.hooksPath: ${wiring.note}`);
+    hookState = wiring.wired ? "wired" : "written";
+  }
 
   // Logged here, before the prompts below. Every line is time-stamped, so logging these after the
   // first commit would date the hook install later than the commit it came before.
   logChecks(["Set Up Version Control & Checks:", ...notes.map((n) => `  • ${n}`)].join("\n"));
 
   await maybeAddRemote(bin, ws);
-  await maybeFirstCommit(bin, ws);
+  const text = setupText(hookState);
+  await maybeFirstCommit(bin, ws, hookPaths.check, text);
 
-  void vscode.window.showInformationMessage("MessageFoundry: version control & checks are set up.");
+  void vscode.window.showInformationMessage(text.done);
 }
 
 async function guideGitInstall(): Promise<void> {
@@ -214,13 +233,50 @@ function shSingleQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-async function scaffoldHook(bin: string, ws: string): Promise<string> {
+/** The two folders setup's `check` runs on. */
+interface CheckPaths {
+  readonly configDir: string;
+  readonly messagesDir: string;
+}
+
+/**
+ * The `configDir` and `messageSetsDir` setup uses, or undefined after a refusal. Each is read as a
+ * write (BACKLOG #5404): a dropped value refuses the whole setup rather than run on the substitute.
+ * `check` is the pair as set, for the first commit's pre-flight on this machine. `hook` is the same
+ * pair relative to the workspace for the committed hook, or undefined when either lies outside the
+ * folder, which a user setting can name: the hook is committed, so every clone would run it against
+ * this machine's layout (see committedRelativePath). Setup then writes no hook and says so.
+ */
+function hookPathValues(ws: string): { check: CheckPaths; hook: CheckPaths | undefined } | undefined {
+  const cfg = writerPathSetting("configDir");
+  if (cfg === undefined) {
+    return undefined;
+  }
+  const msgs = writerPathSetting("messageSetsDir");
+  if (msgs === undefined) {
+    return undefined;
+  }
+  const check = { configDir: cfg, messagesDir: msgs };
+  const configRel = committedRelativePath(ws, cfg);
+  const messagesRel = committedRelativePath(ws, msgs);
+  if (configRel === undefined || messagesRel === undefined) {
+    const key = configRel === undefined ? "configDir" : "messageSetsDir";
+    void vscode.window.showWarningMessage(
+      `MessageFoundry: messagefoundry.${key} names a path outside the workspace folder. The commit hook is ` +
+        "committed to the repository, so it names folders inside the workspace only; no commit hook was set up.",
+    );
+    return { check, hook: undefined };
+  }
+  return { check, hook: { configDir: configRel, messagesDir: messagesRel } };
+}
+
+async function scaffoldHook(bin: string, ws: string, paths: CheckPaths): Promise<string> {
   // Function replacements (not string ones) — a string replacement would interpret `$`-sequences
   // (e.g. `$'`) in the quoted value, re-injecting unescaped text.
   const hook = PRE_COMMIT_TEMPLATE.replace(
     /__CONFIG_DIR__/g,
-    () => shSingleQuote(configDir()),
-  ).replace(/__MESSAGES_DIR__/g, () => shSingleQuote(messageSetsDir()));
+    () => shSingleQuote(paths.configDir),
+  ).replace(/__MESSAGES_DIR__/g, () => shSingleQuote(paths.messagesDir));
   const hookPath = path.join(ws, HOOKS_DIR, "pre-commit");
   await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.join(ws, HOOKS_DIR)));
   await vscode.workspace.fs.writeFile(vscode.Uri.file(hookPath), Buffer.from(hook, "utf8"));
@@ -232,17 +288,44 @@ async function scaffoldHook(bin: string, ws: string): Promise<string> {
   return "written (.mefor-hooks/pre-commit, +x)";
 }
 
-/** Point git at the hook only if safe: don't clobber a user's existing hooksPath or real hook. */
-async function wireHooksPath(bin: string, ws: string): Promise<string> {
+/** Whether `a` and `b` name one directory, compared by real path (case-folded on Windows). */
+function sameDir(a: string, b: string): boolean {
+  const norm = (p: string): string => {
+    let real: string;
+    try {
+      real = fs.realpathSync.native(p);
+    } catch {
+      real = path.resolve(p); // a folder that cannot be read: compare its spelling instead
+    }
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  };
+  return norm(a) === norm(b);
+}
+
+/**
+ * Point git at the hook only if safe: don't clobber a user's existing hooksPath or real hook.
+ * `wired` is true only when core.hooksPath resolves to the hook's folder afterwards. Git resolves a
+ * relative core.hooksPath from the repository's top level, so a workspace folder below that top
+ * level is never wired: `.mefor-hooks` there would name a folder the hook was not written to.
+ */
+async function wireHooksPath(bin: string, ws: string): Promise<{ note: string; wired: boolean }> {
+  const top = await git(bin, ["rev-parse", "--show-toplevel"], ws);
+  const topDir = top.code === 0 ? top.stdout.trim() : "";
+  if (!topDir || !sameDir(topDir, ws)) {
+    return {
+      note: "not set (git resolves core.hooksPath from the repository's top level, which is not this workspace folder)",
+      wired: false,
+    };
+  }
   const current = await getHooksPath(bin, ws);
-  if (current === HOOKS_DIR) {
-    return "already set";
+  if (current && sameDir(path.resolve(topDir, current), path.join(ws, HOOKS_DIR))) {
+    return { note: "already set", wired: true };
   }
   if (current) {
     void vscode.window.showWarningMessage(
       `MessageFoundry: core.hooksPath is already '${current}'. Left as-is — point it at '${HOOKS_DIR}' to enable checks.`,
     );
-    return `left as '${current}' (not clobbered)`;
+    return { note: `left as '${current}' (not clobbered)`, wired: false };
   }
   const realHook = vscode.Uri.file(path.join(ws, ".git", "hooks", "pre-commit"));
   try {
@@ -250,12 +333,14 @@ async function wireHooksPath(bin: string, ws: string): Promise<string> {
     void vscode.window.showWarningMessage(
       "MessageFoundry: an existing .git/hooks/pre-commit was found. Left it alone — remove or merge it, then re-run setup.",
     );
-    return "not set (existing .git/hooks/pre-commit)";
+    return { note: "not set (existing .git/hooks/pre-commit)", wired: false };
   } catch {
     // no existing real hook — safe to set
   }
   const res = await git(bin, ["config", "core.hooksPath", HOOKS_DIR], ws);
-  return res.code === 0 ? `set to '${HOOKS_DIR}'` : `failed: ${res.stderr.trim()}`;
+  return res.code === 0
+    ? { note: `set to '${HOOKS_DIR}'`, wired: true }
+    : { note: `failed: ${res.stderr.trim()}`, wired: false };
 }
 
 // "Where should this config repo be stored?" — the setup-time storage choice. Local-only suits a
@@ -502,13 +587,11 @@ async function stageBaseline(bin: string, ws: string): Promise<boolean> {
 // REQUIRED check failed — advisories (e.g. dead-config) print but never block (checks.py / __main__).
 // A required failure doesn't stop the baseline: the seed is conventionally exempt, so we offer to
 // commit it and fix forward, with the details one click away — never leading with --no-verify.
-async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
+async function maybeFirstCommit(bin: string, ws: string, paths: CheckPaths, text: SetupText): Promise<void> {
   // Only a repository with no commits yet gets a baseline. In one with history, staging the whole
   // tree would sweep the user's work in progress into a commit named "Initial commit".
   if ((await git(bin, ["rev-parse", "--verify", "-q", "HEAD"], ws)).code === 0) {
-    void vscode.window.showInformationMessage(
-      "MessageFoundry: this repository already has commits, so no baseline commit was made. Review and commit .gitignore, .gitattributes and .mefor-hooks/pre-commit yourself.",
-    );
+    void vscode.window.showInformationMessage(text.hasHistory);
     return;
   }
   const pick = await vscode.window.showInformationMessage(
@@ -521,14 +604,15 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
   }
 
   logChecks("--- pre-flight: messagefoundry check ---");
-  const chk = await run(["check", "--config", configDir(), "--messages", messageSetsDir()], ws);
+  // The folders setup read at its start, so the pre-flight judges the ones the hook names.
+  const chk = await run(["check", "--config", paths.configDir, "--messages", paths.messagesDir], ws);
   logResult("", chk);
 
   if (chk.code === 0) {
     if (!(await stageBaseline(bin, ws))) {
       return;
     }
-    const res = await git(bin, ["commit", "-m", "Initial commit (MessageFoundry checks enabled)"], ws);
+    const res = await git(bin, ["commit", "-m", text.commitMessage], ws);
     logResult("--- baseline commit ---", res);
     if (res.code === 0) {
       void vscode.window.showInformationMessage(
@@ -536,9 +620,7 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
       );
     } else {
       showChecks();
-      void vscode.window.showWarningMessage(
-        "MessageFoundry: the commit hook reported an issue — see the 'MessageFoundry Checks' output.",
-      );
+      void vscode.window.showWarningMessage(text.commitFailed);
     }
     return;
   }
@@ -547,7 +629,7 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
   // exempted; every commit after it runs the hook.
   showChecks();
   const choice = await vscode.window.showWarningMessage(
-    "A required check hasn't passed yet. You can still commit this as your baseline snapshot — the checks run on every commit after it, so you can fix the flagged items next. Details are in the 'MessageFoundry Checks' output.",
+    text.offerBaseline,
     "Commit baseline anyway",
     "Show details",
     "Cancel",
@@ -560,14 +642,12 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
     }
     const res = await git(
       bin,
-      ["commit", "-m", "Initial commit (MessageFoundry checks enabled)", "--no-verify"],
+      ["commit", "-m", text.commitMessage, "--no-verify"],
       ws,
     );
     logResult(`--- baseline commit (hooks skipped): git exit code ${res.code} ---`, res);
     if (res.code === 0) {
-      void vscode.window.showInformationMessage(
-        "MessageFoundry: baseline committed. Checks are active for your next commit — fix the flagged items in 'MessageFoundry Checks' before then.",
-      );
+      void vscode.window.showInformationMessage(text.committedAnyway);
     } else {
       void vscode.window.showErrorMessage(`MessageFoundry: commit failed — ${res.stderr.trim()}`);
     }

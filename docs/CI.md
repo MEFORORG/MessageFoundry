@@ -407,7 +407,7 @@ Two limits, stated so nobody reads more into a green than it carries:
   2026-10-30, decided under the owner's delegation, warned on `pull_request` down to 1.20x. The
   test shard pools of 2026-11-09 in `scripts/ci/step_margin_baseline.toml` ended both. The ruling
   of 2026-10-29 also moved the recurring timing tests listed in `tests/timing_quarantine.txt` off the engine legs into the advisory `timing-quarantine` job
-  (BACKLOG #4773). Each gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
+  (BACKLOG #4773); that file quotes this ruling and the later one, of 2026-11-18, that added to it. Each gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
   them: it times the **step** (not the job — the job runs minutes longer under its own cap, and
   misreading one for the other has produced published-then-retracted numbers here more than once),
   keys on that step's **own** `outcome`, and reds below 1.30x. It

@@ -164,7 +164,8 @@ re-binds (reload quiesces every source and re-binds from the new graph). The inb
 declines to bind — `deployed=False`, `auto_start=False` and not previously listening, DR-filtered —
 stay halted, as do the connections a per-connection restart does not name. *(Note, BACKLOG #5704:
 under the pooled claim mode a router, transform or response lane that is STOPPED at a
-per-connection restart of its inbound stays STOPPED after it.)*
+per-connection restart of its inbound is re-armed by it and its hold released, except a lane that
+STOPPED holding claimed rows whose re-pend never landed, which stays STOPPED with a WARNING.)*
 The outbound **pause is
 operator-owned in both cases** (#115/#233: a reload never resumes a lane an operator has not looked
 at), so delivery needs an explicit `start_outbound` or a service restart either way. Stated the other
@@ -237,7 +238,14 @@ records, and the two are easy to conflate — hence this clause. An application-
 store failure, and the guard performs **no store I/O at all**. A message already committed to the
 ingress stage was ACKed on receipt; stopping its inbound unbinds the listener and touches no row, and
 pausing an outbound retains its rows PENDING un-errored. Nothing is un-ACKed, lost, or double-
-delivered — fix the disk, reload, and the backlog drains. **Fix the disk first**: the reload re-arms
+delivered — fix the disk, reload, and the backlog drains, with at least these qualifications
+(BACKLOG #5704). Under the pooled claim mode, a router, transform or response lane that STOPPED
+while holding claimed rows whose re-pend never landed is not re-armed by the lift of the halt,
+which logs a WARNING. Any later `notify_work` broadcast re-arms such a lane, at least a reload, a
+replay, a resend, an inject or a dead-letter replay, and it then claims past the unlanded rows;
+until one arrives it stays STOPPED. At least a service restart returns its rows to the queue first. Under per_lane, a worker that a content STOP ended during the halt
+is respawned by the reload or restart that lifts its inbound's gate, and it retries that STOP's row.
+**Fix the disk first**: the reload re-arms
 only once the log accepts a record again (section 4), so on a still-broken disk the rows simply stay
 where the halt left them. A test asserts store stats are byte-identical across a stage-2 halt and that
 the committed ingress row is still claimable afterwards.

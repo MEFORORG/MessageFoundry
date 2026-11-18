@@ -274,13 +274,14 @@ rather than a mapping.
 its re-arm genuinely is per-connection.
 *(Note, BACKLOG #5704: the INBOUND tier now takes this ADR's shape too. Its claim gate,
 `_inbound_log_halted`, reads the process latch as well as the per-inbound marks, in the per_lane
-workers' loop top and, under pooled, in a pre-claim predicate on the INGRESS, ROUTED and
+workers' loop top and again once their claim returns and, under pooled, in a pre-claim predicate on the INGRESS, ROUTED and
 RESPONSE dispatchers: a gated pooled lane parks with no claim and no row write until the gate lifts. The halt pauses
 no internal lane, and STOPs one only through its hand-back of a prefix claimed before the gate shut
 (on leadership loss, or at T17, when that pooled hand-back's reschedule raises and the lane's
 infra-fault count reaches its bound, for example while the head's re-pend keeps failing on a full
 store). A lane can still STOP while the halt is in force for other causes, at least under its own
-fault policy; lifting the gate does not itself re-arm a STOP. `_inbound_log_halted` states this in full
+fault policy; a latch a probe clears does not itself re-arm a STOP, and the restart of the
+inbound that lifts its mark does, except a pooled lane still holding claimed rows in flight. `_inbound_log_halted` states this in full
 in the code. It marks every inbound as it latches, before it waits
 for the reload lock, so a reload holding that lock cannot rebind a listener over gated stages. A
 halt whose latch a probe cleared while it waited still completes, as before; decision

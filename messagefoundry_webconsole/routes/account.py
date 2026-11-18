@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.auth_models import (
+    MfaConfirmRequest,
     NotifyEmailRequest,
     PasswordChangeRequest,
 )
@@ -31,6 +32,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_WEBAUTHN_DELETE,
     STEP_UP_ACTION_WEBAUTHN_ENROLL,
     AuthService,
+    Elevation,
     EnrolmentCodeRefused,
     NotifyEmailAlreadySet,
 )
@@ -61,7 +63,7 @@ from .._auth import (
 )
 from .._service import _service
 from ._common import _form_pairs, _rate_limited
-from .core import _CEREMONY_RETRY_AFTER, _refusal_error
+from .core import _CEREMONY_RETRY_AFTER, _CODE_FIELD, _form_fits, _refusal_error
 
 _log = logging.getLogger(__name__)
 
@@ -224,9 +226,6 @@ register_ui_action(
 _SESSION_OFFER_TTL_SECONDS = 300.0
 #: The most sessions the table holds; the oldest mark is dropped first.
 _SESSION_OFFER_SESSIONS_MAX = 4096
-#: The longest enrolment code the console passes on, as the JSON plane's MfaConfirmRequest caps
-#: it (ADR 0207). A real code is far shorter.
-_ENROLMENT_CODE_MAX = 64
 
 
 class _SessionOffers:
@@ -631,17 +630,25 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not token:  # pragma: no cover - require_ui already authenticated this cookie
             return RedirectResponse("/ui/login", status_code=303)
         form = dict(await _form_pairs(request))
+        # Stripped once, and that value is both the one measured and the one sent, as at
+        # /ui/login: a correct code with surrounding space still counts.
         code = form.get("code", "").strip()
+        enrolment_code = form.get("enrolment_code", "")
         try:
-            elevation = await service.confirm_mfa_enrollment(
-                identity,
-                code,
-                token=token,
-                client=client,
-                # Bounded as the JSON plane bounds it (MfaConfirmRequest, max_length=64): no
-                # code is that long, so the cut only stops an outsized value being normalised.
-                enrolment_code=form.get("enrolment_code", "")[:_ENROLMENT_CODE_MAX] or None,
-            )
+            # The JSON MfaConfirmRequest's bound, by length only: an oversized code is refused,
+            # never cut, is never checked, and reads as a wrong code. The enrolment code goes on
+            # uncut; the service bounds it where it reads it (BACKLOG #5399), so the refusals it
+            # gives before that read still come first.
+            if not _form_fits(request, MfaConfirmRequest, length_only=_CODE_FIELD, code=code):
+                elevation = Elevation()
+            else:
+                elevation = await service.confirm_mfa_enrollment(
+                    identity,
+                    code,
+                    token=token,
+                    client=client,
+                    enrolment_code=enrolment_code or None,
+                )
         except EnrolmentCodeRefused as exc:
             # ADR 0207: the one reply, so the holder can retry; the refusal spent no TOTP step and
             # left the staged secret in place. The gate spent the confirm proof, though, so under
@@ -885,10 +892,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             label = str(body.get("label", ""))
             # ADR 0207: the enrolment code a directory account's first factor needs, or None.
             raw_code = body.get("enrolment_code")
-            enrolment_code = (
-                raw_code[:_ENROLMENT_CODE_MAX] if isinstance(raw_code, str) and raw_code else None
-            )
-        except (ValueError, KeyError, TypeError, AttributeError):
+            enrolment_code = raw_code if isinstance(raw_code, str) and raw_code else None
+        # RecursionError: a body nested too deep for json's stack (BACKLOG #5341), which uncaught
+        # would answer 500. Its label cannot be read either, so it gets this unaudited malformed-body
+        # answer like any other: the service's audited refusal needs a label the body does not yield.
+        except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         # BACKLOG #3014: ui_mfa_verify's per-actor budget, charged only on a request that reaches
         # the ceremony, and after the gate's admin-write charge (that order is BACKLOG #2652's, left
@@ -917,6 +925,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 headers={"Retry-After": _CEREMONY_RETRY_AFTER},
             )
         try:
+            # BACKLOG #5399: the enrolment code goes on as submitted, never cut. The service bounds
+            # it where it reads it, after every refusal that comes before that read, and refuses
+            # an oversized one as a refused code, audited.
             elevation = await service.finish_webauthn_registration(
                 identity,
                 response_json,

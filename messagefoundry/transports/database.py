@@ -105,7 +105,7 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.config.wiring import _is_text_codec
-from messagefoundry.connection_names import inbound_record_name
+from messagefoundry.connection_names import db_lookup_record_name, inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
 from messagefoundry.odbc_call_gate import (
@@ -120,7 +120,7 @@ from messagefoundry.odbc_call_gate import (
 )
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.redaction import prints_a_codec_error, safe_exc
+from messagefoundry.redaction import prints_a_codec_error, safe_exc, safe_text
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
@@ -2246,25 +2246,74 @@ _SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 # `@@TRANCOUNT` at 1 on a pooled autocommit connection. An unquoted name spelled like one of these
 # words is refused too, failing closed: at least a PostgreSQL column `begin` on the generic dialect,
 # and on any dialect a column `receive`, which T-SQL does not reserve.
+#
+# BACKLOG #5346 extended this DENYLIST rather than narrowing the gate to an allowlist of read tokens:
+# a SELECT names arbitrary tables, columns and functions, so an allowlist of words cannot be written,
+# and a grammar-level allow shape is a SQL parser, which this gate says it is not. The extension
+# covers at least these T-SQL verbs that can follow a SELECT with no `;` and change state on the
+# pooled autocommit connection or beyond it: `SET` (`SET IMPLICIT_TRANSACTIONS ON` would leave every
+# later lookup on that connection in an open transaction), `USE` and `SETUSER` (session database and
+# identity), `REVERT`, `COMMIT`/`ROLLBACK`/`SAVE` (transaction control, as `BEGIN` is),
+# `DECLARE`/`OPEN`/`CLOSE`/`DEALLOCATE` (a global cursor, or an opened symmetric or master key, would
+# outlive the lookup on the pooled connection), `RAISERROR` (`WITH LOG` writes the server error log),
+# `SEND` and `MOVE` (Service Broker), `BACKUP`, `RESTORE`, `KILL`, `SHUTDOWN`, `DBCC`, `RECONFIGURE`,
+# `CHECKPOINT`, `ADD` (`ADD SIGNATURE`) and `ENABLE`/`DISABLE` (`... TRIGGER`). It is not proved to be
+# every such verb; one it lacks passes. `OPENROWSET`, `OPENDATASOURCE` and `OPENQUERY` are refused
+# too, though they sit inside a read's FROM: each sends a pass-through query this scan cannot read to
+# another server or provider, and `OPENROWSET(BULK ...)` reads a server-side file. PostgreSQL and
+# MySQL need a `;` between statements, which rule 3 refuses, so their own statement verbs are not
+# listed. Fail-closed costs at least a read through `OPENQUERY` or `OPENROWSET`, a T-SQL
+# `OPTION (USE HINT(...))`, `USE PLAN` or `DISABLE EXTERNALPUSHDOWN` hint, a MySQL `USE INDEX`
+# hint, a MySQL `CHARACTER SET` cast, and any unquoted name spelled like one of these words: at
+# least `send`, `move`, `enable` and `disable`, which T-SQL does not reserve, and on the generic
+# dialect `open` and `close`, which PostgreSQL and MySQL do not reserve. SQL Server reserves `OPEN`
+# and `CLOSE`, so it needs those two quoted whatever this gate does. Quote such a name.
 _SQL_WRITE_KEYWORDS = frozenset(
     {
+        "ADD",
         "ALTER",
+        "BACKUP",
         "BEGIN",
+        "CHECKPOINT",
+        "CLOSE",
+        "COMMIT",
         "CREATE",
+        "DBCC",
+        "DEALLOCATE",
+        "DECLARE",
         "DELETE",
         "DENY",
+        "DISABLE",
         "DROP",
+        "ENABLE",
         "EXEC",
         "EXECUTE",
         "GRANT",
         "INSERT",
         "INTO",
+        "KILL",
         "MERGE",
+        "MOVE",
+        "OPEN",
+        "OPENDATASOURCE",
+        "OPENQUERY",
+        "OPENROWSET",
+        "RAISERROR",
         "RECEIVE",
+        "RECONFIGURE",
+        "RESTORE",
+        "REVERT",
         "REVOKE",
+        "ROLLBACK",
+        "SAVE",
+        "SEND",
+        "SET",
+        "SETUSER",
+        "SHUTDOWN",
         "TRUNCATE",
         "UPDATE",
         "UPDATETEXT",
+        "USE",
         "WRITETEXT",
     }
 )
@@ -2480,8 +2529,9 @@ def _require_read_only(
     All three passed the former leading-token gate (BACKLOG #1574, #1658).
 
     This is still a lightweight gate and not a SQL parser, and a statement test is not read-only
-    *authority*: a keyword scan cannot follow a write executed on a linked server through a
-    pass-through literal, so the account itself should be read-only (``docs/CONNECTIONS.md``). Raises
+    *authority*: it refuses ``OPENQUERY``, ``OPENROWSET`` and ``OPENDATASOURCE`` outright, since it
+    cannot read their pass-through literal, but a keyword scan cannot follow a write executed on a
+    linked server another way, so the account itself should be read-only (``docs/CONNECTIONS.md``). Raises
     :class:`DbLookupError` on violation. The message stays PHI-free — it never echoes statement text,
     and any keyword it names comes from the fixed vocabulary above, never from operator data."""
     refusal = _read_only_message(subject)
@@ -2791,7 +2841,7 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
 
 class RedactedDbError(Exception):
     """Stands in for one exception of a logged chain: the original's frames, and
-    :func:`_safe_db_error`'s line as its message (BACKLOG #1661). Never raised. Unprefixed because
+    :func:`_poll_log_line`'s line as its message (BACKLOG #1661, #5348). Never raised. Unprefixed because
     its name prints on every line it stands in for."""
 
 
@@ -2800,14 +2850,15 @@ def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
 
     ``logger.exception`` ends each exception of the chain with its ``str()``, and a driver error's
     ``str()`` is the text that embeds the offending value: a 2627 duplicate key, a 245 conversion.
-    So each link is copied as a :class:`RedactedDbError` whose message is :func:`_safe_db_error`'s
+    So each link is copied as a :class:`RedactedDbError` whose message is :func:`_poll_log_line`'s
     line, with the original's traceback and its cause, context and suppression wired the same way.
     The record then takes the logging chain's own path: ``prepare_log_record`` renders it into
     ``exc_text`` with the stdlib's walker, and the control-character scrub keeps its line breaks.
 
     What the copy loses: an exception group's members, any ``__notes__``, the stdlib's extra hints
-    (``Did you mean``, a ``SyntaxError``'s location), each link's module name, and ``safe_exc``'s
-    200-character bound applies to every non-driver line.
+    (``Did you mean``, a ``SyntaxError``'s location), each link's module name, and the text of
+    every link :func:`_poll_log_line` withholds; ``safe_exc``'s 200-character bound applies to
+    every non-driver line it keeps, and :data:`_ENGINE_TEXT_LIMIT` to the engine's fixed text.
 
     It never raises, because it runs in the poll loop's error arm, which must not kill the poller.
     A copy that fails gives one :class:`RedactedDbError` with no frames, whose message names the
@@ -2832,7 +2883,7 @@ def _redacted_copy(
     found = made.get(id(exc))
     if found is not None:
         return found
-    copy = RedactedDbError(_safe_db_error(exc, withhold=under)).with_traceback(exc.__traceback__)
+    copy = RedactedDbError(_poll_log_line(exc, under=under)).with_traceback(exc.__traceback__)
     made[id(exc)] = copy
     below = under or _raised_by_a_driver(exc)
     if exc.__cause__ is not None:
@@ -2841,6 +2892,42 @@ def _redacted_copy(
         copy.__context__ = _redacted_copy(exc.__context__, made, under=below)
     copy.__suppress_context__ = exc.__suppress_context__  # set last: a cause assignment sets it
     return copy
+
+
+def _poll_log_line(exc: BaseException, *, under: bool) -> str:
+    """One link's line in the poll-failure traceback: :func:`_safe_db_error`'s, except that a link
+    with no SQLSTATE is named by its type alone, unless it is one of :data:`_ENGINE_FIXED_TEXT` (a
+    ``NegativeAckError`` included), the missing-extra error, an ``ImportError`` or a
+    ``UnicodeError`` (BACKLOG #5348).
+
+    The poll arm meets connect failures, and a connect error can carry DSN attributes, the server
+    and the credentials among them, so the rule :func:`_lookup_connect_failure` states applies here
+    too: ``safe_exc``'s bounded, redacted text is not credential-free. A ``DeliveryError`` keeps
+    its text on :func:`_credential_free_cause`'s premise, which is why :func:`_connect` and
+    :func:`_probe_db` no longer quote a no-SQLSTATE error: the pool-acquire timeout and the
+    ``statement_timeout`` refusal keep their remedies. The missing-extra error's text is a fixed
+    install hint, and an ``ImportError``'s names the module or shared library that failed to load,
+    which no DSN reaches; ``safe_exc`` renders a ``UnicodeError`` from its codec, position and
+    reason, never its text. What this costs is the text of any other error with no SQLSTATE, a
+    bug's message included; the frames still locate it, and their source lines still print. An
+    error with no arguments has no text to
+    withhold and is named by its type alone. It never raises: a link whose classification raises
+    is named by its type and a fixed note. A failure in :func:`_redacted_copy`'s own driver test
+    on that link still falls to :func:`_safe_db_exc_info`'s whole-chain fallback."""
+    try:
+        if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
+            return _safe_db_error(exc, withhold=under)
+        if isinstance(exc, _ENGINE_FIXED_TEXT):
+            return safe_exc(exc, limit=_ENGINE_TEXT_LIMIT)  # the call-gate remedy is its tail
+        if isinstance(exc, (_DriverMissingError, ImportError, UnicodeError)):
+            return _safe_db_error(exc)
+        if not exc.args:
+            return type(exc).__name__
+    except Exception as failure:  # noqa: BLE001 - see docstring: one link must not cost the chain
+        return (
+            f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"
+        )
+    return f"{type(exc).__name__} [message withheld]"
 
 
 class _DriverMissingError(RuntimeError):
@@ -2938,6 +3025,24 @@ class AutocommitNotConfirmed(RuntimeError):
     on it until a later borrow has set the mode. A setter that raises a driver error raises that
     error instead, and its connection goes back unconfirmed the same way. The text names neither
     the DSN nor the server."""
+
+
+#: Errors the engine raises with fixed text and no driver message, so a credential-free renderer
+#: may print it, remedy included (BACKLOG #5348): every ``DeliveryError`` and ``NegativeAckError``
+#: this module builds (:func:`_credential_free_cause` states the bound), and the two borrow
+#: refusals, whose texts are literals naming neither the DSN nor the server.
+_ENGINE_FIXED_TEXT: tuple[type[BaseException], ...] = (
+    DeliveryError,
+    AutocommitNotConfirmed,
+    UngatedConnectionError,
+)
+
+#: The bound on an engine error's text where :func:`_credential_free_cause` and
+#: :func:`_poll_log_line` print it. ``safe_exc``'s default of 200 cuts the call-gate refusal,
+#: about 235 characters whose remedy is its tail, and about 275 inside a connect failure's prefix
+#: and a type name; this keeps that whole with room. It also bounds every other ``DeliveryError``,
+#: one another module built included, so it is kept no longer than that needs.
+_ENGINE_TEXT_LIMIT = 400
 
 
 def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> asyncio.Future[T]:
@@ -4006,7 +4111,8 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
     except Exception as exc:
         state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE
         if state is None:
-            raise DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}") from exc
+            # Type alone, never the text: a connect error can carry DSN attributes (#5348).
+            raise DeliveryError(f"DATABASE connect failed: {_credential_free_cause(exc)}") from exc
         raise _classify_db_error(state, str(exc), connecting=True) from exc
 
 
@@ -4071,7 +4177,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE probe failed: {_safe_db_error(exc)}")
+            else DeliveryError(f"DATABASE probe failed: {_credential_free_cause(exc)}")
         ) from exc
     finally:
         await _close_and_release(pool, conn, cur, discard=discard)
@@ -4706,25 +4812,48 @@ class DatabaseSource(SourceConnector):
 
     async def _finish_stop(self, task: asyncio.Task[None] | None, *, interrupted: bool) -> None:
         """Clear a finished poll task, log its fault, and close the pool, bounded if interrupted."""
+        fault: BaseException | None = None
         if task is not None and task.done():
             # A faulted poll task must not re-raise here — stop() runs during reload quiesce,
             # outside its rollback (mirrors the File source). It is logged instead, once, by the
             # stop() that clears it; reading it in every stop() keeps it from going unretrieved.
-            fault = None if task.cancelled() else task.exception()
+            done_fault = None if task.cancelled() else task.exception()
             if self._task is task:
                 self._task = None
-                if fault is not None:
-                    logger.warning("DATABASE source poll task failed: %s", _safe_db_error(fault))
-        if task is not None and self._task is not None and self._task is not task:
-            return  # a later start() made a new poll task, and the pool is now that task's
+                fault = done_fault
+        # False when a later start() made a new poll task: the pool is now that task's.
+        owns_pool = task is None or self._task is None or self._task is task
         try:
-            await self.aclose(timeout=_POOL_CLOSE_TIMEOUT_S if interrupted else None)
-        except Exception as exc:
-            if not interrupted:
-                raise
-            logger.warning(
-                "DATABASE source pool close failed after a cancel or a cut: %s", _safe_db_error(exc)
-            )
+            if fault is not None:
+                try:
+                    logger.warning(
+                        "DATABASE source poll task failed: %s", _credential_free_cause(fault)
+                    )
+                except Exception as failure:  # noqa: BLE001 - a fixed line in its place
+                    try:
+                        logger.warning(
+                            "DATABASE source poll task failed: %s [message withheld: %s while "
+                            "rendering it]",
+                            type(fault).__name__,
+                            type(failure).__name__,
+                        )
+                    except Exception:
+                        # Logging itself is failing. Under a cancel it must not replace the
+                        # CancelledError stop() re-raises, as a close failure does not.
+                        if not interrupted:
+                            raise
+        finally:
+            # The pool closes whatever the log line did: stop() runs during reload quiesce.
+            if owns_pool:
+                try:
+                    await self.aclose(timeout=_POOL_CLOSE_TIMEOUT_S if interrupted else None)
+                except Exception as exc:
+                    if not interrupted:
+                        raise
+                    logger.warning(
+                        "DATABASE source pool close failed after a cancel or a cut: %s",
+                        _safe_db_error(exc),
+                    )
 
     async def _join_poll(self, task: asyncio.Task[None]) -> bool:
         """Wait for the poll task, bounded outside a hand-off; on a cancel, apply stop()'s row-step
@@ -4827,7 +4956,8 @@ class DatabaseSource(SourceConnector):
                 # still reports running. Log and retry on the next interval (mirrors the File source).
                 # Not logger.exception: its traceback ends in the driver's text, which quotes the
                 # offending value, such as a 245 conversion error naming the column value it could not
-                # convert. The frames are kept and each exception line is _safe_db_error's (#1661).
+                # convert. The frames are kept and each exception line is _poll_log_line's (#1661),
+                # which also withholds a no-SQLSTATE error's text, as a DSN can sit in it (#5348).
                 logger.error(
                     "DATABASE source poll failed; retrying next interval",
                     exc_info=_safe_db_exc_info(exc),
@@ -4955,12 +5085,14 @@ class DatabaseSource(SourceConnector):
         except Exception as exc:
             # The handler already ingested the message; a mark failure means the row re-emits next
             # poll (a duplicate — at-least-once). Log and move on rather than abort the batch tail.
-            # _safe_db_error, not safe_exc: a mark is an UPDATE bound from the row's own columns,
-            # so the driver's rejection text quotes the bound value straight back, and safe_exc
-            # is measured to keep a partial copy of it (BACKLOG #1661).
+            # Not safe_exc: a mark is an UPDATE bound from the row's own columns, so the driver's
+            # rejection text quotes the bound value straight back, and safe_exc is measured to
+            # keep a partial copy of it (BACKLOG #1661). Credential-free, not only _safe_db_error:
+            # the mark's borrow can open a connection, and a connect error with no SQLSTATE can
+            # carry DSN attributes (#5348).
             logger.warning(
                 "DATABASE source mark failed (row will re-emit, a duplicate): %s",
-                _safe_db_error(exc),
+                _credential_free_cause(exc),
             )
         return True
 
@@ -5382,7 +5514,32 @@ def _probe_failure_cause(exc: Exception) -> str:
     """A PHI-free, credential-free cause: the engine's own pool-timeout text, a driver error's
     SQLSTATE and native number, or the type alone. Never a driver message, which can carry DSN
     attributes (the rule :func:`_lookup_connect_failure` states)."""
-    return str(exc) if isinstance(exc, DeliveryError) else _credential_free_detail(exc)
+    return _credential_free_cause(exc)
+
+
+def _credential_free_cause(exc: BaseException) -> str:
+    """The text of an error in :data:`_ENGINE_FIXED_TEXT`, else :func:`_credential_free_detail`
+    (BACKLOG #5348).
+
+    Every ``DeliveryError`` and ``NegativeAckError`` this module builds holds fixed text, a
+    SQLSTATE and native number, a type name or a setting, never a driver message: at least
+    :func:`_connect` and :func:`_probe_db` build theirs with this function. One another module
+    raises is printed too, so that is a bound and not a guarantee. Either way the text is
+    redacted and cut at :data:`_ENGINE_TEXT_LIMIT` by ``safe_text``, with no type prefix; one
+    whose ``str()`` would print a codec error takes :func:`_credential_free_detail` instead,
+    and one with no text is named by its type.
+
+    It never raises, as the ``_safe_db_error`` it replaced at the mark-failure log and in
+    ``_finish_stop`` never did: an error whose rendering raises is named by its type and a
+    fixed note."""
+    try:
+        if not isinstance(exc, _ENGINE_FIXED_TEXT) or prints_a_codec_error(exc):
+            return _credential_free_detail(exc)
+        return safe_text(str(exc), limit=_ENGINE_TEXT_LIMIT) or type(exc).__name__
+    except Exception as failure:  # noqa: BLE001 - see docstring: its callers are error arms
+        return (
+            f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"
+        )
 
 
 def _log_login_role_reading(reading: LoginRoleReading, label: str) -> None:
@@ -5537,7 +5694,7 @@ class DatabaseLookupExecutor:
                 read_only=True,
                 attested=attested,
                 # Named as the loosening reports name a lookup, so a refusal matches its row.
-                connection=f"db_lookup:{cname}",
+                connection=db_lookup_record_name(cname),
             )
             self._pool_max[cname] = count_setting(
                 s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
@@ -5580,7 +5737,7 @@ class DatabaseLookupExecutor:
             # and the next lookup opens and probes it again.
             self._role_readings[connection] = await probe_login_roles(
                 pool,
-                label=f"db_lookup:{connection}",
+                label=db_lookup_record_name(connection),
                 acquire_timeout=self._acquire_timeout[connection],
             )
         # The local, not a re-read: an aclose() that ran during the probe has removed the entry.

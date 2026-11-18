@@ -12,10 +12,17 @@
 // "make deviations from safe defaults obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
 import * as fs from "node:fs";
 import * as vscode from "vscode";
-import { runJson, serviceConfig, workspaceDir } from "./cli";
+import { runJson, workspaceDir, writerCheckSetting } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { FIELDS, securityEditorScript } from "./securityEditorWebview";
-import { ShownFile, saveUpdatesProblem, securityConfigTarget, securitySetArgs, securityShowArgs } from "./securityEditorModel";
+import {
+  ShownFile,
+  saveUpdatesProblem,
+  securityConfigInput,
+  securityConfigTarget,
+  securitySetArgs,
+  securityShowArgs,
+} from "./securityEditorModel";
 
 interface ShowResult {
   values: Record<string, unknown>;
@@ -91,9 +98,9 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
 function configPath(ws: string, current: vscode.WebviewPanel): string | undefined {
   // Trust is passed in and checked first, so an untrusted workspace makes no file-system call here.
   const seen = vscode.workspace.getConfiguration("messagefoundry").inspect("serviceConfig");
-  // Unread scope counts as the workspace's, so the check is never skipped by a missing answer.
-  const fromWorkspace = seen === undefined || seen.workspaceValue !== undefined || seen.workspaceFolderValue !== undefined;
-  const target = securityConfigTarget(ws, serviceConfig(), { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
+  // A value cli.ts's containment dropped (BACKLOG #5404) is checked as written; securityConfigInput.
+  const { value, fromWorkspace } = securityConfigInput(seen, writerCheckSetting("serviceConfig"));
+  const target = securityConfigTarget(ws, value, { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
     lstat: fs.lstatSync,
     realpath: fs.realpathSync.native,
   });

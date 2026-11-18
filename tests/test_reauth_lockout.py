@@ -42,7 +42,7 @@ from messagefoundry.auth.notifications import (
     SUSPICIOUS_LOGIN_FAILURE_THRESHOLD,
     SecurityEvent,
 )
-from messagefoundry.auth.passwords import hash_password
+from messagefoundry.auth.passwords import hash_password, verify_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -452,8 +452,9 @@ async def test_a_threshold_of_zero_revokes_on_the_first_failure_not_on_every_rep
 async def test_one_account_cannot_evict_another_sessions_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Evicting a live count hands that session a fresh budget. One account's entries are capped and
-    evict only its own; a full map revokes a new session on its first failure instead of evicting."""
+    """Evicting a live count hands that session a fresh budget. One account's entries are capped, and
+    at its cap or with the map full a new session is answered at the cap, so its caller revokes it on
+    its first failure, instead of anything being evicted (BACKLOG #5336)."""
     monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
     monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_MAX", 3)
     store = await MessageStore.open(":memory:")
@@ -466,10 +467,419 @@ async def test_one_account_cannot_evict_another_sessions_count(
         owned = [
             h for h, (_, _, uid) in service._reproof_session_failures.items() if uid == "u-attacker"
         ]
-        assert len(owned) == 2
+        assert sorted(owned)[:2] == ["attacker-0", "attacker-1"], "a live count was evicted"
+        assert all(service._session_reproof_failures(h) == 5 for h in sorted(owned)[2:])
         # Full: a third account's new session is answered at the cap, so its caller revokes it.
         assert service._charge_reproof_failure("other", "u-other") == 5
         assert service._session_reproof_failures("victim") == 1
+    finally:
+        await store.close()
+
+
+async def test_an_account_at_its_cap_keeps_every_live_count_and_a_new_session_meets_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: at the per-account cap the account's oldest LIVE count was dropped, so round-
+    robin guesses over more sessions than the cap each got a fresh budget. Now no live count goes:
+    a new session is answered at the cap, so its caller revokes it."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        assert service._charge_reproof_failure("s-0", "u-bob") == 1
+        assert service._charge_reproof_failure("s-0", "u-bob") == 2
+        assert service._charge_reproof_failure("s-1", "u-bob") == 1
+        assert service._charge_reproof_failure("s-2", "u-bob") == 5, "a new session was tracked"
+        assert service._session_reproof_failures("s-0") == 2, "a live count was evicted"
+        assert service._session_reproof_failures("s-1") == 1
+        # Held AT the cap, so a revoke that fails still leaves the next attempt revoking unverified.
+        assert service._session_reproof_failures("s-2") == 5
+        # Another account is not touched by bob's cap.
+        assert service._charge_reproof_failure("s-other", "u-other") == 1
+    finally:
+        await store.close()
+
+
+async def test_a_reauth_past_the_account_cap_revokes_the_session_on_its_first_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336, end to end: with the account's live counts at the cap, a wrong re-proof on a
+    new session ends that session rather than evicting another's count."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 1)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        first_identity, first = await _signed_in(service)
+        assert not (await service.reauth(first_identity, WRONG, token=first)).ok
+        assert service._session_reproof_failures(hash_token(first)) == 1
+        identity, token = await _signed_in(service)
+        out = await service.reauth(identity, WRONG, token=token)
+        assert out.session_lost, "a session past the cap kept its budget"
+        assert service._session_reproof_failures(hash_token(first)) == 1, "a live count went"
+        assert hash_token(token) not in service._reproof_session_failures
+    finally:
+        await store.close()
+
+
+async def test_a_busy_account_whose_old_sessions_ended_is_not_revoked_on_its_first_typo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: a session the store ends without the service, here by a revoke, keeps its
+    re-proof count, so at the account's cap the counts of sessions the store shows as revoked or
+    holds no row for are dropped before the verify. Otherwise the cap
+    would fill with dead sessions' counts and revoke every new session of the account on its first
+    typo."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        ended: list[str] = []
+        for _ in range(2):
+            identity, token = await _signed_in(service)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            await store.revoke_session(hash_token(token))  # ended outside the service
+            ended.append(hash_token(token))
+        assert all(service._session_reproof_failures(h) == 1 for h in ended)
+        identity, token = await _signed_in(service)
+        out = await service.reauth(identity, WRONG, token=token)
+        assert not out.ok and not out.session_lost, "revoked on its first typo"
+        assert service._session_reproof_failures(hash_token(token)) == 1
+        assert all(h not in service._reproof_session_failures for h in ended)
+    finally:
+        await store.close()
+
+
+def _count_password_verifies(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Wrap the service's ``verify_password`` and return the list each call appends to."""
+    verified: list[object] = []
+    real_verify = verify_password
+
+    def counting_verify(*args: Any, **kwargs: Any) -> bool:
+        verified.append(args)
+        return bool(real_verify(*args, **kwargs))
+
+    monkeypatch.setattr("messagefoundry.auth.service.verify_password", counting_verify)
+    return verified
+
+
+async def _session_ended(store: AuthStore, token: str) -> bool:
+    """The row is still there under this token and carries a revoke. Unlike
+    :func:`_session_revoked`, a missing row does not count, since a step-up re-keys the row away."""
+    session = await store.get_session(hash_token(token))
+    return session is not None and session.revoked_at is not None
+
+
+async def test_a_reproof_on_a_session_past_its_expiry_is_gone_and_never_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: a just-expired session whose re-proofs queued behind the lock is one the
+    validator refuses, so it is refused as gone and ended before any verify, never verified on the
+    budget it had or on a fresh one. The session is kept in use up to the step, so only its absolute
+    expiry, not its idle window, refuses it."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 1)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        verified = _count_password_verifies(monkeypatch)
+        for _ in range(3):
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+        assert len(verified) == 3, "the verify counter does not see a re-proof"
+        verified.clear()
+        assert service._session_reproof_failures(hash_token(token)) == 3
+        lifetime = service._settings.session_absolute_hours * 3600
+        later = time.time() + lifetime + 60
+        await store.touch_session(hash_token(token), now=later - 60)
+        monkeypatch.setattr(time, "time", lambda: later)
+        out = await service.reauth(identity, WRONG, token=token)
+        assert out.session_lost and not out.ok
+        assert verified == [], "a guess on an expired session was verified"
+        assert await _session_ended(store, token)
+        assert hash_token(token) not in service._reproof_session_failures
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("last_use", "clock"),
+    [
+        # Stepped back before both stamps.
+        pytest.param(None, -600.0, id="both_stamps"),
+        # A used session, stepped back to between its creation and its last use: only
+        # ``last_used_at`` lies ahead, and the idle window would read as reset.
+        pytest.param(300.0, 150.0, id="last_use_only"),
+        # A last use stamped before creation, so only ``created_at`` lies ahead of the clock.
+        pytest.param(-300.0, -150.0, id="creation_only"),
+    ],
+)
+async def test_a_reproof_after_the_clock_steps_back_is_gone_and_never_verified(
+    monkeypatch: pytest.MonkeyPatch, last_use: float | None, clock: float
+) -> None:
+    """BACKLOG #5336: after a backward clock step a session stamp lies ahead of the clock, which the
+    validator refuses, so a re-proof on it is refused as gone and ended before any verify -- even
+    with the right password, which would otherwise step the session up. ``last_use`` and ``clock``
+    are offsets from the session's creation stamp."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        verified = _count_password_verifies(monkeypatch)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+        assert len(verified) == 1, "the verify counter does not see a re-proof"
+        verified.clear()
+        assert service._session_reproof_failures(hash_token(token)) == 1
+        attempts_before, _ = await _lock_state(store, "u-bob")
+        row = await store.get_session(hash_token(token))
+        assert row is not None
+        if last_use is not None:
+            await store.touch_session(hash_token(token), now=row.created_at + last_use)
+        stepped_clock = row.created_at + clock
+        monkeypatch.setattr(time, "time", lambda: stepped_clock)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.session_lost and not out.ok, "a session stamped ahead of the clock stepped up"
+        assert verified == [], "a re-proof on a session ahead of the clock was verified"
+        assert await _lock_state(store, "u-bob") == (attempts_before, None)
+        assert await _session_ended(store, token)
+        assert hash_token(token) not in service._reproof_session_failures
+    finally:
+        await store.close()
+
+
+async def test_a_refused_revoke_of_a_lapsed_session_is_still_refused_as_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the revoke a re-proof makes of a lapsed session is refused here with the
+    closed connection's bare ``ValueError``. The re-proof is still refused as gone, never a 500,
+    and the session keeps its count, since the revoke did not commit."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+
+        async def refused(*_args: object, **_kwargs: object) -> object:
+            raise ValueError("no active connection")
+
+        monkeypatch.setattr(store, "revoke_session", refused)
+        later = time.time() + service._settings.session_absolute_hours * 3600 + 60
+        monkeypatch.setattr(time, "time", lambda: later)
+        out = await service.reauth(identity, WRONG, token=token)
+        assert out.session_lost and not out.ok
+        assert service._session_reproof_failures(hash_token(token)) == 1
+    finally:
+        await store.close()
+
+
+async def test_many_accounts_ended_sessions_do_not_fill_the_global_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: no account here reaches its own cap, so only the drop at each sign-out keeps
+    the whole map from filling with dead counts and revoking every new session on its first typo."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_MAX", 3)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        for name in ("ann", "ben", "cat", "dan"):
+            await _local_user(store, name)
+            identity, token = await _signed_in(service, name)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            await service.logout(token, client=None, proven_at=None)
+        assert service._reproof_session_failures == {}, "an ended session kept its count"
+        await _local_user(store, "eve")
+        identity, token = await _signed_in(service, "eve")
+        out = await service.reauth(identity, WRONG, token=token)
+        assert not out.ok and not out.session_lost, "revoked on its first typo"
+        assert service._session_reproof_failures(hash_token(token)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_deleted_accounts_counts_are_dropped() -> None:
+    """BACKLOG #5336: deleting an account ends its sessions, so their counts go with it. Kept,
+    they would sit under a user id nobody can re-prove as, which no drop at a cap ever reaches."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+        assert service._session_reproof_failures(hash_token(token)) == 1
+        await service.delete_user("u-bob", actor="admin")
+        assert service._reproof_session_failures == {}
+    finally:
+        await store.close()
+
+
+async def test_the_reproved_session_keeps_its_count_whatever_the_listing_says(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the session was found live, but the listing the cap's drop reads comes a
+    moment later, and a session ended in between is not listed. Its own count is kept, so the
+    guess is charged on the budget it has, not a fresh one."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 1)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+
+        async def expired_meanwhile(*_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+        monkeypatch.setattr(store, "list_sessions", expired_meanwhile)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+        assert service._session_reproof_failures(hash_token(token)) == 2, "a fresh budget"
+    finally:
+        await store.close()
+
+
+async def test_a_forward_clock_step_does_not_reset_a_live_sessions_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the drop at the account's cap read the store's listing, which filters on
+    ``expires_at >= now``. During a forward wall-clock step past the session lifetime every older
+    session dropped out of it, so their counts were dropped; once the clock was set right those
+    sessions came back live on a fresh budget. Only a revoked or deleted session's count goes.
+    The session cap is off, because its own revoke ends the older sessions at the stepped sign-in,
+    and a count of a session the store ended is rightly dropped."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store, AuthSettings(lockout_threshold=5, require_mfa=False, max_sessions_per_user=0)
+        )
+        await _local_user(store)
+        old: list[str] = []
+        for _ in range(2):
+            identity, token = await _signed_in(service)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            old.append(hash_token(token))
+        real_time = time.time
+        stepped = real_time() + service._settings.session_absolute_hours * 3600 + 60
+        monkeypatch.setattr(time, "time", lambda: stepped)
+        identity, token = await _signed_in(service)
+        out = await service.reauth(identity, WRONG, token=token)
+        monkeypatch.setattr(time, "time", real_time)
+        assert all(service._session_reproof_failures(h) == 1 for h in old), "a budget was reset"
+        for h in old:  # control: the store never ended them, so they are live again now
+            row = await store.get_session(h)
+            assert row is not None and row.revoked_at is None
+        # The account had no room left, so the new session was answered at the cap (fail closed).
+        assert out.session_lost and not out.ok
+    finally:
+        await store.close()
+
+
+async def test_a_refused_read_at_the_reproof_cap_leaves_the_reproof_to_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the drop at the account's cap is housekeeping. A refused read of the
+    account's sessions, here the closed connection's bare ``ValueError``, is logged, the counts
+    stay, and the re-proof is verified and charged as before, never a 500."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 1)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+
+        async def refused(*_args: object, **_kwargs: object) -> object:
+            raise ValueError("no active connection")
+
+        monkeypatch.setattr(store, "list_sessions", refused)
+        out = await service.reauth(identity, WRONG, token=token)
+        assert not out.ok and not out.session_lost
+        assert service._session_reproof_failures(hash_token(token)) == 2
+    finally:
+        await store.close()
+
+
+async def test_an_admin_revoke_drops_the_accounts_counts_and_keeps_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: a revoke of every session of one account drops that account's counts, and
+    no other account's."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        await _local_user(store, "ann")
+        identity, token = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+        other_identity, other = await _signed_in(service, "ann")
+        assert not (await service.reauth(other_identity, WRONG, token=other)).ok
+        assert await service.revoke_sessions_for_user("u-bob", actor="admin") == 1
+        assert hash_token(token) not in service._reproof_session_failures
+        assert service._session_reproof_failures(hash_token(other)) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("refusal", ["operational", "closed"])
+async def test_a_refused_read_after_the_session_cap_loses_neither_its_row_nor_the_token(
+    monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    """BACKLOG #5336: the session cap's revoke names no hash, so the counts it ended are found by
+    reading the account's sessions again. That read comes after the cap's ``auth.session_revoked``
+    row, and a refusal of it is logged: the sign-in still returns its token, and the row stands.
+    ``closed`` is the bare ``ValueError`` aiosqlite raises for a closed connection, which the
+    session-write set does not take."""
+    import json
+    import sqlite3
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store, AuthSettings(lockout_threshold=5, require_mfa=False, max_sessions_per_user=1)
+        )
+        await _local_user(store)
+        identity, first = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=first)).ok
+        assert service._session_reproof_failures(hash_token(first)) == 1
+
+        async def refused(*_args: object, **_kwargs: object) -> object:
+            if refusal == "closed":
+                raise ValueError("no active connection")
+            raise sqlite3.OperationalError("synthetic: the read was refused")
+
+        monkeypatch.setattr(store, "list_sessions", refused)
+        out = await service.login("bob", GOOD, client="10.0.0.7")
+        assert out.ok and out.token is not None, out.error
+        cap_rows = [
+            json.loads(str(row["detail"]))
+            for row in await store.list_audit()
+            if row["action"] == "auth.session_revoked" and row["detail"]
+        ]
+        assert any(d.get("scope") == "cap" for d in cap_rows), cap_rows
+        # The read was refused, so the ended session's count stays, to a later drop.
+        assert service._session_reproof_failures(hash_token(first)) == 1
+    finally:
+        await store.close()
+
+
+async def test_an_account_at_its_cap_prunes_its_expired_counts_before_refusing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: an entry older than the absolute session lifetime belongs to no live session,
+    so it goes first when the account is at its cap, even with the map itself far from full."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        lifetime = service._settings.session_absolute_hours * 3600
+        long_ago = time.monotonic() - lifetime - 60
+        service._reproof_session_failures["old"] = (3, long_ago, "u-bob")
+        assert service._charge_reproof_failure("live", "u-bob") == 1
+        assert service._charge_reproof_failure("new", "u-bob") == 1, "the expired entry stayed"
+        assert "old" not in service._reproof_session_failures
+        assert service._session_reproof_failures("live") == 1
     finally:
         await store.close()
 

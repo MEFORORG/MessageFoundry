@@ -34,7 +34,7 @@ import { registerLiveDebug } from "./liveDebug";
 import { openCodeSetEditor } from "./codeSetEditor";
 import { CodeSetsProvider } from "./codesetsTree";
 import { openConnectionEditor } from "./connectionEditor";
-import { codesetRemove, codesetRename } from "./cli";
+import { codesetRemove, codesetRename, writerPathSetting } from "./cli";
 import { GraphProvider } from "./graphTree";
 import { HomeView } from "./home";
 import { openNewRoute } from "./newRoute";
@@ -342,6 +342,10 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!ws) {
         return;
       }
+      const dir = writerPathSetting("configDir");
+      if (dir === undefined) {
+        return;
+      }
       const to = await vscode.window.showInputBox({
         prompt: `Rename code set "${name}" to…`,
         value: name,
@@ -351,7 +355,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return; // cancelled or unchanged
       }
       try {
-        await codesetRename(name, to, ws);
+        await codesetRename(dir, name, to, ws);
       } catch (e) {
         void vscode.window.showErrorMessage(`MessageFoundry: rename failed — ${String(e)}`);
         return;
@@ -369,6 +373,10 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!ws) {
         return;
       }
+      const dir = writerPathSetting("configDir");
+      if (dir === undefined) {
+        return;
+      }
       const confirm = await vscode.window.showWarningMessage(
         `Remove code set "${name}"?`,
         { modal: true },
@@ -378,7 +386,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       try {
-        await codesetRemove(name, ws);
+        await codesetRemove(dir, name, ws);
       } catch (e) {
         void vscode.window.showErrorMessage(`MessageFoundry: remove failed — ${String(e)}`);
         return;

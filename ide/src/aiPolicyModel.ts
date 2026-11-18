@@ -99,6 +99,16 @@ export function evaluatedPermission(v: unknown): boolean | null {
 }
 
 /**
+ * Narrow a wire `mode` to a string (BACKLOG #5406), for the same reason as
+ * {@link evaluatedPermission}: a 200 can omit it or carry a non-string. Anything but a string becomes
+ * `"unrecognized"`, a mode {@link assistantState} does not name and so disables, and which every
+ * reader, the gate and "Show AI Policy" alike, then sees the same way.
+ */
+export function narrowMode(v: unknown): string {
+  return typeof v === "string" ? v : "unrecognized";
+}
+
+/**
  * Merge a FRESH authoritative (engine) policy over the last cached one, retaining an
  * `assistPermitted: false` that the fresh answer could not re-evaluate.
  *
@@ -142,8 +152,9 @@ export function mergeAuthoritativePolicy(cached: AiPolicy | null, fresh: AiPolic
 
 /**
  * Apply the gating rules to a resolved policy. `enabled` false means the chat handler must not call
- * the model and should stream `message` instead. The only ENABLED case is BYO with the permission
- * granted or unknown (null) — BYO is PHI-safe by construction (code-only context).
+ * the model and should stream `message` instead. The only ENABLED cases are `byo` and
+ * `managed_endpoint` with the permission granted or unknown (null) — BYO is PHI-safe by construction
+ * (code-only context). Every other mode, named here or not, disables assistance.
  *
  * It lives here rather than in aiPolicy.ts (it is re-exported from there, so every caller is unchanged)
  * because it is the PREDICATE {@link mergeAuthoritativePolicy} feeds. Asserting the merge rule without
@@ -163,15 +174,6 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
         "MessageFoundry AI policy could not be verified (engine unreachable) — assistance is disabled until it can be confirmed.",
     };
   }
-  if (p.mode === "managed_endpoint") {
-    // Engine-brokered path (ADR 0135): the ENGINE brokers the call to the customer-managed / self-hosted
-    // LLM under central per-use audit. Enabled when the caller holds ai:assist (or it is unknown offline);
-    // chat.ts routes this mode to the engine broker instead of the local vscode.lm model.
-    if (p.assistPermitted === false) {
-      return { enabled: false, message: "Your role does not include the ai:assist permission." };
-    }
-    return { enabled: true };
-  }
   if (p.mode === "managed_claude" || p.mode === "managed_claude_baa") {
     return {
       enabled: false,
@@ -179,10 +181,25 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
         "Your MessageFoundry policy uses a managed AI provider, which this extension version does not yet support. Assistance is unavailable.",
     };
   }
-  if (p.mode === "byo" && p.assistPermitted === false) {
+  // managed_endpoint is the engine-brokered path (ADR 0135): the ENGINE brokers the call to the
+  // customer-managed / self-hosted LLM under central per-use audit, and chat.ts routes it there
+  // instead of the local vscode.lm model.
+  // The permission comes before the allow-list below, so an ai:assist deny is named as such for any
+  // mode that reaches here; off, unverified and the managed modes have already answered above.
+  if (p.assistPermitted === false) {
     return { enabled: false, message: "Your role does not include the ai:assist permission." };
   }
-  // BYO with assistPermitted true OR null (RBAC not evaluable offline) — allowed.
+  if (p.mode !== "byo" && p.mode !== "managed_endpoint") {
+    // An ALLOW-list, not a deny-list (BACKLOG #5406): a mode this version does not name -- a newer
+    // engine's, or a missing or malformed one -- disables assistance rather than falling through to
+    // the local model (SEC-022, CWE-636).
+    return {
+      enabled: false,
+      message:
+        "Your MessageFoundry policy does not give an AI mode this extension version recognizes. Assistance is disabled.",
+    };
+  }
+  // byo or managed_endpoint with assistPermitted true OR null (RBAC not evaluable offline) — allowed.
   return { enabled: true };
 }
 
@@ -332,8 +349,9 @@ function policyOnly(p: CachedAiPolicy): AiPolicy {
 const MALFORMED_DENY: AiPolicy = { ...UNVERIFIED_POLICY, assistPermitted: false };
 
 /** A carried entry as the carrier may use it: a deny-shaped object the gate disables, as it is;
- *  anything else as {@link MALFORMED_DENY}. A deny in a mode the gate does not know is not used as
- *  it is, since the gate enables a mode it does not know. Never throws, and never permits. */
+ *  anything else as {@link MALFORMED_DENY}. The gate check is kept beside the gate's own allow-list
+ *  (BACKLOG #5406), so "never permits" does not rest on how the gate is shaped. Never throws, and
+ *  never permits. */
 function carriedEntry(value: unknown): AiPolicy {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return MALFORMED_DENY;
@@ -456,4 +474,20 @@ export function carryDeniesOffline(store: PolicyStore, offline: AiPolicy): Promi
     const deny = Object.values(carried).find(isPolicyDeny);
     return { next: carried, result: deny === undefined ? offline : { ...deny } };
   });
+}
+
+/**
+ * What the chat says when an engine-brokered request got no reply because `withAuth` answered
+ * undefined (BACKLOG #5407). `sent` is whether the request itself went out. Before it goes, that
+ * answer means a cancelled sign-in or a target the gate refused. After it, it means the engine
+ * refused the token with a 401 and signing in again was cancelled or failed, so the prompt and any
+ * code attached to it did reach the engine, and saying nothing was sent would be false.
+ */
+export function brokeredNoReplyNotice(sent: boolean): string {
+  return sent
+    ? "_The request was sent to the MessageFoundry engine, with your prompt and any code attached to it, but " +
+        "the engine refused the sign-in it carried and signing in again did not complete, so no reply was " +
+        "received. Sign in to the engine and ask again._"
+    : "_Nothing was sent: sign in to the MessageFoundry engine to use engine-brokered AI assistance, " +
+        "or, if an error said the engine address was refused, correct that address._";
 }

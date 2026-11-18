@@ -521,15 +521,20 @@ Manager keep their exemption: they never use `AskUserQuestion`, and put an owner
 table instead. A Builder still gets one turn: it puts an owner question in its report, never in
 `AskUserQuestion`.
 
-**No new process machinery until 2026-12-02 (ledger ruling R5, owner-signed 2026-11-04, in session:
-*"Sign R1-R9"*).** For the four weeks from that signature to 2026-12-02, no seat adds a new gate,
-hook, required context, seat or method rule, except a fix for a red `main` or a security control.
-Existing machinery is still repaired, and review effort is not touched. The freeze lapses on
-2026-12-02. The drafting Manager reads R5 as not freezing R1-R9 themselves, so building what they
-require is carrying them out, not new machinery; that reading is recorded beside the signed text
-and is not part of the signature. The signature covers R1-R9 as they stand in vault
-`docs/LEDGER-INFLOW-RULINGS-DRAFT.md` at commit `22579b25071c`, anchored at the vault ref
-`refs/liaison/owner-ruling-20261104-r1-r9`; that commit is not on vault `main`, so fetch the ref.
+**Ledger ruling R5's freeze on new process machinery is LIFTED (owner instruction 2026-11-17, US
+Central, in the Lander's chat: *"resume normal work, but spawn a subagent to remove the R5
+hold"*).** The owner also wrote, the same evening in a Manager's chat (session
+`local_ae773a22-34a8-4183-9af2-51586b765f99`), *"the R5 freeze is revolked"*, so the whole freeze
+no longer binds. The other ledger rulings, R1-R4 and R6-R9, still stand. **CORRECTED 2026-11-17:**
+this paragraph opened *"No new process machinery until 2026-12-02"*, under ledger ruling R5: no
+new gate, hook, required context, seat or method rule, except a fix for a red `main` or a security
+control, while existing machinery was still repaired and review effort was not touched. The owner
+signed R1-R9 together on 2026-11-04, in session: *"Sign R1-R9"*. The drafting Manager reads R5 as
+not freezing R1-R9 themselves, so building what they require is carrying them out, not new
+machinery; that reading is recorded beside the signed text and is not part of the signature. The
+signature covers R1-R9 as they stand in vault `docs/LEDGER-INFLOW-RULINGS-DRAFT.md` at commit
+`22579b25071c`, anchored at the vault ref `refs/liaison/owner-ruling-20261104-r1-r9`; that commit
+is not on vault `main`, so fetch the ref.
 The copy on vault `main` is `docs/LEDGER-INFLOW-RULINGS.md`, from vault PR 2818 (`a03b25550`). At
 `a03b25550` it keeps R1-R9 as signed, edits the sections around them, and adds, as its last
 section, the Manager's reading that this file calls "recorded beside the signed text".

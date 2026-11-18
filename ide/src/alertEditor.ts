@@ -10,7 +10,7 @@
 // a rule is remove + re-add. A change lands in the file immediately but the engine reads `[alerts]`
 // at startup, so it takes effect on the next engine restart (not via Promote/reload) — the UI says so.
 import * as vscode from "vscode";
-import { runJson, serviceConfig, workspaceDir } from "./cli";
+import { runJson, serviceConfig, workspaceDir, writerPathSetting } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { alertEditorScript } from "./alertEditorWebview";
 
@@ -104,9 +104,15 @@ async function add(rule: NewRule, current: vscode.WebviewPanel): Promise<void> {
   if (!ws) {
     return;
   }
+  // A write: a dropped workspace or user value refuses rather than add the rule to the file used in
+  // its place (BACKLOG #5404).
+  const file = writerPathSetting("serviceConfig");
+  if (file === undefined) {
+    return;
+  }
   try {
     await runJson(
-      ["alert", "add", "--service-config", serviceConfig(), "--data", JSON.stringify(rule)],
+      ["alert", "add", "--service-config", file, "--data", JSON.stringify(rule)],
       ws,
     );
   } catch (e) {
@@ -125,6 +131,10 @@ async function remove(index: number, current: vscode.WebviewPanel): Promise<void
   if (!ws) {
     return;
   }
+  const file = writerPathSetting("serviceConfig");
+  if (file === undefined) {
+    return;
+  }
   const confirm = await vscode.window.showWarningMessage(
     `Remove alert rule #${index}?`,
     { modal: true },
@@ -135,7 +145,7 @@ async function remove(index: number, current: vscode.WebviewPanel): Promise<void
   }
   try {
     await runJson(
-      ["alert", "remove", "--service-config", serviceConfig(), "--index", String(index)],
+      ["alert", "remove", "--service-config", file, "--index", String(index)],
       ws,
     );
   } catch (e) {

@@ -375,8 +375,7 @@ function Set-ServiceAccount {
     )
     $fail = {
         param([string]$Why)
-        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
-        throw "$Why '$ServiceName' was set to Disabled so it cannot start as the wrong account."
+        throw "$Why $(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it cannot start as the wrong account')"
     }
     $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
         Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
@@ -424,24 +423,36 @@ function Set-ServiceAccount {
             "reported success.")
     }
 }
-# END pinned-hash check
 
 function Disable-RefusedService {
     <#
       Set $ServiceName to Disabled after a refusal, and return the sentence that says what happened:
       that it was set to Disabled, so $Consequence, or that it could not be and must be disabled by
       hand before the next boot. The refusal message reports this, rather than assuming it.
+
+      ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Set-Service -Name also takes a
+      DISPLAY name, so the service is found by Name and disabled as the object (-InputObject); a name
+      that matches no service exactly is reported as not disabled. A failed SCM read is
+      reported with its own message, not as a missing service. The hand advice names sc.exe,
+      which opens a service by its name only.
     #>
     param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Consequence)
     try {
-        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction Stop
+        try { $found = @(Get-Service -Name $ServiceName -ErrorAction Stop) } catch {
+            if ("$($_.FullyQualifiedErrorId)" -notlike 'NoServiceFoundForGivenName,*') { throw }
+            $found = @()
+        }
+        $exact = $found | Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+        if (-not $exact) { throw "no service is named exactly '$ServiceName'" }
+        Set-Service -InputObject $exact -StartupType Disabled -ErrorAction Stop
         return "'$ServiceName' was set to Disabled so $Consequence."
     } catch {
         return ("WARNING: '$ServiceName' could NOT be set to Disabled ($($_.Exception.Message)), so " +
-            "it may start at the next boot. Disable it by hand: Set-Service -Name '$ServiceName' " +
-            "-StartupType Disabled.")
+            "it may start at the next boot. Disable it by hand: sc.exe config `"$ServiceName`" " +
+            "start= disabled.")
     }
 }
+# END pinned-hash check
 
 function Set-AdminOnlyAcl {
     <#
@@ -1690,40 +1701,63 @@ function Set-ServiceLogonRight {
     $inf = Join-Path $work "grant.inf"
     $sdb = Join-Path $work "grant.sdb"
     try {
+        # A native command that never ran leaves $LASTEXITCODE as it was, often 0 from an earlier
+        # call, so it is cleared first and $null read as "did not run".
+        $outcome = {
+            if ($null -eq $global:LASTEXITCODE) { "did not run (it left no exit code)" }
+            else { "failed (exit $global:LASTEXITCODE)" }
+        }
+        $global:LASTEXITCODE = $null
         & secedit /export /areas USER_RIGHTS /cfg $inf | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $inf)) {
-            Write-Warning "secedit export failed (exit $LASTEXITCODE); grant 'Log on as a service' to '$Account' manually."
+            Write-Warning ("secedit export $(& $outcome); grant 'Log on as a service' to " +
+                "'$Account' manually.")
             return
         }
-        $lines = Get-Content -LiteralPath $inf
-        $row = $lines | Where-Object { $_ -match '^\s*SeServiceLogonRight\s*=' }
-        if ($row) {
+        $lines = @(Get-Content -LiteralPath $inf)
+        $at = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*SeServiceLogonRight\s*=') { $at = $i; break }
+        }
+        if ($at -ge 0) {
             # Compare against exact SID tokens, not a raw substring: a SID that is a string prefix of an
             # already-granted SID (RID 110 vs 1100) would false-positive under -match and skip the grant,
             # so the service could fail to start (error 1069). Split the value on ',' and match each
-            # trimmed entry exactly (secedit writes SIDs in the leading-'*' form).
-            $value = ($row -replace '^\s*SeServiceLogonRight\s*=', '')
-            $held = $value -split ',' | ForEach-Object { $_.Trim() } | Where-Object {
-                $_ -eq ("*" + $sid) -or $_ -eq $sid
-            }
-            if ($held) {
+            # trimmed entry exactly (secedit writes SIDs in the leading-'*' form). Blank tokens are
+            # dropped, so an empty row or a stray comma writes no empty holder (BACKLOG #5401).
+            $value = $lines[$at] -replace '^\s*SeServiceLogonRight\s*=', ''
+            $holders = @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid }) {
                 Write-Host "  Right  : '$Account' already holds SeServiceLogonRight (Log on as a service)."
                 return
             }
-        }
-        if ($row) {
-            $new = $lines -replace '^\s*SeServiceLogonRight\s*=(.*)$', "SeServiceLogonRight =`$1,*$sid"
-        } else {
+            # Only the row read is rewritten, as plain text rather than a -replace replacement, so a
+            # '$' in a held account name is written as itself.
+            $new = $lines.Clone()
+            $new[$at] = "SeServiceLogonRight = " + (@($holders + "*$sid") -join ',')
+        } elseif ($lines -match '^\s*\[Privilege Rights\]\s*$') {
             # No existing row: inject one under [Privilege Rights].
-            $new = $lines -replace '(\[Privilege Rights\])', "`$1`r`nSeServiceLogonRight = *$sid"
+            $new = $lines -replace '^(\s*\[Privilege Rights\]\s*)$', "`$1`r`nSeServiceLogonRight = *$sid"
+        } else {
+            # No section either. Without one the re-import would change nothing and still be
+            # reported as a grant.
+            $new = @($lines) + @("[Privilege Rights]", "SeServiceLogonRight = *$sid")
         }
         Set-Content -LiteralPath $inf -Value $new -Encoding Unicode
+        $global:LASTEXITCODE = $null
         & secedit /configure /db $sdb /cfg $inf /areas USER_RIGHTS | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning "secedit configure failed (exit $LASTEXITCODE); grant 'Log on as a service' to '$Account' manually."
+            Write-Warning ("secedit configure $(& $outcome); grant 'Log on as a service' to " +
+                "'$Account' manually.")
             return
         }
         Write-Host "  Right  : granted SeServiceLogonRight (Log on as a service) to '$Account'." -ForegroundColor Green
+    } catch {
+        # Best-effort, as the header says: a secedit that cannot launch, or a policy file that
+        # cannot be read or written, throws under the script's Stop preference.
+        Write-Warning ("'Log on as a service' was NOT granted to '$Account' ($($_.Exception.Message)); " +
+            "grant SeServiceLogonRight manually (secpol.msc -> Local Policies -> User Rights " +
+            "Assignment) or the service will fail to start with error 1069.")
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -2813,7 +2847,8 @@ function Invoke-Nssm {
 function Stop-ServiceAndConfirm {
     <#
       Stop the service and CONFIRM from the SCM that it actually stopped. Returns $true when the
-      service is Stopped (or gone); $false when it is still running.
+      service is Stopped (or gone); $false when it is still running. Throws when the SCM cannot be
+      read, since that says neither.
 
       Neither half of this existed before (BACKLOG #1558), and neither half is enough on its own.
 
@@ -2860,6 +2895,27 @@ function Stop-ServiceAndConfirm {
         [string]$NssmPath,
         [int]$TimeoutSeconds = 30
     )
+    # EXACTLY THIS SERVICE, NEVER ONE WHOSE DISPLAY NAME IS $ServiceName (BACKLOG #5402). Get-Service
+    # and Stop-Service -Name also match a service's DISPLAY name, and the name pattern every caller
+    # validates against allows a space, so 'Windows Time' passes it and -Name resolves it to W32Time.
+    # The pattern keeps wildcards out; only this filter keeps a display name out. -eq and not -ceq,
+    # because the SCM compares service names without case. What is stopped is the object this
+    # returned (-InputObject), never a name a cmdlet resolves again.
+    #
+    # ONLY "NO SUCH SERVICE" READS AS GONE. Any other failure to read the SCM throws: it says nothing
+    # about whether the service still runs, and the caller would reconfigure or remove it as stopped.
+    $exact = {
+        try { $found = @(Get-Service -Name $ServiceName -ErrorAction Stop) } catch {
+            if ("$($_.FullyQualifiedErrorId)" -like 'NoServiceFoundForGivenName,*') { return }
+            throw ("Could not read '$ServiceName' from the SCM ($($_.Exception.Message)), so " +
+                "whether it is still running is not known. Nothing was changed after this read.")
+        }
+        $found | Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    }
+    $target = & $exact
+    # Nothing by that exact name means nothing to stop, so neither nssm nor the SCM is asked to stop
+    # anything: each would resolve the name again, and either can take it as a display name.
+    if (-not $target) { return $true }
     if ($NssmPath) {
         $launched = $true
         $global:LASTEXITCODE = $null
@@ -2867,24 +2923,24 @@ function Stop-ServiceAndConfirm {
             $launched = $false
             Write-Warning ("Could not run '$NssmPath' to stop '$ServiceName' " +
                 "($($_.Exception.Message)). Falling back to the SCM.")
-            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+            Stop-Service -InputObject $target -Force -ErrorAction SilentlyContinue
         }
         $exit = $LASTEXITCODE
         if ($launched -and $null -eq $exit) {
             $launched = $false
             Write-Warning ("'$NssmPath' left no exit code, so nssm never ran and '$ServiceName' was " +
                 "not stopped by it. Falling back to the SCM.")
-            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+            Stop-Service -InputObject $target -Force -ErrorAction SilentlyContinue
         } elseif ($launched -and $exit -ne 0) {
             Write-Warning ("nssm stop '$ServiceName' exited $exit (its message is above). " +
                 "The service may still be running; the status is checked below.")
         }
     } else {
-        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        Stop-Service -InputObject $target -Force -ErrorAction SilentlyContinue
     }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ($true) {
-        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        $svc = & $exact
         if (-not $svc) { return $true }
         if ($svc.Status -eq "Stopped") { return $true }
         if ((Get-Date) -ge $deadline) {
@@ -2899,8 +2955,10 @@ function Stop-ServiceAndConfirm {
 
 # If the service already exists, reconfigure it in place (idempotent install).
 # Detect via Get-Service rather than `nssm status` (which errors to stderr on a missing
-# service and would abort under ErrorActionPreference=Stop).
-$ServiceExisted = [bool](Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)
+# service and would abort under ErrorActionPreference=Stop). Only the service whose NAME is
+# $ServiceName counts: -Name also matches a display name (BACKLOG #5402).
+$ServiceExisted = [bool](@(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+    Where-Object { $_.Name -eq $ServiceName })
 if ($ServiceExisted) {
     Write-Host "Service '$ServiceName' exists - stopping and reconfiguring..."
     if (-not (Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath $NssmPath)) {

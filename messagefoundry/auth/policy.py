@@ -36,6 +36,8 @@ from dataclasses import fields as dataclass_fields
 from importlib.resources import files
 from typing import TYPE_CHECKING
 
+from messagefoundry.password_bounds import PASSWORD_MAX
+
 if TYPE_CHECKING:  # annotation only -- this module stays runtime-free of config, see from_settings
     from messagefoundry.config.settings import AuthSettings
 
@@ -312,6 +314,10 @@ class PasswordPolicy:
         problems: list[str] = []
         if len(password) < self.min_length:
             problems.append(f"be at least {self.min_length} characters")
+        # BACKLOG #5397: the sign-in and step-up surfaces refuse a password over PASSWORD_MAX, so a
+        # longer one set here could never be used to sign in. Refused at set time instead.
+        if len(password) > PASSWORD_MAX:
+            problems.append(f"be at most {PASSWORD_MAX} characters")
         if self.require_uppercase and not any(c.isupper() for c in password):
             problems.append("contain an uppercase letter")
         if self.require_lowercase and not any(c.islower() for c in password):

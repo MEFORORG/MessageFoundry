@@ -22,6 +22,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.redaction import safe_name
+from messagefoundry.transports import file as file_mod
 from messagefoundry.transports.file import FileSource, ScanRejected, set_scan_hook
 
 # A partner-chosen name built from an MRN: an exact copy of it must not reach the reason.
@@ -200,9 +201,10 @@ async def test_a_quarantine_whose_move_failed_records_nothing(
     source._handler = handler
     moves: list[Path] = []
 
-    def failed_move(path: Path, _dest: Path, *_rest: object) -> tuple[bool, bool]:
+    def failed_move(path: Path, _dest: Path, *_rest: object, **_kw: object) -> file_mod._Archived:
         moves.append(path)
-        return False, False  # nothing archived (BACKLOG #5717: and not remembered as stuck)
+        # Nothing archived; the file stays for a lasting reason, so it is remembered (#5717).
+        return file_mod._Archived(archived=False, stays=True, lasting=True)
 
     monkeypatch.setattr(FileSource, "_archive_to", staticmethod(failed_move))
 
@@ -212,3 +214,4 @@ async def test_a_quarantine_whose_move_failed_records_nothing(
     assert moves == [inbox / _NAME], "the oversize arm really tried the move (not a vacuous pass)"
     assert sink.events == []
     assert (inbox / _NAME).exists()
+    assert len(source._stuck) == 1
