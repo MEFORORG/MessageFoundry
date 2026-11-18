@@ -568,7 +568,7 @@ def _short_name(path: Path) -> str:
     import ctypes
 
     buf = ctypes.create_unicode_buffer(32767)
-    n = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf))  # type: ignore[attr-defined]
+    n = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf))  # type: ignore[attr-defined,unused-ignore]
     return buf.value if 0 < n < len(buf) else ""
 
 
@@ -597,7 +597,7 @@ def test_a_cd_inside_a_start_folder_outside_every_checkout_is_not_a_fault(tmp_pa
 def test_an_8dot3_spelling_of_a_start_folder_outside_every_checkout_is_not_a_fault(
     tmp_path: Path,
 ) -> None:
-    """#5586 item 1, the short-name half, and the only test that runs GetLongPathName."""
+    """#5586 item 1, the short-name half: a subfolder of the start reached through its 8.3 name."""
     base = Path(os.path.realpath(tmp_path))
     start = base / "no repo long name"
     (start / "deeper").mkdir(parents=True)

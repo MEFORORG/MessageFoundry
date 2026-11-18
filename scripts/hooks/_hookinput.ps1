@@ -320,13 +320,13 @@ function Test-CcxSamePath {
 function ConvertTo-CcxRealPath {
     <#
       .SYNOPSIS
-        $Path with every symlink and junction followed and, on Windows, every 8.3 name made long, or
-        '' when it cannot be read.
+        $Path with every symlink and junction followed, or '' when it cannot be read. An 8.3 name
+        is already made long by ConvertTo-CcxNormPath: .NET's GetFullPath expands a path holding `~`.
 
       .DESCRIPTION
-        Test-CcxSamePath compares text, so two spellings of one directory through a link or a short
-        name differ there. This reads the disk, and on Windows its first 8.3 name costs an Add-Type,
-        so it is kept to the one rare case that needs it: a hook started in no checkout.
+        Test-CcxSamePath compares text, so two spellings of one directory through a link differ
+        there. This reads the disk, so it is kept to the one rare case that needs it: a hook started
+        in no checkout.
     #>
     param([string] $Path)
     $todo = ConvertTo-CcxNormPath $Path
@@ -353,19 +353,6 @@ function ConvertTo-CcxRealPath {
                 $cur = $next
             }
             break
-        }
-        # Only a component shaped like an 8.3 alias (`NAME~1`, `NAME~1.EXT`) pays for the Add-Type; a
-        # long name that merely holds a tilde does not. Where Add-Type is refused this returns ''.
-        if ($IsWindows -and $cur -match '(?:^|[\\/])[^\\/.~]{1,6}~\d+(?:\.[^\\/.]{1,3})?(?:[\\/]|$)') {
-            if (-not ('CcxHookInput.Native' -as [type])) {
-                Add-Type -Namespace CcxHookInput -Name Native -MemberDefinition @'
-[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-public static extern uint GetLongPathName(string shortPath, System.Text.StringBuilder longPath, uint size);
-'@
-            }
-            $buf = [System.Text.StringBuilder]::new(32767)
-            $n = [CcxHookInput.Native]::GetLongPathName($cur, $buf, [uint32]$buf.Capacity)
-            if ($n -gt 0 -and $n -lt $buf.Capacity) { $cur = $buf.ToString() }
         }
         return ConvertTo-CcxNormPath $cur
     }
@@ -619,7 +606,7 @@ function Resolve-CcxHookSession {
         # session's own (it launched in none), so the hook stays put. -AllowOutside still takes a
         # `cwd` that sits in no checkout, and stays put in silence for one in a checkout, because
         # mail-drain's -AnchorRepo case answers for where it started. A `cwd` that IS the start
-        # directory, or a folder below it that sits in no checkout, is answered by staying put: a `cd`
+        # directory, or a folder below it that Test-CcxInStartDir takes, is answered by staying put: a `cd`
         # inside the project changes nothing it answers for. For any other caller any other named
         # `cwd` is a fault: staying put in silence let steer-inject read CLAUDE_PROJECT_DIR instead.
         if ($p.Reason) { $out.Reason = $p.Reason }
