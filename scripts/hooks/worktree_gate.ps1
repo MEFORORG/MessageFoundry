@@ -236,16 +236,18 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     `<name>.` apart from `<name>`; and it creates a real file named `nul` where GetFullPath maps that
     segment to the `\\.\nul` device.
 
-    SO THE FOLD IS NEVER THE ONLY ANSWER. Every governed-path decision runs under BOTH path forms and
-    DENIES IF EITHER DENIES (Set-PathForm, below): the LEXICAL form, Get-ComparablePathLexical, which is
-    this function as it stood before BACKLOG #5454, kept unchanged; and this FOLDED form. A path the
-    folded form reads wrongly in the allow direction, such as each case in the paragraph above, or a fold
-    that cannot resolve, is still judged by the lexical form, so nothing the pre-#5454 gate denied is
-    allowed. The construction keeps the pre-#5454 false denies too, among them a `\\?\` path whose `..`
-    climbs OUT of a governed root (`\\?\C:\<governed>\..\else`): it compared lexically as
-    `c:/<governed>/../else`, matched the root, and still does. Rules 3c and 3d also ask git for the
-    target's ABSOLUTE common dir (`rev-parse --path-format=absolute --git-common-dir`), which names the
-    real repository for at least the device spellings the review measured, and deny if that is governed.
+    SO THE FOLD IS NEVER THE ONLY ANSWER. At least the governed-path decisions of rules 1, 1a, 1b, 2, 3,
+    3b, 3c and 3d run under BOTH path forms and DENY IF EITHER DENIES (Set-PathForm, below): the LEXICAL
+    form, Get-ComparablePathLexical, which is this function as it stood before BACKLOG #5454, kept
+    unchanged; and this FOLDED form. A decision point added later is folded-only until it is wrapped the
+    same way, and nothing checks that it was. Within those rules, a path the folded form reads wrongly in
+    the allow direction, such as each case in the paragraph above, or a fold that cannot resolve, is still
+    judged by the lexical form, so nothing the pre-#5454 gate denied there is allowed. The construction
+    keeps the pre-#5454 false denies too, among them a `\\?\` path whose `..` climbs OUT of a governed root
+    (`\\?\C:\<governed>\..\else`): it compared lexically as `c:/<governed>/../else`, matched the root,
+    and still does. Rules 3c and 3d also ask git for the target's ABSOLUTE common dir (`rev-parse
+    --path-format=absolute --git-common-dir`), which names the real repository for at least the device
+    spellings the review measured, and deny if that is governed.
 
     It runs at the shared comparison point, so a rule inherits it wherever that rule reaches this
     function. A rule that refuses a token BEFORE comparing it does not: rule 3c's Test-ShellLiteralPath
@@ -257,13 +259,18 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     second IP); a device path that names a VOLUME rather than a drive letter (`\\.\Volume{<guid>}\`,
     `\\?\GLOBALROOT\Device\HarddiskVolume<n>\`), which keeps its prefix and compares as a path under
     `//./` or `//?/` (the review reported git accepting the volume-GUID spelling with rc=0); a device
-    path whose first segment after the prefix is not a drive, such as `\\?\X:\..\C:\<governed>`,
-    `\\?\.\C:\<governed>` or an empty segment; CHAINED aliases such as `\\.\Global\Global\C:\`. Neither
-    form folds those two classes onto the drive. Rule 3c denies at least the three just named, unquoted,
-    through the absolute common-dir query (tests/test_worktree_gate_dos_device.py), and rule 3d asks git
-    the same query; rules 1, 3 and 3b have no such query and do not. Also open: under the Bash tool, a
-    DOUBLE-QUOTED device spelling written with escaped backslashes, which the gate reads as written while
-    bash unescapes it; and the extra git call per candidate in rules 3c and 3d, which is not batched.
+    path whose first segment after the prefix is not a drive, such as `\\?\.\C:\<governed>` or an empty
+    segment; a `..` that climbs past the drive and names a drive again, such as
+    `\\?\X:\..\C:\<governed>`, or `\\.\C:\<governed>\..\..\<x>`, which Win32 itself resolves past the
+    drive; CHAINED aliases such as `\\.\Global\Global\C:\`. Neither form folds those classes onto the
+    governed drive path. Rule 3c denies at least `\\?\.\`, `\\?\X:\..\` and `\\.\Global\Global\` in front
+    of a governed repo, unquoted, through the absolute common-dir query
+    (tests/test_worktree_gate_dos_device.py), and rule 3d asks git the same query. Rules 1 and 3 ask git
+    nothing about the path; rule 3b asks git and finds the primary, then RETURNS ("rule 3 owns it")
+    without denying (review round 8e7d5e24 measured `git -C \\?\.\<primary> reset --hard` allowed). Also
+    open: under the Bash tool, a DOUBLE-QUOTED device spelling written with escaped backslashes, which the
+    gate reads as written while bash unescapes it; and the cost, unbatched: the extra git call per
+    candidate in rules 3c and 3d, and rule 3b's git calls, which run once per path form.
     #>
     # Read through Test-Path, as in Get-FullPathRaw: a strict-mode caller of this function alone has no flag.
     if ((Test-Path variable:script:PathFormLexical) -and $script:PathFormLexical) {
@@ -274,7 +281,8 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     if (-not $full) { return "" }
 
     # GetFullPath keeps a device prefix. It returns a `\\?\` path VERBATIM, and it normalises a `\\.\`
-    # path with `\\.\` (or `\\.\<device>\`) as the root, so neither comes back in drive-letter form. Take
+    # path with `\\.\` (or `\\.\<device>\`) as the root, so neither comes back in drive-letter form; a
+    # `..` in a `\\.\` path can climb past the drive there (measured, review round 8e7d5e24). Take
     # the remainder of a DRIVE or UNC device path and resolve it as an ordinary path. ORDER MATTERS: the
     # UNC result must exist before the admin-share fold below can see it.
     #
@@ -299,9 +307,15 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
         # A remainder that does not resolve to a non-empty path KEEPS THE DEVICE FORM. `\\?\UNC` leaves
         # `\\`, which GetFullPath refuses, and keeping that remainder made the result "", the "could not
         # resolve" sentinel, where the pre-#5454 form was the non-empty `unc` (review round 1850f169).
+        #
+        # A remainder GetFullPath turns into a DEVICE keeps the drive spelling instead. Win32 maps a final
+        # reserved name (`nul`, and on older builds `con`, `aux`, `com1` and more) to `\\.\<name>`, which
+        # matches no root, while a device-prefixed writer creates a real file of that name in the
+        # directory (review round 8e7d5e24 measured `\\.\<primary>\src\nul` allowed by both forms).
         if ($local -and [System.IO.Path]::IsPathFullyQualified($local)) {
             $resolved = ""
             try { $resolved = [System.IO.Path]::GetFullPath($local) } catch { $resolved = "" }
+            if ($resolved -match '^[\\/]{2}[?.][\\/]') { $resolved = $local }
             if ($resolved -replace '[\\/]', '') { $full = $resolved }
         }
     }
@@ -339,8 +353,9 @@ function Get-ComparablePathLexical([string]$Path, [string]$Base) {
 # device fold in Get-ComparablePath and the NT-prefix mapping in Get-FullPathRaw. $true is the LEXICAL
 # form: both resolvers exactly as they stood before #5454, and $roots built from the lexical form of each
 # allowlist entry. A rule asks its governed question once under each form and denies if either denies, so
-# a fold that reads a governed path wrongly can add denies and never remove one. Every caller that sets
-# the lexical form sets the folded form back before its next step.
+# a fold that reads a governed path wrongly can add denies and never remove one, in the rules that do it
+# (Get-ComparablePath's docstring names them). Each caller in this file that sets the lexical form sets
+# the prior form back before its next step; nothing enforces that for a new caller.
 $script:PathFormLexical = $false
 function Set-PathForm([bool]$Lexical) {
     $script:PathFormLexical = $Lexical
@@ -3056,15 +3071,17 @@ function Test-Governed([string]$Candidate) {
 
 # Test-Governed of a RAW path under BOTH path forms (BACKLOG #5454): the governed root either form names,
 # the lexical one first, or $null. A form that cannot resolve the path gives "" and Test-Governed "" is
-# $null, so an unresolvable form never removes the other form's deny. Leaves the folded form set.
+# $null, so an unresolvable form never removes the other form's deny. Restores the caller's form.
 function Test-GovernedEitherForm([string]$Path, [string]$Base) {
+    $prior = [bool]$script:PathFormLexical
     $hit = $null
     foreach ($lexical in @($true, $false)) {
         Set-PathForm $lexical
         $hit = Test-Governed (Get-ComparablePath $Path $Base)
         if ($hit) { break }
     }
-    Set-PathForm $false
+    # Restores the caller's form, so a call made inside another form loop does not switch it.
+    Set-PathForm $prior
     $hit
 }
 

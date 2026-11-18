@@ -248,12 +248,26 @@ def test_a_dot_dot_climb_past_the_drive_that_names_the_drive_again_is_denied(
     assert_denied(run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file))
 
 
+@pytest.mark.parametrize("prefix", ["//?/", "//./"])
 def test_a_final_nul_segment_in_the_primary_is_denied(
-    tmp_path: Path, primary: Path, repos_file: Path
+    tmp_path: Path, primary: Path, repos_file: Path, prefix: str
 ) -> None:
-    """The fold read ``//./nul``; a ``\\\\?\\`` writer creates a real file named nul in the primary."""
-    target = B + B + "?" + B + str(primary / "src" / "nul")
+    """The fold read ``//./nul``; a device-prefixed writer creates a real file named nul there.
+
+    The question-mark row was denied by the pre-#5454 gate (review round 1850f169). The dot row was
+    allowed by it as well as by the fold (review round 8e7d5e24), so it is a new deny, not a restored one.
+    """
+    target = prefix.replace("/", B) + str(primary / "src" / "nul")
     assert_denied(run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file))
+
+
+@pytest.mark.parametrize("prefix", ["//?/", "//./"])
+def test_a_final_nul_segment_in_an_UNGOVERNED_tree_is_allowed(
+    tmp_path: Path, repos_file: Path, prefix: str
+) -> None:
+    """Control: the reserved name alone does not deny."""
+    target = prefix.replace("/", B) + str(tmp_path / "Elsewhere" / "src" / "nul")
+    assert run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file) is None
 
 
 @pytest.mark.parametrize(
@@ -357,13 +371,62 @@ def test_a_git_C_neither_form_folds_into_an_UNGOVERNED_repo_is_allowed(
     assert run_gate(bash(cmd, repo.elsewhere, tool="PowerShell"), repo.repos) is None
 
 
-@pytest.mark.parametrize("spelling", DISARM_SPELLINGS[:3] + DISARM_SPELLINGS[-1:])
+@pytest.mark.parametrize("spelling", DISARM_SPELLINGS)
 def test_a_device_spelled_git_C_into_an_UNGOVERNED_repo_is_allowed(
     repo: SimpleNamespace, spelling: str
 ) -> None:
     """Control: the same spellings of a repository nobody governs pass, so the deny is the fold's."""
     target = spelling.format(b=str(repo.elsewhere), f=str(repo.elsewhere).replace(B, "/"))
     cmd = "git -C " + target + " config core.hooksPath x"
+    assert run_gate(bash(cmd, repo.elsewhere, tool="PowerShell"), repo.repos) is None
+
+
+# --------------------------------------------- rules 3 and 3d, the lexical form end to end
+#
+# `\\?\UNC\?\<path>` is the spelling only the LEXICAL form reads as the drive path (its two replaces), and
+# git enters it (rc=0, review round 1850f169). The rule 3 row denies only while rule 3 still asks the
+# lexical form: dropping that pass from Test-GovernedEitherForm turns it red (it fails on fe218d603d8).
+# The rule 3d row is ALSO held by git's absolute common dir, which a linked worktree reports anyway, so
+# it pins the deny and not rule 3d's lexical pass; it passed on fe218d603d8 too.
+UNC_Q = B + B + "?" + B + "UNC" + B + "?" + B
+
+
+def test_a_tree_swap_only_the_lexical_form_reads_as_the_primary_is_denied(
+    repo: SimpleNamespace,
+) -> None:
+    cmd = "git -C " + UNC_Q + str(repo.primary) + " checkout other"
+    reason = assert_denied(run_gate(bash(cmd, repo.elsewhere, tool="PowerShell"), repo.repos))
+    assert "SHARED PRIMARY" in reason
+
+
+def test_the_same_tree_swap_into_an_UNGOVERNED_repo_is_allowed(repo: SimpleNamespace) -> None:
+    """Control for the row above."""
+    cmd = "git -C " + UNC_Q + str(repo.elsewhere) + " checkout other"
+    assert run_gate(bash(cmd, repo.elsewhere, tool="PowerShell"), repo.repos) is None
+
+
+def _linked_worktree(main: Path, wt: Path) -> None:
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(main)]
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    subprocess.run([*git, "worktree", "add", "-q", "-b", "wt-branch", str(wt)], check=True)
+
+
+def test_removing_a_governed_worktree_only_the_lexical_form_reads_is_denied(
+    tmp_path: Path, repo: SimpleNamespace
+) -> None:
+    wt = tmp_path / "Primary-wt"
+    _linked_worktree(repo.primary, wt)
+    cmd = "git worktree remove " + UNC_Q + str(wt)
+    assert_denied(run_gate(bash(cmd, repo.elsewhere, tool="PowerShell"), repo.repos))
+
+
+def test_removing_an_UNGOVERNED_worktree_the_same_way_is_allowed(
+    tmp_path: Path, repo: SimpleNamespace
+) -> None:
+    """Control for the row above."""
+    wt = tmp_path / "Elsewhere-wt"
+    _linked_worktree(repo.elsewhere, wt)
+    cmd = "git worktree remove " + UNC_Q + str(wt)
     assert run_gate(bash(cmd, repo.elsewhere, tool="PowerShell"), repo.repos) is None
 
 
