@@ -165,11 +165,9 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
     refuse a CSVFS or FAT volume, or one whose file system cannot be read, as it did not before
     this amendment.
   - Where the walk ends on a link back to a folder already on the path, `full.parent` is read by
-    its path as written, as before this amendment; for a drive root nothing is read.
+    its path as written, as before this amendment.
   - The holder rule is unchanged: an inherit-only entry is counted, and any conditional, object
-    or callback allow entry is refused. When the folder holding the path is itself a junction or
-    link that leads to a folder not already on the path, the holder rule reads where it leads,
-    and the link's own list is judged by the link rule only.
+    or callback allow entry is refused.
   - A `subst` drive on the path gives no folder the link rule; as before, only a junction or
     link on the path does.
   - **The share rule.** A UNC path, or a drive `GetDriveTypeW` answers as `DRIVE_REMOTE` (a
@@ -185,11 +183,9 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
     - the folder at `full.parent`, read through the share, is a reparse point, a junction or link
       among others.
 
-    Otherwise that folder's owner and access list are read there by the holder rule. When the
-    path is itself a share's root, no holder is read.
+    Otherwise that folder's owner and access list are read there by the holder rule.
 
-  So the drive-root gap in the 2026-11-13 list is partly closed for a `subst` drive root: in most
-  cases the holder rule reads the folder that holds where it leads. A mapped network drive root
+  So the drive-root gap in the 2026-11-13 list is partly closed for a `subst` drive root. A mapped network drive root
   is read as a share root, so no holder is read for it. By the holder rule, a
   broad group's `DELETE` on the holder is still not counted; the link rule, where it judges the
   holder, counts it, except on a volume root. The code is the record of the rest. The check is

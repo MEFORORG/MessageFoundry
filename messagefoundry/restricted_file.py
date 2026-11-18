@@ -777,7 +777,7 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     link and ``subst`` drive on the way, or for a drive root the folder holding where it leads
     (none for a volume root), and its owner and entries are read there. Where the walk ends on a
     link back to a folder already on the path, ``full.parent`` is read by its path as written
-    instead (:func:`_windows_holder_as_written_problem`), and for a drive root nothing is read. On that walk each
+    instead (:func:`_windows_holder_as_written_problem`). On that walk each
     volume's drive type is read, not its file system, and a volume whose drive type cannot be read
     ends it and is refused. A UNC share or a mapped network drive (``GetDriveTypeW`` answers
     ``DRIVE_REMOTE``) stops it; what is then refused, and where the holder is read, is stated once
