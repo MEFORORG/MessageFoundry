@@ -944,36 +944,43 @@ async def _no_report(_failures: Any) -> None:
     return None
 
 
-async def test_batch_writes_failing_in_a_row_end_the_call_flagged_write_failed(
+async def test_two_adjacent_batches_whose_writes_fail_do_not_stop_the_rows_after_them(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5651: a write fault that hits every batch, such as a full disk, ends the call after
-    ``WRITE_FAILURE_MAX_BATCHES`` batches in a row, flagged ``write_failed``, and each failure is
-    logged at ERROR with its type only."""
+    """BACKLOG #5651: writes that fail for reasons of their own rows (a lock timeout on the two
+    oldest batches, say) are passed over, and the pass still strips the rows after them, so a fault
+    at the head of the keyset cannot stop every pass at the same place. Each failure is logged at
+    ERROR with its type only, and the call is flagged ``write_failed``."""
     monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
-    writes: list[int] = []
+    writes: list[str] = []
 
-    async def full_disk(updates: Any) -> list[Any]:
-        writes.append(len(updates))
-        raise sqlite3.OperationalError("database or disk is full SECRET-TEXT")
+    async def locked_head(updates: Any) -> list[Any]:
+        writes.append(updates[0].message_id)
+        if updates[0].message_id in ("M-0", "M-1"):
+            raise sqlite3.OperationalError("lock timeout on this row SECRET-TEXT")
+        return list(updates)
 
     with caplog.at_level(logging.DEBUG, logger="messagefoundry.store.document_strip"):
-        result = await _run_pass(_keyset_fetch(_plain_rows(6)), full_disk, _no_report)
+        result = await _run_pass(_keyset_fetch(_plain_rows(5)), locked_head, _no_report)
 
-    assert len(writes) == document_strip.WRITE_FAILURE_MAX_BATCHES
-    assert result == StripResult(ended_early=True, write_failed=True)
+    assert writes == ["M-0", "M-1", "M-2", "M-3", "M-4"]
+    assert result == StripResult(
+        messages_stripped=3,
+        documents_stripped=3,
+        bytes_reclaimed=result.bytes_reclaimed,
+        write_failed=True,
+    )
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == len(writes)
+    assert len(errors) == 2
     assert all("OperationalError" in r.getMessage() for r in errors)
     assert not any("SECRET-TEXT" in r.getMessage() for r in caplog.records)
 
 
-async def test_one_failed_batch_write_is_flagged_but_is_not_audited_work(
+async def test_a_failed_batch_write_is_flagged_and_counts_as_audited_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #5651: a single failed write is passed over, and the scan goes on, but the call
-    still says a write failed. A retention pass records the flag in an audit row it writes, but does
-    not write one for it alone: a read-only store would refuse that row too."""
+    """BACKLOG #5651: a failed write is passed over and the scan goes on, but the call says a write
+    failed, and a retention pass treats that alone as work for its audit row, which records it."""
     from messagefoundry.pipeline.retention import RetentionPass
 
     monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
@@ -999,28 +1006,7 @@ async def test_one_failed_batch_write_is_flagged_but_is_not_audited_work(
         "size_bytes": None,
         "over_limit": False,
     }
-    assert not RetentionPass(**quiet, documents_strip_write_failed=True).did_work
-
-
-async def test_a_batch_with_nothing_to_write_does_not_reset_the_failed_write_run(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """BACKLOG #5651: batches holding no embedded document, between batches whose writes fail,
-    try no write, so they do not keep a store that fails every write from ending the call."""
-    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
-    rows = _plain_rows(10)
-    for row in rows[1::2]:
-        row["raw"] = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|X|P|2.5.1\r"
-    writes: list[int] = []
-
-    async def read_only(updates: Any) -> list[Any]:
-        writes.append(len(updates))
-        raise sqlite3.OperationalError("attempt to write a readonly database")
-
-    result = await _run_pass(_keyset_fetch(rows), read_only, _no_report)
-
-    assert len(writes) == document_strip.WRITE_FAILURE_MAX_BATCHES
-    assert result == StripResult(ended_early=True, write_failed=True)
+    assert RetentionPass(**quiet, documents_strip_write_failed=True).did_work
 
 
 async def test_refused_cells_of_a_batch_whose_transform_raises_are_still_audited(

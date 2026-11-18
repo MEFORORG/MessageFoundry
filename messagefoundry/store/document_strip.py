@@ -46,10 +46,9 @@ keyset moves past it; its rows are tried again on the next pass. A batch whose w
 rolled back whole and passed over the same way, but logged at ERROR, and the call is flagged
 ``write_failed``.
 
-A strip call ends early, flagged ``ended_early`` with what its batches committed, in three cases: a
-batch read fails (``read_failed`` is then set too); the attempted writes of
-:data:`WRITE_FAILURE_MAX_BATCHES` batches in a row fail, as on a full disk or a read-only store; or
-at least :data:`OUTAGE_MIN_ROWS` rows of one batch reached the key service and none got a verdict.
+A strip call ends early, flagged ``ended_early`` with what its batches committed, in two cases: a
+batch read fails (``read_failed`` is then set too), or at least :data:`OUTAGE_MIN_ROWS` rows of one
+batch reached the key service and none got a verdict.
 The retention pass then skips the rest of its strip phase, and the strip logs the early end at
 WARNING. An outage alone is not counted as work for the pass's audit row, so it does not also send
 that row through the failing key service; a failed read is a database fault, not a key-service one,
@@ -76,7 +75,6 @@ if TYPE_CHECKING:
 __all__ = [
     "OUTAGE_MIN_ROWS",
     "STRIP_BATCH_ROWS",
-    "WRITE_FAILURE_MAX_BATCHES",
     "StripBatch",
     "StripResult",
     "StripUpdate",
@@ -98,12 +96,6 @@ STRIP_BATCH_ROWS = 200
 #: the service always refuses cannot stop the strip (BACKLOG #5651).
 OUTAGE_MIN_ROWS = 3
 
-#: How many batches in a row must fail an attempted write before the call ends early, flagged
-#: ``write_failed``; a batch with nothing to write neither counts nor resets the run. A fault that
-#: hits every write, such as a full disk or a read-only store, then stops the strip instead of being
-#: met once per batch for the whole scan (BACKLOG #5651).
-WRITE_FAILURE_MAX_BATCHES = 2
-
 
 @dataclass(frozen=True)
 class StripResult:
@@ -115,13 +107,13 @@ class StripResult:
     messages_stripped: int = 0
     documents_stripped: int = 0
     bytes_reclaimed: int = 0
-    #: The call ended before its last batch, on a failed batch read, on batch writes failing in a
-    #: row, or on a key-service outage (BACKLOG #5651); the counts are what its batches committed.
+    #: The call ended before its last batch, on a failed batch read or a key-service outage
+    #: (BACKLOG #5651); the counts are what its batches committed.
     ended_early: bool = False
     #: The early end was a failed batch read, a database fault (BACKLOG #5651).
     read_failed: bool = False
-    #: At least one batch's write failed and was rolled back, a database fault; the call ended early
-    #: too when :data:`WRITE_FAILURE_MAX_BATCHES` did in a row (BACKLOG #5651).
+    #: At least one batch's write failed and was rolled back, a database fault; the call went on
+    #: past it (BACKLOG #5651).
     write_failed: bool = False
 
 
@@ -226,7 +218,6 @@ async def run_strip_pass(
     after: StripCursor = None
     reported = False
     ended_early = read_failed = write_failed = False
-    failed_writes = 0  # batches in a row whose write failed
     try:
         while True:
             limit = STRIP_BATCH_ROWS
@@ -278,34 +269,22 @@ async def run_strip_pass(
                     ended_early = True
                     _log_early_end("the key service gave no verdict", None, documents, messages)
                     break
-                # A batch with nothing to write tries no write, so it leaves the failure run as is.
                 if batch.updates:
                     try:
                         landed = await write(batch.updates)
                     except Exception as exc:
                         # The batch rolled back whole and counts nothing; the keyset goes on past
-                        # it. ERROR, since nothing the strip changes can land while this lasts: the
-                        # type only (a server error's text can quote stored values), the traceback
-                        # at DEBUG.
+                        # it, so a fault on particular rows cannot stop the rows after them. Its
+                        # rows are tried again on the next pass. ERROR, with the type only (a
+                        # server error's text can quote stored values), the traceback at DEBUG.
                         write_failed = True
-                        failed_writes += 1
                         log.error(
                             "document strip passed over a batch whose write failed and rolled "
                             "back (%s)",
                             type(exc).__name__,
                         )
                         log.debug("document strip batch write failure", exc_info=True)
-                        if failed_writes >= WRITE_FAILURE_MAX_BATCHES:
-                            ended_early = True
-                            _log_early_end(
-                                f"{failed_writes} batch writes in a row failed",
-                                exc,
-                                documents,
-                                messages,
-                            )
-                            break
                     else:
-                        failed_writes = 0
                         for done in landed:
                             messages += 1
                             documents += done.documents
