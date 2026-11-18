@@ -475,7 +475,8 @@ def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str,
         # Rule 3c's owning-word reading compares bracket counts, not nesting, so the owner git in an
         # earlier closed `$( )` decides the disarm in a later one.
         ("echo $(git -C '{p}' log -1) $(/usr/bin/git config {k})", "outside", "Bash"),
-        # After an earlier line's chdir in parentheses, the $absC fallback refuses these.
+        # Each is refused on a line of its own (origin/main's too); the $absC fallback carries that
+        # refusal past an earlier line's chdir in parentheses. A fix belongs in the one-line reading.
         ("(cd {tmp} && ls)\ngit -C '{p}' stash list", "outside", "Bash"),
         ("(cd {tmp} && ls)\ngit -C '{p}' ''--git-dir={o}/.git config {k}", "outside", "Bash"),
         (
