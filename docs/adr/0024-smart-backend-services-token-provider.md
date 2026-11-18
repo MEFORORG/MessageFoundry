@@ -144,7 +144,7 @@ signing core, and rest.py's opener — the allowed direction):
   fetch is refused, the same PHI/credential-redirect defense the data path uses), parses `access_token` +
   `expires_in`, caches, and returns it. A non-2xx / malformed token response raises `DeliveryError` (transient —
   the next delivery retry re-attempts) with a **PHI/secret-safe** message (status + redacted token-host only,
-  **never** the response body, which may carry the token or error detail). A token reply in a content coding the engine does not decode is the exception: since BACKLOG #5910 it is refused permanently with code `token-reply-coded`.
+  **never** the response body, which may carry the token or error detail).
 - A small lock guards the cache (one delivery worker per outbound means little real contention, but
   `test_connection`/`_probe` can also call — cheap insurance).
 
@@ -343,3 +343,7 @@ must ride one keep-alive TCP connection). `urllib.request` opens a **fresh conne
 structurally cannot carry the handshake — a correct build needs a keep-alive HTTP client driven by
 `pyspnego` (already in `requirements.lock`, backing the AD/SSO server path). Deferred as a follow-up; the
 provider seam here is shaped to admit it (a challenge/response plug alongside the bearer + digest plugs).
+
+## Amendment (2026-11-18, BACKLOG #5910)
+
+A token reply in a content coding the engine does not decode is refused permanently with code `token-reply-coded`, not retried as a malformed token response; owner ruling 2026-11-18.
