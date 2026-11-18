@@ -20215,8 +20215,8 @@ class AuthService:
     ) -> None:
         """One :data:`GATE_ONLY_REVOKE_ACTION` row per account a custom-role edit or delete of
         ``role_id`` revoked although, read after the gate, it neither holds the role in its stored
-        role rows nor has role rows or a timestamp or counter cell that do not parse
-        (BACKLOG #5505). The gate names such an account because its integrity
+        role rows, nor has role rows that do not parse, nor a timestamp or counter cell that does
+        not parse (BACKLOG #5505). The gate names such an account because its integrity
         check failed, or because it held the role when the gate read it. The role's own row does
         not list the accounts it ended, so this is the row that names them. A refused write is
         logged, not raised: the change and the revoke have both happened."""

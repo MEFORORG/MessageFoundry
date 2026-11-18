@@ -3161,7 +3161,7 @@ def _listed_user(d: Mapping[str, Any]) -> UserRecord:
     """One row of a list read: :meth:`UserRecord.from_mapping`, or, for a row that does not
     parse (:func:`listed_users` says which), :meth:`UserRecord.unreadable_row`. Such a row whose id
     cell is empty or not text still raises the :class:`RowSealError`, which :func:`decoded_rows` leaves
-    out: nothing could name it."""
+    out."""
     try:
         return UserRecord.from_mapping(d)
     except RowSealError:

@@ -619,7 +619,7 @@ async def test_a_recovery_code_cell_that_does_not_parse_is_charged_as_a_wrong_co
     tmp_path: Path, keyed: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Finding 1 of round 8b6500f2 on PR 3007: a wrong code against an account whose recovery-code
-    cell does not parse is charged to the second-step lockout, and the verify never raises. On a
+    cell does not parse is charged to the second-step lockout. On a
     keyed store the cell is written through the store's own sealing helper, so the record passes
     its seal and only the parse fails."""
     path = tmp_path / "codes-lockout.db"
