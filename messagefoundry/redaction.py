@@ -2705,7 +2705,7 @@ def _name_forms(text: str) -> list[str]:
         except UnicodeEncodeError:
             continue
         forms.update((repr(encoded)[2:-1], repr(encoded + b'"')[2:-2]))
-    return sorted(forms, key=len, reverse=True)
+    return sorted(forms, key=lambda form: (-len(form), form))
 
 
 #: ``encodings`` modules that are no text codec: the alias table, the bytes-to-bytes and str-to-str
