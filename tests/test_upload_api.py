@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 import pytest
 
+from messagefoundry import uploads as uploads_mod
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import (
@@ -616,6 +617,34 @@ async def test_upload_over_quota_rejected_409_and_audited(engine: Engine, tmp_pa
     assert set(json.loads(detail)) == {"reason"}  # no file name (vault BACKLOG #2619)
     assert "b.hl7" not in detail
     assert "MSH" not in detail and "MRN" not in detail  # never any body content
+
+
+async def test_an_account_name_past_the_sidecar_bound_answers_400_with_nothing_stored(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5387: the sidecar reader refuses a name past its bound, so the save refuses it first.
+    # Before, the upload was stored, then hidden from its owner and unbilled by the quota. The bound
+    # is lowered here, because local login caps a username well below the shipped one; a directory
+    # account is not capped there.
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    name = "op-long-name"
+    monkeypatch.setitem(uploads_mod._MAX_SIDECAR_TEXT, "uploader", len(name) - 1)  # noqa: SLF001
+    service = await _make_user(engine, Role.OPERATOR, name=name)
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, name)
+        resp = await c.post(
+            "/uploads", files={"file": ("a.hl7", ADT, "application/octet-stream")}, headers=h
+        )
+        assert resp.status_code == 400, resp.text
+        assert name not in resp.text
+        assert (await c.get("/uploads", headers=h)).json()["files"] == []
+    assert not list((tmp_path / "uploads").glob("*.meta"))
+    rej = [a for a in await engine.store.list_audit() if a["action"] == "upload.reject"]
+    assert len(rej) == 1 and name not in (rej[0]["detail"] or "")
 
 
 async def test_browse_and_delete_path_traversal_404(engine: Engine, tmp_path: Path) -> None:
@@ -1520,6 +1549,70 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
         assert [f["file_id"] for f in (await c.get("/uploads", headers=h)).json()["files"]] == [
             half
         ]
+
+
+#: The damaged 423's text (BACKLOG #5388). It promises no removal, because at least a directory in
+#: a part's place is kept by the prune and refused by the delete.
+_DAMAGED_TEXT = (
+    "this uploaded file is damaged, so it was not read and is not served. No key and no command "
+    "repairs it. An operator may try to delete it, and the delete may be refused too"
+)
+
+
+async def test_a_damaged_sidecar_answers_a_handled_error_not_a_500(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #5388: a sidecar that is not UTF-8, or not the metadata JSON, used to raise an
+    uncaught error from get_meta and delete, so its routes answered 500. It is now refused like an
+    unreadable one: 404 for the owner, whose ownership cannot be read, and 423 for an override
+    holder, with the file left on disk."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    await _add_user(service, Role.ADMINISTRATOR, name="root")
+    root = tmp_path / "uploads"
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ha = await _login(c, "root")
+        for raw in (b"\xff\xfe not utf-8", b"[" * 100_000):
+            fid = (
+                await c.post("/uploads", files={"file": ("x.hl7", ADT, "text/plain")}, headers=h)
+            ).json()["file_id"]
+            (root / f"{fid}.meta").write_bytes(raw)
+            for headers, status in ((h, 404), (ha, 423)):
+                for r in (
+                    await c.get(f"/uploads/{fid}/messages", headers=headers),
+                    await c.delete(f"/uploads/{fid}", headers=headers),
+                ):
+                    assert r.status_code == status, r.text
+                    if status == 423:
+                        # Its own text: rotate-key repairs nothing here (BACKLOG #5388).
+                        assert r.json()["detail"] == _DAMAGED_TEXT
+            assert (root / f"{fid}.meta").exists()
+        # A damaged body, under a sound sidecar, answers the damaged 423 to its own owner too, and
+        # a directory in place of the body does not answer a 500.
+        for damage in ("bytes", "dir"):
+            fid = (
+                await c.post("/uploads", files={"file": ("x.hl7", ADT, "text/plain")}, headers=h)
+            ).json()["file_id"]
+            blob = root / f"{fid}.blob"
+            if damage == "bytes":
+                blob.write_bytes(b"not base64!")
+            else:
+                blob.unlink()
+                blob.mkdir()
+            r = await c.get(f"/uploads/{fid}/messages", headers=h)
+            assert r.status_code == 423, r.text
+            assert r.json()["detail"] == _DAMAGED_TEXT
+            if damage == "dir":
+                # The delete refuses a directory body, which is why the text promises no removal.
+                r = await c.delete(f"/uploads/{fid}", headers=h)
+                assert r.status_code == 423, r.text
+                assert r.json()["detail"] == _DAMAGED_TEXT
+                assert blob.is_dir() and (root / f"{fid}.meta").exists()
 
 
 @_BREAKS

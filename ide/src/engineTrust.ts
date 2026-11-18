@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 
 import * as vscode from "vscode";
 
-import { engineUrl, environments, isExecGated, runJson, serviceConfig, workspaceDir } from "./cli";
+import { engineUrl, environments, isExecGated, runJson, workspaceDir, writerCheckSetting } from "./cli";
 import {
   clearEngineTrustAnchors,
   setEngineTrustAnchor,
@@ -16,6 +16,7 @@ import {
 } from "./engineClient";
 import { engineLog } from "./engineLog";
 import { isLocalEngine } from "./engineTarget";
+import { droppedSkipped } from "./workspaceContainment";
 import {
   engineHostKey,
   hostPinsOf,
@@ -475,7 +476,7 @@ async function askCli(
 ): Promise<void> {
   // The same guard the three sibling CLI calls in extension.ts use. Without it, opening a loose .py
   // file with no folder spawns a Python interpreter for a command that can only fail: isExecGated()
-  // is false when there is no workspace, so it does not cover this on its own.
+  // is false in a trusted window with no folder, so it does not cover this on its own.
   //
   // Captured ONCE, and every use below is this constant. The workspace is both the cwd the reading is
   // taken in and the base a relative certificate path is resolved against, so two calls that could
@@ -502,6 +503,24 @@ async function askCli(
     return;
   }
 
+  // A value the containment dropped (BACKLOG #5404) is refused, as a writer refuses one: the file
+  // used in its place is not the one the operator named, so its `[api].tls_cert_file` must not
+  // become a trust anchor. No outcome is set, so any anchor this source registered earlier is
+  // dropped too; a caFile pin is read separately and still applies. Checked before the
+  // earlier-run branch below, which keeps the old anchor, so a dropped value drops it on that path
+  // as well.
+  const setting = writerCheckSetting("serviceConfig");
+  if (setting.dropped !== false) {
+    engineLog().warn(
+      droppedSkipped(
+        "serviceConfig",
+        setting.dropped,
+        `\`cert inventory\` was not run and no certificate it would name is trusted for ${url} ` +
+          "(a caFile pin in messagefoundry.environments still applies)",
+      ),
+    );
+    return;
+  }
   if (cliRun !== undefined) {
     cliWanted = true;
     engineLog().warn("an earlier `cert inventory` run has not exited; not starting another");
@@ -514,7 +533,7 @@ async function askCli(
     // The path is workspace-relative (like every other messagefoundry.* path setting), so it runs
     // from the workspace the same way alertEditor.ts runs `alert list`.
     const call = runJson<unknown>(
-      ["cert", "inventory", "--service-config", serviceConfig()],
+      ["cert", "inventory", "--service-config", setting.value],
       workspace,
       { timeoutMs: CERT_INVENTORY_TIMEOUT_MS },
     );
@@ -798,6 +817,9 @@ function cliCouldAnchor(key: string): boolean {
     // askCli's own guard: with no workspace, or an untrusted one, the CLI is never asked.
     !!workspaceDir() &&
     !isExecGated() &&
+    // And its refusal of a dropped serviceConfig (BACKLOG #5404), so a failure does not schedule
+    // refreshes that can only refuse again.
+    writerCheckSetting("serviceConfig").dropped === false &&
     !claimedKeys.has(key) &&
     // The settings as they are now too: a host claimed since the last refresh is no longer the CLI's.
     !configuredPins().has(key) &&

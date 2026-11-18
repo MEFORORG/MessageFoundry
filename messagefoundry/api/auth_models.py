@@ -23,16 +23,21 @@ from messagefoundry.api.validation import (
     PermissionId,
     RoleId,
 )
+from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
 from messagefoundry.auth.usernames import username_refusal
+from messagefoundry.password_bounds import PASSWORD_MAX as _PASSWORD_MAX
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.
 # The ITEM rules for the id-shaped lists below live in `api/validation.py`, with the rest of the
 # operator API's input rules (BACKLOG #1108, docs/API-INPUT-VALIDATION.md).
 _NAME_MAX = 256
-_PASSWORD_MAX = 1024
 _GROUP_MAX = 512
+#: A TOTP code or a single-use recovery code (``MfaVerifyRequest.code``).
+_MFA_CODE_MAX = 64
+#: A TOTP code confirming a staged enrolment (``MfaConfirmRequest.code``).
+_CONFIRM_CODE_MAX = 16
 # A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
 _TOKEN_MAX = 256
 
@@ -467,7 +472,7 @@ class PasswordResetResponse(CredentialReply):
 class MfaVerifyRequest(RequestModel):
     """Satisfy a session's second factor with a TOTP code **or** a single-use recovery code."""
 
-    code: str = Field(max_length=64)
+    code: str = Field(max_length=_MFA_CODE_MAX)
 
 
 class MfaEnrollResponse(CredentialReply):
@@ -481,10 +486,10 @@ class MfaEnrollResponse(CredentialReply):
 class MfaConfirmRequest(RequestModel):
     """Confirm a staged enrollment by proving a live TOTP code from the authenticator app."""
 
-    code: str = Field(max_length=16)
+    code: str = Field(max_length=_CONFIRM_CODE_MAX)
     #: ADR 0207: the issued enrolment code, which a directory account's first
     #: factor needs on a session not stamped MFA-verified. Ignored where none is owed.
-    enrolment_code: str | None = Field(default=None, max_length=64)
+    enrolment_code: str | None = Field(default=None, max_length=ENROLMENT_CODE_MAX)
 
 
 class MfaConfirmResponse(CredentialReply):

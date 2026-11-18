@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import contextvars
 import errno
@@ -47,14 +48,18 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISLNK, S_ISREG
-from typing import Any, Literal, NamedTuple, Protocol
+from typing import Any, Literal, NamedTuple, Protocol, TypeGuard
 
 from messagefoundry.config.atomic_edit import _REFUSED, LOCK_FILE_NAME, edit_lock, lock_path_for
-from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
+from messagefoundry.controlchars import (
+    has_lone_surrogate,
+    scrub_log_argument,
+    strip_control_chars,
+)
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws, nontext_upload_reason
 from messagefoundry.parsing.split import split_batch
-from messagefoundry.redaction import codec_safe_str
+from messagefoundry.redaction import codec_safe_str, json_loads_or_refusal
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import (
     MARKER_PREFIX,
@@ -318,6 +323,17 @@ class UploadNotTextError(UploadContentError):
     #5551)."""
 
 
+class UploadFieldError(UploadContentError):
+    """A value :meth:`UploadStore.save` would store in the sidecar is one the sidecar reader refuses
+    (BACKLOG #5387): an account name or id longer than :data:`_MAX_SIDECAR_TEXT` allows, or a field
+    that holds a lone surrogate, or an engine clock that reads as no time after 1970
+    (:func:`_stamp_in_range`). That last is the host's fault, not the uploader's, and is still
+    answered 400. Refused before anything is written, so no upload is stored that
+    its own owner could not see, and the quota would not bill. A subclass, so the API answers it
+    as any other :class:`UploadContentError`: 400 and a metadata-only ``upload.reject`` audit.
+    ``reason`` names the field and the defect, never the value."""
+
+
 class UploadQuotaError(UploadError):
     """An upload would push the uploader over their file-count or aggregate-bytes quota (ASVS 5.2.4).
 
@@ -413,7 +429,10 @@ class UploadUnreadableError(UploadError, CipherError):
     :class:`CipherError` too, so any caller that already catches the cipher's error still does. The
     API maps it to HTTP 423 without importing the cipher module. The message is the cipher's own,
     which names only the surface and the remedies it offers, or
-    :data:`_REFUSED_NOT_UNSEALABLE` from :meth:`UploadStore.delete`, which names neither."""
+    :data:`_REFUSED_NOT_UNSEALABLE` from :meth:`UploadStore.delete`, which names neither. A damaged
+    file raises the subclass :class:`UploadDamagedError` (BACKLOG #5388). On a store that refuses
+    plaintext, :meth:`UploadStore.delete` may instead remove a sidecar that is not UTF-8, when it is
+    the never-sealable kind the scan classes too."""
 
 
 class UploadUnavailableError(UploadError, CipherError):
@@ -427,6 +446,49 @@ class UploadUnavailableError(UploadError, CipherError):
 #: The text of the refusal :meth:`UploadStore.delete` raises when its caller's read was refused
 #: and the upload is not the never-sealable kind. It names no file and no cipher detail.
 _REFUSED_NOT_UNSEALABLE = "the uploaded file's metadata is refused under the configured store key"
+
+
+_DAMAGED = "the uploaded file's {part} is damaged or is not this upload's, so it was not read"
+
+_STILL_SEALED = "the uploaded file's {part} is sealed under a store key this engine does not hold"
+
+
+def _refuse_still_sealed(text: str, part: str) -> None:
+    """Raise a :class:`CipherError` when the cipher handed back text that is still sealed, as the
+    keyless cipher does with a value it cannot open. Such a file is not damaged: the key it was
+    sealed under recovers it. So it must take the cipher-declined path, which the prune never
+    removes, rather than the damaged one, which the prune ages on disk (BACKLOG #5387, #5388). No
+    sidecar JSON and no base64 body ever starts with the marker, so a sound file never trips it."""
+    if text.startswith(MARKER_PREFIX):
+        raise CipherError(_STILL_SEALED.format(part=part))
+
+
+class UploadDamagedError(UploadUnreadableError):
+    """The :class:`UploadUnreadableError` of a damaged file, which no key or ``rotate-key`` repairs
+    (BACKLOG #5388): at least a file that is not UTF-8, a body that is not strict base64, a sidecar
+    that is not this upload's metadata, and a part that is not a regular file. A subclass, so a
+    caller that catches the refusal still does, and the API can answer it with its own text."""
+
+
+def _damaged(file_id: str, part: str, defect: str) -> UploadDamagedError:
+    """Log a damaged ``part`` of upload ``file_id`` and return the refusal a by-id read raises
+    (BACKLOG #5388), so one damaged file answers a handled error rather than a server error.
+    ``defect`` is already rendered content-free, and the caller raises after its handler ends, so
+    the decode error, which holds the whole file, is not left on the refusal's ``__context__``."""
+    _log.warning("uploaded-file %s %s: damaged, refused: %s", part, file_id, defect)
+    return UploadDamagedError(_DAMAGED.format(part=part))
+
+
+def _refuse_unplain(file_id: str, part: str, path: Path) -> None:
+    """Raise the damaged refusal when ``path`` is not a plain file (:func:`_not_a_plain_file`),
+    the check the listing scan makes (BACKLOG #5552), so a by-id read does not open a directory,
+    which answered a server error, or a FIFO, which blocked a worker thread for good, that is in
+    place when it looks. It guards against what is on disk then, not against a writer racing it: a
+    FIFO swapped in between this ``lstat`` and the open can still block a worker thread. A path that
+    is absent passes, and the caller's read answers it as missing."""
+    refused = _not_a_plain_file(path)
+    if refused is not None:
+        raise _damaged(file_id, part, refused)
 
 
 class UploadNotFoundError(UploadError):
@@ -479,9 +541,11 @@ class _UnsealableUpload:
     serve it, and :meth:`UploadStore.delete` removes it.
 
     **Not every refused upload is one, so this class does not keep every refused upload inside
-    retention** (BACKLOG #3240). At least these are not: a blank sidecar, or one that is not UTF-8
-    within the part :meth:`UploadStore._unsealable_sync` reads, and a plaintext sidecar over a body
-    that is oversized and not text, is not a regular file, or cannot be read for another cause. ``docs/PHI.md`` §3 names the ones outside retention.
+    retention** (BACKLOG #3240). At least a plaintext sidecar over a body that is oversized and not
+    text, is not a regular file, or cannot be read for another cause is not. A blank sidecar, or one
+    that is not UTF-8 within the part :meth:`UploadStore._unsealable_sync` reads, is not one either,
+    but the prune ages it as damaged (:meth:`UploadStore._aged_on_disk_sync`), which reuses this record
+    with a blank owner. ``docs/PHI.md`` §3 names the ones outside retention.
 
     At least these fields are not taken from the plaintext. ``file_id`` comes from the PATH, so a
     planted sidecar cannot name another upload. ``modified`` is the sidecar's mtime, which is the
@@ -561,10 +625,142 @@ def sanitize_filename(name: str | None) -> str:
         return "upload"
     # Strip directory parts on either separator (the value may come from a Windows or POSIX client).
     base = name.replace("\\", "/").rsplit("/", 1)[-1]
-    base = strip_control_chars(base).strip()
-    if not base:
-        return "upload"
-    return base[:_MAX_FILENAME]
+    # Cut, then strip again, so a cut that ends on a space leaves none and a second pass, as every
+    # sidecar read makes (BACKLOG #5387), returns the same name.
+    base = strip_control_chars(base).strip()[:_MAX_FILENAME].rstrip()
+    return base or "upload"
+
+
+class _MalformedSidecarError(ValueError):
+    """A sidecar that reached the JSON parse but is not metadata this store would have written
+    (BACKLOG #5387, #5388). Its message names only the defect, never a value from the sidecar."""
+
+
+#: The longest each text field of a sidecar may be. :meth:`UploadStore.save` writes a hex SHA-256
+#: and a format tag, which are always within it, and the sanitized filename and an account's own
+#: name and id, which it refuses up front when the reader would (:class:`UploadFieldError`), so no
+#: write is one the reader refuses. A longer one is refused as malformed, so a plant cannot carry an
+#: unbounded value into the permanent ``upload.prune`` audit row, a listing page or a log line.
+_MAX_SIDECAR_TEXT = {
+    "filename": _MAX_FILENAME,
+    "uploader": 1024,
+    "uploader_id": 1024,
+    "content_type": 64,
+    "sha256": 64,
+}
+
+
+def _sidecar_text_defect(key: str, value: str) -> str | None:
+    """Why the text field ``key`` of a sidecar would be refused, or ``None``. The one rule, which
+    the reader applies and :meth:`UploadStore.save` applies before it writes, so the two agree."""
+    if len(value) > _MAX_SIDECAR_TEXT[key]:
+        return f"field {key!r} is longer than {_MAX_SIDECAR_TEXT[key]} characters"
+    # A JSON escape can carry a lone surrogate, which no response can serialize, so one such
+    # sidecar would fail every listing page it falls on.
+    if has_lone_surrogate(value):
+        return f"field {key!r} holds a lone surrogate"
+    return None
+
+
+def _sidecar_text(d: dict[str, Any], key: str, default: str) -> str:
+    value = d.get(key, default)
+    if not isinstance(value, str):
+        raise _MalformedSidecarError(f"field {key!r} is not a string")
+    defect = _sidecar_text_defect(key, value)
+    if defect is not None:
+        raise _MalformedSidecarError(defect)
+    return value
+
+
+#: The largest count a sidecar may carry, far past any upload the engine accepts, and the largest
+#: ``uploaded_at`` in seconds. It bounds the digits a plant can write into the audit detail. It
+#: does not stop a plant billing an uploader out of quota: any count near it does that, because
+#: ``size`` is not checked against the body on disk.
+_MAX_SIDECAR_COUNT = 2**53
+
+
+def _sidecar_count(d: dict[str, Any], key: str) -> int:
+    value = d.get(key, 0)
+    # bool is an int subclass, and no field here is ever written as one.
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= _MAX_SIDECAR_COUNT
+    ):
+        raise _MalformedSidecarError(f"field {key!r} is not a count in range")
+    return value
+
+
+def _stamp_in_range(value: object) -> TypeGuard[int | float]:
+    """Whether ``value`` is an ``uploaded_at`` the sidecar reader accepts: a number above 0 and no
+    larger than :data:`_MAX_SIDECAR_COUNT`. The one rule, which the reader applies and
+    :meth:`UploadStore.save` applies to its clock before it writes, so the two agree.
+
+    A missing stamp, and 0 or a negative one, are refused rather than read as the epoch: the prune
+    would take such a stamp as decades old and delete the body on its first pass, with no
+    retention window (BACKLOG #5387). Refused, the pair is aged by its age on disk instead
+    (:meth:`UploadStore._aged_on_disk_sync`)."""
+    # bool is an int subclass, and no stamp is ever written as one. An int compares with a float
+    # exactly, so a huge one is refused here rather than overflowing; NaN fails both bounds, and
+    # infinity the upper one.
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0 < value <= _MAX_SIDECAR_COUNT
+    )
+
+
+def _meta_from_json(raw: str, file_id: str) -> UploadedFileMeta:
+    """The metadata a decrypted sidecar holds, checked rather than trusted (BACKLOG #5387).
+
+    On a store that passes unmarked sidecars (keyless, ``vault_transit``, or
+    ``allow_unmarked_ciphertext``) the JSON is not bound to its path, so a planted one could name
+    another upload's ``file_id`` for the prune to delete, or carry a negative ``size`` that lifts a
+    quota. So the ``file_id`` must be the path's own id, each count an integer from 0 to
+    :data:`_MAX_SIDECAR_COUNT`, the timestamp present and a number above 0 in that range
+    (:func:`_stamp_in_range`), and every text field a
+    string no longer than :data:`_MAX_SIDECAR_TEXT` allows with no lone surrogate, and the filename
+    is sanitized as :meth:`UploadStore.save` sanitizes it. Anything else, including JSON that does
+    not parse or nests past the parser's depth, raises :class:`_MalformedSidecarError` (BACKLOG
+    #5388).
+
+    **The check reads no clock.** A timestamp far ahead of the clock is not refused: after a host
+    clock is stepped back, every genuine upload is dated ahead, and refusing them would hide each
+    from its owner and from the quota. Such a timestamp is not trusted for retention either, since
+    it would never age out; the prune ages that upload by its pair's age on disk instead
+    (:meth:`UploadStore.prune_expired`).
+
+    A refused sidecar is left out of the listing and the quota, and the prune ages it as
+    :meth:`UploadStore._aged_on_disk_sync` says."""
+    # Returns rather than raises, so the decode error, which holds the whole sidecar, is not left
+    # on the refusal's __context__.
+    d, hint = json_loads_or_refusal(raw)
+    if hint is not None:
+        raise _MalformedSidecarError("not valid JSON")
+    if not isinstance(d, dict):
+        raise _MalformedSidecarError("not a JSON object")
+    if d.get("file_id") != file_id:
+        raise _MalformedSidecarError("its file_id is not its own upload id")
+    uploaded_at = d.get("uploaded_at")
+    if not _stamp_in_range(uploaded_at):
+        raise _MalformedSidecarError("field 'uploaded_at' is not a time in range")
+    stamp = float(uploaded_at)
+    return UploadedFileMeta(
+        file_id=file_id,
+        filename=sanitize_filename(_sidecar_text(d, "filename", "upload")),
+        uploader=_sidecar_text(d, "uploader", ""),
+        # Tolerant, like every other optional field — a sidecar without the key yields "", which
+        # matches NOBODY at the ownership check (api/app.py ``_may_access_upload``) and buckets
+        # into no operator's quota. That is the fail-closed end state, not a migration gap: there
+        # is deliberately no fallback to ``uploader`` here, because a name fallback would
+        # reintroduce exactly the recycled-username reachability this field exists to close.
+        uploader_id=_sidecar_text(d, "uploader_id", ""),
+        content_type=_sidecar_text(d, "content_type", "hl7v2"),
+        size=_sidecar_count(d, "size"),
+        sha256=_sidecar_text(d, "sha256", ""),
+        uploaded_at=stamp,
+        message_count=_sidecar_count(d, "message_count"),
+    )
 
 
 def content_type_for(filename: str) -> str:
@@ -1000,7 +1196,11 @@ class UploadStore:
             aad=cell_aad("uploaded_file", "body", file_id),
             allow_unmarked=self._passes_unmarked,
         )
-        return base64.b64decode(b64)
+        _refuse_still_sealed(b64, "body")
+        # Strict, as the writer emits it, so a damaged body is refused rather than served with
+        # its stray characters dropped. Encoded first, so a non-ASCII character raises a
+        # UnicodeError and the only other refusal is binascii.Error, the two read_bytes catches.
+        return base64.b64decode(b64.encode("ascii"), validate=True)
 
     def _encrypt_meta(self, meta: UploadedFileMeta) -> str:
         return self._cipher.encrypt(
@@ -1013,23 +1213,8 @@ class UploadStore:
             aad=cell_aad("uploaded_file", "meta", file_id),
             allow_unmarked=self._passes_unmarked,
         )
-        d = json.loads(raw)
-        return UploadedFileMeta(
-            file_id=str(d["file_id"]),
-            filename=str(d.get("filename", "upload")),
-            uploader=str(d.get("uploader", "")),
-            # Tolerant, like every other optional field — a sidecar without the key yields "", which
-            # matches NOBODY at the ownership check (api/app.py ``_may_access_upload``) and buckets
-            # into no operator's quota. That is the fail-closed end state, not a migration gap: there
-            # is deliberately no fallback to ``uploader`` here, because a name fallback would
-            # reintroduce exactly the recycled-username reachability this field exists to close.
-            uploader_id=str(d.get("uploader_id", "")),
-            content_type=str(d.get("content_type", "hl7v2")),
-            size=int(d.get("size", 0)),
-            sha256=str(d.get("sha256", "")),
-            uploaded_at=float(d.get("uploaded_at", 0.0)),
-            message_count=int(d.get("message_count", 0)),
-        )
+        _refuse_still_sealed(raw, "sidecar")
+        return _meta_from_json(raw, file_id)
 
     def _iter_sidecars(self) -> Iterator[tuple[str, Path]]:
         """Every ``(file_id, sidecar path)`` pair in the uploads root, as :meth:`_walk_sidecars`
@@ -1054,7 +1239,11 @@ class UploadStore:
                 yield fid, entry
 
     def _scan_metas_sync(
-        self, held: list[_UnsealableUpload] | None = None, *, outage_raises: bool = False
+        self,
+        held: list[_UnsealableUpload] | None = None,
+        *,
+        outage_raises: bool = False,
+        damaged: list[_UnsealableUpload] | None = None,
     ) -> list[UploadedFileMeta]:
         """Walk the uploads root and decrypt every well-formed ``.meta`` sidecar (UNSORTED). A
         bad/foreign/undecryptable sidecar is skipped **with its cause named** (never a body in the
@@ -1087,9 +1276,14 @@ class UploadStore:
         residual for all of that. The residual is named in ``docs/PHI.md`` §3: a refused upload is
         outside retention and the quota until ``rotate-key`` seals it, and ``serve`` logs the count
         at startup so the operator knows to run it. One kind ``rotate-key`` can never seal is
-        brought back through ``held`` instead, without trusting its sidecar. At least a blank
-        sidecar, or one that is not UTF-8 within the part :meth:`_unsealable_sync` reads, is still
-        left out.
+        brought back through ``held`` instead, without trusting its sidecar.
+
+        **``damaged`` is for the prune only (BACKLOG #5387, #5388).** When it is a list, each
+        sidecar that is not UTF-8, or that decrypted but is not this upload's metadata
+        (:func:`_meta_from_json`), and that ``held`` did not take, is appended to it as
+        :meth:`_aged_on_disk_sync` records it, which says how the prune ages it. A sidecar the cipher declined is never
+        appended, because a key rotated away must not silently destroy data. At least that kind is
+        still left out of the prune.
 
         **``held`` is for the quota and the prune only (BACKLOG #2322, #3184).** When it is a list
         and the cipher refuses plaintext, each refused sidecar that is an upload ``rotate-key``
@@ -1104,8 +1298,9 @@ class UploadStore:
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. Each of those is cut from the
         stored text, so the cipher bounds what it echoes of one (BACKLOG #5553). The malformed-shape branch
-        logs only the exception TYPE, because a ``ValueError`` from coercing a metadata field can
-        echo that field's value back into the message.
+        names only the field and the defect (:class:`_MalformedSidecarError`), or for any other
+        ``ValueError`` only its TYPE, because such an error can echo a field's value back into the
+        message.
 
         **A sidecar whose tag fails under a key the cipher holds is reported (BACKLOG #5553),**
         through the cipher's tag-failure hook, once per upload per hour
@@ -1128,6 +1323,7 @@ class UploadStore:
                 _log.warning("uploaded-file sidecar %s: %s, so it was not read", fid, refused)
                 continue
             classify = False
+            broken = False
             stored = ""
             try:
                 stored = entry.read_text(encoding="utf-8")
@@ -1155,16 +1351,30 @@ class UploadStore:
                 # A decode error is classed too: a plaintext sidecar that is not UTF-8 only past
                 # the part the class check reads is still one rotate-key can never seal. An
                 # OSError is not, so a stalled read is not paid twice under _quota_lock.
-                classify = isinstance(exc, UnicodeDecodeError)
+                classify = broken = isinstance(exc, UnicodeDecodeError)
             except (ValueError, TypeError, KeyError) as exc:
-                # Decrypted, but the JSON is malformed or a field will not coerce. Type only.
-                _log.warning(
-                    "uploaded-file sidecar %s: malformed metadata (%s)", fid, type(exc).__name__
+                # Decrypted, but not metadata this store wrote, or not this upload's (BACKLOG
+                # #5387). Left out of the listing and the quota; the prune ages it on disk only.
+                # Never a value logged. A _MalformedSidecarError names only the defect; any other
+                # error, which could echo a value, only its type.
+                defect = (
+                    codec_safe_str(exc)
+                    if isinstance(exc, _MalformedSidecarError)
+                    else type(exc).__name__
                 )
+                _log.warning("uploaded-file sidecar %s: malformed metadata: %s", fid, defect)
+                # Only the store's own shape refusal is damage the prune may age. Any other error
+                # here is not known to be one, so it is skipped, never pruned.
+                broken = isinstance(exc, _MalformedSidecarError)
+            lost = None
             if classify and sink is not None:
                 lost = self._unsealable_sync(fid, entry)
                 if lost is not None:
                     sink.append(lost)
+            if lost is None and broken and damaged is not None:
+                record = self._aged_on_disk_sync(fid)
+                if record is not None:
+                    damaged.append(record)
         if sink is not None:
             # Forget the checks of uploads that are gone, so the cache cannot outgrow the directory.
             # A copy, because a scan on another worker thread may be writing to it.
@@ -1229,6 +1439,33 @@ class UploadStore:
                 if isinstance(d, dict) and isinstance(d.get("uploader_id"), str):
                     owner = d["uploader_id"]
         return _UnsealableUpload(file_id=fid, uploader_id=owner, size=size, modified=modified)
+
+    def _aged_on_disk_sync(self, fid: str) -> _UnsealableUpload | None:
+        """Upload ``fid`` as the prune ages it by its pair on disk (BACKLOG #5387, #5388): one whose
+        sidecar is refused as damaged, or a sound one whose ``uploaded_at`` the prune cannot trust
+        (:meth:`prune_expired`). ``None`` when its pair cannot be checked; the next pass tries again.
+
+        Nothing is taken from the sidecar. ``modified`` is the later of the sidecar's and the
+        body's modification times, read without following a link, so a pair is due only once both
+        halves are old on disk. Unlike the never-sealable kind, one dated ahead is not pruned: the
+        prune compares it with the cutoff alone, so a pair written before a clock was stepped back
+        waits for wall time. ``size`` is the body's size on disk, ``0`` when it is gone. The owner
+        is blank, so the record bills nobody and the audit row names no owner. The record is the
+        never-sealable kind's only in shape: it reaches the prune alone."""
+        try:
+            blob_path, sidecar = self._paths_unfollowed(fid)
+            modified = sidecar.lstat().st_mtime
+            try:
+                body = blob_path.lstat()
+            except FileNotFoundError:
+                size = 0
+            else:
+                modified = max(modified, body.st_mtime)
+                size = body.st_size
+        except OSError as exc:
+            _log.warning("uploaded-file %s: could not age the pair on disk: %s", fid, exc)
+            return None
+        return _UnsealableUpload(file_id=fid, uploader_id="", size=size, modified=modified)
 
     @property
     def _stored_limit(self) -> int:
@@ -1301,7 +1538,9 @@ class UploadStore:
         extension / content mismatch (ASVS 5.2.2), :class:`UploadQuotaError` when
         the uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4), or
         :class:`UploadUnavailableError` when the cipher's key service gave no verdict, before anything
-        is written (BACKLOG #3734).
+        is written (BACKLOG #3734), or :class:`UploadFieldError` when the filename, ``uploader`` or
+        ``uploader_id`` is one the sidecar reader would refuse, before anything is written (BACKLOG
+        #5387).
 
         **A cancellation that reaches ``save`` after the pair landed removes it (BACKLOG #2262).**
         The caller writes ``upload.create`` only once this returns. A kept pair would be stored with
@@ -1323,6 +1562,16 @@ class UploadStore:
                 f"upload is {len(data)} bytes; the limit is {self._max_bytes}"
             )
         display = sanitize_filename(filename)
+        # The reader's own rule, applied before anything is written, so no write is one it refuses
+        # (BACKLOG #5387). content_type and sha256 are the store's own, always within it.
+        for key, value in (
+            ("filename", display),
+            ("uploader", uploader),
+            ("uploader_id", uploader_id),
+        ):
+            defect = _sidecar_text_defect(key, value)
+            if defect is not None:
+                raise UploadFieldError(display, f"was not stored: {defect}")
         # Text-only check, extension allowlist + content-vs-extension sniff at the chokepoint (ASVS
         # 14.2.8, 5.2.2). Both upload surfaces (POST /uploads and POST /ui/uploaded-logs/upload) reach
         # save(), so a non-text body, a disallowed extension or a content/extension mismatch is
@@ -1359,6 +1608,14 @@ class UploadStore:
                 is not None
             ):
                 raise self._shard_refusal(uploader=uploader, observed=disk)
+            stamp = time.time()
+            # The reader's own rule for the stamp, so a clock before 1970 writes no sidecar the
+            # reader refuses (BACKLOG #5387). Refused, not clamped: a stamp clamped near the epoch
+            # would be read as decades old and pruned on the next pass.
+            if not _stamp_in_range(stamp):
+                raise UploadFieldError(
+                    display, "was not stored: the engine clock is not a time in range"
+                )
             meta = UploadedFileMeta(
                 file_id=file_id,
                 filename=display,
@@ -1367,7 +1624,7 @@ class UploadStore:
                 content_type=ctype,
                 size=len(data),
                 sha256=hashlib.sha256(data).hexdigest(),
-                uploaded_at=time.time(),
+                uploaded_at=stamp,
                 # Message count is derived once at save (bounded by max_bytes) so listing never re-splits.
                 message_count=len(split_batch(_decode_text(data))),
             )
@@ -2156,10 +2413,12 @@ class UploadStore:
         return await asyncio.to_thread(_scan)
 
     async def get_meta(self, file_id: str) -> UploadedFileMeta:
-        """Return one file's metadata (path-traversal-guarded). Raises :class:`UploadNotFoundError`."""
+        """Return one file's metadata (path-traversal-guarded). Raises :class:`UploadNotFoundError`,
+        and :class:`UploadUnreadableError` for a sidecar the cipher refuses or that is damaged."""
 
         def _read() -> UploadedFileMeta:
             _, meta_path = self._paths(file_id)
+            _refuse_unplain(file_id, "sidecar", meta_path)
             try:
                 return self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
@@ -2168,15 +2427,21 @@ class UploadStore:
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
+            except (UnicodeDecodeError, _MalformedSidecarError) as exc:
+                defect = codec_safe_str(exc)
+            # Raised after the handler, so the error holding the file is on no chain.
+            raise _damaged(file_id, "sidecar", defect)
 
         return await asyncio.to_thread(_read)
 
     async def read_bytes(self, file_id: str) -> bytes:
         """Return the decrypted body bytes (path-traversal-guarded). Raises
-        :class:`UploadNotFoundError`."""
+        :class:`UploadNotFoundError`, and :class:`UploadUnreadableError` for a body the cipher
+        refuses or that is damaged."""
 
         def _read() -> bytes:
             blob_path, _ = self._paths(file_id)
+            _refuse_unplain(file_id, "body", blob_path)
             try:
                 return self._decrypt_blob(blob_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
@@ -2185,6 +2450,10 @@ class UploadStore:
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
+            except (UnicodeError, binascii.Error) as exc:
+                # Not UTF-8, not ASCII, or not the strict base64 the body is stored as.
+                defect = codec_safe_str(exc)
+            raise _damaged(file_id, "body", defect)
 
         return await asyncio.to_thread(_read)
 
@@ -2210,8 +2479,15 @@ class UploadStore:
 
         def _delete() -> UploadedFileMeta:
             blob_path, meta_path = self._paths(file_id)
+            # Before anything is read or classed. The sidecar is opened, so it must be a plain
+            # file. The body is only unlinked, which a FIFO allows and a directory refuses.
+            _refuse_unplain(file_id, "sidecar", meta_path)
+            if blob_path.is_dir():
+                raise _damaged(file_id, "body", "it is a directory")
             meta: UploadedFileMeta | None = None
             refusal = _REFUSED_NOT_UNSEALABLE
+            defect: str | None = None
+            classed = False
             if sidecar_refused:
                 # The store checks the caller's claim: only a cipher that refuses plaintext can
                 # hold the never-sealable kind.
@@ -2227,6 +2503,15 @@ class UploadStore:
                     raise UploadUnavailableError(str(exc)) from exc
                 except CipherError as exc:
                     refusal = str(exc)
+                except (UnicodeDecodeError, _MalformedSidecarError) as exc:
+                    defect = codec_safe_str(exc)
+                    classed = isinstance(exc, UnicodeDecodeError)
+            # Damaged, never trusted, and raised after the handler, so the error holding the file
+            # is on no chain. Classed only where the scan classes it too: a sidecar that is not
+            # UTF-8, on a cipher that refuses plaintext, may be the never-sealable kind. That one
+            # is logged as a refusal below only if the class check refuses it too.
+            if defect is not None and not (classed and self._refuses_plaintext):
+                raise _damaged(file_id, "sidecar", defect)
             if meta is None:
                 held = self._unsealable_sync(file_id, meta_path)
                 if held is None:
@@ -2238,6 +2523,8 @@ class UploadStore:
                         meta_path.lstat()
                     except FileNotFoundError as exc:
                         raise UploadNotFoundError(file_id) from exc
+                    if defect is not None:
+                        raise _damaged(file_id, "sidecar", defect)
                     raise UploadUnreadableError(refusal)
                 meta = held.as_meta()
             # Remove the body first, then the sidecar (best-effort on the body — the sidecar is the
@@ -2681,10 +2968,15 @@ class UploadStore:
         the ``upload.prune`` audit: ``file_id`` + ``uploader`` only, never content) plus the orphan count.
 
         Idempotent: a re-run finds the already-deleted pairs gone and returns an empty pass.
-        Undecryptable/foreign sidecars are skipped (never pruned — a rotated-away key must not silently
+        Sidecars the cipher declines are skipped (never pruned — a rotated-away key must not silently
         destroy data). One exception is an upload ``rotate-key`` can never seal (BACKLOG #2322):
         it is pruned once its sidecar's mtime passes the cutoff, and is reported with blank owner
-        fields (:class:`_UnsealableUpload`). Runs off the event loop; the periodic runner + the
+        fields (:class:`_UnsealableUpload`). Another is a sidecar refused as damaged, which the
+        cipher did not decline (BACKLOG #5387, #5388), aged as :meth:`_aged_on_disk_sync` says, reported
+        the same way and logged as such. A sound sidecar whose ``uploaded_at`` is more than a day
+        ahead of ``now`` is aged the same way, by its pair's age on disk and never by an mtime
+        ahead of the clock, since that stamp alone would never age out; it is reported with its own
+        metadata and logged as such. Runs off the event loop; the periodic runner + the
         opportunistic save-time sweep both drive it. A save wakes the runner, and sweeps itself only
         where none is running (:meth:`wake_retention`).
 
@@ -2714,17 +3006,39 @@ class UploadStore:
 
         stop = abort if abort is not None else threading.Event()
         sweep = tally if tally is not None else _SweepTally()
+        # The due uploads aged by their age on disk, with why, which the pass logs.
+        by_disk: dict[str, str] = {}
 
         def _due() -> list[UploadedFileMeta]:
             # Checked before the scan too: the scan decrypts every sidecar, which is wasted on a stop.
             if stop.is_set():
                 return []
             held: list[_UnsealableUpload] = []
-            metas = self._scan_metas_sync(held)
-            # An upload rotate-key cannot seal ages by its sidecar's mtime (BACKLOG #2322).
-            return [meta for meta in metas if meta.uploaded_at < cutoff] + [
-                lost.as_meta() for lost in held if lost.expired(cutoff, at)
-            ]
+            broken: list[_UnsealableUpload] = []
+            metas = self._scan_metas_sync(held, damaged=broken)
+            due: list[UploadedFileMeta] = []
+            for meta in metas:
+                if meta.uploaded_at <= at + _SECONDS_PER_DAY:
+                    if meta.uploaded_at < cutoff:
+                        due.append(meta)
+                    continue
+                # A stamp this far ahead is not one this clock wrote, so it alone would never age
+                # out (BACKLOG #5387). It may be a genuine upload after a clock step-back, so it is
+                # still listed and billed, and aged here by the pair's age on disk instead.
+                on_disk = self._aged_on_disk_sync(meta.file_id)
+                if on_disk is not None and on_disk.modified < cutoff:
+                    due.append(meta)
+                    by_disk[meta.file_id] = "whose uploaded_at is ahead of the clock"
+            # An upload rotate-key cannot seal ages by its sidecar's mtime (BACKLOG #2322), and one
+            # whose sidecar is damaged by its pair's mtimes (BACKLOG #5387, #5388).
+            aged = [lost for lost in held if lost.expired(cutoff, at)]
+            for lost in broken:
+                # By the cutoff alone, never by an mtime ahead of the clock, so a pair written
+                # before a clock was stepped back waits for wall time.
+                if lost.modified < cutoff:
+                    aged.append(lost)
+                    by_disk[lost.file_id] = "whose sidecar was refused"
+            return due + [lost.as_meta() for lost in aged]
 
         def _remove(meta: UploadedFileMeta) -> bool | None:
             """Remove one due pair; ``None`` when the pass was stopped before it."""
@@ -2735,6 +3049,15 @@ class UploadStore:
                 removed = self._prune_pair_sync(meta)
             finally:
                 sweep.end(removed)
+            # Logged once the pair is gone, a lone sidecar's included, which writes no audit row,
+            # so the log is that removal's only record. It says why the stamp was not used.
+            why = by_disk.get(meta.file_id)
+            if why is not None and (
+                removed or not os.path.lexists(self._paths_unfollowed(meta.file_id)[1])
+            ):
+                _log.warning(
+                    "uploaded-logs prune took %s, %s, by its age on disk", meta.file_id, why
+                )
             return removed
 
         def _orphans() -> int:
@@ -2775,7 +3098,7 @@ class UploadStore:
         ``OSError`` there leaves the pair for the next pass like a refused unlink does."""
         # A sidecar whose id fails the path guard, or whose pair holds a link, is left alone (never
         # blindly unlinked) and named, so an operator can remove it (BACKLOG #5552). The id is cut
-        # short: an unsealed sidecar's JSON chooses it.
+        # short: the scan's ids are the path's own (BACKLOG #5387), but a caller may pass any.
         try:
             blob_path, meta_path = self._paths(meta.file_id)
         except UploadPathError:

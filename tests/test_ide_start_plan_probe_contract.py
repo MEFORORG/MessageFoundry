@@ -69,7 +69,9 @@ def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
     The IDE adds ``--service-config`` only when ``messagefoundry.serviceConfig`` is set and not
     blank; this file's probe runs with the setting at its default, where ``serviceConfigFlag`` adds
     nothing. Comments are blanked first, so a comment quoting the argv cannot satisfy the pin, and
-    the pin ends at the array's close, so an element added after the flag reds it.
+    the pin ends at the array's close, so an element added after the flag reds it. The array is
+    handed to ``cliArgv`` (BACKLOG #5409), so its body is pinned too: the interpreter options,
+    then ``-m messagefoundry``, then this array, and nothing after it.
     """
     raw = _MODEL.read_text(encoding="utf-8")
     src = " ".join(blank_js_comments(raw).split())
@@ -78,11 +80,16 @@ def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
     assert "Each value is bound with" not in src
     assert re.search(
         re.escape(
-            '"provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`, '
+            'const args = cliArgv("messagefoundry", [ "provision-admin", '
+            "`--username=${opts.username}`, `--email=${opts.email.trim()}`, "
             "...serviceConfigFlag(opts.serviceConfig)"
         )
-        + r",? \];",
+        + r",? \]\);",
         src,
+    )
+    assert (
+        "function cliArgv(module: string, args: readonly string[]): string[] { "
+        'return [...INTERPRETER_OPTIONS, "-m", module, ...args]; }' in src
     )
     assert (
         "function serviceConfigFlag(serviceConfig: string | undefined): string[] { "

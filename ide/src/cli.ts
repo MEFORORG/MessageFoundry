@@ -16,9 +16,16 @@ import {
   type CliModule,
   type CliResult,
 } from "./cliJson";
-import { settingIsSet } from "./connectionWizardModel";
+import { connectionServiceConfig, settingIsSet } from "./connectionWizardModel";
+import { cliArgv } from "./engineControlModel";
 import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from "./stepsModel";
 import type { LensParseResult, OpSchema } from "./stepsModel";
+import {
+  containedPathSetting,
+  droppedNotice,
+  writerRefusal,
+  type ContainedPathSetting,
+} from "./workspaceContainment";
 
 // Parsing lives in cliJson.ts (no vscode, so the unit suite runs it). Every importer of CliResult
 // keeps importing it from here.
@@ -71,28 +78,129 @@ export function pythonPath(): string {
 }
 
 /**
- * True when there IS a workspace and it is NOT trusted: in that state the CLI must not exec a
- * (possibly repo-supplied) interpreter. run()/runJson() short-circuit on this rather than launching
- * anything, so neither activation nor save-triggered refreshes can run a workspace binary (SEC-004).
+ * True when the window is NOT trusted: in that state the CLI must not exec a (possibly repo-supplied)
+ * interpreter. run()/runJson() short-circuit on this rather than launching anything, so neither
+ * activation nor save-triggered refreshes can run a workspace binary (SEC-004).
+ *
+ * Trust alone decides it, with or without a workspace folder (BACKLOG #5408). A Restricted Mode
+ * window with no folder open (an empty window under `security.workspace.trust.emptyWindow: false`)
+ * is untrusted too, and gating only when a folder existed let the extension spawn Python there.
  */
 export function isExecGated(): boolean {
-  return Boolean(workspaceDir()) && !vscode.workspace.isTrusted;
+  return !vscode.workspace.isTrusted;
+}
+
+/** The dropped values already named to the user, keyed by setting, scope and value, so each is
+ *  named once a session rather than on every CLI call, and a new dropped value is named again. */
+const droppedPathSettings = new Set<string>();
+
+/** The workspace-relative path settings {@link containedPathSetting} contains. */
+export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
+
+/**
+ * A workspace-relative path setting, contained to the workspace folder by
+ * {@link containedPathSetting} (BACKLOG #5404): a workspace value that leaves the folder, or a user
+ * value that is not text, is dropped for the next scope down, and the user is told once per value.
+ */
+function pathSetting(key: PathSettingKey, fallback: string, warn = true): ContainedPathSetting {
+  const seen = config().inspect(key);
+  const contained = containedPathSetting(seen, workspaceDir(), fallback);
+  if (contained.dropped === false || !warn) {
+    return contained;
+  }
+  const raw = contained.dropped === "workspace" ? seen?.workspaceValue : seen?.globalValue;
+  const seenKey = `${key}\u0000${contained.dropped}\u0000${JSON.stringify(raw) ?? ""}`;
+  if (!droppedPathSettings.has(seenKey)) {
+    droppedPathSettings.add(seenKey);
+    // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
+    void vscode.window.showWarningMessage(droppedNotice(key, contained.dropped));
+  }
+  return contained;
+}
+
+/** Each path setting's fallback when the manifest gives no default. */
+const PATH_FALLBACK: Readonly<Record<PathSettingKey, string>> = {
+  configDir: "samples/config",
+  serviceConfig: "messagefoundry.toml",
+  messageSetsDir: "samples/messages",
+};
+
+/** A path setting read for a writer's own check, without the reader's once-per-value warning, so
+ *  the writer's refusal is the notice its command shows. A reader elsewhere may still have warned
+ *  about the same value earlier in the session; that warning names the same cause. */
+export function writerCheckSetting(key: PathSettingKey): ContainedPathSetting {
+  return pathSetting(key, PATH_FALLBACK[key], false);
+}
+
+/** {@link writerPathSetting}'s reading with its scope, or undefined after the refusal is shown. */
+function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
+  const s = writerCheckSetting(key);
+  if (s.dropped !== false) {
+    void vscode.window.showErrorMessage(writerRefusal(key, s.dropped));
+    return undefined;
+  }
+  return s;
+}
+
+/**
+ * The value of a path setting for a command that WRITES or LAUNCHES under it (BACKLOG #5404), or
+ * undefined after an error naming the setting when a value the operator wrote was dropped. A reader
+ * uses {@link configDir}, {@link serviceConfig} or {@link messageSetsDir}, which go on with the
+ * value used in the dropped one's place; a writer must not act on that substitute. See
+ * {@link writerRefusal}.
+ */
+export function writerPathSetting(key: PathSettingKey): string | undefined {
+  return writerSetting(key)?.value;
+}
+
+/**
+ * The `--config` directory and the `--service-config` value (see `connectionServiceConfig`) that
+ * every connections.toml writer passes and Start and Restart launch serve with, both read through
+ * {@link writerPathSetting}, or undefined after its refusal is shown.
+ */
+export function writerConfigTarget(): { configDir: string; serviceConfig: string | undefined } | undefined {
+  const dir = writerPathSetting("configDir");
+  if (dir === undefined) {
+    return undefined;
+  }
+  const file = writerSetting("serviceConfig");
+  if (file === undefined) {
+    return undefined;
+  }
+  // Nothing was dropped, so the setting is set exactly when it did not come from the default.
+  return { configDir: dir, serviceConfig: connectionServiceConfig(file.value, file.source !== "default") };
 }
 
 export function configDir(): string {
-  return config().get<string>("configDir", "samples/config");
+  return configDirSetting().value;
 }
 
-/** Service-settings TOML the engine loads (`[alerts].rules` live here — ADR 0014). Workspace-relative;
- *  the `alert` CLI creates it on first `add` if absent. */
+/** {@link configDir} with its scope and which value, if any, was dropped. */
+export function configDirSetting(): ContainedPathSetting {
+  return pathSetting("configDir", PATH_FALLBACK.configDir);
+}
+
+/** Service-settings TOML the engine loads (`[alerts].rules` live here — ADR 0014). Workspace-relative,
+ *  and a workspace value is contained to the folder (BACKLOG #5404); the `alert` CLI creates it on
+ *  first `add` if absent. */
 export function serviceConfig(): string {
-  return config().get<string>("serviceConfig", "messagefoundry.toml");
+  return serviceConfigSetting().value;
+}
+
+/** {@link serviceConfig} with the scope it came from, for a caller whose checks depend on whether
+ *  the workspace set the value it is handed (securityEditor.ts). */
+export function serviceConfigSetting(): ContainedPathSetting {
+  return pathSetting("serviceConfig", PATH_FALLBACK.serviceConfig);
 }
 
 /** Whether `messagefoundry.serviceConfig` is set rather than left at the manifest default; see
- *  `settingIsSet` and `connectionServiceConfig` in connectionWizardModel.ts (BACKLOG #2908). */
+ *  `connectionServiceConfig` in connectionWizardModel.ts (BACKLOG #2908). For the readers only, at
+ *  least the status bar's control context: writers and the offline ai-policy refuse a dropped value
+ *  (writerConfigTarget, aiPolicy.ts). A value the containment dropped still counts (BACKLOG #5404),
+ *  so the file a reader judges in its place is the one named explicitly. */
 export function serviceConfigIsSet(): boolean {
-  return settingIsSet(config().inspect("serviceConfig"));
+  const s = serviceConfigSetting();
+  return s.source !== "default" || s.dropped !== false;
 }
 
 /**
@@ -176,7 +284,12 @@ export function shardsOf(env: EnvironmentTarget): Shard[] {
 }
 
 export function messageSetsDir(): string {
-  return config().get<string>("messageSetsDir", "samples/messages");
+  return messageSetsDirSetting().value;
+}
+
+/** {@link messageSetsDir} with its scope and which value, if any, was dropped. */
+export function messageSetsDirSetting(): ContainedPathSetting {
+  return pathSetting("messageSetsDir", PATH_FALLBACK.messageSetsDir);
 }
 
 /**
@@ -223,7 +336,7 @@ export function run(args: string[], cwd?: string, opts: RunOptions = {}): Promis
   return new Promise((resolve) => {
     execFile(
       pythonPath(),
-      ["-m", module, ...args],
+      cliArgv(module, args),
       { cwd, maxBuffer: 64 * 1024 * 1024, timeout: opts.timeoutMs ?? 0 },
       (err, stdout, stderr) => {
         const code =
@@ -265,7 +378,7 @@ export function runWithStdin(
   return new Promise((resolve) => {
     const child = execFile(
       pythonPath(),
-      ["-m", module, ...args],
+      cliArgv(module, args),
       { cwd, maxBuffer: 64 * 1024 * 1024, encoding: "utf8", timeout: opts.timeoutMs ?? 0 },
       (err, stdout, stderr) => {
         const code =
@@ -422,17 +535,16 @@ export function codesetShow(name: string, cwd?: string): Promise<CodeSetDetail> 
   return runJson<CodeSetDetail>(["codeset", "show", "--config", configDir(), "--name", name], cwd);
 }
 
-/** `codeset upsert` — write codesets/NAME.csv from a DETAIL (the CLI validates + re-loads it). */
-export function codesetUpsert(detail: CodeSetDetail, cwd?: string): Promise<unknown> {
-  return runJson(["codeset", "upsert", "--config", configDir(), "--data", JSON.stringify(detail)], cwd);
-}
+// The code-set writers take the config directory from their caller, which reads it with
+// writerPathSetting and stops before any prompt when that refuses (BACKLOG #5404). The editors
+// build their own `codeset upsert`, which takes an optional `--name`.
 
 /** `codeset rename NAME --to NEWNAME` — rename the file (keeps its extension). */
-export function codesetRename(name: string, to: string, cwd?: string): Promise<unknown> {
-  return runJson(["codeset", "rename", "--config", configDir(), "--name", name, "--to", to], cwd);
+export function codesetRename(dir: string, name: string, to: string, cwd?: string): Promise<unknown> {
+  return runJson(["codeset", "rename", "--config", dir, "--name", name, "--to", to], cwd);
 }
 
 /** `codeset remove NAME` — delete codesets/NAME.csv|.toml. */
-export function codesetRemove(name: string, cwd?: string): Promise<unknown> {
-  return runJson(["codeset", "remove", "--config", configDir(), "--name", name], cwd);
+export function codesetRemove(dir: string, name: string, cwd?: string): Promise<unknown> {
+  return runJson(["codeset", "remove", "--config", dir, "--name", name], cwd);
 }

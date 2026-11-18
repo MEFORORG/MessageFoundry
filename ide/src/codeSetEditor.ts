@@ -12,7 +12,7 @@
 // disabled) — `upsert` only ever writes CSV. After a save the Translation Tables tree refreshes and a
 // Promote is offered (the same messagefoundry.promote command the connection editor reuses).
 import * as vscode from "vscode";
-import { configDir, runJson, workspaceDir } from "./cli";
+import { configDir, runJson, workspaceDir, writerPathSetting } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { codeSetEditorScript } from "./codeSetEditorWebview";
 
@@ -142,7 +142,11 @@ async function save(
   // Create-intent (#240): pass `--name <editName>` on an EDIT of an existing stem so the CLI treats the
   // save as an overwrite of that code set; OMIT it when creating a new table so the server refuses a
   // name collision (`create=--name is None`) instead of silently overwriting an existing code set.
-  const args = ["codeset", "upsert", "--config", configDir(), "--data", JSON.stringify(detail)];
+  const dir = writerPathSetting("configDir");
+  if (dir === undefined) {
+    return;
+  }
+  const args = ["codeset", "upsert", "--config", dir, "--data", JSON.stringify(detail)];
   if (editName) {
     args.push("--name", editName);
   }
@@ -174,8 +178,12 @@ async function rename(
   if (!ws) {
     return;
   }
+  const dir = writerPathSetting("configDir");
+  if (dir === undefined) {
+    return;
+  }
   try {
-    await runJson(["codeset", "rename", "--config", configDir(), "--name", name, "--to", to], ws);
+    await runJson(["codeset", "rename", "--config", dir, "--name", name, "--to", to], ws);
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
     return;
@@ -190,6 +198,10 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
   if (!ws) {
     return;
   }
+  const dir = writerPathSetting("configDir");
+  if (dir === undefined) {
+    return;
+  }
   const confirm = await vscode.window.showWarningMessage(
     `Remove code set "${name}" (codesets/${name}.csv)?`,
     { modal: true },
@@ -199,7 +211,7 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
     return;
   }
   try {
-    await runJson(["codeset", "remove", "--config", configDir(), "--name", name], ws);
+    await runJson(["codeset", "remove", "--config", dir, "--name", name], ws);
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
     return;

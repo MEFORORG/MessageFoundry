@@ -309,9 +309,9 @@ suite("connectionServiceConfig — which settings file a connection edit names",
 
 // The builders above pin the argv, but only if every writer uses them. Read the extension source and
 // pin that (1) no file but the model spells a `connection upsert|remove` argv by hand, and (2) every
-// call to a builder passes `serviceConfig()`, the workspace setting the alert, security and trust
-// editors pass, and `serviceConfigIsSet()` through connectionServiceConfig. A source scan, because
-// the callers import `vscode` and cannot run under plain mocha.
+// call to a builder passes the target writerConfigTarget read, which runs the service settings
+// through connectionServiceConfig and refuses a value the containment dropped (BACKLOG #5404). A
+// source scan, because the callers import `vscode` and cannot run under plain mocha.
 suite("connection writers — every upsert and remove names the service settings (BACKLOG #2908)", () => {
   const SRC = path.join(__dirname, "..", "..", "..", "src");
   // Every extension source file, subdirectories included, but not the test tree.
@@ -326,7 +326,7 @@ suite("connection writers — every upsert and remove names the service settings
     assert.deepStrictEqual(spellers, ["connectionWizardModel.ts"]);
   });
 
-  test("every builder call passes serviceConfig() and serviceConfigIsSet() through connectionServiceConfig", () => {
+  test("every builder call passes the target writerConfigTarget read (BACKLOG #5404)", () => {
     // Each call's opening text, long enough to hold its first two arguments over any line breaks.
     const call = /connection(?:Upsert|Remove)Args\(/g;
     const calls = sources
@@ -340,10 +340,22 @@ suite("connection writers — every upsert and remove names the service settings
     for (const f of ["connectionEditor.ts", "configEditors.ts", "connectionQuickInput.ts"]) {
       assert.ok(callers.has(f), `${f} no longer calls a connection argv builder`);
     }
-    const flagged =
-      /^connection(?:Upsert|Remove)Args\([^,]+,\s*connectionServiceConfig\(\s*serviceConfig\(\)\s*,\s*serviceConfigIsSet\(\)\s*\)/;
+    const flagged = /^connection(?:Upsert|Remove)Args\(\s*target\.configDir\s*,\s*target\.serviceConfig\s*,/;
     const unflagged = calls.filter((c) => !flagged.test(c.call));
     assert.deepStrictEqual(unflagged, []);
+    // Each caller takes `target` from writerConfigTarget, which reads the service settings the way the
+    // alert, security and trust editors do and passes them through connectionServiceConfig.
+    for (const f of ["connectionEditor.ts", "configEditors.ts", "connectionQuickInput.ts"]) {
+      const text = sources.find((s) => s.file === f)?.text ?? "";
+      assert.match(text, /const target = writerConfigTarget\(\);/, f);
+    }
+    const cli = sources.find((s) => s.file === "cli.ts")?.text ?? "";
+    assert.match(
+      cli,
+      /export function writerConfigTarget\(\)[\s\S]*?connectionServiceConfig\(file\.value, file\.source !== "default"\)/,
+    );
+    // Control: the pre-#5404 call, which read the substitute, fails the predicate.
+    assert.ok(!flagged.test("connectionUpsertArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), c)"));
   });
 });
 
