@@ -12,6 +12,7 @@ out-of-band edit would. Synthetic accounts only.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from dataclasses import replace
@@ -721,6 +722,39 @@ async def test_a_logout_whose_ended_row_does_not_parse_still_signs_out(tmp_path:
             "session": hash_token(token)[:12],
         }
         assert len(alerts) == 1 and hash_token(token)[:12] in alerts[0]
+    finally:
+        await store.close()
+
+
+async def test_a_logout_whose_ended_row_report_fails_still_signs_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding 15 of PR 3007: the integrity report for an ended row that does not parse raised a
+    defect out of its audit write after the revoke committed, so the sign-out answered 500. The
+    report's failure is now logged and the sign-out completes."""
+    path = tmp_path / "logout-report.db"
+    store = await MessageStore.open(path)
+    try:
+        await _user(store, "u-out-r")
+        token = await _token_session(store, "u-out-r")
+        _unparseable(path, token)
+        service = AuthService(store, AuthSettings())
+        audit = service._audit
+
+        async def _refuse_seal_row(action: str, **kwargs: object) -> None:
+            if action == AUTHORITY_SEAL_FAILED_ACTION:
+                raise NotImplementedError("planted defect")  # in AUDIT_WRITE_DEFECTS
+            await audit(action, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(service, "_audit", _refuse_seal_row)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            assert await service.logout(token, client=None, proven_at=None) == "revoked"
+        assert _revoked(path, hash_token(token))
+        assert [json.loads(r["detail"])["outcome"] for r in await store.list_audit()] == ["revoked"]
+        said = [
+            r.getMessage() for r in caplog.records if "integrity report failed" in r.getMessage()
+        ]
+        assert len(said) == 1 and hash_token(token)[:12] in said[0]
     finally:
         await store.close()
 

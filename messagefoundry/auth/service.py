@@ -13119,13 +13119,20 @@ class AuthService:
         """The store's ``supersede_session``. A row it ended that then did not parse (BACKLOG
         #5505) is reported, as :meth:`_session_seal_failed` reports one, and answered as
         :class:`_EndedUnread`: the store committed that revoke before it raised
-        :class:`RevokedRowSealError`, so the session has ended and no caller raises for it."""
+        :class:`RevokedRowSealError`, so the session has ended and no caller raises for it. A
+        fault in that report is logged, not raised, for the same reason."""
         try:
             return await self._store.supersede_session(
                 token_hash, now=now, lineage_since=lineage_since
             )
         except RevokedRowSealError as exc:
-            await self._report_ended_session(exc.subject)
+            try:
+                await self._report_ended_session(exc.subject)
+            except Exception:  # noqa: BLE001 - the revoke committed; a raise would report it failed
+                _log.exception(
+                    "session %s was ended but does not parse, and its integrity report failed",
+                    exc.subject,
+                )
             return _EndedUnread(exc.subject)
 
     async def _report_seal_failure(self, key: str, reason: str, detail: dict[str, str]) -> None:
