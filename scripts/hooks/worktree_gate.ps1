@@ -887,8 +887,7 @@ function Get-ScanRawIndexMap($Seg) {
 #
 # KNOWN WRONG REFUSAL TEXT, left open, origin/main's too: rule 3c words its refusal from the disarm
 # match, not from what the command does, so it can call a refused read "changing" or "setting" (`git
-# config --file=.git/config --get core.hooksPath` and `git config --get core.hooksPath x` from the
-# primary).
+# config --get core.hooksPath x y` and `git config --get core.hooksPath "a b"` from the primary).
 #
 # THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
@@ -3737,12 +3736,14 @@ if ($tool -in @("Bash", "PowerShell")) {
     # -----------------------------------------------------------------------------------------------
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
     # The valueless read options rule 3c's read exemptions accept between `config` and the key
-    # (BACKLOG #5588, #5589). Exact spellings only: an abbreviation or a value-taking option is no read.
+    # (BACKLOG #5588, #5589). Exact spellings only: an abbreviation is no read, and a value-taking
+    # option is one only in $readValueOpts below.
     $readOpts = '--(?:get|get-all|get-regexp|local|global|system|worktree|includes|no-includes|null|name-only|show-origin|show-scope|all|show-names|bool|int|bool-or-int|path|expiry-date)|-z'
-    # ONE SHELL WORD THAT IS PLAIN TEXT IN BOTH HOSTS: no quote, escape, sigil, glob, bracket,
-    # redirect, comment or newline, and no leading `-`, so it cannot be an option or hide a second
+    # ONE SHELL WORD THAT IS PLAIN TEXT IN BASH, POWERSHELL AND CMD: no quote, escape, sigil
+    # (cmd's `%` and `^` included, since the scan reads `cmd /c` text too), glob, bracket, redirect,
+    # comment or newline, and no leading `-` or `=`, so it cannot be an option or hide a second
     # command. Used for an option's value below and for a --get read's value pattern (BACKLOG #5589).
-    $plainWord = '[A-Za-z0-9._/:+%^][A-Za-z0-9._/:+=%^-]*'
+    $plainWord = '[A-Za-z0-9._/:+][A-Za-z0-9._/:+=-]*'
     # The read options that take a value, each with a plain-word value and spaces or tabs only, never
     # a CR, which PowerShell runs as a statement break (#8240 item 51). `--type` takes only its types.
     $readValueOpts = "--type(?:=|[ \t]+)(?:bool|int|bool-or-int|path|expiry-date|color)|(?:--default|--file)(?:=|[ \t]+)$plainWord|-f[ \t]+$plainWord"

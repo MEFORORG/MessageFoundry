@@ -2619,14 +2619,14 @@ def test_real_git_stores_a_value_after_a_display_flag_with_no_get_mode(git_prima
     [
         # #5589 added step 1: a real multi-argument read, a --get mode then the key then a pattern.
         "git config --get core.hooksPath /nope",
-        "git config --get-all core.hooksPath ^/x",
+        "git config --get-all core.hooksPath /x",
         "git config --get-regexp alias.x st",
         "git config --local --get core.worktree x.y",
         "git --no-pager config --get alias.lg log",
         "git config --get core.hooksPath /nope && echo ok",
         # The scan unmasks a quoted span holding one bare word (BACKLOG #1069), and so does the shell.
         'git config --get core.hooksPath "/nope"',
-        "git config --get core.hooksPath '^/nope'",
+        "git config --get core.hooksPath '/nope'",
         # #8240 item 51: read options the allowlist refused.
         "git config get --all core.hooksPath",
         "git config get --show-names core.hooksPath",
@@ -2680,6 +2680,8 @@ def test_rule_3c_allows_a_multi_argument_read(
         "git config --get core.hooksPath {a,b}",
         "git config --get core.hooksPath @x",
         "git config --get core.hooksPath x*",
+        "git config --get core.hooksPath %X%",
+        "git config --get core.hooksPath x^",
         # A value-taking option whose value is an option, or not one plain word.
         "git config --default --get core.hooksPath /nope",
         "git config --file --get core.hooksPath /nope",
@@ -2697,8 +2699,9 @@ def test_rule_3c_still_denies_writes_beside_the_multi_argument_read(
     git_primary: Path, git_repos_file: Path, cmd: str
 ) -> None:
     """The negative controls for the read above: each of these may store, or hides a second word."""
-    reason = assert_denied(run_gate(bash(cmd, cwd=git_primary), git_repos_file))
-    assert "SHARED git configuration" in reason, cmd
+    for tool in ("Bash", "PowerShell"):
+        reason = assert_denied(run_gate(bash(cmd, cwd=git_primary, tool=tool), git_repos_file))
+        assert "SHARED git configuration" in reason, (tool, cmd)
 
 
 @pytest.mark.parametrize(
