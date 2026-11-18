@@ -23,6 +23,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   external provider. (`BACKLOG #2595`)
 
 ### Changed
+- **A store path that names no file, or a Windows drive-relative one, is refused.** An empty
+  `[store].path`, or one such as `.` or `..`, anchored to a directory under the project root, and
+  `C:mf.db` resolved against a per-process current directory. Each is now refused when the
+  settings load, and as a `serve` or `supervise --db` before it is anchored, with the value
+  withheld. A plain relative path, an absolute one and `:memory:` are unchanged. (BACKLOG #5926)
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
   other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or

@@ -164,6 +164,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "store_path_refusal",
     "settings_file_path",
     "settings_error_detail",
     "keyless_opt_out_refusal",
@@ -752,19 +753,24 @@ def _check_revocation_attestation_pair(
 _SCHEMA_LOCK_TIMEOUT_MAX: Final[float] = float((2**31 - 1) // 1000)
 
 
-def store_path_refusal(value: str) -> str | None:
+def store_path_refusal(value: str, *, name: str = "[store].path") -> str | None:
     """Why ``value`` cannot be a SQLite store path the project root anchors, or None if it can
-    (BACKLOG #5926): an empty path, or a Windows drive-qualified relative one such as ``C:mf.db``.
-    Off Windows a path has no drive, so ``C:mf.db`` is an ordinary relative file name there."""
-    if not value.strip():
-        return (
-            "[store].path is empty; name the SQLite file, e.g. 'messagefoundry.db' "
-            "(a relative path resolves under [environments].base_dir)"
-        )
+    (BACKLOG #5926). ``name`` is the setting or flag the refusal names.
+
+    At least two shapes are refused. A path naming no file (empty, blank, ``.``, ``..``) anchors
+    to a directory, which passes an exists() guard as if it were a store. A Windows drive-relative
+    path such as ``C:mf.db`` resolves against that drive's per-process current directory, or,
+    joined under a root on another drive, drops the root. Off Windows a path has no drive, so
+    ``C:mf.db`` is an ordinary relative file name there. The value is withheld from the refusal,
+    as the file source's path refusals withhold theirs."""
     p = Path(value)
+    if not value.strip() or p.name in ("", ".."):
+        return (
+            f"{name} names no file (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
+        )
     if p.drive and not p.is_absolute():
         return (
-            f"[store].path {value!r} is drive-relative; on Windows give a fully-qualified "
+            f"{name} is drive-relative (value withheld); on Windows give a fully-qualified "
             "path (e.g. 'C:/data/mf.db') or a plain relative one (e.g. 'mf.db')"
         )
     return None
@@ -1178,12 +1184,10 @@ class StoreSettings(_Section):
     @classmethod
     def _anchorable_store_path(cls, value: str) -> str:
         # BACKLOG #5926 (and #5927's remaining harm): [store].path is joined under the project root
-        # (config/anchor.py) by serve and the offline store commands alike. An empty path joins to
-        # the root directory itself, which passes an exists() guard as if it were a store. A Windows
-        # drive-qualified relative path such as `C:mf.db` names no fixed file: it resolves against
-        # that drive's per-process current directory, or, joined under a root on another drive,
-        # drops the root. Refused here, at load, for every command that loads settings; supervise
-        # applies the same test to its own --db, which it anchors without them.
+        # (config/anchor.py) by serve and the offline store commands alike; store_path_refusal
+        # says which values no anchor can place. Refused here, at load, for every command that
+        # loads settings. serve and supervise anchor their --db before the load, so they apply the
+        # same test to the flag first.
         refusal = store_path_refusal(value)
         if refusal is not None:
             raise ValueError(refusal)

@@ -2859,6 +2859,7 @@ def _serve(args: argparse.Namespace) -> int:
         insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
+        store_path_refusal,
         uvicorn_trusted_hosts,
     )
     from messagefoundry.config.tls_policy import (
@@ -2910,6 +2911,12 @@ def _serve(args: argparse.Namespace) -> int:
     # Only pass flags the user actually supplied so they override env/file but an unset flag doesn't.
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
+        # BACKLOG #5926: tested before the join, since the anchored result is what the settings
+        # load sees, and an empty --db joined under the root is the root itself.
+        db_refusal = store_path_refusal(args.db, name="--db")
+        if db_refusal is not None:
+            print(f"error: {db_refusal}", file=sys.stderr)
+            return 2
         # A relative --db follows the root; an absolute one is honored as-is (AC-7). Resolved here so
         # it lands in [store].path the same way a file-set relative path is anchored below.
         anchored_db = anchor_under_root(args.db, root, cwd=cwd)
@@ -5471,10 +5478,11 @@ def _supervise(args: argparse.Namespace) -> int:
     # supervisor (not only via each child re-anchoring a relative --db). --service-config is forwarded raw
     # and each child serve resolves it under the forwarded --project-root (same precedence as serve).
     # BACKLOG #5926: the --db base is anchored here, before any settings load could refuse it, and
-    # each shard's path is derived from it, so test it the way [store].path is tested at load.
+    # each engine shard's store path is derived from it, so test it the way [store].path is tested
+    # at load.
     from messagefoundry.config.settings import store_path_refusal
 
-    db_refusal = store_path_refusal(args.db)
+    db_refusal = store_path_refusal(args.db, name="--db")
     if db_refusal is not None:
         print(f"error: {db_refusal}", file=sys.stderr)
         return 2
