@@ -2585,10 +2585,164 @@ def test_rule_3c_allows_bare_reads_the_allowlist_names(
 
 
 @pytest.mark.parametrize(
+    "args",
+    [
+        ["--get", "--show-names", "core.hooksPath", "/nope"],
+        ["--get", "--bool", "core.hooksPath", "/nope"],
+        ["--get", "--path", "core.hooksPath", "/nope"],
+        ["--get", "--type=bool", "core.hooksPath", "/nope"],
+        ["--get", "--type", "bool", "core.hooksPath", "/nope"],
+        ["--get", "--default", "x", "core.hooksPath", "/nope"],
+        ["--get", "--default=x", "core.hooksPath", "/nope"],
+        ["--get", "--file", ".git/config", "core.hooksPath", "/nope"],
+        ["--get", "-f", ".git/config", "core.hooksPath", "/nope"],
+    ],
+)
+def test_real_git_stores_nothing_for_a_get_read_with_an_option_value(
+    git_primary: Path, args: list[str]
+) -> None:
+    """The ground truth under #8240 item 51's value-taking read options: with a --get mode, the
+    word after the key is a pattern, never a value."""
+    _git_out(git_primary, "config", *args, check=False)
+    assert _git_out(git_primary, "config", "--get", "core.hooksPath", check=False) == ""
+
+
+def test_real_git_stores_a_value_after_a_display_flag_with_no_get_mode(git_primary: Path) -> None:
+    """Why the multi-argument read needs a --get mode, and a display flag alone is not one."""
+    probe = subprocess.run(
+        ["git", "config", "--show-names", "core.hooksPath", "/nope"],
+        cwd=git_primary,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if "unknown option" in probe.stderr:
+        pytest.skip(f"this git has no legacy --show-names: {probe.stderr.strip()}")
+    assert _git_out(git_primary, "config", "--get", "core.hooksPath") == "/nope"
+    _git_out(git_primary, "config", "--unset", "core.hooksPath")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # #5589 added step 1: a real multi-argument read, a --get mode then the key then a pattern.
+        "git config --get core.hooksPath /nope",
+        "git config --get-all core.hooksPath /x",
+        "git config --get-regexp alias.x st",
+        "git config --local --get core.worktree x.y",
+        "git --no-pager config --get alias.lg log",
+        "git config --get core.hooksPath /nope && echo ok",
+        # The scan unmasks a quoted span holding one bare word (BACKLOG #1069), and so does the shell.
+        'git config --get core.hooksPath "/nope"',
+        "git config --get core.hooksPath '/nope'",
+        # #8240 item 51: read options the allowlist refused.
+        "git config get --all core.hooksPath",
+        "git config get --show-names core.hooksPath",
+        "git config --get --show-names core.hooksPath /nope",
+        "git config --get --type=bool core.hooksPath",
+        "git config --get --type bool core.hooksPath",
+        "git config --get --default x core.hooksPath",
+        "git config --get --default=x core.hooksPath",
+        "git config --get --file .git/config core.hooksPath",
+        "git config --get --file=.git/config core.hooksPath",
+        "git config --get -f .git/config core.hooksPath",
+        "git config --path core.hooksPath",
+        "git config --bool core.hooksPath",
+    ],
+)
+def test_rule_3c_allows_a_multi_argument_read(
+    git_primary: Path, git_repos_file: Path, cmd: str
+) -> None:
+    assert_denied(run_gate(bash(DISARM_WRITE, cwd=git_primary), git_repos_file))  # control
+    assert run_gate(bash(cmd, cwd=git_primary), git_repos_file) is None, cmd
+    assert run_gate(bash(cmd, cwd=git_primary, tool="PowerShell"), git_repos_file) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # No --get mode: the word after the key is a value, and git stores it.
+        "git config --show-names core.hooksPath /nope",
+        "git config --bool core.hooksPath /nope",
+        "git config --path core.hooksPath /nope",
+        "git config --file .git/config core.hooksPath /nope",
+        "git config -f .git/config core.hooksPath /nope",
+        "git config --default x core.hooksPath /nope",
+        "git config --local core.hooksPath /nope",
+        # A --get read whose rest is not one plain word.
+        "git config --get core.hooksPath /nope extra",
+        'git config --get core.hooksPath "/nope x"',
+        "git config --get core.hooksPath '/nope x'",
+        'git config --get core.hooksPath "$HOME"',
+        "git config --get core.hooksPath $HOME",
+        "git config --get core.hooksPath ${x}",
+        "git config --get core.hooksPath -x",
+        "git config --get core.hooksPath --unset",
+        "git config --get core.hooksPath /x$(git config core.hooksPath /dev/null)",
+        "git config --get core.hooksPath x`git config core.hooksPath /dev/null`",
+        "git config --get core.hooksPath x>out",
+        "git config --get core.hooksPath x<(git config core.hooksPath /dev/null)",
+        "git config --get core.hooksPath x\\ y",
+        "git config --get core.hooksPath x#y z",
+        "git config --get core.hooksPath ~/x",
+        "git config --get core.hooksPath {a,b}",
+        "git config --get core.hooksPath @x",
+        "git config --get core.hooksPath x*",
+        "git config --get core.hooksPath %X%",
+        "git config --get core.hooksPath x^",
+        # A value-taking option whose value is an option, or not one plain word.
+        "git config --default --get core.hooksPath /nope",
+        "git config --file --get core.hooksPath /nope",
+        "git config -f --get core.hooksPath /nope",
+        "git config --type --get core.hooksPath /nope",
+        "git config --type=str --get core.hooksPath /nope",
+        'git config --get --file "a b" core.hooksPath /nope',
+        "git config --get --default $(git config core.hooksPath /dev/null) core.hooksPath",
+        # -c and --config-env stay overrides whatever follows them.
+        "git -c core.hooksPath=/x config --get core.hooksPath /nope",
+        "git --config-env=core.hooksPath=X config --get alias.x y",
+    ],
+)
+def test_rule_3c_still_denies_writes_beside_the_multi_argument_read(
+    git_primary: Path, git_repos_file: Path, cmd: str
+) -> None:
+    """The negative controls for the read above: each of these may store, or hides a second word."""
+    for tool in ("Bash", "PowerShell"):
+        reason = assert_denied(run_gate(bash(cmd, cwd=git_primary, tool=tool), git_repos_file))
+        assert "SHARED git configuration" in reason, (tool, cmd)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        'git config -f ".git/config"--unset core.hooksPath',
+        'git config --file ".git/config"--unset core.hooksPath',
+        'git config --local -f ".git/config"--unset core.hooksPath',
+        'git config -f ".git/config"--unset-all alias.lg',
+        'git config --get core.hooksPath "x"--unset',
+        'git config --get core.hooksPath "x"y',
+        "git config --get core.hooksPath 'x'y",
+    ],
+)
+def test_rule_3c_a_quote_joined_to_the_next_word_gets_no_added_reading(
+    git_primary: Path, git_repos_file: Path, cmd: str
+) -> None:
+    """The scan joins an unmasked quoted word to the text after it; PowerShell splits them, so the
+    first spelling REMOVES core.hooksPath there (review round 91d27d05d7). origin/main denies each."""
+    for tool in ("Bash", "PowerShell"):
+        reason = assert_denied(run_gate(bash(cmd, cwd=git_primary, tool=tool), git_repos_file))
+        assert "SHARED git configuration" in reason, (tool, cmd)
+
+
+@pytest.mark.parametrize(
     "cmd",
     [
         "git config --get alias.x y\rgit config core.hooksPath /dev/null",
         "git config --get alias.x\rgit config core.hooksPath /dev/null",
+        "git config --get core.hooksPath y \rgit config core.hooksPath /dev/null",
+        "git config --get core.hooksPath y\r",
+        "git config --get --default x\rcore.hooksPath y",
+        "git config --get --file\t.git/config core.hooksPath y\rgit config core.hooksPath /x",
     ],
 )
 def test_rule_3c_a_read_does_not_hide_a_second_powershell_statement(
