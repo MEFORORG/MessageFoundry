@@ -61,10 +61,11 @@ artifacts — **no engine code changes**:
    like the npm-audit job — the **full** tree, since the extension is esbuild-bundled with no runtime npm
    deps, so its build toolchain is the only npm supply chain worth inventorying). Both are finalized by the
    same helper and retained as CI artifacts. *Amended 2026-11-17 (PR 3039):* the `cyclonedx-npm`
-   version is now whatever [`ci/npm-tools/package.json`](../../ci/npm-tools/package.json) pins, not
-   `6.0.0`, and the 7.x line it moved to defaults to CycloneDX 1.7 and no longer installs its
-   validator. `security.yml` therefore passes `--spec-version 1.6 --validate`; why, and what a failure
-   there does, is that step's comment.
+   version is the one [`ci/npm-tools/package.json`](../../ci/npm-tools/package.json) pins, not
+   `6.0.0`. That file also declares the schema-validator packages the tool's major-7 line no longer
+   installs, and `security.yml` passes `--spec-version 1.6 --validate`, so the extension SBOM stays on
+   1.6 and a run fails when the validator is missing rather than skipping validation. Why, and what a
+   failure there does, is that step's comment; removing those packages breaks the step.
 3. **SBOM quality gate.** Score the Python engine and npm extension SBOMs with `sbomqs` (pinned `v2.0.11`,
    checksum-verified) — advisory (`sbomqs score -b` + NTIA breakdown), printed to the CI/release log, never
    blocking. *Amended 2026-09-30 (owner ruling, BACKLOG #1698):* the SCORE stays advisory, but in
