@@ -68,9 +68,9 @@ __all__ = [
     "ReferenceColumnMismatch",
     "ReferenceKeyRefused",
     "ReferenceRowCeilingExceeded",
+    "ReferenceStatementRefused",
     "ReferenceStatementTimedOut",
     "ReferenceStatementTimeoutRefused",
-    "ReferenceStatementRefused",
     "ReferenceSyncError",
     "ReferenceSyncRunner",
 ]
@@ -119,6 +119,8 @@ class ReferenceKeyRefused(ReferenceSyncError):
 
 #: The SQLSTATE a statement that ran past its ODBC query timeout fails with.
 _STATEMENT_TIMEOUT_STATE = "HYT00"
+#: The SQLSTATEs a driver that refuses the query timeout on a cursor raises (docs/CONNECTIONS.md).
+_CURSOR_TIMEOUT_REFUSALS = frozenset({"HYC00", "HY092"})
 
 
 @dataclass(frozen=True)
@@ -339,6 +341,10 @@ async def _load_database_source(
     )
 
     where = "" if name is None else f"reference set {name!r}: "
+    refused_text = (
+        f"{where}the database driver refused statement_timeout; set statement_timeout = 0"
+        " on this DatabaseRef if its driver cannot take one"
+    )
     server = str(settings.get("server", ""))
     # `egress` is required (vault BACKLOG #2605): a caller that passed none used to skip this check.
     # The same [egress].allowed_db rule as a db_lookup, so the two cannot drift.
@@ -401,22 +407,28 @@ async def _load_database_source(
         except NegativeAckError:
             timeout_refused = True  # raised below, outside the handler, so no chain is carried
         if timeout_refused:
-            raise ReferenceStatementTimeoutRefused(
-                f"{where}the database driver refused statement_timeout; set statement_timeout = 0"
-                " on this DatabaseRef if its driver cannot take one"
-            )
+            raise ReferenceStatementTimeoutRefused(refused_text)
         timed_out = False
         cur: Any = None
         try:
-            cur = await conn.cursor()
             try:
-                await cur.execute(statement)
-                columns = [d[0] for d in cur.description]
-                rows = await _fetch_reference_rows(cur, limit, name)
+                cur = await conn.cursor()
             except Exception as exc:
-                if _sqlstate(exc) != _STATEMENT_TIMEOUT_STATE:
+                # A driver that takes the connection timeout but refuses it on a cursor refuses
+                # every cursor (docs/CONNECTIONS.md, the statement_timeout facts).
+                if not statement_timeout or _sqlstate(exc) not in _CURSOR_TIMEOUT_REFUSALS:
                     raise
-                timed_out = True  # raised below, outside the handler: driver text is withheld
+                timeout_refused = True  # raised below, outside the handler
+            if cur is not None:
+                try:
+                    await cur.execute(statement)
+                    columns = [d[0] for d in cur.description]
+                    rows = await _fetch_reference_rows(cur, limit, name)
+                except Exception as exc:
+                    # Read as this setting firing only where one was set.
+                    if not statement_timeout or _sqlstate(exc) != _STATEMENT_TIMEOUT_STATE:
+                        raise
+                    timed_out = True  # raised below, outside the handler: driver text is withheld
         finally:
             # A cancellation returns the connection only once its statement and cursor close have
             # ended (BACKLOG #2394). The pool close below stops waiting for such a held connection
@@ -426,6 +438,8 @@ async def _load_database_source(
             await _close_and_release(pool, conn, cur)
     finally:
         await _close_pool_bounded(pool, "DATABASE reference source")
+    if timeout_refused:
+        raise ReferenceStatementTimeoutRefused(refused_text)
     if timed_out:
         raise ReferenceStatementTimedOut(
             f"{where}the DatabaseRef statement ran past statement_timeout={statement_timeout}s;"
@@ -458,7 +472,13 @@ def _rows_to_snapshot(
             )
     key_at = columns.index(key_col)
     value_at = None if value_col is None else columns.index(value_col)
-    others = [(c, i) for i, c in enumerate(columns) if c != key_col]
+    others = [(c, i) for i, c in enumerate(columns) if c != key_col] if value_at is None else []
+    if len({c for c, _ in others}) != len(others):
+        # The dict shape would keep only the last of two same-named columns.
+        raise ReferenceColumnMismatch(
+            f"{where}the statement's result holds a column name twice and no value_column is"
+            " set; alias the columns apart, or set value_column; refusing the snapshot"
+        )
     out: dict[str, Any] = {}
     for ordinal, row in enumerate(rows):
         raw_key = row[key_at]

@@ -569,7 +569,8 @@ the next reader does not re-derive the wrong precedent from the same comment.
   a generic connection whose driver is Microsoft's; on every other generic driver, psqlODBC and
   MySQL among them, it defaults to `0` (`docs/CONNECTIONS.md`). So a pool reaches this state when
   its `statement_timeout` is `0`, which is the default on those generic drivers. A
-  `DatabaseRef` reference sync sets none, so it is still always in this state. The rest of this
+  `DatabaseRef` reference sync set none until BACKLOG #5891 gave it one, 30 s unset, by the
+  same rule. The rest of this
   paragraph, and the one below, hold for every pool in this state. A cancelled borrow waits without bound for its running call before its cursor
   closes, and holds its pool slot for all of that time. The statement's own worker thread is held
   for that time too, as it was before the gate; the close adds no thread to it.

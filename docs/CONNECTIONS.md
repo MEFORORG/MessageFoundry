@@ -2677,7 +2677,7 @@ error can hold a reference key. The class names above are what tell those failur
 column and key refusals are also logged with their text, which names the set, the setting and row
 ordinals, never a column's name or a key.
 
-Neither control is read-only authority, for the reasons in the table above, and the sync pool is
+Neither the statement gate nor the row ceiling is read-only authority, for the reasons in the table above, and the sync pool is
 autocommit. Give the `DatabaseRef` login `SELECT` on what the statement reads, and nothing else. The
 engine probes that login's role membership the first time a sync opens its pool, and warns on an
 over-grant; see *The engine probes a lookup or reference login for write roles* below.

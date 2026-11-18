@@ -179,6 +179,29 @@ async def test_a_driver_that_refuses_the_timeout_fails_as_its_own_class(
     assert info.value.__context__ is None
 
 
+async def test_a_cursor_refusing_the_timeout_fails_as_the_refusal_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _patch_pool(monkeypatch, [("A", "1")])
+
+    async def refuse_cursor() -> _Cursor:
+        raise RuntimeError("HY092", "[HY092] invalid attribute")
+
+    monkeypatch.setattr(pool.conn, "cursor", refuse_cursor)
+    with pytest.raises(ReferenceStatementTimeoutRefused) as info:
+        await _load_database_source(dict(_BASE), _EGRESS, name="codes")
+    assert info.value.__context__ is None
+
+
+async def test_a_hyt00_with_no_timeout_set_is_not_read_as_this_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _patch_pool(monkeypatch, [("A", "1")])
+    pool.conn.cur.execute_error = RuntimeError("HYT00", "[HYT00] timeout")
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await _load_database_source({**_BASE, "statement_timeout": 0}, _EGRESS, name="codes")
+
+
 def test_databaseref_carries_and_checks_statement_timeout() -> None:
     spec = DatabaseRef(server="s", database="d", statement="SELECT 1 AS k", key_column="k")
     assert reference_statement_timeout(spec.settings) == DEFAULT_DB_STATEMENT_TIMEOUT
@@ -241,6 +264,23 @@ async def test_a_key_column_the_result_holds_twice_is_refused(
     _patch_pool(monkeypatch, [("A", "X", "1")], columns=("code", "code", "value"))
     with pytest.raises(ReferenceColumnMismatch, match="key_column names more than one"):
         await _load_database_source(dict(_BASE), _EGRESS, name="codes")
+
+
+async def test_a_doubled_column_in_the_dict_shape_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Red before the fix: of two ``name`` columns the dict kept only the last."""
+    _patch_pool(monkeypatch, [("A", "x", "y")], columns=("code", "name", "name"))
+    with pytest.raises(ReferenceColumnMismatch, match="holds a column name twice"):
+        await _load_database_source(dict(_BASE), _EGRESS, name="codes")
+
+
+async def test_a_doubled_other_column_is_fine_with_a_value_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_pool(monkeypatch, [("A", "x", "y", "1")], columns=("code", "name", "name", "value"))
+    rows = await _load_database_source({**_BASE, "value_column": "value"}, _EGRESS, name="codes")
+    assert rows == {"A": "1"}
 
 
 async def test_a_null_key_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:

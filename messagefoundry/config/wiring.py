@@ -1200,7 +1200,7 @@ def DatabaseRef(
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
     max_rows: int | EnvRef = DEFAULT_REFERENCE_MAX_ROWS,  # refuse a larger result; 0 = off (#2617)
-    statement_timeout: int | EnvRef | None = None,  # whole s, 0 = no limit, unset = 30 (#5756)
+    statement_timeout: int | EnvRef | None = None,  # whole s, 0 = no limit, unset = 30 (#5891)
     tls_hop_attested: bool = False,
     tls_hop_attested_reason: str | None = None,
 ) -> ReferenceSourceSpec:
@@ -1307,7 +1307,7 @@ def DatabaseRef(
             rows_refusal = str(exc)
         if rows_refusal is not None:
             raise WiringError(rows_refusal)
-    # statement_timeout by the same rule and for the same reason (BACKLOG #5756).
+    # statement_timeout by the same rule and for the same reason (BACKLOG #5891; the rule is #5756).
     if statement_timeout is not None and not isinstance(statement_timeout, EnvRef):
         from messagefoundry.transports.database import _statement_timeout
 
