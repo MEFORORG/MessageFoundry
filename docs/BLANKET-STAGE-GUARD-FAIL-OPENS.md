@@ -791,6 +791,14 @@ Notes on these rows:
   (`git -C "x" add "-A"`, `git --config-env="a=B" add "-A"`): the blanked value splits in two and its
   closing quote is read as the subcommand. tests/test_blanket_stage_config_env.py pins those as
   strict xfails.
+- **Widening the skip list removes no deny.** BACKLOG #5450 added `--config-env`, `--attr-source`
+  and `--shallow-file` to the list. Read with the wider list alone, `git --attr-source HEAD log add
+  -A` resolves to `log`, which is read-only, and would be allowed; read with the list before #5450,
+  it resolves to `HEAD` and is denied on the word `add`. The guard judges each segment under both
+  lists and denies when either reading denies, so that command is still refused. git takes the
+  option's value as the next argument (measured on git 2.55.0 for this item) and so runs `log`,
+  which cannot stage: this is a false deny, kept because a guard may only tighten.
+  tests/test_blanket_stage_config_env.py pins it and two rows of the same shape as denies.
 - **Rows 5 and 8** are a stage or a commit scoped to one directory. The guard cannot see the
   working directory, so it reads the dot as the whole tree.
 - **The last two rows** hold the blanket spelling in a trailing comment. The `add` rules and the

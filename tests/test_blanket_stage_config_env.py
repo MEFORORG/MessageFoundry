@@ -51,16 +51,14 @@ BLANKET = [
 SCOPED = [
     pytest.param("git --attr-source HEAD add src/x.py", id="attr-source-scoped"),
     pytest.param('git --config-env user.name=GN add "src/x.py"', id="config-env-scoped-quoted"),
-    # The direction this change moves from deny to allow, pinned: git runs `log` here, which
-    # cannot stage, and the guard used to read `HEAD` as the subcommand and deny on the word `add`.
-    pytest.param("git --attr-source HEAD log add -A", id="attr-source-then-read-only-subcommand"),
     # The reverted quote-skip loop denied these scoped stages; they must stay allowed.
     pytest.param('git -C "." add src/x.py', id="dash-C-quoted-dot-scoped"),
     pytest.param("git --shallow-file x add src/x.py", id="shallow-file-scoped"),
 ]
 
 
-# STILL OPEN (see Resolve-GitSubcommand's comment): a quoted value is blanked into two tokens.
+# STILL OPEN (see the comment above $GLOBAL_VALUE_OPTIONS in the hook): a quoted value is blanked
+# into two tokens.
 _QUOTED_VALUE_OPEN = pytest.mark.xfail(
     strict=True, reason="a quoted global-option value is split by the blanked view (still open)"
 )
@@ -86,3 +84,21 @@ def test_a_blanket_stage_behind_config_env_or_attr_source_is_denied(command: str
 @pytest.mark.parametrize("command", SCOPED)
 def test_a_scoped_or_read_only_command_behind_them_is_allowed(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
+
+
+# NO DENY MAY BE LOST. The guard judges a segment under BOTH skip lists, the one before this change
+# and the widened one, and denies if either reading denies, so widening the list can only add
+# denies. These rows were denied before the widening; read with the widened list alone, the
+# subcommand resolves to a read-only word and the segment would be allowed. git runs `log` for the
+# first row, which stages nothing, so the deny is a false one kept on purpose: a guard may only
+# tighten.
+STILL_DENIED_UNDER_THE_OLD_LIST = [
+    pytest.param("git --attr-source HEAD log add -A", id="attr-source-then-read-only-subcommand"),
+    pytest.param("git --config-env x=V status add .", id="config-env-then-read-only-subcommand"),
+    pytest.param("git --shallow-file f diff stage -u", id="shallow-file-then-read-only-subcommand"),
+]
+
+
+@pytest.mark.parametrize("command", STILL_DENIED_UNDER_THE_OLD_LIST)
+def test_widening_the_skip_list_loses_no_deny(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
