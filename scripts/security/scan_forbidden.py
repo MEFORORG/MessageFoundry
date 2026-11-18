@@ -2177,6 +2177,11 @@ def _tracked_under(root: Path) -> set[str] | None:
     return tracked
 
 
+#: How a --path hit for a named root that does not exist ends. ``main`` leaves such a hit out of the
+#: summary's unread count, since nothing was there to be set aside.
+_NO_ROOT = "does not exist, so its files were not scanned (fail closed)"
+
+
 def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
     """Every file under the directory ``raw``, keyed by its root-relative posix path (BACKLOG #5585).
     SKIP_DIRS is pruned as ``_tracked_under`` answers: where git lists the tracked files, only for
@@ -2202,7 +2207,7 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
             return  # Removed after it was listed (a cache cleared mid-walk): nothing left to read.
         name = raw if name == "." else name
         if exc.errno == errno.ENOENT:
-            errors.append(f"{name}/:0: does not exist, so its files were not scanned (fail closed)")
+            errors.append(f"{name}/:0: {_NO_ROOT}")
             return
         why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
         errors.append(f"{name}:0: unreadable ({why}), so its content was not scanned (fail closed)")
@@ -3105,9 +3110,10 @@ def main(argv: list[str]) -> int:
         )
         return 2
     scanned = 0
-    # Each walk hit is a named path or a directory under it whose files were not read: one the walk
-    # could not list, or a named root that does not exist. The summary counts each as one unread entry.
-    unread = unreadable = len(hits)
+    # A walk hit for a directory the walk could not list is counted as unread; one for a named root
+    # that does not exist is not, since nothing was there. Both still fail the run as unreadable.
+    unread = sum(not h.endswith(_NO_ROOT) for h in hits)
+    unreadable = len(hits)
     for abs_path, rel in candidates:
         # SKIP_DIRS is applied by the --path walk alone (_walk); the tracked and staged scans prune no
         # directory.
