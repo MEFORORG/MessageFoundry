@@ -174,6 +174,81 @@ def test_shard_db_composes_under_project_root(tmp_path: object) -> None:
         assert Path(spec.db_path).name in {"mefor_a.db", "mefor_b.db"}
 
 
+def _supervise_captured(
+    tmp_path: Path,
+    monkey: pytest.MonkeyPatch,
+    argv: list[str],
+) -> dict[str, object]:
+    """Run ``supervise`` through its own parser up to the fleet start and return what the fleet
+    would be started with. The gates it passes on the way are provisioned as in the test above."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.crypto import generate_key
+    from tests._phi_gate_provisions import (
+        make_syslog_ca_and_crl,
+        setenv_declared_egress,
+        setenv_verified_log_forwarding,
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _fake_supervise(config: str, *, db_base: str, base_port: int, **_kw: object) -> int:
+        captured["db_base"] = db_base
+        captured["base_port"] = base_port
+        return 0
+
+    monkey.setattr("messagefoundry.pipeline.supervisor.supervise", _fake_supervise)
+    monkey.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    setenv_verified_log_forwarding(monkey, make_syslog_ca_and_crl(tmp_path))
+    setenv_declared_egress(monkey)
+    monkey.setattr(cli, "configure_logging", lambda *args, **kwargs: False)
+    args = cli._build_parser()[0].parse_args(["supervise", "--env", "prod", *argv])
+    assert cli._supervise(args) == 0
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("flags", "env", "db_name", "port"),
+    [
+        pytest.param([], {}, "site.db", 9100, id="settings-file"),
+        pytest.param(
+            [],
+            {"MEFOR_STORE_PATH": "envsite.db", "MEFOR_API_PORT": "9200"},
+            "envsite.db",
+            9200,
+            id="mefor-env",
+        ),
+        pytest.param(
+            ["--db", "flag.db", "--base-port", "9300"], {}, "flag.db", 9300, id="flags-override"
+        ),
+    ],
+)
+def test_supervise_takes_store_path_and_api_port_from_settings_without_flags(
+    tmp_path: Path,
+    flags: list[str],
+    env: dict[str, str],
+    db_name: str,
+    port: int,
+) -> None:
+    """BACKLOG #5817: ``supervise --db`` and ``--base-port`` once defaulted to ``messagefoundry.db``
+    and 8765, so [store].path, [api].port and their MEFOR_ variables never reached the engine
+    shards. Absent flags now leave the settings' values in force; a given flag still overrides."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[store]\npath = "site.db"\n\n[api]\nport = 9100\n', encoding="utf-8")
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.delenv("MEFOR_STORE_PATH", raising=False)
+        monkey.delenv("MEFOR_API_PORT", raising=False)
+        for name, value in env.items():
+            monkey.setenv(name, value)
+        argv = ["--service-config", str(svc), "--project-root", str(root), *flags]
+        captured = _supervise_captured(tmp_path, monkey, argv)
+    finally:
+        monkey.undo()
+    assert captured == {"db_base": str(root / db_name), "base_port": port}
+
+
 # --- lifecycle (fake process) ------------------------------------------------
 
 

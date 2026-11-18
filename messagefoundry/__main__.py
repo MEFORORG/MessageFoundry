@@ -366,15 +366,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     supervise.add_argument(
         "--db",
-        default="messagefoundry.db",
-        help="base store path; each shard gets <stem>_<shard>.db (a single default shard keeps the "
-        "bare path)",
+        default=None,
+        help="base store path (overrides [store].path); each shard gets <stem>_<shard>.db (a single "
+        "default shard keeps the bare path)",
     )
     supervise.add_argument(
         "--base-port",
         type=int,
-        default=8765,
-        help="API port for the first shard; subsequent shards get base+1, base+2, ... (sorted order)",
+        default=None,
+        help="API port for the first shard (overrides [api].port); subsequent shards get base+1, "
+        "base+2, ... (sorted order)",
     )
     supervise.add_argument(
         "--env",
@@ -5490,8 +5491,8 @@ def _supervise(args: argparse.Namespace) -> int:
     # forwarder (BACKLOG #2356).
     configure_logging("INFO")
 
-    # ADR 0050 AC-9: anchor the discovery --config and the --db base under the project root HERE, before
-    # discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
+    # ADR 0050 AC-9: anchor the discovery --config here, and the db base once the settings load below
+    # has merged it, both before discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
     # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
     # supervisor (not only via each child re-anchoring a relative --db). --service-config is forwarded raw
     # and each child serve resolves it under the forwarded --project-root (same precedence as serve).
@@ -5499,9 +5500,6 @@ def _supervise(args: argparse.Namespace) -> int:
     root = resolve_project_root(args.project_root, cwd=cwd)
     config = anchor_under_root(args.config, root, cwd=cwd)
     assert config is not None  # args.config always has a string default
-    db_base = anchor_under_root(args.db, root, cwd=cwd)
-    assert db_base is not None  # supervise --db has a string default ("messagefoundry.db")
-
     # Resolve the store backend up front so the no-split-store guard (ADR 0063) can refuse a >1-shard
     # config on SQLite BEFORE any subprocess is spawned. --service-config is anchored the same way each
     # child resolves it; --db only sets the SQLite path, never the backend.
@@ -5520,8 +5518,14 @@ def _supervise(args: argparse.Namespace) -> int:
     # here. Each engine shard is still started with the flag itself.
     # --db goes in as [store].path, as the offline commands merge it (BACKLOG #5926): every engine
     # shard is started with a --db derived from it, which overrides the file's value, so the load
-    # judges the path the shards use rather than one none of them reads.
-    supervise_cli: dict[str, dict[str, object]] = {"store": {"path": args.db}}
+    # judges the path the shards use rather than one none of them reads. --db and --base-port go in
+    # only when given, as `serve` passes its flags, so [store].path, [api].port and their MEFOR_
+    # variables reach the engine shards when the flags are absent (BACKLOG #5817).
+    supervise_cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        supervise_cli["store"] = {"path": args.db}
+    if args.base_port is not None:
+        supervise_cli["api"] = {"port": args.base_port}
     if args.env is not None:
         supervise_cli["ai"] = {"environment": args.env}
     settings, detail = _load_service_settings(service_config, cli=supervise_cli)
@@ -5535,10 +5539,17 @@ def _supervise(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import StoreBackend, store_path_refusal
 
     if settings.store.backend == StoreBackend.SQLITE:
-        db_refusal = store_path_refusal(args.db, name="--db")
+        db_refusal = (
+            store_path_refusal(settings.store.path)
+            if args.db is None
+            else store_path_refusal(args.db, name="--db")
+        )
         if db_refusal is not None:
             print(f"error: {db_refusal}", file=sys.stderr)
             return 2
+    # The merged [store].path, from --db or the settings, anchored as a --db was before #5817.
+    db_base = anchor_under_root(settings.store.path, root, cwd=cwd)
+    assert db_base is not None  # [store].path is a str, never None
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
     # below: every shard would refuse, and the supervisor would only restart them.
@@ -5816,7 +5827,7 @@ def _supervise(args: argparse.Namespace) -> int:
             config,
             store_backend=settings.store.backend,
             db_base=db_base,
-            base_port=args.base_port,
+            base_port=settings.api.port,
             env=args.env,
             service_config=args.service_config,
             project_root=args.project_root,
