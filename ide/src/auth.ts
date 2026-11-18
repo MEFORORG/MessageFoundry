@@ -279,6 +279,21 @@ export async function withAuth<T>(
   url: string,
   call: (token: string) => Promise<T>,
 ): Promise<T | undefined> {
+  return await withAuthAdopting(ctx, url, call);
+}
+
+/**
+ * {@link withAuth}, for a `call` that may replace its own token mid-call, as a step-up re-proof
+ * does. The call reports the token it now holds through `adopt` (BACKLOG #5960). A 401 on that
+ * token then reads as this call's own session ending, and signs in again. Without it, the cache
+ * holding the adopted token would read as a sign-in elsewhere, and the retry would spend one of the
+ * three calls on a token the engine had just refused.
+ */
+async function withAuthAdopting<T>(
+  ctx: vscode.ExtensionContext,
+  url: string,
+  call: (token: string, adopt: (token: string) => void) => Promise<T>,
+): Promise<T | undefined> {
   if (refuseDisallowedTarget(url)) {
     return undefined;
   }
@@ -292,7 +307,9 @@ export async function withAuth<T>(
   // session on the engine with no client holding it -- and otherwise by signing in again.
   for (let attempt = 0; ; attempt++) {
     try {
-      return await call(token);
+      return await call(token, (adopted) => {
+        token = adopted;
+      });
     } catch (e) {
       if (!(e instanceof HttpError && e.status === 401) || attempt >= 2) {
         throw e;
@@ -330,7 +347,7 @@ export async function withStepUpAuth<T>(
   url: string,
   call: (token: string) => Promise<T>,
 ): Promise<T | undefined> {
-  const host: StepUpHost = {
+  const host: Omit<StepUpHost, "storeToken"> = {
     promptPassword: async (signal, retry) =>
       await vscode.window.showInputBox({
         prompt:
@@ -354,9 +371,16 @@ export async function withStepUpAuth<T>(
       const reply = await postJson<{ token?: unknown }>(url, "/me/reauth", body, token, SIGN_IN_TIMEOUT_MS);
       return typeof reply.token === "string" ? reply.token : undefined;
     },
-    storeToken: async (token) => {
-      await ctx.secrets.store(secretKey(url), token);
-    },
   };
-  return await withAuth(ctx, url, (token) => withStepUp(token, call, host));
+  return await withAuthAdopting(ctx, url, (token, adopt) =>
+    withStepUp(token, call, {
+      ...host,
+      // The re-proof ended the token withAuth handed in, so withAuth is told which one this call
+      // now holds: a 401 on it is this session ending, not a sign-in elsewhere (BACKLOG #5960).
+      storeToken: async (rotated) => {
+        adopt(rotated);
+        await ctx.secrets.store(secretKey(url), rotated);
+      },
+    }),
+  );
 }
