@@ -11709,8 +11709,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     own fingerprint (``active_key_id``, stored scheme-tagged, BACKLOG #3421), never the sub-key (ADR
     0196 AC-7).
 
-    **What the order of the steps guarantees (BACKLOG #3737).** The rotation record opens before
-    either data pass, the audit range rolls after both, and the stamp and the record's close come
+    **What the order of the steps guarantees (BACKLOG #3737).** The rotation record opens inside
+    the store open, before its first write under the key, on every store (BACKLOG #4936), so before
+    either data pass too; the audit range rolls after both, and the stamp and the record's close come
     last, on a run with no skip, an uploads directory both its pre-check and its uploads pass could
     list (BACKLOG #4940; a listable directory that is not the one holding the uploads passes both,
     which docs/PHI.md states) and a good roll. One it cannot list at the start refuses before
@@ -11868,16 +11869,26 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # A key the open cannot resolve, or a store hop the posture refuses, exits 2 as one at
         # resolve_active_key above does. vault_transit mode never gets here (BACKLOG #2109).
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
-        store = await _open_store_or_refuse(open_store(settings.store, posture=posture))
+        today = datetime.datetime.now(tz=datetime.UTC).date().isoformat()
+        # Whether the record names this key: a run with the key already in use opens none.
+        record_named = False
+
+        async def open_record(opening: object) -> None:
+            # BACKLOG #3737, #4936: inside the store open, before its first write under the key,
+            # so a kill after it, the open's own writes and either data pass
+            # included, leaves any record it opened open until a run closes it.
+            nonlocal record_named
+            # Every backend's store has cipher_info(); the hook is typed for any of them.
+            info = getattr(opening, "cipher_info", None)
+            key = info().active_key_id if callable(info) else None
+            if isinstance(opening, SecretRotationMetaStore) and isinstance(key, str) and key:
+                record_named = await open_rotation_record(opening, key, today)
+
+        store = await _open_store_or_refuse(
+            open_store(settings.store, posture=posture, before_first_write=open_record)
+        )
         try:
-            today = datetime.datetime.now(tz=datetime.UTC).date().isoformat()
             key_id = store.cipher_info().active_key_id
-            # BACKLOG #3737: before either data pass, so a kill or an abort in one leaves it open too.
-            # The store open above can already have written under this key.
-            # Whether it names this key: a run with the key already in use opens none.
-            record_named = False
-            if isinstance(store, SecretRotationMetaStore) and key_id:
-                record_named = await open_rotation_record(store, key_id, today)
             count = await store.reencrypt_to_active()
             # Vault BACKLOG #5635: what the store pass left under a key it holds and could not
             # re-seal, for the note below. A record under a key it does not hold aborted the pass.

@@ -764,10 +764,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # selector, and "ad" stays in the allow-list only so the ENGINE (_dispatch_login) is the
         # single point that refuses and audits it. Directory accounts sign in by Windows SSO or
         # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth
-        # (and the JSON /me/reauth).
+        # (and the JSON /me/reauth). A NUL name (BACKLOG #5342): pinned by
+        # test_ui_passkey_body_refusals.py::test_the_form_sign_in_refuses_a_nul_username_before_the_store.
+
+        def _refused() -> Response:
+            # Pinned by test_ui_passkey_body_refusals.py::
+            # test_the_combined_passkey_sign_in_refuses_a_nul_username_and_ends_its_challenge.
+            refused = RedirectResponse("/ui/login?e=bad", status_code=303)
+            if handle:
+                clear_passkey_sign_in_cookie(refused, request)
+            return refused
+
         provider_value = form.get("provider", "local")
         if provider_value not in ("local", "ad"):
-            return RedirectResponse("/ui/login?e=bad", status_code=303)
+            return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,
         # the handle of its challenge the cookie the begin leg set; both or neither. Clamped, so an
         # oversized assertion is simply an invalid one.
@@ -795,10 +805,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             passkey_challenge=staged.challenge if staged is not None else None,
         )
         if not outcome.ok or outcome.token is None:
-            refused = RedirectResponse("/ui/login?e=bad", status_code=303)
-            if handle:
-                clear_passkey_sign_in_cookie(refused, request)
-            return refused
+            return _refused()
         # A must-change account goes straight to the browser rotation page (L4b) — every other
         # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
         # second-factor page for the same reason (ASVS 6.3.3). must_change comes first for an

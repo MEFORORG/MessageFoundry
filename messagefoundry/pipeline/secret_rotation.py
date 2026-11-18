@@ -277,9 +277,15 @@ async def open_rotation_record(
     meta_store: SecretRotationMetaStore, key_id: str, day: str, *, keep_another: bool = False
 ) -> bool:
     """Record that ``rotate-key`` is moving this store to the DEK ``key_id``, before either data
-    pass, so a crash or a failed step in one leaves the record standing (BACKLOG #3737). The store
-    open has run by then and can already have written under the key. A ``serve`` start calls it too,
-    for a changed key the keyed audit chain has not rolled to (BACKLOG #4942), with ``keep_another``:
+    pass, so a crash or a failed step in one leaves the record standing (BACKLOG #3737).
+    ``rotate-key`` calls it from the store open's ``before_first_write`` hook (BACKLOG #4936), so
+    before the open's first write under the key. Steps that write nothing under the key can run
+    before it, at least the schema step, the store id pin check and, on SQL Server, the database
+    option switch. A ``serve`` start calls it too, after its own open has written under the key,
+    through :func:`reconcile_rotation_meta`, which says when: at least for a changed key the keyed
+    audit chain has not rolled to, unless the record already names that key or cannot be read,
+    and for one it has rolled to while a record stands open for another key (BACKLOG #4942). It
+    passes ``keep_another``:
     it then writes nothing over a record open for another key. That record holds its own key, which a
     run may have rolled the chain to with an upload still under the prior key, so replacing it would
     let a later start on that key stamp it. ``rotate-key`` replaces it, keeping its dates. A start on
@@ -338,23 +344,21 @@ async def close_rotation_record(meta_store: SecretRotationMetaStore, day: str) -
 
 #: The WARNING a start logs when it opened the rotation record itself (BACKLOG #4942).
 _OPENED_AT_START = (
-    "secret rotation: the store key in use differs from its stamp, or has none, and the audit "
-    "chain has not been rolled to it, so no `messagefoundry rotate-key` run has completed on it. A "
+    "secret rotation: the store key in use is not confirmed by its stamp, and the open did not "
+    "find the audit chain rolled to it. A "
     "rotation record was opened for it, its rotation date was not stamped and its age was not "
     "reset. Stop the engine and run `messagefoundry rotate-key`, with the prior key in "
-    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, until it exits 0. If it refuses at its audit chain step, "
-    "its error says whether a re-run can clear that, and the way out where none can."
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED."
 )
 
 #: The WARNING a start logs when it held a key and kept a record open for another key (BACKLOG
 #: #4942): see :func:`open_rotation_record`'s ``keep_another``.
 _HELD_FOR_ANOTHER_RECORD = (
-    "secret rotation: the store key in use differs from its stamp, or has none, while the "
+    "secret rotation: the store key in use is not confirmed by its stamp, while the "
     "rotation record stands open for another store key that no `messagefoundry rotate-key` run has "
     "completed on. That record was kept, this key's "
     "rotation date was not stamped and its age was not reset. Stop the engine and run "
-    "`messagefoundry rotate-key`, with every prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, "
-    "until it exits 0."
+    "`messagefoundry rotate-key`, with every prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED."
 )
 
 
@@ -365,9 +369,10 @@ def _rotation_hold(record: SecretRotationMetaRow | None, fingerprint: str) -> st
     It holds for a record naming this key. It also holds for a record that cannot be read, because
     this function fails toward NOT stamping: an unstamped key over-reports its age, and a false stamp
     is what would lift an overdue refusal. A record naming another key does not hold here: the key
-    in use was changed by hand. Where the keyed audit chain has not rolled to that key,
-    :func:`reconcile_rotation_meta` holds it anyway and keeps the record (BACKLOG #4942); elsewhere
-    it stamps as any such change does."""
+    in use was changed by hand. On a store with a keyed audit chain,
+    :func:`reconcile_rotation_meta` holds it anyway and keeps the record (BACKLOG #4942), whether or
+    not the chain has rolled to the key in use; on a store with none it stamps as any such change
+    does."""
     if record is None or record.fingerprint == _ROTATION_RECORD_CLOSED:
         return None
     # A key id has one length, so one of any other length is a damaged record, not another key.

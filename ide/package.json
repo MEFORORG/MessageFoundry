@@ -829,7 +829,7 @@
     "compile-tests": "tsc -p ./tsconfig.test.json",
     "pretest": "npm run compile && npm run compile-tests",
     "test": "node ./out/test/runTest.js",
-    "package": "vsce package",
+    "package": "npx --yes @vscode/vsce package",
     "vscode:prepublish": "node -e \"require('fs').copyFileSync('../LICENSE','LICENSE')\" && npm run compile",
     "pretest:unit": "npm run compile-tests",
     "test:unit": "mocha \"out/test/suite/**/*.test.js\" --ui tdd --ignore \"out/test/suite/ai-policy.test.js\" --ignore \"out/test/suite/chat.test.js\" --ignore \"out/test/suite/editor-toolbar.test.js\" --ignore \"out/test/suite/extension.test.js\" --ignore \"out/test/suite/insert-element.test.js\" --ignore \"out/test/suite/live-debug.test.js\" --ignore \"out/test/suite/promote-target.test.js\" --ignore \"out/test/suite/pythonpath.test.js\" --ignore \"out/test/suite/webview-delivery-probe.test.js\""
@@ -839,10 +839,9 @@
     "@types/node": "^20.19.43",
     "@types/vscode": "~1.95.0",
     "@vscode/test-electron": "^3.1.0",
-    "@vscode/vsce": "^4.1.0",
     "esbuild": "^0.28.2",
     "glob": "^14.0.3",
-    "jsdom": "^31.0.0",
+    "jsdom": "^31.0.1",
     "mocha": "^12.0.3",
     "typescript": "^5.4.5"
   },

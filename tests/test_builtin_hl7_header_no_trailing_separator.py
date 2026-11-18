@@ -91,14 +91,113 @@ def test_a_leading_header_with_no_encoding_character_is_the_contract_error() -> 
         Message.parse("\r".join(["BHS|", _MSH, _PID]))
 
 
-@pytest.mark.parametrize("line", ["MSH|^~\\&", "MSH|^~\\&|"])
+@pytest.mark.parametrize(
+    "line", ["MSH|^~\\&", "MSH|^~\\&|", "BHS|^~\\&", "BHS|^~\\&|", "FHS|^~\\&", "FHS|^~\\&|"]
+)
 def test_the_delimiter_rewrite_keeps_a_later_header_line_in_shape(line: str) -> None:
     """The third header re-join, the outbound delimiter override, follows the same three-or-four
-    entry split for a later MSH line: an unchanged delimiter set gives the line back. A BHS or FHS
-    line is not covered here: that path writes it with its field separator doubled, on ``main``
-    before this change too."""
+    entry split for a later header line: an unchanged delimiter set gives the line back. A BHS or
+    FHS line once came back with its field separator doubled (BACKLOG #5802)."""
     parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
     assert line in _builtin_hl7.encode_with_separators(parsed, parsed["seps"]).split("\r")
+
+
+_TARGET = ("#", "@", "$", "%", "!")  # field, component, repetition, subcomponent, escape
+
+
+@pytest.mark.parametrize(
+    ("line", "rewritten"),
+    [
+        ("BHS|^~\\&|A", "BHS#@$!%#A"),
+        ("BHS|^~\\&*|A", "BHS#@$!%*#A"),  # a v2.7 truncation character is kept
+        ("FHS|^~|A", "FHS#@$!%#A"),  # a leading part of the four
+    ],
+)
+def test_a_later_header_line_takes_the_target_encoding_characters(
+    line: str, rewritten: str
+) -> None:
+    parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
+    assert _builtin_hl7.encode_with_separators(parsed, _TARGET).split("\r")[2] == rewritten
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "BHS|SYNTHTEXT",
+        "BHS|SYNTHTEXT|A",
+        "BHSX|A|B",
+        "BHS|^~\\&EXTRA|B",
+        "BHS|^~\\&#*|B",
+        "BHS|^~\\&#|B",  # a fifth character that is a target delimiter
+        "BHS|^~\\&^|B",  # or a source delimiter
+        "BHS|^~\\&\x0b|B",  # or a control character
+        "BHS|^~\\& |B",  # or a space
+    ],
+)
+def test_a_header_line_not_in_the_message_delimiters_is_refused(line: str) -> None:
+    """Rewriting field 2 of these would drop its text or write a character the receiver would read
+    as structure, so a new delimiter set refuses (BACKLOG #5802)."""
+    parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
+    with pytest.raises(_builtin_hl7.DelimiterRewriteRefused, match="would lose text"):
+        _builtin_hl7.encode_with_separators(parsed, _TARGET)
+
+
+@pytest.mark.parametrize(
+    "line", ["BHS|SYNTHTEXT", "BHS|", "BHS|^~\\&EXTRA|B", "BHSX|A|B", "FHS|^~\\&|A"]
+)
+def test_a_same_set_override_writes_a_batch_header_line_as_it_came(line: str) -> None:
+    """With the target set equal to the message's own, nothing is refused or rewritten."""
+    parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
+    assert _builtin_hl7.encode_with_separators(parsed, parsed["seps"]).split("\r")[2] == line
+
+
+#: MSH lines and what ``encode_with_separators`` wrote for them on ``origin/main`` before BACKLOG
+#: #5802, as (message, same-set output, ``_TARGET`` output). MSH-2 always becomes the four target
+#: characters, and nothing here is refused.
+_MSH_ON_MAIN = [
+    (
+        "MSH|^~\\&#|A|B\r" + _PID,
+        "MSH|^~\\&|A|B\r" + _PID + "\r",
+        "MSH#@$!%#A#B\rPID#1##100@@@H@MR##DOE@JANE\r",
+    ),
+    (
+        "MSH|^~\\&EXTRA|A\r" + _PID,
+        "MSH|^~\\&|A\r" + _PID + "\r",
+        "MSH#@$!%#A\rPID#1##100@@@H@MR##DOE@JANE\r",
+    ),
+    (
+        "MSH|^~|A\r" + _PID,
+        "MSH|^~\\&|A\r" + _PID + "\r",
+        "MSH#@$!%#A\rPID#1##100@@@H@MR##DOE@JANE\r",
+    ),
+    (
+        "MSH|^~\\&\x0b|A\r" + _PID,
+        "MSH|^~\\&|A\r" + _PID + "\r",
+        "MSH#@$!%#A\rPID#1##100@@@H@MR##DOE@JANE\r",
+    ),
+    (
+        "FHS|^~\\&|A\rMSH!^~\\&!A\r" + _PID,
+        "MSH|^~\\&|A\r" + _PID + "\r",
+        "MSH#@$!%#A\rPID#1##100@@@H@MR##DOE@JANE\r",
+    ),
+]
+
+
+@pytest.mark.parametrize(("message", "same", "target"), _MSH_ON_MAIN)
+def test_an_msh_line_is_rewritten_as_main_rewrote_it(message: str, same: str, target: str) -> None:
+    """BACKLOG #5802 changed only BHS and FHS. An MSH-2 that is long, truncated, or carries a fifth
+    character becomes the four target characters, under the same set too, and is never refused.
+    The comparison starts at the MSH line, since a leading FHS line is #5802's to change."""
+    parsed = _builtin_hl7.parse(message)
+    for seps, expected in ((parsed["seps"], same), (_TARGET, target)):
+        encoded = _builtin_hl7.encode_with_separators(parsed, seps)
+        assert encoded[encoded.index("MSH") :] == expected
+
+
+def test_a_v27_header_with_a_truncation_character_still_rewrites() -> None:
+    """MSH-2 ``^~\\&#`` with a target field separator of ``#`` is delivered, not refused."""
+    parsed = _builtin_hl7.parse("MSH|^~\\&#|SND|FAC|RCV|FAC|20260101||ADT^A01|1|P|2.8\r" + _PID)
+    assert _builtin_hl7.encode_with_separators(parsed, _TARGET).startswith("MSH#@$!%#SND#")
 
 
 #: Bodies whose first line ``strip`` would change: padded single lines, whitespace past the encoding

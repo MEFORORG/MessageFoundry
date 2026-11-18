@@ -663,9 +663,10 @@ def test_an_http_listener_refusal_names_its_own_family(tmp_path: Path) -> None:
     """The inbound HTTP listener builds its context through the MLLP builder. Built the way the
     runner builds it, a refusal names it an HTTP listener, not an MLLP one, with its connection."""
     cert, key = _self_signed(tmp_path)
-    spec = Http(
-        port=8443, tls=True, tls_cert_file=str(cert), tls_key_file=str(key), tls_ca_pin="ab" * 32
-    )
+    spec = Http(port=8443, tls=True, tls_cert_file=str(cert), tls_key_file=str(key))
+    # The factory refuses a pin with no CA itself (BACKLOG #5329), so the orphan pin is set on the
+    # built spec, the shape a hand-built spec would reach the runtime check with.
+    spec.settings["tls_ca_pin"] = "ab" * 32
     with pytest.raises(ValueError) as caught:
         build_source(
             _source_config(

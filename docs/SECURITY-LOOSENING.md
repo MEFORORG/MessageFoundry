@@ -81,7 +81,8 @@ pointed at one of those levers.
 | The store login (`[store]`, SQL Server and PostgreSQL) | `trust_server_certificate = true` or `encrypt = false` (owner ruling 2026-11-14, vault BACKLOG #3533 item 2) | trust the server's certificate, or pin it with `[store].ssl_root_cert` |
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
-pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
+pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter
+or `name=value` segment after a `;` or a second `?`, the same in a FHIR `conditional_query`, and
 a static header that settings views would mask, such as `Authorization` or an API key, in any
 letter case. On a `verify_tls = false` hop the engine also refuses any other static header,
 unless its name is
@@ -94,9 +95,10 @@ message under `dynamic_headers` meets the same rule as the hop's static headers,
 message is sent, after the hop's own send-time check. That refusal dead-letters the one
 message and names neither the header nor its
 value. The HTTP family reads its
-auth-setting credentials from the same reader as the static-credential inventory. That inventory
-does not yet count a static header or a `url` query credential, so for those two kinds this rule is
-the wider of the two. A hop with no credential and no such header is not refused by this rule. Its own loosening entry
+auth-setting credentials from the same reader as the static-credential inventory. The inventory
+does not count every kind this rule refuses: at least a credential in a `url` `;` segment, after
+an earlier `#` or a second `?`, and one in a FHIR `conditional_query` are refused here and not
+counted there, so for those kinds this rule is the wider of the two. A hop with no credential and no such header is not refused by this rule. Its own loosening entry
 decides it.
 
 An AD bind always carries a credential, because the service account must bind first. So
@@ -110,7 +112,8 @@ engine has not verified, when the lever named beside each is set:
 - an HTTP-family secret in the `url` that the refusal cannot see as a credential, on a
   `verify_tls = false` hop or over plain `http`, under that hop's own levers. That covers at least a
   query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
-  like a credential. A secret anywhere in the path crosses unrefused too. A path secret cannot be
+  like a credential. A secret in the path crosses unrefused too, unless it is a `;name=` path
+  parameter under a name that looks like a credential, such as `;jsessionid=`. A path secret cannot be
   told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
 - a secret that is not
   [credential-shaped](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine) under
