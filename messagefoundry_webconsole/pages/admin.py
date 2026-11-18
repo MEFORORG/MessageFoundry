@@ -299,7 +299,8 @@ def users_page(users: Sequence[UserListEntry], *, can_delete: bool = False) -> M
     for u in users:
         if isinstance(u, IntegrityFailedUser):
             # Not linked: the detail page answers 423 for this record (BACKLOG #5559). The delete
-            # is offered here instead, as the engine keeps the account listed so it can be removed.
+            # is offered here instead, to a caller who may delete, as the engine keeps the account
+            # listed so it can be removed.
             failed: list[object] = [""] * len(headers)
             failed[0] = u.id
             failed[headers.index("Status")] = (

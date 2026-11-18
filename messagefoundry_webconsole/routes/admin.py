@@ -1014,12 +1014,25 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 return await _user_detail(
                     user_id, service, identity, error=str(exc.detail), status_code=400
                 )
-            except HTTPException:
+            except HTTPException as page_exc:
                 # BACKLOG #5559: the users list offers the delete for a record that fails its
                 # seal, whose detail page answers 423. The delete's own refusal is the answer, and
-                # it stays the answer when the page's read is refused for any other reason (a 503
-                # Vault Outage, an account gone since), which would otherwise replace it.
-                raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc.detail)) from exc
+                # it stays the answer when the page's read is refused otherwise (a 503 Vault
+                # Outage, say), which would replace it. An account gone since answers 404.
+                if page_exc.status_code == status.HTTP_404_NOT_FOUND:
+                    raise
+                reason = f"answered {page_exc.status_code}"
+            except account_read_errors() as read_exc:
+                if isinstance(read_exc, AUDIT_WRITE_DEFECTS):
+                    raise
+                reason = f"failed ({type(read_exc).__name__})"
+            _log.warning(
+                "the page for a refused delete of account %s was not shown: its read %s; "
+                "the delete's own refusal is answered",
+                scrub_log_argument(user_id),
+                reason,
+            )
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc.detail)) from exc
         return RedirectResponse("/ui/users", status_code=303)
 
     # --- roles ------------------------------------------------------------

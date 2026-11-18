@@ -9,8 +9,8 @@ of what was planted shown, and the failure is handed to the seal-failure report,
 ``integrity.authority_seal_failed`` row and raises the alert. Before #5559 these read the store row
 directly: the page showed the planted values with a 200 and nothing was recorded.
 
-The users list keeps such an account by id alone (BACKLOG #5520) and now offers its delete, the
-one action the console takes on it, since its detail page answers 423.
+The users list keeps such an account by id alone (BACKLOG #5520) and offers a users:manage holder
+its delete, the one action the console takes on it, since its detail page answers 423.
 
 Every test has a control: the same read of an intact account, or of the same account before the
 tampering.
@@ -246,6 +246,35 @@ async def test_a_refused_delete_keeps_its_own_refusal_when_the_page_read_is_unav
         r = await c.post(f"/ui/users/{intact}/delete", headers=SAME_ORIGIN)
     assert r.status_code == 400 and refusal in r.text
     assert await engine.store.get_user(intact) is not None
+
+
+async def test_a_refused_delete_keeps_its_own_refusal_when_the_page_read_fails(
+    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """As above, for a page read that fails outright (a store refusal stood in for), which would
+    otherwise answer 500. The fallback is logged with the account's id."""
+    engine, _path = keyed
+    service, _alerts, intact, _victim = await _setup(engine)
+    refusal = "stand-in: this would leave no enabled administrator"
+
+    async def refused(user_id: str, *, actor: str) -> None:
+        raise LastAdministratorRefused(refusal)
+
+    async def failing(user_id: str) -> None:
+        raise OSError("stand-in: a store read failed")
+
+    monkeypatch.setattr(service, "delete_user", refused)
+    monkeypatch.setattr(service, "checked_user", failing)
+    async with _client(engine, service) as c:
+        await cookie_login(c, "root")
+        r = await c.post(f"/ui/users/{intact}/delete", headers=SAME_ORIGIN)
+    assert r.status_code == 400 and refusal in r.text
+    assert any(
+        rec.levelname == "WARNING"
+        and intact in rec.getMessage()
+        and "refused delete" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 @pytest.mark.parametrize(

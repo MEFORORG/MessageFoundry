@@ -333,21 +333,27 @@ async def test_the_suggestion_comes_only_from_a_checked_read(
     )
 
 
+@pytest.mark.parametrize(
+    "defect",
+    [TypeError("stand-in: a defect"), NotImplementedError("stand-in: a listed defect")],
+    ids=["outside-the-refusals", "listed-defect"],
+)
 async def test_a_defect_in_the_suggestion_read_raises(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, defect: Exception
 ) -> None:
-    """The fallback takes only a refusal; an error outside the refusal set raises. The control is
-    the test above."""
+    """The fallback takes only a refusal. An error outside the refusal set, and a listed defect
+    inside it (``AUDIT_WRITE_DEFECTS``; NotImplementedError is a RuntimeError), raise. The control
+    is the test above."""
     service = await _service(engine, notifier=_FakeNotifier())
     await provision(service, "bare", [Role.OPERATOR.value])
 
     async def failing(user_id: str) -> None:
-        raise TypeError("stand-in: a defect")
+        raise defect
 
     async with _client(engine, service) as c:
         await cookie_login(c, "bare")
         monkeypatch.setattr(service, "checked_user", failing)
-        with pytest.raises(TypeError, match="stand-in"):
+        with pytest.raises(type(defect), match="stand-in"):
             await c.get(PAGE)
 
 

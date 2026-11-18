@@ -6,7 +6,7 @@ ADR 0215 moves the console off its in-process seam: each ``/ui`` route will send
 JSON route, so one gate family authorizes both planes. Its first slice is this inventory. It
 classifies every ``/ui`` route by the JSON route that carries its authority, and every handle the
 console holds on the engine: the handler fields of ``CoreHandlers`` and ``AdminHandlers`` (86 when
-slice 1 measured them, 89 since BACKLOG #5559, as the field-count test pins), the
+slice 1 measured them, 89 now; the field-count test pins the count and says what added each), the
 other ``UiDeps`` fields with ``get_engine`` and ``get_gate`` among them, and the ``AuthService``
 members and auth-store reads the console makes. Slices 2 to 6 work from these tables.
 
