@@ -7,16 +7,20 @@ reused by the dry-run / Test Bench:
 
 * :func:`split_batch` — a **batch** file (an ``FHS``/``BHS`` batch or just several ``MSH`` messages
   concatenated) becomes one message per ``MSH`` boundary, in file order. This is the canonical
-  splitter the File source uses at ingress and that :func:`~messagefoundry.pipeline.dryrun.split_messages`
-  delegates to, so the live engine and a dry-run split identically (single source of truth).
+  splitter the File source uses at ingress and that
+  :func:`~messagefoundry.pipeline.dryrun.split_messages` delegates to; that docstring says where
+  the two still differ.
 
 * :func:`split_by_obr` — one HL7 order message (an ORM/ORU carrying several ``OBR`` order groups)
   becomes one message per ``OBR`` group, each re-attached to the shared header. This is the
   handler-side equivalent of Corepoint's ``ItemSplit`` — a pure helper a Handler calls to fan one
   order message out into per-order messages.
 
-Both read the message's **own** separators (MSH-1/MSH-2) and go through the :class:`Message`
-primitive — never raw string-slicing of structured HL7.
+:func:`split_by_obr` reads the message's **own** separators (MSH-1/MSH-2) and goes through the
+:class:`Message` primitive. :func:`split_batch` cuts the received text, its line ends made CR,
+with no parse: at ``MSH`` boundaries and past the byte order marks that lead a later ``MSH``,
+past leading header lines, and before the trailer lines that end a message, whose test reads that
+message's MSH-1.
 """
 
 from __future__ import annotations
@@ -146,6 +150,16 @@ _LEADING_BOM = re.compile(rb"\s*" + _BOM_BYTES)
 #: The batch-envelope header lines a first chunk may open with; neither is a message.
 _ENVELOPE_HEADERS = ("FHS", "BHS")
 
+#: The batch-envelope segment ids a trailer line opens with, a file's or batch's header or trailer
+#: (BACKLOG #5806). :func:`_trailer_start` says what must follow one.
+_ENVELOPE_IDS = ("BTS", "FTS", "BHS", "FHS")
+
+#: An envelope segment id right after a line break, in a file's bytes or its text: where a trailer
+#: line may start, so a file holding none cannot lose one. ``[BF][HT]S`` is exactly the four ids.
+#: A trailer line is never a file's first line, so a line break always leads one.
+_TRAILER_ID_BYTES = re.compile(rb"[\r\n][BF][HT]S")
+_TRAILER_ID = re.compile(r"[\r\n][BF][HT]S")
+
 #: Codecs (by ``codecs.lookup`` name) that write every ASCII character as that one byte and use no
 #: ASCII byte for anything else, so a byte scan for a later ``MSH`` answers what a decode would.
 _ASCII_SAFE_CODECS = frozenset({"utf-8", "ascii"})
@@ -161,17 +175,25 @@ def split_batch(raw: str | bytes) -> list[str]:
     too, and the cut is past those marks, so the message starts with ``MSH`` (BACKLOG #5918). Each
     returned message is ``\r``-delimited. The leading ``FHS``/``BHS`` envelope header lines before
     the first ``MSH`` are dropped, since each split message is routed on its own and the batch
-    framing has no per-message meaning.
+    framing has no per-message meaning. So is the run of envelope trailer lines that ends an
+    ``MSH``-led message (:func:`_trailer_start`, BACKLOG #5806): each line of it starts with
+    ``BTS``, ``FTS``, ``BHS`` or ``FHS`` and then that message's own field separator (MSH-1),
+    when that is ASCII. Every other cut is the one the split made before that change.
 
     **No message is dropped.** Only the first chunk can come before an ``MSH``. It is read past
     whitespace, a byte order mark (U+FEFF) and those envelope header lines. What remains is a
     message when it starts with ``MSH``, and is otherwise kept as one too, so the parser records its
     ``ERROR`` rather than the split discarding what the sender sent.
 
-    A payload with a single message round-trips unchanged (a one-element list); an empty/whitespace
-    payload yields the normalized text as the sole element (the caller — e.g. the parser — then
-    reports it as malformed rather than silently dropping it).
+    A payload with a single message is a one-element list; an empty/whitespace payload yields the normalized text as the sole element
+    (the caller — e.g. the parser — then reports it as malformed rather than silently dropping it).
     """
+    return [_without_trailer(m) for m in _split_keeping_trailers(raw)]
+
+
+def _split_keeping_trailers(raw: str | bytes) -> list[str]:
+    """:func:`split_batch` before it drops trailer lines, which is the whole split as it stood
+    before BACKLOG #5806."""
     text = normalize(raw)  # \r-delimited, decoupled from the inbound line endings
     bounds: list[int] = []
     at = _next_boundary(text, 0, _NORMALIZED)
@@ -191,6 +213,45 @@ def split_batch(raw: str | bytes) -> list[str]:
     return messages or [text]
 
 
+def _without_trailer(message: str) -> str:
+    """``message`` cut at :func:`_trailer_start`, or ``message`` itself, uncopied, when it is not
+    ``MSH``-led or ends with no trailer line."""
+    cut = _trailer_start(message)
+    return message if cut == len(message) else message[:cut]
+
+
+def _trailer_start(text: str) -> int:
+    """Where the run of envelope trailer lines that ends the normalized (``\\r``-delimited)
+    ``text`` starts, or ``len(text)`` when it ends with none or is not ``MSH``-led (BACKLOG #5806).
+
+    A trailer line starts with ``BTS``, ``FTS``, ``BHS`` or ``FHS`` and then, right after the id,
+    the field separator (MSH-1) of ``text``'s own ``MSH`` line. Nothing else is one: not a line led
+    by whitespace or a byte order mark, not a bare id, and not an id followed by any other
+    character, so ``FHS: 140 bpm`` and, under ``|``, ``BTS^1`` stay. The run is the trailer lines
+    that end ``text``, read back from its last line, which one final CR may end. It starts at its
+    first line, so the CR before that line stays with the message. The ``MSH`` line is never in
+    it. A message whose MSH-1 is not ASCII has no trailer run, so the dry run's latin-1 view, which
+    reads such a separator as its first byte, drops what the live split drops."""
+    if not text.startswith(_MSH) or len(text) <= len(_MSH):
+        return len(text)
+    separator = text[len(_MSH)]
+    if separator == "\r" or not separator.isascii():
+        return len(text)
+    cut = len(text)
+    end = cut - 1 if text.endswith("\r") else cut
+    while True:
+        start = text.rfind("\r", 0, end) + 1
+        if (
+            start == 0
+            or end - start <= len(_MSH)
+            or not text.startswith(_ENVELOPE_IDS, start)
+            or text[start + len(_MSH)] != separator
+        ):
+            return cut
+        cut = start
+        end = start - 1
+
+
 def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
     """Split a received HL7 file's bytes into one byte string per message, for a source that reads
     whole files and hands each message over on its own (ADR 0206 rule 5).
@@ -207,8 +268,12 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
     is one message the parser reads as it is. Under UTF-8 only, it must also not open with a byte
     order mark, which the split reads past. Under a single-byte charset the mark's bytes are three
     characters the split keeps. Where a byte scan can tell (:func:`_needs_a_decode`), such a file
-    is returned without a decode or a split, so the common single-message file pays one scan."""
-    if not _needs_a_decode(raw, encoding):
+    is handed over as its own bytes, less any trailer lines :func:`split_batch` drops from the
+    message it reads there (BACKLOG #5806). One with no ``BTS``, ``FTS``, ``BHS`` or ``FHS`` right
+    after a line break holds none, so it is returned without a decode or a split, and the common
+    single-message file pays two scans."""
+    decode = _needs_a_decode(raw, encoding)
+    if not decode and _TRAILER_ID_BYTES.search(raw) is None:
         return [raw]
     try:
         text = raw.decode(encoding)
@@ -217,25 +282,81 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
         # "undefined", raises the bare base class, and it too must reach the listener's decode,
         # which records it as an ERROR row, rather than escape the hand-off (BACKLOG #5102).
         return [raw]
-    messages = split_batch(text)
+    messages = _split_keeping_trailers(text)
     if len(messages) == 1:
-        return [one_message_bytes(raw, text, messages[0], encoding)]
-    return [message.encode(encoding) for message in messages]
+        if not decode:
+            # The byte scan alone hands this file over as its bytes; the decode only finds the
+            # trailer lines to cut from them.
+            return [_less_the_trailer_lines(raw, messages[0])]
+        return [one_message_bytes(raw, text, _without_trailer(messages[0]), encoding)]
+    return [_without_trailer(message).encode(encoding) for message in messages]
 
 
 def one_message_bytes(raw: bytes, text: str, message: str, encoding: str) -> bytes:
     """What a whole-file source hands over for a file :func:`split_batch` read as one ``message``,
-    where ``text`` is ``raw`` decoded with ``encoding``.
+    where ``text`` is the text the split was given: ``raw`` decoded with ``encoding``, or the dry
+    run's view of it.
 
-    ``raw`` itself, byte for byte, when the parser reads ``text`` as it is: ``text`` starts with
-    ``MSH`` after whitespace, or the split found no ``MSH``-led message in it either. Otherwise the
-    split read the message past leading noise the parser refuses, a byte order mark or an
-    ``FHS``/``BHS`` envelope header, so ``message`` is handed over re-encoded, as each member of a
-    batch is. Without this, one such message was an ``ERROR`` where the same message in a batch of
-    two was recorded."""
-    if starts_with_msh(text) or not message.startswith(_MSH):
+    ``raw`` when the parser reads ``text`` as it is: ``text`` starts with ``MSH`` after whitespace,
+    or the split found no ``MSH``-led message in it either. In the first case the trailer lines the
+    split dropped (BACKLOG #5806) are cut from ``raw`` at the line break before them, and every
+    other byte stays, but only under an ``encoding`` that writes ASCII as itself, one
+    :func:`_writes_ascii_as_itself` accepts: UTF-8, ASCII, ISO 8859 or Windows-125x, as
+    ``_ASCII_SAFE_CODECS`` and ``_ASCII_SAFE_PREFIXES`` spell them. ``utf-8-sig``, UTF-16 and
+    cp932 are not. Under any other
+    encoding ``raw`` is handed over whole, trailer lines included, as it was before that change.
+
+    Otherwise the split read the message past leading noise the parser refuses, a byte order mark
+    or an ``FHS``/``BHS`` envelope header, so ``message`` is handed over re-encoded, as each member
+    of a batch is. Without this, one such message was an ``ERROR`` where the same message in a
+    batch of two was recorded."""
+    if not message.startswith(_MSH):
         return raw
+    if starts_with_msh(text):
+        if not _writes_ascii_as_itself(encoding) or _TRAILER_ID.search(text) is None:
+            return raw
+        # The split's message, before it dropped the trailer, runs from the first MSH to the end.
+        full = normalize(text)
+        return _less_the_trailer_lines(raw, full[full.find(_MSH) :])
     return message.encode(encoding)
+
+
+#: A line break as :func:`~messagefoundry.parsing.peek.normalize` reads one, in bytes.
+_LINE_BREAK_BYTES = re.compile(b"\r\n|\r|\n")
+
+
+def _less_the_trailer_lines(raw: bytes, message: str) -> bytes:
+    """``raw`` less the trailer lines :func:`_trailer_start` finds at the end of ``message``, the
+    split's reading of ``raw`` before it dropped them, which ends where ``raw`` ends. The cut is at
+    the line break before the first of them, in ``raw``'s own bytes. Only the caller's
+    :func:`_writes_ascii_as_itself` check makes that byte cut the line cut."""
+    cut = _trailer_start(message)
+    if cut == len(message):
+        return raw
+    dropped = len(message) - cut
+    lines = message[cut:].removesuffix("\r").count("\r") + 1
+    # A normalized character is at most two of the file's, each at most four bytes.
+    return raw[: _start_of_last_lines(raw, lines, 8 * dropped + 8)]
+
+
+def _start_of_last_lines(raw: bytes, lines: int, span: int) -> int:
+    """Where the last ``lines`` lines of ``raw`` start, one final line break ending the last of
+    them, when those lines and the break before them lie in the last ``span`` bytes of ``raw``.
+    Only that tail is scanned, so a cut costs the length of what it drops."""
+    ends = [found.end() for found in _LINE_BREAK_BYTES.finditer(raw, max(0, len(raw) - span))]
+    if ends and ends[-1] == len(raw):
+        ends.pop()
+    return ends[-lines]
+
+
+def _writes_ascii_as_itself(encoding: str) -> bool:
+    """Whether ``encoding`` writes each ASCII character as that one byte and uses no ASCII byte for
+    anything else, so a byte scan for an ASCII shape answers what a decode would."""
+    try:
+        name = codecs.lookup(encoding).name
+    except LookupError:
+        return False
+    return name in _ASCII_SAFE_CODECS or name.startswith(_ASCII_SAFE_PREFIXES)
 
 
 def _needs_a_decode(raw: bytes, encoding: str) -> bool:
@@ -246,13 +367,9 @@ def _needs_a_decode(raw: bytes, encoding: str) -> bool:
     so the caller decodes. Under a single-byte charset the mark's bytes are three characters the
     split keeps, so a leading one needs no decode, and a later one costs a decode that finds one
     message."""
-    try:
-        name = codecs.lookup(encoding).name
-    except LookupError:
+    if not _writes_ascii_as_itself(encoding):
         return True
-    if name not in _ASCII_SAFE_CODECS and not name.startswith(_ASCII_SAFE_PREFIXES):
-        return True
-    if name == "utf-8" and _LEADING_BOM.match(raw):
+    if codecs.lookup(encoding).name == "utf-8" and _LEADING_BOM.match(raw):
         return True
     return _next_boundary(raw, 0, _RAW_BYTES) >= 0
 

@@ -511,8 +511,12 @@ class IntakeRateLimiter(Protocol):
         """
         ...
 
-    def charge_failure(self, peer: str) -> None:
-        """Record one FAILED attempt against ``peer``. Called only on the refusal branch."""
+    def charge_failure(self, peer: str, *, charge_global: bool = True) -> None:
+        """Record one FAILED attempt against ``peer``. Called only on the refusal branch.
+
+        ``charge_global=False`` charges ``peer``'s own budget alone, for a second key of one failed
+        request, such as the HTTP listener's second reading of an ambiguous forwarded hop: the
+        global budget counts failed requests, not keys (BACKLOG #5525)."""
         ...
 
     def note_success(self, peer: str) -> None:

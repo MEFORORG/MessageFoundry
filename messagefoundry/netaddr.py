@@ -31,8 +31,18 @@ from typing import Any, Final
 __all__ = [
     "ALLOWLIST_MIN_PREFIX_V4",
     "ALLOWLIST_MIN_PREFIX_V6",
+    "IPV4_COMPATIBLE",
+    "IPV4_EMBEDDING_PREFIXES",
+    "IPV4_MAPPED",
+    "IPV4_MAPPED_BASE",
+    "NAT64_LOCAL_USE",
+    "NAT64_WELL_KNOWN",
+    "SIX_TO_FOUR",
     "allowlist_restricts",
     "client_network_allowed",
+    "host_address",
+    "ipv4_meaning",
+    "not_a_host_address",
     "peer_ip_allowed",
 ]
 
@@ -42,6 +52,85 @@ __all__ = [
 #: internet while reading, in a config file, exactly like a restriction.
 ALLOWLIST_MIN_PREFIX_V4: Final = 8
 ALLOWLIST_MIN_PREFIX_V6: Final = 32
+
+#: The IPv4-mapped block. An entry or address inside it names IPv4 hosts in their IPv6 spelling
+#: (BACKLOG #3042).
+IPV4_MAPPED: Final = ipaddress.IPv6Network("::ffff:0:0/96")
+IPV4_MAPPED_BASE: Final = int(IPV4_MAPPED.network_address)
+
+#: IPv6 prefixes whose addresses carry an IPv4 client: the NAT64 well-known and local-use prefixes
+#: (RFC 6052, RFC 8215), Teredo (RFC 4380), 6to4 (RFC 3056) and the deprecated IPv4-compatible
+#: form. Only the span limit on the HTTP listener's ``trusted_proxies``
+#: (``config.listener_proxies``) reads ``IPV4_EMBEDDING_PREFIXES`` (BACKLOG #5525). The listener's
+#: budget keying, at least ``_budget_key``, ``_embedded_client`` and ``_is_phantom``, reads
+#: ``NAT64_WELL_KNOWN``, ``NAT64_LOCAL_USE``, ``IPV4_COMPATIBLE`` and ``ipaddress``'s Teredo and
+#: 6to4 readings instead. :func:`allowlist_restricts` reads :data:`_IPV4_EMBEDDING_RANGES`, which,
+#: unlike ``IPV4_EMBEDDING_PREFIXES``, also holds the IPv4-mapped block and SIIT
+#: (``::ffff:0:0:0/96``) and leaves out 6to4.
+NAT64_WELL_KNOWN: Final = ipaddress.IPv6Network("64:ff9b::/96")
+NAT64_LOCAL_USE: Final = ipaddress.IPv6Network("64:ff9b:1::/48")
+SIX_TO_FOUR: Final = ipaddress.IPv6Network("2002::/16")
+IPV4_COMPATIBLE: Final = ipaddress.IPv6Network("::/96")
+IPV4_EMBEDDING_PREFIXES: Final = (
+    NAT64_WELL_KNOWN,
+    NAT64_LOCAL_USE,
+    ipaddress.IPv6Network("2001::/32"),
+    SIX_TO_FOUR,
+    IPV4_COMPATIBLE,
+)
+
+#: RFC 1122's "this network" block. ``ipaddress`` names only its first address, as unspecified: it
+#: reads the rest, such as ``0.1.2.3``, as neither unspecified nor reserved (BACKLOG #3765).
+_THIS_NETWORK: Final = ipaddress.IPv4Network("0.0.0.0/8")
+
+
+def ipv4_meaning(
+    network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    """``network`` as the IPv4 range it names when it sits inside the mapped block, else itself, so
+    ``::ffff:0:0/96`` counts as the whole IPv4 family it trusts (BACKLOG #3042)."""
+    # Every caller passes a zoneless network: a zoned entry is refused, or stripped of its zone.
+    if isinstance(network, ipaddress.IPv6Network) and network.subnet_of(IPV4_MAPPED):
+        return ipaddress.IPv4Network(
+            (int(network.network_address) & 0xFFFF_FFFF, network.prefixlen - IPV4_MAPPED.prefixlen)
+        )
+    return network
+
+
+def not_a_host_address(text: str) -> bool:
+    """Whether the canonical IPv4 ``text`` is not one host's address: at least the whole
+    ``0.0.0.0/8`` block, a multicast group, and the reserved class E range, which holds the limited
+    broadcast ``255.255.255.255`` (BACKLOG #3075, #3765). No identity provider or link is served
+    from one, and some browsers route ``0.0.0.0`` to the local machine. This does not refuse
+    loopback: a ``127.0.0.1`` entry still loads, as ``localhost`` does.
+
+    The console keeps its own copy, ``_is_one_host`` in ``messagefoundry_webconsole/_external.py``,
+    for an entry that reaches it another way. ``tests/test_domain_shape.py`` compares the two on a
+    ``/16`` grid."""
+    address = ipaddress.IPv4Address(text)
+    return address in _THIS_NETWORK or address.is_multicast or address.is_reserved
+
+
+def host_address(text: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """A plain address, a socket peer or a forwarded hop's host, normalised; ``None`` when it is
+    not one.
+
+    An IPv6 zone is dropped, as :func:`_peer_ip` drops it, so a key or a recorded address never
+    carries text after a ``%``. An IPv4-mapped address is read as its IPv4 address, so one host
+    reads the same whichever spelling a dual-stack socket or proxy gives. Unlike :func:`_peer_ip`,
+    which splits the text at ``%`` first, an IPv4 text carrying a ``%`` is refused: it has no zone."""
+    if text is None:
+        return None
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.scope_id is not None:
+            address = ipaddress.IPv6Address(int(address))
+        if address.ipv4_mapped is not None:
+            return address.ipv4_mapped
+    return address
 
 
 def _peer_ip(peername: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:

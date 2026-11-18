@@ -195,6 +195,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     ResealOutcome,
+    RevokedRowSealError,
     RowSealError,
     SealPager,
     classify_unrotated,
@@ -348,6 +349,7 @@ from messagefoundry.store.store import (
     cleanup_failed_open,
     conditional_way_past,
     create_batch_failure,
+    decoded_rows,
     delivery_key,
     enrolment_code_issue,
     enrolment_code_revoke,
@@ -369,6 +371,7 @@ from messagefoundry.store.store import (
     inheritance_plan,
     inheriting_children,
     judge_totp,
+    listed_users,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -379,6 +382,7 @@ from messagefoundry.store.store import (
     not_deployed_detail,
     operator_audits,
     owned_lane_scope,
+    parse_recovery_code_hashes,
     passkey_digest,
     password_change,
     raise_account_epoch,
@@ -15331,7 +15335,7 @@ class SqlServerStore:
 
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
-        return [UserRecord.from_mapping(d) for d in rows]
+        return listed_users(rows)
 
     async def count_users(self) -> int:
         return await self._count("users")
@@ -15574,9 +15578,7 @@ class SqlServerStore:
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
         d = await self._fetchone("SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,))
-        if not d or d["totp_recovery_codes"] is None:
-            return []
-        return [str(h) for h in json.loads(d["totp_recovery_codes"])]
+        return parse_recovery_code_hashes(d["totp_recovery_codes"] if d else None, user_id)
 
     async def consume_recovery_code_hash(
         self, user_id: str, code_hash: str, *, now: float | None = None
@@ -16867,10 +16869,15 @@ class SqlServerStore:
         return SessionRecord.from_mapping(d) if d else None
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        strict: bool = False,
     ) -> list[SessionRecord]:
         """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
-        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
+        :meth:`AuthStore.list_sessions` for ``idle_seconds`` and ``strict``."""
         now = time.time() if now is None else now
         if idle_seconds is None:
             rows = await self._fetchall(
@@ -16884,7 +16891,9 @@ class SqlServerStore:
                 " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                 (user_id, now, now, float(idle_seconds)),
             )
-        return [SessionRecord.from_mapping(r) for r in rows]
+        if strict:
+            return [SessionRecord.from_mapping(r) for r in rows]
+        return decoded_rows(rows, SessionRecord.from_mapping)
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -16993,14 +17002,24 @@ class SqlServerStore:
                 rows = await cur.fetchall()
                 return str(rows[0][0]) if rows else None
 
+            refused: RowSealError | None = None
             try:
-                ended = await revoke_through_lineage(
-                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
-                )
+                try:
+                    ended = await revoke_through_lineage(
+                        token_hash,
+                        lineage_since=lineage_since,
+                        revoke=_revoke,
+                        successor=_successor,
+                    )
+                except RowSealError as exc:
+                    # BACKLOG #5505: only the read-back refused the row; its revoke still commits.
+                    refused, ended = exc, None
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+        if refused is not None:
+            raise RevokedRowSealError(refused.kind, refused.subject)
         return ended
 
     async def revoke_user_sessions(

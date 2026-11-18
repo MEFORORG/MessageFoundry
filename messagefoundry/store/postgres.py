@@ -203,6 +203,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     ResealOutcome,
+    RevokedRowSealError,
     RowSealError,
     SealPager,
     classify_unrotated,
@@ -341,6 +342,7 @@ from messagefoundry.store.store import (
     cleanup_failed_open,
     conditional_way_past,
     create_batch_failure,
+    decoded_rows,
     delivery_key,
     enrolment_code_issue,
     enrolment_code_revoke,
@@ -361,6 +363,7 @@ from messagefoundry.store.store import (
     inheritance_plan,
     inheriting_children,
     judge_totp,
+    listed_users,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -371,6 +374,7 @@ from messagefoundry.store.store import (
     not_deployed_detail,
     operator_audits,
     owned_lane_scope,
+    parse_recovery_code_hashes,
     passkey_digest,
     password_change,
     raise_account_epoch,
@@ -1765,8 +1769,9 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
     # that flag rather than the setting. The pool builds a fresh context per connection through the
-    # same builder (`_per_connection_ssl_connect`), and that builder either sets the flag or raises,
-    # so the verdict reached here holds for every connection the pool opens.
+    # same builder (`_per_connection_ssl_connect`). With ssl_crl_file set it either sets the flag or
+    # raises; unset, it leaves the flag clear. Either way the verdict reached here holds for every
+    # connection the pool opens.
     _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
     return ctx
 
@@ -1871,7 +1876,12 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
     The one builder for both verifying branches. :func:`_build_ssl` calls it once at pool open, to run
     the refusals against a real context. The pool's ``connect`` hook calls it again for EVERY new
     connection (BACKLOG #300), so each handshake reads the trust store and the CRL file as they are
-    then, which is what asyncpg's own ``ssl=True`` did for the system trust store."""
+    then, which is what asyncpg's own ``ssl=True`` did for the system trust store.
+
+    With ``[store].ssl_crl_file`` set, it loads that CRL and sets ``VERIFY_CRL_CHECK_LEAF``
+    (``harden_crl_check``), or raises. Unset, it leaves that flag clear, so the
+    context checks no revocation and the store's revocation guard credits it nothing
+    (:func:`_refuse_store_revocation`)."""
     if settings.ssl_root_cert:
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
@@ -2015,12 +2025,15 @@ def _refuse_store_revocation(
     reviewer can check one named hop against that hop's PKI, and a claim the operator can set without
     naming what was reviewed is the blanket env wearing a different key.
 
-    ``context`` is a real :class:`ssl.SSLContext`, so :func:`context_checks_revocation` reads
-    ``VERIFY_CRL_CHECK_LEAF`` off an object rather than off the presence of a setting. ``_build_ssl``
+    ``context`` is a real :class:`ssl.SSLContext`, so ``capture`` reads it through
+    :func:`~messagefoundry.config.tls_policy.crl_no_credit`, the rule
+    :func:`~messagefoundry.config.tls_policy.crl_credited` answers yes or no, off an object rather than off the
+    presence of a setting. ``_build_ssl``
     supplies it on both verifying branches. It is built at pool open and not handshaken on: the pool
     builds each connection's context afresh (:func:`_per_connection_ssl_connect`). Both come from
-    :func:`_verifying_context` with the same settings, and that builder either sets the flag or
-    raises, so this verdict holds for every connection. Before BACKLOG #300 the default branch
+    :func:`_verifying_context` with the same settings. With ``[store].ssl_crl_file`` set, that
+    builder either sets ``VERIFY_CRL_CHECK_LEAF`` or raises; unset, it leaves that flag clear, so
+    the guard credits none. Either way this verdict holds for every connection. Before BACKLOG #300 the default branch
     returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
     nowhere to load."""
     RevocationHopGuard.capture(
@@ -10373,7 +10386,7 @@ class PostgresStore:
 
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
-        return [UserRecord.from_mapping(dict(r)) for r in rows]
+        return listed_users(dict(r) for r in rows)
 
     async def count_users(self) -> int:
         return await self._count("users")
@@ -10584,9 +10597,7 @@ class PostgresStore:
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
         d = await self._fetchone("SELECT totp_recovery_codes FROM users WHERE id=$1", user_id)
-        if not d or d["totp_recovery_codes"] is None:
-            return []
-        return [str(h) for h in json.loads(d["totp_recovery_codes"])]
+        return parse_recovery_code_hashes(d["totp_recovery_codes"] if d else None, user_id)
 
     async def consume_recovery_code_hash(
         self, user_id: str, code_hash: str, *, now: float | None = None
@@ -11562,10 +11573,15 @@ class PostgresStore:
         return SessionRecord.from_mapping(dict(d)) if d else None
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        strict: bool = False,
     ) -> list[SessionRecord]:
         """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
-        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
+        :meth:`AuthStore.list_sessions` for ``idle_seconds`` and ``strict``."""
         now = time.time() if now is None else now
         if idle_seconds is None:
             rows = await self._fetchall(
@@ -11582,7 +11598,9 @@ class PostgresStore:
                 now,
                 float(idle_seconds),
             )
-        return [SessionRecord.from_mapping(dict(r)) for r in rows]
+        if strict:
+            return [SessionRecord.from_mapping(dict(r)) for r in rows]
+        return decoded_rows(rows, lambda r: SessionRecord.from_mapping(dict(r)))
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -11667,9 +11685,15 @@ class PostgresStore:
                 found = await conn.fetchval(_PG_SESSION_LINEAGE_SUCCESSOR, h, since)
                 return None if found is None else str(found)
 
-            return await revoke_through_lineage(
-                token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
-            )
+            try:
+                return await revoke_through_lineage(
+                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+                )
+            except RowSealError as exc:
+                # BACKLOG #5505: only the read-back refused the row, so the block exits cleanly
+                # and its revoke commits before the refusal is raised.
+                refused = exc
+        raise RevokedRowSealError(refused.kind, refused.subject)
 
     async def revoke_user_sessions(
         self,

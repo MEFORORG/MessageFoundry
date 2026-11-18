@@ -217,6 +217,15 @@ function saved(p: Page, clone: boolean): Payload {
   return JSON.parse(JSON.stringify(save[0].conn.settings)) as Payload;
 }
 
+/** Pick another outbound transport and deliver the host's rebuild of what the request sent. */
+function switchTransport(p: Page, to: string): void {
+  const transport = p.window.document.getElementById("transport");
+  transport.value = to;
+  transport.dispatchEvent(new p.window.Event("change"));
+  const asked = p.posted.filter((m) => m.command === "fields");
+  p.deliver({ command: "fields", groups: buildForm(SCHEMA, to, "outbound", asked[asked.length - 1].settings) });
+}
+
 suite("connection editor — edit and clone use the schema-driven fields (BACKLOG #5565)", () => {
   teardown(closeWindows);
 
@@ -422,6 +431,83 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
       box.dispatchEvent(new p.window.Event("input"));
     }
     assert.deepStrictEqual(saved(p, false).db_password, RECORD.settings.db_password, "a kept credential was dropped");
+  });
+
+  test("edit: a setting removed and kept again before its rebuild's reply keeps its inline default (BACKLOG #8243 item 18)", () => {
+    const p = load({ groups });
+    const doc = p.window.document;
+    const drop = doc.querySelector('#settings [data-remove-key="db_password"]');
+    drop.click();
+    const transport = doc.getElementById("transport");
+    transport.value = "file";
+    transport.dispatchEvent(new p.window.Event("change"));
+    // Kept again before any reply arrives, then saved with the key untouched.
+    drop.click();
+    assert.deepStrictEqual(saved(p, false).db_password, RECORD.settings.db_password, "the kept setting lost its default");
+  });
+
+  test("edit: an untouched env key is saved as recorded, not trimmed (BACKLOG #8243 item 19)", () => {
+    {
+      const env = " DB_PW ";
+      const initial = { ...RECORD, settings: { ...RECORD.settings, db_password: { env, default: INLINE_DEFAULT } } };
+      const p = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
+      assert.deepStrictEqual(saved(p, false).db_password, { env, default: INLINE_DEFAULT }, "the key was rewritten");
+    }
+    // A non-secret env reference too, and the key survives a transport round trip untouched.
+    const initial = { ...RECORD, settings: { ...RECORD.settings, host: { env: " PEER_HOST ", default: "localhost" } } };
+    const p = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
+    switchTransport(p, "file");
+    switchTransport(p, "mllp");
+    assert.deepStrictEqual(saved(p, false).host, initial.settings.host, "a round trip rewrote the key");
+  });
+
+  test("edit: a recorded env key holding a line break is saved trimmed, as before, so it can be repaired", () => {
+    // The box cannot show a CR or LF, so leaving it and retyping what it shows look the same; the
+    // trimmed text is written, as origin/main wrote it, and the inline default stays with it.
+    const initial = { ...RECORD, settings: { ...RECORD.settings, db_password: { env: "DB_\r\nPW", default: INLINE_DEFAULT } } };
+    const p = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
+    assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW", default: INLINE_DEFAULT }, "the line break was written back");
+  });
+
+  test("edit: a default dropped by switching to a literal on another transport does not come back (BACKLOG #8243 item 20)", () => {
+    const p = load({ groups });
+    const doc = p.window.document;
+    // The file transport does not declare db_password, so it draws it as an unknown setting, with
+    // a literal/env() switch a secret does not get.
+    switchTransport(p, "file");
+    const toggle = doc.querySelector('#settings [data-env-toggle="db_password"]');
+    assert.ok(toggle, "the file transport drew db_password with no env() switch");
+    toggle.checked = false;
+    toggle.dispatchEvent(new p.window.Event("change"));
+    switchTransport(p, "mllp");
+    doc.querySelector('#settings [data-key="db_password"]').value = "DB_PW";
+    assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW" }, "the dropped inline default came back");
+  });
+
+  test("edit: a picked choice keeps its own type when the recorded value was a table (BACKLOG #8243 item 31)", () => {
+    const schema: ConnectionSchema = {
+      ...SCHEMA,
+      transports: { mllp: { doc: "MLLP.", params: { level: param({ choices: ["1", "2"] }) } } },
+    };
+    const initial = { ...RECORD, settings: { level: { tier: 1 } } };
+    const p = load({ groups: buildForm(schema, "mllp", "outbound", initial.settings), initial, transports: ["mllp"] });
+    const select = p.window.document.querySelector('#settings [data-key="level"]');
+    assert.strictEqual(select.tagName, "SELECT", "level is not drawn as a select");
+    select.value = "2";
+    assert.strictEqual(saved(p, false).level, "2", "the picked choice was JSON-parsed");
+  });
+
+  test("edit: a select with a table among its choices parses the picked choice, as before", () => {
+    const schema: ConnectionSchema = {
+      ...SCHEMA,
+      transports: { mllp: { doc: "MLLP.", params: { level: param({ choices: [{ a: 1 }, { b: 2 }] }) } } },
+    };
+    const initial = { ...RECORD, settings: { level: { tier: 1 } } };
+    const p = load({ groups: buildForm(schema, "mllp", "outbound", initial.settings), initial, transports: ["mllp"] });
+    const select = p.window.document.querySelector('#settings [data-key="level"]');
+    assert.strictEqual(select.tagName, "SELECT", "level is not drawn as a select");
+    select.value = '{"b":2}';
+    assert.deepStrictEqual(saved(p, false).level, { b: 2 }, "the picked table was posted as text");
   });
 
   for (const how of ["removed", "cleared"]) {

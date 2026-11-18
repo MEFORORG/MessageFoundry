@@ -451,14 +451,20 @@ than a path is not checked
   engine's own account with full control for the host file, or with read and delete for the
   handoff file.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
-  the owner and access list of the folder just above the key file in its path, as written, and
-  refuses the key file when one of the groups above or an application package may delete a file in that folder, change its access list or take it over, or when that
-  folder's owner is such a group or cannot be read
+  the owner and access list of the folder that holds the key file, in most cases where its path
+  resolves to, after any junction, link or `subst` drive, and refuses the key file when one of
+  the groups above or an application package may delete a file in that folder, change its access
+  list or take it over, or when that folder's owner is such a group or cannot be read
   (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`). A folder whose access list
   the engine's account may not read is refused: give that account read access to the folder's
   permissions. On Windows the TLS key the engine mints must also be owned by the engine's own
-  account, SYSTEM or Administrators. It is not a complete check of the file's surroundings; see
-  [ADR 0214](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments). Do not rely on this check alone. Restrict the
+  account, SYSTEM or Administrators; an engine running as LOCAL SERVICE or NETWORK SERVICE shares
+  that account with other services, so that owner does not show the engine made it. Where that
+  folder is read, and what is refused on a network share or a mapped network drive, is in the
+  2026-11-17 entry of the
+  [ADR 0214 amendments](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments),
+  under *The share rule*. It is not a complete check of the file's surroundings. Do not rely on
+  this check alone. Restrict the
   secrets directory and every folder above it yourself, and the folder that holds each key file
   and every folder above it.
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other
@@ -1749,8 +1755,8 @@ bodies). Read the trail via `GET /audit` (`audit:read`).
 `summary_access` rows differ from a single-request row like `message_view`:
 
 - It is coalesced: one row per actor, channel scope and hour, carrying the count. Its sources
-  include at least the message list, its content search, the dead-letter list and the message
-  detail view.
+  include at least the message list, its content search, the layered preset search
+  (`GET /search/layered`), the dead-letter list and the message detail view.
 - It is written late. The engine keeps the open hour's count in memory. It writes the row when a
   later access rolls into a new hour, or when the engine stops cleanly, so a crash would lose the
   open hour's count.
@@ -2554,8 +2560,11 @@ Properties of the anonymizer:
   alphabet. The rates and the stated bound are in the docstring of `_estimated_entropy_bits` in
   [`keying.py`](../messagefoundry_toolkit/anon/keying.py) (vault BACKLOG #3359).
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
-  scrubbed dataset stays structurally realistic. An identifier surrogate (`mrn`, `id`) fabricates
-  every letter and digit of the id, as ASCII; `ssn` writes fabricated digits. Each keeps only the
+  scrubbed dataset stays structurally realistic. An identifier surrogate (`mrn`, `id`) writes a
+  fabricated ASCII letter or digit for every letter, digit, non-ASCII character and escape
+  character of the id, and keeps none of them; the docstring of `_fake_like` in
+  [`surrogates.py`](../messagefoundry_toolkit/anon/surrogates.py) says what it keeps.
+  `ssn` writes fabricated digits. Each keeps only the
   CX components that describe the id rather than hold it: CX.3 to CX.6, CX.9 and CX.10. They are
   the check-digit scheme, the identifier type and the issuer's names. It blanks CX.2, the check digit, the CX.7 and
   CX.8 dates, and anything past CX.10. `PID-20`, a driver's licence, takes the `dln` kind: the
@@ -2566,8 +2575,11 @@ Properties of the anonymizer:
   CX positions whatever the field's type, so an overlay that points an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. Each component and subcomponent is read in several ways, among them as
-  written, decoded from its escape sequences, and with its invisible characters (Unicode
-  categories Cc and Cf) removed, and some of those readings are also split into pieces. A reading
+  written, decoded from its escape sequences, and with its invisible characters removed, and each
+  reading that is not ASCII is also folded to Unicode compatibility form (NFKC), and some of those
+  readings are also split into pieces. An invisible character, here and wherever this section
+  removes one, is one in Unicode category Cc or Cf or a default-ignorable code point outside
+  them, as `_is_invisible` in `surrogates.py` defines it (BACKLOG #5654). A reading
   or piece that is a site code whole counts. A part that holds no escape character is never split
   at whitespace, so `Call 971234 today`, as a component with no escape character, is not found by
   this check and is left by the scrub. A part that holds one is split at whitespace in its decoded
@@ -2604,9 +2616,9 @@ both are described below:
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
-| A value with a non-empty first component and an `MR` or `MRN` id type: any component that is `MR` or `MRN` whole or as its first subcomponent, such as `12345^MR` or `12345^MR&L`, or CX.5, the identifier type code, in any of its subcomponents too, such as `ID^^^AUTH^MR&local`. Component 5 of any field the check reads is read as CX.5 whatever the field's type, so `70553^MRI^C4^^PET&MR` in `OBR-4`, a coded field and not a CX, is refused. An `MR` subcomponent past the first in any other component, such as the modality in `70553^PET&MR^C4`, does not count (BACKLOG #5654) | Fields no rule maps |
+| A value with a non-empty first component and an `MR` or `MRN` id type: any component that is `MR` or `MRN` whole or as its first subcomponent, such as `12345^MR` or `12345^MR&L`, or components 5, 7 and 13, where CX.5, XON.7 and XCN.13 carry an id type, in any of their subcomponents too, such as `ID^^^AUTH^MR&local`. Those components are read so in every field whatever its type, so `70553^MRI^C4^^PET&MR` in `OBR-4`, a coded field and not a CX, is refused. An `MR` subcomponent past the first in any other component, such as the modality in `70553^PET&MR^C4`, does not count (BACKLOG #5654) | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields whose first field is `MSH`, in capitals or not. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
-| The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
+| The denylist tables did not load or failed the floor check, or the site-code check's prefixes differ from the two-digit entries of the publish guard's `[site_prefix]` table (BACKLOG #5541), and the caller passed `require_live_denylist=True` | The token source |
 
 The rows describe both anonymizers, the toolkit's `messagefoundry_toolkit/anon/` and the tee's
 `tee/anon/`. The inputs on which the two are known to differ are listed in one place, the list
@@ -2624,15 +2636,24 @@ as an escape sequence, so `123\X2D\45\X2D\6789` is a dashed SSN and `M\X52\` is 
 component read and one subcomponent on a subcomponent read, and `Peek` decodes a subcomponent,
 reading the first one where a component has several. An escape can pair across the subcomponent
 separator in the first reading and not in the second, so the check takes both. The shape
-detectors read each unmapped value as written, then each of its components decoded whole and each
-of its subcomponents decoded on its own. The MRN-typed check reads every component, its first
-subcomponent and each subcomponent of CX.5, as written, decoded, and with invisible characters
-removed, each trimmed and never split; `tests/test_anon_b224_5654.py` is the specification
+detectors read each unmapped value as written and with invisible characters removed, then each
+of its components decoded whole and each of its subcomponents decoded on its own, also with
+`\H\` and `\N\` dropped and with invisible characters removed. The MRN-typed check reads every
+component, its first subcomponent and each subcomponent of components 5, 7 and 13, as written,
+decoded, and with invisible characters removed, each trimmed, also folded to Unicode
+compatibility form, and never split; `tests/test_anon_b224_5654.py` is the specification
 of which forms count (BACKLOG #5654). The check for a shape cut
 across fields reads each line as written and with each field decoded a subcomponent and a
 component at a time, and counts a cut only where two fields meet (BACKLOG #5533 item 8). The
 token scan reads the whole message as written, then decoded a subcomponent at a time, then
-decoded a component at a time. The escape
+decoded a component at a time. Both also take each decoding with `\H\` and `\N\` dropped, and
+every reading with invisible characters removed, the token scan line by line (BACKLOG #5654).
+The token scan, the cut-shape check and the shape detectors' reading of a value as written keep
+the field, component, repetition and subcomponent separators the message declares when they
+remove invisible characters, so a TAB field separator does not join two fields there. A shape
+detector's reading of a decoded part does not keep them. Every one of those readings keeps a
+TAB, line feed, vertical tab, form feed, carriage return or NEL, which a consumer shows as white
+space, so `1<TAB>23-45-6789` is not read as a dashed SSN. The escape
 character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
 own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
 delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with
@@ -2653,11 +2674,20 @@ still pass:
   and a code written as the argument of a well-formed hex or multi-byte character-set escape,
   such as `\X971234\` or `\M971234\`, which a raw viewer shows as digits. That argument is
   not read as a site code, so a name such as `\M242844\Yamada` keeps its text (BACKLOG #5654).
+  So does a code that some invisible characters interrupt inside an escape body, such as
+  `\Z97<U+034F>1234\` or `X\97<U+200B>1234\Y`; the miss comes from the escape body, not from
+  the character alone. A code a vertical tab or file separator interrupts there is found, and a
+  carriage return or line feed there ends the line, so the message is refused as holding a line
+  no rule can reach.
 - The IPv6 check misses some routable addresses. At least these pass: one joined to an allowed
-  address, such as `fe80::1.4000:a1::5`, and one split by a highlighting or control escape, such
-  as `4000:a1:\H\:5` or `4000:a1\X00\::5` (BACKLOG #5654).
+  address, such as `fe80::1.4000:a1::5`, one written with fullwidth hex digits, which the IPv6 check does not fold, and an IPv4-mapped or
+  IPv4-compatible one whose IPv4 part sits inside more than four dotted groups after the
+  last colon, neither first nor last, such as `::ffff:10.0.0.1.8.8.8.8.10.0.0.1`
+  (BACKLOG #5654).
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
+  An invisible character written that way still hides a dashed SSN, a punctuated phone number or
+  an `MR` type, such as `123-45-67\XC2AD\89` or `12345^M\XE2808B\R`.
 
 The IPv6 check also refuses some text that holds no routable address. It reads runs of hex
 characters (0-9 and A-F), colons and dots, so a word that ends in hex characters can read as an
@@ -2797,8 +2827,8 @@ which cause applies to each, and the `error:` line that ends the run repeats the
 
 `python -m tee anonymize-captures` logs the summary at INFO once per run, after it has checked
 the captures, with a count per address. A quieter `--log-level` does not hide it: the line is
-then printed plain to stderr. It says the denylist tables were live only when they loaded and
-passed the floor check on every message. Read that list before you share a dataset. Map any
+then printed plain to stderr. It says the denylist tables were live only when they loaded,
+passed the floor check and their two-digit site prefixes matched the site-code check's on every message. Read that list before you share a dataset. Map any
 field that carries PHI in an `anon.toml` overlay, then run again.
 
 ### A captured record's id follows the rules, and its time is the real capture time

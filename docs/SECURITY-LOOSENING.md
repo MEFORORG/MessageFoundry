@@ -1867,7 +1867,10 @@ count is above `0` (vault BACKLOG #2613).
   the shapes its own controls pin. It reads call shapes by name, not what the code evaluates to, so
   some such call sites pass it; ADR 0173 §4.3's note of 2026-11-04 and the docstrings of that
   file's relaxed-hop census say what it reads. REST, SOAP
-  and FHIR hand the guard no context there.)* The engine will tell you *which* connections have it set,
+  and FHIR hand the guard no context there.)* *(Note 2026-11-17, vault BACKLOG #4912: on a
+  context whose `verify_mode` is `CERT_NONE`, `capture` names a remedy that makes the context
+  verify the peer, not the `tls_allow_expired` one, for a hop that passes no remedy of its own;
+  `_DEFAULT_WAYS_ACROSS` in `config/tls_policy.py` maps each reason to its default remedy.)* The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.

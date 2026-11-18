@@ -20,9 +20,10 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.listener_proxies import TrustedProxies, trusted_proxy_networks
 from messagefoundry.config.wiring import EnvRef, Http, WiringError, env, resolve_env_settings
 from messagefoundry.pipeline.wiring_runner import _IntakeRateLimiter
-from messagefoundry.transports.http_listener import HttpSource, trusted_proxy_networks
+from messagefoundry.transports.http_listener import HttpSource
 from tests.test_inbound_http_intake_auth import (
     KEY,
     _Audit,
@@ -314,11 +315,10 @@ def test_a_padded_header_is_read_no_further_than_the_hop_bound() -> None:
 def test_the_proxy_match_agrees_with_a_scan_of_the_list() -> None:
     """The listener bisects the collapsed ranges rather than scan every entry once per hop, since
     the span limit allows 65,536 single-host entries. It must answer as the scan does."""
-    from messagefoundry.transports.http_listener import _ProxyMatcher
 
     entries = ["10.0.0.0/24", "10.0.2.5", "10.0.4.0/31", "2001:db8::/64", "2001:db8:0:2::9"]
     networks = trusted_proxy_networks(entries)
-    matcher = _ProxyMatcher(networks)
+    matcher = TrustedProxies(networks)
     probes = [
         "10.0.0.0", "10.0.0.255", "10.0.1.0", "10.0.2.4", "10.0.2.5", "10.0.2.6", "10.0.4.1",
         "10.0.4.2", "192.0.2.1", "2001:db8::1", "2001:db8:0:1::", "2001:db8:0:2::9",
@@ -327,7 +327,7 @@ def test_the_proxy_match_agrees_with_a_scan_of_the_list() -> None:
     for probe in probes:
         address = ipaddress.ip_address(probe)
         assert (address in matcher) == any(address in n for n in networks), probe
-    assert ipaddress.ip_address("10.0.0.1") not in _ProxyMatcher(())
+    assert ipaddress.ip_address("10.0.0.1") not in TrustedProxies(())
 
 
 def test_entries_that_together_span_a_family_are_refused() -> None:
@@ -686,10 +686,10 @@ def test_a_mapped_socket_peer_still_reads_as_a_listed_proxy() -> None:
             settings={"port": 0, "intake_auth": "api_key", "trusted_proxies": ["10.0.0.5"]},
         )
     )
-    from messagefoundry.transports.http_listener import _peer_address
+    from messagefoundry.netaddr import host_address
 
     head = HttpRequest("POST", "/", {}, b"", frozenset(), CLIENT_A)
-    assert source._forwarded_client(head, _peer_address("::ffff:10.0.0.5")) == (
+    assert source._forwarded_client(head, host_address("::ffff:10.0.0.5")) == (
         ipaddress.ip_address(CLIENT_A),
     )
 
@@ -838,3 +838,271 @@ def test_the_settings_view_shows_the_proxy_addresses() -> None:
         port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=["10.0.0.5"]
     )
     assert redacted_settings(spec.settings)["trusted_proxies"] == ["10.0.0.5"]
+
+
+# --- batch 214: the open findings of PR 2887 (BACKLOG #5525 items) --------------------------------
+
+
+async def test_a_two_key_failure_spends_one_global_unit() -> None:
+    """Items 12 and 19. Two readings of one ambiguous hop are two per-peer keys of one failed
+    request, so the global window counts it once. Red on 78d8f8256a: two global units each, so two
+    such failures spent four of a budget of three, and a partner arriving next got ``429``."""
+    limiter = _IntakeRateLimiter(per_peer=10, glob=3)
+    src = await _proxied(trusted_proxies=[PROXY])
+    src.intake_rate_limiter = limiter
+    try:
+        for _ in range(2):
+            await _request(
+                src.sockport,
+                headers={"x-api-key": "wrong", "X-Forwarded-For": "2001:db8::1:2:3:4:5"},
+            )
+        partner = await _request(
+            src.sockport, headers={"x-api-key": KEY, "X-Forwarded-For": CLIENT_B}
+        )
+    finally:
+        await src.stop()
+    assert partner.status == 202, partner.status
+
+
+async def test_only_the_first_key_of_a_two_key_failure_is_charged_globally() -> None:
+    limiter = _CountingLimiter()
+    src = await _proxied(trusted_proxies=[PROXY])
+    src.intake_rate_limiter = limiter
+    try:
+        await _request(
+            src.sockport,
+            raw=_raw_with(["x-api-key: wrong", "X-Forwarded-For: 2001:db8::1:2:3:4:5"]),
+        )
+    finally:
+        await src.stop()
+    assert limiter.charges == ["2001:db8:0:1::/64", "2001:db8::/64"]
+    assert limiter.global_charges == ["2001:db8:0:1::/64"]
+
+
+async def test_a_listed_inner_proxy_whose_other_reading_is_a_phantom_is_skipped() -> None:
+    """Items 3 and 22. The bare hop ``64:ff9b::c000:221`` also reads as ``64:ff9b::c000``, which
+    carries ``0.0.192.0`` and so is no host's. With the inner proxy listed, the walk skips its hop
+    and keys on the client left of it. Red on 78d8f8256a: the phantom reading was not listed, so
+    the inner proxy was taken for the client and every client behind it keyed on its budget."""
+    limiter = _CountingLimiter()
+    src = await _proxied(trusted_proxies=[PROXY, "64:ff9b::c000:221"])
+    src.intake_rate_limiter = limiter
+    try:
+        await _request(
+            src.sockport,
+            raw=_raw_with(["x-api-key: wrong", f"X-Forwarded-For: {CLIENT_A}, 64:ff9b::c000:221"]),
+        )
+    finally:
+        await src.stop()
+    assert limiter.charges == [CLIENT_A]
+
+
+async def test_a_listed_inner_proxy_whose_other_reading_is_real_is_still_the_client() -> None:
+    """The control for the test above: a reading a client could hold is not dropped, so an inner
+    proxy listed under one reading alone is still not skipped."""
+    limiter = _CountingLimiter()
+    src = await _proxied(trusted_proxies=[PROXY, "2001:db8::1:2:3:4:5"])
+    src.intake_rate_limiter = limiter
+    try:
+        await _request(
+            src.sockport,
+            raw=_raw_with(
+                ["x-api-key: wrong", f"X-Forwarded-For: {CLIENT_A}, 2001:db8::1:2:3:4:5"]
+            ),
+        )
+    finally:
+        await src.stop()
+    assert limiter.charges == ["2001:db8:0:1::/64", "2001:db8::/64"]
+
+
+@pytest.mark.parametrize(
+    ("entry", "why"),
+    [
+        # Items 15 and 25: a zoned network is not a zoned host, and is not worded as one.
+        ("fe80::%eth0/64", "network with a zone"),
+        ("fe80::1%eth0", "address with a zone"),
+        # A zoned CIDR with host bits is refused for its host bits, as the parse refuses it.
+        ("fe80::1%eth0/64", "host bits set"),
+    ],
+)
+def test_a_refusal_names_the_form_the_parse_refused(entry: str, why: str) -> None:
+    """The refusal reads the parse's own reason rather than classify the entry a second time. Red
+    on 78d8f8256a: every entry with a '%' and a ':' was worded as a zoned host."""
+    with pytest.raises(ValueError, match=why) as excinfo:
+        trusted_proxy_networks([entry])
+    assert entry not in str(excinfo.value)
+    assert excinfo.value.__context__ is None
+
+
+def test_the_listener_imports_no_private_config_name() -> None:
+    """Items 8, 17, 24 and 26: the listener reads the address rules from ``netaddr`` and the list
+    reader from ``config.listener_proxies``, both public, rather than private ``config.settings``
+    names, and keeps no address normaliser of its own. Item 29: the config layer reads the list
+    without importing the transport."""
+    import ast
+    from pathlib import Path
+
+    import messagefoundry.config.wiring as wiring
+    import messagefoundry.transports.http_listener as listener
+
+    tree = ast.parse(Path(listener.__file__).read_text(encoding="utf-8"))
+    config_imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and (node.module or "").startswith("messagefoundry.config")
+    ]
+    # Positive control: the listener does import from the config layer, so the scan below reads
+    # real imports rather than passing on none.
+    assert config_imports
+    private = [
+        (node.module, alias.name)
+        for node in config_imports
+        for alias in node.names
+        if alias.name.startswith("_")
+    ]
+    assert not private, private
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            assert node.name != "_peer_address"
+    wiring_tree = ast.parse(Path(wiring.__file__).read_text(encoding="utf-8"))
+    assert not [
+        node
+        for node in ast.walk(wiring_tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "messagefoundry.transports.http_listener"
+    ]
+
+
+def test_a_validated_list_parses_each_entry_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Items 9, 16 and 27: a list that loads is parsed once per entry, and the whole-family
+    classifier, which parses every entry again, runs only on the refusal path. Red on 78d8f8256a,
+    where the classifier ran on every list."""
+    import messagefoundry.config.listener_proxies as reader
+
+    calls: list[str] = []
+    from messagefoundry.config.settings import _parse_trusted_proxy as real
+
+    def counting(entry: str) -> Any:
+        calls.append(entry)
+        return real(entry)
+
+    def refused(entries: Any) -> Any:
+        raise AssertionError("the classifier ran on a list that loads")
+
+    monkeypatch.setattr(reader, "_parse_trusted_proxy", counting)
+    monkeypatch.setattr(reader, "_classify_proxy_entries", refused)
+    reader._validated.cache_clear()
+    try:
+        entries = ["10.9.0.5", "10.9.1.0/24"]
+        proxies = reader.read_trusted_proxies(entries)
+        assert calls == entries
+        assert ipaddress.ip_address("10.9.1.7") in proxies
+        assert ipaddress.ip_address("10.9.2.7") not in proxies
+    finally:
+        reader._validated.cache_clear()  # drop the entry built under the patch
+
+
+def test_the_cache_holds_fewer_lists() -> None:
+    """Items 9 and 16: a list may hold 65,536 entries, so the cache keeps half the 64 lists it
+    kept, which bounds what a reload leaves pinned."""
+    import messagefoundry.config.listener_proxies as reader
+
+    maxsize = reader._validated.cache_info().maxsize
+    assert maxsize is not None and 1 <= maxsize <= 32  # still a cache, never switched off
+
+
+def test_a_matcher_built_from_a_mapped_range_matches_its_ipv4_hosts() -> None:
+    """Every hop and peer is read as IPv4 where it is mapped, so a matcher built from raw networks
+    reads a mapped range the same way."""
+    proxies = TrustedProxies((ipaddress.ip_network("::ffff:10.0.0.5/128"),))
+    assert ipaddress.ip_address("10.0.0.5") in proxies
+
+
+@pytest.mark.parametrize("entry", ["::fffe:0:0/95", "::ff00:0:0/88", "::8000:0:0/81"])
+def test_a_range_holding_the_mapped_block_is_refused(entry: str) -> None:
+    """An IPv6 range around the IPv4-mapped block trusts the mapped hop of every IPv4 host, so it is
+    the whole IPv4 family. Its mapped addresses count toward the span as the IPv4 keys they are,
+    which is what sends it to the whole-family refusal; counted as /64 networks it would load."""
+    with pytest.raises(ValueError, match="whole address family"):
+        trusted_proxy_networks([entry])
+
+
+async def test_a_hop_whose_whole_reading_is_a_phantom_stays_the_client() -> None:
+    """The reverse of the inner-proxy skip: a client sourcing ``64:ff9b::c000:221:1234`` makes its
+    hop's port-stripped reading the listed inner proxy ``64:ff9b::c000:221``. The hop is not skipped
+    on that reading, so the client cannot reach the text it wrote on its left; it keys on the
+    reading kept, as on origin/main."""
+    limiter = _CountingLimiter()
+    src = await _proxied(trusted_proxies=[PROXY, "64:ff9b::c000:221"])
+    src.intake_rate_limiter = limiter
+    try:
+        await _request(
+            src.sockport,
+            raw=_raw_with(
+                ["x-api-key: wrong", "X-Forwarded-For: 198.51.100.77, 64:ff9b::c000:221:1234"]
+            ),
+        )
+    finally:
+        await src.stop()
+    assert limiter.charges == ["192.0.2.33"]
+
+
+def test_the_hop_parameter_has_no_default() -> None:
+    """Item 21: every hop parameter of ``security_loosenings`` is required, so a caller cannot leave
+    this one out by accident and report a listener's loosening as absent."""
+    import inspect
+
+    from messagefoundry.config.settings import security_loosenings
+
+    parameter = inspect.signature(security_loosenings).parameters["listener_trusted_proxy_hops"]
+    assert parameter.default is inspect.Parameter.empty
+
+
+_CHECK_MODULE = """
+from messagefoundry import Http, MLLP, Send, env, handler, inbound, outbound, router
+
+inbound(
+    "IB_PROXIED",
+    Http(
+        port=18081, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=["10.0.0.0/24"]
+    ),
+    router="r",
+)
+inbound("IB_DIRECT", Http(port=18082, intake_auth="api_key", intake_api_key=env("k")), router="r")
+outbound("OB", MLLP(host="127.0.0.1", port=18083))
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def handle(msg):
+    return Send("OB", msg)
+"""
+
+
+def test_check_names_a_listener_that_trusts_a_proxy(tmp_path: Any) -> None:
+    """Items 6, 14 and 20: ``messagefoundry check`` names the loosening, as it names its siblings.
+    Red on 78d8f8256a, which had no such line."""
+    from messagefoundry.checks import run_checks
+    from tests.test_connection_tls_loosenings import _result, _write_config
+
+    report = run_checks(_write_config(tmp_path, module=_CHECK_MODULE), run_lint=False)
+    r = _result(report, "listener-trusted-proxies")
+    assert r.ok and not r.required and not r.skipped, r.detail
+    assert "1 HTTP listener(s)" in r.detail
+    assert "IB_PROXIED (range)" in r.detail
+    assert "IB_DIRECT" not in r.detail
+
+
+def test_check_says_none_when_no_listener_trusts_a_proxy(tmp_path: Any) -> None:
+    from messagefoundry.checks import run_checks
+    from tests.test_connection_tls_loosenings import _result, _write_config
+
+    report = run_checks(_write_config(tmp_path, clean=True), run_lint=False)
+    r = _result(report, "listener-trusted-proxies")
+    assert r.ok and not r.skipped, r.detail
+    assert "no HTTP listener trusts X-Forwarded-For" in r.detail
