@@ -193,20 +193,26 @@ It blocks a commit that:
 A file that arrives by **rename or copy** onto an ADR path is an added ADR to every rule above: the gate
 turns git's rename detection off, so a `git mv` cannot hide it (BACKLOG #5453).
 
-Under rule 1, where git itself pairs the new file with the base's own ADR of the same number, which this
-change removes, the change is a rename, and its row must link the new name in the same commit; the
-refusal says so rather than calling it a reuse. A paired source the base does not hold, such as a
-branch's own ADR under a number the base has since spent, is refused as a reuse.
+Under rule 1, where git itself pairs the new file, diffed against the base, with the base's own ADR of
+the same number, the change is a rename, and its row must link the new name in the same commit; the
+refusal says so rather than calling it a reuse. Where the staged file is itself one the base carries,
+as when a merge brings in an ADR the base renamed, the refusal says the row is wrong. A branch's own
+ADR under a number the base has since spent is refused as a reuse, unless git scores its body as
+similar to the base's ADR under that number.
 
 Under rule 2, a same-number rename allocates nothing, so the gate grants it, but only on positive facts.
-Git pairs the file with an ADR of the same number. No commit on the base's history touched an ADR under
-that number, read in a clone that is not shallow. And the fork point between the branch and the base
-holds no ADR under it. A number the base ever held fails the second, however the branch came to carry
-it: cut before the base deleted that ADR, merged with the base after, or restored exactly and renamed
-in a later commit. Rule 2's restore test then judges the file, and that test matches bytes at the path
-that lost them, so a revival under a new name is refused. A shallow clone cannot show that the base
-never held the number, so the rename is refused there with the truncated-history text, deepened or
-not; `git fetch --unshallow origin` makes it checkable. A git failure refuses too.
+Git pairs the file, diffed against `HEAD`, with an ADR of the same number. A walk of the base's history
+with `--full-history`, so that a side branch merged into the base counts, finds no commit that touched
+an ADR under that number, in a clone that is not shallow. And the fork point between the branch and
+the base holds no ADR under it. A number the base held at any commit that walk reaches fails the
+second, at least where the branch was cut before the base deleted that ADR, merged the base after, or
+restored it exactly and renamed it in a later commit. Rule 2's restore test then judges the file, and
+that test matches bytes at the path that lost them, so a revival under a new name is refused; its
+refusal says to keep the lost name until the restore lands on the base. A shallow clone cannot show
+that the base never held the number, so the rename is refused there with the truncated-history text,
+deepened or not; `git fetch --unshallow origin` makes it checkable. A git failure refuses too, and the
+gate drops `GIT_LITERAL_PATHSPECS` and `GIT_NOGLOB_PATHSPECS` from its own git calls, because either
+would make the walk's pattern match nothing.
 
 The gate asks git for the pairing with no rename limit, over `docs/adr/` alone, so the size of the rest
 of the change cannot cost a rename its pairing. A rename onto a different number is a new number and

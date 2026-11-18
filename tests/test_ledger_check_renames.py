@@ -13,6 +13,7 @@ the fix is shown not to refuse a rename the index still covers.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -35,13 +36,14 @@ def git(repo: Path, *args: str) -> str:
     return proc.stdout
 
 
-def run_check(repo: Path, *args: str) -> tuple[int, str]:
+def run_check(repo: Path, *args: str, env: dict[str, str] | None = None) -> tuple[int, str]:
     proc = subprocess.run(
         [sys.executable, str(CHECK), *args],
         cwd=repo,
         capture_output=True,
         text=True,
         check=False,
+        env={**os.environ, **env} if env else None,
     )
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -386,35 +388,21 @@ def test_a_rename_that_revives_a_number_the_base_LOST_is_a_restore_not_a_rename(
     """The branch was cut while the base still held ADR 0002; the base then deleted it. Renaming the
     branch's copy brings the number back with new bytes, which rule 2 refuses: only the lost bytes
     may come back. The rename exemption must not skip that."""
-    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
-    second = BODY.replace("synthetic", "second")
-    write(repo, "docs/adr/0002-second.md", second)
-    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="second", title="S") + "\n")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-qm", "the base takes 0002")
-    git(repo, "switch", "-q", "-c", "stale")
-    git(repo, "switch", "-q", "main")
-    git(repo, "rm", "-q", "docs/adr/0002-second.md")
-    write(repo, "docs/adr/README.md", rows)
-    git(repo, "add", "-A")
-    git(repo, "commit", "-qm", "the base drops 0002")
-    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    second = _base_takes_then_drops_0002(repo, branch_before_drop="stale")
     git(repo, "switch", "-q", "stale")
-
-    git(repo, "mv", "docs/adr/0002-second.md", "docs/adr/0002-revived.md")
-    write(repo, "docs/adr/0002-revived.md", second + "Edited.\n")
-    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="revived", title="S") + "\n")
-    git(repo, "add", "-A")
-    assert _staged_status(repo).startswith("R"), _staged_status(repo)
+    _rename_0002_second_to_revived(repo, second)
 
     code, out = run_check(repo)
     assert code == 1, out
     assert "ADR 0002 is a RESTORE" in out
+    # The remedy says why an exact restore will not let this rename through, so it cannot loop.
+    assert "a rename is refused even after an exact restore" in out
 
 
 def test_a_revival_by_rename_in_a_SHALLOW_clone_is_refused(repo: Path, tmp_path: Path) -> None:
-    """The grant needs the fork point with the base. A clone too shallow to reach it cannot show
-    that the number is new on the branch, and a doubt refuses."""
+    """A shallow clone cannot show that the base never held the number, so the grant refuses
+    whether or not the fork point is in reach; the next test pins the in-reach case. The refusal
+    names the truncated history, and, because this is a rename, how to make it checkable."""
     rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
     second = BODY.replace("synthetic", "second")
     write(repo, "docs/adr/0002-second.md", second)
@@ -449,6 +437,7 @@ def test_a_revival_by_rename_in_a_SHALLOW_clone_is_refused(repo: Path, tmp_path:
     code, out = run_check(clone)
     assert code == 1, out
     assert "ADR 0002 cannot be checked against origin/main -- the history is TRUNCATED" in out
+    assert "git fetch --unshallow origin" in out
 
 
 def test_several_adr_renames_past_the_rename_limit_still_pair(repo: Path) -> None:
@@ -611,3 +600,122 @@ def test_a_branch_adr_rename_in_a_SHALLOW_clone_is_refused_even_with_the_fork_po
     code, out = run_check(clone)
     assert code == 1, out
     assert "ADR 0002 cannot be checked against origin/main -- the history is TRUNCATED" in out
+
+
+def test_CONTROL_an_unallocated_plain_add_in_a_SHALLOW_clone_is_not_told_to_unshallow(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The unshallow line belongs to a rename only: for a plain unallocated add, unshallowing changes
+    the refusal and lets nothing through."""
+    write(repo, "docs/notes/two.md", "Base note two.\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the base adds a note")
+    clone = tmp_path / "shallow-plain"
+    clone_args = ["clone", "-q", "--depth", "1", "--no-single-branch"]
+    subprocess.run(["git", *clone_args, repo.as_uri(), str(clone)], capture_output=True, check=True)
+    for key, value in (("user.email", "t@t"), ("user.name", "t")):
+        git(clone, "config", key, value)
+    assert git(clone, "rev-parse", "--is-shallow-repository").strip() == "true"
+
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    write(clone, "docs/adr/0002-new.md", "# New\n")
+    write(clone, "docs/adr/README.md", rows + ROW.format(n="0002", slug="new", title="N") + "\n")
+    git(clone, "add", "-A")
+
+    code, out = run_check(clone)
+    assert code == 1, out
+    assert "the history is TRUNCATED" in out
+    assert "--unshallow" not in out
+
+
+def test_a_revival_by_rename_through_a_MERGED_SIDE_BRANCH_is_still_a_restore(repo: Path) -> None:
+    """A side branch takes ADR 0002 and drops it, then merges into the base with --no-ff. Default
+    history simplification follows the merge's first parent, which never held 0002, so a plain walk
+    reads the number as never spent. --full-history sees the side branch."""
+    git(repo, "switch", "-q", "-c", "side")
+    second = BODY.replace("synthetic", "second")
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    write(repo, "docs/adr/0002-second.md", second)
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="second", title="S") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the side branch takes 0002")
+    git(repo, "branch", "stale")
+    git(repo, "rm", "-q", "docs/adr/0002-second.md")
+    write(repo, "docs/adr/README.md", rows)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the side branch drops 0002")
+    git(repo, "switch", "-q", "main")
+    git(repo, "merge", "-q", "--no-ff", "side", "-m", "merge the side branch")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    # The premise: a simplified walk misses the number entirely.
+    assert git(repo, "rev-list", "origin/main", "--", "docs/adr/0002-*.md").strip() == ""
+
+    git(repo, "switch", "-q", "stale")
+    git(repo, "merge", "-q", "-s", "ours", "main", "-m", "merge the base, keeping 0002")
+    _rename_0002_second_to_revived(repo, second)
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 is a RESTORE" in out
+
+
+def test_a_revival_by_rename_is_refused_under_GIT_LITERAL_PATHSPECS(repo: Path) -> None:
+    """GIT_LITERAL_PATHSPECS makes `*` literal and disables `:(glob)`, so the walk would come back
+    empty and grant the rename. The gate drops the variable for its own git calls."""
+    second = _base_takes_then_drops_0002(repo, branch_before_drop="stale")
+    git(repo, "switch", "-q", "stale")
+    git(repo, "merge", "-q", "-s", "ours", "main", "-m", "merge the base, keeping 0002")
+    _rename_0002_second_to_revived(repo, second)
+
+    code, out = run_check(repo, env={"GIT_LITERAL_PATHSPECS": "1"})
+    assert code == 1, out
+    assert "ADR 0002 is a RESTORE" in out
+
+
+def test_a_base_adr_renamed_over_TWO_commits_keeps_the_rename_wording(repo: Path) -> None:
+    """The first rename relinks its row and passes. The second does not relink, and is paired with
+    the base's name, as CI pairs it, so the advice is to relink the row and keep the number."""
+    git(repo, "mv", "docs/adr/0001-first.md", "docs/adr/0001-mid.md")
+    write(
+        repo, "docs/adr/README.md", README_HEAD + ROW.format(n="0001", slug="mid", title="F") + "\n"
+    )
+    git(repo, "add", "-A")
+    code, out = run_check(repo)
+    assert code == 0, out
+    git(repo, "commit", "-qm", "rename ADR 0001 once")
+
+    git(repo, "mv", "docs/adr/0001-mid.md", "docs/adr/0001-final.md")
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 was renamed from 0001-first.md" in out
+    assert "already exists" not in out
+    assert "alloc.ps1" not in out
+
+
+def test_a_merge_carrying_the_bases_own_renamed_adr_is_told_to_relink_the_row(repo: Path) -> None:
+    """The base renamed ADR 0001 and relinked its row. A merge of the base whose README keeps the
+    old link adds the base's own file: nothing is reused, so the advice is to fix the row."""
+    git(repo, "switch", "-q", "-c", "old")
+    git(repo, "switch", "-q", "main")
+    git(repo, "mv", "docs/adr/0001-first.md", "docs/adr/0001-renamed.md")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD + ROW.format(n="0001", slug="renamed", title="First") + "\n",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the base renames ADR 0001")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "switch", "-q", "old")
+
+    git(repo, "merge", "-q", "--no-commit", "--no-ff", "main")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n",
+    )
+    git(repo, "add", "docs/adr/README.md")
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "does not link a file origin/main carries under that number" in out
+    assert "already exists" not in out
+    assert "alloc.ps1" not in out
