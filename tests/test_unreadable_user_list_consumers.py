@@ -127,9 +127,9 @@ async def test_the_reminder_pass_skips_an_unreadable_account_and_says_so(
         await store.close()
     said = [r.getMessage() for r in caplog.records if "fails its integrity check" in r.getMessage()]
     names = sorted(e["name"] for e in sink.events)
+    # The pass reached both accounts, so the count of skip lines below is read over a real walk:
+    # the healthy account is reminded either way, and bob too when his record reads.
+    assert names == (["user:alice"] if corrupt else ["user:alice", "user:bob"])
+    assert len(said) == (1 if corrupt else 0)
     if corrupt:
-        assert len(said) == 1 and bob in said[0]
-        assert names == ["user:alice"]  # the healthy account is still reminded
-    else:
-        assert said == []
-        assert names == ["user:alice", "user:bob"]
+        assert bob in said[0]
