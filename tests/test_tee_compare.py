@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from tee.compare import CompareConfig, compare
+from tee.compare import SEGMENT_ORDER, CompareConfig, compare
 
 A = (
     "MSH|^~\\&|MEFOR|RFAC|RECV|RFAC|20260604120000||ADT^A01|MSG1|P|2.5.1\r"
@@ -76,3 +76,62 @@ def test_custom_separators_field_addressing() -> None:
     r = compare(e1, e2)
     assert r.kind == "mismatch"
     assert any(diff.location == "PID-5" for diff in r.material_diffs)
+
+
+# Synthetic ORU with two OBR groups. Moving a segment from group 1 to group 2 keeps every segment's
+# (id, occurrence) key and every field, so only the order shows the regrouping (BACKLOG #5403).
+_ORU_HEAD = (
+    "MSH|^~\\&|MEFOR|RFAC|RECV|RFAC|20260604120000||ORU^R01|MSG1|P|2.5.1\rPID|1||100^^^H^MR\r"
+)
+_GROUP_1 = "OBR|1|||CBC\rOBX|1|NM|WBC||7.1\r"
+_NTE = "NTE|1||Specimen hemolyzed\r"
+_GROUP_2 = "OBR|2|||BMP\rOBX|1|NM|NA||140\r"
+
+
+def test_mismatch_when_an_nte_moves_between_obr_groups() -> None:
+    left = _ORU_HEAD + _GROUP_1 + _NTE + _GROUP_2
+    right = _ORU_HEAD + _GROUP_1 + _GROUP_2 + _NTE
+    r = compare(left, right)
+    assert r.kind == "mismatch"
+    [diff] = r.material_diffs
+    assert diff.location == SEGMENT_ORDER
+    assert diff.left == "MSH PID OBR OBX NTE OBR OBX"
+    assert diff.right == "MSH PID OBR OBX OBR OBX NTE"
+
+
+def test_mismatch_when_an_obx_moves_between_obr_groups() -> None:
+    obx2 = "OBX|2|NM|HGB||13.9\r"
+    left = _ORU_HEAD + _GROUP_1 + obx2 + "OBR|2|||BMP\r"
+    right = _ORU_HEAD + _GROUP_1 + "OBR|2|||BMP\r" + obx2
+    r = compare(left, right)
+    assert r.kind == "mismatch"
+    assert [d.location for d in r.material_diffs] == [SEGMENT_ORDER]
+
+
+def test_same_order_reports_no_order_diff() -> None:
+    oru = _ORU_HEAD + _GROUP_1 + _NTE + _GROUP_2
+    assert compare(oru, oru).kind == "exact"
+    # A segment on one side only is a presence diff alone; the shared segments keep their order.
+    r = compare(oru, oru + "ZID|extra\r")
+    assert [d.location for d in r.material_diffs] == ["ZID"]
+
+
+def test_an_inserted_repeated_segment_reports_no_reorder() -> None:
+    # One extra OBX in group 1 renumbers the later OBX occurrence. That is a presence diff and a
+    # mismatch, not a regrouping, so no order diff names a sequence neither message has.
+    left = _ORU_HEAD + _GROUP_1 + _GROUP_2
+    right = _ORU_HEAD + _GROUP_1 + "OBX|2|NM|HGB||13.9\r" + _GROUP_2
+    r = compare(left, right)
+    assert r.kind == "mismatch"
+    assert SEGMENT_ORDER not in {d.location for d in r.diffs}
+
+
+def test_a_regrouping_is_reported_beside_an_unrelated_extra_segment() -> None:
+    left = _ORU_HEAD + _GROUP_1 + _NTE + _GROUP_2
+    right = _ORU_HEAD + _GROUP_1 + _GROUP_2 + _NTE + "ZID|extra\r"
+    r = compare(left, right)
+    order = [d for d in r.material_diffs if d.location == SEGMENT_ORDER]
+    assert [(d.left, d.right) for d in order] == [
+        ("MSH PID OBR OBX NTE OBR OBX", "MSH PID OBR OBX OBR OBX NTE")
+    ]
+    assert "ZID" in {d.location for d in r.material_diffs}

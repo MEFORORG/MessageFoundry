@@ -2,6 +2,8 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
 
+import { UNTRUSTED_WORKSPACE_STDERR } from "../../cliJson";
+
 import {
   LENS_CONTRACT,
   type LensRow,
@@ -133,7 +135,7 @@ suite("contract negotiation — skew is handled, not discovered", () => {
       "unknown contract version 99 (supported: [1, 2])",
       "the row's source no longer matches the editor buffer (stale coordinates)",
       "row at lines 6-6 is a 'code' row",
-      "workspace not trusted — MessageFoundry CLI disabled until you trust this workspace",
+      UNTRUSTED_WORKSPACE_STDERR,
     ]) {
       assert.strictEqual(looksLikeUnknownArgument(text), false, text);
     }

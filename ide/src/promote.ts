@@ -7,9 +7,9 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { withStepUpAuth } from "./auth";
-import { configDir, engineUrl, environments, runJson, workspaceDir, type EnvironmentTarget } from "./cli";
+import { engineUrl, environments, runJson, workspaceDir, writerPathSetting, type EnvironmentTarget } from "./cli";
 import { HttpError, type Approvable } from "./engineClient";
-import { assertTargetAllowed, isLocalEngine } from "./engineTarget";
+import { assertTargetAllowed, isLocalEngine, targetRefusalNotice } from "./engineTarget";
 import {
   preflightOutcome,
   promoteOutcomeMessage,
@@ -73,7 +73,12 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
     void vscode.window.showInformationMessage("MessageFoundry: open a workspace folder first.");
     return;
   }
-  const cfg = configDir();
+  // The reload makes the engine load this folder, so a dropped value refuses rather than validate and
+  // promote the folder used in its place (BACKLOG #5404).
+  const cfg = writerPathSetting("configDir");
+  if (cfg === undefined) {
+    return;
+  }
 
   // 1. Stage — validate the candidate config locally; block the promote on any error.
   let diags: Diagnostic[];
@@ -112,7 +117,7 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
   // and bearer token. Loopback over http stays allowed (the default 127.0.0.1 dev flow).
   const gate = assertTargetAllowed(target.url);
   if (!gate.ok) {
-    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+    void vscode.window.showErrorMessage(targetRefusalNotice(gate.reason));
     return;
   }
   if (!isLocalEngine(target.url)) {

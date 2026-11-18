@@ -127,6 +127,31 @@ def client_network_allowed(host: str | None, allowlist: Sequence[str] | None) ->
     return peer_ip_allowed((host, 0), allowlist)
 
 
+#: What :func:`allowlist_restricts` accepts as an entry.
+_ALLOWLIST_ENTRY_TYPES: Final = (
+    str,
+    ipaddress.IPv4Network,
+    ipaddress.IPv6Network,
+    ipaddress.IPv4Address,
+    ipaddress.IPv6Address,
+)
+
+#: IPv6 ranges that carry an IPv4 address, each with the bit at which :func:`allowlist_restricts`
+#: takes the IPv4 address to start. Where the position varies (RFC 8215 local-use NAT64) or is
+#: obfuscated (Teredo's client address), the latest position, bit 96, is used: it demands the most
+#: fixed bits, so the guess can only fail closed.
+_IPV4_EMBEDDING_RANGES: Final = (
+    (ipaddress.IPv6Network("::ffff:0:0/96"), 96),  # IPv4-mapped, how a dual-stack socket reports
+    (ipaddress.IPv6Network("::/96"), 96),  # IPv4-compatible, deprecated but parseable
+    (ipaddress.IPv6Network("64:ff9b::/96"), 96),  # NAT64 well-known prefix, RFC 6052
+    (ipaddress.IPv6Network("64:ff9b:1::/48"), 96),  # NAT64 local-use prefix, RFC 8215
+    (ipaddress.IPv6Network("::ffff:0:0:0/96"), 96),  # IPv4-translated (SIIT), RFC 6145
+    (ipaddress.IPv6Network("2001::/32"), 96),  # Teredo, RFC 4380
+)
+# 6to4 (2002::/16, IPv4 from bit 16) is left out: an entry the IPv6 floor admits fixes at least
+# 16 of its IPv4 bits. A network-specific NAT64 prefix is the operator's own and cannot be listed.
+
+
 def allowlist_restricts(allowlist: Any) -> bool:
     """Whether a ``source_ip_allowlist`` actually limits who may connect, so a gate may count it as
     a peer control.
@@ -135,15 +160,38 @@ def allowlist_restricts(allowlist: Any) -> bool:
     every entry must be at least a :data:`ALLOWLIST_MIN_PREFIX_V4` (IPv4) or
     :data:`ALLOWLIST_MIN_PREFIX_V6` (IPv6) network, and ONE too-wide entry defeats the whole list.
     An empty or missing list restricts nobody, and so does an unparseable entry, which cannot be
-    shown to restrict anyone."""
-    if not allowlist:
+    shown to restrict anyone.
+
+    **Fail closed on shape** (vault BACKLOG #5393). Only a list, tuple or set counts, so a mapping
+    is not read as its keys. Only a string or an :mod:`ipaddress` object counts as an entry, since
+    ``ip_network`` reads the integer ``5`` and ``True`` as host addresses. The gates hand this a
+    list of strings today, so these refusals guard a direct caller.
+
+    **An IPv6 entry is also judged by the IPv4 space it embeds.** ``::ffff:0:0/96`` is a /96, far past
+    the IPv6 floor, yet a dual-stack listener sees every IPv4 peer inside it. So an entry that
+    overlaps a range in :data:`_IPV4_EMBEDDING_RANGES` must leave at least
+    :data:`ALLOWLIST_MIN_PREFIX_V4` bits of the embedded IPv4 address fixed, counted from the bit
+    that table names, and one that contains a whole range does not count at all."""
+    if not isinstance(allowlist, (list, tuple, set, frozenset)) or not allowlist:
         return False
     for entry in allowlist:
+        if not isinstance(entry, _ALLOWLIST_ENTRY_TYPES):
+            return False
         try:
-            net = ipaddress.ip_network(str(entry), strict=False)
+            net = ipaddress.ip_network(entry, strict=False)
         except ValueError:
             return False
-        floor = ALLOWLIST_MIN_PREFIX_V4 if net.version == 4 else ALLOWLIST_MIN_PREFIX_V6
-        if net.prefixlen < floor:
+        if isinstance(net, ipaddress.IPv4Network):
+            if net.prefixlen < ALLOWLIST_MIN_PREFIX_V4:
+                return False
+            continue
+        if net.prefixlen < ALLOWLIST_MIN_PREFIX_V6:
             return False
+        for embedding, ipv4_start in _IPV4_EMBEDDING_RANGES:
+            if not net.overlaps(embedding):
+                continue
+            if net.prefixlen < embedding.prefixlen:
+                return False  # it holds the whole range, so every embedded IPv4 address
+            if net.prefixlen - ipv4_start < ALLOWLIST_MIN_PREFIX_V4:
+                return False
     return True

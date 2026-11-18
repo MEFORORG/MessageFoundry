@@ -15,6 +15,10 @@ Mirth/NextGen Connect parity reference for what's planned.
 - **MESSAGE TYPE** — the HL7 message code carried (`ADT`, `ORM`, `ORU`, `SIU`, `DFT`, `MDM`, `VXU`, …),
   or `MIXED` / `ALL` when a connection isn't message‑type‑specific.
 
+Two inbound, or two outbound, connections may not have names that differ only in case
+(`IB_Test_ADT` beside `IB_TEST_ADT`): the config refuses to load, because a SQL Server store column
+that compares without case would read the two as one (BACKLOG #5392).
+
 Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sample uses partner
 `Test`: **`IB_Test_ADT`** (inbound MLLP) → **`FILE-OUT_Test_ADT`** (outbound file).
 
@@ -2745,7 +2749,7 @@ opt-out. That is expected, and the table says which they are.
 | `FhirLookup(...)` | `fhir_lookup:<name>` | yes: SMART Backend Services |
 | `Soap(...)` | `<name>` | yes: client certificate, or OAuth2 |
 | `DICOMweb(...)` | `<name>` | **no** (static bearer or Basic only) |
-| forward-proxy credential on any HTTP connection (`proxy_user`/`proxy_password`; a user or a password in the proxy URL is not listed, because it fails the connection's build, or for `[egress].proxy_url` the config load) | `proxy:<name>`, or `proxy:fhir_lookup:<name>` for a lookup, which `FhirLookup()` gives no proxy credential, so it appears only for a pair written into the lookup's settings after the factory ran | **no** (Basic or Digest only) |
+| forward-proxy credential on any HTTP connection (`proxy_user`/`proxy_password`; a user or a password in the proxy URL is not listed, because it fails the connection's build, or for `[egress].proxy_url` the config load; nor, at least, a Digest proxy on a connection whose own `url` is `https` or that mints a bearer from literal settings, which the build refuses or never sends through) | `proxy:<name>`, or `proxy:fhir_lookup:<name>` for a lookup, which `FhirLookup()` gives no proxy credential, so it appears only for a pair written into the lookup's settings after the factory ran | **no** (Basic or Digest only) |
 | `MLLP(...)`, `DICOM(...)` outbound | `<name>` | yes: `tls=True` with `tls_cert_file` |
 | `Tcp(...)`, `X12(...)` outbound | `<name>` | **no** (no credential of any kind) |
 | `Email(...)`, `Direct(...)` SMTP AUTH | `<name>` | **no** |
@@ -3787,10 +3791,11 @@ def handle(msg):
     measurements = ds.measurements()
     if not measurements:
         return None                  # nothing to deliver → FILTERED (counted + logged)
-    oru = Message.parse(
-        "MSH|^~\\&|MEFOR|RADIOLOGY|POWERSCRIBE|FACILITY|"
-        f"{ds.study_date or ''}||ORU^R01|{ds.sop_instance_uid or 'UNKNOWN'}|P|2.5.1"
-    )
+    oru = Message.parse("MSH|^~\\&|MEFOR|RADIOLOGY|POWERSCRIBE|FACILITY|||ORU^R01||P|2.5.1")
+    # Peer values go in as DATA (set_data escapes the delimiters), never into the parsed string;
+    # set_data refuses CR/LF, so flatten them first, as hl7_map's builders do.
+    oru.set_data("MSH-7", (ds.study_date or "").replace("\r", " ").replace("\n", " "))
+    oru.set_data("MSH-10", (ds.sop_instance_uid or "UNKNOWN").replace("\r", " ").replace("\n", " "))
     oru.add_segment(hl7_map.pid_from_dataset(ds))   # SR→HL7: code-first, HL7-escaped, CR/LF-guarded
     oru.add_segment(hl7_map.obr_from_dataset(ds))
     for set_id, m in enumerate(measurements, start=1):
@@ -5008,19 +5013,13 @@ quarantined to the error directory — charges. **One gap in that rule:** a quar
 the error directory fails still charges, although the file stays where it was. A file that can never
 be quarantined would therefore spend the budget on every tick, which is the starvation this rule exists
 to prevent. On `File(...)` under `after_read` `move` or `delete` (BACKLOG #5717) the gap is
-narrowed, not closed. When the move failed for a reason that looks lasting, such as access denied,
-the source remembers the file and skips it unread and uncharged until its size, modification time or
-file identity changes or `STUCK_RETRY_SECONDS` pass, whichever comes first. Once they pass, it
-examines the file again in full, oldest failure first, as soon as a scan's retry allowance reaches
-it: it is read and judged afresh, and a file that now passes, for example because a scanner no
-longer rejects it, is ingested. A file that was copied into the error directory but whose original
-could not be removed is examined the same way, so each retry may write another copy and record
-another event. Retries run after every other candidate in the scan and count against
-`FileSource._retry_allowance`, not against `poll_max_files`, so a scan can take that many files
-beyond the ceiling; the ceiling's log line does not count them. A failure that `_lasting` judges
-transient is not remembered, so such a file still charges on later scans as before. At least a
-restart of the connection and a full memory also leave a file charged again; a full memory is logged
-once. The constants are in
+narrowed, not closed. The source remembers such a file and skips it unread and uncharged until its
+size, modification time or file identity changes, or its retry falls due. Retries run in a separate
+pass after the scan's other files, a bounded number per scan outside `poll_max_files` that the
+ceiling's log line does not count. A due retry is judged afresh, so a file that now
+passes is ingested. At least a restart of the connection and a full memory leave such a file read
+and charged again. When a retry falls due is the back-off rule
+stated once at `STUCK_RETRY_SECONDS` in
 [`transports/file.py`](../messagefoundry/transports/file.py). Under `leave`, and on
 `Sftp(...)`/`Ftp(...)`, the gap stands as described.
 

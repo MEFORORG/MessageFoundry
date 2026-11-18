@@ -496,11 +496,12 @@ def _prints(atom: str, text: str) -> bool:
 
 
 def _scrub_before(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
-    """``scrub_credentials`` as it read before BACKLOG #5545: every pattern through ``_pre_camel``."""
+    """``scrub_credentials`` as it read before BACKLOG #5545: every pattern through ``_pre_camel``,
+    and no widened DSN pass (BACKLOG #5386), as ``_union`` runs its reading before."""
     folded = secretscrub._gate_fold(text)
     if not secretscrub._admits(folded, secretscrub._ANY_HINT):
         return text
-    return secretscrub._run(text, placeholder, folded, secretscrub._pre_camel_sub)
+    return secretscrub._run(text, placeholder, folded, secretscrub._pre_camel_sub, wide=False)
 
 
 def _surfaces_before(patch: pytest.MonkeyPatch) -> None:

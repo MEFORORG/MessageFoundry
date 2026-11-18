@@ -6,7 +6,7 @@
 // `generate` is a toolkit command (ADR 0201 slice 4), so both calls run `python -m messagefoundry_toolkit`.
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { TOOLKIT_RUN, messageSetsDir, run, runJson, workspaceDir } from "./cli";
+import { TOOLKIT_RUN, run, runJson, workspaceDir, writerPathSetting } from "./cli";
 
 function err(message: string): void {
   void vscode.window.showErrorMessage(`MessageFoundry: ${message}`);
@@ -16,6 +16,12 @@ export async function generateSamples(): Promise<void> {
   const ws = workspaceDir();
   if (!ws) {
     err("open a workspace folder first.");
+    return;
+  }
+  // A write: a dropped value refuses, before any prompt, rather than generate into the folder used
+  // in its place (BACKLOG #5404).
+  const setsDir = writerPathSetting("messageSetsDir");
+  if (setsDir === undefined) {
     return;
   }
 
@@ -73,7 +79,6 @@ export async function generateSamples(): Promise<void> {
   }
   const count = parseInt(countStr.trim(), 10);
 
-  const setsDir = messageSetsDir();
   const baseAbs = path.isAbsolute(setsDir) ? setsDir : path.join(ws, setsDir);
   const outAbs = path.join(baseAbs, type.toLowerCase());
 

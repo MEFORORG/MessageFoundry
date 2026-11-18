@@ -236,7 +236,9 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: **The answer should be the same on a second call over the first call's output, and it is where
 #: only the credential filters wrote in between.** They keep what this pattern reads:
 #: ``label=<redacted>``, ``bearer <redacted>``, ``scheme://user:<redacted>@`` and ``code=<redacted>``
-#: all still match.
+#: all still match. The widened DSN reading writes ``scheme://user:<redacted>@`` only over text this
+#: pattern already read, and ``scheme://:<redacted>@`` this pattern does not read, as the text it
+#: replaced was not read either; the URL arm's sentence below says why.
 #:
 #: **It would NOT be the same where something else rewrites the text between two calls, so
 #: :func:`redact` also leaves the run off any text that holds a character that is not printable.**
@@ -250,8 +252,8 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: lines, so no encoded run in one is scrubbed. Moving the credential filters ahead of this module
 #: in the log chain would lift it.
 #:
-#: **Each arm is a copy of its source, or wider, with ONE stated exception, and one source has no
-#: arm.** The label arm is
+#: **Each arm is a copy of its source, or wider, except where stated below, at least the label
+#: arm's start; and at least two sources have no arm.** The label arm is
 #: ``secretscrub``'s own: the same bounded dotted prefix as ``_LABEL_PREFIX``, the same words, and
 #: the separator. Its start is ``\b`` alone. Since BACKLOG #2999 ``secretscrub`` also starts a label
 #: right after a ``%XX`` escape (``_LABEL_START``), and this arm deliberately does not. Taking that
@@ -262,9 +264,16 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: label sits in the run's own token and its value in the next one, as in
 #: ``a%7Cb%7Cc%2Cpassword: <value>``, the run takes the label and the value prints, as it did before
 #: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme.
-#: The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
+#: ``secretscrub``'s widened reading, ``_WIDE_DSN_PASSWORD`` (BACKLOG #5386), has no arm. With a user,
+#: its first password segment takes one character or more, each in ``_DSN_PASSWORD``'s password
+#: class, and stops no later than that class does, so every text it rewrites there, this arm
+#: already reads. With an empty user it reads a DSN this
+#: arm does not, and its rewrite, ``scheme://:<redacted>@``, this arm does not read either, since its
+#: user may not be empty. So a password-only DSN does not switch the encoded run off, and a PID run
+#: beside it is still hidden. The price is that run's own: where such a DSN sits in the run's token,
+#: the run takes it, as it did before #5386. The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
 #:
-#: **A second exception: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
+#: **A source with no arm: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
 #: A draft that did switched the run off on every text holding ``;<key>=`` with a key ending in one
 #: of that pattern's words (``password``, ``pass``, ``pwd``, ``token`` and the rest), ``;Bypass=1``
 #: among them, so an encoded PHI run beside one printed where the run hid it. Without the arm the
@@ -272,9 +281,10 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: ``a%7Cb%7Cc;sslpassword=x y``, the run takes the token and the value's tail after a space prints,
 #: as it did before #5030. This module is stdlib-only and cannot
 #: import them, so ``tests/test_redaction.py`` holds each arm to its source, and checks by behaviour
-#: that this pattern matches every text either filter changes when the filters start a label at
-#: ``\b`` alone. A plain literal, so the static regex gate reads it. The prefix bound keeps the scan
-#: linear, as it does there.
+#: that this pattern matches every text of a seeded corpus either filter changes when the filters
+#: start a label at ``\b`` alone. The widened DSN reading is not counted apart there, and that
+#: corpus is not known to reach it, so that test does not gate it. A plain literal, so the
+#: static regex gate reads it. The prefix bound keeps the scan linear, as it does there.
 _CREDENTIAL_AHEAD = re.compile(
     r"""\b(?:MEFOR_[A-Z0-9_]+|(?i:(?:[A-Za-z0-9]+[._-]){0,6}(?:"""
     r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
@@ -2472,6 +2482,16 @@ def _clear_of_own_notes(text: str, kept: int) -> int:
     return kept
 
 
+def _held_back(message: str, limit: int) -> str:
+    """``message``, already redacted, cut to ``limit`` at a whole token with the ``(+N chars)`` count
+    of what it held back: :func:`safe_text`'s length bound without its work bound, for a caller whose
+    text an earlier pass already bounded and scanned (``verify.model.safe_detail_text``)."""
+    if len(message) <= limit:
+        return message
+    kept = _clear_of_own_notes(message, _whole_token_prefix(message, limit))
+    return f"{message[:kept]}{_COUNT_OPENER}{len(message) - kept}{_COUNT_CLOSER}"
+
+
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     """A PHI-redacted, length-bounded rendering of a free-text diagnostic string — the string analog of
     :func:`safe_exc`, for error/detail text that isn't an exception object (joined strict-validation
@@ -2515,10 +2535,7 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
     unterminated, which a further pass scrubbed the same way."""
     head, note = safe_text_bound(text)
-    message = redact(head).strip()
-    if len(message) > limit:
-        kept = _clear_of_own_notes(message, _whole_token_prefix(message, limit))
-        message = f"{message[:kept]}{_COUNT_OPENER}{len(message) - kept}{_COUNT_CLOSER}"
+    message = _held_back(redact(head).strip(), limit)
     return f"{message}{note}"
 
 

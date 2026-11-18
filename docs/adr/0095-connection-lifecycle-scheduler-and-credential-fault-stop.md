@@ -369,16 +369,23 @@ retried. That gap is left open.
 `http://` token endpoint must now be on the box, and a loopback hop is dialled direct, so its
 request never meets the proxy (`test_no_built_http_token_endpoint_reaches_the_web_proxy`).*
 *Closed 2026-11-06 (vault BACKLOG #2989, #3532 item 1): where the token hop's web proxy is set up
-for Digest, `smart.request_token` now raises the same fault for the proxy's 407 to an `https://`
-token endpoint's `CONNECT`, which `rest.is_refused_proxy_digest_tunnel` recognises. Since
-2026-11-13 (BACKLOG #2989 items 14 and 15) its text names the proxy's `CONNECT`, and the match
-reads the status of the proxy's reply and a flag the hop sets when it is built, not
+for Digest, `smart.request_token` raised the same fault for the proxy's 407 to an `https://`
+token endpoint's `CONNECT`, which `rest.is_refused_proxy_digest_tunnel` recognised. From
+2026-11-13 (BACKLOG #2989 items 14 and 15) its text named the proxy's `CONNECT`, and the match
+read the status of the proxy's reply and a flag the hop set when it was built, not
 `http.client`'s message.*
 *Overtaken 2026-11-14 (BACKLOG #2989 item 11): an OAuth2 or SMART token hop with an `https://` token
 endpoint, whose web proxy resolved for the token host is set up for Digest, is refused when it is
 built, so no built configuration meets this 407 and the send-time match is gone. A token host the
-proxy bypasses builds, and so does a token hop behind an ECH sidecar, whose request goes to the
-loopback sidecar direct.* The Digest
+proxy bypasses builds. A connection with `ech_egress` builds no web proxy, so a token hop behind an
+ECH sidecar never meets this refusal.*
+*Amended 2026-11-17 (BACKLOG #2989 items 20 and 21): on some REST and FHIR outbounds the refusal
+runs where the connection's web proxy is built, before the proxy credential's hop is judged, and so
+before any record of that credential crossing; `http_auth.refuse_a_digest_proxy_on_the_token_hop`
+says which. Every other token hop is refused when its provider is built, after that judgement.
+`rest.digest_proxy_meets_the_token_connect` states the rule.
+The delivery hop's own rule still differs on a bypass: it refuses Digest for any `https://`
+destination (ADR 0126 AC-6).* The Digest
 handler never sees that 407, so no retry can answer it, whatever the proxy's challenge says. The
 error carries no challenge, so a Digest-set-up proxy that challenges the `CONNECT` with Basic was
 read the same way; the engine holds no Basic credential there to answer it with. The remedies
@@ -388,9 +395,14 @@ password. A per-host bypass is such a route only where no environment or system 
 carries the request.
 A `CONNECT` 407 on a token hop with no Digest set up, a rejected pre-emptive Basic credential
 among them, still reads as unreachable and retries, which keeps the Basic case above. Any other
-`CONNECT` status retries too. The case needed a loopback `http://` destination, since proxy Digest
-is refused for an `https://` one and a bearer for an off-box `http://` one. For the same reason
-the delivery hops need no change: a delivery hop that sends a `CONNECT` has no Digest set up.
+`CONNECT` status retries too. The Digest case needed a loopback `http://` destination, since proxy
+Digest is refused for an `https://` one and a bearer for an off-box `http://` one. For the same
+reason the delivery hops need no change: a delivery hop that sends a `CONNECT` has no Digest set up.
+A delivery hop's `CONNECT` 407 retries the same way. So where the proxy is set up for Basic, each
+retry of a `CONNECT` that met a 407, on a token hop or a delivery hop, sends the rejected Basic
+credential to the proxy again, and a proxy that locks an account after failed logins could lock it
+(BACKLOG #2989 item 12). Telling that 407 apart from other `CONNECT` refusals would need the
+override of `http.client`'s private tunnel code that item 11 removed.
 
 **A 407 on a request that went direct is not the proxy's.** The proxy Digest handler answered
 nothing on such a request, but it still screened the challenge, so an NTLM 407 from the origin or
