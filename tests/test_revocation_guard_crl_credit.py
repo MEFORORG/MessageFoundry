@@ -391,7 +391,7 @@ def test_a_guard_not_verifying_the_peer_cannot_be_built_crediting_a_crl() -> Non
     import dataclasses
 
     guard = _peer_not_verified_guard(False, ssl.CERT_NONE)
-    with pytest.raises(ValueError, match="verify_mode is CERT_NONE"):
+    with pytest.raises(ValueError, match="peer_not_verified cannot credit"):
         dataclasses.replace(guard, crl_checked=True)
 
 

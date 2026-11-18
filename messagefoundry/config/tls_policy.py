@@ -1061,8 +1061,8 @@ def crl_no_credit(ctx: ssl.SSLContext | None) -> CrlNoCredit | None:
     :func:`crl_credited` is the yes-or-no form. Find the readers of both by symbol; at least
     :meth:`RevocationHopGuard.capture` and the Vault and proxy legs in
     ``transports/strict_requests.py`` read one. The verify condition can decide only where a
-    reader is handed a context whose ``verify_mode`` is ``CERT_NONE``, as ``capture`` can be. The two
-    legs read a context from the hop's own factory, and the shipped factory's context verifies it.
+    reader can be handed a ``CERT_NONE`` context, as ``capture`` can be. The two legs read a
+    context from the hop's own factory, and the shipped factory's context verifies the peer.
     ``NarrowedHTTPSConnection.connect`` on those legs is a separate check: it reads the
     connection's ``cert_reqs``, not this context. ``tests/test_revocation_guard_crl_credit.py``
     fails a read of :func:`context_checks_revocation` by that name elsewhere in the engine package.
@@ -1107,10 +1107,7 @@ EXPIRY_RELAXED_WAYS_ACROSS = (
 #: ``[tls].crl_file``, would name a lever that cannot work. It does not offer the attestation
 #: either. The disposition still ALLOWs an attested hop (:func:`revocation_hop_disposition`)
 #: (vault BACKLOG #4912).
-PEER_NOT_VERIFIED_WAYS_ACROSS = (
-    "Make this hop's TLS context verify the peer; while its verify_mode is CERT_NONE, no CRL can "
-    "admit it."
-)
+PEER_NOT_VERIFIED_WAYS_ACROSS = "Make this hop's TLS context verify the peer."
 
 
 def warn_hostname_check_off(*, connector: str, name: str, host: str) -> None:
@@ -3024,7 +3021,7 @@ class RevocationHopGuard:
         if self.crl_checked and self.expiry_relaxed:
             raise ValueError("a guard on a hop that skips time validity cannot credit a CRL")
         if self.crl_checked and self.peer_not_verified:
-            raise ValueError("a guard on a hop whose verify_mode is CERT_NONE cannot credit a CRL")
+            raise ValueError("a guard marked peer_not_verified cannot credit a CRL")
 
     @property
     def no_credit(self) -> CrlNoCredit | None:

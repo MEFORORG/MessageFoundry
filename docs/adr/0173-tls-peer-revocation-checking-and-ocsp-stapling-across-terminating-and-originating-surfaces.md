@@ -802,7 +802,8 @@ at least, off-box and unattested, it is refused under an enforcing posture, and 
 instance that does not enforce unless `MEFOR_TLS_REVOCATION_ATTESTED` is set. Before it, a guard handed such a context without the flag
 admitted the hop on that CRL, the case §4.3's note of 2026-11-03 left open. A hop is relaxed for
 the record's words and for the remedy when the flag is set or the context skips time validity, so a
-caller that passes no `ways_across` there gets `EXPIRY_RELAXED_WAYS_ACROSS`. No shipped call site's
+caller that passes no `ways_across` there gets `EXPIRY_RELAXED_WAYS_ACROSS` (not on a `CERT_NONE`
+context: see the 2026-11-17 bracket above). No shipped call site's
 disposition moved: MLLP, the DICOM SCU and FTPS pass their relaxed context with the flag (vault
 BACKLOG #5089), and at least REST, SOAP and FHIR hand the guard no context there. Tests in
 `tests/test_revocation_guard_census.py` pin the call sites as written:
