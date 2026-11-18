@@ -2441,10 +2441,13 @@ def judge_tokens(found: Iterable[str], verified: Iterable[str], mark: str) -> fr
     """The token set both directions of an inventory diff read, with a verdict on each token
     (BACKLOG #5578).
 
-    ``found`` is everything the widest reading gives; ``verified`` is what the stricter reading
-    confirms: for TypeScript/JavaScript, the per-line view plus the lexer matches whose first
-    character the lexer calls code; for Python, the scope-aware reading. A confirmed token keeps its
-    spelling. Any other found token is kept with ``mark`` appended.
+    ``found`` is what the gate reports and lists, the widest reading; ``verified`` is what the
+    stricter reading confirms: for TypeScript/JavaScript, the per-line view plus the lexer matches
+    the lexer's verdict confirms (:func:`_matches`); for Python, the scope-aware reading. A found
+    token the stricter reading also gives keeps its spelling; any other is kept with ``mark``
+    appended. A token only the stricter reading gives is not added: the stricter reading judges
+    what is found and never finds on its own, so the corpus line, ``--list-operations`` and the
+    import-only checks, which read the found set, describe the same tokens the diff reads.
 
     Why a mark and not a drop. The undocumented and stale directions must read one set, or no
     inventory satisfies both: a token the first demands, the second must accept. Dropping an
@@ -2453,18 +2456,18 @@ def judge_tokens(found: Iterable[str], verified: Iterable[str], mark: str) -> fr
     found and still has to be listed, a plain row it alone backs reads stale, and a marked row goes
     stale once the token is gone or is confirmed."""
     confirmed = frozenset(verified)
-    return confirmed | {token + mark for token in found if token not in confirmed}
+    return frozenset(token if token in confirmed else token + mark for token in found)
 
 
 def judge_map(
     found: dict[str, frozenset[str]], verified: dict[str, frozenset[str]], mark: str
 ) -> dict[str, frozenset[str]]:
-    """:func:`judge_tokens` per path, over every path either reading names; empty results dropped."""
-    judged = {
-        path: judge_tokens(found.get(path, ()), verified.get(path, ()), mark)
-        for path in found.keys() | verified.keys()
+    """:func:`judge_tokens` for every path ``found`` names."""
+    return {
+        path: judge_tokens(tokens, verified.get(path, ()), mark)
+        for path, tokens in found.items()
+        if tokens
     }
-    return {path: tokens for path, tokens in judged.items() if tokens}
 
 
 def _js_views(text: str) -> tuple[list[str], list[tuple[str, str]]]:
@@ -2503,13 +2506,24 @@ def _js_views(text: str) -> tuple[list[str], list[tuple[str, str]]]:
     return per_line, lexed
 
 
-def _matches(pattern: re.Pattern[str], line: str, verdicts: str | None) -> list[re.Match[str]]:
-    """Every match of ``pattern`` in ``line``; with ``verdicts``, only those whose first character
-    the lexer calls code."""
+#: The operation patterns whose match is a string literal's own text (a suite name, a cipher-string
+#: word), so the lexer verdict that confirms one is a literal opened on the same line. Every other
+#: pattern names a call or an option key, and is confirmed only where its first character is code.
+_LITERAL_PATTERNS = frozenset({"suite", "cipher_string"})
+
+
+def _matches(
+    pattern: re.Pattern[str], line: str, verdicts: str | None, *, in_literal: bool = False
+) -> list[re.Match[str]]:
+    """Every match of ``pattern`` in ``line``. With ``verdicts``, only those whose first character
+    the lexer calls code, or, when ``in_literal``, text of a literal opened on this line. Text on a
+    template literal's later line is never confirmed: it is where a comment-shaped line of prose
+    sits that the per-line view skips."""
+    accept = (js_lexer.CODE, js_lexer.LITERAL) if in_literal else (js_lexer.CODE,)
     return [
         match
         for match in pattern.finditer(line)
-        if verdicts is None or verdicts[match.start() : match.start() + 1] == js_lexer.CODE
+        if verdicts is None or verdicts[match.start() : match.start() + 1] in accept
     ]
 
 
@@ -2586,7 +2600,7 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
     The file count is returned so the caller can PRINT what was scanned. An instrument that reports
     "clean" without saying what it read is indistinguishable from one that read nothing, which is the
     failure this arm exists to close for ASVS 11.5.1."""
-    violations: list[str] = []
+    violations = lexer_verdict_self_test()
     actual: dict[str, frozenset[str]] = {}
     verified: dict[str, frozenset[str]] = {}
     scanned = 0
@@ -2882,7 +2896,7 @@ def _pattern_tokens(
     With the lexer's ``verdicts`` for the line, only matches whose first character it calls code."""
     found: set[str] = set()
     for name, (pattern, op_class) in patterns.items():
-        for match in _matches(pattern, line, verdicts):
+        for match in _matches(pattern, line, verdicts, in_literal=name in _LITERAL_PATTERNS):
             groups = match.groupdict()
             alg, ref = groups.get("alg"), groups.get("ref")
             if ref:
@@ -2963,9 +2977,41 @@ def _run_pattern_arm(
     return violations + undocumented + stale, scanned, actual
 
 
+#: The lexer verdict's POSITIVE CONTROL (BACKLOG #5578): ``source -> (found, verified)`` for the
+#: randomness views, then for the operation views. Prose on a template literal's later line is found
+#: and not confirmed; a *-continuation call and a call after an inline comment are both.
+_VERDICT_SELF_TEST_RANDOMNESS: dict[str, tuple[set[str], set[str]]] = {
+    "const help = `\n * call randomBytes(16)\n`;\n": ({"randomBytes"}, set()),
+    "const n = 1\n  * randomBytes(1)[0];\n": ({"randomBytes"}, {"randomBytes"}),
+}
+_VERDICT_SELF_TEST_OPERATIONS: dict[str, tuple[set[str], set[str]]] = {
+    "const help = `\n * createHash('md5')\n`;\n": ({"hash:createHash[md5]"}, set()),
+    "/* legacy */ createHash('md5')\n": ({"hash:createHash[md5]"}, {"hash:createHash[md5]"}),
+}
+
+
+def lexer_verdict_self_test() -> list[str]:
+    """Run the JS/TS views over the planted sources above. Returns violation lines: if the verdict
+    stops telling text from code, an extra token could keep a row green again, or a genuine find
+    could be marked, and the arm's clean result would mean nothing."""
+    out: list[str] = []
+    for views, planted in (
+        (randomness_token_views, _VERDICT_SELF_TEST_RANDOMNESS),
+        (non_python_operation_token_views, _VERDICT_SELF_TEST_OPERATIONS),
+    ):
+        for source, expected in planted.items():
+            got = views(source)
+            if got != expected:
+                out.append(
+                    f"lexer verdict POSITIVE CONTROL did not fire as planted on {source!r}: "
+                    f"expected (found, verified) {expected}, got {got}"
+                )
+    return out
+
+
 def check_non_python_operations(repo: Path) -> tuple[list[str], int, dict[str, frozenset[str]]]:
     """Run the TypeScript/JavaScript operation arm. Returns ``(violations, scanned, found)``."""
-    return _run_pattern_arm(
+    violations, scanned, found = _run_pattern_arm(
         repo,
         NON_PYTHON_WALK_ROOTS,
         non_python_sources,
@@ -2973,6 +3019,7 @@ def check_non_python_operations(repo: Path) -> tuple[list[str], int, dict[str, f
         NON_PYTHON_OPERATION_INVENTORY,
         "TypeScript/JavaScript",
     )
+    return lexer_verdict_self_test() + violations, scanned, found
 
 
 # --------------------------------------------------------------------------------------------
@@ -3206,6 +3253,12 @@ def powershell_operation_tokens_in(text: str) -> set[str]:
     return found
 
 
+def _powershell_token_views(text: str) -> tuple[set[str], set[str]]:
+    """The PowerShell arm has one view, so every token it finds is confirmed and none is marked."""
+    tokens = powershell_operation_tokens_in(text)
+    return tokens, tokens
+
+
 def powershell_sources(root: Path) -> list[Path]:
     """Every PowerShell script or module under ``root``, matched on the suffix case-insensitively,
     so a ``.PS1`` on a case-sensitive filesystem is still read."""
@@ -3222,7 +3275,7 @@ def check_powershell_operations(repo: Path) -> tuple[list[str], int, dict[str, f
         repo,
         POWERSHELL_WALK_ROOTS,
         powershell_sources,
-        lambda text: (tokens := powershell_operation_tokens_in(text), tokens),
+        _powershell_token_views,
         POWERSHELL_OPERATION_INVENTORY,
         "PowerShell",
     )

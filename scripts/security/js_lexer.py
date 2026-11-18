@@ -41,8 +41,10 @@ _REGEX_KEYWORDS = frozenset(
 )
 
 
-#: The verdict :func:`classify_js` gives each character: code, a literal's text, or a comment.
-CODE, LITERAL, COMMENT = "c", "l", "#"
+#: The verdict :func:`classify_js` gives each character: code, a literal's text on the line the
+#: literal opens on, a literal's text on a later line (a template literal, or a string continued by
+#: a backslash), or a comment.
+CODE, LITERAL, CONTINUED, COMMENT = "c", "l", "t", "#"
 
 
 def blank_js_comments(source: str) -> str:
@@ -60,17 +62,24 @@ def blank_js_comments(source: str) -> str:
 def classify_js(source: str) -> tuple[str, str]:
     """``(blanked, verdicts)``: :func:`blank_js_comments`'s text, and beside it one verdict per
     character of ``source``: :data:`CODE`, :data:`LITERAL` (inside a string, template or regex
-    literal, its delimiters included) or :data:`COMMENT`. A newline is kept as itself in both, so
-    the two split into the same lines. The crypto inventory gate reads the verdict at a match's
-    first character (BACKLOG #5578)."""
+    literal, its delimiters included, on the line it opens on), :data:`CONTINUED` (the same, on a
+    later line) or :data:`COMMENT`. A newline is kept as itself in both, so the two split into the
+    same lines. The crypto inventory gate reads the verdict at a match's first character
+    (BACKLOG #5578)."""
     out: list[str] = []
     verdicts: list[str] = []
     i, n = 0, len(source)
     prev = ""
 
     def emit(text: str, kind: str) -> None:
-        out.append(text if kind != COMMENT else "".join(c if c == "\n" else " " for c in text))
-        verdicts.append("".join(c if c == "\n" else kind for c in text))
+        if kind == COMMENT:
+            out.append("".join(c if c == "\n" else " " for c in text))
+        else:
+            out.append(text)
+        first, newline, rest = text.partition("\n")
+        later = CONTINUED if kind == LITERAL else kind
+        verdicts.append(kind * len(first) + newline)
+        verdicts.append("".join(c if c == "\n" else later for c in rest))
 
     while i < n:
         char, nxt = source[i], source[i + 1 : i + 2]

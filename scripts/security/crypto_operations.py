@@ -62,6 +62,14 @@ seen:
   a line, and a misread lexer blanks it. At least these misread a literal: regex-versus-division
   decided from the previous token only (a TypeScript ``x! / y``, a ``)`` before a regex), a quoted
   string ended at a newline, and a U+2028 or U+2029 inside a string, which is folded to a newline;
+* for the TypeScript/JavaScript arms' per-token verdict (BACKLOG #5578): the lexer does not model a
+  template literal's ``${}`` holes. A template nested inside a hole flips its string parity, so
+  template text after it can read as code, and a mention there is confirmed as if it were a call.
+  Code inside a hole reads as template text, so a real call on a hole's later line is marked
+  ``(not code)``. The per-line view's own false positives (a trailing comment, a mention inside a
+  quoted string) are confirmed as before #5578;
+* for the scope-aware Python reading (BACKLOG #5578): a PEP 695 type-parameter scope, a walrus in a
+  comprehension, and a ``match`` capture are not modelled as bindings;
 * a parameter or local assignment that shadows an imported name. Only imports are bindings, so a
   ``def go(sig): sig.verify(d)`` in a module that imports a first-party ``sig`` reads as a call to
   that first-party function and skips the method rule.
@@ -436,6 +444,8 @@ class _Scope:
         self.imports: dict[str, list[str]] = {}
         self.globals: set[str] = set()
         self.nonlocals: set[str] = set()
+        #: Every name the scope binds by any means, so a ``nonlocal`` can find the scope it names.
+        self.binds: set[str] = set()
 
 
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
@@ -454,78 +464,90 @@ def scoped_bindings(
     Python's own rule, for imports: an import binds its name in the scope it runs in, so a
     function-local ``from x import y as hashlib`` makes ``hashlib`` local to that whole function.
     The module-level ``hashlib`` does not reach a call inside it, and the local one reaches no
-    other function. A class body does not enclose the functions nested in it. ``global`` and
-    ``nonlocal`` move an import's binding to the module or to the enclosing function. Within one
-    scope every binding is kept, because which one runs depends on control flow (a ``try`` import
-    and its ``except ImportError`` fallback). A parameter or assignment is still not a binding, as
-    in :func:`import_aliases`, so a name that only a parameter shadows reads as the enclosing
-    import."""
+    other function. A class body does not enclose the functions nested in it. ``global`` moves an
+    import's binding to the module, and ``nonlocal`` to the nearest enclosing function that binds
+    the name. Within one scope every binding is kept, because which one runs depends on control
+    flow (a ``try`` import and its ``except ImportError`` fallback). A parameter or assignment is
+    still not a binding for this reading, as in :func:`import_aliases`, so a name that only a
+    parameter shadows reads as the enclosing import; it is tracked only to place a ``nonlocal``.
+
+    The walk keeps its own stack rather than recursing, so a deeply nested expression (a long
+    ``+`` chain) cannot exhaust the interpreter's recursion limit and crash the gate."""
     module = _Scope("module", None)
     pending: list[tuple[_Scope, str, str]] = []
     names: list[tuple[ast.Name, _Scope]] = []
+    stack: list[tuple[ast.AST, _Scope]] = [(top, module) for top in reversed(tree.body)]
 
-    def visit(node: ast.AST, scope: _Scope) -> None:
+    def push(nodes: list[ast.AST], scope: _Scope) -> None:
+        stack.extend((child, scope) for child in reversed(nodes))
+
+    while stack:
+        node, scope = stack.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             # Defaults, decorators and annotations run in the enclosing scope; the body in its own.
             args = node.args
             outer: list[ast.AST] = [*args.defaults, *(d for d in args.kw_defaults if d)]
-            body: list[ast.AST] = [node.body] if isinstance(node, ast.Lambda) else [*node.body]
-            if not isinstance(node, ast.Lambda):
-                every = [*args.posonlyargs, *args.args, *args.kwonlyargs]
-                every += [a for a in (args.vararg, args.kwarg) if a]
+            every = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+            every += [a for a in (args.vararg, args.kwarg) if a]
+            inner = _Scope("function", scope)
+            inner.binds.update(a.arg for a in every)
+            if isinstance(node, ast.Lambda):
+                body: list[ast.AST] = [node.body]
+            else:
+                scope.binds.add(node.name)
+                body = [*node.body]
                 outer += [*node.decorator_list, *(a.annotation for a in every if a.annotation)]
                 outer += [node.returns] if node.returns else []
-            for child in outer:
-                visit(child, scope)
-            inner = _Scope("function", scope)
-            for child in body:
-                visit(child, inner)
-            return
+            push(outer, scope)
+            push(body, inner)
+            continue
         if isinstance(node, ast.ClassDef):
-            for child in [*node.decorator_list, *node.bases, *node.keywords]:
-                visit(child, scope)
-            inner = _Scope("class", scope)
-            for child in node.body:
-                visit(child, inner)
-            return
+            scope.binds.add(node.name)
+            push([*node.decorator_list, *node.bases, *node.keywords], scope)
+            push([*node.body], _Scope("class", scope))
+            continue
         if isinstance(node, _COMPREHENSIONS):
             # The first iterable runs in the enclosing scope; everything else in the comprehension.
             first, *rest = node.generators
-            visit(first.iter, scope)
             inner = _Scope("function", scope)
             parts: list[ast.AST] = [first.target, *first.ifs]
             for gen in rest:
                 parts += [gen.target, gen.iter, *gen.ifs]
             parts += [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
-            for child in parts:
-                visit(child, inner)
-            return
+            push([first.iter], scope)
+            push(parts, inner)
+            continue
         if isinstance(node, ast.Global):
             scope.globals.update(node.names)
         elif isinstance(node, ast.Nonlocal):
             scope.nonlocals.update(node.names)
         elif isinstance(node, ast.Name):
             names.append((node, scope))
+            if not isinstance(node.ctx, ast.Load):
+                scope.binds.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            scope.binds.add(node.name)
         for local, target in _import_bindings(node, mod, is_init):
+            scope.binds.add(local)
             pending.append((scope, local, target))
-        for child in ast.iter_child_nodes(node):
-            visit(child, scope)
+        push(list(ast.iter_child_nodes(node)), scope)
 
-    for top in tree.body:
-        visit(top, module)
-
-    def enclosing_function(scope: _Scope) -> _Scope:
+    def nonlocal_scope(scope: _Scope, name: str) -> _Scope:
+        """The nearest enclosing function that binds ``name`` and does not pass it further up."""
         outer = scope.parent
-        while outer is not None and outer.kind == "class":
+        while outer is not None and outer is not module:
+            if outer.kind == "function" and name in outer.binds and name not in outer.nonlocals:
+                return outer
             outer = outer.parent
-        return outer or module
+        # Python refuses such a ``nonlocal`` at compile time; keep the binding somewhere it is seen.
+        return scope.parent or module
 
     # A declaration applies to its whole scope, so imports are placed once every one is read.
     for scope, local, target in pending:
         if scope.kind != "module" and local in scope.globals:
             scope = module
-        elif scope.kind == "function" and local in scope.nonlocals:
-            scope = enclosing_function(scope)
+        elif scope.kind != "module" and local in scope.nonlocals:
+            scope = nonlocal_scope(scope, local)
         _bind(scope.imports, local, target)
 
     resolved: dict[int, list[str]] = {}
@@ -538,8 +560,8 @@ def scoped_bindings(
                 continue
             if at.kind != "module" and node.id in at.globals:
                 at = module
-            elif at.kind == "function" and node.id in at.nonlocals:
-                at = enclosing_function(at)
+            elif at.kind != "module" and node.id in at.nonlocals:
+                at = nonlocal_scope(at, node.id)
                 continue
             hit = at.imports.get(node.id)
             if hit:
