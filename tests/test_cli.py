@@ -4013,7 +4013,8 @@ def test_admin_unlock_does_not_send_a_transit_seal_refusal_to_stop_the_engine(
 ) -> None:
     """BACKLOG #5633 item 2: a Transit row seal that could not be made is not a busy store, so
     its text names Vault transit rather than telling the operator to stop the engine. Raised from
-    the real clear's seal step, so its transaction's rollback is what leaves the lock standing."""
+    the real clear's seal step, which comes before its UPDATE; the defect test below is the one
+    that raises after the UPDATE."""
     import time
 
     import messagefoundry.store.store as store_module
@@ -4053,12 +4054,13 @@ def test_admin_unlock_does_not_call_an_unverifiable_seal_an_outage(
     _seed_locked(db, locked_until=time.time() + 86_400)
 
     async def unverifiable(*_a: object, **_k: object) -> None:
-        raise RowSealUnverifiableError("user")
+        raise RowSealUnverifiableError("user", stored_version=7, probe_version=3)
 
     monkeypatch.setattr(store_module, "require_user_seal_for_write", unverifiable)
     assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
     error = json.loads(capsys.readouterr().out)["error"]
     assert "RowSealUnverifiableError" in error and "would not check" in error
+    assert "stored key version 7, probe version 3" in error
     assert "stop it" not in error and "reachable" not in error
     monkeypatch.undo()
     assert _read_lock(db)[0] is not None
@@ -4112,6 +4114,14 @@ def test_admin_unlock_names_the_stored_username(
     assert json.loads(capsys.readouterr().out)["username"] == "admin"
     assert main(["admin-unlock", "--username", "ADMIN", "--db", str(db)]) == 0
     assert "cleared lockout for 'admin'" in capsys.readouterr().out
+
+    async def refuse(*_a: object, **_k: object) -> object:
+        raise RuntimeError("the audit append was refused")
+
+    # A refusal after the account was found names it as stored too.
+    monkeypatch.setattr(MessageStore, "_append_audits", refuse)
+    assert main(["admin-unlock", "--username", "ADMIN", "--db", str(db), "--json"]) == 1
+    assert "refused the unlock for 'admin'" in json.loads(capsys.readouterr().out)["error"]
     monkeypatch.undo()
     assert [d["username"] for d in _unlock_audit_details(db)] == ["admin", "admin"]
 

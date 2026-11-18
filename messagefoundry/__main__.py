@@ -7156,6 +7156,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         *reach_errors,
     )
 
+    # The name every refusal after the read uses: the stored username once the account is found,
+    # as the output and the audit row name it (BACKLOG #5633 item 7).
+    named = [wanted]
+
     async def run() -> tuple[str, Any]:
         """``(outcome, extra)``: ``extra`` is the report for ``unlocked``, the error for
         ``open-failed``, ``read-refused`` and ``refused``, else ``None``. Each catch is scoped to
@@ -7186,6 +7190,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 return ("read-refused", exc)
             if user is None:
                 return ("no-such-user", None)
+            named[0] = user.username
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
             # ADR 0197: both old expiries and both cycle counts, read before the clear so they are
             # what the clear replaced. The engine is stopped for this command (ADR 0171). The
@@ -7244,13 +7249,14 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         # #1670: a path that is not a database, or a server the driver could not reach. A refusal
         # class the engine defines, such as SchemaNotProvisionedError, is printed whole, so its
         # remedy survives, as the transit-bound commands print one (BACKLOG #5633). A plain
-        # RuntimeError keeps the redacted rendering, since its text is not the engine's own prose.
+        # RuntimeError keeps the redacted rendering it had on main: one the engine raises can
+        # embed a driver's text, so printing it whole is left open rather than taken here.
         whole = type(extra) is not RuntimeError and _is_engine_refusal(extra)
         return _emit_store_open_error(
             extra,
             _store_label(settings.store),
             as_json=args.json,
-            text=_transit_store_error_text(extra) if whole else None,
+            text=_engine_refusal_text(extra) if whole else None,
         )
     if outcome in ("read-refused", "refused"):
         # Logged, so the cause can be found: WARNING names the class only, since a driver's
@@ -7260,7 +7266,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         log.warning(
             "admin-unlock: the store refused the %s for %r (%s)",
             "account read" if outcome == "read-refused" else "unlock",
-            wanted,
+            named[0],
             type(extra).__name__,
         )
         log.debug("admin-unlock: the refusal's traceback", exc_info=extra)
@@ -7271,27 +7277,29 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             as_json=args.json,
         )
     # A Transit row seal is not a busy store, so neither gets the busy store's remedy (BACKLOG
-    # #5633 item 2). An outage clears when Vault answers; an unverifiable seal is Transit's
-    # answer, so a re-run meets it again.
+    # #5633 item 2). The Outage class covers a refused hmac or verify too, so its remedy names
+    # the token's grants; an unverifiable seal is Transit's answer, so a re-run meets it again.
     if outcome == "refused" and isinstance(extra, TransitSealUnavailableError):
         return _emit_error(
-            f"the store refused the unlock for {wanted!r} ({type(extra).__name__}): a row seal "
+            f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}): a row seal "
             "could not be made or checked through Vault transit. The clear and its audit row are "
-            "one transaction, so neither was written. Check that Vault transit is reachable, then "
-            "re-run",
+            "one transaction, so neither was written. Check that Vault transit is reachable and "
+            "that the token holds transit/hmac and transit/verify on the audit key, then re-run",
             as_json=args.json,
         )
     if outcome == "refused" and isinstance(extra, RowSealUnverifiableError):
         return _emit_error(
-            f"the store refused the unlock for {wanted!r} ({type(extra).__name__}): Vault transit "
-            "would not check the account's row seal. The clear and its audit row are one "
-            "transaction, so neither was written. A re-run meets the same answer until Transit "
-            "checks that seal: check the Transit key's versions, then read the audit log",
+            f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}): Vault "
+            "transit would not check the account's row seal (stored key version "
+            f"{extra.stored_version}, probe version {extra.probe_version}). The clear and its "
+            "audit row are one transaction, so neither was written, and this refusal wrote no "
+            "audit row. A re-run meets the same answer until Transit checks that seal: check "
+            "the Transit key's versions",
             as_json=args.json,
         )
     if outcome == "refused":
         return _emit_error(
-            f"the store refused the unlock for {wanted!r} ({type(extra).__name__}). The clear and "
+            f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}). The clear and "
             "its audit row are one transaction, so neither was written, unless a server "
             "database reported the error after its commit. If the engine is running, stop it "
             "and re-run; a second unlock is harmless",
@@ -7299,7 +7307,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
     if outcome == "changed":
         return _emit_error(
-            f"the account {wanted!r} was removed or changed while this command ran; nothing was "
+            f"the account {named[0]!r} was removed or changed while this command ran; nothing was "
             "written. Stop the engine and re-run",
             as_json=args.json,
         )
@@ -12319,10 +12327,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     if seals.refused:
         # Vault BACKLOG #5635: a seal that names a key this run holds other than the active one, or
         # is malformed, is left as it is. One that fails no key re-seals, so it must not fail the
-        # run, or every later run would fail on it too (the BACKLOG #3181 precedent). The read-back
-        # does not verify, so a sound seal an engine wrote during the run under a held retired key
-        # is counted here too, and a re-run with no engine re-seals it (items 14 and 15). Said
-        # here, not only logged.
+        # run, or every later run would fail on it too (the BACKLOG #3181 precedent).
+        # `ResealOutcome` says what else the count holds. Said here, not only logged.
         print(
             f"note: {seals.refused} user, role, open approval or directory-map record(s) were left "
             "as they are: their seal names a key this run holds other than the active one, or is "

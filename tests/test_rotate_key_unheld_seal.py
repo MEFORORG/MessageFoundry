@@ -12,10 +12,8 @@ user's seal covers, and leave the record verifying under no key.
 
 A record whose seal fails under a key the run holds, or is malformed, is the control. No key
 re-seals it, so failing on it would fail every later run too (the BACKLOG #3181 precedent); the
-run completes and says so in a note. The note's count is read back without verifying, so it
-also holds a sound seal a running engine wrote under a held retired key, and the note says so.
-The SQLite store contract runs here too; the Postgres and SQL Server suites run it on their own
-legs.
+run completes and says so in a note. The SQLite store contract runs here too; the Postgres and SQL
+Server suites run it on their own legs.
 """
 
 from __future__ import annotations
