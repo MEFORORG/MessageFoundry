@@ -3451,7 +3451,11 @@ jobs:
           # touches only that lock, and the manifest tests that read it would otherwise run nowhere.
           # `ci/python-version` is that shape once more: a patch bump edits only the pin, and
           # tests/test_ci_tool_and_image_pins.py, a manifest entry, is what reads it.
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|pyproject\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          # `hatch.toml` and `packaging/<name>/pyproject.toml` or `hatch.toml` are that shape too
+          # (BACKLOG #5641): tests/test_new_dependency_check.py, a manifest entry, sweeps every
+          # packaging pyproject and a hatch.toml beside any swept one, so an edit to one of those
+          # alone must still run this tier.
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|pyproject\.toml|hatch\.toml|packaging/[^/]+/(pyproject|hatch)\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else
