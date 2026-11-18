@@ -112,7 +112,10 @@ def _cap(root: Path, event: str, seconds: int) -> None:
     (root / ".codex").mkdir(exist_ok=True)
     (root / ".codex/config.toml").write_text(
         f'[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = "command"\n'
-        f'command = "x"\ntimeout = {seconds}\n',
+        f'command = "pwsh scripts/codex/invoke.ps1 hook"\ntimeout = {seconds}\n'
+        # Another hook's shorter timeout is not the bridge's budget.
+        f'[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = "command"\n'
+        'command = "lint"\ntimeout = 1\n',
         encoding="utf-8",
     )
 
@@ -140,7 +143,7 @@ def test_hooks_share_one_budget(bridge, tmp_path):
 
 def test_a_timeout_kills_a_grandchild_holding_the_pipes(bridge, tmp_path):
     # The hook starts a child that inherits its stdout and outlives it; subprocess.run alone would
-    # wait for that child after killing the hook.
+    # wait for that child after killing the hook, on Windows; elsewhere the drain is bounded.
     spawn = (
         "import subprocess, sys, time; "
         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(40)']); time.sleep(40)"
@@ -159,6 +162,19 @@ def test_session_start_exit_2_and_a_bad_shell_do_not_drop_context(bridge, tmp_pa
     result = bridge.dispatch(tmp_path, _SESSION_START)
     assert "earlier" in result["hookSpecificOutput"]["additionalContext"]
     assert result["systemMessage"].count("SessionStart hook") == 2
+
+
+def test_session_start_non_object_json_does_not_drop_context(bridge, tmp_path):
+    _settings(tmp_path, "SessionStart", [_context("earlier"), _py("print('[1]')")])
+    result = bridge.dispatch(tmp_path, _SESSION_START)
+    assert "earlier" in result["hookSpecificOutput"]["additionalContext"]
+    assert "not an object" in result["systemMessage"]
+
+
+def test_a_wrongly_shaped_codex_config_falls_back_to_the_default(bridge, tmp_path):
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex/config.toml").write_text("hooks = []\n", encoding="utf-8")
+    assert bridge.outer_timeout(tmp_path, "PreToolUse") == bridge.DEFAULT_OUTER_TIMEOUT
 
 
 def test_a_null_timeout_runs_within_the_budget(bridge, tmp_path):

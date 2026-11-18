@@ -15,7 +15,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -44,7 +43,9 @@ POINTER_MARKER = "<!-- codex-claude-skill-pointer -->"
 # an event's hooks one after another, so they all share that one budget. The margin leaves time for
 # the launcher, the interpreter and the reply.
 DEFAULT_OUTER_TIMEOUT = 90.0
+GIT_REPOSITORY_VARIABLES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")
 OUTER_TIMEOUT_MARGIN = 10.0
+KILL_DRAIN_TIMEOUT = 3.0
 
 
 def user_skill_directory() -> Path:
@@ -65,6 +66,7 @@ def repo_skill_directories(root: Path) -> tuple[Path, ...]:
     try:
         lines = subprocess.run(  # nosec B603 B607 - fixed git query, no shell
             ["git", "-C", str(root), *query],
+            env={k: v for k, v in os.environ.items() if k not in GIT_REPOSITORY_VARIABLES},
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -165,18 +167,24 @@ class HookBlocked(Exception):
 
 
 def outer_timeout(root: Path, event: str) -> float:
-    """The smallest timeout .codex/config.toml gives this event, or the default without one."""
+    """The timeout .codex/config.toml gives the bridge's own entry for this event, or the default."""
     try:
         config = tomllib.loads((root / ".codex/config.toml").read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        timeouts = [
+            float(hook["timeout"])
+            for group in config.get("hooks", {}).get(event, [])
+            for hook in group.get("hooks", [])
+            if "scripts/codex/invoke.ps1" in str(hook.get("command", ""))
+            and isinstance(hook.get("timeout"), int | float)
+            and not isinstance(hook.get("timeout"), bool)
+        ]
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, AttributeError) as exc:
         # The bridge never needed this file before; an unreadable one must not fail every event.
+        print(
+            f"Codex bridge: .codex/config.toml unreadable, using the default: {exc}",
+            file=sys.stderr,
+        )
         return DEFAULT_OUTER_TIMEOUT
-    timeouts = [
-        float(hook["timeout"])
-        for group in config.get("hooks", {}).get(event, [])
-        for hook in group.get("hooks", [])
-        if isinstance(hook.get("timeout"), int | float)
-    ]
     return min(timeouts, default=DEFAULT_OUTER_TIMEOUT)
 
 
@@ -194,7 +202,9 @@ def find_bash() -> str:
         # git.exe sits at several depths. bin/bash.exe first: it is the wrapper Git for Windows
         # launches, which puts /usr/bin on PATH. usr/bin/bash.exe started directly does not, so a
         # hook's own `bash` or coreutils could then resolve elsewhere, WSL's bash.exe included.
-        for parent in Path(git).resolve().parents:
+        # Up to the install root only; a walk to the drive root would try C:\bin, which any user
+        # may create.
+        for parent in Path(git).resolve().parents[:3]:
             candidates += [parent / "bin/bash.exe", parent / "usr/bin/bash.exe"]
     # System32's and WindowsApps' bash.exe launch WSL, which does not see this environment.
     if found and not re.search(r"[\\/](system32|windowsapps)[\\/]", found, re.IGNORECASE):
@@ -228,12 +238,13 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
 def run_hook(
     argv: list[str], payload: dict, root: Path, env: dict[str, str], timeout: float | None
 ) -> subprocess.CompletedProcess[str]:
-    """subprocess.run, except a timeout kills the hook's whole process tree.
+    """subprocess.run, except a timeout never waits unbounded on the hook's descendants.
 
-    subprocess.run kills only the direct child, then waits with no limit for any grandchild still
-    holding the pipes, so a hung grandchild would outlast the budget and Codex's own timeout.
+    On Windows subprocess.run kills only the direct child, then waits with no limit for any
+    grandchild still holding the pipes, so a timeout kills the tree with taskkill /T. Whatever still
+    holds the pipes after that gets a short drain, and is then abandoned to the bridge's own exit.
     """
-    with subprocess.Popen(  # nosec B603 - trusted repo hook; event data is stdin only
+    process = subprocess.Popen(  # nosec B603 - trusted repo hook; event data is stdin only
         argv,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -243,23 +254,25 @@ def run_hook(
         text=True,
         encoding="utf-8",
         errors="replace",
-        start_new_session=os.name != "nt",
-    ) as process:
+    )
+    try:
+        stdout, stderr = process.communicate(json.dumps(payload), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            subprocess.run(  # nosec B603 B607 - fixed command, our own child's pid
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        process.kill()
         try:
-            stdout, stderr = process.communicate(json.dumps(payload), timeout=timeout)
+            process.communicate(timeout=KILL_DRAIN_TIMEOUT)
         except subprocess.TimeoutExpired:
-            if os.name == "nt":
-                subprocess.run(  # nosec B603 B607 - fixed command, our own child's pid
-                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-            else:
-                os.killpg(process.pid, signal.SIGKILL)
-            process.kill()
-            process.communicate()
-            raise
+            print(
+                "Codex bridge: a timed-out hook's descendant still holds its pipes", file=sys.stderr
+            )
+        raise
     return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
@@ -406,7 +419,12 @@ def dispatch(root: Path, payload: dict) -> dict:
                     "hookSpecificOutput": {"hookEventName": event, "additionalContext": output}
                 }
             if not isinstance(update, dict):
-                raise ValueError("Hook JSON output must be an object")
+                if event != "SessionStart":
+                    raise ValueError("Hook JSON output must be an object")
+                message = "Codex bridge: a SessionStart hook printed JSON that is not an object"
+                print(message, file=sys.stderr)
+                merge_output(result, {"systemMessage": message})
+                continue
             merge_output(result, update)
     return result
 

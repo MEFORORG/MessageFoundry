@@ -13,7 +13,9 @@ Never edit Claude settings, credentials, or session markers to configure Codex.
 
 When a repo skill applies, read its current `.claude/skills/<name>/SKILL.md`.
 The entries under `.agents/skills/` are discovery pointers only. If a requested
-skill is not listed there, check `.claude/skills/` before reporting it missing.
+skill is not listed there, run `scripts/codex/invoke.ps1 source-skill <name>`
+before reporting it missing. In a linked worktree `.claude/skills/` is empty,
+and `source-skill` also reads the primary checkout's.
 Resolve linked resources from the source skill's directory.
 Also check Claude's user-level skills through
 `scripts/codex/invoke.ps1 source-skill <name>`. Repo names take precedence.

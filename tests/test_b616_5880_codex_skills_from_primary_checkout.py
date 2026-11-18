@@ -127,5 +127,13 @@ def test_a_directory_nested_in_a_repository_is_not_given_its_skills(bridge, link
     assert bridge.repo_skill_directories(nested) == (nested / ".claude/skills",)
 
 
+def test_an_inherited_git_dir_does_not_reach_the_skill_query(bridge, linked, tmp_path, monkeypatch):
+    primary, _ = linked
+    monkeypatch.setenv("GIT_DIR", str(primary / ".git"))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    assert bridge.repo_skill_directories(elsewhere) == (elsewhere / ".claude/skills",)
+
+
 def test_outside_any_repository_only_the_root_is_searched(bridge, tmp_path):
     assert bridge.repo_skill_directories(tmp_path) == (tmp_path / ".claude/skills",)

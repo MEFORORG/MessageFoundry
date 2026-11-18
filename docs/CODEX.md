@@ -30,7 +30,8 @@ New event types appear as unmapped at startup. Unsupported handler types and
 failed commands report errors. The bridge does not silently claim they ran.
 A failed SessionStart hook, exit 2 included, is reported in `systemMessage` and
 the other hooks' context is kept, as in Claude Code; on every other event a
-failure fails closed. A timeout kills the hook's whole process tree.
+failure fails closed. On Windows a timeout kills the hook's process tree; a
+descendant that escaped it gets a short drain and is then left behind.
 A command-only hook runs in the shell its `shell` key names: `bash` (Git Bash on
 Windows, never the WSL launcher) or `powershell`. With no `shell`, it uses
 PowerShell on Windows and `sh` elsewhere. Structured `command` and `args` avoid
