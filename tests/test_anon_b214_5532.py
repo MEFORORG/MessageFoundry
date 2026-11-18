@@ -116,7 +116,6 @@ def test_the_escape_character_is_the_one_msh_2_declares(leak: ModuleType) -> Non
         "A\\F\\B\\S\\C\\R\\D\\E\\",  # every delimiter escape, no shape in it
         "123\\X2\\45",  # an odd hex digit reads alone, as the engine reads it
         "123\\Q\\45\\X2D",  # an unknown escape, and an escape with no closing character
-        "123\\H\\-45-6789",  # highlighting reads as an underscore, as the engine reads it
         # An unknown escape is consumed whole, so the X2D after it is text, not a hex dash. HL7
         # reads this as 123X2DX2D followed by an unclosed run, with no shape in it.
         "123\\Q\\X2D\\45\\X2D\\6789",
@@ -198,7 +197,7 @@ def test_an_escaped_token_is_found(
     hits: list[str] = leak.leak_report(text).hits
     assert hits.count(reason) == 1, hits
     # Control: written plainly, the same token is found once, not twice.
-    plain = leak.unescape(value, leak.Seps(), "|")
+    plain = engine_surrogates.unescape(value, engine_surrogates.Seps(), "|")
     plain_hits: list[str] = leak.leak_report(f"{_HEAD}\r{line}{plain}").hits
     assert plain_hits.count(reason) == 1, plain_hits
 

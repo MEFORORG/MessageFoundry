@@ -21,6 +21,7 @@ import pytest
 
 import tee.anon as tee_anon
 from tee.anon import leak as tee_leak
+from tee.anon import surrogates as tee_surrogates
 
 _SALT = "b214-5541-salt-0123456789abcdef"
 _HEAD = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
@@ -41,11 +42,14 @@ def reloaded_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
     before = (tee_leak.estate_tokens(), guard.TOKENS_PRESENT)
     monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", _TOKENS)
     guard.reload_tokens()
+    # The site-code check's own table too: a report is live only when it holds the guard's.
+    tee_surrogates.reload_site_prefixes()
     try:
         yield guard
     finally:
         monkeypatch.undo()
         guard.reload_tokens()
+        tee_surrogates.reload_site_prefixes()
     # The guard is shared by the whole session, so its tables must be what they were.
     assert (tee_leak.estate_tokens(), guard.TOKENS_PRESENT) == before
 

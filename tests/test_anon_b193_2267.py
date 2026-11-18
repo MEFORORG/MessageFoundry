@@ -312,7 +312,10 @@ def test_a_kept_component_refusal_is_not_told_to_add_a_keep(
     assert tee.anon.leak.KEPT_COMPONENT_ADVICE in error
     assert "A keep would leave the whole field." in error
     assert ("Then retry." in error) is not other
-    assert ("For the others: Extend" in error) is other
+    # The kept-component report is the only failed message, so its other cause is not "the
+    # others" (vault BACKLOG #5533 item 19).
+    assert "For the others" not in error
+    assert ("At least one of them also had another cause: Extend" in error) is other
     assert (_GENERAL in error) is other
     assert _TOLD.capitalize() not in error
     assert "123-45-6789" not in error
@@ -390,3 +393,36 @@ def test_the_overlay_warning_reaches_real_stderr_at_every_log_level(
         assert done.returncode == 0, done.stderr
         assert len(_warnings(done.stderr)) == 1, done.stderr
         assert done.stderr.count("WARNING tee.anon.rules") == logged, done.stderr
+
+
+def test_a_field_separator_refusal_is_not_told_to_add_a_keep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Under MSH-1 ``[``, the free-text redaction ``[REDACTED]`` would hold the field separator, so
+    the tee refuses the message (BACKLOG #5540). A keep on that field would emit the captured
+    note, so the run line names this cause and its fix, never the keep (vault BACKLOG #5533 items
+    13 and 18)."""
+    path = str(tmp_path / "sep.db")
+    header = "[".join(("MSH", "^~\\&", "SAPP", "SFAC", "RAPP", "RFAC", "20260101", "", "ADT^A01"))
+    raw = f"{header}[S0[P[2.5.1\rNTE[1[[SYNTHETIC NOTE"
+
+    async def seed() -> None:
+        store = await RelayStore.open(path)
+        try:
+            await store.record_capture(
+                direction="corepoint_copy", control_id="S0", raw=raw.encode("latin-1")
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+
+    assert _run(path, tmp_path / "ds.jsonl") == 1
+
+    (error,) = [line for line in capsys.readouterr().err.splitlines() if line.startswith("error:")]
+    assert "would hold the message's field separator or a control byte" in error
+    assert "in NTE-3." in error and "point the field at drop" in error
+    assert _GENERAL not in error
+    assert "Then retry." in error
+    assert "SYNTHETIC NOTE" not in error
