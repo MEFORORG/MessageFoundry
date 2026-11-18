@@ -1042,6 +1042,15 @@ def test_a_soap_delivery_whose_token_reply_is_coded_is_a_configuration_fault() -
     _assert_coded_token_stops_the_lane(err.value)
 
 
+def test_a_rest_delivery_whose_token_reply_is_coded_is_a_configuration_fault() -> None:
+    dest = _rest()
+    dest._token_provider = _oauth2_coded()
+    dest._opener = _RaisingOpener(AssertionError("the delivery must not be sent"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as err:
+        dest._post("<payload/>")
+    _assert_coded_token_stops_the_lane(err.value)
+
+
 def test_a_fhir_delivery_whose_token_reply_is_coded_is_a_configuration_fault(ec_pem: str) -> None:
     dest = _fhir()
     dest._token_provider = _smart_coded(ec_pem)

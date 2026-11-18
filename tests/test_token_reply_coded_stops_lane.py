@@ -184,10 +184,14 @@ async def _run_three_through_the_worker(
         egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
-    await runner._destinations[OUT].aclose()  # the File connector start() built
-    runner._destinations[OUT] = cast(DestinationConnector, connector)
-    for n in (1, 2, 3):
-        (inbox / f"{n}.hl7").write_bytes(_adt(n).encode("utf-8"))
+    try:
+        await runner._destinations[OUT].aclose()  # the File connector start() built
+        runner._destinations[OUT] = cast(DestinationConnector, connector)
+        for n in (1, 2, 3):
+            (inbox / f"{n}.hl7").write_bytes(_adt(n).encode("utf-8"))
+    except BaseException:
+        await runner.stop()  # the caller's finally is not entered yet
+        raise
     return runner, sink
 
 
@@ -256,7 +260,7 @@ def _batch_runner(store: MessageStore, connector: object, sink: _RecordsStops) -
 
 
 @pytest.mark.parametrize("marked", [True, False], ids=["coded-token-reply", "unmarked-reject"])
-async def test_a_coded_token_reply_on_a_batch_stops_the_lane_and_keeps_every_member(
+async def test_a_batch_keeps_every_member_on_a_coded_token_reply_and_dead_letters_on_a_reject(
     store: MessageStore, marked: bool
 ) -> None:
     sink = _RecordsStops()
