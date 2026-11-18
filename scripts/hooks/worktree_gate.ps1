@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.17.5"
+$GateVersion = "2026.11.17.6"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -826,13 +826,17 @@ function Get-ScanRawIndexMap($Seg) {
 # chdirs, a relative chdir after an earlier line's) where the invocation's `-C` does not make that
 # directory irrelevant -- an absolute `-C` is read past such a chdir, under the conditions in
 # Get-InvocationReading and the resolver's -OwnWindow branch; git options after the verb; and a git
-# word the token pattern misses (`git.EXE reset --hard`, or `GIT` on Windows): a command whose git is
-# spelled that way is allowed unless another reading happens to refuse it, origin/main's gap too, and
-# no rule here states when one does. Also, at least: any line after an earlier line whose chdir sits
-# in parentheses, which makes the earlier-line reading answer nothing, unless the invocation's `-C`
-# fold ends absolute and its window names no work tree or git dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the PowerShell tool
-# `(Set-Location <p>)` DOES move the shell, so `(Set-Location <p>)` then `git -C . reset --hard` is
-# allowed (fail-open, f0e49f45c5c has it too).
+# word the token pattern ($gitInvocation) misses, such as `git.EXE` or `GIT` on Windows. Rule 3
+# reads a `git.EXE` invocation only where some line of the command holds both a recognised git token
+# and a rule-3 verb-hunt hit (the first reading exits on `-not $verb` otherwise), and never reads
+# `GIT`, `Git.EXE` or any spelling not starting with lowercase `git`, because the verb hunt is
+# case-sensitive; rule 3c judges a disarm only where the disarm's own line holds a recognised git
+# token. Elsewhere such a command is allowed (origin/main's gap too). Also, at least: any line after
+# an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
+# nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
+# dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the
+# PowerShell tool `(Set-Location <p>)` DOES move the shell, so `(Set-Location <p>)` then `git -C .
+# reset --hard` is allowed (fail-open, f0e49f45c5c has it too).
 # And after such a line, a `-C` window that also names a work tree or git dir is not read: git roots a
 # relative `--git-dir` or `--work-tree` against the `-C` directory, not against the unknown one, but
 # the $absC test excludes every such window, so `git -C '<p>' --work-tree=<rel> reset --hard` and
@@ -869,12 +873,12 @@ function Get-ScanRawIndexMap($Seg) {
 #   * rule 3c's owning-word reading compares bracket COUNTS, not nesting, so an owner git in an
 #     earlier closed `$( )` decides a disarm in a later one (`echo $(git -C '<p>' log -1)
 #     $(/usr/bin/git config <key>)` from outside);
-#   * the $absC fallback carries the false denies these commands already get on a line of their own
-#     (origin/main's too) past an earlier line's chdir in parentheses, where origin/main f0e49f45c5c
-#     allows them: `(cd <tmp> && ls)`, then any of `git -C '<p>' stash list` (rule 3 counts
-#     `stash` whatever the subcommand), `git -C '<p>' ''--git-dir=<o>/.git config <key>` or `git -C
-#     '<o>' log $(git -C '<p>' rev-parse HEAD) -- config <key> x`, from outside. A fix for each
-#     belongs in the one-line reading, not in $absC.
+#   * the $absC fallback carries at least the one-line false denies of an absolute `-C` window
+#     (origin/main's too) past an earlier line's chdir in parentheses. Examples origin/main
+#     f0e49f45c5c allows: `(cd <tmp> && ls)`, then any of `git -C '<p>' stash list` (rule 3
+#     counts `stash` whatever the subcommand), `git -C '<p>' ''--git-dir=<o>/.git config <key>` or
+#     `git -C '<o>' log $(git -C '<p>' rev-parse HEAD) -- config <key> x`, from outside. A fix for
+#     each belongs in the one-line reading, not in $absC.
 #
 # KNOWN WRONG REFUSAL TEXT, left open, origin/main's too: rule 3c words its refusal from the disarm
 # match, not from what the command does, so it can call a refused read "changing" or "setting" (`git
