@@ -783,7 +783,11 @@ Notes on these rows:
   pathspec. Quoting the message avoids it.
 - **Rows 3 and 4** follow from matching the word `commit` wherever the subcommand is not `add`
   or `stage`. The guard's staging rule falls back to the bare word the same way, so that an
-  option it does not know cannot hide the subcommand.
+  option it does not know is less likely to hide the subcommand. It does not make an unknown
+  option harmless: the option's value is read as the subcommand, so a value naming a read-only
+  subcommand is suppressed, and any other value sends the arguments to the blanked view, where a
+  quoted flag is not seen (BACKLOG #5450). The resolver's skip list names the value-taking global
+  options it knows; an option missing from it is a fail-open of this shape.
 - **Rows 5 and 8** are a stage or a commit scoped to one directory. The guard cannot see the
   working directory, so it reads the dot as the whole tree.
 - **The last two rows** hold the blanket spelling in a trailing comment. The `add` rules and the
