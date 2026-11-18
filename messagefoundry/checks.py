@@ -4250,9 +4250,15 @@ def _tool_installed(module: str) -> bool:
     entry whose ``os.path.normcase`` equals the working directory's, the search standing in for the
     child :func:`_run_tool` starts with ``-P``, whose environment from
     :func:`~messagefoundry.childenv.worker_environment` drops a relative ``PYTHONPATH`` entry.
-    Locates only; imports nothing. Two limits: an entry naming the working directory in another
-    spelling, such as with a trailing separator, is not skipped, and the child keeps every absolute
-    ``PYTHONPATH`` entry, so a tool package on such an entry is found and used."""
+    Locates only; imports nothing.
+
+    The search and the child differ in at least these ways. A path that reaches the working
+    directory under another name, such as a junction or a symbolic link, is not skipped. Unless
+    this interpreter runs with ``-E`` or ``-I``, which the child repeats, the child keeps every
+    absolute ``PYTHONPATH`` entry, one naming the working directory included, which this search
+    skips: the child can then import a tool package from the working directory ahead of a copy
+    this search found elsewhere. A relative ``PYTHONPATH`` entry, made absolute in this
+    interpreter's ``sys.path``, is searched here, but the child drops it."""
     import importlib.machinery
 
     try:
@@ -4314,8 +4320,9 @@ def _tool_command(module: str) -> list[str] | None:
     absolute path (:func:`_ruff_binary`). Any other tool is ``python -m <module>`` by this
     interpreter's absolute path, through :func:`~messagefoundry.childenv.python_module_argv`, whose
     ``-P`` stops the child prepending the working directory to its import path; it removes no
-    ``PYTHONPATH`` entry, so an absolute entry, even one naming the working directory, still
-    reaches the child. ``-X utf8`` sets UTF-8 output where ``-I`` would make the child ignore
+    ``PYTHONPATH`` entry, so unless this interpreter runs with ``-E`` or ``-I``, which the child
+    repeats, an absolute entry, even one naming the working directory, still reaches the child
+    (:func:`_tool_installed` says what that leaves open). ``-X utf8`` sets UTF-8 output where ``-I`` would make the child ignore
     ``PYTHONIOENCODING``."""
     from messagefoundry.childenv import python_module_argv
 

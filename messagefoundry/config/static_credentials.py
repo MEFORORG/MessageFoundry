@@ -79,9 +79,11 @@ Not every function here is pure. At least these do more than read their argument
 :func:`apply_static_credential_gate` and the guard :func:`make_static_credential_guard` returns,
 which log, the guard also reading the ``env()`` values the engine sets around it; ``_digest``,
 which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529); ``_is_https``, which logs
-at debug a proxy target that does not parse; and ``_http_literal_static`` and
+at debug a proxy target that does not parse; and ``_http_literal_static`` (BACKLOG #5510) and
 ``_dicomweb_build_refused`` (vault BACKLOG #5359), whose ``env()`` resolution runs an operator
-``cast`` as the build does (BACKLOG #5510).
+``cast`` as the build does. A function that calls one of these does the same, at least
+:func:`static_credential_hops`, :func:`run_static_credential_gate` and
+:func:`http_hop_credentials`.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
