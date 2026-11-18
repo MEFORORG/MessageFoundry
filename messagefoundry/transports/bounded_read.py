@@ -540,6 +540,18 @@ def reply_framing_fault(reader: object) -> str | None:
 _CONTENT_CODED_REASON = "a content coding other than identity, which the engine does not decode"
 
 
+def refused_error_body_phrase(refusal: EgressReplyError, body: str) -> str:
+    """How a WARNING names a non-2xx ``body`` the engine refused with ``refusal`` (BACKLOG #5910).
+
+    A content-coded body was read whole and is not ambiguously framed: it is in a coding the engine
+    does not decode, so the warning says that rather than "could not read whole". Fixed text only,
+    never a byte of the reply.
+    """
+    if isinstance(refusal, AmbiguousFramingError) and refusal.reason == _CONTENT_CODED_REASON:
+        return f"{body} in a content coding the engine does not decode"
+    return f"{body} the engine could not read whole"
+
+
 def _codings(fields: Collection[object]) -> list[str]:
     """The non-empty codings named across ``fields``, each stripped of OWS and lower-cased."""
     codings = (c.strip(" \t").lower() for field in fields for c in str(field).split(","))

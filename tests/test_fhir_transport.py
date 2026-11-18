@@ -378,6 +378,55 @@ def test_header_form_oversized_conditional_query_refused_at_construction() -> No
         _dest(conditional="if-none-exist", conditional_query=_OVER_HEADER_LIMIT_QUERY)
 
 
+@pytest.mark.parametrize("conditional", ["if-none-exist", "conditional-update"])
+@pytest.mark.parametrize("value", [" ", "   ", " \u00a0 "])
+def test_an_all_space_conditional_query_is_refused_at_construction(
+    conditional: str, value: str
+) -> None:
+    """BACKLOG #5911 step 1: all spaces is no search, and the header form would send it as one."""
+    with pytest.raises(ValueError, match="requires a 'conditional_query'"):
+        _dest(conditional=conditional, conditional_query=value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"{BASE}/a b",  # http.client refuses a space in the request line
+        f"{BASE}/caf\u00e9",  # the request target is sent as ASCII
+        f"{BASE}?q=\u0101",
+        f"{BASE}/a\u00a0b",  # a non-ASCII space
+    ],
+)
+def test_an_unsendable_static_url_is_refused_at_construction(url: str) -> None:
+    """BACKLOG #5911 step 2: the static base url gets the screen conditional_query gets."""
+    with pytest.raises(ValueError, match="'url' must have no whitespace") as ei:
+        build_destination(
+            Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=FHIR(url=url).settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
+    assert ei.value.__context__ is None
+
+
+def test_an_unsendable_static_header_value_is_refused_at_construction() -> None:
+    """BACKLOG #5911 step 2: http.client sends a header value as Latin-1, so a static one that is
+    not would fail every send. The value never reaches the refusal."""
+    with pytest.raises(ValueError, match="X-Site.*Latin-1") as ei:
+        _dest(headers={"X-Site": "snow\u0101man"})
+    assert "snow" not in str(ei.value)
+    assert ei.value.__context__ is None
+
+
+def test_a_non_ascii_static_header_name_is_refused_at_construction() -> None:
+    with pytest.raises(ValueError, match="header name that is not ASCII"):
+        _dest(headers={"X-Caf\u00e9": "1"})
+
+
+def test_a_latin_1_static_header_value_still_constructs() -> None:
+    """Positive control: a space and a Latin-1 character are legal in a header value."""
+    dest = _dest(headers={"X-Site": "caf\u00e9 one"})
+    assert dest._headers["X-Site"] == "caf\u00e9 one"
+
+
 def test_header_form_hash_refused_at_construction() -> None:
     """BACKLOG #5350: a server reading the If-None-Exist value as a query stops at a '#', so it
     would match on a shorter search than the one configured."""

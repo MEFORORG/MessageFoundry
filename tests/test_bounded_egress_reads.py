@@ -62,6 +62,7 @@ from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     MAX_TOKEN_RESPONSE_BYTES,
     REPLY_TOO_LARGE_CODE,
+    AmbiguousFramingError,
     EgressReplyError,
     ResponseTooLargeError,
     TruncatedResponseError,
@@ -942,6 +943,149 @@ def test_a_truncated_error_body_still_warns_rather_than_going_silent(
     with caplog.at_level(logging.WARNING), pytest.raises(DeliveryError):
         dest._post(json.dumps({"resourceType": "Patient"}), "POST", f"{FHIR_BASE}/Patient", {})
     assert any("could not read whole" in r.getMessage() for r in caplog.records)
+
+
+# --- a content-coded reply on the token, AI broker and lookup reads (BACKLOG #5910 step 3) --------
+#
+# reply_framing_fault refuses any content coding but identity as an AmbiguousFramingError. These
+# pin what each reader that retypes, or lets through, that refusal does with it. They pin the
+# current classification only: whether a coded token reply should stay retryable is an owner
+# question (#5910 step 4), so nothing here asserts it should.
+
+_CODED_200 = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
+
+
+def test_an_oauth2_token_reply_in_a_content_coding_is_refused() -> None:
+    provider = OAuth2ClientCredentialsProvider(
+        token_url=TOKEN_URL, client_id="cid", client_secret="s3cr3t"
+    )
+    provider._opener = _FakeOpener(_wire(_CODED_200))  # type: ignore[assignment]
+    with pytest.raises(AmbiguousFramingError, match="content coding") as err:
+        provider.access_token()
+    assert "s3cr3t" not in str(err.value)
+
+
+def test_a_smart_token_reply_in_a_content_coding_is_refused(ec_pem: str) -> None:
+    provider = SmartBackendTokenProvider(
+        token_url=TOKEN_URL,
+        client_id="cid",
+        private_key=ec_pem,
+        algorithm=SignatureAlgorithm.ES256,
+        scope="system/*.rs",
+    )
+    provider._opener = _FakeOpener(_wire(_CODED_200))  # type: ignore[assignment]
+    with pytest.raises(AmbiguousFramingError, match="content coding"):
+        provider.access_token()
+
+
+def test_the_ai_broker_maps_a_content_coded_reply_onto_its_own_error_type() -> None:
+    broker = AiBroker(
+        endpoint=AI_ENDPOINT,
+        api_key="sk-secret-key-value",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_AI_ATTESTED_REASON,
+    )
+    broker._opener = _FakeOpener(_wire(_CODED_200))  # type: ignore[assignment]
+    with pytest.raises(AiBrokerError, match="content coding") as err:
+        broker.chat("def handle(msg): ...")
+    assert "sk-secret-key-value" not in str(err.value)
+
+
+def test_fhir_lookup_maps_a_content_coded_reply_onto_fhir_lookup_error() -> None:
+    ex = FhirLookupExecutor(
+        {"epic": {"url": FHIR_BASE}}, egress=EgressSettings(deny_by_default=False)
+    )
+    ex._opener["epic"] = _FakeOpener(_wire(_CODED_200, method="GET"))  # type: ignore[assignment]
+    with pytest.raises(FhirLookupError, match="content coding"):
+        ex._get("epic", f"{FHIR_BASE}/Patient/123")
+
+
+# --- the SOAP and FHIR error-body reads (BACKLOG #5910 steps 1 and 2) ------------------------------
+
+_CODED_500 = b"HTTP/1.1 500 Internal Server Error\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
+
+
+def _coded_500_error(url: str) -> urllib.error.HTTPError:
+    inner = _wire(_CODED_500)
+    return urllib.error.HTTPError(url, 500, "err", inner.headers, inner)
+
+
+def _post_soap(dest: SoapDestination) -> None:
+    dest._post("<env:Envelope/>")
+
+
+def _post_fhir(dest: FhirDestination) -> None:
+    dest._post(json.dumps({"resourceType": "Patient"}), "POST", f"{FHIR_BASE}/Patient", {})
+
+
+@pytest.mark.parametrize("which", ["soap", "fhir"])
+def test_a_content_coded_error_body_is_named_as_coded_not_as_unread(
+    which: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Step 1: a coded error body was read whole, so "could not read whole" misnames it."""
+    if which == "soap":
+        soap = _soap()
+        soap._opener = _RaisingOpener(_coded_500_error(SOAP_URL))  # type: ignore[assignment]
+        post: Callable[[], None] = lambda: _post_soap(soap)  # noqa: E731
+    else:
+        fhir = _fhir()
+        fhir._opener = _RaisingOpener(_coded_500_error(FHIR_BASE))  # type: ignore[assignment]
+        post = lambda: _post_fhir(fhir)  # noqa: E731
+    with caplog.at_level(logging.WARNING), pytest.raises(DeliveryError):
+        post()
+    assert "in a content coding the engine does not decode" in caplog.text
+    assert "could not read whole" not in caplog.text
+
+
+class _FailingReadHTTPError(urllib.error.HTTPError):
+    """A non-2xx whose error-body read raises ``exc``."""
+
+    def __init__(self, url: str, exc: Exception) -> None:
+        super().__init__(url, 500, "err", email.message.Message(), io.BytesIO(b""))
+        self.exc = exc
+
+    def read(self, amt: int = -1) -> bytes:
+        raise self.exc
+
+
+@pytest.mark.parametrize("which", ["soap", "fhir"])
+@pytest.mark.parametrize("failure", [ConnectionResetError(), ValueError("closed")])
+def test_a_socket_failure_on_the_error_body_still_classifies_on_the_status(
+    which: str, failure: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Step 2: what a socket read raises is still dropped to status-only, and now logged."""
+    url = SOAP_URL if which == "soap" else FHIR_BASE
+    err = _FailingReadHTTPError(url, failure)
+    if which == "soap":
+        soap = _soap()
+        soap._opener = _RaisingOpener(err)  # type: ignore[assignment]
+        post: Callable[[], None] = lambda: _post_soap(soap)  # noqa: E731
+    else:
+        fhir = _fhir()
+        fhir._opener = _RaisingOpener(err)  # type: ignore[assignment]
+        post = lambda: _post_fhir(fhir)  # noqa: E731
+    with caplog.at_level(logging.WARNING), pytest.raises(DeliveryError) as raised:
+        post()
+    assert "500" in str(raised.value)
+    assert type(failure).__name__ in caplog.text
+
+
+@pytest.mark.parametrize("which", ["soap", "fhir"])
+def test_a_defect_in_the_error_body_read_is_not_swallowed(which: str) -> None:
+    """Step 2: the bare `except Exception` hid any defect as a status-only classification."""
+    url = SOAP_URL if which == "soap" else FHIR_BASE
+    err = _FailingReadHTTPError(url, RuntimeError("defect"))
+    if which == "soap":
+        soap = _soap()
+        soap._opener = _RaisingOpener(err)  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="defect"):
+            _post_soap(soap)
+    else:
+        fhir = _fhir()
+        fhir._opener = _RaisingOpener(err)  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="defect"):
+            _post_fhir(fhir)
 
 
 def test_a_truncated_reply_never_carries_the_partial_body_on_the_exception_chain() -> None:

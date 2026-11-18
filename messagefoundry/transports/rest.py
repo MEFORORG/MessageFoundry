@@ -132,6 +132,7 @@ __all__ = [
     "refuse_cleartext_credentials",
     "refuse_cleartext_egress",
     "refuse_unrevoked_verified_hop",
+    "refuse_unsendable_static_request",
     "refuse_url_credentials",
     "refuse_verify_off",
     "url_host_label",
@@ -1820,6 +1821,36 @@ def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
         f"outbound header {violation.name!r} is {violation.length} chars, over the "
         f"{violation.limit}-char limit; check the configured header / credential value"
     )
+
+
+def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, setting: str) -> None:
+    """Refuse at construction a static URL or header ``http.client`` could never send (BACKLOG #5911).
+
+    The screen a configured value needs beside :func:`enforce_outbound_length_limits`: that gate
+    bounds lengths only, and these values are the same for every message, so one the wire refuses
+    would fail every send. ``http.client`` sends the request target as ASCII and refuses a space in
+    it, encodes a header name as ASCII and a header value as Latin-1. The host is left alone, since
+    ``http.client`` IDNA-encodes a non-ASCII one. Control characters are screened by the caller.
+
+    Raises :class:`ValueError` naming ``setting`` and the header name only, never a value, which an
+    ``env()`` binding can fill with a credential. Every raise sits outside any ``except`` block, so
+    no ``__context__`` carries the value (see :func:`_latin1_refusal_position`).
+    """
+    parts = urllib.parse.urlsplit(url)
+    target = url[len(f"{parts.scheme}://{parts.netloc}") :] if parts.netloc else url
+    if not target.isascii() or any(ch.isspace() for ch in url):
+        raise ValueError(
+            f"{setting} 'url' must have no whitespace, and an ASCII path and query (http.client "
+            "sends the request target as ASCII); percent-encode it"
+        )
+    for name, value in headers.items():
+        if not name.isascii():
+            raise ValueError(f"{setting} has a header name that is not ASCII")
+        if _latin1_refusal_position(value) is not None:
+            raise ValueError(
+                f"{setting} header {name!r} is not encodable as Latin-1 (http.client sends header "
+                "values as Latin-1)"
+            )
 
 
 def enforce_send_time_length_limits(

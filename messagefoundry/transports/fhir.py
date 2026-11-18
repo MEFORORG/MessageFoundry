@@ -97,6 +97,7 @@ from messagefoundry.transports.bounded_read import (
     hop_identity,
     read_2xx_reply_text,
     read_bounded_text,
+    refused_error_body_phrase,
 )
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture
@@ -136,6 +137,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_egress,
     refuse_held_dynamic_headers,
     refuse_unrevoked_verified_hop,
+    refuse_unsendable_static_request,
     refuse_url_credentials,
     refuse_verify_off,
     revocation_attestation_from_settings,
@@ -1120,9 +1122,9 @@ class FhirDestination(DestinationConnector):
         self.conditional_query: str | None = (
             _reject_config_control_chars(str(_q), "conditional_query") if _q else None
         )
-        if (
-            self.conditional in ("if-none-exist", "conditional-update")
-            and not self.conditional_query
+        if self.conditional in ("if-none-exist", "conditional-update") and not (
+            # BACKLOG #5911: all spaces is no search; the header form would send it as one.
+            self.conditional_query and self.conditional_query.strip()
         ):
             raise ValueError(
                 f"FHIR destination conditional={self.conditional!r} requires a 'conditional_query' "
@@ -1232,6 +1234,8 @@ class FhirDestination(DestinationConnector):
             else []
         )
         enforce_outbound_length_limits(self.base_url, self._headers)
+        # BACKLOG #5911: the space and Latin-1 screen conditional_query gets, for the static rest.
+        refuse_unsendable_static_request(self.base_url, self._headers, setting="FHIR destination")
         refuse_cleartext_credentials(
             scheme,
             self._headers,
@@ -1749,18 +1753,27 @@ class FhirDestination(DestinationConnector):
                     connector=f"{self._hop} error body",
                     encoding=self.encoding,
                 )
-            except EgressReplyError:
+            except EgressReplyError as refused:
                 # The FAMILY, not just the byte bound: a truncated error body is equally unusable
-                # and equally worth a named warning. Catching the member sent it to the bare
-                # `except Exception` below, where the operator got no signal at all.
+                # and equally worth a named warning. Catching the member once sent it to a bare
+                # `except Exception`, where the operator got no signal at all.
                 logger.warning(
-                    "%s returned an HTTP %s error body the engine could not read whole; "
-                    "classifying on the status alone",
+                    "%s returned an HTTP %s %s; classifying on the status alone",
                     self._hop,
                     exc.code,
+                    refused_error_body_phrase(refused, "error body"),
                 )
                 body = ""
-            except Exception:  # noqa: BLE001 - a body we can't read just becomes status-only
+            except (OSError, ValueError, http.client.HTTPException) as failed:
+                # BACKLOG #5910: what a socket read can raise, named rather than caught bare, so a
+                # defect raising anything else is not hidden. By class only: no reply byte.
+                logger.warning(
+                    "%s returned an HTTP %s error body the read failed on (%s); classifying on "
+                    "the status alone",
+                    self._hop,
+                    exc.code,
+                    type(failed).__name__,
+                )
                 body = ""
             if self._token_provider is not None and exc.code == 401:
                 # ADR 0024: the SMART token may have expired between mint and use — drop it and retry
