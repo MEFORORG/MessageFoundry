@@ -3553,7 +3553,7 @@ def Http(
     written: Any = trusted_proxies
     if isinstance(trusted_proxies, EnvRef):
         written = None if trusted_proxies.default is _UNSET else trusted_proxies.default
-    from messagefoundry.transports.http_listener import trusted_proxy_networks
+    from messagefoundry.config.listener_proxies import trusted_proxy_networks
 
     refusal: str | None = None
     try:
@@ -7913,7 +7913,7 @@ def listener_trusted_proxy_hops(
     never left off. A ``deployed=False`` listener with an ``env()`` value is skipped, as
     :func:`ech_cleartext_sidecar_hops` skips one, since its values are never resolved. A value the
     build would refuse is skipped too: no listener is built from it."""
-    from messagefoundry.transports.http_listener import trusted_proxy_networks
+    from messagefoundry.config.listener_proxies import trusted_proxy_networks
 
     out: list[tuple[str, str]] = []
     for ic in registry.inbound.values():

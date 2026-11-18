@@ -252,7 +252,7 @@ class _Ledger:
     def check_peer(self, peer: str) -> bool:
         return True
 
-    def charge_failure(self, peer: str) -> None:
+    def charge_failure(self, peer: str, *, charge_global: bool = True) -> None:
         self.charges.append(peer)
 
     def note_success(self, peer: str) -> None:
