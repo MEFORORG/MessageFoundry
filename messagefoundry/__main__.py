@@ -12344,8 +12344,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "the store is refused on every read and no key re-seals it, so it does not hold this "
             "rotation open; recreate or remove it. A write an engine made during this run may be "
             "sound and still under the prior key: stop every engine using this store and re-run "
-            "before dropping that key. If such a run counts the records again, treat them as "
-            "changed outside the store."
+            "before dropping that key. A re-run may count such a record again; do not remove an "
+            "account on this count alone."
         )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under

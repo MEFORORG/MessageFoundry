@@ -914,8 +914,8 @@ class ResealOutcome:
     the rest it left: a seal that names a key the run holds other than the active one, or is
     malformed. The read-back does not verify them, so ``refused`` holds at least a seal that fails
     under a key the run holds, which no key re-seals, and a sound seal a writer running alongside
-    made under a retired key the run holds after its pass, which a re-run with no writer re-seals
-    (vault BACKLOG #5635 items 14 and 15). They never hold a rotation open: failing on a seal no
+    made under a retired key the run holds after its pass (vault BACKLOG #5635 items 14 and
+    15). They never hold a rotation open: failing on a seal no
     key re-seals would fail every later run too."""
 
     unheld: int = 0
