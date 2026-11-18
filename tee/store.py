@@ -39,10 +39,11 @@ __all__ = ["RelayStore", "NakRow", "CaptureRow", "PurgeIncompleteError"]
 # back. What is escaped is stated once, in docs/PHI.md, section 7, the tee relay paragraph.
 _MAX_DETAIL = 500
 
-# Bound the stored identifiers too. MSH-10 and MSH-9 come from partner bytes, and a frame may be up
-# to the relay's 16 MiB limit, so an unbounded field would be stored whole and every `naks` read
-# would load and escape it. 199 is MSH-10's length in HL7 v2.7 and later, the longer of the two
-# fields, so no conformant identifier is cut. Cut, not escaped: `naks` escapes what it prints.
+# Bound the stored identifiers and ACK code too. MSH-10, MSH-9 and MSA-1 come from partner bytes, and
+# a frame may be as large as --max-frame-bytes allows (16 MiB by default), so an unbounded field
+# would be stored whole and every `naks` or `export` read would load it. 199 is the longest MSH-10
+# recent HL7 v2 versions allow, the longest of the three fields, so no conformant value is cut. Cut,
+# not escaped: `naks` escapes what it prints.
 _MAX_IDENTIFIER = 199
 
 _SCHEMA = """
@@ -183,7 +184,7 @@ def _clean_detail(detail: str | None) -> str | None:
 
 
 def _bound_identifier(value: str | None) -> str | None:
-    """An MSH-10 or MSH-9 value kept to at most ``_MAX_IDENTIFIER`` characters, or ``None``."""
+    """An MSH-10, MSH-9 or MSA-1 value kept to at most ``_MAX_IDENTIFIER`` characters, or ``None``."""
     return None if value is None else value[:_MAX_IDENTIFIER]
 
 
@@ -337,7 +338,7 @@ class RelayStore:
                     _bound_identifier(message_type),
                     size_bytes,
                     outcome,
-                    ack_code,
+                    _bound_identifier(ack_code),
                     _clean_detail(detail),
                 ),
             )
@@ -362,7 +363,7 @@ class RelayStore:
     ) -> list[CaptureRow]:
         """Captured full message **bodies** (PHI) for the #14 parity comparison — typically the
         Corepoint-output rows (``direction='corepoint_copy'``) the compare tool diffs against MEFOR's
-        transform output, carrying the MSH-10 control id for correlation.
+        transform output, carrying the MSH-10 control id for correlation, cut to ``_MAX_IDENTIFIER``.
 
         Unlike :meth:`export` (deliberately body-free), this returns raw bodies and is therefore
         **test-data-only**: never log it or redirect it to CI. ``direction``/``since``/``before`` narrow

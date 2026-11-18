@@ -95,7 +95,7 @@ async def test_detail_is_bounded_and_scrubbed(tmp_path: Path) -> None:
 
 
 async def test_identifiers_are_bounded_before_they_are_stored(tmp_path: Path) -> None:
-    # BACKLOG #5637: MSH-10 and MSH-9 come from partner bytes, so a huge value must not be stored
+    # BACKLOG #5637: MSH-10, MSH-9 and MSA-1 come from partner bytes, so a huge value must not be stored
     # whole for every `naks` read to load and escape. A conformant identifier is kept as sent.
     huge_id = "9" * 1_000_000
     huge_type = "ADT^" * 250_000
@@ -107,8 +107,8 @@ async def test_identifiers_are_bounded_before_they_are_stored(tmp_path: Path) ->
             control_id=huge_id,
             message_type=huge_type,
             size_bytes=1,
-            outcome="nak",
-            ack_code="AR",
+            outcome="transport_error",  # `naks` lists it whatever its code
+            ack_code="AR" * 500_000,
             detail=None,
         )
         await store.record_leg(
@@ -126,6 +126,7 @@ async def test_identifiers_are_bounded_before_they_are_stored(tmp_path: Path) ->
         by_leg = {n.leg: n for n in naks}
         assert by_leg["corepoint"].control_id == huge_id[:199]
         assert by_leg["corepoint"].message_type == huge_type[:199]
+        assert by_leg["corepoint"].ack_code == ("AR" * 500_000)[:199]
         assert by_leg["mefor"].control_id == "C" * 199
         assert by_leg["mefor"].message_type == "ADT^A01^ADT_A01"
         (capture,) = await store.captures()

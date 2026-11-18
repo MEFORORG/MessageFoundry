@@ -865,7 +865,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             failed += 1  # it is a count, not a leak (LeakError, or anything else)
             continue
         # The id is read from the anonymized body, with the reader the relay used for row.control_id,
-        # so it follows the rules; it is None when that body has no MSH-10. received_at is the
+        # though the store then cuts an over-long one (`_MAX_IDENTIFIER`, tee/store.py) and this does
+        # not, so it follows the rules; it is None when that body has no MSH-10. received_at is the
         # relay's real receive time, which no MSH-7 rule touches (BACKLOG #2994). The surrogates
         # are ASCII today, but this runs outside the catch above, so a character latin-1 cannot
         # hold must give None rather than end the run.
