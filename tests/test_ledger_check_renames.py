@@ -81,6 +81,11 @@ def _staged_status(repo: Path) -> str:
     return git(repo, "diff", "--cached", "--name-status")
 
 
+def _ci_status(repo: Path) -> str:
+    """What the CI mode's two-dot diff reports, with git's default rename detection on."""
+    return git(repo, "diff", "--name-status", "origin/main", "HEAD")
+
+
 def test_a_rename_onto_a_base_adr_number_is_blocked(repo: Path) -> None:
     git(repo, "mv", "docs/notes/draft.md", "docs/adr/0001-moved.md")
     # The premise: git itself reports this as a rename, which is what the filter used to drop.
@@ -94,6 +99,7 @@ def test_a_rename_onto_a_base_adr_number_is_blocked(repo: Path) -> None:
 def test_a_rename_onto_a_base_adr_number_is_blocked_in_CI_mode(repo: Path) -> None:
     git(repo, "mv", "docs/notes/draft.md", "docs/adr/0001-moved.md")
     git(repo, "commit", "-qm", "move a note onto ADR 0001")
+    assert _ci_status(repo).startswith("R"), _ci_status(repo)
 
     code, out = run_check(repo, "--ci")
     assert code == 1, out
@@ -103,6 +109,7 @@ def test_a_rename_onto_a_base_adr_number_is_blocked_in_CI_mode(repo: Path) -> No
 def test_a_rename_onto_a_new_number_with_no_index_row_is_blocked(repo: Path) -> None:
     git(repo, "mv", "docs/notes/draft.md", "docs/adr/0002-moved.md")
     git(repo, "commit", "-qm", "move a note onto ADR 0002")
+    assert _ci_status(repo).startswith("R"), _ci_status(repo)
 
     code, out = run_check(repo, "--ci")
     assert code == 1, out
@@ -135,3 +142,18 @@ def test_CONTROL_a_slug_rename_whose_row_follows_it_passes(repo: Path) -> None:
 
     code, out = run_check(repo)
     assert code == 0, out
+
+
+def test_a_slug_rename_whose_row_still_links_the_old_name_is_refused_as_a_rename(
+    repo: Path,
+) -> None:
+    """Refused, because the row would link a file that is gone, but NOT as a reuse: the remedy is to
+    relink the row, never to allocate a new number for an ADR that already has one."""
+    git(repo, "mv", "docs/adr/0001-first.md", "docs/adr/0001-renamed.md")
+    assert _staged_status(repo).startswith("R"), _staged_status(repo)
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 was renamed from 0001-first.md" in out
+    assert "already exists" not in out
+    assert "alloc.ps1" not in out

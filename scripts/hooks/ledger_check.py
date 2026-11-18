@@ -405,23 +405,17 @@ class Ledger:
     # and copies under `diff.renames=copies`, so a `git mv` onto an ADR path reports as R (a copy as
     # C), the A filter dropped it, and the file skipped every rule below. With detection off, the
     # destination of a rename or copy is the plain add it is.
+    _ADDED = ("-z", "--name-only", "--no-renames", "--diff-filter=A")
+
     def added_files(self) -> list[str]:
         """Files ADDED by this change. In CI, HEAD is the PR merged into base, so this is the PR's set."""
         if self.ci:
-            return _paths(
-                git(
-                    "diff",
-                    "-z",
-                    "--name-only",
-                    "--no-renames",
-                    "--diff-filter=A",
-                    self.base,
-                    "HEAD",
-                )
-            )
-        return _paths(
-            git("diff", "-z", "--cached", "--name-only", "--no-renames", "--diff-filter=A")
-        )
+            return _paths(git("diff", *self._ADDED, self.base, "HEAD"))
+        return _paths(git("diff", "--cached", *self._ADDED))
+
+    def in_head(self, path: str) -> bool:
+        """Does the path exist in the tree this change produces (the index locally, HEAD in CI)?"""
+        return _obj_exists(f"HEAD:{path}" if self.ci else f":{path}")
 
     def head_text(self, path: str) -> str:
         """The file as it will exist after this commit — the INDEX, not the working tree."""
@@ -753,7 +747,8 @@ class Ledger:
         ledgers hid a deletion differently. A backlog item was a HEADING inside a 30k-line file:
         absorb it into the line above and the diffstat reads 5 insertions, 1 deletion, with the
         item's whole body still present and re-attributed (BACKLOG #1470). An ADR is a FILE --
-        delete it and git prints `D docs/adr/0084-x.md` in the diffstat and in the PR's file list.
+        delete it and git prints `D docs/adr/0084-x.md` in the diffstat and in the PR's file list,
+        or, where rename detection pairs it with a new path, a rename line naming the old path.
         Building the same machinery against a threat git already reports is not depth, it is noise.
         So the reverse arm went with the half that needed it, and nothing is owed here.
 
@@ -785,6 +780,19 @@ class Ledger:
                 # names the companion. ADR 0013 is exactly this and is CORRECT. Only an UNdeclared reuse
                 # is a collision.
                 if not row_names_file(first_rows.get(number, ""), basename):
+                    if not self.in_head(f"docs/adr/{base_adrs[number]}"):
+                        # The base's file for this number is gone from this change, so this is a
+                        # RENAME of that ADR (BACKLOG #5453), not a second session's reuse. It
+                        # allocates nothing; what it owes is a row that links the new name.
+                        self.fail(
+                            f"ADR {number} was renamed from "
+                            f"{_safe_for_message(base_adrs[number])}, and its row in "
+                            "docs/adr/README.md does not link the new file",
+                            "The index row would keep linking a file that no longer exists, and "
+                            "the renamed ADR would be invisible in the index.",
+                            "make the row link the renamed file in THIS commit; keep the number",
+                        )
+                        continue
                     self.fail(
                         f"ADR {number} already exists on {self.base} as "
                         f"{_safe_for_message(base_adrs[number])}",

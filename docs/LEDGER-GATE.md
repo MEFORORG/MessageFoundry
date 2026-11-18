@@ -190,6 +190,11 @@ It blocks a commit that:
 4. **adds an ADR under a new number whose row does not link it** (BACKLOG #2002); or
 5. leaves **duplicate index rows** for one number.
 
+A file that arrives by **rename or copy** onto an ADR path is an added ADR to every rule above: the gate
+turns git's rename detection off, so a `git mv` cannot hide it (BACKLOG #5453). Renaming an ADR's own
+file under the same number allocates nothing, but its row must link the new name in the same commit;
+the gate says so rather than calling it a reuse.
+
 In every rule above, and in the corpus check, "names" and "links" mean the same thing. The file must be
 the target of a Markdown link in the row, not a substring of it (BACKLOG #2001). The gate reads one link
 form: `[text](NNNN-name.md)` or `[text](./NNNN-name.md)`, with an optional `#fragment`. It ignores a link
