@@ -209,6 +209,9 @@ def main(argv: list[str] | None = None) -> int:
             result = _core.write_corpus(
                 "ADT", triggers=[trigger], count=args.count, out=args.out, seed=args.seed
             )
+        except OSError as exc:
+            print(f"could not write the corpus under {out_root}: {exc}", file=sys.stderr)
+            return 1
         except _core.GenerationError as exc:
             print(f"VALIDATION FAILED: {trigger} #{exc.index} ({structure})", file=sys.stderr)
             for err in exc.errors:

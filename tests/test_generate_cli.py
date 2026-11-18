@@ -149,3 +149,42 @@ def test_generate_reports_a_write_failure_without_a_traceback(
 
     assert rc == 1
     assert "error: could not write the corpus" in capsys.readouterr().err
+
+
+def test_generate_json_reports_a_write_failure_as_a_json_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+
+    rc = main(
+        [
+            "generate",
+            "--type",
+            "ADT",
+            "--triggers",
+            "A01",
+            "--count",
+            "1",
+            "--out",
+            str(blocker),
+            "--json",
+        ]
+    )
+
+    assert rc == 1
+    assert "could not write the corpus" in _out_json(capsys)["error"]  # type: ignore[index]
+
+
+def test_adt_generator_reports_a_write_failure_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from messagefoundry_toolkit.generators import adt
+
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+
+    rc = adt.main(["--triggers", "A01", "--count", "1", "--out", str(blocker), "--quiet"])
+
+    assert rc == 1
+    assert "could not write the corpus" in capsys.readouterr().err

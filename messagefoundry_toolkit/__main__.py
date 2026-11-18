@@ -659,6 +659,11 @@ def _generate(args: argparse.Namespace) -> int:
     code = args.type.upper()
     triggers = [t.strip().upper() for t in args.triggers.split(",") if t.strip()] or None
     out = args.out or f"samples/messages/{code.lower()}"
+    # Checked here as well as in write_corpus, so a bad count is a usage error (exit 2) without
+    # catching every ValueError generation might raise (BACKLOG #5819).
+    if not 1 <= args.count <= _core.MAX_CORPUS_COUNT:
+        _emit_error(f"--count must be between 1 and {_core.MAX_CORPUS_COUNT}", as_json=args.json)
+        return 2
     # `is None`, not `or`: an explicit empty --seed is a seed the user chose (BACKLOG #5819).
     seed = _core.DEFAULT_SEED if args.seed is None else args.seed
     try:
@@ -666,15 +671,16 @@ def _generate(args: argparse.Namespace) -> int:
     except KeyError as exc:
         print(f"error: {exc.args[0] if exc.args else exc}", file=sys.stderr)
         return 2
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
     except _core.GenerationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:
-        print(f"error: could not write the corpus: {exc}", file=sys.stderr)
-        return 1
+        # The failure can land after a trigger's old files were cleared, so do not imply nothing
+        # changed.
+        return _emit_error(
+            f"could not write the corpus under {out}, which may now be partly rewritten: {exc}",
+            as_json=args.json,
+        )
 
     if args.json:
         _print_json(
@@ -727,7 +733,7 @@ def _impact(args: argparse.Namespace) -> int:
         return _emit_error(
             "--apply is not supported for a code_set rename: it would rewrite the code_set(...) "
             "references without moving the code set's file. Use `messagefoundry codeset rename "
-            f"--config {args.config} --name {args.name} --to {args.rename_to}` instead",
+            "--config <dir> --name <old> --to <new>` instead",
             as_json=args.json,
         )
 

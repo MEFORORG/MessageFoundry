@@ -72,7 +72,10 @@ export async function generateSamples(): Promise<void> {
     prompt: "Messages per trigger",
     value: "5",
     validateInput: (v) =>
-      /^\d+$/.test(v.trim()) && Number(v) > 0 ? undefined : "enter a positive integer",
+      // 9999 is the generator's MAX_CORPUS_COUNT: files are named NNNN.hl7.
+      /^\d+$/.test(v.trim()) && Number(v) > 0 && Number(v) <= 9999
+        ? undefined
+        : "enter a whole number from 1 to 9999",
   });
   if (countStr === undefined) {
     return;
