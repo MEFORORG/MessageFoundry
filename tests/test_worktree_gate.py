@@ -2715,6 +2715,28 @@ def test_rule_3c_still_denies_writes_beside_the_multi_argument_read(
 @pytest.mark.parametrize(
     "cmd",
     [
+        'git config -f ".git/config"--unset core.hooksPath',
+        'git config --file ".git/config"--unset core.hooksPath',
+        'git config --local -f ".git/config"--unset core.hooksPath',
+        'git config -f ".git/config"--unset-all alias.lg',
+        'git config --get core.hooksPath "x"--unset',
+        'git config --get core.hooksPath "x"y',
+        "git config --get core.hooksPath 'x'y",
+    ],
+)
+def test_rule_3c_a_quote_joined_to_the_next_word_gets_no_added_reading(
+    git_primary: Path, git_repos_file: Path, cmd: str
+) -> None:
+    """The scan joins an unmasked quoted word to the text after it; PowerShell splits them, so the
+    first spelling REMOVES core.hooksPath there (review round 91d27d05d7). origin/main denies each."""
+    for tool in ("Bash", "PowerShell"):
+        reason = assert_denied(run_gate(bash(cmd, cwd=git_primary, tool=tool), git_repos_file))
+        assert "SHARED git configuration" in reason, (tool, cmd)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
         "git config --get alias.x y\rgit config core.hooksPath /dev/null",
         "git config --get alias.x\rgit config core.hooksPath /dev/null",
         "git config --get core.hooksPath y \rgit config core.hooksPath /dev/null",

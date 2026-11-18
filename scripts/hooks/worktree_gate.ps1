@@ -3739,6 +3739,8 @@ if ($tool -in @("Bash", "PowerShell")) {
     # (BACKLOG #5588, #5589). Exact spellings only: an abbreviation is no read, and a value-taking
     # option is one only in $readValueOpts below.
     $readOpts = '--(?:get|get-all|get-regexp|local|global|system|worktree|includes|no-includes|null|name-only|show-origin|show-scope|all|show-names|bool|int|bool-or-int|path|expiry-date)|-z'
+    # The list as it stood before #5589's added step, for a segment the scan may have misjoined (below).
+    $readOptsBefore = '--(?:get|get-all|get-regexp|local|global|system|worktree|includes|no-includes|null|name-only|show-origin|show-scope)|-z'
     # ONE SHELL WORD THAT IS PLAIN TEXT IN BASH, POWERSHELL AND CMD: no quote, escape, sigil
     # (cmd's `%` and `^` included, since the scan reads `cmd /c` text too), glob, bracket, redirect,
     # comment or newline, and no leading `-` or `=`, so it cannot be an option or hide a second
@@ -3809,11 +3811,19 @@ if ($tool -in @("Bash", "PowerShell")) {
         # plain word ($readValueOpts); what follows the key is $rest, judged below.
         # Spaces and tabs only between tokens: a CR there is a PowerShell statement break, and with the
         # value-taking options it would let a second statement start between `config` and the key.
-        $viaRead = $viaConfig -and ($via -cmatch "^config(?:[ \t]+get)?(?:[ \t]+(?:$readOpts|$readValueOpts))*[ \t]+\z")
+        # A QUOTE JOINED TO THE TEXT AFTER IT IS READ TWO WAYS. The scan unmasks a quoted one-word
+        # span (BACKLOG #1069) and joins it to what follows, but PowerShell ends a token that starts
+        # with a quote at the closing quote: `-f ".git/config"--unset core.hooksPath` scans as one
+        # `-f` value and runs as `-f .git/config --unset core.hooksPath` (review round 91d27d05d7).
+        # On such a segment the readings #5589 added (the value-taking options, the added flags and
+        # the multi-argument read) are not given, and the rule judges it as it did before them.
+        $quoteJoined = $seg.Raw -match '["''][^"''\r\n]*["''][^\s|;&)]'
+        $viaRead = $viaConfig -and $(if ($quoteJoined) { $via -cmatch "^config(?:[ \t]+get)?(?:[ \t]+(?:$readOptsBefore))*[ \t]+\z" }
+                                     else { $via -cmatch "^config(?:[ \t]+get)?(?:[ \t]+(?:$readOpts|$readValueOpts))*[ \t]+\z" })
         # A --get MODE IN $via makes what follows the key a value PATTERN, never a value to store
         # (BACKLOG #5589; measured in tests/test_worktree_gate.py). A display flag alone does not:
         # real git stores `/nope` for `git config --show-names core.hooksPath /nope`.
-        $viaGet = $viaRead -and ($via -cmatch '(?:^|\s)--(?:get|get-all|get-regexp)(?=\s)')
+        $viaGet = $viaRead -and -not $quoteJoined -and ($via -cmatch '(?:^|\s)--(?:get|get-all|get-regexp)(?=\s)')
         # For the refusal's wording only: a config-form disarm that is not the plain `config <key> <v>`
         # shape may REMOVE the key, so "setting" would misdescribe it. The wording can still misname a
         # refused read; see KNOWN WRONG REFUSAL TEXT under THE ADDED READINGS.
@@ -3944,7 +3954,9 @@ if ($tool -in @("Bash", "PowerShell")) {
         # tabs, one $plainWord, which holds no quote, sigil, bracket, redirect or CR, and nothing
         # else. It needs every token of $via on the allowlist and a --get mode among them. A second
         # word stays DENIED, and so does a quoted pattern, except one the scan unmasks because it holds
-        # one bare word (BACKLOG #1069), which the shell reads as that word.
+        # one bare word (BACKLOG #1069) with a space or separator after its closing quote. A quote with
+        # text right after it is read one way by the scan and another by PowerShell, so a segment
+        # holding one gets none of #5589's added readings ($quoteJoined).
         # ===============================================================================================
 
         # ===============================================================================================
