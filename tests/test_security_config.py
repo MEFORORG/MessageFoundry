@@ -922,11 +922,16 @@ def test_an_intermediary_list_never_satisfies_the_open_egress_gate(
 ) -> None:
     """``allowed_proxy`` and ``allowed_ech_sidecar`` gate a transport intermediary, not a
     destination, so listing one says nothing about where PHI may be sent: under the opt-out the
-    gate still refuses an instance that lists only one of them (BACKLOG #1659, #5528)."""
+    gate still names an instance that lists only one of them, on both arms: under the opt-out it
+    refuses, and with the switch unset it still says no destination is declared, where an SMTP or
+    Direct list would satisfy it (BACKLOG #1659, #5528)."""
     toml = f"security.block_unlisted_outbound = false\n{intermediary}\n"
     rc = _serve(tmp_path, monkeypatch, toml, env="prod")
     assert rc == 2
     assert "egress is UNRESTRICTED on a production PHI instance" in capsys.readouterr().err
+
+    _serve(tmp_path, monkeypatch, f"{intermediary}\n", env="prod")
+    assert "no outbound destination is declared" in capsys.readouterr().err
 
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
