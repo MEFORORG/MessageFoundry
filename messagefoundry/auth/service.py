@@ -18123,7 +18123,7 @@ class AuthService:
         except RowSealError:
             # BACKLOG #5505: a cell that does not parse holds no code the caller could match. The
             # walk below runs over the padding alone, so a wrong code reaches the second-step
-            # lockout as any other does, and the verify still never raises. The decoder logged it.
+            # lockout as any other does. The decoder logged it.
             real = []
         # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
         # first argon2id match, so the NUMBER of ~64 MiB verifications was a function of which code
@@ -20214,8 +20214,9 @@ class AuthService:
         self, gate_only: frozenset[str], *, role_id: str, actor: str
     ) -> None:
         """One :data:`GATE_ONLY_REVOKE_ACTION` row per account a custom-role edit or delete of
-        ``role_id`` revoked although its stored rows, read after the gate, neither hold the role
-        nor fail to parse (BACKLOG #5505). The gate names such an account because its integrity
+        ``role_id`` revoked although its stored role rows, read after the gate, neither hold the
+        role nor fail to parse, and its stored row has no timestamp or counter cell that does not
+        parse (BACKLOG #5505). The gate names such an account because its integrity
         check failed, or because it held the role when the gate read it. The role's own row does
         not list the accounts it ended, so this is the row that names them. A refused write is
         logged, not raised: the change and the revoke have both happened."""
@@ -20288,8 +20289,8 @@ class AuthService:
         says. So on a store with an integrity key a row tampered to read as outside the save is
         still named, and its sessions are revoked rather than only refused, so a later repair of
         its row does not bring them back. With no key no seal is checked, so such a row is taken
-        as it reads. A row the list read leaves out is not named, at least one whose id cell does
-        not read.
+        as it reads. A row the list read leaves out is not named, at least one with a cell that
+        does not parse and an id cell that is empty or not text.
 
         The step-up gate reads it with ``checked`` and hands that set to the save, so the caller's
         own check is read once. The revoke adds a read without ``checked``, after the save, so an
@@ -21171,7 +21172,8 @@ class AuthService:
         Resolving which principals a map edit actually affects would mean re-binding to the
         directory, and both a removed mapping and an added one change an outcome, so the affected set
         is not derivable from the entries alone. A local account reads neither map, and one whose row
-        parses and whose integrity check passed at the gate is left alone.
+        has no timestamp or counter cell that does not parse and whose integrity check passed at
+        the gate is left alone.
 
         Each account's unrevoked rows are revoked with the store's ``revoke_user_sessions``, so this
         needs no schema change on any backend. The count it returns includes rows already past their

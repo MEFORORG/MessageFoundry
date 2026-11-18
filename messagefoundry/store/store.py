@@ -2853,8 +2853,7 @@ def decode_or_refuse[T](kind: str, ident: str, decode: Callable[[], T]) -> T:
         failure = type(exc).__name__
     subject = seal_row_ref(kind, ident) if ident else ""
     log.warning(
-        "a row of a %s record (%s) holds a cell that does not parse (%s); it is refused as a"
-        " failed seal",
+        "a row of a %s record (%s) holds a cell that does not parse (%s)",
         kind,
         subject or "no readable id",
         failure,
@@ -3160,8 +3159,8 @@ class UserRecord:
 
 def _listed_user(d: Mapping[str, Any]) -> UserRecord:
     """One row of a list read: :meth:`UserRecord.from_mapping`, or, for a row that does not
-    parse (:func:`listed_users` says which), :meth:`UserRecord.unreadable_row`. A row whose id is
-    itself unreadable still raises the :class:`RowSealError`, which :func:`decoded_rows` leaves
+    parse (:func:`listed_users` says which), :meth:`UserRecord.unreadable_row`. Such a row whose id
+    cell is empty or not text still raises the :class:`RowSealError`, which :func:`decoded_rows` leaves
     out: nothing could name it."""
     try:
         return UserRecord.from_mapping(d)
