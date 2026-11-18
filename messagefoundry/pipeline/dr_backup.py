@@ -1888,9 +1888,7 @@ def _verify_archive_blocking(
                     secure=secure,
                     posture=posture,
                 )
-        # sqlite3.Error: a store.db member that is not a database, or is too damaged to read, is a
-        # verdict on the archive like any other, so a backup's own verify still quarantines it.
-        except (BackupCodecError, OSError, tarfile.TarError, sqlite3.Error) as exc:
+        except (BackupCodecError, OSError, tarfile.TarError) as exc:
             result = _verify_failure(exc)
     except BaseException as exc:
         # Unexpected, an interrupt, or a fault while mapping an expected one. The teardown still
@@ -4198,9 +4196,14 @@ def _verify_in_staging(
     # (3) integrity_check (the fuller PRAGMA integrity_check, off the hot path).
     integrity_ok, integrity_msg = _integrity_check(snap)
     if not integrity_ok:
-        # Before the count: a snapshot that fails integrity_check may not count at all.
+        # Before the count: a snapshot that fails integrity_check may not count at all. The
+        # manifest's own counts need no read of it, so they are still reported.
+        manifest_counts, _ = _compare_row_counts(manifest, {})
         return VerifyResult(
-            "FAIL", integrity_ok=False, reason=f"integrity_check failed: {integrity_msg}"
+            "FAIL",
+            integrity_ok=False,
+            manifest_counts=manifest_counts,
+            reason=f"integrity_check failed: {integrity_msg}",
         )
     row_counts = _count_tables(snap)
     manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
@@ -4393,10 +4396,19 @@ def _count_tables(db_path: Path) -> dict[str, int]:
 
 def _integrity_check(db_path: Path) -> tuple[bool, str]:
     """``PRAGMA integrity_check`` on a snapshot, opened through :func:`connect_readonly`, so a ``#``
-    or ``?`` in the staging path cannot cut the URI and check an empty stand-in (BACKLOG #2186)."""
+    or ``?`` in the staging path cannot cut the URI and check an empty stand-in (BACKLOG #2186).
+
+    A file that is not a database, or too damaged to check, fails the check rather than raising, so
+    verify and restore report it as the integrity failure it is. Any other SQLite error, a disk I/O
+    error or a lock among them, is not a fact about the snapshot and still raises."""
     conn = connect_readonly(db_path, busy_timeout=_SNAPSHOT_BUSY_TIMEOUT)
     try:
         results = [str(r[0]) for r in conn.execute("PRAGMA integrity_check")]
+    except sqlite3.DatabaseError as exc:
+        # The low byte is the primary code, so an extended CORRUPT code counts too.
+        if exc.sqlite_errorcode & 0xFF not in (sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT):
+            raise
+        return False, _sqlite_error_reason(exc)
     finally:
         conn.close()
     ok = results == ["ok"]
@@ -5994,19 +6006,11 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
     """``integrity_check`` + the manifest row-count compare (:func:`_compare_row_counts`) on the
     extracted ``store.db``, run on the exact file about to be placed. Same two checks (and the same
     helpers) as :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore
-    summary. A ``store.db`` that is not a database, or is too damaged to read, is a ``verify``
-    refusal too."""
-    try:
-        integrity_ok, integrity_msg = _integrity_check(snap)
-        if not integrity_ok:
-            raise BackupError(
-                "verify", f"the archive's store failed integrity_check: {integrity_msg}"
-            )
-        row_counts = _count_tables(snap)
-    except sqlite3.Error as exc:
-        raise BackupError(
-            "verify", f"the archive's store could not be read: {safe_exc(exc)}"
-        ) from exc
+    summary."""
+    integrity_ok, integrity_msg = _integrity_check(snap)
+    if not integrity_ok:
+        raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
+    row_counts = _count_tables(snap)
     _manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
     if count_refusal is not None:
         raise BackupError("verify", count_refusal)

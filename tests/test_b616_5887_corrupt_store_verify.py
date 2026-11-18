@@ -38,17 +38,45 @@ def _plaintext_archive(path: Path, store_bytes: bytes) -> str:
     return str(path)
 
 
-def test_verify_reports_a_store_member_that_is_not_a_database_as_a_fail(tmp_path: Path) -> None:
+@pytest.mark.parametrize("standalone", [False, True], ids=["backup-staging", "standalone"])
+def test_verify_reports_a_store_member_that_is_not_a_database_as_a_fail(
+    tmp_path: Path, standalone: bool
+) -> None:
     archive = _plaintext_archive(tmp_path / "bad.mfbak", _NOT_A_DATABASE)
     result = dr_backup._verify_archive_blocking(
         archive_path=archive,
         keys=[],
         full=False,
-        staging_root=tmp_path / "staging",
+        staging_root=None if standalone else tmp_path / "staging",
         secure=True,
     )
     assert result.status == "FAIL"
-    assert result.reason
+    assert result.integrity_ok is False
+    assert result.manifest_counts == {"messages": 0}
+    assert result.reason is not None
+    assert "integrity_check failed: DatabaseError: file is not a database" in result.reason
+
+
+def test_an_error_that_is_not_about_the_snapshot_still_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a file that is not a database, or is corrupt, is a verdict on the archive. A lock or an
+    I/O error is about the volume, so it must not become a FAIL that quarantines a good archive."""
+    db = tmp_path / "good.db"
+    sqlite3.connect(db).close()
+
+    class _Conn:
+        def execute(self, _sql: str) -> object:
+            exc = sqlite3.OperationalError("disk I/O error")
+            exc.sqlite_errorcode = sqlite3.SQLITE_IOERR
+            raise exc
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(dr_backup, "connect_readonly", lambda *_a, **_k: _Conn())
+    with pytest.raises(sqlite3.OperationalError):
+        dr_backup._integrity_check(db)
 
 
 def test_verify_tests_integrity_before_it_counts(
@@ -94,4 +122,5 @@ def test_restore_reports_a_store_member_that_is_not_a_database_as_a_verify_error
             max_age_seconds=None,
         )
     assert caught.value.kind == "verify"
+    assert "failed integrity_check" in str(caught.value)
     assert not dest.exists()
