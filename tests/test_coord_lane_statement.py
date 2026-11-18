@@ -93,13 +93,15 @@ def _pwsh(
 def repo(tmp_path: Path) -> Path:
     """A throwaway git repo with one commit, so ``git rev-parse`` answers."""
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    for k, v in (("user.email", "t@t"), ("user.name", "t")):
-        subprocess.run(["git", "-C", str(tmp_path), "config", k, v], check=True)
-    # No background maintenance: the commit below can detach one that holds
-    # .git/objects/maintenance.lock while the -Show test snapshots the tree, and the lock then
-    # vanishes between its before and after reads. Measured on the ubuntu repo harness tests leg,
-    # PR 3047. This removes the writer, so _tree still sees every path, a *.lock included.
-    for k, v in (("maintenance.auto", "false"), ("gc.auto", "0")):
+    # Maintenance off for the reason test_coord_cloud_refusal.py's _template gives: the -Show test
+    # otherwise sees the commit's background maintenance.lock vanish between its two snapshots
+    # (CI run 44211257229, repo harness tests ubuntu-latest). It removes the writer, not a path.
+    for k, v in (
+        ("user.email", "t@t"),
+        ("user.name", "t"),
+        ("maintenance.auto", "false"),
+        ("gc.auto", "0"),
+    ):
         subprocess.run(["git", "-C", str(tmp_path), "config", k, v], check=True)
     (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(tmp_path), "add", "seed.txt"], check=True)
