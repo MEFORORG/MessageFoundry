@@ -4041,8 +4041,8 @@ def test_admin_unlock_does_not_send_a_transit_seal_refusal_to_stop_the_engine(
 def test_admin_unlock_does_not_call_an_unverifiable_seal_an_outage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #5633 item 2: Transit answered and would not check the seal, so a re-run meets the
-    same answer. The text neither sends the operator to stop the engine nor to wait for Vault."""
+    """BACKLOG #5633 item 2: Transit answered and would not check the seal. The text does not send
+    the operator to stop the engine."""
     import time
 
     import messagefoundry.store.store as store_module

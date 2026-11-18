@@ -7287,7 +7287,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
     # A Transit row seal is not a busy store, so neither gets the busy store's remedy (BACKLOG
     # #5633 item 2). The Outage class covers a refused hmac or verify too, so its remedy names
-    # the token's grants; an unverifiable seal is Transit's answer, so a re-run meets it again.
+    # the token's grants.
     if outcome == "refused" and isinstance(extra, TransitSealUnavailableError):
         return _emit_error(
             f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}): a row seal "
