@@ -21,17 +21,24 @@
 
     Where each CA goes. This is the one statement of it; docs/DEPLOY-SERVER-DB.md section 5.2
     repeats it for operators, and every other document points there. A self-signed root, whose
-    signature verifies under its own key, goes into LocalMachine\Root. Any other CA in the file,
-    such as an issuing CA in a .p7b chain, or a self-issued certificate another key signed, goes
-    into the intermediate store LocalMachine\CA. That store is not a trust anchor for SChannel or
-    ODBC Driver 18 chain building, so the SQL Server hop still checks the chain up to the root. It
-    IS usable as a trust anchor by the engine's Python TLS on Windows: CPython's
-    ssl.create_default_context(), which the PostgreSQL system-trust path calls, loads the CA and
-    ROOT system stores, and Python 3.13 and later set partial-chain verification, so a chain that
-    reaches a certificate in LocalMachine\CA validates there without its root. A file is refused
-    unless at least one certificate in it is a self-signed root. That is the whole check: it does
-    not check that each other CA in the file chains to that root, and with -Confirm the operator
-    may still decline the root and accept another CA.
+    signature verifies under its own key as .NET's chain engine (X509Chain) reads it, goes into
+    LocalMachine\Root. Any other CA in the file, such as an issuing CA in a .p7b chain, or a
+    self-issued certificate another key signed, goes into the intermediate store
+    LocalMachine\CA. That store is not a trust anchor for SChannel or ODBC Driver 18 chain
+    building, so the SQL Server hop still checks the chain up to the root. It IS usable as a
+    trust anchor by the engine's Python TLS on Windows: CPython's ssl.create_default_context(),
+    which the PostgreSQL system-trust path calls, loads the CA and ROOT system stores, and Python
+    3.13 and later set partial-chain verification, so a chain that reaches a certificate in
+    LocalMachine\CA validates there without its root. So a file is
+    refused unless the chain engine, given every certificate in the file as extra certificates,
+    builds a chain from each certificate in it to a self-signed root in the same file, with no
+    chain status other than an untrusted root or a time status; a chain that ends at a root
+    outside the file is refused too. Every self-signed root in the file must also be within its
+    validity period. The validity of any other CA is only warned of, and revocation is not
+    checked. Where the .NET runtime has the DisableCertificateDownloads switch, as PowerShell 7's
+    does, the script sets it; under Windows PowerShell 5.1, which has none, the engine may fetch
+    a missing issuer from a URL the certificate names. With -Confirm the operator may still
+    decline the root and accept another CA.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
@@ -39,14 +46,14 @@
     The file is read once. Every certificate it holds is shown, checked, and only then added, so
     nothing reaches a store that the operator was not shown. The whole file is refused, and
     nothing is imported, when any certificate in it is not marked as a CA by its basic
-    constraints, has a key usage that cannot sign certificates, or carries a private key, when it
-    holds no self-signed root, when a DER value in it (the whole file, a PEM block, or decoded
-    base64) does not end where its bytes end, or when a control character other than tab, CR or
-    LF sits outside its PEM blocks. Other text outside PEM blocks, bare base64 among them, is
-    ignored, not refused. At least a .pfx, and
-    a well-formed PEM block with any label but CERTIFICATE, X509 CERTIFICATE or PKCS7 (such as a
-    PRIVATE KEY block), are refused before anything is parsed. Key material outside well-formed
-    PEM armour is not looked for; no private key is ever loaded either way.
+    constraints, has a key usage that cannot sign certificates, carries a private key, or fails
+    the chain and root checks in "Where each CA goes", when a DER value in it (the whole file, a
+    PEM block, or decoded base64) does not end where its bytes end, or when a control character
+    other than tab, CR or LF sits outside its PEM blocks. Other text outside PEM blocks, bare
+    base64 among them, is ignored, not refused. At least a .pfx, and a well-formed PEM block
+    with any label but CERTIFICATE, X509 CERTIFICATE or PKCS7 (such as a PRIVATE KEY block),
+    are refused before anything is parsed. Key material outside well-formed PEM armour is not
+    looked for; no private key is ever loaded either way.
 
     Run from an elevated (Administrator) PowerShell prompt; -WhatIf needs no elevation and changes
     nothing. Idempotent: re-importing the same CA is a no-op (each store keys on thumbprint).
@@ -299,75 +306,60 @@ function Read-CaBundle {
     return , $unique
 }
 
-# Whether the certificate is self-signed: its subject and issuer are the same name AND its signature
-# verifies under its own public key. A self-issued certificate another key signed, such as a CA
-# re-key link certificate, is not. RSA PKCS#1 v1.5 and ECDSA with SHA-1 or SHA-2 are checked; any
-# other signature algorithm (RSA-PSS, for one) reads as not self-signed, which fails closed.
-function Test-SelfSigned {
-    param([Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
-    if ([Convert]::ToBase64String($Certificate.SubjectName.RawData) -cne
-        [Convert]::ToBase64String($Certificate.IssuerName.RawData)) { return $false }
-    $hashes = @{
-        '1.2.840.113549.1.1.5' = 'SHA1'; '1.2.840.113549.1.1.11' = 'SHA256'
-        '1.2.840.113549.1.1.12' = 'SHA384'; '1.2.840.113549.1.1.13' = 'SHA512'
-        '1.2.840.10045.4.1' = 'SHA1'; '1.2.840.10045.4.3.2' = 'SHA256'
-        '1.2.840.10045.4.3.3' = 'SHA384'; '1.2.840.10045.4.3.4' = 'SHA512'
-    }
-    $oid = $Certificate.SignatureAlgorithm.Value
-    if (-not $hashes.ContainsKey($oid)) { return $false }
-    $hash = [System.Security.Cryptography.HashAlgorithmName]::new($hashes[$oid])
-    # Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue BIT STRING }.
-    $raw = $Certificate.RawData
-    $outer = Read-DerHeader -Bytes $raw
-    if (-not $outer) { return $false }
-    $tbs = Read-DerHeader -Bytes $raw -Offset $outer.Start
-    if (-not $tbs) { return $false }
-    $algorithm = Read-DerHeader -Bytes $raw -Offset $tbs.End
-    if (-not $algorithm) { return $false }
-    $bits = Read-DerHeader -Bytes $raw -Offset $algorithm.End
-    if (-not $bits -or $bits.Tag -ne 0x03 -or $bits.Length -lt 2 -or $raw[$bits.Start] -ne 0) { return $false }
-    $signed = New-Object byte[] ($tbs.End - $outer.Start)
-    [Array]::Copy($raw, $outer.Start, $signed, 0, $signed.Length)
-    $signature = New-Object byte[] ($bits.Length - 1)
-    [Array]::Copy($raw, $bits.Start + 1, $signature, 0, $signature.Length)
+# What the chain engine makes of one certificate in the file: the store it belongs in, and why it
+# must not be trusted, or $null when it may be. The chain is built by .NET's X509Chain, the Windows
+# chain engine on Windows, with every certificate in the file in ChainPolicy.ExtraStore, so the
+# engine, not this script, matches each issuer to its signer and verifies each signature, in every
+# signature algorithm it supports. A certificate is a root when the chain built for it is that
+# certificate alone and its signature verifies under its own key; it goes into Root, and any other
+# CA into CertificateAuthority (the intermediate store). The help's "Where each CA goes" says what
+# each store means. Revocation is not checked: the file is being imported to become trusted.
+function Get-CaChainCheck {
+    param(
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Bundle,
+        [Parameter(Mandatory = $true)][datetime]$Now
+    )
+    $flagsType = [System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
     try {
-        if ($oid.StartsWith('1.2.840.113549.')) {
-            $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($Certificate)
-            if (-not $rsa) { return $false }
-            return [bool]$rsa.VerifyData($signed, $signature, $hash,
-                [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $policy = $chain.ChainPolicy
+        $policy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        [void]$policy.ExtraStore.AddRange($Bundle)
+        # PowerShell 7's .NET can keep the engine from fetching a missing issuer from a URL the
+        # certificate names; Windows PowerShell 5.1's .NET Framework has no such switch.
+        if ($policy.PSObject.Properties['DisableCertificateDownloads']) {
+            $policy.DisableCertificateDownloads = $true
         }
-        $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPublicKey($Certificate)
-        if (-not $ecdsa) { return $false }
-        # X.509 carries an ECDSA signature as a DER SEQUENCE of r and s; .NET Framework's VerifyData
-        # reads only r and s side by side, each padded to the key's width.
-        $sequence = Read-DerHeader -Bytes $signature
-        if (-not $sequence -or $sequence.End -ne $signature.Length) { return $false }
-        $r = Read-DerHeader -Bytes $signature -Offset $sequence.Start
-        if (-not $r) { return $false }
-        $s = Read-DerHeader -Bytes $signature -Offset $r.End
-        if (-not $s -or $s.End -ne $signature.Length) { return $false }
-        $width = [int][Math]::Ceiling($ecdsa.KeySize / 8)
-        $fixed = New-Object byte[] (2 * $width)
-        foreach ($part in @(@($r, 0), @($s, $width))) {
-            $from = $part[0].Start
-            $count = $part[0].Length
-            while ($count -gt 0 -and $signature[$from] -eq 0) { $from++; $count-- }
-            if ($count -gt $width) { return $false }
-            [Array]::Copy($signature, $from, $fixed, $part[1] + $width - $count, $count)
+        # Build's own verdict is not used: the file's roots are not trusted yet, which it reports
+        # as UntrustedRoot. Each status the engine set is read instead.
+        [void]$chain.Build($Certificate)
+        $flags = 0
+        foreach ($status in $chain.ChainStatus) { $flags = $flags -bor [int]$status.Status }
+        $elements = $chain.ChainElements
+        $top = $elements[$elements.Count - 1].Certificate
+        $unlinked = [int]$flagsType::PartialChain -bor [int]$flagsType::NotSignatureValid
+        $isRoot = $elements.Count -eq 1 -and -not ($flags -band $unlinked)
+        $store = if ($isRoot) { 'Root' } else { 'CertificateAuthority' }
+        # UntrustedRoot is expected before the import. Validity is judged below for a root, and
+        # only warned of for any other CA, so the engine's time statuses are set aside here.
+        $ignored = [int]$flagsType::UntrustedRoot -bor [int]$flagsType::NotTimeValid -bor
+            [int]$flagsType::NotTimeNested
+        $other = $flags -band -bnot $ignored
+        $refusal = $null
+        if ($flags -band [int]$flagsType::PartialChain) {
+            $refusal = 'it does not chain to a self-signed root in this file'
+        } elseif (-not $Bundle.Contains($top)) {
+            $refusal = "its chain ends at $($top.Thumbprint), a root that is not in this file"
+        } elseif ($other) {
+            $refusal = "the chain engine reports $([System.Enum]::ToObject($flagsType, $other)) on its chain"
+        } elseif ($isRoot -and ($Certificate.NotAfter -lt $Now -or $Certificate.NotBefore -gt $Now)) {
+            $refusal = 'it is a self-signed root outside its validity period'
         }
-        return [bool]$ecdsa.VerifyData($signed, $fixed, $hash)
-    } catch [System.Management.Automation.MethodInvocationException] {
-        return $false
+        return @{ Store = $store; Refusal = $refusal }
+    } finally {
+        $chain.Dispose()
     }
-}
-
-# The store a checked CA belongs in: Root for a self-signed one, CertificateAuthority (the
-# intermediate store) for any other. The help's "Where each CA goes" says what each store means.
-function Get-CaStoreName {
-    param([Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
-    if (Test-SelfSigned -Certificate $Certificate) { return 'Root' }
-    return 'CertificateAuthority'
 }
 
 # Why the certificate must not be trusted as a CA, or $null when it may be. A certificate whose basic
@@ -418,17 +410,20 @@ $now = [datetime]::Now
 $refusals = [System.Collections.Generic.List[object]]::new()
 # The store each certificate is shown with is the one it is offered for and written to.
 $entries = @(foreach ($cert in $bundle) {
-    $target = $stores[(Get-CaStoreName -Certificate $cert)]
+    $check = Get-CaChainCheck -Certificate $cert -Bundle $bundle -Now $now
+    $target = $stores[$check.Store]
     Write-Host ""
     Write-Host "  Subject    : $(ConvertTo-PrintableText $cert.Subject)"
     Write-Host "  Issuer     : $(ConvertTo-PrintableText $cert.Issuer)"
     Write-Host "  Thumbprint : $($cert.Thumbprint)"
-    Write-Host "  Not after  : $($cert.NotAfter.ToString('u'))"
+    # 'u' writes a 'Z' suffix whatever the DateTime's kind, so the time must be UTC.
+    Write-Host "  Not after  : $($cert.NotAfter.ToUniversalTime().ToString('u'))"
     Write-Host "  Store      : $($target.Label)"
     if ($cert.NotAfter -lt $now -or $cert.NotBefore -gt $now) {
         Write-Warning "$($cert.Thumbprint) is outside its validity period; a chain through it will not validate."
     }
     $why = Get-CaRefusal -Certificate $cert
+    if (-not $why) { $why = $check.Refusal }
     if ($why) { $refusals.Add([pscustomobject]@{ Thumbprint = $cert.Thumbprint; Why = $why }) }
     @{ Certificate = $cert; Target = $target }
 })
@@ -440,13 +435,16 @@ if ($refusals.Count -gt 0) {
     Write-Host "Refused:"
     foreach ($refusal in $refusals) { Write-Host "  $($refusal.Thumbprint): $($refusal.Why)" }
     throw ("Nothing was imported. Every certificate in the file must be a CA that may sign " +
-        "certificates and carries no private key. Refused: " +
+        "certificates, carries no private key, and chains to a self-signed root in the file " +
+        "that is within its validity period. Refused: " +
         (($refusals | ForEach-Object { "$($_.Thumbprint) ($($_.Why))" }) -join '; ') + ".")
 }
 if (-not ($entries | Where-Object { $_.Target -eq $stores['Root'] })) {
-    # Without its root an issuing CA validates nothing over SChannel, and over the engine's Python TLS
-    # it would be trusted with no root's revocation or constraints over it (the help's "Where each
-    # CA goes"), so a rootless file is refused rather than imported.
+    # Get-CaChainCheck has already refused any certificate whose chain does not end at a root in
+    # this file, so a file that reaches here holds one. This second check keeps a rootless file
+    # out even if a platform's chain engine ever reported a chain without that root: an issuing
+    # CA alone validates nothing over SChannel, and over the engine's Python TLS it would be
+    # trusted with no root over it (the help's "Where each CA goes").
     throw ("Nothing was imported. The file holds no self-signed root. Give this script the root " +
         "the CA chains to, alone or in the same .p7b chain.")
 }
