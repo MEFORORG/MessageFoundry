@@ -13051,8 +13051,8 @@ class AuthService:
         try:
             session = await self._store.get_session(token_hash)
         except RowSealError:
-            # A row whose cells do not parse (BACKLOG #5505) is ended and reported as one that
-            # fails its seal, and is no session.
+            # A row with a cell the read parses that does not parse (BACKLOG #5505) is ended and
+            # reported as one that fails its seal, and is no session.
             await self._session_seal_failed(token_hash)
             return None
         if session is None or session.revoked_at is not None:
@@ -13511,8 +13511,10 @@ class AuthService:
         The result's ``user`` is ``None`` for no account, and for an account whose record fails its
         seal, which is handed to :meth:`_user_seal_failed` and marked ``failed`` (BACKLOG #5520). A
         failing account is denied, never written: the store's write helper refuses to re-seal it.
-        On a keyless store there is no seal to check, but a role row whose cells do not parse
-        still fails the pair (BACKLOG #5505). One statement more than the row read, for
+        On a keyless store there is no seal to check, but a role row with a cell the read parses
+        that does not parse still fails the pair, and so does the stand-in for a users row that
+        does not parse (:func:`~messagefoundry.store.store.listed_users` says which; BACKLOG
+        #5505). One statement more than the row read, for
         the role rows; the identity build reads them from the result instead of reading them
         again.
 
@@ -13525,7 +13527,8 @@ class AuthService:
         if user is None:
             return _SealCheck()
         if user.unreadable:
-            # A listed row whose cells do not parse (BACKLOG #5505): it fails as a forged record
+            # The stand-in for a row that does not parse (store.listed_users says which; BACKLOG
+            # #5505), from a list read or read_user_or_unreadable: it fails as a forged record
             # does, on a keyless store too. A re-read would only raise again, so there is none.
             await self._user_seal_failed(user.id)
             return _SealCheck(failed=True)
@@ -13534,8 +13537,9 @@ class AuthService:
             try:
                 grants = await self._store.get_user_role_grants(user.id)
             except RowSealError:
-                # A role row whose cells do not parse (BACKLOG #5505) fails the pair as a forged
-                # record does, on a keyless store too, as the write helpers refuse it.
+                # A role row with a cell the read parses that does not parse (BACKLOG #5505)
+                # fails the pair as a forged record does, on a keyless store too, as the write
+                # helpers refuse it.
                 grants = None
             if grants is not None:
                 record = None if user.row is None else UserAuthzRecord.of(user.row, grants)

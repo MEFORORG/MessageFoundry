@@ -119,7 +119,8 @@ _FLOAT_INF: Final = float("inf")
 
 class RowSealError(Exception):
     """A stored row failed its integrity check, and the store refused it: a write helper read a
-    row whose seal does not verify, or a read met a row whose cells do not parse (BACKLOG #5505).
+    row whose seal does not verify, or a read met a row with a cell it parses that does not parse
+    (BACKLOG #5505).
     Nothing is written either way, so the message says only that.
 
     The helper never re-seals such a row, because the next honest write would otherwise turn a

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every consumer of ``list_users`` that reports or acts on account state checks ``unreadable``
-(BACKLOG #5505): the list's stand-in for a row whose cells do not parse carries invented fields.
+(BACKLOG #5505): the list's stand-in for a row that does not parse (``listed_users`` says which)
+carries invented fields.
 
 The lockout census and ``verify`` name such an account as failing its integrity check rather than
 omit it, and the credential-reminder pass skips it and says so. Each case has a healthy twin.

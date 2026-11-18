@@ -370,11 +370,11 @@ async def test_an_ad_map_save_revokes_every_directory_account_and_every_failing_
     tmp_path: Path, keyed: bool, save: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Either AD map save revokes the sessions of each account whose stored row reads as an
-    enabled directory account, whatever its check says, of each whose users row does not parse,
-    and of each whose integrity check fails whatever its row says (BACKLOG #5505). So on a keyed
-    store a directory row tampered to read as local or disabled is ended too. A keyless store
-    checks no seal, so there such a row reads as what it says. A local account that passes and a
-    disabled directory account keep their sessions."""
+    enabled directory account, whatever its check says, of each whose users row does not parse
+    (``listed_users`` says which), and of each whose integrity check fails whatever its row says
+    (BACKLOG #5505). So on a keyed store a directory row tampered to read as local or disabled is
+    ended too. A keyless store checks no seal, so there such a row reads as what it says. A local
+    account that passes and a disabled directory account keep their sessions."""
     path = tmp_path / "ad-map.db"
     cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
     store = await MessageStore.open(path, cipher=cipher)

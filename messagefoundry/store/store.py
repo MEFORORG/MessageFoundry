@@ -2788,7 +2788,7 @@ async def admin_guard_counts(
         try:
             record = await read_record(holder_id)
         except RowSealError:
-            continue  # a holder whose row does not parse counts as one that fails (BACKLOG #5505)
+            continue  # a holder row that does not parse (see listed_users) fails (BACKLOG #5505)
         if record is None or not await user_seal_ok_async(sealer, record):
             continue
         if record.row.disabled or role_id not in record.role_ids:
@@ -3039,8 +3039,9 @@ class UserRecord:
     #: to pin a compare-and-set (``VerifiedUser.totp_secret_cell``, and ``admin-reset-totp``,
     #: BACKLOG #3778). ``None`` on a record built by hand.
     row: UserRow | None = field(default=None, compare=False, repr=False)
-    #: Set only on the stand-in :meth:`unreadable_row` builds for a listed row that does not parse
-    #: (:func:`listed_users` says which; BACKLOG #5505). ``AuthService._verified`` answers it as a
+    #: Set only on the stand-in :meth:`unreadable_row` builds for a row that does not parse
+    #: (:func:`listed_users` says which; BACKLOG #5505), from a list read or
+    #: ``read_user_or_unreadable``. ``AuthService._verified`` answers it as a
     #: record that fails its seal, on a keyless store too, so a list keeps showing the account as
     #: failing and reports it. Its other fields are invented closed values: a caller that is not
     #: the seal check must not read them as the account's state.
@@ -3176,11 +3177,10 @@ def listed_users(rows: Iterable[Mapping[str, Any]]) -> list[UserRecord]:
     :meth:`UserRecord.unreadable_row`, so the admin list shows it as failing. The read coerces the
     flag cells with ``bool()`` and copies the text cells, at least ``totp_recovery_codes`` and
     ``channel_scope``, without parsing them, so a bad value in one leaves the account listed as it
-    reads. The list is the
-    only reader that returns the stand-in: the single-row user readers raise
-    :class:`RowSealError` for such a row, which the service's loaders answer as a failed seal, and
-    the write helpers refuse it. A caller iterating a list read checks ``unreadable``
-    before it acts on a field."""
+    reads. The single-row user readers raise :class:`RowSealError` for such a row instead, which
+    the service's ``read_user_or_unreadable`` turns into the same stand-in; the service's loaders
+    answer it as a failed seal, and the write helpers refuse it. A caller iterating a list read
+    checks ``unreadable`` before it acts on a field."""
     return decoded_rows(rows, _listed_user)
 
 

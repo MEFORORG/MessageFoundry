@@ -2174,9 +2174,10 @@ class ApprovalGate:
         must not spend :meth:`_read`'s throttle slot, which would silence approve()'s own ERROR."""
 
         async def read() -> tuple[UserRecord | None, bool]:
-            # BACKLOG #5505: a requester row whose cells do not parse fails its integrity check,
-            # so the requester cannot be verified. Answered here, before _read, which would call
-            # it an outage; never read as missing or disabled, which nothing established.
+            # BACKLOG #5505: a requester row that does not parse (store.listed_users says which)
+            # fails its integrity check, so the requester cannot be verified. Answered here,
+            # before _read, which would call it an outage; never read as missing or disabled,
+            # which nothing established.
             try:
                 return await self._store.get_user(requester_user_id), False
             except RowSealError:
