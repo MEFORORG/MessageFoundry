@@ -56,12 +56,17 @@
     hook where it started. Input the hook cannot use is a fault, because nothing says it would have
     named no `cwd`. At least these set a non-empty Reason: stdin still open at the read's bound, a
     stdin read that threw, input that is not one JSON object (an array is not, even of one), a
-    `cwd` field that is blank or relative, a refused `cwd`, and a `cwd` named to a hook that started
-    in no checkout it can read, except where -AllowOutside stays there. A PINNED session whose
-    `cwd` is refused answers for its pin instead, with a Note and no Reason. Both entry points
-    return the Reason so the caller can say it aloud and act on no checkout. Falling back in silence
-    is the defect this file exists to fix: a caller that reads no Reason takes the start checkout,
-    the PRIMARY under the desktop app.
+    `cwd`, `session_id`, `hook_event_name` or `source` named twice in keys that differ only in
+    case, a `cwd` field that is blank, not a string, or relative, and a refused `cwd` of an
+    UNPINNED session, except one in no checkout that -AllowOutside takes. A PINNED session whose
+    `cwd` is refused answers for its pin instead, with a Note and no Reason. A hook that started in
+    no checkout it can read sets a Reason for a `cwd` other than the start directory or a folder
+    below it that sits in no checkout, each read through links and 8.3 names, except where
+    -AllowOutside takes the `cwd` or stays put. JSON that
+    ConvertFrom-Json refuses only for keys that differ in case, or an empty key, is still read:
+    those keys are left out of the Payload. Both entry points return the Reason so the caller can
+    say it aloud and act on no checkout. Falling back in silence is the defect this file exists to
+    fix: a caller that reads no Reason takes the start checkout, the PRIMARY under the desktop app.
 
     A hook reads its input with Read-CcxHookInput and then does ONE of two things:
 
@@ -118,6 +123,67 @@ function Read-CcxHookInput {
     }
 }
 
+function ConvertTo-CcxJsonObject {
+    # A -AsHashtable value rebuilt as ConvertFrom-Json builds one. An empty key, and every key of a set
+    # that differs only in case, is left out: a case-insensitive reader cannot tell which is meant. The
+    # top level's left-out keys are added to $Dropped.
+    param([object] $Value, [System.Collections.Generic.List[string]] $Dropped)
+    if ($Value -is [System.Collections.IDictionary]) {
+        $count = @{}
+        foreach ($k in $Value.Keys) { $count[[string]$k] = 1 + [int]$count[[string]$k] }
+        $obj = [pscustomobject]@{}
+        foreach ($k in $Value.Keys) {
+            $name = [string]$k
+            if (-not $name -or $count[$name] -gt 1) {
+                if ($null -ne $Dropped) { $Dropped.Add($name) }
+                continue
+            }
+            $obj | Add-Member -NotePropertyName $name -NotePropertyValue (ConvertTo-CcxJsonObject $Value[$k] $null)
+        }
+        return $obj
+    }
+    if ($Value -is [System.Array]) { return , @(foreach ($v in $Value) { ConvertTo-CcxJsonObject $v $null }) }
+    return $Value
+}
+
+function ConvertFrom-CcxHookJson {
+    <#
+      .SYNOPSIS
+        The hook input parsed: Value, and Reason, which is '' when Value is one usable JSON object.
+
+      .DESCRIPTION
+        ConvertFrom-Json refuses valid JSON with keys that differ only in case, or an empty key, and
+        a tool's own input can hold either. Such text is read through -AsHashtable and rebuilt, with
+        those keys left out. Left out, a key this file reads (cwd, session_id, hook_event_name,
+        source) would be read as absent, and an absent `source` makes a SessionStart a launch that
+        pins, so naming one of them twice that way is a Reason.
+    #>
+    param([string] $Text)
+    $out = [pscustomobject]@{ Value = $null; Reason = '' }
+    # -NoEnumerate, or an array holding one object would read as that object.
+    try { $out.Value = $Text | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
+    catch {
+        try { $table = $Text | ConvertFrom-Json -AsHashtable -NoEnumerate -ErrorAction Stop }
+        catch {
+            $out.Reason = 'the hook input is not readable JSON, so it names no cwd this hook can use'
+            return $out
+        }
+        $dropped = [System.Collections.Generic.List[string]]::new()
+        $out.Value = ConvertTo-CcxJsonObject $table $dropped
+        $twice = @($dropped | Where-Object { $_ -in @('cwd', 'session_id', 'hook_event_name', 'source') })
+        if ($twice) {
+            $out.Value = $null
+            $out.Reason = "the hook input names $($twice[0]) in keys that differ only in case, so it names no $($twice[0]) this hook can use"
+            return $out
+        }
+    }
+    if ($out.Value -isnot [System.Management.Automation.PSCustomObject]) {
+        $out.Value = $null
+        $out.Reason = 'the hook input is not a JSON object, so it names no cwd this hook can use'
+    }
+    return $out
+}
+
 function Get-CcxHookPayloadCwd {
     <#
       .SYNOPSIS
@@ -126,8 +192,9 @@ function Get-CcxHookPayloadCwd {
       .DESCRIPTION
         Named is $false when the input is a JSON object with no cwd field, or there is no input at
         all, which is not a fault. Cwd is the resolved directory when it exists. Reason says why the
-        input or its cwd could not be used: input that is not one JSON object, or a blank or relative
-        cwd field, sets Named and a Reason, because nothing says that input would have named no cwd.
+        input or its cwd could not be used: input ConvertFrom-CcxHookJson refuses, or a cwd field
+        that is blank, not a string, or relative, sets Named and a Reason, because nothing says that
+        input would have named no cwd.
 
         -Payload takes input already parsed, so a caller holding one does not parse it twice.
     #>
@@ -136,24 +203,30 @@ function Get-CcxHookPayloadCwd {
     $payload = $Payload
     if ($null -eq $payload) {
         if ([string]::IsNullOrWhiteSpace($Text)) { return $out }
-        # -NoEnumerate, or an array holding one object would read as that object.
-        try { $payload = $Text | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
-        catch {
+        $json = ConvertFrom-CcxHookJson $Text
+        if ($json.Reason) {
             $out.Named = $true
-            $out.Reason = 'the hook input is not readable JSON, so it names no cwd this hook can use'
+            $out.Reason = $json.Reason
             return $out
         }
+        $payload = $json.Value
     }
     if ($payload -isnot [System.Management.Automation.PSCustomObject]) {
         $out.Named = $true
         $out.Reason = 'the hook input is not a JSON object, so it names no cwd this hook can use'
         return $out
     }
-    if (-not $payload.PSObject.Properties['cwd']) { return $out }
+    $field = $payload.PSObject.Properties['cwd']
+    if (-not $field) { return $out }
     $out.Named = $true
-    $dir = [string]$payload.cwd
-    if ([string]::IsNullOrWhiteSpace($dir)) {
+    # Read as it is, never cast: [string] turns a one-element array into its element.
+    $dir = $field.Value
+    if ($null -eq $dir -or ($dir -is [string] -and [string]::IsNullOrWhiteSpace($dir))) {
         $out.Reason = 'the hook input names a blank cwd'
+        return $out
+    }
+    if ($dir -isnot [string]) {
+        $out.Reason = 'the hook input names a cwd that is not a string, so it names no cwd this hook can use'
         return $out
     }
     # A relative cwd would resolve against where the hook runs, the primary under the desktop app.
@@ -224,6 +297,82 @@ function Test-CcxSamePath {
     if (-not $na -or -not $nb) { return $false }
     $mode = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
     return [string]::Equals($na, $nb, $mode)
+}
+
+function ConvertTo-CcxRealPath {
+    <#
+      .SYNOPSIS
+        $Path with every symlink and junction followed and, on Windows, every 8.3 name made long, or
+        '' when it cannot be read.
+
+      .DESCRIPTION
+        Test-CcxSamePath compares text, so two spellings of one directory through a link or a short
+        name differ there. This reads the disk, and on Windows its first 8.3 name costs an Add-Type,
+        so it is kept to the one rare case that needs it: a hook started in no checkout.
+    #>
+    param([string] $Path)
+    $todo = ConvertTo-CcxNormPath $Path
+    if (-not $todo) { return '' }
+    try {
+        $hops = 0
+        :restart while ($true) {
+            $root = [System.IO.Path]::GetPathRoot($todo)
+            if (-not $root) { return '' }
+            $parts = $todo.Substring($root.Length).Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries)
+            $cur = $root
+            for ($i = 0; $i -lt $parts.Count; $i++) {
+                $next = Join-Path $cur $parts[$i]
+                $target = [System.IO.DirectoryInfo]::new($next).LinkTarget
+                if ($target) {
+                    # A link loop, or a chain this long, is not a directory anyone means.
+                    if (++$hops -gt 32) { return '' }
+                    if (-not [System.IO.Path]::IsPathFullyQualified($target)) { $target = Join-Path $cur $target }
+                    $todo = [System.IO.Path]::GetFullPath([System.IO.Path]::Join([string[]](@($target) + @($parts | Select-Object -Skip ($i + 1)))))
+                    continue restart
+                }
+                $cur = $next
+            }
+            break
+        }
+        if ($IsWindows -and $cur.Contains('~')) {
+            if (-not ('CcxHookInput.Native' -as [type])) {
+                Add-Type -Namespace CcxHookInput -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathName(string shortPath, System.Text.StringBuilder longPath, uint size);
+'@
+            }
+            $buf = [System.Text.StringBuilder]::new(32767)
+            $n = [CcxHookInput.Native]::GetLongPathName($cur, $buf, [uint32]$buf.Capacity)
+            if ($n -gt 0 -and $n -lt $buf.Capacity) { $cur = $buf.ToString() }
+        }
+        return ConvertTo-CcxNormPath $cur
+    }
+    catch { return '' }
+}
+
+function Test-CcxInStartDir {
+    <#
+      .SYNOPSIS
+        Whether $Cwd is $StartDir, or a folder below it that sits in no checkout. For a hook that
+        started in no checkout: a `cd` inside its own folder is not a move.
+
+      .DESCRIPTION
+        Read through links and 8.3 names, so another spelling of the same folder is the same folder.
+        A folder below that holds a checkout is a move into a repository the hook cannot check, so
+        it is not taken.
+    #>
+    param([string] $Cwd, [string] $StartDir)
+    if (Test-CcxSamePath $Cwd $StartDir) { return $true }
+    $real = ConvertTo-CcxRealPath $Cwd
+    $start = ConvertTo-CcxRealPath $StartDir
+    if (-not $real -or -not $start) { return $false }
+    if (-not (Test-CcxSamePath $real $start)) {
+        $sep = [System.IO.Path]::DirectorySeparatorChar
+        $prefix = if ($start.EndsWith($sep)) { $start } else { $start + $sep }
+        $mode = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+        if (-not $real.StartsWith($prefix, $mode)) { return $false }
+    }
+    return -not (Get-CcxWorktreeRoot $real) -and -not (Get-CcxWorktreeRoot $Cwd)
 }
 
 function Get-CcxWorktreeRoot {
@@ -412,16 +561,14 @@ function Resolve-CcxHookSession {
         return $out
     }
     if (-not [string]::IsNullOrWhiteSpace($Text)) {
-        try { $out.Payload = $Text | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { $out.Payload = $null }
-        # Not one object is a fault, not "no cwd": the same text through Get-CcxHookPayloadCwd -Text
-        # gives the same Reason, so hand it over rather than restate it.
-        if ($out.Payload -isnot [System.Management.Automation.PSCustomObject]) {
-            $p = Get-CcxHookPayloadCwd -Text $Text
+        # Not one usable object is a fault, not "no cwd"; Get-CcxHookPayloadCwd -Text gives the same Reason.
+        $json = ConvertFrom-CcxHookJson $Text
+        if ($json.Reason) {
             $out.Named = $true
-            $out.Reason = $p.Reason
-            $out.Payload = $null
+            $out.Reason = $json.Reason
             return $out
         }
+        $out.Payload = $json.Value
     }
     # Through PSObject.Properties, because a caller under Set-StrictMode throws on a missing member.
     $source = ''
@@ -439,11 +586,12 @@ function Resolve-CcxHookSession {
         # session's own (it launched in none), so the hook stays put. -AllowOutside still takes a
         # `cwd` that sits in no checkout, and stays put in silence for one in a checkout, because
         # mail-drain's -AnchorRepo case answers for where it started. A `cwd` that IS the start
-        # directory is answered by staying put. For any other caller any other named `cwd` is a
-        # fault: staying put in silence let steer-inject read CLAUDE_PROJECT_DIR instead.
+        # directory, or a folder below it that sits in no checkout, is answered by staying put: a `cd`
+        # inside the project changes nothing it answers for. For any other caller any other named
+        # `cwd` is a fault: staying put in silence let steer-inject read CLAUDE_PROJECT_DIR instead.
         if ($p.Reason) { $out.Reason = $p.Reason }
         elseif ($p.Cwd -and $AllowOutside -and -not (Get-CcxWorktreeRoot $p.Cwd)) { $out.Dir = $p.Cwd; $out.Source = 'cwd' }
-        elseif ($p.Named -and -not $AllowOutside -and -not (Test-CcxSamePath $p.Cwd $StartDir)) {
+        elseif ($p.Named -and -not $AllowOutside -and -not (Test-CcxInStartDir $p.Cwd $StartDir)) {
             $out.Reason = "the hook started in $StartDir, which is in no checkout this hook can read, so it cannot check the hook input's cwd $($p.Cwd) against a repository"
         }
         return $out
