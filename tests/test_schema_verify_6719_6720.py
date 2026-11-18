@@ -220,8 +220,9 @@ async def test_the_expected_shape_holds_no_virtual_table() -> None:
     # Positive control: the walk saw the built schema (40 tables when this floor was set), so the
     # absence below cannot pass on an empty walk.
     assert len(tables) >= 30, f"the scratch schema holds only {len(tables)} tables"
-    # The view walk's own floor. The tables are among these objects, so it adds nothing to the floor
-    # above beyond catching a narrowed query; the vacuous-absence lint needs it on this walk.
+    # The view walk's own floor (105 objects when it was set: 40 tables, 65 indexes). The tables are
+    # among these objects, so it adds nothing to the floor above beyond catching a query narrowed to
+    # fewer than 30 rows, such as a views-only one; the vacuous-absence lint needs it on this walk.
     assert len(objects) >= 30, f"the scratch schema holds only {len(objects)} objects"
     virtual = [name for name, is_virtual in tables if is_virtual]
     assert virtual == []
