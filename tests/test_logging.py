@@ -3434,6 +3434,8 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
     assert hidden in raw_line, "the password is hidden, but the scheme, user or host went with it"
     with monkeypatch.context() as m:
         m.setattr(support_redact, "scrub_credentials", lambda text, **_: text)
+        # The widened reading runs last since BACKLOG #5386 and would hide it too; it is off as well.
+        m.setattr(support_redact, "_WIDE_DSN_PASSWORD", re.compile(r"(?!)"))
         (twin_only,) = _read_back(raw_dir)
         m.setattr(support_redact, "_DSN_PASSWORD", re.compile(r"(?!)"))
         (neither,) = _read_back(raw_dir)

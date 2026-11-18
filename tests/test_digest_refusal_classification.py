@@ -713,9 +713,10 @@ _DIGEST_PROXY_REFUSED = "token endpoint is https and its web proxy is set up for
 @pytest.mark.usefixtures("no_bypass")
 def test_an_https_token_endpoint_behind_a_digest_proxy_is_refused_at_build() -> None:
     """BACKLOG #2989 item 11. An https token request meets its web proxy only as a CONNECT, and
-    urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest setup could
-    be minted. The build refuses it as a configuration fault, and nothing reaches the proxy. Fails
-    on the code before that change, which built the provider and stopped the lane at send."""
+    urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest setup
+    could never answer it and no token could be minted. The build refuses it as a configuration
+    fault, and nothing reaches the proxy. Fails on the code before that change, which built the
+    provider and stopped the lane at send."""
     with (
         _Challenger(407, _SHA256, refuse_answered=True) as proxy,
         pytest.raises(HttpAuthError) as ei,
@@ -775,10 +776,35 @@ def test_a_token_host_urllibs_bypass_list_names_still_builds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A token host urllib's own bypass list names gets the proxy handler with no credential and no
-    Digest handler (vault BACKLOG #3442), so the Digest setup never meets it and it builds."""
+    Digest handler (vault BACKLOG #3442), so the Digest setup never meets it and it builds. The
+    opener is read for the Digest handler itself (BACKLOG #2989 item 24): a Digest setup never puts
+    a pre-emptive header on the request, so an empty ``_proxy_auth`` held whatever the bypass did."""
     monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
     provider = _token_provider_via("http://127.0.0.1:3128", auth="digest")
-    assert provider._proxy_auth == {}
+    assert not _has_proxy_digest_handler(provider._opener)
+    assert any(isinstance(h, urllib.request.ProxyHandler) for h in _handlers(provider._opener))
+
+
+def _handlers(opener: urllib.request.OpenerDirector) -> list[object]:
+    return list(getattr(opener, "handlers"))  # noqa: B009 -- untyped in typeshed
+
+
+def _has_proxy_digest_handler(opener: urllib.request.OpenerDirector) -> bool:
+    return any(isinstance(h, urllib.request.ProxyDigestAuthHandler) for h in _handlers(opener))
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_the_digest_handler_reader_sees_one_on_an_http_token_hop() -> None:
+    """THE CONTROL for the reader above: a Digest proxy the token hop does use puts its handler on
+    the opener. Only an off-box http token host meets the proxy, and its build is refused for the
+    cleartext credential, so the handlers are read off the proxy resolved for that host."""
+    proxy = _digest_proxy_config("http://127.0.0.1:3128", auth="digest")
+    host_proxy = proxy.for_host("http://auth.partner.invalid/token")
+    assert host_proxy is not None
+    opener = urllib.request.OpenerDirector()
+    for handler in host_proxy.opener_handlers():
+        opener.add_handler(handler)
+    assert _has_proxy_digest_handler(opener)
 
 
 @pytest.mark.usefixtures("no_bypass")
@@ -858,9 +884,9 @@ def test_a_rest_destination_minting_through_a_digest_proxy_is_refused_at_build()
     """The configuration that reached the token hop's CONNECT 407 before BACKLOG #2989 item 11: a
     loopback ``http://`` REST destination, which goes direct, minting a bearer at an https token
     endpoint behind a web proxy set up for Digest. The destination is now refused when it is
-    built rather than stopping its lane at the first send. The connection's name leads the text
-    only where the runner mirrors it into the settings, which a direct build does not."""
-    with pytest.raises(HttpAuthError, match=f"^OAuth2 {_DIGEST_PROXY_REFUSED} "):
+    built rather than stopping its lane at the first send. The refusal runs where the proxy is
+    built, which knows the connection's name (BACKLOG #2989 item 20), so the name leads the text."""
+    with pytest.raises(HttpAuthError, match=f"^connection 'OB'; OAuth2 {_DIGEST_PROXY_REFUSED} "):
         _build(
             ConnectorType.REST,
             "http://127.0.0.1:9/x",
@@ -869,6 +895,289 @@ def test_a_rest_destination_minting_through_a_digest_proxy_is_refused_at_build()
             proxy_password="pw",
             proxy_auth_type="digest",
             oauth2_token_url=_HTTPS_TOKEN_URL,
+        )
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_built_connection_whose_token_host_the_proxy_bypasses_still_builds() -> None:
+    """THE CONTROL for the build-path refusal above, which reads ``proxy_no_proxy`` from the
+    settings: the same destination with its token host on the bypass list builds."""
+    dest = _build(
+        ConnectorType.REST,
+        "http://127.0.0.1:9/x",
+        proxy="http://127.0.0.1:3128",
+        proxy_user="pu",
+        proxy_password="pw",
+        proxy_auth_type="digest",
+        proxy_no_proxy=["auth.partner.invalid"],
+        oauth2_token_url=_HTTPS_TOKEN_URL,
+    )
+    assert dest._token_provider is not None
+
+
+def test_a_built_connection_whose_token_host_urllib_bypasses_still_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same control for urllib's own bypass list, which the build-path refusal reads too."""
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
+    dest = _build(
+        ConnectorType.REST,
+        "http://127.0.0.1:9/x",
+        proxy="http://127.0.0.1:3128",
+        proxy_user="pu",
+        proxy_password="pw",
+        proxy_auth_type="digest",
+        oauth2_token_url=_HTTPS_TOKEN_URL,
+    )
+    assert dest._token_provider is not None
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_built_smart_connection_behind_a_digest_proxy_is_refused_at_build(ec_pem: str) -> None:
+    """The build-path refusal on the SMART provider, in its own error type."""
+    from messagefoundry.transports.smart import SmartAuthError, with_smart_backend
+
+    spec = with_smart_backend(
+        Rest(
+            url="http://127.0.0.1:9/x",
+            proxy="http://127.0.0.1:3128",
+            proxy_user="pu",
+            proxy_password="pw",
+            proxy_auth_type="digest",
+        ),
+        token_url=_HTTPS_TOKEN_URL,
+        client_id="cid",
+        private_key=ec_pem,
+        algorithm=SignatureAlgorithm.ES256,
+        scope="system/*.rs",
+    )
+    with (
+        active_hop_posture(_WARN_DIAL),
+        pytest.raises(SmartAuthError, match=f"^connection 'OB'; SMART {_DIGEST_PROXY_REFUSED} "),
+    ):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.REST,
+                settings=spec.settings,
+                cleartext_accepted=True,
+                cleartext_reason="test peer has no TLS",
+            ),
+            egress=permitting(spec.settings),
+        )
+
+
+#: A non-loopback proxy, so its credential's hop is judged and, when accepted, recorded. Nothing
+#: dials it.
+_OFF_BOX_PROXY = "http://10.0.0.9:3128"
+_CROSSING = "web-proxy credential over cleartext http"
+
+
+def _build_off_box_proxy(auth: str, ctype: ConnectorType = ConnectorType.REST) -> Any:
+    return _build(
+        ctype,
+        "http://127.0.0.1:9/x",
+        proxy=_OFF_BOX_PROXY,
+        proxy_user="pu",
+        proxy_password="pw",
+        proxy_auth_type=auth,
+        oauth2_token_url=_HTTPS_TOKEN_URL,
+    )
+
+
+@pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("ctype", [ConnectorType.REST, ConnectorType.FHIR])
+def test_a_refused_token_hop_leaves_no_record_of_a_proxy_credential_crossing(
+    caplog: pytest.LogCaptureFixture, ctype: ConnectorType
+) -> None:
+    """BACKLOG #2989 item 20. The refusal ran after the proxy credential's hop was judged, so a
+    connection refused at build still logged and audited an accepted crossing of a hop that never
+    runs. It now runs first. Fails on the code before that change, and, for FHIR, without the
+    ``builds_token_hop=True`` the FHIR outbound passes (review finding 4)."""
+    with caplog.at_level("INFO"), pytest.raises(HttpAuthError, match=_DIGEST_PROXY_REFUSED):
+        _build_off_box_proxy("digest", ctype)
+    assert not [r for r in caplog.records if _CROSSING in r.getMessage()]
+
+
+@pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("ctype", [ConnectorType.REST, ConnectorType.FHIR])
+def test_an_accepted_proxy_credential_crossing_is_still_recorded(
+    caplog: pytest.LogCaptureFixture, ctype: ConnectorType
+) -> None:
+    """THE CONTROL for the arm above: the same connection with a Basic proxy credential builds, and
+    its accepted crossing is recorded, so the empty result above is not a deaf instrument."""
+    with caplog.at_level("INFO"):
+        _build_off_box_proxy("basic", ctype)
+    assert [r for r in caplog.records if _CROSSING in r.getMessage()]
+
+
+# --- the early refusal is for a caller that builds the provider the settings name -----------------
+#
+# Vault BACKLOG #2989, review round 3. ``rest.proxy_auth_handler_from_settings`` runs the token
+# hop's Digest refusal early only for the REST and FHIR outbounds, which pass
+# ``builds_token_hop``. A DICOMweb outbound builds no token provider, and a FhirLookup
+# builds SMART only, so OAuth2 settings on either name a provider that is never built. Each fails
+# on 19540d5bb7, where the early refusal read the settings for every caller.
+
+#: The OAuth2 settings ``with_oauth2_client_credentials`` writes, which only an HTTP spec accepts.
+_OAUTH2_SETTINGS: dict[str, object] = {
+    "oauth2_enabled": True,
+    "oauth2_token_url": _HTTPS_TOKEN_URL,
+    "oauth2_client_id": "cid",
+    "oauth2_client_secret": "s3cr3t",
+}
+_DIGEST_PROXY_SETTINGS: dict[str, object] = {
+    "proxy_url": "http://127.0.0.1:3128",
+    "proxy_user": "pu",
+    "proxy_password": "pw",
+    "proxy_auth_type": "digest",
+    "cleartext_accepted": True,
+    "cleartext_reason": "test peer has no TLS",
+}
+
+
+def _digest_proxied_lookup(**token: object) -> FhirLookupExecutor:
+    settings = {"url": "http://fhir.partner.invalid/fhir", **_DIGEST_PROXY_SETTINGS, **token}
+    with active_hop_posture(_WARN_DIAL):
+        return FhirLookupExecutor({"epic": settings}, egress=permitting(settings))
+
+
+def _smart_settings(private_key: str) -> dict[str, object]:
+    return {
+        "smart_token_url": _HTTPS_TOKEN_URL,
+        "smart_client_id": "cid",
+        "smart_private_key": private_key,
+        "smart_algorithm": "ES256",
+        "smart_scope": "system/*.rs",
+    }
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_fhir_lookup_with_oauth2_settings_behind_a_digest_proxy_builds() -> None:
+    ex = _digest_proxied_lookup(**_OAUTH2_SETTINGS)
+    assert ex._token["epic"] is None
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_fhir_lookup_with_smart_and_oauth2_settings_is_refused_by_its_smart_provider(
+    ec_pem: str,
+) -> None:
+    """THE CONTROL, as on main: a FhirLookup builds its SMART provider whatever OAuth2 settings sit
+    beside it, and that provider refuses the Digest proxy when it is built."""
+    from messagefoundry.transports.smart import SmartAuthError
+
+    with pytest.raises(SmartAuthError, match=_DIGEST_PROXY_REFUSED):
+        _digest_proxied_lookup(**_smart_settings(ec_pem), **_OAUTH2_SETTINGS)
+
+
+@pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("provider", ["oauth2", "smart"])
+def test_a_dicomweb_outbound_with_token_settings_behind_a_digest_proxy_builds(
+    provider: str, ec_pem: str
+) -> None:
+    spec = DICOMweb(
+        url="http://127.0.0.1:9/x",
+        proxy="http://127.0.0.1:3128",
+        proxy_user="pu",
+        proxy_password="pw",
+        proxy_auth_type="digest",
+    )
+    settings = {
+        **spec.settings,
+        **(_OAUTH2_SETTINGS if provider == "oauth2" else _smart_settings(ec_pem)),
+    }
+    with active_hop_posture(_WARN_DIAL):
+        dest: Any = build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.DICOMWEB,
+                settings=settings,
+                cleartext_accepted=True,
+                cleartext_reason="test peer has no TLS",
+            ),
+            egress=permitting(settings),
+        )
+    assert dest._proxy is not None
+    assert dest._proxy.digest is not None
+
+
+def test_the_early_refusal_checks_the_token_url_before_it_reads_it() -> None:
+    """Review round 3, F4: the early refusal runs the provider's own ``_check_token_url`` first, so
+    a URL that check refuses is refused for itself. A token URL holding a credential is
+    refused for the credential, as the provider refuses it. On 19540d5bb7 it was refused as a
+    Digest token hop instead."""
+    from messagefoundry.transports.http_auth import refuse_a_digest_proxy_on_the_token_hop
+
+    settings = {
+        **_DIGEST_PROXY_SETTINGS,
+        **_OAUTH2_SETTINGS,
+        "oauth2_token_url": "https://cid:s3cr3t@auth.partner.invalid/token",
+    }
+    with pytest.raises(HttpAuthError) as ei:
+        refuse_a_digest_proxy_on_the_token_hop(settings, connection="OB")
+    message = str(ei.value)
+    assert _DIGEST_PROXY_REFUSED not in message
+    assert "oauth2_token_url" in message
+    assert "s3cr3t" not in message
+    # CONTROL: the same settings with a clean token URL meet the Digest refusal.
+    with pytest.raises(HttpAuthError, match=_DIGEST_PROXY_REFUSED):
+        refuse_a_digest_proxy_on_the_token_hop(
+            {**settings, "oauth2_token_url": _HTTPS_TOKEN_URL}, connection="OB"
+        )
+
+
+@pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("ctype", [ConnectorType.REST, ConnectorType.FHIR])
+@pytest.mark.parametrize("scheme", ["https", "http"])
+def test_a_token_url_with_no_host_is_refused_as_on_main(ctype: ConnectorType, scheme: str) -> None:
+    """Review findings 1 and 9: behind a Digest proxy, a token URL that names no host is refused
+    for that, naming its setting, as on main, not as a Digest token hop or with no setting named.
+    Fails on ef3d956b6c, where the early refusal read the URL first."""
+    with pytest.raises(ValueError, match="^oauth2_token_url: the URL names no host"):
+        _build(
+            ctype,
+            "http://127.0.0.1:9/x",
+            proxy="http://127.0.0.1:3128",
+            proxy_user="pu",
+            proxy_password="pw",
+            proxy_auth_type="digest",
+            oauth2_token_url=f"{scheme}:///token",
+        )
+
+
+@pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("scheme", ["https", "http"])
+def test_a_smart_token_url_with_no_host_is_refused_as_on_main(ec_pem: str, scheme: str) -> None:
+    """The same for the SMART provider, naming ``smart_token_url``."""
+    from messagefoundry.transports.smart import with_smart_backend
+
+    spec = with_smart_backend(
+        Rest(
+            url="http://127.0.0.1:9/x",
+            proxy="http://127.0.0.1:3128",
+            proxy_user="pu",
+            proxy_password="pw",
+            proxy_auth_type="digest",
+        ),
+        token_url=f"{scheme}:///token",
+        client_id="cid",
+        private_key=ec_pem,
+        algorithm=SignatureAlgorithm.ES256,
+        scope="system/*.rs",
+    )
+    with (
+        active_hop_posture(_WARN_DIAL),
+        pytest.raises(ValueError, match="^smart_token_url: the URL names no host"),
+    ):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.REST,
+                settings=spec.settings,
+                cleartext_accepted=True,
+                cleartext_reason="test peer has no TLS",
+            ),
+            egress=permitting(spec.settings),
         )
 
 

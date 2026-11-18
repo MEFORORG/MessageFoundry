@@ -71,6 +71,22 @@ export function assertTargetAllowed(url: string): TargetCheck {
 }
 
 /**
+ * The notification text for a refusal {@link assertTargetAllowed} returned. Every caller that shows
+ * that refusal uses this, so they all show it the same way.
+ *
+ * Defence in depth: the reason quotes the URL verbatim, and a notification renders a markdown link
+ * in its text, `command:` links included. engineUrl and environments are machine-scoped, so a
+ * checked-in workspace cannot supply the URL, but a caller's URL is still any text. A notification
+ * does not honour a backslash escape, so the link breaks only where a backslash lands between `]`
+ * and `(`; escaping the four link characters does that. It leaves most hosts as typed, where a full
+ * markdown escape would also put a backslash before an underscore in one; an IPv6 host shows its
+ * brackets escaped, as `\[::1\]`.
+ */
+export function targetRefusalNotice(reason: string): string {
+  return `MessageFoundry: ${reason.replace(/[[\]()]/g, (c) => `\\${c}`)}`;
+}
+
+/**
  * Gate a URL before it is handed to `vscode.env.openExternal`, which routes to the OS handler and so
  * can launch an application, not just a browser.
  *

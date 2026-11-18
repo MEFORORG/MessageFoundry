@@ -2252,17 +2252,17 @@ class ProxyConfig:
         The record states the fact and names the connection, and nothing else. It carries no
         part of the proxy URL and no part of ``host``. Both are read out of the settings mapping
         that also holds the connection's credentials, and a proxy URL can carry userinfo."""
-        host = urllib.parse.urlsplit(url).hostname or ""
-        if _is_loopback_target(host):
+        route = _proxy_route(url, self.bypass)
+        if route == "loopback":
             logger.info(
                 "connection %s; the configured web proxy is not used for a loopback target, "
                 "because a loopback hop is always dialled direct",
                 audit_connection_name(self.connection),
             )
             return None
-        if _proxy_bypasses(host, self.bypass):
+        if route == "bypassed":
             return None
-        if _urllib_bypasses(url):
+        if route == "urllib-bypassed":
             # proxy_url = "default" carries no credential and means "follow the system's settings",
             # bypass list included, so following that list is no override and is not logged.
             if not self.use_default:
@@ -2277,6 +2277,43 @@ class ProxyConfig:
                 )
             return _HostProxy(self, credentialed=False)
         return _HostProxy(self)
+
+
+def _proxy_route(
+    url: str, bypass: tuple[str, ...]
+) -> Literal["loopback", "bypassed", "urllib-bypassed", "proxied"]:
+    """How :meth:`ProxyConfig.for_host` routes a request for ``url``, before it logs anything: a
+    loopback host, a host ``bypass`` names, a host urllib's own bypass list names, or the proxy. One
+    reading for that method and for :func:`digest_proxy_meets_the_token_connect`."""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if _is_loopback_target(host):
+        return "loopback"
+    if _proxy_bypasses(host, bypass):
+        return "bypassed"
+    if _urllib_bypasses(url):
+        return "urllib-bypassed"
+    return "proxied"
+
+
+def digest_proxy_meets_the_token_connect(token_url: object, no_proxy: object) -> bool:
+    """Whether a token request to ``token_url`` meets an explicit web proxy set up for Digest on a
+    ``CONNECT``, where Digest cannot answer the proxy's 407 (vault BACKLOG #2989, ADR 0095 B.1).
+
+    It reads no proxy and no Digest setting, so the caller checks that a proxy set up for Digest
+    exists. True for an ``https`` token URL that is not loopback and that neither ``no_proxy`` nor
+    urllib's own bypass list names, as :meth:`ProxyConfig.for_host` routes it. The token hop's build
+    refusals of a Digest proxy read it (``http_auth.refuse_a_digest_proxy_on_the_token_hop`` and
+    ``smart._TokenEndpointProvider._open_token_hop``). A value that is not a string, or that does not parse, answers ``False``."""
+    if not isinstance(token_url, str):
+        return False
+    try:
+        if urllib.parse.urlsplit(token_url).scheme.lower() != "https":
+            return False
+        return _proxy_route(token_url, _normalize_no_proxy(no_proxy)) == "proxied"
+    except ValueError:
+        # Value-free: a URL can carry userinfo.
+        logger.debug("token URL does not parse; the Digest proxy rule does not apply to it")
+        return False
 
 
 def _urllib_bypasses(url: str) -> bool:
@@ -2313,9 +2350,7 @@ class _HostProxy:
 
     @property
     def answers_digest(self) -> bool:
-        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener. The
-        token hop's build refusal of a Digest proxy for an https token endpoint reads it, so the two
-        decide from one rule (BACKLOG #2989)."""
+        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener."""
         return self.credentialed and self.config.digest is not None
 
     def auth_headers(self) -> dict[str, str]:
@@ -2358,6 +2393,7 @@ def proxy_auth_handler_from_settings(
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
+    builds_token_hop: bool = False,
 ) -> tuple[tuple[tuple[str, str], ...], _ProxyDigestRecipe | None]:
     """The #127 proxy-credential-type dispatch: returns ``(pre-emptive auth header, reactive digest
     recipe)`` for an already-``env()``-resolved settings mapping ``s``. (Named per the phase doc; lives
@@ -2378,7 +2414,13 @@ def proxy_auth_handler_from_settings(
     ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
     destination's own credentials (:func:`refuse_cleartext_credential_hop`, vault BACKLOG #3533
     item 4), this leg can be declared, with ``cleartext_accepted`` and a reason alone.
-    ``docs/CONNECTIONS.md`` states the owner's rulings on this credential (vault BACKLOG #3007)."""
+    ``docs/CONNECTIONS.md`` states the owner's rulings on this credential (vault BACKLOG #3007).
+
+    ``builds_token_hop`` is set by the REST and FHIR outbounds only. For them a Digest credential
+    also meets ``http_auth.refuse_a_digest_proxy_on_the_token_hop`` here, before the guard below.
+    Every other caller leaves it unset, the SOAP outbound included, although it builds its bearer
+    the same way: its token hop, if any, keeps the later refusal in
+    ``smart._TokenEndpointProvider._open_token_hop``, after the guard."""
     user = s.get("proxy_user")
     password = s.get("proxy_password")
     auth_type = s.get("proxy_auth_type")
@@ -2423,6 +2465,14 @@ def proxy_auth_handler_from_settings(
                 "challenge arrives inside the CONNECT tunnel (digest-over-CONNECT is unsupported); use "
                 "proxy_auth_type='basic' (pre-emptive) or a local authenticating proxy (ADR 0126)"
             )
+        if builds_token_hop:
+            # The token hop's half of the same rule (vault BACKLOG #2989 items 11, 20 and 21), here
+            # so it runs before the guard below records the credential's crossing. Only for a
+            # caller that builds the provider these settings name. Lazy: http_auth and smart import
+            # this module.
+            from messagefoundry.transports.http_auth import refuse_a_digest_proxy_on_the_token_hop
+
+            refuse_a_digest_proxy_on_the_token_hop(s, connection=connection)
         result = (), _ProxyDigestRecipe(proxy_url, str(user), str(password))
     elif kind in ("ntlm", "windows"):
         raise ValueError(
@@ -2575,12 +2625,13 @@ def proxy_config_from_settings(
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
+    builds_token_hop: bool = False,
 ) -> ProxyConfig | None:
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
     (#128), and ``proxy_user``/``proxy_password``/``proxy_auth_type`` (#127). ``dest_scheme`` is the
-    target's scheme (for the digest-over-https refusal; a token hop's https endpoint is refused
-    for Digest in ``smart._TokenEndpointProvider._open_token_hop``).
+    target's scheme (for the digest-over-https refusal). ``builds_token_hop`` is passed on to
+    :func:`proxy_auth_handler_from_settings`, which says what it adds.
 
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
     (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.
@@ -2646,6 +2697,7 @@ def proxy_config_from_settings(
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
         connection=connection,
+        builds_token_hop=builds_token_hop,
     )
     return ProxyConfig(
         proxies=(("http", proxy_url), ("https", proxy_url)),
@@ -2806,6 +2858,7 @@ def egress_route_from_settings(
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
+    builds_token_hop: bool = False,
 ) -> ProxyConfig | None:
     """Resolve the per-connection forward/egress **proxy** (ADR 0126) from ``proxy_url``, or ``None``
     (byte-identical). **Fails closed on ``ech_egress``:** the ECH SNI-hiding send-path (ADR 0139) is
@@ -2819,7 +2872,8 @@ def egress_route_from_settings(
     than only the ones routing through here. This one stays for the callers that are **not** destinations
     and so never reach that seam — ``FhirLookupExecutor`` (ADR 0043, ``fhir.py``) is the live case. Both
     raise the **same** message, so a doubly-covered connector never shows an operator two different
-    explanations for one key."""
+    explanations for one key. ``builds_token_hop`` is
+    :func:`proxy_auth_handler_from_settings`'s."""
     if s.get("ech_egress"):
         raise ValueError(ECH_UNSUPPORTED_DESTINATION_MSG)
     return proxy_config_from_settings(
@@ -2828,6 +2882,7 @@ def egress_route_from_settings(
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
         connection=connection,
+        builds_token_hop=builds_token_hop,
     )
 
 
@@ -2949,6 +3004,7 @@ class RestDestination(DestinationConnector):
                 cleartext_accepted=accepted,
                 cleartext_reason=accept_reason,
                 connection=config.name,
+                builds_token_hop=True,  # bearer_provider_from_settings, below
             )
         )
         proxy_dest = self._proxy.for_host(self.url) if self._proxy is not None else None

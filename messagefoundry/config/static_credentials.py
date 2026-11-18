@@ -75,10 +75,13 @@ redaction screen's header test and the query-credential reader; ``_http_literal_
   listed: the first fails the connector's build, and the second meets the send-time proxy rule. A
   ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
 
-Pure apart from at least :func:`apply_static_credential_gate`, which also logs, ``_digest``,
-which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529), and
-``_http_literal_static``, whose ``env()`` resolution runs an operator ``cast`` as the build does
-(BACKLOG #5510), as does ``_dicomweb_build_refused`` (vault BACKLOG #5359).
+Not every function here is pure. At least these do more than read their arguments:
+:func:`apply_static_credential_gate` and the guard :func:`make_static_credential_guard` returns,
+which log, the guard also reading the ``env()`` values the engine sets around it; ``_digest``,
+which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529); ``_is_https``, which logs
+at debug a proxy target that does not parse; and ``_http_literal_static`` and
+``_dicomweb_build_refused`` (vault BACKLOG #5359), whose ``env()`` resolution runs an operator
+``cast`` as the build does (BACKLOG #5510).
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -105,6 +108,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.wiring import (
     _UNRESOLVED,
     _WITHHELD_PEER,
+    EnvRef,
     Registry,
     WiringError,
     _db_setting,
@@ -389,6 +393,39 @@ def _proxy_bypasses(target: object, no_proxy: object) -> bool:
     return proxy_bypasses_host(host, no_proxy)
 
 
+def _is_https(url: object) -> bool:
+    if not isinstance(url, str):
+        return False  # an env() reference, resolved only when the connector is built
+    try:
+        return urllib.parse.urlsplit(url).scheme.lower() == "https"
+    except ValueError:
+        # Value-free: a URL can carry userinfo.
+        logging.getLogger(__name__).debug("static-credential census: a proxy target does not parse")
+        return False
+
+
+def _digest_proxy_refused(targets: Sequence[object], settings: Mapping[str, Any]) -> bool:
+    """Whether a web proxy set up for Digest never carries this connection's credential, read from
+    the targets :func:`_proxy_targets` lists (vault BACKLOG #2989 item 28).
+
+    The build refuses Digest for a connection whose own ``url`` is ``https``, whatever the bypass
+    list says (ADR 0126 AC-6). A connection that also mints a bearer cannot use the proxy either:
+    its own ``url``, if not ``https``, must be loopback, which is dialled direct, since a bearer over
+    cleartext http off this machine is refused; and its token URL, if ``https``, meets the proxy
+    on a ``CONNECT``, which the build refuses (ADR 0095 B.1), or bypasses it, and if ``http`` is
+    loopback too. The bearer counts only where nothing from ``env()`` decides it: a literal token
+    URL and no ``env()`` switch on either provider. Otherwise the hop is listed."""
+    if not targets:
+        return False
+    url, *token_urls = targets
+    if _is_https(url):
+        return True
+    switches_literal = not any(
+        isinstance(settings.get(key), EnvRef) for key in ("smart_enabled", "oauth2_enabled")
+    )
+    return switches_literal and any(isinstance(t, str) and t for t in token_urls)
+
+
 def _proxy_targets(
     ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool = False
 ) -> list[object]:
@@ -426,7 +463,8 @@ def _proxy_hop(
     credential never leaves the engine. A loopback address always bypasses it, with no entry in the
     list (vault BACKLOG #2579). The bypass list is the connection's own, else the inherited
     ``[egress].proxy_no_proxy`` (``site_no_proxy``, ``None`` when the caller has no settings). With no
-    ``targets`` the hop is reported, because nothing says it is bypassed.
+    ``targets`` the hop is reported, because nothing says it is bypassed. Nor is a Digest proxy that
+    never carries the credential to those targets (:func:`_digest_proxy_refused`).
 
     The credential is the ``proxy_user``/``proxy_password`` pair. A user or a password in the proxy
     URL itself (:func:`_proxy_url_holds_credential`) is not a hop: the connector's build refuses it.
@@ -448,6 +486,8 @@ def _proxy_hop(
     # From a closed set, not echoed: only a known scheme name reaches the detail. The type is read
     # the way the transport reads it.
     kind = str(settings.get("proxy_auth_type") or "basic").strip().lower()
+    if kind == "digest" and _digest_proxy_refused(targets, settings):
+        return None  # the build refuses this Digest proxy, or never sends through it
     if kind not in ("basic", "digest"):
         kind = "static"
     return StaticCredentialHop(
@@ -793,7 +833,7 @@ def run_static_credential_gate(
     env_values: Mapping[str, Any] | None = None,
 ) -> StaticCredentialGateOutcome | None:
     """Run the opt-in ``[security].require_nonstatic_credentials`` gate over one half of the set,
-    logging nothing: the caller decides when the audit lines are logged.
+    returning its audit lines: the caller decides when they are logged.
 
     ``serve`` needs that choice (BACKLOG #1989). It judges the settings half before
     ``configure_logging`` has installed any handler, so a line logged then reaches stderr only and

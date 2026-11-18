@@ -41,10 +41,11 @@ param(
     # this script - refused at parameter binding, before it can say why. This read "^[A-Za-z0-9._-]+$"
     # until BACKLOG #1523's third review round, and that was the defect.
     #
-    # The literal copies (here, twice in install-net-helper.ps1, and install-service.ps1's
-    # -ServiceName) cannot be collapsed into one: a PowerShell attribute argument must be a
-    # compile-time constant, so `[ValidatePattern($pattern)]` is a parse error. They are pinned to
-    # the Python definition by tests/test_net_helper_install_scripts.py instead.
+    # The literal copies (here, twice in install-net-helper.ps1, and the -ServiceName of
+    # install-service.ps1 and uninstall-service.ps1) cannot be collapsed into one: a PowerShell
+    # attribute argument must be a compile-time constant, so `[ValidatePattern($pattern)]` is a
+    # parse error. They are pinned to the Python definition by
+    # tests/test_net_helper_install_scripts.py instead.
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$ServiceName = "MessageFoundryNetHelper",
     # Where install-net-helper.ps1 put the files. Read for mefor-net-helper.conf, which is the only
     # record on the node of which address the helper was scoped to.
@@ -69,7 +70,13 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Removing a Windows service requires an elevated (Administrator) PowerShell."
 }
 
-if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+# ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Get-Service and Stop-Service -Name
+# also match a DISPLAY name, which the pattern above cannot keep out because it allows a space, so
+# the lookup filters on Name and the stop below takes the object it found (-InputObject).
+$exactService = { @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+    Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1 }
+$existingService = & $exactService
+if (-not $existingService) {
     Write-Host "Service '$ServiceName' is not installed - nothing to do."
     return
 }
@@ -234,11 +241,11 @@ if ($ReleaseAddress) {
 # two things that function exists to do -- issue the stop, then confirm the status back from the SCM
 # rather than assuming it (BACKLOG #1558).
 Write-Host "Stopping '$ServiceName'..."
-Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+Stop-Service -InputObject $existingService -Force -ErrorAction SilentlyContinue
 $stopped = $false
 $deadline = (Get-Date).AddSeconds(30)
 while ($true) {
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    $svc = & $exactService
     if (-not $svc -or $svc.Status -eq "Stopped") { $stopped = $true; break }
     if ((Get-Date) -ge $deadline) { break }
     Start-Sleep -Milliseconds 500

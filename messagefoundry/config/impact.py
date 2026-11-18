@@ -214,6 +214,17 @@ def plan_rename(
             f"cannot rename {target_kind} {old!r} to {new!r}: {new!r} already names a "
             f"registered {target_kind}"
         )
+    # And onto a case twin of another connection, which graph_problems refuses (BACKLOG #5392).
+    if target_kind in ("inbound", "outbound"):
+        folded = new.casefold()
+        twin = next(
+            (n for n in _table(registry, target_kind) if n != old and n.casefold() == folded), None
+        )
+        if twin is not None:
+            raise WiringError(
+                f"cannot rename {target_kind} {old!r} to {new!r}: it differs only in case from "
+                f"the registered {target_kind} {twin!r}"
+            )
 
     sources = SourceCache()
     index = build_reference_index(registry, sources)
@@ -905,6 +916,10 @@ def _validate_new_name(config_dir: Path, target_kind: str, new: str) -> None:
 
 
 def _is_registered(registry: Registry, target_kind: str, name: str) -> bool:
+    return name in _table(registry, target_kind)
+
+
+def _table(registry: Registry, target_kind: str) -> Mapping[str, object]:
     tables: dict[str, Mapping[str, object]] = {
         "inbound": registry.inbound,
         "outbound": registry.outbound,
@@ -915,7 +930,7 @@ def _is_registered(registry: Registry, target_kind: str, name: str) -> bool:
         "lookup": registry.lookups,
         "fhir_lookup": registry.fhir_lookups,
     }
-    return name in tables[target_kind]
+    return tables[target_kind]
 
 
 def _is_connections_toml(source_file: str) -> bool:

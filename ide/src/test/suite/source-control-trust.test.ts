@@ -43,7 +43,10 @@ const vscodeStub = {
     get isTrusted(): boolean {
       return stubTrusted;
     },
-    getConfiguration: () => ({ get: (_key: string, fallback: unknown): unknown => fallback }),
+    getConfiguration: () => ({
+      get: (_key: string, fallback: unknown): unknown => fallback,
+      inspect: (): undefined => undefined,
+    }),
     fs: {
       stat: (uri: { fsPath: string }): Promise<fs.Stats> => {
         calls.push({ api: "fs.stat", args: [uri.fsPath] });

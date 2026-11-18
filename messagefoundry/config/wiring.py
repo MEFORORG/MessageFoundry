@@ -116,9 +116,11 @@ from messagefoundry.config.snapshot import (
 )
 from messagefoundry.connection_names import (
     CONNECTION_NAME_PATTERN,
+    db_lookup_record_name,
     fhir_lookup_record_name,
     inbound_record_name,
     is_connection_name,
+    reference_record_name,
 )
 from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import QUALIFIED_CERT_NAME, unmatchable_san_reason
@@ -6711,6 +6713,21 @@ def _require_connection_name(conn: InboundConnection | OutboundConnection, kind:
     )
 
 
+def case_twins(names: Iterable[str]) -> Iterator[tuple[str, str]]:
+    """Each pair of ``names`` that differ only in case, as (first declared, later one) (BACKLOG
+    #5392). A SQL Server store with a case-insensitive default collation compares the queue,
+    response and scope rows a connection name keys without case, so two such connections would
+    share them there while SQLite and Postgres keep them apart. A connection or FHIR lookup name is
+    ASCII (the name rule), so ``casefold`` is exactly that collation's comparison for it; trailing
+    spaces and width, which SQL Server also ignores, cannot occur in one. Per table: an inbound and
+    an outbound may share a name, as they may exactly."""
+    seen: dict[str, str] = {}
+    for name in names:
+        first = seen.setdefault(name.casefold(), name)
+        if first != name:
+            yield first, name
+
+
 @dataclass
 class Registry:
     """The wired graph produced by loading config modules."""
@@ -6920,6 +6937,17 @@ class Registry:
         # Before the other rules: some read the same literals laxly, and validate raises only the
         # first problem, so a symptom would hide the bad literal (vault BACKLOG #3234).
         yield from self.bool_literal_problems()
+        for kind, table in (
+            ("inbound connection", self.inbound),
+            ("outbound connection", self.outbound),
+            ("fhir lookup", self.fhir_lookups),
+        ):
+            for first, second in case_twins(table):
+                yield (
+                    f"duplicate {kind} name: {second!r} differs only in case from {first!r}, and "
+                    "a SQL Server store column that compares without case, at least the alert "
+                    "and event columns, would read the two as one"
+                )
         for conn in self.inbound.values():
             if conn.router not in self.routers:
                 yield f"inbound connection {conn.name!r} references unknown router {conn.router!r}"
@@ -7405,8 +7433,11 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
             (fhir_lookup_record_name(s.name), s.settings, s.cleartext_accepted)
             for s in registry.fhir_lookups.values()
         ),
-        *((f"db_lookup:{s.name}", s.settings, False) for s in registry.lookups.values()),
-        *((f"reference:{r.name}", r.source.settings, False) for r in registry.references.values()),
+        *((db_lookup_record_name(s.name), s.settings, False) for s in registry.lookups.values()),
+        *(
+            (reference_record_name(r.name), r.source.settings, False)
+            for r in registry.references.values()
+        ),
     ]
     out += [
         AttestedHop(
@@ -8351,13 +8382,17 @@ def static_credential_db_hops(
     for spec in registry.lookups.values():
         reason = kind(spec.settings)
         if reason is not None:
-            out.append((f"db_lookup:{spec.name}", f"{reason} ({_peer_label(spec.settings)})"))
+            out.append(
+                (db_lookup_record_name(spec.name), f"{reason} ({_peer_label(spec.settings)})")
+            )
     for ref in registry.references.values():
         if ref.source.kind != "database":
             continue
         reason = kind(ref.source.settings)
         if reason is not None:
-            out.append((f"reference:{ref.name}", f"{reason} ({_peer_label(ref.source.settings)})"))
+            out.append(
+                (reference_record_name(ref.name), f"{reason} ({_peer_label(ref.source.settings)})")
+            )
     return sorted(out)
 
 

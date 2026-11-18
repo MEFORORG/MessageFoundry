@@ -16,9 +16,15 @@ starts no server. Contents (each a small text/JSON member):
 * ``app-log.txt`` — a **redacted** tail of the configured app log (see
   :mod:`messagefoundry.support.redact`); omitted when no ``[logging].log_dir`` is configured.
 
-HARD RULE (do not break): no raw message bodies and no secrets. The config summary emits counts/names
-only; the status snapshot is the metadata-only status models; the log tail is run through the redaction
-pass; and ``.env`` / ``*.db`` / ``MEFOR_*`` are never read into the bundle.
+HARD RULE (do not break): no member this module builds reads a message body from the store, and only
+the app-log tail can carry a secret or a body into the archive. The config summary loads the config but
+emits counts/names only; the status snapshot opens the store read-only, with its credentials, and emits
+only the metadata-only status models; and ``.env`` / ``*.db`` / ``MEFOR_*`` are never read into the
+bundle. **The app-log tail is the exception.** It reads the app log, which can hold a residual secret
+the redaction pass does not read, and, on a non-production instance running at ``DEBUG``, a full
+message body (``docs/PHI.md`` §7, the prod-``DEBUG`` refusal), so the redacted tail can still carry
+either. What the archive does and does not hold is stated once, in the manifest's ``phi_contract``
+(BACKLOG #5385), and ``docs/PHI.md`` stream 14 is the record.
 
 That rule reaches the FAILURE branches too, which is where it used to fail (BACKLOG #1571). A caught
 exception's **message** never enters the bundle: config loading wraps text raised by arbitrary operator
@@ -381,11 +387,18 @@ def build_bundle(
         "generated_at": now,
         "generated_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
         "members": sorted(members),
-        # An explicit, auditable statement of what is and isn't in the bundle (the PHI contract).
+        # An explicit, auditable statement of what is and isn't in the bundle (the PHI contract). It
+        # is machine-readable and a reviewer may rely on it, so it claims no more than every member
+        # meets, and it is the one place the log tail's residual is stated (BACKLOG #5385; the CLI
+        # help made the same repair under BACKLOG #1475).
         "phi_contract": (
-            "no raw message bodies, no secrets; config summary is counts/names only; status is the "
-            "metadata-only status models; the app-log tail is redacted; a section that failed reports "
-            "a fixed MF-BUNDLE-* code plus the exception type, never the exception message"
+            "no member reads a message body from the store; config summary is counts/names only and "
+            "holds no secret; status is the metadata-only status models; the app-log tail is a "
+            "BEST-EFFORT redacted copy of the app log, and values survive it, at least a single-token "
+            "identifier such as an operator username and, on a non-production instance logging at "
+            "DEBUG, a message body the log recorded in a shape the redaction does not read, so the bundle is to be handled as a copy of the app log, "
+            "not as secret-free or PHI-free; a section that failed reports a fixed MF-BUNDLE-* code plus "
+            "the exception type, never the exception message"
         ),
     }
     members["manifest.json"] = json.dumps(manifest, indent=2, sort_keys=True)
