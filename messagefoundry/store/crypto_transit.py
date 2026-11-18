@@ -326,8 +326,8 @@ def _names_aead_failure(exc: Exception) -> bool:
     return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
 
 
-#: The seconds within which each :func:`_warn_when_due` warning is logged at most once per process,
-#: and :func:`_report_unlogged`'s rate limit (BACKLOG #5650, #6707). A proxy can cause one on every
+#: The seconds within which each :func:`_warn_when_due` warning is logged at most once per process
+#: unless logging it raises, and :func:`_report_unlogged`'s rate limit (BACKLOG #5650, #6707). A proxy can cause one on every
 #: read or every row; once is the signal.
 _WARNING_LOG_INTERVAL_S = 3600.0
 #: When each such warning, by kind, was last logged.
@@ -458,7 +458,8 @@ def _unconfirmed_warning(
         lambda: ("unconfirmed", audit_key, cause, raised),
         lambda: (
             "an audit MAC verify at key version %d got a 400 labelled unconfirmed, because %s%s "
-            "(key=%r); logged at most once in %d seconds per process for this key and this cause",
+            "(key=%r); logged at most once in %d seconds per process for this key and this cause "
+            "unless logging it raises",
             version,
             cause,
             " " + raised if raised else "",
