@@ -354,6 +354,12 @@ class Ledger:
         # retired per-ref item sweep was five spawns plus two full parses of a 30k-line file per ref.
         self._parents: list[str] | None = None
         self._renames: dict[str, str] | None = None
+        self._shallow: bool | None = None
+        # Number -> the base commits that touched that number's ADR path, or None where git failed.
+        self._number_commits: dict[str, list[str] | None] = {}
+        # The ADR numbers at the fork point with the base, read once; None where git failed.
+        self._fork_read = False
+        self._fork_numbers: frozenset[str] | None = None
 
     def _resolve_alloc(self) -> None:
         if self._alloc_resolved:
@@ -452,21 +458,59 @@ class Ledger:
     def _renames_a_number_new_on_this_branch(self, path: str, number: str) -> bool:
         """Is this add a same-number rename of an ADR this branch itself introduced (BACKLOG #5453)?
 
-        Such a rename allocates nothing, so the ownership arm grants it. The grant needs a POSITIVE
-        fact, and every doubt refuses: git must pair the file with a same-number ADR, and the fork
-        point with the base must hold no ADR under that number. A branch cut while the base still
-        held the number fails the second test, because renaming its copy revives a number the base
-        lost, which is the restore rule's to judge. A merge-base git cannot compute, as in a shallow
-        clone whose graft hides the fork point, is a doubt.
+        Such a rename allocates nothing, so the ownership arm grants it. The grant needs POSITIVE
+        facts, and every doubt refuses. Git must pair the file with a same-number ADR. The base's
+        history must show the number never spent: no commit reachable from the base touched an ADR
+        under it, in a clone that is not shallow. And the fork point with the base must hold no ADR
+        under it. A rename onto a number the base once held revives a number the base lost, which is
+        the restore rule's to judge, whether the branch was cut before the base deleted it, merged
+        the base after, or restored the file exactly and renamed it in a later commit. The caller
+        reaches this only for a number absent from the base tip, so the source is never a live base
+        ADR there. A git failure, a shallow clone and a fork point git cannot compute are doubts.
         """
         if self.same_number_source(path, number) is None:
             return False
-        try:
-            fork = git("merge-base", self.base, "HEAD").strip()
-            names = _paths(git("ls-tree", "-z", "--name-only", fork, "docs/adr/"))
-        except OSError:
+        if self._commits_touching_number(number) != [] or self._is_shallow():
             return False
-        return not any((m := ADR_FILE.match(n)) and m.group(1) == number for n in names)
+        fork_numbers = self._numbers_at_fork()
+        return fork_numbers is not None and number not in fork_numbers
+
+    def _is_shallow(self) -> bool:
+        if self._shallow is None:
+            self._shallow = _clone_is_shallow()
+        return self._shallow
+
+    def _numbers_at_fork(self) -> frozenset[str] | None:
+        """The ADR numbers in the fork point's tree, or None where git cannot say. Read once a run."""
+        if not self._fork_read:
+            self._fork_read = True
+            try:
+                fork = git("merge-base", self.base, "HEAD").strip()
+                names = _paths(git("ls-tree", "-z", "--name-only", fork, "docs/adr/"))
+            except OSError:
+                self._fork_numbers = None
+            else:
+                self._fork_numbers = frozenset(
+                    m.group(1) for n in names if (m := ADR_FILE.match(n))
+                )
+        return self._fork_numbers
+
+    def _commits_touching_number(self, number: str) -> list[str] | None:
+        """Base commits that touched an ADR under this number, newest first, capped; None on a git
+        failure. One walk a number a run, shared by the rename grant and the restore rule."""
+        if number not in self._number_commits:
+            try:
+                out: list[str] | None = git(
+                    "rev-list",
+                    f"--max-count={RESTORE_HISTORY_DEPTH}",
+                    self.base,
+                    "--",
+                    f"docs/adr/{number}-*.md",
+                ).split()
+            except OSError:
+                out = None
+            self._number_commits[number] = out
+        return self._number_commits[number]
 
     def head_text(self, path: str) -> str:
         """The file as it will exist after this commit — the INDEX, not the working tree."""
@@ -575,15 +619,8 @@ class Ledger:
         see :class:`_RestoreEvidence`, whose ``exhausted`` flag is what stops the refusal text claiming
         the base never held bytes it simply did not walk far enough to see.
         """
-        try:
-            commits = git(
-                "rev-list",
-                f"--max-count={RESTORE_HISTORY_DEPTH}",
-                self.base,
-                "--",
-                f"docs/adr/{number}-*.md",
-            ).split()
-        except OSError:  # pragma: no cover - defensive; an unreadable base is never a restore
+        commits = self._commits_touching_number(number)
+        if commits is None:  # pragma: no cover - defensive; an unreadable base is never a restore
             return _RestoreEvidence(False, False, False)
         staged = _blob_id(f":{path}")
         restores = staged is not None and any(
@@ -591,7 +628,7 @@ class Ledger:
         )
         # "I found nothing" and "I could not look" must not share an answer. A shallow clone is the
         # measured case; a walk that hit its own cap is the other.
-        truncated = (not commits and _clone_is_shallow()) or len(commits) >= RESTORE_HISTORY_DEPTH
+        truncated = (not commits and self._is_shallow()) or len(commits) >= RESTORE_HISTORY_DEPTH
         return _RestoreEvidence(restores, bool(commits), truncated)
 
     # -- ownership -----------------------------------------------------------------------------------
@@ -768,6 +805,8 @@ class Ledger:
                 "because guessing in the other direction hands out a number that is already spent.",
                 "deepen the clone, then retry:\n"
                 "          git fetch --deepen=1000 origin\n"
+                "      A number the base never held reads this way in ANY shallow clone, deepened or\n"
+                "      not; only `git fetch --unshallow origin` lets the gate see that it is new.\n"
                 "      If this is NOT a restore, the number simply needs allocating:\n"
                 f"      {remedy}",
             )
@@ -832,12 +871,14 @@ class Ledger:
                 # is a collision.
                 if not row_names_file(first_rows.get(number, ""), basename):
                     src = self.same_number_source(path, number)
-                    if src is not None:
-                        # git pairs this file with an ADR of the SAME number that this change
-                        # removes, so it is a RENAME of that ADR (BACKLOG #5453), not a second
-                        # session's reuse. It allocates nothing; it owes a row linking the new name.
-                        # With no row left at all, the index-row rule below refuses it and names
-                        # that remedy, so this wording, about the row that stays, is not printed.
+                    if src is not None and _obj_exists(f"{self.base}:{src}"):
+                        # git pairs this file with the base's own ADR of the SAME number, which
+                        # this change removes, so it is a RENAME of that ADR (BACKLOG #5453), not a
+                        # second session's reuse. It allocates nothing; it owes a row linking the
+                        # new name. With no row left at all, the index-row rule below refuses it and
+                        # names that remedy, so this wording, about the row that stays, is not
+                        # printed. A source the base does not hold is the branch's own ADR under a
+                        # number the base has since spent: a reuse, so it takes the wording below.
                         if number in rows:
                             self.fail(
                                 f"ADR {number} was renamed from "
@@ -865,7 +906,10 @@ class Ledger:
             ):
                 # LAST, AND THE ORDER IS THE COST CONTROL. Everything above is cheap or memoized; the
                 # history walk is not. Reaching it means the commit was already headed for a refusal,
-                # so the walk is never paid on a passing commit (BACKLOG #1468).
+                # so the walk is never paid on a passing commit (BACKLOG #1468), with one exception:
+                # the rename grant above walks the same history for a file git pairs with a
+                # same-number ADR (BACKLOG #5453). The walk is memoized per number, so a refusal
+                # after that grant declines reuses it rather than walking again.
                 #
                 # ***IT MUST NOT `continue`, AND WRITING IT THAT WAY ONCE IS WHY THIS SAYS SO.*** The
                 # index-row rule below is the second half of THIS iteration, and a restore needs its

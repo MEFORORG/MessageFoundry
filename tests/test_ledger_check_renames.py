@@ -448,7 +448,7 @@ def test_a_revival_by_rename_in_a_SHALLOW_clone_is_refused(repo: Path, tmp_path:
 
     code, out = run_check(clone)
     assert code == 1, out
-    assert "ADR 0002" in out
+    assert "ADR 0002 cannot be checked against origin/main -- the history is TRUNCATED" in out
 
 
 def test_several_adr_renames_past_the_rename_limit_still_pair(repo: Path) -> None:
@@ -479,3 +479,135 @@ def test_several_adr_renames_past_the_rename_limit_still_pair(repo: Path) -> Non
 
     code, out = run_check(repo)
     assert code == 0, out
+
+
+def _base_takes_then_drops_0002(repo: Path, *, branch_before_drop: str | None = None) -> str:
+    """The base takes ADR 0002, then deletes it and its row. Returns the deleted bytes. A branch
+    named ``branch_before_drop`` is cut between the two, while the base still holds the number."""
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    second = BODY.replace("synthetic", "second")
+    write(repo, "docs/adr/0002-second.md", second)
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="second", title="S") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the base takes 0002")
+    if branch_before_drop:
+        git(repo, "branch", branch_before_drop)
+    git(repo, "rm", "-q", "docs/adr/0002-second.md")
+    write(repo, "docs/adr/README.md", rows)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the base drops 0002")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    return second
+
+
+def _rename_0002_second_to_revived(repo: Path, second: str) -> None:
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    git(repo, "mv", "docs/adr/0002-second.md", "docs/adr/0002-revived.md")
+    write(repo, "docs/adr/0002-revived.md", second + "Edited.\n")
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="revived", title="S") + "\n")
+    git(repo, "add", "-A")
+    assert _staged_status(repo).startswith("R"), _staged_status(repo)
+
+
+def test_a_revival_by_rename_after_MERGING_the_base_is_still_a_restore(repo: Path) -> None:
+    """The branch was cut while the base held ADR 0002, then merged the base after the base dropped
+    it, keeping its copy. The fork point is now the base tip, which holds no 0002, so a fork-point
+    test alone would grant the rename. The base's history still spent the number."""
+    second = _base_takes_then_drops_0002(repo, branch_before_drop="stale")
+    git(repo, "switch", "-q", "stale")
+    git(repo, "merge", "-q", "-s", "ours", "main", "-m", "merge the base, keeping 0002")
+    assert (
+        git(repo, "merge-base", "origin/main", "HEAD").strip()
+        == git(repo, "rev-parse", "origin/main").strip()
+    )
+
+    _rename_0002_second_to_revived(repo, second)
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 is a RESTORE" in out
+
+
+def test_an_exact_restore_then_a_rename_in_a_second_commit_is_still_a_restore(
+    repo: Path,
+) -> None:
+    """Restoring the lost bytes exactly passes, as docs/LEDGER-GATE.md says. Renaming the restored
+    file in a later commit brings the number back under a name and bytes the base never held, so it
+    is refused the same way a revival under a new name in one commit is."""
+    second = _base_takes_then_drops_0002(repo)
+    git(repo, "switch", "-q", "-c", "restorer")
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    write(repo, "docs/adr/0002-second.md", second)
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="second", title="S") + "\n")
+    git(repo, "add", "-A")
+    code, out = run_check(repo)
+    assert code == 0, out  # the premise: an exact restore passes
+    git(repo, "commit", "-qm", "restore ADR 0002 exactly")
+
+    _rename_0002_second_to_revived(repo, second)
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 is a RESTORE" in out
+
+
+def test_a_rename_of_a_branch_adr_whose_number_the_base_has_since_SPENT_is_a_reuse(
+    repo: Path,
+) -> None:
+    """The branch carries its own ADR 0002, and another session lands a different 0002 on the base.
+    Renaming the branch's file is paired by git, but the source is not the base's ADR, so keeping
+    the number is wrong advice: the number is spent, and the refusal must say allocate."""
+    git(repo, "switch", "-q", "-c", "stale")
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    write(repo, "docs/adr/0002-x.md", BODY.replace("synthetic", "branch"))
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="x", title="X") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the branch carries 0002")
+    git(repo, "switch", "-q", "main")
+    write(repo, "docs/adr/0002-alpha.md", "# Alpha\n")
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="alpha", title="A") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "another session takes 0002")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "switch", "-q", "stale")
+
+    git(repo, "mv", "docs/adr/0002-x.md", "docs/adr/0002-y.md")
+    assert _staged_status(repo).startswith("R"), _staged_status(repo)
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 already exists on origin/main as 0002-alpha.md" in out
+    assert "alloc.ps1" in out
+    assert "renamed" not in out
+
+
+def test_a_branch_adr_rename_in_a_SHALLOW_clone_is_refused_even_with_the_fork_point_in_reach(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The fork point is inside the clone, so the fork-point test alone would grant this. But past
+    the graft the base's history cannot show the number was never spent, and a doubt refuses."""
+    for name in ("one", "two"):
+        write(repo, f"docs/notes/{name}.md", f"Base note {name}.\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", f"the base adds note {name}")
+    git(repo, "switch", "-q", "-c", "stale")
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    write(repo, "docs/adr/0002-x.md", BODY.replace("synthetic", "branch"))
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="x", title="X") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the branch carries 0002")
+
+    clone = tmp_path / "shallow-reach"
+    clone_args = ["clone", "-q", "--depth", "2", "--no-single-branch", "--branch", "stale"]
+    subprocess.run(["git", *clone_args, repo.as_uri(), str(clone)], capture_output=True, check=True)
+    for key, value in (("user.email", "t@t"), ("user.name", "t"), ("diff.renames", "true")):
+        git(clone, "config", key, value)
+    assert git(clone, "rev-parse", "--is-shallow-repository").strip() == "true"
+    # The premise: the fork point IS reachable, so only the history test can refuse.
+    assert git(clone, "merge-base", "origin/main", "HEAD").strip()
+
+    git(clone, "mv", "docs/adr/0002-x.md", "docs/adr/0002-y.md")
+    write(clone, "docs/adr/README.md", rows + ROW.format(n="0002", slug="y", title="X") + "\n")
+    git(clone, "add", "-A")
+    assert _staged_status(clone).startswith("R"), _staged_status(clone)
+
+    code, out = run_check(clone)
+    assert code == 1, out
+    assert "ADR 0002 cannot be checked against origin/main -- the history is TRUNCATED" in out

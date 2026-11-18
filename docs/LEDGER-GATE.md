@@ -191,17 +191,26 @@ It blocks a commit that:
 5. leaves **duplicate index rows** for one number.
 
 A file that arrives by **rename or copy** onto an ADR path is an added ADR to every rule above: the gate
-turns git's rename detection off, so a `git mv` cannot hide it (BACKLOG #5453). Where git itself pairs
-the new file with a removed ADR of the same number, the change is a rename, and its row must link the
-new name in the same commit; the refusal says so rather than calling it a reuse. A rename allocates
-nothing, so rule 2 grants it, but only on a positive fact: the fork point between the branch and the
-base holds no ADR under that number. Where the fork point held one, as on a branch cut before the base
-deleted that ADR, the rename revives a number the base lost, and rule 2's restore test judges it; that
-test matches bytes at the path that lost them, so a revival under a new name is refused. Where git
-cannot find the fork point, as in a clone too shallow to reach it, the rename is refused too. The gate
-asks git for the pairing with no rename limit, over `docs/adr/` alone, so the size of the rest of the
-change cannot cost a rename its pairing. A rename onto a different number is a new number and owes an
-allocation like any other.
+turns git's rename detection off, so a `git mv` cannot hide it (BACKLOG #5453).
+
+Under rule 1, where git itself pairs the new file with the base's own ADR of the same number, which this
+change removes, the change is a rename, and its row must link the new name in the same commit; the
+refusal says so rather than calling it a reuse. A paired source the base does not hold, such as a
+branch's own ADR under a number the base has since spent, is refused as a reuse.
+
+Under rule 2, a same-number rename allocates nothing, so the gate grants it, but only on positive facts.
+Git pairs the file with an ADR of the same number. No commit on the base's history touched an ADR under
+that number, read in a clone that is not shallow. And the fork point between the branch and the base
+holds no ADR under it. A number the base ever held fails the second, however the branch came to carry
+it: cut before the base deleted that ADR, merged with the base after, or restored exactly and renamed
+in a later commit. Rule 2's restore test then judges the file, and that test matches bytes at the path
+that lost them, so a revival under a new name is refused. A shallow clone cannot show that the base
+never held the number, so the rename is refused there with the truncated-history text, deepened or
+not; `git fetch --unshallow origin` makes it checkable. A git failure refuses too.
+
+The gate asks git for the pairing with no rename limit, over `docs/adr/` alone, so the size of the rest
+of the change cannot cost a rename its pairing. A rename onto a different number is a new number and
+owes an allocation like any other.
 
 Any other file added under a base number falls to rule 1: it passes when the number's row links it, as
 a declared companion, and is refused as a reuse when the row does not. That includes an unrelated file
