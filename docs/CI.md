@@ -335,8 +335,7 @@ would be exactly the thing it exists to prevent.
 `CI gate` `needs:` the individual legs, runs with `if: always()`, and fails on a `failure` or
 `cancelled` leg. A **`skipped`** leg counts as a **pass** — that is what lets a path-gated leg stay off
 an unrelated PR without turning the gate red. **One exception:** `test-shard2` and `test-shard3`,
-the engine suite's second and third shards (BACKLOG #5247; the third shard, owner ruling
-2026-11-18), must each SUCCEED wherever a `test` leg runs its suite (a code pull request, a push, a
+the engine suite's second and third shards (BACKLOG #5247), must each SUCCEED wherever a `test` leg runs its suite (a code pull request, a push, a
 dispatch or a queue entry), so a skip there is a red too.
 
 **The Windows Postgres leg is deliberately outside the roll-up.** `postgres store (windows-2022)`
@@ -426,7 +425,7 @@ Two limits, stated so nobody reads more into a green than it carries:
   #5247), the 1.30x floor is met against a cap sized for about three times a test shard's work: the
   margin gate is about a third as sensitive to a test shard slowing down. The two-shard pools were
   measured on 2026-11-09 and are recorded beside the rows; no row or cap moved with them, nor with
-  the third shard (owner ruling 2026-11-18). The `RE-DERIVE` and `RE-SIZE` warning stays inert on
+  the third shard, whose ruling the `test` job's `Tests (pytest)` note in `ci.yml` dates. The `RE-DERIVE` and `RE-SIZE` warning stays inert on
   every shard for the same reason, since a shard run is not expected to reach a whole-suite row.
   **A red here is not a request to raise the cap:** the cap is sized against the work in `ci.yml`,
   and the underlying Windows slowness is its own backlog item.

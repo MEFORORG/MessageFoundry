@@ -20,8 +20,9 @@
 # the observed distribution the cap was sized against, kept separately so a run exceeding the record is
 # visible without anyone re-reading a comment.
 #
-# THE ENGINE ROWS NOW SERVE TWO STEPS, AND EVERY ONE OF THEM WAS MEASURED ON THE WHOLE SUITE. Since
-# BACKLOG #5247 the engine suite runs in shards, three since the owner ruling of 2026-11-18: the
+# THE ENGINE ROWS NOW SERVE THREE STEPS, AND EVERY ONE OF THEM WAS MEASURED ON THE WHOLE SUITE. Since
+# BACKLOG #5247 the engine suite runs in shards, three since the third was added (ci.yml's `test`
+# job `Tests (pytest)` note says when): the
 # `test` job's `Tests (pytest)` step and the `test-shard2` and `test-shard3` jobs' steps of the same
 # name, and every one of their margin checks reads the `Tests (pytest)` rows below. Those pools hold whole-suite runs, so each row is an upper bound on a shard and not a
 # measurement of one; the test shard pools measured 2026-11-09 are recorded below, beside the rows

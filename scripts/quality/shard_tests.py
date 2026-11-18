@@ -21,7 +21,7 @@ that held one would import and collect it for nothing, and the balance would cou
 not run. The list is tests/tooling_manifest.txt, read through its own parser.
 
 `--suite engine` IS ci.yml's ENGINE `Tests (pytest)` STEP, split across the `test`, `test-shard2`
-and `test-shard3` jobs (BACKLOG #5247; the third shard, owner ruling 2026-11-18). It differs from the coverage split in two ways, both constants
+and `test-shard3` jobs (BACKLOG #5247). It differs from the coverage split in two ways, both constants
 below. It leaves out the web console package, which that step subtracts with `--ignore-glob`
 because the `webconsole` job runs it (BACKLOG #1027), so a shard naming one of its files would run
 it twice. And it holds the connscale smoke in shard 1, because scripts/connscale_harvest.py joins

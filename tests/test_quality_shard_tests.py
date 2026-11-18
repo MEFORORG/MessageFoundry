@@ -10,6 +10,7 @@ would report it, because the combined coverage.xml still lists every source file
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -94,9 +95,19 @@ def test_main_prints_one_shard_and_refuses_an_out_of_range_index(
 # --- the engine suite (BACKLOG #5247) -------------------------------------------------------------
 
 
-#: ci.yml's engine suite shard count (the third shard, owner ruling 2026-11-18).
-#: tests/test_ci_engine_suite_shards.py holds every `--of` in ci.yml to its own count of shard jobs.
-_ENGINE_SHARDS = 3
+def _engine_shards() -> int:
+    """ci.yml's engine suite shard count, read from its shard jobs' run lines, so this file grades
+    the split those jobs run. tests/test_ci_engine_suite_shards.py holds each `--of` there to its
+    own count of shard jobs."""
+    text = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    counts = set(
+        re.findall(r'shard_tests\.py --suite engine --shard "\$TEST_SHARD" --of (\d+)', text)
+    )
+    assert len(counts) == 1, f"ci.yml's engine shard jobs disagree on --of: {sorted(counts)}"
+    return int(counts.pop())
+
+
+_ENGINE_SHARDS = _engine_shards()
 
 
 @pytest.fixture(scope="module")

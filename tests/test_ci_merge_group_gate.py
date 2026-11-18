@@ -92,9 +92,9 @@ _SELF_GATED_ON_QUEUE = {
     "timing-quarantine",
     # BACKLOG #5247: test shard 2's job `if:` is the `Tests (pytest)` step's condition, queue included.
     "test-shard2",
-    # The third shard (owner ruling 2026-11-18) copies test-shard2's job `if:`.
+    # The third shard copies test-shard2's job `if:`.
     "test-shard3",
-    # BACKLOG #5247 too: ci-gate's steps for each shard's own result repeat that condition. The job is
+    # BACKLOG #5247 too: ci-gate's step for the shards' own results repeats that condition. The job is
     # `always()` and ran on a queue entry before; what moved is that a step `if:` now names the event.
     "ci-gate",
 }
@@ -164,7 +164,7 @@ _NAMES_MERGE_GROUP_NOWHERE = {
 #: carry `code` in their STEP `if:` lines, which ci.yml's `code` row calls belt-and-braces -- so the
 #: tidy-up that empties this set is an invited edit, not a contrived one. timing-quarantine and
 #: the shard jobs carry `code` and merge_group side by side in their JOB `if:`, copied from the
-#: `Tests (pytest)` step, and ci-gate in one STEP `if:` per shard job, copied from that job's.
+#: `Tests (pytest)` step, and ci-gate in one STEP `if:`, copied from theirs.
 _SELF_GATED_AND_GATED = {
     "test",
     "webconsole",

@@ -1182,7 +1182,7 @@ jobs:
         # #5247; owner ruling 2026-11-02 on #3515, "Split/speed suite"). One runner's step was growing
         # into its cap with the per-test cost flat and no file long enough to attack.
         # It was two shards until the owner ruling of 2026-11-18 ("Build after R5 lapses", then the R5
-        # freeze revoked). The Manager's reading of 50 merge_group runs, 2026-11-17T03:30Z to
+        # freeze revoked); this is the one place that ruling is dated, and the rest point here. The Manager's reading of 50 merge_group runs, 2026-11-17T03:30Z to
         # 2026-11-18T02:26Z, put a windows-2022 shard job on the long pole in 25 of 35 green runs, at
         # a median of 30.7 to 33.6 minutes, and a windows-2025 one in 8 of the other 10, with a cycle
         # p50 of 34.5 minutes. Every leg takes the third shard, ubuntu included, so
@@ -1420,7 +1420,8 @@ jobs:
       # THE PARTITION GUARD (BACKLOG #5247). It runs pytest's own collection under the engine step's
       # selection and fails if a collected file is in no shard or a file is in two. The split is a
       # pure function of the tree, so one leg answers for all three. `test-shard3` carries the same
-      # guard, so a shard 2 that failed or was cancelled does not leave the partition unchecked.
+      # guard, so the two jobs stay one body; the second copy changes no merge outcome, since a
+      # shard that failed or was cancelled already reds `ci-gate`.
       # After the margin check, so its collection is not timed as part of the suite.
       # Only after a passing suite: after one killed at its cap, the guard's minutes could push the job
       # past `job_timeout`, and a hang would then report as a cancellation.
@@ -1440,11 +1441,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # THE ENGINE SUITE'S THIRD SHARD (owner ruling 2026-11-18, under BACKLOG #5247's split). It is
-  # `test-shard2` with the shard number, the check name, the junit artifact name and two comments
-  # changed, and nothing else: the notes in that job cover this one, and tests/test_ci_engine_suite_shards.py
-  # holds the two jobs equal on that basis. `ci-gate` needs it and judges it as it judges
-  # `test-shard2`, so a failed, cancelled or wrongly skipped third shard reds the gate.
+  # THE ENGINE SUITE'S THIRD SHARD (BACKLOG #5247's split; the note above the `test` job's
+  # `Tests (pytest)` run line says when and why it was added). It is `test-shard2` with these
+  # changed: the job id, the check name, TEST_SHARD, the junit upload step's name and its artifact
+  # name, and the partition guard's comment. The notes in that job cover this one, and
+  # tests/test_ci_engine_suite_shards.py holds the two jobs equal, as parsed YAML, on that basis.
+  # `ci-gate` needs it and judges it in the same step as `test-shard2`, so a failed, cancelled or
+  # wrongly skipped third shard reds the gate.
   test-shard3:
     name: test shard 3 (${{ matrix.os }}, py${{ matrix.python-version }})
     needs: changes
@@ -1536,7 +1539,8 @@ jobs:
       # THE PARTITION GUARD (BACKLOG #5247). It runs pytest's own collection under the engine step's
       # selection and fails if a collected file is in no shard or a file is in two. The split is a
       # pure function of the tree, so one leg answers for all three. `test-shard2` carries the same
-      # guard, so a shard 3 that failed or was cancelled does not leave the partition unchecked.
+      # guard, so the two jobs stay one body; the second copy changes no merge outcome, since a
+      # shard that failed or was cancelled already reds `ci-gate`.
       # After the margin check, so its collection is not timed as part of the suite.
       # Only after a passing suite: after one killed at its cap, the guard's minutes could push the job
       # past `job_timeout`, and a hang would then report as a cancellation.
@@ -7010,17 +7014,17 @@ jobs:
       # `contains(needs.*.result, ...)` check below -- which is the behaviour wanted, with the
       # same merge_group caveat the `tooling` note states.
       - packaging-build
-      # `test-shard2` and `test-shard3` are two thirds of the engine suite (BACKLOG #5247; the third
-      # shard, owner ruling 2026-11-18). Unlike the path-gated needs above, a skip there is never
-      # acceptable where `test` runs its suite, so the two steps before `Gated legs OK` fail on any
-      # result but `success` under that condition, one step per shard.
+      # `test-shard2` and `test-shard3` are two thirds of the engine suite (BACKLOG #5247). Unlike
+      # the path-gated needs above, a skip there is never acceptable where `test` runs its suite, so
+      # the step before `Gated legs OK` fails when either reports any result but `success` under
+      # that condition.
       - test-shard2
       - test-shard3
     runs-on: ubuntu-latest
     steps:
-      # BACKLOG #5247 added a THIRD failing step, after these two, for the one need whose skip is not a
-      # pass: test-shard2 where the engine suite runs. The third shard added a FOURTH, its copy for
-      # test-shard3. The note below is about the first two.
+      # BACKLOG #5247 added a THIRD failing step, after these two, for the needs whose skip is not a
+      # pass: test-shard2 and test-shard3 where the engine suite runs. The note below is about the
+      # first two.
       #
       # TWO failing steps, not one, and the predicates PARTITION the old single condition -- their
       # union is identical and their intersection is empty, so this gate's BEHAVIOUR is unchanged and
@@ -7159,36 +7163,34 @@ jobs:
           echo "$NEEDS_JSON"
           exit 1
 
-      # BACKLOG #5247. The bracketed condition is `test-shard2`'s own job `if:`, which is the `test`
-      # job's pytest-step condition, so this fails exactly where a third of the engine suite should
-      # have run and did not report a pass. The two arms above already name a failure or a
+      # BACKLOG #5247. The bracketed condition is the shard jobs' own job `if:`, which is the `test`
+      # job's pytest-step condition, so this fails exactly where a third of the engine suite or more
+      # should have run and did not report a pass. The two arms above already name a failure or a
       # cancellation, and the leading guards keep this one out of their way; it is for the `skipped`
-      # they let through. The next step is the same check for `test-shard3`.
-      # tests/test_merge_gate_controls.py pins the match and grades both steps.
-      - name: Fail -- engine suite shard 2 did not succeed
+      # they let through.
+      #
+      # ONE STEP FOR BOTH SHARDS, not one each. A step `if:` with no status function carries an
+      # implicit `success()`, so a second step after a first that exited 1 would never run, and a run
+      # where both shards skipped would name one of them and report a third of the suite missing when
+      # two thirds were. Naming both here keeps every annotation true and the steps a partition.
+      # tests/test_merge_gate_controls.py pins the match and grades the step for each shard.
+      - name: Fail -- an engine suite shard did not succeed
         if: >-
           !contains(needs.*.result, 'failure') &&
           !contains(needs.*.result, 'cancelled') &&
           (needs.changes.outputs.code == 'true' || github.event_name == 'push' ||
           github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') &&
-          needs['test-shard2'].result != 'success'
+          (needs['test-shard2'].result != 'success' || needs['test-shard3'].result != 'success')
         env:
           SHARD2_RESULT: ${{ needs['test-shard2'].result }}
-        run: |
-          echo "::error::CI gate failed: test-shard2 (check list: \"test shard 2 (*, py*)\") reported '${SHARD2_RESULT}' on an event where the engine suite runs. A third of that suite did not report a pass."
-          exit 1
-
-      - name: Fail -- engine suite shard 3 did not succeed
-        if: >-
-          !contains(needs.*.result, 'failure') &&
-          !contains(needs.*.result, 'cancelled') &&
-          (needs.changes.outputs.code == 'true' || github.event_name == 'push' ||
-          github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') &&
-          needs['test-shard3'].result != 'success'
-        env:
           SHARD3_RESULT: ${{ needs['test-shard3'].result }}
         run: |
-          echo "::error::CI gate failed: test-shard3 (check list: \"test shard 3 (*, py*)\") reported '${SHARD3_RESULT}' on an event where the engine suite runs. A third of that suite did not report a pass."
+          if [ "$SHARD2_RESULT" != "success" ]; then
+            echo "::error::CI gate failed: test-shard2 (check list: \"test shard 2 (*, py*)\") reported '${SHARD2_RESULT}' on an event where the engine suite runs. A third of that suite did not report a pass."
+          fi
+          if [ "$SHARD3_RESULT" != "success" ]; then
+            echo "::error::CI gate failed: test-shard3 (check list: \"test shard 3 (*, py*)\") reported '${SHARD3_RESULT}' on an event where the engine suite runs. A third of that suite did not report a pass."
+          fi
           exit 1
 
       - name: Gated legs OK

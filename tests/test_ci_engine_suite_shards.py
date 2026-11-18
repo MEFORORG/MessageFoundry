@@ -3,7 +3,7 @@
 """The engine suite's three shards in ci.yml, held to one another (BACKLOG #5247).
 
 The suite runs as the `test` job's `Tests (pytest)` step and the `test-shard2` and `test-shard3`
-jobs' steps of the same name; the third shard is the owner ruling of 2026-11-18. Every property
+jobs' steps of the same name. Every property
 below is one the split can lose SILENTLY: a copy that drifts from the first runs a third of the
 suite under different belts, a shard number or count that disagrees drops or
 doubles files, and a guard step whose selection differs from the suite's compares the shards with
@@ -94,9 +94,9 @@ def test_every_shard_runs_one_body_under_one_condition_and_one_cap() -> None:
 
 
 def test_the_extra_shard_jobs_differ_only_in_their_shard() -> None:
-    """`test-shard3` is `test-shard2` with its shard number and names changed. Compared as parsed
-    YAML, so the comments, which name their own job, are not part of it; the per-property tests in
-    this file still read every job on its own.
+    """`test-shard3` is `test-shard2` with its shard number and the names that carry it changed.
+    Compared as parsed YAML, so the comments, which name their own job, are not part of it; the
+    per-property tests in this file still read every job on its own.
 
     Falsified by setting `PYTEST_WORKERS` to a literal in shard 3 alone: RED. Restored."""
     jobs = _jobs()

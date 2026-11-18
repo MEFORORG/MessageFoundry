@@ -397,13 +397,14 @@ def test_the_rollup_steps_partition_and_each_one_exits_nonzero() -> None:
     )
 
 
-#: The engine suite's shard jobs ci-gate judges by their own result (BACKLOG #5247; the third shard,
-#: owner ruling 2026-11-18). `test`, shard 1, is a required context and needs no such step.
+#: The engine suite's shard jobs ci-gate judges by their own result (BACKLOG #5247). `test`, shard
+#: 1, is a required context and needs no such step.
 _SHARD_JOBS = ("test-shard2", "test-shard3")
 
 
 def _shard_step(job: str) -> str:
-    """The `ci-gate` step for one shard job's own result (BACKLOG #5247), found by what it reads."""
+    """The `ci-gate` step that reads one shard job's own result (BACKLOG #5247), found by what it
+    reads. One step reads both, and the test after next says why that matters."""
     found = [cond for _, cond in _rollup_fail_conditions() if f"needs['{job}'].result" in cond]
     assert len(found) == 1, f"expected one ci-gate step reading {job}'s result, found {found}"
     return found[0]
@@ -418,6 +419,31 @@ def test_every_shard_job_ci_gate_needs_has_a_step_of_its_own() -> None:
     `_SHARD_JOBS`: RED. Restored."""
     needs = {str(n) for n in _ci_gate_job().get("needs", [])}
     assert {n for n in needs if n.startswith("test-shard")} == set(_SHARD_JOBS)
+
+
+@pytest.mark.parametrize("code", ["true", "false"])
+def test_shards_that_skip_together_fire_one_step_that_names_each(code: str) -> None:
+    """The shard jobs share one job `if:`, so a drift there skips them together. A step `if:` with no
+    status function carries an implicit `success()`, so a second failing step after a first that
+    exited 1 never runs, and a run with both shards skipped would name only one of them. One step
+    must read every shard, and its body must name each.
+
+    Falsified by splitting the step into one per shard: RED on the count below. Restored."""
+    context = dict(_DEFAULT_CONTEXT, code=code)
+    for job in _SHARD_JOBS:
+        context["need_" + job.replace("-", "_")] = "skipped"
+    vector = ["success", "skipped", "skipped", "skipped"]
+    fired = [name for name, cond in _rollup_fail_conditions() if _evaluate(cond, vector, context)]
+    assert len(fired) == (1 if code == "true" else 0), fired
+    steps = [
+        s
+        for s in _ci_gate_job()["steps"]
+        if all(f"needs['{job}'].result" in str(s.get("if", "")) for job in _SHARD_JOBS)
+    ]
+    assert len(steps) == 1, [s.get("name") for s in steps]
+    run = str(steps[0]["run"])
+    for job in _SHARD_JOBS:
+        assert f"::error::CI gate failed: {job} " in run, job
 
 
 @pytest.mark.parametrize("job", _SHARD_JOBS)
