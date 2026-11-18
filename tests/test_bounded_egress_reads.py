@@ -62,7 +62,6 @@ from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     MAX_TOKEN_RESPONSE_BYTES,
     REPLY_TOO_LARGE_CODE,
-    AmbiguousFramingError,
     EgressReplyError,
     ResponseTooLargeError,
     TruncatedResponseError,
@@ -79,7 +78,7 @@ from messagefoundry.transports.signing import (
     SigningError,
     _read_key_material,
 )
-from messagefoundry.transports.smart import SmartBackendTokenProvider
+from messagefoundry.transports.smart import TOKEN_REPLY_CODED_CODE, SmartBackendTokenProvider
 from messagefoundry.transports.soap import SoapDestination
 
 REST_URL = "https://api.example.com/ingest"
@@ -955,17 +954,15 @@ def test_a_truncated_error_body_still_warns_rather_than_going_silent(
 _CODED_200 = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
 
 
-def test_an_oauth2_token_reply_in_a_content_coding_is_refused() -> None:
+def _oauth2_coded() -> OAuth2ClientCredentialsProvider:
     provider = OAuth2ClientCredentialsProvider(
         token_url=TOKEN_URL, client_id="cid", client_secret="s3cr3t"
     )
     provider._opener = _FakeOpener(_wire(_CODED_200))  # type: ignore[assignment]
-    with pytest.raises(AmbiguousFramingError, match="content coding") as err:
-        provider.access_token()
-    assert "s3cr3t" not in str(err.value)
+    return provider
 
 
-def test_a_smart_token_reply_in_a_content_coding_is_refused(ec_pem: str) -> None:
+def _smart_coded(ec_pem: str) -> SmartBackendTokenProvider:
     provider = SmartBackendTokenProvider(
         token_url=TOKEN_URL,
         client_id="cid",
@@ -974,8 +971,58 @@ def test_a_smart_token_reply_in_a_content_coding_is_refused(ec_pem: str) -> None
         scope="system/*.rs",
     )
     provider._opener = _FakeOpener(_wire(_CODED_200))  # type: ignore[assignment]
-    with pytest.raises(AmbiguousFramingError, match="content coding"):
+    return provider
+
+
+def _assert_coded_token_dead_letters(exc: BaseException) -> None:
+    """Step 4, owner ruling 2026-11-18: "Dead-letter, no retry". A retry would re-send the client
+    credential to an endpoint that answers the same way."""
+    assert isinstance(exc, NegativeAckError)
+    assert exc.permanent is True
+    assert exc.code == TOKEN_REPLY_CODED_CODE
+    assert "s3cr3t" not in str(exc)
+    assert exc.__context__ is None
+
+
+def test_an_oauth2_token_reply_in_a_content_coding_is_a_permanent_refusal() -> None:
+    with pytest.raises(NegativeAckError) as err:
+        _oauth2_coded().access_token()
+    _assert_coded_token_dead_letters(err.value)
+
+
+def test_a_smart_token_reply_in_a_content_coding_is_a_permanent_refusal(ec_pem: str) -> None:
+    with pytest.raises(NegativeAckError) as err:
+        _smart_coded(ec_pem).access_token()
+    _assert_coded_token_dead_letters(err.value)
+
+
+def test_a_misframed_token_reply_that_is_not_coded_stays_retryable() -> None:
+    """The control: only the coded refusal changed; a reply cut short is still transient."""
+    provider = OAuth2ClientCredentialsProvider(
+        token_url=TOKEN_URL, client_id="cid", client_secret="s3cr3t"
+    )
+    provider._opener = _FakeOpener(_wire(_FIXED_TRUNCATED))  # type: ignore[assignment]
+    with pytest.raises(TruncatedResponseError) as err:
         provider.access_token()
+    assert not isinstance(err.value, NegativeAckError)
+
+
+def test_a_soap_delivery_whose_token_reply_is_coded_dead_letters() -> None:
+    dest = _soap()
+    dest._token_provider = _oauth2_coded()
+    dest._opener = _RaisingOpener(AssertionError("the delivery must not be sent"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as err:
+        dest._post("<env:Envelope/>")
+    _assert_coded_token_dead_letters(err.value)
+
+
+def test_a_fhir_delivery_whose_token_reply_is_coded_dead_letters(ec_pem: str) -> None:
+    dest = _fhir()
+    dest._token_provider = _smart_coded(ec_pem)
+    dest._opener = _RaisingOpener(AssertionError("the delivery must not be sent"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as err:
+        dest._post(json.dumps({"resourceType": "Patient"}), "POST", f"{FHIR_BASE}/Patient", {})
+    _assert_coded_token_dead_letters(err.value)
 
 
 def test_the_ai_broker_maps_a_content_coded_reply_onto_its_own_error_type() -> None:
@@ -1023,7 +1070,8 @@ def _post_fhir(dest: FhirDestination) -> None:
 def test_a_content_coded_error_body_is_named_as_coded_not_as_unread(
     which: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Step 1: a coded error body was read whole, so "could not read whole" misnames it."""
+    """Step 1: a coded body is refused for its coding, not its length, so "could not read whole"
+    misnames it."""
     if which == "soap":
         soap = _soap()
         soap._opener = _RaisingOpener(_coded_500_error(SOAP_URL))  # type: ignore[assignment]

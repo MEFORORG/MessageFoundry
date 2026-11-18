@@ -160,6 +160,7 @@ __all__ = [
     "build_strict_opener",
     "drain_bounded",
     "hop_identity",
+    "is_content_coded_refusal",
     "is_never_proxied_host",
     "is_proxy_credential_header_name",
     "proxy_credential_header_name_shown",
@@ -167,6 +168,7 @@ __all__ = [
     "read_bounded",
     "read_bounded_text",
     "read_reply_body",
+    "refused_error_body_phrase",
     "reply_framing_fault",
 ]
 
@@ -540,14 +542,20 @@ def reply_framing_fault(reader: object) -> str | None:
 _CONTENT_CODED_REASON = "a content coding other than identity, which the engine does not decode"
 
 
+def is_content_coded_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` is the refusal of a body in a content coding the engine does not decode
+    (BACKLOG #5910), rather than of a body that is misframed, cut short or over its bound."""
+    return isinstance(exc, AmbiguousFramingError) and exc.reason == _CONTENT_CODED_REASON
+
+
 def refused_error_body_phrase(refusal: EgressReplyError, body: str) -> str:
     """How a WARNING names a non-2xx ``body`` the engine refused with ``refusal`` (BACKLOG #5910).
 
-    A content-coded body was read whole and is not ambiguously framed: it is in a coding the engine
-    does not decode, so the warning says that rather than "could not read whole". Fixed text only,
-    never a byte of the reply.
+    A content-coded body is refused before any byte of it is read, for its coding, which the engine
+    does not decode, and not for its length, so the warning names the coding rather than saying
+    "could not read whole". Fixed text only, never a byte of the reply.
     """
-    if isinstance(refusal, AmbiguousFramingError) and refusal.reason == _CONTENT_CODED_REASON:
+    if is_content_coded_refusal(refusal):
         return f"{body} in a content coding the engine does not decode"
     return f"{body} the engine could not read whole"
 

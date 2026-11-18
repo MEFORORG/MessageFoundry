@@ -1823,33 +1823,49 @@ def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
     )
 
 
+#: ``http.client``'s own header-name and header-value rules (its ``_is_legal_header_name`` and
+#: ``_is_illegal_header_value``), applied to ``str`` so a configured value meets them at build.
+_SENDABLE_HEADER_NAME = re.compile(r"[^:\s][^:\r\n]*")
+_UNSENDABLE_HEADER_VALUE = re.compile(r"\n(?![ \t])|\r(?![ \t\n])")
+
+
 def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, setting: str) -> None:
     """Refuse at construction a static URL or header ``http.client`` could never send (BACKLOG #5911).
 
     The screen a configured value needs beside :func:`enforce_outbound_length_limits`: that gate
     bounds lengths only, and these values are the same for every message, so one the wire refuses
-    would fail every send. ``http.client`` sends the request target as ASCII and refuses a space in
-    it, encodes a header name as ASCII and a header value as Latin-1. The host is left alone, since
-    ``http.client`` IDNA-encodes a non-ASCII one. Control characters are screened by the caller.
+    would fail every send. A URL must be ASCII with no whitespace: ``http.client`` sends the request
+    target as ASCII and refuses a space in it, and urllib sets the ``Host`` header from the URL's
+    host as it stands, which ``http.client`` encodes as Latin-1 rather than IDNA. A ``#`` is refused
+    too, because urllib splits it off client-side, so every path the connector appends to the URL
+    would be dropped. A header name must be ASCII and pass ``http.client``'s name rule, and a header
+    value must be Latin-1 and pass its CR/LF rule.
 
-    Raises :class:`ValueError` naming ``setting`` and the header name only, never a value, which an
-    ``env()`` binding can fill with a credential. Every raise sits outside any ``except`` block, so
-    no ``__context__`` carries the value (see :func:`_latin1_refusal_position`).
+    Raises :class:`ValueError` naming ``setting``, and a header key only as
+    :func:`_shown_header_key` shows it, never a value, which an ``env()`` binding can fill with a
+    credential. Every raise sits outside any ``except`` block, so no ``__context__`` carries the
+    value (see :func:`_latin1_refusal_position`).
     """
-    parts = urllib.parse.urlsplit(url)
-    target = url[len(f"{parts.scheme}://{parts.netloc}") :] if parts.netloc else url
-    if not target.isascii() or any(ch.isspace() for ch in url):
+    if not url.isascii() or any(ch.isspace() for ch in url) or "#" in url:
         raise ValueError(
-            f"{setting} 'url' must have no whitespace, and an ASCII path and query (http.client "
-            "sends the request target as ASCII); percent-encode it"
+            f"{setting} 'url' must be ASCII with no whitespace or '#' (http.client sends it as "
+            "ASCII); percent-encode it, and give an internationalized host in its IDNA form"
         )
     for name, value in headers.items():
-        if not name.isascii():
-            raise ValueError(f"{setting} has a header name that is not ASCII")
+        if not (name.isascii() and _SENDABLE_HEADER_NAME.fullmatch(name)):
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} is not a header name http.client "
+                "can send"
+            )
         if _latin1_refusal_position(value) is not None:
             raise ValueError(
-                f"{setting} header {name!r} is not encodable as Latin-1 (http.client sends header "
-                "values as Latin-1)"
+                f"{setting} header {_shown_header_key(name)} is not encodable as Latin-1 "
+                "(http.client sends header values as Latin-1)"
+            )
+        if _UNSENDABLE_HEADER_VALUE.search(value):
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} holds a line break http.client "
+                "refuses to send"
             )
 
 

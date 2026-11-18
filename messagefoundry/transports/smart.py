@@ -60,10 +60,11 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.redaction import json_loads_or_refusal
-from messagefoundry.transports.base import DeliveryError, float_setting
+from messagefoundry.transports.base import DeliveryError, NegativeAckError, float_setting
 from messagefoundry.transports.bounded_read import (
     MAX_TOKEN_RESPONSE_BYTES,
     EgressReplyError,
+    is_content_coded_refusal,
     read_bounded_text,
 )
 
@@ -132,6 +133,10 @@ _BEARER_TOKEN_CHARS = re.compile(r"[\x21-\x7e]+")
 # no helper ever sees the credential or the query string.
 
 
+#: The ``code`` of the permanent refusal of a token reply in a content coding (BACKLOG #5910).
+TOKEN_REPLY_CODED_CODE = "token-reply-coded"  # nosec B105 -- a refusal code, not a credential
+
+
 def request_token(
     opener: urllib.request.OpenerDirector,
     req: urllib.request.Request,
@@ -148,8 +153,31 @@ def request_token(
     in a refusal of the reply body, and holds no URL (BACKLOG #2060). A Digest refusal raised by the
     opener's proxy Digest handler becomes the permanent configuration fault
     ``rest.auth_challenge_refused`` builds (BACKLOG #2989); no built provider's hop reaches that
-    handler, since a Digest proxy in front of an https token endpoint is refused at build."""
-    body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint, connector=connector)
+    handler, since a Digest proxy in front of an https token endpoint is refused at build.
+
+    A reply in a content coding the engine does not decode is a permanent
+    :class:`~messagefoundry.transports.base.NegativeAckError` coded
+    :data:`TOKEN_REPLY_CODED_CODE`, so the delivery dead-letters rather than retries: each retry
+    would re-send the client credential to an endpoint that answers the same way. Owner ruling
+    2026-11-18 on BACKLOG #5910 step 4: "Dead-letter, no retry"."""
+    coded = False
+    try:
+        body = _read_token_reply(
+            opener, req, timeout=timeout, endpoint=endpoint, connector=connector
+        )
+    except EgressReplyError as exc:
+        if not is_content_coded_refusal(exc):
+            raise
+        coded = True
+    if coded:
+        # Raised outside the handler, so no __context__ keeps the reply's frame alive. Fixed text:
+        # the endpoint label is the redacted URL, and no reply byte is read.
+        raise NegativeAckError(
+            f"{TOKEN_REPLY_CODED_CODE}, not sent again. {endpoint} answered in a content coding the "
+            "engine does not decode",
+            code=TOKEN_REPLY_CODED_CODE,
+            permanent=True,
+        )
     return _parse_token_reply(body, endpoint=endpoint)
 
 

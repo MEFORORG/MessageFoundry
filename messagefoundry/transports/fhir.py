@@ -1234,7 +1234,8 @@ class FhirDestination(DestinationConnector):
             else []
         )
         enforce_outbound_length_limits(self.base_url, self._headers)
-        # BACKLOG #5911: the space and Latin-1 screen conditional_query gets, for the static rest.
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, as a
+        # bad conditional_query does, rather than every message at send time.
         refuse_unsendable_static_request(self.base_url, self._headers, setting="FHIR destination")
         refuse_cleartext_credentials(
             scheme,
@@ -2098,6 +2099,8 @@ class FhirLookupExecutor:
             # call site was the DESTINATION's __init__, so a lookup connection's base URL and static
             # headers were unbounded on both sides.
             enforce_outbound_length_limits(url, headers)
+            # BACKLOG #5911: the destination's static-settings screen, at this sibling too (#1241).
+            refuse_unsendable_static_request(url, headers, setting=f"FhirLookup {cname!r}")
             self._headers[cname] = headers
             self._token[cname] = token
             if bool_setting(s, "verify_tls", default=True):
