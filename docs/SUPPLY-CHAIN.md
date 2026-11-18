@@ -370,7 +370,7 @@ have not, the document says nothing about that CVE and your scanner's finding st
   not part of it. The broader all-extras dependency set is continuously audited by
   **pip-audit**.
 - **VS Code extension** — `@cyclonedx/cyclonedx-npm --package-lock-only` over the committed
-  `ide/package-lock.json` (install-free, full tree). The extension bundles its payload with esbuild and
+  `ide/package-lock.json` (install-free, full locked tree). The extension bundles its payload with esbuild and
   has no runtime npm dependencies, so the SBOM inventories the locked build toolchain. Continuously
   audited by **npm-audit**. **Not in that lock: `@vscode/vsce`, which packages the `.vsix`.** `npm run
   package` fetches it with `npx` at the top-level version its `package` script in `ide/package.json`
