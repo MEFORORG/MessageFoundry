@@ -2124,6 +2124,15 @@ class FactorEnrolmentRequired(ValueError):
         super().__init__(ENROL_AUTHENTICATOR_FIRST)
 
 
+class PasswordChangeNotApplied(RuntimeError):
+    """The password write matched no row although the caller's account is still there: its record
+    changed between the read and the write, so nothing was set (BACKLOG #5902). Raised rather than
+    reporting a change that did not land; the route answers 409 and the caller tries again."""
+
+    def __init__(self) -> None:
+        super().__init__("the account changed while the password was being set; try again")
+
+
 #: ADR 0207 section 3: an enrolment code lives 24 hours from issue, fixed rather than a setting. That
 #: is the ADR's recommended answer to its open lifetime item, and Amendment A6 records the trade: a
 #: shorter life would expire codes handed over late in a day, and each re-issue is one more handover.
@@ -16360,10 +16369,13 @@ class AuthService:
         Returns policy violations (empty list = changed). No-op-safe for AD identities at the API
         layer, which rejects password changes for AD users before calling this.
 
-        **Raises ``ValueError("no such user")`` when the caller's row is gone**, before the write or
-        because the write matched no row, so no ``auth.password_changed`` row or success is reported
-        for a deleted account (BACKLOG #5902). :class:`BreachCorpusUnavailable` propagates from the
-        policy check unchanged: the password is refused, never accepted unscreened.
+        **A write that matched no row is never reported as a change** (BACKLOG #5902). It raises
+        ``ValueError("no such user")`` when a re-read finds the caller's row gone, as it does when
+        the row is gone before the write; :class:`FactorEnrolmentRequired` for a covered account
+        whose row is still there; and :class:`PasswordChangeNotApplied` otherwise. A deletion that
+        lands after the write has committed is not caught: that change is reported as made.
+        :class:`BreachCorpusUnavailable` propagates from the policy check unchanged: the password
+        is refused, never accepted unscreened.
 
         **Raises :class:`FactorEnrolmentRequired` while ``[security].require_mfa`` covers the account
         and it holds no factor with a way past the sign-in lock** (ADR 0197 Amendment A, N-B2 part 4).
@@ -16414,6 +16426,7 @@ class AuthService:
                 raise ValueError("no such user")
             if covered:
                 raise FactorEnrolmentRequired()
+            raise PasswordChangeNotApplied()
         await self._revoke_after_commit(
             identity.user_id, change="password_changed", actor=identity.username, client=client
         )

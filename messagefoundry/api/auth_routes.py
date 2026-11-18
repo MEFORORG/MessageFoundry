@@ -166,6 +166,7 @@ from messagefoundry.auth.service import (
     InvalidUsername,
     LastAdministratorRefused,
     NotifyEmailAlreadySet,
+    PasswordChangeNotApplied,
     SelfTargetOp,
     TemporaryPasswordUnavailable,
     UsernameTaken,
@@ -866,6 +867,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "password screening is unavailable; ask an administrator to repair it",
             ) from exc
+        except PasswordChangeNotApplied as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
             if str(exc) != "no such user":
                 raise

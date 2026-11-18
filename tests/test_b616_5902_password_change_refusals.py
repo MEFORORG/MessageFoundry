@@ -21,7 +21,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.passwords import hash_password
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, PasswordChangeNotApplied
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import Store
@@ -171,3 +171,21 @@ async def test_a_deleted_account_is_a_401_not_a_success(
     assert r.status_code == 401, r.text
     assert r.json()["detail"] == "session ended; sign in again"
     assert await _changed_rows(engine.store) == []
+
+
+async def test_a_write_that_lost_a_race_is_not_reported_as_a_change(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, identity = await _account(store)
+    before = await store.get_user("u1")
+    assert before is not None
+
+    async def lost(_uid: str, **_kwargs: Any) -> bool:
+        return False  # the row is still there; the write's compare lost to another writer
+
+    monkeypatch.setattr(store, "set_password", lost)
+    with pytest.raises(PasswordChangeNotApplied):
+        await service.change_password(identity, _NEW_PASSWORD)
+    assert await _changed_rows(store) == []
+    after = await store.get_user("u1")
+    assert after is not None and after.password_hash == before.password_hash
