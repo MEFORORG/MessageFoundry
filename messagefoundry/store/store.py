@@ -3172,9 +3172,11 @@ def _listed_user(d: Mapping[str, Any]) -> UserRecord:
 
 def listed_users(rows: Iterable[Mapping[str, Any]]) -> list[UserRecord]:
     """The accounts a list read returned, in order (BACKLOG #5505). An account whose row has a
-    number cell that does not parse stays in the list as :meth:`UserRecord.unreadable_row`, so the
-    admin list shows it as failing. The read copies text cells without parsing them, at least
-    ``totp_recovery_codes`` and ``channel_scope``, so a bad value in one does not. The list is the
+    timestamp or counter cell that does not parse stays in the list as
+    :meth:`UserRecord.unreadable_row`, so the admin list shows it as failing. The read coerces the
+    flag cells with ``bool()`` and copies the text cells, at least ``totp_recovery_codes`` and
+    ``channel_scope``, without parsing them, so a bad value in one leaves the account listed as it
+    reads. The list is the
     only reader that returns the stand-in: the single-row user readers raise
     :class:`RowSealError` for such a row, which the service's loaders answer as a failed seal, and
     the write helpers refuse it. A caller iterating a list read checks ``unreadable``

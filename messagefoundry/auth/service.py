@@ -2272,10 +2272,11 @@ class UserSealRefused(RuntimeError):
 
 
 async def read_user_or_unreadable(read: Awaitable[UserRecord | None]) -> UserRecord | None:
-    """One store user read, with a row that does not parse (``listed_users`` says which) answered
-    as the store's list answers it (BACKLOG #5505): :meth:`UserRecord.unreadable_row`. The
-    single-row readers raise :class:`RowSealError` for such a row, whose subject is the row's
-    bounded id; one with no readable id is raised as it is.
+    """One store user read, with a row that does not parse
+    (:func:`~messagefoundry.store.store.listed_users` says which) answered as the store's list
+    answers it (BACKLOG #5505): :meth:`UserRecord.unreadable_row`. The single-row readers raise
+    :class:`RowSealError` for such a row, whose subject is the row's bounded id; one with no
+    readable id is raised as it is.
 
     The stand-in's fields other than ``id`` are invented, so only two kinds of caller may take it:
     ``AuthService``'s loaders, whose ``_verified`` fails and reports it as a record that fails its
@@ -16656,8 +16657,8 @@ class AuthService:
         if census.integrity_failed:
             _log.warning(
                 "ADR 0197: %d account(s) have a record that fails its integrity check (a stored "
-                "cell does not parse), so whether each is lockable cannot be told: %s. Restore the "
-                "row from a backup, or delete the account (BACKLOG #5505).",
+                "timestamp or counter does not parse), so whether each is lockable cannot be told: "
+                "%s. Restore the row from a backup, or delete the account (BACKLOG #5505).",
                 len(census.integrity_failed),
                 ", ".join(scrub_log_argument(i) for i in census.integrity_failed),
             )
@@ -20283,8 +20284,8 @@ class AuthService:
         says. So on a store with an integrity key a row tampered to read as outside the save is
         still named, and its sessions are revoked rather than only refused, so a later repair of
         its row does not bring them back. With no key no seal is checked, so such a row is taken
-        as it reads. A row the list read leaves out is not named,
-        at least one whose id cell does not read.
+        as it reads. A row the list read leaves out is not named, at least one whose id cell does
+        not read.
 
         The step-up gate reads it with ``checked`` and hands that set to the save, so the caller's
         own check is read once. The revoke adds a read without ``checked``, after the save, so an

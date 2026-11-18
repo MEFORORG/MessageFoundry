@@ -662,8 +662,8 @@ def check_lockable_accounts(
     if census.integrity_failed:
         # BACKLOG #5505: named by stored id, never judged on fields the store could not read.
         parts.append(
-            "record fails its integrity check (a stored cell does not parse), so whether it is "
-            "lockable cannot be told; restore the row or delete the account: "
+            "record fails its integrity check (a stored timestamp or counter does not parse), so "
+            "whether it is lockable cannot be told; restore the row or delete the account: "
             + ", ".join(scrub_log_argument(i) for i in census.integrity_failed)
         )
     if census.no_way_past:
