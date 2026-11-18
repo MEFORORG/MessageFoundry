@@ -121,7 +121,7 @@ ACK-on-receipt, and the no-"channel"-element rule are untouched.
   → `tests/test_outbound_forward_proxy.py::test_digest_https_and_ntlm_windows_refused`
   *Amended 2026-11-17, recording BACKLOG #2989 item 11, filed 2026-11-07 and built 2026-11-14: an
   OAuth2 or SMART token hop whose `https://` token endpoint meets a Digest proxy is refused at build
-  too. A token host the proxy bypasses builds.
+  too.
   [ADR 0095](0095-connection-lifecycle-scheduler-and-credential-fault-stop.md) B.1 has the detail.*
   → `tests/test_digest_refusal_classification.py::test_an_https_token_endpoint_behind_a_digest_proxy_is_refused_at_build`
 - **AC-7** — WHERE a target host matches `proxy_no_proxy`, THE SYSTEM SHALL bypass the proxy for that host
