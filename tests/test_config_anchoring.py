@@ -710,9 +710,7 @@ _DRIVE = "drive-relative"
 _TRIMMED = "ends in a dot or a space, which Windows trims from a file name"
 
 
-@pytest.mark.parametrize(
-    "value", ["", "   ", ".", "./", "..", "site-dir/..", "site-dir/", "site-dir/."]
-)
+@pytest.mark.parametrize("value", ["", ".", "./", "..", "site-dir/..", "site-dir/", "site-dir/."])
 def test_a_store_path_naming_no_file_is_refused_at_load(value: str) -> None:
     from pydantic import ValidationError
 
@@ -722,6 +720,20 @@ def test_a_store_path_naming_no_file_is_refused_at_load(value: str) -> None:
     with pytest.raises(ValidationError, match=r"\[store\]\.path .*names no file") as exc:
         StoreSettings(path=value)
     assert "site-dir" not in settings_error_detail(exc.value)  # the value is withheld
+
+
+@pytest.mark.parametrize("value", ["   ", " ", "\t "])
+def test_a_blank_store_path_is_refused_as_blank_not_as_naming_no_file(value: str) -> None:
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreSettings, settings_error_detail
+
+    # A blank is a legal POSIX file name, so "names no file" would be false there.
+    with pytest.raises(
+        ValidationError, match=r"\[store\]\.path .*is blank \(value withheld\)"
+    ) as exc:
+        StoreSettings(path=value)
+    assert _NO_FILE not in settings_error_detail(exc.value)
 
 
 @pytest.mark.parametrize(

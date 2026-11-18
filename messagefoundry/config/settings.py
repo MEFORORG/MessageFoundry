@@ -767,10 +767,11 @@ def store_path_refusal(
     (BACKLOG #5926). ``name`` is the setting or flag the refusal names.
 
     It refuses at least these shapes, by their spelling; it cannot see whether a plain name such
-    as ``data`` is an existing directory. A path whose last part is empty, ``.`` or ``..`` (an
-    empty or blank path, ``data/``, ``data/..``) names a directory, which passes an exists() guard
-    as if it were a store. On Windows, where a backslash also separates parts, a last part ending
-    in a dot or a space (Win32 trims it, so ``...`` is the working directory), and a colon
+    as ``data`` is an existing directory. A value of only blanks is refused as blank, since a blank
+    is a legal POSIX file name. A path whose last part is empty, ``.`` or ``..`` (an empty path,
+    ``data/``, ``data/..``) names a directory, which passes an exists() guard as if it were a
+    store. On Windows, where a backslash also separates parts, a last part ending in a dot or a
+    space (Win32 trims it, so ``...`` is the working directory), and a colon
     anywhere except right after the drive letter of a fully-qualified path: ``C:mf.db`` is
     drive-relative, resolved against that drive's per-process current directory, and
     ``mf.db:x`` names an NTFS alternate data stream. SQLite's ``:memory:`` is not a file and is
@@ -781,7 +782,10 @@ def store_path_refusal(
     windows = os.name == "nt"
     # The last part as written: Win32 trims a trailing dot or space, so it is tested unstripped.
     last = re.split(r"[\\/]", value)[-1] if windows else value.split("/")[-1]
-    if not value.strip() or last in ("", ".", ".."):
+    if value and not value.strip():
+        # Blank is a legal POSIX file name, so "names no file" would be false there; refused anyway.
+        return f"{name} is blank (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
+    if last in ("", ".", ".."):
         return (
             f"{name} names no file (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
         )
