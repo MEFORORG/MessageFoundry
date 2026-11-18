@@ -77,7 +77,6 @@ import re
 import traceback
 import weakref
 from abc import ABCMeta
-from bisect import bisect_left, bisect_right
 from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
@@ -94,7 +93,7 @@ from types import (
     TracebackType,
     WrapperDescriptorType,
 )
-from typing import Any, Final, NamedTuple
+from typing import Any, Final
 
 __all__ = [
     "RepeatedKeyError",
@@ -1311,198 +1310,27 @@ def _json_scalar(match: re.Match[str], policy: int, widened: bool) -> str:
     return f"{prefix}{quote}{_REDACTED}{closer}"
 
 
-class _Anchors(NamedTuple):
-    """What a malformed JSON walk keeps for the passes after it (:func:`_label_anchors`)."""
-
-    #: Label spans, sorted, disjoint and merged.
-    spans: list[tuple[int, int]]
-    #: Where the content of a vocabulary XML element starts, straight after its start tag's ``>``,
-    #: sorted.
-    content: list[int]
+class _MismatchedJsonCloser(Exception):
+    """Raised by :func:`_scrub_json_value` on a closer of another kind than the open container's, and
+    caught only by :func:`redact` (BACKLOG #5814)."""
 
 
-def _xml_start_tag_anchors(text: str, pos: int, spans: list[tuple[int, int]]) -> int | None:
-    """Add to ``spans`` what the XML pass reads in the start tag whose attributes begin at ``pos``,
-    walking it as :func:`_walk_xml_tag` does: each attribute's ``=`` and opening quote, and the name
-    too when it is ``value``, the one name that decides whether its value is scrubbed. Any other name
-    and every value are left to be scrubbed. Returns where the content starts if the tag is an open
-    one, else ``None``."""
-    n = len(text)
-    while pos < n:
-        part = _XML_TAG_PART.match(text, pos)
-        if part is None:
-            return None
-        if part.group("end") is not None:
-            return part.end() if part.group("end") == ">" else None
-        pos = part.end()
-        if part.group("attr") is None:
-            continue
-        local = part.group("attr").rpartition(":")[2]
-        lo = part.start() if local == _VALUE_MEMBER else part.end("attr")
-        if part.group("unquoted") is not None:
-            spans.append((lo, part.start("unquoted")))
-            continue
-        spans.append((lo, pos))
-        value = _XML_ATTR_VALUE[part.group("q")].match(text, pos)
-        if value is not None:
-            pos = value.end()
-    return None
-
-
-def _label_anchors(text: str) -> _Anchors:
-    """The parts of ``text`` a pass after the JSON pass reads as a label: a DICOM keyword label
-    (:data:`_DICOM_PHI_LABEL`), a group 0010 dump tag (:data:`_DICOM_TAG`), a vocabulary XML start
-    tag with what :func:`_xml_start_tag_anchors` keeps of it, and a vocabulary end tag
-    (:data:`_XML_PHI_END`, :data:`_XML_PHI_END_OPEN`). Read off the passes' own patterns, so a label
-    they learn is kept here too. An MRN label is not among them: :data:`_MRN_LABELLED` lets only a
-    ``[`` stand between the label and its number, which opens a frame, so a number after a label in
-    the walk is in the walk too. One linear search per pattern over the whole text, made once per
-    :func:`_redact_json_fields` call and only once a walk turns malformed."""
-    spans = [
-        found.span()
-        for pattern in (_DICOM_PHI_LABEL, _XML_PHI_END, _XML_PHI_END_OPEN)
-        for found in pattern.finditer(text)
-    ]
-    spans += [found.span() for found in _DICOM_TAG.finditer(text) if found.group(1) == "0010"]
-    content: set[int] = set()
-    for found in _XML_PHI_ELEMENT.finditer(text):
-        spans.append(found.span())
-        start = _xml_start_tag_anchors(text, found.end(), spans)
-        if start is not None:
-            content.add(start)
-    spans.sort()
-    merged: list[tuple[int, int]] = []
-    for start, end in spans:
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
-        elif start < end:
-            merged.append((start, end))
-    return _Anchors(merged, sorted(content))
-
-
-#: A run of word characters, the part of a token outside a label that a malformed walk scrubs.
-_WORD_RUN = re.compile(r"\w++")
-
-
-def _scrub_gap(text: str, lo: int, hi: int, content: list[int]) -> str:
-    """``text[lo:hi]``, a part of a token outside every label, with each word run scrubbed. A run that
-    is a literal :data:`_JSON_LITERALS` keeps stays, ``redacted`` among them, so a scrubbed run stays
-    as it is on a second pass. A run that opens a vocabulary XML element's content becomes the bare
-    word ``redacted``, not the placeholder: the XML pass reads a word character there as evidence the
-    tag is markup (:data:`_XML_CONTENT_EVIDENCE`), and without it the content past this walk is
-    kept."""
-    out: list[str] = []
-    pos = lo
-    for word in _WORD_RUN.finditer(text, lo, hi):
-        out.append(text[pos : word.start()])
-        if word.group() in _JSON_LITERALS:
-            out.append(word.group())
-        else:
-            opens = bisect_left(content, word.start())
-            at_content = opens < len(content) and content[opens] == word.start()
-            out.append(_REDACTED[1:-1] if at_content else _REDACTED)
-        pos = word.end()
-    out.append(text[pos:hi])
-    return "".join(out)
-
-
-def _malformed_scalar(match: re.Match[str], anchors: _Anchors, widened: bool) -> str:
-    """The data token ``match`` read after a mismatched closer (BACKLOG #5814), one the older walk
-    left as written: scrubbed as a leaf, except the part of it inside a label span of ``anchors``
-    (:func:`_label_anchors`). A later pass
-    reads that label to scrub the value after it, and the value may lie past the end of this walk,
-    where nothing else scrubs it. Outside a label only word runs are replaced (:func:`_scrub_gap`),
-    so the punctuation a label needs around it, such as the ``>`` of ``<given>``, stays."""
-    start, end = match.span()
-    spans = anchors.spans
-    # The spans are disjoint and sorted, so the one holding `start`, if any, is the last to open at or
-    # before it.
-    index = max(bisect_right(spans, (start, len(match.string) + 1)) - 1, 0)
-    kept: list[tuple[int, int]] = []
-    while index < len(spans) and spans[index][0] < end:
-        lo, hi = spans[index]
-        if hi > start:
-            kept.append((max(lo, start), min(hi, end)))
-        index += 1
-    opens = bisect_left(anchors.content, start)
-    holds_content = opens < len(anchors.content) and anchors.content[opens] < end
-    if not kept and not holds_content:
-        return _json_scalar(match, _LEAF, widened)
-    text = match.string
-    out: list[str] = []
-    pos = start
-    for lo, hi in kept:
-        out.append(_scrub_gap(text, pos, lo, anchors.content))
-        out.append(text[lo:hi])
-        pos = hi
-    out.append(_scrub_gap(text, pos, end, anchors.content))
-    return "".join(out)
-
-
-def _overlaps(spans: list[tuple[int, int]], start: int, end: int) -> bool:
-    """Whether ``[start, end)`` overlaps a span of ``spans``, which are sorted and disjoint."""
-    # The last span to open at or before `start` is the only earlier one that can reach it.
-    index = max(bisect_right(spans, start, key=lambda span: span[0]) - 1, 0)
-    while index < len(spans) and spans[index][0] < end:
-        if spans[index][1] > start:
-            return True
-        index += 1
-    return False
-
-
-class _JsonWalk:
-    """What the walks of one :func:`_redact_json_fields` call share.
-
-    ``strict`` says whether a container ends only on its own closer (BACKLOG #5814). The older walk,
-    run with it off, let any closer end the open container, and ``scrubbed`` then collects the spans
-    of ``text`` that walk replaced. :meth:`malformed` is made once, when a strict walk first meets a
-    closer of the wrong kind."""
-
-    def __init__(self, text: str, widened: bool, *, strict: bool) -> None:
-        self.text = text
-        self.widened = widened
-        self.strict = strict
-        self.scrubbed: list[tuple[int, int]] = []
-        self._anchors: _Anchors | None = None
-        self._older: list[tuple[int, int]] | None = None
-
-    def malformed(self) -> tuple[_Anchors, list[tuple[int, int]]]:
-        """The labels later passes read (:func:`_label_anchors`), and the spans the older walk
-        replaced over the same text."""
-        if self._anchors is None or self._older is None:
-            self._anchors = _label_anchors(self.text)
-            older = _JsonWalk(self.text, self.widened, strict=False)
-            _json_fields(older)
-            self._older = older.scrubbed
-        return self._anchors, self._older
-
-
-def _scrub_json_value(walk: _JsonWalk, pos: int, policy: int) -> tuple[str, int]:
-    """``(replacement, end)`` for the JSON value starting at ``pos`` of ``walk.text``, scrubbed under
-    ``policy``.
+def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[str, int]:
+    """``(replacement, end)`` for the JSON value starting at ``pos``, scrubbed under ``policy``.
 
     An explicit stack rather than recursion, because the nesting depth is the peer's choice. The walk
     visits each character once. A structure that never closes runs to the end of the text, so a cut
-    inside it strands nothing (the fail-closed rule on the section comment above).
+    inside it strands nothing (the fail-closed rule on the section comment above). A container ends
+    only on its own closer; a closer of another kind raises :class:`_MismatchedJsonCloser`.
 
     **Object KEYS are always kept**, which is what keeps the output legible, so a structure that uses
     PHI as its keys (``{"name": {"DOE": 1}}``) is a residual. A bare token straight before ``(`` is a
     callable's name (``date(``, ``frozenset(``) and is kept too; its arguments are the value."""
-    text, widened = walk.text, walk.widened
     out: list[str] = []
     #: One frame per open container: ``(is_object, policy, closer)``. An object's policy is LEAF or
     #: INHERIT (searched); an array's or a call's is the policy its elements take. ``closer`` is the
-    #: one delimiter that ends the frame (BACKLOG #5814).
+    #: one delimiter that ends the frame.
     frames: list[tuple[bool, int, str]] = []
-    #: Set by a closer of another kind than the open frame's, which ends nothing. From then on every
-    #: data token is scrubbed as LEAF, keys and callable names included, until the walk's own frames
-    #: close or the text ends. Ending a frame early would hand what follows to a parent frame or a
-    #: later key that may keep it, and keeping the walk as it was would keep what an INHERIT frame
-    #: holds. It covers only this walk: a value the walk has already returned from is outside it.
-    #: The one exception is a token the older walk left as written: there a label a later pass reads
-    #: is kept (:func:`_malformed_scalar`), since that pass read it before and may scrub a value
-    #: past this walk's end.
-    malformed = False
     pending = policy
     n = len(text)
     while pos < n:
@@ -1530,24 +1358,17 @@ def _scrub_json_value(walk: _JsonWalk, pos: int, policy: int) -> tuple[str, int]
                 closer = "]" if punct == "[" else ")"
                 frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending, closer))
                 pending = frames[-1][1]
-            elif punct == frames[-1][2] or (punct in "}])" and not walk.strict):
+            elif punct in "}])":
+                if punct != frames[-1][2]:
+                    raise _MismatchedJsonCloser
                 frames.pop()
                 if not frames:
                     return "".join(out), pos
                 pending = frames[-1][1]
-            elif punct in "}])":
-                malformed = True
             elif punct == ",":
                 pending = frames[-1][1]
             continue
         pos = match.end()
-        if malformed:
-            anchors, older = walk.malformed()
-            if _overlaps(older, match.start(), pos):
-                out.append(_json_scalar(match, _LEAF, widened))
-            else:
-                out.append(_malformed_scalar(match, anchors, widened))
-            continue
         bare = match.group("bare") is not None
         if bare and text.startswith("(", pos):
             out.append(token)  # a callable's name; the call's parentheses hold the value
@@ -1569,39 +1390,11 @@ def _scrub_json_value(walk: _JsonWalk, pos: int, policy: int) -> tuple[str, int]
                 value = text[match.start() : pos]
                 keep = pending == _INHERIT or (pending == _STRUCTURE_ONLY and not widened)
                 out.append(value if keep else _REDACTED)
-                if not keep:
-                    walk.scrubbed.append((match.start(), pos))
                 return "".join(out), pos
-        scalar = _json_scalar(match, pending, widened)
-        if scalar != token:
-            walk.scrubbed.append((match.start(), pos))
-        out.append(scalar)
+        out.append(_json_scalar(match, pending, widened))
         if not frames:
             return "".join(out), pos
     return "".join(out), pos
-
-
-def _json_fields(walk: _JsonWalk) -> str:
-    """:func:`_redact_json_fields` over ``walk.text``, with ``walk``'s closer rule."""
-    text, widened = walk.text, walk.widened
-    out: list[str] = []
-    pos = 0
-    while (match := _JSON_PHI_KEY.search(text, pos)) is not None:
-        key = match.group(2)
-        if key[0] == "0" and not _is_dicom_phi_tag(key, widened):
-            # A group 0010 tag outside 00xx, which only the widened stage reads.
-            out.append(text[pos : match.end()])
-            pos = match.end()
-            continue
-        policy = _vocabulary_policy(key, widened)
-        replacement, end = _scrub_json_value(walk, match.end(), policy)
-        out.append(text[pos : match.end()])
-        out.append(replacement)
-        pos = end
-    if not out:
-        return text
-    out.append(text[pos:])
-    return "".join(out)
 
 
 def _redact_json_fields(text: str, *, widened: bool) -> str:
@@ -1613,7 +1406,24 @@ def _redact_json_fields(text: str, *, widened: bool) -> str:
     operator configured it (:func:`_kept_under_structure_only`). Keys stay, so
     ``{"family": "[redacted]"}`` still says what was withheld. A key nested inside a region is handled
     by the walk, so the search resumes after the region."""
-    return _json_fields(_JsonWalk(text, widened, strict=True))
+    out: list[str] = []
+    pos = 0
+    while (match := _JSON_PHI_KEY.search(text, pos)) is not None:
+        key = match.group(2)
+        if key[0] == "0" and not _is_dicom_phi_tag(key, widened):
+            # A group 0010 tag outside 00xx, which only the widened stage reads.
+            out.append(text[pos : match.end()])
+            pos = match.end()
+            continue
+        policy = _vocabulary_policy(key, widened)
+        replacement, end = _scrub_json_value(text, match.end(), policy, widened)
+        out.append(text[pos : match.end()])
+        out.append(replacement)
+        pos = end
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
 
 
 #: Any DICOM tag as a dump prints it, ``(gggg,eeee)`` -- pydicom 2 wrote a space after the comma. Read
@@ -2121,7 +1931,10 @@ def redact(text: str) -> str:
     54,280 (342 through :func:`safe_exc` then :func:`safe_text`): a JSON ``name`` value that took a
     following ``PatientID=`` or ``<given value=`` with it, leaving that label's value to walk
     through. So the #1711 passes run to their fixed point first, and the widened passes then run over
-    their output.
+    their output. Every step only ever replaces text with the placeholder, so nothing the #1711
+    redactor removed can survive -- by construction, with ONE deliberate difference: the first stage
+    keeps an ``MRN`` label that ends a name run (:data:`_MRN_LABEL_SPELLINGS`), which is not PHI and
+    is what lets the second stage read the number after it.
 
     **The two stages protect #1711's labels, not each other's.** Inside the widened stage one widened
     scrub can still swallow another widened label: ``{"name": OtherPatientIDs= "x"}`` keeps ``"x"``.
@@ -2150,7 +1963,19 @@ def redact(text: str) -> str:
     call can scrub what the first kept, but only while the key is still there. A run that took a
     key glued to its token left that value in view on the second call, where the stages alone scrub
     it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
-    and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels."""
+    and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
+
+    **A JSON value with a mismatched closer makes the whole text redacted (BACKLOG #5814)**: the
+    result is the placeholder alone."""
+    try:
+        return _redact_unguarded(text)
+    except _MismatchedJsonCloser:
+        return _REDACTED
+
+
+def _redact_unguarded(text: str) -> str:
+    """:func:`redact` without its mismatched-closer rule, which raises :class:`_MismatchedJsonCloser`
+    out of here."""
     out = _redact_stages(text)
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
@@ -2203,9 +2028,8 @@ def _needs_widened_stage(text: str) -> bool:
     * a widened DICOM keyword, and the widened value terminator (which only differs before one): a
       :data:`_DICOM_PHI_LABEL` match outside :data:`_DICOM_KEYWORDS_1711`, behind the word screen.
 
-    No stage-1 scrub can CREATE one of these, since every scrub inserts the placeholder, or after a
-    mismatched JSON closer the bare word ``redacted`` (:func:`_scrub_gap`), so the stage-1 output is
-    screened. ``tests/test_redaction_structured_shapes.py`` holds the property: on text the
+    No stage-1 scrub can CREATE one of these, since every scrub inserts the placeholder, so the stage-1
+    output is screened. ``tests/test_redaction_structured_shapes.py`` holds the property: on text the
     screen skips, every pass gives the same output in both stages."""
     if any(word in text for word in _WIDENED_KEY_WORDS) and _WIDENED_JSON_KEY.search(text):
         return True
