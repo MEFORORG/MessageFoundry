@@ -859,6 +859,19 @@ def dec_result(phase: str, node: Any, reader: _Reader) -> object:
     raise SandboxCodecError(f"unknown sandbox phase {phase!r}")
 
 
+def _user_exc_text(exc: BaseException) -> str:
+    """``safe_exc(exc)``, or the class name when the error's own ``__str__`` raises, since that is
+    user code too and would otherwise escape this error arm. A ``SystemExit`` is its class name
+    alone: its code may be the author's text, which the worker's own sys.exit() arm never carries
+    across either (vault BACKLOG #3134)."""
+    if isinstance(exc, SystemExit):
+        return type(exc).__name__
+    try:
+        return safe_exc(exc)
+    except (Exception, SystemExit):  # noqa: BLE001 — the class name is all that is left to report
+        return type(exc).__name__
+
+
 def _enc_item(item: object, blobs: _Blobs) -> dict[str, Any]:
     # The SAME admissibility rule _partition applies in the parent (config.wiring), for the parity
     # reason enc_result's transform branch states above (BACKLOG #1687). The verdict travels back as a
@@ -873,10 +886,15 @@ def _enc_item(item: object, blobs: _Blobs) -> dict[str, Any]:
         # dryrun.py's `send.message if isinstance(..., str) else send.message.encode()`, which is the
         # SOLE parent-side consumer of Send.message. Carrying text (never a live Message) is what makes
         # the parent's Send() rebuild a provable no-op for ADR 0104's copy-on-Send choke point.
+        # A custom message's encode() is user code, and mode=off treats ANY raise from it, sys.exit()
+        # included, as the Handler's content fault. Catch the same set here: anything narrower
+        # escapes _respond and ends the worker (BACKLOG #5890).
         try:
             text = item.message if isinstance(item.message, str) else item.message.encode()
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise SandboxCodecError(f"Send message is not encodable: {safe_exc(exc)}") from exc
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 — user code; reported, never crashed
+            raise SandboxCodecError(
+                f"Send message is not encodable: {_user_exc_text(exc)}"
+            ) from exc
         if not isinstance(text, str):
             raise SandboxCodecError(
                 f"Send message encoded to {type(text).__name__}, expected a str"
