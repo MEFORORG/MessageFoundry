@@ -331,9 +331,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> HTMLResponse:
         users = await admin.list_users(service=service, identity=identity)
         # Each summary says whether its scope was withheld from this caller (BACKLOG #3189).
-        return HTMLResponse(
-            pages.users_page(users, can_delete=identity.has(Permission.USERS_MANAGE))
-        )
+        return HTMLResponse(pages.users_page(users))
 
     # Declared BEFORE /ui/users/{user_id} so the literal segment wins the route match.
     @app.get("/ui/users/new", response_class=HTMLResponse)
@@ -1021,18 +1019,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 # Outage, say), which would replace it. An account gone since answers 404.
                 if page_exc.status_code == status.HTTP_404_NOT_FOUND:
                     raise
-                reason = f"answered {page_exc.status_code}"
-            except account_read_errors() as read_exc:
-                if isinstance(read_exc, AUDIT_WRITE_DEFECTS):
-                    raise
-                reason = f"failed ({type(read_exc).__name__})"
-            _log.warning(
-                "the page for a refused delete of account %s was not shown: its read %s; "
-                "the delete's own refusal is answered",
-                scrub_log_argument(user_id),
-                reason,
-            )
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc.detail)) from exc
+                _log.warning(
+                    "the page for a refused delete of account %s was not shown: it answered %s; "
+                    "the delete's own refusal is answered",
+                    scrub_log_argument(user_id),
+                    page_exc.status_code,
+                )
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc.detail)) from exc
         return RedirectResponse("/ui/users", status_code=303)
 
     # --- roles ------------------------------------------------------------

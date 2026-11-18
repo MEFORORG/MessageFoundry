@@ -549,8 +549,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
         The form starts with the account's profile ``email`` where it passes the submit's own
         checks. On a directory account that is the last ``mail`` the directory supplied. THIS GET
-        SETS NOTHING ON THE ACCOUNT; its checked read reports a record that fails its seal, as
-        every checked read does. The address reaches ``notify_email`` only when the holder submits it,
+        SETS NOTHING ON THE ACCOUNT, though its checked read may report a record that fails its
+        seal. The address reaches ``notify_email`` only when the holder submits it,
         through the POST below and ``fill_own_notify_email``, so a directory writer can shape the
         suggestion but cannot set the target."""
         if not identity.must_set_notify_email:

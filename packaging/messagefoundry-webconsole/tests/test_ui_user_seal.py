@@ -9,8 +9,8 @@ of what was planted shown, and the failure is handed to the seal-failure report,
 ``integrity.authority_seal_failed`` row and raises the alert. Before #5559 these read the store row
 directly: the page showed the planted values with a 200 and nothing was recorded.
 
-The users list keeps such an account by id alone (BACKLOG #5520) and offers a users:manage holder
-its delete, the one action the console takes on it, since its detail page answers 423.
+The users list keeps such an account by id alone (BACKLOG #5520) and now offers its delete, the
+one action the console takes on it, since its detail page answers 423.
 
 Every test has a control: the same read of an intact account, or of the same account before the
 tampering.
@@ -173,28 +173,6 @@ async def test_a_failing_account_is_listed_with_its_delete_and_the_delete_remove
     assert await engine.store.get_user(intact) is not None
 
 
-async def test_the_list_offers_a_failing_account_s_delete_only_to_a_users_manage_holder(
-    keyed: tuple[Engine, Path],
-) -> None:
-    """The delete route requires users:manage, so a users:read-only reader's list names the
-    failing account and says its check failed, with no delete button. The control is the
-    administrator's list in the test above."""
-    engine, path = keyed
-    service, _alerts, _intact, victim = await _setup(engine)
-    role = await service.create_custom_role(
-        display_name="User reader", description=None, permissions=["users:read"], actor="test"
-    )
-    await provision(service, "reader", [role.id])
-    _tamper(path, victim)
-    async with _client(engine, service) as c:
-        await cookie_login(c, "reader")
-        listed = await c.get("/ui/users")
-    assert listed.status_code == 200
-    assert victim in listed.text and "integrity check failed" in listed.text
-    assert f'action="/ui/users/{victim}/delete"' not in listed.text
-    assert _PLANTED not in listed.text
-
-
 async def test_a_refused_delete_of_a_failing_account_answers_its_own_refusal(
     keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -248,11 +226,11 @@ async def test_a_refused_delete_keeps_its_own_refusal_when_the_page_read_is_unav
     assert await engine.store.get_user(intact) is not None
 
 
-async def test_a_refused_delete_keeps_its_own_refusal_when_the_page_read_fails(
-    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_a_refused_delete_of_an_account_gone_since_answers_404(
+    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """As above, for a page read that fails outright (a store refusal stood in for), which would
-    otherwise answer 500. The fallback is logged with the account's id."""
+    """A refused delete whose page read finds no account answers 404, not the stale refusal. The
+    control is the 503 case above."""
     engine, _path = keyed
     service, _alerts, intact, _victim = await _setup(engine)
     refusal = "stand-in: this would leave no enabled administrator"
@@ -260,21 +238,15 @@ async def test_a_refused_delete_keeps_its_own_refusal_when_the_page_read_fails(
     async def refused(user_id: str, *, actor: str) -> None:
         raise LastAdministratorRefused(refusal)
 
-    async def failing(user_id: str) -> None:
-        raise OSError("stand-in: a store read failed")
+    async def gone(user_id: str) -> None:
+        return None
 
     monkeypatch.setattr(service, "delete_user", refused)
-    monkeypatch.setattr(service, "checked_user", failing)
+    monkeypatch.setattr(service, "checked_user", gone)
     async with _client(engine, service) as c:
         await cookie_login(c, "root")
         r = await c.post(f"/ui/users/{intact}/delete", headers=SAME_ORIGIN)
-    assert r.status_code == 400 and refusal in r.text
-    assert any(
-        rec.levelname == "WARNING"
-        and intact in rec.getMessage()
-        and "refused delete" in rec.getMessage()
-        for rec in caplog.records
-    )
+    assert r.status_code == 404 and refusal not in r.text
 
 
 @pytest.mark.parametrize(
