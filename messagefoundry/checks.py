@@ -1926,6 +1926,7 @@ def _check_dryrun(
     suppress_search: bool = False,
     env: str | None = None,
 ) -> CheckResult:
+    from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_message_sets
     from messagefoundry.redaction import safe_error
@@ -1951,6 +1952,12 @@ def _check_dryrun(
         )
     try:
         reg = load_config(config_dir)
+    except ConfigDirMissing as exc:
+        # Not a WiringError, so the arm below never saw it and its traceback aborted every later leg
+        # and the --json report (BACKLOG #5810). The fixtures make this leg required and none of them
+        # ran, so it fails rather than skips: a skip would pass the gate if validate had not
+        # reported the same missing directory, as when this leg is called on its own.
+        return CheckResult("dryrun", ok=False, required=True, detail=f"config did not load: {exc}")
     except WiringError as exc:
         # validate already reports (and blocks on) this — don't double-fail here.
         return CheckResult(
