@@ -257,6 +257,10 @@ class AttestationResult:
     #: set. The single source of truth for :attr:`attested_nothing`'s cause and for
     #: :attr:`declared_editable`.
     unattested_reason: UnattestedReason | None = None
+    #: The ``RECORD`` relpath of each loaded package directory that is a link out of the install
+    #: root (``package_directory_links_out_of_install_root``), so the warning can name which one;
+    #: empty otherwise.
+    linked_out_paths: tuple[str, ...] = ()
 
     @property
     def attested_nothing(self) -> bool:
@@ -289,12 +293,21 @@ class AttestationResult:
         return not self.attested_nothing and not self.drift
 
     def audit_detail(self) -> dict[str, object]:
-        """A PHI-free JSON-able summary for the ``startup_integrity`` audit detail / alert payload."""
+        """A PHI-free JSON-able summary for the ``startup_integrity`` audit detail / alert payload.
+
+        The row must not read as a verified pass when the pass verified nothing (BACKLOG #5376), so
+        here ``attested`` is ``False`` whenever :attr:`attested_nothing` holds, and ``checked`` counts
+        only verified files: ``0`` for a pass with an ``unattested_reason``. A pass through a package
+        directory linked out of the install root still read files; their count goes under
+        ``read_through_link``, which no other shape carries."""
+        unverified = self.attested_nothing
         detail: dict[str, object] = {
-            "attested": self.attested,
-            "checked": self.checked,
+            "attested": self.attested and not unverified,
+            "checked": 0 if unverified else self.checked,
             "drift_count": len(self.drift),
         }
+        if self.unattested_reason == "package_directory_links_out_of_install_root":
+            detail["read_through_link"] = self.checked
         if self.editable:
             detail["editable"] = True
         if self.no_record:
@@ -832,7 +845,8 @@ def _attest_distribution(
     # install root is read through the link at its record place when that place is in the package (a
     # package directory linked out of the install root), and is otherwise not compared at all.
     anchors: list[tuple[Path, Path | None]] = []
-    linked_out = rooted = False
+    linked_out: list[str] = []
+    rooted = False
     for root in package_roots:
         place, resolved = _record_place(root), Path(root).resolve()
         place_rel = _record_relpath(place, install_root)
@@ -840,9 +854,9 @@ def _attest_distribution(
         rooted = rooted or in_package(place_rel) or in_package(resolved_rel)
         if resolved_rel is not None:
             anchors.append((place, resolved))
-        elif in_package(place_rel):
+        elif place_rel is not None and in_package(place_rel):
             anchors.append((place, place))
-            linked_out = True
+            linked_out.append(place_rel)
         else:
             anchors.append((place, None))
     anchors.sort(key=lambda anchor: len(anchor[0].parts), reverse=True)  # the deepest root wins
@@ -916,6 +930,7 @@ def _attest_distribution(
         # A real baseline was read and still nothing was verified. `UnattestedReason` says which value
         # names which shape; `_act_on` decides the outcome.
         unattested_reason=reason,
+        linked_out_paths=tuple(sorted(set(linked_out))),
     )
 
 
@@ -1066,10 +1081,11 @@ async def _act_on(
         reason = result.unattested_reason or "unknown"
         if reason == "package_directory_links_out_of_install_root":
             # Files were compared here, through the link, so "no file was compared" would be false.
+            paths = ", ".join(result.linked_out_paths) or "a package directory"
             what = (
-                f"the {arm.noun} package directory is a link out of the install root, so files "
-                "read through it are not counted as verified, whatever they hash to; replace the "
-                "link with the installed directory"
+                f"loaded {arm.noun} path {paths} links out of the install root, so files read "
+                "through it are not counted as verified; install the package under the install "
+                "root, or accept this warning ([integrity].fail_closed_on_drift refuses to start)"
             )
             log.warning(
                 "startup integrity: attestation verified NOTHING (%s) — %s (fail_closed=%s)",
