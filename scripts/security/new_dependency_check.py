@@ -31,10 +31,13 @@ REFUSED RATHER THAN VETTED (each a finding, never a silent skip; ``unnameable_en
 entry the gate cannot name (a bare URL, a path, a non-string, a table or list of the wrong TOML
 type); a direct reference (``name @ url``), whose bytes come from the URL rather than from the PyPI
 project the name would be vetted against; ``[project].dynamic`` naming the dependency lists, which a
-build plugin fills from a file this gate never opens; an in-tree build backend (``backend-path``) or
-an in-tree hatch ``custom`` build or metadata hook, any of which can return requirements from code; a
+build plugin fills from a file this gate never opens; an in-tree build backend (``backend-path``),
+an in-tree hatch ``custom`` build or metadata hook, or a hatch ``custom`` build target
+(``[tool.hatch.build.targets.custom]``), any of which can return requirements from code; a
 non-empty source or index key in ``[tool.uv]`` or ``[tool.uv.pip]``, which sends a vetted name
-somewhere other than pypi.org; and a ``[tool.uv].workspace``, whose members this gate does not sweep.
+somewhere other than pypi.org; a non-empty ``allow-insecure-host`` in either, which lets uv fetch
+without verifying TLS, so the bytes need not be what pypi.org serves; and a ``[tool.uv].workspace``,
+whose members this gate does not sweep.
 
 EXEMPT FROM THE AGE FLOOR ONLY: this repository's own distributions (``FIRST_PARTY``), by exact PEP
 503 name, wherever declared. Every other check still runs on them; the comment above ``FIRST_PARTY``
@@ -43,12 +46,10 @@ gives the reason. Nothing is skipped outright except a reviewed ``ALLOWLIST`` en
 NOT SWEPT, at least: npm manifests (``ide/package.json``, ``ci/npm-tools/package.json``); tools a
 workflow or script installs by command line (a ``pipx install`` or ``uv tool install``); hatch
 environment tables; any requirements file; a ``uv.toml``; a ``setup.py``, whose ``setup_requires``
-runs under a setuptools backend; and the BUILDER of a hatch custom target
-(``[tool.hatch.build.targets.custom]``), in-tree code that can return build requirements. That
-target's ``dependencies`` list is read like any other target's, but the builder is not refused, as
-the ``custom`` hook is. An invented name supplied by any of these passes this gate. For npm, ``npm audit`` answers known advisories,
-the npm counterpart of pip-audit, and so shares its blindness to a freshly registered name. The npm
-boundary is pinned by a named test in ``tests/test_new_dependency_check.py``.
+runs under a setuptools backend. An invented name supplied by any of these passes this gate. For
+npm, ``npm audit`` answers known advisories, the npm counterpart of pip-audit, and so shares its
+blindness to a freshly registered name. The npm boundary is pinned by a named test in
+``tests/test_new_dependency_check.py``.
 
 WHAT IT CHECKS, per declared distribution:
   * EXISTS         -- PyPI serves a project page for the name at all.
@@ -96,6 +97,15 @@ the first reply, and a 4xx other than 429, any TLS error other than a timeout (a
 above all), a proxy refusal, and a body that is not UTF-8 JSON naming an object keep their meaning.
 When the retries are spent the last error propagates and the run exits 2 exactly as before; a retry
 never turns an unreachable PyPI into a pass.
+
+EXIT CODES, as ``main`` returns them. 0: every distribution examined passed and nothing was refused.
+2, "could not see", at least: the default sweep found no ``packaging/*/pyproject.toml``; a pyproject
+or its ``hatch.toml`` could not be read or parsed; the default sweep's root runtime tables yielded no
+name; PyPI could not be reached or sent an unreadable reply once the retries were spent; and zero
+distributions were examined with nothing refused. argparse also exits 2 on a bad command line. 1: a
+refusal or a failed check, when none of the exit-2 cases above occurred. A refusal found beside an
+exit-2 case is still printed, but the run exits 2, not 1. An exception ``main`` does not catch ends
+the run with Python's traceback exit, also 1.
 
 Worst case added time. The whole run gets at most ``_RUN_RETRY_BUDGET`` (6) retries, and none starts
 once the sweep has been running ``_RETRY_WINDOW_S`` (120s). So retries add at most those 120s plus
@@ -208,6 +218,8 @@ _UV_REQUIREMENT_LISTS = (
 )
 # The [tool.uv] keys that change where a distribution is fetched from. Any non-empty one is refused.
 _UV_SOURCE_KEYS = ("sources", "index", "index-url", "extra-index-url", "find-links")
+# The [tool.uv] key that turns off TLS verification for a host. Any non-empty one is refused.
+_UV_INSECURE_KEYS = ("allow-insecure-host",)
 
 
 def scan(
@@ -364,6 +376,14 @@ def scan(
                     "this redirects where uv fetches a distribution from, and this gate vets names "
                     "against pypi.org only, so what it passes is not what would be installed.",
                 )
+        for key in _UV_INSECURE_KEYS:
+            if settings.get(key):
+                refuse(
+                    f"{where}.{key}",
+                    "insecure host",
+                    "this lets uv fetch from a host without verifying TLS, so the bytes installed "
+                    "need not be what pypi.org serves for the name this gate vetted.",
+                )
     if uv.get("workspace"):
         refuse(
             "[tool.uv].workspace",
@@ -392,6 +412,15 @@ def scan(
         if not isinstance(config, dict):
             refuse(where, "not a table", "a hatch build target must be a table.")
             continue
+        # The `custom` target's builder is a class loaded from the tree; like the custom hook, it can
+        # return build requirements from code this gate never reads.
+        if target == "custom":
+            refuse(
+                where,
+                "in-tree build target",
+                "a hatch custom build target loads a builder from the tree, which can return build "
+                "requirements from code this gate never reads. Use a published builder plugin.",
+            )
         requirements(config.get("dependencies", []), f"{where}.dependencies")
         hooks.append((f"{where}.hooks", table(config, "hooks", f"{where}.hooks")))
     for prefix, hook_table in hooks:
