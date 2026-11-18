@@ -25,7 +25,8 @@ from typing import Any
 
 import pytest
 import yaml
-from _bash_resolver import require_bash
+
+from tests._bash_resolver import explain_returncode, probe_env, require_bash
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
@@ -131,8 +132,17 @@ def test_each_job_runs_its_own_shard_of_the_count_there_are_shards() -> None:
         assert _pytest_argv(run)[-1] == "@out/test-shard/files.txt"
 
 
+@pytest.fixture(scope="module")
+def bash_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Resolved once, never a bare `bash`: on hosted Windows that can be the WSL launcher, which
+    cannot open a file this process wrote. `require_bash` fails loudly rather than skipping."""
+    return require_bash(tmp_path_factory.mktemp("resolve-bash"))
+
+
 @pytest.mark.parametrize("repo", ["MEFORORG/MessageFoundry", "someone/fork"])
-def test_the_shard_matrix_is_every_leg_once_per_shard(repo: str, tmp_path: Path) -> None:
+def test_the_shard_matrix_is_every_leg_once_per_shard(
+    repo: str, tmp_path: Path, bash_path: str
+) -> None:
     """The `changes` step's own lines, run under bash: `shard_matrix` must be every `matrix` leg,
     unchanged, once per shard, on this repository and on a fork. A leg dropped there drops two
     thirds of the suite on that leg, and the job-level checks below cannot see it.
@@ -141,11 +151,22 @@ def test_the_shard_matrix_is_every_leg_once_per_shard(repo: str, tmp_path: Path)
     script = tmp_path / "matrix.sh"
     script.write_text(_matrix_snippet(), encoding="utf-8", newline="\n")
     out = tmp_path / "output.txt"
-    env = dict(os.environ, GITHUB_REPOSITORY=repo, GITHUB_OUTPUT=str(out))
-    # Resolved, never a bare `bash`: on hosted Windows that can be the WSL launcher, which cannot
-    # open a file this process wrote. `require_bash` fails loudly rather than skipping.
-    bash = require_bash(tmp_path, env)
-    subprocess.run([bash, "-eo", "pipefail", str(script)], env=env, check=True, timeout=60)
+    # probe_env gives the child the utilities that ship beside the interpreter (BACKLOG #1373).
+    env = probe_env(Path(bash_path), dict(os.environ))
+    env.update(GITHUB_REPOSITORY=repo, GITHUB_OUTPUT=str(out))
+    proc = subprocess.run(
+        [bash_path, "-eo", "pipefail", str(script)],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        explain_returncode(proc.returncode, "the `changes` step's matrix lines")
+        + "\n"
+        + proc.stderr.decode("utf-8", "replace")
+    )
     outputs = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
     legs = json.loads(outputs["matrix"])["include"]
     sharded = json.loads(outputs["shard_matrix"])["include"]
