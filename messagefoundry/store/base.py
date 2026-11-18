@@ -2961,9 +2961,10 @@ class AuthStore(Protocol):
         passkeys goes through one helper per backend, which verifies the record it read before it
         re-seals it and raises :class:`~messagefoundry.store.row_seal.RowSealError` rather than
         re-seal a record that fails. Deleting needs no key. :class:`AuthService` checks the seal,
-        in its one user loader; the store's readers return rows unchecked. A role row whose cells
-        do not parse raises ``RowSealError``, as the write helpers' read does (BACKLOG #5505), and
-        that loader answers it as a record that fails its integrity check, keyed or keyless."""
+        in its one user loader; the store's readers return rows unchecked. A role row with a cell
+        the read parses that does not parse raises ``RowSealError``, as the write helpers' read
+        does (BACKLOG #5505), and that loader answers it as a record that fails its integrity
+        check, keyed or keyless."""
         ...
 
     async def reseal_user_records(self) -> tuple[int, int]:

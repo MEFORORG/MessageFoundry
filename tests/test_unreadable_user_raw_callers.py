@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A caller outside ``AuthService`` that reads a users row that does not parse (``listed_users``
-says which) refuses with a truthful reason, and never acts on invented fields (BACKLOG #5505).
+says which) never acts on invented fields (BACKLOG #5505).
 
 The single-row user readers raise ``RowSealError`` for such a row; the store's list, and the
 service's ``read_user_or_unreadable``, return a stand-in, whose fields other than the id are
-invented. Each case has a twin on a healthy account,
-so a gate that refused everything would not pass. Synthetic accounts only.
+invented. Synthetic accounts only.
 """
 
 from __future__ import annotations
