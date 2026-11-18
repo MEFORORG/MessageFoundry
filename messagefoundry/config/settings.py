@@ -753,25 +753,35 @@ def _check_revocation_attestation_pair(
 _SCHEMA_LOCK_TIMEOUT_MAX: Final[float] = float((2**31 - 1) // 1000)
 
 
-def store_path_refusal(value: str, *, name: str = "[store].path") -> str | None:
+def store_path_refusal(
+    value: str, *, name: str = "[store].path (from the settings file or --db)"
+) -> str | None:
     """Why ``value`` cannot be a SQLite store path the project root anchors, or None if it can
     (BACKLOG #5926). ``name`` is the setting or flag the refusal names.
 
-    At least two shapes are refused. A path naming no file (empty, blank, ``.``, ``..``) anchors
-    to a directory, which passes an exists() guard as if it were a store. A Windows drive-relative
-    path such as ``C:mf.db`` resolves against that drive's per-process current directory, or,
-    joined under a root on another drive, drops the root. Off Windows a path has no drive, so
-    ``C:mf.db`` is an ordinary relative file name there. The value is withheld from the refusal,
-    as the file source's path refusals withhold theirs."""
-    p = Path(value)
-    if not value.strip() or p.name in ("", ".."):
+    It refuses at least these shapes, by their spelling; it cannot see whether a plain name such
+    as ``data`` is an existing directory. A path whose last part is empty, ``.`` or ``..`` (an
+    empty or blank path, ``data/``, ``data/..``) names a directory, which passes an exists() guard
+    as if it were a store. On Windows, a last part ending in a dot or a space (Win32 trims it, so
+    ``...`` is the working directory), and a colon anywhere but a drive letter: ``C:mf.db`` is
+    drive-relative, resolved against that drive's per-process current directory, and
+    ``mf.db:x`` names an NTFS alternate data stream. SQLite's ``:memory:`` is not a file and is
+    accepted. Off Windows those Windows spellings are ordinary file names. The value is withheld
+    from the refusal, as the file source's path refusals withhold theirs."""
+    if value == ":memory:":
+        return None
+    last = re.split(r"[\\/]", value.rstrip())[-1]
+    windows = os.name == "nt"
+    if last in ("", ".", "..") or (windows and last != last.rstrip(". ")):
         return (
             f"{name} names no file (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
         )
-    if p.drive and not p.is_absolute():
+    drive = Path(value).drive
+    if (windows and ":" in value[len(drive) :]) or (drive and not Path(value).is_absolute()):
         return (
-            f"{name} is drive-relative (value withheld); on Windows give a fully-qualified "
-            "path (e.g. 'C:/data/mf.db') or a plain relative one (e.g. 'mf.db')"
+            f"{name} is drive-relative or names a file stream (value withheld); on Windows use a "
+            "colon only after the drive letter of a fully-qualified path (e.g. 'C:/data/mf.db'), "
+            "or give a plain relative path (e.g. 'mf.db')"
         )
     return None
 

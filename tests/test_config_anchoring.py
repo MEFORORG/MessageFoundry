@@ -9,6 +9,7 @@ subcommand (the smallest CLI surface that runs the anchor resolver without start
 
 from __future__ import annotations
 
+import os
 import textwrap
 from pathlib import Path
 
@@ -708,35 +709,50 @@ _NO_FILE = "names no file"
 _DRIVE = "drive-relative"
 
 
-@pytest.mark.parametrize("value", ["", "   ", ".", "./", "..", "data/.."])
+@pytest.mark.parametrize(
+    "value", ["", "   ", ".", "./", "..", "site-dir/..", "site-dir/", "site-dir/.", "site-dir/ "]
+)
 def test_a_store_path_naming_no_file_is_refused_at_load(value: str) -> None:
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreSettings, settings_error_detail
 
     # Joined under the root, each names a directory, which passes an exists() guard.
-    with pytest.raises(ValidationError, match=r"\[store\]\.path names no file") as exc:
+    with pytest.raises(ValidationError, match=r"\[store\]\.path .*names no file") as exc:
         StoreSettings(path=value)
-    assert "data/" not in settings_error_detail(exc.value)  # the value is withheld
+    assert "site-dir" not in settings_error_detail(exc.value)  # the value is withheld
 
 
-def test_a_drive_qualified_relative_store_path_is_refused_on_windows() -> None:
+@pytest.mark.parametrize(
+    ("value", "why"),
+    [
+        ("C:site-store.db", _DRIVE),  # drive-relative: per-process current directory of C:
+        ("/C:site-store.db", _DRIVE),  # the anchor strips the slash, leaving C:site-store.db
+        ("site-store.db:x", "file stream"),  # an NTFS alternate data stream
+        ("site-store...", _NO_FILE),  # Win32 trims the dots
+    ],
+)
+def test_a_windows_only_store_path_shape_is_refused_on_windows(value: str, why: str) -> None:
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import StoreSettings, settings_error_detail
 
-    if Path("C:mf.db").drive:  # Windows: a drive with no root, resolved per process and drive
-        with pytest.raises(ValidationError, match=_DRIVE) as exc:
-            StoreSettings(path="C:site-store.db")
+    if os.name == "nt":
+        with pytest.raises(ValidationError, match=why) as exc:
+            StoreSettings(path=value)
         assert "site-store" not in settings_error_detail(exc.value)  # the value is withheld
-    else:  # POSIX: `C:mf.db` is an ordinary relative file name and anchors under the root
-        assert StoreSettings(path="C:mf.db").path == "C:mf.db"
-    # A plain relative path and the in-memory sentinel stay accepted on every platform.
-    assert StoreSettings(path="data/mf.db").path == "data/mf.db"
-    assert StoreSettings(path=":memory:").path == ":memory:"
+    else:  # POSIX: each is an ordinary file name and anchors under the root
+        assert StoreSettings(path=value).path == value
 
 
-def _windows_only(db: str) -> None:
+def test_plain_store_paths_stay_accepted() -> None:
+    from messagefoundry.config.settings import StoreSettings
+
+    for value in ("mf.db", "data/mf.db", ":memory:", str(Path.cwd() / "mf.db")):
+        assert StoreSettings(path=value).path == value
+
+
+def _skip_drive_case_off_windows(db: str) -> None:
     if db and not Path(db).drive:
         pytest.skip("drive-qualified relative paths exist only on Windows")
 
@@ -752,7 +768,7 @@ def test_an_offline_command_refuses_an_unanchorable_db(
     away_from_root: tuple[Path, Path], capsys: pytest.CaptureFixture[str], db: str, why: str
 ) -> None:
     root, svc = away_from_root
-    _windows_only(db)
+    _skip_drive_case_off_windows(db)
     rc = main(["audit-verify", "--service-config", str(svc), "--db", db])
     out = capsys.readouterr()
     assert rc == 2, out.out + out.err
@@ -777,7 +793,7 @@ def test_serve_and_supervise_refuse_an_unanchorable_db_under_a_root(
 
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", _no_spawn)
     root, svc = away_from_root
-    _windows_only(db)
+    _skip_drive_case_off_windows(db)
     argv = [command, "--project-root", str(root), "--service-config", str(svc), "--db", db]
     rc = main(argv)
     out = capsys.readouterr()
