@@ -123,8 +123,10 @@ $PrimarySlug = Get-Slug $Primary
 
 # All logins on this box. The Desktop app uses the default ~\.claude; each CLI subscription launcher sets
 # CLAUDE_CONFIG_DIR to its own ~\.claude-account-N. A session is only visible to the login that owns it.
+# -LiteralPath: a profile folder whose name holds [ or ] is not a pattern (vault BACKLOG #2985, added
+# item 2).
 $ConfigDirs = @(
-    Get-ChildItem -Path $env:USERPROFILE -Directory -Filter ".claude*" -Force -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter ".claude*" -Force -ErrorAction SilentlyContinue |
         Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "projects") } |
         ForEach-Object { $_.FullName }
 )

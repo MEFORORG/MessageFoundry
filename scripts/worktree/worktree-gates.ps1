@@ -58,7 +58,9 @@ function Assert-NoGitRedirect([string]$Who) {
 #: purpose: it swaps the global config for a file the operator did not set up as theirs. What this does
 #: NOT cover, at least: the global file HOME, XDG_CONFIG_HOME or USERPROFILE names, the repository's own
 #: config, and other GIT_* variables. The worktree gate's argv rules cannot see this carrier (vault
-#: BACKLOG #1070); this guards only the nightly removal's own git calls, not prune-merged.ps1's.
+#: BACKLOG #1070). What a reader does when a carrier is set is in that reader's own header; the readers
+#: include at least finished-worktree-removal.ps1, hygiene-report.ps1 and remove.ps1. prune-merged.ps1
+#: does not read this list.
 $GIT_CONFIG_CARRIER_PATTERN = '\AGIT_CONFIG(?:_|\z)'
 
 # The GIT_CONFIG carriers set in this process, sorted. Wrap the call in @(): one name unrolls to a string.

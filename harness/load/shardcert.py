@@ -36,7 +36,7 @@ import time
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -85,6 +85,9 @@ from messagefoundry.pipeline.sharding import (
     shard_ids,
 )
 from messagefoundry.terminal_text import escape_for_terminal
+
+if TYPE_CHECKING:
+    from messagefoundry.store.sqlserver import SqlServerStore
 
 _log = logging.getLogger(__name__)
 
@@ -1232,6 +1235,12 @@ async def _await_port(host: str, port: int, *, timeout: float) -> bool:
 #: The tables :func:`_reset_store` empties, children before ``messages`` (``queue`` and ``response``
 #: carry a foreign key to it, and SQL Server refuses a DELETE while a row still refers to it). The names
 #: are spliced into T-SQL, so this must stay a LITERAL constant: never build it from settings or input.
+#: This module's store-truth scan and the store methods behind the engine's ``/stats`` read ``queue``
+#: alone. tests/test_shardcert_pass_bars.py scans that SQL for table names; its docstring says what
+#: the scan reads and what it does not.
+#: ``message_events`` is left out on purpose: no verdict here reads it, and
+#: scripts/bench/stage_residency.py segments a climb's rungs out of it, which needs every rung's rows
+#: kept (BACKLOG #5576).
 _RESET_TABLES = (
     "queue",
     "response",
@@ -1308,6 +1317,23 @@ async def _reset_store_or_signal(coord: FileDropCoord, node_env: Mapping[str, st
         raise
 
 
+async def _open_rig_store(env: Mapping[str, str]) -> SqlServerStore:
+    """Open the rig's SQL Server store from ``env``, at a warn posture. The caller closes it.
+
+    The TLS-escape guard (insecure_tls_allowed) reads os.environ DIRECTLY, so the parent-process
+    store open needs the escape + creds in os.environ, not just the load_settings `environ=` arg."""
+    import os
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    with _env_scope(dict(env)):
+        settings = load_settings(environ=os.environ).store
+        # The escape needs a known warn posture (vault BACKLOG #2354); this rig is a dev container.
+        return await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
+
+
 async def _reset_store(env: Mapping[str, str]) -> None:
     """DELETE the pipeline tables so a re-run starts clean (mirrors test_load_failover_sqlserver).
 
@@ -1315,24 +1341,13 @@ async def _reset_store(env: Mapping[str, str]) -> None:
     SQL (``OBJECT_ID``), but any other DELETE failure raises :class:`StoreResetFailed`, and so does a
     table that still holds rows after the DELETE. Suppressing the error would leave rows from an earlier
     run in place for this run's drain and store-truth reads to count."""
-    import os
-
-    from messagefoundry.config.settings import load_settings
-    from messagefoundry.config.tls_policy import HopPosture
-    from messagefoundry.store.sqlserver import SqlServerStore
-
     driver_error = _store_driver_error()
-    # The TLS-escape guard (insecure_tls_allowed) reads os.environ DIRECTLY, so the parent-process
-    # store open needs the escape + creds in os.environ, not just the load_settings `environ=` arg.
-    with _env_scope(dict(env)):
-        settings = load_settings(environ=os.environ).store
-        # The escape needs a known warn posture (vault BACKLOG #2354); this rig is a dev container.
-        try:
-            store = await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
-        except driver_error as exc:
-            raise StoreResetFailed(
-                f"store reset could not open the store: {type(exc).__name__}: {exc}"
-            ) from exc
+    try:
+        store = await _open_rig_store(env)
+    except driver_error as exc:
+        raise StoreResetFailed(
+            f"store reset could not open the store: {type(exc).__name__}: {exc}"
+        ) from exc
     try:
         async with store._pool.acquire() as conn:
             cur = await conn.cursor()
@@ -1461,16 +1476,7 @@ async def _queue_breakdown(env: Mapping[str, str]) -> QueueBreakdown:
     those acked-on-receipt rows are acknowledged loss the engine's own store-truth verdict must catch without
     leaning on the driver half's sink-truth. Every figure is derived from the single ``GROUP BY stage,
     status`` scan below (via :func:`_summarize_queue_rows`) — no extra round trip."""
-    import os
-
-    from messagefoundry.config.settings import load_settings
-    from messagefoundry.config.tls_policy import HopPosture
-    from messagefoundry.store.sqlserver import SqlServerStore
-
-    with _env_scope(dict(env)):  # escape reads os.environ directly — see _reset_store
-        settings = load_settings(environ=os.environ).store
-        # The escape needs a known warn posture (vault BACKLOG #2354); this rig is a dev container.
-        store = await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
+    store = await _open_rig_store(env)
     try:
         async with store._pool.acquire() as conn:
             cur = await conn.cursor()

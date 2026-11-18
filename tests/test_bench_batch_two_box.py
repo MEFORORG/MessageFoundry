@@ -870,6 +870,72 @@ async def test_batch_driver_crashed_band_fails_cell_not_absent(
     assert report.exit_code != 0
 
 
+async def test_batch_driver_keeps_a_loss_a_sibling_of_a_crashed_band_proved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5574 item 7, through the driver: one band crashes in every cell and the others are
+    # over their stranding budget, so every failed cell record is LOSS, not INCONCLUSIVE.
+    import asyncio
+
+    profile = load_connscale_profile_text(_MINIMAL_BATCH)
+
+    async def one_crashes(argv: list[str], report_path: Path, cwd: Path) -> dict[str, Any]:
+        if report_path.name.endswith(".p0.json"):  # band 0 of every cell
+            raise OSError("connscale-remote crashed")
+        return {
+            "engine_index_base": 0,
+            "traffic": {"sent": 10, "acked": 2, "nak": 0, "deferred": 0, "timeouts": 8},
+            "no_loss": {
+                "ok": False,
+                "inconclusive": False,
+                "stranding": {"unconfirmed": 8, "budget": 7, "over_budget": True},
+            },
+        }
+
+    monkeypatch.setattr(bb, "_run_remote_proc", one_crashes)
+    with tempfile.TemporaryDirectory() as tmp:
+        coord = FileDropCoord(tmp, run_id="batch_ab")
+        cells = bb.iter_batch_cells(profile, claim_mode="pooled")
+
+        async def stub_engine() -> None:
+            for cell in cells:
+                cc = coord.for_run(f"batch_ab.{cell.cell_id}")
+                cc.post(
+                    BATCH_CELL_READY,
+                    {
+                        "cell_id": cell.cell_id,
+                        "inbound_base": 20000,
+                        "api_port": 9000,
+                        "sink_base": 40000,
+                        "sink_procs": 6,
+                        "count": cell.count,
+                        "hold_seconds": profile.hold_seconds,
+                        "drain_timeout_s": profile.drain_timeout_s,
+                        "aggregate_rate": 24.0,
+                    },
+                )
+                await cc.await_message(BATCH_CELL_DONE, timeout=10.0, interval=0.02)
+
+        driver_task = asyncio.create_task(
+            bb.run_batch_driver(
+                profile=profile,
+                claim_mode="pooled",
+                engine_host="10.0.0.5",
+                coord=coord,
+                sink_host="0.0.0.0",
+                report_dir=Path(tmp) / "reports",
+                cell_timeout=10.0,
+            )
+        )
+        _, report = await asyncio.gather(stub_engine(), driver_task)
+
+    assert len(report.records) == len(cells)
+    for rec in report.records:
+        assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+        assert "cell drive failed" in rec.no_loss.detail
+        assert "exceed its stranding budget" in rec.no_loss.detail
+
+
 async def _drive_against_stub_engine(
     monkeypatch: pytest.MonkeyPatch,
     first_ready: Callable[[dict[str, Any]], dict[str, Any]] | None,

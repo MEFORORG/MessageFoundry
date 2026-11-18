@@ -553,6 +553,44 @@ def test_what_the_removal_would_take_or_someone_holds_keeps_a_merged_tree_back(f
         assert name not in block, name
 
 
+def test_what_the_nightly_content_gates_refuse_keeps_a_merged_tree_back(fx: Fx) -> None:
+    """Vault BACKLOG #8225 item 1, #5647's remainder. Red before the fix: the report did not call the
+    nightly removal's in-progress, ignored-file and nested-checkout gates, so each of these trees,
+    merged at its tip, clean, idle and unoccupied, was proposed for a raw `git worktree remove`."""
+    inprog = _add_merged(fx, "m-inprog")
+    gitdir = Path(_git(inprog, "rev-parse", "--absolute-git-dir").strip())
+    (gitdir / "BISECT_LOG").write_text("# a bisect left running\n", encoding="utf-8")
+    # An ignored store file: git status does not list it, and `worktree remove` deletes it unasked.
+    ignored = _add_merged(fx, "m-ignored")
+    common = Path(
+        _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    )
+    (common / "info").mkdir(exist_ok=True)
+    (common / "info" / "exclude").write_text("local.db\n", encoding="utf-8")
+    (ignored / "local.db").write_bytes(b"a dev store")
+    # A nested checkout inside the ignored .venv, which git status never reads into.
+    nested = _add_merged(fx, "m-nested")
+    (nested / ".venv" / "src" / "pkg").mkdir(parents=True)
+    _git(nested / ".venv" / "src" / "pkg", "init", "-q")
+
+    fake, _ = _fake_gh(fx)
+    proc = _run(fx, "-Gh", str(fake), "-GhRepo", "acme/repo")
+    assert proc.returncode == 0, proc.stderr
+    rows = _rows(_report(fx))
+    expected = {
+        "repo-m-inprog": "operation is in progress in its git dir (BISECT_LOG)",
+        "repo-m-ignored": "ignored entr(ies) that are not a regenerable cache",
+        "repo-m-nested": "a nested git checkout at .venv/src/pkg/.git",
+    }
+    for name, needle in expected.items():
+        assert rows[name]["verdict"] == "HUMAN", (name, rows[name])
+        assert any(needle in r for r in rows[name]["reasons"]), (name, rows[name]["reasons"])
+        assert rows[name]["command"] == ""
+    # The controls in the same run: the clean tree and the one with only a plain .venv are proposed.
+    assert rows["repo-m-clean"]["verdict"] == "REMOVE", rows["repo-m-clean"]
+    assert rows["repo-m-venv"]["verdict"] == "REMOVE", rows["repo-m-venv"]
+
+
 def test_an_unreadable_claim_holds_every_merged_tree_back(fx: Fx) -> None:
     """CANNOT-TELL HOLDS: a claim file that will not parse might name any tree."""
     _record(fx, "claims", "x", {"key": "x", "worktree": "C:/elsewhere"})

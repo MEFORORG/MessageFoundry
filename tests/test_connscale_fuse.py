@@ -234,6 +234,36 @@ def test_go_when_b1_lift_ge_10pct_and_gt_2sigma() -> None:
     assert cmp.ok  # correctness gate (zero-loss held, present)
 
 
+def test_a_b0_placeholder_trial_is_no_reference_for_a_go() -> None:
+    from dataclasses import replace
+
+    # BACKLOG #5574 item 5. A failed B0 cell's placeholder (batchbox `_failed_cell_record`: sent 0,
+    # read 0.0, no drain time) dragged B0's mean down and passed B1's drain guard, so this B1 read
+    # GO beside four clean B0 trials and one placeholder.
+    placeholder = _rec(
+        fuse=False, read=0.0, sent=0, sink_received=0, no_loss_ok=False, drain_seconds=None
+    )
+    clean_b0 = _trials(False, [100.0, 101.0, 99.0, 100.0])
+    recs = clean_b0 + [placeholder] + _trials(True, [200.0, 201.0, 199.0, 200.0, 200.0])
+    cmp = build_fuse_comparison(recs, (False, True))
+    assert cmp is not None
+    row = cmp.rows[0]
+    assert row.verdict == FUSE_INCONCLUSIVE, row.reason
+    assert "1 B0 trial(s) recorded no traffic" in row.reason
+    assert row.ok and cmp.overall_verdict == FUSE_INCONCLUSIVE
+    # A B0 that ran and drowned (drain timed out, its reconcile INCONCLUSIVE) is still a
+    # measurement, so a fully-draining B1 with the lift is a GO: the drowning-baseline guard.
+    drowned = [
+        replace(r, drain_seconds=None, no_loss=replace(r.no_loss, ok=False, inconclusive=True))
+        for r in clean_b0
+    ]
+    cmp = build_fuse_comparison(
+        drowned + _trials(True, [120.0, 121.0, 119.0, 120.0]), (False, True)
+    )
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_GO, cmp.rows[0].reason
+
+
 def test_no_go_when_lift_below_threshold() -> None:
     # B1 only ~2% faster ⇒ below the 10% bar ⇒ NO-GO (fusion banked no worthwhile margin).
     recs = _trials(False, [100.0, 101.0, 99.0]) + _trials(True, [102.0, 103.0, 101.0])
@@ -303,13 +333,15 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
     assert "breached" in cmp.rows[0].reason
     # An INCONCLUSIVE arm that also never drained is a definite NO-GO on the drain guard, which
     # the INCONCLUSIVE label must not pre-empt.
-    undrained = [replace(r, drain_seconds=None) for r in unsure]
+    undrained = [
+        replace(r, drain_seconds=None, no_loss=replace(r.no_loss, backlog=5)) for r in unsure
+    ]
     cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + undrained, (False, True))
     assert cmp is not None
     assert cmp.rows[0].verdict == FUSE_NO_GO
     assert "did not fully drain" in cmp.rows[0].reason
-    # These trials sent traffic, so a None drain is a real await_drain timeout and keeps its
-    # specific reason, which the INCONCLUSIVE reconcile used to make unreachable.
+    # These trials sent traffic and read rows left at the end, so a None drain is a real stall and
+    # keeps its specific reason, which the INCONCLUSIVE reconcile used to make unreachable.
     assert "await_drain timed out" in cmp.rows[0].reason
     assert "rows stranded" in cmp.rows[0].reason and "never ran" not in cmp.rows[0].reason
     # A failed cell (batchbox `_failed_cell_record`: a placeholder sent of 0) carries the same None
@@ -335,6 +367,16 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
     assert cmp is not None
     assert "rows stranded" in cmp.rows[0].reason
     assert "1 B1 trial(s) recorded no traffic" in cmp.rows[0].reason
+    # BACKLOG #5574 item 4: a timeout that read no rows left at the end, a backlog of 0 or the -1 a
+    # band that could not read /stats reports, is still a timeout but shows no strand.
+    for backlog in (-1, 0):
+        blind = [replace(r, no_loss=replace(r.no_loss, backlog=backlog)) for r in undrained]
+        cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + blind, (False, True))
+        assert cmp is not None
+        assert cmp.rows[0].verdict == FUSE_NO_GO and not cmp.ok
+        assert "await_drain timed out" in cmp.rows[0].reason
+        assert "no strand is asserted" in cmp.rows[0].reason
+        assert "rows stranded" not in cmp.rows[0].reason
     # A lift under the bar is a definite NO-GO too, which the INCONCLUSIVE label must not pre-empt.
     flat = [
         replace(r, no_loss=replace(r.no_loss, inconclusive=True))
