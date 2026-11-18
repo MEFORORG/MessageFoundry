@@ -80,7 +80,9 @@ class MultipartError(ValueError):
 
 
 class MultipartTooLargeError(MultipartError):
-    """A file part exceeds the caller's byte cap, or a non-file part exceeds ``_MAX_FIELD_BYTES``."""
+    """A file part exceeds the caller's byte cap, or a non-file part with a header block exceeds
+    ``_MAX_FIELD_BYTES`` (HTTP 413). A part with no header block over that cap raises the base
+    :class:`MultipartError` instead (HTTP 400)."""
 
 
 @dataclass(frozen=True)
@@ -166,9 +168,7 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     alive at once. Here the only copy of a part's content is the one the caller takes of a value it
     keeps. Two passes: the first counts parts, bounds each header block and bounds each part with no
     header block, all before any header is parsed; the second parses each header, which says
-    whether the part is a file, and applies the file and field caps to the part's length. A body
-    over more than one cap is refused by whichever check the walk reaches first, so its message
-    and status can differ from the parser this replaced.
+    whether the part is a file, and applies the file and field caps to the part's length.
 
     Raises what :func:`parse_multipart_form` documents."""
     boundary = parse_boundary(content_type)
@@ -254,8 +254,10 @@ def parse_multipart_form(
     """Parse a ``multipart/form-data`` body into file parts + text fields.
 
     Raises :class:`MultipartError` if the Content-Type is not multipart, the body is malformed, or it
-    holds more than ``_MAX_PARTS`` parts, and :class:`MultipartTooLargeError` if a file part exceeds
-    ``max_file_bytes`` or any non-file part exceeds ``_MAX_FIELD_BYTES``. The boundary is trusted not
+    holds more than ``_MAX_PARTS`` parts, or a part with no header block exceeds ``_MAX_FIELD_BYTES``
+    (all HTTP 400 at the route), and :class:`MultipartTooLargeError` if a file part exceeds
+    ``max_file_bytes`` or a non-file part with a header block exceeds ``_MAX_FIELD_BYTES`` (HTTP 413
+    at the route). The boundary is trusted not
     to appear inside a part body (the RFC-2046 invariant every multipart parser relies on).
 
     The function is synchronous and walks the whole body. The upload route keeps one file and no
@@ -299,9 +301,9 @@ async def parse_upload_off_loop(
     raises.
 
     **What leaves the loop, and what does not.** This is the one statement of that limit; the
-    comments that rely on it point here. The per-part Python work runs on the worker thread. Each
-    ``find`` over the body, each regex scan of a header block, and the copy of the file part is still
-    one C call that holds the GIL while it runs, so the event loop can still lose the time of the
+    comments that rely on it point here. The per-part Python work runs on the worker thread. At least
+    each ``find`` over the body, each regex scan of a header block, and the copy of the file part is
+    still one C call that holds the GIL while it runs, so the event loop can still lose the time of the
     longest such call.
 
     When a request is cancelled (the request deadline) while its parse is still queued, the work
