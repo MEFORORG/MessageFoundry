@@ -359,8 +359,9 @@ a `nosec` note naming the rule it answers.
 `checks.py` runs `ruff` by its absolute path, from the first of three scripts folders that holds
 it: the running interpreter's environment, its base installation, then the user scheme's
 (`~/.local/bin` on Linux, where a pipx or `uv tool` ruff may live). It runs `mypy` as a `-m`
-module of that interpreter, by its absolute path and with `-P`. So neither a `PATH` search nor the
-working directory picks the copy (BACKLOG #5375). `mypy` is also started with `--config-file=`,
+module of that interpreter, by its absolute path and with `-P`. So no `PATH` search picks the
+copy, and the working directory is kept out only as far as the `_tool_installed` docstring in
+`checks.py` says (BACKLOG #5375). `mypy` is also started with `--config-file=`,
 an empty name, so it reads no configuration file at all. Without it, mypy reads a `mypy.ini`,
 `.mypy.ini`, `pyproject.toml` or `setup.cfg` from the working directory or a parent folder, or the
 user's own file, and such a file can name a plugin that mypy imports and runs. At least two

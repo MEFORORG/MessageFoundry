@@ -4254,8 +4254,8 @@ def _tool_installed(module: str) -> bool:
 
     The working-directory skip has at least these limits. An entry that reaches the working
     directory under another name, such as a junction or a symbolic link, is not skipped, and nor
-    is an entry inside it, such as a virtual environment's ``site-packages`` there; the child keeps
-    both and runs what they hold. Unless this interpreter runs with ``-E`` or ``-I``, which the
+    is an entry inside it, such as a virtual environment's ``site-packages`` there; the child can
+    keep both and run what they hold. Unless this interpreter runs with ``-E`` or ``-I``, which the
     child repeats, the child keeps every absolute ``PYTHONPATH`` entry, one naming the working
     directory included, which this search skips: every module the child imports, the tool's own
     dependencies included, can then come from the working directory ahead of a copy this search
@@ -4348,8 +4348,8 @@ _MODULE_NOT_FOUND = (
 
 def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
     """Advisory: run lint tool ``module`` with ``args``, only where :func:`_tool_command` finds it;
-    a tool it does not find is skipped and never blocks. ``mypy`` must be importable by this
-    interpreter. ``ruff`` is looked for in three scripts folders (:func:`_ruff_binary`): this
+    a tool it does not find is skipped and never blocks. ``mypy`` must be found by
+    :func:`_tool_installed`'s search. ``ruff`` is looked for in three scripts folders (:func:`_ruff_binary`): this
     interpreter's environment, its base installation, and the user scheme's, which belongs to the
     user rather than to this interpreter (on Linux ``~/.local/bin``, shared by every Python and by
     a pipx or ``uv tool`` install). A copy found only through ``PATH`` is not run.

@@ -758,8 +758,9 @@ def static_credential_hops(
     ``env_values``, when the caller has the running instance's, resolves at least a database
     hop's ``env()`` dialect as the build does (see ``static_credential_db_hops``), and an
     HTTP-family hop's ``env()`` ``headers`` table or ``url`` (see ``_http_literal_static``), and
-    whether a DICOMweb connection's build is refused, which leaves it and its proxy hop out (see
-    ``_dicomweb_build_refused``). Without them an ``env()`` DICOMweb credential is unresolved, and
+    whether a DICOMweb connection's credential settings are refused at build, which leaves it and
+    its proxy hop out (see ``_dicomweb_build_refused``); a DICOMweb connection whose build is
+    refused on another ground, such as a query in its ``url``, is still listed. Without them an ``env()`` DICOMweb credential is unresolved, and
     the hop is not left out on that ground."""
     out: list[StaticCredentialHop] = []
     if registry is not None:
