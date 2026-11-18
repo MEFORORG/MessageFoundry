@@ -872,8 +872,9 @@ class TransitCipher(_UnmarkedPolicy):
         names, raises :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`);
         Transit refusing the version is one cause, not the only one. It raises the subclass
         :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` gives a
-        reason, for example for a proxy's page, or when that read raises one of
-        :data:`_READ_FAULTS`, except as :data:`_READ_FAULTS` says (BACKLOG #6707). Anything else that read raises propagates.
+        reason, for example for a proxy's page, or when it raises one of :data:`_READ_FAULTS`,
+        both except as :data:`_READ_FAULTS` says (BACKLOG #6707). Anything else it raises
+        propagates.
 
         A 400 on which hvac raises something other than ``InvalidRequest`` raises neither of
         those, and is read as the next paragraph says (BACKLOG #6707). hvac 2.4.0 raises
