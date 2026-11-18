@@ -754,7 +754,14 @@ def _server_pin_warning(data: bytes, spec: AnchorSpec) -> PinReason | None:
     if isinstance(cert, PinReason):
         return PinReason(f"{spec.setting} {spec.path!r} {cert}.", cert.scope)
     moment = _clock()
-    not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
+    try:
+        not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
+    except ValueError as exc:  # a date the parser read but Python cannot hold: content, not I/O
+        return PinReason(
+            f"{spec.setting} {spec.path!r} is not a usable SQL Server pin: its validity period "
+            f"could not be read ({type(exc).__name__}).",
+            "unreadable_validity",
+        )
     if moment > not_after.timestamp():
         return PinReason(
             f"{spec.setting} {spec.path!r}: the pinned certificate expired at "
@@ -1629,12 +1636,12 @@ def _enforce_verdict(
 
 
 def _is_clean(verdict: AnchorVerdict) -> bool:
-    """Whether ``verdict``'s ACL and path are both plainly fine. A verdict that passes logs a
-    warning from :func:`_enforce_verdict`, and gets a violation row from :func:`_audit_verdict`,
-    exactly when this is False: an ``acl_insecure``, ``acl_indeterminate``, ``path_insecure`` or
-    ``path_indeterminate`` row today. The lane check remembers only a clean pass (vault BACKLOG
-    #3188), so a change to which pass gets a row must change this too, or the lane check's
-    repeats would skip that row."""
+    """Whether ``verdict``'s ACL and path are both plainly fine. A verdict that passes logs an
+    ACL or path warning from :func:`_enforce_verdict`, and gets an ``acl_insecure``,
+    ``acl_indeterminate``, ``path_insecure`` or ``path_indeterminate`` row from
+    :func:`_audit_verdict`, exactly when this is False. The lane check remembers only a clean pass
+    (vault BACKLOG #3188), so a change to which pass gets one of those rows must change this too,
+    or the lane check's repeats would skip that row."""
     return verdict.acl_ok is True and verdict.path_ok is True
 
 

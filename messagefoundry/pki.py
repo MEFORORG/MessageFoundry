@@ -1369,20 +1369,22 @@ class PinRefused(ValueError):
     """Why a SQL Server pin file can never match the server's certificate. Its text is the engine's
     own and names no part of the file, unlike a ``ValueError`` from ``cryptography``'s parser.
     ``scope`` is a fixed word naming the check that refused, for an audit row that carries no
-    path or text (vault BACKLOG #3714)."""
+    path or text (vault BACKLOG #3714). It has a default so a copy or an unpickle, which calls
+    the class with the text alone and then restores ``scope``, works as before."""
 
-    def __init__(self, text: str, *, scope: str) -> None:
+    def __init__(self, text: str, *, scope: str = "pin_refused") -> None:
         super().__init__(text)
         self.scope = scope
 
 
 class PinReason(str):
     """A reason :func:`pinned_server_certificate` returns, with ``scope``, the fixed word naming
-    the check that refused (vault BACKLOG #3714)."""
+    the check that refused (vault BACKLOG #3714). ``scope`` has a default for the same reason as
+    :class:`PinRefused`'s."""
 
     scope: str
 
-    def __new__(cls, text: str, scope: str) -> PinReason:
+    def __new__(cls, text: str, scope: str = "pin_refused") -> PinReason:
         reason = super().__new__(cls, text)
         reason.scope = scope
         return reason

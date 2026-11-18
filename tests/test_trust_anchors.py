@@ -3798,6 +3798,46 @@ def test_a_bounded_read_asks_for_no_more_than_the_file_and_one_byte(
     assert ta.read_if_regular(str(small)) == b"x" * 10  # and no limit reads it all
 
 
+def test_a_pin_reason_and_refusal_copy_and_pickle_with_their_scope() -> None:
+    """Review round-82c31950f8 finding 7: :class:`~messagefoundry.pki.PinReason` and
+    :class:`~messagefoundry.pki.PinRefused` copy and pickle, as main's ``PinRefused`` did, and keep
+    their ``scope``. Red on 591cea6d04, where a required ``scope`` made both raise TypeError."""
+    import copy
+    import pickle
+
+    from messagefoundry.pki import PinReason, PinRefused
+
+    reason = PinReason("is too large", "oversize")
+    refusal = PinRefused("holds 2 certificates", scope="certificate_count")
+    for clone in (copy.copy(reason), pickle.loads(pickle.dumps(reason))):
+        assert clone == "is too large" and clone.scope == "oversize"
+    for twin in (copy.copy(refusal), pickle.loads(pickle.dumps(refusal))):
+        assert str(twin) == "holds 2 certificates" and twin.scope == "certificate_count"
+
+
+def test_a_pin_validity_date_python_cannot_hold_warns_as_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round-82c31950f8 finding 6: a ``ValueError`` reading the pin's validity dates is a
+    content warning with its own scope, not an unreadable file. Red on 591cea6d04, where it
+    escaped to the preflight's unreadable-anchor refusal."""
+    from messagefoundry import pki
+
+    class _BadDates:
+        @property
+        def not_valid_before_utc(self) -> Any:
+            raise ValueError("year 0 is out of range")
+
+        not_valid_after_utc = not_valid_before_utc
+
+    monkeypatch.setattr(pki, "pinned_server_certificate", lambda _d, **_k: _BadDates())
+    pin = _sqlserver_pin(tmp_path)
+    (spec,) = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    warning = ta._server_pin_warning(pin.read_bytes(), spec)
+    assert warning is not None and warning.scope == "unreadable_validity"
+    assert "validity period could not be read" in warning
+
+
 def test_a_bounded_read_reads_past_an_understated_size_up_to_the_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
