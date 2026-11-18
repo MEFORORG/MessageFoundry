@@ -254,13 +254,16 @@ class RetentionPass:
     documents_messages_stripped: int = 0
     documents_stripped: int = 0
     documents_bytes_reclaimed: int = 0
-    # BACKLOG #5651: the strip phase ended before its last batch, for one of two causes; the counts
-    # above are what it had committed, and the strip logs the early end at WARNING either way.
+    # BACKLOG #5651: the strip phase ended before its last batch, on a key-service outage, a failed
+    # batch read, or batch writes failing in a row; the counts above are what it had committed, and
+    # the strip logs the early end at WARNING either way.
     # A key-service outage is recorded in the audit row when the pass writes one, but is not itself
     # work: an outage pass must not send an audit row through the failing key service. A failed
     # batch read is a database fault, so it is work (`documents_strip_read_failed`), and the pass
-    # writes an audit row recording it. So is a batch write that failed and rolled back
-    # (`documents_strip_write_failed`), whether or not enough of them in a row ended the phase.
+    # writes an audit row recording it. A batch write that failed and rolled back
+    # (`documents_strip_write_failed`) is recorded in the audit row when the pass writes one, but is
+    # not itself work: a full disk or a read-only store, the faults that fail every write, would fail
+    # that row too.
     documents_strip_ended_early: bool = False
     documents_strip_read_failed: bool = False
     documents_strip_write_failed: bool = False
@@ -333,7 +336,6 @@ class RetentionPass:
             or self.conn_events_purged > 0
             or self.documents_messages_stripped > 0
             or self.documents_strip_read_failed
-            or self.documents_strip_write_failed
             or self.alert_instances_purged > 0
             or self.app_logs_deleted > 0
             or self.app_logs_compressed > 0

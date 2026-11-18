@@ -407,7 +407,8 @@ async def _run_sql_on_server(store: Any, sql: str, params: tuple[Any, ...]) -> N
             await cur.execute(sql, params)
             await conn.commit()
         except BaseException:
-            await conn.rollback()
+            with contextlib.suppress(Exception):  # the writer's own error is the one to report
+                await conn.rollback()
             raise
         finally:
             await cur.close()
@@ -575,7 +576,7 @@ async def test_a_write_that_fails_rolls_back_its_batch_and_the_scan_goes_on(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5651: a batch whose write fails is rolled back whole and counts nothing; the
-    keyset moves past it and the next batch is stripped. The WARNING names the error's type, and
+    keyset moves past it and the next batch is stripped. The ERROR names the error's type, and
     the traceback goes to DEBUG."""
     if not isinstance(store, MessageStore) or type(store) is not MessageStore:
         pytest.skip("drives the SQLite write path")
@@ -606,6 +607,7 @@ async def test_a_write_that_fails_rolls_back_its_batch_and_the_scan_goes_on(
     assert binary.is_document_tombstone((await _get(store, second))["raw"])
     warned = [r for r in caplog.records if "passed over a batch" in r.getMessage()]
     assert len(warned) == 1 and "RuntimeError" in warned[0].getMessage()
+    assert warned[0].levelno == logging.ERROR
     assert any(r.levelno == logging.DEBUG and r.exc_info for r in caplog.records)
 
 
@@ -637,9 +639,9 @@ async def test_one_row_that_fails_to_strip_is_skipped(
 async def test_a_batch_with_any_verdict_does_not_end_the_call(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5651: the call ends early only when the first ``OUTAGE_MIN_ROWS`` rows of a batch to
-    reach the key service all got no verdict. A batch where one of them got one (here refused cells)
-    is not an outage: its no-verdict rows are skipped, and the scan goes on."""
+    """BACKLOG #5651: the call ends early only when every row of a batch got no verdict. A batch
+    where some rows got one (here refused cells) is not an outage: its no-verdict rows are skipped,
+    and the scan goes on."""
     ids = [
         await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=float(i), control=f"C-RS{i}")
         for i in range(5)
@@ -962,11 +964,12 @@ async def test_batch_writes_failing_in_a_row_end_the_call_flagged_write_failed(
     assert not any("SECRET-TEXT" in r.getMessage() for r in caplog.records)
 
 
-async def test_one_failed_batch_write_is_flagged_and_counts_as_audited_work(
+async def test_one_failed_batch_write_is_flagged_but_is_not_audited_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #5651: a single failed write is passed over, and the scan goes on, but the call
-    still says a write failed, and a retention pass treats that as work for its audit row."""
+    still says a write failed. A retention pass records the flag in an audit row it writes, but does
+    not write one for it alone: a read-only store would refuse that row too."""
     from messagefoundry.pipeline.retention import RetentionPass
 
     monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
@@ -992,35 +995,28 @@ async def test_one_failed_batch_write_is_flagged_and_counts_as_audited_work(
         "size_bytes": None,
         "over_limit": False,
     }
-    assert RetentionPass(**quiet, documents_strip_write_failed=True).did_work
+    assert not RetentionPass(**quiet, documents_strip_write_failed=True).did_work
 
 
-def test_an_outage_is_judged_without_asking_about_every_row_of_the_batch(
+async def test_a_batch_with_nothing_to_write_does_not_reset_the_failed_write_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #5651: once the first ``OUTAGE_MIN_ROWS`` rows to reach the key service got no
-    verdict, the batch asks about no more rows, rather than waiting on an unreachable service once
-    per row of a full batch."""
-    calls: list[str] = []
+    """BACKLOG #5651: batches holding no embedded document, between batches whose writes fail,
+    try no write, so they do not keep a store that fails every write from ending the call."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    rows = _plain_rows(10)
+    for row in rows[1::2]:
+        row["raw"] = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|X|P|2.5.1\r"
+    writes: list[int] = []
 
-    def unavailable(*_args: Any, message_id: str, **_kwargs: Any) -> str:
-        calls.append(message_id)
-        raise CipherUnavailableError("synthetic: the key service is unreachable")
+    async def read_only(updates: Any) -> list[Any]:
+        writes.append(len(updates))
+        raise sqlite3.OperationalError("attempt to write a readonly database")
 
-    monkeypatch.setattr(document_strip, "open_message_cell", unavailable)
+    result = await _run_pass(_keyset_fetch(rows), read_only, _no_report)
 
-    batch = document_strip.transform_strip_batch(
-        IdentityCipher(),
-        _plain_rows(10),
-        now=PRUNED_AT,
-        older_than=float("-inf"),
-        connection_cutoffs={"IB": 4 * DAY},
-        min_bytes=0,
-        content_types={},
-    )
-
-    assert batch.outage
-    assert len(calls) == document_strip.OUTAGE_MIN_ROWS
+    assert len(writes) == document_strip.WRITE_FAILURE_MAX_BATCHES
+    assert result == StripResult(ended_early=True, write_failed=True)
 
 
 async def test_refused_cells_of_a_batch_whose_transform_raises_are_still_audited(
