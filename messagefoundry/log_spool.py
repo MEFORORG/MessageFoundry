@@ -442,8 +442,8 @@ class LogSpool:
         now. Idempotent until :meth:`advance`.
 
         A read error never escapes: ``QueueListener`` catches only ``queue.Empty``, so an exception
-        here would end the listener thread for good. Only a segment that is GONE is retired, and the
-        read then moves on to the next segment: answering ``None`` there would read as drained, and
+        here would end the listener thread for good. Only a segment whose own file is confirmed
+        GONE is retired, and the read then moves on to the next segment: answering ``None`` there would read as drained, and
         the forwarder could send live records ahead of the older ones still spooled (BACKLOG #5811).
         A spool DIRECTORY that is missing, or that the read error names as out of reach
         (:func:`_directory_unreachable`), is not a gone segment: like any other
@@ -467,10 +467,18 @@ class LogSpool:
                     self._close_reader()
                     self._close_writer()
                     return None
-                self.unreadable += 1
-                # Only opening a segment's file raises this, so there is a first segment. Each
-                # pass retires one, so the loop ends with the segments.
+                # Only opening a segment's file raises this, so there is a first segment.
                 seq = self._segments[0]
+                if not self._segment_confirmed_missing(seq):
+                    # The open said ENOENT but the file is there, or cannot be checked: a
+                    # transient fault (an SMB share reconnecting), never a reason to retire and
+                    # unlink records still undelivered.
+                    self.read_errors += 1
+                    self.read_faulted = True
+                    self._close_reader()
+                    return None
+                self.unreadable += 1
+                # Each pass retires one, so the loop ends with the segments.
                 if seq == self._write_seq:
                     self._close_writer()
                 self._retire(seq)
@@ -483,6 +491,18 @@ class LogSpool:
                     # closed for the same reason.
                     self._close_writer()
                 return None
+
+    def _segment_confirmed_missing(self, seq: int) -> bool:
+        """Whether segment ``seq``'s own file is confirmed gone: its ``lstat`` raises
+        ``FileNotFoundError``. Any other answer, including another ``OSError``, is not a
+        confirmation."""
+        try:
+            self._path(seq).lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return False
 
     def _close_reader(self) -> None:
         if self._reader is not None:

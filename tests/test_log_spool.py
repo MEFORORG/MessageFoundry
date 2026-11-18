@@ -860,6 +860,37 @@ def test_a_read_error_that_means_the_directory_is_out_of_reach_closes_the_writer
         spool.close()
 
 
+def test_a_transient_file_not_found_on_a_segment_still_there_retires_nothing(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An open that says ENOENT for a segment whose file is still there (an SMB share
+    reconnecting) is a read fault: nothing is retired or unlinked, and the spool replays whole
+    once the open works again. NEGATIVE CONTROL: on 254672242d the directory still existed, so
+    every head segment was retired and unlinked in one peek."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        assert len(segments) >= 2
+        used = spool.bytes_used
+        real_open = spool._open_reader
+
+        def transient(seq: int) -> None:
+            raise FileNotFoundError(errno.ENOENT, "network path not found")
+
+        monkeypatch.setattr(spool, "_open_reader", transient)
+        assert spool.peek() is None
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        assert _segments(spool_dir) == segments
+        monkeypatch.setattr(spool, "_open_reader", real_open)
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.close()
+
+
 def test_two_segments_gone_in_a_row_are_both_passed_over(spool_dir: Path) -> None:
     """One peek walks past every missing segment at the head, however many, to the oldest one left."""
     spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
