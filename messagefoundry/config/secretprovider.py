@@ -80,17 +80,19 @@ class EnvSecretProvider:
 
     A degenerate-but-useful built-in: it keeps the env as the source of truth while still routing through
     the provider seam (so a deployment can standardize on ``[secrets].provider = env`` and per-credential
-    ``*_secret`` references without an external backend). Fail-closed: an unset/blank env var raises rather
-    than yielding a blank credential."""
+    ``*_secret`` references without an external backend). Fail-closed: an unset, empty or
+    whitespace-only env var raises rather than yielding a blank credential (BACKLOG #5326)."""
 
     def resolve(self, ref: str) -> str:
         value = os.environ.get(ref)
-        if not value:
-            # Name the env var (not a value) so the operator can fix it; a blank/unset secret is a
-            # misconfiguration, never a silent anonymous credential.
+        if value is None or not value.strip():
+            # The refusal does not repeat the reference (BACKLOG #5326): an operator may have pasted
+            # the secret itself where its variable name belongs, and the text reaches the log.
             raise SecretProviderError(
-                f"[secrets].provider='env': secret reference {ref!r} names an environment variable that "
-                f"is unset or empty — set it, or correct the reference."
+                "[secrets].provider='env': the secret reference names an environment variable that "
+                "is unset, empty or whitespace-only. Set it, or correct the reference: a *_secret or "
+                "*_ref setting read through this provider. The reference is not repeated here, in "
+                "case a secret was placed in it by mistake."
             )
         return value
 
