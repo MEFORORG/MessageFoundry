@@ -400,11 +400,28 @@ class Ledger:
     # This mattered more than it looks: the three-dot failure was SILENT. git() used to swallow a nonzero
     # exit and return "", so added_files() was [] and the gate reported PASS on every run where it could
     # not see. A false clean, on the one check whose whole purpose is never to emit one.
+    #
+    # --no-renames IS REQUIRED WITH --diff-filter=A (BACKLOG #5453). git detects renames by default,
+    # and copies under `diff.renames=copies`, so a `git mv` onto an ADR path reports as R (a copy as
+    # C), the A filter dropped it, and the file skipped every rule below. With detection off, the
+    # destination of a rename or copy is the plain add it is.
     def added_files(self) -> list[str]:
         """Files ADDED by this change. In CI, HEAD is the PR merged into base, so this is the PR's set."""
         if self.ci:
-            return _paths(git("diff", "-z", "--name-only", "--diff-filter=A", self.base, "HEAD"))
-        return _paths(git("diff", "-z", "--cached", "--name-only", "--diff-filter=A"))
+            return _paths(
+                git(
+                    "diff",
+                    "-z",
+                    "--name-only",
+                    "--no-renames",
+                    "--diff-filter=A",
+                    self.base,
+                    "HEAD",
+                )
+            )
+        return _paths(
+            git("diff", "-z", "--cached", "--name-only", "--no-renames", "--diff-filter=A")
+        )
 
     def head_text(self, path: str) -> str:
         """The file as it will exist after this commit — the INDEX, not the working tree."""
