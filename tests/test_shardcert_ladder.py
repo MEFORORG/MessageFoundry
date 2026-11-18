@@ -78,6 +78,11 @@ def _step(
         sent=offered if sent is None else sent,
         deferred_backpressure=deferred_backpressure,
         deferred_schedule=deferred_schedule,
+        # BACKLOG #5441: the rest of the pass bar the ladder verdict reads; a healthy step saw several lanes
+        # and dead-lettered nothing.
+        lanes_observed=8,
+        engine_dead=0,
+        dead_total=0,
     )
 
 
@@ -1191,9 +1196,8 @@ def test_colocated_ladder_report_rolls_up_the_void_rates(monkeypatch: pytest.Mon
 
     assert report.fidelity_void_rates == [80.0, 120.0]  # the shortfall AND the intake bind
     js = report.to_json_dict()
-    assert (
-        js["schema_version"] == 3
-    )  # v2: +sent +fidelity per record; v3 (#5575/#5576): copies, abort
+    # v2: +sent +fidelity per record; v3 (#5575/#5576): copies, abort; v4 (#5441): full pass bar
+    assert js["schema_version"] == 4
     fid = js["fidelity"]
     assert isinstance(fid, dict)
     assert fid["all_admissible"] is False
