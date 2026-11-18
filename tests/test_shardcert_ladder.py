@@ -382,6 +382,7 @@ def _report(**over: object) -> ShardCertReport:
         "achieved_intake": 1000,
         "delivering": 1,
         "acked_copies_missing": 0,
+        "dead_total": 0,
     }
     base.update(over)
     return ShardCertReport(**base)  # type: ignore[arg-type]
@@ -1215,7 +1216,8 @@ def test_colocated_report_records_the_pool_and_the_inbound_bands() -> None:
     )
     assert rep.inbound_bands == 4  # G = 4 shards x 1 lane
     js = rep.to_json_dict()
-    assert js["schema_version"] == 5  # v4: +store_pool, +topology G; v5 (#5575): +gated copy check
+    # v4: +store_pool, +topology G; v5 (#5575): +gated copy check; v6 (#5440): +gated dead_total
+    assert js["schema_version"] == 6
 
     topo = js["topology"]
     assert isinstance(topo, dict)

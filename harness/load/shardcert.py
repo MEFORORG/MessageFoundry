@@ -1012,6 +1012,11 @@ class ShardCertReport:
     #: :attr:`copies_ok`: ``acked_not_delivered`` counts DISTINCT messages, so one copy of each clears it
     #: and a fan-out run that lost most of its copies would otherwise certify PASS.
     acked_copies_missing: int = -1
+    #: Dead-lettered rows at EVERY stage, from the store (BACKLOG #5440). Must be 0. ``engine_dead`` is the
+    #: OUTBOUND-scoped ``/stats`` count, so a handler whose transform dead-lettered at the routed stage left
+    #: it at 0, and a filtering handler's lost work never shows in the sink copy check either. ``-1`` = NOT
+    #: MEASURED, which FAILS :attr:`ok`, as :attr:`acked_copies_missing` does.
+    dead_total: int = -1
 
     @property
     def inbound_bands(self) -> int:
@@ -1034,14 +1039,15 @@ class ShardCertReport:
     @property
     def ok(self) -> bool:
         """Pass bar: :attr:`lossless` (every ACKed message delivered to each of its expected
-        destinations, drained pipeline), per-lane FIFO (non-vacuous), no dead-letters, no stranded
-        non-terminal rows. Duplicates are allowed only across a kill."""
+        destinations, drained pipeline), per-lane FIFO (non-vacuous), no dead-letters at any stage, no
+        stranded non-terminal rows. Duplicates are allowed only across a kill."""
         dup_ok = self.lane_repeats == 0 if self.killed_shard is None else True
         return (
             self.acked > 0
             and self.lossless
             and self.in_pipeline_final == 0
             and self.engine_dead == 0
+            and self.dead_total == 0
             and self.lane_inversions == 0
             and self.lanes_observed >= 2
             and self.stranded_nonterminal == 0
@@ -1062,7 +1068,8 @@ class ShardCertReport:
             f"  engine done={self.engine_done} dead={self.engine_dead} "
             f"in_pipeline_final={self.in_pipeline_final} drained={self.drained} "
             f"drain_s={self.drain_seconds}",
-            f"  stranded_nonterminal_rows={self.stranded_nonterminal}",
+            f"  stranded_nonterminal_rows={self.stranded_nonterminal} "
+            f"dead_total(all stages)={self.dead_total}",
             "  ownership: "
             + " ".join(f"{s}->[{','.join(self.owned[s]) or '-'}]" for s in self.shards),
             f"  {self.queue_breakdown}",
@@ -1098,7 +1105,11 @@ class ShardCertReport:
             # v5 (BACKLOG #5575) — the PASS bar CHANGED: `correctness.acked_copies_missing` is new and gated.
             # A v4 PASS checked only that each ACKed message reached SOME sink, so a fan-out run that lost
             # most of its copies could PASS; a v5 PASS also requires every expected copy to have arrived.
-            "schema_version": 5,
+            #
+            # v6 (BACKLOG #5440) — the PASS bar CHANGED: `correctness.dead_total` is new and gated. A v5 PASS
+            # checked only the outbound-scoped `engine_dead`, so work dead-lettered at the routed stage could
+            # PASS; a v6 PASS also requires no dead row at any stage.
+            "schema_version": 6,
             "kind": "shardcert",
             "verdict": "PASS" if self.ok else "FAIL",
             "shards": list(self.shards),
@@ -1138,6 +1149,7 @@ class ShardCertReport:
                 "lane_repeats": self.lane_repeats,
                 "stranded_nonterminal": self.stranded_nonterminal,
                 "engine_dead": self.engine_dead,
+                "dead_total": self.dead_total,
             },
             "throughput": {
                 "in_pipeline_peak": self.in_pipeline_peak,
@@ -1846,12 +1858,12 @@ async def run_shardcert(
         drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
         final = poller.final
 
-        # Store-truth: stranded non-terminal rows + stage/status breakdown. (Single-box gates no-loss
-        # on the SINK truth -- `acked_copies_missing==0` and `acked_not_delivered==0` -- so the all-stage
-        # dead total is surfaced in the
-        # breakdown but not separately gated here — see ShardCertEngineReport for the two-box rationale.)
+        # Store-truth: stranded non-terminal rows, the all-stage dead total, and the stage/status breakdown.
+        # BACKLOG #5440: the dead total is GATED (ShardCertReport.ok), as ShardCertEngineReport.ok gates it.
+        # The sink checks cannot see a dead routed row whose handler delivers nothing, and `engine_dead` is
+        # outbound-scoped, so without it routed-stage dead letters certified PASS.
         _qb = await _queue_breakdown(node_env)
-        stranded, breakdown = _qb.nonterminal, _qb.summary
+        stranded, dead_total, breakdown = _qb.nonterminal, _qb.dead_total, _qb.summary
 
     finally:
         if peak_task is not None and not peak_task.done():
@@ -1915,6 +1927,7 @@ async def run_shardcert(
         drained=drain_s is not None,
         drain_seconds=drain_s,
         stranded_nonterminal=stranded,
+        dead_total=dead_total,
         queue_breakdown=breakdown,
         offered=round(aggregate_rate * hold_seconds),
         achieved_intake=ctr.acked,
