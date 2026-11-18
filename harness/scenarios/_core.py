@@ -25,6 +25,7 @@ from typing import ClassVar
 from uuid import uuid4
 
 from harness import drivers, sinks
+from harness.bounded_file import NOT_REGULAR
 from harness.endpoints import Endpoints
 from harness.sinks import file as file_sink
 from messagefoundry.apiclient import ApiError, EngineClient
@@ -294,18 +295,24 @@ def _verify_sink(
 
 
 def sink_faults(records: Iterable[sinks.Record]) -> str:
-    """A failure note naming the records a sink took as a link (``meta["symlink"]``) and the file
-    sink's scan-wide refusals (a replaced directory, a bounded scan), or "" when there are none.
-    A link is recorded unread, so it carries no control id, and a scan that did not cover the
-    directory may have missed one: either would otherwise be invisible to a check that counts
-    control ids."""
+    """A failure note naming the records a sink took as a link (``meta["symlink"]``), the other
+    entries the file sink recorded unread (a FIFO or device, a refused name), and its scan-wide
+    refusals (a replaced directory, a bounded scan), or "" when there are none. Each is recorded
+    unread, so it carries no control id, and a scan that did not cover the directory may have
+    missed a link: any of them would otherwise be invisible to a check that counts control ids."""
     links: list[str] = []
+    unread: list[str] = []
     incomplete: list[str] = []
     for r in records:
+        refused = r.meta.get("refused")
         if r.meta.get("symlink") == "true":
             links.append(r.meta.get("relpath", r.meta.get("name", "?")))
-        elif r.meta.get("refused") in (file_sink.ROOT_CHANGED, file_sink.WALK_BOUND):
-            incomplete.append(r.meta["refused"])
+        elif refused in (NOT_REGULAR, file_sink.UNSAFE_NAME):
+            unread.append(r.meta.get("relpath", r.meta.get("name", "?")))
+        elif refused in (file_sink.ROOT_CHANGED, file_sink.WALK_BOUND):
+            incomplete.append(refused)
     notes = [f"a link appeared in the sink ({', '.join(links)})"] if links else []
+    if unread:
+        notes.append(f"a non-file entry appeared in the sink ({', '.join(map(repr, unread))})")
     notes += [f"the file sink's scan was incomplete: {reason}" for reason in incomplete]
     return "; ".join(notes)

@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 import harness.sinks.file as file_sink
+from harness.bounded_file import NOT_REGULAR
 from harness.scenarios import SCENARIOS
 from harness.scenarios._core import Scenario, _verify_sink
 from harness.scenarios.internal import TimerScenario
@@ -151,10 +152,11 @@ def test_a_file_swapped_for_a_link_between_lstat_and_open_is_not_read(
         sink.records()
         records = sink.records()
     assert fired, "the hook never fired: the swap was not staged"
-    assert records and all(r.payload != _SECRET for r in records)
-    assert all(r.payload == _BODY or _is_unread_link(r) for r in records)
-    if not restore:
-        assert [r.meta["relpath"] for r in records if _is_unread_link(r)] == ["a.hl7"]
+    if restore:
+        # Nothing recorded for the swap itself; the real file is read once it is back.
+        assert [r.payload for r in records] == [_BODY]
+    else:
+        assert [(r.meta["relpath"], _is_unread_link(r)) for r in records] == [("a.hl7", True)]
 
 
 @pytest.mark.parametrize("restore", [True, False], ids=["swapped-back", "left-swapped"])
@@ -213,11 +215,23 @@ def test_a_root_swapped_for_a_link_after_start_is_reported_and_not_scanned(
     assert [(r.payload, r.meta["refused"]) for r in records] == [(b"", ROOT_CHANGED)]
 
 
-def test_a_scan_stops_at_its_entry_bound_and_reports_it_once(tmp_path: Path) -> None:
+def test_the_directory_s_own_listing_is_not_bounded(tmp_path: Path) -> None:
+    """An output folder the engine keeps filling must not fail for its size: only names listed in
+    sub-folders, where an escaped walk would go, count against the bound."""
     with FileSink(tmp_path) as sink:
         sink.max_entries = 3
         for i in range(6):
             (tmp_path / f"m{i}.hl7").write_bytes(_BODY)
+        records = sink.records()
+    assert len(records) == 6 and all("refused" not in r.meta for r in records)
+
+
+def test_a_scan_stops_at_its_entry_bound_and_reports_it_once(tmp_path: Path) -> None:
+    with FileSink(tmp_path) as sink:
+        sink.max_entries = 3
+        (tmp_path / "sub").mkdir()
+        for i in range(6):
+            (tmp_path / "sub" / f"m{i}.hl7").write_bytes(_BODY)
         records = sink.records()
         assert [r for r in sink.records() if r.meta.get("refused") == WALK_BOUND] == [
             r for r in records if r.meta.get("refused") == WALK_BOUND
@@ -416,6 +430,39 @@ def test_a_directory_that_cannot_be_listed_is_retried_not_reported_replaced(
         denied[0] = False
         records = sink.records()
     assert [r.payload for r in records] == [_BODY]
+
+
+@pytest.mark.parametrize("by_path", [False, True], ids=["native-walk", "by-path-walk"])
+def test_start_refuses_a_first_scan_that_missed_a_sub_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, by_path: bool
+) -> None:
+    """A sub-folder start could not list would later read as all new deliveries."""
+    if by_path:
+        monkeypatch.setattr(file_sink, "_DIR_FD", False)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "old.hl7").write_bytes(_BODY)
+    sub = os.stat(tmp_path / "sub")
+    real_scandir = os.scandir
+
+    def scandir(target: Any = ".") -> Any:
+        listed = os.fstat(target) if isinstance(target, int) else os.stat(target)
+        if os.path.samestat(listed, sub):
+            raise PermissionError(13, "denied")
+        return real_scandir(target)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    with pytest.raises(NotADirectoryError):
+        FileSink(tmp_path).start()
+
+
+def test_verify_sink_fails_on_a_non_file_entry_in_the_sink() -> None:
+    scenario = Scenario("s", "", "ADT", "A01", 1, sink="file", sink_endpoint="file_out")
+    fake = _Fake()
+    fake._add(Record(_BODY))
+    meta = {"relpath": "f.hl7", "inside": "true", "refused": NOT_REGULAR}
+    fake._add(Record(b"", meta))
+    result = _verify_sink(scenario, fake, ["X1"], 0.2, "p")
+    assert not result.ok and "a non-file entry appeared in the sink ('f.hl7')" in result.detail
 
 
 def test_verify_sink_fails_on_an_incomplete_file_scan() -> None:
