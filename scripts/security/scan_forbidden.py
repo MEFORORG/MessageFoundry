@@ -1999,9 +1999,9 @@ def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> st
         # site-code scrub and leak check would match nothing for it (BACKLOG #5366).
         return (
             f"{wide} [site_prefix] entr{'y is' if wide == 1 else 'ies are'} not exactly "
-            f"{_SITE_PREFIX_WIDTH} ASCII digits — the anonymizer cannot load "
-            f"{'it' if wide == 1 else 'them'}, so its site-code scrub and leak check would not "
-            "match what this gate reports as loaded. Correct the entry in the token source"
+            f"{_SITE_PREFIX_WIDTH} ASCII digits, and the anonymizer loads two-digit prefixes only "
+            "(surrogates.py), so its site-code scrub and leak check would not match what this gate "
+            "reports as loaded"
         )
     empty = [s for s in _FLOOR_SECTIONS if not counts[s]]
     if empty:

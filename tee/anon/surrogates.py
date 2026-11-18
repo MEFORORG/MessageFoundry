@@ -139,6 +139,9 @@ def site_prefixes_loaded() -> bool:
 
 #: How the :func:`site_prefix_split` reason starts, so a caller can tell it from a floor failure.
 SITE_PREFIX_SPLIT_LEAD = "the site-code check uses"
+#: What the publish guard's width refusal says (scripts/security/scan_forbidden.py,
+#: ``token_floor_failure``), so a caller can tell it from a source that did not load.
+SITE_PREFIX_WIDTH_MARK = "the anonymizer loads two-digit prefixes only"
 
 
 def site_prefix_split(guard_prefixes: tuple[str, ...]) -> str | None:

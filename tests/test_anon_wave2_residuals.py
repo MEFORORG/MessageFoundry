@@ -5,8 +5,8 @@
 * #5541: the site-code check reads a prefix table of its own, loaded in ``surrogates.py``, while
   the report's liveness reads the publish guard's. After a reload of one alone, a report called
   the denylist live while the site-code check matched other prefixes or none. It now reads not
-  live, naming the split. One source loaded into both reads live, as on origin/main, even with a
-  ``[site_prefix]`` entry that is not two digits.
+  live, naming the split. A source with a ``[site_prefix]`` entry that is not two digits reads
+  not live too (BACKLOG #5366).
 * #5540: under a digit MSH-1 or MSH-2, the site-code pass wrote fabricated digits that could be
   a separator, so a field shifted past its rule. The pass now writes no such digit.
 * #5534: an identifier surrogate lettered a non-ASCII subcomponent separator or escape character,
@@ -120,14 +120,18 @@ def test_a_guard_reload_alone_reads_not_live(
 @_NO_SCANNER
 @_LEAKS
 @pytest.mark.parametrize("prefixes", ["975\n", "97\n975\n"], ids=["three-digit", "two-and-three"])
-def test_one_source_with_a_prefix_that_is_not_two_digits_reads_live(
+def test_one_source_with_a_prefix_that_is_not_two_digits_reads_not_live(
     leak: ModuleType, prefixes: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Both tables loaded from one source read the same, as on origin/main: the guard's entries
-    are read as the site-code table loads them, two digits only."""
+    """The site-code table loads two-digit prefixes only, so the guard refuses a source holding
+    another (BACKLOG #5366), and the advice does not ask to load a source that loaded."""
     with _token_source(monkeypatch, prefixes, guards=True, surrogates=True):
         report = leak.leak_report(f"{_HEAD}\rPV2|1", rules=engine_anon.DEFAULT_RULES)
-        assert leak.denylist_is_live(report), report.token_floor_reason
+        assert not leak.denylist_is_live(report)
+        assert engine_surrogates.SITE_PREFIX_WIDTH_MARK in (report.token_floor_reason or "")
+        advice = leak.refusal_advice(report, denylist_refused=True)
+        assert "two-digit prefixes only" in advice
+        assert "Load the denylist token source" not in advice
 
 
 @_NO_SCANNER
@@ -148,7 +152,18 @@ def test_the_opt_in_refuses_on_a_split_table(
 
 
 @_LEAKS
-def test_the_split_advice_names_no_removal_of_a_site_prefix_entry(leak: ModuleType) -> None:
+@pytest.mark.parametrize(
+    "reason",
+    [
+        f"{engine_surrogates.SITE_PREFIX_SPLIT_LEAD} 1 two-digit prefix(es)",
+        f"1 [site_prefix] entry is not exactly 2 ASCII digits, and "
+        f"{engine_surrogates.SITE_PREFIX_WIDTH_MARK} (surrogates.py)",
+    ],
+    ids=["split", "width"],
+)
+def test_the_split_advice_names_no_removal_of_a_site_prefix_entry(
+    leak: ModuleType, reason: str
+) -> None:
     """The publish guard reads every numeric ``[site_prefix]`` entry, so advice to remove or edit
     one would delete a guard detector (BACKLOG #5541)."""
     report = leak.LeakReport(
@@ -156,10 +171,11 @@ def test_the_split_advice_names_no_removal_of_a_site_prefix_entry(leak: ModuleTy
         unmapped_fields=(),
         structural_hits=[],
         token_tables_live=False,
-        token_floor_reason=f"{engine_surrogates.SITE_PREFIX_SPLIT_LEAD} 1 two-digit prefix(es)",
+        token_floor_reason=reason,
     )
     advice = leak.refusal_advice(report, denylist_refused=True)
-    assert "[site_prefix]" in advice  # the control: this is the split step
+    assert "[site_prefix]" in advice  # the control: this is a site-prefix step
+    assert "Load the denylist token source" not in advice
     for verb in ("remove", "delete", "drop", "edit", "rename", "replace", "change"):
         assert verb not in advice.lower(), verb
 

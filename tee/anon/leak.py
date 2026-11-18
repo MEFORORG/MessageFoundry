@@ -52,6 +52,7 @@ from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind, retarge
 from .surrogates import (
     COMPONENT_KEEPING_KINDS,
     SITE_PREFIX_SPLIT_LEAD,
+    SITE_PREFIX_WIDTH_MARK,
     Seps,
     decoded_readings,
     dropped,
@@ -1410,6 +1411,12 @@ def refusal_advice(
                 "The site-code check's prefixes differ from the publish guard's [site_prefix] "
                 "table. A new run loads both from one token source, which clears a split that a "
                 "reload of one table left; docs/PHI.md section 9 describes the check."
+            )
+        elif SITE_PREFIX_WIDTH_MARK in reason:
+            # The source loaded; the site-code table cannot load one of its entries.
+            steps.append(
+                "The token source holds a [site_prefix] entry that is not two digits, and the "
+                "anonymizer loads two-digit prefixes only."
             )
         else:
             steps.append("Load the denylist token source.")
