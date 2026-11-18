@@ -227,10 +227,11 @@ class MultiShardRecord:
             if e.reads <= 0:
                 out.append(f"{e.node_id}: read nothing on its own lanes")
             if e.failed_lanes:
-                # The engine's own reasons, so a console reader can diagnose without the JSON.
+                # The count only. The reasons come from the audited `/connections` reveal, a PHI
+                # read, so they stay in the JSON artifact and never reach the console or a CI log.
                 out.append(
                     f"{e.node_id}: {len(e.failed_lanes)} inbound lanes not listening "
-                    f"({'; '.join(e.failed_lanes)})"
+                    "(reasons in the JSON failed_lanes)"
                 )
         return tuple(out)
 

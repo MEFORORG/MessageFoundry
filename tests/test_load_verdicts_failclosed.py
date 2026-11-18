@@ -114,7 +114,7 @@ def test_multishard_clean_record_passes() -> None:
         ),
         pytest.param(
             {"per_engine": (_engine(0), _engine(1, failed_lanes=("IB_E1_CS_00000: bind",)))},
-            "ms-e1: 1 inbound lanes not listening (IB_E1_CS_00000: bind)",
+            "ms-e1: 1 inbound lanes not listening",
             id="failed-lanes",
         ),
         pytest.param({"drain_seconds": None}, "the drain timed out", id="drain-timeout"),
@@ -141,6 +141,22 @@ def test_multishard_step_problem_fails_the_report(
     assert isinstance(records, list)
     assert any(needle in p for p in records[0]["problems"])
     assert needle in report.render_console()
+
+
+def test_multishard_revealed_lane_reasons_stay_out_of_the_console() -> None:
+    # The reasons come from the audited `/connections` reveal, a PHI read, so they belong only in
+    # the JSON artifact's `failed_lanes`, never in `problems` or the console and CI log.
+    sentinel = "SENTINEL-REVEALED-REASON-5438"
+    engine = _engine(1, failed_lanes=(f"IB_E1_CS_00000: {sentinel}",))
+    record = _ms_record(per_engine=(_engine(0), engine))
+    report = _ms_report(record)
+    assert not report.result_ok
+    assert any("ms-e1: 1 inbound lanes not listening" in p for p in record.problems)
+    assert not any(sentinel in p for p in record.problems), record.problems
+    assert sentinel not in report.render_console()
+    records = report.to_json_dict()["records"]
+    assert isinstance(records, list)
+    assert records[0]["per_engine"][1]["failed_lanes"] == [f"IB_E1_CS_00000: {sentinel}"]
 
 
 def test_multishard_one_bad_step_fails_a_sweep() -> None:
