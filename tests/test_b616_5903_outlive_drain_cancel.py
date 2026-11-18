@@ -4,27 +4,21 @@
 
 The caller was never cancelled, so it must not get a bare ``CancelledError``: that would reach a
 request as a cancellation nobody asked for, past the API's exception handlers. It gets
-:class:`OperationInterrupted`, which the API answers 503. A caller that WAS cancelled still gets
-its ``CancelledError``."""
+:class:`OperationInterrupted`, a 503. A caller that is cancelling still gets its
+``CancelledError``."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
-import json
-from collections.abc import AsyncIterator, Mapping
-from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
+import httpx
 import pytest
-from starlette.requests import Request
-from starlette.responses import Response
+from fastapi import FastAPI
 
-from messagefoundry.api import create_app
 from messagefoundry.api.outlive import OperationInterrupted, OutlivingOperations
-from messagefoundry.config.settings import EgressSettings
-from messagefoundry.pipeline import Engine
 
 _WAIT_S = 10.0
 
@@ -43,7 +37,8 @@ async def test_a_drain_cancel_reaches_a_waiting_caller_as_operation_interrupted(
     assert await ops.drain(timeout=0.0, grace=5.0) == ["DR activation"]
     with pytest.raises(OperationInterrupted, match="DR activation") as info:
         await asyncio.wait_for(caller, _WAIT_S)
-    assert info.value.label == "DR activation"
+    assert info.value.status_code == 503 and info.value.label == "DR activation"
+    assert isinstance(info.value.__cause__, asyncio.CancelledError)
     assert not caller.cancelled()
     assert ops.inflight == []
 
@@ -65,9 +60,9 @@ async def test_a_cancelled_caller_still_gets_its_cancel_when_the_operation_is_ca
     assert caller.cancelled()
 
 
-async def test_a_caller_already_cancelling_on_entry_is_not_mistaken_for_a_fresh_cancel() -> None:
-    """The baseline is the caller's cancelling() count on entry, so a cancel it had absorbed before
-    the run does not make a drain's cancel read as the caller's."""
+async def test_a_caller_already_cancelling_on_entry_keeps_its_cancel() -> None:
+    """A caller that entered with a cancel in flight, as in a cleanup path, is never handed an
+    ordinary exception in place of that cancel."""
     ops = OutlivingOperations()
     started = asyncio.Event()
     seen: list[BaseException] = []
@@ -88,7 +83,7 @@ async def test_a_caller_already_cancelling_on_entry_is_not_mistaken_for_a_fresh_
     await asyncio.wait_for(started.wait(), _WAIT_S)
     assert await ops.drain(timeout=0.0, grace=5.0) == ["upload delete"]
     await asyncio.wait_for(caller, _WAIT_S)
-    assert [type(exc) for exc in seen] == [OperationInterrupted]
+    assert [type(exc) for exc in seen] == [asyncio.CancelledError]
 
 
 async def test_a_released_operation_the_drain_cancels_ends_interrupted() -> None:
@@ -130,24 +125,22 @@ async def test_a_released_operation_the_drain_cancels_ends_interrupted() -> None
         await store.close()
 
 
-@pytest.fixture
-async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(
-        tmp_path / "outlive.db",
-        poll_interval=0.02,
-        egress_settings=EgressSettings(deny_by_default=False),
-    )
-    yield eng
-    await eng.stop()
+async def test_a_route_whose_operation_is_drained_answers_503() -> None:
+    """Through a real route: the request gets an answer, not a CancelledError out of the app."""
+    ops = OutlivingOperations()
+    started = asyncio.Event()
+    app = FastAPI()
 
+    @app.post("/op")
+    async def _op() -> dict[str, str]:
+        await ops.run(_hangs(started), "DR release")
+        return {"ran": "yes"}
 
-async def test_the_api_answers_an_interrupted_operation_503(engine: Engine) -> None:
-    app = create_app(engine)
-    handler = app.exception_handlers[OperationInterrupted]
-    request = Request({"type": "http", "method": "POST", "path": "/dr/activate", "headers": []})
-    answered = handler(request, OperationInterrupted("DR activation"))
-    assert inspect.isawaitable(answered)
-    response = await answered
-    assert isinstance(response, Response)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        sent = asyncio.create_task(client.post("/op"))
+        await asyncio.wait_for(started.wait(), _WAIT_S)
+        assert await ops.drain(timeout=0.0, grace=5.0) == ["DR release"]
+        response = await asyncio.wait_for(sent, _WAIT_S)
     assert response.status_code == 503
-    assert "interrupted" in json.loads(bytes(response.body))["detail"]
+    assert "outcome is unknown" in response.json()["detail"]

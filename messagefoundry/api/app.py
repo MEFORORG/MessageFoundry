@@ -236,7 +236,6 @@ from messagefoundry.api.multipart import (
 )
 from messagefoundry.api.outlive import (
     CANCEL_GRACE_SECONDS,
-    OperationInterrupted,
     OutlivingOperations,
     cancel_grace_left,
 )
@@ -4938,17 +4937,6 @@ def create_app(
         if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
             headers[HSTS_HEADER] = HSTS_VALUE
         return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
-
-    @app.exception_handler(OperationInterrupted)
-    async def _operation_interrupted(request: Request, exc: OperationInterrupted) -> JSONResponse:
-        # An outliving operation the shutdown drain cancelled while its request still waited
-        # (BACKLOG #5903): a 503 to retry, not a bare CancelledError past every handler. The
-        # operation's own cancellation arm records its outcome. The text is the label only.
-        _log.warning("%s %s: %s", request.method, request.url.path, exc)
-        return JSONResponse(
-            {"detail": "the operation was interrupted by a shutdown; retry once the engine is up"},
-            status_code=503,
-        )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

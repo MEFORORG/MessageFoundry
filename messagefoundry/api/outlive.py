@@ -114,25 +114,23 @@ class OutlivingOperations:
         goes on. Its result or error is then logged once, with ``label``, which names the operation
         and nothing from the request body.
 
-        An operation cancelled while the caller was NOT, at least by :meth:`drain`, raises
-        :class:`OperationInterrupted` here rather than its ``CancelledError``, which would tell a
-        caller nobody cancelled that it had been (BACKLOG #5903). A caller that was cancelled still
-        gets its ``CancelledError``."""
-        caller = asyncio.current_task()
-        # The caller's own pending cancels on entry, so one delivered while this awaits is told
-        # apart from the operation's cancel, which task.result() also raises as CancelledError.
-        baseline = 0 if caller is None else caller.cancelling()
+        An operation cancelled while the caller is not cancelling raises
+        :class:`OperationInterrupted` (BACKLOG #5903). A caller that is cancelling still gets its
+        ``CancelledError``."""
         task = asyncio.ensure_future(coro)
         self._inflight[task] = label
         task.add_done_callback(self._forget)
         try:
             return await _outlive_caller(task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             if task.cancelled():
                 # The operation was cancelled and raised this through task.result(); its own
                 # cancellation arm has already run, and there is nothing left to read.
-                if caller is not None and caller.cancelling() <= baseline:
-                    raise OperationInterrupted(label) from None
+                # task.result() raises the operation's cancel as CancelledError too. The caller's
+                # cancelling() count tells the two apart, read as _write_through_cancel reads it.
+                caller = asyncio.current_task()
+                if caller is not None and caller.cancelling() == 0:
+                    raise OperationInterrupted(label) from exc
                 raise
             if not task.done():
                 log.warning(
