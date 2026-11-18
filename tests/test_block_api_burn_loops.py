@@ -8,8 +8,11 @@ required `gh` and whitespace, so `gh.exe` was never gh; it ended `--watch` only 
 end, so `--watch;` was no flag; and its forever-loop list held `while true`, `while :`,
 `while ($true)` and `until`, so `while (1)` and `for (;;)` were no loop.
 
-The allow arm pins the ordinary work the widened anchors must still pass. The guard is driven as a
-subprocess with a real PreToolUse payload, through the helpers of tests/test_api_burn_guard.py.
+The deny arm pins at least those shapes; it does not claim every way to run gh or to loop, and the
+open bypasses are listed beside $ASSIGN in the guard. The allow arm pins the ordinary work the
+widened anchors must still pass, including the commands origin/main allowed that the first cuts of
+this change denied. The guard is driven as a subprocess with a real PreToolUse payload, through the
+helpers of tests/test_api_burn_guard.py.
 """
 
 from __future__ import annotations
@@ -72,6 +75,29 @@ MUST_ALLOW = [
     ),
     pytest.param("gh pr checks 5 --watch=false", id="watch-explicitly-off"),
     pytest.param("for ($i = 0; $i -lt 3; $i++) { gh pr view $i }", id="bounded-powershell-for"),
+    # Allowed on origin/main and newly denied by the first two cuts of this change (review round
+    # 2c1df56a). None of them watches with gh or runs gh in a loop.
+    pytest.param("gh pr checkout 5 && npx jest --watch;", id="watch-belongs-to-a-later-command"),
+    pytest.param(
+        "gh pr view 5 --json number\nnpx jest --watch;", id="watch-on-a-later-line-of-a-script"
+    ),
+    pytest.param('echo "never write $x = gh run watch"', id="powershell-assignment-in-prose"),
+    pytest.param(
+        "while true; do if [ $x = gh ]; then break; fi; done", id="test-bracket-compares-to-gh"
+    ),
+    pytest.param("s=gh run watch", id="gh-as-an-assigned-string-value"),
+    pytest.param("gh pr view 5; while (1) { echo tick }", id="while-1-body-without-gh"),
+    pytest.param("gh pr view 5 && for ((;;)); do date; done", id="for-ever-body-without-gh"),
+    pytest.param("gh pr checks 5 --watch=0", id="watch-explicitly-zero"),
+    pytest.param("if (gh pr view 1) { echo --watch; }", id="watch-belongs-to-a-braced-body"),
+    # STILL DENIED, AND PINNED SO A FIX SHOWS. The guard cannot find where a loop body ends, so a
+    # gh after a forever loop reads as inside it. That gh never runs, so this is a false deny; a
+    # body-end rule would lose the deny on a nested body such as `for (;;) { if (x) { y }; gh ... }`.
+    pytest.param(
+        "while (1) { echo tick }; gh pr view 5",
+        id="gh-after-a-forever-loop",
+        marks=pytest.mark.xfail(strict=True, reason="loop body end is not parsed"),
+    ),
 ]
 
 

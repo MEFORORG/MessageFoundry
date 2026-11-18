@@ -78,10 +78,17 @@ try {
     #
     # SO MAY AN ASSIGNMENT (BACKLOG #5449). `$r = gh ...` and `` s=`gh ...` `` run gh exactly as a
     # bare call does, and neither was in command position here, so a poll loop around one passed.
-    # Only a variable assignment counts: `--grep=gh`, `a == gh` and a backticked MENTION of a gh
-    # command in prose are not one. And the program may carry .exe: the pattern required `gh` and
-    # whitespace, so `gh.exe` was never gh.
-    $ASSIGN = '(?:(?:^|[\s;&|(){}])[A-Za-z_]\w*=`?|\$[\w:.]+\s*=\s*)'
+    # The assignment must itself sit in command position, and a bash one must open a backtick
+    # substitution (`$(` already counts through the `(`). So `--grep=gh`, `a == gh`, `[ $x = gh ]`,
+    # `$x = gh` inside quoted prose, and `s=gh run watch`, which runs `run` with s set to the string
+    # gh, are not one. And the program may carry .exe: the pattern required `gh` and whitespace, so
+    # `gh.exe` was never gh.
+    #
+    # This covers at least those two assignment shapes, not every way to run gh. Still open: an
+    # assignment that follows another on one line (`a=1 b=`` `gh ...` ``), `NAME=value gh ...`,
+    # PowerShell `+=` and other compound assignments, gh behind a wrapper such as `env`, `time` or
+    # `xargs`, and gh inside an interpreter's string other than the three $INTERP names.
+    $ASSIGN = "$POS(?:[A-Za-z_]\w*=``|\`$[\w:.]+\s*=\s*)"
     $GH = "(?:$POS(?:(?:while|until|if|!)\s+)?|$INTERP|$ASSIGN)gh(?:\.exe)?\s"
     if ($c -notmatch $GH) { exit 0 }
 
@@ -97,12 +104,17 @@ try {
     # `--watch` on any gh subcommand is the same loop wearing a flag.
     # Behind an interpreter the closing quote ends the flag too, so `pwsh -Command 'gh pr checks 5
     # --watch'` is caught; elsewhere a quote after it is a mention, as in `--body "never --watch"`.
-    # A shell delimiter, a redirect or an `=value` other than false ends the flag too, where no
-    # quote sits between gh and the flag, so it is not prose in a quoted body (BACKLOG #5449). A `)`
-    # is not one: `"polling (gh pr checks --watch)"` is prose, so `$(gh pr checks --watch)` passes.
+    # A shell delimiter, a redirect or an `=value` other than false or 0 ends the flag too, where
+    # neither a quote, a separator (`;`, `&`, `|`, or a line break) nor a bracket sits between gh
+    # and the flag (BACKLOG #5449). So it is not prose in a quoted body, and it is not a later
+    # command's own `--watch`, as in `gh pr checkout 5 && npx jest --watch;` or
+    # `if (gh pr view 1) { echo --watch; }`. That rule reads $lines, where a line break is a
+    # separator; $c has none left. A `)` is not a delimiter: `"polling (gh pr checks --watch)"` is
+    # prose, so `$(gh pr checks --watch)` passes.
+    $lines = (($cmd -replace '\\\r?\n', ' ') -replace '\r?\n', ' ; ' -replace '\s+', ' ').Trim()
     if ($c -match '(^|\s)--watch(\s|$)' -or
         $c -match ("$INTERP" + 'gh(?:\.exe)?\s[^"'']*\s--watch["'']') -or
-        $c -match ($GH + '[^"''`]*?\s--watch(?=$|[;&|}>`]|=(?!false\b))')) {
+        $lines -match ($GH + '[^"''`;&|(){}]*?\s--watch(?=$|[;&|}>`]|=(?!(?:false|0)\b))')) {
         Deny ("BLOCKED: a `--watch` flag on a `gh` command polls in a loop and draws on the fleet's " +
               "shared 5000/hr GitHub API budget. Drop `--watch` and read once. For a run: " +
               "`gh run view <run-id>`. For a PR's checks: `gh pr checks <N>` or " +
@@ -122,10 +134,15 @@ try {
     # `while :`, `while ($true)` and `until` around gh spend requests as fast as gh returns, which
     # is the worst rate of all. `... | while read n` iterates over input, ends, and stays allowed.
     # `while (1)`, bash `while ((1))`, and `for (;;)` or `for ((;;))` never end either (BACKLOG #5449).
+    # Those four count only with gh in command position AFTER the keyword, so a line that reads a
+    # PR once and then runs some other endless loop is not a poll. A gh after the loop's end is read
+    # as inside it, because nothing here finds where a loop body ends; the loop never ends, so that
+    # gh never runs. The older spellings keep their older rule, with gh anywhere on the line.
     $LOOP = "(?:$POS(?:while|until|for|foreach|ForEach-Object)\b|\bdo\s*\{|\|\s*%\s*\{)"
-    $FOREVER = "$POS(?:while\s+(?:true|:)(?:\s|;|$)|while\s*\(\s*\`$true\s*\)|until\s|" +
-               'while\s*\(\(?\s*1\s*\)\)?|for\s*\(\(?\s*;\s*;\s*\)\)?)'
-    if ($c -match ($LOOP + '.*\b(sleep|Start-Sleep)\b') -or $c -match $FOREVER) {
+    $FOREVER = "$POS(?:while\s+(?:true|:)(?:\s|;|$)|while\s*\(\s*\`$true\s*\)|until\s)"
+    $FOREVER_GH = "$POS(?:while\s*\(\(?\s*1\s*\)\)?|for\s*\(\(?\s*;\s*;\s*\)\)?).*$GH"
+    if ($c -match ($LOOP + '.*\b(sleep|Start-Sleep)\b') -or $c -match $FOREVER -or
+        $c -match $FOREVER_GH) {
         Deny ("BLOCKED: this is a hand-rolled polling loop around `gh`, which costs the fleet's shared " +
               "GitHub API budget the same way `gh run watch` does. Make ONE call per turn and let the " +
               "next turn make the next one. If you must wait inside a turn, sleep once and then read " +
