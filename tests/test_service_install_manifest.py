@@ -3350,8 +3350,9 @@ def test_the_secedit_files_sit_in_a_fresh_folder_only_administrators_can_change(
     ("where", "grant"),
     [
         # A parent that lets another account delete its children lets that account rename the
-        # private folder away and substitute its own. F, not M: Modify holds no FILE_DELETE_CHILD.
-        ("parent-children", "*S-1-5-32-545:(OI)(CI)F"),
+        # private folder away and substitute its own. Delete-child alone, so this case still fails
+        # if the check stops judging FILE_DELETE_CHILD.
+        ("parent-children", "*S-1-5-32-545:(DC)"),
         # Modify holds DELETE on the parent itself but no FILE_DELETE_CHILD, so the parent, with
         # the private folder inside, can be renamed away and a planted one put at its name.
         ("parent", "*S-1-5-32-545:M"),
@@ -3392,7 +3393,9 @@ def test_the_work_folder_is_refused_when_the_parent_or_a_folder_above_can_be_ren
     )
     assert got["made"] is None, f"a folder was made though {where} can be renamed: {got['made']}"
     assert "S-1-5-32-545" in got["refusal"] or "Users" in got["refusal"], got["refusal"]
-    assert str(target) in got["refusal"], f"the refusal does not name {target}: {got['refusal']}"
+    assert f"'{target}' S-1-5-32-545" in got["refusal"], (
+        f"the refusal does not name {target} as the open folder: {got['refusal']}"
+    )
     # POSITIVE CONTROL: the same chain without the grant is accepted.
     assert got["clean"] and not str(got["clean"]).startswith("ERR"), got["clean"]
     assert got["left"] == [Path(got["clean"]).name], (
@@ -3444,6 +3447,8 @@ def test_the_secedit_folder_defaults_to_the_windows_temp_not_the_users(tmp_path:
     assert re.search(rf"\b{_WORKDIR_FN}\b", code), (
         "Remove-ServiceLogonRight does not call the helper"
     )
+    # The walk to the root is the production check; -CheckedUpTo, which ends it early, is a test seam.
+    assert "CheckedUpTo" not in code, "Remove-ServiceLogonRight cuts the ancestor walk short"
     assert re.search(r'Join-Path \(\[Environment\]::GetFolderPath\("Windows"\)\) "Temp"', helper), (
         "the helper's default parent must be the Windows folder's Temp, asked of the system"
     )

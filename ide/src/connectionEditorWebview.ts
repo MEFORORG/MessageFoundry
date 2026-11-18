@@ -401,21 +401,20 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       try { return JSON.parse(text); } catch (e) { return text; }
     }
 
-    // Edited text for a schema field, read by the field's declared type: a table, or a value the
-    // record held as a table, parses as JSON; a select takes the matching choice with its JSON type;
-    // a bool is converted when the text is one; a number only when the text is a finite decimal,
+    // Edited text for a schema field, read by the field's declared type: a select takes the matching
+    // choice with its JSON type, even where the record held a table; any other table, or value the
+    // record held as a table, parses as JSON; a bool is converted when the text is one; a number only when the text is a finite decimal,
     // which is narrower than coerce in connectionForm.ts, since a text box here takes any text; anything else, and text that does not convert, is posted verbatim, so the
     // engine's validator refuses what the user typed rather than this page guessing.
     const DECIMAL_TEXT = /^-?(\\d+(\\.\\d+)?|\\.\\d+)([eE][-+]?\\d+)?$/;
     function typedValue(f, raw) {
       // A select's picked choice first, with its own type: a select whose recorded value was a table
       // must not JSON-parse a choice such as "2" into a number (BACKLOG #8243 item 31).
-      const tableValued = f.control === 'table' || (f.value !== null && typeof f.value === 'object');
       if (f.control === 'select') {
         const hit = (f.choices || []).find((c) => String(c) === raw);
-        return hit !== undefined ? hit : tableValued ? parseTable(raw) : raw;
+        return hit !== undefined ? hit : raw;
       }
-      if (tableValued) return parseTable(raw);
+      if (f.control === 'table' || (f.value !== null && typeof f.value === 'object')) return parseTable(raw);
       // Only decimal text, the text a number box accepted: Number() also reads hex, binary, octal
       // and a leading '+', which would post a number the user never typed. An exponent that
       // overflows is posted as typed too, since Infinity would cross to the host as null, and so is
