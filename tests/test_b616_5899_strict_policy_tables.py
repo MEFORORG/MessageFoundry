@@ -64,8 +64,9 @@ def test_unknown_key_is_refused_without_echoing_its_value(table: str, key: str) 
         ("buildup", 'max_depth = "10"'),
         ("buildup", "max_oldest_seconds = true"),
         ("stall", 'max_oldest_seconds = "300"'),
-        ("batch", 'max_count = "10"'),
-        ("batch", "max_wait_ms = true"),
+        ("batch", 'max_count = "10"\nmax_wait_ms = 500'),
+        ("batch", "max_count = 10\nmax_wait_ms = true"),
+        ("batch", "max_count = 10.0\nmax_wait_ms = 500"),
     ],
 )
 def test_wrong_type_is_refused_not_coerced(table: str, body: str) -> None:

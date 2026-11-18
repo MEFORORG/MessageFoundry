@@ -311,7 +311,7 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         if table.get("priority") is not None
         else None,
         shard=_optional_str(table, "shard", where),
-        schedule=_policy(Schedule, table.get("schedule"), "schedule", where),
+        schedule=_policy(Schedule, table.get("schedule"), "schedule", where, strict=False),
         # Both lifecycle flags default TRUE (an absent key means "run it", as it always has).
         auto_start=_require_bool(table, "auto_start", where, default=True),
         deployed=_require_bool(table, "deployed", where, default=True),
@@ -339,25 +339,23 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
     return build_outbound_connection(
         name,
         spec,
-        retry=_policy(
-            RetryPolicy, _coerce_retry_forever(table.get("retry")), "retry", where, strict=True
-        ),
+        retry=_policy(RetryPolicy, _coerce_retry_forever(table.get("retry")), "retry", where),
         ordering=_enum(OrderingMode, table["ordering"], "ordering", where)
         if table.get("ordering") is not None
         else None,
         internal_error=_enum(InternalErrorPolicy, table["internal_error"], "internal_error", where)
         if table.get("internal_error") is not None
         else None,
-        buildup=_policy(BuildupThreshold, table.get("buildup"), "buildup", where, strict=True),
-        stall=_policy(StallThreshold, table.get("stall"), "stall", where, strict=True),
-        batch=_policy(BatchConfig, table.get("batch"), "batch", where, strict=True),
+        buildup=_policy(BuildupThreshold, table.get("buildup"), "buildup", where),
+        stall=_policy(StallThreshold, table.get("stall"), "stall", where),
+        batch=_policy(BatchConfig, table.get("batch"), "batch", where),
         simulate=_require_bool(table, "simulate", where),
         dead_letter_days=_optional_int(table, "dead_letter_days", where),
         priority=_enum(Priority, table["priority"], "priority", where)
         if table.get("priority") is not None
         else None,
         metadata=_optional_table(table, "metadata", where),
-        schedule=_policy(Schedule, table.get("schedule"), "schedule", where),
+        schedule=_policy(Schedule, table.get("schedule"), "schedule", where, strict=False),
         # Both lifecycle flags default TRUE (an absent key means "run it", as it always has).
         auto_start=_require_bool(table, "auto_start", where, default=True),
         deployed=_require_bool(table, "deployed", where, default=True),
@@ -1019,18 +1017,20 @@ def _enum(enum_cls: type[_E], value: Any, key: str, where: str) -> _E:  # noqa: 
 
 
 def _policy(  # noqa: UP047
-    model_cls: type[_M], raw: Any, key: str, where: str, *, strict: bool = False
+    model_cls: type[_M], raw: Any, key: str, where: str, *, strict: bool = True
 ) -> _M | None:
     """Build one policy sub-table (BACKLOG #5899).
 
-    An unknown key is refused here, by name, before the model sees the table. pydantic's own
-    ``extra_forbidden`` error would quote the key's value, so a secret written under the wrong table
-    would reach the load error; this names only the key, as every other table in the file does.
+    An unknown key at the table's top level is refused here, by name, before the model sees the
+    table. pydantic's own ``extra_forbidden`` error would quote the key's value, so a secret written
+    under the wrong table would reach the load error; this names only the key, as every other table
+    in the file does. A nested table, such as a schedule's ``windows``, is still checked by its model
+    alone.
 
-    ``strict`` refuses a value of the wrong TOML type instead of coercing it, so ``max_attempts =
-    "3"``, ``max_depth = true`` or ``max_count = 10.0`` is a load error rather than a number. The
-    schedule table stays lax: its ``days`` arrive as a TOML array, and strict mode refuses a list for
-    the model's ``frozenset``."""
+    ``strict``, the default, refuses a value of the wrong TOML type instead of coercing it, so
+    ``max_attempts = "3"``, ``max_depth = true`` or ``max_count = 10.0`` is a load error rather than
+    a number. The schedule table passes ``strict=False``: its ``days`` arrive as a TOML array, and
+    strict mode refuses a list for the model's ``frozenset``."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -1047,8 +1047,8 @@ def _coerce_retry_forever(raw: Any) -> Any:
     (``[outbound.retry] max_attempts = "forever"``, case-insensitive) needs a string spelling here —
     mirrors the ``[delivery]`` global's field validator on ``DeliverySettings.retry_max_attempts``
     (``config/settings.py``). Anything else (not a table, no ``max_attempts`` key, or a value that
-    isn't the literal word) passes through untouched so ``_policy``'s "must be a table" check and
-    :class:`~messagefoundry.config.models.RetryPolicy`'s own validation still fire exactly as before.
+    isn't the literal word) passes through untouched to ``_policy``, which refuses a non-table, an
+    unknown key and a wrong-typed value (BACKLOG #5899) before RetryPolicy's own validation runs.
     """
     if not isinstance(raw, dict):
         return raw
