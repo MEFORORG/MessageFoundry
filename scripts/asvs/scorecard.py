@@ -1113,13 +1113,25 @@ def load_reviewer_exceptions(path: Path) -> dict[str, str]:
         raise ScorecardError(
             "reviewer_exception must be an array of tables, written `[[reviewer_exception]]`"
         )
-    first_cell = re.search(r"^\[\[cell\]\]", text, re.M)
-    first_exc = re.search(r"^\[\[reviewer_exception\]\]", text, re.M)
-    if first_cell and first_exc and first_exc.start() > first_cell.start():
-        raise ScorecardError(
-            "[[reviewer_exception]] must come before the first [[cell]]: after it, apply.py reads "
-            "the table as part of the cell above and a rewrite of that cell deletes it"
-        )
+    # EVERY entry must sit before the first cell, so the text before it is PARSED and must hold
+    # all of them. The check compared the FIRST exception header with the first cell, by a
+    # column-zero, unspaced search, so a second entry after a cell, or one whose header was
+    # indented, spaced or quoted, loaded unrefused (BACKLOG #5460). Parsing the head reads every
+    # spelling TOML admits. A cut that lands inside a string fails to parse and is refused, and a
+    # cell the cut missed, written in a spelling the search does not know, shows up in the head.
+    first_cell = re.search(r"^[ \t]*\[\[[ \t]*cell[ \t]*\]\]", text, re.M)
+    if entries:
+        head = text[: first_cell.start()] if first_cell else text
+        try:
+            before: dict[str, Any] | None = tomllib.loads(head)
+        except tomllib.TOMLDecodeError:
+            before = None
+        if before is None or "cell" in before or before.get("reviewer_exception") != entries:
+            raise ScorecardError(
+                "every [[reviewer_exception]] must come before the first [[cell]]: after it, "
+                "apply.py reads the table as part of the cell above and a rewrite of that cell "
+                "deletes it"
+            )
     out: dict[str, str] = {}
     for e in entries:
         cid = e.get("id")

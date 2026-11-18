@@ -20,6 +20,7 @@ from scripts.asvs.scorecard import (
     Findings,
     ScorecardError,
     check_anchors,
+    load_reviewer_exceptions,
     load_scorecard,
     locate_anchor,
     main,
@@ -349,3 +350,55 @@ def test_check_anchors_does_not_read_outside_the_root(tmp_path: Path) -> None:
     check_anchors([cell], root, findings)
     assert findings.checked_anchors == 0
     assert any("outside the root" in p for p in findings.problems), findings.problems
+
+
+# --- BACKLOG #5460: every reviewer exception must sit before the first cell ----------------------
+
+
+def _exception(cid: str, header: str = "[[reviewer_exception]]") -> str:
+    return f'{header}\nid = "{cid}"\nprovenance = "history shows a named pass"\n\n'
+
+
+def test_exceptions_that_all_precede_the_cells_load(tmp_path: Path) -> None:
+    """Control: the ordering refusal fires on placement, not on the number of exceptions."""
+    body = _exception("1.1.1") + _exception("1.1.2") + _CELL
+    assert set(load_reviewer_exceptions(_write(tmp_path, body))) == {"1.1.1", "1.1.2"}
+
+
+@pytest.mark.parametrize(
+    "late",
+    [
+        "[[reviewer_exception]]",
+        "  [[reviewer_exception]]",
+        "[[ reviewer_exception ]]",
+        '[["reviewer_exception"]]',
+    ],
+    ids=["plain", "indented", "spaced", "quoted"],
+)
+def test_an_exception_after_a_cell_is_refused_even_behind_an_earlier_one(
+    tmp_path: Path, late: str
+) -> None:
+    """Before: only the FIRST exception header was compared with the first cell, so a second one
+    placed after a cell loaded, and apply.py's rewrite of that cell would delete it."""
+    body = _exception("1.1.1") + _CELL + "\n" + _exception("1.1.2", late)
+    with pytest.raises(ScorecardError, match="before the first"):
+        load_reviewer_exceptions(_write(tmp_path, body))
+
+
+@pytest.mark.parametrize(
+    "late", ["  [[reviewer_exception]]", "[[ reviewer_exception ]]"], ids=["indented", "spaced"]
+)
+def test_a_lone_exception_after_a_cell_is_refused_in_any_header_spelling(
+    tmp_path: Path, late: str
+) -> None:
+    """Before: the column-zero, unspaced search did not see these headers at all."""
+    body = _CELL + "\n" + _exception("1.1.1", late)
+    with pytest.raises(ScorecardError, match="before the first"):
+        load_reviewer_exceptions(_write(tmp_path, body))
+
+
+def test_an_exception_after_a_cell_header_spelled_another_way_is_refused(tmp_path: Path) -> None:
+    """A first cell written `[[ cell ]]` still starts the cells."""
+    body = _CELL.replace("[[cell]]", "[[ cell ]]") + "\n" + _exception("1.1.1")
+    with pytest.raises(ScorecardError, match="before the first"):
+        load_reviewer_exceptions(_write(tmp_path, body))
