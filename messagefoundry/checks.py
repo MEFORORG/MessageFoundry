@@ -4246,10 +4246,13 @@ _LINT_TOOL_NAMES = frozenset(
 
 
 def _tool_installed(module: str) -> bool:
-    """Whether ``module`` is importable by the child :func:`_run_tool` starts. Searched on this
-    interpreter's absolute import-path entries less the working directory, since the child starts
-    with ``-P`` and :func:`~messagefoundry.childenv.worker_environment` drops a relative
-    ``PYTHONPATH`` entry. Locates only; imports nothing."""
+    """Whether ``module`` is found on this interpreter's absolute ``sys.path`` entries, less any
+    entry whose ``os.path.normcase`` equals the working directory's, the search standing in for the
+    child :func:`_run_tool` starts with ``-P``, whose environment from
+    :func:`~messagefoundry.childenv.worker_environment` drops a relative ``PYTHONPATH`` entry.
+    Locates only; imports nothing. Two limits: an entry naming the working directory in another
+    spelling, such as with a trailing separator, is not skipped, and the child keeps every absolute
+    ``PYTHONPATH`` entry, so a tool package on such an entry is found and used."""
     import importlib.machinery
 
     try:
@@ -4305,13 +4308,15 @@ def _module_absent_in_child(module: str, stderr: str) -> bool:
 def _tool_command(module: str) -> list[str] | None:
     """The command line that starts lint tool ``module``, or ``None`` when it is not found: ``ruff``
     in the three scripts folders :func:`_ruff_binary` reads, any other tool as a module this
-    interpreter can import outside the working directory. Never a bare program name a ``PATH`` search resolves: on Windows that search
-    reads the working directory first, which can be the config repository under check (BACKLOG
-    #5375). ``ruff`` is its program by absolute path (:func:`_ruff_binary`). Any other tool is
-    ``python -m <module>`` by this interpreter's absolute path, through
-    :func:`~messagefoundry.childenv.python_module_argv`, whose ``-P`` keeps the working directory
-    off the child's import path; ``-X utf8`` sets UTF-8 output where ``-I`` would make the child
-    ignore ``PYTHONIOENCODING``."""
+    interpreter's import path holds, as :func:`_tool_installed` searches it. Never a bare program
+    name a ``PATH`` search resolves: on Windows that search reads the working directory first,
+    which can be the config repository under check (BACKLOG #5375). ``ruff`` is its program by
+    absolute path (:func:`_ruff_binary`). Any other tool is ``python -m <module>`` by this
+    interpreter's absolute path, through :func:`~messagefoundry.childenv.python_module_argv`, whose
+    ``-P`` stops the child prepending the working directory to its import path; it removes no
+    ``PYTHONPATH`` entry, so an absolute entry, even one naming the working directory, still
+    reaches the child. ``-X utf8`` sets UTF-8 output where ``-I`` would make the child ignore
+    ``PYTHONIOENCODING``."""
     from messagefoundry.childenv import python_module_argv
 
     if module == "ruff":
