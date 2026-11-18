@@ -4,14 +4,16 @@
 # merge_group until #3515 re-measures the cap, and quarantine the recurring timing tests under
 # #4773." That ruling is this file's first authority, and it authorises nothing wider.
 #
-# OWNER RULING 2026-11-18, in the Manager's session, answering an AskUserQuestion about the entries
-# below from tests/test_scan_forbidden.py and tests/test_uploads_cross_process_quota.py, after a
-# measurement of 50 merge_group runs from 2026-11-17 03:30Z to 2026-11-18 02:26Z, in which 13
-# failed and these two tests caused 7. The question, verbatim: "Should I add both to
+# OWNER RULING 2026-11-18 (UTC), in the Manager's session, answering an AskUserQuestion about two
+# tests, tests/test_scan_forbidden.py::test_the_baseline_stays_linear_at_the_body_limit and
+# tests/test_uploads_cross_process_quota.py::test_the_shutdown_drain_does_not_wait_for_a_heartbeat_touch,
+# after a measurement of 50 merge_group runs from 2026-11-17 03:30Z to 2026-11-18 02:26Z, in which
+# 13 failed and these two tests caused 7. The question, verbatim: "Should I add both to
 # tests/timing_quarantine.txt? They would still run in the advisory timing-quarantine job, and each
 # would get a vault row that owns the timing fix." The answer, verbatim: "Quarantine both
-# (Recommended)". That ruling is this file's second authority. It authorises exactly those two
-# entries, and nothing wider.
+# (Recommended)". That ruling is this file's second authority. It authorises entries for exactly
+# those two tests, and nothing wider. Only the uploads test is listed: PR 3035 fixed the
+# scan_forbidden test's timing dependence before this list changed, so the exit rule keeps it out.
 #
 # WHAT IT DOES. tests/conftest.py marks each test below `timing_quarantine`. ci.yml's engine legs
 # run `-m 'not tooling and not timing_quarantine'`, so these tests no longer gate a merge. The
@@ -22,8 +24,8 @@
 #
 # THE SELECTION RULE. Under the first ruling, a test enters only if it failed in the engine merge
 # queue on at least two unrelated PRs in the window of 2026-10-27 16Z to 2026-10-29 15Z (200
-# merge_group runs, 33 failed), or if #4773 names it. The second ruling adds only the two tests it
-# names, measured in its own window above. Each test enters with the row that owns its timing
+# merge_group runs, 33 failed), or if #4773 names it. The second ruling admits only the two tests
+# it names, measured in its own window above. Each test enters with the row that owns its timing
 # dependence.
 #
 # THE EXIT RULE. A test leaves this file when its timing dependence is fixed, under its own row, in
@@ -41,5 +43,4 @@ tests/test_harness_scenarios.py::test_a_scenario_expecting_the_wrong_disposition
 tests/test_harness_fuzz.py::test_a_seeded_campaign_holds_every_invariant  merge-queue timing failure on unrelated PRs; row #3837, also #3349
 tests/test_transform_offloop.py::test_slow_handler_does_not_stall_the_loop  named by #4773
 tests/test_intake_pause_mllp_dicom_timer.py::test_an_association_accepted_before_a_pause_finishes_normally  merge-queue timing failure on unrelated PRs; row #3147, also #3266
-tests/test_scan_forbidden.py::test_the_baseline_stays_linear_at_the_body_limit  merge-queue timing failure on unrelated PRs (3001, 3004, 3018, 3023), [bracket-lines] over the 2 s wall-clock bound on test shard 2 (windows-2025); #4773
 tests/test_uploads_cross_process_quota.py::test_the_shutdown_drain_does_not_wait_for_a_heartbeat_touch  merge-queue timing failure on unrelated PRs (3023, 3025, 3032), [ended-slow-unwind] assert 0 == 1; #4773
