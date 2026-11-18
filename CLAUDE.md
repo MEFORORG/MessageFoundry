@@ -523,9 +523,9 @@ table instead. A Builder still gets one turn: it puts an owner question in its r
 
 **Ledger ruling R5's freeze on new process machinery is LIFTED (owner instruction 2026-11-17, US
 Central, in the Lander's chat: *"resume normal work, but spawn a subagent to remove the R5
-hold"*).** The Lander reads "the R5 hold" as R5's whole freeze, so the freeze no longer binds; that
-scope is the Lander's reading, not the owner's words. The other ledger rulings, R1-R4 and R6-R9,
-still stand. **CORRECTED 2026-11-17:** this paragraph opened *"No new process machinery until
+hold"*).** The owner also wrote, the same evening in a Manager's chat (session `local_ae773a22`),
+*"the R5 freeze is revolked"*, so the whole freeze no longer binds. The other ledger rulings, R1-R4
+and R6-R9, still stand. **CORRECTED 2026-11-17:** this paragraph opened *"No new process machinery until
 2026-12-02"*, under ledger ruling R5: no new gate, hook, required context, seat or method rule,
 except a fix for a red `main` or a security control, while existing machinery was still repaired
 and review effort was not touched. The owner signed R1-R9 together on 2026-11-04, in session:
