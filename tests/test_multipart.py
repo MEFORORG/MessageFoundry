@@ -199,8 +199,8 @@ def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
 
     The header block is attacker-supplied, and the worker thread the upload route parses in does
     not spare the event loop a scan (``multipart.parse_upload_off_loop`` says why), so a quadratic
-    scan here is a whole-engine denial of service, not a slow request. ``_MAX_PART_HEADER_BYTES`` bounds the input as well, but the two controls
-    are independent on purpose: the cap is a size policy someone could reasonably raise, while this
+    scan here is a whole-engine denial of service, not a slow request. ``_MAX_PART_HEADER_BYTES``
+    bounds the input as well, but the two controls are independent on purpose: the cap is a size policy someone could reasonably raise, while this
     bounds what the scan costs at the size the cap admits today.
 
     **This replaced a growth-ratio assertion, and the ratio is why BACKLOG #1385 has this row.** The
@@ -263,8 +263,8 @@ def test_oversized_part_header_is_refused_not_parsed(monkeypatch: pytest.MonkeyP
 
     The per-part ``max_file_bytes`` cap applies to a part's *content*, and only AFTER its header has
     been parsed — so without this bound the header scan's input is the whole request body (25 MiB by
-    default, 512 MiB at the ceiling). A real client never approaches it: a
-    Content-Disposition plus a Content-Type is a couple hundred bytes.
+    default, 512 MiB at the ceiling). A real client never approaches it: a Content-Disposition plus
+    a Content-Type is a couple hundred bytes.
 
     **"Before" is the whole claim, so it is asserted rather than described.** A sentinel stands in for
     the pattern and raises if the scan reaches it, so the refusal has to arrive with the header
@@ -368,8 +368,9 @@ def test_the_part_parse_sentinel_fires_when_a_part_is_parsed(
 
 def _peak_allocated(func: Callable[[], object]) -> int:
     """Bytes ``func`` allocated at its peak, over what was allocated when it started."""
-    assert not tracemalloc.is_tracing(), "an outer trace would be stopped by this measurement"
-    tracemalloc.start()
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
     try:
         tracemalloc.reset_peak()
         base, _ = tracemalloc.get_traced_memory()
@@ -377,11 +378,50 @@ def _peak_allocated(func: Callable[[], object]) -> int:
             func()
         _, peak = tracemalloc.get_traced_memory()
     finally:
-        tracemalloc.stop()
+        if not was_tracing:
+            tracemalloc.stop()
     return peak - base
 
 
 _BIG = 4 * 1024 * 1024
+
+
+class _FindCounter(bytes):
+    """A body that counts the ``find`` calls made on it."""
+
+    finds = 0
+
+    def find(self, *args: Any) -> int:
+        self.finds += 1
+        return super().find(*args)
+
+
+def test_the_walk_stops_at_the_first_part_over_the_cap() -> None:
+    """The part cap bounds the walk itself, not only the answer: a body of thousands of empty parts
+    is refused after about ``_MAX_PARTS`` parts' worth of ``find`` calls, so a refusal reached only
+    after walking every part (and the per-part cost the cap exists to bound) shows here."""
+    delim = f"--{_B}".encode()
+    body = _FindCounter(
+        _body(_parts(multipart._MAX_PARTS))[: -len(delim) - 4] + (delim + b"\r\n") * 10_000
+    )
+    with pytest.raises(MultipartError, match="more parts than the limit"):
+        parse_multipart_form(f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024)
+    assert body.finds <= 3 * (multipart._MAX_PARTS + 2), body.finds
+
+
+def test_a_part_with_no_header_block_is_bounded_too() -> None:
+    """A part with no blank line after its headers is skipped, and is bounded like a nameless field
+    rather than by the body cap alone."""
+    junk = b"x" * (multipart._MAX_FIELD_BYTES + 1)
+    with pytest.raises(MultipartTooLargeError, match="no header block"):
+        parse_single_file_upload(
+            f"multipart/form-data; boundary={_B}", _body([_FILE_PART, junk]), max_file_bytes=1024
+        )
+    small = b"x" * multipart._MAX_FIELD_BYTES
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}", _body([_FILE_PART, small]), max_file_bytes=1024
+    )
+    assert file.data == b"MSH|body"
 
 
 def test_an_admitted_file_part_is_copied_once() -> None:

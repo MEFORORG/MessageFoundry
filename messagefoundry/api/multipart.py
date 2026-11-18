@@ -28,8 +28,8 @@ from dataclasses import dataclass, field
 # O(n^2) on a header of n word characters. That header block is attacker-supplied and bounded only by
 # ``[store].max_upload_bytes`` (25 MiB default), and a single scan would wedge the whole engine for
 # days. Running the parse in a worker thread (BACKLOG #5522) does not change that, for the reason
-# ``parse_upload_off_loop``'s docstring states. The lookbehind is O(1) and fails every offset *inside* a run immediately, leaving one ``\w+`` walk per run — O(n)
-# overall.
+# ``parse_upload_off_loop``'s docstring states. The lookbehind is O(1) and fails every offset
+# *inside* a run immediately, leaving one ``\w+`` walk per run — O(n) overall.
 #
 # It removes no match: ``=`` is not a word character, so ``\w+`` starting anywhere inside a run can
 # only ever succeed at that run's end — i.e. an interior offset matches iff the run's first offset
@@ -45,8 +45,8 @@ _DISPOSITION_PARAM = re.compile(r'(?<!\w)(\w+)="([^"]*)"')
 #: but it ran synchronously on the asyncio event loop that also drives every listener and worker, and
 #: linear is not free at that size: a single request would block the engine for ~0.35 s at 25 MiB and
 #: ~7 s at the ceiling (the worker thread since BACKLOG #5522 does not help a single scan; see
-#: ``parse_upload_off_loop``). Bounding the header keeps the cost microseconds and, incidentally, gives the ReDoS
-#: analysis a length-bounded source instead of an attacker-sized one.
+#: ``parse_upload_off_loop``). Bounding the header keeps the cost microseconds and, incidentally,
+#: gives the ReDoS analysis a length-bounded source instead of an attacker-sized one.
 _MAX_PART_HEADER_BYTES = 16 * 1024
 
 #: Cap on the number of parts in one body. The upload route keeps one file part and reads no other
@@ -131,8 +131,9 @@ def _disposition(head: bytes) -> tuple[str | None, str | None]:
 #: ``filename``), as ``curl -F 'file=<log.hl7'`` sends one, rather than as a file part.
 _FILE_AS_FIELD_HINT = 'Send a file as a file part with a plain filename parameter (filename="...")'
 
-#: The CR/LF run a non-conforming client leaves after a delimiter (the old parser ``lstrip``-ed it).
-_LEADING_CRLF = re.compile(rb"[\r\n]*")
+#: Ends the CR/LF run a non-conforming client leaves after a delimiter (the old parser ``lstrip``-ed
+#: it).
+_NOT_CRLF = re.compile(rb"[^\r\n]")
 
 
 @dataclass(frozen=True)
@@ -182,9 +183,10 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
         # After each delimiter comes CRLF, then the part's header block.
         if body.startswith(b"\r\n", start, end):
             start += 2
-        elif leading := _LEADING_CRLF.match(body, start, end):
+        else:
             # In C rather than a byte at a time: a run of CR/LF here can be most of the body.
-            start = leading.end()
+            first = _NOT_CRLF.search(body, start, end)
+            start = end if first is None else first.start()
         if nxt == -1 and start == end:
             break  # a last delimiter line with no close marker and nothing after it: not a part
         # A part with no header separator is skipped below, but it is counted: each one costs a
@@ -194,7 +196,17 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             # Refuse before any header is parsed: a body of this shape is never a real form.
             raise MultipartError(f"multipart body has more parts than the limit of {_MAX_PARTS}")
         sep = body.find(b"\r\n\r\n", start, end)
-        if sep != -1:
+        if sep == -1:
+            # A part with no header block is kept by nobody, like a nameless field, and is bounded
+            # the same way (less the CRLF before the next delimiter), so no shape of ignored part is
+            # bounded by the body cap alone.
+            size = end - start - (2 if body.endswith(b"\r\n", start, end) else 0)
+            if size > _MAX_FIELD_BYTES:
+                raise MultipartTooLargeError(
+                    f"multipart part with no header block is {size} bytes; the limit is "
+                    f"{_MAX_FIELD_BYTES}. {_FILE_AS_FIELD_HINT}"
+                )
+        else:
             if sep - start > _MAX_PART_HEADER_BYTES:
                 # Refuse rather than skip: a header this size is never a real client, and skipping
                 # would surface as the confusing "no file part" error instead of the real problem.
@@ -290,10 +302,9 @@ async def parse_upload_off_loop(
     held = [body]
 
     def parse() -> FilePart:
-        try:
-            data = held.pop()
-        except IndexError:
-            raise MultipartError("the upload was cancelled before its parse started") from None
+        if not held:  # only after a cancel, so nobody reads this refusal
+            raise MultipartError("the upload was cancelled before its parse started")
+        data = held.pop()
         return parse_single_file_upload(content_type, data, max_file_bytes=max_file_bytes)
 
     ctx = contextvars.copy_context()
