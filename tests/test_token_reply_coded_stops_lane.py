@@ -220,6 +220,9 @@ async def test_a_coded_token_reply_stops_the_lane_and_keeps_every_queued_row(
     detail = stopped[0][1]
     assert "configuration fault (token-reply-coded)" in detail
     assert "queue retained" in detail
+    # It names where to fix it, the transport's remedy, not the connection's configuration.
+    assert "fix the token endpoint, or a proxy in front of it" in detail
+    assert "#2083" not in detail
 
 
 async def test_an_unmarked_permanent_refusal_still_dead_letters_each_row(
@@ -244,19 +247,39 @@ async def test_an_unmarked_permanent_refusal_still_dead_letters_each_row(
     assert connector.sends == 3
 
 
-def _batch_runner(store: MessageStore, connector: object, sink: _RecordsStops) -> RegistryRunner:
+def _runner(
+    store: MessageStore, connector: object, sink: _RecordsStops, *, policy: str = "stop"
+) -> RegistryRunner:
+    """An unstarted runner with ``connector`` wired on ``OUT``, for a test that drives one delivery
+    body directly. The test stops it, and closes the connector, when it is done."""
     runner = RegistryRunner(
         Registry(),
         store,
         poll_interval=0.02,
         alert_sink=sink,
+        credential_fault_policy=policy,
         egress=EgressSettings(deny_by_default=False),
     )
-    runner._batch[OUT] = BatchConfig(max_count=5, max_wait_ms=1)
     runner._destinations[OUT] = cast(DestinationConnector, connector)
     runner._retry[OUT] = RetryPolicy()
     runner._simulate[OUT] = False
     return runner
+
+
+def _batch_runner(
+    store: MessageStore, connector: object, sink: _RecordsStops, *, policy: str = "stop"
+) -> RegistryRunner:
+    runner = _runner(store, connector, sink, policy=policy)
+    runner._batch[OUT] = BatchConfig(max_count=5, max_wait_ms=1)
+    return runner
+
+
+async def _enqueue(store: MessageStore, count: int) -> None:
+    for n in range(1, count + 1):
+        body = _adt(n)
+        await store.enqueue_message(
+            channel_id="c1", raw=body, deliveries=[(OUT, body)], now=100.0 + n
+        )
 
 
 @pytest.mark.parametrize("marked", [True, False], ids=["coded-token-reply", "unmarked-reject"])
@@ -268,48 +291,93 @@ async def test_a_batch_keeps_every_member_on_a_coded_token_reply_and_dead_letter
         _MintsThroughACodedTokenEndpoint() if marked else _UnmarkedRefusal()
     )
     runner = _batch_runner(store, connector, sink)
-    for n in (1, 2, 3):
-        body = _adt(n)
-        await store.enqueue_message(
-            channel_id="c1", raw=body, deliveries=[(OUT, body)], now=100.0 + n
-        )
-    await run_one_batch(runner, OUT)
-
-    assert connector.sends == 1  # one envelope
-    if marked:
-        assert await _outbound_rows(store) == [(OutboxStatus.PENDING.value, 0, None)] * 3
-        assert await store.count_dead(allowed_channels=None) == 0
-        assert [name for name, _ in sink.stopped] == [OUT]
-        assert runner.outbound_stop_held(OUT)
-    else:
-        assert await store.count_dead(allowed_channels=None) == 3
-        assert sink.stopped == []
+    await _enqueue(store, 3)
+    try:
+        await run_one_batch(runner, OUT)  # closes the connector
+        assert connector.sends == 1  # one envelope
+        if marked:
+            assert await _outbound_rows(store) == [(OutboxStatus.PENDING.value, 0, None)] * 3
+            assert await store.count_dead(allowed_channels=None) == 0
+            assert [name for name, _ in sink.stopped] == [OUT]
+            assert runner.outbound_stop_held(OUT)
+        else:
+            assert await store.count_dead(allowed_channels=None) == 3
+            assert sink.stopped == []
+    finally:
+        await runner.stop()
 
 
+@pytest.mark.parametrize("batched", [False, True], ids=["single-row", "batch"])
 async def test_under_the_dead_letter_policy_a_coded_token_reply_dead_letters_as_any_config_fault(
-    store: MessageStore,
+    store: MessageStore, batched: bool
 ) -> None:
     # credential_fault_policy = "dead_letter" opts every configuration fault back into the
-    # fail-fast dead-letter, and the coded token reply follows it: the lane does not stop.
+    # fail-fast dead-letter, and the coded token reply follows it: the lane does not stop. This
+    # pins the built behaviour; whether it should also alert is with the owner.
     sink = _RecordsStops()
-    runner = RegistryRunner(
-        Registry(),
-        store,
-        poll_interval=0.02,
-        alert_sink=sink,
-        credential_fault_policy="dead_letter",
-        egress=EgressSettings(deny_by_default=False),
-    )
     connector = _MintsThroughACodedTokenEndpoint()
-    runner._destinations[OUT] = cast(DestinationConnector, connector)
-    runner._retry[OUT] = RetryPolicy()
-    runner._simulate[OUT] = False
-    body = _adt(1)
-    await store.enqueue_message(channel_id="c1", raw=body, deliveries=[(OUT, body)], now=101.0)
-    item = await store.claim_next_fifo(OUT)
-    assert item is not None
-    await runner._process_delivery_item(OUT, item)
+    try:
+        if batched:
+            runner = _batch_runner(store, connector, sink, policy="dead_letter")
+            await _enqueue(store, 3)
+            await run_one_batch(runner, OUT)  # closes the connector
+            dead = 3
+        else:
+            runner = _runner(store, connector, sink, policy="dead_letter")
+            await _enqueue(store, 1)
+            item = await store.claim_next_fifo(OUT)
+            assert item is not None
+            await runner._process_delivery_item(OUT, item)
+            dead = 1
+        try:
+            assert connector.sends == 1
+            assert await store.count_dead(allowed_channels=None) == dead
+            assert sink.stopped == []
+            assert not runner.outbound_stop_held(OUT)
+        finally:
+            await runner.stop()
+    finally:
+        await connector.aclose()
 
-    assert await store.count_dead(allowed_channels=None) == 1
-    assert sink.stopped == []
-    assert not runner.outbound_stop_held(OUT)
+
+class _RetiredMidSend(_MintsThroughACodedTokenEndpoint):
+    """Swaps itself out of the lane while it mints, as a reload landing mid-send would."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.runner: RegistryRunner | None = None
+
+    async def send(self, payload: str) -> None:
+        assert self.runner is not None
+        self.runner._destinations[OUT] = cast(DestinationConnector, _UnmarkedRefusal())
+        await super().send(payload)
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["single-row", "batch"])
+async def test_a_coded_token_reply_from_a_retired_connector_goes_back_to_the_new_one(
+    store: MessageStore, batched: bool
+) -> None:
+    # A reload that swaps the connector mid-send may be the fix, so the old connector's
+    # configuration fault is not this lane's: the rows go back un-charged for the new connector,
+    # and the lane does not stop (BACKLOG #5718).
+    sink = _RecordsStops()
+    connector = _RetiredMidSend()
+    runner = _batch_runner(store, connector, sink) if batched else _runner(store, connector, sink)
+    connector.runner = runner
+    count = 3 if batched else 1
+    await _enqueue(store, count)
+    try:
+        if batched:
+            await run_one_batch(runner, OUT)  # closes the connector it found at the start
+        else:
+            item = await store.claim_next_fifo(OUT)
+            assert item is not None
+            await runner._process_delivery_item(OUT, item)
+        assert connector.sends == 1
+        assert await _outbound_rows(store) == [(OutboxStatus.PENDING.value, 0, None)] * count
+        assert await store.count_dead(allowed_channels=None) == 0
+        assert sink.stopped == []
+        assert not runner.outbound_stop_held(OUT)
+    finally:
+        await runner.stop()
+        await connector.aclose()

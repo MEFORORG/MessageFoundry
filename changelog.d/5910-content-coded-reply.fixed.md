@@ -9,7 +9,8 @@
   and JWKS reads and `fhir_lookup` with their own error. On a coded 2xx token reply with a body,
   the SMART and OAuth2 token reads raise a permanent configuration fault with the code
   `token-reply-coded`: a delivery that mints its bearer does not retry, and under the default
-  `credential_fault_policy` stops the lane and keeps the queue (owner ruling 2026-11-18), and a
+  `credential_fault_policy` stops the lane and keeps the queue (owner ruling "Stop the lane",
+  2026-11-18, on PR 3069), and a
   probe that mints one fails. The replies the
   coding check skips are listed on `reply_framing_fault`; they include at least a `204`, a
   `Content-Length: 0` reply and a reply to `HEAD`. (`BACKLOG #5910`)

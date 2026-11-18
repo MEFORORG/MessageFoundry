@@ -12113,16 +12113,23 @@ class RegistryRunner:
             )
             detail = f"credential fault ({exc.code}); lane stopped, queue retained (#109)"
         else:
+            # A transport names where to fix a fault that is not the connection's own settings
+            # (ADR 0095 Amendment B.2); the worker reads that, never the code.
+            remedy = getattr(exc, "remedy", None)
             log.error(
                 "delivery worker %r: PERMANENT connection configuration fault (%s); STOPPING the "
                 "lane and retaining %d queued row(s) un-errored, since every row would fail the "
-                "same way (operator must fix the connection's configuration + reload/restart to "
-                "resume)",
+                "same way (operator must fix %s + reload/restart to resume)",
                 name,
                 exc.code,
                 len(ids),
+                remedy or "the connection's configuration",
             )
-            detail = f"configuration fault ({exc.code}); lane stopped, queue retained (#2083)"
+            detail = (
+                f"configuration fault ({exc.code}); lane stopped, queue retained; fix {remedy}"
+                if remedy
+                else f"configuration fault ({exc.code}); lane stopped, queue retained (#2083)"
+            )
         self._alert_sink.connection_stopped(name, detail=detail)
         self._hold_for_operator(name, "outbound")
 

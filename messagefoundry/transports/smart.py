@@ -135,6 +135,11 @@ _BEARER_TOKEN_CHARS = re.compile(r"[\x21-\x7e]+")
 
 #: The ``code`` of the permanent refusal of a token reply in a content coding (BACKLOG #5910).
 TOKEN_REPLY_CODED_CODE = "token-reply-coded"  # nosec B105 -- a refusal code, not a credential
+#: Where an operator fixes it: the engine sends ``Accept-Encoding: identity``, so the coding is the
+#: endpoint's, or a proxy's in front of it (ADR 0095 Amendment B.2).
+TOKEN_REPLY_CODED_REMEDY = (
+    "the token endpoint, or a proxy in front of it that ignores Accept-Encoding: identity"  # nosec B105 -- an operator hint
+)
 
 
 def request_token(
@@ -180,6 +185,7 @@ def request_token(
             code=TOKEN_REPLY_CODED_CODE,
             permanent=True,
             config_fault=True,
+            remedy=TOKEN_REPLY_CODED_REMEDY,
         )
     return _parse_token_reply(body, endpoint=endpoint)
 
