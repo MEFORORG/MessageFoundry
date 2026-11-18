@@ -2272,10 +2272,10 @@ class UserSealRefused(RuntimeError):
 
 
 async def read_user_or_unreadable(read: Awaitable[UserRecord | None]) -> UserRecord | None:
-    """One store user read, with a row whose cells do not parse answered as the store's list
-    answers it (BACKLOG #5505): :meth:`UserRecord.unreadable_row`. The single-row readers raise
-    :class:`RowSealError` for such a row, whose subject is the row's bounded id; one with no
-    readable id is raised as it is.
+    """One store user read, with a row that does not parse (``listed_users`` says which) answered
+    as the store's list answers it (BACKLOG #5505): :meth:`UserRecord.unreadable_row`. The
+    single-row readers raise :class:`RowSealError` for such a row, whose subject is the row's
+    bounded id; one with no readable id is raised as it is.
 
     The stand-in's fields other than ``id`` are invented, so only two kinds of caller may take it:
     ``AuthService``'s loaders, whose ``_verified`` fails and reports it as a record that fails its
@@ -2996,11 +2996,11 @@ class LockableAccountCensus:
     #: discoverable or not. The cure is the store key for a cell that does not open, and removing
     #: and enrolling the app again for an enrolment this release refuses.
     reset_would_remove_a_passkey: tuple[str, ...] = ()
-    #: Every account whose users row does not parse when read, by its stored id (BACKLOG #5505).
-    #: The read does not parse the recovery-code cell (``totp_recovery_codes``), which is judged
-    #: only when its codes are read, so a bad value there alone is not named. A named record fails
-    #: its integrity check, so whether it is lockable is unknown: it is named here and in no other
-    #: list, since every other list would read fields the store could not read.
+    #: Every account whose users row does not parse
+    #: (:func:`~messagefoundry.store.store.listed_users` says which), by its stored id (BACKLOG
+    #: #5505). Its record fails its integrity check, so whether it is lockable is unknown: it is
+    #: named here and in no other list, since every other list would read fields the store could
+    #: not read.
     integrity_failed: tuple[str, ...] = ()
 
     @property
@@ -20278,12 +20278,12 @@ class AuthService:
     ) -> frozenset[str]:
         """The account ids whose sessions a group-wide save ends (BACKLOG #3401, #5505): each
         listed ``users`` row ``named`` answers yes for, read with no seal checked, and each listed
-        row whose cells do not parse when read (not the recovery-code cell). With ``checked``, also
-        each listed account whose integrity check fails, whatever its row says. So on a store with
-        an integrity key a row tampered to read as outside the save is still named, and its
-        sessions are revoked rather than only refused, so a later repair of its row does not bring
-        them back. With no key no seal is
-        checked, so such a row is taken as it reads. A row the list read leaves out is not named,
+        row that does not parse (:func:`~messagefoundry.store.store.listed_users` says which).
+        With ``checked``, also each listed account whose integrity check fails, whatever its row
+        says. So on a store with an integrity key a row tampered to read as outside the save is
+        still named, and its sessions are revoked rather than only refused, so a later repair of
+        its row does not bring them back. With no key no seal is checked, so such a row is taken
+        as it reads. A row the list read leaves out is not named,
         at least one whose id cell does not read.
 
         The step-up gate reads it with ``checked`` and hands that set to the save, so the caller's

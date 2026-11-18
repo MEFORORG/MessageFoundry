@@ -931,8 +931,9 @@ from typing import Any
 #: saves, and an older console on this engine omits ``ended``, which the save then reads itself.
 #: The digest moved for another reason: the console's
 #: ``require_ui_step_up_when_own_sessions_end`` gate now keeps its set for the route, and the
-#: snapshot hashes that gate's body. Re-derived with ``--write``, from ``f16ae6b198ad952b`` to
-#: ``10638208017f77d0``.
+#: snapshot hashes that gate's body. Re-derived with ``--write`` on the branch, from
+#: ``bc56eed44a1590fd`` to ``3485aab8a5abd1bc``, and over the merge with BACKLOG #5397 above, from
+#: ``f16ae6b198ad952b`` to ``10638208017f77d0``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

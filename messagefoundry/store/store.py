@@ -3039,11 +3039,11 @@ class UserRecord:
     #: to pin a compare-and-set (``VerifiedUser.totp_secret_cell``, and ``admin-reset-totp``,
     #: BACKLOG #3778). ``None`` on a record built by hand.
     row: UserRow | None = field(default=None, compare=False, repr=False)
-    #: Set only on the stand-in :meth:`unreadable_row` builds for a listed row whose cells do not
-    #: parse (BACKLOG #5505). ``AuthService._verified`` answers it as a record that fails its seal,
-    #: on a keyless store too, so a list keeps showing the account as failing and reports it. Its
-    #: other fields are invented closed values: a caller that is not the seal check must not read
-    #: them as the account's state.
+    #: Set only on the stand-in :meth:`unreadable_row` builds for a listed row that does not parse
+    #: (:func:`listed_users` says which; BACKLOG #5505). ``AuthService._verified`` answers it as a
+    #: record that fails its seal, on a keyless store too, so a list keeps showing the account as
+    #: failing and reports it. Its other fields are invented closed values: a caller that is not
+    #: the seal check must not read them as the account's state.
     unreadable: bool = field(default=False, compare=False)
 
     def sign_in_locked(self, now: float) -> bool:
@@ -3157,9 +3157,10 @@ class UserRecord:
 
 
 def _listed_user(d: Mapping[str, Any]) -> UserRecord:
-    """One row of a list read: :meth:`UserRecord.from_mapping`, or, for a row whose cells do not
-    parse, :meth:`UserRecord.unreadable_row`. A row whose id is itself unreadable still raises the
-    :class:`RowSealError`, which :func:`decoded_rows` leaves out: nothing could name it."""
+    """One row of a list read: :meth:`UserRecord.from_mapping`, or, for a row that does not
+    parse (:func:`listed_users` says which), :meth:`UserRecord.unreadable_row`. A row whose id is
+    itself unreadable still raises the :class:`RowSealError`, which :func:`decoded_rows` leaves
+    out: nothing could name it."""
     try:
         return UserRecord.from_mapping(d)
     except RowSealError:
@@ -3170,9 +3171,10 @@ def _listed_user(d: Mapping[str, Any]) -> UserRecord:
 
 
 def listed_users(rows: Iterable[Mapping[str, Any]]) -> list[UserRecord]:
-    """The accounts a list read returned, in order (BACKLOG #5505). An account whose row does not
-    parse when read (not the recovery-code cell) stays in the list as
-    :meth:`UserRecord.unreadable_row`, so the admin list shows it as failing. The list is the
+    """The accounts a list read returned, in order (BACKLOG #5505). An account whose row has a
+    number cell that does not parse stays in the list as :meth:`UserRecord.unreadable_row`, so the
+    admin list shows it as failing. The read copies text cells without parsing them, at least
+    ``totp_recovery_codes`` and ``channel_scope``, so a bad value in one does not. The list is the
     only reader that returns the stand-in: the single-row user readers raise
     :class:`RowSealError` for such a row, which the service's loaders answer as a failed seal, and
     the write helpers refuse it. A caller iterating a list read checks ``unreadable``
