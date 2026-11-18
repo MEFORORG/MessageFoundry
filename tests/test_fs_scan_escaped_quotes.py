@@ -38,6 +38,7 @@ POWERSHELL_DENY = [
     pytest.param("git commit -m @'\ndon't\n'@\ngrep -r x /proc", id="apostrophe-in-a-here-string"),
     pytest.param("$m = 'done'# it's fine\ngrep -r x /proc", id="comment-right-after-a-quote"),
     pytest.param("$x =# it's\ngrep -r x /proc", id="comment-right-after-an-operator"),
+    pytest.param("$x +=# it's\ngrep -r x /proc", id="comment-right-after-a-compound-operator"),
 ]
 
 POWERSHELL_ALLOW = [
@@ -55,6 +56,22 @@ POWERSHELL_ALLOW = [
     pytest.param("Write-Output x 2>&1# it`'s; grep -r x /proc", id="comment-after-a-redirect"),
 ]
 
+# A `#` STARTS A COMMENT ONLY AT A TOKEN START. Inside a bareword (`a^#`, `a=#`, `a/#`, `a_#`,
+# `a<#`, or a quoted part glued to one, `a'b'#`) it is a literal character, and PowerShell's own
+# tokenizer reads each of these as one argument, the quote spanning the lines after it. A reading
+# that took the `#` for a comment blanked the opening quote and exposed the walk the quote holds.
+# `=` at a token start is an operator only in an expression statement, so among a command's
+# arguments (`x =#`) it starts a bareword too.
+TOKEN_START_ALLOW = [
+    pytest.param("Write-Output a^#'\nfind /proc\n'", id="hash-after-caret"),
+    pytest.param("Write-Output a=#'\nfind /proc\n'", id="hash-after-equals-in-a-word"),
+    pytest.param("Write-Output a/#'\nfind /proc\n'", id="hash-after-slash"),
+    pytest.param("Write-Output a_#'\nfind /proc\n'", id="hash-after-underscore"),
+    pytest.param("Write-Output a<#'\nfind /proc\n'", id="hash-after-a-less-than-in-a-word"),
+    pytest.param("Write-Output a'b'#'\nfind /proc\n'", id="hash-after-a-quote-glued-to-a-word"),
+    pytest.param("Write-Output x =#'\nfind /proc\n'", id="hash-after-equals-in-arguments"),
+]
+
 
 @pytest.mark.parametrize("command", POWERSHELL_DENY)
 def test_an_escaped_quote_does_not_hide_the_walk_after_it(command: str) -> None:
@@ -63,4 +80,19 @@ def test_an_escaped_quote_does_not_hide_the_walk_after_it(command: str) -> None:
 
 @pytest.mark.parametrize("command", POWERSHELL_ALLOW)
 def test_powershell_prose_naming_a_walk_is_still_allowed(command: str) -> None:
+    assert_allowed(run_guard(bash(command, tool="PowerShell")))
+
+
+@pytest.mark.parametrize("command", TOKEN_START_ALLOW)
+def test_a_hash_inside_a_bareword_is_not_a_comment(command: str) -> None:
+    assert_allowed(run_guard(bash(command, tool="PowerShell")))
+
+
+# STILL A FALSE DENY. The reading tells an expression statement from a command by the statement's
+# first character only, so after `$null = Write-Output` it still takes `=#` for an operator and a
+# comment, where PowerShell reads a bareword. Allowing it means reading the statement grammar;
+# dropping the `=` rule instead would lose the comment-right-after-an-operator deny row.
+@pytest.mark.xfail(strict=True, reason="expression mode is read from the first character only")
+def test_equals_hash_among_arguments_after_an_assignment() -> None:
+    command = "$null = Write-Output =#'\nfind /proc\n'"
     assert_allowed(run_guard(bash(command, tool="PowerShell")))
