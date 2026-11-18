@@ -1203,8 +1203,8 @@ class StoreSettings(_Section):
         # BACKLOG #5926 (and #5927's remaining harm): [store].path is joined under the project root
         # (config/anchor.py) by serve and the offline store commands alike; store_path_refusal
         # says which values no anchor can place. Refused here, at load, for every command that
-        # loads settings. serve and supervise anchor their --db before the load, so they apply the
-        # same test to the flag after it. Server backends are not checked here. `backend` is
+        # loads settings. serve anchors its --db before the load, so it applies the same test to
+        # the flag after it. Server backends are not checked here. `backend` is
         # declared first, so it is in info.data once it validated.
         if info.data.get("backend", StoreBackend.SQLITE) != StoreBackend.SQLITE:
             return value

@@ -5513,9 +5513,9 @@ def _supervise(args: argparse.Namespace) -> int:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
         return 2
-    # BACKLOG #5926: each engine shard's store path is derived from the --db base, which no
-    # settings load here sees, so test it the way [store].path is tested at load. A SQLite store
-    # only: a server backend opens no file at that path.
+    # BACKLOG #5926: each engine shard's store path is derived from the --db base, so test it the
+    # way [store].path is tested at load. A SQLite store only: a server backend opens no file at
+    # that path.
     from messagefoundry.config.settings import StoreBackend, store_path_refusal
 
     if settings.store.backend == StoreBackend.SQLITE:

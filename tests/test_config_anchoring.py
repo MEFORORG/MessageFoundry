@@ -800,8 +800,6 @@ def test_serve_and_supervise_refuse_an_unanchorable_db_under_a_root(
     db: str,
     why: str,
 ) -> None:
-    # Both anchor --db under --project-root before the settings load, so the load would see the
-    # joined result (the root itself, for an empty one) and pass it; the flag is tested first.
     def _no_spawn(*args: object, **kwargs: object) -> object:
         raise AssertionError("supervise spawned engine shards")
 
@@ -843,8 +841,8 @@ def test_a_server_backend_db_with_a_colon_is_not_refused(
     capsys: pytest.CaptureFixture[str],
     command: str,
 ) -> None:
-    # supervise derives each engine shard's --db as <stem>_<shard tag>.db, and a shard tag may hold
-    # a colon, which the SQLite rules refuse on Windows. On a server backend it names no file.
+    # supervise derives each engine shard's --db as <stem>_<shard tag>.db, and an engine shard tag
+    # may hold a colon, which the SQLite rules refuse on Windows. On a server backend it names no file.
     import messagefoundry.__main__ as cli_main
 
     reached: list[str] = []
