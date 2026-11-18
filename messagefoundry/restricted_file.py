@@ -891,6 +891,16 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             return problem
         if as_written:
             return _windows_holder_as_written_problem(Path(holder_path))
+        if (
+            cause is None
+            and walked not in (full, walked.parent)  # a drive root is not a junction
+            and _is_reparse_point(str(walked))
+        ):
+            # A junction or link holding the path: its own list is read too, as origin/main read
+            # it, so reading where it leads drops no refusal main made.
+            problem = _windows_holder_as_written_problem(walked)
+            if problem is not None:
+                return problem
         if cause is not None and _is_reparse_point(holder_path):
             # Read with FILE_FLAG_OPEN_REPARSE_POINT, a junction's own list would stand in for the
             # folder it points at, which is not read.
@@ -913,8 +923,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
 
 def _windows_holder_as_written_problem(holder_path: Path) -> str | None:
     """Why ``holder_path``, read by its path as written with the config-source reader, lets a broad group or an application package replace a key file in it, or ``None``.
-    This is the holder read the check made before it read the holder where the path resolves to,
-    kept for a path the walk cannot resolve (:func:`_windows_surroundings_problem`). Windows
+    This is the holder read the check made before it read the holder where the path resolves to
+    (:func:`_windows_surroundings_problem`). Windows
     only."""
     from messagefoundry.config.wiring import _win32_config_source_probes
 

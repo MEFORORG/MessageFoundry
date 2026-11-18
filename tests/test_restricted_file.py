@@ -1615,6 +1615,33 @@ def test_windows_a_junction_at_the_holder_is_judged_where_it_points(
 
 
 @windows_only
+@pytest.mark.parametrize("grant", ["(DC)", "(OI)(IO)(F)"])
+def test_windows_a_junction_at_the_holder_is_also_judged_by_its_own_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grant: str
+) -> None:
+    """origin/main read a junction standing in for the holder by its own access list, with the
+    holder rule, and refused one granting Users a replace right there. Reading where the junction
+    leads must not drop that read."""
+    judge_links_only_under(monkeypatch, tmp_path)
+    real = tmp_path / "real"
+    real.mkdir()
+    write_restricted_file(real / "store.key", b"KEY-MATERIAL-STAND-IN")
+    _junction(tmp_path / "mine", real)
+    assert broad_access_problem(tmp_path / "mine" / "store.key") is None  # the control
+    _icacls(tmp_path / "mine", "/L", "/grant", f"*{_USERS}:{grant}")  # the junction's own list
+    assert broad_access_problem(real / "store.key") is None  # the target is unchanged
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    holder = _win32_config_source_probes().read_path(tmp_path / "mine")
+    problem = restricted_file._windows_access_problem(
+        holder, restricted_file._HOLDER_REPLACE_MASK, reach=restricted_file._HOLDER_REACH
+    )
+    assert problem is not None  # main's own reader and rule refuse the junction's list
+    problem = str(broad_access_problem(tmp_path / "mine" / "store.key"))
+    assert f"Users ({_USERS}) can delete or replace a file in it" in problem
+
+
+@windows_only
 def test_windows_a_share_is_refused_when_this_hosts_name_cannot_be_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
