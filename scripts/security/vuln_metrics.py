@@ -141,11 +141,11 @@ def kev_cves(timeout: float) -> set[str] | None:
     vulns = data.get("vulnerabilities") if isinstance(data, dict) else None
     if not isinstance(vulns, list) or not vulns:
         return None
-    ids = {
-        v["cveID"].upper() for v in vulns if isinstance(v, dict) and isinstance(v.get("cveID"), str)
-    }
-    # Entries none of which carries a cveID (a renamed field) are a catalog not shaped as one.
-    return ids or None
+    # Any entry without a cveID string makes the whole catalog unread, not partial: the CVE that
+    # entry should have named would score an open PR as off KEV, a false zero exposure.
+    if not all(isinstance(v, dict) and isinstance(v.get("cveID"), str) for v in vulns):
+        return None
+    return {v["cveID"].upper() for v in vulns}
 
 
 def epss_scores(cves: set[str], timeout: float) -> dict[str, float] | None:
@@ -203,7 +203,7 @@ def adopter_lag(
     rel = _gh(
         ["api", f"repos/{repo}/releases/latest", "--jq", "{tag: .tag_name, at: .published_at}"]
     )
-    if not isinstance(rel, dict) or not rel.get("tag"):
+    if not isinstance(rel, dict) or not isinstance(rel.get("tag"), str) or not rel["tag"]:
         return "n/a: no engine release to compare against"
     latest = _norm_ver(rel["tag"])
     published = _parse_dt(rel.get("at"))
@@ -214,11 +214,42 @@ def adopter_lag(
         content = answer.get("content") if isinstance(answer, dict) else None
         if not isinstance(content, str) or not content:
             return f"n/a: can't read {ar}/requirements.txt (cross-repo access?)"
-        text = base64.b64decode(content).decode("utf-8", "replace")
-        match = re.search(r"messagefoundry==([\w.\-]+)", text)
-        if match and _norm_ver(match.group(1)) != latest and published:
+        try:
+            text = base64.b64decode(content).decode("utf-8", "replace")
+        # binascii.Error is a ValueError, and so is a non-ASCII str: either is an unread file.
+        except ValueError:
+            return f"n/a: {ar}/requirements.txt content is not base64"
+        pin = _exact_pin(text)
+        # Only an exact pin can be compared. A range, an extras pin this did not parse, or no
+        # messagefoundry line at all is not "up to date", so it is n/a, never a lag of 0.
+        if pin is None:
+            return f"n/a: {ar}/requirements.txt has no single exact messagefoundry== pin"
+        if _norm_ver(pin) != latest:
+            if published is None:
+                return "n/a: the latest engine release has no publish date"
             lags.append((now - published).total_seconds() / 86400)
     return f"{max(lags):.1f}" if lags else "0"
+
+
+#: A requirement line naming the engine distribution itself (not messagefoundry-toolkit), with
+#: optional extras; group 1 is the version specifier and whatever follows it.
+_ENGINE_REQ_RE = re.compile(r"messagefoundry(?![\w.-])\s*(?:\[[^\]]*\])?(.*)", re.IGNORECASE)
+
+
+def _exact_pin(text: str) -> str | None:
+    """The version of the one ``messagefoundry==X`` requirement in ``text``, or ``None`` when there
+    is no messagefoundry requirement, more than one, or it is not an exact ``==`` pin."""
+    pins: list[str | None] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        req = _ENGINE_REQ_RE.match(line)
+        if req is None:
+            continue
+        # Cut an environment marker, a comment, a line continuation, or a trailing option.
+        spec = re.split(r"[;#\\]|\s--", req.group(1), maxsplit=1)[0].strip()
+        exact = re.fullmatch(r"==\s*([\w.+!-]+)", spec)
+        pins.append(exact.group(1) if exact else None)
+    return pins[0] if len(pins) == 1 else None
 
 
 #: The metrics each source feeds, so a source that could not be read blanks exactly these.

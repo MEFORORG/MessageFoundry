@@ -13,6 +13,7 @@ No test here touches the network: ``gh`` and every HTTP fetch are stubbed at the
 
 from __future__ import annotations
 
+import base64
 import csv
 import importlib.util
 import io
@@ -217,3 +218,102 @@ def test_control_a_kev_outage_with_no_cve_seen_changes_nothing(
     code, row = _main(mod, tmp_path)
     assert code == 0, row
     assert row["kev_exposure_max_age_days"] == "0"
+
+
+def test_a_kev_catalog_with_one_malformed_entry_is_unread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A good entry beside a malformed one is not a partial catalog: the malformed entry's CVE
+    would score an open PR as off KEV, so the whole catalog is unread."""
+    mod = _load()
+    _stub(monkeypatch, mod)
+    real = mod.urllib.request.urlopen
+
+    def urlopen(req: Any, timeout: float = 0) -> _Resp:
+        if req.full_url == mod.KEV_URL:
+            vulns = [{"cveID": _CVE_KEV}, {"cveId": _CVE_OTHER}]
+            return _Resp(json.dumps({"vulnerabilities": vulns}).encode())
+        return real(req, timeout)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
+    code, row = _main(mod, tmp_path)
+    assert code == 2, row
+    assert row["kev_exposure_max_age_days"].startswith("n/a"), row
+
+
+_RELEASE = {"tag": "v1.2.0", "at": (_NOW - timedelta(days=6)).isoformat()}
+
+
+def _adopter(
+    monkeypatch: pytest.MonkeyPatch,
+    mod,
+    requirements: str | None,
+    *,
+    content: str | None = None,
+    release: dict[str, Any] | None = None,
+) -> str:
+    """``adopter_lag`` over one synthetic adopter whose requirements.txt holds ``requirements``,
+    or whose contents answer carries the raw ``content`` string."""
+    if content is None:
+        assert requirements is not None
+        content = base64.b64encode(requirements.encode()).decode()
+
+    def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        if "releases/latest" in argv[2]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(release or _RELEASE), "")
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"content": content}), "")
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    return mod.adopter_lag("example/repo", ["example/adopter"], _NOW, 1.0)
+
+
+@pytest.mark.parametrize(
+    "requirements",
+    [
+        pytest.param("messagefoundry[vault]>=1.0\n", id="extras-range"),
+        pytest.param("messagefoundry>=0.1\n", id="range"),
+        pytest.param("messagefoundry~=1.2\n", id="compatible-release"),
+        pytest.param("messagefoundry==1.*\n", id="wildcard"),
+        pytest.param("httpx==0.28.1\n", id="no-engine-line"),
+        pytest.param("messagefoundry-toolkit==0.1\n", id="toolkit-only"),
+        pytest.param("messagefoundry==1.1\nmessagefoundry==1.2.0\n", id="two-lines"),
+    ],
+)
+def test_adopter_lag_is_never_zero_without_an_exact_pin(
+    monkeypatch: pytest.MonkeyPatch, requirements: str
+) -> None:
+    mod = _load()
+    lag = _adopter(monkeypatch, mod, requirements)
+    assert lag.startswith("n/a") and "example/adopter" in lag, lag
+
+
+@pytest.mark.parametrize(
+    ("requirements", "expected"),
+    [
+        pytest.param("messagefoundry==1.2.0\n", "0", id="current"),
+        pytest.param(
+            "messagefoundry[vault] == v1.2.0 ; python_version>='3.14'\n", "0", id="extras"
+        ),
+        pytest.param("# pins\nmessagefoundry==1.1.0 \\\n    --hash=sha256:00\n", "6.0", id="stale"),
+    ],
+)
+def test_control_adopter_lag_measures_an_exact_pin(
+    monkeypatch: pytest.MonkeyPatch, requirements: str, expected: str
+) -> None:
+    """Control: an exact pin, with or without extras, a marker or a hash, is still measured."""
+    mod = _load()
+    assert _adopter(monkeypatch, mod, requirements) == expected
+
+
+def test_adopter_content_that_is_not_base64_is_na(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A body that does not decode is an unread file, n/a naming it, not a crash to exit 1."""
+    mod = _load()
+    lag = _adopter(monkeypatch, mod, None, content="abc")
+    assert lag.startswith("n/a") and "example/adopter" in lag, lag
+
+
+def test_a_stale_pin_against_an_undated_release_is_na(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale pin whose lag cannot be dated is not a lag of 0."""
+    mod = _load()
+    lag = _adopter(monkeypatch, mod, "messagefoundry==1.1.0\n", release={"tag": "v1.2.0"})
+    assert lag.startswith("n/a"), lag
