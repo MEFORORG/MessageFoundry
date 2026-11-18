@@ -12,8 +12,10 @@
 # tests/timing_quarantine.txt? They would still run in the advisory timing-quarantine job, and each
 # would get a vault row that owns the timing fix." The answer, verbatim: "Quarantine both
 # (Recommended)". That ruling is this file's second authority. It authorises entries for exactly
-# those two tests, and nothing wider. Only the uploads test is listed: PR 3035 fixed the
-# scan_forbidden test's timing dependence before this list changed, so the exit rule keeps it out.
+# those two tests, and nothing wider. Only the uploads test is listed. All five scan_forbidden
+# failures in that window predate PR 3035 (merged 2026-11-17 21:55Z), which cut its [bracket-lines]
+# case about 13x in a local measurement under the same 2 s bound, and it has not failed in the
+# queue since, so it was not added.
 #
 # WHAT IT DOES. tests/conftest.py marks each test below `timing_quarantine`. ci.yml's engine legs
 # run `-m 'not tooling and not timing_quarantine'`, so these tests no longer gate a merge. The
@@ -43,4 +45,4 @@ tests/test_harness_scenarios.py::test_a_scenario_expecting_the_wrong_disposition
 tests/test_harness_fuzz.py::test_a_seeded_campaign_holds_every_invariant  merge-queue timing failure on unrelated PRs; row #3837, also #3349
 tests/test_transform_offloop.py::test_slow_handler_does_not_stall_the_loop  named by #4773
 tests/test_intake_pause_mllp_dicom_timer.py::test_an_association_accepted_before_a_pause_finishes_normally  merge-queue timing failure on unrelated PRs; row #3147, also #3266
-tests/test_uploads_cross_process_quota.py::test_the_shutdown_drain_does_not_wait_for_a_heartbeat_touch  merge-queue timing failure on unrelated PRs (3023, 3025, 3032), [ended-slow-unwind] assert 0 == 1; #4773
+tests/test_uploads_cross_process_quota.py::test_the_shutdown_drain_does_not_wait_for_a_heartbeat_touch  merge-queue timing failure on unrelated PRs, assert 0 == 1: [ended] on 2836 (run 42349365047), [ended-slow-unwind] on 3023, 3025, 3032; #4773
