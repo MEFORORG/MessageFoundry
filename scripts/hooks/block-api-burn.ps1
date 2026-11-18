@@ -75,25 +75,42 @@ try {
     $POS = '(?:^|[;&|(){}]\s*|\s(?:do|then|else)\s)'
     $INTERP = '(?:\b(?:ba|z|da)?sh(?:\.exe)?\s+(?:-\w+\s+)*(?-i:-[a-z]*c)|\b(?:pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+)*-(?:c|Command)|\bcmd(?:\.exe)?\s+/[ck])\s+["'']?'
     # A loop or conditional keyword may sit in front: `until gh pr merge 5; do :; done`.
+    $GH0 = "(?:$POS(?:(?:while|until|if|!)\s+)?|$INTERP)gh\s"
+
+    # SO MAY AN ASSIGNMENT, AND THE PROGRAM MAY BE gh.exe (BACKLOG #5449). `$r = gh ...` and
+    # `` s=`gh ...` `` run gh exactly as a bare call does, and `gh.exe` is gh, but $GH0 reads none
+    # of them, so a poll loop around one passed. $GHN reads them. The assignment must itself sit in
+    # command position, and a bash one must open a backtick substitution (`$(` already counts
+    # through the `(`). So `--grep=gh`, `a == gh`, `[ $x = gh ]` and `s=gh run watch`, which runs
+    # `run` with s set to the string gh, are not one.
     #
-    # SO MAY AN ASSIGNMENT (BACKLOG #5449). `$r = gh ...` and `` s=`gh ...` `` run gh exactly as a
-    # bare call does, and neither was in command position here, so a poll loop around one passed.
-    # The assignment must itself sit in command position, and a bash one must open a backtick
-    # substitution (`$(` already counts through the `(`). So `--grep=gh`, `a == gh`, `[ $x = gh ]`,
-    # `$x = gh` inside quoted prose, and `s=gh run watch`, which runs `run` with s set to the string
-    # gh, are not one. And the program may carry .exe: the pattern required `gh` and whitespace, so
-    # `gh.exe` was never gh.
+    # A LINE $GH0 READS KEEPS EVERY RULE IT HAD BEFORE. One that only $GHN reads gets only the
+    # narrower rules below, each tied to that gh: it sits outside any quoted string ($Q), and the
+    # flag or the loop belongs to it. Widening the anchor alone handed the old whole-line rules
+    # commands that call gh once, such as `$n = gh pr view 1; npx jest --watch`.
     #
-    # This covers at least those two assignment shapes, not every way to run gh. Still open: an
-    # assignment that follows another on one line (`a=1 b=`` `gh ...` ``), `NAME=value gh ...`,
-    # PowerShell `+=` and other compound assignments, gh behind a wrapper such as `env`, `time` or
-    # `xargs`, and gh inside an interpreter's string other than the three $INTERP names.
-    $ASSIGN = "$POS(?:[A-Za-z_]\w*=``|\`$[\w:.]+\s*=\s*)"
-    $GH = "(?:$POS(?:(?:while|until|if|!)\s+)?|$INTERP|$ASSIGN)gh(?:\.exe)?\s"
-    if ($c -notmatch $GH) { exit 0 }
+    # This reads at least those shapes, not every way to run gh. Still open, at least: an
+    # assignment after another on one line (`a=1 b=`` `gh ...` ``), `NAME=value gh ...`, `export`,
+    # `local` and `declare`, a typed PowerShell assignment (`[string]$r = gh ...`), `+=` and the
+    # other compound assignments, a quoted substitution (`` s="`gh ...`" ``), a full path to gh,
+    # gh behind a wrapper such as `env`, `time` or `xargs`, gh inside an interpreter string other
+    # than the three $INTERP names, and gh at the start of any line but the first.
+    $GHN = "(?:$POS(?:(?:while|until|if|!)\s+|[A-Za-z_]\w*=``|\`$[\w:.]+\s*=\s*)?|$INTERP)gh(?:\.exe)?\s"
+    $Q = '^(?:[^"'']|"[^"]*"|''[^'']*'')*?'
+    $GHQ = $Q + $GHN
+    $wide = $c -match $GH0
+    # $lines keeps each line break as a \x01, which no rule reads as a separator, so a tied rule
+    # stops at the end of gh's line: `gh pr view 5`, then `npx jest --watch;` on the next line, is
+    # not gh's flag. A backslash line continuation is joined first.
+    $lines = (($cmd -replace '\\\r?\n', ' ') -replace '\r?\n', " $([char]1) " -replace '\s+', ' ').Trim()
+    if (-not $wide -and $lines -notmatch $GHQ) { exit 0 }
+    # From gh to its own flag: no separator, bracket, comment, backtick or line end, and a quoted
+    # argument whole, so `-R 'o/r' --watch;` is read and `--body "never --watch"` is not.
+    $SPAN = '(?:[^"''`;&|(){}#\x01]|"[^"]*"|''[^'']*'')*?'
 
     # `gh run watch` -- the measured 1200/hr offender.
-    if ($c -match ($GH + '.*\brun\s+watch\b')) {
+    if (($wide -and $c -match ($GH0 + '.*\brun\s+watch\b')) -or
+        $lines -match ($GHQ + $SPAN + '\brun\s+watch\b')) {
         Deny ("BLOCKED: `gh run watch` polls every 3 seconds, about 1200 of the 5000 hourly GitHub API " +
               "requests, and every seat in this fleet shares ONE budget as the same identity. Use a " +
               "single-shot read instead: `gh run view <run-id>` for status now, or " +
@@ -104,17 +121,18 @@ try {
     # `--watch` on any gh subcommand is the same loop wearing a flag.
     # Behind an interpreter the closing quote ends the flag too, so `pwsh -Command 'gh pr checks 5
     # --watch'` is caught; elsewhere a quote after it is a mention, as in `--body "never --watch"`.
-    # A shell delimiter, a redirect or an `=value` other than false or 0 ends the flag too, where
-    # neither a quote, a separator (`;`, `&`, `|`, or a line break) nor a bracket sits between gh
-    # and the flag (BACKLOG #5449). So it is not prose in a quoted body, and it is not a later
-    # command's own `--watch`, as in `gh pr checkout 5 && npx jest --watch;` or
-    # `if (gh pr view 1) { echo --watch; }`. That rule reads $lines, where a line break is a
-    # separator; $c has none left. A `)` is not a delimiter: `"polling (gh pr checks --watch)"` is
-    # prose, so `$(gh pr checks --watch)` passes.
-    $lines = (($cmd -replace '\\\r?\n', ' ') -replace '\r?\n', ' ; ' -replace '\s+', ' ').Trim()
-    if ($c -match '(^|\s)--watch(\s|$)' -or
+    # On a line $GH0 reads, any ` --watch` that whitespace or the end closes is denied, whichever
+    # command owns it, so `gh pr checkout 5 && npx jest --watch` is denied as it was before.
+    #
+    # The tied rule also ends the flag at a shell delimiter, a redirect, a backtick, a line end or
+    # an `=value` other than one of gh's false spellings (false, f, 0), and reads a flag only
+    # where $SPAN reaches it from gh (BACKLOG #5449). So a later command's own `--watch;`, as in
+    # `gh pr checkout 5 && npx jest --watch;` or `if (gh pr view 1) { echo --watch; }`, and gh
+    # inside quoted prose or after a `#` are not read. A `)` is not a delimiter:
+    # `"polling (gh pr checks --watch)"` is prose, so `$(gh pr checks --watch)` passes.
+    if (($wide -and $c -match '(^|\s)--watch(\s|$)') -or
         $c -match ("$INTERP" + 'gh(?:\.exe)?\s[^"'']*\s--watch["'']') -or
-        $lines -match ($GH + '[^"''`;&|(){}]*?\s--watch(?=$|[;&|}>`]|=(?!(?:false|0)\b))')) {
+        $lines -match ($GHQ + $SPAN + '\s--watch(?=$|[\s;&|}>`\x01]|=(?!(?:false|f|0)\b))')) {
         Deny ("BLOCKED: a `--watch` flag on a `gh` command polls in a loop and draws on the fleet's " +
               "shared 5000/hr GitHub API budget. Drop `--watch` and read once. For a run: " +
               "`gh run view <run-id>`. For a PR's checks: `gh pr checks <N>` or " +
@@ -133,16 +151,24 @@ try {
     # AND A LOOP THAT NEVER ENDS ON ITS OWN IS A POLL WITH OR WITHOUT A SLEEP. `while true`,
     # `while :`, `while ($true)` and `until` around gh spend requests as fast as gh returns, which
     # is the worst rate of all. `... | while read n` iterates over input, ends, and stays allowed.
-    # `while (1)`, bash `while ((1))`, and `for (;;)` or `for ((;;))` never end either (BACKLOG #5449).
-    # Those four count only with gh in command position AFTER the keyword, so a line that reads a
-    # PR once and then runs some other endless loop is not a poll. A gh after the loop's end is read
-    # as inside it, because nothing here finds where a loop body ends; the loop never ends, so that
-    # gh never runs. The older spellings keep their older rule, with gh anywhere on the line.
-    $LOOP = "(?:$POS(?:while|until|for|foreach|ForEach-Object)\b|\bdo\s*\{|\|\s*%\s*\{)"
+    # On a line $GH0 reads, those rules stand as they were, with gh anywhere on the line.
+    #
+    # `while (1)`, bash `while ((1))`, and `for (;;)` or `for ((;;))` never end on their own either
+    # (BACKLOG #5449). Those, and every loop on a line only $GHN reads, count only with a gh from
+    # $GHN AFTER a loop opener, so reading a PR once and then running some other loop is not a
+    # poll; `do { gh ... } while (1)` is one, because `do {` opens it. Nothing here finds where a
+    # loop body ends, so a gh after the loop reads as inside it. That is a false deny whenever
+    # the gh is after the loop, as in `while (1) { if ($x) { break } }; gh pr view 5`; reading a
+    # body end would lose the deny on a nested body such as `for (;;) { if ($x) { y }; gh ... }`.
+    # The `{` of `do {` and `% {` is only looked at, so a gh right after it is still in command
+    # position for $LOOPGH.
+    $LOOP = "(?:$POS(?:while|until|for|foreach|ForEach-Object)\b|\bdo\s*(?=\{)|\|\s*%\s*(?=\{))"
     $FOREVER = "$POS(?:while\s+(?:true|:)(?:\s|;|$)|while\s*\(\s*\`$true\s*\)|until\s)"
-    $FOREVER_GH = "$POS(?:while\s*\(\(?\s*1\s*\)\)?|for\s*\(\(?\s*;\s*;\s*\)\)?).*$GH"
-    if ($c -match ($LOOP + '.*\b(sleep|Start-Sleep)\b') -or $c -match $FOREVER -or
-        $c -match $FOREVER_GH) {
+    $FOREVER1 = $POS + '(?:while\s*\(\(?\s*1\s*\)\)?|for\s*\(\(?\s*;\s*;\s*\)\)?)'
+    $LOOPGH = $LOOP + '.*' + $GHN
+    if (($wide -and ($c -match ($LOOP + '.*\b(sleep|Start-Sleep)\b') -or $c -match $FOREVER)) -or
+        ($lines -match ($LOOP + '(?=.*' + $GHN + ')(?=.*\b(?:sleep|Start-Sleep)\b)')) -or
+        (($c -match $FOREVER -or $c -match $FOREVER1) -and $lines -match $LOOPGH)) {
         Deny ("BLOCKED: this is a hand-rolled polling loop around `gh`, which costs the fleet's shared " +
               "GitHub API budget the same way `gh run watch` does. Make ONE call per turn and let the " +
               "next turn make the next one. If you must wait inside a turn, sleep once and then read " +

@@ -51,6 +51,13 @@ MUST_DENY = [
     pytest.param("for (;;) { gh pr view 1 --json state }", id="powershell-for-ever"),
     pytest.param("for ((;;)); do gh pr view 1; done", id="bash-for-ever"),
     pytest.param("while ((1)); do gh pr view 1; done", id="bash-while-arith-1"),
+    pytest.param("do { gh pr view 1 --json state } while (1)", id="powershell-do-while-1"),
+    pytest.param(
+        "do { $r = gh pr view 1 --json state; Start-Sleep 30 } while ($true)",
+        id="powershell-do-while-assignment",
+    ),
+    pytest.param("gh pr checks 5 -R 'o/r' --watch; echo done", id="watch-after-a-quoted-argument"),
+    pytest.param('gh pr checks 5 --repo "o/r" --watch&& echo done', id="watch-after-quoted-repo"),
 ]
 
 MUST_ALLOW = [
@@ -90,12 +97,47 @@ MUST_ALLOW = [
     pytest.param("gh pr view 5 && for ((;;)); do date; done", id="for-ever-body-without-gh"),
     pytest.param("gh pr checks 5 --watch=0", id="watch-explicitly-zero"),
     pytest.param("if (gh pr view 1) { echo --watch; }", id="watch-belongs-to-a-braced-body"),
+    pytest.param("gh pr checks 5 --watch=f", id="watch-explicitly-f"),
+    # Review round de5b1e8b: each calls gh once, origin/main allowed it, and the widened anchor
+    # alone handed it to the old whole-line rules.
+    pytest.param(
+        "$prs = gh pr list --json number; foreach ($p in $prs) { Start-Sleep 1 }",
+        id="assigned-gh-then-a-sleeping-loop",
+    ),
+    pytest.param("$n = gh pr view 1; npx jest --watch", id="assigned-gh-then-another-watch"),
+    pytest.param("gh.exe pr view 1; npx jest --watch", id="gh-exe-then-another-watch"),
+    pytest.param(
+        "$x = gh pr view 1 --json title; Write-Host 'gh run watch is banned'",
+        id="assigned-gh-then-run-watch-prose",
+    ),
+    pytest.param(
+        "$o = gh pr view 1 --json state; until ((Test-Path flag)) { Start-Sleep 1 }",
+        id="assigned-gh-then-an-until-loop",
+    ),
+    pytest.param(
+        'gh pr comment 5 --body "Replaced the poll (gh pr checks --watch; 1200/hr) with one read"',
+        id="watch-in-bracketed-quoted-prose",
+    ),
+    pytest.param(
+        'git commit -m "Drop the poll; gh pr checks 5 --watch; is banned"',
+        id="watch-after-a-separator-in-quoted-prose",
+    ),
+    pytest.param("gh pr view 5 # never use --watch; read once", id="watch-in-a-comment"),
+    pytest.param(
+        'echo "never do this; $y = gh run watch 5"', id="assignment-after-quoted-separator"
+    ),
     # STILL DENIED, AND PINNED SO A FIX SHOWS. The guard cannot find where a loop body ends, so a
-    # gh after a forever loop reads as inside it. That gh never runs, so this is a false deny; a
-    # body-end rule would lose the deny on a nested body such as `for (;;) { if (x) { y }; gh ... }`.
+    # gh after a while (1) or for (;;) loop reads as inside it. That gh runs once at most, so each
+    # is a false deny; a body-end rule would lose the deny on a nested body such as
+    # `for (;;) { if (x) { y }; gh ... }`.
     pytest.param(
         "while (1) { echo tick }; gh pr view 5",
         id="gh-after-a-forever-loop",
+        marks=pytest.mark.xfail(strict=True, reason="loop body end is not parsed"),
+    ),
+    pytest.param(
+        "while (1) { if (Test-Path x) { break } }; gh pr view 5",
+        id="gh-after-a-loop-that-breaks",
         marks=pytest.mark.xfail(strict=True, reason="loop body end is not parsed"),
     ),
 ]
