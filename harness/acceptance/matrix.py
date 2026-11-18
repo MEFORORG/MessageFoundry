@@ -105,8 +105,8 @@ def _row(
 #: it, so that no row file mixes SQLite tests with per-test server gates.
 #: ``tests/test_acceptance_framework.py`` checks the files' own source, and nothing they import: a
 #: file listed here skips whole through a module-level ``pytestmark`` unless its variable is set, and
-#: names no other server variable; no other file a Per-DB row names mentions a server variable
-#: outside its docstrings.
+#: names no other server variable; no other file a Per-DB row names spells a ``MEFOR_TEST``
+#: variable in its code. The test's docstrings list the gate shapes it does not see.
 SERVER_SUITE_GATES: dict[str, str] = {
     "tests/test_sqlserver_store.py": "MEFOR_TEST_SQLSERVER",
     "tests/test_cluster_failover_sqlserver.py": "MEFOR_TEST_SQLSERVER",

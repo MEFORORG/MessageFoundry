@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,15 +41,30 @@ _COLLECTION_FAILURE = "collection failure"
 
 @dataclass(frozen=True)
 class FileCounts:
-    """How many of one file's JUnit testcases passed, skipped, and failed.
+    """How many of one file's JUnit testcases fell into each outcome.
 
-    These count ``<testcase>`` elements as pytest wrote them: an error counts as failed, an xfail
-    as skipped, and a test that fails and then errors in teardown twice.
+    These count ``<testcase>`` elements as pytest wrote them, so a test that fails and then errors
+    in teardown counts twice. ``errored`` is a collection failure (the file's ``ERROR`` verdict);
+    any other JUnit error counts as ``failed``. An xfail reads ``SKIP`` for the verdict but is kept
+    out of ``skipped``, so ``skipped`` holds only tests that did not run.
     """
 
     passed: int = 0
     skipped: int = 0
+    xfailed: int = 0
     failed: int = 0
+    errored: int = 0
+
+
+#: The verdict each :class:`FileCounts` field feeds; within a file FAIL > ERROR > PASS > SKIP.
+_KIND_STATUS: dict[str, Status] = {
+    "passed": Status.PASS,
+    "skipped": Status.SKIP,
+    "xfailed": Status.SKIP,
+    "failed": Status.FAIL,
+    "errored": Status.ERROR,
+}
+_FILE_ORDER = (Status.FAIL, Status.ERROR, Status.PASS, Status.SKIP)
 
 
 @dataclass
@@ -98,8 +113,7 @@ def _parse_junit_by_file(
     if not junit_path.is_file():
         return {}, [], {}
     tree = ElementTree.parse(junit_path)
-    # Collect each file's testcase outcomes; precedence within a file: FAIL > ERROR > PASS > SKIP.
-    per_file: dict[str, Counter[Status]] = {}
+    per_file: defaultdict[str, Counter[str]] = defaultdict(Counter)
     unattributed: list[str] = []
     for case in tree.iter("testcase"):
         failed = case.find("failure") is not None or case.find("error") is not None
@@ -110,34 +124,23 @@ def _parse_junit_by_file(
             continue
         key = _normalize(file_attr)
         error = case.find("error")
+        skipped = case.find("skipped")
         if error is not None and error.get("message") == _COLLECTION_FAILURE:
-            outcome = Status.ERROR  # the module did not import: the check broke, not the product
+            kind = "errored"  # the module did not import: the check broke, not the product
         elif failed:
-            outcome = Status.FAIL
-        elif case.find("skipped") is not None:
-            outcome = Status.SKIP
+            kind = "failed"
+        elif skipped is not None:
+            kind = "xfailed" if skipped.get("type") == "pytest.xfail" else "skipped"
         else:
-            outcome = Status.PASS
-        per_file.setdefault(key, Counter())[outcome] += 1
+            kind = "passed"
+        per_file[key][kind] += 1
 
     result: dict[str, Status] = {}
-    for key, outcomes in per_file.items():
-        if Status.FAIL in outcomes:
-            result[key] = Status.FAIL
-        elif Status.ERROR in outcomes:
-            result[key] = Status.ERROR
-        elif Status.PASS in outcomes:
-            result[key] = Status.PASS
-        else:  # only skips collected
-            result[key] = Status.SKIP
-    counts = {
-        key: FileCounts(
-            passed=c[Status.PASS],
-            skipped=c[Status.SKIP],
-            failed=c[Status.FAIL] + c[Status.ERROR],
-        )
-        for key, c in per_file.items()
-    }
+    counts: dict[str, FileCounts] = {}
+    for key, kinds in per_file.items():
+        seen = {_KIND_STATUS[kind] for kind in kinds}
+        result[key] = next(status for status in _FILE_ORDER if status in seen)
+        counts[key] = FileCounts(**kinds)
     return result, unattributed, counts
 
 
@@ -235,10 +238,20 @@ def _aggregate(statuses: Iterable[Status], *, per_db: bool = False) -> Status | 
 
 def _partial_note(counts: FileCounts | None) -> str:
     """`` (n passed, k skipped)`` for a file that ran partly, so its skips show beside its verdict."""
-    if counts is None or not counts.skipped or not (counts.passed or counts.failed):
+    if counts is None or not counts.skipped:
         return ""
-    failed = f", {counts.failed} failed" if counts.failed else ""
-    return f" ({counts.passed} passed, {counts.skipped} skipped{failed})"
+    if not (counts.passed or counts.xfailed or counts.failed or counts.errored):
+        return ""  # skipped whole: the verdict already says SKIP
+    extra = "".join(
+        f", {n} {label}"
+        for n, label in (
+            (counts.xfailed, "xfailed"),
+            (counts.failed, "failed"),
+            (counts.errored, "errored"),
+        )
+        if n
+    )
+    return f" ({counts.passed} passed, {counts.skipped} skipped{extra})"
 
 
 def _pytest_row_result(row: MatrixRow, run: PytestRun) -> RowResult:

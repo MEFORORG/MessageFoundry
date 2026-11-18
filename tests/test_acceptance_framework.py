@@ -189,7 +189,7 @@ def test_collection_error_in_a_row_file_reads_error_not_fail(
     run = default_pytest_runner(["tests/test_a.py", "tests/test_b.py"])
     assert run == PytestRun(
         {"tests/test_a.py": Status.PASS, "tests/test_b.py": Status.ERROR},
-        counts={"tests/test_a.py": FileCounts(passed=1), "tests/test_b.py": FileCounts(failed=1)},
+        counts={"tests/test_a.py": FileCounts(passed=1), "tests/test_b.py": FileCounts(errored=1)},
     )
 
 
@@ -272,9 +272,10 @@ def test_once_row_still_passes_with_a_skipped_suite() -> None:
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_SERVER_GATE_VARS = frozenset(SERVER_SUITE_GATES.values())
-#: A string that ends in the shared prefix builds a gate name at run time (``f"MEFOR_TEST_{db}"``).
-_BUILT_GATE_NAME = re.compile(r"MEFOR_TEST_?$")
+#: Any ``MEFOR_TEST_*`` name, in any case (Windows reads environment names case-insensitively), and
+#: the bare prefix a name built at run time starts from (``f"MEFOR_TEST_{db}"``). Not derived from
+#: the registry, so a gate the registry has never heard of is still found.
+_TEST_GATE_NAME = re.compile(r"MEFOR_TEST\w*", re.IGNORECASE)
 
 
 def _strip_docstrings(tree: ast.AST) -> None:
@@ -291,28 +292,22 @@ def _strip_docstrings(tree: ast.AST) -> None:
             body[0] = ast.Pass()
 
 
-def _named_gates(text: str) -> set[str]:
-    return {v for v in _SERVER_GATE_VARS if re.search(rf"(?<!\w){v}(?!\w)", text)}
-
-
 def server_gates(source: str) -> list[tuple[int, str]]:
-    """Each place ``source`` names a server-backend variable outside a docstring, as (line, name).
+    """Each ``MEFOR_TEST`` name in a string of ``source`` outside a docstring, as (line, name).
 
-    Any mention counts, not only a skip condition: whatever shape a gate takes (a ``skipif`` or
-    ``xfail`` mark, ``pytest.skip`` or a raised ``SkipTest`` under an ``if``, a local, a class
-    attribute or a module name bound to the read) spells its variable somewhere in the file. A
-    string ending in ``MEFOR_TEST_`` counts as a name built at run time. A gate that lives in an
-    imported helper or a conftest fixture is not in the file, and this does not see it.
+    Any mention counts, not only a skip condition, so at least these gate shapes are found: a
+    ``skipif`` or ``xfail`` mark, ``pytest.skip`` or a raised ``SkipTest`` under an ``if``, and a
+    local, class attribute or module name bound to the read, in any letter case, and a name built at
+    run time from the whole ``MEFOR_TEST`` prefix. Not found: a gate in an imported helper or a
+    conftest fixture, a prefix split across strings (``"MEFOR_" + "TEST_"``), and a gate on some
+    other variable.
     """
     tree = ast.parse(source)
     _strip_docstrings(tree)
     hits: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            names = sorted(_named_gates(node.value))
-            if not names and _BUILT_GATE_NAME.search(node.value):
-                names = ["a MEFOR_TEST_ name built at run time"]
-            hits.extend((node.lineno, name) for name in names)
+            hits.extend((node.lineno, name) for name in _TEST_GATE_NAME.findall(node.value))
     return hits
 
 
@@ -348,9 +343,23 @@ def _is_unset_test(cond: ast.expr, var: str) -> bool:
 
 
 def skips_whole_unless(source: str, var: str) -> bool:
-    """Whether the module's last ``pytestmark`` binding carries a skipif on ``var`` being unset."""
+    """Whether the module's one ``pytestmark`` binding carries a skipif on ``var`` being unset.
+
+    The name must appear exactly once in the module, at that top-level binding, so a rebinding in
+    an ``if``, a ``for``, an import, or a mutation such as ``pytestmark.clear()`` reads as not proven.
+    """
+    tree = ast.parse(source)
+    uses = sum(isinstance(n, ast.Name) and n.id == "pytestmark" for n in ast.walk(tree))
+    uses += sum(
+        "pytestmark" in (alias.name, alias.asname)
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+        for alias in n.names
+    )
+    if uses != 1:
+        return False
     value: ast.expr | None = None
-    for stmt in ast.parse(source).body:
+    for stmt in tree.body:
         if (
             isinstance(stmt, ast.Assign)
             and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in stmt.targets)
@@ -389,8 +398,9 @@ def test_every_server_suite_skips_whole_on_its_own_gate(ref: str) -> None:
     source = (_REPO_ROOT / ref).read_text(encoding="utf-8")
     own = SERVER_SUITE_GATES[ref]
     assert skips_whole_unless(source, own)
-    # Gated whole on one backend, the file must not gate some tests on another backend too.
-    assert [hit for hit in server_gates(source) if hit[1] != own] == []
+    # Gated whole on one backend, the file must not gate some tests on another backend too. Its own
+    # variants (MEFOR_TEST_SQLSERVER_STRICT) only narrow a file that already skips whole.
+    assert [hit for hit in server_gates(source) if not hit[1].upper().startswith(own)] == []
 
 
 def test_no_other_per_db_file_gates_a_test_on_a_server_backend() -> None:
@@ -437,6 +447,21 @@ def backend(request):
     if request.param != "sqlite" and not os.getenv(f"MEFOR_TEST_{request.param.upper()}"):
         pytest.skip("no server")
 """,
+    "lower case": """
+import os, pytest
+@pytest.mark.skipif(not os.getenv("mefor_test_sqlserver"), reason="server")
+def test_server(): pass
+""",
+    "a variant of a registered gate": """
+import os, pytest
+@pytest.mark.skipif(os.getenv("MEFOR_TEST_SQLSERVER_STRICT") != "1", reason="strict")
+def test_strict(): pass
+""",
+    "a backend the registry does not name": """
+import os, pytest
+@pytest.mark.skipif(not os.getenv("MEFOR_TEST_ORACLE"), reason="server")
+def test_server(): pass
+""",
 }
 
 
@@ -469,6 +494,9 @@ _GATED = 'pytest.mark.skipif(not os.getenv("MEFOR_TEST_SQLSERVER"), reason="serv
         (f"pytestmark = {_GATED}\npytestmark = pytest.mark.asyncio", False),
         (f"pytestmark = pytest.mark.asyncio({_GATED})", False),
         ("pytestmark: object", False),
+        (f"pytestmark = {_GATED}\nif True:\n    pytestmark = pytest.mark.asyncio", False),
+        (f"pytestmark = {_GATED}\npytestmark.args = ()", False),
+        (f"pytestmark = {_GATED}\nfrom other import pytestmark", False),
     ],
 )
 def test_the_whole_file_check_reads_the_condition_not_a_mention(
@@ -478,14 +506,13 @@ def test_the_whole_file_check_reads_the_condition_not_a_mention(
     assert skips_whole_unless(source, "MEFOR_TEST_SQLSERVER") is whole
 
 
-def test_the_mixed_file_check_ignores_prose_and_other_variables() -> None:
+def test_the_mixed_file_check_ignores_prose_and_other_settings() -> None:
     source = '''
 """Gated elsewhere on ``MEFOR_TEST_SQLSERVER``; this module is not."""
 import os, pytest
 def test_doc():
     """Mentions MEFOR_TEST_POSTGRES in prose only."""
-@pytest.mark.skipif(os.getenv("MEFOR_TEST_SQLSERVER_STRICT") != "1", reason="strict")
-def test_strict(): pass
+    assert os.getenv("MEFOR_STORE_BACKEND", "sqlite")
 '''
     assert server_gates(source) == []
 
@@ -511,6 +538,18 @@ def test_a_mixed_file_reads_pass_with_its_counts(monkeypatch: pytest.MonkeyPatch
     result = _pytest_row_result(row, run)
     assert result.status is Status.PASS
     assert result.detail == "test_mixed.py=PASS (1 passed, 2 skipped)"
+
+
+def test_an_xfail_is_not_counted_as_a_skip(tmp_path: Path) -> None:
+    xfail = '<testcase name="t" file="tests/test_a.py"><skipped type="pytest.xfail"/></testcase>'
+    junit = tmp_path / "junit.xml"
+    junit.write_text(_passing_plus(xfail), encoding="utf-8")
+    status, _, counts = _parse_junit_by_file(junit)
+    assert status["tests/test_a.py"] is Status.PASS
+    assert counts["tests/test_a.py"] == FileCounts(passed=1, xfailed=1)
+    row = MatrixRow("Z3", "Z", "t", PER_DB, Coverage.PYTEST, ("tests/test_a.py",))
+    run = PytestRun(status, counts=counts)
+    assert _pytest_row_result(row, run).detail == "test_a.py=PASS"  # no skip to show
 
 
 def test_default_runner_flags_a_report_that_attributes_nothing(
