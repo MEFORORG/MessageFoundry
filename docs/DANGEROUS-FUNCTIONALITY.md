@@ -332,7 +332,7 @@ debugging on, because a launcher passes no interpreter option.
 | `service_status.py` | `sc.exe query` | Reading the service's state | argument list |
 | `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
 | `store/store.py` | `icacls.exe` | Setting owner-only permissions on store files, which hold no key | argument list |
-| `checks.py` | `ruff` from the running interpreter's, its base installation's or the user scheme's scripts folder, and `mypy` as a module of that interpreter | `messagefoundry check`, unless `--no-lint` is passed: `ruff` when it is in one of those folders, and `mypy`, on its own, when the search `_tool_installed` runs finds it. Either can be a copy inside the working directory, for example from a virtual environment there: nothing keeps `ruff` out of it, and `_tool_installed`'s docstring names at least the limits of the working-directory skip in `mypy`'s search | argument list |
+| `checks.py` | `ruff` from the running interpreter's, its base installation's or the user scheme's scripts folder, and `mypy` as a module of that interpreter | `messagefoundry check`, unless `--no-lint` is passed: `ruff` when it is in one of those folders, and `mypy`, on its own, when the search `_tool_installed` runs finds it. Either can be a copy inside the working directory, for example from a virtual environment there; the `checks.py` paragraph below says what bounds each | argument list |
 | `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` from the system TLS module on Windows; `openssl ciphers` and `openssl version -d`, found on `PATH`, on Linux | `messagefoundry verify`, in its host section, which runs by default, when that row reads the policy ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 says when) | argument list |
 | `security/audit_all_platforms.py` | `pip` and `pip-audit`, as modules of the running interpreter | A dependency audit in CI or by hand, never in the service | argument list |
 | `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
@@ -360,10 +360,11 @@ a `nosec` note naming the rule it answers.
 it: the running interpreter's environment, its base installation, then the user scheme's
 (`~/.local/bin` on Linux, where a pipx or `uv tool` ruff may live). It runs `mypy` as a `-m`
 module of that interpreter, by its absolute path and with `-P`. So no `PATH` search picks
-either copy. Nothing keeps the working directory's `ruff` out: when the running interpreter's
-environment lives there, its scripts folder is the first one read. `mypy`'s module search keeps
-the working directory out only as far as the `_tool_installed` docstring in `checks.py` says
-(BACKLOG #5375). `mypy` is also started with `--config-file=`,
+either copy. Only those three folders are read for `ruff`, so one elsewhere in the working
+directory does not run, but a folder of the three can lie inside the working directory, at least
+when the running interpreter's environment lives there, and its `ruff` then runs. `mypy`'s module
+search keeps the working directory out only as far as the `_tool_installed` docstring in
+`checks.py` says (BACKLOG #5375). `mypy` is also started with `--config-file=`,
 an empty name, so it reads no configuration file at all. Without it, mypy reads a `mypy.ini`,
 `.mypy.ini`, `pyproject.toml` or `setup.cfg` from the working directory or a parent folder, or the
 user's own file, and such a file can name a plugin that mypy imports and runs. At least two
