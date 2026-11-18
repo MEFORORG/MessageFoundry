@@ -851,14 +851,14 @@ because neither opener it can dial relaxes: rest.py's shared opener, or, since B
 anchored opener it holds, built by rest.py's `_no_redirect_opener`, which never calls
 `relax_verify_expiry`. *(Note 2026-11-17, vault BACKLOG #4912: the AI broker now takes its
 crossing line's lead from the guard and words its records from the guard's reason, so a context
-that skips time validity, if one reached it, would get the relaxed words, unless it is also
-`CERT_NONE`, where it would get the `CrlNoCredit.PEER_NOT_VERIFIED` words.)* *(Note 2026-11-04: the open limit above is closed by
+that skips time validity, if one reached it, would get the relaxed words, or the
+`CrlNoCredit.PEER_NOT_VERIFIED` words if that context's `verify_mode` is `CERT_NONE`.)* *(Note 2026-11-04: the open limit above is closed by
 vault BACKLOG #5086. `capture()` reads the time-validity flag off any context it is handed, so a
 context that skips time validity earns no CRL credit without the flag either, takes the relaxed
-words and, where the caller passes no remedy, `EXPIRY_RELAXED_WAYS_ACROSS`, unless it is also
-`CERT_NONE`, where the `CrlNoCredit.PEER_NOT_VERIFIED` words and `PEER_NOT_VERIFIED_WAYS_ACROSS`
-apply; "Only the flag sets
-them" no longer holds. Its attested line is kept on `crl_checked`, which is now False there, so the
+words and, where the caller passes no remedy, `EXPIRY_RELAXED_WAYS_ACROSS`; "Only the flag sets
+them" no longer holds. Where that context's `verify_mode` is `CERT_NONE` it takes the
+`CrlNoCredit.PEER_NOT_VERIFIED` words instead and, where the caller passes no remedy,
+`PEER_NOT_VERIFIED_WAYS_ACROSS`. Its attested line is kept on `crl_checked`, which is now False there, so the
 record and the disposition no longer contradict each other. `crl_is_a_check` is gone; §4.3's note
 of 2026-11-04 above says what replaced it. CORRECTED 2026-11-18, vault BACKLOG #4912: the
 relaxed-words sentence had no `CERT_NONE` exception; it read "takes the relaxed words and, where
