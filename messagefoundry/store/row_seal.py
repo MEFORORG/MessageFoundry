@@ -369,7 +369,8 @@ class RowSealer:
         be genuine and sealed under a retired key the run was not given, so the run stops short
         until a run that holds that key re-seals it. A row whose seal names a key this sealer
         holds, or that is malformed, answers ``False`` and does not hold the rotation open;
-        :class:`ResealOutcome` says what such a row may be. A key id that is not one :func:`row_seal_key_id` could return is malformed."""
+        :class:`ResealOutcome` says what such a row may be. A key id that is not one
+        :func:`row_seal_key_id` could return is malformed."""
         parsed = self._parse(stored)
         if parsed is None or parsed[0] == self.key_id or parsed[0] in self._retired:
             return False

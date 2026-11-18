@@ -4013,7 +4013,7 @@ def test_admin_unlock_does_not_send_a_transit_seal_refusal_to_stop_the_engine(
 ) -> None:
     """BACKLOG #5633 item 2: a Transit row seal that could not be made is not a busy store, so
     its text names Vault transit rather than telling the operator to stop the engine. Raised from
-    the real clear's seal step, which comes before its UPDATE; the defect test below is the one
+    the real clear's seal step, which comes before its UPDATE; the defect test above is the one
     that raises after the UPDATE."""
     import time
 
@@ -4061,6 +4061,14 @@ def test_admin_unlock_does_not_call_an_unverifiable_seal_an_outage(
     error = json.loads(capsys.readouterr().out)["error"]
     assert "RowSealUnverifiableError" in error and "would not check" in error
     assert "stored key version 7, probe version 3" in error
+    # ADR 0217 (a)'s recovery, as the auth service words it: never "lower the version", and a
+    # lagging node clears on a retry, so no "a re-run meets the same answer".
+    from messagefoundry.__main__ import _UNVERIFIABLE_RECOVERY
+    from messagefoundry.auth.service import _UNVERIFIABLE_ACCOUNT_REFUSAL
+
+    assert _UNVERIFIABLE_RECOVERY in _UNVERIFIABLE_ACCOUNT_REFUSAL
+    assert _UNVERIFIABLE_RECOVERY in error
+    assert "min_decryption_version" not in error and "same answer" not in error
     assert "stop it" not in error and "reachable" not in error
     monkeypatch.undo()
     assert _read_lock(db)[0] is not None
@@ -4122,6 +4130,18 @@ def test_admin_unlock_names_the_stored_username(
     monkeypatch.setattr(MessageStore, "_append_audits", refuse)
     assert main(["admin-unlock", "--username", "ADMIN", "--db", str(db), "--json"]) == 1
     assert "refused the unlock for 'admin'" in json.loads(capsys.readouterr().out)["error"]
+
+    import messagefoundry.store.store as store_module
+    from messagefoundry.store.row_seal import RowSealError
+
+    async def forged(*_a: object, **_k: object) -> None:
+        raise RowSealError("user")
+
+    # The seal refusal names it as stored too.
+    monkeypatch.setattr(store_module, "require_user_seal_for_write", forged)
+    assert main(["admin-unlock", "--username", "ADMIN", "--db", str(db), "--json"]) == 1
+    sealed = json.loads(capsys.readouterr().out)["error"]
+    assert "the unlock for 'admin'" in sealed and "'ADMIN'" not in sealed
     monkeypatch.undo()
     assert [d["username"] for d in _unlock_audit_details(db)] == ["admin", "admin"]
 

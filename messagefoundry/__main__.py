@@ -7048,6 +7048,15 @@ def _host_gated_store_settings(
     return settings
 
 
+#: The recovery an Unverifiable row seal gets (ADR 0217 (a)): the exact closing clause of
+#: ``auth.service._UNVERIFIABLE_ACCOUNT_REFUSAL``, whose opening names provision-admin's scan and
+#: so does not fit a host unlock (BACKLOG #5633).
+_UNVERIFIABLE_RECOVERY = (
+    "The seal may be planted: check that Vault is healthy and that every node holds the audit "
+    "key's latest version, then retry"
+)
+
+
 def _seal_refusal(username: str, act: str) -> str:
     """The fixed refusal of a host command whose write the store refused because the account's
     record fails its integrity seal (BACKLOG #3510). Logs it and returns the text, which the caller
@@ -7238,7 +7247,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     except RowSealError:
         # BACKLOG #3510: the store's write helper refused the clear, writing nothing.
         return _emit_error(
-            _seal_refusal(wanted, "unlock") + ". Nothing was written", as_json=args.json
+            _seal_refusal(named[0], "unlock") + ". Nothing was written", as_json=args.json
         )
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
@@ -7292,9 +7301,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}): Vault "
             "transit would not check the account's row seal (stored key version "
             f"{extra.stored_version}, probe version {extra.probe_version}). The clear and its "
-            "audit row are one transaction, so neither was written, and this refusal wrote no "
-            "audit row. A re-run meets the same answer until Transit checks that seal: check "
-            "the Transit key's versions",
+            "audit row are one transaction, so neither was written. " + _UNVERIFIABLE_RECOVERY,
             as_json=args.json,
         )
     if outcome == "refused":
