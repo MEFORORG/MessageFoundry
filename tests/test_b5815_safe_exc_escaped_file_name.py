@@ -25,6 +25,8 @@ NAMES = [
     "MRN4455667\x7f_ADT.hl7",  # DEL: rendered \x7f
     "O'Zqxdoe_MRN4455667.hl7",  # an apostrophe: rendered \' or kept, by the whole path's quote
     "O'Zqxdoe\u200b_MRN4455667.hl7",  # both
+    "MRN4455667\ud800_ADT.hl7",  # a lone surrogate, which a Windows directory listing can return
+    "MRN4455667\udc80_ADT.hl7",  # a lone low surrogate, which POSIX uses to escape a raw byte
 ]
 
 
@@ -66,7 +68,9 @@ def test_a_plain_name_still_renders_as_before() -> None:
 @pytest.mark.parametrize("name", NAMES)
 def test_a_bytes_path_in_an_oserror_is_swapped_out(name: str) -> None:
     """A bytes path renders as ``b'...'`` with the name's UTF-8 bytes escaped."""
-    exc = FileNotFoundError(2, "No such file or directory", f"C:/drops/{name}".encode())
+    exc = FileNotFoundError(
+        2, "No such file or directory", f"C:/drops/{name}".encode("utf-8", "surrogatepass")
+    )
     out = safe_exc(exc, file_name=name)
     assert "MRN4455667" not in out and "Zqxdoe" not in out, out
     assert safe_name(name) in out
