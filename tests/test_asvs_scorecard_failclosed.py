@@ -13,7 +13,17 @@ from pathlib import Path
 import pytest
 
 import scripts.asvs.scorecard as scorecard_module
-from scripts.asvs.scorecard import ScorecardError, load_scorecard, main
+from scripts.asvs.scorecard import (
+    ANCHOR_GONE,
+    Anchor,
+    Cell,
+    Findings,
+    ScorecardError,
+    check_anchors,
+    load_scorecard,
+    locate_anchor,
+    main,
+)
 
 #: One loadable cell. Each test appends or substitutes the one field it is about.
 _CELL = '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "fail"\nresidual = "why"\n'
@@ -273,3 +283,69 @@ def test_an_interrupt_is_not_swallowed(tmp_path: Path, monkeypatch: pytest.Monke
     record = _record(tmp_path, _CELL.encode())
     with pytest.raises(KeyboardInterrupt):
         main(_mode_argv("status", record, tmp_path))
+
+
+# --- BACKLOG #5459: an anchor must name a token, and must stay inside the engine root ------------
+
+_ANCHOR = '  [[cell.evidence]]\n  path = "mod.py"\n  line = 1\n  expect = "TOKEN"\n'
+
+
+def test_the_well_formed_anchor_loads(tmp_path: Path) -> None:
+    """Control for the anchor refusals below."""
+    assert load_scorecard(_write(tmp_path, _CELL + _ANCHOR))[0].evidence[0].expect == "TOKEN"
+
+
+@pytest.mark.parametrize("text", ["", "x = 1\n"], ids=["empty-file", "any-file"])
+def test_an_empty_token_never_locates(text: str) -> None:
+    """Before: the empty string occurs exactly once in an empty file, so it LOCATED there."""
+    assert locate_anchor(text, "").status == ANCHOR_GONE
+
+
+@pytest.mark.parametrize("expect", ["", "   ", "\n"], ids=["empty", "spaces", "newline"])
+def test_a_blank_expect_is_refused_at_load(tmp_path: Path, expect: str) -> None:
+    body = _CELL + _ANCHOR.replace('expect = "TOKEN"', f"expect = {expect!r}".replace("'", '"'))
+    with pytest.raises(ScorecardError, match="expect"):
+        _load(tmp_path, body)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../outside.py", "a/../../outside.py", "/etc/outside.py", "C:/outside.py", "C:outside.py", ""],
+    ids=["dotdot", "inner-dotdot", "posix-absolute", "drive-absolute", "drive-relative", "empty"],
+)
+def test_an_anchor_path_outside_the_root_is_refused_at_load(tmp_path: Path, path: str) -> None:
+    body = _CELL + _ANCHOR.replace('path = "mod.py"', f'path = "{path}"')
+    with pytest.raises(ScorecardError, match="path"):
+        _load(tmp_path, body)
+
+
+def test_a_backslash_dotdot_path_is_refused_at_load(tmp_path: Path) -> None:
+    """A Windows separator must not hide a `..` from a check that splits on `/` only."""
+    body = _CELL + _ANCHOR.replace('path = "mod.py"', "path = '..\\outside.py'")
+    with pytest.raises(ScorecardError, match="path"):
+        _load(tmp_path, body)
+
+
+@pytest.mark.parametrize("line", ["0", "-3"])
+def test_an_anchor_line_below_one_is_refused_at_load(tmp_path: Path, line: str) -> None:
+    body = _CELL + _ANCHOR.replace("line = 1", f"line = {line}")
+    with pytest.raises(ScorecardError, match="line"):
+        _load(tmp_path, body)
+
+
+def test_check_anchors_does_not_read_outside_the_root(tmp_path: Path) -> None:
+    """A Cell built in code skips the loader, so the check holds the line itself. Before: the
+    anchor resolved against a file beside the engine root and passed as LOCATED."""
+    (tmp_path / "outside.py").write_text("TOKEN = 1\n", encoding="utf-8")
+    root = tmp_path / "engine"
+    root.mkdir()
+    cell = Cell(
+        id="1.1.1",
+        level=1,
+        verdict="fail",
+        evidence=(Anchor(path="../outside.py", line=1, expect="TOKEN"),),
+    )
+    findings = Findings()
+    check_anchors([cell], root, findings)
+    assert findings.checked_anchors == 0
+    assert any("outside the root" in p for p in findings.problems), findings.problems

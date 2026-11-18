@@ -33,7 +33,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Final, Literal, get_args
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
@@ -191,7 +191,13 @@ def locate_anchor(text: str, expect: str) -> AnchorLocation:
     Substring count for the uniqueness rule, and the line derived from the CHARACTER OFFSET rather
     than by scanning lines: 42 of the roughly 1,980 recorded tokens span a newline, and a per-line
     scan finds none of them.
+
+    **An empty token locates nothing.** ``"".count("")`` is 1, so before BACKLOG #5459 an empty
+    ``expect`` LOCATED, uniquely, in any empty file, and certified nothing. It is GONE here for every
+    caller, and :func:`load_scorecard` refuses a blank one before it gets this far.
     """
+    if not expect:
+        return AnchorLocation(ANCHOR_GONE, 0)
     occurrences = text.count(expect)
     if occurrences == 0:
         return AnchorLocation(ANCHOR_GONE, 0)
@@ -939,11 +945,28 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
         evidence: list[Anchor] = []
         for i, e in enumerate(_tables(raw, "evidence", where)):
             at = f"{where} evidence[{i}]"
+            # An anchor names a token, at a line, in a file under the engine root. A blank token
+            # located in any empty file, and a `..` or absolute path read a file outside the tree
+            # being measured, so each is refused here rather than resolved (BACKLOG #5459).
+            anchor_path = _str(e, "path", at)
+            if not anchor_path.strip() or not _is_within_tree(anchor_path):
+                raise ScorecardError(
+                    f"{at}: `path` must be a non-empty path relative to the engine root, with no "
+                    "drive, no leading separator and no `..`"
+                )
+            line = _int(e, "line", at)
+            if line < 1:
+                raise ScorecardError(f"{at}: `line` must be 1 or more; lines are numbered from 1")
+            expect = _str(e, "expect", at)
+            if not expect.strip():
+                raise ScorecardError(
+                    f"{at}: `expect` is blank, so it names no token and cannot certify anything"
+                )
             evidence.append(
                 Anchor(
-                    path=_str(e, "path", at),
-                    line=_int(e, "line", at),
-                    expect=_str(e, "expect", at),
+                    path=anchor_path,
+                    line=line,
+                    expect=expect,
                     # Absent stays None, deliberately: an empty string is the assertion "module
                     # level" / "unnested", so defaulting to it would turn every un-backfilled anchor
                     # into that claim overnight and light up every anchor that is legitimately
@@ -1525,9 +1548,19 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     text_cache: dict[Path, str] = {}
     spans_cache: dict[Path, list[tuple[int, int]] | None] = {}
     ast_cache: dict[Path, ast.Module | None] = {}
+    resolved_root = root.resolve()
     for c in cells:
         for a in c.evidence:
             target = root / a.path
+            # Resolved, so a symlink out of the tree is caught as well as a `..` or absolute path.
+            # The loader refuses the last two; a Cell built in code does not pass through it, and
+            # an anchor read outside the root certifies a tree nobody asked about (BACKLOG #5459).
+            if not _is_within_tree(a.path) or not target.resolve().is_relative_to(resolved_root):
+                findings.problems.append(
+                    f"{c.id}: evidence path {a.path} resolves outside the root {root}, so it is "
+                    "not evidence about the engine tree being checked"
+                )
+                continue
             if not target.is_file():
                 findings.problems.append(f"{c.id}: evidence path {a.path} does not exist")
                 continue
@@ -2279,12 +2312,16 @@ def _copy_scratch(root: Path, dest: Path) -> Path:
 
 def _is_within_tree(rel: str) -> bool:
     """True only for a repo-relative path with no anchor and no ``..`` component — one that cannot
-    escape the scratch copy when joined onto it. ``mutation_path`` comes from the authored scorecard,
-    so it is untrusted for this purpose: an absolute or ``..``-bearing value is refused, not resolved."""
-    p = Path(rel)
-    if p.is_absolute() or p.anchor:
-        return False
-    return ".." not in p.parts
+    escape the scratch copy when joined onto it. ``mutation_path`` and an anchor's ``path`` come from
+    the authored scorecard, so they are untrusted for this purpose: an absolute or ``..``-bearing
+    value is refused, not resolved.
+
+    Read under BOTH path flavours, whatever the host: on Linux ``..\\x`` is one component and
+    ``C:/x`` has no anchor, and the record is authored and checked on both (BACKLOG #5459)."""
+    for p in (PurePosixPath(rel.replace("\\", "/")), PureWindowsPath(rel)):
+        if p.is_absolute() or p.anchor or ".." in p.parts:
+            return False
+    return True
 
 
 def _apply_mutation(scratch: Path, mutation_path: str, mutation: str) -> None:
