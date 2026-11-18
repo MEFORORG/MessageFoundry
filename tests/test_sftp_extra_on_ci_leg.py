@@ -42,9 +42,9 @@ def test_the_sftp_extra_is_importable_where_the_leg_requires_it() -> None:
     assert hasattr(paramiko, "Transport"), "paramiko imported but is not the SSH library"
 
 
-#: The engine suite's two shards (BACKLOG #5247). Each runs whichever half holds this file, so each
-#: must install the extra and arm the check.
-_ENGINE_JOBS = ("test", "test-shard2")
+#: The engine suite's shard jobs (BACKLOG #5247): `test` runs shard 1 and `test-shards` the rest.
+#: Each runs whichever third holds this file, so each must install the extra and arm the check.
+_ENGINE_JOBS = ("test", "test-shards")
 
 
 @functools.cache
