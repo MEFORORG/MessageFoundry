@@ -435,7 +435,8 @@ already unwritable keeps it unwritable, and still fires a stage-2 event and the 
 `main` does. The row's *one page per break* clause is therefore not closed for these rolls. A
 stage-2 event that was not delivered is now owed and fired again later;
 `LogWriteGuard.record_unwritable`'s docstring says when. A responder that raises on a stage-2 event
-gets a stderr line saying so once per break of the sink, not once per event fired again.
+gets a stderr line saying so once per break of the sink and responder, not once per event
+fired again.
 
 **The stage-2 stderr line.** Where every other sink reads unwritable but at least one only through
 the flap latch, the line now says so, instead of saying another sink is still writable.

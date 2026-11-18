@@ -221,6 +221,9 @@ class LogWriteGuard:
         with self._lock:
             previous = self._escalation
             self._escalation = callback
+            if callback != previous:
+                # A new responder's first raise in a break is said, whatever the old one did.
+                self._escalation_failure_said.clear()
             owed = self._take_owed_events() if callback is not None else []
         if callback is not None and previous is not None and previous != callback:
             _last_resort(
@@ -561,7 +564,7 @@ class LogWriteGuard:
         """Hand ``event`` to the responder, and report whether it was delivered: False when no
         responder is wired, the responder returned False, which it does when it dropped the
         event, or the responder raised. A raise writes a stderr line, for a stage-2 event at most
-        once per break of the sink."""
+        once per break of the sink and responder."""
         with self._lock:
             callback = self._escalation
         if callback is None:

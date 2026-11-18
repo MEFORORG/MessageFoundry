@@ -1179,6 +1179,13 @@ def test_a_responder_that_keeps_raising_writes_one_stderr_line_per_break(
     guard.record_unwritable("file", reason="still the second break")
     assert capsys.readouterr().err.count("log-sink escalation for file failed") == 1
 
+    def other_responder(event: LogSinkEvent) -> bool:
+        raise ValueError("the new responder broke too")
+
+    # A new responder's failure in the same break is said too.
+    guard.set_escalation(other_responder)
+    assert capsys.readouterr().err.count("log-sink escalation for file failed") == 1
+
 
 async def test_the_runners_responder_reports_an_event_it_dropped(store: MessageStore) -> None:
     # The guard learns of a drop only from the responder's return. NEGATIVE CONTROL: on
