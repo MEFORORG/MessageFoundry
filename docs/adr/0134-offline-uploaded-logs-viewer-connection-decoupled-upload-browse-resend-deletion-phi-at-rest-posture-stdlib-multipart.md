@@ -94,7 +94,10 @@ access, and injects a resent message through a **distinct ingest path** — neve
    splits the body on the boundary delimiter, and extracts the single file part's filename + bytes, with a
    **hard size cap** enforced before buffering. **No `python-multipart`** — honouring the `routes/core.py`
    no-multipart stance and avoiding an owner dep-vet + re-lock. The global 1 MiB request-body middleware is
-   made path-aware so only the upload route admits up to `max_upload_bytes`.
+   made path-aware so only the upload route admits up to `max_upload_bytes`. *(Amended 2026-11-17 under
+   BACKLOG #5520 and #5522: the parser now locates each part by the offset of the boundary delimiter
+   rather than splitting the body, refuses a body with more than one file part, and caps every part;
+   the module docstring of `api/multipart.py` states the current behaviour.)*
 
 7. **Web console.** A new `/ui/uploaded-logs` page (list + upload form + per-file browse + per-message
    resend) reaches the engine only through new `CoreHandlers` seam handlers (ADR 0065; `ENGINE_UI_SEAM`

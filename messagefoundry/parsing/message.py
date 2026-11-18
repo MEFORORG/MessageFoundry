@@ -562,12 +562,36 @@ class Message:
         clone._shared = True
         return clone
 
+    def __copy__(self) -> Message:
+        # copy.copy shares the tree, so both sides take the copy-on-write flag, or a write would
+        # reach both. Built on type(self) from the instance __dict__ (slots are not copied).
+        new = object.__new__(type(self))
+        new.__dict__.update(self.__dict__)
+        self._shared = new._shared = True
+        return new
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Message:
+        # A deep copy shares nothing and leaves the source's flag alone. The tree goes through
+        # clone(): copy.deepcopy would walk a _lazy a reader of a clone may be splitting (#5801).
+        new = object.__new__(type(self))
+        memo[id(self)] = new
+        for name, value in self.__dict__.items():
+            if name == "_m":
+                value = _builtin_hl7.clone(value)
+            elif name == "_shared":
+                value = False
+            else:
+                value = copy.deepcopy(value, memo)
+            setattr(new, name, value)
+        return new
+
     def _ensure_owned(self) -> None:
         """Copy-on-write hook — every mutator calls this before touching ``self._m``. If the backing tree
         is still shared with a :meth:`copy` snapshot/clone, take a private deepcopy now (and clear the
         flag) so the mutation lands only on this message; if already owned it is a cheap no-op."""
         if self._shared:
-            self._m = copy.deepcopy(self._m)
+            # Not copy.deepcopy: a reader of the other side may be splitting this tree (#5801).
+            self._m = _builtin_hl7.clone(self._m)
             self._shared = False
 
     def __str__(self) -> str:

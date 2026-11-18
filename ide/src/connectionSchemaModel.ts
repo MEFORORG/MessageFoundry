@@ -188,10 +188,11 @@ export type ConnectionSchemaFetcher = (cwd?: string) => Promise<unknown>;
  * Module-level memo of the catalogue, keyed by the cwd the CLI ran in.
  *
  * The catalogue describes the ENGINE, not a workspace, and the engine binary cannot change while
- * the extension host lives — but WHICH engine answers does depend on cwd: `python -m messagefoundry`
- * puts the cwd first on sys.path, so a folder containing a `messagefoundry/` package shadows the
- * installed one. Keying by cwd keeps a source checkout and an installed engine from sharing an
- * answer. {@link resetConnectionSchemaCache} is the escape hatch for the cases that DO change the
+ * the extension host lives — but WHICH engine answers can depend on cwd. The CLI bridge runs with
+ * `-P` (BACKLOG #5409), so the cwd is no longer on sys.path, but the default interpreter is still the
+ * workspace's own `.venv` where one exists (resolvePythonPath), and an editable install there can
+ * point at that checkout. Keying by cwd keeps a source checkout and an installed engine from
+ * sharing an answer. {@link resetConnectionSchemaCache} is the escape hatch for the cases that DO change the
  * engine under us: a changed interpreter setting, or an engine-changed event.
  */
 const cache = new Map<string, Promise<ConnectionSchema>>();

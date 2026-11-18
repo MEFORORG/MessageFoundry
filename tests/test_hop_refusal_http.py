@@ -620,6 +620,101 @@ def test_a_proxy_credential_or_a_cleartext_url_is_not_this_refusals_case() -> No
     )
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    [f";jsessionid={_SECRET}", f";jsessionid={_SECRET}/next", f"?a=1?api_key={_SECRET}"],
+)
+@pytest.mark.parametrize("cell", _CELLS)
+def test_a_url_segment_credential_the_query_misses_is_refused_over_verify_off(
+    cell: str, suffix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5353: a ``;``-split segment or a second ``?`` holds a credential the ``&``-split
+    query reader does not reach, and it used to cross a verify-off hop."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    url = f"{_HTTPS[cell][2]}{suffix}"
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw(cell, {"verify_tls": False, "url": url})
+    assert "url segment with a credential-looking name" in str(exc.value)
+    _assert_credential_refusal(exc)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+def test_a_url_segment_credential_over_declared_cleartext_is_refused(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The off-box cleartext rule reads the same list (BACKLOG #5353)."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    ctype, factory, url = _CLEARTEXT[cell]
+    with (
+        active_hop_posture(_PROD),
+        pytest.raises(InsecureHopRefused, match="HTTP cleartext credentials") as exc,
+    ):
+        _build((ctype, factory, f"{url};jsessionid={_SECRET}"), attested=True)
+    assert _SECRET not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("query", "shown"),
+    [
+        (f"identifier=sys|1&api_key={_SECRET}", "conditional_query parameter api_key"),
+        (f"identifier=sys|1;token={_SECRET}", "conditional_query segment"),
+    ],
+)
+@pytest.mark.parametrize("conditional", ["if-none-exist", "conditional-update"])
+def test_a_fhir_conditional_query_credential_is_refused_over_verify_off(
+    query: str, shown: str, conditional: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5353: ``conditional_query`` crosses the hop in the URL or the If-None-Exist header,
+    so a credential in it is refused as a ``url`` query credential is."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {"verify_tls": False, "conditional": conditional, "conditional_query": query}
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw("FHIR", extra)
+    assert shown in str(exc.value)
+    _assert_credential_refusal(exc)
+
+
+def test_url_segment_and_conditional_query_readings() -> None:
+    """The reader names a query credential, counts a segment one unnamed, reads conditional_query
+    on FHIR only, and leaves a harmless value alone."""
+    from messagefoundry.transports.rest import _query_credentials_sent, http_credentials_sent
+
+    assert http_credentials_sent(ConnectorType.REST, {"url": "https://h.example/x;v=1?f=j#t"}) == []
+    # The path before any ';' or '?' is not read, so an OData key predicate is no credential, and
+    # urllib never sends a fragment, so a name there does not cross the hop.
+    odata = "https://odata.example/Orders(OrderKey=5)/Items(token=1)"
+    assert http_credentials_sent(ConnectorType.REST, {"url": odata}) == []
+    fragment = f"https://h.example/x?fmt=json#access_token={_SECRET}"
+    assert http_credentials_sent(ConnectorType.REST, {"url": fragment}) == []
+    # urllib splits the fragment at the LAST '#', so text between two is sent and is read.
+    twice = f"https://h.example/x?fmt=json#a;jsessionid={_SECRET}#b"
+    assert http_credentials_sent(ConnectorType.REST, {"url": twice}) == [
+        "url segment with a credential-looking name"
+    ]
+    # With no ';' or '?' before it, the earlier '#' itself starts the read (urllib sends
+    # '/x#a=1&api_key=S').
+    bare = "https://partner.example/x#a=1&api_key=S#b"
+    assert http_credentials_sent(ConnectorType.REST, {"url": bare}) == [
+        "url segment with a credential-looking name"
+    ]
+    assert _query_credentials_sent("conditional_query", "identifier=s|1", query_only=True) == []
+    secret = f"_id=1&client_secret={_SECRET}"
+    assert _query_credentials_sent("conditional_query", secret, query_only=True) == [
+        "conditional_query parameter client_secret"
+    ]
+    # The shared reader leaves conditional_query to the FHIR destination's own call sites.
+    assert http_credentials_sent(ConnectorType.FHIR, {"conditional_query": secret}) == []
+
+
+def test_a_fhir_search_code_parameter_in_conditional_query_is_not_a_credential() -> None:
+    """``code`` is FHIR's own search parameter in a conditional_query, so the ``url`` refusal's
+    function-key reading of it does not apply there (BACKLOG #5350)."""
+    from messagefoundry.transports.rest import _query_credentials_sent
+
+    query = "code=http://loinc.org|1234-5"
+    assert _query_credentials_sent("conditional_query", query, query_only=True) == []
+
+
 @pytest.mark.parametrize("cell", _CELLS)
 def test_an_explicit_none_verify_tls_verifies(cell: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Vault BACKLOG #3230: ``verify_tls = None`` takes the default (on). It used to read as off, so

@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -320,3 +321,266 @@ def test_registered_command_runs_from_a_subdirectory(tmp_path):
         timeout=20,
     )
     assert json.loads(completed.stdout) == {"probe": True}
+
+
+# --- The registered line, end to end: a hook's exit 2 reaches Codex as 2 where the outer shell
+# keeps it, and every fault path is at least as strict as main's exit code (non-zero, as on main).
+
+_DENY = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}}
+_PAYLOAD = {"session_id": "x", "hook_event_name": "PreToolUse", "tool_name": "Bash"}
+
+
+def _py(source, **extra):
+    return {"type": "command", "command": sys.executable, "args": ["-c", source], **extra}
+
+
+def _outer_shells():
+    shells = ["pwsh"]
+    if os.name == "nt":
+        shells.append("cmd")
+    if shutil.which("sh"):
+        shells.append("sh")
+    return shells
+
+
+def _outer_argv(shell, command):
+    # cmd takes the line verbatim, as a string: Python's argv quoting escapes quotes in a way cmd
+    # does not read.
+    if shell == "cmd":
+        return f"cmd /d /c {command}"
+    if shell == "pwsh":
+        return ["pwsh", "-NoProfile", "-Command", command]
+    if shell == "none":
+        return shlex.split(command)
+    return [shutil.which("sh"), "-c", command]
+
+
+def _link_python(root):
+    """Give the copied launcher a .venv that reaches this test's own interpreter."""
+    if os.name == "nt":
+        if not (Path(sys.prefix) / "Scripts/python.exe").is_file():
+            pytest.skip("needs a virtualenv to junction on Windows")
+        link = ["cmd", "/c", "mklink", "/J", str(root / ".venv"), sys.prefix]
+        subprocess.run(link, check=True, capture_output=True)
+    else:
+        (root / ".venv/bin").mkdir(parents=True)
+        (root / ".venv/bin/python").symlink_to(sys.executable)
+
+
+def _make_repo(tmp_path, settings_text, venv=True):
+    root = tmp_path / "repo"
+    scripts = root / "scripts/codex"
+    scripts.mkdir(parents=True)
+    for name in ("invoke.ps1", "bridge.py"):
+        shutil.copy2(ROOT / "scripts/codex" / name, scripts / name)
+    (root / ".claude").mkdir()
+    (root / ".claude/settings.json").write_text(settings_text, encoding="utf-8")
+    if venv:
+        _link_python(root)
+    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+    return root
+
+
+def _launch(argv, cwd, payload=_PAYLOAD, env=None):
+    stdin = payload if isinstance(payload, str) else json.dumps(payload)
+    return subprocess.run(
+        argv,
+        cwd=cwd,
+        input=stdin,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+        env=env,
+    )
+
+
+def _run_registered(tmp_path, shell, settings_text, payload=_PAYLOAD, venv=True):
+    import tomllib
+
+    root = _make_repo(tmp_path, settings_text, venv)
+    config = tomllib.loads((ROOT / ".codex/config.toml").read_text())
+    command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    return _launch(_outer_argv(shell, command), root / "scripts/codex", payload)
+
+
+def _hooks(*handlers):
+    return json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": list(handlers)}]}})
+
+
+_FAULTS = {
+    "hook-exits-1": (_hooks(_py("import sys; sys.exit(1)")), _PAYLOAD, True),
+    "hook-timeout": (_hooks(_py("import time; time.sleep(5)", timeout=0.5)), _PAYLOAD, True),
+    "unsupported-hook": (_hooks({"type": "prompt", "prompt": "review"}), _PAYLOAD, True),
+    "non-object-json": (_hooks(_py("print('[1]')")), _PAYLOAD, True),
+    "null-json": (_hooks(_py("print('null')")), _PAYLOAD, True),
+    "hooks-null": (
+        json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": None}]}}),
+        _PAYLOAD,
+        True,
+    ),
+    "unparseable-settings": ("{not json", _PAYLOAD, True),
+    "missing-session-id": (_hooks(_py("print('{}')")), {**_PAYLOAD, "session_id": ""}, True),
+    "unparseable-payload": (_hooks(_py("print('{}')")), "not json", True),
+    "no-venv": (_hooks(_py("print('{}')")), _PAYLOAD, False),
+}
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.parametrize("shell", _outer_shells())
+@pytest.mark.parametrize("fault", list(_FAULTS))
+def test_every_fault_path_is_at_least_as_strict_as_mains_exit_code(tmp_path, shell, fault):
+    """On origin/main each of these exits non-zero through the registered line, never 0."""
+    settings_text, payload, venv = _FAULTS[fault]
+    completed = _run_registered(tmp_path, shell, settings_text, payload, venv)
+    assert completed.returncode != 0, (completed.stdout, completed.stderr)
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.parametrize("shell", _outer_shells())
+def test_a_hooks_exit_2_reaches_codex_where_the_outer_shell_keeps_it(tmp_path, shell):
+    completed = _run_registered(tmp_path, shell, _hooks(_py("import sys; sys.exit(2)")))
+    # pwsh -Command reports a last native program's or script's exit 2 as 1; cmd and sh pass it on.
+    assert completed.returncode == (1 if shell == "pwsh" else 2), completed.stderr
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.parametrize("shell", _outer_shells())
+def test_a_deny_and_a_clean_run_exit_0(tmp_path, shell):
+    deny = _run_registered(tmp_path / "deny", shell, _hooks(_py(f"print({json.dumps(_DENY)!r})")))
+    assert deny.returncode == 0, deny.stderr
+    assert json.loads(deny.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    clean = _run_registered(tmp_path / "clean", shell, _hooks(_py("print('{}')")))
+    assert clean.returncode == 0, clean.stderr
+
+
+# --- The block exit flag. invoke.ps1 passes `--block-exit 10` only for `hook` as its first
+# argument, the condition its 10-to-2 mapping uses; without the flag a hook's exit 2 exits 2, as on
+# main. The flag is argv, so neither a child nor an inherited environment carries it.
+
+_EXIT_2 = _hooks(_py("import sys; sys.exit(2)"))
+# A variable an ancestor could set; the block exit must not depend on the environment.
+_OLD_SENTINEL = {"MEFOR_CODEX_BLOCK_SENTINEL": "1"}
+_needs_pwsh = pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+
+
+def _env(**extra):
+    env = {k: v for k, v in os.environ.items() if k not in _OLD_SENTINEL}
+    env.update(extra)
+    return env
+
+
+def _direct(root, *args, payload=_PAYLOAD, **extra):
+    bridge_py = root / "scripts/codex/bridge.py"
+    return _launch([sys.executable, str(bridge_py), *args], root, payload, _env(**extra))
+
+
+def _invoke_file(root, *args, payload=_PAYLOAD, **extra):
+    invoke = root / "scripts/codex/invoke.ps1"
+    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(invoke), *args]
+    return _launch(argv, root, payload, _env(**extra))
+
+
+def _assert_blocked(completed, code):
+    """Assert the exit code and the bridge's block line, which a silent blocking hook produces."""
+    assert completed.returncode == code, completed.stderr
+    assert "Claude hook blocked this event" in completed.stderr
+
+
+@_needs_pwsh
+def test_the_registered_line_gives_2_for_a_hooks_exit_2(tmp_path):
+    _assert_blocked(_run_registered(tmp_path, "none", _EXIT_2), 2)
+
+
+def test_a_direct_bridge_hook_gives_2_for_a_hooks_exit_2(tmp_path):
+    root = _make_repo(tmp_path, _EXIT_2, venv=False)
+    _assert_blocked(_direct(root, "hook"), 2)
+    _assert_blocked(_direct(root, "hook", "--block-exit", "10"), 10)
+
+
+def test_the_retired_sentinel_variable_does_not_change_the_block_exit(tmp_path):
+    root = _make_repo(tmp_path, _EXIT_2, venv=False)
+    _assert_blocked(_direct(root, "hook", **_OLD_SENTINEL), 2)
+
+
+@_needs_pwsh
+def test_invoke_ignores_an_inherited_environment(tmp_path):
+    root = _make_repo(tmp_path, _EXIT_2)
+    _assert_blocked(_invoke_file(root, "--session-id", "x", "hook", **_OLD_SENTINEL), 2)
+
+
+_ARGV_CHILD = "import json, sys\nprint(json.dumps(sys.argv[1:]))\n"
+
+
+@_needs_pwsh
+def test_invoke_adds_no_flag_to_a_run_childs_argv(tmp_path):
+    root = _make_repo(tmp_path, _hooks())
+    (root / "scripts/argv.py").write_text(_ARGV_CHILD, encoding="utf-8")
+    completed = _invoke_file(root, "run", "scripts/argv.py", "--b", "1", CODEX_THREAD_ID="x")
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == ["--b", "1"]
+
+
+@pytest.mark.parametrize("flags", [["--block", "1", "--block-exit", "0"], ["--block-exit", "10"]])
+def test_a_run_childs_block_exit_flags_pass_through_as_on_main(tmp_path, flags):
+    root = _make_repo(tmp_path, _hooks(), venv=False)
+    (root / "scripts/argv.py").write_text(_ARGV_CHILD, encoding="utf-8")
+    completed = _direct(root, "--session-id", "x", "run", "scripts/argv.py", *flags)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == flags
+
+
+def test_only_the_launchers_block_exit_is_honoured(tmp_path):
+    root = _make_repo(tmp_path, _EXIT_2, venv=False)
+    _assert_blocked(_direct(root, "hook", "--block-exit", "0"), 2)
+
+
+@_needs_pwsh
+def test_invoke_forwards_a_single_argument_whole(tmp_path):
+    root = _make_repo(tmp_path, _hooks())
+    completed = _invoke_file(root, "state-dir", CODEX_THREAD_ID="x")
+    assert completed.returncode == 0, completed.stderr
+    assert ".codex" in completed.stdout
+
+
+@_needs_pwsh
+def test_invoke_with_a_flag_before_hook_gives_2(tmp_path):
+    root = _make_repo(tmp_path, _EXIT_2)
+    _assert_blocked(_invoke_file(root, "--session-id", "x", "hook"), 2)
+
+
+@_needs_pwsh
+def test_a_run_child_exiting_10_is_not_remapped(tmp_path):
+    root = _make_repo(tmp_path, _hooks())
+    (root / "scripts/exit10.py").write_text("import sys\nsys.exit(10)\n", encoding="utf-8")
+    assert _invoke_file(root, "--session-id", "x", "run", "scripts/exit10.py").returncode == 10
+    run_first = _invoke_file(root, "run", "scripts/exit10.py", CODEX_THREAD_ID="x")
+    assert run_first.returncode == 10, run_first.stderr
+    direct = _direct(root, "--session-id", "x", "run", "scripts/exit10.py")
+    assert direct.returncode == 10, direct.stderr
+
+
+# The exit code each fault gave on origin/main, through each launch path. "registered" runs the
+# .codex/config.toml line with no outer shell; its pwsh -Command reports the script's exit 2 as 1.
+# With no .venv, invoke.ps1 throws before the bridge runs, which exits 1.
+_MAIN_FAULT_EXIT = {"registered": 1, "direct": 2, "invoke": 2}
+
+
+@pytest.mark.parametrize("path", list(_MAIN_FAULT_EXIT))
+@pytest.mark.parametrize("fault", list(_FAULTS))
+def test_every_fault_path_exits_as_on_main(tmp_path, path, fault):
+    settings_text, payload, venv = _FAULTS[fault]
+    if path != "direct" and shutil.which("pwsh") is None:
+        pytest.skip("requires PowerShell")
+    if path == "registered":
+        completed = _run_registered(tmp_path, "none", settings_text, payload, venv)
+    elif not venv and path == "direct":
+        pytest.skip("the direct path never reads a .venv")
+    else:
+        root = _make_repo(tmp_path, settings_text, venv and path != "direct")
+        if path == "direct":
+            completed = _direct(root, "hook", "--block-exit", "10", payload=payload)
+        else:
+            completed = _invoke_file(root, "hook", payload=payload)
+    expected = 1 if not venv else _MAIN_FAULT_EXIT[path]
+    assert completed.returncode == expected, (completed.stdout, completed.stderr)

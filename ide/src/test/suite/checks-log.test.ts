@@ -76,8 +76,16 @@ let stubWorkspace: string | undefined;
 let checkCode = 1;
 /** Whether the stubbed repository already has a commit (BACKLOG #5413: then no baseline is offered). */
 let hasHead = false;
+/** What `git config --get core.hooksPath` prints; empty is unset, as git reports it. */
+let hooksPath = "";
+/** What `git rev-parse --show-toplevel` prints; undefined is the workspace folder itself. */
+let topLevel: string | undefined;
 /** The answer to the "required check hasn't passed" prompt. */
 let baselineAnswer: string | undefined = "Commit baseline anyway";
+/** Settings the stub reports as set in USER settings; everything else is left at its default. */
+let userSettings: Record<string, unknown> = {};
+/** Every notification setup showed, in order. */
+let shown: string[] = [];
 
 const CHECK_STDOUT = "FAIL dryrun\r\n  synthetic detail line\nPASS validate";
 
@@ -88,7 +96,11 @@ const vscodeStub = {
       return stubWorkspace === undefined ? undefined : [{ uri: { fsPath: stubWorkspace } }];
     },
     isTrusted: true,
-    getConfiguration: () => ({ get: (_key: string, fallback: unknown): unknown => fallback }),
+    getConfiguration: () => ({
+      get: (key: string, fallback: unknown): unknown => (key in userSettings ? userSettings[key] : fallback),
+      inspect: (key: string): { globalValue: unknown } | undefined =>
+        key in userSettings ? { globalValue: userSettings[key] } : undefined,
+    }),
     fs: {
       stat: (uri: { fsPath: string }): Promise<fs.Stats> => fs.promises.stat(uri.fsPath),
       readFile: (uri: { fsPath: string }): Promise<Buffer> => fs.promises.readFile(uri.fsPath),
@@ -101,13 +113,18 @@ const vscodeStub = {
   },
   window: {
     // The two prompts on the path under test are answered; every other prompt is dismissed.
-    showInformationMessage: (message: string): Promise<string | undefined> =>
-      Promise.resolve(message.startsWith("Make the first commit") ? "Run checks & commit" : undefined),
-    showWarningMessage: (message: string): Promise<string | undefined> =>
-      Promise.resolve(
-        message.startsWith("A required check hasn't passed") ? baselineAnswer : undefined,
-      ),
-    showErrorMessage: nothing,
+    showInformationMessage: (message: string): Promise<string | undefined> => {
+      shown.push(message);
+      return Promise.resolve(message.startsWith("Make the first commit") ? "Run checks & commit" : undefined);
+    },
+    showWarningMessage: (message: string): Promise<string | undefined> => {
+      shown.push(message);
+      return Promise.resolve(message.startsWith("A required check hasn't passed") ? baselineAnswer : undefined);
+    },
+    showErrorMessage: (message: string): Promise<undefined> => {
+      shown.push(message);
+      return Promise.resolve(undefined);
+    },
     showQuickPick: nothing,
     showInputBox: nothing,
     // `appendLine` and `show` only. A write that went around the stamper through `append` or
@@ -199,7 +216,11 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     events = [];
     checkCode = 1;
     hasHead = false;
+    hooksPath = "";
+    topLevel = undefined;
     baselineAnswer = "Commit baseline anyway";
+    userSettings = {};
+    shown = [];
     // No process runs. git answers as an existing repository with no remote and no hooks path, and
     // `messagefoundry check` answers with `checkCode` and a multi-line block.
     childProcess.execFile = ((
@@ -217,6 +238,10 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
       } else if (args[0] === "rev-parse" && args.includes("HEAD")) {
         // An unborn branch fails this, as a freshly initialised repository does.
         done(hasHead ? null : Object.assign(new Error("stubbed"), { code: 1 }), hasHead ? "0000000\n" : "", "");
+      } else if (args.includes("--show-toplevel")) {
+        done(null, `${topLevel ?? ws}\n`, "");
+      } else if (args[0] === "config" && args.includes("--get") && args.includes("core.hooksPath")) {
+        done(hooksPath ? null : Object.assign(new Error("stubbed"), { code: 1 }), hooksPath ? `${hooksPath}\n` : "", "");
       } else if (args[0] === "commit") {
         done(null, "[main (root-commit) 0000000] Initial commit\n", "");
       } else {
@@ -309,6 +334,86 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     assert.ok(runs.some((a) => a[0] === "rev-parse" && a.includes("HEAD")), JSON.stringify(runs));
     assert.ok(!runs.some(isStageAll), JSON.stringify(runs));
     assert.ok(!runs.some((a) => a[0] === "commit" || a.includes("check")), JSON.stringify(runs));
+  });
+
+  /** A configDir outside the workspace, set in user settings: setup then writes no hook. */
+  const configDirOutside = (): void => {
+    userSettings = { configDir: path.join(os.tmpdir(), "mf-outside-config") };
+  };
+  const commits = (): string[][] => launches().filter((a) => a[0] === "commit");
+
+  test("with no hook written, nothing setup shows or commits says checks run on commit (BACKLOG #5404)", async () => {
+    configDirOutside();
+    for (const code of [0, 1]) {
+      checkCode = code;
+      events = [];
+      shown = [];
+      await sc.setupSourceControl({} as never);
+      assert.ok(lines().some((l) => l.includes("hook: not written")), JSON.stringify(lines()));
+      assert.ok(!launches().some((a) => a.includes("core.hooksPath")), JSON.stringify(launches()));
+      const made = commits();
+      assert.strictEqual(made.length, 1, JSON.stringify(launches()));
+      assert.strictEqual(made[0][made[0].indexOf("-m") + 1], "Initial commit");
+      for (const m of shown) {
+        assert.ok(!/checks are set up|checks enabled|checks run on every commit|Checks are active|pre-commit/.test(m), m);
+      }
+      assert.ok(shown.some((m) => m.includes("wrote no commit hook")), JSON.stringify(shown));
+    }
+  });
+
+  test("with no hook written and existing history, the hook file is not named for commit", async () => {
+    configDirOutside();
+    hasHead = true;
+    await sc.setupSourceControl({} as never);
+    const history = shown.find((m) => m.includes("already has commits"));
+    assert.ok(history !== undefined, JSON.stringify(shown));
+    assert.ok(!history.includes("pre-commit"), history);
+  });
+
+  test("with the hook written but core.hooksPath left elsewhere, nothing says checks run on commit", async () => {
+    hooksPath = "other-hooks"; // the user's own hooks path, which setup does not clobber
+    for (const code of [0, 1]) {
+      checkCode = code;
+      events = [];
+      shown = [];
+      await sc.setupSourceControl({} as never);
+      assert.ok(lines().some((l) => l.includes("hook: written")), JSON.stringify(lines()));
+      assert.ok(lines().some((l) => l.includes("core.hooksPath: left as 'other-hooks'")), JSON.stringify(lines()));
+      const made = commits();
+      assert.strictEqual(made.length, 1, JSON.stringify(launches()));
+      assert.strictEqual(made[0][made[0].indexOf("-m") + 1], "Initial commit");
+      for (const m of shown) {
+        assert.ok(!/checks are set up|checks enabled|checks run on every commit|Checks are active/.test(m), m);
+      }
+      assert.ok(shown.some((m) => m.includes("core.hooksPath does not point git at it")), JSON.stringify(shown));
+    }
+  });
+
+  test("a workspace folder below the repository's top level sets no core.hooksPath and claims no checks", async () => {
+    // Git would resolve `.mefor-hooks` from the top level, a folder the hook was not written to.
+    topLevel = path.dirname(ws);
+    checkCode = 0;
+    await sc.setupSourceControl({} as never);
+    assert.ok(lines().some((l) => l.includes("core.hooksPath: not set (git resolves")), JSON.stringify(lines()));
+    assert.ok(!launches().some((a) => a[0] === "config" && !a.includes("--get")), JSON.stringify(launches()));
+    assert.strictEqual(commits()[0]?.[commits()[0].indexOf("-m") + 1], "Initial commit");
+    assert.ok(!shown.includes("MessageFoundry: version control & checks are set up."), JSON.stringify(shown));
+  });
+
+  test("control: a core.hooksPath spelled './.mefor-hooks' already points at the hook", async () => {
+    hooksPath = "./.mefor-hooks";
+    checkCode = 0;
+    await sc.setupSourceControl({} as never);
+    assert.ok(lines().some((l) => l.includes("core.hooksPath: already set")), JSON.stringify(lines()));
+    assert.ok(shown.includes("MessageFoundry: version control & checks are set up."), JSON.stringify(shown));
+  });
+
+  test("control: with the hook written, setup and the baseline commit say checks are enabled", async () => {
+    checkCode = 0;
+    await sc.setupSourceControl({} as never);
+    const made = commits();
+    assert.strictEqual(made[0]?.[made[0].indexOf("-m") + 1], "Initial commit (MessageFoundry checks enabled)");
+    assert.ok(shown.includes("MessageFoundry: version control & checks are set up."), JSON.stringify(shown));
   });
 
   test("control: when the check passes, the commit runs the hooks and no bypass is recorded", async () => {

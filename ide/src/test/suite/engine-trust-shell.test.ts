@@ -32,6 +32,8 @@ interface StubConfig {
 }
 
 let stubConfig: StubConfig;
+/** Values the stub reports as set in WORKSPACE settings, beside the user-set {@link stubConfig}. */
+let stubWorkspaceValues: Record<string, unknown>;
 let stubWorkspace: string | undefined;
 /** The object the stubbed `messagefoundry cert inventory --json` prints. */
 let stubInventory: unknown;
@@ -59,6 +61,14 @@ const vscodeStub = {
     getConfiguration: () => ({
       get: (key: string, fallback: unknown): unknown =>
         key in stubConfig ? (stubConfig as unknown as Record<string, unknown>)[key] : fallback,
+      // User-set, so cli.ts's containment of the path settings (BACKLOG #5404) returns it as written.
+      inspect: (key: string): { globalValue?: unknown; workspaceValue?: unknown } | undefined =>
+        key in stubConfig || key in stubWorkspaceValues
+          ? {
+              globalValue: (stubConfig as unknown as Record<string, unknown>)[key],
+              workspaceValue: stubWorkspaceValues[key],
+            }
+          : undefined,
     }),
     onDidChangeConfiguration: (listener: ConfigListener) => {
       configListener = listener;
@@ -193,6 +203,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     ws = fs.mkdtempSync(path.join(os.tmpdir(), "mf-engine-trust-"));
     stubWorkspace = ws;
     stubConfig = { engineUrl: LOOPBACK, serviceConfig: "messagefoundry.toml", environments: [] };
+    stubWorkspaceValues = {};
     invocations = [];
     logged = [];
     stubInventory = undefined;
@@ -234,6 +245,40 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
 
     assert.strictEqual(await trust.refreshEngineTrust(), true);
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+  });
+
+  test("a dropped WORKSPACE serviceConfig runs no `cert inventory` and anchors nothing (BACKLOG #5404)", async () => {
+    // The control is the test above: the same certificate, named by the user value, IS anchored.
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    stubWorkspaceValues.serviceConfig = path.join(os.tmpdir(), "elsewhere", "messagefoundry.toml");
+
+    await trust.refreshEngineTrust();
+    assert.deepStrictEqual(invocations, []);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+    assert.ok(
+      logged.some((l) => l.includes("messagefoundry.serviceConfig, set in workspace settings") && l.includes("not run")),
+      logged.join("\n"),
+    );
+  });
+
+  test("a dropped workspace value drops an anchor the substitute file gave earlier", async () => {
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+
+    stubWorkspaceValues.serviceConfig = path.join(os.tmpdir(), "elsewhere", "messagefoundry.toml");
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+  });
+
+  test("a contained workspace serviceConfig is used, and passed to `cert inventory` as written", async () => {
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    stubWorkspaceValues.serviceConfig = path.join("conf", "svc.toml");
+
+    assert.strictEqual(await trust.refreshEngineTrust(), true);
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+    const args = invocations[0]?.args ?? [];
+    assert.strictEqual(args[args.indexOf("--service-config") + 1], path.join("conf", "svc.toml"), JSON.stringify(args));
   });
 
   test("a LOCAL certificate is never anchored for a REMOTE engine", async () => {
@@ -1095,6 +1140,27 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(invocations.length, 3, "the child's exit queued no refresh");
     assert.ok(invocations[2].args.includes("other.toml"), JSON.stringify(invocations[2].args));
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
+  });
+
+  test("a value dropped while an abandoned CLI child is alive drops the anchor, not keeps it (BACKLOG #5404)", async () => {
+    // The control is the test above: with the child alive and the value NOT dropped, the anchor is kept.
+    stubInventory = plantedEngine();
+    await trust.refreshEngineTrust();
+    trust.setEngineTrustLimitsForTest({ cliAnswerMs: 50 });
+    const exit = hungCli();
+    await trust.refreshEngineTrust(); // gives up on the child, which stays alive
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+
+    stubWorkspaceValues.serviceConfig = path.join(os.tmpdir(), "elsewhere", "messagefoundry.toml");
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined, "the in-flight path kept the anchor");
+    assert.strictEqual(invocations.length, 2, "a CLI started for a dropped value");
+
+    exit();
+    await ticks();
+    await settle();
+    assert.strictEqual(invocations.length, 2, "the child's exit ran the CLI for a dropped value");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
   });
 
   test("a failure while an abandoned CLI child is alive waits for its exit, then asks", async () => {

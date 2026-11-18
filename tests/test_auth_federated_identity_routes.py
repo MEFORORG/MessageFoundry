@@ -924,6 +924,25 @@ async def test_a_directory_row_created_by_name_takes_its_id_from_the_directory_a
     assert await _pairs(engine, user.id) == {user.id: (ISSUER, "S-1-a")}
 
 
+async def test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory(
+    engine: Engine,
+) -> None:
+    """A NUL name answers 422 and the directory is not asked; the same name without it is asked
+    and answers 201 (vault BACKLOG #5342)."""
+    directory = _Directory(_principal("jdoe"))
+    service = await _directory_service(engine, directory)
+    async with _client(engine, service) as c:
+        tok = await _admin(c, service)
+        refused = await c.post(
+            "/users/directory", json={"username": "jd\x00oe"}, headers=_auth(tok)
+        )
+        assert refused.status_code == 422, refused.text
+        assert directory.asked == []
+        ok = await c.post("/users/directory", json={"username": "jdoe"}, headers=_auth(tok))
+        assert ok.status_code == 201, ok.text
+        assert directory.asked != []
+
+
 async def test_the_directory_create_needs_users_manage_and_a_fresh_step_up(engine: Engine) -> None:
     """Gated as ``POST /users``: a Viewer is refused, and so is an Administrator whose step-up
     window has lapsed. The control is the same Administrator after a re-authentication."""

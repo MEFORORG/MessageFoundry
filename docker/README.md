@@ -136,7 +136,8 @@ against one case that matters, described under
 ## Run
 
 - **Docker single host:** [`compose.yaml`](compose.yaml) — Topology A (in-process TLS). Copy
-  `secrets.env.example` → `secrets.env`, drop a cert/key under `./tls`, point `./config` at your repo.
+  `secrets.env.example` → `secrets.env`, drop a cert/key under `./tls`, point `./config` at your repo,
+  and read topology A below for the revocation attestation `docker compose` requires.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
   — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set all three `image:` fields (`tls-dir`, `copy-tls` and `engine`) to your config-baked image.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
@@ -154,6 +155,9 @@ against one case that matters, described under
   `tls_key_file`; MLLP runs `tls=True`. Self-contained, fewest moving parts. Off loopback it also
   needs your revocation attestation, `MEFOR_TLS_REVOCATION_ATTESTED=1`, on the rule
   [SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate) states.
+  `compose.yaml` passes it by compose substitution with no default, so `docker compose` refuses to
+  start until you export it or put it in a `.env` beside `compose.yaml` (an `env_file:` does not
+  feed substitution). Set it only if your PKI enforces revocation; the file never sets it for you.
 - **(B) Reverse-proxy / same-pod sidecar — k8s-preferred.** Engine stays on loopback behind the
   sidecar, declared with `tls_terminated_upstream=true` + `trusted_proxies=[…]` +
   `plaintext_upstream_hop_acknowledged=true`, because with no `tls_cert_file` that hop is
