@@ -192,7 +192,8 @@ function ConvertFrom-CcxHookJson {
     }
     foreach ($name in @('session_id', 'hook_event_name', 'source')) {
         $field = $out.Value.PSObject.Properties[$name]
-        if ($field -and $null -ne $field.Value -and $field.Value -isnot [string]) {
+        # A [datetime] is a string ConvertFrom-Json read as a date, so it is still a string here.
+        if ($field -and $null -ne $field.Value -and $field.Value -isnot [string] -and $field.Value -isnot [datetime]) {
             $out.Value = $null
             $out.Reason = "the hook input names a $name that is not a string, so it names no cwd this hook can use"
             return $out
@@ -338,7 +339,8 @@ function ConvertTo-CcxRealPath {
             $parts = $todo.Substring($root.Length).Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries)
             $cur = $root
             for ($i = 0; $i -lt $parts.Count; $i++) {
-                $next = Join-Path $cur $parts[$i]
+                # String work, not Join-Path, which needs a PowerShell drive for the root.
+                $next = [System.IO.Path]::Join($cur, $parts[$i])
                 $target = [System.IO.DirectoryInfo]::new($next).LinkTarget
                 if ($target) {
                     # A link loop, or a chain this long, is not a directory anyone means.
@@ -394,10 +396,11 @@ function Test-CcxInStartDir {
         if (-not $real.StartsWith($prefix, $mode)) { return $false }
     }
     # Both spellings, so neither the link's side nor the target's side holds a checkout the start does not.
+    # The roots are compared through links too, since one may be spelled through a junction.
     foreach ($pair in @(@($real, $start), @($Cwd, $StartDir))) {
         $a = Get-CcxWorktreeRoot $pair[0]
         $b = Get-CcxWorktreeRoot $pair[1]
-        if (($a -or $b) -and -not (Test-CcxSamePath $a $b)) { return $false }
+        if (($a -or $b) -and -not ($a -and $b -and (Test-CcxSamePath (ConvertTo-CcxRealPath $a) (ConvertTo-CcxRealPath $b)))) { return $false }
     }
     return $true
 }
@@ -551,8 +554,10 @@ function Resolve-CcxHookSession {
           Dir        the directory to answer for, or $null to stay where the hook started.
           Root       the worktree root Dir sits in; $null with Dir, or for a -AllowOutside answer.
           Source     'cwd', 'pin', or 'start' when Dir is $null.
-          Reason     the fault to say aloud: a cwd this refused, or input it could not read or
-                     parse as one object. Named is then $true; Payload may be $null.
+          Reason     the fault to say aloud: a cwd this refused, input it could not read or parse
+                     as one object, or input ConvertFrom-CcxHookJson refuses (a top-level case
+                     twin, a non-string session_id, hook_event_name or source). Named is then $true;
+                     Payload may be $null.
           Note       set when Dir is the pinned worktree and not the `cwd`: why the `cwd` was not used.
           Pinned     the worktree the pin records after this call, or $null.
           Named, SessionId, Event, Payload  what the input said.

@@ -435,7 +435,8 @@ def test_input_the_helper_cannot_use_is_a_fault(tmp_path: Path, stdin: bytes, wh
     got = _resolve_bytes(repo, tmp_path, stdin)
     assert got["Dir"] is None and got["Named"] is True, got
     assert why in got["Reason"], got
-    # Get-CcxHookPayloadCwd, which hooks such as collision_gate call directly, agrees.
+    # Get-CcxHookPayloadCwd -Text agrees. Hooks such as collision_gate call it with -Payload on
+    # their own parse, which reads only the cwd field, so this does not speak for them.
     assert got["PNamed"] is True and why in got["PReason"], got
 
 
@@ -468,6 +469,17 @@ def test_json_that_only_convertfrom_json_refuses_is_still_read(tmp_path: Path, e
     sub.mkdir()
     cwd = json.dumps(str(sub))
     got = _resolve_bytes(repo, tmp_path, f'{{"cwd": {cwd}, "session_id": "s1", {extra}}}'.encode())
+    assert got["Reason"] == "" and got["PReason"] == "", got
+    assert got["Dir"] and _same_dir(got["Dir"], sub), got
+
+
+def test_a_date_shaped_session_id_is_still_a_string(tmp_path: Path) -> None:
+    """ConvertFrom-Json reads an ISO-8601 string as a date; that is not a non-string input."""
+    repo, _ = _primary_with(tmp_path, "linked")
+    sub = repo / "sub"
+    sub.mkdir()
+    payload = {"cwd": str(sub), "session_id": "2026-11-18T10:00:00Z", "source": "2026-11-18"}
+    got = _resolve_bytes(repo, tmp_path, _raw(payload))
     assert got["Reason"] == "" and got["PReason"] == "", got
     assert got["Dir"] and _same_dir(got["Dir"], sub), got
 
@@ -608,6 +620,14 @@ def test_a_cd_inside_a_start_folder_below_an_unreadable_git_is_not_a_fault(tmp_p
     (stale / ".git").write_text("gitdir: C:/nonexistent/worktrees/x\n", encoding="utf-8")
     got = _resolve(start, tmp_path, {"cwd": str(start / "sub"), "session_id": "s1"})
     assert got["Reason"] == "" and got["Dir"] is None, got
+    # Through a junction to the stale folder, the two roots differ only in spelling (review round 2).
+    _junction(base / "jstale", stale)
+    for cwd, where in (
+        (base / "jstale" / "start" / "sub", start),
+        (start / "sub", base / "jstale" / "start"),
+    ):
+        linked = _resolve(where, tmp_path, {"cwd": str(cwd), "session_id": "s1"})
+        assert linked["Reason"] == "" and linked["Dir"] is None, (cwd, where, linked)
     # The control: a sibling of the start inside the same stale folder is still a move.
     (stale / "other").mkdir()
     moved = _resolve(start, tmp_path, {"cwd": str(stale / "other"), "session_id": "s1"})
