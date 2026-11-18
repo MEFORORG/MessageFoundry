@@ -358,9 +358,10 @@ def windows_member_name_reason(name: str) -> str | None:
     ending in a dot or space (``a.hl7.`` opens ``a.hl7``, and its extension would read as ``.`` and
     skip the content check) are refused. So is a component :func:`ntpath.isreserved` names: a
     reserved device name, bare or with any extension (``NUL``, ``COM1``, ``CONIN$``, ``con.hl7``),
-    or a component holding a character Windows refuses in a name. That arm is a fixed list in the
-    standard library, not a question put to the OS, so it refuses the same names on every platform
-    and build, ordinary member names such as ``con.hl7`` and ``aux.json`` included.
+    or a component holding a character Windows refuses in a name. That arm is the running Python's
+    own list, not a question put to the OS, so one Python release refuses the same names on every
+    platform and Windows build, ordinary member names such as ``con.hl7`` and ``aux.json``
+    included; a later release may change the list.
     :func:`messagefoundry.pipeline.dr_backup._win_opens_another` asks the OS instead, and records
     which of these names one Windows build's path rewrite changed. These arms do NOT refuse every
     alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or a long name beside its

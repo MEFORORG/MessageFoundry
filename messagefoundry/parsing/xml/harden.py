@@ -89,11 +89,12 @@ _DOCTYPE_REFUSAL = (
     "refusing an XML document that declares a DOCTYPE/DTD (entity-definition carrier)"
 )
 
-#: The failed-parse arm's own text. Such a document opens a DOCTYPE in its prolog but is not
-#: well-formed, so nothing says it defines an entity (``<!DOCTYPE html>`` defines none); it is
-#: refused for the DOCTYPE alone.
+#: The failed-parse arm's own text. Such a document opens a DOCTYPE in its prolog and the parser
+#: did not finish it: it may be malformed, or well-formed and stopped by a parser limit, as an
+#: entity-expansion bomb is. The parse did not say what the DOCTYPE defines (``<!DOCTYPE html>``
+#: defines nothing), so the text names the DOCTYPE and the failed parse, and no entity.
 _BROKEN_DOCTYPE_REFUSAL = (
-    "refusing an XML document that opens a DOCTYPE in its prolog and is not well-formed XML"
+    "refusing an XML document that opens a DOCTYPE in its prolog and that the parser did not finish"
 )
 
 #: Encodings a failed document is read in to look for a DOCTYPE. ``latin-1`` stands for every
@@ -139,7 +140,8 @@ def parse_bytes(data: bytes | str) -> Any:
     (a DTD/entity-definition carrier), and, with a message of its own, when the document fails to
     parse but its prolog opens a DOCTYPE within its first 64 KiB (``_DOCTYPE_SCAN_BYTES``), read as
     latin-1 (which stands for every ASCII-compatible encoding, UTF-8 included) or as UTF-16 or
-    UTF-32 in either byte order; and :class:`XmlParseError` if it is not well-formed XML. Each
+    UTF-32 in either byte order (``_DOCTYPE_SCAN_CODECS``, which names encodings it does not read);
+    and :class:`XmlParseError` if it is not well-formed XML. Each
     message is fixed text plus, for a parse error, the fault's line, column and libxml2 error code;
     none carries lxml's message, and none is chained from lxml's error (BACKLOG #5371). Requires
     the ``[xml]`` extra."""

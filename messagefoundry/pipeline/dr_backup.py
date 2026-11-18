@@ -2129,11 +2129,12 @@ def _win_opens_another(path: Path) -> bool:
     than keep a list. A name it changes is reported: the open would reach some other object, and the
     listed file would keep its bytes while the report called it empty.
 
-    That rewrite does not change every name an open reaches a device by. Of ``NUL``, ``AUX``,
-    ``COM1``, ``CONIN$`` and ``con.txt``, ``GetFullPathNameW`` on Windows 11 build 26300 changed only
-    ``NUL`` (measured), and the set differs by build. A bare ``AUX``, ``COM1`` or ``PRN`` still opens
-    the device, so this check does not flag every device name. The final-path compare on the opened
-    handle backs this up (:func:`_open_unfollowed`)."""
+    Of ``NUL``, ``AUX``, ``COM1``, ``CONIN$`` and ``con.txt``, ``GetFullPathNameW`` on Windows 11
+    build 26300 changed only ``NUL`` (measured), and the set differs by build. On that build a bare
+    ``AUX``, ``COM1`` or ``PRN``, with no directory, still opened the device, but each joined to a
+    directory opened a regular file there, and of the names joined to a directory only ``NUL``
+    reached the device (measured). This checks a name joined to its directory. The final-path
+    compare on the opened handle backs this up (:func:`_open_unfollowed`)."""
     # The trailing dot or space is tested as such too: `abspath` falls back to a pure-Python join that
     # rewrites nothing if `GetFullPathNameW` raises, and this must not then pass the name.
     if path.name.endswith((".", " ")):

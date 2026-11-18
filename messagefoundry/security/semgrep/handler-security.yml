@@ -82,8 +82,8 @@ rules:
     message: >
       Message-derived data flows into the db_lookup/fhir_lookup STATEMENT/QUERY argument, or into a
       FhirRaw value or the system half of a FhirToken. Keep the statement and query constant, pass
-      message values through the parameterized `params` dict, and never interpolate them (SQL / FHIR
-      injection).
+      message values as values in the parameterized `params` dict, never inside a FhirRaw or a
+      FhirToken system, and never interpolate them (SQL / FHIR injection).
     pattern-sources:
       - patterns:
           - pattern-either:

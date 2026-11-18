@@ -4320,10 +4320,12 @@ def _tool_command(module: str) -> list[str] | None:
     return python_module_argv(module, extra_flags=("-X", "utf8"))
 
 
-#: :func:`_run_tool`'s skip detail when :func:`_tool_command` finds no copy to start.
-_TOOL_NOT_FOUND = (
+#: :func:`_run_tool`'s skip detail when :func:`_tool_command` finds no ``ruff`` to start.
+_RUFF_NOT_FOUND = (
     "not found beside this interpreter or in the user scripts folder; a copy on PATH is not used"
 )
+#: The same, for any other tool, which :func:`_tool_command` looks for only as a module.
+_MODULE_NOT_FOUND = "not importable by this interpreter; a copy on PATH is not used"
 
 
 def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
@@ -4342,7 +4344,8 @@ def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
 
     cmd = _tool_command(module)
     if cmd is None:
-        return CheckResult(name, ok=True, required=False, skipped=True, detail=_TOOL_NOT_FOUND)
+        detail = _RUFF_NOT_FOUND if module == "ruff" else _MODULE_NOT_FOUND
+        return CheckResult(name, ok=True, required=False, skipped=True, detail=detail)
     try:
         # nosec: an absolute program or interpreter path, no shell; args are repo paths.
         proc = subprocess.run(  # nosec B603

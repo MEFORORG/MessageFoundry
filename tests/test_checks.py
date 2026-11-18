@@ -501,6 +501,18 @@ def test_lint_tool_absent_is_skipped_without_starting_anything(
     monkeypatch.setattr(subprocess, "run", no_run)
     result = checks._run_tool("mypy", "mypy_b614_not_a_module", ["cfg"])
     assert result.skipped is True and result.detail == (
+        "not importable by this interpreter; a copy on PATH is not used"
+    )
+
+
+def test_ruff_not_found_skip_names_where_it_looked(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_run(*_a: object, **_k: object) -> None:
+        raise AssertionError("a ruff that was not found must not be started")
+
+    monkeypatch.setattr(checks, "_ruff_binary", lambda: None)
+    monkeypatch.setattr(subprocess, "run", no_run)
+    result = checks._run_tool("ruff", "ruff", ["check", "cfg"])
+    assert result.skipped is True and result.detail == (
         "not found beside this interpreter or in the user scripts folder; a copy on PATH is not used"
     )
 

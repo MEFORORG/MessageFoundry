@@ -120,7 +120,8 @@ def test_failed_parse_doctype_refusal_has_its_own_message() -> None:
     with pytest.raises(XmlSecurityError) as ei:
         parse_bytes(b"<!DOCTYPE html><html><body></html>")
     assert str(ei.value) == (
-        "refusing an XML document that opens a DOCTYPE in its prolog and is not well-formed XML"
+        "refusing an XML document that opens a DOCTYPE in its prolog and that the parser did not "
+        "finish"
     )
     assert "entity-definition" not in str(ei.value)
     with pytest.raises(XmlSecurityError, match=r"\(entity-definition carrier\)"):

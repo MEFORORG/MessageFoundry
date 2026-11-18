@@ -877,8 +877,9 @@ or compression library:
   ceiling holds as it goes only for those two methods, because stdlib `zipfile` does not bound one
   read's output for the others (BACKLOG #5535). Each member's name must be a safe relative path, and its bytes must match the
   type its extension names. A zip member's name must also pass the Windows name check,
-  `windows_member_name_reason` in `parsing/sniff.py`, which refuses a colon, a component ending in a
-  dot or space, and a reserved device name such as `con.hl7` (BACKLOG #5369). Members come back as bytes in memory; this module writes no file.
+  `windows_member_name_reason` in `parsing/sniff.py`, which refuses at least a colon, a component
+  ending in a dot or space, a reserved device name such as `con.hl7`, and a character Windows
+  refuses in a name (BACKLOG #5369). Members come back as bytes in memory; this module writes no file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.
 - `parsing/dicom/_deps.py` imports `zlib` only to name `zlib.error` in the tuple of parse errors
