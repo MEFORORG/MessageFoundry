@@ -2871,7 +2871,9 @@ class ConsolidatedLadderReport:
                 f"RESOURCE bind, NOT the engine's ceiling; raise --store-pool-size and re-run) "
                 f"-> exit {self.exit_code}"
             )
-        elif self.setup_degraded:
+        elif self.exit_code == 2:
+            # Keyed on the exit code, not on `setup_degraded`: a correctness break outranks a pool bind
+            # (exit 1), and that run must print FAIL below, never a SETUP-DEGRADED reason beside "exit 1".
             if self.climb_aborted:
                 reason = "two-box rendezvous/timeout broke mid-run"
             elif self.soak_aborted:

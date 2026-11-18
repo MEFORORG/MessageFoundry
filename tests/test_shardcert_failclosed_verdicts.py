@@ -474,6 +474,25 @@ def test_correctness_break_outranks_a_pool_bind() -> None:
     assert rep.result_label == "FAIL"
 
 
+def _result_line(rep: ConsolidatedLadderReport) -> str:
+    lines = [ln for ln in rep.render().splitlines() if ln.startswith("RESULT:")]
+    assert len(lines) == 1
+    return lines[0]
+
+
+def test_break_over_a_pool_bind_renders_fail_not_setup_degraded() -> None:
+    """The RESULT line must agree with the exit code: a correctness break over a pool bind is exit 1, so it
+    must not print a SETUP-DEGRADED "inconclusive rung" reason."""
+    broken = build_rung_outcome(_rung(1, 24.0), _drive(24.0), _clean_gate(_HEALTHY_POOL), None)
+    broken = dataclasses.replace(broken, lane_inversions=3, verdict=RungVerdict.CORRECTNESS_FAIL)
+    rep = _consolidated([_sustained(0, 20.0, pool=_TRIPPED_POOL), broken])
+    assert rep.exit_code == 1
+    line = _result_line(rep)
+    assert line.startswith("RESULT: FAIL")
+    assert "SETUP-DEGRADED" not in line
+    assert line.endswith("-> exit 1")
+
+
 def test_report_pool_still_wins_over_the_gate() -> None:
     """The report's pool block is read first; the gate's is the fallback only."""
     report = {**_clean_gate(), "store_pool": _TRIPPED_POOL.to_json_dict()}
