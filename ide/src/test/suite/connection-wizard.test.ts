@@ -12,6 +12,7 @@ import {
   connectionServiceConfig,
   connectionUpsertArgs,
   planWizardSave,
+  removalDirection,
   settingIsSet,
   settingKeysFor,
   shouldSaveConnection,
@@ -378,5 +379,17 @@ suite("connectionWizardModel — remove argv", () => {
   test("names the direction when given, since an inbound and an outbound may share a name (BACKLOG #5898)", () => {
     const args = connectionRemoveArgs("samples/config", undefined, "X", "outbound");
     assert.deepStrictEqual(args, ["connection", "remove", "--config", "samples/config", "--name", "X", "--direction", "outbound"]);
+  });
+
+  test("removalDirection names the direction only when one connection holds the name (BACKLOG #5898)", () => {
+    const entries = [
+      { direction: "inbound" as const, name: "X", transport: "mllp" },
+      { direction: "outbound" as const, name: "X", transport: "file" },
+      { direction: "outbound" as const, name: "OB", transport: "file" },
+    ];
+    // A shared name: the editors cannot tell the twins apart, so the engine must refuse it.
+    assert.strictEqual(removalDirection(entries, "X"), undefined);
+    assert.strictEqual(removalDirection(entries, "OB"), "outbound");
+    assert.strictEqual(removalDirection(entries, "NOPE"), undefined);
   });
 });

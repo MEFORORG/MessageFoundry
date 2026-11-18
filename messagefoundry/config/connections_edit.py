@@ -251,24 +251,31 @@ def remove_connection(
         text, crlf = atomic_edit.read_text(path, refused_error=WiringError)
         doc = tomlkit.parse(text)
 
-        directions = ("inbound", "outbound") if direction is None else (direction,)
         matches = [
             (where, aot, index)
-            for where in directions
+            for where in ("inbound", "outbound")
             if (aot := doc.get(where)) is not None
             for index in range(len(aot))
             if aot[index].get("name") == name
         ]
+        held = [where for where, _aot, _index in matches]
+        if direction is not None:
+            if held and direction not in held:
+                raise WiringError(
+                    f"{direction} connection {name!r} is not in {CONNECTIONS_FILE_NAME}; "
+                    f"it holds {name!r} only as an {held[0]} (nothing was removed)"
+                )
+            matches = [match for match in matches if match[0] == direction]
         if not matches:
-            scope = "" if direction is None else f"{direction} "
             raise WiringError(
-                f"{scope}connection {name!r} is not in {CONNECTIONS_FILE_NAME} "
+                f"connection {name!r} is not in {CONNECTIONS_FILE_NAME} "
                 "(a code-authored connection can't be removed here)"
             )
-        if len({where for where, _aot, _index in matches}) > 1:
+        if len(matches) > 1:
             raise WiringError(
                 f"connection {name!r} is both an inbound and an outbound in "
-                f"{CONNECTIONS_FILE_NAME}; name the direction to remove (nothing was removed)"
+                f"{CONNECTIONS_FILE_NAME}; name the direction to remove, with --direction inbound "
+                "or --direction outbound on the CLI (nothing was removed)"
             )
         removed_direction, aot, index = matches[0]
         del aot[index]

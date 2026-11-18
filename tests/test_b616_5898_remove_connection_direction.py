@@ -124,6 +124,17 @@ def test_unique_name_still_removes_without_direction(cfg: tuple[Path, Path]) -> 
 def test_direction_that_does_not_hold_the_name_is_refused(cfg: tuple[Path, Path]) -> None:
     config_dir, _svc = cfg
     before = (config_dir / "connections.toml").read_bytes()
-    with pytest.raises(WiringError, match="inbound connection 'OB' is not in"):
+    with pytest.raises(WiringError, match="it holds 'OB' only as an outbound"):
         connections_edit.remove_connection(config_dir, "OB", validate=_noop, direction="inbound")
     assert (config_dir / "connections.toml").read_bytes() == before
+
+
+def test_direction_is_refused_outside_remove(
+    cfg: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_dir, _svc = cfg
+    rc = main(
+        ["connection", "list", "--config", str(config_dir), "--direction", "inbound", "--json"]
+    )
+    assert rc == 1
+    assert "--direction applies only to `connection remove`" in capsys.readouterr().out

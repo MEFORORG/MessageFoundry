@@ -13349,6 +13349,10 @@ def _connection(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
 
+    if args.direction is not None and args.action != "remove":
+        # Only `remove` reads it; an upsert takes its direction from the connection JSON.
+        return _emit_error("--direction applies only to `connection remove`", as_json=args.json)
+
     if args.action == "schema":
         # Describes the ENGINE, not a workspace: no --config, no load_config. A schema fetch must not
         # fail because some unrelated module in the user's config dir does not import, and it must

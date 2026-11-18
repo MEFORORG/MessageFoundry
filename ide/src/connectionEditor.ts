@@ -7,8 +7,8 @@
 // source instead. After a save the graph refreshes and a Promote is offered.
 import * as vscode from "vscode";
 import { configDir, writerConfigTarget, runJson, workspaceDir } from "./cli";
-import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
-import { connectionRemoveArgs, connectionUpsertArgs } from "./connectionWizardModel";
+import { type ConnObj, type Direction, nameCollisionError, planSave } from "./connectionMerge";
+import { connectionRemoveArgs, connectionUpsertArgs, removalDirection } from "./connectionWizardModel";
 import { type FieldGroup, buildForm } from "./connectionForm";
 import { connectionSchema } from "./connectionSchema";
 import { STARTUP_BANNERS, openChannel, postToSameRender, postToWebview, requestToken } from "./webviewMessaging";
@@ -79,6 +79,7 @@ export async function openConnectionEditor(
   const lookupName = opts.editName ?? opts.cloneFrom;
   const clone = opts.editName == null && opts.cloneFrom != null;
   let initial: ConnObj | undefined;
+  let deleteDirection: Direction | undefined;
   if (lookupName) {
     let entries: ConnObj[];
     try {
@@ -88,6 +89,7 @@ export async function openConnectionEditor(
       return;
     }
     initial = entries.find((c) => c.name === lookupName);
+    deleteDirection = removalDirection(entries, lookupName);
     if (!initial) {
       void vscode.window.showInformationMessage(
         `MessageFoundry: ${lookupName} is authored in code (a .py module), not connections.toml — ` +
@@ -125,7 +127,7 @@ export async function openConnectionEditor(
       if (m?.command === "save" && m.conn) {
         await save(m.conn, current, { editName: opts.editName, cloneFrom: opts.cloneFrom }, opts.onSaved);
       } else if (m?.command === "delete" && m.name) {
-        await remove(m.name, initial?.direction, current, opts.onSaved);
+        await remove(m.name, deleteDirection, current, opts.onSaved);
       } else if (m?.command === "cancel") {
         current.dispose();
       } else if (
@@ -221,7 +223,7 @@ async function save(
 
 async function remove(
   name: string,
-  direction: ConnObj["direction"] | undefined,
+  direction: Direction | undefined,
   current: vscode.WebviewPanel,
   onSaved?: () => void,
 ): Promise<void> {
@@ -234,7 +236,7 @@ async function remove(
     return;
   }
   const confirm = await vscode.window.showWarningMessage(
-    `Remove connection "${name}" from connections.toml?`,
+    `Remove ${direction === undefined ? "" : `${direction} `}connection "${name}" from connections.toml?`,
     { modal: true },
     "Remove",
   );

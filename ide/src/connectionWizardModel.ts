@@ -8,7 +8,7 @@
 // `connection upsert|remove` argv builders here are shared with the webview form and the
 // connections.toml custom editor, so every IDE writer names the same settings file (BACKLOG #2908).
 
-import { type ConnObj, type SavePlan, planSave } from "./connectionMerge";
+import { type ConnObj, type Direction, type SavePlan, planSave } from "./connectionMerge";
 
 /** The connection object the `connection upsert --data <json>` CLI consumes (ADR 0007). Mirrors the
  *  shape connectionEditor.ts builds; kept local so this module imports nothing from vscode/cli. */
@@ -241,7 +241,7 @@ export function connectionRemoveArgs(
   configDir: string,
   serviceConfig: string | undefined,
   name: string,
-  direction?: ConnObj["direction"],
+  direction?: Direction,
 ): string[] {
   return [
     "connection",
@@ -253,6 +253,16 @@ export function connectionRemoveArgs(
     name,
     ...(direction === undefined ? [] : ["--direction", direction]),
   ];
+}
+
+/** The direction a delete of `name` may name, given the listed connections: the one that holds it,
+ *  or undefined when an inbound and an outbound share it. The editors look a connection up by name
+ *  and so cannot tell which twin the operator opened; naming the first match would remove the inbound
+ *  when the outbound was meant (BACKLOG #5898). Undefined leaves the engine to refuse the ambiguous
+ *  name instead. */
+export function removalDirection(entries: readonly ConnObj[], name: string): Direction | undefined {
+  const held = new Set(entries.filter((c) => c.name === name).map((c) => c.direction));
+  return held.size === 1 ? [...held][0] : undefined;
 }
 
 /**
