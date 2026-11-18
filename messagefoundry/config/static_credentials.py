@@ -81,9 +81,9 @@ which log, the guard also reading the ``env()`` values the engine sets around it
 which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529); ``_is_https``, which logs
 at debug a proxy target that does not parse; and ``_http_literal_static`` (BACKLOG #5510) and
 ``_dicomweb_build_refused`` (vault BACKLOG #5359), whose ``env()`` resolution runs an operator
-``cast`` as the build does. A function that calls one of these does the same, at least
-:func:`static_credential_hops`, :func:`run_static_credential_gate` and
-:func:`http_hop_credentials`.
+``cast`` as the build does. A caller inherits its callee's effect: at least
+:func:`static_credential_hops` and :func:`run_static_credential_gate` can run an operator ``cast``
+and log, and :func:`http_hop_credentials` logs through ``_digest`` and resolves no ``env()``.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -465,8 +465,8 @@ def _proxy_hop(
     credential never leaves the engine. A loopback address always bypasses it, with no entry in the
     list (vault BACKLOG #2579). The bypass list is the connection's own, else the inherited
     ``[egress].proxy_no_proxy`` (``site_no_proxy``, ``None`` when the caller has no settings). With no
-    ``targets`` the hop is reported, because nothing says it is bypassed. Nor is a Digest proxy that
-    never carries the credential to those targets (:func:`_digest_proxy_refused`).
+    ``targets`` the hop is reported, because nothing says it is bypassed. A Digest proxy that never
+    carries the credential to those targets is not a hop either (:func:`_digest_proxy_refused`).
 
     The credential is the ``proxy_user``/``proxy_password`` pair. A user or a password in the proxy
     URL itself (:func:`_proxy_url_holds_credential`) is not a hop: the connector's build refuses it.
@@ -757,7 +757,10 @@ def static_credential_hops(
     ``[egress].proxy_no_proxy`` to decide whether a connection's proxy credential is ever sent.
     ``env_values``, when the caller has the running instance's, resolves at least a database
     hop's ``env()`` dialect as the build does (see ``static_credential_db_hops``), and an
-    HTTP-family hop's ``env()`` ``headers`` table or ``url`` (see ``_http_literal_static``)."""
+    HTTP-family hop's ``env()`` ``headers`` table or ``url`` (see ``_http_literal_static``), and
+    whether a DICOMweb connection's build is refused, which leaves it and its proxy hop out (see
+    ``_dicomweb_build_refused``). Without them an ``env()`` DICOMweb credential is unresolved, and
+    the hop is not left out on that ground."""
     out: list[StaticCredentialHop] = []
     if registry is not None:
         site_proxy = None if settings is None else (settings.egress.proxy_url or "")

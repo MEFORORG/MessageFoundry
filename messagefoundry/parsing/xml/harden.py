@@ -20,7 +20,7 @@ Guards (all on by design — inbound HL7/XML is attacker-influenceable, CLAUDE.m
   (``etree.DOCSTRING``/``DTD`` in the tree), so a payload can't smuggle entity *definitions* even
   though references wouldn't be resolved — defense in depth, mirroring defusedxml's ``forbid_dtd``.
   A document that fails to parse is refused too, with a message of its own, when its prolog opens
-  a DOCTYPE in one of the encodings :func:`_declares_doctype` reads.
+  a DOCTYPE within the bytes and encodings :func:`_declares_doctype` reads.
 * **No second decode** — for ``str`` input, :func:`parse_bytes` neutralizes the XML declaration's
   ``encoding=`` pseudo-attribute before encoding to UTF-8 (ASVS 1.5.3, see
   :func:`_without_declared_encoding`).
