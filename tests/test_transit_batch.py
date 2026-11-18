@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import collections
 import json
+import logging
 import os
 import traceback
 from pathlib import Path
@@ -494,6 +495,41 @@ def test_a_refused_decrypt_batch_asks_alone_and_stops_batching() -> None:
     transit.decrypt_data = too_large  # type: ignore[method-assign]
     assert cipher.decrypt_many(items) == [f"value {i}" for i in range(len(items))]
     assert batches == 1  # the second run went value by value without a batch first
+
+
+class _RaisingFilter(logging.Filter):
+    """A log filter that fails on every record, as a broken redaction filter would."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise ValueError("filter fault")
+
+
+def test_a_raising_log_filter_does_not_stop_the_switch_to_sending_alone_except_out_of_memory(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: the warning that batching is off goes through :func:`_warn_quietly`, so a
+    log filter that raises leaves every value opened and batching off, and is reported on
+    stderr, except out of memory or stack."""
+    monkeypatch.setattr(crypto_transit, "_logged_at", {})
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 3)
+    real = transit.decrypt_data
+
+    def too_large(**kw: Any) -> dict[str, Any]:
+        if kw.get("batch_input") is not None:
+            raise UnexpectedError("413 Request Entity Too Large")
+        return real(**kw)
+
+    transit.decrypt_data = too_large  # type: ignore[method-assign]
+    raising = _RaisingFilter()
+    crypto_transit.log.addFilter(raising)
+    try:
+        assert cipher.decrypt_many(items) == [f"value {i}" for i in range(3)]
+    finally:
+        crypto_transit.log.removeFilter(raising)
+    assert cipher._batch_alone is True
+    assert "could not be logged ('ValueError')" in capsys.readouterr().err
 
 
 def _without_reference(results: list[dict[str, Any]]) -> list[dict[str, Any]]:

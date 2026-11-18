@@ -99,6 +99,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
 )
 from messagefoundry.connection_events import check_connection_event_kind
+from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
 from messagefoundry.redaction import json_loads_or_refusal, safe_text
@@ -7324,9 +7325,28 @@ def _audit_row_mac(
     except AuditVerifyTimedOutError as exc:
         if in_walk:
             raise
-        log.warning("%s; read as a MAC that does not verify", exc)
+        _log_timeout_read_as_unverified(exc)
         return None
     return stored if verified is True and checked else None
+
+
+#: What :func:`_log_timeout_read_as_unverified` writes on stderr when its log call raises.
+_TIMEOUT_WARNING_UNLOGGED: Final = "an audit row check that timed out could not be logged"
+
+
+def _log_timeout_read_as_unverified(exc: AuditVerifyTimedOutError) -> None:
+    """Log that a row check outside the walk timed out and is read as a MAC that does not verify.
+    A failure of the log call is reported on stderr by its class alone (BACKLOG #6707), except out
+    of memory or stack, where that report can itself raise out of this function.
+    :func:`settle_audit_ranges`' own log calls are not guarded, so the store open
+    can still fail when a failing filter meets them."""
+    try:
+        log.warning("%s; read as a MAC that does not verify", exc)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+        text = _TIMEOUT_WARNING_UNLOGGED
+        with suppress(Exception):
+            text = f"{_TIMEOUT_WARNING_UNLOGGED} ({ascii(type(fault).__name__)})"
+        _last_resort(text)
 
 
 def _audit_digest_line(r: Mapping[str, Any]) -> bytes:

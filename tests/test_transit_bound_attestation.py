@@ -590,6 +590,14 @@ _UNHELD_VERSION = 9999999
 _PLANTED = f"vault:v{_UNHELD_VERSION}:" + base64.b64encode(bytes(32)).decode("ascii")
 
 
+@pytest.fixture(autouse=True)
+def _fresh_warning_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test starts with no 400 warning logged, so none depends on test order (BACKLOG #6707)."""
+    from messagefoundry.store import crypto_transit
+
+    monkeypatch.setattr(crypto_transit, "_logged_at", {})
+
+
 def _needs_hvac() -> None:
     """Skip without the [vault] extra: the cipher tells a refused version by hvac's own class."""
     pytest.importorskip("hvac.exceptions")
@@ -694,6 +702,8 @@ async def test_a_planted_unheld_key_version_is_a_chain_break_on_the_startup_walk
     """A DML writer names a Transit key version Transit does not hold. Transit refuses to verify
     at it, and that is the row's own evidence: the startup walk must raise the tamper alert at
     that row, never stop with "could not run" and no alert (the sixth defect on PR 2167)."""
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
     _use_fake(monkeypatch, _RotatingTransit())
     db = tmp_path / "planted.db"
     seq = await _chain_with_a_planted_version(db)
@@ -704,7 +714,8 @@ async def test_a_planted_unheld_key_version_is_a_chain_break_on_the_startup_walk
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
-    assert f"key version {_UNHELD_VERSION}" in str(msg), msg
+    # Vault's own refusal text keeps the refused label, whole (BACKLOG #6707).
+    assert str(AuditKeyVersionRefusedError(_UNHELD_VERSION)) in str(msg), msg
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
     assert f"seq={seq}," in sink.events[0][1], sink.events
     assert not any("could not run" in line for line in lines), lines
@@ -964,6 +975,15 @@ def test_a_400_on_the_row_alone_at_the_latest_version_is_a_break() -> None:
     assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
 
 
+@pytest.mark.parametrize("failure", [AttributeError, TypeError], ids=lambda f: f.__name__)
+def test_a_row_400_hvac_cannot_build_is_still_a_break(failure: type[Exception]) -> None:
+    """BACKLOG #6707: hvac raises ``AttributeError`` or ``TypeError`` for some JSON 400 bodies
+    (``test_hvac_raises_no_invalid_request_for_these_json_400_bodies``). On one row alone, while
+    the fixed input verifies, that is still a break at the row, not a walk that could not run."""
+    cipher = _scripted_cipher([failure("hvac"), failure("hvac")])
+    assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
+
+
 def test_a_failed_fixed_input_verify_keeps_the_rows_failure_as_the_cause() -> None:
     """When the fixed input fails too, the check could not run, and the error's cause is the
     row's own failure, so a reader of the cause's class still tells an outage from a refusal."""
@@ -1066,6 +1086,50 @@ def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verif
     assert isinstance(caught.value.__cause__, UnexpectedError)
     assert rechecked, "the fixed input was checked between the asks"
     assert real_fixed(), "the control: the fixed input verifies"
+
+
+class _TimedOutVerifier:
+    """An audit MAC verifier whose every check times out on both asks."""
+
+    def __call__(self, data: bytes, /) -> str:
+        return "vault:v1:AAAA"
+
+    def verify(self, data: bytes, stored: str, /) -> bool:
+        from messagefoundry.store.crypto import AuditVerifyTimedOutError
+
+        raise AuditVerifyTimedOutError("synthetic timeout")
+
+
+def test_a_raising_log_filter_does_not_fail_a_timed_out_check_outside_the_walk(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #6707: outside the walk, as on the store open's genesis check, a timed-out row check
+    reads as a MAC that does not verify even when the log call beside it raises; the failure is
+    reported on stderr by its class. In the walk the timeout still propagates."""
+    from messagefoundry.store import store
+    from messagefoundry.store.crypto import AuditVerifyTimedOutError
+
+    row = {
+        "seq": 1,
+        "ts": "2026-01-01T00:00:00Z",
+        "actor": "synthetic",
+        "action": "test",
+        "channel_id": None,
+        "detail": "{}",
+        "client": None,
+        "row_hash": "vault:v1:AAAA",
+    }
+    raising = _RaisingFilter()
+    store.log.addFilter(raising)
+    try:
+        assert store._audit_row_mac(row, "", None, _TimedOutVerifier()) is None
+        with pytest.raises(AuditVerifyTimedOutError):
+            store._audit_row_mac(row, "", None, _TimedOutVerifier(), in_walk=True)
+    finally:
+        store.log.removeFilter(raising)
+    assert "audit row check that timed out could not be logged ('ValueError')" in (
+        capsys.readouterr().err
+    )
 
 
 @pytest.mark.parametrize(
@@ -1465,14 +1529,10 @@ def test_a_verify_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: A
             None,
             id="known-policy-refusal",
         ),
-        pytest.param(["key version 3 is not held by this key"], None, id="unknown-wording"),
         pytest.param(
             ["no such key version", "missing input for HMAC"], None, id="refusal-beside-non-version"
         ),
-        pytest.param(
-            ["missing input for HMAC: and more"], None, id="non-version-only-as-substring"
-        ),
-        pytest.param([], None, id="empty-vault-list"),
+        pytest.param(["NO SUCH KEY VERSION"], None, id="known-refusal-any-case"),
         pytest.param(["invalid HMAC: version is too new"], None, id="verify-too-new"),
         pytest.param(
             ["invalid HMAC: version is too new", "encryption key not found"],
@@ -1485,17 +1545,21 @@ def test_a_verify_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: A
             id="verify-below-min-decryption",
         ),
         pytest.param(None, '{"errors": ["no such key version"]}', id="vault-json-in-text-only"),
-        pytest.param(None, '{"errors": ["reworded refusal"]}', id="unknown-wording-in-text-only"),
+        pytest.param(
+            None,
+            '{"errors": [7, "no such key version"]}',
+            id="refusal-beside-non-text-entry-in-text-only",
+        ),
     ],
 )
 def test_a_verify_400_read_as_a_version_refusal_keeps_the_refused_label(
     errors: Any, text: str | None
 ) -> None:
-    """BACKLOG #6707: a 400 whose ``errors`` value is a list is labelled a refused version unless
-    that list is non-empty and holds only whole known non-version texts. An empty list and unknown
-    Vault wording keep that label, so a reworded refusal on an upgraded Vault is labelled as
-    before. hvac fills ``errors`` only for a Content-Type of exactly ``application/json``, so the
-    same JSON in the body (a charset-tagged reply) must read the same way."""
+    """BACKLOG #6707: a 400 whose ``errors`` list has a text entry holding one of Vault's version
+    refusal texts is labelled a refused version, whatever else the list holds. hvac fills
+    ``errors`` only for a Content-Type of exactly ``application/json``, so the same JSON in the
+    body (a charset-tagged reply, which hvac does not parse) reads the same way; that is also
+    where an entry that is not text can arrive, since hvac's own join refuses one."""
     from messagefoundry.store.crypto import (
         AuditKeyVersionRefusedError,
         AuditKeyVersionUnverifiedError,
@@ -1515,16 +1579,25 @@ def test_a_verify_400_read_as_a_version_refusal_keeps_the_refused_label(
         pytest.param(None, '{"message": "bad request"}', id="json-without-errors"),
         pytest.param(["missing input for HMAC"], None, id="known-non-version-text"),
         pytest.param(["  Encryption key not found "], None, id="known-non-version-any-case"),
+        pytest.param(
+            ["missing input for HMAC: and more"], None, id="non-version-only-as-substring"
+        ),
+        pytest.param(["key version 3 is not held by this key"], None, id="unknown-wording"),
+        pytest.param([], None, id="empty-vault-list"),
+        pytest.param(None, '{"errors": ["reworded refusal"]}', id="unknown-wording-in-text-only"),
+        pytest.param(None, '{"errors": []}', id="empty-list-in-text-only"),
+        pytest.param(None, '{"errors": [7]}', id="non-text-entry-in-text-only"),
+        pytest.param(None, '{"errors": "no such key version"}', id="string-errors-value"),
     ],
 )
 def test_a_verify_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
     errors: Any, text: str | None
 ) -> None:
     """BACKLOG #6707: after a rotation the probe answers under a newer version, so the probe alone
-    labelled ANY 400 on a check a refused version. A 400 with no ``errors`` value that is a list, even
-    one whose reply holds a refusal text elsewhere, or with a list of only whole known non-version
-    texts, is labelled unconfirmed instead. It stays a subclass, so its handlers handle the row as
-    on main."""
+    labelled ANY 400 on a check a refused version. A 400 with no ``errors`` list, even one whose
+    reply holds a refusal text elsewhere, or with a list naming no version refusal (empty, unknown
+    wording, or only a reason Vault gives for something else), is labelled unconfirmed instead. It
+    stays a subclass, so its handlers handle the row as on main."""
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     refused = _verify_refusal("vault:v2:AAAA", errors, text=text)
@@ -1537,25 +1610,514 @@ def test_a_verify_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
     assert _KEY_NAME not in str(refused)  # the walk puts this text in the tamper alert
 
 
-def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error() -> None:
-    """The label changes nothing else: a proxy 400 whose probe also fails is an outage, as on main."""
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(RuntimeError("down"), id="probe-fails"),
+        pytest.param("vault:v3:AAAA", id="probe-names-the-same-version"),
+    ],
+)
+def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: Any) -> None:
+    """The label changes nothing else: a proxy 400 whose probe fails, or answers under the version
+    the row names, is not read as a refused version, as on main."""
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
-    refused = _verify_refusal(RuntimeError("down"), None, text=_PROXY_PAGE)
+    refused = _verify_refusal(answer, None, text=_PROXY_PAGE)
     assert not isinstance(refused, AuditKeyVersionRefusedError)
 
 
-def test_a_non_text_entry_in_vault_errors_is_labelled_a_refused_version() -> None:
-    """A Vault error list holding an entry that is not text could name the version, so it keeps
-    the refused-version label (BACKLOG #6707)."""
+def test_an_unconfirmed_label_logs_its_reason_once_per_interval(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707: why a 400 was labelled unconfirmed is logged, by a fixed reason that carries
+    none of the reply's text, and once an interval per reason, since a proxy can cause it on every
+    row. Past the interval it is logged again."""
+    from messagefoundry.store import crypto_transit
+
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
+    for _ in range(3):
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    _verify_refusal("vault:v2:AAAA", ["reworded refusal"])
+    _verify_refusal("vault:v2:AAAA", ["no such key version"])  # the refused label logs nothing
+    now[0] += crypto_transit._WARNING_LOG_INTERVAL_S
+    _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
+    assert len(logged) == 3, logged
+    assert "because it carries no errors list (key=" in logged[0], logged
+    assert "because its errors list names no version refusal (key=" in logged[1], logged
+    assert "because it carries no errors list (key=" in logged[2], logged
+    assert not any("400 Bad Request" in line or "reworded" in line for line in logged), logged
+
+
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError, ValueError])
+def test_a_fault_in_the_unconfirmed_log_keeps_the_label(
+    fault: type[BaseException], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6707: the log beside an unconfirmed label may fail; the label still stands, so the
+    row stays a break rather than a walk that could not run."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def failing(*_a: Any, **_kw: Any) -> None:
+        raise fault
+
+    monkeypatch.setattr(crypto_transit.log, "warning", failing)
+    assert isinstance(
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
+    )
+
+
+class _RaisingFilter(logging.Filter):
+    """A log filter that fails on every record, as a broken redaction filter would."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise ValueError("filter fault")
+
+
+@pytest.fixture
+def _raising_log_filter() -> Any:
+    """A :class:`_RaisingFilter` on the Transit cipher's logger for one test."""
+    from messagefoundry.store import crypto_transit
+
+    raising = _RaisingFilter()
+    crypto_transit.log.addFilter(raising)
+    try:
+        yield raising
+    finally:
+        crypto_transit.log.removeFilter(raising)
+
+
+@pytest.mark.usefixtures("_raising_log_filter")
+def test_a_raising_log_filter_keeps_the_ciphers_break(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #6707: the Transit cipher's audit verify paths that log beside a break keep the
+    break when the log call itself raises, except out of memory or stack: at least the
+    unconfirmed label, a row refused twice, and a malformed stored MAC whose cost-only call
+    failed. A failure is reported by its class on stderr."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
-    from messagefoundry.store.crypto_transit import _names_no_version_reason
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
-    exc = InvalidRequest(errors=["missing input for HMAC"])
-    exc.errors = ["missing input for HMAC", 7]  # hvac's constructor joins entries, so set it after
-    assert not _names_no_version_reason(exc)
+    assert isinstance(
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
+    )
+    cipher = _scripted_cipher([InvalidRequest("bad"), InvalidRequest("bad")])
+    assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
+
+    class _DownTransit(_FakeTransit):
+        def generate_hmac(self, **_kw: Any) -> dict[str, Any]:
+            raise RuntimeError("down")
+
+    from messagefoundry.store.crypto_transit import TransitCipher
+    from tests.test_crypto_transit import _FakeClient
+
+    assert (
+        TransitCipher(_FakeClient(_DownTransit()), _KEY_NAME).verify_audit_hmac(b"row", "not a mac")
+        is False
+    )
+    assert capsys.readouterr().err.count("could not be logged ('ValueError')") == 3
+
+
+class _RaisingStream:
+    """A stderr whose every write fails."""
+
+    def write(self, _text: str) -> int:
+        raise OSError("stderr is gone")
+
+    def flush(self) -> None:
+        raise OSError("stderr is gone")
+
+
+def test_the_unlogged_report_survives_a_failing_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #6707: the stderr report of a warning that could not be logged does not raise when
+    stderr fails or the failure's class name cannot be rendered."""
+    import sys
+
+    from messagefoundry.store import crypto_transit
+
+    monkeypatch.setattr(sys, "stderr", _RaisingStream())
+    crypto_transit._report_unlogged(ValueError("x"), "site-a")
+
+    def no_ascii(_value: object) -> str:
+        raise RuntimeError("cannot render")
+
+    monkeypatch.setattr(crypto_transit, "ascii", no_ascii, raising=False)
+    crypto_transit._report_unlogged(ValueError("x"), "site-b")
+
+    def failing_build() -> tuple[object, ...]:
+        raise ValueError("build fault")
+
+    assert crypto_transit._warn_quietly(failing_build) is False
+    crypto_transit._warn_when_due(lambda: "kind", failing_build)
+
+
+def test_the_unlogged_report_is_rate_limited_per_site(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a log path that fails on every read reports on stderr at most once per
+    interval for each site and failure class; another site, or the next interval, reports
+    again."""
+    from messagefoundry.store import crypto_transit
+
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    for _ in range(5):
+        crypto_transit._report_unlogged(ValueError("x"), "site-a")
+    assert capsys.readouterr().err.count("could not be logged") == 1
+    crypto_transit._report_unlogged(ValueError("x"), "site-b")
+    crypto_transit._report_unlogged(MemoryError(), "site-a")
+    assert capsys.readouterr().err.count("could not be logged") == 2
+    now[0] += crypto_transit._WARNING_LOG_INTERVAL_S
+    crypto_transit._report_unlogged(ValueError("x"), "site-a")
+    assert capsys.readouterr().err.count("could not be logged") == 1
+
+
+@pytest.mark.usefixtures("_raising_log_filter")
+def test_a_persistently_failing_unconfirmed_log_reports_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #6707: an unconfirmed 400 on every read, with a log that always fails, tries the
+    warning each time but writes the stderr line once in the interval."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    for _ in range(4):
+        assert isinstance(
+            _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE),
+            AuditKeyVersionUnverifiedError,
+        )
+    assert capsys.readouterr().err.count("could not be logged ('ValueError')") == 1
+
+
+class _FullDict(dict[object, float]):
+    """A throttle table whose write fails, as a dict resize short of memory would."""
+
+    def __setitem__(self, key: object, value: float) -> None:
+        raise MemoryError
+
+
+def test_a_fault_in_the_unconfirmed_throttle_keeps_the_label(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: the throttle's key and its slot are built inside the warning's guard, so a
+    fault there leaves the unconfirmed label standing and, except out of memory or stack, is
+    reported on stderr."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    monkeypatch.setattr(crypto_transit, "_logged_at", _FullDict())
+    assert isinstance(
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
+    )
+    assert "rate limit failed ('MemoryError')" in capsys.readouterr().err
+
+
+def test_a_fault_building_the_throttle_key_is_reported_as_building(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #6707: the stderr line names the step that failed: a fault in ``kind()`` reads as
+    building the warning, an unhashable key as the rate limit, never as the log call."""
+    from messagefoundry.store import crypto_transit
+
+    def broken_kind() -> object:
+        raise KeyError("kind")
+
+    crypto_transit._warn_when_due(broken_kind, lambda: ("never logged",))
+    crypto_transit._warn_when_due(lambda: ["unhashable"], lambda: ("never logged",))
+    err = capsys.readouterr().err
+    assert "a Transit cipher warning could not be built ('KeyError')" in err, err
+    assert "a Transit cipher warning's rate limit failed ('TypeError')" in err, err
+    assert "could not be logged" not in err, err
+
+
+def test_a_fault_in_the_reports_own_rate_limit_is_reported(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a fault in the stderr report's own bookkeeping is reported by a fixed
+    literal, and the report is still written."""
+    from messagefoundry.store import crypto_transit
+
+    monkeypatch.setattr(crypto_transit, "_logged_at", _FullDict())
+    crypto_transit._report_unlogged(ValueError("x"), "site-a")
+    err = capsys.readouterr().err
+    assert crypto_transit._REPORT_UNTHROTTLED in err, err
+    assert "could not be logged ('ValueError')" in err, err
+
+
+def test_a_fault_rendering_a_break_warning_keeps_the_break(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a warning's text is rendered inside its guard, so a fault there, here a
+    stand-in for ``vault_failure_text`` that raises, leaves a row refused twice a break."""
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store import crypto_transit
+
+    cipher = _scripted_cipher([InvalidRequest("bad"), InvalidRequest("bad")])
+    stored = cipher.audit_hmac(b"row")
+
+    def broken(_exc: object) -> str:
+        raise ImportError("lazy import failed")
+
+    monkeypatch.setattr(crypto_transit, "vault_failure_text", broken)
+    assert cipher.verify_audit_hmac(b"row", stored) is False
+    assert "could not be built ('ImportError')" in capsys.readouterr().err
+
+
+def test_a_fault_rendering_vault_failure_text_keeps_a_malformed_mac_a_break(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6707: a fault rendering the cost-only call's failure beside a malformed stored MAC
+    falls back to the type name, so the row's break stands, rather than an error the verify does
+    not read as a cipher failure."""
+    from messagefoundry.store import keyprovider_vault
+    from messagefoundry.store.crypto_transit import TransitCipher
+    from messagefoundry.transports import strict_requests
+    from tests.test_crypto_transit import _FakeClient
+
+    def broken(_exc: object) -> str:
+        raise ImportError("lazy import failed")
+
+    monkeypatch.setattr(strict_requests, "vault_failure_text", broken)
+    assert keyprovider_vault.vault_failure_text(RuntimeError("vault:v1:c3ludA==")) == "RuntimeError"
+
+    class _DownTransit(_FakeTransit):
+        def generate_hmac(self, **_kw: Any) -> dict[str, Any]:
+            raise RuntimeError("down")
+
+    cipher = TransitCipher(_FakeClient(_DownTransit()), _KEY_NAME)
+    assert cipher.verify_audit_hmac(b"row", "not a mac") is False
+
+
+def test_classifier_faults_log_through_the_guard(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a raising log filter beside a classifier fault does not replace the cipher
+    error ``_transit_failure`` returns, or the flags ``_classify_batch_failure`` returns."""
+    from messagefoundry.store import crypto_transit
+
+    def broken(_exc: object) -> bool:
+        raise KeyError("classifier")
+
+    monkeypatch.setattr(crypto_transit, "is_vault_unavailable", broken)
+    raising = _RaisingFilter()
+    crypto_transit.log.addFilter(raising)
+    try:
+        error = crypto_transit._transit_failure("decrypt", _KEY_NAME, RuntimeError("x"))
+        flags = crypto_transit._classify_batch_failure(RuntimeError("x"))
+    finally:
+        crypto_transit.log.removeFilter(raising)
+    assert type(error) is CipherError and "RuntimeError" in str(error)
+    assert flags == (False, True)
+    assert capsys.readouterr().err.count("could not be logged ('ValueError')") == 2
+
+
+def test_a_failed_unconfirmed_log_is_tried_again(caplog: pytest.LogCaptureFixture) -> None:
+    """BACKLOG #6707: a warning whose log failed does not use up its interval, so it is logged on
+    the next unconfirmed 400, except out of memory or stack."""
+    from messagefoundry.store import crypto_transit
+
+    caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
+    raising = _RaisingFilter()
+    crypto_transit.log.addFilter(raising)
+    try:
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    finally:
+        crypto_transit.log.removeFilter(raising)
+    _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
+    assert len(logged) == 1, logged
+
+
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError])
+def test_a_fault_reading_the_400_is_labelled_unconfirmed_and_logged_by_type(
+    fault: type[Exception], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707: a read that runs short of memory or stack picks the unconfirmed label rather
+    than escaping, as on main, and the log names the fault by its class alone."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def broken(*_a: Any, **_kw: Any) -> Any:
+        raise fault("not for the log")
+
+    monkeypatch.setattr(crypto_transit, "_names_no_version_reason", broken)
+    caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
+    assert isinstance(_verify_refusal("vault:v2:AAAA"), AuditKeyVersionUnverifiedError)
+    logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
+    expected = f"because reading it raised {fault.__name__} (key="
+    assert len(logged) == 1 and expected in logged[0], logged
+    assert "not for the log" not in logged[0], logged
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [TypeError, NameError, AttributeError, AssertionError, KeyError, ValueError],
+)
+def test_a_programming_error_reading_the_400_propagates(
+    fault: type[Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6707: only ``MemoryError`` and ``RecursionError`` label the 400 unconfirmed; any
+    other exception from the reader, ``ValueError`` included, is a defect and propagates."""
+    from messagefoundry.store import crypto_transit
+
+    def broken(*_a: Any, **_kw: Any) -> Any:
+        raise fault("a bug in the reader")
+
+    monkeypatch.setattr(crypto_transit, "_names_no_version_reason", broken)
+    with pytest.raises(fault):
+        _verify_refusal("vault:v2:AAAA")
+
+
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError])
+def test_a_fault_making_the_unconfirmed_warning_keeps_the_label(
+    fault: type[Exception], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a fault raised while the unconfirmed warning's closures are made, outside
+    :func:`_warn_when_due`'s own guard, writes a fixed literal on stderr in place of the warning,
+    and the label still stands."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def short(*_a: Any, **_kw: Any) -> Any:
+        raise fault
+
+    monkeypatch.setattr(crypto_transit, "_unconfirmed_warning", short)
+    refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
+    assert crypto_transit._WARNING_UNBUILT in capsys.readouterr().err
+
+
+def test_a_fault_inside_warn_when_due_is_not_reported_as_unbuilt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a fault in :data:`_READ_FAULTS` escaping :func:`_warn_when_due` keeps the
+    unconfirmed label, and is written on stderr by its class, not as the warning that could not
+    be built."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def short_of_memory(*_a: Any, **_kw: Any) -> None:
+        raise MemoryError
+
+    monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
+    refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
+    err = capsys.readouterr().err
+    assert crypto_transit._WARNING_UNBUILT not in err
+    assert f"{crypto_transit._WARNING_UNLOGGED} ('MemoryError')" in err
+
+
+def test_a_raising_report_of_an_escaped_warning_fault_keeps_the_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6707: when a fault in :data:`_READ_FAULTS` escapes the unconfirmed warning and the
+    report of it raises too, the report was attempted and the 400 keeps the unconfirmed label."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def short_of_memory(*_a: Any, **_kw: Any) -> None:
+        raise MemoryError
+
+    reported: list[BaseException] = []
+
+    def report_fails(fault: BaseException, *_a: Any, **_kw: Any) -> None:
+        reported.append(fault)
+        raise MemoryError
+
+    monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
+    monkeypatch.setattr(crypto_transit, "_report_unlogged", report_fails)
+    refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
+    assert len(reported) == 1 and isinstance(reported[0], MemoryError)
+
+
+def test_repeated_escapes_from_the_unconfirmed_warning_report_once_per_interval(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: five faults escaping the unconfirmed warning within one interval write one
+    stderr line."""
+    from messagefoundry.store import crypto_transit
+
+    def short_of_memory(*_a: Any, **_kw: Any) -> None:
+        raise MemoryError
+
+    monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
+    for _ in range(5):
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    lines = [line for line in capsys.readouterr().err.splitlines() if "could not be" in line]
+    assert len(lines) == 1, lines
+
+
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError])
+def test_a_fault_escaping_the_unconfirmed_warning_keeps_the_label_and_frees_the_slot(
+    fault: type[Exception], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707: when the warning's log call raises and its stderr report then raises a
+    fault in :data:`_READ_FAULTS`, the 400 keeps the unconfirmed label, and the slot is given
+    back, so the next unconfirmed 400 logs the warning."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def report_fails(*_a: Any, **_kw: Any) -> None:
+        raise fault
+
+    caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
+    raising = _RaisingFilter()
+    crypto_transit.log.addFilter(raising)
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(crypto_transit, "_report_unlogged", report_fails)
+            refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    finally:
+        crypto_transit.log.removeFilter(raising)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
+    _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
+    assert len(logged) == 1, logged
+
+
+def test_a_body_hvac_parsed_past_the_bound_is_not_read() -> None:
+    """BACKLOG #6707: the bound covers a list hvac already parsed too, so an oversized body gets
+    the same label whatever its Content-Type; its refusal text is not read."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}')
+    refused = _verify_refusal("vault:v2:AAAA", ["no such key version"], text=body)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("[]", id="list"),
+        pytest.param("null", id="null"),
+        pytest.param('"text"', id="string"),
+        pytest.param('{"errors":[{"message":"x"}]}', id="object-entry"),
+        pytest.param('{"errors":[1]}', id="number-entry"),
+        pytest.param('{"errors":5}', id="number"),
+        pytest.param('{"errors":true}', id="true"),
+    ],
+)
+def test_hvac_raises_no_invalid_request_for_these_json_400_bodies(body: str) -> None:
+    """BACKLOG #6707: ``verify_audit_hmac``'s docstring says the installed hvac raises
+    ``AttributeError`` or ``TypeError``, not ``InvalidRequest``, for a JSON 400 body that is not
+    an object, or whose ``errors`` is truthy and a number, ``true`` or a list with a non-text
+    entry. This runs hvac's own adapter on such replies, so a release that changes it fails here."""
+    _needs_hvac()
+    import requests
+    from hvac.adapters import RawAdapter  # type: ignore[import-untyped]
+
+    reply = requests.Response()
+    reply.status_code = 400
+    reply.headers["Content-Type"] = "application/json"
+    reply._content = body.encode("utf-8")
+    with pytest.raises((AttributeError, TypeError)):
+        RawAdapter()._raise_for_error("POST", "https://vault.invalid/v1/transit/verify/k", reply)
 
 
 class _ProxiedRotatingTransit(_RotatingTransit):
@@ -1574,11 +2136,26 @@ class _ProxiedRotatingTransit(_RotatingTransit):
             raise InvalidRequest(self.page, errors=self.errors, text=self.page) from None
 
 
+class _HvacFailingProxiedTransit(_RotatingTransit):
+    """``_RotatingTransit`` behind a proxy whose JSON 400 body makes hvac raise ``AttributeError``
+    in place of ``InvalidRequest`` (``test_hvac_raises_no_invalid_request_for_these_json_400_bodies``)."""
+
+    def verify_signed_data(self, **kw: Any) -> dict[str, Any]:
+        from hvac.exceptions import InvalidRequest
+
+        try:
+            return super().verify_signed_data(**kw)
+        except InvalidRequest:
+            raise AttributeError("'list' object has no attribute 'get'") from None
+
+
 async def test_a_planted_version_behind_a_proxy_is_a_chain_break_on_the_startup_walk(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #6707: a proxy's page in place of Transit's refusal changes the label only. The walk
     still reports the planted row as a break, raises the tamper alert and keeps going."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
     _needs_hvac()
     _use_fake(monkeypatch, _ProxiedRotatingTransit())
     db = tmp_path / "proxied-planted.db"
@@ -1590,8 +2167,30 @@ async def test_a_planted_version_behind_a_proxy_is_a_chain_break_on_the_startup_
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
-    assert f"check at key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
+    assert str(AuditKeyVersionUnverifiedError(_UNHELD_VERSION)) in str(msg), msg
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
+    assert not any("could not run" in line for line in lines), lines
+
+
+async def test_a_planted_version_behind_a_proxy_hvac_cannot_parse_is_a_chain_break(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707: a planted version whose 400 hvac fails to build into ``InvalidRequest`` is
+    no refused version, but the row alone fails while the fixed input verifies, so the walk still
+    reports a break at that row with the tamper alert, never "could not run"."""
+    _needs_hvac()
+    _use_fake(monkeypatch, _HvacFailingProxiedTransit())
+    db = tmp_path / "hvac-failing-planted.db"
+    seq = await _chain_with_a_planted_version(db)
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+    assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
+    assert f"seq={seq}," in sink.events[0][1], sink.events
     assert not any("could not run" in line for line in lines), lines
 
 
@@ -1599,6 +2198,8 @@ async def test_a_planted_genesis_version_behind_a_proxy_opens_and_reads_as_a_bre
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """BACKLOG #6707: the genesis row behaves as on main behind a proxy too; the open goes on."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
     _needs_hvac()
     _use_fake(monkeypatch, _ProxiedRotatingTransit())
     db = tmp_path / "proxied-genesis.db"
@@ -1610,6 +2211,7 @@ async def test_a_planted_genesis_version_behind_a_proxy_opens_and_reads_as_a_bre
     finally:
         await store.close()
     assert not ok and "seq=1," in str(msg), msg
+    assert str(AuditKeyVersionUnverifiedError(_UNHELD_VERSION)) in str(msg), msg
 
 
 def _past_the_reparse_bound(head: str, tail: str, *, over: int = 1) -> str:
@@ -1638,6 +2240,11 @@ def test_an_oversized_vault_shaped_body_is_labelled_unconfirmed_unparsed(
     assert isinstance(
         _verify_refusal("vault:v2:AAAA", None, text=body), AuditKeyVersionUnverifiedError
     )
+    # The negative control: with the bound one character wider the body is parsed, and the
+    # parser's AssertionError propagates, so the assertion above can fail.
+    monkeypatch.setattr(crypto_transit, "_REPARSED_BODY_MAX_CHARS", len(body))
+    with pytest.raises(AssertionError, match="an oversized body was parsed"):
+        _verify_refusal("vault:v2:AAAA", None, text=body)
 
 
 def test_a_vault_shaped_body_at_the_bound_is_still_read() -> None:
@@ -1678,27 +2285,28 @@ class _PaddedProxiedRotatingTransit(_ProxiedRotatingTransit):
 
 
 class _ExplodingText(str):
-    """An ``errors`` entry whose ``strip``, the first step of the cipher's lower-cased copy, fails
-    as copying a huge list would: with MemoryError."""
+    """An ``errors`` entry whose ``lower``, the cipher's one copy of an entry, fails with
+    MemoryError, as a process short of memory would."""
 
     __slots__ = ()
 
-    def strip(self, chars: str | None = None) -> str:
+    def lower(self) -> str:
         raise MemoryError
 
 
-class _HugeErrorsRotatingTransit(_ProxiedRotatingTransit):
-    """A 400 carrying a huge Vault ``errors`` list, as hvac fills it, and no body to re-parse."""
+class _UnreadableErrorsRotatingTransit(_ProxiedRotatingTransit):
+    """A 400 whose body, within the bound, hvac parsed into an ``errors`` list whose entry cannot
+    be read."""
 
-    page = None
-    errors = [_ExplodingText("no such key version")] * 20_000
+    page = '{"errors": ["no such key version"]}'
+    errors = [_ExplodingText("no such key version")]
 
 
 @pytest.mark.parametrize(
     "transit_class",
     [
         pytest.param(_PaddedProxiedRotatingTransit, id="oversized-body"),
-        pytest.param(_HugeErrorsRotatingTransit, id="oversized-errors-list"),
+        pytest.param(_UnreadableErrorsRotatingTransit, id="unreadable-errors-entry"),
     ],
 )
 async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_walk(
@@ -1710,8 +2318,9 @@ async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_w
     """BACKLOG #6707 item 48: a MemoryError while reading the 400 must not escape as a non-cipher
     error, or the walk logs "could not run" and drops the row's break and its alert. The parser
     raises MemoryError if it is reached at all, and it must not be reached for a body past the
-    bound; a huge ``errors`` list, which hvac parsed, fails in the lower-cased copy instead."""
+    bound; an ``errors`` list hvac parsed fails in the lower-cased copy of an entry instead."""
     from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     parsed: list[int] = []
 
@@ -1731,7 +2340,7 @@ async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_w
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
-    assert f"check at key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
+    assert str(AuditKeyVersionUnverifiedError(_UNHELD_VERSION)) in str(msg), msg
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
     assert f"seq={seq}," in sink.events[0][1], sink.events
     assert not any("could not run" in line for line in lines), lines
