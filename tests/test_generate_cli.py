@@ -188,3 +188,13 @@ def test_adt_generator_reports_a_write_failure_without_a_traceback(
 
     assert rc == 1
     assert "could not write the corpus" in capsys.readouterr().err
+
+
+def test_adt_generator_refuses_a_zero_count_and_keeps_the_old_corpus(tmp_path: Path) -> None:
+    from messagefoundry_toolkit.generators import adt
+
+    assert adt.main(["--triggers", "A01", "--count", "1", "--out", str(tmp_path), "--quiet"]) == 0
+    with pytest.raises(SystemExit) as excinfo:
+        adt.main(["--triggers", "A01", "--count", "0", "--out", str(tmp_path), "--quiet"])
+    assert excinfo.value.code == 2
+    assert (tmp_path / "A01" / "0001.hl7").exists()

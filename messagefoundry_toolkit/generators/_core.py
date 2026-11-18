@@ -592,7 +592,10 @@ def write_corpus(
     corpus_root: str | Path | None = None,
 ) -> CorpusResult:
     """Generate + strict-validate ``count`` messages per trigger and write them as
-    ``<out>/<TRIGGER>/NNNN.hl7`` (all-or-nothing per trigger; stale generated files are cleared first).
+    ``<out>/<TRIGGER>/NNNN.hl7``. A trigger's whole batch is generated and validated before anything
+    is written, so a validation failure leaves its files alone; stale generated files are then cleared
+    and the batch written, and an :class:`OSError` there can leave the trigger partly rewritten, after
+    earlier triggers were already replaced.
 
     ``triggers`` defaults to every trigger of ``code``. The cleanup is **scoped**: it deletes only
     its own ``NNNN.hl7`` files, never arbitrary ``*.hl7`` a user placed there (GEN-1). When
@@ -621,7 +624,7 @@ def write_corpus(
     total = 0
     for trigger in chosen:
         structure = structure_for(code, trigger)
-        # Build + validate the whole batch before writing (all-or-nothing per trigger).
+        # Build + validate the whole batch before writing, so a validation failure writes nothing.
         messages: list[str] = []
         for index in range(1, count + 1):
             msg = generate_message(code, trigger, index, seed=seed)
