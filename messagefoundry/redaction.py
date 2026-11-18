@@ -1407,8 +1407,9 @@ def _scrub_gap(text: str, lo: int, hi: int, content: list[int]) -> str:
 
 
 def _malformed_scalar(match: re.Match[str], anchors: _Anchors, widened: bool) -> str:
-    """The data token ``match`` read after a mismatched closer (BACKLOG #5814): scrubbed as a leaf,
-    except the part of it inside a label span of ``anchors`` (:func:`_label_anchors`). A later pass
+    """The data token ``match`` read after a mismatched closer (BACKLOG #5814), one the older walk
+    left as written: scrubbed as a leaf, except the part of it inside a label span of ``anchors``
+    (:func:`_label_anchors`). A later pass
     reads that label to scrub the value after it, and the value may lie past the end of this walk,
     where nothing else scrubs it. Outside a label only word runs are replaced (:func:`_scrub_gap`),
     so the punctuation a label needs around it, such as the ``>`` of ``<given>``, stays."""
@@ -1438,10 +1439,47 @@ def _malformed_scalar(match: re.Match[str], anchors: _Anchors, widened: bool) ->
     return "".join(out)
 
 
-def _scrub_json_value(
-    text: str, pos: int, policy: int, widened: bool, anchors: list[_Anchors]
-) -> tuple[str, int]:
-    """``(replacement, end)`` for the JSON value starting at ``pos``, scrubbed under ``policy``.
+def _overlaps(spans: list[tuple[int, int]], start: int, end: int) -> bool:
+    """Whether ``[start, end)`` overlaps a span of ``spans``, which are sorted and disjoint."""
+    # The last span to open at or before `start` is the only earlier one that can reach it.
+    index = max(bisect_right(spans, start, key=lambda span: span[0]) - 1, 0)
+    while index < len(spans) and spans[index][0] < end:
+        if spans[index][1] > start:
+            return True
+        index += 1
+    return False
+
+
+class _JsonWalk:
+    """What the walks of one :func:`_redact_json_fields` call share.
+
+    ``strict`` says whether a container ends only on its own closer (BACKLOG #5814). The older walk,
+    run with it off, let any closer end the open container, and ``scrubbed`` then collects the spans
+    of ``text`` that walk replaced. :meth:`malformed` is made once, when a strict walk first meets a
+    closer of the wrong kind."""
+
+    def __init__(self, text: str, widened: bool, *, strict: bool) -> None:
+        self.text = text
+        self.widened = widened
+        self.strict = strict
+        self.scrubbed: list[tuple[int, int]] = []
+        self._anchors: _Anchors | None = None
+        self._older: list[tuple[int, int]] | None = None
+
+    def malformed(self) -> tuple[_Anchors, list[tuple[int, int]]]:
+        """The labels later passes read (:func:`_label_anchors`), and the spans the older walk
+        replaced over the same text."""
+        if self._anchors is None or self._older is None:
+            self._anchors = _label_anchors(self.text)
+            older = _JsonWalk(self.text, self.widened, strict=False)
+            _json_fields(older)
+            self._older = older.scrubbed
+        return self._anchors, self._older
+
+
+def _scrub_json_value(walk: _JsonWalk, pos: int, policy: int) -> tuple[str, int]:
+    """``(replacement, end)`` for the JSON value starting at ``pos`` of ``walk.text``, scrubbed under
+    ``policy``.
 
     An explicit stack rather than recursion, because the nesting depth is the peer's choice. The walk
     visits each character once. A structure that never closes runs to the end of the text, so a cut
@@ -1450,6 +1488,7 @@ def _scrub_json_value(
     **Object KEYS are always kept**, which is what keeps the output legible, so a structure that uses
     PHI as its keys (``{"name": {"DOE": 1}}``) is a residual. A bare token straight before ``(`` is a
     callable's name (``date(``, ``frozenset(``) and is kept too; its arguments are the value."""
+    text, widened = walk.text, walk.widened
     out: list[str] = []
     #: One frame per open container: ``(is_object, policy, closer)``. An object's policy is LEAF or
     #: INHERIT (searched); an array's or a call's is the policy its elements take. ``closer`` is the
@@ -1457,17 +1496,13 @@ def _scrub_json_value(
     frames: list[tuple[bool, int, str]] = []
     #: Set by a closer of another kind than the open frame's, which ends nothing. From then on every
     #: data token is scrubbed as LEAF, keys and callable names included, until the walk's own frames
-    #: close or the text ends, except a label a later pass reads past ``loose`` below
-    #: (:func:`_malformed_scalar`). Ending a frame early would hand what follows to a parent frame or
-    #: a later key that may keep it, and keeping the walk as it was would keep what an INHERIT frame
+    #: close or the text ends. Ending a frame early would hand what follows to a parent frame or a
+    #: later key that may keep it, and keeping the walk as it was would keep what an INHERIT frame
     #: holds. It covers only this walk: a value the walk has already returned from is outside it.
+    #: The one exception is a token the older walk left as written: there a label a later pass reads
+    #: is kept (:func:`_malformed_scalar`), since that pass read it before and may scrub a value
+    #: past this walk's end.
     malformed = False
-    #: The frames the walk would hold if any closer ended the open one, as it did before BACKLOG
-    #: #5814, and whether that count has reached zero, where that walk returned. Before that point the
-    #: older walk scrubbed every label too, and a kept one could end a value a later pass scrubs, so a
-    #: label is kept only after it, where the older walk left the text as written for the later passes.
-    loose_depth = 0
-    loose = False
     pending = policy
     n = len(text)
     while pos < n:
@@ -1487,11 +1522,6 @@ def _scrub_json_value(
                 break  # the key had no value: nothing to scrub, and nothing consumed
             pos = match.end()
             out.append(token)
-            if punct in "{[(":
-                loose_depth += 1
-            elif punct in "}])" and loose_depth:
-                loose_depth -= 1
-                loose = loose_depth == 0
             if punct == "{":
                 leaf = pending in (_LEAF, _STRUCTURE_ONLY)
                 frames.append((True, _LEAF if leaf else _INHERIT, "}"))
@@ -1500,7 +1530,7 @@ def _scrub_json_value(
                 closer = "]" if punct == "[" else ")"
                 frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending, closer))
                 pending = frames[-1][1]
-            elif punct == frames[-1][2]:
+            elif punct == frames[-1][2] or (punct in "}])" and not walk.strict):
                 frames.pop()
                 if not frames:
                     return "".join(out), pos
@@ -1512,12 +1542,11 @@ def _scrub_json_value(
             continue
         pos = match.end()
         if malformed:
-            if not loose:
+            anchors, older = walk.malformed()
+            if _overlaps(older, match.start(), pos):
                 out.append(_json_scalar(match, _LEAF, widened))
-                continue
-            if not anchors:
-                anchors.append(_label_anchors(text))
-            out.append(_malformed_scalar(match, anchors[0], widened))
+            else:
+                out.append(_malformed_scalar(match, anchors, widened))
             continue
         bare = match.group("bare") is not None
         if bare and text.startswith("(", pos):
@@ -1540,11 +1569,39 @@ def _scrub_json_value(
                 value = text[match.start() : pos]
                 keep = pending == _INHERIT or (pending == _STRUCTURE_ONLY and not widened)
                 out.append(value if keep else _REDACTED)
+                if not keep:
+                    walk.scrubbed.append((match.start(), pos))
                 return "".join(out), pos
-        out.append(_json_scalar(match, pending, widened))
+        scalar = _json_scalar(match, pending, widened)
+        if scalar != token:
+            walk.scrubbed.append((match.start(), pos))
+        out.append(scalar)
         if not frames:
             return "".join(out), pos
     return "".join(out), pos
+
+
+def _json_fields(walk: _JsonWalk) -> str:
+    """:func:`_redact_json_fields` over ``walk.text``, with ``walk``'s closer rule."""
+    text, widened = walk.text, walk.widened
+    out: list[str] = []
+    pos = 0
+    while (match := _JSON_PHI_KEY.search(text, pos)) is not None:
+        key = match.group(2)
+        if key[0] == "0" and not _is_dicom_phi_tag(key, widened):
+            # A group 0010 tag outside 00xx, which only the widened stage reads.
+            out.append(text[pos : match.end()])
+            pos = match.end()
+            continue
+        policy = _vocabulary_policy(key, widened)
+        replacement, end = _scrub_json_value(walk, match.end(), policy)
+        out.append(text[pos : match.end()])
+        out.append(replacement)
+        pos = end
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _redact_json_fields(text: str, *, widened: bool) -> str:
@@ -1556,27 +1613,7 @@ def _redact_json_fields(text: str, *, widened: bool) -> str:
     operator configured it (:func:`_kept_under_structure_only`). Keys stay, so
     ``{"family": "[redacted]"}`` still says what was withheld. A key nested inside a region is handled
     by the walk, so the search resumes after the region."""
-    out: list[str] = []
-    pos = 0
-    #: :func:`_label_anchors` for ``text``, made by the first walk that needs it and shared by the
-    #: rest, so many malformed values cost one search rather than one each.
-    anchors: list[_Anchors] = []
-    while (match := _JSON_PHI_KEY.search(text, pos)) is not None:
-        key = match.group(2)
-        if key[0] == "0" and not _is_dicom_phi_tag(key, widened):
-            # A group 0010 tag outside 00xx, which only the widened stage reads.
-            out.append(text[pos : match.end()])
-            pos = match.end()
-            continue
-        policy = _vocabulary_policy(key, widened)
-        replacement, end = _scrub_json_value(text, match.end(), policy, widened, anchors)
-        out.append(text[pos : match.end()])
-        out.append(replacement)
-        pos = end
-    if not out:
-        return text
-    out.append(text[pos:])
-    return "".join(out)
+    return _json_fields(_JsonWalk(text, widened, strict=True))
 
 
 #: Any DICOM tag as a dump prints it, ``(gggg,eeee)`` -- pydicom 2 wrote a space after the comma. Read

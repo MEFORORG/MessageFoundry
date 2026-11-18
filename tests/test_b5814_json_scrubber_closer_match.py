@@ -6,7 +6,7 @@ Before the fix its open-container stack popped on ANY of ``}``, ``]`` and ``)``,
 the wrong kind inside a PHI-keyed value ended the scrub early, and a single-token name after it walked
 through ``redact``, ``safe_text`` and the bundle's ``redact_log_line`` on defaults. Every value here is
 synthetic and invented for the test; none is name-, date- or HL7-shaped, so only the JSON pass can
-earn its removal.
+earn its removal, except in the label tests, where the pass that reads the label earns it.
 """
 
 from __future__ import annotations
@@ -145,6 +145,22 @@ def test_a_label_inside_a_malformed_walk_still_anchors_the_pass_after_it(
 
 
 @pytest.mark.parametrize("scrub", SCRUBBERS)
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The older walk kept these tokens as written, an INHERIT value and a value after a
+        # container reopened past its return point, so the pass after it read their label.
+        '{"identifier": [{"system": {"a": "x" ] , "b": "PatientID=1" }}] Qmrnxq',
+        '{"family": [["x" ) ) [[ ] PatientID: ]]] Qmrnxq',
+        '{"family": [["x" ) ) [[ ] <given>Qa ]]] Qmrnxq',
+    ],
+)
+def test_a_label_the_older_walk_kept_is_still_kept(scrub: Callable[[str], str], text: str) -> None:
+    out = scrub(text)
+    assert "Qmrnxq" not in out, out
+
+
+@pytest.mark.parametrize("scrub", SCRUBBERS)
 def test_the_label_is_kept_and_what_surrounds_it_in_the_token_is_not(
     scrub: Callable[[str], str],
 ) -> None:
@@ -167,6 +183,10 @@ def test_the_label_is_kept_and_what_surrounds_it_in_the_token_is_not(
         'PatientName=Zq {"family": [["x" ) PatientID=a;b ]] Qmrnxq',
         'PatientName=Zq {"family": [["x" ) "PatientID=a;b" ]] Qmrnxq',
         'PatientName=Zq {"family": [["x" ) <telecom value=1/> ]] Qmrnxq',
+        # Past the point where the older walk returned, its key search walked a later vocabulary
+        # key's value and scrubbed the label in it.
+        '<given>Zq {"family": ["x" ) "family": ["</given>" ] ] Qmrnxq',
+        'PatientName=Zq {"family": ["x" ) "given": "PatientID=a;b" ] Qmrnxq',
     ],
 )
 def test_a_label_the_older_walk_scrubbed_is_still_scrubbed(
