@@ -249,3 +249,52 @@ def test_the_post_splice_check_names_an_altered_untouched_cell(
     out = capsys.readouterr().out
     assert "untouched cell 99.1.2" in out
     assert "the cell list" not in out
+
+
+def test_mixed_id_types_refuse_cleanly_not_with_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A TOML integer id beside a string id, both unseen by the span reader. Sorting the unseen
+    ids without a key raised TypeError, a traceback where a refusal belongs."""
+    int_cell = "  [[cell]]\n" + _SECOND_BODY.replace('id = "99.1.2"\n', "id = 7\n")
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_HEAD + _FIRST + int_cell + "  [[cell]]\n" + _SECOND_BODY, encoding="utf-8")
+    # The fixture must hold both id types, or the test proves nothing.
+    ids = [c["id"] for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]]
+    assert ids == ["99.1.1", 7, "99.1.2"]
+    before = rec.read_bytes()
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "REFUSING" in out
+    assert "99.1.2" in out
+
+
+def test_the_unseen_header_hint_does_not_ask_for_an_unindented_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The span reader takes an indented id line, so a hint asking for an unindented one is false."""
+    rec = _record(tmp_path, "  [[cell]]\n")
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 1
+    out = capsys.readouterr().out
+    assert "unindented [[cell]]" in out
+    assert "unindented id" not in out
+
+
+def test_a_repeated_id_refuses_with_a_hint_about_the_repeat(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two blocks carrying one id is not an id-spelling problem, so the spelling hint was wrong."""
+    # The same verdict as the payload, so no verdict guard refuses first.
+    body = _SECOND_BODY.replace('id = "99.1.2"\n', 'id = "99.1.1"\n').replace(
+        'verdict = "pass"', 'verdict = "partial"'
+    )
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_HEAD + _FIRST + "[[cell]]\n" + body, encoding="utf-8")
+    before = rec.read_bytes()
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "two [[cell]] blocks carry id" in out
+    assert "no escapes" not in out
+    assert "distinct id" in out

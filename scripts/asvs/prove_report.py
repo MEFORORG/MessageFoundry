@@ -302,8 +302,10 @@ def _instrument_failure(reason: str, *raw: tuple[str, str], detail: bool = False
     The prover's raw streams print only under ``--detail`` (BACKLOG #5456). They hold the problem
     lines and more: a failing load names the cell, and a traceback can quote a claim. These paths
     printed them unconditionally, so a public run log carried exactly the text ``_report``
-    suppresses. Without ``--detail`` only their size is printed. The reason, which carries no claim
-    text, also goes to the job summary, so a red run says which failure it was.
+    suppresses. Without ``--detail`` a note says each was suppressed, in words only: a stream's size
+    is a figure about the record, which a public log must not carry either. The reason, which
+    carries no claim text and no count, also goes to the job summary, so a red run says which
+    failure it was.
     """
     print(f"error: {reason}", file=sys.stderr)
     for name, text in raw:
@@ -311,9 +313,8 @@ def _instrument_failure(reason: str, *raw: tuple[str, str], detail: bool = False
             print(f"the prover's {name} was:\n{text}", file=sys.stderr)
         else:
             print(
-                f"  the prover's {name} ({len(text.splitlines())} line(s)) is SUPPRESSED: it can "
-                "name cells and claims, and this repo's run logs are public. Re-run with --detail "
-                "where the log is private.",
+                f"  the prover's {name} is SUPPRESSED: it can name cells and claims, and this "
+                "repo's run logs are public. Re-run with --detail where the log is private.",
                 file=sys.stderr,
             )
     _emit_summary(
@@ -453,13 +454,23 @@ def run(args: argparse.Namespace) -> int:
     # problem and 1 on a problem, and prints one FAIL line per problem after the summary. A crash
     # after the summary also exits 1: with zero problems it was read as a clean run, and with some it
     # was read as an ordinary findings run whose FAIL lines were cut short.
+    # The reason names which condition failed in words, never a count: the log is public.
     crashed = any(ln.startswith("Traceback (most recent call last)") for ln in stderr.splitlines())
-    if rc != (1 if r.problems else 0) or crashed or len(r.problem_lines) < r.problems:
+    why = [
+        text
+        for failed, text in (
+            (crashed, "the prover crashed"),
+            (rc != (1 if r.problems else 0), "its exit code does not match its summary"),
+            (
+                len(r.problem_lines) < r.problems,
+                "it printed fewer FAIL lines than its summary reports problems",
+            ),
+        )
+        if failed
+    ]
+    if why:
         return _instrument_failure(
-            f"the prover exited {rc} after reporting {r.problems} problem(s), printed "
-            f"{len(r.problem_lines)} FAIL line(s) and {'a' if crashed else 'no'} traceback; it "
-            "exits 0 on none and 1 on some with one line each, so it did not finish the way its "
-            "summary says",
+            "the prover did not finish the way its summary says: " + "; ".join(why),
             ("stderr", stderr),
             detail=args.detail,
         )

@@ -664,6 +664,18 @@ def _lines_in_strings(text: str) -> set[int]:
     return inside
 
 
+#: How to write an id line `_ID_RE` reads, for the refusals' fix hints. Indentation is allowed.
+_ID_HINT = 'an id = "..." line in a basic string with no escapes, or in a literal string'
+
+
+class BlockSpanError(ValueError):
+    """A record `block_spans` cannot divide into cells, with the fix that applies (BACKLOG #5455)."""
+
+    def __init__(self, message: str, hint: str) -> None:
+        super().__init__(message)
+        self.hint = hint
+
+
 def block_spans(text: str) -> dict[str, tuple[int, int]]:
     """Map cell id -> (start, end) character offsets of its whole top-level [[cell]] block.
 
@@ -679,8 +691,8 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
     cell's text and a rewrite of it deleted both. A line that begins inside a multi-line string is
     prose and is never taken as a header or an id. A header spelling still out of reach, such as an
     indented or quoted one, is caught by `main`, which refuses when these spans and the parsed
-    record name different cells. A block with no readable id, or a repeated id, raises ValueError,
-    which `main` reports as a refusal.
+    record name different cells. A block with no readable id, or a repeated id, raises
+    BlockSpanError, which `main` reports as a refusal with the error's own fix hint.
     """
     in_string = _lines_in_strings(text)
     newlines = [m.start() for m in re.finditer("\n", text)]
@@ -694,12 +706,16 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
         e = starts[i + 1] if i + 1 < len(starts) else len(text)
         m = next((x for x in _ID_RE.finditer(text, s, e) if structural(x.start())), None)
         if not m:
-            raise ValueError(
-                f"the [[cell]] block at line {text.count(chr(10), 0, s) + 1} has no id"
+            raise BlockSpanError(
+                f"the [[cell]] block at line {text.count(chr(10), 0, s) + 1} has no id",
+                f"Write the cell's id as {_ID_HINT}, then re-run.",
             )
         cell_id = m.group(1) if m.group(1) is not None else m.group(2)
         if cell_id in spans:
-            raise ValueError(f"two [[cell]] blocks carry id {cell_id!r}")
+            raise BlockSpanError(
+                f"two [[cell]] blocks carry id {cell_id!r}",
+                "Give each cell a distinct id, or remove the repeated block, then re-run.",
+            )
         lines = text[s:e].split("\n")
         keep = len(lines)
         while keep > 1 and (not lines[keep - 1].strip() or lines[keep - 1].startswith("#")):
@@ -1187,9 +1203,9 @@ def main(argv: list[str] | None = None) -> int:
     text = live_text
     try:
         spans = block_spans(text)
-    except ValueError as exc:
+    except BlockSpanError as exc:
         print(f"REFUSING: {_printable(str(exc))}")
-        print('  Write each cell\'s id as an id = "..." line with no escapes, then re-run.')
+        print(f"  {exc.hint}")
         return 1
 
     # THE SPANS MUST NAME EVERY CELL THE RECORD HOLDS, CHECKED BEFORE THE SPLICE (BACKLOG #5455). A
@@ -1203,13 +1219,14 @@ def main(argv: list[str] | None = None) -> int:
             f"{len(spans)} [[cell]] blocks that do not name them in order; a rewrite could "
             "splice away a cell it cannot see"
         )
-        if unseen := sorted(set(live_ids) - set(spans)):
+        # `key=str`: TOML allows an id of any type, and a mixed list does not sort without one.
+        if unseen := sorted(set(live_ids) - set(spans), key=str):
             print(f"  cells with no block of their own: {_printable(str(unseen))}")
-        if stray := sorted(set(spans) - set(live_ids)):
+        if stray := sorted(set(spans) - set(live_ids), key=str):
             print(f"  blocks naming no cell of the record: {_printable(str(stray))}")
         print(
-            "  Write each cell's header as an unindented [[cell]] line and its id as an "
-            'unindented id = "..." line, then re-run.'
+            f"  Write each cell's header as an unindented [[cell]] line and its id as {_ID_HINT}, "
+            "then re-run."
         )
         return 1
 

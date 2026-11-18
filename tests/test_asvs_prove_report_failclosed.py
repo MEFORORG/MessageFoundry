@@ -240,6 +240,76 @@ def test_raw_prover_streams_stay_out_of_the_log_without_detail(
     assert _SECRET in shown.err
 
 
+#: A count no fixture holds by chance, standing in for a figure the public log must not carry.
+_COUNT = 4729
+
+
+def test_the_suppression_note_carries_no_line_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    summary: Path,
+) -> None:
+    """A suppressed stream's size is a figure about the record, so the note states the reason in
+    words only."""
+    sc = tmp_path / "scorecard.toml"
+    sc.write_text(_ONE_CLAIM, encoding="utf-8")
+    _fake_prover(monkeypatch, 0, "no summary here\n" * _COUNT)
+    assert run(_ns(sc, tmp_path)) == EXIT_INSTRUMENT
+    captured = capsys.readouterr()
+    assert "SUPPRESSED" in captured.err
+    assert str(_COUNT) not in captured.out + captured.err
+    assert "line(s)" not in captured.err
+    assert str(_COUNT) not in summary.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("rc", "prover_summary", "stderr"),
+    [
+        pytest.param(
+            0,
+            _CLEAN_SUMMARY.replace("0 problem(s)", f"{_COUNT} problem(s)"),
+            "  FAIL synthetic\n" * 2,
+            id="problems-with-a-zero-exit",
+        ),
+        pytest.param(
+            1,
+            _CLEAN_SUMMARY.replace("0 problem(s)", f"{_COUNT} problem(s)"),
+            "  FAIL synthetic\n" * 2,
+            id="fail-lines-cut-short",
+        ),
+        pytest.param(
+            1,
+            _CLEAN_SUMMARY.replace("0 problem(s)", "2 problem(s)"),
+            "  FAIL synthetic\n" * 2 + "Traceback (most recent call last):\n  boom\n",
+            id="traceback-after-the-fail-lines",
+        ),
+    ],
+)
+def test_the_crash_reason_carries_no_problem_or_line_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    summary: Path,
+    rc: int,
+    prover_summary: str,
+    stderr: str,
+) -> None:
+    """The reason for a crash refusal named how many problems the prover reported and how many FAIL
+    lines it printed, into the public log and the job summary. It says why in words instead."""
+    sc = tmp_path / "scorecard.toml"
+    sc.write_text(_ONE_CLAIM, encoding="utf-8")
+    _fake_prover(monkeypatch, rc, prover_summary, stderr)
+    assert run(_ns(sc, tmp_path)) == EXIT_INSTRUMENT
+    captured = capsys.readouterr()
+    published = summary.read_text(encoding="utf-8")
+    for text in (captured.out + captured.err, published):
+        assert str(_COUNT) not in text
+        assert "problem(s)" not in text
+        assert "FAIL line(s)" not in text
+    assert "did not finish the way its summary says" in published
+
+
 def test_a_non_latin1_line_survives_a_cp1252_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
