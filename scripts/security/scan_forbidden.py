@@ -2267,8 +2267,8 @@ def _candidate_files(
             root = Path(raw)
             if root.is_file():
                 # rel is the bare name, matching the directory case, where the rel path starts below
-                # the root the caller NAMED. So the path the caller wrote is not judged: a file named
-                # under docs/security/ earns no location hit here, as on origin/main.
+                # the root the caller NAMED. The location rule also judges the file's absolute path
+                # (_name_hits), so a file named under docs/security/ is still a hit (BACKLOG #5446).
                 if root.name != ".git":
                     out.append((root, root.name))
                 continue
@@ -2368,8 +2368,18 @@ def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
 
     A location hit names ``path``, the root the caller wrote joined to ``posix``, so in a scan of
     several roots it names the root (the branch leak scan's commit directory). Under an absolute root
-    that path can carry a user-home path."""
-    if reason := forbidden_path_reason(posix):
+    that path can carry a user-home path.
+
+    The location rule judges ``posix`` AND the file's absolute path (BACKLOG #5446). In ``--path`` mode
+    ``posix`` starts below the root the caller named, so naming ``docs/security`` itself, a file in it,
+    or its parent ``docs`` dropped the ``docs/security/`` prefix from it and a private document read
+    clean. ``abspath`` is lexical: it adds the working directory a relative root was named from and
+    folds ``..``, so a root reached by ``..`` out of ``docs/security`` is judged where it lands."""
+    try:
+        where = Path(os.path.abspath(path)).as_posix()
+    except OSError:  # The working directory is gone: judge the path as the caller wrote it.
+        where = path.as_posix()
+    if reason := forbidden_path_reason(posix) or forbidden_path_reason(where):
         return [f"{path.as_posix()}:0: {reason}"], True
     hits: list[str] = []
     # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
