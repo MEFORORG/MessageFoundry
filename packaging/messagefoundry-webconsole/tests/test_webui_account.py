@@ -24,7 +24,11 @@ from _webui_support import (
 from messagefoundry.api import create_app
 from messagefoundry.api.security import is_route_gate
 from messagefoundry.auth import Role, totp
-from messagefoundry.auth.service import STEP_UP_ACTION_MFA_CONFIRM, AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_MFA_CONFIRM,
+    AuthService,
+    EnrolmentCodeRefused,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -40,6 +44,26 @@ from messagefoundry_webconsole.routes import account as account_routes
 NEW_PW = "another-strong-test-passphrase"
 #: Sent as a program would: no Sec-Fetch-Site, no Origin, so the origin check refuses it.
 HEADERLESS = {HEADERLESS_UI_REQUEST: True}
+
+
+async def _opt_out_service(engine: Engine) -> AuthService:
+    """The suite's service under ``[auth].require_action_step_up = false``."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            require_action_step_up=False,
+            admin_write_min_interval_seconds=0,
+            mfa_verify_min_elapsed_seconds=0,
+        ),
+    )
+    await service.initialize()
+    return service
+
+
+async def _refuse_enrolment_code(*_args: object, **_kwargs: object) -> None:
+    """A ``confirm_mfa_enrollment`` stand-in that refuses the enrolment code (ADR 0207)."""
+    raise EnrolmentCodeRefused
 
 
 async def test_account_page_renders(engine: Engine) -> None:
@@ -276,6 +300,11 @@ async def test_mfa_confirm_form_is_unlock_reentry(engine: Engine) -> None:
         assert r.status_code == 200
         assert secret is not None and secret not in r.text  # the secret is never re-shown
         assert 'action="/ui/account/mfa/verify"' in r.text
+        # Nor on the code-form variant, which the page renders once the confirm proof is held.
+        await _mint_action(c, "/ui/account/mfa/confirm")
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and 'name="code"' in r.text
+        assert secret not in r.text
 
 
 async def test_first_enrolment_code_is_accepted_after_the_confirm_reauth(engine: Engine) -> None:
@@ -309,6 +338,8 @@ async def test_first_enrolment_code_is_accepted_after_the_confirm_reauth(engine:
         assert r.status_code == 303 and r.headers["location"] == "/ui/account/mfa/confirm"
         r = await c.get("/ui/account/mfa/confirm")
         assert r.status_code == 200 and 'action="/ui/account/mfa/verify"' in r.text
+        # The confirm page carries the code field itself, not only a form posting to verify.
+        assert 'name="code"' in r.text
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
         assert secret is not None
@@ -371,6 +402,119 @@ async def test_enrolment_still_takes_two_separate_single_use_proofs(engine: Engi
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
         user = await service.store.get_user(uid)
         assert user is not None and not user.totp_enabled
+
+
+async def test_a_refused_enrolment_code_rerenders_the_continue_under_the_default(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0207's refusal re-render on the verify route, under the default action binding: a 400
+    carrying the refusal, and the Continue to a fresh re-auth in the form's place, because the gate
+    spent the confirm proof before the service refused the enrolment code (BACKLOG #5931).
+
+    RED when: the refusal branch renders the code form while no confirm proof is held, so the next
+    code would post into a gate that drops it, or the refusal is not answered on the confirm page."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/account/mfa/enroll")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _refuse_enrolment_code)
+        await _mint_action(c, "/ui/account/mfa/confirm")
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "123456", "enrolment_code": "not-the-code"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400
+        assert "Confirm enrollment" in r.text and "needs a one-time enrolment code" in r.text
+        assert ">Continue<" in r.text and 'name="code"' not in r.text
+        assert 'name="enrolment_code"' not in r.text
+
+
+async def test_a_refused_enrolment_code_rerenders_both_fields_under_the_opt_out(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``[auth].require_action_step_up = false`` no proof was spent, so the refusal re-render
+    keeps the code form, and with it the enrolment-code field, for a retry (ADR 0207, BACKLOG
+    #5931).
+
+    RED when: the refusal branch drops the enrolment-code field or the code form."""
+    service = await _opt_out_service(engine)
+    await _add(service, "op", Role.OPERATOR)
+
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _refuse_enrolment_code)
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "123456", "enrolment_code": "not-the-code"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400 and "needs a one-time enrolment code" in r.text
+        assert "Confirm enrollment" in r.text
+        assert 'name="code"' in r.text and 'name="enrolment_code"' in r.text
+        assert ">Continue<" not in r.text
+
+
+async def test_the_confirm_page_offers_continue_while_no_confirm_proof_is_held(
+    engine: Engine,
+) -> None:
+    """BACKLOG #5931 closing step 1: the confirm GET, reached with a fresh session window but no
+    confirm proof held (here Back after a refused code spent it), offers the Continue to a fresh
+    re-auth rather than a code form whose code the gate would drop. Once the re-auth mints the
+    proof, the same page carries the code form.
+
+    RED when: the confirm GET renders the code form without peeking the confirm proof."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/account/mfa/enroll")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+        await _mint_action(c, "/ui/account/mfa/confirm")
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "badcod"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400  # the refused code spent the confirm proof
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and "Confirm enrollment" in r.text
+        assert ">Continue<" in r.text and 'name="code"' not in r.text
+        assert "To enter a code" in r.text and "try a code again" not in r.text
+        await _mint_action(c, "/ui/account/mfa/confirm")
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and 'name="code"' in r.text and ">Continue<" not in r.text
+
+
+async def test_the_confirm_page_keeps_the_code_form_under_the_opt_out_while_binding_is_blocked(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``[auth].require_action_step_up = false`` the confirm GET keeps main's code form even
+    when the factor-binding refusal blocks the confirm proof, as for an MFA-pending session on an
+    account that holds a factor (BACKLOG #5931). There the code-less Continue's post is not sent to
+    the re-auth, so once the block cleared it would be checked as a wrong code.
+
+    RED when: the confirm GET decides the form from the proof peek alone under the opt-out."""
+    service = await _opt_out_service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+
+        async def blocked(_token: str | None, _action: str) -> bool:
+            return True
+
+        monkeypatch.setattr(service, "factor_binding_is_blocked", blocked)
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and 'name="code"' in r.text and ">Continue<" not in r.text
 
 
 async def test_empty_code_continue_with_a_held_grant_spends_nothing(
@@ -510,16 +654,7 @@ async def test_an_empty_code_under_the_opt_out_is_checked_as_before(engine: Engi
     """Under ``[auth].require_action_step_up = false`` there is no grant to spend, so an empty code
     is not sent to the re-auth: the route checks it and answers "Invalid code." as main does
     (BACKLOG #5931)."""
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            require_mfa=False,
-            require_action_step_up=False,
-            admin_write_min_interval_seconds=0,
-            mfa_verify_min_elapsed_seconds=0,
-        ),
-    )
-    await service.initialize()
+    service = await _opt_out_service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
@@ -535,16 +670,7 @@ async def test_enroll_page_keeps_the_code_form_under_the_opt_out(engine: Engine)
     """Under ``[auth].require_action_step_up = false`` the confirm gate is the session window, which
     the enroll re-auth left fresh, so the enroll page keeps its code form and the first code turns
     TOTP on with no second re-auth (BACKLOG #5931)."""
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            require_mfa=False,
-            require_action_step_up=False,
-            admin_write_min_interval_seconds=0,
-            mfa_verify_min_elapsed_seconds=0,
-        ),
-    )
-    await service.initialize()
+    service = await _opt_out_service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
@@ -553,6 +679,9 @@ async def test_enroll_page_keeps_the_code_form_under_the_opt_out(engine: Engine)
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
         assert secret is not None
+        # The confirm page keeps the form too: under the opt-out the window is the proof.
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and 'name="code"' in r.text and ">Continue<" not in r.text
         # A wrong code keeps the form too: the window still holds, so no re-auth is owed.
         r = await c.post(
             "/ui/account/mfa/verify",
