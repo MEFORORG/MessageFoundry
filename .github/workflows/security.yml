@@ -632,7 +632,16 @@ jobs:
           until npm ci --prefix ../ci/npm-tools --ignore-scripts --no-audit --no-fund; do
             n=$((n + 1)); [ "$n" -ge 3 ] && exit 1; sleep $((n * 15))
           done
+          # --spec-version 1.6 holds the extension SBOM on the spec cyclonedx-npm 6.x emitted by default
+          # and docs/SUPPLY-CHAIN.md's "Using the SBOM + VEX" section states; 7.x defaults to 1.7.
+          # Moving to 1.7 is a deliberate change to that section, not a tool bump. --validate checks the SBOM
+          # against that schema and exits non-zero, before writing it, when it is invalid or the ajv
+          # validator packages in ci/npm-tools are absent. Without the flag, 7.x skips validation
+          # when they are absent, and at this step's default verbosity it prints nothing about it.
+          # This job is continue-on-error, so a failure here leaves the run without the extension
+          # SBOM and blocks nothing. Guarded by tests/test_ci_tool_and_image_pins.py.
           ../ci/npm-tools/node_modules/.bin/cyclonedx-npm --package-lock-only \
+            --spec-version 1.6 --validate \
             --output-format JSON --output-file ../sbom-ide.cdx.json
           python ../scripts/security/sbom_finalize.py ../sbom-ide.cdx.json --phase build
       - name: Score SBOM quality (sbomqs — advisory)

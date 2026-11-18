@@ -60,7 +60,12 @@ artifacts — **no engine code changes**:
    Code extension** CycloneDX SBOM (`@cyclonedx/cyclonedx-npm@6.0.0 --package-lock-only`, install-free
    like the npm-audit job — the **full** tree, since the extension is esbuild-bundled with no runtime npm
    deps, so its build toolchain is the only npm supply chain worth inventorying). Both are finalized by the
-   same helper and retained as CI artifacts.
+   same helper and retained as CI artifacts. *Amended 2026-11-17 (PR 3039):* the `cyclonedx-npm`
+   version is the one [`ci/npm-tools/package.json`](../../ci/npm-tools/package.json) pins, not
+   `6.0.0`. That file also declares the schema-validator packages the tool's major-7 line no longer
+   installs, and `security.yml` passes `--spec-version 1.6 --validate`, so the extension SBOM stays on
+   1.6 and a run fails when the validator is missing rather than skipping validation. Why, and what a
+   failure there does, is that step's comment; removing those packages breaks the step.
 3. **SBOM quality gate.** Score the Python engine and npm extension SBOMs with `sbomqs` (pinned `v2.0.11`,
    checksum-verified) — advisory (`sbomqs score -b` + NTIA breakdown), printed to the CI/release log, never
    blocking. *Amended 2026-09-30 (owner ruling, BACKLOG #1698):* the SCORE stays advisory, but in
@@ -129,7 +134,8 @@ our own scanner, closing the SBOM→VEX→gate loop. Strengthens the answer to h
 questionnaires — a differentiator vs. Mirth/Corepoint, which ship no SBOM.
 
 **Negative / risks** — More release/CI surface to maintain (pinned tool versions: `cyclonedx-bom~=7.3`,
-`@cyclonedx/cyclonedx-npm@6.0.0`, `sbomqs v2.0.11` — bump deliberately). *Amended 2026-09-18:* bumping
+`@cyclonedx/cyclonedx-npm@6.0.0`, `sbomqs v2.0.11` — bump deliberately; *amended 2026-11-17:*
+the `cyclonedx-npm` pin is the one in `ci/npm-tools/package.json`, see Decision item 2). *Amended 2026-09-18:* bumping
 sbomqs in `release.yml` is now **two coupled edits in one commit** — `VER` and `SBOMQS_SHA256` — and the
 new digest should be taken from **both** the release `checksums.txt` and GitHub's server-side asset
 `digest` field, two independent routes, which is what makes the literal evidence rather than a copied

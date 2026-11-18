@@ -369,8 +369,10 @@ have not, the document says nothing about that CVE and your scanner's finding st
   build their scratch environment without pip, so pip is not listed: pip installs the engine but is
   not part of it. The broader all-extras dependency set is continuously audited by
   **pip-audit**.
-- **VS Code extension** — `@cyclonedx/cyclonedx-npm --package-lock-only` over the committed
-  `ide/package-lock.json` (install-free, full locked tree). The extension bundles its payload with esbuild and
+- **VS Code extension** — `@cyclonedx/cyclonedx-npm --package-lock-only --spec-version 1.6 --validate`
+  over the committed `ide/package-lock.json` (install-free, full locked tree). What the two flags do,
+  and that a failure there blocks nothing, is the comment on that step in `security.yml`. The
+  extension bundles its payload with esbuild and
   has no runtime npm dependencies, so the SBOM inventories the locked build toolchain. Continuously
   audited by **npm-audit**. **Not in that lock: `@vscode/vsce`, which packages the `.vsix`.** `npm run
   package` fetches it with `npx` at the top-level version its `package` script in `ide/package.json`
@@ -387,9 +389,10 @@ have not, the document says nothing about that CVE and your scanner's finding st
   change between runs. The generator itself, and the jscpd clone report
   in `quality-advisory.yml`, install from a separate committed lock,
   `ci/npm-tools/package-lock.json` (vault BACKLOG #2793). **No blocking audit lane reads that lock**;
-  Dependabot watches it. Read 2026-11-06, with the `overrides`
-  in `ci/npm-tools/package.json` (why: its description), `npm audit` on it reports 0
-  vulnerabilities. That is a dated reading, not a standing property.
+  Dependabot watches it. Read 2026-11-17, `npm audit` on it reports 5 high-severity findings, all one
+  picomatch advisory (GHSA-fc5q-39xc-vjpf) reached through jscpd 4.x's fast-glob. The only fix npm
+  offers is jscpd 5.x, which the 4.x hold in `ci/npm-tools/package.json`'s description rules out.
+  That is a dated reading, not a standing property.
 - **Container image** — `trivy image --format cyclonedx` over the built image (OS + Python layers).
   Continuously vuln-scanned by **Trivy** (with our VEX applied).
 
