@@ -271,16 +271,22 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
 # A `#` or `<#` STARTS A COMMENT ONLY AT A TOKEN START, as PowerShell's tokenizer reads it: at the
 # start, after whitespace or one of `;|&(){},`, after a quoted string that itself began a token, or
 # after a `>&1` or `>&2` redirection. Anywhere else it continues a bareword and is literal: after
-# `a`, `^`, `/`, `_`, `a<`, an escaped character, or a quote glued to a word (`a'b'#`). One of
-# `=+-*/%!` at a token start is an operator, after which `#` starts a comment, only in a statement
-# whose first character is `$`; among a command's arguments it starts a bareword. Reading too few
-# comments is the safe direction, since this reading only adds denies to the toggle's: a comment
-# read where PowerShell has none blanks an opening quote and exposes the prose it holds.
+# `a`, `^`, `/`, `_`, `a<`, an escaped character, or a quote glued to a word (`a'b'#`). The one
+# exception is a statement whose first character is `$`, an expression statement: there `#` ends
+# the first token too (`$x#`, `$x.Count#`, `$x++#`), and one of `=+-*/%!` at a token start is an
+# operator, after which `#` starts a comment. Among a command's arguments, and after `|`, `&`, `(`
+# or `{`, `=` starts a bareword. `${...}` is a variable name, never a comment or a brace.
+#
+# A COMMENT READ WHERE POWERSHELL HAS NONE is the harmful misreading: it blanks an opening quote and
+# exposes the prose the quote holds, a false deny. A comment left unread cannot remove a deny the
+# toggle makes, but it is not harmless: its apostrophe can still hide a walk after it, and its `;`
+# can still split a false deny out of it.
 #
 # A comment, a `<# ... #>` block and a here-string body (`@'` or `@"` ending its line, closed by
 # `'@` or `"@` starting one) are blanked whole, so an apostrophe in one opens no span. It still
 # does not read a `"$(...)"` subexpression, a line continuation, a backtick inside a word, an
-# expression after a statement's first token (`$x = 5# it's`), or a typographic quote.
+# expression after a statement's first token (`$x = 5# it's`), a `-Param:'x'#` argument, or a
+# typographic quote.
 function Hide-PowerShellSpans([string]$Text) {
     $sb = [System.Text.StringBuilder]::new($Text.Length)
     $quote = $null
@@ -289,7 +295,8 @@ function Hide-PowerShellSpans([string]$Text) {
     $inWord = $false        # the last character continues a bareword, so a `#` here is literal
     $quoteGlued = $false    # the open quote was glued to a bareword
     $stmtStart = $true
-    $exprStmt = $false
+    $exprStmt = $false      # this statement began with `$`
+    $firstToken = $false    # still inside that expression statement's first token
     $n = 0
     while ($n -lt $Text.Length) {
         $ch = $Text[$n]
@@ -304,7 +311,8 @@ function Hide-PowerShellSpans([string]$Text) {
             # Kept as it is outside a string and blanked inside one, except a newline.
             if ($null -eq $quote) {
                 [void]$sb.Append($ch); [void]$sb.Append($next); $afterEscape = $true
-                $inWord = $true; $stmtStart = $false
+                $inWord = $true
+                if ($stmtStart) { $exprStmt = $false; $stmtStart = $false }
             } else { [void]$sb.Append(' '); [void]$sb.Append($(if ($next -ceq "`n") { $next } else { ' ' })) }
             $n += 2; continue
         }
@@ -322,19 +330,34 @@ function Hide-PowerShellSpans([string]$Text) {
             while ($k -lt $Text.Length -and ($Text[$k] -ceq ' ' -or $Text[$k] -ceq "`t")) { $k++ }
             if ($k -lt $Text.Length -and $Text[$k] -ceq "`r") { $k++ }
             if ($k -lt $Text.Length -and $Text[$k] -ceq "`n") {
-                $here = "$next@"; [void]$sb.Append("@$next"); $stmtStart = $false; $n += 2; continue
+                $here = "$next@"; [void]$sb.Append("@$next"); $n += 2
+                if ($stmtStart) { $exprStmt = $false; $stmtStart = $false }
+                continue
+            }
+        }
+        if ($ch -ceq '$' -and $next -ceq '{') {
+            # `${#x}` is the variable `#x`: its name is blanked, and it is one word.
+            $close = $Text.IndexOf('}', $n + 2)
+            if ($close -ge 0) {
+                [void]$sb.Append('${')
+                [void]$sb.Append([regex]::Replace($Text.Substring($n + 2, $close - $n - 2), '[^\n]', ' '))
+                [void]$sb.Append('}')
+                if ($stmtStart) { $exprStmt = $true; $firstToken = $true; $stmtStart = $false }
+                $inWord = $true; $n = $close + 1; continue
             }
         }
         $end = -1
-        # A merge redirection such as `2>&1` ends in a digit and is still a whole token.
-        $tokenStart = -not $inWord -or
-            (-not $wasEscape -and $n -ge 3 -and $Text.Substring($n - 3, 3) -cmatch '^>&[12]$')
-        if ($tokenStart -and $ch -ceq '<' -and $next -ceq '#') {
-            $end = $Text.IndexOf('#>', $n + 2, [StringComparison]::Ordinal)
-            $end = if ($end -lt 0) { $Text.Length } else { $end + 2 }
-        } elseif ($tokenStart -and $ch -ceq '#') {
-            $end = $Text.IndexOf([char]10, $n)
-            if ($end -lt 0) { $end = $Text.Length }
+        if ($ch -ceq '#' -or ($ch -ceq '<' -and $next -ceq '#')) {
+            # A merge redirection such as `2>&1` ends in a digit and is still a whole token.
+            $tokenStart = -not $inWord -or ($exprStmt -and $firstToken) -or
+                (-not $wasEscape -and $n -ge 3 -and $Text.Substring($n - 3, 3) -cmatch '^>&[12]$')
+            if ($tokenStart -and $ch -ceq '<') {
+                $end = $Text.IndexOf('#>', $n + 2, [StringComparison]::Ordinal)
+                $end = if ($end -lt 0) { $Text.Length } else { $end + 2 }
+            } elseif ($tokenStart -and $ch -ceq '#') {
+                $end = $Text.IndexOf([char]10, $n)
+                if ($end -lt 0) { $end = $Text.Length }
+            }
         }
         if ($end -ge 0) {
             [void]$sb.Append($ch)
@@ -342,10 +365,12 @@ function Hide-PowerShellSpans([string]$Text) {
             $n = $end; continue
         }
         if ([char]::IsWhiteSpace($ch) -or ';|&(){},'.IndexOf($ch) -ge 0) {
-            $inWord = $false
-            if ($ch -ceq "`n" -or ';|&({'.IndexOf($ch) -ge 0) { $stmtStart = $true }
+            $inWord = $false; $firstToken = $false
+            if ($ch -ceq "`n" -or $ch -ceq ';') { $stmtStart = $true }
+            elseif ('|&({'.IndexOf($ch) -ge 0) { $exprStmt = $false; $stmtStart = $false }
         } else {
-            if ($stmtStart) { $exprStmt = $ch -ceq '$'; $stmtStart = $false }
+            if ($stmtStart) { $exprStmt = $ch -ceq '$'; $firstToken = $exprStmt; $stmtStart = $false }
+            if ($ch -ceq '=') { $firstToken = $false }
             if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch; $quoteGlued = $inWord }
             elseif (-not $inWord -and $exprStmt -and '=+-*/%!'.IndexOf($ch) -ge 0) { $inWord = $false }
             else { $inWord = $true }

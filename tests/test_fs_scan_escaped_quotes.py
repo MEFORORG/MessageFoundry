@@ -31,14 +31,19 @@ pytestmark = pytest.mark.skipif(
 POWERSHELL_DENY = [
     pytest.param('Write-Output "a`"b"; find /proc', id="escaped-quote-inside-a-string"),
     pytest.param('Write-Output `"; find /proc; Write-Output `"', id="escaped-quotes-outside"),
-    pytest.param("Write-Output 'it`'; grep -r x /proc", id="backtick-is-literal-in-single-quotes"),
-    pytest.param('Write-Output "x``"; grep -r x /proc', id="escaped-backtick-before-the-close"),
+    # The leading escaped quote throws the toggle off, so each of these two rows is denied only by
+    # a reading that keeps the backtick literal in single quotes and lets an escaped backtick end.
+    pytest.param(
+        "Write-Output `\"x 'it`'; grep -r x /proc", id="backtick-is-literal-in-single-quotes"
+    ),
+    pytest.param('Write-Output `" "x``"; grep -r x /proc', id="escaped-backtick-before-the-close"),
     pytest.param("# don't walk\ngrep -r x /proc", id="apostrophe-in-a-line-comment"),
     pytest.param("<# it's #>\ngrep -r x /proc", id="apostrophe-in-a-block-comment"),
     pytest.param("git commit -m @'\ndon't\n'@\ngrep -r x /proc", id="apostrophe-in-a-here-string"),
     pytest.param("$m = 'done'# it's fine\ngrep -r x /proc", id="comment-right-after-a-quote"),
     pytest.param("$x =# it's\ngrep -r x /proc", id="comment-right-after-an-operator"),
     pytest.param("$x +=# it's\ngrep -r x /proc", id="comment-right-after-a-compound-operator"),
+    pytest.param("$x.Count# it's\ngrep -r x /proc", id="comment-ending-an-expression-first-token"),
 ]
 
 POWERSHELL_ALLOW = [
@@ -61,7 +66,9 @@ POWERSHELL_ALLOW = [
 # tokenizer reads each of these as one argument, the quote spanning the lines after it. A reading
 # that took the `#` for a comment blanked the opening quote and exposed the walk the quote holds.
 # `=` at a token start is an operator only in an expression statement, so among a command's
-# arguments (`x =#`) it starts a bareword too.
+# arguments (`x =#`), and after `(`, `&` or an escaped statement start, it starts a bareword too.
+# `${#x}` is a variable name. The last row is the other direction: a `$x#` comment left unread
+# exposed its `;` once the line above was read right.
 TOKEN_START_ALLOW = [
     pytest.param("Write-Output a^#'\nfind /proc\n'", id="hash-after-caret"),
     pytest.param("Write-Output a=#'\nfind /proc\n'", id="hash-after-equals-in-a-word"),
@@ -70,6 +77,11 @@ TOKEN_START_ALLOW = [
     pytest.param("Write-Output a<#'\nfind /proc\n'", id="hash-after-a-less-than-in-a-word"),
     pytest.param("Write-Output a'b'#'\nfind /proc\n'", id="hash-after-a-quote-glued-to-a-word"),
     pytest.param("Write-Output x =#'\nfind /proc\n'", id="hash-after-equals-in-arguments"),
+    pytest.param("Write-Output ($a) =#'\nfind /proc\n'", id="equals-after-a-parenthesis"),
+    pytest.param("& $s =#'\nfind /proc\n'", id="equals-after-the-call-operator"),
+    pytest.param("$x = 1; `n =#'\nfind /proc\n'", id="equals-after-an-escaped-statement-start"),
+    pytest.param("Write-Output ${#x} '\nfind /proc\n'", id="hash-in-a-braced-variable-name"),
+    pytest.param("# don't\n$x#; find /proc", id="comment-ending-an-expression-first-token"),
 ]
 
 
