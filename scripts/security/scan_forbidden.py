@@ -2081,8 +2081,19 @@ def _load_allowlist() -> list[re.Pattern[str]]:
         if any(pat.search(probe) is not None for probe in _ALLOWLIST_CANARIES):
             print(
                 f"scan_forbidden: scan-allowlist.txt line {lineno}: pattern matches ordinary text — "
-                "it would veto every line and disable the whole gate. IGNORED. Anchor it or make it "
-                "specific to the false positive you are excusing.",
+                "it would veto every line and disable the whole gate. IGNORED. Write it as the whole "
+                "line it excuses, specific to that false positive.",
+                file=sys.stderr,
+            )
+            continue
+        # A whole-line match (``_allowlisted``) holds an entry to the line it was written for only
+        # if no part of it can absorb arbitrary text: ``.*OIDC.*``, or ``^# keep .* here$``, excuses
+        # a leak written inside the padding exactly as an unanchored entry did (BACKLOG #5445).
+        if _ABSORBS_ANY_TEXT.search(line):
+            print(
+                f"scan_forbidden: scan-allowlist.txt line {lineno}: pattern has an unbounded wildcard "
+                "(., \\S, \\W, \\D or a negated class, repeated without limit), so a leak written "
+                "inside the line it excuses would pass every detector. IGNORED. Spell that part out.",
                 file=sys.stderr,
             )
             continue
@@ -2090,15 +2101,24 @@ def _load_allowlist() -> list[re.Pattern[str]]:
     return out
 
 
+#: An unescaped ``.``, ``\S``, ``\W``, ``\D`` or negated class under ``*``, ``+`` or ``{n,}``: the
+#: pattern pieces that match ANY text, so an allowlist entry holding one is not tied to one line.
+#: An even run of backslashes before it is a literal backslash, so it does not escape the wildcard.
+_ABSORBS_ANY_TEXT = re.compile(
+    r"(?<!\\)(?:\\\\)*(?:\.|\\[SWD]|\[\^(?:\\.|[^\]\\])*\])(?:[*+]|\{\d*,\})"
+)
+
+
 ALLOWLIST = _load_allowlist()
 reload_tokens()
 
 
 def _allowlisted(line: str) -> bool:
-    """Whether an allowlist entry excuses ``line``. An entry must match the WHOLE line, so it excuses
-    only the line it was written for: applied with ``search``, an entry missing its ``^``/``$`` excused
-    any line that merely CARRIED its shape, and so a leak beside that shape went past every detector
-    (BACKLOG #5445). ``fullmatch`` holds every entry to that, whatever anchors it was written with."""
+    """Whether an allowlist entry excuses ``line``. An entry must match the WHOLE line: applied with
+    ``search``, an entry missing its ``^``/``$`` excused any line that merely CARRIED its shape, so a
+    leak beside that shape went past every detector (BACKLOG #5445). ``fullmatch`` removes the
+    dependence on anchors; the loader's wildcard refusal (``_ABSORBS_ANY_TEXT``) is what keeps an
+    entry from matching a whole line with a leak inside it."""
     return any(a.fullmatch(line) for a in ALLOWLIST)
 
 
@@ -2185,12 +2205,33 @@ def _tracked_under(root: Path) -> set[str] | None:
     return tracked
 
 
+#: A file to judge: its openable path, its scan-root-relative posix path, and in ``--path`` mode
+#: where it really is (``_location``), which the location rule judges too; ``None`` elsewhere, where
+#: the relative path is already relative to the repository.
+_Candidate = tuple[Path, str, str | None]
+
+
+def _location(path: Path) -> str:
+    """Where ``path`` really is, as the location rule judges it in ``--path`` mode (BACKLOG #5446):
+    its real path, relative to the work tree holding it, or whole outside any work tree; NFC and
+    case-folded as ``_path_key`` folds. Real, so a link, junction or subst drive into docs/security,
+    a root named from inside ``docs``, or one reached by ``..``, is judged where it lands, in its
+    on-disk case where the platform reports one. Relative to the work tree, so a clone that itself
+    sits under some ``docs/security`` directory is not a hit on every file. Empty for the top."""
+    real = Path(os.path.realpath(path))
+    for top in (real, *real.parents):
+        if (top / ".git").exists():
+            rel = real.relative_to(top).as_posix()
+            return "" if rel == "." else _path_key(rel)
+    return _path_key(real.as_posix())
+
+
 #: How a --path hit for a named root that does not exist ends. ``main`` leaves such a hit out of the
 #: summary's unread count, since nothing was there to be set aside.
 _NO_ROOT = "does not exist, so its files were not scanned (fail closed)"
 
 
-def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
+def _walk(raw: str, out: list[_Candidate], errors: list[str]) -> None:
     """Every file under the directory ``raw``, keyed by its root-relative posix path (BACKLOG #5585).
     SKIP_DIRS is pruned as ``_tracked_under`` answers: where git lists the tracked files, only for
     files it does not list, so by name under a root git tracks nothing under; where git cannot list
@@ -2199,6 +2240,7 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
     it without a word, except one below the root whose listing raises ENOENT or ENOTDIR, which is
     passed over as removed since it was listed, whatever the cause of that errno."""
     root = Path(raw)
+    at = _location(root)
     tracked = _tracked_under(root)
     tracked_dirs = {
         "/".join(p.split("/")[:i]) for p in tracked or () for i in range(1, p.count("/") + 1)
@@ -2241,13 +2283,12 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
                 in_skip_dir and tracked is not None and _path_key(rel) not in tracked
             ):
                 continue
-            out.append((Path(top) / name, rel))
+            out.append((Path(top) / name, rel, f"{at}/{_path_key(rel)}" if at else _path_key(rel)))
 
 
-def _candidate_files(
-    paths: list[str], *, path_mode: bool
-) -> tuple[list[tuple[Path, str]], list[str]]:
-    # Returns (openable path, scan-root-RELATIVE posix) pairs, and an unreadable-directory hit for each
+def _candidate_files(paths: list[str], *, path_mode: bool) -> tuple[list[_Candidate], list[str]]:
+    # Returns (openable path, scan-root-RELATIVE posix, location) triples, the location for --path only
+    # (_Candidate), and an unreadable-directory hit for each
     # directory a --path walk could not list. The relative posix is what all skip decisions and hit
     # reports key on, so the logic is identical whether we scan tracked files (already repo-relative) or
     # a --path snapshot in an arbitrary directory.
@@ -2261,22 +2302,22 @@ def _candidate_files(
         # refusal below only fires when the TOTAL is zero, so mixing one real directory with dropped
         # paths exited 0 and read as "all of these are clean". Measured 2026-08-04: a four-path audit
         # reported clean having examined one of the four.
-        out: list[tuple[Path, str]] = []
+        out: list[_Candidate] = []
         errors: list[str] = []
         for raw in paths:
             root = Path(raw)
             if root.is_file():
                 # rel is the bare name, matching the directory case, where the rel path starts below
-                # the root the caller NAMED. The location rule also judges the file's absolute path
-                # (_name_hits), so a file named under docs/security/ is still a hit (BACKLOG #5446).
+                # the root the caller NAMED. Its location (_location) is judged too, so a regular
+                # file named under docs/security/ is still a hit (BACKLOG #5446).
                 if root.name != ".git":
-                    out.append((root, root.name))
+                    out.append((root, root.name, _location(root)))
                 continue
             _walk(raw, out, errors)
         return out, errors
     if paths:
-        return [(Path(a), Path(a).as_posix()) for a in paths], []
-    return [(Path(p), Path(p).as_posix()) for p in _git_tracked()], []
+        return [(Path(a), Path(a).as_posix(), None) for a in paths], []
+    return [(Path(p), Path(p).as_posix(), None) for p in _git_tracked()], []
 
 
 #: Byte-order marks, longest first: a UTF-32-LE mark begins with the UTF-16-LE one. The wide entries of
@@ -2361,7 +2402,7 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     return _scan_file(path, rel_posix, show_context=show_context)[0]
 
 
-def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
+def _name_hits(path: Path, posix: str, where: str | None = None) -> tuple[list[str], bool]:
     """The hits a file earns by its path and name alone, and whether its content is not to be read.
     Judged whatever its bytes are. ``_scan_file`` keeps them when the content cannot be read, and the
     non-file branch of ``main`` keeps them beside any does-not-exist or unreadable hit.
@@ -2370,16 +2411,11 @@ def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
     several roots it names the root (the branch leak scan's commit directory). Under an absolute root
     that path can carry a user-home path.
 
-    The location rule judges ``posix`` AND the file's absolute path (BACKLOG #5446). In ``--path`` mode
-    ``posix`` starts below the root the caller named, so naming ``docs/security`` itself, a file in it,
-    or its parent ``docs`` dropped the ``docs/security/`` prefix from it and a private document read
-    clean. ``abspath`` is lexical: it adds the working directory a relative root was named from and
-    folds ``..``, so a root reached by ``..`` out of ``docs/security`` is judged where it lands."""
-    try:
-        where = Path(os.path.abspath(path)).as_posix()
-    except OSError:  # The working directory is gone: judge the path as the caller wrote it.
-        where = path.as_posix()
-    if reason := forbidden_path_reason(posix) or forbidden_path_reason(where):
+    ``where`` is where the file really is, from ``_location``, and the location rule judges it beside
+    ``posix`` (BACKLOG #5446). In ``--path`` mode ``posix`` starts below the root the caller named, so
+    naming ``docs/security`` itself, a file in it, or its parent ``docs`` dropped the prefix the rule
+    keys on, and a private document read clean."""
+    if reason := forbidden_path_reason(posix) or (where and forbidden_path_reason(where)):
         return [f"{path.as_posix()}:0: {reason}"], True
     hits: list[str] = []
     # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
@@ -2490,7 +2526,11 @@ _FileState = Literal["read", "unread", "unreadable"]
 
 
 def _scan_file(
-    path: Path, rel_posix: str | None = None, *, show_context: bool = False
+    path: Path,
+    rel_posix: str | None = None,
+    *,
+    show_context: bool = False,
+    where: str | None = None,
 ) -> tuple[list[str], _FileState]:
     """``scan_file``'s hits, and what became of the file's content. A binary file is judged by its name
     and location only, so the run must not count it as scanned, and an unreadable one is an instrument
@@ -2503,7 +2543,7 @@ def _scan_file(
     # exactly as much of a leak as the markdown beside it. Reported at line 0 because the finding is
     # the path itself and there is no line to point at -- the reason names the file, not a location
     # inside it. Scanning stops here; content hits on a file that must not exist add nothing.
-    hits, stop = _name_hits(path, posix)
+    hits, stop = _name_hits(path, posix, where)
     if stop:
         return hits, "unread"
     try:
@@ -3132,7 +3172,7 @@ def main(argv: list[str]) -> int:
     # that does not exist is not, since nothing was there. Both still fail the run as unreadable.
     unread = sum(not h.endswith(_NO_ROOT) for h in hits)
     unreadable = len(hits)
-    for abs_path, rel in candidates:
+    for abs_path, rel, where in candidates:
         # SKIP_DIRS is applied by the --path walk alone (_walk); the tracked and staged scans prune no
         # directory.
         if _is_skipped(rel):
@@ -3174,13 +3214,13 @@ def main(argv: list[str]) -> int:
             # The path alone decides a location or name hit, so it is kept for every entry that gets
             # here: an unstatable name under docs/security/, or in staged mode a missing one, still
             # exits 1, not 2. A gone entry passed over above earns no hit.
-            hits.extend(_name_hits(abs_path, rel)[0])
+            hits.extend(_name_hits(abs_path, rel, where)[0])
             if reason is None:
                 continue
             hits.append(f"{rel}:0: {reason}, so its content was not scanned (fail closed)")
             unreadable += 1
             continue
-        file_hits, state = _scan_file(abs_path, rel, show_context=show_context)
+        file_hits, state = _scan_file(abs_path, rel, show_context=show_context, where=where)
         hits.extend(file_hits)
         if state == "read":
             scanned += 1

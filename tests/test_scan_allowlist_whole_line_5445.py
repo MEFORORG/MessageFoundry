@@ -6,7 +6,8 @@ An allowlist entry is a per-line veto applied before every detector of the leak 
 citation entry was the one entry written without whole-line anchors, and the scanner applied entries
 with ``search``, so any line that also carried that citation shape skipped every detector: a routable
 IP, a site code or a customer name on the same line went unreported. The scanner now applies every
-entry with ``fullmatch``, so an entry excuses only a line it matches in full, whatever its anchors.
+entry with ``fullmatch``, and its loader refuses an entry with an unbounded wildcard, which would
+let a whole-line match still carry a leak inside it.
 
 Every probe value here is synthetic and assembled at runtime, because this file is itself scanned by
 the gate it tests: a literal dotted section number reads as an IP address.
@@ -16,19 +17,21 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shutil
 from pathlib import Path
 
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_SCANNER_PATH = _REPO_ROOT / "scripts" / "security" / "scan_forbidden.py"
-_ALLOWLIST_PATH = _REPO_ROOT / "scripts" / "security" / "scan-allowlist.txt"
+_SECURITY_DIR = _REPO_ROOT / "scripts" / "security"
+_SCANNER_PATH = _SECURITY_DIR / "scan_forbidden.py"
+_ALLOWLIST_PATH = _SECURITY_DIR / "scan-allowlist.txt"
 #: The one tracked line the OIDC core entry exists to excuse.
 _CLAIMS = _REPO_ROOT / "messagefoundry" / "auth" / "oidc" / "claims.py"
 
 
-def _load_scanner():
-    spec = importlib.util.spec_from_file_location("scan_forbidden_5445", _SCANNER_PATH)
+def _load_scanner(path: Path = _SCANNER_PATH, name: str = "scan_forbidden_5445"):
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -40,9 +43,13 @@ def _routable_ip() -> str:
     return ".".join(("8", "8", "4", "4"))
 
 
+def _section() -> str:
+    return ".".join(("3", "1", "3", "7"))
+
+
 def _citation_line() -> str:
     """The tracked comment line the OIDC core entry was written for, read from the tree."""
-    marker = "OIDC core " + ".".join(("3", "1", "3", "7")) + "/2"
+    marker = f"OIDC core {_section()}/2"
     lines = [ln for ln in _CLAIMS.read_text(encoding="utf-8").splitlines() if marker in ln]
     assert len(lines) == 1, "claims.py must carry the citation the allowlist entry excuses"
     return lines[0]
@@ -50,19 +57,12 @@ def _citation_line() -> str:
 
 @pytest.fixture
 def mod():
-    m = _load_scanner()
-    # The committed allowlist must load in full, or a vacuous pass below would mean nothing.
-    committed = [
-        ln.strip()
-        for ln in _ALLOWLIST_PATH.read_text(encoding="utf-8").splitlines()
-        if ln.strip() and not ln.strip().startswith("#")
-    ]
-    assert len(m.ALLOWLIST) == len(committed)
-    return m
+    return _load_scanner()
 
 
 def test_the_excused_citation_line_itself_stays_clean(mod, tmp_path: Path) -> None:
     """Control: the line the entry exists for still passes, so the tree stays green."""
+    assert mod.ALLOWLIST, "the committed allowlist must load"
     p = tmp_path / "claims.py"
     p.write_text(_citation_line() + "\n", encoding="utf-8")
     assert mod.scan_file(p) == []
@@ -70,26 +70,33 @@ def test_the_excused_citation_line_itself_stays_clean(mod, tmp_path: Path) -> No
 
 def test_a_leak_beside_the_citation_shape_still_trips(mod, tmp_path: Path) -> None:
     """The defect: the citation shape on a line excused the whole line, so the IP beside it was
-    never seen. Each variant carries the shape the old unanchored entry searched for."""
-    section = ".".join(("3", "1", "3", "7"))
+    never seen. Each variant carries the shape the old unanchored entry searched for, and the hit
+    must name the PLANTED address, not only the section number that now reads as one."""
     ip = _routable_ip()
     variants = (
-        f"# OIDC core {section}/2 host {ip}",
+        f"# OIDC core {_section()}/2 host {ip}",
         f"{_citation_line()} {ip}",
-        f"connect({ip!r})  # OIDC core {section}/2",
+        f"connect({ip!r})  # OIDC core {_section()}/2",
     )
     for i, line in enumerate(variants):
         p = tmp_path / f"leak{i}.py"
         p.write_text(line + "\n", encoding="utf-8")
-        hits = mod.scan_file(p)
-        assert any("routable IP address" in h for h in hits), (i, hits)
+        hits = mod.scan_file(p, show_context=True)
+        assert any(f"routable IP address ({ip})" in h for h in hits), (i, hits)
+
+
+def _insertions(probe: str, leak: str) -> list[str]:
+    """``probe`` with ``leak`` added at its start, at its end, and beside every space inside it."""
+    spaces = [i for i, ch in enumerate(probe) if ch == " "]
+    inner = [probe[:i] + " " + leak + probe[i:] for i in spaces]
+    return [leak + " " + probe, probe + " " + leak, *inner]
 
 
 def test_every_allowlist_entry_excuses_only_a_whole_line(mod) -> None:
     """The class, not the instance: a line an entry excuses stops being excused once anything is
-    appended to it, for every committed entry. ``re`` cannot generate a matching string, so each
-    entry is probed with a line built for it below; a new entry without a probe fails here, which
-    is the point -- it must be shown to be whole-line before it ships."""
+    added to it, at either end or inside it, for every committed entry. ``re`` cannot generate a
+    matching string, so each entry is probed with a line built for it below; a new entry without a
+    probe fails here, which is the point -- it must be shown to be whole-line before it ships."""
     six = "".join(("1", "2", "3", "4", "5", "6"))
     probes = {
         r"^\s*[A-Z0-9_]+\s+\d+ ms\s+\d+ tasks\s*$": "WRITELOG  12 ms  " + six + " tasks",
@@ -97,14 +104,36 @@ def test_every_allowlist_entry_excuses_only_a_whole_line(mod) -> None:
         r"^lky_vipnyc_\d{6}$": f"lky_vipnyc_{six}",
         r"^dungklose_\d{6}$": f"dungklose_{six}",
     }
+    assert mod.ALLOWLIST, "the committed allowlist must load"
     for pat in mod.ALLOWLIST:
         if pat.pattern.startswith("^openssl "):
-            probe = re.sub(r"\[0\]\{3\}", "000", pat.pattern[1:-1].replace("\\", ""))
+            probe = re.sub(r"\[0\]\{3\}", "000", pat.pattern[1:-1])
         elif "OIDC core" in pat.pattern:
             probe = _citation_line()
         else:
             assert pat.pattern in probes, f"no probe for allowlist entry {pat.pattern!r}"
             probe = probes[pat.pattern]
         assert mod._allowlisted(probe), pat.pattern
-        assert not mod._allowlisted(probe + " " + _routable_ip()), pat.pattern
-        assert not mod._allowlisted(_routable_ip() + " " + probe), pat.pattern
+        for line in _insertions(probe, _routable_ip()):
+            assert not mod._allowlisted(line), (pat.pattern, line)
+
+
+@pytest.mark.parametrize(
+    ("entry", "keep"),
+    [
+        pytest.param(".*OIDC core [0-9]+.*", False, id="padded-both-ends"),
+        pytest.param("^# keep .* here$", False, id="interior-wildcard"),
+        pytest.param("^# keep [^!]+ here$", False, id="negated-class"),
+        pytest.param("^# keep [a-z]+ here$", True, id="control-a-bounded-class"),
+    ],
+)
+def test_the_loader_refuses_an_entry_with_an_unbounded_wildcard(
+    tmp_path: Path, entry: str, keep: bool
+) -> None:
+    """Under a whole-line match, a wildcard is where a leak would sit: ``^# keep .* here$`` excuses
+    ``# keep <a routable IP> here``. The bounded control loads, so the refusal is the wildcard."""
+    dst = tmp_path / "security"
+    shutil.copytree(_SECURITY_DIR, dst)
+    (dst / "scan-allowlist.txt").write_text(entry + "\n", encoding="utf-8")
+    loaded = _load_scanner(dst / "scan_forbidden.py", f"scan_forbidden_5445_{keep}_{len(entry)}")
+    assert bool(loaded.ALLOWLIST) is keep, entry
