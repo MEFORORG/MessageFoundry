@@ -2273,6 +2273,20 @@ def test_an_unlistable_directory_fails_the_walk_as_an_instrument(
     ) in err.splitlines(), err
 
 
+def test_a_missing_path_root_is_counted_in_the_summary(
+    sf_main, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A named --path root that does not exist fails the run as an instrument, and the summary counts
+    it as an entry whose files were not read rather than saying none went unscanned."""
+    assert sf_main.main(["--path", str(tmp_path / "nope")]) == 2
+    err = capsys.readouterr().err
+    assert "nope/:0: does not exist, so its files were not scanned (fail closed)" in err, err
+    assert (
+        "scan_forbidden: examined 0 file(s) across 1 named path(s); 1 more were binary, not regular"
+        " files, unreadable or under a forbidden path, so their content was not scanned."
+    ) in err.splitlines(), err
+
+
 def test_only_a_vendored_action_bundle_keeps_the_dist_skip(
     sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
