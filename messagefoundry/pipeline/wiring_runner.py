@@ -6742,7 +6742,9 @@ class RegistryRunner:
         marked, so it stays halted after another inbound's restart clears the latch.
 
         Lifting the gate re-arms the inbound's internal lanes (:meth:`_lift_log_halt`): under pooled
-        a STOPPED or PAUSED one is resumed and its hold lifted here, and under per_lane the start that
+        a STOPPED or PAUSED one is resumed and its hold lifted here, except a pooled lane kept
+        STOPPED because it holds claimed rows whose return to the queue never landed, and under
+        per_lane the start that
         called this then respawns the finished workers (:meth:`_ensure_inbound_workers`), which
         re-arms such a STOP."""
         if not self._inbound_log_halted(name):
