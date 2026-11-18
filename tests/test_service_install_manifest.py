@@ -3067,7 +3067,8 @@ def _workdir_seam(parent: Path) -> str:
         return rf"""
   $script:RealWorkDir = ${{function:{_WORKDIR_FN}}}
   $script:WorkOwner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  function {_WORKDIR_FN} {{ & $script:RealWorkDir -Parent {_psq(str(parent))} -OwnerSid $script:WorkOwner }}
+  function {_WORKDIR_FN} {{ & $script:RealWorkDir -Parent {_psq(str(parent))} -OwnerSid $script:WorkOwner `
+    -CheckedUpTo {_psq(str(parent.parent))} }}
 """
     return rf"""
   function {_WORKDIR_FN} {{
@@ -3345,24 +3346,43 @@ def test_the_secedit_files_sit_in_a_fresh_folder_only_administrators_can_change(
 
 
 @_windows_only
-def test_the_work_folder_is_refused_under_a_parent_others_can_delete_in(tmp_path: Path) -> None:
-    """A parent folder that lets another account delete its children lets that account rename the
-    private folder away and substitute its own, so the helper refuses it."""
+@pytest.mark.parametrize(
+    ("where", "grant"),
+    [
+        # A parent that lets another account delete its children lets that account rename the
+        # private folder away and substitute its own. F, not M: Modify holds no FILE_DELETE_CHILD.
+        ("parent-children", "*S-1-5-32-545:(OI)(CI)F"),
+        # Modify holds DELETE on the parent itself but no FILE_DELETE_CHILD, so the parent, with
+        # the private folder inside, can be renamed away and a planted one put at its name.
+        ("parent", "*S-1-5-32-545:M"),
+        # Full control on the folder ABOVE the parent, on that folder only: delete-child there
+        # renames the parent away, though the parent's own DACL grants nothing.
+        ("above", "*S-1-5-32-545:F"),
+    ],
+)
+def test_the_work_folder_is_refused_when_the_parent_or_a_folder_above_can_be_renamed(
+    tmp_path: Path, where: str, grant: str
+) -> None:
+    """The helper refuses a parent whose children, or which itself, or any folder above which,
+    another account can rename. BACKLOG #8239 item 13 added the last two."""
     assert _UNINSTALL is not None
-    parent = tmp_path / "open-parent"
-    parent.mkdir()
+    above = tmp_path / "above"
+    parent = above / "parent"
+    parent.mkdir(parents=True)
+    target = above if where == "above" else parent
     body = rf"""
   $parent = {_psq(str(parent))}
+  $top = {_psq(str(tmp_path))}
+  $target = {_psq(str(target))}
   $me = [Security.Principal.WindowsIdentity]::GetCurrent()
-  # F, not M: Modify holds no FILE_DELETE_CHILD, and that is the right that renames a child.
-  & icacls $parent /grant '*S-1-5-32-545:(OI)(CI)F' | Out-Null
+  & icacls $target /grant {_psq(grant)} | Out-Null
   $made = $null
   $refusal = ''
-  try {{ $made = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value }}
+  try {{ $made = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value -CheckedUpTo $top }}
   catch {{ $refusal = $_.Exception.Message }}
   $clean = $null
-  & icacls $parent /remove:g '*S-1-5-32-545' | Out-Null
-  try {{ $clean = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value }} catch {{ $clean = "ERR $_" }}
+  & icacls $target /remove:g '*S-1-5-32-545' | Out-Null
+  try {{ $clean = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value -CheckedUpTo $top }} catch {{ $clean = "ERR $_" }}
   [pscustomobject]@{{ made = $made; refusal = $refusal; clean = $clean
     left = @(Get-ChildItem -LiteralPath $parent -Force | ForEach-Object {{ $_.Name }}) }} |
     ConvertTo-Json -Compress
@@ -3370,9 +3390,10 @@ def test_the_work_folder_is_refused_under_a_parent_others_can_delete_in(tmp_path
     got = json.loads(
         _ok(_extract(_UNINSTALL, [_WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
     )
-    assert got["made"] is None, f"a folder was made under an open parent: {got['made']}"
+    assert got["made"] is None, f"a folder was made though {where} can be renamed: {got['made']}"
     assert "S-1-5-32-545" in got["refusal"] or "Users" in got["refusal"], got["refusal"]
-    # POSITIVE CONTROL: the same parent without the grant is accepted.
+    assert str(target) in got["refusal"], f"the refusal does not name {target}: {got['refusal']}"
+    # POSITIVE CONTROL: the same chain without the grant is accepted.
     assert got["clean"] and not str(got["clean"]).startswith("ERR"), got["clean"]
     assert got["left"] == [Path(got["clean"]).name], (
         f"the refused attempt left a folder behind: {got['left']}"
