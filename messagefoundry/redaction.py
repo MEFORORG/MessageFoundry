@@ -2627,7 +2627,8 @@ def safe_exc(
     (BACKLOG #1748), so swapping :func:`safe_name` in has to happen where the name is known. Without
     it, routing a file source's error arm through this function would keep the OS diagnostic and leak
     the name anyway: a control that reports success while the hole stays open. The basename is
-    replaced wherever it appears, so a full path is covered; the directory part is operator
+    replaced wherever it appears, as written or in a form ``repr()`` escapes, so a full path is
+    covered;the directory part is operator
     configuration, not partner-chosen, and stays.
 
     A ``UnicodeError`` never reaches :func:`redact` as text (vault BACKLOG #3033). Its ``str()`` quotes
@@ -2649,9 +2650,32 @@ def safe_exc(
         return f"{name}: {_HOLDER_TEXT}"
     raw = str(exc)
     if file_name and (base := _basename(file_name)):
-        raw = raw.replace(base, safe_name(file_name))
+        label = safe_name(file_name)
+        # An OSError quotes its path with repr(), so a name holding a control, a non-printable or a
+        # quote character appears escaped and the raw name alone matches nothing (BACKLOG #5815).
+        # The escaped forms go first: none of them is a substring the label could produce.
+        for form in (*_repr_escaped_forms(base), base):
+            raw = raw.replace(form, label)
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
+
+
+def _repr_escaped_forms(text: str) -> list[str]:
+    """The bodies ``repr()`` can render ``text`` as inside a longer quoted string, other than
+    ``text`` itself. ``repr()`` escapes character by character, so each character's own repr is its
+    escape, except the quote: repr quotes with ``'`` and escapes it, unless the WHOLE string holds
+    ``'`` and no ``"``, when it quotes with ``"`` and escapes neither. The whole string is the path,
+    so a directory can make either choice for the same basename, and both forms are returned. Longest
+    first, so a form never shadows a longer one it is a prefix of."""
+    forms: set[str] = set()
+    for escape_apostrophe in (True, False):
+        body = "".join(
+            "\\'" if ch == "'" and escape_apostrophe else ch if ch in "'\"" else repr(ch)[1:-1]
+            for ch in text
+        )
+        if body != text:
+            forms.add(body)
+    return sorted(forms, key=len, reverse=True)
 
 
 #: ``encodings`` modules that are no text codec: the alias table, the bytes-to-bytes and str-to-str
