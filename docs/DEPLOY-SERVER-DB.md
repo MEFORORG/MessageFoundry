@@ -552,6 +552,8 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 .\scripts\service\import-db-ca.ps1 -CaPath C:\certs\internal-root-ca.crt
 ```
 
+This script needs PowerShell 7.1 or later (pwsh); it refuses to run under Windows PowerShell 5.1.
+
 The helper shows every certificate in the file, and refuses the whole file in at least these cases:
 any one is not a CA or carries a private key, any one does not chain to a self-signed root in the
 same file, a root in it is outside its validity period, or a DER value in it does not end where its
@@ -564,21 +566,17 @@ verifies. Any other CA in the file, such as an issuing CA in a `.p7b` chain, or 
 self-issued certificate another key signed, goes into the intermediate store `LocalMachine\CA`.
 The Windows chain engine needs an authority key identifier to link a self-issued certificate to its
 signer; without one it reads the certificate as self-signed with a signature that fails, so the
-file is refused. `LocalMachine\CA` is **not** a trust anchor for SChannel or ODBC Driver 18 chain building, so the SQL
-Server hop still checks the chain up to the root. It **is** usable as a trust anchor by the
+file is refused. `LocalMachine\CA` is **not** a trust anchor for SChannel or ODBC Driver 18 chain
+building, so the SQL Server hop still checks the chain up to the root. It **is** usable as a trust anchor by the
 engine's Python TLS on Windows: CPython's `ssl.create_default_context()`, which the PostgreSQL
 system-trust path calls, loads the `CA` and `ROOT` system stores, and Python 3.13 and later set
 partial-chain verification, so a chain that reaches a certificate in `LocalMachine\CA` validates
 there without its root. So the helper refuses a file unless the chain engine, given every
 certificate in the file, builds a chain from each one to a self-signed root in the same file with
 every signature verifying and no fault reported but an untrusted root or a time status, and every
-self-signed root in it is within its validity period. Under PowerShell 7.1 and later only the
-file's own roots anchor that chain, and the helper turns off fetching a missing issuer from a URL
-a certificate names. Under Windows PowerShell 5.1 or PowerShell 7.0 the machine's stores take
-part, a chain that ends anywhere but at one of the file's roots is refused, and the engine may fetch
-a missing issuer from such a URL, a network request the file decides, so the same file can pass
-there and be refused under PowerShell 7.1. It warns
-of, but does not refuse, an expired issuing CA, and it does not check revocation. With `-Confirm`
+self-signed root in it is within its validity period. Only the file's own roots anchor that chain,
+and the helper turns off fetching a missing issuer from a URL a certificate names. It warns of,
+but does not refuse, an expired issuing CA, and it does not check revocation. With `-Confirm`
 you may still decline the root and accept another CA, so give it the root of the CA you mean to
 trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
 

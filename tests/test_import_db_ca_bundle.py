@@ -639,3 +639,40 @@ def test_the_script_adds_through_the_store_and_never_by_path() -> None:
     assert body.index("IsInRole(") < body.index("ReadAllBytes(")
     assert body.index("Get-CaRefusal -Certificate") < body.index("ShouldProcess(")
     assert body.index("ShouldProcess(") < body.index(".Store.Add(")
+
+
+_NEEDS_PWSH_71 = "This script needs PowerShell 7.1 or later."
+
+
+def test_the_runtime_guard_runs_before_any_store_or_chain() -> None:
+    code = "\n".join(
+        ln
+        for ln in _SCRIPT.read_text(encoding="utf-8").splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    body = code.split("[CmdletBinding(", 1)[1]
+    guard = body.index("PSObject.Properties['TrustMode']")
+    assert "PSObject.Properties['DisableCertificateDownloads']" in body[guard : guard + 200]
+    assert _NEEDS_PWSH_71 in body[guard : guard + 400]
+    # Before the stores are built, elevation is checked, a chain is built or the file is read.
+    for later in ("X509Store]::new(", "IsInRole(", "X509Chain]::new(", "ReadAllBytes("):
+        assert guard < body.index(later), later
+    # Nothing past the guard asks the runtime again, so no fallback path is left behind it.
+    assert body.count("PSObject.Properties[") == 2
+
+
+def test_windows_powershell_is_refused_before_anything_is_read(files: dict[str, Path]) -> None:
+    exe = shutil.which("powershell")
+    if exe is None or sys.platform != "win32":
+        pytest.skip("SKIP (nothing run): no Windows PowerShell 5.1 here")
+    proc = subprocess.run(
+        [exe, "-NoProfile", "-NonInteractive", "-File", str(_SCRIPT)]
+        + ["-CaPath", str(files["p7b_der"]), "-WhatIf"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert _NEEDS_PWSH_71 in " ".join(out.split()), out
+    assert "The file holds" not in out and "What if" not in out

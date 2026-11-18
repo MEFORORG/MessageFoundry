@@ -34,17 +34,13 @@
     chain that reaches a certificate in LocalMachine\CA validates there without its root. So a
     file is refused unless the chain engine, given every certificate in the file as extra certificates,
     builds a chain from each certificate in it to a self-signed root in the same file, with no
-    chain status other than an untrusted root or a time status. Where the .NET runtime has
-    CustomRootTrust, only the file's own self-signed roots anchor that chain, so a root this
-    machine already trusts cannot stand in for them; where it has not, as under Windows
-    PowerShell 5.1, the machine's stores take part, and a chain that ends anywhere but at one of
-    the file's roots is refused. Every self-signed root in the file must also be within its
+    chain status other than an untrusted root or a time status. Only the file's own self-signed
+    roots anchor that chain (CustomRootTrust), so a root this machine already trusts cannot
+    stand in for them, and the engine fetches no missing issuer from a URL a certificate names
+    (DisableCertificateDownloads). Every self-signed root in the file must also be within its
     validity period. The validity of any other CA is only warned of, and revocation is not
-    checked. Where the runtime has the DisableCertificateDownloads switch the script sets it;
-    where it has not, as under Windows PowerShell 5.1, the engine may fetch a missing issuer
-    from a URL the certificate names, a network request the file decides, and the same file can
-    then pass there and be refused under PowerShell 7. With -Confirm the operator may still
-    decline the root and accept another CA.
+    checked. With -Confirm the operator may still decline the root and accept another CA. The
+    PowerShell version this needs is stated in docs/DEPLOY-SERVER-DB.md section 5.2.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
@@ -93,6 +89,16 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Checked first, before any store or chain is touched. The chain check needs CustomRootTrust and
+# DisableCertificateDownloads, which .NET 5 and later have and Windows PowerShell 5.1's .NET
+# Framework does not, so this file keeps to syntax 5.1 parses and stops here.
+$chainPolicy = [System.Security.Cryptography.X509Certificates.X509ChainPolicy]::new()
+if (-not ($chainPolicy.PSObject.Properties['TrustMode'] -and
+        $chainPolicy.PSObject.Properties['DisableCertificateDownloads'])) {
+    throw ("This script needs PowerShell 7.1 or later. Run it from pwsh, not Windows PowerShell " +
+        "(powershell.exe); nothing was imported.")
+}
 
 # The machine stores -- NOT the per-user ones. The engine runs as a service principal
 # (LocalSystem / gMSA / dedicated account), which only reads the machine stores, so a CurrentUser
@@ -325,19 +331,12 @@ function Invoke-CaChainBuild {
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Bundle,
         [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Anchors
     )
-    # The machine context, the one the service principal validates in, not the elevated
-    # operator's own CurrentUser stores.
     $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new($true)
     try {
         $policy = $chain.ChainPolicy
         $policy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
         [void]$policy.ExtraStore.AddRange($Bundle)
-        # Where the runtime has the switch, the engine may not fetch a missing issuer from a URL
-        # the certificate names. Windows PowerShell 5.1's .NET Framework has none, so there a
-        # file's certificates can make this run reach out to a host they name.
-        if ($policy.PSObject.Properties['DisableCertificateDownloads']) {
-            $policy.DisableCertificateDownloads = $true
-        }
+        $policy.DisableCertificateDownloads = $true
         if ($Anchors) {
             $policy.TrustMode = [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
             [void]$policy.CustomTrustStore.AddRange($Anchors)
@@ -364,11 +363,11 @@ function Invoke-CaChainBuild {
 # validity period at $Now, a UTC time. A certificate is a root when the chain built for it is that
 # certificate alone and its signature verifies under its own key; it goes into Root, and any other
 # CA into CertificateAuthority (the intermediate store). The help's "Where each CA goes" says what
-# each store means. Every other certificate must chain to one of the file's roots. Where the
-# runtime has CustomRootTrust, only the file's roots anchor that chain, so a root the machine
-# already trusts cannot take the place of the file's own, as an older root of the same name would.
-# Without it (Windows PowerShell 5.1, PowerShell 7.0), a chain that ends anywhere but at one of the
-# file's roots is refused.
+# each store means. Every other certificate must chain to one of the file's roots, and only the
+# file's roots anchor that chain, so a root the machine already trusts cannot take the place of the
+# file's own, as an older root of the same name would. A file with no root gets no anchored build:
+# an empty CustomTrustStore is never passed, and each certificate's chain, which then ends at no
+# root of the file, is refused.
 function Get-CaChainCheck {
     param(
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Bundle,
@@ -393,13 +392,11 @@ function Get-CaChainCheck {
             $rootThumbprints[$cert.Thumbprint] = $true
         }
     }
-    $custom = $roots.Count -gt 0 -and
-        [System.Security.Cryptography.X509Certificates.X509ChainPolicy]::new().PSObject.Properties['TrustMode']
     $checks = @{}
     foreach ($cert in $Bundle) {
         $isRoot = $rootThumbprints.ContainsKey($cert.Thumbprint)
         $built = $first[$cert.Thumbprint]
-        if ($custom -and -not $isRoot) {
+        if ($roots.Count -gt 0 -and -not $isRoot) {
             $built = Invoke-CaChainBuild -Certificate $cert -Bundle $Bundle -Anchors $roots
         }
         $outside = $cert.NotAfter.ToUniversalTime() -lt $Now -or $cert.NotBefore.ToUniversalTime() -gt $Now
