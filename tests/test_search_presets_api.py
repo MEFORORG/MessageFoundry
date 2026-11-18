@@ -472,7 +472,7 @@ async def test_a_blanked_criteria_cell_answers_423_rather_than_widening(
 
 
 async def test_a_planted_unmarked_criteria_cell_is_an_audited_integrity_refusal(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #5523, then #5650: an unmarked value planted in a keyed store's criteria cell escaped
     as a 500, then answered 423 through the route's plain ``CipherError`` arm, unaudited. Since
@@ -485,6 +485,12 @@ async def test_a_planted_unmarked_criteria_cell_is_an_audited_integrity_refusal(
 
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
+    from messagefoundry.store import cell_tag, crypto
+
+    # The unmarked WARNINGs are logged once per cell column per hour, process-wide, so an earlier
+    # refusal must not mute the control below (as tests/test_cell_tag.py resets them).
+    monkeypatch.setattr(cell_tag, "_reported", {})
+    monkeypatch.setattr(crypto, "_unmarked_logged", {})
 
     db = tmp_path / "keyed.db"
     store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))

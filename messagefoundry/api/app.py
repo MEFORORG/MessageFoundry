@@ -9886,14 +9886,21 @@ def create_app(
                 # class per interval: an outage fails every write. Later failures in that window
                 # leave no row and no log line.
                 failed = type(exc).__name__
-                if _first_layered_refusal(preset_id, f"audit:{cause}:{failed}"):
-                    _log.error(
-                        "layered search could not audit its refusal of preset %s (%s %s; %s)",
-                        preset_id,
-                        str(refusal.status_code),
-                        cause,
-                        failed,
-                    )
+            except Exception as exc:  # noqa: BLE001 -- a defect must not replace the refusal owed
+                # A backstop for a fault outside that set, a defect in the chain seal say: logged
+                # the same way, by type name only, with no exc_info and no message text, so no
+                # audit-write failure changes the 423, 503 or 400 answer.
+                failed = f"defect {type(exc).__name__}"
+            else:
+                return refusal
+            if _first_layered_refusal(preset_id, f"audit:{cause}:{failed}"):
+                _log.error(
+                    "layered search could not audit its refusal of preset %s (%s %s; %s)",
+                    preset_id,
+                    str(refusal.status_code),
+                    cause,
+                    failed,
+                )
             return refusal
 
         criterias: list[dict[str, Any]] = []
@@ -9906,9 +9913,9 @@ def create_app(
                 )
             except (BlankCellError, NonTextCellError) as exc:
                 # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, which
-                # it never writes (audited, alerted and logged there), so it never reads as an
-                # empty filter that would widen the search. Its own text: a keyless store has no
-                # integrity tag for such a cell to fail.
+                # it never writes (audited and logged there, and alerted on a keyed store), so it
+                # never reads as an empty filter that would widen the search. Its own text: a
+                # keyless store has no integrity tag for such a cell to fail.
                 cause = type(exc).__name__
                 shape = "blank" if isinstance(exc, BlankCellError) else "non-text"
                 refusal = HTTPException(

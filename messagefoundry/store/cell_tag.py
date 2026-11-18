@@ -269,8 +269,8 @@ class BlankCellError(CellTagError):
     blank cell was written outside the store. Read as an empty filter it would drop a narrowing
     preset out of a layered search and widen it, so it is refused.
 
-    It counts as drift: it writes the tag-failed audit row and raises the ``integrity_drift`` alert,
-    as a moved cell does."""
+    It counts as drift: it writes the tag-failed audit row and, on a keyed store, raises the
+    ``integrity_drift`` alert, as a moved cell does. A keyless store's cipher has no alert hook."""
 
     def _describe(self) -> str:
         return (
@@ -393,9 +393,9 @@ def open_preset_criteria(
 
     The store writes every preset's criteria as non-blank text, so a NULL or empty cell raises
     :class:`BlankCellError` and a value that is not text, a planted BLOB say, raises
-    :class:`NonTextCellError`, on a keyed and a keyless store alike (BACKLOG #5523). Both are drift,
-    alerted here and audited by the store's read, before the caller reads the cell or stamps the
-    preset as used. The store's whole-surface cell walks do not run this check."""
+    :class:`NonTextCellError`, on a keyed and a keyless store alike (BACKLOG #5523). Both are drift:
+    logged here, alerted here on a keyed store only, and audited by the store's read, before the
+    caller reads the cell or stamps the preset as used. The store's whole-surface cell walks do not run this check."""
     if stored is None or stored == "":
         refused: CellTagError = BlankCellError("search_presets", "criteria", preset_id, None)
     elif not isinstance(stored, str):
