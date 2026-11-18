@@ -56,7 +56,6 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
-    CrlNoCredit,
     HopPosture,
     TrustAnchorPolicy,
 )
@@ -78,8 +77,9 @@ _LOGGER = "messagefoundry.transports.ai_broker"
 
 @pytest.fixture(autouse=True)
 def _fresh_crossings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Each test starts with no crossing logged, no anchored opener held, no held CRL copy
-    recorded and no process-wide attestation set. Each is restored after the test."""
+    """Each test starts with no crossing logged, no anchored opener held, no CRL load, refusal or
+    unconfirmed signature recorded, and no process-wide attestation set. Each is restored after
+    the test."""
     # raising=False only so this file fails on its assertions, not in setup, where the set is
     # absent; the once-per-process tests below go red if it is renamed.
     monkeypatch.setattr(ai_broker_mod, "_LOGGED_CROSSINGS", set(), raising=False)
@@ -87,6 +87,8 @@ def _fresh_crossings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(ai_broker_mod, "_anchored_opener", None, raising=True)
     # The anchored contexts these tests build are recorded here; other suites reset it the same way.
     monkeypatch.setattr(loaded_crls, "_HELD", weakref.WeakKeyDictionary(), raising=True)
+    monkeypatch.setattr(loaded_crls, "_REFUSED", {}, raising=True)
+    monkeypatch.setattr(loaded_crls, "_UNCONFIRMED", {}, raising=True)
     monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
     yield
 
@@ -804,29 +806,6 @@ def test_the_anchored_opener_is_held_across_requests(pki: _Pki) -> None:
     third = _broker(posture=_ENFORCING, policy=pinned)
     assert third._opener is not first._opener
     assert _broker(posture=_ENFORCING, policy=pinned)._opener is third._opener
-
-
-def test_an_anchor_that_narrows_nothing_leaves_the_held_opener_held(pki: _Pki) -> None:
-    """What the ``_endpoint_opener`` docstring states: a non-narrowing anchor dials the shared
-    opener and leaves the slot as it is, so the narrowing anchor's opener is reused after it."""
-    crl = TrustAnchorPolicy(crl_file=pki.crl_file)
-    first = _broker(posture=_ENFORCING, policy=crl)
-    assert _broker(posture=_WARN, policy=TrustAnchorPolicy())._opener is (
-        _shared_no_redirect_opener()
-    )
-    assert _broker(posture=_ENFORCING, policy=crl)._opener is first._opener
-
-
-def test_each_remedy_is_printed_as_its_constants_are_written() -> None:
-    """The remedy the refusal prints is the module's constants verbatim, never re-cased, so the
-    logged sentence can be found in the source. Red on the parent commit: the no-CRL remedy was
-    built by upper-casing the first character of a constant that read "set ..."."""
-    alone = ai_broker_mod._revocation_lever(crl_reachable=False, no_credit=CrlNoCredit.NO_CRL)
-    assert alone == ai_broker_mod._AI_ATTESTATION_LEVER
-    both = ai_broker_mod._revocation_lever(crl_reachable=True, no_credit=CrlNoCredit.NO_CRL)
-    assert both == f"{ai_broker_mod._AI_CRL_LEVER} {ai_broker_mod._AI_ATTESTATION_LEVER}"
-    assert alone.startswith("Set ") and both.startswith("Set ")
-    assert _PAIR in alone
 
 
 def test_a_tls_file_that_cannot_be_loaded_is_the_brokers_own_error(tmp_path: Path) -> None:

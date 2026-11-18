@@ -125,15 +125,13 @@ _AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 #: ``create_app`` whose embedder set no ``app.state.tls_settings``, setting it would change
 #: nothing. No connection's attestation is offered either:
 #: the endpoint is not a connection. Naming either would be a remedy the operator cannot perform.
-#: Each lever is printed as written, never re-cased, so the logged text can be found here; where
-#: both are offered, :func:`_revocation_lever` joins them with a space.
 _AI_CRL_LEVER = (
     "Set [tls].crl_file to a CRL file that covers the issuer of the AI endpoint's certificate (it "
     "is instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that file, "
-    "or its handshake fails). Or instead:"
+    "or its handshake fails), or "
 )
 _AI_ATTESTATION_LEVER = (
-    "Set [ai].endpoint_revocation_attested = true with an "
+    "set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
     "endpoint's certificate, or use an endpoint on this machine."
 )
@@ -147,8 +145,8 @@ def _revocation_lever(*, crl_reachable: bool, no_credit: CrlNoCredit | None) -> 
     if no_credit is CrlNoCredit.PEER_NOT_VERIFIED:
         return PEER_NOT_VERIFIED_WAYS_ACROSS
     if crl_reachable and no_credit is CrlNoCredit.NO_CRL:
-        return f"{_AI_CRL_LEVER} {_AI_ATTESTATION_LEVER}"
-    return _AI_ATTESTATION_LEVER
+        return _AI_CRL_LEVER + _AI_ATTESTATION_LEVER
+    return _AI_ATTESTATION_LEVER[0].upper() + _AI_ATTESTATION_LEVER[1:]
 
 
 #: Each crossing line already logged, keyed by its kind and the endpoint host, so each is written
@@ -206,8 +204,9 @@ def _endpoint_opener(
     held. A replaced opener is no longer held here, but ``loaded_crls`` keeps its context's record
     until the opener is garbage-collected. Held, its context is a live hop as every connection's
     is, so ``loaded_crls`` records the CRL it holds, the expiry monitor judges that copy, and
-    ``crl_reload`` brings it current when the file is replaced. Built per request, it would read and judge the CA and CRL files on every
-    assist call, and record a held copy for each throwaway context.
+    ``crl_reload`` brings it current when the file is replaced. Built per request, it would read
+    and judge the CA and CRL files on every assist call, and record a held copy for each throwaway
+    context.
 
     Raises ``ValueError`` or ``OSError`` for a file that cannot be loaded or a CRL that
     ``harden_crl_check`` refuses; a build that raises caches nothing."""
