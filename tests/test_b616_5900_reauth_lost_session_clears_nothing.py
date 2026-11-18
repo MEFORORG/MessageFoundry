@@ -16,6 +16,7 @@ All credentials here are synthetic.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -28,9 +29,9 @@ from messagefoundry.auth.notifications import (
     SecurityEvent,
 )
 from messagefoundry.auth.passwords import hash_password
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService, _UserLookup
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.row_seal import SESSION_KIND, RowSealError
+from messagefoundry.store.row_seal import SESSION_KIND, USER_KIND, RowSealError
 from messagefoundry.store.store import MessageStore
 
 GOOD = "Synth3tic-Pass-Phrase!!"
@@ -229,5 +230,87 @@ async def test_two_concurrent_correct_reauths_flag_one_run_of_failures_once() ->
         flagged = len([e for e in feed if e["action"] == "auth.login_after_failures"])
         notices = len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES])
         assert (flagged - flagged_before, notices - notices_before) == (1, 1)
+    finally:
+        await store.close()
+
+
+async def test_a_record_failing_its_seal_at_the_deferred_clear_is_reported_and_grants_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clear's write is refused because the account's record fails its seal. Before the clear
+    was deferred that raise granted nothing; now it is reported as a seal failure, the rotated
+    session is ended, and the caller is told to sign in again, with no token handed back."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+
+        async def forged(user_id: str, **kwargs: Any) -> None:
+            raise RowSealError(USER_KIND, user_id)
+
+        monkeypatch.setattr(store, "record_login_success", forged)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.session_lost and not out.ok and out.token is None
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        assert await store.list_sessions("u-bob") == [], "the rotated session was left live"
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+        assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
+    finally:
+        await store.close()
+
+
+async def test_a_reread_the_checked_loader_refuses_grants_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The re-read finds a row there that the checked loader refuses, which that loader reports.
+    The re-auth grants nothing, as when the write is refused."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+
+        async def refused(user_id: str) -> _UserLookup:
+            return _UserLookup(None, True)
+
+        real_elevated: Callable[..., Awaitable[Any]] = service._elevated
+
+        async def refuse_after_rotation(*args: Any, **kwargs: Any) -> Any:
+            out = await real_elevated(*args, **kwargs)
+            monkeypatch.setattr(service, "_lookup_user", refused)
+            return out
+
+        monkeypatch.setattr(service, "_elevated", refuse_after_rotation)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.session_lost and not out.ok and out.token is None
+        assert await store.list_sessions("u-bob") == []
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+    finally:
+        await store.close()
+
+
+async def test_a_reread_that_finds_no_row_clears_nothing_and_says_missing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No row at the re-read is an account deleted meanwhile: logged as missing, not as a changed
+    lockout state, and nothing is written."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, _, _ = await _setup(store)
+        decided = await store.get_user("u-bob")
+        assert decided is not None
+
+        async def gone(user_id: str) -> _UserLookup:
+            return _UserLookup(None, False)
+
+        async def never(user_id: str, **kwargs: Any) -> None:
+            raise AssertionError("the clear wrote over an account the re-read did not find")
+
+        monkeypatch.setattr(service, "_lookup_user", gone)
+        monkeypatch.setattr(store, "record_login_success", never)
+        with caplog.at_level(logging.INFO, logger="messagefoundry.auth.service"):
+            assert await service._clear_after_reauth(decided) == "kept"
+        assert "found the account missing" in caplog.text
+        assert "lockout state changed" not in caplog.text
+        assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
     finally:
         await store.close()

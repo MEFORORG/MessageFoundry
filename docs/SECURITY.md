@@ -3767,7 +3767,13 @@ session of the same account can set the second-step lock there, and the passkey 
 no account queue, would then clear it. The re-read does not check the session's expiry either;
 the rotation that follows refuses an expired session, but only after the counters are cleared.
 Closing the window would take store writes conditional on the state the re-read saw, which no leg
-has. The re-read narrows it from the whole proof check to those writes.
+has. The re-read narrows it from the whole proof check to those writes. The password re-auth leg
+has a narrower window of the same kind (BACKLOG #5900): its clear runs once the session has
+rotated, re-reads the account and writes only when no lockout column changed since the proof, but
+only re-proofs take the account's re-proof lock it holds. A failure or lock that the sign-in leg,
+these factor legs or another engine shard writes between that re-read and the write is cleared by
+it. An account record that fails its seal at that re-read or write is reported, the rotated
+session is ended, and the re-auth answers `session_lost`.
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
 (BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP
@@ -7283,7 +7289,14 @@ only as a combined sign-in with both factors right. A session holder reaches it 
 TOTP or recovery code (`verify_mfa`) or a good passkey assertion (`finish_webauthn_assertion`),
 because the sign-in lock refuses neither leg and each success makes that write. Nothing reaches the
 successful-login write under a live second-step lock, which refuses every sign-in and both of those
-legs. A good password re-proof or IdP step-up clears neither lock. At least three routes reach
+legs. A good password re-proof or IdP step-up clears neither lock, with one window: the re-auth
+leg's clear (BACKLOG #5900) waits for the session's rotation, then re-reads the account and skips
+the write when any lockout column changed since the proof. That re-read and write run under the
+account's re-proof lock, which only re-proofs take. At least the sign-in leg, the two factor legs
+and any other engine shard take no such lock, so a lock one of them sets between the re-read and
+the write is cleared by it, as in the factor legs' accepted window under
+[Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753). At
+least three routes reach
 `set_password` while a local account is locked,
 and **each of these issues a new password rather than merely lifting the lock**: the holder's own
 `POST /me/password`, reachable only while they still have a live session (session validation
