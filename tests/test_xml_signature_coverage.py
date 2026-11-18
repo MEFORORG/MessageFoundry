@@ -133,11 +133,22 @@ def test_whitespace_after_the_signature_does_not_cause_a_false_refusal() -> None
     assert result.verified, f"a tail after the signature caused a refusal: {result.reason}"
 
 
-def test_a_comment_the_signature_covers_is_accepted() -> None:
-    """Comments are refused only when the signature excludes them; a with-comments c14n covers them."""
+def test_a_with_comments_signature_over_a_comment_free_body_verifies() -> None:
+    """The positive control for the next test: naming a with-comments c14n is not itself refused."""
+    result = _verify(_sign(_BODY, c14n=_WITH_COMMENTS))
+    assert result.verified, f"a with-comments signature was refused: {result.reason}"
+    assert result.reason is None
+
+
+def test_a_comment_under_a_same_document_reference_is_not_trusted() -> None:
+    """Even a with-comments c14n does not sign a comment under ``URI=""`` or ``URI="#id"``.
+
+    The XMLDSig rule for same-document references omits comments before the transforms run, and
+    signxml 5.3.0 applies it in both its signer and its verifier. So the comment is unsigned, and the
+    comparison against the received document must refuse it.
+    """
     body = b"<Order><!-- synthetic note --><Item>SYNTHETIC-WIDGET</Item></Order>"
-    result = _verify(_sign(body, c14n=_WITH_COMMENTS))
-    assert result.verified, f"a signed comment was refused: {result.reason}"
+    _refused(_verify(_sign(body, c14n=_WITH_COMMENTS)))
 
 
 # --- the refusals ------------------------------------------------------------------------------------
