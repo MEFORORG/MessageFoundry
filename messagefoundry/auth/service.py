@@ -174,6 +174,7 @@ from messagefoundry.store.base import (
     AdminStore,
     audit_write_errors,
     is_store_shape_error,
+    sealed_read_errors,
     store_call_errors,
     store_connect_errors,
     store_open_errors,
@@ -2540,6 +2541,22 @@ def _holds_lockout_state(user: UserRecord) -> bool:
     )
 
 
+def _clear_snapshot(user: UserRecord) -> tuple[object, ...]:
+    """The columns a deferred full-authentication reset must find unchanged before it writes
+    (BACKLOG #5900): the six lockout columns :func:`_holds_lockout_state` reads, and the directory
+    identity the re-proof judged."""
+    return (
+        user.failed_attempts,
+        user.locked_until,
+        user.lock_cycles,
+        user.second_step_failed_attempts,
+        user.second_step_locked_until,
+        user.second_step_lock_cycles,
+        user.directory_object_id,
+        user.auth_provider,
+    )
+
+
 #: How the reconciler reads each directory refusal (ADR 0195 rule item 1). FOUND is absent on
 #: purpose: a found account carries a principal and never reaches this map.
 _REFUSED_OUTCOMES: dict[DirectoryAnswer, reconcile.ProbeOutcome] = {
@@ -2665,8 +2682,9 @@ class _Reproof:
     ``user`` is the row read BEFORE the verify, so ``user.failed_attempts`` is the count as it stood
     at the start of the attempt -- the login leg's ``prior_failures``. ``just_locked`` and
     ``attempts`` come from the one atomic store call; the caller audits its own row first and only
-    then records the lockout, so the order in the trail matches the login leg's. ``cleared`` says a
-    success reset the counter, which happens only at full authentication. ``session_revoked`` says
+    then records the lockout, so the order in the trail matches the login leg's. ``clear_due`` says a
+    success may reset the counter, which happens only at full authentication; the re-auth leg
+    writes the reset only once its rotation succeeds (BACKLOG #5900). ``session_revoked`` says
     this attempt spent the session's re-proof budget; the caller audits it and then revokes the
     session with :meth:`AuthService._revoke_for_budget`."""
 
@@ -2683,7 +2701,7 @@ class _Reproof:
     #: The TOTP verdict that attempt's escalation used (:class:`LockoutIncrement`), carried to the
     #: lock notice too (BACKLOG #3948 finding 16).
     totp_state: TotpState | None = None
-    cleared: bool = False
+    clear_due: bool = False
     #: A closed-set slug for an uncounted directory refusal: at least one that judged no password
     #: (BACKLOG #2027), a row with no id or any :class:`_DirectoryRebind` reason, and one that judged
     #: it right on an account the directory has demoted (``directory_roles_demoted``, #3081), or
@@ -15131,7 +15149,9 @@ class AuthService:
         granted.
 
         ``clear`` marks the re-auth leg, whose success rotates the session: only there does a success
-        reset the session's budget and the account counter. The account counter resets only at FULL
+        reset the session's budget, and decide whether the account counter is due a reset, which the
+        caller writes with :meth:`_clear_after_reauth` once the rotation succeeds (BACKLOG #5900).
+        The account counter resets only at FULL
         authentication (BACKLOG #1638's rule for the login leg): the session must have met its
         second-factor requirement, and no lock may be live. The password-change leg leaves both to
         the change itself, which revokes every session and clears the counter when it commits.
@@ -15417,18 +15437,57 @@ class AuthService:
             return _Reproof(ok=True, user=current)
         # The re-auth leg: a good proof resets this session's budget, and the success rotates it.
         self._reproof_session_failures.pop(token_hash, None)
-        # ADR 0197: neither lock live, and any of the six lockout columns to clear.
-        cleared = (
+        # ADR 0197: neither lock live, and any of the six lockout columns to clear. Decided here,
+        # against the OLD token, before the rotation retires it; written by the caller only once the
+        # rotation succeeds (BACKLOG #5900).
+        clear_due = (
             not locked
             and not current.second_step_locked(now)
             and _holds_lockout_state(current)
             and await self.mfa_satisfied(token)
         )
-        if cleared:
-            await self._store.record_login_success(user.id, now=now)
         # The FRESH row, so the caller's login-after-failures check sees failures other legs added
         # during the verify.
-        return _Reproof(ok=True, user=current, cleared=cleared)
+        return _Reproof(ok=True, user=current, clear_due=clear_due)
+
+    async def _clear_after_reauth(self, decided: UserRecord) -> bool:
+        """Write the full-authentication reset a re-auth's proof found due on ``decided``, once its
+        rotation has succeeded (BACKLOG #5900): a correct password on a session revoked, failing
+        its seal or failing its rotation is no full authentication, so it clears nothing. ``True``
+        when the reset was written.
+
+        The row is read again and the reset is written only when its six lockout columns and its
+        directory identity are still those the proof decided on: a failure, a lock or a re-key
+        another leg wrote since then means this success clears nothing (fail closed). A window
+        remains from that re-read to the reset, which clears unconditionally, as the factor legs'
+        window does (docs/SECURITY.md, *A window remains, and it is accepted*). A refused store
+        call is logged and clears nothing, because the session has already rotated and its new
+        token must still reach the caller."""
+        # A refusal, the user row's seal included; an Unverifiable answer and a defect still raise,
+        # as on every other leg.
+        refusals: tuple[type[Exception], ...] = (
+            *sealed_read_errors(),
+            *store_connect_errors(),
+            RowSealError,
+            RowSealKeyRetiredError,
+            TransitSealUnavailableError,
+        )
+        try:
+            current = await self._load_user(decided.id)
+            if current is None or _clear_snapshot(current) != _clear_snapshot(decided):
+                return False
+            await self._store.record_login_success(decided.id)
+        except refusals as exc:
+            if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                raise
+            _log.warning(
+                "a re-auth of account id %r rotated its session but could not clear the account's "
+                "lockout counters (%s); they stay",
+                decided.id,
+                type(exc).__name__,
+            )
+            return False
+        return True
 
     async def _record_reproof_lockout(
         self, proof: _Reproof, *, client: str | None, audit_detail: dict[str, Any] | None
@@ -15499,7 +15558,7 @@ class AuthService:
             )
             return Elevation(idp_step_up_required=True)
         # The counter-clearing decision is made inside, against the OLD token, before the rotation
-        # below retires it.
+        # below retires it. The clear itself waits for the rotation (BACKLOG #5900).
         proof = await self._reproof(
             identity,
             password,
@@ -15592,6 +15651,14 @@ class AuthService:
         await self._record_reproof_lockout(proof, client=client, audit_detail=provider_detail)
         if proof.session_revoked:
             await self._revoke_for_budget(hash_token(token))
+        # A correct password on a session lost at its stamp or rotation clears nothing and is not
+        # flagged (BACKLOG #5900).
+        cleared = (
+            proof.clear_due
+            and elevation.ok
+            and proof.user is not None
+            and await self._clear_after_reauth(proof.user)
+        )
         # Flagged only on the success that CLEARED the counter. On a session still owing its second
         # factor nothing clears, so flagging there would repeat the row and the notice on every
         # re-auth. That session's clear happens later in verify_mfa, which flags nothing: the gap
@@ -15604,7 +15671,7 @@ class AuthService:
             else 0
         )
         if (
-            proof.cleared
+            cleared
             and proof.user is not None
             and prior_failures >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
         ):
