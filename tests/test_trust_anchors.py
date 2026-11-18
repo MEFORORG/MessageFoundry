@@ -5,9 +5,11 @@ the optional SHA-256 pin, the anchor-changed audit event, and dormant-when-uncon
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -3382,19 +3384,40 @@ def _with_header(pin: Path) -> bytes:
     )
 
 
-#: Each content outcome the store open refuses: (the file, the clock or None, text the warning holds).
+#: Each content outcome the store open refuses: (the file, the clock or None, text the logged
+#: warning holds, the scope its row carries).
 _PIN_OUTCOMES = [
-    pytest.param(_with_header, None, ta.ENCRYPTION_HEADER_SCOPE, id="encryption-header"),
-    pytest.param(_two_certificates, None, "holds 2 certificates", id="multi-cert"),
-    pytest.param(_signing_ca, None, "it is a CA certificate", id="ca-cert"),
-    pytest.param(lambda p: b"not a certificate", None, "it is not a certificate", id="no-cert"),
     pytest.param(
-        lambda p: p.read_bytes() + b"\n" * PIN_FILE_MAX_BYTES, None, "larger than", id="oversize"
+        _with_header, None, ta.ENCRYPTION_HEADER_SCOPE, "encryption_header", id="encryption-header"
     ),
     pytest.param(
-        lambda p: p.read_bytes(), 10.0**10, "the pinned certificate expired at", id="expired"
+        _two_certificates, None, "holds 2 certificates", "certificate_count", id="multi-cert"
     ),
-    pytest.param(lambda p: p.read_bytes(), 0.0, "is not valid until", id="not-yet-valid"),
+    pytest.param(_signing_ca, None, "it is a CA certificate", "ca_certificate", id="ca-cert"),
+    pytest.param(
+        lambda p: b"not a certificate",
+        None,
+        "it is not a certificate",
+        "not_a_certificate",
+        id="no-cert",
+    ),
+    pytest.param(
+        lambda p: p.read_bytes() + b"\n" * PIN_FILE_MAX_BYTES,
+        None,
+        "larger than",
+        "oversize",
+        id="oversize",
+    ),
+    pytest.param(
+        lambda p: p.read_bytes(),
+        10.0**10,
+        "the pinned certificate expired at",
+        "expired",
+        id="expired",
+    ),
+    pytest.param(
+        lambda p: p.read_bytes(), 0.0, "is not valid until", "not_yet_valid", id="not-yet-valid"
+    ),
 ]
 
 
@@ -3403,14 +3426,16 @@ def _warning_rows(rows: list[dict]) -> list[dict]:
 
 
 @pytest.mark.parametrize("route", _ROUTES)
-@pytest.mark.parametrize(("shape", "moment", "warning"), _PIN_OUTCOMES)
+@pytest.mark.parametrize(("shape", "moment", "warning", "scope"), _PIN_OUTCOMES)
 async def test_a_store_pin_content_problem_warns_on_every_reload_route(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     route: Any,
     shape: Any,
     moment: float | None,
     warning: str,
+    scope: str,
 ) -> None:
     """Vault BACKLOG #3714, the Manager's ruling on review finding R1-2: at a reload, a convergence
     reload or a DR activation, a pin the store open would refuse warns with one
@@ -3428,11 +3453,13 @@ async def test_a_store_pin_content_problem_warns_on_every_reload_route(
         pin.write_bytes(shape(pin))
         if moment is not None:
             monkeypatch.setattr(ta, "_clock", lambda: moment)
-        for _retry in range(3):
-            await route(engine, cfg)  # nothing raised
+        with caplog.at_level(logging.WARNING, logger=ta.log.name):
+            for _retry in range(3):
+                await route(engine, cfg)  # nothing raised
         rows = await _rows(engine.store, "store_sqlserver_pin")
         (row,) = _warning_rows(rows)
-        assert warning in row["reason"] and "[store].ssl_root_cert" in row["reason"]
+        assert row["reason"] == scope  # the check's name, never the path or the warning's text
+        assert any(warning in m and "[store].ssl_root_cert" in m for m in caplog.messages)
         assert "pem_refused" not in [r["event"] for r in rows]
     finally:
         await engine.stop()
@@ -3577,10 +3604,7 @@ async def test_an_oversized_store_pin_warns_with_its_row_from_a_whole_read(
     assert await run_anchor_preflight(specs, store, enforcing=True)
     assert reads == [pin.stat().st_size]  # the whole file, not the pin's cap
     (row,) = _warning_rows(await _rows(store, "store_sqlserver_pin"))
-    assert row["reason"].startswith(
-        f"[store].ssl_root_cert {str(pin)!r} is not a usable SQL Server pin: it is larger than "
-        f"{pki.PIN_FILE_MAX_BYTES} bytes"
-    )
+    assert row["reason"] == "oversize"
 
 
 def _padded_pin(tmp_path: Path) -> tuple[Path, list[AnchorSpec]]:
@@ -3651,8 +3675,9 @@ async def test_an_oversized_postgres_store_ca_is_refused_with_its_row(
         TrustAnchorError, match=f"is larger than {ta.POSTGRES_CA_MAX_BYTES} bytes"
     ) as err:
         await run_anchor_preflight(specs, store, enforcing=True)
+    assert err.value.scope == "oversize"
     (row,) = [r for r in await _rows(store, "store_postgres_ca") if r["event"] == "pem_refused"]
-    assert row["reason"] == str(err.value)
+    assert row["reason"] == "oversize"
 
 
 async def test_a_postgres_store_ca_bundle_past_the_pin_cap_still_passes(
@@ -3793,12 +3818,12 @@ def test_a_bounded_read_reads_past_an_understated_size_up_to_the_limit(
     assert ta.read_if_regular(str(grown), 20) == b"y" * 20  # the limit still applies
 
 
-async def test_a_pem_refused_row_carries_the_refusal(
+async def test_a_pem_refused_row_carries_the_refusal_scope(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vault BACKLOG #4569 finding 6: the ``pem_refused`` row says which content check refused the
-    file, as the raised refusal does, and never the key block's body. Red under: ``reason`` dropped
-    from the row."""
+    """Vault BACKLOG #4569 finding 6, #3714: the ``pem_refused`` row says which content check
+    refused the file, as a fixed scope word, and never the refusal's text, which names the path,
+    or the key block's body. Red under: ``reason`` dropped from the row, or set to the text."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     ca = _sqlserver_pin(tmp_path)
@@ -3807,9 +3832,59 @@ async def test_a_pem_refused_row_carries_the_refusal(
     with pytest.raises(TrustAnchorError) as err:
         await run_anchor_preflight(specs, store, enforcing=True)
     (row,) = [r for r in await _rows(store, "store_postgres_ca") if r["event"] == "pem_refused"]
-    assert row["reason"] == str(err.value)
-    assert ta.PRIVATE_KEY_SCOPE in row["reason"]
-    assert _KEY_BODY_MARKER not in row["reason"]
+    assert ta.PRIVATE_KEY_SCOPE in str(err.value)  # the raised refusal keeps its text
+    assert row["reason"] == err.value.scope == "private_key"
+    assert _KEY_BODY_MARKER not in json.dumps(row)
+
+
+@pytest.mark.parametrize(
+    ("backend", "label", "content"),
+    [
+        (
+            "postgres",
+            "store_postgres_ca",
+            lambda p: p.read_bytes() + b"\n" * ta.POSTGRES_CA_MAX_BYTES,
+        ),
+        (
+            "postgres",
+            "store_postgres_ca",
+            lambda p: p.read_bytes() + _marked_key_block("PRIVATE" + " KEY"),
+        ),
+        ("sqlserver", "store_sqlserver_pin", _two_certificates),
+        (
+            "sqlserver",
+            "store_sqlserver_pin",
+            lambda p: p.read_bytes() + _marked_key_block("PRIVATE" + " KEY"),
+        ),
+    ],
+    ids=["pg-oversize", "pg-key", "pin-warning", "pin-key"],
+)
+async def test_no_content_row_carries_the_anchor_path(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    label: str,
+    content: Any,
+) -> None:
+    """Vault BACKLOG #3714: a ``pem_refused`` or ``pin_content_warning`` row carries the check's
+    scope, never the anchor's path or the TLS library's text. Red under: the row's ``reason`` set
+    to the refusal's or the warning's text, which names the path."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    anchor = _sqlserver_pin(tmp_path)
+    specs = _store_specs(backend=backend, ssl_root_cert=str(anchor))
+    anchor.write_bytes(content(anchor))
+    with contextlib.suppress(TrustAnchorError):  # refused or warned: the rows are what it reads
+        await run_anchor_preflight(specs, store, enforcing=True)
+    rows = [
+        r for r in await _rows(store, label) if r["event"] in ("pem_refused", "pin_content_warning")
+    ]
+    assert rows  # the control: a content row was written
+    for row in rows:
+        text = json.dumps(row)
+        assert str(anchor) not in text and json.dumps(str(anchor))[1:-1] not in text
+        assert anchor.name not in text
 
 
 def test_a_server_pin_spec_must_be_read_by_path() -> None:

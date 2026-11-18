@@ -242,7 +242,7 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     PEM label refuses, with a ``pem_refused`` row (BACKLOG #3745). Other content problems the
     store open would refuse, the pin's size and validity period included
     (:func:`_server_pin_warning`), **warn and do not refuse**: a WARNING and a
-    ``pin_content_warning`` row whose ``reason`` is the warning. A repeat with unchanged
+    ``pin_content_warning`` row whose ``reason`` names the check. A repeat with unchanged
     fingerprint and outcome writes no further row (:data:`_STORE_CONTENT_RECORDED`). ACL, path
     and unreadable findings behave as for every anchor (items 1, 3 and 4; the spec has no pin).
     The store open refuses as before. At ``warn`` the start logs the pin's ACL or path warning
@@ -337,6 +337,7 @@ if TYPE_CHECKING:
         TlsSettings,
     )
     from messagefoundry.config.wiring import Registry, WiringError
+    from messagefoundry.pki import PinReason
     from messagefoundry.store.base import Store
 
 log = logging.getLogger(__name__)
@@ -350,9 +351,9 @@ log = logging.getLogger(__name__)
 #: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025; and,
 #: since BACKLOG #3745, a file naming a private-key label, which the TLS library would load, on
 #: every anchor; at least the other refusals of :func:`_refuse_by_path_content` write it too; its
-#: ``reason`` is the refusal's text, vault BACKLOG #4569), ``pin_content_warning`` (a SQL Server
+#: ``reason`` is the refusal's :attr:`TrustAnchorError.scope`, vault BACKLOG #4569, #3714), ``pin_content_warning`` (a SQL Server
 #: pin the store open would refuse, found by a settings check, which warns and does not refuse;
-#: its ``reason`` is the warning; module item 11, vault BACKLOG #3714), and
+#: its ``reason`` is the warning's ``scope``; module item 11, vault BACKLOG #3714), and
 #: ``restart_required`` (a reload found a settings anchor whose bytes differ from the ones its
 #: consumer loaded, BACKLOG #2185).
 AUDIT_ACTION = "auth.trust_anchor"
@@ -382,14 +383,25 @@ class TrustAnchorError(Exception):
 
     ``fixed_text`` is True for a message built from fixed words, a connection's name and a
     setting key, never from a refusal's own text, such as a lane's status line. A caller may then
-    keep more of it than its usual length limit (vault BACKLOG #3498)."""
+    keep more of it than its usual length limit (vault BACKLOG #3498).
+
+    ``scope`` is a fixed word naming the content check that refused, such as ``private_key``, set
+    by those checks. A ``pem_refused`` row carries it in place of the refusal's text, which names
+    the path (vault BACKLOG #3714). ``None`` for any other refusal."""
 
     unaudited: bool = False
 
-    def __init__(self, *args: object, setting: str | None = None, fixed_text: bool = False) -> None:
+    def __init__(
+        self,
+        *args: object,
+        setting: str | None = None,
+        fixed_text: bool = False,
+        scope: str | None = None,
+    ) -> None:
         super().__init__(*args)
         self.setting = setting
         self.fixed_text = fixed_text
+        self.scope = scope
 
 
 class AnchorSettingRefused(ValueError):
@@ -691,11 +703,12 @@ def _refuse_a_private_key(data: bytes, spec: AnchorSpec) -> None:
             f"{spec.setting}: the trust anchor {spec.path!r} {PRIVATE_KEY_SCOPE}. A trust anchor "
             "is public trust material and needs only certificate blocks, so a private key, "
             "encrypted or not, does not belong in it. Move the key to its own file, readable only "
-            "by the account that uses it, and keep only the CA certificates here"
+            "by the account that uses it, and keep only the CA certificates here",
+            scope="private_key",
         )
 
 
-def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> str | None:
+def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> PinReason | None:
     """The content checks of an anchor its hop reads by path (``loads_verified_bytes`` False):
     the encryption-header refusal when ``spec`` asks for it (module item 12), then the private-key
     refusal (BACKLOG #3745), in the order the DATABASE build runs them. A spec with ``max_bytes``
@@ -710,13 +723,15 @@ def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> str | None:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} is larger than {spec.max_bytes} "
             "bytes, so the engine does not read it whole. A CA bundle needs only its CA "
-            "certificates; name a file holding only those"
+            "certificates; name a file holding only those",
+            scope="oversize",
         )
     if spec.refuses_encryption_header and has_encryption_header_bytes(data):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. Its hop "
             "hands it to a driver that loads it with its own TLS library, which can wait for a "
-            "password on an encrypted block. Keep only the CA certificates here"
+            "password on an encrypted block. Keep only the CA certificates here",
+            scope="encryption_header",
         )
     _refuse_a_private_key(data, spec)
     return None
@@ -726,30 +741,32 @@ def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> str | None:
 _clock: Callable[[], float] = time.time
 
 
-def _server_pin_warning(data: bytes, spec: AnchorSpec) -> str | None:
+def _server_pin_warning(data: bytes, spec: AnchorSpec) -> PinReason | None:
     """Why the store open would refuse these SQL Server pin bytes, as a warning, or ``None`` when
     it would take them (vault BACKLOG #3714, module item 11). It runs the store open's checks:
     :func:`~messagefoundry.pki.pinned_server_certificate`, then the validity period at
     :data:`_clock`, where notAfter itself still counts as valid. A ``MemoryError`` is raised, not
-    returned, since it is no verdict on the file."""
-    from messagefoundry.pki import pinned_server_certificate  # lazy: pki loads cryptography
+    returned, since it is no verdict on the file. The warning's ``scope`` names the check."""
+    # lazy: pki loads cryptography
+    from messagefoundry.pki import PinReason, pinned_server_certificate
 
     cert = pinned_server_certificate(data, raise_memory_error=True)
-    if isinstance(cert, str):
-        return f"{spec.setting} {spec.path!r} {cert}."
+    if isinstance(cert, PinReason):
+        return PinReason(f"{spec.setting} {spec.path!r} {cert}.", cert.scope)
     moment = _clock()
     not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
     if moment > not_after.timestamp():
-        return (
+        return PinReason(
             f"{spec.setting} {spec.path!r}: the pinned certificate expired at "
-            f"{log_timestamp(not_after)}. Pin the server's "
-            "renewed certificate."
+            f"{log_timestamp(not_after)}. Pin the server's renewed certificate.",
+            "expired",
         )
     if moment < not_before.timestamp():
-        return (
+        return PinReason(
             f"{spec.setting} {spec.path!r}: the pinned certificate is not valid until "
             f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). A store open "
-            "before that date refuses it."
+            "before that date refuses it.",
+            "not_yet_valid",
         )
     return None
 
@@ -758,8 +775,8 @@ def _server_pin_warning(data: bytes, spec: AnchorSpec) -> str | None:
 _STORE_ANCHOR_LABELS = frozenset({"store_sqlserver_pin", "store_postgres_ca"})
 
 #: The last content outcome audited for each store anchor, keyed by label and path: the
-#: fingerprint of the bytes read and the outcome's text, a ``pin_content_warning`` or
-#: ``pem_refused`` reason. A check whose fingerprint and outcome both match it writes no further
+#: fingerprint of the bytes read and the full text of the warning or refusal its row was
+#: written for. A check whose fingerprint and outcome both match it writes no further
 #: row for that outcome, so retries, such as a convergence retry's, add no content row; their
 #: ACL and path rows are still written (module item 11).
 _STORE_CONTENT_RECORDED: dict[tuple[str, str], tuple[str, str]] = {}
@@ -860,7 +877,8 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
                 "discards its trust settings, so confirm the CA should be trusted without them. "
                 "The engine does not load such a block. Remove a comment that names the marker, "
                 "or convert: openssl x509 -in <one cert> -out <plain.pem> writes one plain "
-                "CERTIFICATE block per run"
+                "CERTIFICATE block per run",
+                scope="trusted_certificate",
             )
         if line.startswith(_PEM_BEGIN):
             blocks += 1
@@ -879,7 +897,8 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     if not blocks:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} holds no PEM block, so it names no "
-            "certificate to trust"
+            "certificate to trust",
+            scope="no_pem_block",
         )
     joined = b"".join(kept)
     if has_encryption_header_bytes(joined):
@@ -889,7 +908,8 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "format. A trust anchor needs only plain "
             "CERTIFICATE blocks, and loading an encrypted one can make the TLS library wait for a "
             "password. Remove the encrypted block and any comment that names one of those headers, "
-            "or export the CA certificate as a plain CERTIFICATE block"
+            "or export the CA certificate as a plain CERTIFICATE block",
+            scope="encryption_header",
         )
     _refuse_a_private_key(data, spec)
     try:
@@ -898,7 +918,8 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
             "block, or on or below a line holding a -----BEGIN and above the next -----END line. "
-            "Remove that byte, or the -----BEGIN text if that line is a comment"
+            "Remove that byte, or the -----BEGIN text if that line is a comment",
+            scope="non_ascii",
         ) from exc
     try:
         ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
@@ -908,7 +929,8 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             f"{spec.setting}: the TLS library cannot load the trust anchor {spec.path!r} ({why}). "
             "Every PEM block in it must be well-formed, and at least one must be a plain "
             "CERTIFICATE block. A file holding only a CRL names no certificate to trust; a hop "
-            "that checks revocation reads its CRL from its own CRL setting"
+            "that checks revocation reads its CRL from its own CRL setting",
+            scope="unloadable",
         ) from exc
     return text
 
@@ -2553,7 +2575,7 @@ async def _audit_verdict(
     enforcing: bool,
     pin_escapes: bool,
     shape_error: TrustAnchorError | None,
-    pin_warning: str | None = None,
+    pin_warning: PinReason | None = None,
 ) -> None:
     """The audit rows :func:`_preflight_one` writes for ``verdict``, before it enforces.
     ``pin_warning`` is a SQL Server pin's warning to write as a ``pin_content_warning`` row, or
@@ -2624,12 +2646,15 @@ async def _audit_verdict(
             ],
             **extra,
         )
+    # A content row's reason is the fixed word naming the check (vault BACKLOG #4569, #3714),
+    # never the refusal's or warning's text, which names the path and may carry the TLS library's
+    # words; the start or reload raises or logs that text.
     if shape_error is not None:
-        # The refusal's own text, which the start or reload raises too, so the row says which
-        # content check refused the file (vault BACKLOG #4569).
-        await record("pem_refused", fingerprint=verdict.fingerprint, reason=str(shape_error))
+        reason = shape_error.scope or "content"
+        await record("pem_refused", fingerprint=verdict.fingerprint, reason=reason)
     if pin_warning is not None:
-        await record("pin_content_warning", fingerprint=verdict.fingerprint, reason=pin_warning)
+        scope = pin_warning.scope
+        await record("pin_content_warning", fingerprint=verdict.fingerprint, reason=scope)
     if faults:
         raise faults[0]
 
@@ -2698,7 +2723,7 @@ async def _preflight_checks(
 ) -> str:
     """The body of :func:`_preflight_one`, whose docstring says what it checks."""
     shape_error: TrustAnchorError | None = None
-    pin_warning: str | None = None  # why the store open would refuse a SQL Server pin (item 11)
+    pin_warning: PinReason | None = None  # why the store open would refuse a pin (item 11)
     try:
         if verdict is None:
             verdict = await asyncio.to_thread(evaluate_anchor, spec)
