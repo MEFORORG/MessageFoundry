@@ -3,8 +3,8 @@
 """The CRL-credit rule the outbound revocation guards read (vault BACKLOG #4912, #2977 item 11).
 
 ``crl_no_credit`` in ``config/tls_policy.py`` is that rule, and ``crl_credited`` its yes-or-no
-form: the context verifies the peer (``verify_mode`` is not ``CERT_NONE``), does not skip
-validity-period checks, and consults a CRL.
+form: the context's ``verify_mode`` is not ``CERT_NONE``, it does not skip validity-period
+checks, and it consults a CRL.
 At least ``RevocationHopGuard.capture`` and the Vault and proxy legs in
 ``transports/strict_requests.py`` read it; until this change those two legs read
 ``context_checks_revocation`` alone. The leg tests below hand each leg a relaxed context. The guard
@@ -476,7 +476,7 @@ def test_only_the_rule_reads_the_crl_flag_alone() -> None:
     assert _POLICY in scanned, scanned
     assert not reads, (
         f"{_NAME} read outside {_RULE}: {reads}. A guard that credits a CRL reads {_RULE}, which "
-        "also refuses the credit on a context that does not verify the peer or one that skips "
+        "also refuses the credit on a context whose verify_mode is CERT_NONE or one that skips "
         "validity-period checks (ADR 0173 §4.3)."
     )
 

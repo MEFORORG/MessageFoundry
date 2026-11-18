@@ -351,7 +351,7 @@ def _refuse_an_unrevoked_ai_hop(
     if no_credit is CrlNoCredit.PEER_NOT_VERIFIED:
         detail = (
             f"{sent} whose TLS context does not verify the peer (verify_mode is CERT_NONE), and "
-            "the guard credits a revocation check only on a context that does"
+            "the guard credits no revocation check on such a context"
         )
     elif no_credit is CrlNoCredit.EXPIRY_RELAXED:
         # A CRL on such a context still refuses a leaf it lists, so "NO revocation checking"

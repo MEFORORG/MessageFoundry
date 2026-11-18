@@ -2803,7 +2803,7 @@ _EXPIRY_RELAXED_CROSSING = (
 #: (:attr:`CrlNoCredit.PEER_NOT_VERIFIED`). It does not call the peer certificate verified.
 _PEER_NOT_VERIFIED_NO_CHECK = (
     "this hop's TLS context does not verify the peer (verify_mode is CERT_NONE), and the guard "
-    "credits a revocation check only on a context that does (ASVS 12.1.4, ADR 0173)."
+    "credits no revocation check on such a context (ASVS 12.1.4, ADR 0173)."
 )
 
 #: The attested crossing's lead on such a hop.
