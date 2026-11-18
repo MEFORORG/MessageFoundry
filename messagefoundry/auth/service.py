@@ -199,6 +199,7 @@ from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
     AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION,
+    LOCKOUT_COLUMNS,
     LOGIN_ADDRESS_RESET_MARKER,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -2543,18 +2544,21 @@ def _holds_lockout_state(user: UserRecord) -> bool:
 
 def _clear_snapshot(user: UserRecord) -> tuple[object, ...]:
     """The columns a deferred full-authentication reset must find unchanged before it writes
-    (BACKLOG #5900): the six lockout columns :func:`_holds_lockout_state` reads, and the directory
-    identity the re-proof judged."""
-    return (
-        user.failed_attempts,
-        user.locked_until,
-        user.lock_cycles,
-        user.second_step_failed_attempts,
-        user.second_step_locked_until,
-        user.second_step_lock_cycles,
-        user.directory_object_id,
-        user.auth_provider,
-    )
+    (BACKLOG #5900): both counters' lockout columns, the directory identity the re-proof judged,
+    and whether the account is enabled."""
+    lockout = tuple(getattr(user, col) for cols in LOCKOUT_COLUMNS.values() for col in cols)
+    return (*lockout, user.directory_object_id, user.auth_provider, user.disabled)
+
+
+#: The seal answers a post-rotation lockout reset logs and answers rather than raises
+#: (:meth:`AuthService._clear_after_reauth`, BACKLOG #5900), beside the store's refusal sets.
+_REAUTH_CLEAR_REFUSALS: tuple[type[Exception], ...] = (
+    RowSealError,
+    RowSealKeyRetiredError,
+    RowSealUnverifiableError,
+    TransitSealUnavailableError,
+    TransitSealUnverifiableError,
+)
 
 
 #: How the reconciler reads each directory refusal (ADR 0195 rule item 1). FOUND is absent on
@@ -15452,37 +15456,45 @@ class AuthService:
 
     async def _clear_after_reauth(self, decided: UserRecord) -> bool:
         """Write the full-authentication reset a re-auth's proof found due on ``decided``, once its
-        rotation has succeeded (BACKLOG #5900): a correct password on a session revoked, failing
-        its seal or failing its rotation is no full authentication, so it clears nothing. ``True``
-        when the reset was written.
+        rotation has succeeded (BACKLOG #5900). A correct password on a session the ceremony lost,
+        at least one revoked underneath it, one whose stamp failed its seal and one whose rotation
+        failed, is no full authentication, so it clears nothing. ``True`` when the reset was
+        written.
 
-        The row is read again and the reset is written only when its six lockout columns and its
-        directory identity are still those the proof decided on: a failure, a lock or a re-key
-        another leg wrote since then means this success clears nothing (fail closed). A window
-        remains from that re-read to the reset, which clears unconditionally, as the factor legs'
-        window does (docs/SECURITY.md, *A window remains, and it is accepted*). A refused store
-        call is logged and clears nothing, because the session has already rotated and its new
-        token must still reach the caller."""
-        # A refusal, the user row's seal included; an Unverifiable answer and a defect still raise,
-        # as on every other leg.
-        refusals: tuple[type[Exception], ...] = (
+        Under the account's re-proof lock, as the decision was, so a re-proof on another session of
+        the account cannot charge a failure between the re-read and the reset, nor clear the same
+        run twice. The row is read again and the reset is written only when the columns
+        :func:`_clear_snapshot` names are still those the proof decided on: a failure, a lock, a
+        re-key or a disable another leg wrote since then means this success clears nothing (fail
+        closed). Legs that take no such lock, at least the sign-in leg and the second-factor
+        legs, can still write between the re-read and the reset, which clears unconditionally, as
+        on the factor legs (docs/SECURITY.md, *A window remains, and it is accepted*).
+
+        A store refusal or an Unverifiable answer is logged and answered False, because the session
+        has already rotated and its new token must still reach the caller. A refusal raised after
+        the reset committed leaves the counters cleared with no ``auth.login_after_failures`` row;
+        the log line says the reset may not have landed. A defect still raises."""
+        try:
+            async with self._account_reproof_lock(decided.id):
+                current = await self._load_user(decided.id)
+                if current is None or _clear_snapshot(current) != _clear_snapshot(decided):
+                    _log.info(
+                        "a re-auth of account id %r found its lockout state changed since its "
+                        "proof, so it cleared nothing",
+                        decided.id,
+                    )
+                    return False
+                await self._store.record_login_success(decided.id)
+        except (
             *sealed_read_errors(),
             *store_connect_errors(),
-            RowSealError,
-            RowSealKeyRetiredError,
-            TransitSealUnavailableError,
-        )
-        try:
-            current = await self._load_user(decided.id)
-            if current is None or _clear_snapshot(current) != _clear_snapshot(decided):
-                return False
-            await self._store.record_login_success(decided.id)
-        except refusals as exc:
+            *_REAUTH_CLEAR_REFUSALS,
+        ) as exc:
             if isinstance(exc, AUDIT_WRITE_DEFECTS):
                 raise
             _log.warning(
-                "a re-auth of account id %r rotated its session but could not clear the account's "
-                "lockout counters (%s); they stay",
+                "a re-auth of account id %r rotated its session, but its lockout reset was refused "
+                "(%s) and may not have landed",
                 decided.id,
                 type(exc).__name__,
             )
@@ -15536,8 +15548,10 @@ class AuthService:
         at most ``lockout_threshold`` re-proofs before it is revoked (BACKLOG #1138).** See
         :meth:`_reproof`. Neither account lock refuses this. A revoked session answers
         ``session_lost``. A success clears the counter only when the session has met its
-        second-factor requirement and no lock is live (BACKLOG #1638's rule for the login leg), and a
-        success that clears a run of failures is labelled ``auth.login_after_failures``."""
+        second-factor requirement and no lock is live (BACKLOG #1638's rule for the login leg), and
+        only once its rotation succeeded and the account's lockout state is still what the proof
+        saw (:meth:`_clear_after_reauth`, BACKLOG #5900). A success that clears a run of failures is
+        labelled ``auth.login_after_failures``."""
         if await self.session_steps_up_at_idp(token):
             # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at the
             # IdP and NEVER by a password. Refused before any verify, so the password is not sent to
@@ -15653,12 +15667,9 @@ class AuthService:
             await self._revoke_for_budget(hash_token(token))
         # A correct password on a session lost at its stamp or rotation clears nothing and is not
         # flagged (BACKLOG #5900).
-        cleared = (
-            proof.clear_due
-            and elevation.ok
-            and proof.user is not None
-            and await self._clear_after_reauth(proof.user)
-        )
+        cleared = False
+        if proof.clear_due and elevation.ok and proof.user is not None:
+            cleared = await self._clear_after_reauth(proof.user)
         # Flagged only on the success that CLEARED the counter. On a session still owing its second
         # factor nothing clears, so flagging there would repeat the row and the notice on every
         # re-auth. That session's clear happens later in verify_mfa, which flags nothing: the gap

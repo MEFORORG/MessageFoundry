@@ -15,6 +15,7 @@ All credentials here are synthetic.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -192,5 +193,41 @@ async def test_a_refused_clear_after_the_rotation_still_hands_back_the_new_token
         assert out.ok and out.token is not None
         user = await store.get_user("u-bob")
         assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+    finally:
+        await store.close()
+
+
+async def test_two_concurrent_correct_reauths_flag_one_run_of_failures_once() -> None:
+    """Both proofs decide the clear against the same row, so the deferred clears are serialized and
+    the second finds the row changed: one reset, one ``auth.login_after_failures`` row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+        second = await service.login("bob", GOOD, client="10.0.0.8")
+        assert second.ok and second.identity is not None and second.token is not None
+        # The second sign-in cleared the run, so plant it again on the shared row.
+        await store.record_login_failure(
+            "u-bob", failed_attempts=SUSPICIOUS_LOGIN_FAILURE_THRESHOLD, locked_until=None
+        )
+        # That sign-in flagged the run it cleared; count only what the re-auths add.
+        flagged_before = len(
+            [
+                e
+                for e in await service.security_events_for("bob")
+                if e["action"] == "auth.login_after_failures"
+            ]
+        )
+        notices_before = len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES])
+        outs = await asyncio.gather(
+            service.reauth(identity, GOOD, token=token),
+            service.reauth(second.identity, GOOD, token=second.token),
+        )
+        assert all(o.ok for o in outs)
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == 0
+        feed = await service.security_events_for("bob")
+        flagged = len([e for e in feed if e["action"] == "auth.login_after_failures"])
+        notices = len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES])
+        assert (flagged - flagged_before, notices - notices_before) == (1, 1)
     finally:
         await store.close()
