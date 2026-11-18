@@ -1085,10 +1085,6 @@ class FhirDestination(DestinationConnector):
         if scheme not in ("http", "https"):
             raise ValueError(f"FHIR destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "FHIR destination 'url'")
-        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, as a
-        # bad conditional_query does, rather than every message at send time. Before any hop gate,
-        # so none audits a crossing for a connection that never builds (#5529).
-        refuse_unsendable_static_request(url, self._build_headers(s), setting="FHIR destination")
         self.base_url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("FHIR", config.name)
@@ -1204,6 +1200,21 @@ class FhirDestination(DestinationConnector):
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, as a
+        # bad conditional_query does, rather than every message at send time. Before any hop gate,
+        # so none audits a crossing for a connection that never builds (#5529). A static
+        # conditional that a wrapped update moves into the Bundle entry (#1965, below) is JSON
+        # there, never an HTTP header, so it is not judged by the header rules.
+        wrapped = self._is_update and not self._path_form
+        refuse_unsendable_static_request(
+            url,
+            {
+                name: value
+                for name, value in self._build_headers(s).items()
+                if not (wrapped and name.lower() in _ENTRY_CONDITIONAL_FIELDS)
+            },
+            setting="FHIR destination",
+        )
         self._proxy: ProxyConfig | None = egress_route_from_settings(
             s,
             dest_scheme=scheme,
