@@ -3643,6 +3643,31 @@ def test_an_inbounds_lift_re_arms_its_stopped_pooled_lane_unless_rows_are_in_fli
     assert (("inbound", INBOUND) in runner._stop_held) is in_flight
 
 
+def test_an_inbounds_lift_keeps_the_shared_hold_while_a_sibling_lane_holds_rows(
+    store: MessageStore,
+) -> None:
+    # BACKLOG #5704 review: one ("inbound", name) hold covers every internal stage. When the lift
+    # keeps one stage STOPPED for its rows in flight, re-arming a sibling must not release that
+    # hold, or a later window open brings the listener up over the kept lane (BACKLOG #2072).
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    phase = stage_dispatcher._LanePhase
+    for stage in (Stage.INGRESS, Stage.ROUTED):
+        d = runner._make_dispatcher(stage)
+        runner._dispatchers[stage] = d
+        d.mark_ready(INBOUND)
+        d._states[INBOUND].phase = phase.STOPPED
+    runner._dispatchers[Stage.ROUTED]._states[INBOUND].unlanded = True
+    runner._hold_for_operator(INBOUND, "inbound", Stage.ROUTED)
+    runner._log_halted.add(INBOUND)
+
+    runner._lift_log_halt(INBOUND)
+
+    assert not runner._dispatchers[Stage.INGRESS].stopped(INBOUND)
+    assert runner._dispatchers[Stage.ROUTED].stopped(INBOUND)
+    assert ("inbound", INBOUND) in runner._stop_held
+
+
 async def test_a_per_lane_hand_back_whose_release_fails_re_pends_the_batch_and_goes_on(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

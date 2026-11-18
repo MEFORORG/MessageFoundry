@@ -313,8 +313,9 @@ class _LaneState:
     # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
     # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
     claimer_deaths: int = 0
-    # BACKLOG #5704: the lane's last episode ended with claimed rows whose re-pend did not land, so
-    # they are still in flight. Read through :meth:`StageDispatcher.stopped_holding_rows`.
+    # BACKLOG #5704: the STOP that set this lane STOPPED left claimed rows whose re-pend did not
+    # land, so they are still in flight. Written by _to_stopped, read through
+    # StageDispatcher.stopped_holding_rows only while the lane is STOPPED.
     unlanded: bool = False
 
 
@@ -1575,8 +1576,6 @@ class StageDispatcher:
         if st is None:  # torn down under us: stop() already returned every slot, nothing to book
             return
         self._release_lane_slot(st)
-        # Whether this episode ended holding rows in flight, read only if it ends STOPPED.
-        st.unlanded = bool(unlanded)
         # Consume the stamp UNCONDITIONALLY: whichever branch runs below, this episode is over, and a
         # stamp that survived it could be mis-booked onto the lane's NEXT episode.
         _episode_start_ns = st.episode_start_ns
@@ -1615,6 +1614,7 @@ class StageDispatcher:
             if exhausted:
                 # _apply_retry adds this fault, which reaches infra_fault_stop_after.
                 st.infra_error_streak = max(st.infra_error_streak, self._infra_fault_stop_after - 1)
+            st.unlanded = bool(unlanded)  # what a T17 STOP in _apply_retry records
             self._apply_retry(lane, st, outcome)
         else:  # T16 STOP (content-policy STOP — the InternalErrorPolicy path, untouched by ADR 0070)
             # S_lane DROP: a STOPped lane rendered no completed service either. Occupancy.
@@ -1634,7 +1634,9 @@ class StageDispatcher:
             if not unlanded and self._stop_voided(lane):
                 self._to_ready(lane, woken=True)  # as the reload's notify_work would have
             else:
-                self._to_stopped(lane, st, f"{self._stage.value} lane stopped")
+                self._to_stopped(
+                    lane, st, f"{self._stage.value} lane stopped", unlanded=bool(unlanded)
+                )
 
     def _apply_retry(self, lane: str, st: _LaneState, outcome: _LaneOutcome) -> None:
         """Apply a RETRY outcome under the ADR 0070 infra-fault bound (fix B). A T17 zero-progress
@@ -1659,6 +1661,7 @@ class StageDispatcher:
                     st,
                     f"{self._stage.value} lane stopped after {st.infra_error_streak} consecutive "
                     f"infra faults (ADR 0070 T17)",
+                    unlanded=st.unlanded,
                 )
                 self._report_own_stop(lane)
                 return
@@ -1945,12 +1948,16 @@ class StageDispatcher:
         st.gated = False
         self._fire_paused(lane)
 
-    def _to_stopped(self, lane: str, st: _LaneState, detail: str) -> None:
-        """STOP a lane and raise ``connection_stopped``. Re-armed only by reload, ``resume_lane``
+    def _to_stopped(
+        self, lane: str, st: _LaneState, detail: str, *, unlanded: bool = False
+    ) -> None:
+        """STOP a lane and raise ``connection_stopped``. ``unlanded`` records whether this STOP
+        left claimed rows in flight (:meth:`stopped_holding_rows`). Re-armed only by reload, ``resume_lane``
         (#5700) or ``notify_work`` (:meth:`_unpark`), never by a wake or the sweep. The phase is set first and
         a raising sink is logged, not propagated, as the runner guards the same call: a stop must
         not also kill the claimer or serializer that reached it."""
         st.phase = _LanePhase.STOPPED
+        st.unlanded = unlanded
         try:
             self._alert_sink.connection_stopped(lane, detail=detail)
         except Exception:  # noqa: BLE001 — an alert failure must not undo or escalate the stop
