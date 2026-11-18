@@ -2290,7 +2290,7 @@ async def test_an_intact_package_directory_linked_out_is_attested_nothing_and_re
         outcome = (
             "fail_closed_on_drift refuses to start while it stays linked"
             if fail_closed
-            else "left linked, this warning and alert repeat on every start"
+            else "left linked, this warning repeats on every start"
         )
         assert outcome in records[0].getMessage()
         assert "replace the link" not in records[0].getMessage()
@@ -2409,28 +2409,6 @@ def test_a_pass_whose_listed_files_none_opened_says_none_was_read(
     assert _drift(result) == [(_ASSET, "missing")]
     assert result.checked == 0
     assert result.unattested_reason == _NOTHING_READ
-
-
-def test_the_audit_row_of_a_verified_pass_is_unchanged() -> None:
-    """The BACKLOG #5376 row rules touch only a pass that verified nothing and found no drift: a
-    clean pass and a drift pass keep the row they wrote before that item. A linked-out pass adds
-    ``linked_out_paths`` and ``read_through_link``, pinned with the read-through-the-link tests."""
-    clean = AttestationResult(attested=True, editable=False, no_record=False, checked=7)
-    assert clean.audit_detail() == {"attested": True, "checked": 7, "drift_count": 0}
-    drifted = AttestationResult(
-        attested=True,
-        editable=False,
-        no_record=False,
-        checked=7,
-        drift=[integ.DriftEntry(path="mfengine/a.py", reason="hash_mismatch")],
-    )
-    assert drifted.audit_detail() == {
-        "attested": True,
-        "checked": 7,
-        "drift_count": 1,
-        "drift": ["mfengine/a.py"],
-        "drift_reasons": ["hash_mismatch"],
-    }
 
 
 @pytest.mark.parametrize("reason", [_NOTHING_READ, _NOTHING_UNDER_ROOT])

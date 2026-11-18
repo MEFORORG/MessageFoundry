@@ -265,8 +265,8 @@ class AttestationResult:
     #: root (``package_directory_links_out_of_install_root``), so the warning can name which one;
     #: empty otherwise.
     linked_out_paths: tuple[str, ...] = ()
-    #: How many of the ``checked`` files were read through a package directory linked out of the
-    #: install root; ``0`` when ``linked_out_paths`` is empty.
+    #: How many files were read through a package directory linked out of the install root; ``0``
+    #: when ``linked_out_paths`` is empty.
     read_through_link: int = 0
 
     @property
@@ -1108,7 +1108,7 @@ async def _act_on(
             outcome = (
                 "[integrity].fail_closed_on_drift refuses to start while it stays linked"
                 if fail_closed_on_drift
-                else "left linked, this warning and alert repeat on every start"
+                else "left linked, this warning repeats on every start"
             )
             log.warning(
                 "startup integrity: attestation verified NOTHING (%s) — %s. %s (fail_closed=%s)",
