@@ -2557,7 +2557,12 @@ class AuthStore(Protocol):
         """
         ...
 
-    async def list_users(self) -> Sequence[UserRecord]: ...
+    async def list_users(self) -> Sequence[UserRecord]:
+        """Every account. One whose row does not parse is listed as
+        :meth:`~messagefoundry.store.store.UserRecord.unreadable_row`, whose fields other than the
+        id are invented (BACKLOG #5505); the single-row user readers raise ``RowSealError`` for
+        such a row instead."""
+        ...
 
     async def count_users(self) -> int: ...
 
@@ -2955,7 +2960,9 @@ class AuthStore(Protocol):
         passkeys goes through one helper per backend, which verifies the record it read before it
         re-seals it and raises :class:`~messagefoundry.store.row_seal.RowSealError` rather than
         re-seal a record that fails. Deleting needs no key. :class:`AuthService` checks the seal,
-        in its one user loader; the store's readers return rows unchecked."""
+        in its one user loader; the store's readers return rows unchecked. A role row whose cells
+        do not parse raises ``RowSealError``, as the write helpers' read does (BACKLOG #5505), and
+        that loader answers it as a record that fails its integrity check, keyed or keyless."""
         ...
 
     async def reseal_user_records(self) -> tuple[int, int]:
@@ -3539,6 +3546,10 @@ class AuthStore(Protocol):
         ``lineage_since`` left ``None`` no link is followed, and a rotation that committed first
         leaves this returning ``None``, as before. The lineage lookup lives here and nowhere else:
         no session READ follows a link, so a retired hash authenticates nothing.
+
+        A row the revoke ended that does not parse when read back raises
+        :class:`~messagefoundry.store.row_seal.RevokedRowSealError` once the revoke has committed
+        (BACKLOG #5505).
         """
         ...
 

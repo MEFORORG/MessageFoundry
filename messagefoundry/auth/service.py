@@ -184,6 +184,7 @@ from messagefoundry.store.row_seal import (
     UNVERIFIABLE_SUBJECT_PREFIX,
     USER_KIND,
     AnyRowSealer,
+    RevokedRowSealError,
     RowSealError,
     RowSealKeyRetiredError,
     RowSealUnverifiableError,
@@ -298,6 +299,15 @@ class _RowWrite[T]:
     retried: bool  #: the write was applied again without its row
     held: Exception | None  #: raise once the caller's own steps have run
     refused: Exception | None  #: the store refused the row on its own too, and it paged
+
+
+@dataclass(frozen=True, slots=True)
+class _EndedUnread:
+    """A session row :meth:`AuthService._supersede_session` ended whose read-back did not parse
+    (BACKLOG #5505). The revoke committed and the row is reported; only ``ref``, the token hash's
+    first 12 characters, is known of it."""
+
+    ref: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -2259,6 +2269,24 @@ class UserSealRefused(RuntimeError):
     refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
 
 
+async def read_user_or_unreadable(read: Awaitable[UserRecord | None]) -> UserRecord | None:
+    """One store user read, with a row whose cells do not parse answered as the store's list
+    answers it (BACKLOG #5505): :meth:`UserRecord.unreadable_row`. The single-row readers raise
+    :class:`RowSealError` for such a row, whose subject is the row's bounded id; one with no
+    readable id is raised as it is.
+
+    The stand-in's fields other than ``id`` are invented, so only two kinds of caller may take it:
+    ``AuthService``'s loaders, whose ``_verified`` fails and reports it as a record that fails its
+    seal, and an id or existence question, which reads it as held. Nothing else may read it."""
+    try:
+        return await read
+    except RowSealError as exc:
+        if exc.kind != USER_KIND or not exc.subject:
+            raise
+        subject = exc.subject
+    return UserRecord.unreadable_row(subject)
+
+
 @dataclass(frozen=True)
 class ListedUser:
     """One account as :meth:`AuthService.list_checked_users` reads it (BACKLOG #5520): ``user`` with
@@ -2966,10 +2994,14 @@ class LockableAccountCensus:
     #: discoverable or not. The cure is the store key for a cell that does not open, and removing
     #: and enrolling the app again for an enrolment this release refuses.
     reset_would_remove_a_passkey: tuple[str, ...] = ()
+    #: Every account whose users row does not parse, by its stored id (BACKLOG #5505). Its record
+    #: fails its integrity check, so whether it is lockable is unknown: it is named here and in
+    #: no other list, since every other list would read fields the store could not read.
+    integrity_failed: tuple[str, ...] = ()
 
     @property
     def clean(self) -> bool:
-        return not self.no_way_past and not self.undecryptable_totp
+        return not self.no_way_past and not self.undecryptable_totp and not self.integrity_failed
 
 
 @dataclass(frozen=True)
@@ -3266,7 +3298,13 @@ async def lockable_account_census(
             way_past_rp_id is None or cred.rp_id == way_past_rp_id
         ) and credential_id_hash_is_current(cred.credential_id_hash)
 
+    integrity_failed: list[str] = []
     for user in await store.list_users():
+        if user.unreadable:
+            # BACKLOG #5505: the list's stand-in, whose fields are invented. Named as failing its
+            # integrity check, never judged on those fields.
+            integrity_failed.append(user.id)
+            continue
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
         # runs only at startup and in verify.
         state = await _totp_secret_state(store, user) if user.totp_enabled else None
@@ -3362,6 +3400,7 @@ async def lockable_account_census(
         passkey_only=tuple(sorted(passkey_only)),
         unknown_beside_a_passkey=tuple(sorted(unknown_beside_a_passkey)),
         reset_would_remove_a_passkey=tuple(sorted(reset_removes)),
+        integrity_failed=tuple(sorted(integrity_failed)),
     )
 
 
@@ -3510,6 +3549,10 @@ SESSION_REVOKE_MISSED_ACTION: Final = "auth.session_revoke_missed"
 #: stands; the sessions the revoke would have ended may stay live, and this row is what says so. Not
 #: the row above, which records a self-service revoke that named no session.
 SESSIONS_REVOKE_FAILED_ACTION: Final = "auth.sessions_revoke_failed"
+#: BACKLOG #5505: the row naming an account whose sessions a custom-role edit or delete ended
+#: although its stored rows, read after the step-up gate, do not tie it to the role
+#: (:meth:`AuthService._audit_gate_only_revokes` says when).
+GATE_ONLY_REVOKE_ACTION: Final = "role.sessions_revoked"
 #: How many times that revoke runs at most, the pause before each re-run (times its number), and
 #: the seconds after the first attempt past which none is re-run. The revoke is safe to repeat: it
 #: ends unrevoked rows and raises the account's session epoch, and a repeat does both again. A
@@ -3952,10 +3995,10 @@ class _SealCheck:
     failure was handed to :meth:`AuthService._user_seal_failed`; neither, no account, or one whose
     row was deleted, renamed, rebound or re-keyed between its reads, which is not reported. Only
     ``failed`` reads as a record that fails its seal. From :meth:`AuthService._verified` it means
-    two reads naming the same account both failed, which two honest role writes committing across
-    both reads can also produce: a false alarm that docs/SECURITY.md, *What an admin user read
-    reports*, states. :meth:`AuthService._checked_by_id` also sets it when it fails closed, and
-    for a record Vault transit cannot verify, which it hands to
+    the account's record failed every read the check made of it, which two honest role writes
+    committing across two reads can also produce: a false alarm that docs/SECURITY.md, *What an
+    admin user read reports*, states. :meth:`AuthService._checked_by_id` also sets it when it
+    fails closed, and for a record Vault transit cannot verify, which it hands to
     :meth:`AuthService._user_seal_unverifiable` instead (ADR 0217 (a))."""
 
     user: VerifiedUser | None = None
@@ -4004,6 +4047,12 @@ class _StampWindow:
 
 #: The open stamp window of the running ceremony, if any (:meth:`AuthService._stamp_to_rotation`).
 _STAMP_WINDOW: ContextVar[_StampWindow | None] = ContextVar("_STAMP_WINDOW", default=None)
+
+
+async def _reads_as_directory_account(raw: UserRecord) -> bool:
+    """Whether a stored ``users`` row, read with no seal checked, reads as an enabled directory
+    account: the accounts an AD group map save names (BACKLOG #5505)."""
+    return raw.auth_provider == AuthProvider.AD.value and not raw.disabled
 
 
 class AuthService:
@@ -5678,7 +5727,7 @@ class AuthService:
         the leg asks for (``password`` or ``factor``), and the row records ``<proof>_checked``: at
         sign-in this action always means the right password was presented, and here it may not;
         with ``at`` set to ``session`` none was presented."""
-        if await self._store.supersede_session(token_hash, now=time.time()) is None:
+        if await self._supersede_session(token_hash, now=time.time()) is None:
             return
         self._forget_reproof_counts((token_hash,))
         await self._audit_lapsed_credential(
@@ -12994,7 +13043,13 @@ class AuthService:
 
         The account's session epoch is checked where the account is read, in
         :meth:`identity_for_token` and :meth:`list_sessions`, so this costs no extra statement."""
-        session = await self._store.get_session(token_hash)
+        try:
+            session = await self._store.get_session(token_hash)
+        except RowSealError:
+            # A row whose cells do not parse (BACKLOG #5505) is ended and reported as one that
+            # fails its seal, and is no session.
+            await self._session_seal_failed(token_hash)
+            return None
         if session is None or session.revoked_at is not None:
             return None
         if not await self._session_row_holds(session, self._store.row_sealer()):
@@ -13048,11 +13103,30 @@ class AuthService:
                 ref,
             )
             return
+        await self._report_ended_session(ref)
+
+    async def _report_ended_session(self, ref: str) -> None:
+        """The integrity report for a session row that has been ended, named by its ``ref``."""
         await self._report_seal_failure(
             ref,
             f"a {SESSION_KIND} row failed its integrity check and was ended (session {ref})",
             {"kind": SESSION_KIND, "session": ref},
         )
+
+    async def _supersede_session(
+        self, token_hash: str, *, now: float, lineage_since: float | None = None
+    ) -> SessionRecord | _EndedUnread | None:
+        """The store's ``supersede_session``. A row it ended that then did not parse (BACKLOG
+        #5505) is reported, as :meth:`_session_seal_failed` reports one, and answered as
+        :class:`_EndedUnread`: the store committed that revoke before it raised
+        :class:`RevokedRowSealError`, so the session has ended and no caller raises for it."""
+        try:
+            return await self._store.supersede_session(
+                token_hash, now=now, lineage_since=lineage_since
+            )
+        except RevokedRowSealError as exc:
+            await self._report_ended_session(exc.subject)
+            return _EndedUnread(exc.subject)
 
     async def _report_seal_failure(self, key: str, reason: str, detail: dict[str, str]) -> None:
         """Report one authority row that failed its integrity seal (BACKLOG #2592): a WARNING, an
@@ -13212,13 +13286,10 @@ class AuthService:
     # --- the user loader (BACKLOG #2592) -----------------------------------------------------------
 
     async def _load_user(self, user_id: str) -> VerifiedUser | None:
-        """The account ``user_id`` names, its integrity seal checked, or ``None``. With
-        :meth:`_lookup_user`, :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
-        :meth:`_load_user_by_federated_subject`, :meth:`list_checked_users`,
-        :meth:`_checked_by_id` and :meth:`_verified`, the ONLY readers of the store's user readers
-        in this service, beside the existence questions (at least :meth:`_username_held`,
-        :meth:`_user_id_held` and :meth:`_federated_subject_held_elsewhere`);
-        ``tests/test_user_seal.py`` holds the list. See :meth:`_verified` for what ``None`` covers."""
+        """The account ``user_id`` names, its integrity seal checked, or ``None``. The functions
+        in this service that may call the store's user readers are listed, each with its reason,
+        in ``tests/test_user_seal.py`` (``_LOADERS``), which fails on a read outside that list.
+        See :meth:`_verified` for what ``None`` covers."""
         return (await self._lookup_user(user_id)).user
 
     async def _lookup_user(self, user_id: str) -> _UserLookup:
@@ -13226,7 +13297,7 @@ class AuthService:
         caller can tell a record that fails its seal from one that is gone (vault BACKLOG #3069).
         ``refused`` also reads true for a row deleted or re-keyed between the row and role reads;
         :meth:`checked_user` tells those apart."""
-        raw = await self._store.get_user(user_id)
+        raw = await read_user_or_unreadable(self._store.get_user(user_id))
         return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _load_user_by_username(self, username: str) -> VerifiedUser | None:
@@ -13236,19 +13307,21 @@ class AuthService:
     async def _lookup_by_username(self, username: str) -> _UserLookup:
         """:meth:`_load_user_by_username`, also saying whether a row holds the name at all, from
         the same read: a row that fails its seal still holds its name."""
-        raw = await self._store.get_user_by_username(username)
+        raw = await read_user_or_unreadable(self._store.get_user_by_username(username))
         return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _lookup_by_directory_object_id(self, object_id: str) -> _UserLookup:
         """:meth:`_lookup_by_username`, by the directory's immutable id."""
-        raw = await self._store.get_user_by_directory_object_id(object_id)
+        raw = await read_user_or_unreadable(self._store.get_user_by_directory_object_id(object_id))
         return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _load_user_by_federated_subject(
         self, issuer: str, subject: str
     ) -> VerifiedUser | None:
         """:meth:`_load_user`, by the federated ``(issuer, sub)`` pair."""
-        raw = await self._store.get_user_by_federated_subject(issuer, subject)
+        raw = await read_user_or_unreadable(
+            self._store.get_user_by_federated_subject(issuer, subject)
+        )
         return (await self._verified(raw)).user
 
     async def _load_users(self) -> list[VerifiedUser]:
@@ -13306,7 +13379,7 @@ class AuthService:
         raw = listed
         for _ in range(_CHECKED_READ_PASSES):
             if raw is None:
-                raw = await self._store.get_user(user_id)
+                raw = await read_user_or_unreadable(self._store.get_user(user_id))
                 if raw is None:
                     return _SealCheck()
             try:
@@ -13323,7 +13396,7 @@ class AuthService:
             if found.settled:
                 return found
             raw = None
-        still_there = await self._store.get_user(user_id)
+        still_there = await read_user_or_unreadable(self._store.get_user(user_id))
         if still_there is None:
             return _SealCheck()
         # Keyed by the stored id, as _verified reports, so a caller's other spelling of the id on a
@@ -13386,17 +13459,20 @@ class AuthService:
         """Whether any row holds ``username``, sealed or not (BACKLOG #2592). A name question, not
         an authority one: a row that fails its seal still holds its name against a new account, and
         only a ``bool`` leaves here, never the unchecked row."""
-        return await self._store.get_user_by_username(username) is not None
+        return await read_user_or_unreadable(self._store.get_user_by_username(username)) is not None
 
     async def _directory_object_id_held(self, object_id: str) -> bool:
         """:meth:`_username_held`, for the directory's immutable id."""
-        return await self._store.get_user_by_directory_object_id(object_id) is not None
+        return (
+            await read_user_or_unreadable(self._store.get_user_by_directory_object_id(object_id))
+            is not None
+        )
 
     async def _user_id_held(self, user_id: str) -> bool:
         """:meth:`_username_held`, for the account id: whether the row exists at all, sealed or not,
         so a caller can tell an account deleted from one whose record fails its check (BACKLOG
         #3068)."""
-        return await self._store.get_user(user_id) is not None
+        return await read_user_or_unreadable(self._store.get_user(user_id)) is not None
 
     async def _federated_subject_held_elsewhere(
         self, issuer: str, subject: str, user_id: str
@@ -13405,7 +13481,9 @@ class AuthService:
         holds it, sealed or not (BACKLOG #5625). The unique index refuses a second holder whatever
         its seal says, so a bind must ask the raw row, not :meth:`_load_user_by_federated_subject`,
         which reads a failing holder as none."""
-        holder = await self._store.get_user_by_federated_subject(issuer, subject)
+        holder = await read_user_or_unreadable(
+            self._store.get_user_by_federated_subject(issuer, subject)
+        )
         if holder is None or holder.id == user_id:
             return False
         # Checked too: a holder whose record fails its seal is reported as the checked loader
@@ -13422,7 +13500,8 @@ class AuthService:
         The result's ``user`` is ``None`` for no account, and for an account whose record fails its
         seal, which is handed to :meth:`_user_seal_failed` and marked ``failed`` (BACKLOG #5520). A
         failing account is denied, never written: the store's write helper refuses to re-seal it.
-        On a keyless store there is no seal to check. One statement more than the row read, for
+        On a keyless store there is no seal to check, but a role row whose cells do not parse
+        still fails the pair (BACKLOG #5505). One statement more than the row read, for
         the role rows; the identity build reads them from the result instead of reading them
         again.
 
@@ -13434,16 +13513,31 @@ class AuthService:
         whose every check raced."""
         if user is None:
             return _SealCheck()
+        if user.unreadable:
+            # A listed row whose cells do not parse (BACKLOG #5505): it fails as a forged record
+            # does, on a keyless store too. A re-read would only raise again, so there is none.
+            await self._user_seal_failed(user.id)
+            return _SealCheck(failed=True)
         sealer = self._store.row_sealer()
         for attempt in range(2):
-            grants = await self._store.get_user_role_grants(user.id)
-            record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
-            if sealer is None or (record is not None and await user_seal_ok_async(sealer, record)):
-                return _SealCheck(VerifiedUser.of(user, sorted(g.role_id for g in grants)))
+            try:
+                grants = await self._store.get_user_role_grants(user.id)
+            except RowSealError:
+                # A role row whose cells do not parse (BACKLOG #5505) fails the pair as a forged
+                # record does, on a keyless store too, as the write helpers refuse it.
+                grants = None
+            if grants is not None:
+                record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
+                if sealer is None or (
+                    record is not None and await user_seal_ok_async(sealer, record)
+                ):
+                    return _SealCheck(VerifiedUser.of(user, sorted(g.role_id for g in grants)))
             if attempt == 0:
-                reread = await self._store.get_user(user.id)
+                reread = await read_user_or_unreadable(self._store.get_user(user.id))
                 if reread is None:
                     return _SealCheck()  # deleted meanwhile: nothing to report
+                if reread.unreadable:
+                    break  # its row no longer parses, and a stand-in is never verified (#5505)
                 if _lookup_keys(reread) != _lookup_keys(user):
                     # The account was renamed, rebound or re-keyed meanwhile, so it may no longer be
                     # the one the caller looked up. Not reported, and the next request reads afresh.
@@ -14159,9 +14253,11 @@ class AuthService:
         failure, and ``/ui/logout`` answered 500 without clearing the cookie. A failed owner lookup
         leaves the row with no actor when the caller named none, rather than no row, and leaves a
         live session's temporary credential unchecked, so the outcome is ``revoked``; a refused row
-        write leaves no row and an ERROR log line, which names the session when one ended. A fault
-        in the revoke itself still raises: the session may not have ended, and the caller must not
-        say it did.
+        write leaves no row and an ERROR log line, which names the session when one ended. A row
+        the revoke ended that then does not parse (BACKLOG #5505) is reported, and the sign-out is
+        recorded as ``revoked`` under ``actor``, since neither the row's owner nor whether it was
+        live can be read. A fault in the revoke itself still raises: the session may not have
+        ended, and the caller must not say it did.
 
         The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
         caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
@@ -14178,8 +14274,8 @@ class AuthService:
         presented = hash_token(token)
         before = time.time()
         since = (before if proven_at is None else proven_at) - _LOGOUT_LINEAGE_SECONDS
-        ended = await self._store.supersede_session(presented, now=before, lineage_since=since)
-        if ended is not None:
+        ended = await self._supersede_session(presented, now=before, lineage_since=since)
+        if isinstance(ended, SessionRecord):
             self._forget_reproof_counts((ended.token_hash,))
         if ended is None:
             # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
@@ -14207,6 +14303,24 @@ class AuthService:
                 # cannot cost it that row.
                 await self._count_unrecorded_logout_misses(refused=False)
             return "nothing_to_revoke"
+        if isinstance(ended, _EndedUnread):
+            # BACKLOG #5505: the revoke committed and the row is reported, but it did not parse,
+            # so neither its owner nor whether it was live can be read. Recorded as a session
+            # ended with no lapse found, as for an owner that could not be read.
+            unread = {"outcome": "revoked", "session": ended.ref}
+            if not constant_time_equal(ended.ref, presented[:12]):  # ASVS 11.2.4, as elsewhere
+                unread["presented"] = presented[:12]
+            await write_audit_soft(
+                lambda: self._audit(
+                    "auth.logout", actor=actor, detail=_json(unread), client=client
+                ),
+                log=_log,
+                message="a sign-out ended session %s, but its auth.logout row failed",
+                args=(ended.ref,),
+                # A raise would report a sign-out that already ran as a failure (see above).
+                defects=(),
+            )
+            return "revoked"
         after = time.time()
         session = ended.token_hash[:12]
         live = self._was_live_at_revoke(ended, before, after)
@@ -14455,13 +14569,19 @@ class AuthService:
         followed, the hash that was presented.
         """
         before = time.time()
-        prior = await self._store.supersede_session(
+        prior = await self._supersede_session(
             prior_hash, now=before, lineage_since=before - self.supersession_lineage_seconds
         )
-        if prior is not None:
+        if isinstance(prior, SessionRecord):
             self._forget_reproof_counts((prior.token_hash,))
         after = time.time()
-        if prior is None or not self._was_live_at_revoke(prior, before, after):
+        # A prior row that did not parse once ended (BACKLOG #5505) is already reported, and its
+        # liveness cannot be read, so it is recorded as a session already over is: by no row here.
+        if (
+            prior is None
+            or isinstance(prior, _EndedUnread)
+            or not self._was_live_at_revoke(prior, before, after)
+        ):
             return
         owner = await self._load_user(prior.user_id)
         # BACKLOG #3749: a session ``_gate_refusal`` finds a credential lapse on is not recorded as
@@ -14543,7 +14663,7 @@ class AuthService:
         if (
             session is None
             or session.user_id != identity.user_id
-            or await self._store.supersede_session(session_id, now=time.time()) is None
+            or await self._supersede_session(session_id, now=time.time()) is None
         ):
             # The console passes the id as plain text, so only an id-shaped one is copied into the
             # trail; anything else is recorded as malformed, never as the caller's own characters.
@@ -16524,6 +16644,14 @@ class AuthService:
             )
         if census.clean:
             return census
+        if census.integrity_failed:
+            _log.warning(
+                "ADR 0197: %d account(s) have a record that fails its integrity check (a stored "
+                "cell does not parse), so whether each is lockable cannot be told: %s. Restore the "
+                "row from a backup, or delete the account (BACKLOG #5505).",
+                len(census.integrity_failed),
+                ", ".join(scrub_log_argument(i) for i in census.integrity_failed),
+            )
         if census.no_way_past:
             _log.warning(
                 "ADR 0197: %d local account(s) the MFA requirement covers hold a chosen password and "
@@ -16578,6 +16706,7 @@ class AuthService:
                     "undecryptable_totp": list(census.undecryptable_totp),
                     "reset_would_remove_a_passkey": list(keep_passkey),
                     "unknown_totp": list(census.unknown_totp),
+                    "integrity_failed": list(census.integrity_failed),
                 }
             ),
         )
@@ -17975,7 +18104,13 @@ class AuthService:
         normalized = code.upper()  # recovery codes are minted uppercase
         # The hashes the account's seal covered, not a second read nobody checked (BACKLOG #2592).
         # Spending one below goes through the store's write helper, which checks the seal again.
-        real = user.recovery_code_hashes()
+        try:
+            real = user.recovery_code_hashes()
+        except RowSealError:
+            # BACKLOG #5505: a cell that does not parse holds no code the caller could match. The
+            # walk below runs over the padding alone, so a wrong code reaches the second-step
+            # lockout as any other does, and the verify still never raises. The decoder logged it.
+            real = []
         # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
         # first argon2id match, so the NUMBER of ~64 MiB verifications was a function of which code
         # was presented -- and, on the failure path, of how many codes REMAINED. Timing a single
@@ -18456,7 +18591,14 @@ class AuthService:
             )
         # The values the account's seal covered (BACKLOG #2592), the store read only when the sealed
         # digest names no passkey, as _second_factor_enrolled reads it.
-        remaining = len(user.recovery_code_hashes()) if user.totp_enabled else 0
+        remaining = 0
+        if user.totp_enabled:
+            try:
+                remaining = len(user.recovery_code_hashes())
+            except RowSealError:
+                # BACKLOG #5505: a cell that does not parse holds no code, as verify_mfa reads it,
+                # so the caller still sees their posture. The decoder logged it.
+                remaining = 0
         webauthn_enrolled = user.has_passkeys or await self._store.has_webauthn_credentials(
             identity.user_id
         )
@@ -19948,6 +20090,7 @@ class AuthService:
         description: str | None,
         permissions: Sequence[str],
         actor: str,
+        ended: frozenset[str] | None = None,
     ) -> CustomRoleInfo:
         """Edit a custom role's name/description/permission set. Validates the new permission subset and
         rejects editing a built-in (or unknown) role. A permission *reduction* takes effect immediately:
@@ -19956,10 +20099,17 @@ class AuthService:
         an unknown/built-in role and :class:`CustomRoleError` for an invalid permission set.
 
         The whole row is written from these arguments and sealed, so this also repairs a role whose
-        row fails its integrity seal (BACKLOG #2592); nothing is kept from the row it replaces."""
+        row fails its integrity seal (BACKLOG #2592); nothing is kept from the row it replaces.
+
+        ``ended`` is the set the route's step-up gate read from
+        :meth:`sessions_ended_by_custom_role_save`; without one it is read here, before the write.
+        :meth:`_revoke_gate_set_then_reread` says what is revoked, and
+        :meth:`_audit_gate_only_revokes` which of those accounts get a row of their own."""
         if not await self._custom_role_held(role_id):
             raise ValueError("no such custom role")
         perms = validate_custom_role_permissions(permissions)  # raises CustomRoleError
+        if ended is None:
+            ended = await self.sessions_ended_by_custom_role_save(role_id)
         await self._store.upsert_role(
             role_id=role_id,
             display_name=display_name,
@@ -19967,9 +20117,10 @@ class AuthService:
             builtin=False,
             permissions=_json([p.value for p in perms]),
         )
-        await self._revoke_each_after_commit(
-            await self._custom_role_holders(role_id), change="custom_role_saved", actor=actor
+        _, again = await self._revoke_gate_set_then_reread(
+            ended, self._holds_role(role_id), change="custom_role_saved", actor=actor
         )
+        await self._audit_gate_only_revokes(ended - again, role_id=role_id, actor=actor)
         await self._audit(
             "role.updated",
             actor=actor,
@@ -19982,16 +20133,23 @@ class AuthService:
             permissions=frozenset(perms),
         )
 
-    async def delete_custom_role(self, role_id: str, *, actor: str) -> None:
+    async def delete_custom_role(
+        self, role_id: str, *, actor: str, ended: frozenset[str] | None = None
+    ) -> None:
         """Delete a custom role; its user/AD-group assignments are removed in the same transaction, and
         every assigned user's live sessions are revoked so the now-gone permissions don't linger on an
         active token. Raises :class:`ValueError` for an unknown or built-in role. Audited. A role
-        whose row fails its integrity seal is deleted like any other (BACKLOG #2592)."""
+        whose row fails its integrity seal is deleted like any other (BACKLOG #2592). ``ended`` is
+        as :meth:`update_custom_role` takes it."""
         if not await self._custom_role_held(role_id):
             raise ValueError("no such custom role")
+        if ended is None:
+            ended = await self.sessions_ended_by_custom_role_save(role_id)
         # Before the rows are gone, so nothing has committed yet: a refusal is raised at once with
         # the role in place, and not recorded as a miss after a committed change (vault #3023).
-        for user_id in await self._custom_role_holders(role_id):
+        # Sorted, so a revoke a store fault interrupts stops at a repeatable point (ADR 0045 D3).
+        again = await self._accounts_a_save_ends(self._holds_role(role_id), checked=False)
+        for user_id in sorted(ended | again):
             counted = self._reproof_counts_of(user_id)
             await self._store.revoke_user_sessions(user_id, audit=no_audit_row)
             self._forget_reproof_counts(counted)
@@ -20000,14 +20158,15 @@ class AuthService:
         if not await self._store.delete_custom_role(role_id):
             raise ValueError("no such custom role")
         await self._audit("role.deleted", actor=actor, detail=_json({"role_id": role_id}))
+        await self._audit_gate_only_revokes(ended - again, role_id=role_id, actor=actor)
 
     async def sessions_ended_by_custom_role_save(self, role_id: str) -> frozenset[str]:
-        """The account ids whose sessions an edit or a delete of custom role ``role_id`` would end.
+        """The account ids the step-up gate of an edit or a delete of custom role ``role_id`` reads:
+        :meth:`_accounts_a_save_ends`, naming each account whose stored role rows hold the role.
 
         BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
-        :meth:`_custom_role_holders` revokes exactly this set, so a route asking whether the
-        save ends the caller's own sessions gets the answer the revoke acts on. Empty for a role
-        nobody holds, including one that does not exist.
+        The route hands this set to the save, which revokes it, so the
+        caller's integrity check is read once for the gate and the revoke (BACKLOG #5505).
 
         Compared without case. A store whose id columns compare case-insensitively (SQL Server)
         finds the role from another spelling, and the console passes its path to these routes as
@@ -20015,17 +20174,116 @@ class AuthService:
         themselves refuse any id that is not the stored one exactly (:meth:`_custom_role_held`),
         so this fold is no longer what stops a variant save from skipping revocation; it keeps the
         step-up gate asking for proof whenever the store would find the role, and is kept."""
-        wanted = role_id.casefold()
-        return frozenset(
-            user.id
-            for user in await self._load_users()
-            if any(held.casefold() == wanted for held in user.role_ids)
-        )
+        return await self._accounts_a_save_ends(self._holds_role(role_id), checked=True)
 
-    async def _custom_role_holders(self, role_id: str) -> list[str]:
-        """The accounts a custom-role save or delete revokes, sorted, so a revoke a store fault
-        interrupts stops at a repeatable point (ADR 0045 D3)."""
-        return sorted(await self.sessions_ended_by_custom_role_save(role_id))
+    def _holds_role(self, role_id: str) -> Callable[[UserRecord], Awaitable[bool]]:
+        """Whether an account's stored role rows hold ``role_id``, compared without case, read with
+        no seal checked. Role rows that do not parse answer yes (BACKLOG #5505)."""
+        wanted = role_id.casefold()
+
+        async def holds(raw: UserRecord) -> bool:
+            try:
+                grants = await self._store.get_user_role_grants(raw.id)
+            except RowSealError:
+                return True
+            return any(grant.role_id.casefold() == wanted for grant in grants)
+
+        return holds
+
+    async def _audit_gate_only_revokes(
+        self, gate_only: frozenset[str], *, role_id: str, actor: str
+    ) -> None:
+        """One :data:`GATE_ONLY_REVOKE_ACTION` row per account a custom-role edit or delete of
+        ``role_id`` revoked although its stored rows, read after the gate, neither hold the role
+        nor fail to parse (BACKLOG #5505). The gate names such an account because its integrity
+        check failed, or because it held the role when the gate read it. The role's own row does
+        not list the accounts it ended, so this is the row that names them. A refused write is
+        logged, not raised: the change and the revoke have both happened."""
+        for user_id in sorted(gate_only):
+            detail = {"role_id": role_id, "user_id": user_id, "reason": "named_by_gate_only"}
+            await write_audit_soft(
+                partial(self._audit, GATE_ONLY_REVOKE_ACTION, actor=actor, detail=_json(detail)),
+                log=_log,
+                message="a custom-role save revoked an account's sessions, but its %s row failed",
+                args=(GATE_ONLY_REVOKE_ACTION,),
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+
+    async def _revoke_gate_set_then_reread(
+        self,
+        ended: frozenset[str],
+        named: Callable[[UserRecord], Awaitable[bool]],
+        *,
+        change: str,
+        actor: str,
+    ) -> tuple[int, frozenset[str]]:
+        """After a group-wide ``change`` has committed, revoke ``ended``, the set its gate read,
+        then each further account :meth:`_accounts_a_save_ends` names when read again with no seal
+        checked. Returns the count revoked and the set that read named. Each account goes through
+        :meth:`_revoke_each_after_commit`, sorted, so a revoke a store fault interrupts stops at a
+        repeatable point (ADR 0045 D3).
+
+        The gate's set is revoked first, so a read that raises leaves it revoked (BACKLOG #5505).
+        A store refusal of that read is logged at ERROR, recorded as
+        :data:`SESSIONS_REVOKE_FAILED_ACTION` with no ``user_id`` and ``"reread": "refused"``,
+        and raised, so the caller still fails, as a revoke given up on does."""
+        revoked = await self._revoke_each_after_commit(sorted(ended), change=change, actor=actor)
+        try:
+            again = await self._accounts_a_save_ends(named, checked=False)
+        except audit_write_errors() as exc:
+            _log.error(
+                "auth: after a committed %s, the read of which further accounts it ends was"
+                " refused by the store (%s); the %d account(s) its step-up gate named were"
+                " revoked, and any other account the change reaches may keep its sessions",
+                change,
+                type(exc).__name__,
+                len(ended),
+                exc_info=exc,
+            )
+            detail = {"change": change, "reread": "refused", "error": type(exc).__name__}
+            await write_audit_soft(
+                lambda: self._audit(
+                    SESSIONS_REVOKE_FAILED_ACTION, actor=actor, detail=_json(detail)
+                ),
+                log=_log,
+                message="the %s row for that refused revoke could not be written",
+                args=(SESSIONS_REVOKE_FAILED_ACTION,),
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+            raise
+        revoked += await self._revoke_each_after_commit(
+            sorted(again - ended), change=change, actor=actor
+        )
+        return revoked, again
+
+    async def _accounts_a_save_ends(
+        self, named: Callable[[UserRecord], Awaitable[bool]], *, checked: bool
+    ) -> frozenset[str]:
+        """The account ids whose sessions a group-wide save ends (BACKLOG #3401, #5505): each
+        listed ``users`` row ``named`` answers yes for, read with no seal checked, and each listed
+        row whose cells do not parse. With ``checked``, also each listed account whose integrity
+        check fails, whatever its row says. So on a store with an integrity key a row tampered to
+        read as outside the save is still named, and its sessions are revoked rather than only
+        refused, so a later repair of its row does not bring them back. With no key no seal is
+        checked, so such a row is taken as it reads. A row the list read leaves out is not named,
+        at least one whose id cell does not read.
+
+        The step-up gate reads it with ``checked`` and hands that set to the save, so the caller's
+        own check is read once. The revoke adds a read without ``checked``, after the save, so an
+        account that came under the save meanwhile is ended too; only a write to the caller's own
+        row between the two reads can add the caller there. A Vault transit Outage raises from the
+        read with ``checked``, which the save takes before it writes anything."""
+        out: set[str] = set()
+        for raw in await self._store.list_users():
+            if (
+                raw.unreadable
+                or await named(raw)
+                or (checked and (await self._checked_by_id(raw.id, raw)).failed)
+            ):
+                out.add(raw.id)
+        return frozenset(out)
 
     async def _revoke_each_after_commit(
         self, user_ids: Sequence[str], *, change: str, actor: str
@@ -20874,9 +21132,10 @@ class AuthService:
                 return True
         return False
 
-    async def _revoke_ad_sessions(self, *, change: str, actor: str) -> int:
-        """Revoke every unrevoked session held by an enabled directory account whose record passes
-        its seal, lapsed ones included. Returns the number revoked, which is the
+    async def _revoke_ad_sessions(self, ended: frozenset[str], *, change: str, actor: str) -> int:
+        """Revoke every unrevoked session, lapsed ones included, held by an account in ``ended``,
+        the set :meth:`sessions_ended_by_ad_map_save` gave the gate, or named again by
+        :meth:`_accounts_a_save_ends` read after the save. Returns the number revoked, which is the
         ``sessions_revoked`` the two map audit rows record; it counts rows, not live sessions.
 
         BACKLOG #1154 (ASVS 8.3.2). The two AD map setters below are authorization-value mutators:
@@ -20888,16 +21147,13 @@ class AuthService:
         as long as it stayed alive, which the requirement's first arm ("applied immediately") does
         not allow and which no mitigating control covered.
 
-        **Scoped to AD accounts, and deliberately not narrowed further.** Resolving which principals
-        a map edit actually affects would mean re-binding to the directory, and both a removed
-        mapping and an added one change an outcome, so the affected set is not derivable from the
-        entries alone. Local accounts read neither map and are left alone.
+        **Scoped to directory accounts, and deliberately not narrowed further.** Resolving which
+        principals a map edit actually affects would mean re-binding to the directory, and both a
+        removed mapping and an added one change an outcome, so the affected set is not derivable
+        from the entries alone. A local account reads neither map, and one whose row parses and
+        whose integrity check passed at the gate is left alone.
 
-        Takes its set from :meth:`sessions_ended_by_ad_map_save`, which reads
-        :meth:`_load_users`: every enabled directory account whose record passes its seal. An
-        account that fails its seal is reported by :meth:`_verified` and left out, and so are its
-        sessions. On a keyless store there is no seal to check, so no account is left out. Each
-        account's unrevoked rows are then revoked with the store's ``revoke_user_sessions``, so this
+        Each account's unrevoked rows are revoked with the store's ``revoke_user_sessions``, so this
         needs no schema change on any backend. The count it returns includes rows already past their
         limits, which the revoke ends too. Unlike the reconciler this is NOT counted against the
         mass-revoke breaker: that breaker exists to catch a directory the engine cannot read, and
@@ -20909,28 +21165,37 @@ class AuthService:
         # was set right. ``revoke_user_sessions`` matches every unrevoked row, whatever the clock
         # says, and costs one statement where the read cost one too. Each account through
         # _revoke_each_after_commit, since the map write has committed (vault BACKLOG #3023).
-        return await self._revoke_each_after_commit(
-            sorted(await self.sessions_ended_by_ad_map_save()), change=change, actor=actor
+        revoked, _ = await self._revoke_gate_set_then_reread(
+            ended, _reads_as_directory_account, change=change, actor=actor
         )
+        return revoked
 
     async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:
-        """The account ids whose sessions a save of either AD group map would end: every enabled
-        directory account.
+        """The account ids the step-up gate of a save of either AD group map reads:
+        :meth:`_accounts_a_save_ends`, naming each account whose stored ``users`` row reads as an
+        enabled directory account. That method says which other accounts it names.
 
         BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
-        :meth:`_revoke_ad_sessions` revokes exactly this set, so a route asking whether the save
-        ends the caller's own sessions gets the answer the revoke acts on. The entries being saved
-        do not narrow it, for the reason that method's docstring gives."""
-        return frozenset(
-            user.id
-            for user in await self._load_users()
-            if user.auth_provider == AuthProvider.AD.value and not user.disabled
-        )
+        The route hands this set to the save, and :meth:`_revoke_ad_sessions` revokes it, so the
+        caller's integrity check is read once for the gate and the revoke (BACKLOG #5505). The
+        entries being saved do not narrow it, for the reason that method's docstring gives."""
+        return await self._accounts_a_save_ends(_reads_as_directory_account, checked=True)
 
-    async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
-        """Replace the AD-group → role map (C3). Revokes directory sessions so it applies at once."""
+    async def set_ad_group_map(
+        self,
+        entries: Sequence[tuple[str, str]],
+        *,
+        actor: str,
+        ended: frozenset[str] | None = None,
+    ) -> None:
+        """Replace the AD-group to role map (C3). Revokes directory accounts' sessions so it applies
+        at once, as :meth:`_revoke_ad_sessions` says. ``ended`` is the set the route's step-up gate
+        read from :meth:`sessions_ended_by_ad_map_save`; without one it is read here, before the
+        write."""
+        if ended is None:
+            ended = await self.sessions_ended_by_ad_map_save()
         await self._store.set_ad_group_role_map(entries)
-        revoked = await self._revoke_ad_sessions(change="ad_role_map_saved", actor=actor)
+        revoked = await self._revoke_ad_sessions(ended, change="ad_role_map_saved", actor=actor)
         await self._audit(
             "ad_group_map.updated",
             actor=actor,
@@ -20938,13 +21203,20 @@ class AuthService:
         )
 
     async def set_ad_group_scope_map(
-        self, entries: Sequence[tuple[str, str]], *, actor: str
+        self,
+        entries: Sequence[tuple[str, str]],
+        *,
+        actor: str,
+        ended: frozenset[str] | None = None,
     ) -> None:
-        """Replace the AD-group → channel-scope map (C3). Revokes directory sessions so it applies
-        at once. This docstring used to end "Takes effect on each AD user's next login", which was
-        an accurate description of the defect BACKLOG #1154 names and is no longer true."""
+        """Replace the AD-group to channel-scope map (C3). Revokes directory accounts' sessions so
+        it applies at once, and takes ``ended``, as :meth:`set_ad_group_map` does. This docstring
+        used to end "Takes effect on each AD user's next login", which was an accurate description
+        of the defect BACKLOG #1154 names and is no longer true."""
+        if ended is None:
+            ended = await self.sessions_ended_by_ad_map_save()
         await self._store.set_ad_group_scope_map(entries)
-        revoked = await self._revoke_ad_sessions(change="ad_scope_map_saved", actor=actor)
+        revoked = await self._revoke_ad_sessions(ended, change="ad_scope_map_saved", actor=actor)
         await self._audit(
             "ad_group_scope_map.updated",
             actor=actor,

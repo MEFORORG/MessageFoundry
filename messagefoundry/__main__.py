@@ -10774,7 +10774,20 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 "Administrator reset this account's MFA from the web console"
             )
         for other in await store.list_users():
-            if other.id == user.id or other.disabled:
+            if other.id == user.id:
+                continue
+            if other.unreadable:
+                # BACKLOG #5505: its users fields are invented, but its role rows are read apart.
+                # One holding no Administrator role cannot be another Administrator; one that does
+                # may be enabled, which cannot be told, so refuse rather than read it as disabled.
+                if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(other.id):
+                    continue
+                return (
+                    f"the account {other.id!r} has a record that fails its integrity check, so "
+                    "whether it is another enabled Administrator cannot be told; nothing was "
+                    "written. Restore that account's row from a backup first"
+                )
+            if other.disabled:
                 continue
             if Role.ADMINISTRATOR.value in await store.get_user_role_ids(other.id):
                 return (

@@ -642,7 +642,8 @@ from typing import Any
 #: console's new ``require_ui_step_up_when_own_sessions_end`` gate asks, and the four console
 #: routes moved to that gate. ``AdminHandlers.update_custom_role``, ``delete_custom_role``,
 #: ``set_ad_group_map`` and ``set_ad_group_scope_map`` are now the cores past the JSON routes'
-#: step-up, with the signatures the console already called, so no console call changed. The JSON
+#: step-up, with the signatures the console then called, so no console call changed (BACKLOG #5505,
+#: below, has since added a keyword the console passes). The JSON
 #: routes themselves now take ``request``, which the seam does not carry. The digest moved from
 #: ``7f01058f7699dfe8`` because the discovered surface and the route gates did. An older console
 #: on this engine is refused at mount, as is a newer console on an older engine, which lacks the
@@ -913,6 +914,15 @@ from typing import Any
 #: the console's "leaving this site" page and IdP hop call to decide whether they show Sign-out
 #: and the session watchdog. A method the console calls, so a skew would be an AttributeError at
 #: request time. Unnumbered. Re-derived with ``--write``, from ``080ed019349126b8`` to ``bc56eed44a1590fd``.
+#:
+#: BACKLOG #5505: the four ``AdminHandlers`` cores of the group-wide saves,
+#: ``update_custom_role``, ``delete_custom_role``, ``set_ad_group_map`` and
+#: ``set_ad_group_scope_map``, take the keyword ``ended``, the set the step-up gate read, and the
+#: console passes ``ended=gate_ended_sessions(request)`` on each call. The digest did not move: it
+#: records ``AdminHandlers`` field names only, the blind spot BACKLOG #1149 names above. So the
+#: handshake does not catch this skew: a newer console on an older engine raises TypeError on
+#: each of those four saves, and an older console on this engine omits ``ended``, which the save
+#: then reads itself.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
