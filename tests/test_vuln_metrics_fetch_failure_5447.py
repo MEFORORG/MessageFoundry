@@ -7,8 +7,9 @@ FIRST EPSS fetch, used to come back as an empty result that ``compute`` scored a
 ``main`` exited 0, so a feed outage read as "no KEV exposure" in the record. Each now leaves its
 metrics ``n/a`` with the source named, and ``main`` exits 2.
 
-No test here touches the network: ``gh`` and every HTTP fetch are stubbed at the module's own
-``subprocess.run`` and ``urlopen`` seams, so the failure handling under test is the script's own.
+No test here touches the network: ``gh`` and every HTTP fetch are stubbed by patching
+``subprocess.run`` and ``urllib.request.urlopen`` for the test's duration (process-wide, through the
+module's own references), so the failure handling under test is the script's own.
 """
 
 from __future__ import annotations
@@ -640,6 +641,59 @@ def test_an_unread_adopter_source_reds_the_run(
     code, row = _main_with_adopter(monkeypatch, mod, tmp_path, contents, release)
     assert code == 2, row
     assert row["adopter_patch_lag_days"].startswith("n/a"), row
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        pytest.param(["example/stale", "example/range", "example/gone"], id="unread-last"),
+        pytest.param(["example/gone", "example/range", "example/stale"], id="unread-first"),
+    ],
+)
+def test_an_unread_adopter_reds_the_run_whatever_the_order(
+    monkeypatch: pytest.MonkeyPatch, order: list[str]
+) -> None:
+    """An adopter with no exact pin returned at once, so an unread adopter after it was never
+    read and the run exited 0; every adopter is now read, so the order does not matter."""
+    mod = _load()
+    files = {
+        "example/stale": "messagefoundry==1.1.0\n",
+        "example/range": "messagefoundry>=1.0\n",
+    }
+
+    def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        if argv[2].startswith("repos/example/repo/releases"):
+            return subprocess.CompletedProcess(argv, 0, json.dumps([_RELEASE]), "")
+        repo = argv[2].removeprefix("repos/").removesuffix("/contents/requirements.txt")
+        if repo not in files:
+            raise subprocess.CalledProcessError(1, argv, "", "gh: 404")
+        return _contents(files[repo])
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    failures: list[str] = []
+    lag = mod.adopter_lag("example/repo", order, _NOW, 1.0, failures)
+    assert lag.startswith("n/a"), lag
+    assert len(failures) == 1 and "example/gone" in failures[0], failures
+
+
+def test_control_an_unpinned_adopter_is_na_without_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control: an adopter whose file was read but holds a range answered; n/a, no failure."""
+    mod = _load()
+
+    def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        if argv[2].startswith("repos/example/repo/releases"):
+            return subprocess.CompletedProcess(argv, 0, json.dumps([_RELEASE]), "")
+        if "example/range" in argv[2]:
+            return _contents("messagefoundry>=1.0\n")
+        return _contents("messagefoundry==1.1.0\n")
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    failures: list[str] = []
+    lag = mod.adopter_lag("example/repo", ["example/stale", "example/range"], _NOW, 1.0, failures)
+    assert lag.startswith("n/a") and "example/range" in lag, lag
+    assert failures == []
 
 
 def test_control_a_read_adopter_pin_exits_clean(

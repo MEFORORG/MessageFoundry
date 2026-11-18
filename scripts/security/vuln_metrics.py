@@ -302,6 +302,9 @@ def adopter_lag(
     latest, rel = max(engine, key=lambda kr: kr[0])
     published = _parse_dt(rel.get("at")) if isinstance(rel.get("at"), str) else None
     lags: list[float] = []
+    # The first adopter with no exact pin. Every adopter is still read, so an unread one later in
+    # --adopter-repos reds the run whatever the order.
+    unpinned: str | None = None
     for ar in adopter_repos:
         # The whole JSON answer, not `--jq .content`: jq prints a string raw, which is not JSON.
         answer = _gh(["api", f"repos/{ar}/contents/requirements.txt"])
@@ -318,12 +321,17 @@ def adopter_lag(
         # Only an exact pin can be compared. A range, an extras pin this did not parse, or no
         # messagefoundry line at all is not "up to date", so it is n/a, never a lag of 0.
         if pin is None:
-            return f"n/a: {ar}/requirements.txt has no single exact messagefoundry== pin"
+            unpinned = (
+                unpinned or f"n/a: {ar}/requirements.txt has no single exact messagefoundry== pin"
+            )
+            continue
         if _release_tuple(pin) != latest:
             if published is None:
                 # A published release always has a date; a missing or naive one is malformed.
                 return _unread("the latest engine release has no publish date with an offset")
             lags.append((now - published).total_seconds() / 86400)
+    if unpinned is not None:
+        return unpinned
     return f"{max(lags):.1f}" if lags else "0"
 
 
