@@ -25,13 +25,13 @@ import * as vscode from "vscode";
 
 import { peekToken, signIn, signOut } from "./auth";
 import {
-  configDir,
   engineUrl,
   environments,
   pythonPath,
   serviceConfig,
   serviceConfigIsSet,
   workspaceDir,
+  writerConfigTarget,
 } from "./cli";
 import {
   SERVE_DEFAULT_SERVICE_CONFIG,
@@ -76,6 +76,9 @@ import {
   type ProbeOutcome,
   type ProbePlanEntry,
 } from "./engineStatusModel";
+
+/** The config dir and service config a launch runs with, as {@link writerConfigTarget} judged them. */
+type LaunchTarget = NonNullable<ReturnType<typeof writerConfigTarget>>;
 
 /** How often (ms) to re-probe. Modest — this is a liveness hint, not a monitor (that's the Console). */
 const POLL_INTERVAL_MS = 15_000;
@@ -542,21 +545,23 @@ export class EngineStatusBar implements vscode.Disposable {
 
   /** Start the local engine, guarding against a double-launch from a rapid second invocation (the
    *  confirm/preflight awaits leave a window before the terminal exists to be seen by engineAlive). */
-  async startEngine(): Promise<void> {
+  async startEngine(prior?: LaunchTarget): Promise<void> {
     if (this.starting) {
       this.provisionTerminal?.show();
       return;
     }
     this.starting = true;
     try {
-      await this.launchEngine();
+      await this.launchEngine(prior);
     } finally {
       this.starting = false;
     }
   }
 
-  /** The actual launch — only ever entered through {@link startEngine}'s reentrancy guard. */
-  private async launchEngine(): Promise<void> {
+  /** The actual launch — only ever entered through {@link startEngine}'s reentrancy guard. `prior` is
+   *  the launch target a Restart already judged before its stop, so the Start after the stop does not
+   *  read the settings again and refuse on a value that changed meanwhile, leaving the engine down. */
+  private async launchEngine(prior?: LaunchTarget): Promise<void> {
     const url = this.currentUrl();
     const ws = workspaceDir();
     if (!ws) {
@@ -578,7 +583,13 @@ export class EngineStatusBar implements vscode.Disposable {
     }
     // Read once (BACKLOG #5566): the guard below and every command this Start runs use this one
     // value, so a settings change while a prompt or the provisioning terminal is open cannot split them.
-    const serviceConfigArg = startServiceConfig();
+    // Read as a launch (BACKLOG #5404): a dropped workspace or user value refuses rather than start
+    // serve on the folder or file used in its place.
+    const launch = prior ?? writerConfigTarget();
+    if (launch === undefined) {
+      return;
+    }
+    const serviceConfigArg = launch.serviceConfig;
     // A set service config that names no file: serve and provision-admin refuse it, so say so now
     // rather than prompt for a new store that the refusal would never create.
     const refusal = serviceConfigRefusal(ws, serviceConfigArg);
@@ -646,7 +657,7 @@ export class EngineStatusBar implements vscode.Disposable {
       askAdmin: () => askAdminDetails(),
       provisionInTerminal: (admin) => this.provisionInTerminal(python, ws, admin, serviceConfigArg),
       chooseAfterRefusal: (detail) => chooseAfterRefusal(detail),
-      serve: () => this.serveEngine(python, ws, serviceConfigArg),
+      serve: () => this.serveEngine(python, ws, launch.configDir, serviceConfigArg),
       report: (message) => notify(message),
     });
   }
@@ -717,10 +728,10 @@ export class EngineStatusBar implements vscode.Disposable {
   }
 
   /** Start `serve` in its own terminal. Reached only through the Start plan's `serve` effect. */
-  private serveEngine(python: string, ws: string, serviceConfigArg: string | undefined): void {
+  private serveEngine(python: string, ws: string, configDirArg: string, serviceConfigArg: string | undefined): void {
     const { command, args } = buildServeInvocation({
       python,
-      configDir: configDir(),
+      configDir: configDirArg,
       serviceConfig: serviceConfigArg,
     });
     const term = vscode.window.createTerminal({
@@ -759,8 +770,8 @@ export class EngineStatusBar implements vscode.Disposable {
 
   /** Restart: stop the engine we own (waiting for the process to actually exit so the port frees), then start. */
   async restartEngine(): Promise<void> {
-    // Start's target and trust refusals, with its messages, before anything else here (Start checks
-    // for a workspace first; Restart's service config check skips when there is none). That check
+    // Start's target and trust refusals, with its messages, before anything else here, then its
+    // folder refusal, then the service config check, all before the stop. That check
     // stats a path the workspace's settings name, and in an untrusted workspace that path is the
     // repository's choice: a UNC value opens SMB, with NTLM, to a host it names. Nothing may touch the
     // filesystem before these two refusals.
@@ -776,7 +787,17 @@ export class EngineStatusBar implements vscode.Disposable {
     // The Start below would refuse a service config that names no file, so refuse BEFORE stopping
     // the running engine; otherwise a refused Restart acts as Stop (BACKLOG #5566).
     const ws = workspaceDir();
-    const refusal = ws === undefined ? undefined : serviceConfigRefusal(ws, startServiceConfig());
+    if (ws === undefined) {
+      // Start's own first refusal, here before the stop and before a setting is judged.
+      notify("open your engine's project folder first — the IDE runs `serve` in the workspace.");
+      return;
+    }
+    // A dropped value refuses here too, before the stop, for the same reason (BACKLOG #5404).
+    const launch = writerConfigTarget();
+    if (launch === undefined) {
+      return;
+    }
+    const refusal = serviceConfigRefusal(ws, launch.serviceConfig);
     if (refusal !== undefined) {
       notify(refusal);
       return;
@@ -791,7 +812,9 @@ export class EngineStatusBar implements vscode.Disposable {
         await delay(500); // let the OS release the listening port before serve rebinds it
       }
     }
-    await this.startEngine();
+    // The target judged above, so a setting changed during the stop cannot refuse the Start and leave
+    // the engine down.
+    await this.startEngine(launch);
   }
 
   /** Bootstrap a Python environment (create `.venv` + install) for a workspace whose interpreter cannot
@@ -964,13 +987,15 @@ function startServiceConfig(): string | undefined {
 }
 
 /** Why Start must not run with this `--service-config`, or undefined when it may: a set value that
- *  names no file in the workspace, which serve and provision-admin would refuse (BACKLOG #5566). */
+ *  names no file in the workspace, which serve and provision-admin would refuse (BACKLOG #5566).
+ *  The message names the setting and never the value: the value is workspace-controlled, and a
+ *  notification renders a markdown link in it, `command:` links included. */
 function serviceConfigRefusal(ws: string, serviceConfigArg: string | undefined): string | undefined {
   if (serviceConfigArg === undefined || isFile(path.resolve(ws, serviceConfigArg))) {
     return undefined;
   }
   return (
-    `messagefoundry.serviceConfig names "${serviceConfigArg}", which is not a file in this workspace — ` +
+    "messagefoundry.serviceConfig names a path which is not a file in this workspace — " +
     "serve would refuse it. Correct the setting, or clear it to use the default."
   );
 }
@@ -1088,12 +1113,13 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
       const url = bar.currentUrl();
       const revoked = await signOut(context, url);
       logAction("sign out", revoked ? `${url} (session revoked)` : `${url} (local token cleared only)`);
-      // Say which actually happened. If the engine was unreachable we could not revoke, and the session
-      // stays alive there until it times out — claiming a clean "signed out" would be a lie.
+      // Say which actually happened. If the engine was unreachable, or signOut's target gate refused the
+      // address and sent nothing (BACKLOG #5407), the session was not revoked and stays alive there
+      // until it times out; claiming a clean "signed out" would be a lie.
       void vscode.window.showInformationMessage(
         revoked
           ? `MessageFoundry: signed out of ${url}.`
-          : `MessageFoundry: cleared the local token, but could not reach ${url} to revoke the session — it stays active there until it times out.`,
+          : `MessageFoundry: cleared the local token, but the session on ${url} was not revoked: the engine could not be reached, or its address was refused and nothing was sent. It stays active there until it times out.`,
       );
       await bar.recheck();
     }),
@@ -1114,8 +1140,13 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
       // in a git worktree that has no service TOML and no store, so `serve` would quietly create a
       // BRAND-NEW empty database with no account in it, forking the user's engine. Handing them
       // the command lets them run it where they mean to. No --db/--env overrides: the service TOML is
-      // the authority on which store and which environment this engine is.
-      const cmd = serveCommandLine(configDir(), startServiceConfig());
+      // the authority on which store and which environment this engine is. Read as a launch, as Start
+      // reads it, so a dropped value is refused rather than copied (BACKLOG #5404).
+      const launch = writerConfigTarget();
+      if (launch === undefined) {
+        return;
+      }
+      const cmd = serveCommandLine(launch.configDir, launch.serviceConfig);
       await vscode.env.clipboard.writeText(cmd);
       logAction("copy start command", cmd);
       void vscode.window.showInformationMessage(

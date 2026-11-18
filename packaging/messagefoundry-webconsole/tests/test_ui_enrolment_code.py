@@ -28,7 +28,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import ENROLMENT_CODE_REFUSED, AuthService
-from messagefoundry.auth.tokens import enrolment_code_digest, hash_token
+from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX, enrolment_code_digest, hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole.pages import account as account_pages
@@ -103,6 +103,113 @@ async def test_ac4_the_console_passkey_finish_needs_the_code(engine: Engine) -> 
     assert len(await service.store.list_webauthn_credentials(identity.user_id)) == 1
     user = await service.store.get_user(identity.user_id)
     assert user is not None and user.enrolment_code_digest is None
+
+
+async def _code_refusals(service: AuthService) -> list[str]:
+    return [
+        json.loads(r["detail"])["reason"]
+        for r in await service.store.list_audit(action="auth.enrolment_code_refused")
+    ]
+
+
+async def test_an_oversized_passkey_enrolment_code_is_refused_where_the_engine_reads_it(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5399. RED when: the console passkey finish cuts the enrolment code to a length, or
+    the engine reads a code past MfaConfirmRequest's bound rather than refusing it as a refused
+    code, audited. The controls: a wrong code at the bound is refused the same way, and the ceremony
+    both refusals left staged then binds with the issued code."""
+    pytest.importorskip("webauthn")
+    service = await _service(engine)
+    identity, token, body = await _staged(service)
+    issued = await service.issue_enrolment_code(
+        identity.user_id, actor="test-host", issuer_id=None, via="host"
+    )
+    calls: list[object] = []
+    real = service.finish_webauthn_registration
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs.get("enrolment_code"))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(service, "finish_webauthn_registration", spy)
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        # The issued code padded with spaces past the bound. It normalises to the issued code, so
+        # only the bound refuses it; the old handler's cut to the bound would have accepted it.
+        oversized = issued.code.ljust(ENROLMENT_CODE_MAX + 1)
+        assert enrolment_code_digest(oversized) == enrolment_code_digest(issued.code)
+        at_bound = "x" * ENROLMENT_CODE_MAX
+        for code in (oversized, at_bound):
+            refused = await c.post(
+                _VERIFY, json={**body, "enrolment_code": code}, headers=SAME_ORIGIN
+            )
+            assert refused.status_code == 400
+            assert refused.json() == {"ok": False, "error": ENROLMENT_CODE_REFUSED}
+        assert calls == [oversized, at_bound]
+        assert await _code_refusals(service) == ["code_refused", "code_refused"]
+        served = await c.post(
+            _VERIFY, json={**body, "enrolment_code": issued.code}, headers=SAME_ORIGIN
+        )
+        assert served.status_code == 200 and served.json()["ok"] is True, served.text
+    assert len(await service.store.list_webauthn_credentials(identity.user_id)) == 1
+
+
+async def test_a_lost_session_with_an_oversized_enrolment_code_is_still_answered_lost(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5399. RED when: the enrolment-code bound answers a finish whose session died ahead
+    of the service's lost-session reply, the 401 main gave. The session dies after the route's own
+    factor read passed, so the route holds no refusal of its own to explain the 401."""
+    pytest.importorskip("webauthn")
+    service = await _service(engine)
+    identity, token, body = await _staged(service)
+    await service.issue_enrolment_code(
+        identity.user_id, actor="test-host", issuer_id=None, via="host"
+    )
+    real = service.factor_binding_is_blocked
+
+    async def read_then_revoked(token_: str | None, action: str) -> bool:
+        blocked = await real(token_, action)
+        await service.store.revoke_session(hash_token(token))
+        return blocked
+
+    monkeypatch.setattr(service, "factor_binding_is_blocked", read_then_revoked)
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        lost = await c.post(
+            _VERIFY,
+            json={**body, "enrolment_code": "x" * (ENROLMENT_CODE_MAX + 1)},
+            headers=SAME_ORIGIN,
+        )
+    assert lost.status_code == 401 and lost.json()["error"] == "session expired", lost.text
+    assert await _code_refusals(service) == []
+    assert await service.store.list_webauthn_credentials(identity.user_id) == []
+
+
+async def test_an_expired_ceremony_with_an_oversized_enrolment_code_is_still_the_expired_reply(
+    engine: Engine,
+) -> None:
+    """BACKLOG #5399. RED when: the enrolment-code bound answers a finish with no staged ceremony
+    ahead of the service's own "ceremony expired" reply, the one main gave, or writes an
+    enrolment-code refusal for it."""
+    pytest.importorskip("webauthn")
+    service = await _service(engine)
+    identity, token, body = await _staged(service)
+    await service.issue_enrolment_code(
+        identity.user_id, actor="test-host", issuer_id=None, via="host"
+    )
+    service._webauthn_challenges.pop((hash_token(token), "register"))
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        expired = await c.post(
+            _VERIFY,
+            json={**body, "enrolment_code": "x" * (ENROLMENT_CODE_MAX + 1)},
+            headers=SAME_ORIGIN,
+        )
+    assert expired.status_code == 400, expired.text
+    assert "ceremony expired" in expired.json()["error"]
+    assert await _code_refusals(service) == []
 
 
 def test_the_binding_forms_carry_the_code_field_only_when_owed() -> None:

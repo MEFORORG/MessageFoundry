@@ -31,12 +31,15 @@ from messagefoundry.auth.trust_anchors import AUDIT_ACTION, TrustAnchorError
 from messagefoundry.config import wiring
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
+    DICOM,
     FHIR,
+    MLLP,
     DICOMweb,
     Direct,
     Email,
     FhirLookup,
     Ftp,
+    Http,
     Registry,
     Rest,
     Soap,
@@ -398,6 +401,12 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
         recipient_cert="r.pem",
         trust_anchor="t.pem",
         **kw,
+    ),
+    # BACKLOG #5329 and #5331: the listener-capable factories make the same checks.
+    "MLLP": lambda **kw: MLLP(host="lis.example.org", port=2575, tls=True, **kw),
+    "Http": lambda **kw: Http(port=8443, tls=True, **kw),
+    "DICOM": lambda **kw: DICOM(
+        ae_title="MEFOR", host="pacs.example.org", port=11112, tls=True, **kw
     ),
 }
 

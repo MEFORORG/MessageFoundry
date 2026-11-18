@@ -77,6 +77,7 @@ from messagefoundry.transports.rest import (
     _redact_url,
     _shared_no_redirect_opener,
     auth_challenge_refused,
+    digest_proxy_meets_the_token_connect,
     ech_readdressed_request,
     enforce_outbound_length_limits,
     hop_declarations_from_settings,
@@ -179,10 +180,10 @@ def _read_token_reply(
         # BACKLOG #1171, #2989: the proxy Digest handler's refusal, classified as the delivery hop
         # classifies it. No built configuration reaches this arm now: an http:// token endpoint must
         # be loopback and is dialled direct, and an https:// one meets the proxy only on a CONNECT,
-        # where no Digest handler runs; _open_token_hop refuses a Digest proxy there at build (ADR
-        # 0095 B.1). Kept so a refusal that did arrive would still be this fault rather than escape
-        # the DeliveryError contract as a ValueError. Fixed text: the peer's algorithm token stays
-        # on the cause only.
+        # where no Digest handler runs; the build refuses a Digest proxy there (ADR 0095 B.1, the
+        # rule in rest.digest_proxy_meets_the_token_connect). Kept so a refusal that did arrive
+        # would still be this fault rather than escape the DeliveryError contract as a ValueError.
+        # Fixed text: the peer's algorithm token stays on the cause only.
         raise auth_challenge_refused(endpoint) from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as
@@ -273,22 +274,25 @@ class _TokenEndpointProvider(abc.ABC):
     expiry_skew_seconds: float
     timeout_seconds: float
 
+    @classmethod
     def _check_token_url(
-        self,
+        cls,
         token_url: str,
         *,
         connection: str | None,
     ) -> str:
-        """Validate the token URL and refuse a cleartext hop; return its lower-cased scheme."""
+        """Validate the token URL and refuse a cleartext hop; return its lower-cased scheme. A
+        classmethod with no side effect, so ``http_auth.refuse_a_digest_proxy_on_the_token_hop``
+        runs it before any provider is built (vault BACKLOG #2989)."""
         if not token_url:
-            raise self._ERROR(self._MISSING_URL)
+            raise cls._ERROR(cls._MISSING_URL)
         scheme = url_scheme(
-            token_url, self._URL_SETTING, use=self._CREDENTIAL_SETTINGS, error=self._ERROR
+            token_url, cls._URL_SETTING, use=cls._CREDENTIAL_SETTINGS, error=cls._ERROR
         )
         if scheme not in ("http", "https"):
-            raise self._ERROR(f"{self._URL_SETTING} must be http or https, got scheme {scheme!r}")
+            raise cls._ERROR(f"{cls._URL_SETTING} must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(
-            token_url, self._URL_SETTING, use=self._CREDENTIAL_SETTINGS, error=self._ERROR
+            token_url, cls._URL_SETTING, use=cls._CREDENTIAL_SETTINGS, error=cls._ERROR
         )
         # The token POST carries a credential, so an off-box cleartext hop is refused with no
         # escape, as the delivery cells' credentials are (vault BACKLOG #3533 item 4): neither
@@ -300,16 +304,29 @@ class _TokenEndpointProvider(abc.ABC):
             refuse_cleartext_credential_hop(
                 scheme,
                 token_url,
-                credential=f"{self._LABEL} {self._CREDENTIAL_NAME}",
+                credential=f"{cls._LABEL} {cls._CREDENTIAL_NAME}",
                 connection=connection,
             )
         except InsecureHopRefused as exc:
-            raise self._ERROR(
-                f"{hop_name_prefix(connection)}{self._LABEL} token endpoint over cleartext http "
+            raise cls._ERROR(
+                f"{hop_name_prefix(connection)}{cls._LABEL} token endpoint over cleartext http "
                 "would expose the "
-                f"{self._CREDENTIAL_NAME}; refused ({CREDENTIAL_HOP_WAYS_ACROSS})"
+                f"{cls._CREDENTIAL_NAME}; refused ({CREDENTIAL_HOP_WAYS_ACROSS})"
             ) from exc
         return scheme
+
+    @classmethod
+    def digest_proxy_refusal(cls, connection: str | None) -> ValueError:
+        """The build refusal of an https token hop whose web proxy is set up for Digest (vault
+        BACKLOG #2989 item 11), in this provider's error type. One text for the refusal here and
+        the earlier one ``http_auth.refuse_a_digest_proxy_on_the_token_hop`` raises."""
+        return cls._ERROR(
+            f"{hop_name_prefix(connection)}{cls._LABEL} token endpoint is https and its web "
+            "proxy is set up for Digest (proxy_auth_type='digest'); a 407 from the proxy "
+            "arrives on the CONNECT, where Digest cannot answer it. ADR 0095 B.1 gives the "
+            "remedies, and the cost of proxy_auth_type='basic', which sends the password on "
+            "the CONNECT in recoverable form"
+        )
 
     def _open_token_hop(
         self,
@@ -333,40 +350,41 @@ class _TokenEndpointProvider(abc.ABC):
         self.timeout_seconds = timeout_seconds
         # ADR 0126: route the token-endpoint POST through the connection's forward proxy — resolved
         # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener and
-        # no Proxy-Authorization (byte-identical).
-        token_proxy = proxy.for_host(token_url) if proxy else None
+        # no Proxy-Authorization (byte-identical). None with an ECH sidecar too: the POST goes to the
+        # loopback sidecar, which is dialled direct. No built connection pairs the two.
+        token_proxy = proxy.for_host(token_url) if proxy and ech_sidecar is None else None
         # BACKLOG #2989 item 11: an https token request reaches its web proxy only as a CONNECT, and
         # urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest
-        # setup could never answer a challenge on this hop (ADR 0095 B.1). Keyed on the proxy
-        # resolved for the TOKEN host, so a token host the proxy bypasses builds. With an ECH
-        # sidecar the POST is re-addressed to the loopback sidecar, which is dialled direct, so the
-        # proxy never meets it. The data hop refuses Digest for an https destination in
-        # rest.proxy_auth_handler_from_settings.
+        # setup could never answer a challenge on this hop (ADR 0095 B.1). Some REST and FHIR
+        # outbounds meet it earlier; http_auth.refuse_a_digest_proxy_on_the_token_hop says which.
+        # Every other token provider meets it here, at least a SOAP outbound's, a FhirLookup's and
+        # one built directly. Both read the one rule.
         if (
-            scheme == "https"
+            proxy is not None
             and ech_sidecar is None
-            and token_proxy is not None
-            and token_proxy.answers_digest
+            and proxy.digest is not None
+            and digest_proxy_meets_the_token_connect(token_url, proxy.bypass)
         ):
-            raise self._ERROR(
-                f"{hop_name_prefix(connection)}{self._LABEL} token endpoint is https and its web "
-                "proxy is set up for Digest (proxy_auth_type='digest'); a 407 from the proxy "
-                "arrives on the CONNECT, where Digest cannot answer it. ADR 0095 B.1 gives the "
-                "remedies, and the cost of proxy_auth_type='basic', which sends the password on "
-                "the CONNECT in recoverable form"
-            )
+            raise self.digest_proxy_refusal(connection)
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
         # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
         # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
         # from them. Neither -> the shared opener, unmutated (ADR 0126), byte-identical.
-        self._opener: urllib.request.OpenerDirector = (
-            _no_redirect_opener(
+        #
+        # With an ECH sidecar the POST goes to the loopback sidecar, never to the token host, so the
+        # opener is the plain one the REST destination's own ECH hop uses: no proxy, and no anchor
+        # resolved for a host it never dials (vault BACKLOG #2977 item 5). An anchored one would
+        # handshake with an https sidecar under the token host's CA and CRL.
+        self._opener: urllib.request.OpenerDirector
+        if ech_sidecar is not None:
+            self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
+        elif token_proxy is not None or trust_anchor.narrows:
+            self._opener = _no_redirect_opener(
                 *(token_proxy.opener_handlers() if token_proxy is not None else ()),
                 trust_anchor=trust_anchor,
             )
-            if token_proxy is not None or trust_anchor.narrows
-            else _shared_no_redirect_opener()
-        )
+        else:
+            self._opener = _shared_no_redirect_opener()
         # #1498, #2112 (ADR 0173 §4.3): the revocation twin of the cleartext refusal, and the same
         # one-statement call its HTTP-family siblings make. The token hop VERIFIES the authorization
         # server's certificate but stdlib ssl performs no OCSP/CRL, so a revoked-but-unexpired
@@ -399,9 +417,10 @@ class _TokenEndpointProvider(abc.ABC):
         # WITH AN ECH SIDECAR THE GUARD GETS NO OPENER (vault BACKLOG #2169). `_post_token`
         # re-addresses the POST to the loopback sidecar, and the sidecar makes its own TLS connection
         # to the token host. So this opener's context only ever meets the sidecar. A `[tls].crl_file`
-        # covering the token host still lands on it, and reading it here lifted the refusal with no
-        # check behind it. On an enforcing instance a non-loopback token host then crosses on the
-        # per-connection attestation alone.
+        # covering the token host once landed on it, and reading it here lifted the refusal with no
+        # check behind it. The opener no longer carries that anchor (vault BACKLOG #2977 item 5),
+        # and the guard still reads none. On an enforcing instance a non-loopback token host then
+        # crosses on the per-connection attestation alone.
         refuse_unrevoked_verified_hop(
             scheme,
             token_url,

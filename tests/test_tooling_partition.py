@@ -76,6 +76,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # the change that breaks it. Its other half reads docs/SECURITY.md, which is what makes it a
         # doc-drift guard, but the doc half is not the reason it stays.
         "test_adaptive_attributes_doc_drift.py",
+        # Reads messagefoundry/api/app.py to pin the ADR 0167 gate's log-line prefixes that
+        # scripts/service/measure-store-access.ps1 tells apart. An engine diff that rewords them must
+        # meet this test, and the tooling job's path gate would not run it then.
+        "test_measure_store_access_gate_refusal.py",
         # Reads tests/conftest.py and packaging/messagefoundry-webconsole/tests/{conftest,
         # _ui_clients}.py off disk, the two copies of the in-process browser stand-in that every
         # /ui write test in both suites runs through (vault BACKLOG #3316). No messagefoundry/**

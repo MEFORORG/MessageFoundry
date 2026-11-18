@@ -19,6 +19,7 @@ from __future__ import annotations
 import socket
 import ssl
 import threading
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -560,3 +561,229 @@ def test_the_kv_secret_provider_fails_closed_on_a_misframed_reply(
         monkeypatch.delenv("MEFOR_SECRETS_VAULT_CA_FILE", raising=False)
         with pytest.raises(SecretProviderError, match="framed its response body ambiguously"):
             VaultSecretProvider(SecretsSettings()).resolve("mefor/ad")
+
+
+# --- no netrc file is read, and none of its credentials ride on a Vault request (#5355) ----------
+
+
+def _plant_netrc(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A netrc file with an entry for the scripted Vault's host and one for a redirect target.
+    Synthetic credentials only."""
+    netrc_file = tmp_path / "netrc"
+    netrc_file.write_text(
+        "machine 127.0.0.1 login synthetic-user password synthetic-pass\n"
+        "machine elsewhere.example.test login synthetic-other password synthetic-other-pass\n",
+        encoding="ascii",
+    )
+    monkeypatch.setenv("NETRC", str(netrc_file))
+
+
+def _authorization_sent(server: _ScriptedVault) -> list[bytes]:
+    return [
+        line
+        for request in server.requests
+        for line in request.split(b"\r\n")
+        if line.lower().startswith(b"authorization:")
+    ]
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["messagefoundry.config.secretprovider_vault", "messagefoundry.store.keyprovider_vault"],
+)
+def test_a_vault_client_reads_no_netrc_file_and_sends_none_of_its_credentials(
+    module: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #5355. Mutation: drop the session auth the mount sets. Red: a netrc read on
+    the request, and an Authorization header from the planted entry."""
+    import importlib
+
+    _plant_netrc(tmp_path, monkeypatch)
+    reads = _recording_netrc(monkeypatch)
+    mod = importlib.import_module(module)
+    with _ScriptedVault([(_ok(), True)]) as server:
+        client = mod._build_client(
+            f"http://127.0.0.1:{server.port}", _TOKEN, revocation_attested=False
+        )
+        assert _get(client) == {"data": {"data": {"value": "synthetic"}}}
+        # trust_env stays on, so the proxy and CA bundle variables still reach the session.
+        assert client.adapter.session.trust_env is True
+    assert reads == []
+    assert _authorization_sent(server) == []
+    assert any(b"x-vault-token: " + _TOKEN.encode() in r.lower() for r in server.requests)
+
+
+def test_control_a_plain_requests_session_sends_the_planted_netrc_credentials(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control: a stock session with the same netrc file sends its entry as Basic auth,
+    so the empty reading above is the mount's doing and not a netrc file requests cannot read."""
+    import requests
+
+    _plant_netrc(tmp_path, monkeypatch)
+    with _ScriptedVault([(_ok(), True)]) as server, requests.Session() as session:
+        assert session.get(f"http://127.0.0.1:{server.port}/{_KV_PATH}", timeout=10).ok
+    assert [line.split(b" ")[1] for line in _authorization_sent(server)] == [b"Basic"]
+
+
+def _recording_netrc(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record every netrc lookup requests' session code makes, still answering it for real."""
+    import requests.sessions
+    import requests.utils
+
+    reads: list[object] = []
+    real = requests.utils.get_netrc_auth
+
+    def _recording_netrc_auth(*args: Any, **kwargs: Any) -> Any:
+        reads.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(requests.sessions, "get_netrc_auth", _recording_netrc_auth)
+    return reads
+
+
+_REDIRECT = (
+    b"HTTP/1.1 302 Found\r\nLocation: https://elsewhere.example.test/v1/x\r\n"
+    b"Content-Length: 0\r\n\r\n"
+)
+
+
+def test_a_vault_3xx_reads_no_netrc_entry_for_its_location(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #5355. With redirects refused, ``Session.send`` still prepares
+    ``Response.next`` for a 3xx, through ``rebuild_auth``, which reads the netrc file for the
+    Location host. Mutation: drop the mount's rebuild_auth replacement. Red: a read for the
+    Location, and that host's netrc entry on ``Response.next``."""
+    from messagefoundry.config import secretprovider_vault
+
+    _plant_netrc(tmp_path, monkeypatch)
+    reads = _recording_netrc(monkeypatch)
+    with _ScriptedVault([(_REDIRECT, True)]) as server:
+        client = secretprovider_vault._build_client(
+            f"http://127.0.0.1:{server.port}", _TOKEN, revocation_attested=False
+        )
+        response = client.adapter.session.get(
+            f"http://127.0.0.1:{server.port}/{_KV_PATH}", allow_redirects=False, timeout=10
+        )
+    assert response.status_code == 302
+    assert reads == []
+    assert response.next is not None
+    assert "Authorization" not in response.next.headers
+
+
+def test_control_a_plain_session_reads_the_location_netrc_entry_on_a_3xx(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control for the test above: a stock session does read and attach it."""
+    import requests
+
+    _plant_netrc(tmp_path, monkeypatch)
+    reads = _recording_netrc(monkeypatch)
+    with _ScriptedVault([(_REDIRECT, True)]) as server, requests.Session() as session:
+        response = session.get(
+            f"http://127.0.0.1:{server.port}/{_KV_PATH}", allow_redirects=False, timeout=10
+        )
+    assert ("https://elsewhere.example.test/v1/x",) in reads
+    assert response.next is not None
+    assert str(response.next.headers["Authorization"]).startswith("Basic ")
+
+
+def test_url_userinfo_still_becomes_basic_auth_as_it_did_with_no_session_auth(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-op auth changes only the netrc read: userinfo in the URL is still sent as Basic,
+    as ``prepare_auth`` did with no auth set. NETRC names an empty file, so the stock session
+    reads no real one. Synthetic credentials only."""
+    import requests
+
+    empty = tmp_path / "netrc"
+    empty.write_text("", encoding="ascii")
+    monkeypatch.setenv("NETRC", str(empty))
+
+    from messagefoundry.transports.strict_requests import _NoAmbientAuth
+
+    url = "https://synthetic-user:synthetic-pass@vault.example.test/v1/x"
+    with requests.Session() as stock, requests.Session() as mounted:
+        mounted.auth = _NoAmbientAuth()
+        expected = stock.prepare_request(requests.Request("GET", url)).headers["Authorization"]
+        got = mounted.prepare_request(requests.Request("GET", url)).headers["Authorization"]
+    assert got == expected
+
+
+def test_the_mount_keeps_a_truthy_auth_the_caller_set_and_replaces_a_falsy_one() -> None:
+    """requests skips the netrc read only for a truthy session auth, so the mount keeps one and
+    replaces a falsy one. It asserts which auth object the session ends with, nothing more."""
+    import requests
+
+    from messagefoundry.transports.strict_requests import _NoAmbientAuth, mount_strict_reply_adapter
+
+    def _mounted(auth: Any) -> Any:
+        session = requests.Session()
+        session.auth = auth
+        client = SimpleNamespace(
+            adapter=SimpleNamespace(base_uri="https://vault.example.test:8200", session=session)
+        )
+        mount_strict_reply_adapter(
+            client,
+            connector="Vault test hop",
+            ssl_context_factory=ssl.create_default_context,
+            revocation_attested=True,
+            attestation_section="secrets",
+        )
+        result = session.auth
+        session.close()
+        return result
+
+    preset = requests.auth.HTTPBasicAuth("synthetic-user", "synthetic-pass")
+    assert _mounted(preset) is preset
+    assert isinstance(_mounted(()), _NoAmbientAuth)
+
+
+def test_the_mount_swaps_the_session_class_with_no_reference_cycle() -> None:
+    """The rebuild_auth override is the class, not a bound method stored on the session, so a
+    discarded client is freed by reference counting. Mutation: store a partial on the session.
+    Red: the session survives until a cyclic collection."""
+    import gc
+    import weakref
+
+    from messagefoundry.config import secretprovider_vault
+    from messagefoundry.transports.strict_requests import _NetrcFreeSession
+
+    client = secretprovider_vault._build_client(
+        "https://vault.example.test:8200", _TOKEN, revocation_attested=True
+    )
+    assert type(client.adapter.session) is _NetrcFreeSession
+    assert "rebuild_auth" not in vars(client.adapter.session)
+    gone = weakref.ref(client.adapter.session)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del client
+        assert gone() is None
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def test_a_session_subclass_is_refused_rather_than_swapped() -> None:
+    import requests
+
+    from messagefoundry.transports.strict_requests import mount_strict_reply_adapter
+
+    class _Custom(requests.Session):
+        pass
+
+    with _Custom() as session:
+        client = SimpleNamespace(
+            adapter=SimpleNamespace(base_uri="https://vault.example.test:8200", session=session)
+        )
+        with pytest.raises(ValueError, match="not a plain requests.Session"):
+            mount_strict_reply_adapter(
+                client,
+                connector="Vault test hop",
+                ssl_context_factory=ssl.create_default_context,
+                revocation_attested=True,
+                attestation_section="secrets",
+            )
+        assert type(session) is _Custom

@@ -167,15 +167,17 @@ def _supported_pub_key_algs() -> list[COSEAlgorithmIdentifier]:
 
 
 def _invalid_input_errors() -> tuple[type[Exception], ...]:
-    """Every exception py_webauthn raises for bad input, which must all reach the audited path.
+    """Exceptions py_webauthn raises for bad input. Behaviour pinned by tests/test_webauthn.py::
+    test_an_unusable_stored_key_fails_the_assertion_audited_not_raised.
 
-    ``WebAuthnException`` is the library's own base class. The other three entries catch four raw
+    ``WebAuthnException`` is the library's own base class. The next three entries catch four raw
     exception types (``LookupError`` covers both ``KeyError`` and ``IndexError``) that it lets
     out when a COSE key is malformed rather than merely wrong: its key decoder indexes an
     untyped CBOR value, so a missing label is a ``KeyError``, a short array an ``IndexError``, a
     bare integer a ``TypeError``, and a point that is not on its stated curve a ``ValueError`` from
-    ``cryptography``. Measured at engine ``0076e3cec`` on the pinned ``webauthn==3.0.0`` (BACKLOG
-    #1166). Each is attacker-shaped input, so each must land on the audited invalid-input path ADR
+    ``cryptography``. Measured at engine ``0076e3cec`` on ``webauthn`` 3.0.0 (BACKLOG #1166);
+    ``pyproject.toml`` allows ``webauthn>=3.0.0,<4`` and ``requirements.lock`` pins 3.0.1.
+    Each is attacker-shaped input, so each must land on the audited invalid-input path ADR
     0068 decision 1 requires rather than escape as a 500. Use it only around library calls, never
     around our own logic, where the same exceptions would mean a bug.
 
@@ -579,20 +581,20 @@ def verify_registration(
     _require_webauthn()
     from webauthn import verify_registration_response
 
+    supported_algs = _supported_pub_key_algs()
     try:
         verified = verify_registration_response(
             credential=response_json,
             expected_challenge=challenge,
             expected_rp_id=rp_id,
             expected_origin=origin,
-            supported_pub_key_algs=_supported_pub_key_algs(),
+            supported_pub_key_algs=supported_algs,
         )
-    except _invalid_input_errors() as exc:
-        # The BASE class, deliberately (PR-A review HIGH): structurally-malformed browser input
-        # raises siblings of InvalidRegistrationResponse (InvalidJSONStructure, InvalidCBORData,
-        # ...) — every library-side rejection must land on the audited return-False/400 path,
-        # never an unhandled 500. The raw decode errors join it for the same reason (BACKLOG
-        # #1166): a malformed COSE key raised them straight out of this call.
+    except Exception as exc:
+        # vault BACKLOG #5341. Pinned by tests/test_webauthn.py::
+        # test_a_deeply_nested_registration_response_is_the_audited_refusal,
+        # test_a_malformed_safetynet_statement_is_the_audited_refusal and
+        # test_a_malformed_attestation_certificate_is_the_audited_refusal.
         raise _refusal(exc, ceremony="registration") from exc
     _require_usable_public_key(verified.credential_public_key, ceremony="registration")
     return RegistrationResult(
@@ -685,12 +687,9 @@ def verify_assertion(
             credential_public_key=public_key,
             credential_current_sign_count=current_sign_count,
         )
-    except _invalid_input_errors() as exc:
-        # The BASE class, deliberately (PR-A review HIGH): malformed input raises siblings of
-        # InvalidAuthenticationResponse — every rejection lands audited, never a 500. The
-        # sign-count regression message ("...sign count...") still rides through for the
-        # service's clone-signal classification. The raw types stay caught although the stored
-        # key was screened above: the response itself is attacker input too.
+    except Exception as exc:
+        # vault BACKLOG #5341. Pinned by tests/test_webauthn.py::
+        # test_a_deeply_nested_assertion_response_is_the_audited_refusal.
         raise _refusal(exc, ceremony="assertion") from exc
     return AssertionResult(verified.new_sign_count, bool(verified.user_verified))
 
@@ -780,11 +779,12 @@ def resident_key_from_response(response_json: str) -> bool | None:
 
 def _transports_from_response(response_json: str) -> list[str] | None:
     """Best-effort ``response.transports`` extraction (browser hint — absence is fine)."""
-    try:
-        parsed = json.loads(response_json)
-        transports = parsed.get("response", {}).get("transports")
-    except (ValueError, AttributeError):  # pragma: no cover - verify_registration already parsed
+    # vault BACKLOG #5341.
+    parsed, refused = json_loads_or_refusal(response_json)
+    if refused is not None or not isinstance(parsed, dict):
         return None
+    response = parsed.get("response")
+    transports = response.get("transports") if isinstance(response, dict) else None
     if isinstance(transports, list) and all(isinstance(t, str) for t in transports):
         return list(transports) or None
     return None

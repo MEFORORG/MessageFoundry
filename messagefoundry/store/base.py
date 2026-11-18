@@ -28,7 +28,15 @@ import logging
 import sys
 import threading
 import weakref
-from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
@@ -80,6 +88,7 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.row_seal import AnyRowSealer, ResealOutcome
 from messagefoundry.store.store import (
     ANY_CLAIM_OWNER,
+    OPEN_STORE_HOOK,
     OPEN_STORE_PIN,
     OPEN_STORE_PIN_CHECK,
     UPLOAD_RESERVATION_STALE_AFTER,
@@ -4796,6 +4805,7 @@ async def open_store(
     refusal_hook: UnmarkedRefusalHook | None = None,
     custody: HostBlob | None = None,
     recovery_wrap: bytes = b"",
+    before_first_write: Callable[[Any], Awaitable[None]] | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
@@ -4879,6 +4889,12 @@ async def open_store(
     Every custody refusal is a :class:`~messagefoundry.store.keyprovider.KeyProviderError`, with a
     fixed text and no cause or context; :func:`_host_custody_for_open` says which errors on the
     custody path are replaced (BACKLOG #4882).
+
+    ``before_first_write`` (BACKLOG #4936) is awaited with the half-opened backend store on every
+    writable open, right after the pin check: the schema is in place, and nothing has yet bound a
+    salt, reserved a cipher block, sealed a row or written an audit row. ``rotate-key`` opens its
+    rotation record there. The schema step before it can already have run its DDL or a migration.
+    A read-only open does not run it. What it raises fails the open, with the handle closed.
     """
     if create and read_only:
         raise ValueError("open_store: create and read_only exclude each other")
@@ -4931,6 +4947,7 @@ async def open_store(
     # The batch failures a backend typed itself, and the pin refusals, are re-raised as they are.
     check = PinCheck() if minting_open() and settings.backend is not StoreBackend.SQLITE else None
     checking = OPEN_STORE_PIN_CHECK.set(check)
+    hooked = OPEN_STORE_HOOK.set(before_first_write)
     try:
         store = await _open_backend(
             settings,
@@ -4947,6 +4964,7 @@ async def open_store(
             raise
         raise StoreCreateBatchFailedBeforeKeyUse(exc) from exc
     finally:
+        OPEN_STORE_HOOK.reset(hooked)
         OPEN_STORE_PIN_CHECK.reset(checking)
         OPEN_STORE_PIN.reset(pinned)
     if keyless_chain_refusal is not None and audit_mac_key is None and audit_mac_fn is None:

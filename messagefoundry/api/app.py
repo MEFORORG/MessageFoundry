@@ -533,7 +533,7 @@ from messagefoundry.store.base import (
     audit_write_errors,
     build_store_cipher,
 )
-from messagefoundry.store.cell_tag import CellTagError
+from messagefoundry.store.cell_tag import BlankCellError, CellTagError, NonTextCellError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -571,6 +571,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 from messagefoundry.uploads import (
     UploadContentError,
+    UploadDamagedError,
     UploadedFileMeta,
     UploadError,
     UploadNotFoundError,
@@ -9043,6 +9044,14 @@ def create_app(
         "with 'messagefoundry rotate-key', or restore the retired key it was sealed under. If "
         "rotate-key reports it as unsealable, an operator can only delete it"
     )
+    # BACKLOG #5388: a damaged file (UploadDamagedError) is refused with the same status but its
+    # own text, because no key and no rotate-key repairs it, and a keyless store has no key at all.
+    # It promises no removal, because some damaged files are kept by the prune and refused by the
+    # delete; docs/PHI.md section 3 lists them. It says only what holds for every file that gets it.
+    _UPLOAD_DAMAGED = (
+        "this uploaded file is damaged, so it was not read and is not served. No key and no "
+        "command repairs it. An operator may try to delete it, and the delete may be refused too"
+    )
 
     _UPLOAD_UNAVAILABLE = (
         "the store's key service could not complete the request, so nothing was read, stored or "
@@ -9080,10 +9089,17 @@ def create_app(
     class _UploadSidecarRefused(HTTPException):
         """The 423 an override holder gets when an upload's sidecar is refused. Every other route
         answers it as is. DELETE alone catches it and asks ``UploadStore.delete``. That call can
-        still remove an upload ``rotate-key`` never seals (BACKLOG #2322)."""
+        still remove an upload ``rotate-key`` never seals (BACKLOG #2322). ``damaged`` carries a
+        damaged sidecar's own text (BACKLOG #5388), and DELETE then lets the store read it again."""
 
-        def __init__(self) -> None:
-            super().__init__(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE)
+        def __init__(self, damaged: bool = False) -> None:
+            super().__init__(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged))
+            self.damaged = damaged
+
+    def _upload_refused_text(damaged: bool) -> str:
+        """The 423 text of a refused file, a damaged file's own (BACKLOG #5388). Callers pass only
+        the refusal's class, so its message reaches no response."""
+        return _UPLOAD_DAMAGED if damaged else _UPLOAD_UNREADABLE
 
     async def _authorized_upload_meta(
         request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
@@ -9113,8 +9129,8 @@ def create_app(
         except UploadUnavailableError as exc:
             # BACKLOG #3734: an outage, not the 423. Only its text is kept past this clause.
             override_answer = partial(_upload_unavailable, str(exc), op)
-        except UploadUnreadableError:
-            override_answer = _UploadSidecarRefused
+        except UploadUnreadableError as exc:
+            override_answer = partial(_UploadSidecarRefused, isinstance(exc, UploadDamagedError))
         if override_answer is not None:
             # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
             # for everyone but an override holder, who may see any file anyway and is the one who
@@ -9223,7 +9239,8 @@ def create_app(
             )
             raise HTTPException(415, exc.reason) from None
         except UploadContentError as exc:
-            # ASVS 5.2.2: disallowed extension or content/extension mismatch. Refuse with 400 and a
+            # ASVS 5.2.2: disallowed extension or content/extension mismatch, or (BACKLOG #5387,
+            # UploadFieldError) a field the sidecar reader would refuse. Refuse with 400 and a
             # metadata-only audit: the reason without the file name (#2619), NEVER any content. Covers
             # both POST /uploads and POST /ui/uploaded-logs/upload (this handler backs both).
             await engine.store.record_audit(
@@ -9410,8 +9427,9 @@ def create_app(
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
             outage = str(exc)
-        except UploadUnreadableError:
-            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        except UploadUnreadableError as exc:
+            damaged = isinstance(exc, UploadDamagedError)
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "browse")  # after the handler: no chain link
         result = await asyncio.to_thread(
@@ -9571,8 +9589,9 @@ def create_app(
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
             outage = str(exc)
-        except UploadUnreadableError:
-            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        except UploadUnreadableError as exc:
+            damaged = isinstance(exc, UploadDamagedError)
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "resend")  # after the handler: no chain link
         parts = await asyncio.to_thread(split_uploaded, data)
@@ -9653,8 +9672,10 @@ def create_app(
         refused = False
         try:
             await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
-        except _UploadSidecarRefused:
-            refused = True
+        except _UploadSidecarRefused as exc:
+            # A damaged sidecar is read again by the store, which classes it as the scan does and
+            # answers its own refusal (BACKLOG #5388); the flag would skip that read.
+            refused = not exc.damaged
         client = client_ip(request)
         actor = identity.username
 
@@ -9703,8 +9724,9 @@ def create_app(
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
             outage = str(exc)
-        except UploadUnreadableError:
-            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        except UploadUnreadableError as exc:
+            damaged = isinstance(exc, UploadDamagedError)
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "delete")  # after the handler: no chain link
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
@@ -9814,6 +9836,24 @@ def create_app(
         )
         return SearchPresetDeleteResult(id=preset_id, deleted=True)
 
+    # BACKLOG #5523: when the layered search last logged each (preset, cause) refusal. One record per
+    # pair per interval, as the store's tag-failure WARNING is; the route's audit row is written for
+    # each refusal, best effort. Touched on the event loop only.
+    _layered_refusals_logged: dict[tuple[str, str], float] = {}
+    _LAYERED_REFUSAL_LOG_INTERVAL_S = 3600.0
+    _LAYERED_REFUSAL_LOG_MAX = 4096
+
+    def _first_layered_refusal(preset_id: str, cause: str) -> bool:
+        key, now = (preset_id, cause), time.monotonic()
+        last = _layered_refusals_logged.pop(key, None)
+        if last is not None and now - last < _LAYERED_REFUSAL_LOG_INTERVAL_S:
+            _layered_refusals_logged[key] = last
+            return False
+        _layered_refusals_logged[key] = now
+        while len(_layered_refusals_logged) > _LAYERED_REFUSAL_LOG_MAX:
+            _layered_refusals_logged.pop(next(iter(_layered_refusals_logged)))
+        return True
+
     @app.get("/search/layered", response_model=MessageSearchResults)
     async def layered_search(
         request: Request,
@@ -9835,18 +9875,82 @@ def create_app(
             raise HTTPException(400, "provide at least one preset id")
         if len(ids) > _MAX_PRESET_LAYERS:
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
+
+        async def refuse(preset_id: str, refusal: HTTPException, cause: str) -> HTTPException:
+            # BACKLOG #5523: a refused recall of a stored preset writes the route's own audit row,
+            # naming the caller, the preset, the status and the error class, never a cipher text or
+            # a criterion. A drift refusal also has the store's tag-failed row; this one records
+            # who asked. The caller raises the refusal, after any except clause has ended. Best
+            # effort, as the store's tag-failed row is: on a Vault Transit store the audit MAC is
+            # Transit's, so during the outage the 503 arm answers, this write fails too, and the
+            # refusal must still be the answer, not a 500.
+            try:
+                await engine.store.record_audit(
+                    "preset.layered_search",
+                    actor=identity.username,
+                    detail=json.dumps(
+                        {
+                            "presets": len(ids),
+                            "refused": preset_id,
+                            "status": refusal.status_code,
+                            "cause": cause,
+                        }
+                    ),
+                    client=client_ip(request),
+                )
+            except audit_write_errors() as exc:
+                # The store-refusal set the other fail-soft audit writes catch. Defects
+                # (AUDIT_WRITE_DEFECTS) are not re-raised: a raise would replace the refusal owed
+                # with a 500, the case write_audit_soft's docstring says to pass defects=() for.
+                # write_audit_soft itself is not used: it logs the traceback, whose frames reach
+                # the route frame's decrypted `criterias`. Names the refusal's own status and
+                # cause, which the row would have held, at most once per preset, cause and failure
+                # class per interval: an outage fails every write. Later failures in that window
+                # leave no row and no log line.
+                failed = type(exc).__name__
+            except Exception as exc:  # noqa: BLE001 -- a defect must not replace the refusal owed
+                # A backstop for a fault outside that set, a defect in the chain seal say: logged
+                # the same way, by type name only, with no exc_info and no message text, so no
+                # audit-write failure changes the 423, 503 or 400 answer.
+                failed = f"defect {type(exc).__name__}"
+            else:
+                return refusal
+            if _first_layered_refusal(preset_id, f"audit:{cause}:{failed}"):
+                _log.error(
+                    "layered search could not audit its refusal of preset %s (%s %s; %s)",
+                    preset_id,
+                    str(refusal.status_code),
+                    cause,
+                    failed,
+                )
+            return refusal
+
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
             refusal: HTTPException | None = None
+            cause = ""
             try:
                 row = await engine.store.get_search_preset(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
-            except CellTagError:
+            except (BlankCellError, NonTextCellError) as exc:
+                # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, which
+                # it never writes (audited and logged there, and alerted on a keyed store), so it
+                # never reads as an empty filter that would widen the search. Its own text: a
+                # keyless store has no integrity tag for such a cell to fail.
+                cause = type(exc).__name__
+                shape = "blank" if isinstance(exc, BlankCellError) else "non-text"
+                refusal = HTTPException(
+                    423,
+                    f"preset {preset_id} has {shape} criteria, written outside the store, and"
+                    " cannot be used",
+                )
+            except CellTagError as exc:
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
                 # unmarked value (audited; the cipher alerted, BACKLOG #5650) or are corrupt
                 # (logged); the store refused. The caller's own preset exists, so a refusal, never
                 # a 500. Caught before CipherError, which it subclasses.
+                cause = type(exc).__name__
                 refusal = HTTPException(
                     423, f"preset {preset_id} failed its integrity check and cannot be used"
                 )
@@ -9855,6 +9959,7 @@ def create_app(
                 # so a later try may succeed. Its text goes to the log only, as in uploads, and as
                 # a str: the exception's traceback would reach this frame's decrypted `criterias`.
                 _log.warning("layered search answered 503 on preset %s: %s", preset_id, str(exc))
+                cause = type(exc).__name__
                 refusal = HTTPException(
                     503,
                     f"the store's key service could not open preset {preset_id}. Try again shortly",
@@ -9864,11 +9969,16 @@ def create_app(
                 # BACKLOG #5523: a key or format problem the cipher raises as is, for example a
                 # retired key that is not supplied, or a Vault Transit refusal other than the
                 # value's AEAD tag (a key-version refusal, a 403). It answered 500. The type name
-                # only: the text is the cipher's, not this route's. ERROR: it is neither audited
-                # nor alerted, so this is the engine's only record of it. Transit's AEAD refusal of
+                # only: the cipher's text can echo fields cut from the stored value, and this cell
+                # may have been written outside the store. ERROR, once per preset and error class
+                # per interval. refuse() tries to write the route's audit row for each refusal; a
+                # write that fails leaves no row, and its own ERROR is logged at most once per
+                # preset, cause and failure class per interval. Transit's AEAD refusal of
                 # a cell planted across owners is a CellTagError above (BACKLOG #5650). The outage
                 # above is a WARNING: it says nothing about the cell.
-                _log.error("layered search refused preset %s: %s", preset_id, type(exc).__name__)
+                cause = type(exc).__name__
+                if _first_layered_refusal(preset_id, cause):
+                    _log.error("layered search refused preset %s: %s", preset_id, cause)
                 refusal = HTTPException(
                     423,
                     f"preset {preset_id} cannot be opened with the store's keys and cannot be used;"
@@ -9878,30 +9988,26 @@ def create_app(
             if refusal is not None:
                 # Raised after the handler, so the refusal chains nothing (BACKLOG #1796): `from
                 # None` would still leave the store's and the cipher's errors on __context__.
-                raise refusal
+                raise await refuse(preset_id, refusal, cause)
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
-            if not row["criteria"]:
-                # BACKLOG #5523: the store never writes blank criteria, and a keyed store passes a
-                # blank cell through unopened, so NULL or "" was written outside the store. Read as
-                # `{}` it would drop out of the compose and widen the search, so refuse it. Logged,
-                # since only the caller would learn of it otherwise.
-                _log.warning(
-                    "layered search refused preset %s: its criteria cell is blank", preset_id
-                )
-                # Its own text: a keyless store has no integrity tag for it to fail.
-                raise HTTPException(
-                    423,
-                    f"preset {preset_id} has blank criteria, written outside the store, and cannot"
-                    " be used",
-                )
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
-            # arm is gone: get_search_preset returns the criteria through the cipher as a str, or
-            # None for a NULL cell, and the blank-cell refusal above has already refused None.
+            # arm is gone: get_search_preset returns the criteria through the cipher as a
+            # non-blank str, and refuses a NULL, blank or non-text cell itself (BACKLOG #5523).
             criteria, refused = json_loads_or_refusal(row["criteria"])
             if refused is not None or not isinstance(criteria, dict):
-                raise HTTPException(400, f"preset {preset_id} has malformed criteria")
+                # BACKLOG #5523: the store writes criteria as a JSON object, so this was written
+                # outside it. Logged, once per preset per interval, and audited each time.
+                if _first_layered_refusal(preset_id, "malformed"):
+                    _log.warning(
+                        "layered search refused preset %s: its criteria are malformed", preset_id
+                    )
+                raise await refuse(
+                    preset_id,
+                    HTTPException(400, f"preset {preset_id} has malformed criteria"),
+                    "malformed",
+                )
             criterias.append(criteria)
         spec, meta = _compose_preset_layers(criterias)
         # Re-clamp the scan against the request bound (the composed spec used make_spec's default).
@@ -9938,17 +10044,15 @@ def create_app(
         )
         # BACKLOG #5523: coalesced into summary_access after the route's own row, as
         # /messages/search does, so a layered recall is no way round the harvest signal (review
-        # M-5). Counted post-redaction.
-        exposed, masked = count_exposed(messages), count_masked(messages)
-        if exposed or masked:
-            await request.app.state.summary_auditor.note(
-                engine.store,
-                identity.username,
-                meta["channel_id"],
-                exposed,
-                time.time(),
-                masked=masked,
-            )
+        # M-5). Counted post-redaction; note() writes nothing when both counts are zero.
+        await request.app.state.summary_auditor.note(
+            engine.store,
+            identity.username,
+            meta["channel_id"],
+            count_exposed(messages),
+            time.time(),
+            masked=count_masked(messages),
+        )
         return MessageSearchResults(
             messages=messages,
             scanned=result.scanned,
@@ -12459,6 +12563,7 @@ def create_managed_app(
     registry_filter: Callable[[Registry], Registry] | None = None,
     registry_guard: Callable[[Registry], None] | None = None,
     registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
+    start_registry: Registry | None = None,
     static_credential_settings: ServiceSettings | None = None,
     log_dir: str | None = None,
     configured_log_level: str | None = None,
@@ -12488,7 +12593,13 @@ def create_managed_app(
     trust-anchor preflight, never in its place, with the graph and its ``env()`` values: at the
     first load, every real reload and a DR activation, after the shard filter (``serve`` passes the
     connection key-file check, BACKLOG #3402). It runs first so a graph it refuses writes no
-    trust-anchor audit row. ``static_credential_settings`` is
+    trust-anchor audit row. ``start_registry`` is a graph the caller already loaded from
+    ``config_dir`` with ``load_config``, unfiltered; the first load takes it instead of loading
+    again, so the operator's config modules run once on that start (BACKLOG #5391, S19-75). Every
+    step the first load takes after its ``load_config`` still runs on it. It is read before the
+    cluster config version is seeded, which a clustered start must not do (vault BACKLOG #3076),
+    so it is refused beside an enabled ``cluster_settings``, and ``serve`` passes it only on a
+    single node. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
     inventory's settings half from; ``None`` makes that route say it could not read it. The Vault
     privilege preflight (ADR 0216) names the Vault tokens to probe from it too, so with ``None`` no
@@ -12513,9 +12624,15 @@ def create_managed_app(
             "create_managed_app: allow_no_auth=True was passed beside auth_settings; pass the "
             "opt-in only with no auth_settings, since settings always require sign-in"
         )
+    if start_registry is not None and config_dir is None:
+        raise ValueError("create_managed_app: start_registry was passed with no config_dir")
+    if start_registry is not None and cluster_settings is not None and cluster_settings.enabled:
+        # vault BACKLOG #3076: a clustered first load reads the directory after the version seed.
+        raise ValueError("create_managed_app: start_registry was passed on a clustered start")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        nonlocal start_registry
         # Process-level last-resort: route any otherwise-unhandled asyncio task/callback exception
         # through safe_exc → the log, so it can't escape as a raw traceback (possible PHI) or die
         # silently (ASVS 16.5.4). Here because set_exception_handler needs the running loop.
@@ -12702,9 +12819,9 @@ def create_managed_app(
             # binds listeners. On drift it records a hash-chained `startup_integrity` audit row + alerts;
             # under [integrity].fail_closed_on_drift it raises IntegrityError here (refusing to start) so
             # the startup guard closes the store and no listener ever binds. It raises for the same
-            # reason when attestation verified NOTHING — no baseline, a RECORD stripped of its package rows,
-            # or a package loaded from outside the install root (BACKLOG #1679): a pass that compared zero
-            # files cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
+            # reason when attestation verified NOTHING (BACKLOG #1679; `UnattestedReason` in
+            # messagefoundry/integrity.py names the shapes): a pass that verified no
+            # file cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
             # (`pip install -e .`), so dev is never bricked. Off only if [integrity].enabled=false.
             # It attests the web console too when create_app has imported it (serve_ui on), against the
             # console wheel's own RECORD under the same rules (BACKLOG #1802).
@@ -12717,11 +12834,11 @@ def create_managed_app(
                 )
             # #285 (ASVS 6.7.1): preflight every operator-supplied auth-path trust anchor (OIDC / AD /
             # api-mTLS client CA), the settings CAs a hop dials with (vault BACKLOG #3188;
-            # trust_anchors module item 10) and the SQL Server store pin (that module's
-            # store_sqlserver_pin item), BEFORE any listener binds — a group/world-writable anchor refuses (at enforce) or
+            # trust_anchors module item 10) and, at least, the SQL Server store pin and the
+            # PostgreSQL store CA (that module's item 11), BEFORE any listener binds — a group/world-writable anchor refuses (at enforce) or
             # warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
             # change since the last audited observation is audited (auth.trust_anchor; for the store
-            # pin, that item says where this falls short).
+            # anchors, that item says where this falls short).
             # Dormant (no store call, no audit) when no anchor is configured. On a fatal violation it
             # raises, and the startup guard tears down.
             # BACKLOG #3470: a CA refused before the store opened, here or by serve's forwarder gate.
@@ -12990,7 +13107,12 @@ def create_managed_app(
                 # Before the load reads the directory, so a sibling's reload that lands after it is
                 # still converged on (vault BACKLOG #3076). Never raises; a no-op on a single node.
                 await engine.seed_config_version()
-                loaded = load_config(config_dir)
+                # The caller's load of this directory, when it made one, so the config modules do
+                # not run a second time on this start (BACKLOG #5391, S19-75).
+                # Cleared once taken, so this closure does not pin the start's graph past a reload
+                # (vault BACKLOG #3076).
+                loaded = start_registry if start_registry is not None else load_config(config_dir)
+                start_registry = None
                 # The values from the bytes the load read, as a reload parses them, so the guard,
                 # the preflight and the runner use what the config_loaded digest names (vault
                 # BACKLOG #2596, step 6). A refusal is a bad config, as the load's own is.

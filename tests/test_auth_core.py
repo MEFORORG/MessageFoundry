@@ -62,6 +62,17 @@ def test_identity_build_resolves_permissions_and_has() -> None:
     assert ident.roles == frozenset({Role.OPERATOR})
 
 
+def test_password_policy_refuses_a_password_over_the_sign_in_bound() -> None:
+    """BACKLOG #5397: no sign-in or step-up surface accepts a password over ``PASSWORD_MAX``, so the
+    policy refuses one at set time. Exactly at the bound is the paired control."""
+    from messagefoundry.password_bounds import PASSWORD_MAX
+
+    policy = PasswordPolicy()
+    stem = "a-long-unguessable-passphrase-" * (PASSWORD_MAX // 30 + 1)
+    assert policy.violations(stem[:PASSWORD_MAX]) == []
+    assert policy.violations(stem[: PASSWORD_MAX + 1]) == [f"be at most {PASSWORD_MAX} characters"]
+
+
 def test_password_policy_accepts_strong_and_flags_weak() -> None:
     policy = PasswordPolicy()  # ASVS 5.0 defaults: min 15, classes OFF, breach + context screening
     assert policy.violations("a-long-unguessable-passphrase") == []

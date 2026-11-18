@@ -300,7 +300,7 @@ async def mint_bound_proof(client: httpx.AsyncClient, next_path: str) -> None:
 
 
 @contextmanager
-def held_totp_code(secret: str) -> Iterator[str]:
+def held_totp_code(secret: str, *, steps_ahead: int = 0) -> Iterator[str]:
     """A live TOTP code for ``secret``, with the ``totp`` clock held at the instant it was made.
 
     For a test that hands a code it generated straight to the service, such as an enrolment
@@ -312,8 +312,9 @@ def held_totp_code(secret: str) -> Iterator[str]:
 
     The clock is held only inside the ``with`` block, and only on the ``totp`` module, so every
     other clock stays real. A clock the caller has already pinned is read and held as it is, and
-    restored afterwards."""
-    instant = totp.wall_clock()
+    restored afterwards. ``steps_ahead`` holds the clock that many time steps later, for a code the
+    replay guard has not yet seen at a step an earlier code in the test consumed."""
+    instant = totp.wall_clock() + steps_ahead * totp.DEFAULT_PERIOD
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(totp, "time", SimpleNamespace(time=lambda: instant))
         yield totp.totp(secret, now=instant)

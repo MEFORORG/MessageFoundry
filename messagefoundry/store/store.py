@@ -6905,14 +6905,33 @@ class StoreCreateBatchFailedBeforeKeyUse(Exception):
 #: construction; ``None`` for every open that is not under the ``host`` key provider.
 OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
 
+#: The ``before_first_write`` hook of the store open in progress, set by ``store.base.open_store``
+#: around the backend open and run by :func:`run_open_store_hook` (BACKLOG #4936). A context
+#: variable for :data:`OPEN_STORE_PIN`'s reason; ``None`` for an open that passes no hook.
+OPEN_STORE_HOOK: ContextVar[Callable[[Any], Awaitable[None]] | None] = ContextVar(
+    "mefor_open_store_hook", default=None
+)
+
+
+async def run_open_store_hook(host: object) -> None:
+    """Run the open's ``before_first_write`` hook on the half-opened ``host`` (BACKLOG #4936). Each
+    backend's writable open calls this right after :func:`check_open_store_pin`, so once the schema
+    is in place and before it binds a salt, reserves a cipher block, seals a row or writes an audit
+    row. A read-only open never calls it. A no-op when no hook is set. What the hook raises fails
+    the open, which closes the handle."""
+    hook = OPEN_STORE_HOOK.get()
+    if hook is not None:
+        await hook(host)
+
 
 class PinCheck:
-    """Whether the open in progress has passed its store id pin check (:func:`check_open_store_pin`),
-    the last step before its first write under the store key. Under ``auto`` schema management the
-    open may already have committed its schema, and on SQL Server altered the database's options,
-    before it; neither is under the key. A mutable cell rather than a flag in a context variable,
-    so a pass recorded under a copied context still reaches the open that set it (vault BACKLOG
-    #8119 item 2)."""
+    """Whether the open in progress has passed its store id pin check (:func:`check_open_store_pin`).
+    The open's ``before_first_write`` hook (:func:`run_open_store_hook`, BACKLOG #4936) runs after
+    the pin check, and the open's first write under the store key after both. Under ``auto``
+    schema management the open may already have committed its schema, and on SQL Server altered
+    the database's options, before the pin check; neither is under the key. A mutable cell rather
+    than a flag in a context variable, so a pass recorded under a copied context still reaches the
+    open that set it (vault BACKLOG #8119 item 2)."""
 
     __slots__ = ("passed",)
 
@@ -11583,6 +11602,7 @@ class MessageStore:
                 # has not bound, a failure before the bind included (BACKLOG #5720).
                 store._cipher_foreign = True
                 await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
+                await run_open_store_hook(store)  # BACKLOG #4936: after the pin, before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.

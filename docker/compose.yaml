@@ -9,6 +9,11 @@
 # NOT A SUPPORTED V1 DEPLOYMENT (the image runs Linux). See
 # docs/SYSTEM-REQUIREMENTS.md, "Linux is not a supported v1 deployment target".
 
+# The API revocation attestation every serving engine below needs, as a required compose
+# substitution with no default. The default `engine` service's comment says why; this key only
+# holds the value once so the three engines alias one copy.
+x-revocation-attested: &revocation-attested "${MEFOR_TLS_REVOCATION_ATTESTED:?required. serve refuses in-process TLS off loopback until you attest that your PKI enforces revocation for the certificates the engine serves and accepts (docs/SECURITY.md, API revocation gate). Set it to 1 only if that holds, in the shell environment or a .env beside compose.yaml -- an env_file: does NOT feed it}"
+
 # Shared config for the `ha`-profile clustered-engine PAIR (engine-ha + engine-standby), top-level
 # extension keys (`x-*`) so the two stay byte-identical (ADR 0017). These are NOT services — Compose
 # ignores `x-` keys. They are merged into the two services below via the `<<:` merge key.
@@ -43,8 +48,8 @@ x-ha-engine-env: &ha-engine-env
   MEFOR_API_PORT: "8443"
   MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"
   MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
-  # Off loopback serve also refuses this certificate bind until you attest revocation with
-  # MEFOR_TLS_REVOCATION_ATTESTED: "1" (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
+  # The API revocation attestation (x-revocation-attested above; the default `engine` says why).
+  MEFOR_TLS_REVOCATION_ATTESTED: *revocation-attested
   MEFOR_INBOUND_BIND_HOST: "0.0.0.0"
   MEFOR_SECURITY_REQUIRE_MFA: "true"
   MEFOR_STORE_REQUIRE_ENCRYPTION: "true"  # keeps the default keyless refusal past the audited opt-out (docs/PHI.md section 3)
@@ -89,8 +94,18 @@ services:
       MEFOR_API_PORT: "8443"
       MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"   # paths (not secrets) — mounted read-only below
       MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
-      # Off loopback serve also refuses this certificate bind until you attest revocation with
-      # MEFOR_TLS_REVOCATION_ATTESTED: "1" (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
+      # Off loopback, serve refuses this in-process certificate bind until you attest revocation
+      # (docs/SECURITY.md, API revocation gate), and nothing but a loopback bind clears that gate
+      # otherwise; a container cannot bind loopback and still be reached on a published port. So
+      # this variable is REQUIRED, with NO DEFAULT: unset or empty, every `docker compose` command
+      # (up, down, logs, config) refuses at load, rather than the engine exiting 2 and restarting
+      # forever. A value the engine reads as false, such as 0, passes this check and still loops,
+      # so set 1 only if you attest. Without an attestation, run a command that starts no engine
+      # (down, logs) as MEFOR_TLS_REVOCATION_ATTESTED=0 docker compose down, never with 1 exported.
+      # The attestation is yours, so this file never writes it. Outbound hops read the same
+      # variable with a different effect (docs/DEPLOYMENT.md, "Revocation-guard behavior"). Like
+      # the Postgres password below, this is COMPOSE SUBSTITUTION.
+      MEFOR_TLS_REVOCATION_ATTESTED: *revocation-attested
       MEFOR_INBOUND_BIND_HOST: "0.0.0.0"   # MLLP listener off-loopback; each MLLP() MUST set tls=True (gate)
       # --- production guardrails ---
       MEFOR_SECURITY_REQUIRE_MFA: "true"        # the default; covers directory accounts too. Off + exposed = refused under enforce

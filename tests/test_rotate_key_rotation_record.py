@@ -322,7 +322,7 @@ def test_a_serve_start_before_the_first_run_opens_the_record_and_stamps_nothing(
     assert rows[_DEK].last_rotated == _OLD_DATE
     record = rows[ROTATION_RECORD_ID]
     assert record.fingerprint == dek_fingerprint(_key_id(key_b))
-    assert "the audit chain has not been rolled to it" in caplog.text
+    assert "did not find the audit chain rolled to it" in caplog.text
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.secret_rotation"):
@@ -345,8 +345,9 @@ def test_a_run_killed_before_it_opened_the_record_leaves_no_stamp(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """BACKLOG #4936. The run stops after its store open and before the record opens, the window a
-    kill inside the open stands in. No record exists, and the next start must still not stamp."""
+    """BACKLOG #4936. The record open itself fails, inside the store open's hook and before any
+    write under the key. No record exists, and the next start on a keyed chain must still not
+    stamp."""
     db, uploads, key_a, key_b = rig
     _env(monkeypatch, key_b, key_a, uploads)
 
