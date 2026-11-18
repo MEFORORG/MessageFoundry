@@ -114,8 +114,10 @@ async def test_an_oversized_sign_in_credential_never_reaches_login(
 async def test_an_oversized_sign_in_clears_the_passkey_handle_it_consumed(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: the oversized-credential exit stops clearing the passkey sign-in cookie, as every
-    other refused sign-in clears it. The handle was popped before the bound was checked."""
+    """RED when: the oversized-credential exit stops clearing the passkey sign-in cookie, as a
+    refused auth.login clears it. That exit is the one the provider allow-list also takes. The
+    handle was popped before the bound was checked. The rate limiter's 429, which also comes after
+    the pop, does not clear the cookie."""
     service = await _service(engine)
     calls = _spy(monkeypatch, service, "login")
     async with ui_client(engine, service) as c:
