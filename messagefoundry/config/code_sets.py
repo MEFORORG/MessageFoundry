@@ -331,6 +331,47 @@ def _drain_capture(buffer: UnmappedCapture, message_id: str | None) -> None:
 # --- code set ----------------------------------------------------------------
 
 
+def _read_only(self: object, *args: object, **kwargs: object) -> Any:
+    raise TypeError(f"{type(self).__name__} is a read-only code-set value; copy it to modify")
+
+
+class _FrozenDict(dict[str, Any]):
+    """A code-set row (a multi-column CSV row, a nested TOML table) that refuses mutation.
+
+    A ``dict`` subclass, not a ``MappingProxyType``: it stays ``isinstance(row, dict)``, equal to a
+    plain dict and JSON-serializable, so a Handler's existing reads are unchanged. ``dict(row)``,
+    ``row.copy()`` and ``copy.deepcopy(row)`` hand back a plain, mutable copy."""
+
+    __slots__ = ()
+    __setitem__ = __delitem__ = __ior__ = _read_only
+    clear = pop = popitem = setdefault = update = _read_only
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Copy/pickle rebuild a plain dict: the default protocol would call the refused __setitem__.
+        return (dict, (dict(self),))
+
+
+class _FrozenList(list[Any]):
+    """A code-set array value (a TOML array) that refuses mutation; see :class:`_FrozenDict`."""
+
+    __slots__ = ()
+    __setitem__ = __delitem__ = __iadd__ = __imul__ = _read_only
+    append = extend = insert = pop = remove = clear = sort = reverse = _read_only
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (list, (list(self),))
+
+
+def _freeze(value: Any) -> Any:
+    """Freeze a loaded value recursively, once at construction, so a lookup returns the stored
+    object at no per-call cost and still cannot alter the shared table (BACKLOG #5897)."""
+    if isinstance(value, dict):
+        return _FrozenDict((k, _freeze(v)) for k, v in value.items())
+    if isinstance(value, list):
+        return _FrozenList(_freeze(v) for v in value)
+    return value
+
+
 class CodeSet(Mapping[str, Any]):
     """A frozen, read-only reference table: ``name`` + an immutable ``key → value`` mapping.
 
@@ -349,7 +390,9 @@ class CodeSet(Mapping[str, Any]):
         self, name: str, data: Mapping[str, Any], policy: UnmappedPolicy | None = None
     ) -> None:
         self._name = name
-        self._data: dict[str, Any] = dict(data)
+        # Rows are frozen here, not copied per lookup: a Handler that mutated a returned row would
+        # otherwise alter the table shared by every later message until reload (BACKLOG #5897).
+        self._data: dict[str, Any] = {key: _freeze(value) for key, value in data.items()}
         self._policy: UnmappedPolicy = policy if policy is not None else UnmappedPolicy()
 
     @property
