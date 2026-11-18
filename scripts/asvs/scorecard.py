@@ -24,6 +24,7 @@ import datetime
 import io
 import re
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Final, Literal, get_args
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
@@ -191,7 +192,14 @@ def locate_anchor(text: str, expect: str) -> AnchorLocation:
     Substring count for the uniqueness rule, and the line derived from the CHARACTER OFFSET rather
     than by scanning lines: 42 of the roughly 1,980 recorded tokens span a newline, and a per-line
     scan finds none of them.
+
+    **A blank token locates nothing.** ``"".count("")`` is 1, so before BACKLOG #5459 an empty
+    ``expect`` LOCATED, uniquely, in any empty file, and a whitespace run located wherever it
+    happened to occur once; neither certified anything. Both are GONE here for every caller, and
+    :func:`load_scorecard` refuses a blank one before it gets this far.
     """
+    if not expect.strip():
+        return AnchorLocation(ANCHOR_GONE, 0)
     occurrences = text.count(expect)
     if occurrences == 0:
         return AnchorLocation(ANCHOR_GONE, 0)
@@ -257,7 +265,8 @@ class Absence:
 
     Both fields default empty, and their absence means **"not yet proven by execution"** — never
     "proven vacuous". They are opt-in per claim because a live proof spawns a pytest subprocess per
-    claim; a claim with neither field is reported as SKIPPED, not failed.
+    claim; a claim with neither field is reported as SKIPPED, not failed. A pass where EVERY claim
+    is skipped measured nothing, and ``--prove-absences`` exits 2 for it (BACKLOG #5461).
 
     Honest limits of the proving mode, stated so they are not overclaimed:
 
@@ -695,6 +704,89 @@ def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
     return _name_field(raw, "reviewed_by")
 
 
+def _refuse_type(where: str, key: str, want: str, value: object) -> ScorecardError:
+    """The refusal for a TOML value of the wrong type. It names the type, never the value, so a
+    mistyped field holding record text does not echo that text (BACKLOG #5457, #5462)."""
+    return ScorecardError(f"{where}: `{key}` must be {want}, got {type(value).__name__}")
+
+
+def _str(raw: Mapping[str, Any], key: str, where: str, default: str | None = None) -> str:
+    """A string field. ``default`` None makes it required. Never ``str()``-coerced: ``str(false)``
+    is the truthy ``"False"`` and ``str(1)`` is a non-blank rationale (BACKLOG #5457)."""
+    if key not in raw:
+        if default is None:
+            raise ScorecardError(f"{where}: `{key}` is required")
+        return default
+    value = raw[key]
+    if not isinstance(value, str):
+        raise _refuse_type(where, key, "a string", value)
+    return value
+
+
+def _int(raw: Mapping[str, Any], key: str, where: str) -> int:
+    """A required integer. A bool is refused although Python counts it an int, and so is a float or
+    a numeric string, which ``int()`` would have truncated or parsed (BACKLOG #5457)."""
+    if key not in raw:
+        raise ScorecardError(f"{where}: `{key}` is required")
+    value = raw[key]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise _refuse_type(where, key, "an integer", value)
+    return value
+
+
+def _tables(raw: Mapping[str, Any], key: str, where: str) -> list[dict[str, Any]]:
+    """An array of tables, empty when absent. Anything else is refused rather than iterated."""
+    value = raw.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(t, dict) for t in value):
+        raise _refuse_type(where, key, "an array of tables", value)
+    return value
+
+
+def _regex(raw: Mapping[str, Any], key: str, where: str) -> str:
+    """A required regular expression that compiles and cannot match the empty string or a run of
+    lone characters.
+
+    A pattern that matches the empty string matches EVERY text. As a ``positive_control`` that makes
+    the BLIND check unable to fire, because the control is sighted in any corpus at all; as a
+    ``pattern`` it makes the claim false everywhere and its mutation check vacuous. A pattern that
+    does not compile used to escape as ``re.error`` from the check that first used it (BACKLOG #5457).
+    """
+    value = _str(raw, key, where)
+    if not value.strip():
+        raise ScorecardError(f"{where}: `{key}` is blank, so it names nothing to search for")
+    # Each handler keeps only a content-free detail and the refusal is raised after the `try`:
+    # `re.error` holds the pattern on `.pattern`, and a raise inside the handler, even `from None`,
+    # would leave it reachable on `__context__`.
+    compiled: re.Pattern[str] | None = None
+    detail = ""
+    try:
+        compiled = re.compile(value)
+    except re.error as exc:
+        # The position, not `exc.msg`: the message can quote the pattern, a group name for one.
+        detail = "" if exc.pos is None else f" (error at character {exc.pos})"
+    except OverflowError:
+        # `re.compile` raises this, not `re.error`, for a repeat count past the engine's limit.
+        detail = " (a repeat count is too large)"
+    except RecursionError:
+        # Deep nesting exhausts the parser's recursion instead of raising `re.error`.
+        detail = " (it nests too deeply)"
+    if compiled is None:
+        raise ScorecardError(f"{where}: `{key}` is not a valid regular expression{detail}")
+    # The empty string, then single characters. A pattern that matches more than one LONE character
+    # -- `.`, `\w`, `\b`, a lookahead, a character class -- is sighted in almost any file, which is
+    # the same blindness by another route. A one-character literal still loads: it is a token,
+    # however short, and the test fixtures use them.
+    # A set: `string.printable` already holds "\n", so a tuple adding it again would count a
+    # newline-only pattern twice and refuse it as if it matched two characters.
+    singles = sum(compiled.search(c) is not None for c in set(string.printable))
+    if compiled.search("") is not None or singles > 1:
+        raise ScorecardError(
+            f"{where}: `{key}` matches the empty string or many single characters, so it matches "
+            "almost every text and can never go quiet. Name a token that must actually be present"
+        )
+    return value
+
+
 def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
     """The record's cells, refusing anything malformed.
 
@@ -713,7 +805,12 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
         )
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     cells: list[Cell] = []
-    for raw in data.get("cell", []):
+    for n, raw in enumerate(_tables(data, "cell", "the scorecard")):
+        # The refusals that use `where` name the cell by its POSITION, never by its id or any other
+        # value it holds: the message reaches a CI log, and the record's content is private. The
+        # older refusals below, the verdict one among them, still format the raw id; this does not
+        # cover them.
+        where = f"cell[{n}]"
         legacy = raw.get("reviewed_by")
         if historical and isinstance(legacy, str) and legacy.strip():
             raw = {k: v for k, v in raw.items() if k != "reviewed_by"}
@@ -722,15 +819,24 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
             # alone for `_text_field` to refuse.
             if notes is None or (isinstance(notes, str) and not notes.strip()):
                 raw["review_notes"] = legacy
-        verdict = str(raw.get("verdict", "")).lower()
+        verdict = _str(raw, "verdict", where, "").lower()
         if verdict not in VERDICTS:
             raise ScorecardError(
                 f"cell {raw.get('id')!r}: verdict {verdict!r} not one of {sorted(VERDICTS)}"
             )
+        # Every scalar is read TYPED, never `str()`-coerced: `residual = 1` used to pass the `na`
+        # rationale check below as "1", `last_verified = false` read as the truthy "False", and
+        # `decision_closed = "true"` skipped the closure pin (BACKLOG #5457).
+        cell_id = _str(raw, "id", where)
+        level = _int(raw, "level", where)
+        residual = _str(raw, "residual", where, "")
+        decision_closed = raw.get("decision_closed", False)
+        if not isinstance(decision_closed, bool):
+            raise _refuse_type(where, "decision_closed", "true or false", decision_closed)
         # ASVS 5.0's assessment chapter is "should" throughout with exactly ONE "must": a
         # non-applicable requirement must be noted with its reason. So an `na` without a rationale is
         # not a lax entry — it is the single thing the standard actually requires, omitted.
-        if verdict == "na" and not str(raw.get("residual", "")).strip():
+        if verdict == "na" and not residual.strip():
             raise ScorecardError(
                 f"cell {raw.get('id')!r}: verdict 'na' requires a written rationale in `residual` — "
                 "recording the reason for non-applicability is the one MUST in ASVS 5.0's assessment "
@@ -746,8 +852,9 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
         # cost of a silent re-score is a posture document that disagrees with the record and is
         # discovered months later by a reader — which has already happened here, four times in
         # eighteen days on the one cell this rule was written for.
-        if raw.get("decision_closed") is True:
-            pinned = str(raw.get("decision_closed_verdict", "")).lower()
+        decision_closed_on = _str(raw, "decision_closed_on", where, "")
+        if decision_closed:
+            pinned = _str(raw, "decision_closed_verdict", where, "").lower()
             if not pinned:
                 raise ScorecardError(
                     f"cell {raw.get('id')!r}: `decision_closed = true` without "
@@ -764,8 +871,10 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
                     "the pin in the SAME commit and say so in the message; if you do not, revert the "
                     "verdict. See `decision_reopen_requires` on the cell"
                 )
-        for a in raw.get("absence", []):
-            if not str(a.get("mutation", "")).strip():
+        absences: list[Absence] = []
+        for i, a in enumerate(_tables(raw, "absence", where)):
+            at = f"{where} absence[{i}]"
+            if not _str(a, "mutation", at, "").strip():
                 raise ScorecardError(
                     # NO LITERAL CODE EXAMPLE HERE. This module is inside the corpus that absence
                     # patterns are searched over, so an illustrative call in this string becomes a
@@ -781,106 +890,157 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
                     "the thing came back; do NOT derive it from the pattern, which makes the check "
                     "vacuous. See the Absence docstring for a worked example"
                 )
+            absences.append(
+                Absence(
+                    pattern=_regex(a, "pattern", at),
+                    positive_control=_regex(a, "positive_control", at),
+                    # No default. A missing mutation must be authored, not inferred — see the
+                    # Absence docstring on why deriving one from the pattern is worse than none.
+                    mutation=_str(a, "mutation", at),
+                    # Optional, and deliberately NOT refused at load. A hard requirement here would
+                    # void every already-authored absence claim (none carry these yet), and their
+                    # re-authoring is out of this script's reach (ADR 0156 §7). Absent means "not
+                    # yet proven by execution", surfaced by --prove-absences, not "proven vacuous".
+                    mutation_path=_str(a, "mutation_path", at, ""),
+                    observable=_str(a, "observable", at, ""),
+                )
+            )
         # A blocker record is admissible ONLY as a complete set. A partial one -- a reason with no
         # probe, or a probe with no date -- reads as diligence and carries none: it is exactly the
         # "compensating control resting on a false premise" shape, arriving through the fix. So every
-        # field is required, and the two computable ones are type-checked here rather than at the
-        # point of use, where a bad value would surface as a traceback in a renderer.
+        # field is required and typed: a mistyped one used to be `str()`- or `int()`-coerced, so an
+        # integer `20260801` passed the date check and `"30"` passed as a cadence (BACKLOG #5457).
         blocker: Blocker | None = None
         if (rb := raw.get("blocker")) is not None:
+            if not isinstance(rb, dict):
+                raise _refuse_type(where, "blocker", "a table", rb)
             if verdict != "fail":
                 raise ScorecardError(
                     f"cell {raw.get('id')!r}: a `blocker` is only meaningful on verdict 'fail' (got "
                     f"{verdict!r}). A blocked PARTIAL is a real thing, but admitting one here needs "
                     "its own ruling -- widening this is a decision, not a default"
                 )
-            missing = [
-                k
-                for k in (
-                    "blocked_by",
-                    "reason",
-                    "evidence",
-                    "unblock_signal",
-                    "unblock_probe",
-                    "checked_on",
-                    "recheck_days",
-                )
-                if not str(rb.get(k, "")).strip()
-            ]
+            text_keys = (
+                "blocked_by",
+                "reason",
+                "evidence",
+                "unblock_signal",
+                "unblock_probe",
+                "checked_on",
+            )
+            missing = [k for k in (*text_keys, "recheck_days") if k not in rb]
+            missing += [k for k in text_keys if isinstance(rb.get(k), str) and not rb[k].strip()]
             if missing:
                 raise ScorecardError(
                     f"cell {raw.get('id')!r}: `blocker` is missing {missing} -- a partial blocker "
                     "record is a comment, not a control. The unblock half is the whole point: a "
                     "signal nobody can probe, or a probe with no date, cannot go stale visibly"
                 )
-            try:
-                datetime.date.fromisoformat(str(rb["checked_on"]))
-            except ValueError as exc:
+            text: dict[str, str] = {}
+            for k in text_keys:
+                if not isinstance(value := rb[k], str):
+                    raise _refuse_type(where, f"blocker.{k}", "a string", value)
+                text[k] = value
+            checked_on = text["checked_on"]
+            # The shape check runs first: `fromisoformat` also accepts `20260801`.
+            is_date = _DATE_RE.fullmatch(checked_on) is not None
+            if is_date:
+                try:
+                    datetime.date.fromisoformat(checked_on)
+                except ValueError:
+                    is_date = False
+            if not is_date:
+                # The value is not echoed: a refusal names the field, never the record's text. It is
+                # raised outside the handler, because `fromisoformat`'s message can quote the value
+                # and a raise inside it, even `from None`, would keep that on `__context__`.
                 raise ScorecardError(
-                    f"cell {raw.get('id')!r}: `blocker.checked_on` must be an ISO date "
-                    f"(YYYY-MM-DD), got {rb['checked_on']!r}"
-                ) from exc
-            if int(rb["recheck_days"]) < 1:
+                    f"{where}: `blocker.checked_on` must be an ISO date, a real one written "
+                    "YYYY-MM-DD"
+                )
+            recheck_days = rb["recheck_days"]
+            if not isinstance(recheck_days, int) or isinstance(recheck_days, bool):
+                raise _refuse_type(where, "blocker.recheck_days", "an integer", recheck_days)
+            if recheck_days < 1:
                 raise ScorecardError(
                     f"cell {raw.get('id')!r}: `blocker.recheck_days` must be >= 1; a cadence of "
                     "zero or less never comes due, which is the same as having none"
                 )
+            # The deadline `Blocker.days_overdue` computes must be a date, or every reader of the
+            # record that renders it stops on OverflowError instead of naming the field.
+            try:
+                datetime.date.fromisoformat(checked_on) + datetime.timedelta(days=recheck_days)
+            except OverflowError:
+                raise ScorecardError(
+                    f"{where}: `blocker.recheck_days` puts the next re-probe past the last date "
+                    "the calendar can hold, so it never comes due"
+                ) from None
             blocker = Blocker(
-                blocked_by=str(rb["blocked_by"]),
-                reason=str(rb["reason"]),
-                evidence=str(rb["evidence"]),
-                unblock_signal=str(rb["unblock_signal"]),
-                unblock_probe=str(rb["unblock_probe"]),
-                checked_on=str(rb["checked_on"]),
-                recheck_days=int(rb["recheck_days"]),
+                blocked_by=text["blocked_by"],
+                reason=text["reason"],
+                evidence=text["evidence"],
+                unblock_signal=text["unblock_signal"],
+                unblock_probe=text["unblock_probe"],
+                checked_on=checked_on,
+                recheck_days=recheck_days,
+            )
+        evidence: list[Anchor] = []
+        for i, e in enumerate(_tables(raw, "evidence", where)):
+            at = f"{where} evidence[{i}]"
+            # An anchor names a token, at a line, in a file under the engine root. A blank token
+            # located in any empty file, and a `..` or absolute path read a file outside the tree
+            # being measured, so each is refused here rather than resolved (BACKLOG #5459).
+            anchor_path = _str(e, "path", at)
+            # Printable too: a NUL makes `Path.resolve` raise ValueError on POSIX, which stopped
+            # check_anchors on the class name instead of naming the field.
+            if (
+                not anchor_path.strip()
+                or not anchor_path.isprintable()
+                or not _is_within_tree(anchor_path)
+            ):
+                raise ScorecardError(
+                    f"{at}: `path` must be a non-empty, printable path relative to the engine "
+                    "root, with no drive, no leading separator and no `..`"
+                )
+            line = _int(e, "line", at)
+            if line < 1:
+                raise ScorecardError(f"{at}: `line` must be 1 or more; lines are numbered from 1")
+            expect = _str(e, "expect", at)
+            if not expect.strip():
+                raise ScorecardError(
+                    f"{at}: `expect` is blank, so it names no token and cannot certify anything"
+                )
+            evidence.append(
+                Anchor(
+                    path=anchor_path,
+                    line=line,
+                    expect=expect,
+                    # Absent stays None, deliberately: an empty string is the assertion "module
+                    # level" / "unnested", so defaulting to it would turn every un-backfilled anchor
+                    # into that claim overnight and light up every anchor that is legitimately
+                    # inside a function.
+                    sym=_str(e, "sym", at) if "sym" in e else None,
+                    ctx=_str(e, "ctx", at) if "ctx" in e else None,
+                )
             )
         cells.append(
             Cell(
-                id=str(raw["id"]),
-                level=int(raw["level"]),
+                id=cell_id,
+                level=level,
                 verdict=verdict,  # type: ignore[arg-type]
                 blocker=blocker,
-                residual=str(raw.get("residual", "")),
-                posture=str(raw.get("posture", "single")),
-                decision_closed=raw.get("decision_closed") is True,
-                decision_closed_on=str(raw.get("decision_closed_on", "")),
+                residual=residual,
+                posture=_str(raw, "posture", where, "single"),
+                decision_closed=decision_closed,
+                decision_closed_on=decision_closed_on,
                 decision_closed_by=_name_field(raw, "decision_closed_by") or "",
-                last_verified=str(raw.get("last_verified", "")),
-                verified_at=str(raw.get("verified_at", "")),
+                last_verified=_str(raw, "last_verified", where, ""),
+                verified_at=_str(raw, "verified_at", where, ""),
                 # Membership, not `.get(..., "")`: TOML has no null, so `in` is the only way to keep
                 # an absent key distinguishable from a blank one (BACKLOG #1889).
                 reviewed_by=_reviewed_by_field(raw),
                 review_notes=_text_field(raw, "review_notes"),
-                evidence=tuple(
-                    Anchor(
-                        path=str(e["path"]),
-                        line=int(e["line"]),
-                        expect=str(e["expect"]),
-                        # `.get(...)` WITHOUT a "" default, deliberately: absent must stay None. An
-                        # empty string is the assertion "module level" / "unnested", so defaulting to
-                        # it would turn all 1,980 un-backfilled anchors into that claim overnight and
-                        # light up every anchor that is legitimately inside a function.
-                        sym=None if e.get("sym") is None else str(e["sym"]),
-                        ctx=None if e.get("ctx") is None else str(e["ctx"]),
-                    )
-                    for e in raw.get("evidence", [])
-                ),
-                absence=tuple(
-                    Absence(
-                        pattern=str(a["pattern"]),
-                        positive_control=str(a["positive_control"]),
-                        # No default. A missing mutation must be authored, not inferred — see the
-                        # Absence docstring on why deriving one from the pattern is worse than none.
-                        mutation=str(a["mutation"]),
-                        # Optional, and deliberately NOT refused at load. A hard requirement here would
-                        # void every already-authored absence claim (none carry these yet), and their
-                        # re-authoring is out of this script's reach (ADR 0156 §7). Absent means "not
-                        # yet proven by execution", surfaced by --prove-absences, not "proven vacuous".
-                        mutation_path=str(a.get("mutation_path", "")),
-                        observable=str(a.get("observable", "")),
-                    )
-                    for a in raw.get("absence", [])
-                ),
+                evidence=tuple(evidence),
+                absence=tuple(absences),
             )
         )
     return cells
@@ -991,7 +1151,8 @@ def load_reviewer_exceptions(path: Path) -> dict[str, str]:
     A malformed entry fails closed, because it must not quietly waive a refusal. That covers a
     missing field, an id that is not a bare requirement id, a cell named twice, and a table placed
     after the first ``[[cell]]``. ``apply.py`` treats everything from a ``[[cell]]`` header to the
-    next one as that cell's block, so rewriting the cell would silently delete a table sitting there.
+    next one as that cell's block, so it refuses to rewrite a record with a table sitting there
+    rather than delete the table.
     """
     text = path.read_text(encoding="utf-8")
     data = tomllib.loads(text)
@@ -1000,13 +1161,29 @@ def load_reviewer_exceptions(path: Path) -> dict[str, str]:
         raise ScorecardError(
             "reviewer_exception must be an array of tables, written `[[reviewer_exception]]`"
         )
-    first_cell = re.search(r"^\[\[cell\]\]", text, re.M)
-    first_exc = re.search(r"^\[\[reviewer_exception\]\]", text, re.M)
-    if first_cell and first_exc and first_exc.start() > first_cell.start():
-        raise ScorecardError(
-            "[[reviewer_exception]] must come before the first [[cell]]: after it, apply.py reads "
-            "the table as part of the cell above and a rewrite of that cell deletes it"
-        )
+    # EVERY entry must sit before the first cell, so the text before it is PARSED and must hold
+    # all of them. The check compared the FIRST exception header with the first cell, by a
+    # column-zero, unspaced search, so a second entry after a cell, or one whose header was
+    # indented, spaced or quoted, loaded unrefused (BACKLOG #5460). Parsing the head reads every
+    # spelling TOML admits. A cut that lands inside a string fails to parse and is refused, and a
+    # cell the cut missed, written in a spelling the search does not know, shows up in the head.
+    first_cell = re.search(r"^[ \t]*\[\[[ \t]*cell[ \t]*\]\]", text, re.M)
+    if entries:
+        head = text[: first_cell.start()] if first_cell else text
+        try:
+            before: dict[str, Any] | None = tomllib.loads(head)
+        except tomllib.TOMLDecodeError:
+            before = None
+        if before is None or "cell" in before or before.get("reviewer_exception") != entries:
+            # Fails closed on a layout it cannot confirm, too: a first cell header in a quoted
+            # spelling, or a `[[cell]]` line inside a string above the exceptions. Both are valid
+            # TOML and both are refused, so the message says how to write a record that loads.
+            raise ScorecardError(
+                "every [[reviewer_exception]] must come before the first [[cell]]: after it, "
+                "apply.py reads the table as part of the cell above and refuses to rewrite the "
+                "record. If they already do, write each cell header as a plain [[cell]] line "
+                "and keep any [[cell]] text out of strings above them, so the order can be read"
+            )
     out: dict[str, str] = {}
     for e in entries:
         cid = e.get("id")
@@ -1435,9 +1612,27 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     text_cache: dict[Path, str] = {}
     spans_cache: dict[Path, list[tuple[int, int]] | None] = {}
     ast_cache: dict[Path, ast.Module | None] = {}
+    resolved_root = root.resolve()
+    # Keyed on the authored path, not the joined target: on Windows `C:y` and `y` join to one target
+    # but only one of them passes `_is_within_tree`.
+    inside_cache: dict[str, bool] = {}
     for c in cells:
         for a in c.evidence:
             target = root / a.path
+            # Resolved, so a symlink out of the tree is caught as well as a `..` or absolute path.
+            # The loader refuses the last two; a Cell built in code does not pass through it, and
+            # an anchor read outside the root certifies a tree nobody asked about (BACKLOG #5459).
+            # Cached, keyed as said above: the anchors concentrate onto few files.
+            if a.path not in inside_cache:
+                inside_cache[a.path] = _is_within_tree(a.path) and target.resolve().is_relative_to(
+                    resolved_root
+                )
+            if not inside_cache[a.path]:
+                findings.problems.append(
+                    f"{c.id}: evidence path {a.path} resolves outside the root {root}, so it is "
+                    "not evidence about the engine tree being checked"
+                )
+                continue
             if not target.is_file():
                 findings.problems.append(f"{c.id}: evidence path {a.path} does not exist")
                 continue
@@ -2189,12 +2384,16 @@ def _copy_scratch(root: Path, dest: Path) -> Path:
 
 def _is_within_tree(rel: str) -> bool:
     """True only for a repo-relative path with no anchor and no ``..`` component — one that cannot
-    escape the scratch copy when joined onto it. ``mutation_path`` comes from the authored scorecard,
-    so it is untrusted for this purpose: an absolute or ``..``-bearing value is refused, not resolved."""
-    p = Path(rel)
-    if p.is_absolute() or p.anchor:
-        return False
-    return ".." not in p.parts
+    escape the scratch copy when joined onto it. ``mutation_path`` and an anchor's ``path`` come from
+    the authored scorecard, so they are untrusted for this purpose: an absolute or ``..``-bearing
+    value is refused, not resolved.
+
+    Read under BOTH path flavours, whatever the host: on Linux ``..\\x`` is one component and
+    ``C:/x`` has no anchor, and the record is authored and checked on both (BACKLOG #5459)."""
+    for p in (PurePosixPath(rel.replace("\\", "/")), PureWindowsPath(rel)):
+        if p.is_absolute() or p.anchor or ".." in p.parts:
+            return False
+    return True
 
 
 def _apply_mutation(scratch: Path, mutation_path: str, mutation: str) -> None:
@@ -2228,8 +2427,10 @@ def _run_node(scratch: Path, node_id: str, python: str, timeout: float) -> int:
                 node_id,
             ],
             cwd=scratch,
-            capture_output=True,
-            text=True,
+            # Only the exit code is read, so the output is discarded rather than decoded: decoding
+            # it in the locale code page could raise on a byte pytest printed (BACKLOG #5458).
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             check=False,
             timeout=timeout,
         )
@@ -2654,6 +2855,26 @@ def check_pinning(scorecard: Path, corpus: Path) -> list[str]:
     return problems
 
 
+def check_root(scorecard: Path, root: Path) -> None:
+    """Refuse a ``root`` that cannot be the engine tree: not a directory, or one holding the record.
+
+    Shared by :func:`verify` and the ``--prove-absences`` entry point, which skipped both checks
+    and so could prove claims against a missing tree or the vault's own stale engine copy and
+    report success (BACKLOG #5461). See :func:`verify` for why containment, not "same repository".
+    """
+    if not root.is_dir():
+        raise ScorecardError(
+            f"--root {root} is not a directory, so there is no engine tree to measure. Pass the "
+            "engine checkout"
+        )
+    if scorecard.resolve().is_relative_to(root.resolve()):
+        raise ScorecardError(
+            f"--root {root} CONTAINS the scorecard {scorecard}, so the evidence anchors would be "
+            "resolved against the tree that holds the record instead of the engine. That produces a "
+            "self-consistent, wrong answer. Pass the engine checkout as the root."
+        )
+
+
 def verify(scorecard: Path, corpus: Path, root: Path) -> Findings:
     # THE ROOT IS PART OF THE MEASUREMENT, so the refusal lives here rather than in `main`, where only
     # the CLI would get it. A scorecard sitting INSIDE the tree being checked means the anchors are
@@ -2669,13 +2890,9 @@ def verify(scorecard: Path, corpus: Path, root: Path) -> Findings:
     # workspace, so a same-repo test would refuse the sanctioned run and the gate would fail closed
     # forever on its own correct invocation. `vault/engine` does not CONTAIN
     # `vault/docs/security/asvs-scorecard.toml`, so containment passes it and still catches the
-    # default-to-cwd case.
-    if scorecard.resolve().is_relative_to(root.resolve()):
-        raise ScorecardError(
-            f"--root {root} CONTAINS the scorecard {scorecard}, so the evidence anchors would be "
-            "resolved against the tree that holds the record instead of the engine. That produces a "
-            "self-consistent, wrong answer. Pass the engine checkout as the root."
-        )
+    # default-to-cwd case. A root that is not a directory is refused by the same check: every anchor
+    # would read as GONE, a red about the record when the fault is the invocation (BACKLOG #5461).
+    check_root(scorecard, root)
     findings = Findings()
     cells = load_scorecard(scorecard)
     findings.problems.extend(check_pinning(scorecard, corpus))
@@ -3071,8 +3288,9 @@ class RepoStamp:
     #: Short commit, or ``NO-GIT`` when the path is not inside a work tree.
     sha: str
     #: Whole-tree dirty. A measurement taken against uncommitted changes is not reproducible and must
-    #: not look like one that is.
-    dirty: bool
+    #: not look like one that is. ``None`` when ``git status`` failed or timed out: UNKNOWN, rendered
+    #: as such, never folded into clean (BACKLOG #5458).
+    dirty: bool | None
     #: ``CURRENT`` | ``BEHIND <n>`` | ``AHEAD <n>`` | ``DIVERGED`` | ``NO-UPSTREAM`` | ``NO-GIT`` |
     #: ``UNRESOLVED``. The last two are extensions and they exist BECAUSE of the never-silent rule:
     #: calling a non-repo ``NO-UPSTREAM`` would be a false statement (it implies a repo), and calling a
@@ -3088,6 +3306,8 @@ class RepoStamp:
     remote_knowledge: str
 
     def ref(self) -> str:
+        if self.dirty is None:
+            return f"{self.sha}+status-unknown"
         return f"{self.sha}+dirty" if self.dirty else self.sha
 
 
@@ -3101,11 +3321,15 @@ def _git(repo: Path, *args: str) -> str | None:
     none, because its absence gets read as nobody needing it. Refreshing is ``git fetch``, by hand,
     which is a different act performed on purpose.
     """
+    # UTF-8, not the locale's code page: git prints paths as UTF-8, and cp1252 decoding garbled a
+    # non-ASCII git dir so FETCH_HEAD was never found (BACKLOG #5458). `replace` keeps a stray byte
+    # from raising out of a probe that promises None on failure.
     try:
         proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; every subcommand is read-only
             ["git", "-C", str(repo), *args],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=_GIT_TIMEOUT,
         )
@@ -3188,7 +3412,11 @@ def _freshness(repo: Path) -> tuple[str, str]:
 
 def repo_stamp(path: Path, *, now: float | None = None) -> RepoStamp:
     """Stamp the work tree containing `path`. Pure read: no fetch, no write, no network."""
-    repo = path if path.is_dir() else path.parent
+    # Resolved once, so every probe and the FETCH_HEAD join carry the same absolute path. A relative
+    # path already resolved against the same working directory in both git and Python, so this is
+    # hygiene against a later change of directory, not a fix of a measured fault.
+    resolved = path.resolve()
+    repo = resolved if resolved.is_dir() else resolved.parent
     sha = _git(repo, "rev-parse", "--short", "HEAD")
     if sha is None:
         # Not a work tree at all. NOT reported as NO-UPSTREAM: that would imply a repo exists and is
@@ -3198,7 +3426,9 @@ def repo_stamp(path: Path, *, now: float | None = None) -> RepoStamp:
     freshness, upstream = _freshness(repo)
     return RepoStamp(
         sha=sha,
-        dirty=bool(porcelain),
+        # A failed or timed-out status is None, and `bool(None)` stamped the tree CLEAN: the one
+        # answer the flag exists to withhold when nobody knows it (BACKLOG #5458).
+        dirty=None if porcelain is None else bool(porcelain),
         freshness=freshness,
         upstream=upstream,
         remote_knowledge=_remote_knowledge(repo, time.time() if now is None else now),
@@ -3405,12 +3635,44 @@ def form_summary(findings: Findings) -> list[str]:
 
 def _run_prove_absences(scorecard: Path, root: Path) -> int:
     """The ``--prove-absences`` entry point: execute-prove every absence claim (see
-    :func:`prove_absences`). Needs no corpus — it applies mutations, it does not grep for patterns."""
+    :func:`prove_absences`). Needs no corpus — it applies mutations, it does not grep for patterns.
+
+    Held to verify's footing (BACKLOG #5461): the root must be a directory that does not hold the
+    record (:func:`check_root`), the provenance header names both trees before anything is read,
+    and a record with no cells, or with cells but no absence claim, is refused rather than reported
+    as a clean pass over nothing. So is a pass where every claim was skipped for want of a
+    ``mutation_path``: it proved nothing, so it exits 2 rather than 0.
+    """
+    try:
+        check_root(scorecard, root)
+    except ScorecardError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2  # could not measure — never 0, never confused with "clean"
+    for line in provenance_from(
+        repo_stamp(scorecard), repo_stamp(root), label="asvs-prove-absences"
+    ):
+        print(line)
     try:
         cells = load_scorecard(scorecard)
     except ScorecardError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2  # could not measure — never 0, never confused with "clean"
+    if not cells:
+        print(
+            f"error: the scorecard {scorecard} holds no cells, so there is nothing to prove; an "
+            "empty record is not a clean one",
+            file=sys.stderr,
+        )
+        return 2
+    # Cells with no absence claim are the same pass over nothing: the summary would read `saw 0`
+    # and the run would exit 0, which a CI step reads as every claim proved.
+    if not any(c.absence for c in cells):
+        print(
+            f"error: the scorecard {scorecard} holds no absence claims, so there is nothing to "
+            "prove; a record with none to prove is not a proved one",
+            file=sys.stderr,
+        )
+        return 2
     findings = prove_absences(cells, root)
     # `saw N` is the denominator, and it comes FIRST because the parts are unreadable without it: a
     # run over 276 claims and a run over zero otherwise print counter sets that look equally
@@ -3431,6 +3693,16 @@ def _run_prove_absences(scorecard: Path, root: Path) -> int:
         print(f"  NOTE {a}", file=sys.stderr)
     for p in findings.problems:
         print(f"  FAIL {p}", file=sys.stderr)
+    # A pass where every claim was SKIPPED raised no problem, so `ok` held and it exited 0 with
+    # `proved 0`, which a CI step reads as every claim proved (BACKLOG #5461). It measured nothing.
+    # A pass that screened but proved none still exits 0: a screen is a measurement, if not a proof.
+    if findings.skipped_absences == findings.checked_absences:
+        print(
+            "error: every absence claim was skipped because none names a mutation_path, so this "
+            "run neither proved nor screened any claim; a run that measured nothing is not a pass",
+            file=sys.stderr,
+        )
+        return 2  # could not measure — never 0, never confused with "clean"
     return 0 if findings.ok else 1
 
 
@@ -3479,7 +3751,8 @@ def main(argv: list[str] | None = None) -> int:
         "--root",
         type=Path,
         default=None,
-        help="tree the evidence anchors point into (REQUIRED to verify; defaults to cwd elsewhere)",
+        help="tree the evidence anchors point into (REQUIRED to verify and to prove absences; "
+        "--status defaults to cwd)",
     )
     ap.add_argument("--render", type=Path, help="write the generated CURRENT.md here")
     # A separate, opt-in mode: prove each absence claim BITES by applying its mutation to a scratch
@@ -3504,26 +3777,55 @@ def main(argv: list[str] | None = None) -> int:
     # rendered file differ on every run, so the drift check could never pass: a gate that cannot go
     # green is as useless as one that cannot go red, and this one shipped that way.
     args = ap.parse_args(argv)
+    # ONE GUARD AROUND EVERY MODE (BACKLOG #5462). Each entry point caught `ScorecardError` alone, so
+    # a record that is not TOML or not UTF-8, or any failure nobody listed, escaped as a traceback on
+    # exit 1: a code --status promises never to return, and one verify reserves for findings. The
+    # traceback also carried the exception's message, which can quote the record onto a CI log.
+    #
+    # BROAD ON PURPOSE, and it is not a swallow: the failure is reported and the run exits 2, "could
+    # not measure". A list of classes written from the failures seen so far is exactly the gap this
+    # closes. Only the CLASS of an unexpected failure crosses to the output; a `ScorecardError` is
+    # this module's own refusal and keeps its message. `KeyboardInterrupt` and `SystemExit` are not
+    # `Exception`, so they still propagate.
+    try:
+        return _dispatch(args)
+    except ScorecardError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - CLI boundary; reported by class, exit 2, see above
+        print(
+            f"error: the scorecard run stopped on {type(exc).__name__} before it completed. Its "
+            "message is withheld because it can quote the record. A run that did not complete is "
+            "exit 2: neither a pass nor a finding, whatever it printed before it stopped",
+            file=sys.stderr,
+        )
+        return 2
 
+
+def _dispatch(args: argparse.Namespace) -> int:
+    """Every mode after argument parsing. :func:`main` guards it, so whatever escapes is exit 2."""
     # `--status` is the one-second answer to "what does the record say" and needs NO engine tree, so
     # it keeps the cwd default. Making it required here would put an engine checkout between a person
     # and the only fast, correct read of the record -- which is the other half of the problem.
     if args.status:
         return _run_status(args.scorecard, args.root or Path.cwd())
 
-    if args.prove_absences:
-        return _run_prove_absences(args.scorecard, args.root or Path.cwd())
-
-    # VERIFY MODE ONLY from here. The anchors are claims about a specific tree, so a verify pass that
-    # did not name one is not a measurement of anything in particular.
+    # VERIFY AND PROVE-ABSENCES from here. The anchors and the mutations are claims about a specific
+    # tree, so a pass that did not name one is not a measurement of anything in particular. Prove
+    # mode defaulted to the working directory until BACKLOG #5461: run from the vault, it proved
+    # claims against the vault's own stale engine copy and reported success.
     if args.root is None:
         print(
-            "error: --root is required to verify -- the anchors are claims about a specific tree, "
-            "and an unnamed tree makes the result unattributable. Pass the engine checkout "
-            "explicitly. (--status and --prove-absences still default to the working directory.)",
+            "error: --root is required to verify or to prove absences -- the anchors and mutations "
+            "are claims about a specific tree, and an unnamed tree makes the result unattributable. "
+            "Pass the engine checkout explicitly. (--status still defaults to the working "
+            "directory.)",
             file=sys.stderr,
         )
         return 2  # could not measure — never 0, never confused with "clean"
+
+    if args.prove_absences:
+        return _run_prove_absences(args.scorecard, args.root)
 
     # The containment refusal is NOT here: it moved into `verify`, which every caller reaches. The
     # `except ScorecardError` below already maps it to exit 2, so the CLI behaviour is unchanged.

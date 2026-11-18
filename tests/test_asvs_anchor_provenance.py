@@ -425,9 +425,12 @@ def test_the_closing_line_never_stands_alone_when_some_anchor_could_not_be_read(
 #: ``ZZ.SENTINEL.9`` and ``bogus`` cannot collide with a real requirement -- so a hit in a captured
 #: stream is proof of disclosure rather than a coincidence.
 #:
-#: THE THREE ``KeyError`` ROWS ARE THE SECOND HALF OF THE DEFECT. ``load_scorecard`` subscripts the
-#: record directly in a dozen places, so these reached no refusal at all: they escaped as a traceback
-#: and exit 1, a code this tool's own contract never defines and no ``return`` in it produces.
+#: THE THREE MISSING-FIELD ROWS WERE THE SECOND HALF OF THE DEFECT. ``load_scorecard`` subscripted
+#: the record directly in a dozen places, so these reached no refusal at all: they escaped as a
+#: traceback and exit 1, a code this tool's own contract never defines and no ``return`` in it
+#: produces. They raised ``KeyError``, and the non-numeric ``line`` row ``ValueError``, until BACKLOG
+#: #5457 made the loader read every field typed; each is now a ``ScorecardError`` naming the field
+#: and its type, never its value.
 #:
 #: ***THE ``ValueError`` AND ``UnicodeDecodeError`` ROWS EXIST TO FAIL A LIST THAT LOOKS COMPLETE.***
 #: Written from the three classes above, the obvious narrowing is
@@ -436,7 +439,9 @@ def test_the_closing_line_never_stands_alone_when_some_anchor_could_not_be_read(
 #: ``ValueError: invalid literal for int() with base 10: 'ZZ.SENTINEL.7'`` at exit 1, which is a field
 #: of the record on stderr under a code the contract does not define. These two rows are the reason a
 #: reader cannot repair a lint finding on the ``except`` line by enumerating what the suite happens to
-#: raise; the breadth itself is pinned separately, by the paired arms below.
+#: raise; the breadth itself is pinned separately, by the paired arms below. Since BACKLOG #5457 the
+#: non-numeric ``line`` is refused at load as a ``ScorecardError``, so the ``UnicodeDecodeError`` row
+#: alone still raises a class outside that narrowed list; the paired arms are what pin the breadth.
 _UNREADABLE: dict[str, tuple[str | bytes, str]] = {
     "unknown_state": ('[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "bogus"\n', "ScorecardError"),
     "na_without_rationale": (
@@ -447,18 +452,18 @@ _UNREADABLE: dict[str, tuple[str | bytes, str]] = {
         '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\ndecision_closed = true\n',
         "ScorecardError",
     ),
-    "row_without_id": ('[[cell]]\nlevel = 1\nverdict = "pass"\n', "KeyError"),
-    "row_without_level": ('[[cell]]\nid = "{id}"\nverdict = "pass"\n', "KeyError"),
+    "row_without_id": ('[[cell]]\nlevel = 1\nverdict = "pass"\n', "ScorecardError"),
+    "row_without_level": ('[[cell]]\nid = "{id}"\nverdict = "pass"\n', "ScorecardError"),
     "citation_without_a_token": (
         '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\n'
         '[[cell.evidence]]\npath = "mod.py"\nline = 2\n',
-        "KeyError",
+        "ScorecardError",
     ),
     "not_toml_at_all": ('[[cell]\nid = "{id}"\n', "TOMLDecodeError"),
     "line_that_is_not_a_number": (
         '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\n'
         '[[cell.evidence]]\npath = "mod.py"\nline = "' + VALUE_SENTINEL + '"\nexpect = "NEEDLE"\n',
-        "ValueError",
+        "ScorecardError",
     ),
     # Bytes, not text: the fault is that the file never decodes, so it cannot be authored as a str and
     # cannot take the ``{id}`` substitution the rows above use. The sentinel is spliced in from the

@@ -329,10 +329,11 @@ def test_a_record_it_could_not_read_is_never_a_clean_zero(
 #: invented -- ``ZZ.SENTINEL.9`` and ``bogus`` cannot collide with a real requirement -- so a hit in
 #: captured output is proof of disclosure rather than a coincidence.
 #:
-#: THE THREE ``KeyError`` ROWS ARE THE SECOND DEFECT. ``load_scorecard`` subscripts the record
+#: THE THREE MISSING-FIELD ROWS WERE THE SECOND DEFECT. ``load_scorecard`` subscripted the record
 #: directly in a dozen places, so these never reached the reporter's refusal at all: they escaped as a
 #: traceback and exit 1, which is :data:`EXIT_FINDINGS` -- "I could not measure this" rendered as "I
-#: measured it, and citations are broken".
+#: measured it, and citations are broken". They raised ``KeyError`` until BACKLOG #5457 made the loader
+#: read every field typed, so a missing one is now a ``ScorecardError`` naming the field.
 _UNREADABLE: dict[str, tuple[str, str]] = {
     "unknown_state": ('[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "bogus"\n', "ScorecardError"),
     "na_without_rationale": (
@@ -343,12 +344,12 @@ _UNREADABLE: dict[str, tuple[str, str]] = {
         '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\ndecision_closed = true\n',
         "ScorecardError",
     ),
-    "row_without_id": ('[[cell]]\nlevel = 1\nverdict = "pass"\n', "KeyError"),
-    "row_without_level": ('[[cell]]\nid = "{id}"\nverdict = "pass"\n', "KeyError"),
+    "row_without_id": ('[[cell]]\nlevel = 1\nverdict = "pass"\n', "ScorecardError"),
+    "row_without_level": ('[[cell]]\nid = "{id}"\nverdict = "pass"\n', "ScorecardError"),
     "citation_without_a_token": (
         '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\n\n'
         '[[cell.evidence]]\npath = "engine_module.py"\nline = 2\n',
-        "KeyError",
+        "ScorecardError",
     ),
 }
 
