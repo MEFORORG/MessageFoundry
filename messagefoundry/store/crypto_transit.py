@@ -394,8 +394,7 @@ def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = N
 
 
 def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
-    """:func:`_warn_quietly`, unless the warning ``kind()`` was logged in the last
-    :data:`_WARNING_LOG_INTERVAL_S` and logging it did not raise. The slot is taken before the
+    """:func:`_warn_quietly`, unless its slot is taken (see below). The slot is taken before the
     warning, so concurrent callers emit it at most once. When building or logging the warning fails,
     or a fault escapes it, the slot is given back, to the time it held before or to empty, unless a
     later caller has taken it since; when giving it back fails too, the slot stays taken for the
