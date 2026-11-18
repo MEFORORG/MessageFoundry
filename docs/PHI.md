@@ -1711,8 +1711,8 @@ bodies). Read the trail via `GET /audit` (`audit:read`).
 `summary_access` rows differ from a single-request row like `message_view`:
 
 - It is coalesced: one row per actor, channel scope and hour, carrying the count. Its sources
-  include at least the message list, its content search, the dead-letter list and the message
-  detail view.
+  include at least the message list, its content search, the layered preset search
+  (`GET /search/layered`), the dead-letter list and the message detail view.
 - It is written late. The engine keeps the open hour's count in memory. It writes the row when a
   later access rolls into a new hour, or when the engine stops cleanly, so a crash would lose the
   open hour's count.
