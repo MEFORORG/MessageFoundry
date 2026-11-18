@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Shard-certification verdicts that read PASS on a run they exist to refuse (BACKLOG #5440, #5441,
-#5442).
+"""Engine-shard certification verdicts that read PASS on a run they exist to refuse (BACKLOG #5440,
+#5441, #5442).
 
 Unit tests over synthetic counters: no load run, no database, no fleet.
 """
@@ -9,6 +9,7 @@ Unit tests over synthetic counters: no load run, no database, no fleet.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 
 import pytest
 
@@ -194,7 +195,22 @@ def test_broken_rung_pins_nothing_and_stops_the_climb(monkeypatch: pytest.Monkey
     assert lad.exit_code == 1
     assert lad.pinned_rate == 10.0  # the dead-lettering 20 msg/s rung pins nothing
     assert lad.ceiling_rate is None
-    assert any("CLIMB STOPPED" in n for n in lad.notes)
+    assert any("CLIMB STOPPED" in n and "dead_total=5" in n for n in lad.notes)
+    assert "raise the top rate" not in lad.render()
+
+
+def test_inversion_break_is_named_in_the_stop_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    from harness.load import shardcert
+
+    rec = ShardCertStepRecord.from_report(10.0, _report(lane_inversions=2), hold_seconds=60.0)
+    assert rec.correctness_faults() == ["lane_inversions=2"]
+
+    async def fake_step(*, rate: float, **_kw: object) -> ShardCertStepRecord:
+        return rec
+
+    monkeypatch.setattr(shardcert, "_run_ladder_step", fake_step)
+    lad = asyncio.run(shardcert.run_shardcert_ladder(rates=[10]))
+    assert any("lane_inversions=2" in n for n in lad.notes)
 
 
 # --- BACKLOG #5442: the two-box ladder reads the abort marker and the gate's pool -------------------------
@@ -293,7 +309,9 @@ def _sustained(index: int, rate: float, pool: PoolStats = _HEALTHY_POOL) -> Rung
     return out
 
 
-def _consolidated(climb: list[RungOutcome]) -> ConsolidatedLadderReport:
+def _consolidated(
+    climb: list[RungOutcome], soak: RungOutcome | None = None
+) -> ConsolidatedLadderReport:
     return build_consolidated_report(
         shards=("a", "b"),
         dests=_DESTS,
@@ -304,7 +322,7 @@ def _consolidated(climb: list[RungOutcome]) -> ConsolidatedLadderReport:
         driver_count=2,
         sink_count=_DESTS,
         climb=climb,
-        soak=None,
+        soak=soak,
         climb_aborted=False,
         soak_aborted=False,
     )
@@ -349,6 +367,39 @@ def test_pool_bound_gate_only_ladder_does_not_exit_zero() -> None:
     assert rep.ceiling_pool_bound is True
     assert rep.exit_code == 2
     assert rep.result_label == "POOL_BOUND"
+
+
+def test_engine_aborted_soak_is_setup_degraded_not_unconfirmed() -> None:
+    soak_rung = LadderRung(
+        index=9, ingress_rate=20.0, hold_seconds=900.0, drain_timeout=150.0, is_soak=True
+    )
+    soak = build_rung_outcome(
+        soak_rung, _drive(20.0, sink_short=500, drained=False), _ABORTED_GATE, None
+    )
+    assert soak.engine_invalidated is True
+    rep = _consolidated([_sustained(0, 20.0)], soak=soak)
+    assert rep.soak_aborted is True
+    assert rep.exit_code == 2
+    assert rep.result_label == "SETUP_DEGRADED"
+
+
+def test_aborted_report_extras_are_not_read() -> None:
+    """A torn-down rung's report carries a teardown pool sample; it must not trip the ladder's tripwire."""
+    report = {**_ABORTED_GATE, "store_pool": _TRIPPED_POOL.to_json_dict(), "in_pipeline_slope": 5.0}
+    out = build_rung_outcome(_rung(1, 24.0), _drive(24.0), None, report)
+    assert out.pool.measured is False
+    assert out.in_pipeline_slope is None
+    assert out.to_json_dict()["engine"]["invalidated"] is True  # type: ignore[index]
+
+
+def test_correctness_break_outranks_a_pool_bind() -> None:
+    """A FIFO break is FAIL / exit 1 even when a gate-only rung tripped the pool."""
+    broken = build_rung_outcome(_rung(1, 24.0), _drive(24.0), _clean_gate(_HEALTHY_POOL), None)
+    broken = dataclasses.replace(broken, lane_inversions=3, verdict=RungVerdict.CORRECTNESS_FAIL)
+    rep = _consolidated([_sustained(0, 20.0, pool=_TRIPPED_POOL), broken])
+    assert rep.ceiling_pool_bound is True
+    assert rep.exit_code == 1
+    assert rep.result_label == "FAIL"
 
 
 def test_report_pool_still_wins_over_the_gate() -> None:

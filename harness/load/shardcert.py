@@ -2098,6 +2098,24 @@ class ShardCertStepRecord:
             stranded_nonterminal=self.stranded_nonterminal,
         ) and (self.ceiling or self.lanes_observed >= 2)
 
+    def correctness_faults(self) -> list[str]:
+        """The terms of :attr:`correctness_ok` this rung broke, named for an operator note (empty when it
+        held). Kept beside the predicate so a note never shows only the clean values."""
+        terms = [
+            ("loss or undrained pipeline", not self.no_loss),
+            ("nothing acknowledged", self.achieved_intake <= 0),
+            (f"lane_inversions={self.lane_inversions}", self.lane_inversions != 0),
+            (f"lane_repeats={self.lane_repeats}", self.lane_repeats != 0),
+            (f"engine_dead={self.engine_dead}", self.engine_dead != 0),
+            (f"dead_total={self.dead_total}", self.dead_total != 0),
+            (f"stranded={self.stranded_nonterminal}", self.stranded_nonterminal != 0),
+            (
+                f"lanes_observed={self.lanes_observed}",
+                not self.ceiling and self.lanes_observed < 2,
+            ),
+        ]
+        return [label for label, broken in terms if broken]
+
     @property
     def inbound_bands(self) -> int:
         """``G`` — the INGRESS/ROUTED per-lane pool width (``shards x lanes_per_shard``), beside ``dests``
@@ -2361,7 +2379,7 @@ class ShardCertStepRecord:
 class ShardCertLadderReport:
     """The ascending rate-ladder sweep — one :class:`ShardCertStepRecord` per hold step, stopping at
     the first step that fails to SUSTAIN the offered load (:attr:`ShardCertStepRecord.ceiling` — a
-    non-draining/lossy step or a materially-short intake).
+    non-draining/lossy step or a materially-short intake), or that breaks correctness (BACKLOG #5441).
 
     ARTIFACT 4: ``ceiling_rate`` is now ADMISSIBILITY-GATED, exactly as the two-box ladder's pinned ceiling
     is. :func:`_is_ceiling` fires on ``achieved_intake < offered * 0.95`` — which is EXACTLY what a DRIVE
@@ -2574,7 +2592,9 @@ class ShardCertLadderReport:
             #
             # v4 (BACKLOG #5440, #5441): `ok`/`result`/`exit_code` hold each rung to the single-run pass bar
             # (duplicates, at least two lanes, no dead letters at any stage, something acknowledged). Per
-            # record: `lanes_observed`, `engine_dead`, `dead_total` and `correctness_ok` are new.
+            # record: `lanes_observed`, `engine_dead`, `dead_total` and `correctness_ok` are new. A rung that
+            # breaks that bar pins nothing (`pinned_rate` skips it) and stops the climb, so a v4 FAIL may
+            # carry fewer records than a v3 one.
             "schema_version": 4,
             "kind": "shardcert_ladder",
             "result": self.result_label,
@@ -2669,6 +2689,12 @@ class ShardCertLadderReport:
             lines.append(
                 f"  ceiling: NONE PUBLISHED — the climb stopped on a rung that FAILED FIDELITY "
                 f"({self.ceiling_void_reason}). It is not an engine ceiling; fix the rig and re-run."
+            )
+        elif self.records and not self.records[-1].correctness_ok:
+            # BACKLOG #5441: the climb stopped early on a correctness break, so it was not exhausted.
+            lines.append(
+                "  ceiling: NONE — the climb STOPPED on a rung that broke correctness "
+                f"({', '.join(self.records[-1].correctness_faults())}). Fix that before raising the ladder."
             )
         else:
             lines.append("  no ceiling reached across the ladder (raise the top rate)")
@@ -2768,7 +2794,9 @@ async def run_shardcert_ladder(
     (:attr:`ShardCertStepRecord.ceiling` — a non-draining/lossy step, or an intake that fell materially
     short of offered). Each step is a fresh fleet + fresh store (mirrors ``multishard``'s per-step
     isolation), so the recorded intake/delivered/backlog are clean per rate. Correctness is asserted per
-    step via :attr:`ShardCertLadderReport.ok` — the ceiling is a measurement, not a failure."""
+    step via :attr:`ShardCertLadderReport.ok` — the ceiling is a measurement, not a failure. A step that
+    breaks correctness (:attr:`ShardCertStepRecord.correctness_ok`) also stops the climb (BACKLOG #5441):
+    the verdict is already FAIL."""
     report = ShardCertLadderReport()
     ordered = sorted(dict.fromkeys(float(r) for r in rates))  # ascending, de-duplicated
     if not ordered:
@@ -2821,6 +2849,12 @@ async def run_shardcert_ladder(
             #     UNATTRIBUTED one, must never read as a clean PASS with a confident number.
             #   * DRIVEN (ENGINE_INTAKE_BIND / BACKPRESSURE_BIND) -> a REAL engine finding: the drive offered
             #     the rate and the ENGINE would not absorb it. It KEEPS its ceiling_rate, and it is NAMED.
+            if not rec.correctness_ok:
+                # BACKLOG #5441: name the break, so a ceiling read off a FAIL ladder carries its cause.
+                report.notes.append(
+                    f"{rate:g} msg/s: the ceiling rung also broke correctness "
+                    f"({', '.join(rec.correctness_faults())}); the ladder FAILs"
+                )
             fid = rec.fidelity
             if fid.not_driven:
                 report.ceiling_void_reason = _CEILING_VOID_REASONS[fid]
@@ -2850,8 +2884,7 @@ async def run_shardcert_ladder(
             # fleet spent on a run that cannot pass.
             report.notes.append(
                 f"CLIMB STOPPED at {rate:g} msg/s: the rung broke correctness "
-                f"(repeats={rec.lane_repeats} lanes={rec.lanes_observed} dead={rec.engine_dead}/"
-                f"{rec.dead_total} intake={rec.achieved_intake})"
+                f"({', '.join(rec.correctness_faults())})"
             )
             break
     return report
