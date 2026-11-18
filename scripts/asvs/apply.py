@@ -623,22 +623,25 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
     refuses to drop it. Only a comment `_comment_lines` finds outside a string is trimmed, so a
     multi-line string's last line stays in.
 
-    A HEADER IS FOUND IN EVERY UNQUOTED SPELLING TOML ACCEPTS (BACKLOG #5455): leading or trailing
-    whitespace, spaces inside the brackets, and a trailing comment. The exact-line pattern this
-    replaced missed `[[cell]]` followed by a space, so the cell before it owned that cell's text and
-    a rewrite of it deleted both. A spelling still out of reach, such as a quoted `[["cell"]]`, is
-    caught by `main`, which refuses when these spans and the parsed record name different cells.
+    A HEADER OR ID LINE MAY CARRY TRAILING WHITESPACE OR A COMMENT (BACKLOG #5455). The exact-line
+    pattern this replaced missed `[[cell]]` followed by a space, so the cell before it owned that
+    cell's text and a rewrite of it deleted both. The header is still matched at column 0 only,
+    because a looser pattern also matches inside a multi-line string. A spelling still out of reach,
+    such as an indented or quoted header, is caught by `main`, which refuses when these spans and
+    the parsed record name different cells. A repeated id stops here, since a map cannot hold both.
     """
-    starts = [
-        m.start()
-        for m in re.finditer(r"^[ \t]*\[\[[ \t]*cell[ \t]*\]\][ \t]*(?:#.*)?$", text, re.M)
-    ]
+    starts = [m.start() for m in re.finditer(r"^\[\[cell\]\][ \t]*(?:#.*)?$", text, re.M)]
     spans: dict[str, tuple[int, int]] = {}
     for i, s in enumerate(starts):
         e = starts[i + 1] if i + 1 < len(starts) else len(text)
-        m = re.search(r'^id = "([^"]+)"$', text[s:e], re.M)
+        m = re.search(
+            r"""^id[ \t]*=[ \t]*(?:"([^"\\]+)"|'([^']+)')[ \t]*(?:#.*)?$""", text[s:e], re.M
+        )
         if not m:
             raise SystemExit(f"a [[cell]] block at offset {s} has no id")
+        cell_id = m.group(1) if m.group(1) is not None else m.group(2)
+        if cell_id in spans:
+            raise SystemExit(f"two [[cell]] blocks carry id {cell_id!r}")
         lines = text[s:e].split("\n")
         keep = len(lines)
         while keep > 1 and (not lines[keep - 1].strip() or lines[keep - 1].startswith("#")):
@@ -653,7 +656,7 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
             ):
                 keep -= 1
         # Every kept line ends with its newline, which `render`'s output ends with too.
-        spans[m.group(1)] = (s, min(e, s + sum(len(line) + 1 for line in lines[:keep])))
+        spans[cell_id] = (s, min(e, s + sum(len(line) + 1 for line in lines[:keep])))
     return spans
 
 
@@ -862,7 +865,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     live_text = SCORECARD.read_text(encoding="utf-8")
-    live_list = tomllib.loads(live_text)["cell"]
+    live_doc = tomllib.loads(live_text)
+    live_list = live_doc["cell"]
     live_cells = {x["id"]: x for x in live_list}
     # Every cell the record holds, in order: the splice below must keep exactly this list.
     live_ids = [x["id"] for x in live_list]
@@ -1130,17 +1134,19 @@ def main(argv: list[str] | None = None) -> int:
     # so rewriting that one deletes both. The count check after the splice compared against the
     # SPANS, which had already lost the cell, so it agreed with the loss. Compare against TOML's own
     # reading of the record instead.
-    if len(spans) != len(live_ids) or set(spans) != set(live_ids):
-        unseen = sorted(set(live_ids) - set(spans))
+    if list(spans) != live_ids:
         print(
             f"REFUSING: the record holds {len(live_ids)} cells but the writer found "
-            f"{len(spans)} [[cell]] blocks; a rewrite could splice away a cell it cannot see"
+            f"{len(spans)} [[cell]] blocks that do not name them in order; a rewrite could "
+            "splice away a cell it cannot see"
         )
-        if unseen:
+        if unseen := sorted(set(live_ids) - set(spans)):
             print(f"  cells with no block of their own: {_printable(str(unseen))}")
+        if stray := sorted(set(spans) - set(live_ids)):
+            print(f"  blocks naming no cell of the record: {_printable(str(stray))}")
         print(
-            "  Write each such cell's header as a bare [[cell]] line, check no id repeats, then "
-            "re-run."
+            "  Write each cell's header as an unindented [[cell]] line and its id as an "
+            'unindented id = "..." line, then re-run.'
         )
         return 1
 
@@ -1223,20 +1229,44 @@ def main(argv: list[str] | None = None) -> int:
 
     # Parse before writing: a scorecard that does not load is worse than one not updated.
     parsed = tomllib.loads(new_text)
+
+    # EVERYTHING THE PAYLOAD DOES NOT WRITE IS UNCHANGED, read by TOML on both sides (BACKLOG
+    # #5455). The check this replaced compared the cell count against the span count, and the spans
+    # are what could have lost a cell, so it agreed with the loss. Comparing the whole document
+    # outside the payload's cells also catches a non-cell table, such as [[reviewer_exception]],
+    # that sat inside a rewritten span.
+    payload_ids_written = {c["id"] for c in payload}
+    after_list = parsed.get("cell", [])
+    after_ids = [c["id"] for c in after_list]
+    changed = []
+    if after_ids != live_ids:
+        changed.append(
+            f"the cell list ({len(live_ids)} -> {len(after_ids)} cells; lost "
+            f"{_printable(str(sorted(set(live_ids) - set(after_ids))))}, gained "
+            f"{_printable(str(sorted(set(after_ids) - set(live_ids))))}, or reordered)"
+        )
+    changed += [
+        f"untouched cell {_printable(str(x['id']))}"
+        for x, y in zip(live_list, after_list, strict=False)
+        if x["id"] not in payload_ids_written and x != y
+    ]
+    changed += [
+        f"top-level key {_printable(k)}"
+        for k in sorted({*live_doc, *parsed} - {"cell"})
+        if live_doc.get(k) != parsed.get(k)
+    ]
+    if changed:
+        print("REFUSING: the splice changed what the payload does not write:")
+        for what in changed:
+            print(f"  {what}")
+        return 1
+
     by_id = {c["id"]: c for c in parsed["cell"]}
     for c in payload:
         got = by_id[c["id"]]["verdict"]
         if got != c["verdict"]:
             print(f"REFUSING: round-trip mismatch on {c['id']}: {got!r} != {c['verdict']!r}")
             return 1
-    # The record's own cell list, not the span count: the spans are what could have lost a cell.
-    after_ids = [c["id"] for c in parsed["cell"]]
-    if after_ids != live_ids:
-        print(
-            f"REFUSING: the cells changed {len(live_ids)} -> {len(after_ids)}; "
-            f"lost {_printable(str(sorted(set(live_ids) - set(after_ids))))}"
-        )
-        return 1
 
     # FIELD-PRESERVATION INVARIANT. A rewrite must never silently DROP a key, and the anchor gate
     # cannot see that: an absent `decision_closed` is a valid False, so un-closing an owner-closed

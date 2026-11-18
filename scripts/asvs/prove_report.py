@@ -183,9 +183,11 @@ def _invoke_prover(
         # UTF-8 BOTH WAYS, NOT THE LOCALE (BACKLOG #5456). On a cp1252 console the child could not
         # print a claim's non-Latin-1 text and the parent could not decode it, so the run died on an
         # encoding error rather than reporting. `replace` keeps a stray byte from doing the same.
+        # PYTHONUTF8 as well as PYTHONIOENCODING: the prover's own pytest children inherit both, so
+        # they write UTF-8 and the prover, in UTF-8 mode, decodes them as UTF-8 too.
         encoding="utf-8",
         errors="replace",
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
         check=False,
         timeout=timeout,
     )
@@ -285,22 +287,37 @@ def _emit_summary(lines: list[str]) -> None:
         fh.write("\n".join(lines) + "\n")
 
 
-def _print_raw(name: str, text: str, *, detail: bool) -> None:
-    """Print one of the prover's raw streams, but only under ``--detail`` (BACKLOG #5456).
+def _instrument_failure(
+    reason: str, raw: tuple[str, str] | None = None, *, detail: bool = False
+) -> int:
+    """Report a run that measured nothing checkable, and return :data:`EXIT_INSTRUMENT`.
 
-    A raw stream is the problem lines and more: a failing load names the cell, and a traceback can
-    quote a claim. The failure paths printed it unconditionally, so a public run log carried exactly
-    the text ``_report`` suppresses. Without ``--detail`` only its size is printed.
+    The prover's raw stream prints only under ``--detail`` (BACKLOG #5456). It is the problem lines
+    and more: a failing load names the cell, and a traceback can quote a claim. These paths printed
+    it unconditionally, so a public run log carried exactly the text ``_report`` suppresses. Without
+    ``--detail`` only its size is printed. The reason, which carries no claim text, also goes to the
+    job summary, so a red run says which failure it was.
     """
-    if detail:
-        print(f"the prover's {name} was:\n{text}", file=sys.stderr)
-    else:
-        print(
-            f"  the prover's {name} ({len(text.splitlines())} line(s)) is SUPPRESSED: it can name "
-            "cells and claims, and this repo's run logs are public. Re-run with --detail where the "
-            "log is private.",
-            file=sys.stderr,
-        )
+    print(f"error: {reason}", file=sys.stderr)
+    if raw is not None:
+        name, text = raw
+        if detail:
+            print(f"the prover's {name} was:\n{text}", file=sys.stderr)
+        else:
+            print(
+                f"  the prover's {name} ({len(text.splitlines())} line(s)) is SUPPRESSED: it can "
+                "name cells and claims, and this repo's run logs are public. Re-run with --detail "
+                "where the log is private.",
+                file=sys.stderr,
+            )
+    _emit_summary(
+        [
+            "### ASVS `--prove-absences` MEASURED NOTHING CHECKABLE",
+            "",
+            f"{reason}. This run is not evidence about any claim.",
+        ]
+    )
+    return EXIT_INSTRUMENT
 
 
 def _report(
@@ -404,21 +421,11 @@ def run(args: argparse.Namespace) -> int:
     # A RECORD WITH NOTHING TO SCAN IS NOT A CLEAN RECORD (BACKLOG #5456). An empty file, a file
     # with no cells, or cells with no absence claim all reconcile against a prover that saw zero, so
     # without this the run reported a pass having examined nothing.
-    if c.cells == 0 or c.claims == 0:
-        print(
-            f"error: the scorecard holds {c.cells} cells and {c.claims} absence claims -- refusing "
-            "to report a pass on a run that scanned nothing",
-            file=sys.stderr,
+    if c.claims == 0:
+        return _instrument_failure(
+            f"the scorecard holds {c.cells} cells and no absence claim -- refusing to report a "
+            "pass on a run that scanned nothing"
         )
-        _emit_summary(
-            [
-                "### ASVS `--prove-absences` SCANNED NOTHING",
-                "",
-                f"The scorecard held {c.cells} cells and {c.claims} absence claims. This run is not "
-                "evidence about any claim.",
-            ]
-        )
-        return EXIT_INSTRUMENT
 
     try:
         rc, stdout, stderr = _invoke_prover(scorecard, root, args.python, args.timeout)
@@ -427,31 +434,33 @@ def run(args: argparse.Namespace) -> int:
         return EXIT_INSTRUMENT
 
     if rc == EXIT_INSTRUMENT:
-        print("error: the prover could not measure (exit 2)", file=sys.stderr)
-        _print_raw("stderr", stderr, detail=args.detail)
-        return EXIT_INSTRUMENT
+        return _instrument_failure(
+            "the prover could not measure (exit 2)", ("stderr", stderr), detail=args.detail
+        )
 
     r = parse_prover(rc, stdout, stderr)
     if r is None:
-        print(
-            "error: the prover printed no summary line -- its output could not be parsed, so this "
-            "run measured nothing checkable.",
-            file=sys.stderr,
+        return _instrument_failure(
+            "the prover printed no summary line -- its output could not be parsed, so this run "
+            "measured nothing checkable",
+            ("stdout", stdout),
+            detail=args.detail,
         )
-        _print_raw("stdout", stdout, detail=args.detail)
-        return EXIT_INSTRUMENT
 
-    # THE EXIT CODE MUST AGREE WITH THE SUMMARY (BACKLOG #5456). The prover exits 0 on no problem
-    # and 1 on a problem. A crash after the summary line also exits 1, with a summary of zero
-    # problems, and was read as a clean run. Any other pairing is an instrument failure.
-    if rc != (1 if r.problems else 0):
-        print(
-            f"error: the prover exited {rc} after reporting {r.problems} problem(s); it exits 0 on "
-            "none and 1 on some, so it did not finish the way its summary says",
-            file=sys.stderr,
+    # THE PROVER MUST HAVE FINISHED THE WAY ITS SUMMARY SAYS (BACKLOG #5456). It exits 0 on no
+    # problem and 1 on a problem, and prints one FAIL line per problem after the summary. A crash
+    # after the summary also exits 1: with zero problems it was read as a clean run, and with some it
+    # was read as an ordinary findings run whose FAIL lines were cut short.
+    crashed = any(ln.startswith("Traceback (most recent call last)") for ln in stderr.splitlines())
+    if rc != (1 if r.problems else 0) or crashed or len(r.problem_lines) < r.problems:
+        return _instrument_failure(
+            f"the prover exited {rc} after reporting {r.problems} problem(s), printed "
+            f"{len(r.problem_lines)} FAIL line(s) and {'a' if crashed else 'no'} traceback; it "
+            "exits 0 on none and 1 on some with one line each, so it did not finish the way its "
+            "summary says",
+            ("stderr", stderr),
+            detail=args.detail,
         )
-        _print_raw("stderr", stderr, detail=args.detail)
-        return EXIT_INSTRUMENT
 
     _report(scorecard, root, c, r, detail=args.detail, strict=args.strict)
 

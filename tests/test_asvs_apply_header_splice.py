@@ -3,7 +3,7 @@
 """The scorecard writer must never splice away an untouched cell (BACKLOG #5455).
 
 `block_spans` found a cell's header with an exact-line pattern, so a `[[cell]]` header carrying
-trailing whitespace, or spelled with TOML's permitted inner spaces, was not seen as a header at all.
+trailing whitespace, or in another spelling TOML accepts, was not seen as a header at all.
 The cell before it then owned the whole of that cell's text, and rewriting it replaced both. The
 post-splice count check compared the parsed result against the SPAN count, which had already lost
 the cell, so it agreed with the loss and the write went through.
@@ -56,13 +56,20 @@ reviewed_by = { reviewer = "fixture", ref = "unrecorded", date = "unrecorded" }
   expect = "beta"
 """
 
-#: Header spellings TOML accepts that the exact-line pattern did not.
+#: Header spellings TOML accepts that the exact-line pattern did not, and the span reader now does.
 _PADDED_HEADERS = [
     pytest.param("[[cell]]  \n", id="trailing-spaces"),
     pytest.param("[[cell]]\t\n", id="trailing-tab"),
+    pytest.param("[[cell]]  # a note on the header\n", id="trailing-comment"),
+]
+
+#: Header spellings TOML accepts that the span reader still does not take. It matches an
+#: unindented `[[cell]]` only, because anything looser also matches inside a multi-line string, so
+#: these must be REFUSED rather than read.
+_UNREAD_HEADERS = [
+    pytest.param('[["cell"]]\n', id="quoted"),
     pytest.param("[[ cell ]]\n", id="inner-spaces"),
     pytest.param("  [[cell]]\n", id="indented"),
-    pytest.param("[[cell]]  # a note on the header\n", id="trailing-comment"),
 ]
 
 
@@ -110,17 +117,17 @@ def test_rewriting_the_cell_before_a_padded_header_keeps_the_next_cell(
     assert cells["99.1.1"]["residual"] == "first synthetic cell, rewritten"
 
 
+@pytest.mark.parametrize("header", _UNREAD_HEADERS)
 def test_a_header_the_span_reader_cannot_see_refuses_the_write(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], header: str
 ) -> None:
     """THE BACKSTOP, independent of how far the header pattern reaches.
 
-    TOML also accepts a quoted table name, so `[["cell"]]` opens a cell too. The span reader does
-    not take that spelling, and some other spelling will always be out of its reach, so the writer
-    must notice that the record TOML parses holds a cell its spans do not, and refuse before it
-    splices, rather than trust a count taken from the spans themselves.
+    Some spelling will always be out of the span reader's reach, so the writer must notice that the
+    record TOML parses holds a cell its spans do not, and refuse before it splices, rather than
+    trust a count taken from the spans themselves.
     """
-    rec = _record(tmp_path, '[["cell"]]\n')
+    rec = _record(tmp_path, header)
     before = rec.read_bytes()
     rc = main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"])
     assert rc == 1
@@ -128,3 +135,28 @@ def test_a_header_the_span_reader_cannot_see_refuses_the_write(
     out = capsys.readouterr().out
     assert "REFUSING" in out
     assert "99.1.2" in out
+
+
+def test_an_id_line_with_a_trailing_comment_is_still_read(tmp_path: Path) -> None:
+    """The id pattern was exact-line too: a padded id stopped every write to the record."""
+    body = _SECOND_BODY.replace('id = "99.1.2"\n', "id = '99.1.2'   # a note on the id\n")
+    assert body != _SECOND_BODY
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_HEAD + _FIRST + "[[cell]]\n" + body, encoding="utf-8")
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 0
+    cells = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert cells["99.1.2"]["residual"] == "second synthetic cell, never in the payload"
+
+
+def test_a_table_inside_a_rewritten_span_refuses_the_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-cell table after the last cell sits inside that cell's span. Rewriting the cell
+    deleted the table, and a check that compared only cells could not see it."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_HEAD + _FIRST + '[extra]\nnote = "kept"\n', encoding="utf-8")
+    before = rec.read_bytes()
+    rc = main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+    assert "top-level key extra" in capsys.readouterr().out

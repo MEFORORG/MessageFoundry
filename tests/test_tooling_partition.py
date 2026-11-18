@@ -115,6 +115,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # dependency diff the tooling path gate does not see.
         "test_api_listener_ipv6_only.py",
         "test_asvs_apply.py",
+        # The same writer as test_asvs_apply.py, so it stays where that file stays (BACKLOG #5455).
+        "test_asvs_apply_header_splice.py",
         "test_asvs_residual_lint.py",
         # Reads changelog.d/ and CHANGELOG.md (BACKLOG #2080). A changelog fragment arrives on an
         # ENGINE pull request -- that is where every entry is written -- and does not trip the tooling
