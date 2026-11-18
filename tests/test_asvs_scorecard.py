@@ -3692,7 +3692,8 @@ def test_prove_absences_summary_negative_control_an_empty_run_says_saw_zero(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The negative control: a scorecard with NO absence claims must say so, not print four zeroes
-    that read like a clean pass over a real population."""
+    that read like a clean pass over a real population. It REFUSES, exit 2: a `saw 0` summary on
+    exit 0 still read as a pass to a CI step that only checks the code (BACKLOG #5461)."""
     sc = tmp_path / "sc.toml"
     sc.write_text(
         '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n',
@@ -3701,9 +3702,8 @@ def test_prove_absences_summary_negative_control_an_empty_run_says_saw_zero(
     tree = tmp_path / "tree"
     tree.mkdir()
     rc = main(["--scorecard", str(sc), "--root", str(tree), "--prove-absences"])
-    out = capsys.readouterr().out
-    assert rc == 0
-    assert "saw 0 absence claim(s)" in out
+    assert rc == 2
+    assert "no absence claims" in capsys.readouterr().err
 
 
 # --- sym + ctx: WHERE in the structure, and it is a DISPLACEMENT signal ---------------------------

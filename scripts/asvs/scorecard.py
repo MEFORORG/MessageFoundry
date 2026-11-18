@@ -756,8 +756,9 @@ def _regex(raw: Mapping[str, Any], key: str, where: str) -> str:
     try:
         compiled = re.compile(value)
     except re.error as exc:
+        # The position, not `exc.msg`: the message can quote the pattern, a group name for one.
         raise ScorecardError(
-            f"{where}: `{key}` is not a valid regular expression ({exc.msg})"
+            f"{where}: `{key}` is not a valid regular expression (error at character {exc.pos})"
         ) from None
     # The empty string, then single characters. A pattern that matches more than one LONE character
     # -- `.`, `\w`, `\b`, a lookahead, a character class -- is sighted in almost any file, which is
@@ -792,11 +793,12 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
         )
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     cells: list[Cell] = []
-    for raw in _tables(data, "cell", "the scorecard"):
-        # A non-string id is not repeated in the type refusals that use `where`. The older refusals
-        # below, the verdict one among them, still format the raw id; this does not cover them.
-        rid = raw.get("id")
-        where = f"cell {rid!r}" if isinstance(rid, str) else "a cell with no string `id`"
+    for n, raw in enumerate(_tables(data, "cell", "the scorecard")):
+        # The refusals that use `where` name the cell by its POSITION, never by its id or any other
+        # value it holds: the message reaches a CI log, and the record's content is private. The
+        # older refusals below, the verdict one among them, still format the raw id; this does not
+        # cover them.
+        where = f"cell[{n}]"
         legacy = raw.get("reviewed_by")
         if historical and isinstance(legacy, str) and legacy.strip():
             raw = {k: v for k, v in raw.items() if k != "reviewed_by"}
@@ -3605,7 +3607,8 @@ def _run_prove_absences(scorecard: Path, root: Path) -> int:
 
     Held to verify's footing (BACKLOG #5461): the root must be a directory that does not hold the
     record (:func:`check_root`), the provenance header names both trees before anything is read,
-    and a record with no cells is refused rather than reported as a clean pass over nothing.
+    and a record with no cells, or with cells but no absence claim, is refused rather than reported
+    as a clean pass over nothing.
     """
     try:
         check_root(scorecard, root)
@@ -3625,6 +3628,15 @@ def _run_prove_absences(scorecard: Path, root: Path) -> int:
         print(
             f"error: the scorecard {scorecard} holds no cells, so there is nothing to prove; an "
             "empty record is not a clean one",
+            file=sys.stderr,
+        )
+        return 2
+    # Cells with no absence claim are the same pass over nothing: the summary would read `saw 0`
+    # and the run would exit 0, which a CI step reads as every claim proved.
+    if not any(c.absence for c in cells):
+        print(
+            f"error: the scorecard {scorecard} holds no absence claims, so there is nothing to "
+            "prove; a record with none to prove is not a proved one",
             file=sys.stderr,
         )
         return 2

@@ -308,6 +308,42 @@ def test_an_interrupt_is_not_swallowed(tmp_path: Path, monkeypatch: pytest.Monke
         main(_mode_argv("status", record, tmp_path))
 
 
+#: A cell whose id is the sentinel, for the refusals this branch added that once named a cell by id.
+_LEAK_CELL = _CELL.replace('"1.1.1"', f'"{_LEAK}"')
+
+
+@pytest.mark.parametrize(
+    ("body", "field"),
+    [
+        (_LEAK_CELL.replace("level = 1", 'level = "1"'), "level"),
+        (_LEAK_CELL.replace('residual = "why"', "residual = 1"), "residual"),
+        (_LEAK_CELL + _BLOCKER.replace('"2026-08-01"', '"2026-13-01"'), "blocker.checked_on"),
+        (_LEAK_CELL + _BLOCKER.replace("30", '"30"'), "blocker.recheck_days"),
+        (_LEAK_CELL + "  [[cell.evidence]]\n  path = 1\n", "path"),
+        (
+            _LEAK_CELL + '  [[cell.evidence]]\n  path = "m.py"\n  line = 1\n  expect = " "\n',
+            "expect",
+        ),
+        (_LEAK_CELL + _ABSENCE.replace("'def '", "'.'"), "positive_control"),
+        # The regex engine's own message quotes a group name, so the sentinel arrives through it
+        # even when the cell id is clean.
+        (_CELL + _ABSENCE.replace("'eval\\('", f"'(?P<{_LEAK}>x)'"), "pattern"),
+    ],
+    ids=["level", "residual", "checked_on", "recheck_days", "path", "expect", "control", "regex"],
+)
+def test_a_refusal_names_the_field_not_the_record_value(
+    tmp_path: Path, body: str, field: str
+) -> None:
+    """The refusals this branch added reach a CI log, so they name the cell by position and the
+    field by name, and never repeat what the record holds. Before: they named the cell by its id,
+    and an uncompilable pattern carried the regex engine's message, which can quote the pattern."""
+    with pytest.raises(ScorecardError) as exc:
+        _load(tmp_path, body)
+    message = str(exc.value)
+    assert field in message and "cell[0]" in message, message
+    assert _LEAK not in message, message
+
+
 # --- BACKLOG #5459: an anchor must name a token, and must stay inside the engine root ------------
 
 _ANCHOR = '  [[cell.evidence]]\n  path = "mod.py"\n  line = 1\n  expect = "TOKEN"\n'
@@ -506,14 +542,31 @@ def test_prove_absences_refuses_a_record_with_no_cells(
 def test_prove_absences_prints_the_provenance_header(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Before: no line said which trees the proof was measured against."""
+    """Before: no line said which trees the proof was measured against. The record carries one
+    absence claim, so the run gets past every refusal and the header is read off a completed run."""
+    root = tmp_path / "engine"
+    root.mkdir()
+    record = _prove_record(tmp_path, _CELL + _ABSENCE)
+    assert main(["--scorecard", str(record), "--root", str(root), "--prove-absences"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.startswith("# asvs-prove-absences scorecard=")
+    assert "prove-absences: saw 1 absence claim(s);" in captured.out
+    assert "no absence claims" not in captured.err
+
+
+def test_prove_absences_refuses_cells_with_no_absence_claim(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Before: a record whose cells carry no absence claim scanned zero claims and exited 0, the
+    same pass over nothing as an empty record. The header still comes first."""
     root = tmp_path / "engine"
     root.mkdir()
     record = _prove_record(tmp_path)
-    assert main(["--scorecard", str(record), "--root", str(root), "--prove-absences"]) == 0
-    out = capsys.readouterr().out
-    assert out.startswith("# asvs-prove-absences scorecard=")
-    assert "prove-absences: saw 0 absence claim(s);" in out
+    assert main(["--scorecard", str(record), "--root", str(root), "--prove-absences"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out.startswith("# asvs-prove-absences scorecard=")
+    assert "saw 0 absence claim(s)" not in captured.out
+    assert "no absence claims" in captured.err
 
 
 def test_verify_refuses_a_root_that_is_not_a_directory(
