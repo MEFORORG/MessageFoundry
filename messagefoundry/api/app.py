@@ -12388,6 +12388,15 @@ async def _remind_expiring_initial_credentials(
     now = time.time() if now is None else now
     live: set[str] = set()
     for user in await auth.store.list_users():
+        if user.unreadable:
+            # BACKLOG #5505: the list's stand-in, whose fields are invented, so no deadline can be
+            # read from it. Skipped, and said so; the seal-failure report names it elsewhere.
+            _log.warning(
+                "initial credential reminder: the record of %s fails its integrity check, so "
+                "whether it holds an expiring credential cannot be told; skipped",
+                scrub_log_argument(user.id),
+            )
+            continue
         if user.disabled:
             continue
         deadline = pending_credential_deadline(auth, user)

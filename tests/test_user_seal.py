@@ -381,6 +381,12 @@ _LOADERS: dict[str, frozenset[str]] = {
     # The role rows, and one re-read by id before a failing pair is reported.
     "_verified": frozenset({"get_user_role_grants", "get_user"}),
     "_verified_passkeys": frozenset({"list_webauthn_credentials"}),
+    # BACKLOG #5505: which accounts a group-wide save revokes, from the unchecked rows, so a
+    # failing record is revoked too; it also checks each row it does not name through
+    # `_checked_by_id`. Only account ids leave it, and only to a revoke and to the step-up gate's
+    # membership question. `holds` is `_holds_role`'s reader of an account's unchecked role rows.
+    "_accounts_a_save_ends": frozenset({"list_users"}),
+    "holds": frozenset({"get_user_role_grants"}),
     # Existence questions: only a bool leaves them, never the unchecked row.
     "_username_held": frozenset({"get_user_by_username"}),
     "_directory_object_id_held": frozenset({"get_user_by_directory_object_id"}),

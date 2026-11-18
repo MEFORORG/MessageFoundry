@@ -642,7 +642,8 @@ from typing import Any
 #: console's new ``require_ui_step_up_when_own_sessions_end`` gate asks, and the four console
 #: routes moved to that gate. ``AdminHandlers.update_custom_role``, ``delete_custom_role``,
 #: ``set_ad_group_map`` and ``set_ad_group_scope_map`` are now the cores past the JSON routes'
-#: step-up, with the signatures the console already called, so no console call changed. The JSON
+#: step-up, with the signatures the console then called, so no console call changed (BACKLOG #5505,
+#: below, has since added a keyword the console passes). The JSON
 #: routes themselves now take ``request``, which the seam does not carry. The digest moved from
 #: ``7f01058f7699dfe8`` because the discovered surface and the route gates did. An older console
 #: on this engine is refused at mount, as is a newer console on an older engine, which lacks the
@@ -921,12 +922,25 @@ from typing import Any
 #: ``messagefoundry_webconsole/routes/core.py``. The digest records the models' field names, not
 #: their bounds. Re-derived with ``--write``, from ``bc56eed44a1590fd`` to ``f16ae6b198ad952b``.
 #:
+#: BACKLOG #5505: the four ``AdminHandlers`` cores of the group-wide saves,
+#: ``update_custom_role``, ``delete_custom_role``, ``set_ad_group_map`` and
+#: ``set_ad_group_scope_map``, take the keyword ``ended``, the set the step-up gate read, and the
+#: console passes ``ended=gate_ended_sessions(request)`` on each call. The digest records
+#: ``AdminHandlers`` field names only, the blind spot BACKLOG #1149 names above, so it does not see
+#: that keyword: a newer console on an older engine would raise TypeError on each of those four
+#: saves, and an older console on this engine omits ``ended``, which the save then reads itself.
+#: The digest moved for another reason: the console's
+#: ``require_ui_step_up_when_own_sessions_end`` gate now keeps its set for the route, and the
+#: snapshot hashes that gate's body. Re-derived with ``--write`` on the branch, from
+#: ``bc56eed44a1590fd`` to ``3485aab8a5abd1bc``, and over the merge with BACKLOG #5397 above, from
+#: ``f16ae6b198ad952b`` to ``10638208017f77d0``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "f16ae6b198ad952b"
+ENGINE_UI_SEAM: str = "10638208017f77d0"
 
 
 @dataclass(frozen=True, slots=True)

@@ -1817,15 +1817,17 @@ def require_ui_step_up_when_own_sessions_end(
     ASVS 7.5.2).
 
     ``ended`` names the accounts whose sessions the request ends. It is read from the engine's
-    stored accounts, by the same enumeration the revoke runs, never from the caller's identity. A
+    stored accounts, never from the caller's identity, and the save's revoke ends it. A
     caller it names spends the grant, through :func:`_ui_action_step_up_ok`, so the factor-binding
     refusal and the org opt-out apply as on every action-bound lane. Every other caller keeps the
     session window. ``new_ip`` is checked first, so a forced re-auth leaves the grant unspent.
 
     It decides in the gate, before the body is read, because the answer never needs the body:
-    the AD maps end every directory account's sessions whatever they say, and a custom role's
-    holders are named by its path. The route then lands a caller whose session the save ended on
-    the sign-in page."""
+    the accounts an AD map save ends do not depend on the entries saved, and a custom
+    role's holders are named by its path. The set is kept for the route
+    (:func:`gate_ended_sessions`), which hands it to the save, so the revoke ends the set this
+    gate read (BACKLOG #5505). The route then lands a caller whose session the save ended on the
+    sign-in page."""
     # mfa_refusal, NOT allow_mfa_pending, for the reason require_ui_step_up gives.
     base = require_ui(
         *permissions,
@@ -1845,7 +1847,9 @@ def require_ui_step_up_when_own_sessions_end(
             raise _reauth_redirect(request, nxt)
         if await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path):
             raise _reauth_redirect(request, nxt)
-        if identity.user_id in await ended(request, auth):
+        named = await ended(request, auth)
+        request.scope[_GATE_ENDED_SESSIONS] = named
+        if identity.user_id in named:
             ok = await _ui_action_step_up_ok(auth, token, action)
         else:
             ok = await auth.has_recent_step_up(token)
@@ -1854,6 +1858,18 @@ def require_ui_step_up_when_own_sessions_end(
         return identity
 
     return mark_route_gate(dependency)
+
+
+#: The request-scope key :func:`require_ui_step_up_when_own_sessions_end` keeps its set under.
+_GATE_ENDED_SESSIONS = "messagefoundry.gate_ended_sessions"
+
+
+def gate_ended_sessions(request: Request) -> frozenset[str]:
+    """The account ids :func:`require_ui_step_up_when_own_sessions_end` read for this request,
+    whose sessions the save it gated ends (BACKLOG #5505). Raises :class:`KeyError` on a request
+    that gate did not run on."""
+    named: frozenset[str] = request.scope[_GATE_ENDED_SESSIONS]
+    return named
 
 
 #: How long a kept spend record outlives the request that made it. Not a security window: a
