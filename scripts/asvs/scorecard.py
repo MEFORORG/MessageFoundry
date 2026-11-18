@@ -763,7 +763,9 @@ def _regex(raw: Mapping[str, Any], key: str, where: str) -> str:
     # -- `.`, `\w`, `\b`, a lookahead, a character class -- is sighted in almost any file, which is
     # the same blindness by another route. A one-character literal still loads: it is a token,
     # however short, and the test fixtures use them.
-    singles = sum(compiled.search(c) is not None for c in ("\n", *string.printable))
+    # A set: `string.printable` already holds "\n", so a tuple adding it again would count a
+    # newline-only pattern twice and refuse it as if it matched two characters.
+    singles = sum(compiled.search(c) is not None for c in set(string.printable))
     if compiled.search("") is not None or singles > 1:
         raise ScorecardError(
             f"{where}: `{key}` matches the empty string or many single characters, so it matches "
@@ -791,7 +793,8 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     cells: list[Cell] = []
     for raw in _tables(data, "cell", "the scorecard"):
-        # A non-string id is named by its type, so the refusal that follows does not echo it.
+        # A non-string id is not repeated in the type refusals that use `where`. The older refusals
+        # below, the verdict one among them, still format the raw id; this does not cover them.
         rid = raw.get("id")
         where = f"cell {rid!r}" if isinstance(rid, str) else "a cell with no string `id`"
         legacy = raw.get("reviewed_by")
@@ -1576,7 +1579,9 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     spans_cache: dict[Path, list[tuple[int, int]] | None] = {}
     ast_cache: dict[Path, ast.Module | None] = {}
     resolved_root = root.resolve()
-    inside_cache: dict[Path, bool] = {}
+    # Keyed on the authored path, not the joined target: on Windows `C:y` and `y` join to one target
+    # but only one of them passes `_is_within_tree`.
+    inside_cache: dict[str, bool] = {}
     for c in cells:
         for a in c.evidence:
             target = root / a.path
@@ -1584,11 +1589,11 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
             # The loader refuses the last two; a Cell built in code does not pass through it, and
             # an anchor read outside the root certifies a tree nobody asked about (BACKLOG #5459).
             # Cached per target like the text: the anchors concentrate onto few files.
-            if target not in inside_cache:
-                inside_cache[target] = _is_within_tree(a.path) and target.resolve().is_relative_to(
+            if a.path not in inside_cache:
+                inside_cache[a.path] = _is_within_tree(a.path) and target.resolve().is_relative_to(
                     resolved_root
                 )
-            if not inside_cache[target]:
+            if not inside_cache[a.path]:
                 findings.problems.append(
                     f"{c.id}: evidence path {a.path} resolves outside the root {root}, so it is "
                     "not evidence about the engine tree being checked"

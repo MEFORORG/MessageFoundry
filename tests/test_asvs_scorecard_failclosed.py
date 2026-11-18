@@ -98,10 +98,12 @@ def test_a_positive_control_that_matches_everything_is_refused(
         _load(tmp_path, body)
 
 
-def test_a_one_character_literal_control_still_loads(tmp_path: Path) -> None:
-    """Control for the single-character probe: a literal is a token, however short."""
-    body = _CELL + _ABSENCE.replace("positive_control = 'def '", "positive_control = 'y'")
-    assert load_scorecard(_write(tmp_path, body))[0].absence[0].positive_control == "y"
+@pytest.mark.parametrize("control", ["y", "\\n"], ids=["letter", "newline"])
+def test_a_one_character_literal_control_still_loads(tmp_path: Path, control: str) -> None:
+    """Control for the single-character probe: a literal is a token, however short. The newline
+    case pins that the probe set does not count a newline twice."""
+    body = _CELL + _ABSENCE.replace("positive_control = 'def '", f"positive_control = '{control}'")
+    assert load_scorecard(_write(tmp_path, body))[0].absence[0].positive_control == control
 
 
 @pytest.mark.parametrize("pattern", ["", "x?", "|"], ids=["empty", "optional", "empty-branch"])
@@ -370,6 +372,27 @@ def test_check_anchors_does_not_read_outside_the_root(tmp_path: Path) -> None:
         level=1,
         verdict="fail",
         evidence=(Anchor(path="../outside.py", line=1, expect="TOKEN"),),
+    )
+    findings = Findings()
+    check_anchors([cell], root, findings)
+    assert findings.checked_anchors == 0
+    assert any("outside the root" in p for p in findings.problems), findings.problems
+
+
+def test_check_anchors_does_not_follow_a_symlink_out_of_the_root(tmp_path: Path) -> None:
+    """The path passes `_is_within_tree`; only resolving it shows where it lands."""
+    (tmp_path / "outside.py").write_text("TOKEN = 1\n", encoding="utf-8")
+    root = tmp_path / "engine"
+    root.mkdir()
+    try:
+        (root / "inside.py").symlink_to(tmp_path / "outside.py")
+    except OSError as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    cell = Cell(
+        id="1.1.1",
+        level=1,
+        verdict="fail",
+        evidence=(Anchor(path="inside.py", line=1, expect="TOKEN"),),
     )
     findings = Findings()
     check_anchors([cell], root, findings)
