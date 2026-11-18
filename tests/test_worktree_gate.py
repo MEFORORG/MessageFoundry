@@ -2609,7 +2609,15 @@ def test_real_git_stores_nothing_for_a_get_read_with_an_option_value(
 
 def test_real_git_stores_a_value_after_a_display_flag_with_no_get_mode(git_primary: Path) -> None:
     """Why the multi-argument read needs a --get mode, and a display flag alone is not one."""
-    _git_out(git_primary, "config", "--show-names", "core.hooksPath", "/nope")
+    probe = subprocess.run(
+        ["git", "config", "--show-names", "core.hooksPath", "/nope"],
+        cwd=git_primary,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if "unknown option" in probe.stderr:
+        pytest.skip(f"this git has no legacy --show-names: {probe.stderr.strip()}")
     assert _git_out(git_primary, "config", "--get", "core.hooksPath") == "/nope"
     _git_out(git_primary, "config", "--unset", "core.hooksPath")
 
