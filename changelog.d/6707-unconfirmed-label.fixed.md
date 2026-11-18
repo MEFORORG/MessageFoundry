@@ -12,5 +12,5 @@
   failure's text gives the failure's type name instead.** (vault `BACKLOG #6707`)
 - **An audit row check outside the walk that timed out is still read as a MAC that does not
   verify when the log call beside it raises.** The failure's class goes to stderr. Neither holds
-  where that report itself raises, out of memory or stack. The store open can still fail when a failing filter meets `settle_audit_ranges`' own `log.error`.
-  (vault `BACKLOG #6707`)
+  where that report itself raises, out of memory or stack. The store open can still fail when a
+  failing filter meets `settle_audit_ranges`' own `log.error`. (vault `BACKLOG #6707`)

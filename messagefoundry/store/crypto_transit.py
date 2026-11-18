@@ -151,11 +151,11 @@ _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
 #: The failures caught while a 400 is read, which then picks the unconfirmed label, and while that
 #: label's warning is made (BACKLOG #6707): a step short of memory or stack. Anything else the read
-#: raises propagates. Out of memory or stack, a second such fault raised after the caught one can
-#: still propagate. No reply is known to cause
-#: either: a body past :data:`_REPARSED_BODY_MAX_CHARS` is not read, and the parser,
+#: raises propagates. No reply is known to cause either: a body past
+#: :data:`_REPARSED_BODY_MAX_CHARS` is not read, and the parser,
 #: :func:`~messagefoundry.redaction.json_loads_or_refusal`, returns its ``RecursionError`` refusal
-#: rather than raising it.
+#: rather than raising it. Out of memory or stack, a fault on the unconfirmed label's path can still
+#: propagate, including one raised after a caught one.
 _READ_FAULTS = (MemoryError, RecursionError)
 #: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
 #: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
@@ -872,8 +872,8 @@ class TransitCipher(_UnmarkedPolicy):
         names, raises :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`);
         Transit refusing the version is one cause, not the only one. It raises the subclass
         :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` gives a
-        reason, for example for a proxy's page, or raises one of :data:`_READ_FAULTS`, except as
-        :data:`_READ_FAULTS` says (BACKLOG #6707). Anything else that read raises propagates.
+        reason, for example for a proxy's page, or when that read raises one of
+        :data:`_READ_FAULTS`, except as :data:`_READ_FAULTS` says (BACKLOG #6707). Anything else that read raises propagates.
 
         A 400 on which hvac raises something other than ``InvalidRequest`` raises neither of
         those, and is read as the next paragraph says (BACKLOG #6707). hvac 2.4.0 raises
@@ -881,7 +881,7 @@ class TransitCipher(_UnmarkedPolicy):
         :func:`_reply_errors` for when it does) and the value is not an object, or its ``errors``
         value is truthy and is a number, ``true``, or a list holding an entry that is not text. A
         ``MemoryError`` hvac raises while it joins a truthy ``errors`` value is read the same way,
-        except as :data:`_READ_FAULTS` says.
+        though out of memory or stack a later fault can still propagate.
 
         A failure of the verify call not read as a refused version, and not an outage
         (:meth:`_is_outage`), is checked once the handler has let go
