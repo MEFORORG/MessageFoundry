@@ -1433,23 +1433,24 @@ if ($removeCode -ne 0 -and $parkedRef) {
 # Not Test-Path, which reads a directory it may not see as gone. Gone means CONFIRMED gone, the nightly
 # removal's rule (Test-ConfirmedGoneOrThrow; vault BACKLOG #2985, added item 1): a not-found under a
 # folder that cannot be listed is not a removal.
+# Two states, kept apart so a warning never presumes a leftover the check could not see: there, or
+# not confirmed gone (the check itself failed, so the directory may or may not be there).
+$leftoverThere = $false
 $leftoverWhy = ''
-try { if (-not (Test-ConfirmedGoneOrThrow $WorktreePath 'the removed directory')) { $leftoverWhy = 'is still there' } }
-catch { $leftoverWhy = 'could not be confirmed gone: ' + ($_.Exception.Message -replace '\.? Nothing was removed\.\z', '') }
-$leftover = [bool]$leftoverWhy
+try { $leftoverThere = -not (Test-ConfirmedGoneOrThrow $WorktreePath 'the removed directory') }
+catch {
+    $leftoverWhy = (($_.Exception.Message -replace '\.? Nothing was removed\.\z', '') -replace '\s+', ' ').Trim().TrimEnd('.')
+    if (-not $leftoverWhy) { $leftoverWhy = 'the check gave no reason' }
+}
+$leftover = $leftoverThere -or [bool]$leftoverWhy
+$leftoverState = if ($leftoverThere) { 'is still there. What is left is no longer a worktree' } else {
+    "could not be confirmed gone ($leftoverWhy). Anything still there is no longer a worktree" }
 if ($removeCode -ne 0) {
     $after = @(Get-RepoWorktrees $GitRoot)
     if ($leftover -and $after.Count -gt 0 -and -not ($after | Where-Object { $targetNorms -contains (ConvertTo-Norm $_.Path) })) {
-        if ($leftoverWhy -eq 'is still there') {
-            Write-Host ("WARNING: git dropped the registration of '$WorktreePath' but could not delete all of it; " +
-                "something may hold a file open there. What is left is no longer a worktree. Delete it by " +
-                "hand once nothing uses it.") -ForegroundColor Yellow
-        }
-        else {
-            Write-Host ("WARNING: git dropped the registration of '$WorktreePath', but the directory " +
-                "$leftoverWhy. Anything still there is no longer a worktree. Look at it, and delete what " +
-                "is left by hand once nothing uses it.") -ForegroundColor Yellow
-        }
+        Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and failed, and the directory " +
+            "$leftoverState. Something may hold a file open there. Delete what is left by hand once nothing " +
+            "uses it.") -ForegroundColor Yellow
     }
     throw "git worktree remove failed (exit $removeCode)"
 }
@@ -1513,16 +1514,9 @@ if ($DeleteBranch) {
 }
 
 if ($leftover) {
-    if ($leftoverWhy -eq 'is still there') {
-        Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and exited 0, but the directory is " +
-            "still there. What is left is no longer a worktree; a junction inside it is one known cause. Look " +
-            "at it, then delete it by hand.") -ForegroundColor Yellow
-    }
-    else {
-        Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and exited 0, but the directory " +
-            "$leftoverWhy. Anything still there is no longer a worktree. Look at it, and delete what is left " +
-            "by hand.") -ForegroundColor Yellow
-    }
+    Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and exited 0, but the directory " +
+        "$leftoverState; a junction inside it is one known cause. Look at it, then delete what is left by " +
+        "hand.") -ForegroundColor Yellow
 }
 else { Write-Host "Removed worktree '$WorktreePath'." -ForegroundColor Green }
 if ($keptBranch) {
