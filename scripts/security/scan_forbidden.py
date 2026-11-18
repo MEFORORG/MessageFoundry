@@ -3105,7 +3105,8 @@ def main(argv: list[str]) -> int:
         )
         return 2
     scanned = 0
-    unread = 0
+    # Each walk hit is a directory whose content was not read, so the summary counts it as unread.
+    unread = len(hits)
     unreadable = len(hits)
     for abs_path, rel in candidates:
         # SKIP_DIRS is applied by the --path walk alone (_walk); the tracked and staged scans prune no

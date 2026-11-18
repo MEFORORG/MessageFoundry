@@ -2266,6 +2266,11 @@ def test_an_unlistable_directory_fails_the_walk_as_an_instrument(
     err = capsys.readouterr().err
     assert "locked:0: unreadable (EACCES), so its content was not scanned" in err, err
     assert str(tmp_path) not in err.split("UNREADABLE", 1)[-1], "the hit must not echo the root"
+    # The summary counts the directory it could not list, rather than saying none was unreadable.
+    assert (
+        "scan_forbidden: examined 1 file(s) across 1 named path(s); 1 more were binary, not regular"
+        " files, unreadable or under a forbidden path, so their content was not scanned."
+    ) in err.splitlines(), err
 
 
 def test_only_a_vendored_action_bundle_keeps_the_dist_skip(
