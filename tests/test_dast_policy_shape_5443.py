@@ -147,6 +147,19 @@ def test_a_malformed_policy_cannot_measure(
     assert "fail closed" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("break_it", _MALFORMED)
+def test_load_policy_itself_refuses_each_malformed_shape(
+    tmp_path: Path, break_it: Callable[[dict[str, Any]], None]
+) -> None:
+    """The refusal is load_policy's, not only main's backstop: each shape raises PolicyError."""
+    policy = _policy()
+    break_it(policy)
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    with pytest.raises(sweep.PolicyError):
+        sweep.load_policy(path)
+
+
 def test_a_reporting_crash_after_the_sweep_is_could_not_measure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -162,7 +175,7 @@ def test_a_reporting_crash_after_the_sweep_is_could_not_measure(
     assert "fail closed" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("placeholder", ["", "a/b", 7])
+@pytest.mark.parametrize("placeholder", ["", "a/b", 7, ".", ".."])
 def test_a_path_placeholder_that_is_not_one_segment_cannot_measure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, placeholder: object
 ) -> None:
@@ -195,18 +208,22 @@ def test_control_a_detecting_canary_still_exits_1(
 
 
 def test_a_reporting_crash_still_writes_the_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The measured counts are evidence, so the receipt is written, marked could-not-measure."""
+    """The measured counts are evidence, so the receipt is written, marked could-not-measure, and
+    a multi-line exception stays one annotation."""
     policy = _policy()
     _stub_sweep(monkeypatch, _receipt(policy))
 
     def broken(*_: object) -> list[str]:
-        raise KeyError("synthetic\nsecond line")
+        raise RuntimeError("synthetic\nsecond line")
 
     monkeypatch.setattr(sweep, "receipt_lines", broken)
     out = tmp_path / "receipt.json"
     assert _main(tmp_path, policy, "--receipt", str(out)) == 2
+    err = capsys.readouterr().err
+    assert "synthetic%0Asecond line" in err
+    assert not any(line.startswith("second line") for line in err.splitlines())
     written = json.loads(out.read_text(encoding="utf-8"))
     assert written["verdict"] == "COULD NOT MEASURE (fail closed)"
     assert written["gated_http_rows"] == 99

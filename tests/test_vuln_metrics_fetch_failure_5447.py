@@ -191,7 +191,9 @@ def test_epss_rows_with_renamed_fields_are_unread(
 
     def urlopen(req: Any, timeout: float = 0) -> _Resp:
         if req.full_url.startswith(mod.EPSS_URL):
-            return _Resp(json.dumps({"data": [{"cve_id": _CVE_KEV, "score": "0.9"}]}).encode())
+            # One good row beside one that does not parse: a partial answer, not a measurement.
+            rows = [{"cve": _CVE_OTHER, "epss": "0.1"}, {"cve_id": _CVE_KEV, "score": "0.9"}]
+            return _Resp(json.dumps({"data": rows}).encode())
         return real(req, timeout)
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)

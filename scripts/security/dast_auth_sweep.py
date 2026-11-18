@@ -207,10 +207,14 @@ def load_policy(path: Path) -> dict[str, Any]:
                 raise PolicyError(
                     f"the policy at {path} has {key}.{name} as {value!r}, not a whole number >= 0"
                 )
-    placeholder = parsed.get("path_param_placeholder", "dast-probe")
-    # Substituted into every path parameter: an empty or slashed value probes another route, and
-    # its answers would read as findings, exit 1.
-    if not isinstance(placeholder, str) or not re.fullmatch(r"[A-Za-z0-9._~-]+", placeholder):
+    placeholder = parsed.get("path_param_placeholder", route_gates.PATH_PARAM_PLACEHOLDER)
+    # Substituted into every path parameter: an empty, slashed or dot-segment value probes another
+    # route (httpx folds `..`), and its answers would read as findings, exit 1.
+    if (
+        not isinstance(placeholder, str)
+        or not re.fullmatch(r"[A-Za-z0-9._~-]+", placeholder)
+        or placeholder in {".", ".."}
+    ):
         raise PolicyError(
             f"the policy at {path} has 'path_param_placeholder' as {placeholder!r}, not one "
             "non-empty path segment"
@@ -1180,7 +1184,8 @@ def main(argv: list[str] | None = None) -> int:
             args.receipt.write_text(
                 json.dumps(receipt, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
-        except OSError as exc:
+        # ValueError and TypeError too: a value json cannot encode must exit 2, not 1.
+        except (OSError, ValueError, TypeError) as exc:
             print(f"::error::{_PREFIX}: could not write {args.receipt}: {exc}", file=sys.stderr)
             return 2
 

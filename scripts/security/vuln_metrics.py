@@ -23,7 +23,7 @@ alone (adopter patch-lag, reachability ratio) are emitted as `n/a` with the reas
 them, rather than faked.
 
 A source that could not be READ is not a source that answered nothing (BACKLOG #5447). A failed `gh`
-call, or a failed CISA KEV or FIRST EPSS fetch, leaves the metrics it feeds as `n/a` naming the
+call listing the Dependabot PRs, or a failed CISA KEV or FIRST EPSS fetch, leaves the metrics it feeds as `n/a` naming the
 source, never `0`, and the run exits 2 after writing the CSV and summary, so the weekly job goes red
 rather than recording a feed outage as zero exposure.
 """
@@ -161,16 +161,13 @@ def epss_scores(cves: set[str], timeout: float) -> dict[str, float] | None:
         rows = data.get("data") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             return None
-        parsed = 0
         for row in rows:
             try:
                 out[row["cve"].upper()] = float(row["epss"])
             except (KeyError, ValueError, TypeError, AttributeError):
-                continue
-            parsed += 1
-        # Rows none of which parses (renamed fields, an error shape) are not an EPSS answer.
-        if rows and not parsed:
-            return None
+                # A row that does not parse (a renamed field, an error shape) would understate
+                # the coverage, so the answer is not an EPSS answer.
+                return None
     return out
 
 
@@ -272,8 +269,10 @@ def compute(
     seen_cves: set[str] = set()
     for p in sec:
         seen_cves |= _cves_in(p)
-    # No CVE seen, nothing to look up: KEV cannot change a metric then, as EPSS is not asked.
-    kev = kev_cves(timeout) if seen_cves else set()
+    # KEV feeds only the open and merged security PRs' metrics: with no CVE among those, the
+    # catalog cannot change a metric, so it is not asked and its outage cannot red the run.
+    kev_relevant = {c for p in sec_open + sec_merged for c in _cves_in(p)}
+    kev = kev_cves(timeout) if kev_relevant else set()
     if kev is None:
         _unread("the CISA KEV catalog", _KEV_METRICS)
         kev = set()
