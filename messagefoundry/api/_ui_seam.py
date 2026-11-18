@@ -918,18 +918,21 @@ from typing import Any
 #: BACKLOG #5505: the four ``AdminHandlers`` cores of the group-wide saves,
 #: ``update_custom_role``, ``delete_custom_role``, ``set_ad_group_map`` and
 #: ``set_ad_group_scope_map``, take the keyword ``ended``, the set the step-up gate read, and the
-#: console passes ``ended=gate_ended_sessions(request)`` on each call. The digest did not move: it
-#: records ``AdminHandlers`` field names only, the blind spot BACKLOG #1149 names above. So the
-#: handshake does not catch this skew: a newer console on an older engine raises TypeError on
-#: each of those four saves, and an older console on this engine omits ``ended``, which the save
-#: then reads itself.
+#: console passes ``ended=gate_ended_sessions(request)`` on each call. The digest records
+#: ``AdminHandlers`` field names only, the blind spot BACKLOG #1149 names above, so it does not see
+#: that keyword: a newer console on an older engine would raise TypeError on each of those four
+#: saves, and an older console on this engine omits ``ended``, which the save then reads itself.
+#: The digest moved for another reason: the console's
+#: ``require_ui_step_up_when_own_sessions_end`` gate now keeps its set for the route, and the
+#: snapshot hashes that gate's body. Re-derived with ``--write``, from ``bc56eed44a1590fd`` to
+#: ``3485aab8a5abd1bc``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "bc56eed44a1590fd"
+ENGINE_UI_SEAM: str = "3485aab8a5abd1bc"
 
 
 @dataclass(frozen=True, slots=True)
