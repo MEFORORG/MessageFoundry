@@ -419,14 +419,17 @@ class Ledger:
 
         Only the WORDING of a refusal, and the ownership arm for a number the parent already carries,
         read this. A file is still an add to every rule (added_files). A pair needs the old path in
-        the parent tree and a similar body, so a stale base's number or an unrelated file replacing a
-        deleted ADR is never one. A git failure raises, as everywhere in this gate.
+        the parent tree and a body git scores as similar, so a plain add under a number the base has
+        since spent, and most unrelated replacements of a deleted ADR, are not pairs. Not all: a
+        branch renaming its own ADR whose number the base has since spent IS paired, and is worded
+        as a rename locally; CI, which diffs against the moved base, refuses it as a reuse. A git
+        failure raises, as everywhere in this gate.
 
-        THE PATHSPEC AND -l0 KEEP THE PAIRING FROM DEPENDING ON THE REST OF THE CHANGE. Past
-        diff.renameLimit git pairs only EXACT renames, and every rename in the diff counts toward it,
-        so a change carrying many renames elsewhere cost an edited ADR rename its pairing: the wording
-        fell back to a reuse, and a branch ADR's rename to an ownership refusal. Only docs/adr/ can
-        hold a same-number source, so only it is searched, with no limit on that small set.
+        -l0 KEEPS THE PAIRING FROM DEPENDING ON THE SIZE OF THE CHANGE. Past diff.renameLimit, which
+        counts every unpaired removed and added path, git pairs only EXACT renames, so a large change
+        cost an edited ADR rename its pairing: the wording fell back to a reuse, and a branch ADR's
+        rename to an ownership refusal. -l0 lifts the limit; the pathspec keeps that unlimited search
+        to docs/adr/, the only place a same-number source can be.
         """
         args = ("-z", "--name-status", "-M", "-l0", "--diff-filter=R")
         adr = ("--", "docs/adr/")
@@ -837,15 +840,13 @@ class Ledger:
                         )
             elif (
                 not self.ci
-                # A same-number rename of an ADR the parent already carries allocates nothing. The
-                # gate before BACKLOG #5453 never saw one, so this keeps that, and no more.
-                and self.same_number_source(path, number) is None
                 and not self.owns("adr", number)
                 and not self._carried_by_a_merge_parent(path)
             ):
                 # LAST, AND THE ORDER IS THE COST CONTROL. Everything above is cheap or memoized; the
                 # history walk is not. Reaching it means the commit was already headed for a refusal,
-                # so the walk is never paid on a passing commit (BACKLOG #1468).
+                # so the walk is never paid on a passing commit (BACKLOG #1468), except the
+                # same-number rename below, which needs the walk to tell a rename from a revival.
                 #
                 # ***IT MUST NOT `continue`, AND WRITING IT THAT WAY ONCE IS WHY THIS SAYS SO.*** The
                 # index-row rule below is the second half of THIS iteration, and a restore needs its
@@ -853,7 +854,12 @@ class Ledger:
                 # went missing. Skipping the loop body on a granted restore would have shipped the
                 # dropped-row defect through the restore door.
                 seen = self._history_of_this_number(path, number)
-                if not seen.restores_lost_bytes:
+                # A same-number rename of an ADR the parent carries allocates nothing (BACKLOG
+                # #5453), UNLESS the base once held this number and lost it: then the file is a
+                # revival, and rule 2 passes only the lost bytes. A walk cut short by a shallow
+                # clone reads as "never held", the case a branch-new number is in every time.
+                renamed = self.same_number_source(path, number) is not None
+                if not seen.restores_lost_bytes and not (renamed and not seen.number_is_historical):
                     self.fail(*self._ownership_refusal(number, seen))
 
             # Only ADDED files are checked here, the right scope for a commit-time gate. The whole

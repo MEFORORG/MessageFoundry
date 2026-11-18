@@ -378,3 +378,35 @@ def test_CONTROL_an_unrelated_replacement_whose_row_links_it_passes(repo: Path) 
 
     code, out = run_check(repo)
     assert code == 0, out
+
+
+def test_a_rename_that_revives_a_number_the_base_LOST_is_a_restore_not_a_rename(
+    repo: Path,
+) -> None:
+    """The branch was cut while the base still held ADR 0002; the base then deleted it. Renaming the
+    branch's copy brings the number back with new bytes, which rule 2 refuses: only the lost bytes
+    may come back. The rename exemption must not skip that."""
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    second = BODY.replace("synthetic", "second")
+    write(repo, "docs/adr/0002-second.md", second)
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="second", title="S") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the base takes 0002")
+    git(repo, "switch", "-q", "-c", "stale")
+    git(repo, "switch", "-q", "main")
+    git(repo, "rm", "-q", "docs/adr/0002-second.md")
+    write(repo, "docs/adr/README.md", rows)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the base drops 0002")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "switch", "-q", "stale")
+
+    git(repo, "mv", "docs/adr/0002-second.md", "docs/adr/0002-revived.md")
+    write(repo, "docs/adr/0002-revived.md", second + "Edited.\n")
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="revived", title="S") + "\n")
+    git(repo, "add", "-A")
+    assert _staged_status(repo).startswith("R"), _staged_status(repo)
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 is a RESTORE" in out

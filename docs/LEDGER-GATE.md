@@ -194,9 +194,11 @@ A file that arrives by **rename or copy** onto an ADR path is an added ADR to ev
 turns git's rename detection off, so a `git mv` cannot hide it (BACKLOG #5453). Where git itself pairs
 the new file with a removed ADR of the same number, the change is a rename: it allocates nothing, so
 the ownership rule does not refuse it, but its row must link the new name in the same commit, and the
-refusal says so rather than calling it a reuse. The gate asks git for that pairing over `docs/adr/`
-alone, so renames elsewhere in the change cannot push it past git's rename limit. A rename onto a
-different number is a new number and owes an allocation like any other.
+refusal says so rather than calling it a reuse. A number the base once held and lost is the exception:
+renaming a branch's copy of it is a revival, and rule 2 still passes only the lost bytes. The gate asks
+git for that pairing with no rename limit, over `docs/adr/` alone, so the size of the rest of the
+change cannot cost a rename its pairing. A rename onto a different number is a new number and owes an
+allocation like any other.
 
 Any other file added under a base number falls to rule 1: it passes when the number's row links it, as
 a declared companion, and is refused as a reuse when the row does not. That includes an unrelated file
