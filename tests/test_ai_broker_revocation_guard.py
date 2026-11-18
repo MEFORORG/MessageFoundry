@@ -10,7 +10,7 @@ reaches the app serving ``POST /ai/chat``, and the endpoint is not loopback
 enforcing or unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested``
 is set with its reason. Since BACKLOG #5527 the broker resolves the instance ``[tls]`` policy, so
 ``[tls].internal_ca_file`` under ``augment`` or ``pinned`` and ``[tls].crl_file`` reach its
-opener; the last section pins that.
+opener; the section "the [tls] policy reaches the broker's opener" pins that.
 All endpoints, keys, certificates and CRLs here are synthetic.
 """
 
@@ -22,6 +22,7 @@ import json
 import re
 import ssl
 import urllib.request
+import weakref
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import NamedTuple
@@ -76,13 +77,18 @@ _LOGGER = "messagefoundry.transports.ai_broker"
 
 @pytest.fixture(autouse=True)
 def _fresh_crossings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Each test starts with no crossing logged, no anchored opener held and no process-wide
-    attestation set."""
+    """Each test starts with no crossing logged, no anchored opener held, no CRL load, refusal or
+    unconfirmed signature recorded, and no process-wide attestation set. Each is restored after
+    the test."""
     # raising=False only so this file fails on its assertions, not in setup, where the set is
     # absent; the once-per-process tests below go red if it is renamed.
     monkeypatch.setattr(ai_broker_mod, "_LOGGED_CROSSINGS", set(), raising=False)
     # raising=True: a renamed slot must fail here, or held openers would leak across tests.
     monkeypatch.setattr(ai_broker_mod, "_anchored_opener", None, raising=True)
+    # The anchored contexts these tests build are recorded here; other suites reset it the same way.
+    monkeypatch.setattr(loaded_crls, "_HELD", weakref.WeakKeyDictionary(), raising=True)
+    monkeypatch.setattr(loaded_crls, "_REFUSED", {}, raising=True)
+    monkeypatch.setattr(loaded_crls, "_UNCONFIRMED", {}, raising=True)
     monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
     yield
 
