@@ -3111,7 +3111,7 @@ def main(argv: list[str]) -> int:
         return 2
     scanned = 0
     # A walk hit for a directory the walk could not list is counted as unread; one for a named root
-    # that does not exist is not, since nothing was there. Both still fail the run as unreadable.
+    # that does not exist is not, since nothing was there. Both still fail the run.
     unread = sum(not h.endswith(_NO_ROOT) for h in hits)
     unreadable = len(hits)
     for abs_path, rel in candidates:
