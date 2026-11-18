@@ -95,6 +95,16 @@ def test_multishard_clean_record_passes() -> None:
         pytest.param(
             {"per_engine": (_engine(0), _engine(1, inbound_rows=0, reads=0))},
             "ms-e1: 0 inbound lanes attributed",
+            id="no-lanes",
+        ),
+        pytest.param(
+            {
+                "per_engine": (
+                    _engine(0),
+                    _engine(1, inbound_rows=0, reads=0, attribution_failed=True),
+                )
+            },
+            "ms-e1: /connections could not be read for attribution",
             id="unreachable-engine",
         ),
         pytest.param(
@@ -149,20 +159,25 @@ def test_multishard_empty_sweep_fails() -> None:
 
 
 def _phase(name: str, *, rate: object = 100.0, p99: object = 20.0) -> dict[str, Any]:
-    return {"name": name, "measured": True, "achieved_msg_s": rate, "e2e_ms": {"p99": p99}}
+    return {
+        "name": name,
+        "measured": True,
+        "achieved_msg_s": rate,
+        "e2e_ms": {"count": 500, "p99": p99},
+    }
 
 
 def _load_report() -> dict[str, Any]:
     return {
         "phases": [_phase("warmup", rate=50.0), _phase("steady")],
-        "totals": {"errors": 0, "nak": 0},
+        "totals": {"sent": 1000, "errors": 0, "nak": 0},
         "engine_side": {"dead_letters": 0},
         "no_loss": {"ok": True},
     }
 
 
-def _with(path: tuple[str | int, ...], value: object) -> dict[str, Any]:
-    doc = copy.deepcopy(_load_report())
+def _with(path: tuple[str | int, ...], value: object, doc: Any = None) -> dict[str, Any]:
+    doc = copy.deepcopy(_load_report() if doc is None else doc)
     cur: Any = doc
     for key in path[:-1]:
         cur = cur[key]
@@ -174,22 +189,46 @@ def test_baseline_identical_reports_pass() -> None:
     assert compare_to_baseline(_load_report(), _load_report(), tolerance=0.1) == []
 
 
+_MALFORMED = [
+    pytest.param([], id="list"),
+    pytest.param("x", id="string"),
+    pytest.param(None, id="null"),
+    pytest.param({**_load_report(), "phases": "x"}, id="phases-not-list"),
+    pytest.param({**_load_report(), "phases": [1]}, id="phase-not-object"),
+    pytest.param({**_load_report(), "phases": [{"name": ["x"]}]}, id="phase-name-unhashable"),
+    pytest.param({**_load_report(), "phases": [{"achieved_msg_s": 1.0}]}, id="phase-no-name"),
+]
+
+
 @pytest.mark.parametrize(
-    "baseline",
-    [
-        pytest.param([], id="list"),
-        pytest.param("x", id="string"),
-        pytest.param(None, id="null"),
-        pytest.param({"phases": "x"}, id="phases-not-list"),
-        pytest.param({"phases": [1]}, id="phase-not-object"),
-        pytest.param({"phases": [{"name": ["unhashable"]}]}, id="phase-name-unhashable"),
-        pytest.param({"phases": [{"achieved_msg_s": 1.0}]}, id="phase-no-name"),
-        pytest.param({"phases": [_phase("steady"), _phase("steady")]}, id="duplicate-phase"),
-        pytest.param({"phases": []}, id="no-phases"),
-    ],
+    "baseline", [*_MALFORMED, pytest.param({**_load_report(), "phases": []}, id="no-phases")]
 )
 def test_malformed_baseline_is_a_regression_not_a_crash(baseline: object) -> None:
     assert compare_to_baseline(_load_report(), baseline, tolerance=0.1)
+
+
+@pytest.mark.parametrize("current", _MALFORMED)
+def test_malformed_current_report_is_a_regression_not_a_crash(current: object) -> None:
+    assert compare_to_baseline(current, _load_report(), tolerance=0.1)
+
+
+def test_unreadable_phases_do_not_hide_the_counter_checks() -> None:
+    current = _with(("phases",), "x", _with(("engine_side", "dead_letters"), 5))
+    regressions = compare_to_baseline(current, _load_report(), tolerance=0.1)
+    assert any("current report has no phases list" in r for r in regressions), regressions
+    assert any("dead letters worsened" in r for r in regressions), regressions
+
+
+def test_a_repeated_phase_name_is_compared_in_run_order() -> None:
+    # A profile may repeat a phase name; both occurrences are compared, the second by position.
+    report = {**_load_report(), "phases": [_phase("spike"), _phase("calm"), _phase("spike")]}
+    assert compare_to_baseline(report, report, tolerance=0.1) == []
+    slow = _with(("phases", 2, "achieved_msg_s"), 10.0, report)
+    regressions = compare_to_baseline(slow, report, tolerance=0.1)
+    assert any("spike (2): throughput regressed" in r for r in regressions), regressions
+    short = {**report, "phases": report["phases"][:2]}
+    regressions = compare_to_baseline(short, report, tolerance=0.1)
+    assert any("spike (2): phase is in the baseline but missing" in r for r in regressions)
 
 
 @pytest.mark.parametrize(
@@ -205,13 +244,31 @@ def test_malformed_baseline_is_a_regression_not_a_crash(baseline: object) -> Non
             _with(("phases", 1, "achieved_msg_s"), float("nan")), "not a finite", id="nan-rate"
         ),
         pytest.param(
+            _with(("phases", 1, "achieved_msg_s"), 10**400), "not a finite", id="huge-int"
+        ),
+        pytest.param(
             _with(("phases", 1, "e2e_ms", "p99"), float("inf")), "not a finite", id="inf-p99"
         ),
         pytest.param(_with(("phases", 1, "e2e_ms"), None), "not a finite", id="missing-p99"),
+        pytest.param(
+            _with(("phases", 1, "e2e_ms"), {"count": 0, "p99": 0.0}),
+            "steady: no e2e samples in the current run",
+            id="empty-e2e-histogram",
+        ),
         pytest.param(_with(("totals", "errors"), 3), "errors worsened", id="errors"),
         pytest.param(_with(("totals", "nak"), 2), "NAKs worsened", id="naks"),
         pytest.param(
             _with(("engine_side", "dead_letters"), 1), "dead letters worsened", id="dead-letters"
+        ),
+        pytest.param(_with(("totals", "sent"), None), "sent: current value", id="missing-sent"),
+        pytest.param(
+            _with(("no_loss",), None), "current no_loss.ok is missing", id="no-loss-missing"
+        ),
+        pytest.param(
+            _with(("no_loss", "ok"), "false"), "current no_loss.ok is missing", id="no-loss-string"
+        ),
+        pytest.param(
+            _with(("no_loss",), {"ok": False}), "current run lost messages", id="no-loss-regressed"
         ),
     ],
 )
@@ -220,11 +277,27 @@ def test_current_run_regression_is_flagged(current: dict[str, Any], needle: str)
     assert any(needle in r for r in regressions), regressions
 
 
+def test_counters_compare_per_message_sent() -> None:
+    # The same NAK rate on a run that sent twice as much is not a regression; a higher rate is.
+    base = _with(("totals", "nak"), 10)
+    doubled = _with(("totals", "sent"), 2000, _with(("totals", "nak"), 20))
+    assert compare_to_baseline(doubled, base, tolerance=0.1) == []
+    worse = _with(("totals", "nak"), 12, base)
+    assert any("NAKs worsened" in r for r in compare_to_baseline(worse, base, tolerance=0.1))
+
+
 def test_p99_regression_from_a_zero_baseline_is_flagged() -> None:
+    # A zero p99 over real samples is a floor, so any rise above it is a regression.
     baseline = _with(("phases", 1, "e2e_ms", "p99"), 0.0)
     regressions = compare_to_baseline(_load_report(), baseline, tolerance=0.1)
     assert any("steady: e2e p99 regressed" in r for r in regressions), regressions
     assert compare_to_baseline(baseline, baseline, tolerance=0.1) == []
+
+
+def test_a_baseline_phase_with_no_e2e_samples_has_no_p99_to_compare() -> None:
+    # An empty histogram reports p99 0.0; that is "not measured", not a floor.
+    baseline = _with(("phases", 1, "e2e_ms"), {"count": 0, "p99": 0.0})
+    assert compare_to_baseline(_load_report(), baseline, tolerance=0.1) == []
 
 
 def test_non_finite_baseline_metric_is_flagged() -> None:

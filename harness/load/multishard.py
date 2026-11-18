@@ -42,6 +42,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -129,6 +130,9 @@ class EngineAttribution:
     #: the exact CI triple -- inbound_rows PASS, foreign_rows PASS, reads 0 FAIL -- and the engine
     #: reported `status: "failed"` on both lanes throughout. The information was present and discarded.
     failed_lanes: tuple[str, ...] = ()
+    #: The engine's `/connections` could not be read at attribution time, so the counters above are
+    #: zeros the harness filled in, not the engine's answer (BACKLOG #5438).
+    attribution_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -186,7 +190,7 @@ class MultiShardRecord:
         lane collision (the measurement would be invalid)."""
         return any(e.foreign_rows > 0 for e in self.per_engine)
 
-    @property
+    @cached_property
     def problems(self) -> tuple[str, ...]:
         """Every reason this step cannot PASS; empty means it can (BACKLOG #5438).
 
@@ -211,6 +215,10 @@ class MultiShardRecord:
         if len(self.per_engine) != self.engines:
             out.append(f"{len(self.per_engine)} of {self.engines} engines attributed")
         for e in self.per_engine:
+            if e.attribution_failed:
+                # Its lane counts are zeros the harness filled in, not the engine's answer.
+                out.append(f"{e.node_id}: /connections could not be read for attribution")
+                continue
             if e.inbound_rows != self.count_per_engine:
                 out.append(
                     f"{e.node_id}: {e.inbound_rows} inbound lanes attributed, "
@@ -272,6 +280,7 @@ class MultiShardRecord:
                     # In the artifact as well as the assertion: a CI reader who has only the uploaded
                     # JSON must be able to attribute a zero-read engine without re-running anything.
                     "failed_lanes": list(e.failed_lanes),
+                    "attribution_failed": e.attribution_failed,
                 }
                 for e in self.per_engine
             ],
@@ -803,7 +812,7 @@ def _attribute_engines_sync(
         except ApiError:
             # A node unreachable at attribution time (already torn down / transient) surfaces as an
             # empty attribution — the smoke asserts positive rows, so it won't silently pass.
-            out.append(EngineAttribution(node.node_id, tag, 0, 0, 0))
+            out.append(EngineAttribution(node.node_id, tag, 0, 0, 0, attribution_failed=True))
             continue
         failed: list[str] = []
         for row in rows:

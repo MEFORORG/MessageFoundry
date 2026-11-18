@@ -1078,7 +1078,8 @@ def _lat(s: LatencySummary) -> dict[str, float | int]:
 def compare_to_baseline(current: object, baseline: object, *, tolerance: float) -> list[str]:
     """Return regression messages comparing a current report dict to a saved baseline dict. A
     regression is throughput below ``baseline*(1-tolerance)``, p99 above ``baseline*(1+tolerance)``,
-    or any worsening of error/loss. Empty list = no regression.
+    errors, NAKs or dead letters per message sent above ``baseline*(1+tolerance)``, or a loss the
+    baseline did not have. Empty list = no regression.
 
     It fails closed (BACKLOG #5439): a report that is not a JSON object, a baseline with no phases,
     a baseline phase the current run lacks, and a metric that is missing, boolean or not finite in
@@ -1091,38 +1092,38 @@ def compare_to_baseline(current: object, baseline: object, *, tolerance: float) 
         return [f"current report is not a JSON object (got {type(current).__name__})"]
     base_phases = _phases("baseline", baseline, out)
     cur_phases = _phases("current", current, out)
-    if base_phases is None or cur_phases is None:
-        return out
-    if not base_phases:
+    if base_phases == {}:
         out.append("baseline has no phases to compare")
-    for name, bp in base_phases.items():
-        cp = cur_phases.get(name)
-        if cp is None:
-            out.append(f"{name}: phase is in the baseline but missing from the current run")
-            continue
-        rate = _pair(
-            f"{name}: achieved_msg_s", bp.get("achieved_msg_s"), cp.get("achieved_msg_s"), out
-        )
-        if rate is not None:
-            b_rate, c_rate = rate
-            if b_rate > 0 and c_rate < b_rate * (1.0 - tolerance):
-                out.append(f"{name}: throughput regressed {c_rate:.0f} < {b_rate:.0f} msg/s")
-        p99 = _pair(f"{name}: e2e p99", _get(bp, "e2e_ms", "p99"), _get(cp, "e2e_ms", "p99"), out)
-        if p99 is not None:
-            b_p99, c_p99 = p99
-            # No `b_p99 > 0` guard: a zero baseline is a real floor, and the old guard let any
-            # current latency pass against it.
-            if c_p99 > b_p99 * (1.0 + tolerance):
-                out.append(f"{name}: e2e p99 regressed {c_p99:.1f} > {b_p99:.1f} ms")
+    if base_phases is not None and cur_phases is not None:
+        for name, bp in base_phases.items():
+            cp = cur_phases.get(name)
+            if cp is None:
+                out.append(f"{name}: phase is in the baseline but missing from the current run")
+                continue
+            _compare_phase(name, bp, cp, tolerance, out)
+    # Per message sent, not raw totals: a faster backend sends more on a closed loop, so the same
+    # NAK rate is a larger count.
+    sent = _pair("sent", _get(baseline, "totals", "sent"), _get(current, "totals", "sent"), out)
     for label, path in (
         ("errors", ("totals", "errors")),
         ("NAKs", ("totals", "nak")),
         ("dead letters", ("engine_side", "dead_letters")),
     ):
         counts = _pair(label, _get(baseline, *path), _get(current, *path), out)
-        if counts is not None and counts[1] > counts[0]:
-            out.append(f"{label} worsened: {counts[1]:.0f} > {counts[0]:.0f}")
-    if _loss_ok(baseline) and not _loss_ok(current):
+        if counts is None or sent is None or counts[1] <= 0:
+            continue
+        (b_n, c_n), (b_sent, c_sent) = counts, sent
+        if b_sent <= 0 or c_sent <= 0:
+            out.append(f"{label}: {c_n:.0f} in the current run, and sent is not positive in both")
+            continue
+        b_rate, c_rate = b_n / b_sent, c_n / c_sent
+        if c_rate > b_rate * (1.0 + tolerance):
+            out.append(f"{label} worsened: {c_rate:.3%} of sent > {b_rate:.3%}")
+    b_ok, c_ok = _loss_ok(baseline), _loss_ok(current)
+    for which, flag in (("baseline", b_ok), ("current", c_ok)):
+        if flag is None:
+            out.append(f"{which} no_loss.ok is missing or not a boolean")
+    if b_ok is True and c_ok is False:
         nl = current.get("no_loss")
         if isinstance(nl, dict) and nl.get("inconclusive"):
             out.append("no-loss regressed: baseline had no loss, current run is inconclusive")
@@ -1131,37 +1132,65 @@ def compare_to_baseline(current: object, baseline: object, *, tolerance: float) 
     return out
 
 
+def _compare_phase(
+    name: str, bp: dict[str, object], cp: dict[str, object], tolerance: float, out: list[str]
+) -> None:
+    rate = _pair(f"{name}: achieved_msg_s", bp.get("achieved_msg_s"), cp.get("achieved_msg_s"), out)
+    if rate is not None:
+        b_rate, c_rate = rate
+        if b_rate > 0 and c_rate < b_rate * (1.0 - tolerance):
+            out.append(f"{name}: throughput regressed {c_rate:.0f} < {b_rate:.0f} msg/s")
+    count = _pair(
+        f"{name}: e2e count", _get(bp, "e2e_ms", "count"), _get(cp, "e2e_ms", "count"), out
+    )
+    p99 = _pair(f"{name}: e2e p99", _get(bp, "e2e_ms", "p99"), _get(cp, "e2e_ms", "p99"), out)
+    if count is None or p99 is None:
+        return
+    (b_n, c_n), (b_p99, c_p99) = count, p99
+    # An empty histogram reports p99 0.0, so the sample count, not the p99, says whether a side
+    # measured anything. A baseline with no samples has nothing to compare against.
+    if b_n <= 0:
+        return
+    if c_n <= 0:
+        out.append(f"{name}: no e2e samples in the current run, the baseline had {b_n:.0f}")
+    elif c_p99 > b_p99 * (1.0 + tolerance):
+        out.append(f"{name}: e2e p99 regressed {c_p99:.1f} > {b_p99:.1f} ms")
+
+
 def _phases(
     which: str, report: dict[str, object], out: list[str]
 ) -> dict[str, dict[str, object]] | None:
-    """The report's phases by name, or None after naming why they cannot be read."""
+    """The report's phases by name, or None after naming why they cannot be read. A profile may
+    repeat a phase name, so a repeat is keyed ``name (2)``, ``name (3)`` in run order."""
     raw = report.get("phases")
     if not isinstance(raw, list):
         out.append(f"{which} report has no phases list")
         return None
     phases: dict[str, dict[str, object]] = {}
+    seen: dict[str, int] = {}
     for p in raw:
         name = p.get("name") if isinstance(p, dict) else None
         if not isinstance(p, dict) or not isinstance(name, str):
             out.append(f"{which} report has a phase with no name")
             return None
-        if name in phases:
-            out.append(f"{which} report has two phases named {name!r}")
-            return None
-        phases[name] = p
+        seen[name] = seen.get(name, 0) + 1
+        phases[name if seen[name] == 1 else f"{name} ({seen[name]})"] = p
     return phases
 
 
 def _pair(label: str, base: object, cur: object, out: list[str]) -> tuple[float, float] | None:
-    """Both values as finite numbers, or None after naming the one that is not."""
+    """Both values as finite numbers, or None after naming each one that is not."""
     b, c = _f(base), _f(cur)
     if b is None:
-        out.append(f"{label}: baseline value {base!r} is not a finite number")
-        return None
+        out.append(f"{label}: baseline value {_short(base)} is not a finite number")
     if c is None:
-        out.append(f"{label}: current value {cur!r} is not a finite number")
-        return None
-    return b, c
+        out.append(f"{label}: current value {_short(cur)} is not a finite number")
+    return None if b is None or c is None else (b, c)
+
+
+def _short(value: object) -> str:
+    text = repr(value)
+    return text if len(text) <= 40 else f"{text[:37]}..."
 
 
 def _get(d: dict[str, object], *path: str) -> object:
@@ -1185,6 +1214,7 @@ def _f(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _loss_ok(report: dict[str, object]) -> bool:
-    nl = report.get("no_loss")
-    return isinstance(nl, dict) and bool(nl.get("ok"))
+def _loss_ok(report: dict[str, object]) -> bool | None:
+    """``no_loss.ok`` when it is a real boolean, else None: a string ``"false"`` is truthy."""
+    ok = _get(report, "no_loss", "ok")
+    return ok if isinstance(ok, bool) else None
