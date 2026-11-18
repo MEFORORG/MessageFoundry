@@ -947,9 +947,8 @@ def test_a_truncated_error_body_still_warns_rather_than_going_silent(
 # --- a content-coded reply on the token, AI broker and lookup reads (BACKLOG #5910 step 3) --------
 #
 # reply_framing_fault refuses any content coding but identity as an AmbiguousFramingError. These
-# pin what each reader that retypes, or lets through, that refusal does with it. They pin the
-# current classification only: whether a coded token reply should stay retryable is an owner
-# question (#5910 step 4), so nothing here asserts it should.
+# pin what each reader that retypes, or lets through, that refusal does with it. A coded token
+# reply is a permanent refusal by the owner ruling of 2026-11-18 on #5910 step 4.
 
 _CODED_200 = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
 
@@ -996,13 +995,25 @@ def test_a_smart_token_reply_in_a_content_coding_is_a_permanent_refusal(ec_pem: 
     _assert_coded_token_dead_letters(err.value)
 
 
-def test_a_misframed_token_reply_that_is_not_coded_stays_retryable() -> None:
-    """The control: only the coded refusal changed; a reply cut short is still transient."""
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(_FIXED_TRUNCATED, id="cut-short"),
+        pytest.param(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
+            b"5\r\nhello\r\n0\r\n\r\n",
+            id="misframed-not-coded",
+        ),
+    ],
+)
+def test_a_token_reply_refused_for_anything_but_its_coding_stays_retryable(raw: bytes) -> None:
+    """The control: only the coded refusal changed. A misframed reply is an AmbiguousFramingError
+    too, so this is what keeps the coded test from passing on the type alone."""
     provider = OAuth2ClientCredentialsProvider(
         token_url=TOKEN_URL, client_id="cid", client_secret="s3cr3t"
     )
-    provider._opener = _FakeOpener(_wire(_FIXED_TRUNCATED))  # type: ignore[assignment]
-    with pytest.raises(TruncatedResponseError) as err:
+    provider._opener = _FakeOpener(_wire(raw))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as err:
         provider.access_token()
     assert not isinstance(err.value, NegativeAckError)
 

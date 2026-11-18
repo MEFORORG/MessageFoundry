@@ -500,7 +500,8 @@ class _TokenEndpointProvider(abc.ABC):
         (a token ``POST``); the connector calls it inside its off-loop ``send()`` worker. Raises
         :class:`~messagefoundry.transports.base.DeliveryError` (transient) if acquisition fails, or
         the permanent configuration fault :func:`request_token` names for a refused Digest
-        challenge."""
+        challenge, or its permanent ``token-reply-coded`` refusal of a reply in a content coding
+        (owner ruling 2026-11-18, BACKLOG #5910 step 4)."""
         with self._lock:
             if self._cached_token is not None and time.monotonic() < self._cached_expiry_monotonic:
                 return self._cached_token

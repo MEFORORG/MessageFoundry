@@ -270,8 +270,8 @@ class AmbiguousFramingError(EgressReplyError):
     ``http.client`` happens to consult first. The shapes are listed on :func:`reply_framing_fault`.
 
     Also raised for a body in a content coding other than ``identity`` (BACKLOG #5910). That body
-    is framed legally and read whole, but the engine does not decode it, so the caller would take
-    compressed bytes as the reply's text. Its reason names the coding fault, not a length.
+    is framed legally, but the engine does not decode it, so the caller would take compressed
+    bytes as the reply's text. It is refused before any body byte is read. Its reason names the coding fault, not a length.
 
     Also raised part-way through a chunked body, at the first chunk-size line, chunk terminator or
     trailer line that breaks the RFC 9112 section 7.1 grammar. By then some bytes have been read,

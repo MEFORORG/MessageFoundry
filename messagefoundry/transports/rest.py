@@ -96,6 +96,7 @@ from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     LoopbackDirectProxyHandler,
     NoRedirectHandler,
+    _refusal_by_http_client,
     build_strict_opener,
     drain_bounded,
     hop_identity,
@@ -1823,12 +1824,6 @@ def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
     )
 
 
-#: ``http.client``'s own header-name and header-value rules (its ``_is_legal_header_name`` and
-#: ``_is_illegal_header_value``), applied to ``str`` so a configured value meets them at build.
-_SENDABLE_HEADER_NAME = re.compile(r"[^:\s][^:\r\n]*")
-_UNSENDABLE_HEADER_VALUE = re.compile(r"\n(?![ \t])|\r(?![ \t\n])")
-
-
 def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, setting: str) -> None:
     """Refuse at construction a static URL or header ``http.client`` could never send (BACKLOG #5911).
 
@@ -1838,8 +1833,9 @@ def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, se
     target as ASCII and refuses a space in it, and urllib sets the ``Host`` header from the URL's
     host as it stands, which ``http.client`` encodes as Latin-1 rather than IDNA. A ``#`` is refused
     too, because urllib splits it off client-side, so every path the connector appends to the URL
-    would be dropped. A header name must be ASCII and pass ``http.client``'s name rule, and a header
-    value must be Latin-1 and pass its CR/LF rule.
+    would be dropped. Each header is put to ``http.client`` itself, as
+    :func:`~messagefoundry.transports.bounded_read._refusal_by_http_client` does for a proxy
+    header, so the screen follows its name and value rules in every Python version.
 
     Raises :class:`ValueError` naming ``setting``, and a header key only as
     :func:`_shown_header_key` shows it, never a value, which an ``env()`` binding can fill with a
@@ -1852,7 +1848,7 @@ def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, se
             "ASCII); percent-encode it, and give an internationalized host in its IDNA form"
         )
     for name, value in headers.items():
-        if not (name.isascii() and _SENDABLE_HEADER_NAME.fullmatch(name)):
+        if _refusal_by_http_client(name, "") is not None:
             raise ValueError(
                 f"{setting} header {_shown_header_key(name)} is not a header name http.client "
                 "can send"
@@ -1862,10 +1858,10 @@ def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, se
                 f"{setting} header {_shown_header_key(name)} is not encodable as Latin-1 "
                 "(http.client sends header values as Latin-1)"
             )
-        if _UNSENDABLE_HEADER_VALUE.search(value):
+        if _refusal_by_http_client(name, value) is not None:
             raise ValueError(
-                f"{setting} header {_shown_header_key(name)} holds a line break http.client "
-                "refuses to send"
+                f"{setting} header {_shown_header_key(name)} has a value http.client refuses to "
+                "send"
             )
 
 

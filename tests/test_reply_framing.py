@@ -2094,7 +2094,7 @@ def test_a_gzipped_soap_500_still_ends_not_delivered(caplog: pytest.LogCaptureFi
         asyncio.run(_soap(url).send("<soap:Envelope/>"))
     assert type(raised.value) is DeliveryError
     assert "HTTP 500" in str(raised.value)
-    # #5910 step 1: the body was read whole; it is the coding the engine does not decode.
+    # #5910 step 1: the body is refused for its coding, before any byte is read, not its length.
     assert "fault body in a content coding the engine does not decode" in caplog.text
     assert "could not read whole" not in caplog.text
 

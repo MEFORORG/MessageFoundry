@@ -1085,6 +1085,10 @@ class FhirDestination(DestinationConnector):
         if scheme not in ("http", "https"):
             raise ValueError(f"FHIR destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "FHIR destination 'url'")
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, as a
+        # bad conditional_query does, rather than every message at send time. Before any hop gate,
+        # so none audits a crossing for a connection that never builds (#5529).
+        refuse_unsendable_static_request(url, self._build_headers(s), setting="FHIR destination")
         self.base_url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("FHIR", config.name)
@@ -1234,9 +1238,6 @@ class FhirDestination(DestinationConnector):
             else []
         )
         enforce_outbound_length_limits(self.base_url, self._headers)
-        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, as a
-        # bad conditional_query does, rather than every message at send time.
-        refuse_unsendable_static_request(self.base_url, self._headers, setting="FHIR destination")
         refuse_cleartext_credentials(
             scheme,
             self._headers,
@@ -2039,6 +2040,11 @@ class FhirLookupExecutor:
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
             # arrives in these settings, mirrored from the spec's typed fields by
             # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
+            # BACKLOG #5911: the destination's static-settings screen, at this sibling too (#1241),
+            # and like it before any hop gate audits a crossing.
+            refuse_unsendable_static_request(
+                url, self._build_headers(s), setting=f"FhirLookup {cname!r}"
+            )
             # Vault BACKLOG #3139: a refusal from either reader names the lookup, as the url checks do.
             try:
                 attested = hop_attestation_from_settings(s)
@@ -2099,8 +2105,6 @@ class FhirLookupExecutor:
             # call site was the DESTINATION's __init__, so a lookup connection's base URL and static
             # headers were unbounded on both sides.
             enforce_outbound_length_limits(url, headers)
-            # BACKLOG #5911: the destination's static-settings screen, at this sibling too (#1241).
-            refuse_unsendable_static_request(url, headers, setting=f"FhirLookup {cname!r}")
             self._headers[cname] = headers
             self._token[cname] = token
             if bool_setting(s, "verify_tls", default=True):

@@ -407,7 +407,7 @@ def _build_fhir(url: str, **over: object) -> FhirDestination:
         f"{BASE}/a b",  # http.client refuses a space in the request line
         f"{BASE}/café",  # the request target is sent as ASCII
         f"{BASE}?q=ā",
-        f"{BASE}/a b",  # a non-ASCII space
+        f"{BASE}/a\u00a0b",  # a non-ASCII space
         "https://fhir.exāmple.org/fhir",  # urllib's Host header is Latin-1, never IDNA
         f"{BASE}#x",  # urllib drops the fragment, and every path appended after it
     ],
@@ -429,7 +429,7 @@ def test_an_unsendable_static_header_value_is_refused_at_construction() -> None:
 
 
 def test_a_static_header_value_with_a_line_break_is_refused_at_construction() -> None:
-    with pytest.raises(ValueError, match="X-Site holds a line break") as ei:
+    with pytest.raises(ValueError, match="X-Site has a value http.client refuses") as ei:
         _dest(headers={"X-Site": "a\r\nb"})
     assert "a\r\nb" not in str(ei.value)
 
