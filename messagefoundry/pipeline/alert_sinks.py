@@ -2561,8 +2561,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._control_stopped = True
 
     async def aclose(self) -> None:
-        """Drain and stop the delivery task, then cancel every control task still running and wait
-        for it to end (BACKLOG #5909). The lifespan closes this sink
+        """Drain and stop the delivery task, then cancel the control tasks still running when the
+        drain wait ends and wait for each to end (BACKLOG #5909). The lifespan closes this sink
         after engine.stop(), so such a task can only meet a stopped runner. Runs even when the sink
         was never started. A close cancelled while its sentinel waits on a full queue cancels the
         delivery task too and waits for it (BACKLOG #5907), so the startup unwind's cut does not
