@@ -266,14 +266,17 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
 # THE POWERSHELL TOOL'S READING (BACKLOG #5451), with the same contract as Hide-QuotedSpans: equal
 # length, newlines kept. The plain toggle reads a backtick-escaped quote as a quote, so `"a`"b"` and
 # `` `" `` outside a string shifted every later span by one and blanked the walk after it. Here a
-# backtick outside single quotes escapes the next character. A `#` starting a token, a `<# ... #>`
-# block and a here-string body (`@'` or `@"` ending its line, closed by `'@` or `"@` starting one) are
-# blanked whole, so an apostrophe in a comment or a commit message opens no span. It still does not
-# read a `"$(...)"` subexpression, a line continuation, or a backtick inside a word.
+# backtick outside single quotes escapes the next character. A `#` or `<#` that does not continue a
+# bareword starts a comment: at the start, or after whitespace, an operator character or a closing
+# quote or a `>&1` redirection, never after another letter or digit or an escaped character. A comment, a `<# ... #>` block and a
+# here-string body (`@'` or `@"` ending its line, closed by `'@` or `"@` starting one) are blanked
+# whole, so an apostrophe in one opens no span. It still does not read a `"$(...)"` subexpression,
+# a line continuation, a backtick inside a word, or a typographic quote.
 function Hide-PowerShellSpans([string]$Text) {
     $sb = [System.Text.StringBuilder]::new($Text.Length)
     $quote = $null
     $here = $null
+    $afterEscape = $false
     $n = 0
     while ($n -lt $Text.Length) {
         $ch = $Text[$n]
@@ -286,7 +289,7 @@ function Hide-PowerShellSpans([string]$Text) {
         }
         if ($ch -ceq '`' -and $quote -cne "'" -and $null -ne $next) {
             # Kept as it is outside a string and blanked inside one, except a newline.
-            if ($null -eq $quote) { [void]$sb.Append($ch); [void]$sb.Append($next) }
+            if ($null -eq $quote) { [void]$sb.Append($ch); [void]$sb.Append($next); $afterEscape = $true }
             else { [void]$sb.Append(' '); [void]$sb.Append($(if ($next -ceq "`n") { $next } else { ' ' })) }
             $n += 2; continue
         }
@@ -296,24 +299,26 @@ function Hide-PowerShellSpans([string]$Text) {
             else { [void]$sb.Append(' ') }
             $n++; continue
         }
-        $end = -1
+        $wasEscape = $afterEscape
+        $afterEscape = $false
         if ($ch -ceq '@' -and ($next -ceq "'" -or $next -ceq '"') -and
             [regex]::IsMatch($Text.Substring($n + 2), '^[ \t]*\r?\n')) {
             $here = "$next@"; [void]$sb.Append("@$next"); $n += 2; continue
         }
-        if ($ch -ceq '<' -and $next -ceq '#') {
-            $end = $Text.IndexOf('#>', $n + 2)
+        $end = -1
+        # A merge redirection such as `2>&1` ends in a digit and is still a whole token.
+        $tokenStart = -not $wasEscape -and ($n -eq 0 -or -not [char]::IsLetterOrDigit($Text[$n - 1]) -or
+            ($n -ge 3 -and $Text.Substring($n - 3, 3) -cmatch '^>&[12]$'))
+        if ($tokenStart -and $ch -ceq '<' -and $next -ceq '#') {
+            $end = $Text.IndexOf('#>', $n + 2, [StringComparison]::Ordinal)
             $end = if ($end -lt 0) { $Text.Length } else { $end + 2 }
-        } elseif ($ch -ceq '#' -and ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1]) -or
-                  ';|&(){}'.IndexOf($Text[$n - 1]) -ge 0)) {
-            $end = $Text.IndexOf("`n", $n)
+        } elseif ($tokenStart -and $ch -ceq '#') {
+            $end = $Text.IndexOf([char]10, $n)
             if ($end -lt 0) { $end = $Text.Length }
         }
         if ($end -ge 0) {
-            [void]$sb.Append('#')
-            for ($k = $n + 1; $k -lt $end; $k++) {
-                [void]$sb.Append($(if ($Text[$k] -ceq "`n") { "`n" } else { ' ' }))
-            }
+            [void]$sb.Append($ch)
+            [void]$sb.Append([regex]::Replace($Text.Substring($n + 1, $end - $n - 1), '[^\n]', ' '))
             $n = $end; continue
         }
         if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch }

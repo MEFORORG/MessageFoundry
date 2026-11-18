@@ -36,6 +36,8 @@ POWERSHELL_DENY = [
     pytest.param("# don't walk\ngrep -r x /proc", id="apostrophe-in-a-line-comment"),
     pytest.param("<# it's #>\ngrep -r x /proc", id="apostrophe-in-a-block-comment"),
     pytest.param("git commit -m @'\ndon't\n'@\ngrep -r x /proc", id="apostrophe-in-a-here-string"),
+    pytest.param("$m = 'done'# it's fine\ngrep -r x /proc", id="comment-right-after-a-quote"),
+    pytest.param("$x =# it's\ngrep -r x /proc", id="comment-right-after-an-operator"),
 ]
 
 POWERSHELL_ALLOW = [
@@ -49,6 +51,8 @@ POWERSHELL_ALLOW = [
         id="backtick-quote-in-a-here-string",
     ),
     pytest.param("Write-Output 'a' # it`'s; grep -r x /proc", id="backtick-in-a-comment"),
+    pytest.param('Write-Output "x"# uses `"; find /proc', id="backtick-in-a-comment-after-a-quote"),
+    pytest.param("Write-Output x 2>&1# it`'s; grep -r x /proc", id="comment-after-a-redirect"),
 ]
 
 
