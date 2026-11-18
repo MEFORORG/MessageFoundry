@@ -946,12 +946,23 @@ def test_the_listener_imports_no_private_config_name() -> None:
     import messagefoundry.transports.http_listener as listener
 
     tree = ast.parse(Path(listener.__file__).read_text(encoding="utf-8"))
+    config_imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and (node.module or "").startswith("messagefoundry.config")
+    ]
+    # Positive control: the listener does import from the config layer, so the scan below reads
+    # real imports rather than passing on none.
+    assert config_imports
+    private = [
+        (node.module, alias.name)
+        for node in config_imports
+        for alias in node.names
+        if alias.name.startswith("_")
+    ]
+    assert not private, private
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
-            "messagefoundry.config"
-        ):
-            private = [alias.name for alias in node.names if alias.name.startswith("_")]
-            assert not private, (node.module, private)
         if isinstance(node, ast.FunctionDef):
             assert node.name != "_peer_address"
     wiring_tree = ast.parse(Path(wiring.__file__).read_text(encoding="utf-8"))
