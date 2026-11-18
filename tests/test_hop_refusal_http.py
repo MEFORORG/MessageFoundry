@@ -551,12 +551,13 @@ def test_the_verify_off_header_allowlist_is_pinned() -> None:
 _QUERY_CELLS = [cell for cell in _CELLS if cell != "DICOMweb"]
 
 
-@pytest.mark.parametrize("query", ["api_key", "code"])
+@pytest.mark.parametrize("query", ["api_key", "code", "a=1?api_key"])
 @pytest.mark.parametrize("cleartext", [False, True])
 def test_a_dicomweb_url_query_is_refused_first(query: str, cleartext: bool) -> None:
     ctype, factory, url = (_CLEARTEXT if cleartext else _HTTPS)["DICOMweb"]
     with pytest.raises(ValueError, match="no query string or fragment") as exc:
         _build((ctype, factory, f"{url}?{query}={_SECRET}"))
+    assert "connection 'OB'" in str(exc.value)
     assert _SECRET not in str(exc.value)
 
 
@@ -636,10 +637,17 @@ def test_a_proxy_credential_or_a_cleartext_url_is_not_this_refusals_case() -> No
 
 
 @pytest.mark.parametrize(
-    "suffix",
-    [f";jsessionid={_SECRET}", f";jsessionid={_SECRET}/next", f"?a=1?api_key={_SECRET}"],
+    ("cell", "suffix"),
+    [
+        *[
+            (c, s)
+            for c in _CELLS
+            for s in (f";jsessionid={_SECRET}", f";jsessionid={_SECRET}/next")
+        ],
+        # A second ``?`` is a query, which a DICOMweb base url refuses first; see _QUERY_CELLS.
+        *[(c, f"?a=1?api_key={_SECRET}") for c in _QUERY_CELLS],
+    ],
 )
-@pytest.mark.parametrize("cell", _CELLS)
 def test_a_url_segment_credential_the_query_misses_is_refused_over_verify_off(
     cell: str, suffix: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -647,12 +655,6 @@ def test_a_url_segment_credential_the_query_misses_is_refused_over_verify_off(
     query reader does not reach, and it used to cross a verify-off hop."""
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     url = f"{_HTTPS[cell][2]}{suffix}"
-    if cell not in _QUERY_CELLS and "?" in suffix:
-        # A DICOMweb base url refuses any query first (vault BACKLOG #5358); see _QUERY_CELLS.
-        with active_hop_posture(_STAGING), pytest.raises(ValueError, match="no query string") as q:
-            _build_raw(cell, {"verify_tls": False, "url": url})
-        assert _SECRET not in str(q.value)
-        return
     with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
         _build_raw(cell, {"verify_tls": False, "url": url})
     assert "url segment with a credential-looking name" in str(exc.value)
