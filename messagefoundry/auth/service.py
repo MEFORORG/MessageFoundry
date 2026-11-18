@@ -218,6 +218,7 @@ from messagefoundry.store.store import (
     RoleRow,
     SessionRecord,
     TotpState,
+    UnknownRoleError,
     UserAuthzRecord,
     UsernameAuditAppendError,
     UserRecord,
@@ -2386,6 +2387,26 @@ def _is_integrity_refusal(exc: BaseException) -> bool:
     """
     mro = "".join(t.__name__ for t in type(exc).__mro__)
     return "Integrity" in mro or "UniqueViolation" in mro
+
+
+def _role_write_refusal(exc: BaseException, roles: Iterable[str]) -> UnknownRoleError | None:
+    """The :class:`UnknownRoleError` a role write's failure means, or ``None`` when it means
+    something else (BACKLOG #5968).
+
+    A caller checks its role ids in a read of its own before the write, so a custom role deleted
+    between that read and the write's commit reaches the write. The store raises
+    :class:`UnknownRoleError` when the role was already gone when its transaction read ``roles``,
+    and the driver's integrity error when the delete commits after that read and the role foreign
+    key refuses the row. Both mean the same thing to the caller: a role it named no longer exists,
+    and nothing was written. An integrity error names no role, so the custom ids requested stand in
+    for it, as the ones a concurrent delete could have taken."""
+    if isinstance(exc, UnknownRoleError):
+        return exc
+    if not _is_integrity_refusal(exc):
+        return None
+    requested = set(roles)
+    custom = requested - {r.value for r in Role}
+    return UnknownRoleError(sorted(custom or requested))
 
 
 def _reproof_refusal_reason(proof: _Reproof) -> str:
@@ -19740,7 +19761,8 @@ class AuthService:
         anything is written.
 
         Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
-        own check (BACKLOG #1808)."""
+        own check (BACKLOG #1808), and :class:`UnknownRoleError` when a role in ``roles`` was
+        deleted after it, having removed the account it wrote (BACKLOG #5968)."""
         refusal = username_refusal(username)
         if refusal is not None:
             raise InvalidUsername(refusal)
@@ -19782,19 +19804,37 @@ class AuthService:
         # failed append rolls them back. A crash between the two writes, or a refused append,
         # leaves an account with no role and no row, holding its username; its credential was
         # never returned, so nobody holds it.
-        await self._store.set_user_roles(
-            user_id,
-            roles,
-            assigned_by=actor,
-            audits=(
-                AuditAppend(
-                    "user.created",
-                    actor=actor,
-                    detail=_json({"username": username, "roles": list(roles)}),
-                    client=client,
+        try:
+            await self._store.set_user_roles(
+                user_id,
+                roles,
+                assigned_by=actor,
+                audits=(
+                    AuditAppend(
+                        "user.created",
+                        actor=actor,
+                        detail=_json({"username": username, "roles": list(roles)}),
+                        client=client,
+                    ),
                 ),
-            ),
-        )
+            )
+        except Exception as exc:
+            role_refusal = _role_write_refusal(exc, roles)
+            if role_refusal is None:
+                raise
+            # BACKLOG #5968: a custom role deleted after the caller's check refused the role write,
+            # which rolled back. The account row committed first, holding the username with no
+            # role and no `user.created` row, so it is removed: otherwise a retry under the same
+            # name would be refused as taken. It holds no role, so not Administrator, which is
+            # what `delete_user` requires. A failed removal leaves the orphan the crash case above
+            # leaves, and is logged rather than masking the refusal.
+            try:
+                await self._store.delete_user(user_id)
+            except Exception:
+                _log.exception(
+                    "an account whose role write was refused could not be removed (BACKLOG #5968)"
+                )
+            raise role_refusal from exc
         # The address create_user seeded. None means nobody to tell yet: the holder is asked for one
         # at first sign-in (the NOTIFY_EMAIL_SET path) rather than told about this afterwards. Only an
         # internal caller reaches that arm now; both admin surfaces require an address (#2018).
@@ -20018,7 +20058,9 @@ class AuthService:
     async def set_roles(self, user_id: str, roles: Sequence[str], *, actor: str) -> None:
         """Replace an account's roles. Raises :class:`LastAdministratorRefused`, having written
         nothing, when that would take Administrator from the last enabled administrator; the check
-        and the write are one store transaction (vault BACKLOG #2779).
+        and the write are one store transaction (vault BACKLOG #2779). Raises
+        :class:`UnknownRoleError`, having written nothing, when a role it adds no longer exists
+        (BACKLOG #5968).
 
         This method does not refuse a self-target; ``PUT /users/{id}/roles`` does (BACKLOG #1149),
         so behind that route the last-administrator check is a second line, as on disable and
@@ -20028,20 +20070,28 @@ class AuthService:
         after it, because the roles are what it records: a crash between the two leaves the change
         with its row, and only the sessions still to end (BACKLOG #2221)."""
         user = await self._load_user(user_id)  # for the notification address
-        if not await self._store.remove_unless_last_admin(
-            user_id,
-            AdminRemoval.SET_ROLES,
-            admin_role_id=Role.ADMINISTRATOR.value,
-            role_ids=list(roles),
-            assigned_by=actor,
-            audits=(
-                AuditAppend(
-                    "user.roles_changed",
-                    actor=actor,
-                    detail=_json({"user_id": user_id, "roles": list(roles)}),
+        try:
+            written = await self._store.remove_unless_last_admin(
+                user_id,
+                AdminRemoval.SET_ROLES,
+                admin_role_id=Role.ADMINISTRATOR.value,
+                role_ids=list(roles),
+                assigned_by=actor,
+                audits=(
+                    AuditAppend(
+                        "user.roles_changed",
+                        actor=actor,
+                        detail=_json({"user_id": user_id, "roles": list(roles)}),
+                    ),
                 ),
-            ),
-        ):
+            )
+        except Exception as exc:
+            # BACKLOG #5968: a role deleted after the caller's check; the write rolled back.
+            refusal = _role_write_refusal(exc, roles)
+            if refusal is None:
+                raise
+            raise refusal from exc
+        if not written:
             raise LastAdministratorRefused("cannot remove the last administrator")
         # Re-resolve permissions on the next login. The role write above carries the record.
         await self._revoke_after_commit(user_id, change="roles_changed", actor=actor)
@@ -21219,10 +21269,18 @@ class AuthService:
         """Replace the AD-group to role map (C3). Revokes directory accounts' sessions so it applies
         at once, as :meth:`_revoke_ad_sessions` says. ``ended`` is the set the route's step-up gate
         read from :meth:`sessions_ended_by_ad_map_save`; without one it is read here, before the
-        write."""
+        write. Raises :class:`UnknownRoleError`, having written nothing, when a role it names no
+        longer exists (BACKLOG #5968)."""
         if ended is None:
             ended = await self.sessions_ended_by_ad_map_save()
-        await self._store.set_ad_group_role_map(entries)
+        try:
+            await self._store.set_ad_group_role_map(entries)
+        except Exception as exc:
+            # BACKLOG #5968: a role deleted after the caller's check; the write rolled back.
+            refusal = _role_write_refusal(exc, (role for _, role in entries))
+            if refusal is None:
+                raise
+            raise refusal from exc
         revoked = await self._revoke_ad_sessions(ended, change="ad_role_map_saved", actor=actor)
         await self._audit(
             "ad_group_map.updated",
