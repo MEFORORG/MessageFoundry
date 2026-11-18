@@ -3001,7 +3001,7 @@ class LockableAccountCensus:
     #: (:func:`~messagefoundry.store.store.listed_users` says which), by its stored id (BACKLOG
     #: #5505). Its record fails its integrity check, so whether it is lockable is unknown: it is
     #: named here and in no other list, since every other list would read fields the store could
-    #: not read.
+    #: not read. A bad recovery-code cell is not named here; it is refused when its codes are read.
     integrity_failed: tuple[str, ...] = ()
 
     @property

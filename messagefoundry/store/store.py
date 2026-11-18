@@ -2789,7 +2789,7 @@ async def admin_guard_counts(
             record = await read_record(holder_id)
         except RowSealError:
             # A holder whose users row has a timestamp or counter cell that does not parse, or
-            # whose role rows do not parse, fails (BACKLOG #5505).
+            # whose role rows have an assigned_at that does not parse, fails (BACKLOG #5505).
             continue
         if record is None or not await user_seal_ok_async(sealer, record):
             continue
