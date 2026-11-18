@@ -350,7 +350,7 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
         else None,
         buildup=_policy(BuildupThreshold, table.get("buildup"), "buildup", where, strict=True),
         stall=_policy(StallThreshold, table.get("stall"), "stall", where, strict=True),
-        batch=_policy(BatchConfig, table.get("batch"), "batch", where),
+        batch=_policy(BatchConfig, table.get("batch"), "batch", where, strict=True),
         simulate=_require_bool(table, "simulate", where),
         dead_letter_days=_optional_int(table, "dead_letter_days", where),
         priority=_enum(Priority, table["priority"], "priority", where)
@@ -1021,15 +1021,21 @@ def _enum(enum_cls: type[_E], value: Any, key: str, where: str) -> _E:  # noqa: 
 def _policy(  # noqa: UP047
     model_cls: type[_M], raw: Any, key: str, where: str, *, strict: bool = False
 ) -> _M | None:
-    """Build one policy sub-table. ``strict`` (BACKLOG #5899) refuses a value of the wrong TOML type
-    instead of coercing it, so ``max_attempts = "3"`` or ``max_depth = true`` is a load error rather
-    than a number. The retry, buildup and stall tables take it; their models also refuse an unknown
-    key. ``schedule`` and ``batch`` stay lax, because a schedule's ``days`` arrive as a TOML array
-    and strict mode refuses a list for its ``frozenset``."""
+    """Build one policy sub-table (BACKLOG #5899).
+
+    An unknown key is refused here, by name, before the model sees the table. pydantic's own
+    ``extra_forbidden`` error would quote the key's value, so a secret written under the wrong table
+    would reach the load error; this names only the key, as every other table in the file does.
+
+    ``strict`` refuses a value of the wrong TOML type instead of coercing it, so ``max_attempts =
+    "3"``, ``max_depth = true`` or ``max_count = 10.0`` is a load error rather than a number. The
+    schedule table stays lax: its ``days`` arrive as a TOML array, and strict mode refuses a list for
+    the model's ``frozenset``."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise WiringError(f"{where}: [{key}] must be a table")
+    _reject_unknown(raw, frozenset(model_cls.model_fields), f"{where} [{key}]")
     try:
         return model_cls.model_validate(raw, strict=strict)
     except (ValueError, TypeError) as exc:
