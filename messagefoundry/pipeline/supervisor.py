@@ -354,16 +354,22 @@ class Supervisor:
         try:
             await asyncio.gather(*watchers)
         except BaseException:
-            # Cooperative shutdown, or one watcher raised: signal the others to stop relaunching,
-            # then drain every child before the exception goes on.
-            self._stopping.set()
-            for w in watchers:
-                w.cancel()
-            await asyncio.gather(*watchers, return_exceptions=True)
-            await self._terminate_all()
+            # Cooperative shutdown, or one watcher raised: drain every child before the exception
+            # goes on. A second signal during the drain is absorbed rather than cutting it short.
+            await _finish_despite_cancel(self._drain(watchers))
             raise
         else:
-            await self._terminate_all()
+            _, cancelled = await _finish_despite_cancel(self._drain(watchers))
+            if cancelled:
+                raise asyncio.CancelledError
+
+    async def _drain(self, watchers: Sequence[asyncio.Task[None]]) -> None:
+        """Stop the watchers relaunching, wait for them to return, then stop every child."""
+        self._stopping.set()
+        for w in watchers:
+            w.cancel()
+        await asyncio.gather(*watchers, return_exceptions=True)
+        await self._terminate_all()
 
     async def _watch(self, spec: ShardSpec) -> None:
         """Keep one shard alive: spawn it, await exit OR a stop request, relaunch on a crash after
@@ -388,13 +394,12 @@ class Supervisor:
         while not self._stopping.is_set():
             started = self.clock()
             try:
-                process = await self.spawn(spec)
+                process = await self._launch(spec)
             except OSError as exc:
                 if not self.restart:
                     raise
                 rc: int | str = f"launch failed ({exc})"
             else:
-                self._children[spec.shard] = _Child(spec, process)
                 logger.info(
                     "shard %r started (pid=%s, port=%d)", spec.shard, process.pid, spec.port
                 )
@@ -448,6 +453,19 @@ class Supervisor:
             # Counted once the delay is over, so a stop during it does not record a restart that
             # never ran.
             self.restarts[spec.shard] = self.restarts.get(spec.shard, 0) + 1
+
+    async def _launch(self, spec: ShardSpec) -> asyncio.subprocess.Process:
+        """Spawn ``spec``'s child and register it for :meth:`_terminate_all`, even when cancelled.
+
+        A launch's child can exist before its await returns, so a cancel landing mid-spawn would
+        lose the only handle to it and leave it running past the drain. The spawn is let finish,
+        the child registered, and only then is the cancellation raised."""
+        launch, cancelled = await _finish_despite_cancel(self.spawn(spec))
+        if not launch.cancelled() and launch.exception() is None:
+            self._children[spec.shard] = _Child(spec, launch.result())
+        if cancelled:
+            raise asyncio.CancelledError
+        return launch.result()
 
     async def _unless_stopped[T](self, aw: Awaitable[T]) -> T | None:
         """Await ``aw`` unless a stop request comes first: its result, or ``None`` on a stop.
@@ -517,6 +535,22 @@ class Supervisor:
                 except ProcessLookupError:
                     pass
                 await child.process.wait()
+
+
+async def _finish_despite_cancel[T](aw: Awaitable[T]) -> tuple[asyncio.Future[T], bool]:
+    """Await ``aw`` to completion however often the caller is cancelled meanwhile.
+
+    Returns the finished future, which the caller reads, and whether a cancellation arrived. The
+    caller owes that cancellation: it raises it once its own cleanup is done. ``aw`` itself is
+    never cancelled by this, so a shutdown signal cannot cut a drain or a spawn short."""
+    fut = asyncio.ensure_future(aw)
+    cancelled = False
+    while not fut.done():
+        try:
+            await asyncio.wait({fut})
+        except asyncio.CancelledError:
+            cancelled = True
+    return fut, cancelled
 
 
 async def supervise(
