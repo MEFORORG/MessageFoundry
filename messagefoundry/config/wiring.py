@@ -929,7 +929,7 @@ def _check_listener_ca(type_: ConnectorType, tls: object, ca: object, pin: objec
     reason reads it by truthiness."""
     factory = _UNREAD_CA_ON_TLS_OFF[type_]
     if ca is not None:
-        _refuse_bool_literals({"tls": tls}, factory)
+        refuse_bool_literals({"tls": tls}, factory)
     _check_tls_ca_file(factory, ca, unread=None if ca is None else _tls_off_reason(tls))
     _check_tls_ca_pin(factory, pin, ca)
 
