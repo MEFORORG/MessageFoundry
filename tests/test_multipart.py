@@ -200,8 +200,9 @@ def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
     The header block is attacker-supplied, and the worker thread the upload route parses in does
     not spare the event loop a scan (``multipart.parse_upload_off_loop`` says why), so a quadratic
     scan here is a whole-engine denial of service, not a slow request. ``_MAX_PART_HEADER_BYTES``
-    bounds the input as well, but the two controls are independent on purpose: the cap is a size policy someone could reasonably raise, while this
-    bounds what the scan costs at the size the cap admits today.
+    bounds the input as well, but the two controls are independent on purpose: the cap is a size
+    policy someone could reasonably raise, while this bounds what the scan costs at the size the cap
+    admits today.
 
     **This replaced a growth-ratio assertion, and the ratio is why BACKLOG #1385 has this row.** The
     old arm timed the bare regex at n and 4n and required the quotient under 8.0, reasoning that
@@ -406,17 +407,18 @@ def test_the_walk_stops_at_the_first_part_over_the_cap() -> None:
     )
     with pytest.raises(MultipartError, match="more parts than the limit"):
         parse_multipart_form(f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024)
-    assert body.finds <= 3 * (multipart._MAX_PARTS + 2), body.finds
+    assert 0 < body.finds <= 3 * (multipart._MAX_PARTS + 2), body.finds
 
 
 def test_a_part_with_no_header_block_is_bounded_too() -> None:
     """A part with no blank line after its headers is skipped, and is bounded like a nameless field
     rather than by the body cap alone."""
     junk = b"x" * (multipart._MAX_FIELD_BYTES + 1)
-    with pytest.raises(MultipartTooLargeError, match="no header block"):
+    with pytest.raises(MultipartError, match="no header block") as caught:
         parse_single_file_upload(
             f"multipart/form-data; boundary={_B}", _body([_FILE_PART, junk]), max_file_bytes=1024
         )
+    assert type(caught.value) is MultipartError  # 400: the size is not the cause to fix
     small = b"x" * multipart._MAX_FIELD_BYTES
     file = parse_single_file_upload(
         f"multipart/form-data; boundary={_B}", _body([_FILE_PART, small]), max_file_bytes=1024
@@ -544,10 +546,13 @@ async def test_the_off_loop_parse_carries_the_callers_context(
         return real(*args, **kwargs)
 
     monkeypatch.setattr(multipart, "parse_single_file_upload", parse)
-    _PROBE.set("caller")
-    file = await multipart.parse_upload_off_loop(
-        f"multipart/form-data; boundary={_B}", _body([_FILE_PART]), max_file_bytes=1024
-    )
+    token = _PROBE.set("caller")
+    try:
+        file = await multipart.parse_upload_off_loop(
+            f"multipart/form-data; boundary={_B}", _body([_FILE_PART]), max_file_bytes=1024
+        )
+    finally:
+        _PROBE.reset(token)
     assert file.data == b"MSH|body"
     assert seen == ["caller"]
 

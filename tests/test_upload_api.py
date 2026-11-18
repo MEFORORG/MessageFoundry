@@ -502,7 +502,7 @@ async def test_upload_parse_runs_in_a_worker_thread(
 async def test_concurrent_upload_parses_hold_at_most_two_threads(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5522: each parse holds transient copies of its body, so the parser's executor runs
+    """BACKLOG #5522: the parser's executor bounds the threads upload parses take, so it runs
     at most two at once. Four uploads are sent together. Each parse waits until a second one is
     running (or a generous timeout passes), which makes the overlap certain rather than a matter of
     timing, then lingers so a third would be seen if the bound let one in. The most that ever ran

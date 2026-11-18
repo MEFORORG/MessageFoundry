@@ -9,6 +9,11 @@ boundary is read from the ``Content-Type``, each part is located by the offset o
 delimiter, and each part's ``Content-Disposition`` gives its field name + (for a file) filename. A
 **hard size cap** is enforced on each part before any of its content is copied.
 
+What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block over
+``_MAX_PART_HEADER_BYTES``, a file part over the caller's cap, any other part over
+``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), and, in
+:func:`parse_single_file_upload`, a body with no file part or with more than one.
+
 Scope: exactly what an upload form needs — one file part + optional small text fields. It is not a
 general RFC-2388 implementation (no nested multipart/mixed, no transfer-encoding decode); those are out
 of scope for an operator file upload and are not accepted.
@@ -62,11 +67,11 @@ _MAX_PARTS = 16
 _MAX_FIELD_BYTES = 16 * 1024
 
 #: The upload parse's own executor (BACKLOG #5522). Not the loop's default executor: router and
-#: transform work runs there, and each parse holds a copy of the file part it keeps. Two workers
-#: bound the threads, and those copies, that concurrent uploads can take in this process. Later
-#: parses queue here. A semaphore around ``asyncio.to_thread`` would not hold that bound, because a
-#: cancelled request (the request deadline) releases its slot while its thread keeps parsing. The
-#: bodies themselves are read before the parse and are not bounded by this.
+#: transform work runs there. Two workers bound the threads, and so the CPU, that concurrent upload
+#: parses can take in this process. Later parses queue here. A semaphore around ``asyncio.to_thread``
+#: would not hold that bound, because a cancelled request (the request deadline) releases its slot
+#: while its thread keeps parsing. Memory is not bounded by this: each request's body, and the copy
+#: of its file part the parse returns, outlive the worker until the route is done with them.
 _PARSE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mefor-upload-parse")
 
 
@@ -159,9 +164,11 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     The body is walked with ``find`` rather than ``split``: a split copies each segment, and the old
     walk then sliced, partitioned and trimmed it again, about four copies of every admitted part, all
     alive at once. Here the only copy of a part's content is the one the caller takes of a value it
-    keeps. Two passes: the first counts parts and bounds each header block, so both of those caps
-    refuse before any header is parsed; the second parses each header, which says whether the part
-    is a file, and applies the file and field caps to the part's length.
+    keeps. Two passes: the first counts parts, bounds each header block and bounds each part with no
+    header block, all before any header is parsed; the second parses each header, which says
+    whether the part is a file, and applies the file and field caps to the part's length. A body
+    over more than one cap is refused by whichever check the walk reaches first, so its message
+    and status can differ from the parser this replaced.
 
     Raises what :func:`parse_multipart_form` documents."""
     boundary = parse_boundary(content_type)
@@ -197,14 +204,15 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             raise MultipartError(f"multipart body has more parts than the limit of {_MAX_PARTS}")
         sep = body.find(b"\r\n\r\n", start, end)
         if sep == -1:
-            # A part with no header block is kept by nobody, like a nameless field, and is bounded
-            # the same way (less the CRLF before the next delimiter), so no shape of ignored part is
-            # bounded by the body cap alone.
+            # A part with no header block is kept by nobody, and is bounded at the field cap (less
+            # the CRLF before the next delimiter), so no shape of ignored part is bounded by the body
+            # cap alone. A 400, not a 413: the likeliest cause is headers ended with bare LFs, and
+            # the part's size is not what the client has to change.
             size = end - start - (2 if body.endswith(b"\r\n", start, end) else 0)
             if size > _MAX_FIELD_BYTES:
-                raise MultipartTooLargeError(
-                    f"multipart part with no header block is {size} bytes; the limit is "
-                    f"{_MAX_FIELD_BYTES}. {_FILE_AS_FIELD_HINT}"
+                raise MultipartError(
+                    f"multipart part of {size} bytes has no header block ended by a blank CRLF "
+                    f"line; a part without one is skipped only up to {_MAX_FIELD_BYTES} bytes"
                 )
         else:
             if sep - start > _MAX_PART_HEADER_BYTES:
@@ -296,9 +304,10 @@ async def parse_upload_off_loop(
     one C call that holds the GIL while it runs, so the event loop can still lose the time of the
     longest such call.
 
-    A cancelled request (the request deadline) gives up its reference to ``body`` at once: a work
-    item still queued on the executor holds an emptied list, not the body. A parse that has already
-    started runs to the end, since a thread cannot be stopped."""
+    When a request is cancelled (the request deadline) while its parse is still queued, the work
+    item left on the executor holds an emptied list, not the body; the cancelled coroutine's own
+    frame lets go of it when its Task does. A parse that has already started runs to the end,
+    since a thread cannot be stopped."""
     held = [body]
 
     def parse() -> FilePart:
