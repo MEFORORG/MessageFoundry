@@ -243,9 +243,11 @@ def _drop_signature(signature: Any) -> None:
     """Remove ``signature`` from its parent and keep its tail text, as the enveloped transform does.
 
     A copy of ``signxml.util._remove_sig``, the removal the verifier runs, so the document side of
-    the comparison drops exactly what the digest side dropped. Copied rather than imported because
-    that name is private; keep the two in step. Dropping the tail too would refuse a pretty-printed
-    document.
+    the comparison drops the signature exactly as the digest side dropped it. Copied rather than
+    imported because that name is private; keep the two in step. Dropping the tail too would refuse
+    a pretty-printed document. It does not mirror the other removal signxml makes: from 5.3.0 it
+    strips every comment from a same-document reference before digesting, and the comparison in
+    :func:`_coverage_refusal` keeps comments, so it refuses any comment under the signed element.
     """
     parent = signature.getparent()
     if signature.tail:
@@ -306,7 +308,9 @@ def _coverage_refusal(root: Any, result: Any, location: str) -> str | None:
     ``URI="#id"`` naming the document element, without parsing the URI. Both sides are compared as
     exclusive C14N WITH comments. So an unused namespace declaration does not cause a false refusal,
     and a comment the signature excluded is refused: a comment can split a text node and change what
-    an element's ``.text`` reads. For the same reason a comment or processing instruction before or
+    an element's ``.text`` reads. From signxml 5.3.0 a same-document reference, ``URI=""`` or
+    ``URI="#id"``, excludes every comment whatever its c14n method, so every comment under the
+    signed element is refused. For the same reason a comment or processing instruction before or
     after the document element is refused: no enveloped signature covers one. The ``ds:Signature``
     element is checked on its own, because the comparison removes it.
 
