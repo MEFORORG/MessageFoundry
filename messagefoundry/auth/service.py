@@ -20214,8 +20214,8 @@ class AuthService:
         self, gate_only: frozenset[str], *, role_id: str, actor: str
     ) -> None:
         """One :data:`GATE_ONLY_REVOKE_ACTION` row per account a custom-role edit or delete of
-        ``role_id`` revoked although its stored role rows, read after the gate, neither hold the
-        role nor fail to parse, and its stored row has no timestamp or counter cell that does not
+        ``role_id`` revoked although, read after the gate, its stored role rows neither hold the
+        role nor fail to parse and its stored row has no timestamp or counter cell that does not
         parse (BACKLOG #5505). The gate names such an account because its integrity
         check failed, or because it held the role when the gate read it. The role's own row does
         not list the accounts it ended, so this is the row that names them. A refused write is
@@ -20289,8 +20289,8 @@ class AuthService:
         says. So on a store with an integrity key a row tampered to read as outside the save is
         still named, and its sessions are revoked rather than only refused, so a later repair of
         its row does not bring them back. With no key no seal is checked, so such a row is taken
-        as it reads. A row the list read leaves out is not named, at least one with a cell that
-        does not parse and an id cell that is empty or not text.
+        as it reads. A row the list read leaves out is not named, at least one with a timestamp or
+        counter cell that does not parse and an id cell that is empty or not text.
 
         The step-up gate reads it with ``checked`` and hands that set to the save, so the caller's
         own check is read once. The revoke adds a read without ``checked``, after the save, so an
@@ -21171,9 +21171,7 @@ class AuthService:
 
         Resolving which principals a map edit actually affects would mean re-binding to the
         directory, and both a removed mapping and an added one change an outcome, so the affected set
-        is not derivable from the entries alone. A local account reads neither map, and one whose row
-        has no timestamp or counter cell that does not parse and whose integrity check passed at
-        the gate is left alone.
+        is not derivable from the entries alone. A local account reads neither map.
 
         Each account's unrevoked rows are revoked with the store's ``revoke_user_sessions``, so this
         needs no schema change on any backend. The count it returns includes rows already past their
