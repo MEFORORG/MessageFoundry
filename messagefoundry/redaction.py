@@ -1323,12 +1323,14 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
     out: list[str] = []
     #: One frame per open container: ``(is_object, policy, closer)``. An object's policy is LEAF or
     #: INHERIT (searched); an array's or a call's is the policy its elements take. ``closer`` is the
-    #: one delimiter that ends the frame (BACKLOG #5814). A closer of another kind ends nothing: the
-    #: frame stays open and its policy rises to LEAF, so everything up to its own closer is scrubbed.
-    #: Ending the frame early would hand what follows to a parent or a later key that may keep it, and
-    #: keeping the frame's own policy would keep what an INHERIT frame holds. A text that never brings
-    #: the right closer is scrubbed to its end, the direction an unclosed structure already takes.
+    #: one delimiter that ends the frame (BACKLOG #5814).
     frames: list[tuple[bool, int, str]] = []
+    #: Set by a closer of another kind than the open frame's, which ends nothing. From then on every
+    #: data token is scrubbed as LEAF, keys and callable names included, until the walk's own frames
+    #: close or the text ends. Ending a frame early would hand what follows to a parent frame or a
+    #: later key that may keep it, and keeping the walk as it was would keep what an INHERIT frame
+    #: holds. It covers only this walk: a value the walk has already returned from is outside it.
+    malformed = False
     pending = policy
     n = len(text)
     while pos < n:
@@ -1362,12 +1364,14 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
                     return "".join(out), pos
                 pending = frames[-1][1]
             elif punct in "}])":
-                frames[-1] = (frames[-1][0], _LEAF, frames[-1][2])
-                pending = _LEAF
+                malformed = True
             elif punct == ",":
                 pending = frames[-1][1]
             continue
         pos = match.end()
+        if malformed:
+            out.append(_json_scalar(match, _LEAF, widened))
+            continue
         bare = match.group("bare") is not None
         if bare and text.startswith("(", pos):
             out.append(token)  # a callable's name; the call's parentheses hold the value

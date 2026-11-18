@@ -47,9 +47,9 @@ def test_a_mismatched_closer_does_not_end_the_scrub(scrub: Callable[[str], str],
 @pytest.mark.parametrize(
     "text",
     [
-        # A frame that keeps what it holds (the INHERIT members of an identifier or telecom) and an
-        # identifier array both rise to LEAF on a stray closer rather than ending or staying as they
-        # were, so neither the identifier's own value nor a later key's value is kept.
+        # After a stray closer the walk scrubs every data token until its own frames close, so
+        # neither an identifier's own value, nor a later key's value, nor a key or a callable name
+        # in between is kept, whichever frame (INHERIT or not, nested or not) the closer landed in.
         '{"identifier": {"system": [1, 2), "value": "Qmrnxq"}}',
         '{"identifier": [{"system": "x" ] "Qmrnxq"}]',
         '{"identifier": {"system": "x" ) , "value": "Qmrnxq"}}',
@@ -60,9 +60,15 @@ def test_a_mismatched_closer_does_not_end_the_scrub(scrub: Callable[[str], str],
         f'{{"telecom": [{{"use": f(]}}], "given": "{GIVEN}", "family": "{FAMILY}"}}',
         f'{{"identifier": [{{"system": "urn:x", "value": "1"}}}}, "name": [{{"text": "{FAMILY}"}}]}}',
         f"{{'identifier': ['x' }}, 'family': {{'{FAMILY}'}}}}",
+        f'{{"identifier": {{"system": [["x" }}], "family": "{GIVEN}"}}}}',
+        f'{{"telecom": {{"system": [("x" ]), "given": "{GIVEN}"}}}}',
+        f'{{"identifier": {{"system": [["x" }}], "00100010": "{GIVEN}"}}}}',
+        f'{{"name": {{"x" ] "family": "{GIVEN}": 1}}}}',
+        f'{{"family": ["x" ) {GIVEN}(1)]}}',
+        f'{{"identifier": {{"system": "x" ] , "{GIVEN}": 1}}}}',
     ],
 )
-def test_a_mismatched_closer_never_lowers_the_scrub_level(
+def test_a_mismatched_closer_hands_nothing_to_a_frame_that_keeps_it(
     scrub: Callable[[str], str], text: str
 ) -> None:
     out = scrub(text)
