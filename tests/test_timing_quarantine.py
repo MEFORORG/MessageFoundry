@@ -2,7 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pin the timing quarantine against the tree and against ci.yml (BACKLOG #4773).
 
-The owner ruling of 2026-10-29 that authorises it is quoted in tests/timing_quarantine.txt.
+The owner rulings of 2026-10-29 and 2026-11-18 that authorise it are quoted in
+tests/timing_quarantine.txt.
 
 ``tests/timing_quarantine.txt`` takes tests off the engine legs, so it can fail in the two ways the
 tooling manifest can, plus one of its own:
