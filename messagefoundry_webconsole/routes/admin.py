@@ -58,6 +58,7 @@ from .. import pages
 from .._auth import (
     assert_same_origin,
     clear_session_cookie,
+    gate_ended_sessions,
     register_ui_action,
     require_ui,
     require_ui_step_up,
@@ -1104,7 +1105,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 description=form.get("description", "").strip() or None,
                 permissions=perms,
             )
-            await admin.update_custom_role(role_id, body=body, service=service, identity=identity)
+            await admin.update_custom_role(
+                role_id,
+                body=body,
+                service=service,
+                identity=identity,
+                ended=gate_ended_sessions(request),
+            )
         except (ValidationError, HTTPException) as exc:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
@@ -1133,7 +1140,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
-        await admin.delete_custom_role(role_id, service=service, identity=identity)
+        await admin.delete_custom_role(
+            role_id, service=service, identity=identity, ended=gate_ended_sessions(request)
+        )
         return await _after_group_save(request, service, "/ui/roles")
 
     # --- AD group mappings --------------------------------------------------
@@ -1188,7 +1197,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     if g and r
                 ]
             )
-            await admin.set_ad_group_map(body=body, service=service, identity=identity)
+            await admin.set_ad_group_map(
+                body=body, service=service, identity=identity, ended=gate_ended_sessions(request)
+            )
         except (ValidationError, ValueError, HTTPException) as exc:
             detail = str(exc.detail) if isinstance(exc, HTTPException) else "invalid input"
             return await _ad_groups_response(service, identity, error=detail, status_code=400)
@@ -1219,7 +1230,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     if g and c
                 ]
             )
-            await admin.set_ad_group_scope_map(body=body, service=service, identity=identity)
+            await admin.set_ad_group_scope_map(
+                body=body, service=service, identity=identity, ended=gate_ended_sessions(request)
+            )
         except (ValidationError, ValueError, HTTPException) as exc:
             detail = str(exc.detail) if isinstance(exc, HTTPException) else "invalid input"
             return await _ad_groups_response(service, identity, error=detail, status_code=400)

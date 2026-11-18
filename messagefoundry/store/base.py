@@ -2557,7 +2557,14 @@ class AuthStore(Protocol):
         """
         ...
 
-    async def list_users(self) -> Sequence[UserRecord]: ...
+    async def list_users(self) -> Sequence[UserRecord]:
+        """Every account except each one whose row does not parse and whose id cell is empty or not
+        text, which is left out. Any other whose row does not parse
+        (:func:`~messagefoundry.store.store.listed_users` says which) is listed as
+        :meth:`~messagefoundry.store.store.UserRecord.unreadable_row`, whose fields other than the
+        id are invented (BACKLOG #5505); the single-row user readers raise
+        ``RowSealError`` for such a row instead."""
+        ...
 
     async def count_users(self) -> int: ...
 
@@ -2955,7 +2962,10 @@ class AuthStore(Protocol):
         passkeys goes through one helper per backend, which verifies the record it read before it
         re-seals it and raises :class:`~messagefoundry.store.row_seal.RowSealError` rather than
         re-seal a record that fails. Deleting needs no key. :class:`AuthService` checks the seal,
-        in its one user loader; the store's readers return rows unchecked."""
+        in its one user loader; the store's readers return rows unchecked. A role row with a cell
+        the read parses that does not parse raises ``RowSealError``, as the write helpers' read
+        does (BACKLOG #5505), and that loader answers it as a record that fails its integrity
+        check, keyed or keyless."""
         ...
 
     async def reseal_user_records(self) -> tuple[int, int]:
@@ -3406,7 +3416,12 @@ class AuthStore(Protocol):
     async def get_session(self, token_hash: str) -> SessionRecord | None: ...
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        strict: bool = False,
     ) -> list[SessionRecord]:
         """A user's unrevoked sessions not past their absolute expiry, most recently used first.
 
@@ -3421,7 +3436,10 @@ class AuthStore(Protocol):
         This is deliberately not ``SessionRecord.is_live``: a row stamped ahead of ``now`` (a
         backward clock step) stays listed. Unless it is presented and revoked first, the validator
         accepts it again once the clock catches up, so hiding it would keep the user from seeing or
-        ending a session that can still come back."""
+        ending a session that can still come back.
+
+        A row that does not parse is left out (BACKLOG #5505); with ``strict`` it raises
+        :class:`~messagefoundry.store.row_seal.RowSealError` instead."""
         ...
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...
@@ -3539,6 +3557,10 @@ class AuthStore(Protocol):
         ``lineage_since`` left ``None`` no link is followed, and a rotation that committed first
         leaves this returning ``None``, as before. The lineage lookup lives here and nowhere else:
         no session READ follows a link, so a retired hash authenticates nothing.
+
+        A row the revoke ended that does not parse when read back raises
+        :class:`~messagefoundry.store.row_seal.RevokedRowSealError` once the revoke has committed
+        (BACKLOG #5505).
         """
         ...
 
