@@ -231,9 +231,11 @@ def test_a_reporting_crash_still_writes_the_receipt(
 
 
 def test_load_policy_does_not_claim_its_readers_run_outside_a_handler() -> None:
-    """The comment on load_policy's number checks said receipt_lines ran outside any handler.
-    main's catch-all around _report covers it, as the reporting-crash tests above exercise, so the
-    comment must say so rather than give a reason that is no longer true."""
-    source = inspect.getsource(sweep.load_policy)
-    assert "outside any" not in source
-    assert "catch-all around _report" in source
+    """load_policy's comments said its readers ran outside a handler and would crash to exit 1.
+    main's catch-alls now cover every later reader, as the reporting-crash tests above exercise,
+    so neither stale reason may stand. Only the withdrawn claims are pinned, not new wording."""
+    # One line of prose, so a claim wrapped across two comment lines still matches.
+    lines = inspect.getsource(sweep.load_policy).splitlines()
+    source = " ".join(line.strip().lstrip("#").strip() for line in lines)
+    for stale in ("outside any handler", "outside evaluate()'s", "crash it later as exit 1"):
+        assert stale not in source, stale

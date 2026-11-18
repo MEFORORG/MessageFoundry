@@ -182,8 +182,8 @@ def load_policy(path: Path) -> dict[str, Any]:
         if key not in parsed:
             raise PolicyError(f"the policy at {path} is missing the required {key!r} section")
     for key in ("unreachable_allowlist", "anonymous_allowlist", "public_websocket_allowlist"):
-        # Every reader iterates these, some outside evaluate()'s PolicyError handler, so a null or
-        # a string must stop the run here, as could-not-measure, and not crash it later as exit 1.
+        # Every reader iterates these. main's catch-alls would turn a later crash into exit 2, but
+        # checked here a null or a string stops the run before the sweep and names the section.
         if not isinstance(parsed[key], list):
             raise PolicyError(
                 f"the policy at {path} has {key!r} as {type(parsed[key]).__name__}, not a list"

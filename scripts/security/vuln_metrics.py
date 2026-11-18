@@ -50,6 +50,8 @@ KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulner
 EPSS_URL = "https://api.first.org/data/v1/epss"
 _CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 _USER_AGENT = "messagefoundry-vuln-metrics"
+#: Seconds one `gh` call may take; the weekly job's own limit is 10 minutes.
+_GH_TIMEOUT = 120.0
 
 
 def _gh(args: list[str]) -> Any:
@@ -63,8 +65,11 @@ def _gh(args: list[str]) -> Any:
             encoding="utf-8",  # PR bodies carry non-cp1252 bytes; force utf-8 (Windows default isn't)
             errors="replace",
             check=True,
+            # A hung call would hold the step until the job is cancelled, and no row is written.
+            timeout=_GH_TIMEOUT,
         ).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+    # OSError covers a gh that is missing or cannot be executed.
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         print(f"warning: gh {' '.join(args)} failed: {exc}", file=sys.stderr)
         return None
     try:
@@ -175,6 +180,18 @@ def _norm_ver(v: str) -> str:
     return v.strip().lstrip("vV").lower()
 
 
+def _version_key(v: str) -> tuple[int, ...] | str:
+    """A comparison key under which a plain release equals itself padded with zeros, as PEP 440
+    has it (``1.2`` is ``1.2.0``); any other version compares by its normalized text."""
+    norm = _norm_ver(v)
+    if not re.fullmatch(r"\d+(?:\.\d+)*", norm):
+        return norm
+    parts = [int(x) for x in norm.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
 def _reachability_ratio(spec: str | None) -> str:
     """Triaged reachable/total from the runbook records (a judgment, not API-derivable)."""
     if not spec:
@@ -203,9 +220,11 @@ def adopter_lag(
     rel = _gh(
         ["api", f"repos/{repo}/releases/latest", "--jq", "{tag: .tag_name, at: .published_at}"]
     )
+    if rel is None:
+        return "n/a: gh could not read the latest engine release"
     if not isinstance(rel, dict) or not isinstance(rel.get("tag"), str) or not rel["tag"]:
         return "n/a: no engine release to compare against"
-    latest = _norm_ver(rel["tag"])
+    latest = _version_key(rel["tag"])
     published = _parse_dt(rel.get("at"))
     lags: list[float] = []
     for ar in adopter_repos:
@@ -215,7 +234,8 @@ def adopter_lag(
         if not isinstance(content, str) or not content:
             return f"n/a: can't read {ar}/requirements.txt (cross-repo access?)"
         try:
-            text = base64.b64decode(content).decode("utf-8", "replace")
+            # utf-8-sig: a BOM would otherwise hide a pin on the first line.
+            text = base64.b64decode(content).decode("utf-8-sig", "replace")
         # binascii.Error is a ValueError, and so is a non-ASCII str: either is an unread file.
         except ValueError:
             return f"n/a: {ar}/requirements.txt content is not base64"
@@ -224,7 +244,7 @@ def adopter_lag(
         # messagefoundry line at all is not "up to date", so it is n/a, never a lag of 0.
         if pin is None:
             return f"n/a: {ar}/requirements.txt has no single exact messagefoundry== pin"
-        if _norm_ver(pin) != latest:
+        if _version_key(pin) != latest:
             if published is None:
                 return "n/a: the latest engine release has no publish date"
             lags.append((now - published).total_seconds() / 86400)
@@ -342,8 +362,10 @@ def compute(
 
     # 4. EPSS coverage — share of seen CVEs scored + count at the >=0.7 imminent bar.
     if seen_cves:
-        scored = len(epss)
-        imminent = sum(1 for v in epss.values() if v >= 0.7)
+        # Only the CVEs asked about: a row the API added for another CVE would overstate both.
+        asked = {c: v for c, v in epss.items() if c in seen_cves}
+        scored = len(asked)
+        imminent = sum(1 for v in asked.values() if v >= 0.7)
         m["epss_coverage_pct"] = f"{100 * scored / len(seen_cves):.0f}"
         m["epss_ge_0_7_count"] = str(imminent)
     else:

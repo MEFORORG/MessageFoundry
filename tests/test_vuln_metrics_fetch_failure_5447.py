@@ -312,6 +312,78 @@ def test_adopter_content_that_is_not_base64_is_na(monkeypatch: pytest.MonkeyPatc
     assert lag.startswith("n/a") and "example/adopter" in lag, lag
 
 
+@pytest.mark.parametrize(
+    "requirements",
+    [
+        pytest.param("messagefoundry==1.2\n", id="padded-release"),
+        pytest.param("﻿messagefoundry==1.2.0\n", id="bom"),
+    ],
+)
+def test_an_up_to_date_pin_is_not_a_lag(monkeypatch: pytest.MonkeyPatch, requirements: str) -> None:
+    """``1.2`` is ``1.2.0`` under PEP 440, and a BOM does not hide a first-line pin."""
+    mod = _load()
+    assert _adopter(monkeypatch, mod, requirements) == "0"
+
+
+def test_an_unread_release_is_not_no_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A gh failure reading the release is named as one, not as the absence of a release."""
+    mod = _load()
+
+    def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(argv, 1.0)
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    lag = mod.adopter_lag("example/repo", ["example/adopter"], _NOW, 1.0)
+    assert lag.startswith("n/a") and "could not read" in lag, lag
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(subprocess.TimeoutExpired(["gh"], 1.0), id="timeout"),
+        pytest.param(PermissionError("synthetic"), id="not-executable"),
+    ],
+)
+def test_a_hung_or_unexecutable_gh_is_an_unread_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    mod = _load()
+    _stub(monkeypatch, mod)
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert kwargs.get("timeout"), "every gh call carries a timeout"
+        raise error
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    code, row = _main(mod, tmp_path)
+    assert code == 2, row
+    assert row["dependabot_prs_window"].startswith("n/a"), row
+
+
+def test_epss_rows_for_cves_not_asked_do_not_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mod = _load()
+    _stub(monkeypatch, mod)
+    real = mod.urllib.request.urlopen
+
+    def urlopen(req: Any, timeout: float = 0) -> _Resp:
+        if req.full_url.startswith(mod.EPSS_URL):
+            rows = [
+                {"cve": _CVE_KEV, "epss": "0.9"},
+                {"cve": _CVE_OTHER, "epss": "0.1"},
+                {"cve": "CVE-2099-0003", "epss": "0.95"},
+            ]
+            return _Resp(json.dumps({"data": rows}).encode())
+        return real(req, timeout)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
+    code, row = _main(mod, tmp_path)
+    assert code == 0, row
+    assert row["epss_coverage_pct"] == "100", row
+    assert row["epss_ge_0_7_count"] == "1", row
+
+
 def test_a_stale_pin_against_an_undated_release_is_na(monkeypatch: pytest.MonkeyPatch) -> None:
     """A stale pin whose lag cannot be dated is not a lag of 0."""
     mod = _load()
