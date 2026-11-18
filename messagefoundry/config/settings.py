@@ -2217,6 +2217,18 @@ class ApiSettings(_Section):
                 "[api].tls_client_cert_identities requires [api].tls_client_ca_file (in-process mTLS "
                 "verifies the client cert before its subject is resolved to a principal)"
             )
+        # The client-CA pin and the client CRL each act only on the client chain that
+        # tls_client_ca_file has the server verify. Without it no client certificate is asked for,
+        # so a pin or CRL would load while enforcing nothing. Fail loud at load (BACKLOG #5315).
+        for name, value in (
+            ("tls_client_ca_pin", self.tls_client_ca_pin),
+            ("tls_client_crl_file", self.tls_client_crl_file),
+        ):
+            if value is not None and not self.tls_client_ca_file:
+                raise ValueError(
+                    f"[api].{name} requires [api].tls_client_ca_file (in-process mTLS): without "
+                    "it no client certificate is verified, so the setting would enforce nothing"
+                )
         # A declared upstream terminator means nothing unless the engine knows (and trusts) the proxy
         # in front -- otherwise it's an unverifiable claim that XFF could spoof. It never satisfies
         # the off-loopback exposed-bind gate on its own (BACKLOG #4636; docs/SECURITY.md, Plaintext

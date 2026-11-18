@@ -2446,6 +2446,34 @@ def test_an_existing_crl_path_loads_on_each_setting(
     about the path and not the setting. The store is left out because it also needs the postgres
     backend and its server fields; test_hop_refusal_revocation.py covers it."""
     crl = _write(tmp_path / "crl.pem", "placeholder")
-    cfg = _write(tmp_path / "messagefoundry.toml", _toml(section, key, str(crl)))
+    body = _toml(section, key, str(crl)) + _CRL_COMPANIONS.get(section, "")
+    cfg = _write(tmp_path / "messagefoundry.toml", body)
     loaded = load_settings(config_path=cfg, environ={})
     assert getattr(getattr(loaded, section), key) == str(crl), name
+
+
+#: The settings a CRL knob needs beside it to load at all: the client CRL acts only under in-process
+#: mTLS (BACKLOG #5315).
+_CRL_COMPANIONS = {
+    "api": 'tls_cert_file = "server.pem"\ntls_client_ca_file = "client-ca.pem"\n',
+}
+
+
+# --- BACKLOG #5315: the client-CA pin and the client CRL need the client CA they act on --------------
+
+
+@pytest.mark.parametrize("field", ["tls_client_ca_pin", "tls_client_crl_file"])
+def test_a_client_pin_or_crl_without_the_client_ca_is_refused_at_load(
+    tmp_path: Path, field: str
+) -> None:
+    """Without [api].tls_client_ca_file the server asks for no client certificate, so the pin and
+    the CRL would load and enforce nothing. Red under: the refusal removed, where both load."""
+    value = "ab" * 32 if field == "tls_client_ca_pin" else str(_write(tmp_path / "c.pem", "x"))
+    refusal = rf"\[api\]\.{field} requires \[api\]\.tls_client_ca_file"
+    with pytest.raises(ValidationError, match=refusal):
+        ApiSettings.model_validate({"tls_cert_file": "server.pem", field: value})
+    # The control: the same value beside the client CA it acts on loads unchanged.
+    loaded = ApiSettings.model_validate(
+        {"tls_cert_file": "server.pem", "tls_client_ca_file": "client-ca.pem", field: value}
+    )
+    assert getattr(loaded, field) == value

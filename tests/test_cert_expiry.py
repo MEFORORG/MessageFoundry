@@ -565,7 +565,12 @@ def _all_crl_settings(tmp_path: Path, *, next_update: datetime.datetime) -> Serv
             ssl_root_cert=str(paths["store"]),
             ssl_crl_file=str(paths["store"]),
         ),
-        api=ApiSettings(tls_client_crl_file=str(paths["api"])),
+        # The client CRL needs the client CA it acts on (BACKLOG #5315), which needs a server cert.
+        api=ApiSettings(
+            tls_cert_file="server.pem",
+            tls_client_ca_file="client-ca.pem",
+            tls_client_crl_file=str(paths["api"]),
+        ),
     )
 
 

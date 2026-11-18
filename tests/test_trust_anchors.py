@@ -2026,9 +2026,15 @@ def test_a_blank_settings_pin_refuses_at_load(
 
     with pytest.raises(ValidationError, match=re.escape(setting) + " is set but empty"):
         model.model_validate({field: blank})
-    # The controls: absent means no pin, and a real pin loads unchanged.
+    # The controls: absent means no pin, and a real pin loads unchanged. The client-CA pin needs the
+    # client CA it pins, which needs a server cert (BACKLOG #5315).
+    anchor = (
+        {"tls_cert_file": "server.pem", "tls_client_ca_file": "client-ca.pem"}
+        if model is ApiSettings
+        else {}
+    )
     assert getattr(model.model_validate({}), field) is None
-    assert getattr(model.model_validate({field: "ab" * 32}), field) == "ab" * 32
+    assert getattr(model.model_validate({**anchor, field: "ab" * 32}), field) == "ab" * 32
 
 
 def test_a_blank_settings_pin_from_the_environment_refuses(tmp_path: Path) -> None:
