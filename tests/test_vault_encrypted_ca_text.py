@@ -158,8 +158,9 @@ def test_ca_text_with_a_private_key_is_refused_before_any_tls_load(
     proxied: bool, label: str
 ) -> None:
     """BACKLOG #3745. Red with the private-key check removed from ``_refuse_encrypted_ca_text``:
-    the key block has no encryption header, so nothing else refuses it."""
-    text = _PLAIN + f"-----BEGIN {label}-----\nAAAA\n-----END {label}-----\n"
+    the key block has no encryption header, so nothing else refuses it. The key block's own body
+    is a marker too, so a refusal that echoed the key is red (vault BACKLOG #4569 finding 6)."""
+    text = _PLAIN + f"-----BEGIN {label}-----\nSYNTHETICKEYBODYMARKER\n-----END {label}-----\n"
     made, factory = _contexts(_NoTlsLoad)
     conn = _connection(factory, proxied=proxied, ca_cert_data=text)
     with pytest.raises(InsecureHopRefused) as refusal:
@@ -168,6 +169,7 @@ def test_ca_text_with_a_private_key_is_refused_before_any_tls_load(
     assert made == [], "a TLS context was built for CA text the hop refuses"
     assert PRIVATE_KEY_SCOPE in str(refusal.value)
     assert "SYNTHETICBODYMARKER" not in str(refusal.value), "the refusal echoed the CA text"
+    assert "SYNTHETICKEYBODYMARKER" not in str(refusal.value), "the refusal echoed the key's body"
 
 
 @pytest.mark.parametrize(
