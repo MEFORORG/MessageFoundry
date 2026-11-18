@@ -370,9 +370,9 @@ have not, the document says nothing about that CVE and your scanner's finding st
   not part of it. The broader all-extras dependency set is continuously audited by
   **pip-audit**.
 - **VS Code extension** — `@cyclonedx/cyclonedx-npm --package-lock-only --spec-version 1.6 --validate`
-  over the committed `ide/package-lock.json` (install-free, full tree). It emits CycloneDX 1.6, like
-  the engine SBOMs, and fails the step if the SBOM does not validate against that schema or the
-  validator is not installed. The extension bundles its payload with esbuild and
+  over the committed `ide/package-lock.json` (install-free, full tree). What the two flags do, and
+  that a failure there blocks nothing, is the comment on that step in `security.yml`. The extension
+  bundles its payload with esbuild and
   has no runtime npm dependencies, so the SBOM inventories the build toolchain. Continuously audited by
   **npm-audit**. The generator itself, and the jscpd clone report in `quality-advisory.yml`, install
   from a separate committed lock, `ci/npm-tools/package-lock.json` (vault BACKLOG #2793). **No

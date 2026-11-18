@@ -175,7 +175,7 @@ def test_the_npm_tools_lock_pins_every_package_by_integrity() -> None:
     manifest = json.loads((_NPM_TOOLS / "package.json").read_text(encoding="utf-8"))
     declared = manifest["dependencies"]
     print(f"declared npm tools: {declared}")
-    # The three ajv packages are cyclonedx-npm's optional validator peers (why: the description).
+    # The three ajv packages are the validator cyclonedx-npm's --validate loads (why: the description).
     assert set(declared) == {
         "jscpd",
         "@cyclonedx/cyclonedx-npm",
@@ -205,30 +205,57 @@ def test_the_npm_tools_lock_pins_every_package_by_integrity() -> None:
         )
 
 
+#: One cyclonedx-npm command: its arguments stop at a comment or at the next command on the line.
+_CYCLONEDX_NPM_RUN = re.compile(r"node_modules/\.bin/cyclonedx-npm(?![\w-])(?P<args>[^\n#;&|]*)")
+
+
+def _cyclonedx_npm_args(body: str) -> list[list[str]]:
+    """Each cyclonedx-npm command in a run body, as its argument tokens, with comment lines dropped
+    and backslash continuations joined into one line."""
+    code = _shell_code(body).replace("\\\n", " ")
+    return [m.group("args").split() for m in _CYCLONEDX_NPM_RUN.finditer(code)]
+
+
+def _pins_spec_and_validates(args: list[str]) -> bool:
+    """Every spec option says 1.6 and the last validate option is `--validate`. The tool's option
+    parser lets the last occurrence win, so an earlier right value does not count."""
+    specs: list[str] = []
+    validate: list[str] = []
+    for i, token in enumerate(args):
+        name, eq, value = token.partition("=")
+        if name in ("--spec-version", "--sv"):
+            specs.append(value if eq else (args[i + 1] if i + 1 < len(args) else ""))
+        elif token in ("--validate", "--no-validate"):
+            validate.append(token)
+    return bool(specs) and all(s == "1.6" for s in specs) and validate[-1:] == ["--validate"]
+
+
 def test_every_cyclonedx_npm_run_validates_and_pins_the_spec() -> None:
-    """cyclonedx-npm 7.x defaults to spec 1.7 and, without its optional ajv peers, skips schema
-    validation with only an INFO line. Every run passes `--spec-version 1.6`, the spec the engine
-    SBOMs and docs/SUPPLY-CHAIN.md state, and `--validate`, which turns a missing validator into a
-    failed step (why: security.yml's comment on that step)."""
-    run = re.compile(r"node_modules/\.bin/cyclonedx-npm(?![\w-])[^\n]*")
+    """Why both flags: security.yml's comment on the extension SBOM step."""
+    # Controls, through the same two functions the scan uses.
+    good = (
+        "x/node_modules/.bin/cyclonedx-npm --package-lock-only \\\n  --spec-version 1.6 --validate"
+    )
+    assert [_pins_spec_and_validates(a) for a in _cyclonedx_npm_args(good)] == [True]
+    for bad_body in (
+        "x/node_modules/.bin/cyclonedx-npm --package-lock-only",
+        "x/node_modules/.bin/cyclonedx-npm --output-file y  # --spec-version 1.6 --validate",
+        "x/node_modules/.bin/cyclonedx-npm --output-file y; z --spec-version 1.6 --validate",
+        "x/node_modules/.bin/cyclonedx-npm --spec-version 1.6 --validate --sv 1.7",
+        "x/node_modules/.bin/cyclonedx-npm --spec-version 1.6 --validate --no-validate",
+        "x/node_modules/.bin/cyclonedx-npm --spec-version 1.61 --validate",
+        "x/node_modules/.bin/cyclonedx-npm --spec-version=1.6 --validate-only",
+    ):
+        assert [_pins_spec_and_validates(a) for a in _cyclonedx_npm_args(bad_body)] == [False], (
+            bad_body
+        )
+
     calls = [
-        (wf, job, match.group(0))
-        for wf, job, body in _run_bodies()
-        for match in run.finditer(_shell_code(body).replace("\\\n", " "))
+        (wf, job, args) for wf, job, body in _run_bodies() for args in _cyclonedx_npm_args(body)
     ]
     print(f"cyclonedx-npm runs: {calls}")
     assert calls, "found no cyclonedx-npm run, so this scan checks nothing"
-    # Controls: the instrument sees each flag where it appears, and its absence where it does not.
-    assert re.search(r"--spec-version\s+1\.6(?!\S)", "x --spec-version 1.6 --validate")
-    assert not re.search(r"--spec-version\s+1\.6(?!\S)", "x --spec-version 1.61")
-    assert not re.search(r"--validate(?![\w-])", "x --validate-only")
-    bad = [
-        entry
-        for entry in calls
-        if not re.search(r"--spec-version\s+1\.6(?!\S)", entry[2])
-        or not re.search(r"--validate(?![\w-])", entry[2])
-        or "--no-validate" in entry[2]
-    ]
+    bad = [entry for entry in calls if not _pins_spec_and_validates(entry[2])]
     assert not bad, f"cyclonedx-npm runs without --spec-version 1.6 and --validate: {bad}"
 
 
