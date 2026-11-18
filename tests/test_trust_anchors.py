@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import ssl
+import stat
 import subprocess
 import time
 from collections.abc import AsyncIterator
@@ -3770,6 +3771,26 @@ def test_a_bounded_read_asks_for_no_more_than_the_file_and_one_byte(
     assert asked == [11]
     assert ta.read_if_regular(str(small), 4) == b"xxxx"  # a smaller limit still applies
     assert ta.read_if_regular(str(small)) == b"x" * 10  # and no limit reads it all
+
+
+def test_a_bounded_read_reads_past_an_understated_size_up_to_the_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file longer than the size its descriptor reports, such as one that grew between the
+    ``fstat`` and the read, is read up to the ``limit``, as origin/main read it, not cut at the
+    reported size and one byte. Red on 159e5a6ffc, which returned that prefix."""
+    grown = tmp_path / "grown.pem"
+    grown.write_bytes(b"y" * 50)
+    real = os.fstat
+
+    def understated(fd: int) -> os.stat_result:
+        info = list(real(fd))
+        info[stat.ST_SIZE] = 0
+        return os.stat_result(info)
+
+    monkeypatch.setattr(os, "fstat", understated)
+    assert ta.read_if_regular(str(grown), 100) == b"y" * 50
+    assert ta.read_if_regular(str(grown), 20) == b"y" * 20  # the limit still applies
 
 
 async def test_a_pem_refused_row_carries_the_refusal(

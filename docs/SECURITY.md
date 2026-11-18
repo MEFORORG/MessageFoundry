@@ -8163,7 +8163,7 @@ engine cannot read, refuses the start or the reload. These settings take no pin.
 refuse rather than warn). Every anchor the engine checks at start and reload takes it, the dialling
 CAs above and a connection's own `tls_ca_file` included, and so do at least the SQL Server
 `[store].ssl_root_cert` pin, a generic DATABASE connection's `odbc_params` `sslca` file and a Vault
-hop's CA text. The PostgreSQL `[store].ssl_root_cert` takes it only in `serve`'s settings check, at
+hop's CA text. The PostgreSQL `[store].ssl_root_cert` takes it in `serve`'s settings check, at
 least at start, reload and DR activation, after the store has opened with the file, as a paragraph
 below says. Not covered: at least
 the Vault CA files (`MEFOR_STORE_VAULT_CA_FILE`, `MEFOR_SECRETS_VAULT_CA_FILE`), which their hops

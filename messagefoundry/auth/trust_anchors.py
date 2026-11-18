@@ -1288,8 +1288,9 @@ def read_if_regular(path: str, limit: int = -1) -> bytes | None:
     ``os.stat`` opens the path itself, so a named pipe's server sees a client connect and a device
     name is opened, before this function can judge either. The file is then opened once and
     judged again by its own descriptor, so nothing swapped in between is read. A ``limit`` is
-    lowered to the descriptor's size plus one byte, so a small file under a large ``limit`` is
-    read without a buffer of ``limit`` bytes. ``O_NONBLOCK``,
+    first read as the descriptor's size plus one byte, so a small file under a large ``limit`` is
+    read without a buffer of ``limit`` bytes; a file longer than its reported size is read on, up
+    to ``limit``. ``O_NONBLOCK``,
     where the platform has it, keeps that open from waiting on a pipe with no writer, and
     ``O_NOCTTY`` keeps a terminal from becoming the engine's controlling terminal. A regular file
     is read blocking. The descriptor is closed here, once, whatever happens: ``fdopen`` never
@@ -1303,12 +1304,14 @@ def read_if_regular(path: str, limit: int = -1) -> bytes | None:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             return None
-        if limit >= 0:
-            limit = min(limit, info.st_size + 1)
+        first = limit if limit < 0 else min(limit, info.st_size + 1)
         if nonblock:
             os.set_blocking(fd, True)  # a buffered read of a non-blocking descriptor may get None
         with os.fdopen(fd, "rb", closefd=False) as handle:
-            return handle.read(limit)
+            data = handle.read(first)
+            if first < limit and len(data) == first:  # it grew, or its size understates it
+                data += handle.read(limit - first)
+            return data
     finally:
         os.close(fd)
 
