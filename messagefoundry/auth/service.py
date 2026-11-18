@@ -16360,6 +16360,11 @@ class AuthService:
         Returns policy violations (empty list = changed). No-op-safe for AD identities at the API
         layer, which rejects password changes for AD users before calling this.
 
+        **Raises ``ValueError("no such user")`` when the caller's row is gone**, before the write or
+        because the write matched no row, so no ``auth.password_changed`` row or success is reported
+        for a deleted account (BACKLOG #5902). :class:`BreachCorpusUnavailable` propagates from the
+        policy check unchanged: the password is refused, never accepted unscreened.
+
         **Raises :class:`FactorEnrolmentRequired` while ``[security].require_mfa`` covers the account
         and it holds no factor with a way past the sign-in lock** (ADR 0197 Amendment A, N-B2 part 4).
         The rotation ends every session, the holder's own included, so without this a holder who does
@@ -16381,7 +16386,12 @@ class AuthService:
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
-        user = await self._load_user(identity.user_id)
+        lookup = await self._lookup_user(identity.user_id)
+        if not lookup.held:
+            # BACKLOG #5902: the caller's row was deleted after its session was resolved. Refused
+            # here, before the hash, so no password_changed row is written for an absent account.
+            raise ValueError("no such user")
+        user = lookup.user
         covered = user is not None and self._covered_by_requirement(user, identity.roles)
         if covered and user is not None:
             await self._refuse_rotation_without_way_past(user)
@@ -16395,8 +16405,14 @@ class AuthService:
             # _has_way_past counts none (BACKLOG #3948).
             passkey_counts=self._gate_counts if webauthn.available() else _passkey_counts_nothing,
         )
-        if not written and covered:
-            raise FactorEnrolmentRequired()
+        if not written:
+            # A row deleted between the read above and the write is told apart from a lost way
+            # past, so neither a success nor an enrolment refusal is reported for an account that
+            # is gone (BACKLOG #5902).
+            if not (await self._lookup_user(identity.user_id)).held:
+                raise ValueError("no such user")
+            if covered:
+                raise FactorEnrolmentRequired()
         await self._revoke_after_commit(
             identity.user_id, change="password_changed", actor=identity.username, client=client
         )
