@@ -2091,11 +2091,12 @@ def _load_allowlist() -> list[re.Pattern[str]]:
         # a leak written inside the padding exactly as an unanchored entry did (BACKLOG #5445).
         # This refuses the common spellings only; a quantified group, a positive class such as
         # ``[0-9.]+`` or a bounded ``.{1,500}`` still passes it, and review is what stops those.
-        if _ABSORBS_ANY_TEXT.search(line):
+        if _absorbs_any_text(line):
             print(
                 f"scan_forbidden: scan-allowlist.txt line {lineno}: pattern has an unbounded wildcard "
-                "(at least ., \\S, \\W, \\D or a negated class, repeated without limit), so a leak written "
-                "inside the line it excuses would pass every detector. IGNORED. Spell that part out.",
+                "(at least ., \\S, \\W, \\D, \\w or a class holding one or negated, repeated without "
+                "limit), so a leak written inside the line it excuses would pass every detector. "
+                "IGNORED. Spell that part out.",
                 file=sys.stderr,
             )
             continue
@@ -2103,12 +2104,44 @@ def _load_allowlist() -> list[re.Pattern[str]]:
     return out
 
 
-#: An unescaped ``.``, ``\S``, ``\W``, ``\D`` or negated class under ``*``, ``+`` or ``{n,}``: the
-#: pattern pieces that match ANY text, so an allowlist entry holding one is not tied to one line.
-#: An even run of backslashes before it is a literal backslash, so it does not escape the wildcard.
-_ABSORBS_ANY_TEXT = re.compile(
-    r"(?<!\\)(?:\\\\)*(?:\.|\\[SWD]|\[\^(?:\\.|[^\]\\])*\])(?:[*+]|\{\d*,\})"
-)
+#: The escapes that match any text when repeated, or any word token (``\w``): ``\S``, ``\W`` and
+#: ``\D`` each cover all of their complement's letters and punctuation.
+_ABSORBING_ESCAPES = frozenset("SWDw")
+#: A quantifier with no upper bound.
+_UNBOUNDED = re.compile(r"[*+]|\{\d*,\}")
+
+
+def _absorbs_any_text(pattern: str) -> bool:
+    r"""Whether ``pattern`` holds a piece that matches any text, repeated without limit: an unescaped
+    ``.``, an absorbing escape (``_ABSORBING_ESCAPES``), or a character class that is negated or
+    holds one of those escapes (``[\s\S]``, ``[\w\W]``), under ``*``, ``+`` or ``{n,}``. An allowlist
+    entry holding one is not tied to the one line it was written for. Read piece by piece, so a
+    literal class such as ``[.*]`` and an escaped ``\.`` are not wildcards, and a doubled backslash
+    is a literal backslash that escapes nothing after it. A quantified group is not looked into."""
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\":
+            absorbs = pattern[i + 1 : i + 2] in _ABSORBING_ESCAPES
+            i += 2
+        elif ch == "[":
+            j = i + 1
+            absorbs = pattern[j : j + 1] == "^"
+            j += absorbs
+            if pattern[j : j + 1] == "]":
+                j += 1  # A leading ``]`` is a literal member of the class.
+            while j < len(pattern) and pattern[j] != "]":
+                if pattern[j] == "\\":
+                    absorbs = absorbs or pattern[j + 1 : j + 2] in _ABSORBING_ESCAPES
+                    j += 1
+                j += 1
+            i = j + 1
+        else:
+            absorbs = ch == "."
+            i += 1
+        if absorbs and _UNBOUNDED.match(pattern, i):
+            return True
+    return False
 
 
 ALLOWLIST = _load_allowlist()
@@ -2120,7 +2153,7 @@ def _allowlisted(line: str) -> bool:
     ``search``, an entry missing its ``^``/``$`` excused any line that merely CARRIED its shape, so a
     leak beside that shape went past every detector (BACKLOG #5445). ``fullmatch`` removes the
     dependence on anchors. It does not stop an entry whose own pieces can absorb a leak: the
-    loader's wildcard refusal (``_ABSORBS_ANY_TEXT``) catches the common spellings of that, and
+    loader's wildcard refusal (``_absorbs_any_text``) catches the common spellings of that, and
     review of each entry is what catches the rest."""
     return any(a.fullmatch(line) for a in ALLOWLIST)
 

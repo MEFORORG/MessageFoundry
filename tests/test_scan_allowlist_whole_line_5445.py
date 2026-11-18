@@ -129,7 +129,13 @@ def test_every_allowlist_entry_excuses_only_a_whole_line(mod) -> None:
         pytest.param(".*OIDC core [0-9]+.*", False, id="padded-both-ends"),
         pytest.param("^# keep .* here$", False, id="interior-wildcard"),
         pytest.param("^# keep [^!]+ here$", False, id="negated-class"),
+        pytest.param(r"^# keep [\s\S]* here$", False, id="space-and-non-space-class"),
+        pytest.param(r"^# keep [\w\W]+ here$", False, id="word-and-non-word-class"),
+        pytest.param(r"^# keep \w+ here$", False, id="word-escape"),
+        pytest.param(r"^# keep \\.* here$", False, id="a-literal-backslash-then-a-wildcard"),
         pytest.param("^# keep [a-z]+ here$", True, id="control-a-bounded-class"),
+        pytest.param("^# keep [.*] here$", True, id="control-a-literal-class"),
+        pytest.param(r"^# keep \.* here$", True, id="control-an-escaped-dot"),
     ],
 )
 def test_the_loader_refuses_an_entry_with_an_unbounded_wildcard(
