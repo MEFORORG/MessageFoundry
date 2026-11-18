@@ -9876,9 +9876,15 @@ def create_app(
                     ),
                     client=client_ip(request),
                 )
-            except Exception as exc:  # noqa: BLE001 -- the refusal stands whatever the audit does
-                # Names the refusal's own status and cause, which the row would have held, once
-                # per preset and failure per interval: an outage fails every write.
+            except audit_write_errors() as exc:
+                # The store-refusal set the other fail-soft audit writes catch. Defects
+                # (AUDIT_WRITE_DEFECTS) are not re-raised: a raise would replace the refusal owed
+                # with a 500, the case write_audit_soft's docstring says to pass defects=() for.
+                # write_audit_soft itself is not used: it logs the traceback, whose frames reach
+                # the route frame's decrypted `criterias`. Names the refusal's own status and
+                # cause, which the row would have held, at most once per preset, cause and failure
+                # class per interval: an outage fails every write. Later failures in that window
+                # leave no row and no log line.
                 failed = type(exc).__name__
                 if _first_layered_refusal(preset_id, f"audit:{cause}:{failed}"):
                     _log.error(
@@ -9936,7 +9942,9 @@ def create_app(
                 # value's AEAD tag (a key-version refusal, a 403). It answered 500. The type name
                 # only: the cipher's text can echo fields cut from the stored value, and this cell
                 # may have been written outside the store. ERROR, once per preset and error class
-                # per interval; the route's audit row records each one. Transit's AEAD refusal of
+                # per interval. refuse() tries to write the route's audit row for each refusal; a
+                # write that fails leaves no row, and its own ERROR is logged at most once per
+                # preset, cause and failure class per interval. Transit's AEAD refusal of
                 # a cell planted across owners is a CellTagError above (BACKLOG #5650). The outage
                 # above is a WARNING: it says nothing about the cell.
                 cause = type(exc).__name__
