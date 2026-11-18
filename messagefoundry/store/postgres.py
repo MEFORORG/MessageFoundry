@@ -1765,8 +1765,9 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
     # that flag rather than the setting. The pool builds a fresh context per connection through the
-    # same builder (`_per_connection_ssl_connect`), and that builder either sets the flag or raises,
-    # so the verdict reached here holds for every connection the pool opens.
+    # same builder (`_per_connection_ssl_connect`). With ssl_crl_file set it either sets the flag or
+    # raises; unset, it leaves the flag clear. Either way the verdict reached here holds for every
+    # connection the pool opens.
     _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
     return ctx
 
@@ -1871,7 +1872,12 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
     The one builder for both verifying branches. :func:`_build_ssl` calls it once at pool open, to run
     the refusals against a real context. The pool's ``connect`` hook calls it again for EVERY new
     connection (BACKLOG #300), so each handshake reads the trust store and the CRL file as they are
-    then, which is what asyncpg's own ``ssl=True`` did for the system trust store."""
+    then, which is what asyncpg's own ``ssl=True`` did for the system trust store.
+
+    With ``[store].ssl_crl_file`` set, it loads that CRL and sets ``VERIFY_CRL_CHECK_LEAF``
+    (``harden_crl_check``), or raises. Unset, it leaves that flag clear, so the
+    context checks no revocation and the store's revocation guard credits it nothing
+    (:func:`_refuse_store_revocation`)."""
     if settings.ssl_root_cert:
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
@@ -2015,12 +2021,15 @@ def _refuse_store_revocation(
     reviewer can check one named hop against that hop's PKI, and a claim the operator can set without
     naming what was reviewed is the blanket env wearing a different key.
 
-    ``context`` is a real :class:`ssl.SSLContext`, so :func:`context_checks_revocation` reads
-    ``VERIFY_CRL_CHECK_LEAF`` off an object rather than off the presence of a setting. ``_build_ssl``
+    ``context`` is a real :class:`ssl.SSLContext`, so ``capture`` reads it through
+    :func:`~messagefoundry.config.tls_policy.crl_no_credit`, the rule
+    :func:`~messagefoundry.config.tls_policy.crl_credited` answers yes or no, off an object rather than off the
+    presence of a setting. ``_build_ssl``
     supplies it on both verifying branches. It is built at pool open and not handshaken on: the pool
     builds each connection's context afresh (:func:`_per_connection_ssl_connect`). Both come from
-    :func:`_verifying_context` with the same settings, and that builder either sets the flag or
-    raises, so this verdict holds for every connection. Before BACKLOG #300 the default branch
+    :func:`_verifying_context` with the same settings. With ``[store].ssl_crl_file`` set, that
+    builder either sets ``VERIFY_CRL_CHECK_LEAF`` or raises; unset, it leaves that flag clear, so
+    the guard credits none. Either way this verdict holds for every connection. Before BACKLOG #300 the default branch
     returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
     nowhere to load."""
     RevocationHopGuard.capture(
