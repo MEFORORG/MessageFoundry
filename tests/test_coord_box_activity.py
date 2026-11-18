@@ -377,6 +377,7 @@ class TestTheFailOpenOutcomesThePreFixCodeGave:
         a = activity(sandbox, SessionId="abcd1234")
         assert a["FenceVeto"] is True, a
         assert a["Veto"] is True, a
+        assert a["Signals"] == 3, a  # heartbeat + transcript + worktree; the fence is not counted
 
 
 class TestTheTranscriptSlug:
