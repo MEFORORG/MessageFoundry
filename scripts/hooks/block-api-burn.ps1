@@ -75,7 +75,12 @@ try {
     $POS = '(?:^|[;&|(){}]\s*|\s(?:do|then|else)\s)'
     $INTERP = '(?:\b(?:ba|z|da)?sh(?:\.exe)?\s+(?:-\w+\s+)*(?-i:-[a-z]*c)|\b(?:pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+)*-(?:c|Command)|\bcmd(?:\.exe)?\s+/[ck])\s+["'']?'
     # A loop or conditional keyword may sit in front: `until gh pr merge 5; do :; done`.
-    $GH = "(?:$POS(?:(?:while|until|if|!)\s+)?|$INTERP)gh\s"
+    #
+    # SO MAY AN ASSIGNMENT, AND THE PROGRAM MAY CARRY .exe (BACKLOG #5449). `$r = gh ...` and
+    # `` s=`gh ...` `` run gh exactly as a bare call does, and `gh.exe` is the same program; each was
+    # never in command position here, so a poll loop around one passed. `==` and `-eq` are not one.
+    $ASSIGN = '(?:(?<![=!<>])=\s*|`)'
+    $GH = "(?:$POS(?:(?:while|until|if|!)\s+)?|$INTERP|$ASSIGN)gh(?:\.exe)?\s"
     if ($c -notmatch $GH) { exit 0 }
 
     # `gh run watch` -- the measured 1200/hr offender.
@@ -90,8 +95,9 @@ try {
     # `--watch` on any gh subcommand is the same loop wearing a flag.
     # Behind an interpreter the closing quote ends the flag too, so `pwsh -Command 'gh pr checks 5
     # --watch'` is caught; elsewhere a quote after it is a mention, as in `--body "never --watch"`.
-    if ($c -match '(^|\s)--watch(\s|$)' -or
-        $c -match ("$INTERP" + 'gh\s[^"'']*\s--watch["'']')) {
+    # A shell delimiter or an `=value` ends the flag too (BACKLOG #5449): `--watch;` is the flag.
+    if ($c -match '(^|\s)--watch(?=$|[\s;&|)=])' -or
+        $c -match ("$INTERP" + 'gh(?:\.exe)?\s[^"'']*\s--watch["'']')) {
         Deny ("BLOCKED: a `--watch` flag on a `gh` command polls in a loop and draws on the fleet's " +
               "shared 5000/hr GitHub API budget. Drop `--watch` and read once. For a run: " +
               "`gh run view <run-id>`. For a PR's checks: `gh pr checks <N>` or " +
@@ -110,8 +116,10 @@ try {
     # AND A LOOP THAT NEVER ENDS ON ITS OWN IS A POLL WITH OR WITHOUT A SLEEP. `while true`,
     # `while :`, `while ($true)` and `until` around gh spend requests as fast as gh returns, which
     # is the worst rate of all. `... | while read n` iterates over input, ends, and stays allowed.
+    # `while (1)`, bash `while ((1))`, and `for (;;)` or `for ((;;))` never end either (BACKLOG #5449).
     $LOOP = "(?:$POS(?:while|until|for|foreach|ForEach-Object)\b|\bdo\s*\{|\|\s*%\s*\{)"
-    $FOREVER = "$POS(?:while\s+(?:true|:)(?:\s|;|$)|while\s*\(\s*\`$true\s*\)|until\s)"
+    $FOREVER = "$POS(?:while\s+(?:true|:)(?:\s|;|$)|while\s*\(\s*\`$true\s*\)|until\s|" +
+               'while\s*\(\(?\s*1\s*\)\)?|for\s*\(\(?\s*;\s*;\s*\)\)?)'
     if ($c -match ($LOOP + '.*\b(sleep|Start-Sleep)\b') -or $c -match $FOREVER) {
         Deny ("BLOCKED: this is a hand-rolled polling loop around `gh`, which costs the fleet's shared " +
               "GitHub API budget the same way `gh run watch` does. Make ONE call per turn and let the " +
