@@ -462,24 +462,25 @@ def _encode_sends(result: object) -> object:
     so its user code runs inside the caller's run context and exception arms (BACKLOG #5890).
 
     A list stays a list and a single item a single item. An exact ``str`` copy also stops a ``str``
-    subclass's own methods running later in the codec. A raise, ``sys.exit()`` included, is the
-    Handler's, as at ``mode=off``, where dry-run makes the same ``encode()`` call."""
-    from messagefoundry.config.wiring import Send
+    subclass's own methods running later in the codec. A result holding an inadmissible item is
+    left as it is, so the codec refuses it before any ``encode()`` runs, in ``_partition``'s order."""
+    from messagefoundry.config.wiring import Send, handler_item_fault
+
+    items = result if isinstance(result, list) else [result]
+    if any(handler_item_fault(item) is not None for item in items):
+        return result
 
     def encoded(item: object) -> object:
-        if not isinstance(item, Send):
-            return item  # the codec applies the admissibility rule, with its own text
-        message = item.message
-        if type(message) is str:
+        if not isinstance(item, Send) or type(item.message) is str:
             return item
+        message = item.message
         text = message if isinstance(message, str) else message.encode()
         if not isinstance(text, str):
             raise TypeError(f"Send message encoded to {type(text).__name__}, expected a str")
         return Send(item.to, str.__str__(text))
 
-    if isinstance(result, list):
-        return [encoded(item) for item in result]
-    return encoded(result)
+    encoded_items = [encoded(item) for item in items]
+    return encoded_items if isinstance(result, list) else encoded_items[0]
 
 
 def _error_text(exc: BaseException) -> str:
@@ -521,6 +522,22 @@ def _respond(registry: Any, req: Any, code_sets: Any, broker: _Broker | None = N
                 name=req.name,
                 kind="error",
                 error=f"unmarshallable result: {exc}",
+            )
+        except MemoryError:
+            raise  # main() answers it and recycles the worker
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 — user code met while describing
+            # A value's own methods can still run here, outside _run_one's arms: a str subclass in a
+            # SetMeta or SetState value, say. Report it as that Handler's error rather than end the
+            # worker (BACKLOG #5890), with a sys.exit() in mode=off's words.
+            from messagefoundry.pipeline.wiring_runner import UserCodeCalledSysExit
+
+            fault = UserCodeCalledSysExit.from_exit(exc) if isinstance(exc, SystemExit) else exc
+            return codec.encode_fail(
+                request_id=req.request_id,
+                phase=req.phase,
+                name=req.name,
+                kind="error",
+                error=f"unmarshallable result: {_error_text(fault)}",
             )
     return codec.encode_fail(
         request_id=req.request_id, phase=req.phase, name=req.name, kind=kind, error=error
