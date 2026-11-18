@@ -1324,8 +1324,8 @@ class UploadStore:
         message.
 
         **A sidecar whose tag fails under a key the cipher holds is reported (BACKLOG #5553),**
-        through the cipher's tag-failure hook, once per upload per hour
-        (:meth:`_report_tag_failure`). That is a value sealed under this store's key for some other
+        through the cipher's tag-failure hook, once per upload per hour, while a tag-failure hook
+        is armed (:meth:`_report_tag_failure`). That is a value sealed under this store's key for some other
         place, such as another upload's sidecar moved under this id. A value under a key that is
         not configured is a key fault, not that, and is only logged.
 

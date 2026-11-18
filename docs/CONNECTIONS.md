@@ -1443,7 +1443,7 @@ POST `/uploads` (or the web-console delegate POST `/ui/uploaded-logs/upload`, wh
 core handler) to browse/re-send it offline. It is **off unless `[store].uploads_dir` is set**, and its
 upload chokepoint enforces a fixed policy independent of the directory-source policy above:
 
-- **Permitted types — text only.** The upload chokepoint (`UploadStore.save`) refuses any
+- **Permitted types — text only.** The upload chokepoint (`UploadStore.save`) refuses
   **non-text or metadata-bearing container** body with **HTTP 415** (ASVS 14.2.8): a body that begins
   with JPEG/PNG/PDF/ZIP (incl. DOCX)/GIF/TIFF magic bytes, holds a NUL byte anywhere, or has a
   control-character-dense 8 KiB window. It does not refuse every binary body: at least a NUL-free
