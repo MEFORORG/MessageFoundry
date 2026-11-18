@@ -11,14 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-from fastapi import FastAPI
 
+from messagefoundry.api import create_app
 from messagefoundry.api.outlive import OperationInterrupted, OutlivingOperations
+from messagefoundry.api.security import public_route
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.pipeline import Engine
 
 _WAIT_S = 10.0
 
@@ -37,7 +41,7 @@ async def test_a_drain_cancel_reaches_a_waiting_caller_as_operation_interrupted(
     assert await ops.drain(timeout=0.0, grace=5.0) == ["DR activation"]
     with pytest.raises(OperationInterrupted, match="DR activation") as info:
         await asyncio.wait_for(caller, _WAIT_S)
-    assert info.value.status_code == 503 and info.value.label == "DR activation"
+    assert info.value.label == "DR activation"
     assert isinstance(info.value.__cause__, asyncio.CancelledError)
     assert not caller.cancelled()
     assert ops.inflight == []
@@ -125,22 +129,35 @@ async def test_a_released_operation_the_drain_cancels_ends_interrupted() -> None
         await store.close()
 
 
-async def test_a_route_whose_operation_is_drained_answers_503() -> None:
-    """Through a real route: the request gets an answer, not a CancelledError out of the app."""
+@pytest.fixture
+async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
+    eng = await Engine.create(
+        tmp_path / "outlive.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    yield eng
+    await eng.stop()
+
+
+async def test_a_route_whose_operation_is_drained_answers_503(engine: Engine) -> None:
+    """Through the app's own stack: the request gets an answer, not a CancelledError out of it."""
     ops = OutlivingOperations()
     started = asyncio.Event()
-    app = FastAPI()
+    app = create_app(engine)
 
-    @app.post("/op")
+    @app.get("/healthz-5903-probe")
+    @public_route("a test probe for BACKLOG #5903")
     async def _op() -> dict[str, str]:
         await ops.run(_hangs(started), "DR release")
         return {"ran": "yes"}
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        sent = asyncio.create_task(client.post("/op"))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+        sent = asyncio.create_task(client.get("/healthz-5903-probe"))
         await asyncio.wait_for(started.wait(), _WAIT_S)
         assert await ops.drain(timeout=0.0, grace=5.0) == ["DR release"]
         response = await asyncio.wait_for(sent, _WAIT_S)
-    assert response.status_code == 503
-    assert "outcome is unknown" in response.json()["detail"]
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]
+    assert "DR release was interrupted" in detail and "outcome is unknown" in detail

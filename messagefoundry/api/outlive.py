@@ -129,7 +129,7 @@ class OutlivingOperations:
                 # task.result() raises the operation's cancel as CancelledError too. The caller's
                 # cancelling() count tells the two apart, read as _write_through_cancel reads it.
                 caller = asyncio.current_task()
-                if caller is not None and caller.cancelling() == 0:
+                if caller is None or caller.cancelling() == 0:
                     raise OperationInterrupted(label) from exc
                 raise
             if not task.done():

@@ -63,8 +63,6 @@ from dataclasses import dataclass
 from typing import Any, Literal, NoReturn
 from uuid import uuid4
 
-from fastapi import HTTPException
-
 from messagefoundry.api.approval_models import InterruptVerdict, OwnerLiveness
 from messagefoundry.api.models import ReleaseBlocked
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
@@ -509,23 +507,20 @@ class _Operation:
     requires_fingerprint: bool = False
 
 
-class OperationInterrupted(HTTPException):
+class OperationInterrupted(Exception):
     """An outliving operation was cancelled while its caller was NOT (BACKLOG #5903).
 
     :meth:`~messagefoundry.api.outlive.OutlivingOperations.run` raises it in place of the
     operation's ``CancelledError``, which would reach a request as a cancellation nobody asked
     for, past every exception handler. At least the shutdown drain cancels an operation that way
-    (:meth:`~messagefoundry.api.outlive.OutlivingOperations.drain`). An ``HTTPException``, so the
-    API and the ``/ui`` routes that render a refusal answer it as one. The detail names the
-    operation's label only. The operation may have run none, some or all of its effects, so the
-    approval gate records a release that raised it as ``interrupted``, never ``failed``."""
+    (:meth:`~messagefoundry.api.outlive.OutlivingOperations.drain`). The operation may have run
+    none, some or all of its effects, so the approval gate records a release that raised it as
+    ``interrupted``, never ``failed``. Deliberately not an ``HTTPException``: the ``/ui`` routes
+    render an ``HTTPException`` 503 as a refusal where nothing ran, which this is not. The app's
+    own handler answers it (``_operation_interrupted`` in ``api/app.py``)."""
 
     def __init__(self, label: str) -> None:
-        super().__init__(
-            503,
-            f"{label} was interrupted before it answered, and its outcome is unknown; check the "
-            "audit log or the state it changes before trying it again",
-        )
+        super().__init__(f"{label} was interrupted before it answered, and its outcome is unknown")
         self.label = label
 
 
@@ -2131,7 +2126,8 @@ class ApprovalGate:
         ``interrupted`` means the outcome is unknown: the executor may have finished none, some or all
         of its effects. The audit row is ``approval.interrupted``, so the trail tells an operation that
         ran (``approval.approved``) apart from one that was cut off. Its ``recorded`` field says
-        whether the row moved (:meth:`_settle`). The caller re-raises the cancellation either way."""
+        whether the row moved (:meth:`_settle`). The caller re-raises the cancellation, or the
+        :class:`OperationInterrupted` that stands for one, either way."""
         await self._settle(
             approval_id,
             status="interrupted",
