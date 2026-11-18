@@ -452,7 +452,7 @@ Its answer is now `can_log()`'s, read under the lock after the probes, so it rea
 
 **A record that cannot be formatted is not a sink failure** (BACKLOG #5813). On `main`,
 `handleError` rolls the sink on any failure, so a record its formatter refuses rolls the sink, and
-when the re-write fails too the record goes to stage 2. Now the guard writes in the record's
+the re-write, which formats the same record, fails too, so the record always reaches stage 2. Now the guard writes in the record's
 place a fixed notice naming the record's logger, its level and the exception's type, where the
 formatter can format that notice. When the sink takes the notice, neither stage runs and the
 engine keeps processing. **The fault is reported on the stderr last-resort line only, at a bounded
