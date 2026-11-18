@@ -34,9 +34,9 @@ from messagefoundry.config.settings import (
     AuthSettings,
     EgressSettings,
     SecuritySettings,
-    _not_a_host_address,
 )
 from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4, upn_suffix_key
+from messagefoundry.netaddr import not_a_host_address as _not_a_host_address
 from messagefoundry.transports.email import envelope_address_problem
 from messagefoundry.transports.rest import proxy_bypasses_host
 from messagefoundry_webconsole import _external

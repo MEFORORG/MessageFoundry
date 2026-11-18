@@ -18,16 +18,13 @@ builds, so the refusal is the guard and not a rejected sidecar setting.
 
 from __future__ import annotations
 
-import datetime
 import urllib.request
 from collections.abc import Callable
 from typing import Any
 
 import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
@@ -50,6 +47,7 @@ from messagefoundry.transports.rest import (
     refuse_unrevoked_verified_hop,
 )
 from messagefoundry.transports.smart import token_provider_from_settings
+from tests._crl_pki import empty_crl, throwaway_ca
 
 PROD_PHI = HopPosture(enforcing=True)
 
@@ -70,16 +68,7 @@ def _no_blanket_env(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(scope="module")
 def bare_crl(tmp_path_factory: pytest.TempPathFactory) -> str:
     """A bare CRL from a throwaway CA: the shape a hop on the system trust store accepts. Synthetic."""
-    now = datetime.datetime.now(datetime.UTC)
-    day = datetime.timedelta(days=1)
-    key = ec.generate_private_key(ec.SECP256R1())
-    crl = (
-        x509.CertificateRevocationListBuilder()
-        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2169-ca")]))
-        .last_update(now - 2 * day)
-        .next_update(now + 30 * day)
-        .sign(key, hashes.SHA256())
-    )
+    crl = empty_crl(*throwaway_ca("mefor-2169-ca"))
     path = tmp_path_factory.mktemp("crl2169") / "crl_only.pem"
     path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
     return str(path)
@@ -270,21 +259,7 @@ _CA_NAME = "mefor-2977-token-ca"
 @pytest.fixture(scope="module")
 def ca_pem(tmp_path_factory: pytest.TempPathFactory) -> str:
     """A throwaway CA certificate for a per-connection ``tls_ca_file``. Synthetic."""
-    now = datetime.datetime.now(datetime.UTC)
-    day = datetime.timedelta(days=1)
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, _CA_NAME)])
-    ca = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - day)
-        .not_valid_after(now + 365 * day)
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .sign(key, hashes.SHA256())
-    )
+    _, ca = throwaway_ca(_CA_NAME)
     path = tmp_path_factory.mktemp("ca2977") / "ca.pem"
     path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
     return str(path)

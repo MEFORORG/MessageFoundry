@@ -90,9 +90,9 @@ _SELF_GATED_ON_QUEUE = {
     # BACKLOG #4773: the quarantine job copies the `Tests (pytest)` step's condition, queue included.
     # That is this change's choice, not the ruling's, and it is advisory there (job continue-on-error).
     "timing-quarantine",
-    # BACKLOG #5247: test shard 2's job `if:` is the `Tests (pytest)` step's condition, queue included.
-    "test-shard2",
-    # BACKLOG #5247 too: ci-gate's step for shard 2's own result repeats that condition. The job is
+    # BACKLOG #5247: the shard job's `if:` is the `Tests (pytest)` step's condition, queue included.
+    "test-shards",
+    # BACKLOG #5247 too: ci-gate's step for the shard job's own result repeats that condition. The job is
     # `always()` and ran on a queue entry before; what moved is that a step `if:` now names the event.
     "ci-gate",
 }
@@ -161,15 +161,15 @@ _NAMES_MERGE_GROUP_NOWHERE = {
 #: sqlserver-store and postgres-store carry `serverdb` in their job `if:`; `test` and `webconsole`
 #: carry `code` in their STEP `if:` lines, which ci.yml's `code` row calls belt-and-braces -- so the
 #: tidy-up that empties this set is an invited edit, not a contrived one. timing-quarantine and
-#: test-shard2 carry `code` and merge_group side by side in their JOB `if:`, copied from the
-#: `Tests (pytest)` step, and ci-gate in one STEP `if:`, copied from test-shard2's.
+#: test-shards carry `code` and merge_group side by side in their JOB `if:`, copied from the
+#: `Tests (pytest)` step, and ci-gate in one STEP `if:`, copied from test-shards's.
 _SELF_GATED_AND_GATED = {
     "test",
     "webconsole",
     "sqlserver-store",
     "postgres-store",
     "timing-quarantine",
-    "test-shard2",
+    "test-shards",
     "ci-gate",
 }
 

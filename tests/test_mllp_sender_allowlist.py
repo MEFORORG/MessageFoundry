@@ -1194,7 +1194,7 @@ class _Limiter:
         self.calls.append(("check_peer", peer))
         return True
 
-    def charge_failure(self, peer: str) -> None:
+    def charge_failure(self, peer: str, *, charge_global: bool = True) -> None:
         self.calls.append(("charge", peer))
 
     def note_success(self, peer: str) -> None:

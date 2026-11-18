@@ -183,7 +183,9 @@ def _parse_triggers(raw: str) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate conformant HL7 v2.5.1 ADT messages.")
     parser.add_argument("--out", default=DEFAULT_OUT, help=f"output root (default {DEFAULT_OUT})")
-    parser.add_argument("--count", type=int, default=50, help="messages per trigger (default 50)")
+    parser.add_argument(
+        "--count", type=int, default=50, help="messages per trigger, 1 to 9999 (default 50)"
+    )
     parser.add_argument("--triggers", default="", help="comma-separated subset (default: all)")
     parser.add_argument("--seed", default=DEFAULT_SEED, help="RNG seed for reproducible output")
     parser.add_argument("--quiet", action="store_true", help="suppress per-trigger progress")
@@ -194,6 +196,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if not 1 <= args.count <= _core.MAX_CORPUS_COUNT:
+        # write_corpus refuses it too; say so as a usage error rather than a traceback.
+        parser.error(f"--count must be between 1 and {_core.MAX_CORPUS_COUNT}")
     triggers = _parse_triggers(args.triggers)
     out_root = Path(args.out)
     total = 0
@@ -206,6 +211,13 @@ def main(argv: list[str] | None = None) -> int:
             result = _core.write_corpus(
                 "ADT", triggers=[trigger], count=args.count, out=args.out, seed=args.seed
             )
+        except OSError as exc:
+            print(
+                f"error: could not write the corpus under {out_root}, which may now be partly "
+                f"rewritten: {exc}",
+                file=sys.stderr,
+            )
+            return 1
         except _core.GenerationError as exc:
             print(f"VALIDATION FAILED: {trigger} #{exc.index} ({structure})", file=sys.stderr)
             for err in exc.errors:

@@ -3363,9 +3363,9 @@ def _serve(args: argparse.Namespace) -> int:
     # the ADR 0173 revocation attestation with its reason, where it suppresses a refusal; at least the
     # bind gates' and raw-TCP guard's tls_hop_attested line, and the database weakened-TLS line that a
     # DatabaseRef source also writes, without the reason),
-    # and all of them completely by GET /security/posture, which has the graph. `messagefoundry
-    # check` has it too and reports all but an HTTP listener's trusted_proxies (BACKLOG #5525),
-    # whose ranges the listener logs as it is built.
+    # and all of them completely by GET /security/posture, which has the graph, and by `messagefoundry
+    # check`, which has it too; an HTTP listener's trusted_proxies (BACKLOG #5525) is also logged
+    # by the listener as it is built, where the list holds a range.
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
     # preflight's own log line + audit row once the lifespan opens the store, and completely by
@@ -3390,6 +3390,7 @@ def _serve(args: argparse.Namespace) -> int:
         revocation_attested_hops=(),
         path_form_fhir_hops=(),
         ech_cleartext_sidecar_hops=(),
+        listener_trusted_proxy_hops=(),
         api=settings.api,
         approvals=settings.approvals,
         cert_monitor=settings.cert_monitor,
@@ -3413,7 +3414,7 @@ def _serve(args: argparse.Namespace) -> int:
             "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173), FHIR update_url_form "
             "and http ECH sidecar (ADR 0139) declarations, and an HTTP listener's trusted_proxies, "
             "are NOT in this list — the graph is not loaded yet; they are "
-            "reported by GET /security/posture, all but the last by `messagefoundry check`, and "
+            "reported by GET /security/posture and by `messagefoundry check`, and "
             "most also by the connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
             len(_loosenings),
@@ -5218,9 +5219,10 @@ def _serve(args: argparse.Namespace) -> int:
         # GET /logging/level next to the (possibly runtime-overridden) effective level.
         configured_log_level=settings.logging.level,
         # #285 (ASVS 6.7.1): the operator-supplied auth-path trust anchors (OIDC / AD / api-mTLS client
-        # CA), plus the settings CAs an engine hop dials with (vault BACKLOG #3188) and the SQL
-        # Server store pin (vault BACKLOG #3714), that the
-        # lifespan + /config/reload preflight for ACL + optional SHA-256 pin. Empty when none is
+        # CA), plus the settings CAs an engine hop dials with (vault BACKLOG #3188) and, from the
+        # store settings, at least the SQL Server store pin (vault BACKLOG #3714) and the PostgreSQL
+        # store CA (vault BACKLOG #4203), that the lifespan + /config/reload preflight, with at
+        # least an ACL check and an optional SHA-256 pin. Empty when none is
         # configured → dormant, byte-identical. `enforcing` is the [security].enforcement refuse/warn dial.
         trust_anchor_specs=collect_anchor_specs(
             settings.auth,
@@ -5228,7 +5230,7 @@ def _serve(args: argparse.Namespace) -> int:
             tls=settings.tls,
             alerts=settings.alerts,
             log_settings=settings.logging,
-            store=settings.store,  # the SQL Server pin (vault BACKLOG #3714)
+            store=settings.store,  # at least the SQL Server pin and the PostgreSQL CA
         ),
         trust_anchors_enforcing=enforcing,
         # BACKLOG #3470: the collector CA `_start_logging` refused, for the lifespan to refuse on.
@@ -13890,6 +13892,7 @@ def _security(args: argparse.Namespace) -> int:
                 revocation_attested_hops=(),
                 path_form_fhir_hops=(),
                 ech_cleartext_sidecar_hops=(),
+                listener_trusted_proxy_hops=(),
                 api=full.api,
                 approvals=full.approvals,
                 cert_monitor=full.cert_monitor,

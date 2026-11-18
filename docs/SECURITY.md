@@ -4704,13 +4704,13 @@ alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `Ale
 **Audit.** At least five of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
 census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`, and
 `/search/layered` since BACKLOG #5523), so a scripted bulk read cannot harvest the patient census
-unaudited. The rest do **not** call the coalescer — they write their own dedicated audit rows
+unaudited. At least these do **not** call the coalescer — they write their own dedicated audit rows
 instead (`response.read` for `GET /messages/{id}/responses`, a `connection_event_reveal` or `alert_reveal`
 row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
 each per-connection reveal on `GET /connections` and `GET /connections/{name}/metadata`; those
 five write nothing on a masked load). The census surfaces are audited **only when a
 gated property is actually returned** — `count_exposed()` and `count_masked()` are computed
-*post*-redaction and the coalescer is called under `if exposed or masked:`, so a display-masked row
+*post*-redaction and the coalescer counts nothing when both are zero, so a display-masked row
 counts (vault BACKLOG #1187) — so a fully-redacted list read by a caller without
 `messages:view_summary` (a Viewer paging `GET /messages` or `GET /dead-letters`) writes **no audit row
 at all**. That is accepted: those reads carry no PHI, and auditing them would let an unprivileged
@@ -4718,6 +4718,18 @@ caller amplify into unbounded `audit_log` growth. `GET /messages/{id}` and `GET 
 unconditional dedicated rows (`message_view`, `message_search`) regardless, and so does the body fetch
 `GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do
 `GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
+`GET /search/layered` also tries to write its `preset.layered_search` row when it refuses a
+stored preset while loading it, naming the preset id, the status and the refusal cause, an error
+class name or `malformed` (BACKLOG #5523). The write is best effort: a failed write does not change
+the answer, and it is logged at ERROR. A refusal of the composed layers writes no such row. A
+refusal row has `refused` in its detail, which tells it from a search that ran. A NULL, empty or
+non-text criteria cell is refused by the store itself, which logs a WARNING and writes the
+`integrity.preset_tag_failed` row on every store, and on a keyed store raises the
+`integrity_drift` alert, as for a moved preset. The store rate-limits its WARNING, alert and
+`integrity.preset_tag_failed` row for a repeated refusal, and the route rate-limits some of its
+refusal logs, including the failed-write ERROR. These limits are best effort and held in memory per
+engine process, and the AlertSink's per-subject re-alert cooldown applies on top, so the operator
+may see fewer notifications than refusals.
 
 **Roles and visibility.** `messages:view_raw` is **not** a superset of `messages:view_summary` —
 `Identity.has()` is a flat membership check. The built-in roles happen to grant them nested
@@ -8179,9 +8191,11 @@ engine cannot read, refuses the start or the reload. These settings take no pin.
 refuse rather than warn). Every anchor the engine checks at start and reload takes it, the dialling
 CAs above and a connection's own `tls_ca_file` included, and so do at least the SQL Server
 `[store].ssl_root_cert` pin, a generic DATABASE connection's `odbc_params` `sslca` file and a Vault
-hop's CA text. Not covered: at least the Vault CA file (`MEFOR_STORE_VAULT_CA_FILE`,
-`MEFOR_SECRETS_VAULT_CA_FILE`) and the PostgreSQL `[store].ssl_root_cert`, which their hops load
-by path with no such check. The check refuses a PEM label ending in `PRIVATE KEY` anywhere after the file's first
+hop's CA text. The PostgreSQL `[store].ssl_root_cert` takes it in `serve`'s settings check, at
+least at start, reload and DR activation, after the store has opened with the file, as a paragraph
+below says. Not covered: at least
+the Vault CA files (`MEFOR_STORE_VAULT_CA_FILE`, `MEFOR_SECRETS_VAULT_CA_FILE`), which their hops
+load by path with no such check. The check refuses a PEM label ending in `PRIVATE KEY` anywhere after the file's first
 `-----BEGIN `, of any kind: plain, PKCS#8 encrypted, `RSA` or `EC`. A TLS load skips a key block and
 trusts the certificate beside it, so before this a key passed every check and sat in a file the
 engine treats as public trust material. The refusal names the setting, never the content. For an
@@ -8198,9 +8212,18 @@ Those keep the old bytes until they are built again, and a reload writes a `chan
 
 **The SQL Server `[store].ssl_root_cert` pin is checked at the next start or reload too, but its
 change check reads its baseline from, and writes its rows to, the store that pin secures, so it
-cannot vouch for its own hop.** The `store_sqlserver_pin` item of the
+cannot vouch for its own hop.** Item 11 of the
 [trust anchors module](../messagefoundry/auth/trust_anchors.py) docstring says what a swapped pin
-can hide and which checks still refuse.
+can hide, and which checks refuse there and which warn with an audited row instead.
+
+**The PostgreSQL `[store].ssl_root_cert` CA is checked in `serve` too, at least at start, reload and
+DR activation, but only after the store has opened with it** (vault BACKLOG #4203). It takes at
+least the permission, path and change checks, the private-key refusal and a refusal of a file
+larger than 16 MiB. Under `enforce`, a file or folder a broad principal can write, or one whose permissions the engine cannot read,
+refuses the start, the reload or the DR activation. The store runs none of these
+checks when it opens, so a start may already have trusted the file and sent the store login, and a
+command that opens the store without this check does not check the file at all. Item 11 of
+the same docstring says what else the check does not cover.
 
 **What a reload's `restart_required` list covers (BACKLOG #3015).** An empty list in the reload
 response says that no settings anchor with a recorded load changed in the engine process that

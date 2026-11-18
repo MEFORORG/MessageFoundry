@@ -247,15 +247,30 @@ def b64_head(b64: str, max_bytes: int = 32) -> bytes:
     of embedded whitespace. Base64 encodes in independent 4-char groups, so a multiple-of-4 prefix decodes
     to the document's exact leading bytes without materializing the whole payload. Returns ``b""`` when the
     prefix isn't decodable (the caller treats an unconfirmable magic as a contradiction and downgrades to
-    octet-stream — conservative)."""
-    compact = "".join(b64.split())
+    octet-stream — conservative).
+
+    Windows of ``b64`` that double in width are compacted until they hold enough characters or the
+    text ends, so the work grows with the text up to the prefix, whitespace included, and not with
+    the rest of the document (BACKLOG #5805). A ``max_bytes`` of zero or less gives ``b""``."""
+    if max_bytes <= 0:
+        return b""
     need = ((max_bytes + 2) // 3) * 4
-    chunk = compact[:need]
+    parts: list[str] = []
+    have = 0
+    pos = 0
+    width = need
+    while have < need and pos < len(b64):
+        part = "".join(b64[pos : pos + width].split())
+        parts.append(part)
+        have += len(part)
+        pos += width
+        width *= 2
+    chunk = "".join(parts)[:need]
     chunk = chunk[: len(chunk) - (len(chunk) % 4)]
     if not chunk:
         return b""
     try:
-        return base64.b64decode(chunk)
+        return base64.b64decode(chunk, validate=True)
     except (binascii.Error, ValueError):
         return b""
 

@@ -1690,8 +1690,9 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         """Report new spool read faults at most once per :data:`_FORWARD_DROP_REPORT_INTERVAL`
         (BACKLOG #2278).
 
-        :meth:`LogSpool.peek` keeps every file when a read fails for a reason other than a missing
-        file, and returns ``None``, which is also what a drained spool returns. Without this report
+        :meth:`LogSpool.peek` retires nothing when a read fails for a reason other than a missing
+        segment file, a missing spool directory included, and returns ``None``, which is also what
+        a drained spool returns. Without this report
         the only sign was the "spool is full" drop warning, long after and naming the wrong cause.
         The line carries a count and a directory, never a record. It is rate limited for the same
         reason as :meth:`_report_spool_drop`: it comes back through this listener, and every pass
@@ -1708,9 +1709,10 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         batch, self._spool_read_errors_reported = total - self._spool_read_errors_reported, total
         _log.warning(
             "off-box log forwarding could not read its on-disk spool at %s: %d read(s) failed (%d "
-            "since this process started), for a reason other than a missing file. The segments are "
-            "kept, and what they hold is not sent until a read succeeds. Newer records are sent "
-            "ahead of them meanwhile.",
+            "since this process started), for a reason other than a missing segment file; a "
+            "missing spool directory counts. No segment is retired for it, and what the spool "
+            "holds is not sent until a read succeeds. Newer records can be sent ahead of it "
+            "meanwhile.",
             self.spool.directory,
             batch,
             total,
@@ -2143,7 +2145,8 @@ class ForwarderStatus:
     spool_dropped: int = 0
     #: Spooled records skipped as torn or malformed, and segments found gone before they were sent.
     spool_skipped: int = 0
-    #: Spool reads that failed for a reason other than a missing file. Held, not lost.
+    #: Spool reads that failed for a reason other than a missing segment file, a missing spool
+    #: directory included. Nothing is retired for them.
     spool_read_errors: int = 0
     #: Whether the last spool read failed that way.
     spool_read_faulted: bool = False

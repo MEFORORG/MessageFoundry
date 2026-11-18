@@ -22,6 +22,7 @@ from messagefoundry.config.wiring import (
     handler_item_fault,
 )
 from messagefoundry.parsing.message import Message, RawMessage
+from messagefoundry.parsing.split import split_batch_bytes
 from messagefoundry.pipeline.dryrun import (
     AmbiguousInboundError,
     DeliveryPreview,
@@ -430,6 +431,70 @@ def test_split_messages_pipe_batch_and_single() -> None:
     two = (ADT_A01 + ADT_A01.replace("MSG1", "MSG2")).encode("utf-8")
     assert len(split_messages(two)) == 2
     assert len(split_messages(ADT_A01.encode("utf-8"))) == 1
+
+
+@pytest.mark.parametrize("marks", [1, 2], ids=["one-mark", "two-marks"])
+@pytest.mark.parametrize("brk", [b"\r", b"\n", b"\r\n"], ids=["cr", "lf", "crlf"])
+def test_split_messages_splits_where_byte_order_marks_lead_a_later_msh(
+    marks: int, brk: bytes
+) -> None:
+    """BACKLOG #5918 step 1: the live File source decodes, then splits past marks between a line
+    break and a later MSH. The dry run's latin-1 view spelled each mark as three characters, so it
+    read such a file as one message. Mutation: drop the ``view.replace(_LATIN1_BOM, _BOM)``
+    spelling. Red: one message."""
+    first = ADT_A01.encode("utf-8").rstrip(b"\r")
+    second = ADT_A01.replace("MSG1", "MSG2").encode("utf-8")
+    raw = first + brk + b"\xef\xbb\xbf" * marks + second
+    live = split_batch_bytes(raw, "utf-8")
+    assert len(live) == 2
+    assert split_messages(raw) == live
+
+
+@pytest.mark.parametrize(
+    "lead",
+    [b"\xef\xbb\xbf\r\n\xef\xbb\xbf", b"\xef\xbb\xbf\xef\xbb\xbf", b"\r\n\xef\xbb\xbf\xef\xbb\xbf"],
+    ids=["mark-break-mark", "two-marks", "break-two-marks"],
+)
+@pytest.mark.parametrize("count", [1, 2], ids=["one-message", "two-messages"])
+def test_split_messages_reads_a_leading_run_of_marks_as_the_live_split(
+    lead: bytes, count: int
+) -> None:
+    """Round-one review of BACKLOG #5918: the dry run stripped one leading mark before its view, so
+    a second mark, or a mark after a leading line break, stayed three characters and the first
+    member was refused where the live UTF-8 split reads past it. Mutation: strip one leading mark
+    and spell only marks after a line break. Red: a member led by the mark's bytes."""
+    body = ADT_A01 + ADT_A01.replace("MSG1", "MSG2") if count == 2 else ADT_A01
+    raw = lead + body.encode("utf-8")
+    assert split_messages(raw) == split_batch_bytes(raw, "utf-8")
+
+
+@pytest.mark.parametrize(
+    "noise",
+    [b"", b"\xc2\xa0", b"\xc2\x85", b"\xe2\x80\x83", b"\x1c", b"\x0b", b"\xef\xbb\xbf"],
+    ids=["none", "nbsp", "nel", "em-space", "fs", "vt", "mark"],
+)
+@pytest.mark.parametrize("count", [1, 2], ids=["one-message", "two-messages"])
+def test_split_messages_drops_a_trailer_as_the_live_split(noise: bytes, count: int) -> None:
+    """BACKLOG #5806: the dry run's latin-1 view drops the trailer lines the live UTF-8 split drops,
+    and keeps the lines it keeps, a line of non-ASCII or other noise among them included."""
+    body = ADT_A01 + ADT_A01.replace("MSG1", "MSG2") if count == 2 else ADT_A01
+    raw = body.encode("utf-8") + b"BTS|1\r" + noise + b"\rFTS|1\r"
+    assert split_messages(raw) == split_batch_bytes(raw, "utf-8")
+
+
+def test_split_messages_reads_a_non_ascii_field_separator_as_the_live_split() -> None:
+    """A field separator outside ASCII is one character to the live UTF-8 split and its first byte
+    to the dry run's latin-1 view, so neither drops a trailer under one. Mutation: drop the ASCII
+    test in ``_trailer_start``. Red: the dry run drops the ``BTS`` line the live split keeps."""
+    raw = "MSHé^~\\&éA\rPIDé1\rBTSè1\r".encode()
+    assert split_batch_bytes(raw, "utf-8") == [raw]
+    assert split_messages(raw) == [raw]
+
+
+def test_split_messages_keeps_a_mark_that_leads_no_msh() -> None:
+    """Control: marks after a line break that no MSH follows are data, kept byte for byte."""
+    raw = ADT_A01.encode("utf-8") + b"NTE|1||\xef\xbb\xbfnote\r\xef\xbb\xbfNTE|2\r"
+    assert split_messages(raw) == [raw]
 
 
 def test_select_inbound_requires_name_when_ambiguous() -> None:

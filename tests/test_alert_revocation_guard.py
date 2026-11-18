@@ -24,16 +24,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import datetime
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import serialization
 
 from messagefoundry.api import app as app_module
 from messagefoundry.config.settings import (
@@ -72,6 +68,7 @@ from messagefoundry.pipeline.security_notify import (
     security_notifier_from_settings,
 )
 from tests._ast_sites import call_sites, parse_source
+from tests._crl_pki import empty_crl, throwaway_ca
 from tests.test_revocation_guard_remaining_hops import _guard_log
 
 ENFORCING = HopPosture(enforcing=True)
@@ -97,17 +94,7 @@ def _no_blanket_env(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(scope="module")
 def bare_crl(tmp_path_factory: pytest.TempPathFactory) -> str:
     """A CRL with no CA beside it, the shape a system-trust-store hop loads. Synthetic."""
-    now = datetime.datetime.now(datetime.UTC)
-    day = datetime.timedelta(days=1)
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2193-alerts-ca")])
-    crl = (
-        x509.CertificateRevocationListBuilder()
-        .issuer_name(name)
-        .last_update(now - 2 * day)
-        .next_update(now + 30 * day)
-        .sign(key, hashes.SHA256())
-    )
+    crl = empty_crl(*throwaway_ca("mefor-2193-alerts-ca"))
     path = tmp_path_factory.mktemp("crl2193alerts") / "crl_only.pem"
     path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
     return str(path)
@@ -619,6 +606,7 @@ def _loosenings(alerts: AlertsSettings) -> dict[str, str]:
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
             ech_cleartext_sidecar_hops=(),
+            listener_trusted_proxy_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),

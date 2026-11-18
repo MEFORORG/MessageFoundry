@@ -16,6 +16,7 @@ import os
 import queue
 import socket
 import ssl
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -774,11 +775,396 @@ def test_a_segment_that_is_gone_is_retired_and_the_rest_still_replays(spool_dir:
         first = _segments(spool_dir)[0]
         lost = [json.loads(line)["line"] for line in first.read_bytes().splitlines()]
         first.unlink()
-        assert spool.peek() is None  # the pass that finds it gone
+        expected = [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
+        # The pass that finds it gone moves on to the next segment rather than reading as drained
+        # (BACKLOG #5811). NEGATIVE CONTROL: before the fix this peek answered None and `pending`
+        # read False with five records still spooled.
+        entry = spool.peek()
+        assert entry is not None and entry.line == expected[0]
+        assert spool.pending
         assert spool.unreadable == 1
         assert spool.read_errors == 0
-        expected = [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
         assert lost and _drain(spool) == expected
+    finally:
+        spool.close()
+
+
+def test_a_spool_directory_out_of_reach_retires_nothing(spool_dir: Path) -> None:
+    """A missing directory is a read fault, not a gone segment: every segment stays in the order
+    and the cap, and the spool replays whole once the directory is back."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        used = spool.bytes_used
+        spool.directory = spool_dir / "out-of-reach"
+        assert spool.peek() is None
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        # The writer was closed, so an append while the directory is gone is refused and counted,
+        # never written into a file the directory no longer holds.
+        assert not spool.append(_entry(99))
+        assert spool.dropped == 1
+        spool.directory = spool_dir
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.close()
+
+
+def _windows_error(winerror: int | None) -> OSError:
+    """An ``OSError`` as Windows raises it for a network fault: ``EINVAL`` with ``winerror`` set.
+    Built by hand so the case runs on every platform."""
+    exc = OSError(errno.EINVAL, "network fault")
+    if winerror is not None:
+        setattr(exc, "winerror", winerror)  # noqa: B010 - typeshed declares it on win32 only
+    return exc
+
+
+@pytest.mark.parametrize(
+    ("error", "closes_writer"),
+    [
+        (NotADirectoryError(errno.ENOTDIR, "not a directory"), True),
+        (OSError(errno.ENOTCONN, "mount dropped"), True),
+        (OSError(errno.ESTALE, "stale handle"), True),
+        # BACKLOG #5811: a dropped SMB share, which Python maps to EINVAL. NEGATIVE CONTROL: on
+        # ce55b5324d both read as one file failing and left the writer open.
+        (_windows_error(64), True),
+        (_windows_error(59), True),
+        (_windows_error(None), False),
+        (OSError(errno.EMFILE, "too many open files"), False),
+    ],
+)
+def test_a_read_error_that_means_the_directory_is_out_of_reach_closes_the_writer(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, error: OSError, closes_writer: bool
+) -> None:
+    """An error that says the directory itself is gone or out of reach closes the writer, as a
+    missing directory does; one file failing does not. Either way nothing is retired.
+    NEGATIVE CONTROL: on 0a71e8b23f only a missing directory closed the writer."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(3):
+            assert spool.append(_entry(n))
+        assert spool._writer is not None
+        used = spool.bytes_used
+
+        def refuse(seq: int) -> None:
+            raise error
+
+        monkeypatch.setattr(spool, "_open_reader", refuse)
+        assert spool.peek() is None
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        assert (spool._writer is None) is closes_writer
+    finally:
+        spool.close()
+
+
+def test_a_transient_file_not_found_on_a_segment_still_there_retires_nothing(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An open that says ENOENT for a segment whose file is still there (an SMB share
+    reconnecting) is a read fault: nothing is retired or unlinked, and the spool replays whole
+    once the open works again. NEGATIVE CONTROL: on 254672242d the directory still existed, so
+    every head segment was retired and unlinked in one peek."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        assert len(segments) >= 2
+        used = spool.bytes_used
+        real_open = spool._open_reader
+
+        def transient(seq: int) -> None:
+            raise FileNotFoundError(errno.ENOENT, "network path not found")
+
+        monkeypatch.setattr(spool, "_open_reader", transient)
+        assert spool.peek() is None
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        assert _segments(spool_dir) == segments
+        monkeypatch.setattr(spool, "_open_reader", real_open)
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.close()
+
+
+def _windows_not_found(winerror: int | None) -> FileNotFoundError:
+    """A ``FileNotFoundError`` as Windows raises it, ``winerror`` set (or not). Built by hand so
+    the case runs on every platform."""
+    exc = FileNotFoundError(errno.ENOENT, "not found")
+    if winerror is not None:
+        setattr(exc, "winerror", winerror)  # noqa: B010 - typeshed declares it on win32 only
+    return exc
+
+
+def _peek_with_segment_lstat_raising(
+    spool: LogSpool, monkeypatch: pytest.MonkeyPatch, exc: FileNotFoundError
+) -> SpoolEntry | None:
+    """``peek()`` with the head segment's open and its own lstat both raising ``exc``."""
+
+    class _Path:
+        def lstat(self) -> None:
+            raise exc
+
+    def refuse(seq: int) -> None:
+        raise exc
+
+    with monkeypatch.context() as patch:
+        patch.setattr(spool, "_open_reader", refuse)
+        patch.setattr(spool, "_path", lambda seq: _Path())
+        return spool.peek()
+
+
+@pytest.mark.parametrize("winerror", [None, 3, 53, 67, 64])
+def test_on_windows_only_winerror_2_confirms_a_segment_gone(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, winerror: int | None
+) -> None:
+    """On Windows a FileNotFoundError from the segment's own lstat confirms it gone only with
+    ``winerror`` 2. Path-not-found (3), a network path (53, 67), a share out of reach (64) and
+    no ``winerror`` at all are read faults: nothing is retired or unlinked. NEGATIVE CONTROL: on
+    5c4efdd3a1 None and 3 retired the head segment."""
+    monkeypatch.setattr(log_spool, "_WINDOWS", True)
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        used = spool.bytes_used
+        assert (
+            _peek_with_segment_lstat_raising(spool, monkeypatch, _windows_not_found(winerror))
+            is None
+        )
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        assert _segments(spool_dir) == segments
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.close()
+
+
+def test_on_windows_winerror_2_does_confirm_a_segment_gone(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: ``winerror`` 2 retires the head segment."""
+    monkeypatch.setattr(log_spool, "_WINDOWS", True)
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        _peek_with_segment_lstat_raising(spool, monkeypatch, _windows_not_found(2))
+        assert spool.unreadable >= 1 and spool.read_errors == 0
+    finally:
+        spool.close()
+
+
+@pytest.mark.parametrize("winerror", [2, 3])
+def test_a_dangling_symlink_segment_is_retired_and_its_link_unlinked(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    """A head segment whose path is a dangling symlink (lstat shows a link, stat says not found)
+    can never be opened, so it counts as gone: it is retired, the link itself is unlinked, and
+    the read moves on. On Windows a link into a missing directory gives winerror 3, which counts
+    here too. NEGATIVE CONTROL: on cf6bfe2d12 the link was not unlinked, and winerror 3 wedged
+    the spool."""
+    monkeypatch.setattr(log_spool, "_WINDOWS", True)
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        assert len(segments) >= 2
+        head_seq = spool._segments[0]
+        lost = [json.loads(line)["line"] for line in segments[0].read_bytes().splitlines()]
+        real_open, real_path = spool._open_reader, spool._path
+        unlinked: list[int] = []
+
+        class _DanglingLink:
+            def lstat(self) -> os.stat_result:
+                return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
+            def stat(self) -> None:
+                raise _windows_not_found(winerror)
+
+        def open_reader(seq: int) -> None:
+            if seq == head_seq:
+                raise _windows_not_found(2)
+            real_open(seq)
+
+        def path_for(seq: int) -> Any:
+            return _DanglingLink() if seq == head_seq else real_path(seq)
+
+        def record_unlink(seq: int) -> bool:
+            unlinked.append(seq)
+            return True
+
+        with monkeypatch.context() as patch:
+            patch.setattr(spool, "_open_reader", open_reader)
+            patch.setattr(spool, "_path", path_for)
+            patch.setattr(spool, "_unlink", record_unlink)
+            entry = spool.peek()
+            assert entry is not None and entry.line not in lost
+            assert spool.unreadable == 1 and spool.read_errors == 0
+            assert unlinked == [head_seq]
+    finally:
+        spool.close()
+
+
+def test_a_spool_with_a_retired_dangling_link_opens_again_and_sends_the_rest(
+    spool_dir: Path, tmp_path: Path
+) -> None:
+    """A real dangling symlink at the head: peek retires it and removes the link, so the next
+    start's open() does not refuse the spool, and every other undelivered segment is sent.
+    NEGATIVE CONTROL: on cf6bfe2d12 the link stayed and the restart raised SpoolUnavailable."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        head = _segments(spool_dir)[0]
+        lost = [json.loads(line)["line"] for line in head.read_bytes().splitlines()]
+        head.unlink()
+        try:
+            os.symlink(tmp_path / "nowhere" / "target.jsonl", head)
+        except (OSError, NotImplementedError) as exc:  # Windows without symlink rights
+            pytest.skip(f"cannot create a symlink here: {type(exc).__name__}")
+        entry = spool.peek()
+        assert entry is not None and entry.line not in lost
+        assert not os.path.lexists(head)
+    finally:
+        spool.close()
+    restarted = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    restarted.open()
+    try:
+        expected = [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
+        assert _drain(restarted) == expected
+    finally:
+        restarted.close()
+
+
+def test_a_directory_that_drops_between_the_checks_retires_nothing(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The segment's lstat says gone, but the directory is out of reach by the time it is checked
+    after it: a read fault that retires nothing and closes the writer. NEGATIVE CONTROL: on
+    5c4efdd3a1 the directory was checked first and read present, so the segment was retired."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        used = spool.bytes_used
+
+        class _DropsThenGone:
+            def lstat(self) -> None:
+                spool.directory = spool_dir / "dropped"  # the share drops here
+                raise _windows_not_found(2)
+
+        def refuse(seq: int) -> None:
+            raise _windows_not_found(2)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(spool, "_open_reader", refuse)
+            patch.setattr(spool, "_path", lambda seq: _DropsThenGone())
+            assert spool.peek() is None
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        assert spool._writer is None
+        spool.directory = spool_dir
+        assert _segments(spool_dir) == segments
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.close()
+
+
+def test_a_read_error_with_no_winerror_closes_the_writer_when_the_directory_is_unreachable(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows a read error from open() carries no ``winerror``, so the directory is probed:
+    one out of reach closes the writer. NEGATIVE CONTROL: on 5c4efdd3a1 the writer stayed open."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(3):
+            assert spool.append(_entry(n))
+        assert spool._writer is not None
+
+        def refuse(seq: int) -> None:
+            spool.directory = spool_dir / "dropped"
+            raise OSError(errno.EINVAL, "network fault")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(spool, "_open_reader", refuse)
+            assert spool.peek() is None
+        assert spool.read_faulted and spool.unreadable == 0
+        assert spool._writer is None
+    finally:
+        spool.directory = spool_dir
+        spool.close()
+
+
+def test_a_segment_confirmed_gone_is_never_unlinked_or_reclaimed(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A segment retired as confirmed missing is not unlinked and not queued for reclaim(), so a
+    file the confirmation missed is never deleted. NEGATIVE CONTROL: on d02d8b8f3e the retire
+    unlinked it, and a failed unlink queued it for reclaim()."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        first = _segments(spool_dir)[0]
+        held = first.read_bytes()
+        first.unlink()
+        unlinked: list[int] = []
+        real_unlink = spool._unlink
+
+        def failing_unlink(seq: int) -> bool:
+            unlinked.append(seq)
+            return False
+
+        monkeypatch.setattr(spool, "_unlink", failing_unlink)
+        assert spool.peek() is not None
+        assert spool.unreadable == 1
+        assert unlinked == []
+        monkeypatch.setattr(spool, "_unlink", real_unlink)
+        # The file the confirmation called gone turns out to be there after all.
+        first.write_bytes(held)
+        spool.reclaim()
+        assert first.read_bytes() == held
+    finally:
+        spool.close()
+
+
+def test_two_segments_gone_in_a_row_are_both_passed_over(spool_dir: Path) -> None:
+    """One peek walks past every missing segment at the head, however many, to the oldest one left."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(8):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        assert len(segments) >= 3
+        gone = [
+            json.loads(line)["line"]
+            for path in segments[:2]
+            for line in path.read_bytes().splitlines()
+        ]
+        for path in segments[:2]:
+            path.unlink()
+        expected = [f"record {n:04d}" for n in range(8) if f"record {n:04d}" not in gone]
+        entry = spool.peek()
+        assert entry is not None and entry.line == expected[0]
+        assert spool.unreadable == 2
+        assert _drain(spool) == expected
     finally:
         spool.close()
 

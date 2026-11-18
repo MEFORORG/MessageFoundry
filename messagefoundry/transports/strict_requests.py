@@ -116,7 +116,7 @@ from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
-    context_checks_revocation,
+    crl_credited,
     insecure_hop_disposition,
     is_loopback_hop_host,
     log_attested_crossing,
@@ -682,7 +682,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         any send, and an attested one built 1. *(This read "about 11 ms (a review agent's
         measurement, 2026-10-13)" until then.)*"""
         if self._crl_checked is None:
-            self._crl_checked = context_checks_revocation(self._ssl_context_factory())
+            self._crl_checked = crl_credited(self._ssl_context_factory())
         return self._crl_checked
 
     def refuse_an_unrevoked_hop(self, url: str, proxy: str | None) -> None:
@@ -1264,8 +1264,9 @@ def _refuse_an_unrevoked_vault_hop(
     * ``tls_revocation_attested()``, the process-wide variable, goes in ``blanket_attested``
       only. The authority ranks that below the enforcing refusal (BACKLOG #299), so it does not
       cross this hop under an enforcing posture.
-    * ``crl_checked`` is ``checks_revocation()``, which reads the flag off a context the hop's
-      own factory builds, never off a setting (:meth:`StrictReplyAdapter._checks_revocation`).
+    * ``crl_checked`` is ``checks_revocation()``, which reads ``crl_credited`` off a context the
+      hop's own factory builds, never off a setting
+      (:meth:`StrictReplyAdapter._checks_revocation`).
       No CRL lever is built for this hop, so it is ``False`` today. It is asked only when the
       answer could matter: the authority is asked first without it, and a CRL check can only
       turn that answer into ALLOW.
@@ -1497,7 +1498,7 @@ def _refuse_an_unrevoked_proxy_leg(
         connector=connector,
         # The leg ends at the proxy, so only the proxy's own host decides it, without DNS.
         on_box=bool(host := (proxy_host or "").strip("[]")) and is_loopback_hop_host(host),
-        checks_revocation=lambda: context_checks_revocation(context),
+        checks_revocation=lambda: crl_credited(context),
         revocation_attested=revocation_attested,
         attestation_section=attestation_section,
         posture=posture,

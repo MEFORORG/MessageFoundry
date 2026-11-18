@@ -29,9 +29,10 @@ or :meth:`LogSpool.close` deletes it. One that is still there at the next start 
 because nothing on disk marks it as sent. A write the disk refused is dropped and counted; the empty
 segment it would have started is removed, so a full disk does not fill the directory with empty files.
 
-**Replay order.** Strictly first in, first out: segments in sequence order, lines in file order. While
-anything is spooled, the forwarder appends new records to the spool rather than sending them live,
-so nothing overtakes older evidence.
+**Replay order.** Segments in sequence order, lines in file order. While :attr:`LogSpool.pending`
+is True, the forwarder appends new records to the spool rather than sending them live. A read
+fault, a missing or unreachable directory included, makes ``pending`` False, so newer records can
+then be sent live ahead of what the spool keeps.
 
 **Crash safety.** Each append is flushed to the operating system, so a process crash loses nothing
 already appended. A power loss can lose a tail the OS had not yet written.
@@ -60,18 +61,70 @@ lock of its own, by design: a second writer is exactly what the directory lock e
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Literal
 
 from messagefoundry import file_lock
 
 #: The on-disk format version written into every entry. A reader skips an entry of any other version
 #: (counted as unreadable) rather than guessing at its shape.
 SPOOL_FORMAT_VERSION = 1
+
+#: ``errno`` values that say, on POSIX, that the spool directory itself is out of reach: a network
+#: mount that dropped, or a stale handle on one. ``getattr``: a platform's ``errno`` may lack
+#: either name.
+_DIRECTORY_GONE_ERRNOS = frozenset(
+    code
+    for code in (getattr(errno, "ENOTCONN", None), getattr(errno, "ESTALE", None))
+    if code is not None
+)
+
+#: Windows error codes that say the same of a network share: ``ERROR_NETNAME_DELETED`` (64) and
+#: ``ERROR_UNEXP_NET_ERR`` (59). Python maps both to ``EINVAL``, so ``errno`` alone cannot tell
+#: them from one bad argument, and only an exception that carries ``winerror`` can. One raised by
+#: ``open()`` or ``readline()`` does not, so on the read path :meth:`LogSpool.peek` probes the
+#: directory with ``stat`` instead.
+_DIRECTORY_GONE_WINERRORS = frozenset({64, 59})
+
+#: Whether this is Windows, where only ``ERROR_FILE_NOT_FOUND`` (2) on a segment's own ``lstat``
+#: confirms the file gone: Python raises ``FileNotFoundError`` for path-not-found (3) and for
+#: network paths out of reach (53, 67) too. A module global so a test can take either branch.
+_WINDOWS = sys.platform == "win32"
+_WINERROR_FILE_NOT_FOUND = 2
+_WINERROR_PATH_NOT_FOUND = 3
+
+
+def _directory_unreachable(exc: OSError) -> bool:
+    """Whether a read's ``OSError`` says the spool directory is gone or out of reach, rather than
+    one file failing: a path component that is no longer a directory, or a mount or share that
+    dropped. Other network failures, which a platform reports under other codes, read as one
+    file failing."""
+    return (
+        isinstance(exc, NotADirectoryError)
+        or exc.errno in _DIRECTORY_GONE_ERRNOS
+        or getattr(exc, "winerror", None) in _DIRECTORY_GONE_WINERRORS
+    )
+
+
+def _not_found_confirms(exc: FileNotFoundError, *, link_target: bool = False) -> bool:
+    """Whether a ``FileNotFoundError`` from a segment's own ``lstat``, or from ``stat`` on a
+    segment that is a symlink (``link_target``), confirms it gone. On Windows only ``winerror``
+    2 does, and 3 too for a link's target, since a link into a missing directory gives 3. On
+    POSIX it is always ENOENT, which cannot tell a gone file from a directory gone: the caller
+    checks the directory after this."""
+    if _WINDOWS:
+        winerror = getattr(exc, "winerror", None)
+        return winerror == _WINERROR_FILE_NOT_FOUND or (
+            link_target and winerror == _WINERROR_PATH_NOT_FOUND
+        )
+    return True
+
 
 _SEGMENT_PREFIX = "spool-"
 _SEGMENT_SUFFIX = ".jsonl"
@@ -165,7 +218,8 @@ class LogSpool:
         self.dropped = 0
         #: Torn, malformed or other-version lines skipped on replay, and segments found gone.
         self.unreadable = 0
-        #: Reads that failed for a reason other than a missing file. The files are kept.
+        #: Reads that failed for a reason other than a missing segment file, a missing spool
+        #: directory included. Nothing is retired for them.
         self.read_errors = 0
         #: Whether the LAST read failed that way. :attr:`read_errors` never goes down, so it cannot
         #: say whether a fault is still standing; this can.
@@ -412,26 +466,94 @@ class LogSpool:
         now. Idempotent until :meth:`advance`.
 
         A read error never escapes: ``QueueListener`` catches only ``queue.Empty``, so an exception
-        here would end the listener thread for good. Only a segment that is GONE is retired; any
-        other ``OSError`` (out of descriptors, a sharing violation) keeps every file and returns
-        ``None``, so the caller tries again later instead of deleting undelivered records."""
-        try:
-            entry = self._peek()
-            self.read_faulted = False
-            return entry
-        except FileNotFoundError:
-            self.unreadable += 1
-            seq = self._segments[0] if self._segments else None
-            if seq is not None:
+        here would end the listener thread for good. Only a segment whose own file is confirmed
+        GONE is retired, and the read then moves on to the next segment: answering ``None`` there would read as drained, and
+        the forwarder could send live records ahead of the older ones still spooled (BACKLOG #5811).
+        A spool DIRECTORY that is missing, or that the read error names as out of reach
+        (:func:`_directory_unreachable`), is not a gone segment: like any other
+        ``OSError`` (out of descriptors, a sharing violation) it retires nothing and returns
+        ``None``, so the caller tries again later instead of deleting undelivered records. It also
+        closes the writer, for the reason the comment below gives."""
+        while True:
+            try:
+                entry = self._peek()
+                self.read_faulted = False
+                return entry
+            except FileNotFoundError:
+                # Only opening a segment's file raises this, so there is a first segment. Its own
+                # file is checked first and the directory after, so a directory that drops between
+                # the two reads as out of reach rather than confirming the segment gone.
+                seq = self._segments[0]
+                gone = self._segment_confirmed_missing(seq)
+                if not self._directory_present():
+                    # The whole spool is out of reach, not one segment gone: retiring would drop
+                    # every segment from the order and the cap while the files may still exist.
+                    # The writer is closed, so the next append must create its file in the
+                    # directory, and fails and is counted as dropped while the directory is gone,
+                    # rather than landing in a file a removed directory left unlinked.
+                    self.read_errors += 1
+                    self.read_faulted = True
+                    self._close_reader()
+                    self._close_writer()
+                    return None
+                if gone is None:
+                    # The open said ENOENT but the file's own lstat did not confirm it: a
+                    # transient fault (an SMB share reconnecting), never a reason to retire
+                    # records still undelivered.
+                    self.read_errors += 1
+                    self.read_faulted = True
+                    self._close_reader()
+                    return None
+                self.unreadable += 1
+                # Each pass retires one, so the loop ends with the segments.
                 if seq == self._write_seq:
                     self._close_writer()
-                self._retire(seq)
-            return None
+                # A gone file is not unlinked: a delete that later succeeded through reclaim()
+                # could only ever destroy a file the confirmation missed. A dangling link is: it
+                # holds no records, and left in place it would make the next open() refuse the
+                # whole spool.
+                self._retire(seq, unlink=gone == "link")
+            except OSError as exc:
+                self.read_errors += 1
+                self.read_faulted = True
+                self._close_reader()
+                # On Windows a read error from open() or readline() carries no ``winerror``, so
+                # the directory is also probed, by a call that does.
+                if _directory_unreachable(exc) or not self._directory_present():
+                    # The same case as a missing directory above, by another error: the writer is
+                    # closed for the same reason.
+                    self._close_writer()
+                return None
+
+    def _segment_confirmed_missing(self, seq: int) -> Literal["file", "link"] | None:
+        """How segment ``seq`` is confirmed gone: ``"file"`` when its ``lstat`` raises
+        ``FileNotFoundError``, ``"link"`` when it is a symlink whose ``stat`` does (a dangling
+        link, which ``open()`` can never read), as :func:`_not_found_confirms` reads each. Any
+        other answer, including another ``OSError``, is ``None``: not a confirmation."""
+        path = self._path(seq)
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError as exc:
+            return "file" if _not_found_confirms(exc) else None
         except OSError:
-            self.read_errors += 1
-            self.read_faulted = True
-            self._close_reader()
             return None
+        if not stat.S_ISLNK(mode):
+            return None
+        try:
+            path.stat()
+        except FileNotFoundError as exc:
+            return "link" if _not_found_confirms(exc, link_target=True) else None
+        except OSError:
+            return None
+        return None
+
+    def _directory_present(self) -> bool:
+        """Whether the spool directory can be reached and is a directory, read by ``stat``.
+        Any ``OSError`` reads as not present."""
+        try:
+            return stat.S_ISDIR(self.directory.stat().st_mode)
+        except OSError:
+            return False
 
     def _close_reader(self) -> None:
         if self._reader is not None:
@@ -488,14 +610,16 @@ class LogSpool:
         self._reader = open(self._path(seq), "rb")  # noqa: SIM115 - held across calls on purpose
         self._read_seq = seq
 
-    def _retire(self, seq: int) -> None:
+    def _retire(self, seq: int, *, unlink: bool = True) -> None:
+        """Drop segment ``seq`` from the order. With ``unlink`` False its file is left alone and
+        never queued for :meth:`reclaim`."""
         if self._reader is not None and self._read_seq == seq:
             with contextlib.suppress(OSError):
                 self._reader.close()
             self._reader = None
             self._read_seq = None
         self._segments.remove(seq)
-        if self._unlink(seq):
+        if not unlink or self._unlink(seq):
             self._sizes.pop(seq, None)
         else:
             # Still on disk, so still counted. Dropping its size here would let the directory
