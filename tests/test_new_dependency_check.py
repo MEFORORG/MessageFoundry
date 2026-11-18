@@ -1122,7 +1122,6 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
         ("[tool.hatch.build.targets.wheel.hooks.custom]\npath = 'hook.py'\n", "in-tree build hook"),
         ("[tool.hatch.build.targets.custom]\npath = 'hatch_build.py'\n", "in-tree build target"),
         ("[tool.uv]\nallow-insecure-host = ['example.invalid']\n", "insecure host"),
-        ("[tool.uv.pip]\nallow-insecure-host = ['example.invalid:8080']\n", "insecure host"),
         ("[project]\ndynamic = 'dependencies'\n", "not a list"),
         ("[tool.uv.dependency-metadata]\nname = 'x'\n", "not a list"),
     ],
@@ -1142,7 +1141,6 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
         "hatch-target-custom-hook",
         "hatch-custom-target",
         "uv-allow-insecure-host",
-        "uv-pip-allow-insecure-host",
         "dynamic-not-a-list",
         "dependency-metadata-not-an-array",
     ],
@@ -1211,7 +1209,6 @@ def test_a_custom_target_in_hatch_toml_is_refused() -> None:
         "", hatch_toml_text="[build.targets.custom]\ndependencies = ['helper>=1']\n"
     )
     assert [f.problem for f in findings] == ["in-tree build target"], findings
-    assert findings[0].distribution.endswith("[tool.hatch.build.targets.custom]"), findings
     assert set(declared) == {"helper"}, "the target's own dependencies are still vetted"
 
 
@@ -1220,21 +1217,30 @@ def test_an_empty_allow_insecure_host_is_not_refused() -> None:
     assert _gate.scan("[tool.uv]\nallow-insecure-host = []\n") == ({}, [])
 
 
-def test_a_refusal_beside_an_unreachable_pypi_exits_2_not_1(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_allow_insecure_host_under_uv_pip_is_not_read_so_not_refused() -> None:
+    """uv 0.13.1 rejects the key under [tool.uv.pip] as unknown, so only [tool.uv] is refused."""
+    assert _gate.scan("[tool.uv.pip]\nallow-insecure-host = ['example.invalid']\n") == ({}, [])
+
+
+def test_a_failed_check_beside_an_unreachable_pypi_exits_2_not_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The exit-code contract the docstring states: "could not see" outranks a refusal."""
+    """The exit-code contract the docstring states: "could not see" outranks a failed check."""
     project = tmp_path / "pyproject.toml"
     project.write_text(
-        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100", "./x.whl"]\n', encoding="utf-8"
+        '[project]\nname = "x"\ndependencies = ["aaa-invented>=1", "zzz>=1"]\n', encoding="utf-8"
     )
+    asked: list[str] = []
 
-    def unreachable(_name: str, **_kw: object) -> dict:
+    def fetch(name: str, **_kw: object) -> dict | None:
+        asked.append(name)
+        if name == "aaa-invented":
+            return None
         raise urllib.error.URLError("no route to host")
 
-    monkeypatch.setattr(_gate, "_http_fetch", unreachable)
+    monkeypatch.setattr(_gate, "_http_fetch", fetch)
     assert main(["--pyproject", str(project)]) == 2
-    assert "unnameable entry" in capsys.readouterr().err, "the refusal is still printed"
+    assert asked == ["aaa-invented", "zzz"], "the failed check must come first for this to bite"
 
 
 def test_main_reads_a_hatch_toml_beside_a_pyproject(

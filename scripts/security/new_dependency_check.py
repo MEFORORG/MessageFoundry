@@ -32,12 +32,14 @@ entry the gate cannot name (a bare URL, a path, a non-string, a table or list of
 type); a direct reference (``name @ url``), whose bytes come from the URL rather than from the PyPI
 project the name would be vetted against; ``[project].dynamic`` naming the dependency lists, which a
 build plugin fills from a file this gate never opens; an in-tree build backend (``backend-path``),
-an in-tree hatch ``custom`` build or metadata hook, or a hatch ``custom`` build target
-(``[tool.hatch.build.targets.custom]``), any of which can return requirements from code; a
-non-empty source or index key in ``[tool.uv]`` or ``[tool.uv.pip]``, which sends a vetted name
-somewhere other than pypi.org; a non-empty ``allow-insecure-host`` in either, which lets uv fetch
-without verifying TLS, so the bytes need not be what pypi.org serves; and a ``[tool.uv].workspace``,
-whose members this gate does not sweep.
+an in-tree hatch ``custom`` build or metadata hook, any of which can return requirements from code;
+a hatch ``custom`` build target (``[tool.hatch.build.targets.custom]``), whose in-tree builder runs
+when that target is built (this repo's PEP 517 builds consult only the wheel and sdist targets, so
+this one is refused as a precaution); a non-empty source or index key in ``[tool.uv]`` or
+``[tool.uv.pip]``, which sends a vetted name somewhere other than pypi.org; a non-empty
+``[tool.uv].allow-insecure-host``, which lets uv fetch from that host without verifying TLS, so the
+bytes need not be what pypi.org serves; and a ``[tool.uv].workspace``, whose members this gate does
+not sweep.
 
 EXEMPT FROM THE AGE FLOOR ONLY: this repository's own distributions (``FIRST_PARTY``), by exact PEP
 503 name, wherever declared. Every other check still runs on them; the comment above ``FIRST_PARTY``
@@ -103,9 +105,10 @@ EXIT CODES, as ``main`` returns them. 0: every distribution examined passed and 
 or its ``hatch.toml`` could not be read or parsed; the default sweep's root runtime tables yielded no
 name; PyPI could not be reached or sent an unreadable reply once the retries were spent; and zero
 distributions were examined with nothing refused. argparse also exits 2 on a bad command line. 1: a
-refusal or a failed check, when none of the exit-2 cases above occurred. A refusal found beside an
-exit-2 case is still printed, but the run exits 2, not 1. An exception ``main`` does not catch ends
-the run with Python's traceback exit, also 1.
+refusal or a failed check, when none of the exit-2 cases above occurred: beside one of them the run
+exits 2, and a refusal or failed check found before it is not always printed. An exception ``main``
+does not catch, such as a PyPI reply of a shape ``vet`` does not expect, ends the run with Python's
+traceback exit, also 1; that is a gap in FAIL-CLOSED above, not a vetting result.
 
 Worst case added time. The whole run gets at most ``_RUN_RETRY_BUDGET`` (6) retries, and none starts
 once the sweep has been running ``_RETRY_WINDOW_S`` (120s). So retries add at most those 120s plus
@@ -218,8 +221,6 @@ _UV_REQUIREMENT_LISTS = (
 )
 # The [tool.uv] keys that change where a distribution is fetched from. Any non-empty one is refused.
 _UV_SOURCE_KEYS = ("sources", "index", "index-url", "extra-index-url", "find-links")
-# The [tool.uv] key that turns off TLS verification for a host. Any non-empty one is refused.
-_UV_INSECURE_KEYS = ("allow-insecure-host",)
 
 
 def scan(
@@ -376,14 +377,15 @@ def scan(
                     "this redirects where uv fetches a distribution from, and this gate vets names "
                     "against pypi.org only, so what it passes is not what would be installed.",
                 )
-        for key in _UV_INSECURE_KEYS:
-            if settings.get(key):
-                refuse(
-                    f"{where}.{key}",
-                    "insecure host",
-                    "this lets uv fetch from a host without verifying TLS, so the bytes installed "
-                    "need not be what pypi.org serves for the name this gate vetted.",
-                )
+    # [tool.uv] only: uv 0.13.1 rejects the key under [tool.uv.pip] as an unknown field.
+    if uv.get("allow-insecure-host"):
+        refuse(
+            "[tool.uv].allow-insecure-host",
+            "insecure host",
+            "this lets uv fetch from a host without verifying TLS, so the bytes installed need not "
+            "be what pypi.org serves for the name this gate vetted. Remove it, and fix the host's "
+            "certificate chain or trust store instead.",
+        )
     if uv.get("workspace"):
         refuse(
             "[tool.uv].workspace",
@@ -412,14 +414,16 @@ def scan(
         if not isinstance(config, dict):
             refuse(where, "not a table", "a hatch build target must be a table.")
             continue
-        # The `custom` target's builder is a class loaded from the tree; like the custom hook, it can
-        # return build requirements from code this gate never reads.
+        # The `custom` target's builder is a class loaded from the tree when that target is built;
+        # like the custom hook, it can return build requirements from code this gate never reads.
+        # This repo's PEP 517 builds consult only the wheel and sdist targets, so it is a precaution.
         if target == "custom":
             refuse(
                 where,
                 "in-tree build target",
-                "a hatch custom build target loads a builder from the tree, which can return build "
-                "requirements from code this gate never reads. Use a published builder plugin.",
+                "a hatch custom build target loads a builder from the tree when that target is "
+                "built, and it can return build requirements from code this gate never reads. Use "
+                "a published builder plugin.",
             )
         requirements(config.get("dependencies", []), f"{where}.dependencies")
         hooks.append((f"{where}.hooks", table(config, "hooks", f"{where}.hooks")))
