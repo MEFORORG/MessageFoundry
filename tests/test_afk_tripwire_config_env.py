@@ -119,14 +119,31 @@ MUST_HIT = [
     ),
     # Overrides that can bypass hooks or run another command as surely as core.hooksPath.
     pytest.param(
-        "git -c include.path=evil.cfg commit -m x",
+        # git refuses a relative include from the command line, so the path is absolute.
+        "git -c include.path=/tmp/evil.cfg commit -m x",
         "include.path",
         id="c-include-path",
     ),
     pytest.param(
         "git --config-env includeIf.gitdir:/r/.path=V commit -m x",
-        "include.path",
+        "includeIf",
         id="config-env-include-if",
+    ),
+    pytest.param(
+        "git -c remote.origin.mirror=true push origin",
+        "remote mirror or push refspec",
+        id="c-remote-mirror",
+    ),
+    # The value is an environment variable's name, so whether the refspec forces is unseen.
+    pytest.param(
+        "git --config-env=remote.origin.push=V push origin",
+        "remote mirror or push refspec",
+        id="config-env-remote-push-value-unseen",
+    ),
+    pytest.param(
+        "git -c remote.origin.push=+refs/heads/*:refs/heads/* push origin",
+        "remote mirror or push refspec",
+        id="c-remote-push-plus-refspec",
     ),
     pytest.param(
         "git -c alias.ci=commit ci -m x",
@@ -148,6 +165,10 @@ MUST_PASS = [
     # sets nothing. Only the config key folds case.
     pytest.param("git --CONFIG-ENV=core.hooksPath=V commit -m x", id="config-env-name-case-kept"),
     pytest.param("git -c includes.path=x commit -m x", id="c-key-only-looks-like-include"),
+    pytest.param(
+        "git -c remote.origin.push=refs/heads/b:refs/heads/b push origin",
+        id="c-remote-push-plain-refspec",
+    ),
 ]
 
 

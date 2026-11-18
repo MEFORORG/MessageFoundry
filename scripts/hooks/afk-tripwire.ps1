@@ -24,8 +24,9 @@
       * a hook bypass: `--no-verify` on any git subcommand, `-n` on `git commit`,
         `git -c core.hooksPath=...` or `git --config-env core.hooksPath=...`, and pre-commit's `SKIP=`
         in front of a command;
-      * a `-c` or `--config-env` override of `include.path`, `includeIf.*` or `alias.*`, which can load
-        a hooksPath from a file or make any word run any git command;
+      * a `-c` or `--config-env` override of `include.path` or `includeIf.*`, which can load a
+        hooksPath from a file; of `alias.*`, which can run a git command under a new name, or any shell
+        command with `!`; and of `remote.<name>.mirror` or a `+` or `:` `remote.<name>.push` refspec;
       * a force push: `--force`, `-f`, `--force-with-lease`, `--mirror`, or a `+` refspec;
       * a ref deletion by push: `--delete`, `-d`, `--prune`, or a `:<branch>` refspec;
       * `git reset --hard`;
@@ -50,9 +51,12 @@
     WHAT IT DOES NOT SEE (SAIDS section 9: a rule is not a control until something enforces it).
     A script file that runs one of these acts, an alias or variable that spells the command, git
     plumbing that deletes or moves a ref (`update-ref -d`, `branch -D`), and every non-shell tool.
-    Nor a config override set through the environment rather than on the command line:
-    `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`, or `GIT_CONFIG_PARAMETERS`,
-    can set core.hooksPath, an include or an alias as surely as `-c`, and is not read.
+    Nor config that does an act without a flag, at least: a `-c` key that runs a command
+    (`core.pager`, `core.editor`, `sequence.editor`, `core.sshCommand`, `core.fsmonitor`,
+    `diff.external`, `credential.helper`, `gpg.program`) or moves the work tree (`core.worktree`);
+    config set through the environment (`GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>` and
+    `GIT_CONFIG_VALUE_<n>`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, or a
+    moved `HOME` or `XDG_CONFIG_HOME`); and a persistent `git config core.hooksPath <dir>` write.
     The other section 4.4 tripwires -- a diff touching Class C paths, the same permission denial
     twice, `main` red for two hours, two seats on one item -- are rules only in this slice; ADR 0211
     says which the digest reports.
@@ -210,12 +214,17 @@ function Test-KillSwitchWrite($Argv) {
 
 function Get-ConfigOverrideHit([string]$Option, [string]$Pair) {
     # A config override that points the hooks elsewhere skips them as surely as --no-verify; an
-    # include can load a file that does the same, and an alias can make any word run any command.
-    # -match folds case, as git does for a section and variable name; it also folds an includeIf
-    # subsection, which git does not, and so records more, never less.
+    # include can load a file that does the same; an alias can run a git command under a new name,
+    # or any shell command with `!`; a remote's mirror or `+`/`:` push refspec turns a plain push into
+    # a forced one or a deletion. -match folds case, as git does for a section and variable name; it
+    # also folds a subsection, which git does not, and so records more, never less.
     if ($Pair -match '^core\.hooksPath=') { return "git $Option core.hooksPath (hook bypass)" }
-    if ($Pair -match '^include\.path=|^includeIf\.') { return "git $Option include.path (config include, can bypass hooks)" }
+    if ($Pair -match '^include\.path=') { return "git $Option include.path (config include, can bypass hooks)" }
+    if ($Pair -match '^includeIf\.') { return "git $Option includeIf (config include, can bypass hooks)" }
     if ($Pair -match '^alias\.') { return "git $Option alias (command alias override)" }
+    # Under --config-env the text after `=` names an environment variable, so the refspec is unseen.
+    $push = if ($Option -ceq '--config-env') { 'push=' } else { 'push=[+:]' }
+    if ($Pair -match "^remote\..+\.(mirror=|$push)") { return "git $Option remote mirror or push refspec (can force a push)" }
     return $null
 }
 
@@ -242,8 +251,7 @@ function Find-GitTripwires($Argv, $Hits) {
             # --config-env is -c with the value read from an environment variable, in both spellings
             # git accepts (BACKLOG #5448): `--config-env=<key>=<var>` and `--config-env <key>=<var>`.
             # The option NAME is matched case-sensitively, as git does; only the key folds.
-            $hit = if ($t -ceq '-c') { Get-ConfigOverrideHit '-c' $next }
-            elseif ($t -ceq '--config-env') { Get-ConfigOverrideHit '--config-env' $next }
+            $hit = if ($t -cin @('-c', '--config-env')) { Get-ConfigOverrideHit $t $next }
             elseif ($t -cmatch '^--config-env=(.*)$') { Get-ConfigOverrideHit '--config-env' $Matches[1] }
             if ($hit) { $Hits.Add($hit) }
             if ($t -cin $valued) { $k++ }
