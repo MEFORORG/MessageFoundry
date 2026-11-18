@@ -707,6 +707,7 @@ def test_anchor_settings_store_path_tolerates_no_settings(tmp_path: Path) -> Non
 
 _NO_FILE = "names no file"
 _DRIVE = "drive-relative"
+_TRIMMED = "ends in a dot or a space, which Windows trims from a file name"
 
 
 @pytest.mark.parametrize(
@@ -729,10 +730,10 @@ def test_a_store_path_naming_no_file_is_refused_at_load(value: str) -> None:
         ("C:site-store.db", _DRIVE),  # drive-relative: per-process current directory of C:
         ("/C:site-store.db", _DRIVE),  # the anchor strips the slash, leaving C:site-store.db
         ("site-store.db:x", "file stream"),  # an NTFS alternate data stream
-        ("site-store...", _NO_FILE),  # Win32 trims the dots
-        ("site-store.db ", _NO_FILE),  # and a trailing space, so this is site-store.db
-        ("site-store ", _NO_FILE),
-        ("site-store/ ", _NO_FILE),  # a last part of one space names site-store itself
+        ("site-store...", _TRIMMED),  # Win32 trims the dots
+        ("site-store.db ", _TRIMMED),  # and a trailing space, so this is site-store.db
+        ("site-store ", _TRIMMED),
+        ("site-store/ ", _TRIMMED),  # a last part of one space names site-store itself
         ("site-store\\..", _NO_FILE),  # a backslash separates parts on Windows
     ],
 )
