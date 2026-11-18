@@ -948,8 +948,9 @@ async def test_two_adjacent_batches_whose_writes_fail_do_not_stop_the_rows_after
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5651: writes that fail for reasons of their own rows (a lock timeout on the two
-    oldest batches, say) are passed over, and the pass still strips the rows after them, so a fault
-    at the head of the keyset cannot stop every pass at the same place. Each failure is logged at
+    oldest batches, say) are passed over, and the pass still strips the rows after them: a fault on
+    particular rows cannot stop the rows after the failing batch, so a fault at the head of the
+    keyset cannot stop every pass at the same place. Each failure is logged at
     ERROR with its type only, and the call is flagged ``write_failed``."""
     monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
     writes: list[str] = []
@@ -976,11 +977,12 @@ async def test_two_adjacent_batches_whose_writes_fail_do_not_stop_the_rows_after
     assert not any("SECRET-TEXT" in r.getMessage() for r in caplog.records)
 
 
-async def test_a_failed_batch_write_is_flagged_and_counts_as_audited_work(
+async def test_a_failed_batch_write_is_flagged_but_is_not_audited_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #5651: a failed write is passed over and the scan goes on, but the call says a write
-    failed, and a retention pass treats that alone as work for its audit row, which records it."""
+    failed. A retention pass records the flag in an audit row it writes, but does not write one for
+    it alone: on a read-only store or a full disk that row's insert would fail too."""
     from messagefoundry.pipeline.retention import RetentionPass
 
     monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
@@ -1006,7 +1008,7 @@ async def test_a_failed_batch_write_is_flagged_and_counts_as_audited_work(
         "size_bytes": None,
         "over_limit": False,
     }
-    assert RetentionPass(**quiet, documents_strip_write_failed=True).did_work
+    assert not RetentionPass(**quiet, documents_strip_write_failed=True).did_work
 
 
 async def test_refused_cells_of_a_batch_whose_transform_raises_are_still_audited(

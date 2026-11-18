@@ -766,39 +766,6 @@ function Get-OwnInvocationWindow([string]$Scan, [int]$At, [switch]$SeparatorInTo
     }
 }
 
-# Does $Text, the flags between a git token and a `worktree remove|move` (rule 3d, BACKLOG #5643, a
-# finding left open by its first PR), cross the edge of the git command's own group? Two shapes do:
-#   * A `(` still open at its end: `git log $(echo worktree remove <wt>)` puts the match inside a
-#     substitution `echo` runs, while `git -c x.y=$(echo z) worktree remove <wt>` closes its
-#     substitution first, and the match is still git's. A bare `(` counts too: in PowerShell's argument
-#     mode `( ... )` runs a pipeline as `$(` does.
-#   * A `)` with no opener in $Text: `echo $(git -C <d> log -1) worktree remove <wt>` closes the
-#     substitution git ran in, and the match belongs to `echo`. The FIRST reading still judges that
-#     line, so it is still refused for what it names.
-# A `(` or `)` escaped by the HOST'S escape character ($Escape, from Get-EscapeChar: `\` under a POSIX
-# shell, a backtick under PowerShell) is a literal and is not read, so `-c a.b=\)` cannot pass for a
-# closed group. It is escaped only after an ODD-length run of that character: `\\)` is an escaped
-# backslash and a real `)`. The other host's character is no escape: `C:\tmp\)` in PowerShell, and a
-# backtick substitution in bash, end in a real `)`. A quoted one never reaches here: the scan blanks a
-# quoted span holding either. Braces are not read at all: `x{y` is an ordinary unquoted path, and a
-# `{` counted as an opener once let `git -C <d>/x{y worktree remove <wt>` skip the invocation.
-function Test-CrossesOwnGroup([string]$Text, [char]$Escape) {
-    $depth = 0
-    for ($i = 0; $i -lt $Text.Length; $i++) {
-        $c = $Text[$i]
-        if ($c -ne '(' -and $c -ne ')') { continue }
-        $run = 0
-        if ($Escape -ne [char]0) {
-            for ($j = $i - 1; $j -ge 0 -and $Text[$j] -eq $Escape; $j--) { $run++ }
-        }
-        if ($run % 2 -eq 1) { continue }
-        if ($c -eq '(') { $depth++ }
-        elseif ($depth -eq 0) { return $true }
-        else { $depth-- }
-    }
-    $depth -gt 0
-}
-
 # SCAN INDEX -> RAW INDEX for one segment (BACKLOG #5643). Remove-QuotedSpans does not preserve length,
 # so an offset found on the scan string cannot be used on the raw line as it stands. This re-runs the
 # same scan with its -Map on, and returns the raw index of every scan character -- one more entry,
@@ -4370,8 +4337,7 @@ What to do instead:
     # WHERE A VICTIM ENDS (review round cfbde907): at a command separator, and also at a `}` or `)` that
     # closes a script block or substitution, and at a lone `&`. Without the last three `& {git worktree
     # remove <wt>}`, `$(git worktree remove <wt>)` and `git worktree remove <wt>&` read `<wt>}`, `<wt>)`
-    # and `<wt>&`, which name nothing, and were allowed. The cut is found on SCAN, so a closer inside a
-    # quoted span the scan blanks is not a cut (the added reading, below, says how).
+    # and `<wt>&`, which name nothing, and were allowed. Not quote-aware, like the split it widens.
     # A `}` or `)` that closes the shell's own `${...}` or `$(...)` inside the victim is not a closer.
     $wtVictimSplit = '(?:&&|\|\||;|\||(?<!\$\{[^}]*)\}|(?<!\$\([^)]*)\)|(?<![<>&])&(?![>&]))'
     $wtTargets = foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
@@ -4431,59 +4397,29 @@ What to do instead:
         $map = Get-ScanRawIndexMap $seg
         if ($null -ne $map) {
             foreach ($sm in [regex]::Matches($seg.Scan, '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)')) {
-                # THE OWNING git TOKEN IS THE LAST ONE BEFORE THE MATCH THAT STARTS ITS COMMAND, NOT THE
-                # LAST ONE (BACKLOG #5643, a finding left open by its first PR). $gitInvocation also
-                # matches a path leaf, so in `git -C <dir>/git worktree remove ../<wt>` the last token is
-                # the `/git` of the `-C` value. That token fails the command-position test below, and
-                # the invocation was skipped, so only the first base was tried: measured, with another
-                # command's `-C` earlier on the line, a governed relative victim was ALLOWED. A token
-                # that fails the test is now passed over for the one before it.
-                $inv = $null
-                $probeAt = $sm.Index
-                while ($probeAt -ge 0) {
-                    $cand = Get-OwnInvocationWindow $seg.Scan $probeAt -SeparatorInToken -IgnoreCase:$IsWindows
-                    # A `worktree remove` with no git token in front of it is not a git subcommand:
-                    # `echo worktree remove x` stops here.
-                    if (-not $cand.Own) { break }
-                    # NOR IS ONE WITH A COMMAND SEPARATOR between that token and it: `git status ; echo
-                    # worktree remove x` belongs to `echo`. Only a TRUE separator counts -- `;`, `|`,
-                    # `||`, `&&` and a lone `&` -- because the wider class `[;&|(){}]` also matches
-                    # characters INSIDE one invocation, at least `${HOME}`, `$(pwd)`, `2>&1` and `&>`
-                    # (review round 8d822d77). Skipping on that class let `echo 'git worktree remove x'
-                    # ; git -C ${HOME} worktree remove <governed>` through, and the next fix, judging it
-                    # with the first base only, still let a relative victim through.
-                    $ownEnd = $cand.Own.Index + $cand.Own.Length
-                    if ($ownEnd -gt $sm.Index) { break }
-                    $between = $seg.Scan.Substring($ownEnd, $sm.Index - $ownEnd)
-                    if ($between -match '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))') { break }
-                    # NOR IS THIS TOKEN THE OWNER ACROSS THE EDGE OF ITS OWN GROUP (Test-CrossesOwnGroup):
-                    # in `git log $(echo worktree remove <wt>)` the match is `echo`'s argument. The walk
-                    # goes on to the token before it, so in `git -C <p> -c a.b=$(git rev-parse HEAD)
-                    # worktree remove <wt>` the inner git is passed over and the outer one, with its
-                    # `-C`, owns the match.
-                    if (Test-CrossesOwnGroup $between (Get-EscapeChar $seg.Conv)) {
-                        $probeAt = $cand.Own.Index - 1
-                        continue
-                    }
-                    # AND THE git WORD MUST START ITS COMMAND (review round cfbde907): `git worktree
-                    # remove <o>/nope ; echo git worktree remove <wt>` read the printed `git` as an
-                    # invocation and refused the line for what it named. Between the window start and the
-                    # git WORD only whitespace, environment assignments and a directory part of the
-                    # program path may stand. The git word is found inside the match, which can begin on
-                    # the character before it.
-                    $gitWordAt = $cand.Own.Index + [Math]::Max(0, $cand.Own.Value.IndexOf('git', [System.StringComparison]::OrdinalIgnoreCase))
-                    $ownLead = $(if ($gitWordAt -gt $cand.Start) { $seg.Scan.Substring($cand.Start, $gitWordAt - $cand.Start) } else { "" })
-                    if ($ownLead -match '^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:\S*[\\/])?$') {
-                        $inv = [pscustomobject]@{
-                            Own    = $cand.Own
-                            Start  = $cand.Start
-                            CmdWin = $seg.Scan.Substring($cand.Start, $sm.Index - $cand.Start)
-                        }
-                        break
-                    }
-                    $probeAt = $cand.Own.Index - 1
-                }
-                if ($null -eq $inv) { continue }
+                $inv = Get-OwnInvocationWindow $seg.Scan $sm.Index -SeparatorInToken -IgnoreCase:$IsWindows
+                # A `worktree remove` with no git token in front of it is not a git subcommand:
+                # `echo worktree remove x` stops here.
+                if (-not $inv.Own) { continue }
+                # NOR IS ONE WITH A COMMAND SEPARATOR between that token and it: `git status ; echo
+                # worktree remove x` belongs to `echo`. Only a TRUE separator counts -- `;`, `|`, `||`,
+                # `&&` and a lone `&` -- because the wider class `[;&|(){}]` also matches characters
+                # INSIDE one invocation, at least `${HOME}`, `$(pwd)`, `2>&1` and `&>` (review round
+                # 8d822d77). Skipping on that class let `echo 'git worktree remove x' ; git -C ${HOME}
+                # worktree remove <governed>` through, and the next fix, judging it with the first base
+                # only, still let a relative victim through.
+                $ownEnd = $inv.Own.Index + $inv.Own.Length
+                if ($ownEnd -gt $sm.Index) { continue }
+                if ($seg.Scan.Substring($ownEnd, $sm.Index - $ownEnd) -match
+                    '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))') { continue }
+                # AND THE git WORD MUST START ITS COMMAND (review round cfbde907): `git worktree remove
+                # <o>/nope ; echo git worktree remove <wt>` read the printed `git` as an invocation and
+                # refused the line for what it named. Between the window start and the git WORD only
+                # whitespace, environment assignments and a directory part of the program path may stand.
+                # The git word is found inside the match, which can begin on the character before it.
+                $gitWordAt = $inv.Own.Index + [Math]::Max(0, $inv.Own.Value.IndexOf('git', [System.StringComparison]::OrdinalIgnoreCase))
+                $ownLead = $(if ($gitWordAt -gt $inv.Start) { $seg.Scan.Substring($inv.Start, $gitWordAt - $inv.Start) } else { "" })
+                if ($ownLead -notmatch '^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:\S*[\\/])?$') { continue }
                 # THE OWN WINDOW IS ALWAYS OFFERED. A base can only add a deny, so offering it costs at
                 # most a false deny; where its `-C` cannot be read the resolver answers nothing and only
                 # the first base is tried.
@@ -4497,16 +4433,7 @@ What to do instead:
                 # only invocation is still judged without repeating the first reading's own victims.
                 $sameAsOld = ($rawEnd -eq $oldEnd)
                 if ($sameAsOld) { $oldWindow = $win }
-                # THE CUT IS FOUND ON SCAN AND MAPPED BACK (BACKLOG #5643, a finding left open by its
-                # first PR). Cut on RAW, `git worktree remove "<tmp>/Primary-wt2 (2)"` ended at the `)`
-                # inside the quotes, the victim scan read the governed `<tmp>/Primary-wt2` off the front,
-                # and an ungoverned directory was refused. The scan, under the host's own escape
-                # rules, blanks a quoted span holding whitespace or any of the split's characters, so
-                # a closer inside quotes is not a cut.
-                $tailAt = $sm.Index + $sm.Length
-                $cut = [regex]::Match($seg.Scan.Substring($tailAt), $wtVictimSplit)
-                $rawStop = $(if ($cut.Success) { $map[$tailAt + $cut.Index] } else { $seg.Raw.Length })
-                $a2 = $seg.Raw.Substring($rawEnd, [Math]::Max(0, $rawStop - $rawEnd))
+                $a2 = ($seg.Raw.Substring($rawEnd) -split $wtVictimSplit, 2)[0]
                 foreach ($v in @(Get-WorktreeVictimTokens $a2)) {
                     if ($sameAsOld -and @($oldVictims | Where-Object {
                                 [string]::Equals($_, $v, [System.StringComparison]::Ordinal) }).Count -gt 0) { continue }
@@ -4589,7 +4516,9 @@ What to do instead:
         #     blanks (an interpreter payload is recursed separately), one with no git token before it
         #     on its segment, one whose git token `$gitInvocation` does not recognise, and one behind a
         #     separator inside a substitution such as `$(cd x; pwd)`, one whose git word is not at
-        #     command position (`command git`, `sudo git`, a printed `echo git`). The FIRST reading still judges
+        #     command position (`command git`, `sudo git`, a printed `echo git`), and one whose owning
+        #     git token is itself inside a substitution in its flags (`-c x=$(git rev-parse HEAD)`),
+        #     which then loses the outer `-C`. The FIRST reading still judges
         #     whatever the line's first raw match is, a quoted mention included, so a mention can still
         #     be refused for what it names.
         #   * NOT FOLLOWED BY EITHER BASE, at least: a chdir on an EARLIER LINE of the command, a
@@ -4615,8 +4544,8 @@ What to do instead:
         #   * THE PRE-SPLITTERS ARE NOT QUOTE-AWARE. The first reading splits with
         #     `(?:&&|\|\||;|\|)`, so a quoted victim path containing `;` or `&&` is truncated before the
         #     quote-aware scan runs. The added reading splits with $wtVictimSplit, defined above the
-        #     segment loop, which also cuts at a `}`, `)` or lone `&`. It finds the cut on the scan,
-        #     which blanks a quoted span holding any of those, so a quoted victim is not cut there.
+        #     segment loop, which also cuts at a `}`, `)` or lone `&`, so there a quoted path holding
+        #     one of those is truncated too, and only the first reading judges it.
         #
         # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
         # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.

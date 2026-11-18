@@ -274,9 +274,10 @@ async def run_strip_pass(
                         landed = await write(batch.updates)
                     except Exception as exc:
                         # The batch rolled back whole and counts nothing; the keyset goes on past
-                        # it, so a fault on particular rows cannot stop the rows after them. Its
-                        # rows are tried again on the next pass. ERROR, with the type only (a
-                        # server error's text can quote stored values), the traceback at DEBUG.
+                        # it, so a fault on particular rows cannot stop the rows after the failing
+                        # batch. Its rows are tried again on the next pass. ERROR, with the type
+                        # only (a server error's text can quote stored values), the traceback at
+                        # DEBUG.
                         write_failed = True
                         log.error(
                             "document strip passed over a batch whose write failed and rolled "
