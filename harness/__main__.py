@@ -46,8 +46,10 @@
                                                 concurrently-active `serve` engines against ONE shared
                                                 store (disjoint inbound/sink/API ports + disjoint
                                                 connection names), drive per-engine load, and read whether
-                                                one store is the aggregate ceiling. Exits 0 (zero-loss at
-                                                every N) / 1 (loss) / 2 (setup) / 3 (interrupted).
+                                                one store is the aggregate ceiling. Exits 0 (zero-loss and
+                                                lane isolation at every N) / 1 (a step's `problems`: loss,
+                                                a lane steal, an unattributed or idle engine, a timed-out
+                                                drain, nothing sent) / 2 (setup) / 3 (interrupted).
 ``python -m harness shardcert ...``   → run the N-active engine-shard SIZING bench (ADR 0073): N
                                                 `serve --shard` engines on ONE unified server store with
                                                 OVERLAPPING outbound destinations, driven at a single rate
@@ -560,7 +562,7 @@ def _run_load(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from harness.load.profile import LoadProfileError, get_profile
-    from harness.load.report import compare_to_baseline
+    from harness.load.report import compare_to_baseline, tolerance_problem
     from harness.load.runner import PreflightError, run_load
     from messagefoundry.apiclient import ApiError
 
@@ -568,6 +570,12 @@ def _run_load(args: argparse.Namespace) -> int:
         profile = get_profile(args.load)
     except LoadProfileError as exc:
         print(f"bad profile: {exc}", file=sys.stderr)
+        return 2
+    # Before the run, not after it: the comparison would refuse this value only once a full run
+    # had been spent.
+    bad_tolerance = tolerance_problem(args.tolerance) if args.baseline else None
+    if bad_tolerance is not None:
+        print(f"bad --tolerance: {bad_tolerance}", file=sys.stderr)
         return 2
 
     # A run-scoped, ASCII-alnum control-id prefix so a re-run can't collide with a prior run's ids in
