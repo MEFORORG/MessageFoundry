@@ -773,7 +773,7 @@ def store_path_refusal(
         return None
     windows = os.name == "nt"
     # The last part as written: Win32 trims a trailing dot or space, so it is tested unstripped.
-    last = re.split(r"[\\/]" if windows else "/", value)[-1]
+    last = re.split(r"[\\/]", value)[-1] if windows else value.split("/")[-1]
     if not value.strip() or last in ("", ".", ".."):
         return (
             f"{name} names no file (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
