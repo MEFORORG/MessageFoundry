@@ -3,16 +3,18 @@
 """Residual anonymizer gaps of vault BACKLOG #5532, #5533, #5534, #5540, #5541 and #5654.
 
 * #5541: the site-code check reads a prefix table of its own, loaded in ``surrogates.py``, while
-  the report's liveness reads the publish guard's. After a reload of one alone, or with a
-  ``[site_prefix]`` entry that is not two digits, a report called the denylist live while the
-  site-code check matched other prefixes or none. It now reads not live, naming the split.
+  the report's liveness reads the publish guard's. After a reload of one alone, a report called
+  the denylist live while the site-code check matched other prefixes or none. It now reads not
+  live, naming the split. One source loaded into both reads live, as on origin/main, even with a
+  ``[site_prefix]`` entry that is not two digits.
 * #5540: under a digit MSH-1 or MSH-2, the site-code pass wrote fabricated digits that could be
   a separator, so a field shifted past its rule. The pass now writes no such digit.
 * #5534: an identifier surrogate lettered a non-ASCII subcomponent separator or escape character,
   rewrote an escape body letter by letter, and gave an empty id six fabricated digits.
 * #5654: an ``MR`` subcomponent in XCN.13 or XON.7, a default-ignorable character outside Cc and
   Cf, a fullwidth digit or letter, a dashed SSN or phone hidden by an invisible or a ``\\H\\``
-  escape, a multi-dot IPv6 trailer and a routable address dot-joined to an allowed one passed.
+  escape and a multi-dot IPv6 trailer passed. White space a consumer shows, and a dot that joins
+  a version number to an address, are read as origin/main read them.
 
 Every value here is synthetic: made-up ids and site prefixes, IPv6 addresses built from the
 unallocated 4000::/3 range, and tokens that name no real partner or vendor.
@@ -117,15 +119,15 @@ def test_a_guard_reload_alone_reads_not_live(
 
 @_NO_SCANNER
 @_LEAKS
-def test_a_prefix_that_is_not_two_digits_reads_not_live(
-    leak: ModuleType, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("prefixes", ["975\n", "97\n975\n"], ids=["three-digit", "two-and-three"])
+def test_one_source_with_a_prefix_that_is_not_two_digits_reads_live(
+    leak: ModuleType, prefixes: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The guard counts a three-digit entry toward its floor; no site code matches it."""
-    with _token_source(monkeypatch, "975\n", guards=True, surrogates=True):
+    """Both tables loaded from one source read the same, as on origin/main: the guard's entries
+    are read as the site-code table loads them, two digits only."""
+    with _token_source(monkeypatch, prefixes, guards=True, surrogates=True):
         report = leak.leak_report(f"{_HEAD}\rPV2|1", rules=engine_anon.DEFAULT_RULES)
-        assert not leak.denylist_is_live(report)
-        assert "not two digits" in (report.token_floor_reason or "")
-        assert "975" not in (report.token_floor_reason or "")
+        assert leak.denylist_is_live(report), report.token_floor_reason
 
 
 @_NO_SCANNER
@@ -133,11 +135,13 @@ def test_a_prefix_that_is_not_two_digits_reads_not_live(
 def test_the_opt_in_refuses_on_a_split_table(
     anon: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with (
-        _token_source(monkeypatch, "975\n", guards=True, surrogates=True),
-        pytest.raises(anon.LeakError, match="denylist not live: the site-code check") as caught,
-    ):
-        anon.anonymize_checked(f"{_HEAD}\rPV2|1", salt=_SALT, require_live_denylist=True)
+    with _token_source(monkeypatch, "97\n", guards=True, surrogates=False):
+        if set(engine_surrogates._SITE_PREFIXES) == {"97"}:
+            pytest.skip("the real token source already loads this made-up prefix")
+        with pytest.raises(
+            anon.LeakError, match="denylist not live: the site-code check"
+        ) as caught:
+            anon.anonymize_checked(f"{_HEAD}\rPV2|1", salt=_SALT, require_live_denylist=True)
     # The source is loaded, so the advice names the split, not a source to load.
     assert "prefixes differ from the publish guard's [site_prefix] table" in str(caught.value)
     assert "Load the denylist token source." not in str(caught.value)
@@ -413,6 +417,26 @@ def test_a_dashed_shape_behind_an_invisible_or_highlight_is_a_hit(
     assert any("ZPD-4" in hit for hit in hits), hits
 
 
+#: The control characters a consumer shows as white space, written and escaped. origin/main read
+#: none of them as dropped in the shape or token readings, so none may join two runs there.
+_SHOWN_WHITESPACE = pytest.mark.parametrize(
+    "space",
+    ["\t", "\x0c", "\x85", "\x0b", "\\X09\\", "\\X0C\\", "\\X85\\"],
+    ids=["tab", "form-feed", "nel", "vertical-tab", "tab-escaped", "ff-escaped", "nel-escaped"],
+)
+
+
+@_LEAKS
+@_SHOWN_WHITESPACE
+def test_white_space_a_consumer_shows_joins_no_shape(leak: ModuleType, space: str) -> None:
+    """origin/main passed these; the readings that drop invisible characters keep white space."""
+    for value in (f"1{space}23-45-6789", f"55{space}5-555-0199"):
+        assert leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"}) == [], value
+    # The control: the same value behind a character a consumer drops is a hit.
+    hits = leak.structural_phi_hits(_zpd("1​23-45-6789"), {"PID-3", "PID-5"})
+    assert any("ZPD-4" in hit for hit in hits), hits
+
+
 #: A header whose field separator is ``-``, so a dashed SSN is cut across fields.
 _DASH_HEAD = "-".join(
     ("MSH", "^~\\&", "A", "B", "C", "D", "20260101", "", "ADT^A01", "M1", "P", "2.5.1")
@@ -428,6 +452,14 @@ _DASH_HEAD = "-".join(
 def test_a_cut_shape_behind_an_invisible_or_highlight_is_a_hit(leak: ModuleType, tail: str) -> None:
     """The cut-across check takes the readings the one-field detectors take (BACKLOG #5654)."""
     hits = leak.structural_phi_hits(f"{_DASH_HEAD}\rZPD-1-{tail}", set())
+    assert any("cut by the field separator" in hit for hit in hits), hits
+
+
+@_LEAKS
+@_SHOWN_WHITESPACE
+def test_white_space_a_consumer_shows_joins_no_cut_shape(leak: ModuleType, space: str) -> None:
+    assert leak.structural_phi_hits(f"{_DASH_HEAD}\rZPD-1-1{space}23-45-6789", set()) == []
+    hits = leak.structural_phi_hits(f"{_DASH_HEAD}\rZPD-1-1​23-45-6789", set())
     assert any("cut by the field separator" in hit for hit in hits), hits
 
 
@@ -454,6 +486,17 @@ def test_a_token_behind_an_invisible_or_highlight_is_a_hit(
 
 @_NO_SCANNER
 @_LEAKS
+@_SHOWN_WHITESPACE
+def test_white_space_a_consumer_shows_joins_no_token(
+    leak: ModuleType, space: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _token_source(monkeypatch, "97\n", guards=True, surrogates=True):
+        assert leak.leak_report(_zpd(f"zqsynth{space}partner")).hits == []
+        assert "synthetic partner" in leak.leak_report(_zpd("zqsynth​partner")).hits
+
+
+@_NO_SCANNER
+@_LEAKS
 def test_a_token_across_a_line_break_is_no_hit(
     leak: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -467,8 +510,6 @@ def test_a_token_across_a_line_break_is_no_hit(
     "value",
     [
         "4000:a1::5.1.2",
-        "fe80::1.4000:a1::5",
-        "fe80::1.4000:a1::5.443",
         "::ffff:8.8.8.8.1.2",  # an IPv4-mapped address with two trailing groups
         "::8.8.8.8.1.2",  # an IPv4-compatible one
         "::ffff:1.2.8.8.8.8",  # the IPv4 part last
@@ -486,11 +527,13 @@ def test_an_allowed_dotted_ipv6_form_is_no_hit(leak: ModuleType, value: str) -> 
 
 
 @_LEAKS
-@pytest.mark.parametrize("value", ["1.2.3::a", "fe80::1.2::3"])
-def test_the_dot_joined_non_addresses_docs_phi_names_refuse(leak: ModuleType, value: str) -> None:
-    """docs/PHI.md section 9 names these as refused though they hold no address: a dot with a
-    colon after it splits the run, and ``3::a`` and ``2::3`` parse."""
-    hits = leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"})
+@pytest.mark.parametrize("value", ["1.2.3::a", "fe80::1.2::3", "1.2.2600::1", "fe80::1.2600::1"])
+def test_a_dot_joined_non_address_is_no_hit(leak: ModuleType, value: str) -> None:
+    """origin/main passed these, which hold no address; a run is not split at a dot that has a
+    colon after it, so ``3::a`` or ``2600::1`` is never judged on its own."""
+    assert leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"}) == []
+    # The control: a routable address in the same field is a hit.
+    hits = leak.structural_phi_hits(_zpd("4000:a1::5"), {"PID-3", "PID-5"})
     assert any(leak.IPV6_REASON in hit for hit in hits), hits
 
 
@@ -637,13 +680,3 @@ def test_the_spacing_commands_are_the_engines(surrogates: ModuleType) -> None:
     writes_text = {command for command, text in _RICH_TEXT_MAP.items() if text}
     assert writes_text == surrogates._SPACING_FORMAT_COMMANDS
     assert surrogates._MAX_ESCAPE_REPEAT == MAX_ESCAPE_REPEAT
-
-
-@_LEAKS
-def test_a_long_dotted_run_is_split_in_linear_time(leak: ModuleType) -> None:
-    """Every dot of a dotted-hex run is a candidate join; the split reads the run once."""
-    import time
-
-    start = time.perf_counter()
-    leak.structural_phi_hits(_zpd("1." * 40000 + "fe80::1"), {"PID-3", "PID-5"})
-    assert time.perf_counter() - start < 5.0

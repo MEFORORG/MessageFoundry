@@ -9,8 +9,8 @@ leak-check delegates to ``scripts/security/scan_forbidden.py`` — the owner-man
 its importable :func:`scan_text`. The standalone ``tee/anon/leak.py`` loads the same guard file by
 path, as a module instance of its own, and reads its name and estate tables at each scan, so it
 holds no copy of them. Each copy's site-code check reads the table ``surrogates.py`` loads, and a
-report calls the denylist live only when that table holds its guard's ``[site_prefix]`` entries
-(``surrogates.site_prefix_split``, BACKLOG #5541).
+report calls the denylist live only when that table holds its guard's two-digit ``[site_prefix]``
+entries (``surrogates.site_prefix_split``, BACKLOG #5541).
 
 The token denylist alone is a **backstop that only catches known *strings***: a real MRN in a field
 the rule map never mapped is not a denylisted token, so it would sail through clean. Two structural
@@ -241,34 +241,19 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
     part is routable, so the IPv4 allow list stays the publish guard's own. Every text
     :func:`_ipv6_candidates` gives is tried, and any one that parses to a routable address is a
     hit, so a fail-closed check refuses on any reading. When none parses, the texts of
-    :func:`_label_dropped_runs` are tried the same way. Each piece :func:`_dot_joined` cuts a run
-    into is also judged on its own, so in ``fe80::1.4000:a1::5`` an allowed address that parses
-    first does not hide a routable one after it (BACKLOG #5654).
-    What it misses, and what it refuses though it holds no address, is listed in docs/PHI.md
-    section 9."""
+    :func:`_label_dropped_runs` are tried the same way. What it misses, and what it refuses
+    though it holds no address, is listed in docs/PHI.md section 9."""
     for match in _IPV6_RUN.finditer(text):
-        whole = match.group()
-        for run in dict.fromkeys((whole, *_dot_joined(whole))):
-            if run.count(":") < 2:
-                continue
-            verdict = _judge_ipv6_texts(_ipv6_candidates(run), ipv4_is_routable)
-            if verdict is None:
-                labelled = (c for r in _label_dropped_runs(run) for c in _ipv6_candidates(r))
-                verdict = _judge_ipv6_texts(labelled, ipv4_is_routable)
-            if verdict:
-                return True
+        run = match.group()
+        if run.count(":") < 2:
+            continue
+        verdict = _judge_ipv6_texts(_ipv6_candidates(run), ipv4_is_routable)
+        if verdict is None:
+            labelled = (c for r in _label_dropped_runs(run) for c in _ipv6_candidates(r))
+            verdict = _judge_ipv6_texts(labelled, ipv4_is_routable)
+        if verdict:
+            return True
     return False
-
-
-def _dot_joined(run: str) -> list[str]:
-    """``run`` split at each dot that has a colon later in it: such a dot joins two texts that
-    may each be an IPv6 address. A dot after the last colon, as in a dotted IPv4 tail, joins
-    nothing, so the text after the last colon stays with the piece before it. One pass, so the
-    scan stays linear."""
-    last_colon = run.rfind(":")
-    pieces = run[:last_colon].split(".")
-    pieces[-1] += run[last_colon:]
-    return pieces
 
 
 def _judge_ipv6_texts(texts: Iterable[str], ipv4_is_routable: Callable[[str], bool]) -> bool | None:
@@ -733,13 +718,20 @@ def _line_readings(fields: list[str], seps: Seps, field_sep: str) -> list[list[s
             for source in (fields, shown)
             for by_component in (False, True)
         ]
-    keep = _separators(seps, field_sep)
+    keep = _separators(seps, field_sep) + _SHOWN_WHITESPACE
     readings: list[list[str]] = []
     for source in sources:
         for reading in (source, [dropped(field, keep) for field in source]):
             if reading not in readings:
                 readings.append(reading)
     return readings
+
+
+#: The control characters a consumer shows as white space rather than drop: TAB, line feed,
+#: vertical tab, form feed, carriage return and NEL. Every reading this module takes with
+#: invisible characters dropped, but the MRN-typed check's, keeps them, so ``1<TAB>23-45-6789``
+#: is not read as a dashed SSN.
+_SHOWN_WHITESPACE = "\t\n\x0b\x0c\r\x85"
 
 
 def _separators(seps: Seps, field_sep: str) -> str:
@@ -823,9 +815,9 @@ def _shape_forms(value: str, seps: Seps, field_sep: str) -> list[str]:
     :func:`_escaped_parts` names read every way :func:`.surrogates.decoded_readings` reads it
     without splitting it again, ``\\H\\`` and ``\\N\\`` dropped and invisible characters
     dropped among them. So ``123-45-67\\XAD\\89`` reads as a dashed SSN (BACKLOG #5654)."""
-    forms = [value, dropped(value, _separators(seps, field_sep))]
+    forms = [value, dropped(value, _separators(seps, field_sep) + _SHOWN_WHITESPACE)]
     for part in _escaped_parts(value, seps):
-        forms += decoded_readings(part, seps, field_sep, resplit=False)
+        forms += decoded_readings(part, seps, field_sep, resplit=False, keep=_SHOWN_WHITESPACE)
     return list(dict.fromkeys(forms))
 
 
@@ -848,7 +840,7 @@ def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]
     not repeated."""
     sources = [text]
     parsed = read_message_seps(text)
-    keep = _separators(*parsed) if parsed is not None else ""
+    keep = _SHOWN_WHITESPACE + (_separators(*parsed) if parsed is not None else "")
     if parsed is not None and parsed[0].escape and parsed[0].escape in text:
         shown = _without_highlighting(text, parsed[0])
         sources += [
@@ -1272,10 +1264,10 @@ def coverage_clause(report: LeakReport) -> str:
 
 def denylist_is_live(report: LeakReport) -> bool:
     """True only if the token tables loaded, passed the floor check, and hold the same
-    ``[site_prefix]`` entries as the table the site-code check reads (``site_prefix_split``,
-    BACKLOG #5541). ``token_tables_live`` alone is true for a source that lost a whole section,
-    which ``token_floor_reason`` then names, so printing "live" from the first field alone
-    overstated the check (BACKLOG #2247)."""
+    two-digit ``[site_prefix]`` entries as the table the site-code check reads
+    (``site_prefix_split``, BACKLOG #5541). ``token_tables_live`` alone is true for a source that
+    lost a whole section, which ``token_floor_reason`` then names, so printing "live" from the
+    first field alone overstated the check (BACKLOG #2247)."""
     return report.token_tables_live and report.token_floor_reason is None
 
 
@@ -1355,8 +1347,7 @@ def refusal_advice(
             steps.append(
                 "The site-code check's prefixes differ from the publish guard's [site_prefix] "
                 "table. A new run loads both from one token source, which clears a split that a "
-                "reload of one table left. An entry that is not two digits keeps them apart in "
-                "every run; docs/PHI.md section 9 describes the check."
+                "reload of one table left; docs/PHI.md section 9 describes the check."
             )
         else:
             steps.append("Load the denylist token source.")

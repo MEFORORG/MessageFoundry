@@ -143,18 +143,20 @@ SITE_PREFIX_SPLIT_LEAD = "the site-code check uses"
 
 def site_prefix_split(guard_prefixes: tuple[str, ...]) -> str | None:
     """Why the site-code check does not use the publish guard's ``[site_prefix]`` table, or
-    ``None`` when it uses the same prefixes. ``guard_prefixes`` is the guard's own table, whose
-    count its token floor counts. The two differ when the guard holds an entry that is not two
-    digits, which this module does not load and no site code matches, or when one of the two was
-    reloaded and the other was not (BACKLOG #5541). The reason gives counts only, never a prefix:
-    the prefixes name a real estate."""
-    if set(guard_prefixes) == set(_SITE_PREFIXES):
+    ``None`` when it uses the same prefixes. ``guard_prefixes`` is the guard's own table. Its
+    entries are read as :func:`_load_site_prefixes` reads a source, two ASCII digits only, so one
+    token source loaded into both tables reads the same even when it holds an entry that is not
+    two digits. The two differ when one of them was reloaded and the other was not
+    (BACKLOG #5541). The reason gives counts only, never a prefix: the prefixes name a real
+    estate."""
+    loaded = {p for p in guard_prefixes if p.isascii() and p.isdigit() and len(p) == 2}
+    if loaded == set(_SITE_PREFIXES):
         return None
     return (
         f"{SITE_PREFIX_SPLIT_LEAD} {len(_SITE_PREFIXES)} two-digit prefix(es) but the publish "
-        f"guard's [site_prefix] table holds {len(set(guard_prefixes))} entr(ies), not the same set — an entry that "
-        "is not two digits, or a reload of one table without the other "
-        "(surrogates.reload_site_prefixes); the site-code check does not match what the guard counts"
+        f"guard's [site_prefix] table holds {len(loaded)} two-digit entr(ies), not the same set — "
+        "a reload of one table without the other (surrogates.reload_site_prefixes); the site-code "
+        "check does not match what the guard counts"
     )
 
 
@@ -832,12 +834,15 @@ def unescape(value: str, seps: Seps, field_sep: str) -> str:
     return "".join(out)
 
 
-def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) -> list[str]:
+def decoded_readings(
+    part: str, seps: Seps, field_sep: str, *, resplit: bool, keep: str = ""
+) -> list[str]:
     """The decoded readings a consumer can take of ``part``, one component or one subcomponent,
     for the detectors that must fail closed on any of them (BACKLOG #5632, #5654): the part
     decoded (:func:`unescape`), and decoded with ``\\H\\`` and ``\\N\\`` dropped, as a display
     that shows highlighting rather than a character reads it; each of those with its invisible
-    characters dropped (:func:`dropped`); and each trimmed (:func:`trim`). Empty when ``part``
+    characters dropped (:func:`dropped`), a character in ``keep`` kept; and each trimmed
+    (:func:`trim`). Empty when ``part``
     holds no escape character: :func:`_reads_as_site_code` and the MRN-typed check read the part
     as written themselves.
 
@@ -858,7 +863,7 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
     for decoded in dict.fromkeys(
         (unescape(part, seps, field_sep), unescape(shown, seps, field_sep))
     ):
-        candidates = [decoded, dropped(decoded)]
+        candidates = [decoded, dropped(decoded, keep)]
         if resplit:
             # An invisible character becomes a space first, so the one class splits on it too.
             spaced = "".join(" " if _is_invisible(c) else c for c in decoded)

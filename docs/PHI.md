@@ -2556,7 +2556,7 @@ both are described below:
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A value with a non-empty first component and an `MR` or `MRN` id type: any component that is `MR` or `MRN` whole or as its first subcomponent, such as `12345^MR` or `12345^MR&L`, or components 5, 7 and 13, where CX.5, XON.7 and XCN.13 carry an id type, in any of their subcomponents too, such as `ID^^^AUTH^MR&local`. Those components are read so in every field whatever its type, so `70553^MRI^C4^^PET&MR` in `OBR-4`, a coded field and not a CX, is refused. An `MR` subcomponent past the first in any other component, such as the modality in `70553^PET&MR^C4`, does not count (BACKLOG #5654) | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields whose first field is `MSH`, in capitals or not. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
-| The denylist tables did not load or failed the floor check, or the site-code check's prefixes differ from the publish guard's `[site_prefix]` table (BACKLOG #5541), and the caller passed `require_live_denylist=True` | The token source |
+| The denylist tables did not load or failed the floor check, or the site-code check's prefixes differ from the two-digit entries of the publish guard's `[site_prefix]` table (BACKLOG #5541), and the caller passed `require_live_denylist=True` | The token source |
 
 The rows describe both anonymizers, the toolkit's `messagefoundry_toolkit/anon/` and the tee's
 `tee/anon/`. The inputs on which the two are known to differ are listed in one place, the list
@@ -2589,7 +2589,9 @@ every reading with invisible characters removed, the token scan line by line (BA
 The token scan, the cut-shape check and the shape detectors' reading of a value as written keep
 the field, component, repetition and subcomponent separators the message declares when they
 remove invisible characters, so a TAB field separator does not join two fields there. A shape
-detector's reading of a decoded part does not keep them. The escape
+detector's reading of a decoded part does not keep them. Every one of those readings keeps a
+TAB, line feed, vertical tab, form feed, carriage return or NEL, which a consumer shows as white
+space, so `1<TAB>23-45-6789` is not read as a dashed SSN. The escape
 character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
 own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
 delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with
@@ -2615,8 +2617,8 @@ still pass:
   the character alone. A code a vertical tab or file separator interrupts there is found, and a
   carriage return or line feed there ends the line, so the message is refused as holding a line
   no rule can reach.
-- The IPv6 check misses some routable addresses. At least these pass: one written with
-  fullwidth hex digits, which the IPv6 check does not fold, and an IPv4-mapped or
+- The IPv6 check misses some routable addresses. At least these pass: one joined to an allowed
+  address, such as `fe80::1.4000:a1::5`, one written with fullwidth hex digits, which the IPv6 check does not fold, and an IPv4-mapped or
   IPv4-compatible one whose IPv4 part sits inside more than four dotted groups after the
   last colon, neither first nor last, such as `::ffff:10.0.0.1.8.8.8.8.10.0.0.1`
   (BACKLOG #5654).
@@ -2627,10 +2629,8 @@ still pass:
 
 The IPv6 check also refuses some text that holds no routable address. It reads runs of hex
 characters (0-9 and A-F), colons and dots, so a word that ends in hex characters can read as an
-address when a `::` or more colons follow it. A dot that has a colon after it splits a run
-into texts judged one at a time, so a version or section number joined to such a word can
-refuse too. At least these refuse: `Note::`, a colon-written EUI-64 device id such as
-`00:1A:2B:FF:FE:3C:4D:5E`, `1.2.3::a`, read as `3::a`, and `fe80::1.2::3`, read as `2::3`. At least these pass:
+address when a `::` or more colons follow it. At least these refuse: `Note::` and a
+colon-written EUI-64 device id such as `00:1A:2B:FF:FE:3C:4D:5E`. At least these pass:
 `Decade::`, whose hex run is too long to be an address group, and `Xfe80::`, which reads as an
 allowed link-local address.
 
@@ -2766,7 +2766,7 @@ which cause applies to each, and the `error:` line that ends the run repeats the
 `python -m tee anonymize-captures` logs the summary at INFO once per run, after it has checked
 the captures, with a count per address. A quieter `--log-level` does not hide it: the line is
 then printed plain to stderr. It says the denylist tables were live only when they loaded,
-passed the floor check and matched the site-code check's prefixes on every message. Read that list before you share a dataset. Map any
+passed the floor check and their two-digit site prefixes matched the site-code check's on every message. Read that list before you share a dataset. Map any
 field that carries PHI in an `anon.toml` overlay, then run again.
 
 ### A captured record's id follows the rules, and its time is the real capture time
