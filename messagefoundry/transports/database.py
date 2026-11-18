@@ -3545,8 +3545,8 @@ def _register_executor(pool: Any, executor: ThreadPoolExecutor) -> None:
 
 def _bound_statements(pool: Any, seconds: int) -> Any:
     """Record ``seconds`` (:func:`_statement_timeout`) as the statement timeout every borrow from
-    ``pool`` carries (:func:`_apply_statement_timeout`), and return ``pool``. A pool site with no
-    such setting, the reference-set sync's, does not call it, and its borrows carry none."""
+    ``pool`` carries (:func:`_apply_statement_timeout`), and return ``pool``. A pool site that does
+    not call it carries none on its borrows."""
     try:
         _STATEMENT_TIMEOUTS[_pool_key(pool)] = seconds
     except TypeError:

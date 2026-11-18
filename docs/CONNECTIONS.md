@@ -2658,9 +2658,24 @@ A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the
   negative or fractional value is refused when the `DatabaseRef`
   is declared. An `env()` value is refused by the build check, which `messagefoundry check` runs in
   its build leg when the config has a `messagefoundry.toml`, and at each sync.
+- **The statement timeout.** `DatabaseRef(statement_timeout=…)`, whole seconds, bounds the sync's
+  statement by the DATABASE connector's rule: unset is 30 s, `0` is no limit, and a negative,
+  fractional or boolean value is refused when declared, an `env()` value by the build check and at
+  each sync. A statement that runs past it (`HYT00`) fails that sync as
+  `ReferenceStatementTimedOut`, and the last-good snapshot keeps serving; a driver that refuses the
+  value fails it as `ReferenceStatementTimeoutRefused`. The 30 s default was chosen for one
+  statement per message, and a large set's statement can need more. At `0`, an uncancelled
+  statement holds the sequential sync pass, and every other set's sync behind it, until it returns.
+- **The result must fit the declared columns.** A `key_column` or `value_column` the result lacks,
+  or holds twice, as a join can, fails the sync as `ReferenceColumnMismatch`. A NULL key, or two
+  rows with one key, fails it as `ReferenceKeyRefused`. The last-good snapshot keeps serving in
+  each case, rather than being replaced by `None` values, a `"None"` key, whichever duplicate came
+  last, or a column the operator did not mean.
 
 The sync's log line and alert carry the error's class name only, never its text, because a source
-error can hold a reference key. The two class names above are what tell those failures apart.
+error can hold a reference key. The class names above are what tell those failures apart. The two
+column and key refusals are also logged with their text, which names the set, the setting and row
+ordinals, never a column's name or a key.
 
 Neither control is read-only authority, for the reasons in the table above, and the sync pool is
 autocommit. Give the `DatabaseRef` login `SELECT` on what the statement reads, and nothing else. The
@@ -4757,7 +4772,8 @@ Facts that are easy to get wrong, stated plainly first:
   connection test read `HYC00` or `HY092` there as the same configuration fault, while a poll,
   mark or lookup at least reports it as an ordinary failure. Such a connection needs `0`. Both
   refusals are readings of pyodbc's documentation and source, not measurements. A `DatabaseRef` reference sync
-  sets **no** statement timeout. The connector also exposes `connect_timeout` (default 15 s, a
+  takes `statement_timeout` too, 30 s unset, by the SQL Server preset's rule (*A `DatabaseRef`
+  statement passes the same gate, and a row ceiling*). The connector also exposes `connect_timeout` (default 15 s, a
   **login** timeout only, passed to the driver as pyodbc's `timeout=` on both dialects), `pool_max`
   and `acquire_timeout`; there is no `timeout_seconds`. Each DATABASE pool runs aioodbc's driver
   calls (statements, fetches, commits, rollbacks) on its own thread pool, sized `pool_max + 4`,
@@ -5114,7 +5130,7 @@ reading this page already applies to a file the scan never opened.
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |
 | DIRECT (S/MIME over SMTP) | `timeout_seconds` 30 s on the `smtplib` constructor | as EMAIL; key/cert material is loaded once at construction | as EMAIL, plus the send-time certificate check before anything is built or dialled: expired or not yet valid → configuration fault (`direct-cert-validity:<setting>:<bound>`), the lane stops and the queue stays under the default `credential_fault_policy` | `RetryPolicy`, except that certificate class, which stops the lane (or dead-letters under `credential_fault_policy = "dead_letter"`) |
 | DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (**login** timeout only, both dialects), `acquire_timeout` 30 s on the pool borrow and `statement_timeout` on each statement, 30 s on the SQL Server preset and on a generic Microsoft driver, and `0` on any other generic driver, unless set (`0` = no limit; BACKLOG #5756). For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |
-| Reference-set sync (`DatabaseRef`) | `connect_timeout` 15 s (**login** timeout) and `acquire_timeout` 30 s on the pool borrow | the connection is released and the throwaway pool closed in nested `finally` blocks | a sync error (including an acquire expiry) is logged, the AlertSink fires and the previous snapshot keeps serving | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
+| Reference-set sync (`DatabaseRef`) | `connect_timeout` 15 s (**login** timeout), `acquire_timeout` 30 s on the pool borrow and `statement_timeout` 30 s on the statement unless set (`0` = no limit) | the connection is released and the throwaway pool closed in nested `finally` blocks | a sync error (including an acquire expiry) is logged, the AlertSink fires and the previous snapshot keeps serving | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
 | Internal sources — Timer / Loopback / PassThrough | n/a — no socket, no timeout | the worker task is cooperatively cancelled on stop | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn defaults (the engine passes no `timeout_keep_alive`) | the ASGI lifespan calls `engine.stop()`, cancelling every worker | throttled requests get `429` + an audit row | n/a — the caller retries |
 | Reverse proxy → engine segment (`[api].trusted_proxies`) | **none the engine owns** — the proxy's timeouts govern | connection lifetime is the proxy's | operator-owned | n/a |
