@@ -4943,6 +4943,7 @@ async def run_restore(
     store_settings: object,
     config_dest: str | Path | None = None,
     max_age_seconds: float | None = None,
+    posture: HopPosture | None = None,
 ) -> RestoreResult:
     """Restore a ``.mfbak`` archive's store member to ``dest_store_path`` (ADR 0049's missing half; the
     primitive ADR 0048's cold seed consumes).
@@ -4976,9 +4977,14 @@ async def run_restore(
     so the refusal's own remedy (*"set [backup].allow_unencrypted"*) named a setting this path does not
     read — a prescription an operator would have followed to no effect. The parameter is gone and the
     refusal now says the true thing: a plaintext archive restores only on a box with no store key."""
+    # `posture` is the caller's, for the Vault hop the key resolve can dial, as on
+    # :func:`run_restore_verify`; the `restore` command holds none, and `None` counts as enforcing.
     keys = [
         _decode_store_key(k)
-        for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
+        for k in resolve_decrypt_keys(
+            store_settings,  # type: ignore[arg-type]
+            posture=posture,
+        )
     ]
     return await asyncio.to_thread(
         _restore_blocking,
