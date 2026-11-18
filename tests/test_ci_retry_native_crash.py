@@ -150,9 +150,9 @@ def test_the_database_legs_do_not_file_every_crash_under_1459(bash: Path) -> Non
 # ---------------------------------------------------------------------------------------------
 
 
-#: The main suite runs in three shards, one per job, and each shard's step carries both arms below
-#: (BACKLOG #5247).
-_MAIN_SUITE_JOBS = ("test", "test-shard2", "test-shard3")
+#: The main suite runs in three shards, shard 1 in `test` and the rest in `test-shards`'s matrix, and
+#: each job's step carries both arms below (BACKLOG #5247).
+_MAIN_SUITE_JOBS = ("test", "test-shards")
 
 
 def _main_suite_steps() -> list[tuple[str, dict[str, object]]]:

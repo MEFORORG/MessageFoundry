@@ -51,14 +51,9 @@ _ENGINE_STEP = "Tests (pytest)"
 _TOOLING_STEP = "Harness tests (pytest)"
 
 #: Every pytest step these belts must ride, as (job id, step name). The engine suite runs in three
-#: shards, one per job (BACKLOG #5247), and all carry the same step name, so the job is part of the
-#: address.
-_BELTED = [
-    ("test", _ENGINE_STEP),
-    ("test-shard2", _ENGINE_STEP),
-    ("test-shard3", _ENGINE_STEP),
-    ("tooling", _TOOLING_STEP),
-]
+#: shards, shard 1 in `test` and the rest in `test-shards`'s matrix (BACKLOG #5247), and both jobs
+#: carry the same step name, so the job is part of the address.
+_BELTED = [("test", _ENGINE_STEP), ("test-shards", _ENGINE_STEP), ("tooling", _TOOLING_STEP)]
 
 
 def _logical_lines(run: str) -> list[str]:
