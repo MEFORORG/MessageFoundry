@@ -8,6 +8,7 @@ clean, and asserts the refusal. Synthetic fixtures only: the verifier is data-fr
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from scripts.asvs.scorecard import (
     load_scorecard,
     locate_anchor,
     main,
+    repo_stamp,
 )
 
 #: One loadable cell. Each test appends or substitutes the one field it is about.
@@ -477,3 +479,67 @@ def test_verify_refuses_a_root_that_is_not_a_directory(
     argv[argv.index("--root") + 1] = str(tmp_path / "no-such-engine")
     assert main(argv) == 2
     assert "not a directory" in capsys.readouterr().err
+
+
+# --- BACKLOG #5458: a git probe that fails reports UNKNOWN, never clean ---------------------------
+
+
+def _git_repo(path: Path) -> Path:
+    path.mkdir(parents=True)
+    ident = ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid"]
+    subprocess.run(["git", "-C", str(path), "init", "--quiet"], check=True, capture_output=True)
+    (path / "a.txt").write_text("a\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "a.txt"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), *ident, "commit", "--quiet", "-m", "a"],
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
+def test_a_failed_status_probe_is_unknown_not_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before: `git status` failing or timing out returned None, and `bool(None)` stamped the tree
+    clean, which is the one answer the dirty flag exists to withhold when it is not known."""
+    repo = _git_repo(tmp_path / "repo")
+    (repo / "a.txt").write_text("changed\n", encoding="utf-8")  # really dirty
+    real_git = scorecard_module._git
+
+    def _status_fails(where: Path, *args: str) -> str | None:
+        return None if args[:1] == ("status",) else real_git(where, *args)
+
+    monkeypatch.setattr(scorecard_module, "_git", _status_fails)
+    stamp = repo_stamp(repo)
+    assert stamp.dirty is None
+    assert stamp.ref().endswith("+status-unknown")
+
+
+def test_a_clean_and_a_dirty_tree_still_read_as_such(tmp_path: Path) -> None:
+    """Control: the unknown state is only for a failed probe."""
+    repo = _git_repo(tmp_path / "repo")
+    assert repo_stamp(repo).dirty is False
+    (repo / "a.txt").write_text("changed\n", encoding="utf-8")
+    stamp = repo_stamp(repo)
+    assert stamp.dirty is True and stamp.ref().endswith("+dirty")
+
+
+def test_a_repo_under_a_non_ascii_path_still_finds_its_fetch_head(tmp_path: Path) -> None:
+    """git prints paths as UTF-8. Decoded in the locale code page (cp1252 on Windows) the git dir's
+    name came back garbled, FETCH_HEAD was not found, and the stamp read NEVER-FETCHED."""
+    repo = _git_repo(tmp_path / "répertoire-日本")
+    (repo / ".git" / "FETCH_HEAD").write_text("", encoding="utf-8")
+    assert repo_stamp(repo).remote_knowledge != "NEVER-FETCHED"
+
+
+def test_a_relative_path_is_stamped_against_the_tree_it_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative scorecard path must stamp the repository it names, not wherever git resolves a
+    relative `-C`."""
+    repo = _git_repo(tmp_path / "repo")
+    (repo / "sc.toml").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    stamp = repo_stamp(Path("repo") / "sc.toml")
+    assert stamp.sha != "NO-GIT" and stamp.dirty is True

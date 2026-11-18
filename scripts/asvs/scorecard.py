@@ -3226,8 +3226,9 @@ class RepoStamp:
     #: Short commit, or ``NO-GIT`` when the path is not inside a work tree.
     sha: str
     #: Whole-tree dirty. A measurement taken against uncommitted changes is not reproducible and must
-    #: not look like one that is.
-    dirty: bool
+    #: not look like one that is. ``None`` when ``git status`` failed or timed out: UNKNOWN, rendered
+    #: as such, never folded into clean (BACKLOG #5458).
+    dirty: bool | None
     #: ``CURRENT`` | ``BEHIND <n>`` | ``AHEAD <n>`` | ``DIVERGED`` | ``NO-UPSTREAM`` | ``NO-GIT`` |
     #: ``UNRESOLVED``. The last two are extensions and they exist BECAUSE of the never-silent rule:
     #: calling a non-repo ``NO-UPSTREAM`` would be a false statement (it implies a repo), and calling a
@@ -3243,6 +3244,8 @@ class RepoStamp:
     remote_knowledge: str
 
     def ref(self) -> str:
+        if self.dirty is None:
+            return f"{self.sha}+status-unknown"
         return f"{self.sha}+dirty" if self.dirty else self.sha
 
 
@@ -3256,11 +3259,15 @@ def _git(repo: Path, *args: str) -> str | None:
     none, because its absence gets read as nobody needing it. Refreshing is ``git fetch``, by hand,
     which is a different act performed on purpose.
     """
+    # UTF-8, not the locale's code page: git prints paths as UTF-8, and cp1252 decoding garbled a
+    # non-ASCII git dir so FETCH_HEAD was never found (BACKLOG #5458). `replace` keeps a stray byte
+    # from raising out of a probe that promises None on failure.
     try:
         proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; every subcommand is read-only
             ["git", "-C", str(repo), *args],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=_GIT_TIMEOUT,
         )
@@ -3343,7 +3350,10 @@ def _freshness(repo: Path) -> tuple[str, str]:
 
 def repo_stamp(path: Path, *, now: float | None = None) -> RepoStamp:
     """Stamp the work tree containing `path`. Pure read: no fetch, no write, no network."""
-    repo = path if path.is_dir() else path.parent
+    # Absolute, so `git -C` and the FETCH_HEAD join below both name the tree `path` named, whatever
+    # the process's working directory is when they run (BACKLOG #5458).
+    resolved = path.resolve()
+    repo = resolved if resolved.is_dir() else resolved.parent
     sha = _git(repo, "rev-parse", "--short", "HEAD")
     if sha is None:
         # Not a work tree at all. NOT reported as NO-UPSTREAM: that would imply a repo exists and is
@@ -3353,7 +3363,9 @@ def repo_stamp(path: Path, *, now: float | None = None) -> RepoStamp:
     freshness, upstream = _freshness(repo)
     return RepoStamp(
         sha=sha,
-        dirty=bool(porcelain),
+        # A failed or timed-out status is None, and `bool(None)` stamped the tree CLEAN: the one
+        # answer the flag exists to withhold when nobody knows it (BACKLOG #5458).
+        dirty=None if porcelain is None else bool(porcelain),
         freshness=freshness,
         upstream=upstream,
         remote_knowledge=_remote_knowledge(repo, time.time() if now is None else now),
