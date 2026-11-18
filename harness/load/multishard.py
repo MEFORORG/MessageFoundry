@@ -186,6 +186,42 @@ class MultiShardRecord:
         lane collision (the measurement would be invalid)."""
         return any(e.foreign_rows > 0 for e in self.per_engine)
 
+    @property
+    def problems(self) -> tuple[str, ...]:
+        """Every reason this step cannot PASS; empty means it can (BACKLOG #5438).
+
+        The no-loss reconcile alone is not the step's verdict: it reads aggregate counters, so it
+        cannot see a cross-engine lane steal or an engine that never took traffic or was never
+        attributed, and the isolation proof is half of what this gate exists to show. The drain and
+        sent checks repeat the reconcile's own INCONCLUSIVE arms so a record built without them still
+        fails."""
+        out: list[str] = []
+        if not self.no_loss.ok:
+            kind = "INCONCLUSIVE" if self.no_loss.inconclusive else "LOSS"
+            out.append(f"no-loss {kind}: {self.no_loss.detail}")
+        if self.sent <= 0:
+            out.append("nothing was sent")
+        if self.drain_seconds is None:
+            out.append("the drain timed out")
+        if self.any_cross_engine_steal:
+            stolen = ", ".join(
+                f"{e.node_id}={e.foreign_rows}" for e in self.per_engine if e.foreign_rows
+            )
+            out.append(f"cross-engine lane steal (foreign inbound rows: {stolen})")
+        if len(self.per_engine) != self.engines:
+            out.append(f"{len(self.per_engine)} of {self.engines} engines attributed")
+        for e in self.per_engine:
+            if e.inbound_rows != self.count_per_engine:
+                out.append(
+                    f"{e.node_id}: {e.inbound_rows} inbound lanes attributed, "
+                    f"expected {self.count_per_engine}"
+                )
+            if e.reads <= 0:
+                out.append(f"{e.node_id}: read nothing on its own lanes")
+            if e.failed_lanes:
+                out.append(f"{e.node_id}: {len(e.failed_lanes)} inbound lanes not listening")
+        return tuple(out)
+
     def to_json_dict(self) -> dict[str, object]:
         return {
             "engines": self.engines,
@@ -240,6 +276,7 @@ class MultiShardRecord:
                 for e in self.per_engine
             ],
             "cross_engine_steal": self.any_cross_engine_steal,
+            "problems": list(self.problems),
         }
 
     def render_console(self) -> str:
@@ -276,8 +313,9 @@ class MultiShardReport:
 
     @property
     def result_ok(self) -> bool:
-        """PASS iff every step reconciled zero-loss (the mechanics + isolation held at every N)."""
-        return bool(self.records) and all(r.no_loss.ok for r in self.records)
+        """PASS iff every step has no :attr:`MultiShardRecord.problems`: zero-loss reconciled AND the
+        isolation held at every N (BACKLOG #5438)."""
+        return bool(self.records) and all(not r.problems for r in self.records)
 
     @property
     def exit_code(self) -> int:
@@ -285,7 +323,8 @@ class MultiShardReport:
 
     def to_json_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 2,  # 1 -> 2: no_loss.inconclusive (BACKLOG #5574)
+            # 1 -> 2: no_loss.inconclusive (BACKLOG #5574); 2 -> 3: records[].problems (#5438)
+            "schema_version": 3,
             "kind": "multishard",
             "store_backend": self.store_backend,
             "cluster_enabled": self.cluster_enabled,
@@ -303,6 +342,7 @@ class MultiShardReport:
         ]
         for r in self.records:
             lines.append(r.render_console())
+            lines.extend(f"  problem: {p}" for p in r.problems)
         for note in self.notes:
             lines.append(f"note: {note}")
         lines.append("")
