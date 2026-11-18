@@ -346,4 +346,4 @@ provider seam here is shaped to admit it (a challenge/response plug alongside th
 
 ## Amendment (2026-11-18, BACKLOG #5910)
 
-A token reply in a content coding the engine does not decode is refused permanently with code `token-reply-coded`, not retried as a malformed token response; owner ruling 2026-11-18.
+A token reply in a content coding the engine does not decode is refused permanently with code `token-reply-coded`, not retried as a malformed token response. It is a configuration fault, so under the default `credential_fault_policy` a delivery stops the lane and keeps the queue; owner rulings 2026-11-18.

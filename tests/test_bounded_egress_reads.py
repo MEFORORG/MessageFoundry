@@ -948,7 +948,8 @@ def test_a_truncated_error_body_still_warns_rather_than_going_silent(
 #
 # reply_framing_fault refuses any content coding but identity as an AmbiguousFramingError. These
 # pin what each reader that retypes, or lets through, that refusal does with it. A coded token
-# reply is a permanent refusal by the owner ruling of 2026-11-18 on #5910 step 4.
+# reply is a permanent configuration fault that stops the lane, by the owner ruling of 2026-11-18
+# on PR 3069.
 
 _CODED_200 = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
 
@@ -973,10 +974,13 @@ def _smart_coded(ec_pem: str) -> SmartBackendTokenProvider:
     return provider
 
 
-def _assert_coded_token_dead_letters(exc: BaseException) -> None:
-    """Step 4, owner ruling 2026-11-18: "Dead-letter, no retry"."""
+def _assert_coded_token_stops_the_lane(exc: BaseException) -> None:
+    """Owner ruling 2026-11-18 on PR 3069: "Stop the lane." A permanent configuration fault, which
+    the delivery worker's existing lane-stopping route takes."""
     assert isinstance(exc, NegativeAckError)
     assert exc.permanent is True
+    assert exc.config_fault is True
+    assert exc.credential_fault is False
     assert exc.code == TOKEN_REPLY_CODED_CODE
     assert "s3cr3t" not in str(exc)
     assert exc.__context__ is None
@@ -997,13 +1001,13 @@ def test_the_coded_token_refusal_names_the_hop_and_no_url(ec_pem: str) -> None:
 def test_an_oauth2_token_reply_in_a_content_coding_is_a_permanent_refusal() -> None:
     with pytest.raises(NegativeAckError) as err:
         _oauth2_coded().access_token()
-    _assert_coded_token_dead_letters(err.value)
+    _assert_coded_token_stops_the_lane(err.value)
 
 
 def test_a_smart_token_reply_in_a_content_coding_is_a_permanent_refusal(ec_pem: str) -> None:
     with pytest.raises(NegativeAckError) as err:
         _smart_coded(ec_pem).access_token()
-    _assert_coded_token_dead_letters(err.value)
+    _assert_coded_token_stops_the_lane(err.value)
 
 
 @pytest.mark.parametrize(
@@ -1029,22 +1033,22 @@ def test_a_token_reply_refused_for_anything_but_its_coding_stays_retryable(raw: 
     assert not isinstance(err.value, NegativeAckError)
 
 
-def test_a_soap_delivery_whose_token_reply_is_coded_dead_letters() -> None:
+def test_a_soap_delivery_whose_token_reply_is_coded_is_a_configuration_fault() -> None:
     dest = _soap()
     dest._token_provider = _oauth2_coded()
     dest._opener = _RaisingOpener(AssertionError("the delivery must not be sent"))  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as err:
         dest._post("<env:Envelope/>")
-    _assert_coded_token_dead_letters(err.value)
+    _assert_coded_token_stops_the_lane(err.value)
 
 
-def test_a_fhir_delivery_whose_token_reply_is_coded_dead_letters(ec_pem: str) -> None:
+def test_a_fhir_delivery_whose_token_reply_is_coded_is_a_configuration_fault(ec_pem: str) -> None:
     dest = _fhir()
     dest._token_provider = _smart_coded(ec_pem)
     dest._opener = _RaisingOpener(AssertionError("the delivery must not be sent"))  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as err:
         dest._post(json.dumps({"resourceType": "Patient"}), "POST", f"{FHIR_BASE}/Patient", {})
-    _assert_coded_token_dead_letters(err.value)
+    _assert_coded_token_stops_the_lane(err.value)
 
 
 def test_the_ai_broker_maps_a_content_coded_reply_onto_its_own_error_type() -> None:

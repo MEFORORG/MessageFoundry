@@ -1314,17 +1314,6 @@ class NegativeAckError(DeliveryError):
     same way, so the delivery worker stops the lane and keeps the queue, under the same
     ``credential_fault_policy`` as a credential fault. ADR 0095 Amendment B says where "every row"
     is weaker for HTTP than for FTP. Only meaningful when ``permanent`` is True.
-
-    ``lane_wide`` marks a permanent refusal that every queued row on the lane would meet, but that
-    is still dead-lettered row by row rather than stopping the lane: at least a token endpoint's
-    reply in a content coding the engine does not decode (BACKLOG #5910). When a send raises it, the
-    delivery worker dead-letters the row or batch as for any permanent refusal, and also marks the
-    lane down, as a transport failure does: with connection-event capture on
-    (``[diagnostics].connection_events``, the default) that fires the edge-triggered
-    ``connection_error`` alert once, which resolves on the next successful delivery. Not when the
-    send ran on a connector a reload has since retired. Without it a lane that refuses every row
-    drains its queue into the dead-letter store with no alert. Only meaningful when ``permanent`` is
-    True; a credential or configuration fault that stops the lane does not read it.
     """
 
     def __init__(
@@ -1335,14 +1324,12 @@ class NegativeAckError(DeliveryError):
         permanent: bool,
         credential_fault: bool = False,
         config_fault: bool = False,
-        lane_wide: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.permanent = permanent
         self.credential_fault = credential_fault
         self.config_fault = config_fault
-        self.lane_wide = lane_wide
 
 
 #: ``NegativeAckError.code`` of a delivery its send-time hop re-check refused (:func:`insecure_hop_refused`).
