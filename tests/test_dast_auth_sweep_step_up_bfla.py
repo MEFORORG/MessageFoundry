@@ -5,9 +5,9 @@
 ``tests/test_dast_auth_sweep.py`` pins the fix with names the fix introduced
 (``STEP_UP_REQUIRED_HEADER``, ``is_bfla_refused``, ``_bfla_probe``), so against the pre-fix sweep
 that module fails at import rather than on the defect. This module imports only what the sweep and
-the engine had before the fix: ``run_sweep``, ``route_gates`` and the engine's own
-``_step_up_refusal``. Against the pre-fix sweep it fails on the defect itself: a step-up 403 to the
-low-privilege caller scored as a refusal, with no finding.
+the engine had before the fix: ``run_sweep``, ``route_gates``, ``dast_target.PREFLIGHT_PATH`` and
+the engine's own ``_step_up_refusal``. Against the pre-fix sweep it fails on the defect itself: a
+step-up 403 to the low-privilege caller scored as a refusal, with no finding.
 
 The target is an ``httpx.MockTransport``, not a live engine, because no shipped route lets the
 viewer through RBAC to a step-up gate; building one would be the canary's job, and this test is
@@ -27,18 +27,30 @@ import pytest
 import scripts.security.dast_auth_sweep as sweep
 from messagefoundry.api import security
 from scripts.security import route_gates
+from scripts.security.dast_target import PREFLIGHT_PATH
 
 _ADMIN = "dast-test-admin-token"
 _VIEWER = "dast-test-viewer-token"
+_NOT_A_VIEWER_PERMISSION = ("dast-test:not-a-viewer-permission",)
 
-#: A GET the viewer role's permission set does not cover, so the BFLA pass probes it.
-_ROW = route_gates.RouteRow(
-    method="GET",
-    path="/dast-test/step-up/{item_id}",
-    permissions=("dast-test:not-a-viewer-permission",),
-    gates=("require_step_up",),
-    kind=route_gates.KIND_GATED,
-)
+
+def _row(method: str, path: str) -> route_gates.RouteRow:
+    """A gated row the viewer role's permission set does not cover, so a BFLA pass probes it."""
+    return route_gates.RouteRow(
+        method=method,
+        path=path,
+        permissions=_NOT_A_VIEWER_PERMISSION,
+        gates=("require_step_up",),
+        kind=route_gates.KIND_GATED,
+    )
+
+
+#: The viewer meets the step-up gate here: RBAC let it through.
+_STEP_UP_GET = _row("GET", "/dast-test/step-up/{item_id}")
+#: The same, on the write pass.
+_STEP_UP_POST = _row("POST", "/dast-test/step-up-write/{item_id}")
+#: The negative control: the viewer gets a plain 403, a real permission refusal.
+_PLAIN_GET = _row("GET", "/dast-test/plain/{item_id}")
 
 
 class _Auth:
@@ -58,24 +70,31 @@ async def _engine_step_up_headers() -> dict[str, str]:
 async def test_a_step_up_403_to_the_low_privilege_caller_is_a_bfla_finding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The administrator reaches the row, an anonymous or forged caller gets 401, and the viewer
-    gets the engine's step-up 403: RBAC let it through to the step-up gate. That is a BFLA
-    violation. Pre-fix, the sweep kept the status only and scored the 403 as refused."""
+    """The administrator reaches every row and an anonymous or forged caller gets 401. The viewer
+    gets the engine's step-up 403 on one GET and one POST, where RBAC let it through to the step-up
+    gate, and a plain 403 on the control GET. The two step-up rows are BFLA violations, one per
+    pass; the control row is not. Pre-fix, both passes kept the status only and scored every 403
+    as refused, so neither step-up row was a finding."""
     step_up = await _engine_step_up_headers()
 
     def handler(request: httpx.Request) -> httpx.Response:
         bearer = request.headers.get("Authorization", "")
-        if bearer == f"Bearer {_ADMIN}":
+        if bearer not in (f"Bearer {_ADMIN}", f"Bearer {_VIEWER}"):
+            return httpx.Response(401)
+        # The write pass's session-liveness probe: both sessions stay alive throughout.
+        if bearer == f"Bearer {_ADMIN}" or request.url.path == PREFLIGHT_PATH:
             return httpx.Response(200)
-        if bearer == f"Bearer {_VIEWER}":
-            return httpx.Response(403, headers=step_up)
-        return httpx.Response(401)
+        if request.url.path.startswith("/dast-test/plain/"):
+            return httpx.Response(403)
+        return httpx.Response(403, headers=step_up)
 
     transport = httpx.MockTransport(handler)
-    real_client = httpx.AsyncClient
 
-    def _client(**kwargs: Any) -> httpx.AsyncClient:
-        return real_client(transport=transport, **kwargs)
+    # A subclass rather than a factory, so the patched name is still a class an isinstance check
+    # accepts.
+    class _MockClient(httpx.AsyncClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(transport=transport, **kwargs)
 
     async def _no_session_work(*_args: object) -> str:
         raise AssertionError("no row here needs a re-login or a re-proof")
@@ -94,13 +113,13 @@ async def test_a_step_up_403_to_the_low_privilege_caller_is_a_bfla_finding(
         )
 
     def _rows(_app: object = None) -> list[route_gates.RouteRow]:
-        return [_ROW]
+        return [_STEP_UP_GET, _PLAIN_GET, _STEP_UP_POST]
 
     def _no_rows(_app: object = None) -> list[route_gates.RouteRow]:
         return []
 
     monkeypatch.setattr(sweep, "dast_target", _target)
-    monkeypatch.setattr(httpx, "AsyncClient", _client)
+    monkeypatch.setattr(httpx, "AsyncClient", _MockClient)
     monkeypatch.setattr(route_gates, "route_rows", _rows)
     monkeypatch.setattr(route_gates, "gated_http_rows", _rows)
     monkeypatch.setattr(route_gates, "ungated_http_rows", _no_rows)
@@ -113,14 +132,19 @@ async def test_a_step_up_403_to_the_low_privilege_caller_is_a_bfla_finding(
         }
     )
 
-    # The controls: the row was measured as the stub intends, so the BFLA result below is not an
+    # The controls: every row was measured as the stub intends, so the BFLA result below is not an
     # artefact of a target that refused or reached everyone.
     assert receipt["negative_non_401"] == 0, receipt["findings"]
-    assert receipt["reached"] == 1, receipt["findings"]
-    assert receipt["bfla_probes"] == 1, receipt
-    # The defect: the step-up 403 must be a finding, not a refusal.
-    bfla = [f for f in receipt["findings"] if f["pass_name"] == "bfla"]
-    assert [(f["method"], f["path"], f["observed_status"]) for f in bfla] == [
-        ("GET", _ROW.path, 403)
+    assert receipt["reached"] == 2, receipt["findings"]
+    assert receipt["write_reached"] == 1, receipt["findings"]
+    assert receipt["bfla_probes"] == 2, receipt
+    assert receipt["write_bfla_probes"] == 1, receipt
+    assert receipt["write_session_rebuilds"] == 0, receipt
+    # The defect: each step-up 403 is a finding, and the plain 403 is not.
+    bfla = [f for f in receipt["findings"] if f["pass_name"] in ("bfla", "bfla-write")]
+    assert sorted((f["pass_name"], f["method"], f["path"], f["observed_status"]) for f in bfla) == [
+        ("bfla", "GET", _STEP_UP_GET.path, 403),
+        ("bfla-write", "POST", _STEP_UP_POST.path, 403),
     ], receipt["findings"]
     assert receipt["bfla_violations"] == 1, receipt
+    assert receipt["write_bfla_violations"] == 1, receipt

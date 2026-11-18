@@ -332,11 +332,13 @@ class TestAnAbsentRegistryIsNotAnEvaluatedFence:
 class TestTheFailOpenOutcomesThePreFixCodeGave:
     """BACKLOG #5596, asserted on the outcome alone.
 
-    The classes above name `HostHere`, `RecordHost` and the fence's new state names, which the
-    pre-fix function never returned, so against it they fail on a missing key rather than on the
-    defect. These pass only the parameters and read only the fields `Get-BoxActivity` had before the
-    fix (`Signals`, `Evaluable`, `Veto`, `FenceVeto`), so against the pre-fix function each fails on
-    the fail-open answer itself: an evaluable no-veto result for a seat it could not observe.
+    Several tests in the two classes above assert `HostHere` or a fence state name the fix added
+    before they reach the outcome, so against the pre-fix function they stop on a missing key or a
+    renamed state rather than on the defect. These pass only the parameters and read only the fields
+    `Get-BoxActivity` had before the fix (`Signals`, `Evaluable`, `Veto`, `FenceVeto`), so against
+    the pre-fix function each fails on the fail-open answer itself: a seat on another PC counted as
+    evaluable, an absent registry counted as an evaluated fence, and a fresh half-written registry
+    record that did not veto.
     """
 
     def test_a_seat_on_another_pc_with_a_stale_heartbeat_is_not_evaluable(
