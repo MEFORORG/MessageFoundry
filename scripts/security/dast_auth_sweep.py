@@ -78,6 +78,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from collections.abc import Coroutine, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -163,7 +164,8 @@ def load_policy(path: Path) -> dict[str, Any]:
     """Read and structurally validate the policy. Every failure here is fatal by design."""
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    # UnicodeDecodeError too: a policy that is not UTF-8 escaped main as CPython's exit 1.
+    except (OSError, UnicodeDecodeError) as exc:
         raise PolicyError(f"cannot read the policy at {path}: {exc}") from exc
     try:
         parsed = json.loads(raw)
@@ -181,13 +183,55 @@ def load_policy(path: Path) -> dict[str, Any]:
         if key not in parsed:
             raise PolicyError(f"the policy at {path} is missing the required {key!r} section")
     for key in ("unreachable_allowlist", "anonymous_allowlist", "public_websocket_allowlist"):
-        # Every reader iterates these, some outside evaluate()'s PolicyError handler, so a null or
-        # a string must stop the run here, as could-not-measure, and not crash it later as exit 1.
+        # Every reader iterates these. main's catch-alls would turn a later crash into exit 2, but
+        # checked here a null or a string stops the run before the sweep and names the section.
         if not isinstance(parsed[key], list):
             raise PolicyError(
                 f"the policy at {path} has {key!r} as {type(parsed[key]).__name__}, not a list"
             )
+        for entry in parsed[key]:
+            try:
+                _key(entry)
+            except PolicyError as exc:
+                raise PolicyError(f"the policy at {path} has a bad {key!r} entry: {exc}") from exc
+    # Every number below is read with int() by evaluate() and receipt_lines(). Both now run inside
+    # main's catch-all around _report, which turns a raise into exit 2; before that handler, a null or
+    # a string here crashed the run to exit 1 -- the FINDINGS code, which the CI canary loop reads as
+    # a detection (BACKLOG #5443). Checked here, the run refuses before the sweep and names the field.
+    for key in ("floors", "canary_floors"):
+        section = parsed[key]
+        if not isinstance(section, dict):
+            raise PolicyError(
+                f"the policy at {path} has {key!r} as {type(section).__name__}, not an object"
+            )
+        for name, value in section.items():
+            if not _is_count(value):
+                raise PolicyError(
+                    f"the policy at {path} has {key}.{name} as {value!r}, not a whole number >= 0"
+                )
+    placeholder = parsed.get("path_param_placeholder", route_gates.PATH_PARAM_PLACEHOLDER)
+    # Substituted into every path parameter: an empty, slashed or dot-segment value probes another
+    # route (httpx folds `..`), and its answers would read as findings, exit 1.
+    if (
+        not isinstance(placeholder, str)
+        or not re.fullmatch(r"[A-Za-z0-9._~-]+", placeholder)
+        or placeholder in {".", ".."}
+    ):
+        raise PolicyError(
+            f"the policy at {path} has 'path_param_placeholder' as {placeholder!r}, not one "
+            "non-empty path segment"
+        )
+    for key in ("max_unexplained_unreached", "max_write_session_rebuilds"):
+        if key in parsed and not _is_count(parsed[key]):
+            raise PolicyError(
+                f"the policy at {path} has {key!r} as {parsed[key]!r}, not a whole number >= 0"
+            )
     return parsed
+
+
+def _is_count(value: object) -> bool:
+    """A floor or cap: an int, not a bool (``True`` is an int to Python), and not negative."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _key(entry: object) -> tuple[str, str]:
@@ -1120,6 +1164,42 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    try:
+        code = _report(receipt, policy, args.canary, args.summary)
+    except Exception as exc:  # noqa: BLE001 - deliberate catch-all; see below
+        # The same reason as the sweep's catch-all above (BACKLOG #5443): load_policy checks the
+        # policy's shape, but whatever still raises while judging or reporting the receipt must exit 2,
+        # not CPython's 1, which the canary loop would read as a detection.
+        # Escaped as a workflow-command value, so a message with a newline stays one annotation.
+        why = str(exc).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(
+            f"::error::{_PREFIX}: judging or reporting the sweep failed "
+            f"({type(exc).__name__}: {why}). Refusing to report a result (fail closed).",
+            file=sys.stderr,
+        )
+        # The measured counts are still evidence: the receipt is written, marked as such.
+        receipt["verdict"] = "COULD NOT MEASURE (fail closed)"
+        code = 2
+
+    if args.receipt is not None:
+        try:
+            args.receipt.write_text(
+                json.dumps(receipt, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+        # ValueError and TypeError too: a value json cannot encode must exit 2, not 1.
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"::error::{_PREFIX}: could not write {args.receipt}: {exc}", file=sys.stderr)
+            return 2
+
+    return code
+
+
+def _report(
+    receipt: dict[str, Any], policy: dict[str, Any], canary: str | None, summary: Path | None
+) -> int:
+    """Judge ``receipt``, record the verdict and floors in it, emit the receipt lines and the
+    annotations, and return the exit code. ``main`` runs it under one handler, so nothing here
+    can exit 1 by raising."""
     code, errors = evaluate(receipt, policy)
     verdict = {0: "PASS", 1: "FINDINGS", 2: "COULD NOT MEASURE (fail closed)"}[code]
     receipt["verdict"] = verdict
@@ -1141,21 +1221,11 @@ def main(argv: list[str] | None = None) -> int:
         "observed": receipt["unreached_unexplained"],
     }
 
-    _emit(receipt_lines(receipt, policy, verdict), args.summary)
+    _emit(receipt_lines(receipt, policy, verdict), summary)
 
-    level = annotation_level(canary=args.canary, code=code)
+    level = annotation_level(canary=canary, code=code)
     for error in errors:
         print(f"::{level}::{_PREFIX}: {error}", file=sys.stderr)
-
-    if args.receipt is not None:
-        try:
-            args.receipt.write_text(
-                json.dumps(receipt, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-            )
-        except OSError as exc:
-            print(f"::error::{_PREFIX}: could not write {args.receipt}: {exc}", file=sys.stderr)
-            return 2
-
     return code
 
 
