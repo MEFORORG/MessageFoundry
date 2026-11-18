@@ -26,7 +26,8 @@
         in front of a command;
       * a `-c` or `--config-env` override of `include.path` or `includeIf.*`, which can load a
         hooksPath from a file; of `alias.*`, which can run a git command under a new name, or any shell
-        command with `!`; and of `remote.<name>.mirror` or a `+` or `:` `remote.<name>.push` refspec;
+        command with `!`; of `remote.<name>.mirror`; and of `remote.<name>.push` with a `+` or `:`
+        refspec under `-c`, or with any value under `--config-env`, whose value names a variable;
       * a force push: `--force`, `-f`, `--force-with-lease`, `--mirror`, or a `+` refspec;
       * a ref deletion by push: `--delete`, `-d`, `--prune`, or a `:<branch>` refspec;
       * `git reset --hard`;
@@ -215,16 +216,17 @@ function Test-KillSwitchWrite($Argv) {
 function Get-ConfigOverrideHit([string]$Option, [string]$Pair) {
     # A config override that points the hooks elsewhere skips them as surely as --no-verify; an
     # include can load a file that does the same; an alias can run a git command under a new name,
-    # or any shell command with `!`; a remote's mirror or `+`/`:` push refspec turns a plain push into
-    # a forced one or a deletion. -match folds case, as git does for a section and variable name; it
-    # also folds a subsection, which git does not, and so records more, never less.
+    # or any shell command with `!`; a remote's mirror setting, valueless meaning true, turns a plain
+    # push into a forced one, and so can a `+` push refspec, while a `:<dst>` one deletes (a bare `:`
+    # is the matching refspec, recorded all the same). -match folds case, as git does for a section and
+    # variable name; it also folds a subsection, which git does not, and so records more, never less.
     if ($Pair -match '^core\.hooksPath=') { return "git $Option core.hooksPath (hook bypass)" }
     if ($Pair -match '^include\.path=') { return "git $Option include.path (config include, can bypass hooks)" }
     if ($Pair -match '^includeIf\.') { return "git $Option includeIf (config include, can bypass hooks)" }
     if ($Pair -match '^alias\.') { return "git $Option alias (command alias override)" }
     # Under --config-env the text after `=` names an environment variable, so the refspec is unseen.
     $push = if ($Option -ceq '--config-env') { 'push=' } else { 'push=[+:]' }
-    if ($Pair -match "^remote\..+\.(mirror=|$push)") { return "git $Option remote mirror or push refspec (can force a push)" }
+    if ($Pair -match "^remote\..+\.(mirror(=|$)|$push)") { return "git $Option remote mirror or push refspec (can force a push)" }
     return $null
 }
 
@@ -233,8 +235,9 @@ function Get-ConfigOverrideHit([string]$Option, [string]$Pair) {
 # --config-env, --attr-source and --shallow-file, which do (measured on git 2.55.0). Both parses run
 # and every hit either one sees is recorded, because a tripwire may only tighten: under the first, a
 # Class C word in the value position (`git --attr-source reset log --hard`) is the subcommand.
-# Resolve-GitSubcommand in block-blanket-git-stage.ps1 kept a copy of the first list; BACKLOG #5450
-# corrects that copy on its own branch, so the two lists may differ until both merge.
+# Resolve-GitSubcommand in block-blanket-git-stage.ps1 kept a copy of the first list. BACKLOG #5450
+# changes that copy on its own branch, whose wider list keeps --exec-path, so the lists here and
+# there differ, at least until one is changed to match the other; nothing tests them together.
 $script:GitValuedOptionLists = @(
     @('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix'),
     @('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env', '--attr-source', '--shallow-file')
@@ -274,7 +277,10 @@ function Find-GitSubcommandTripwires($Argv, [int]$k, $Hits) {
             $after = $p -gt 0 -and $rest[$p - 1].T -cin $valued
             if (-not $t.Q -or ($t.T -cmatch '^--?[A-Za-z][\w-]*(=\S*)?$' -and -not $after)) { $t.T }
         })
-    if (@($flags | Where-Object { Test-LongOption $_ '--no-verify' 9 }).Count) { $Hits.Add("git $sub --no-verify") }
+    # The record names acts, never command text, and the first parse can put an option's value (a path,
+    # a key=VAR) where the subcommand goes; only a subcommand-shaped word is named.
+    $subName = if ($sub -cmatch '^[a-z][a-z0-9-]*$') { $sub } else { '<subcommand>' }
+    if (@($flags | Where-Object { Test-LongOption $_ '--no-verify' 9 }).Count) { $Hits.Add("git $subName --no-verify") }
     switch -CaseSensitive ($sub) {
         'commit' {
             # -u takes its mode stuck on (`-uno`), so it ends a cluster like the value letters.

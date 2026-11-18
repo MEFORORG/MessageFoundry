@@ -140,6 +140,12 @@ MUST_HIT = [
         "remote mirror or push refspec",
         id="config-env-remote-push-value-unseen",
     ),
+    # A valueless `-c` key is boolean true, so this is a mirror push.
+    pytest.param(
+        "git -c remote.origin.mirror push origin",
+        "remote mirror or push refspec",
+        id="c-remote-mirror-valueless",
+    ),
     pytest.param(
         "git -c remote.origin.push=+refs/heads/*:refs/heads/* push origin",
         "remote mirror or push refspec",
@@ -159,7 +165,7 @@ MUST_HIT = [
 
 MUST_PASS = [
     pytest.param("git --config-env user.name=GN push origin b", id="config-env-plain-push"),
-    pytest.param("git --config-env=core.editor=ED commit -m x", id="config-env-other-key"),
+    pytest.param("git --config-env=user.email=EM commit -m x", id="config-env-other-key"),
     pytest.param("git --attr-source HEAD status", id="attr-source-status"),
     # git option names are case-sensitive: git refuses `--CONFIG-ENV=...` as an unknown option, so it
     # sets nothing. Only the config key folds case.
@@ -177,6 +183,15 @@ def test_each_config_env_or_attr_source_act_trips(sb: Sandbox, command: str, act
     context = _run(sb, command)
     assert context is not None, f"{command!r} did not trip"
     assert act in context and "Class C" in context
+
+
+def test_an_option_value_is_never_named_as_the_subcommand(sb: Sandbox) -> None:
+    # origin/main's parse reads the value of --shallow-file as the subcommand; the record names acts,
+    # never command text, so the path must not reach the note.
+    context = _run(sb, "git --shallow-file /srv/shallow-marker/x commit --no-verify -m x")
+    assert context is not None
+    assert "git commit --no-verify" in context
+    assert "shallow-marker" not in context
 
 
 @pytest.mark.parametrize("command", MUST_PASS)
