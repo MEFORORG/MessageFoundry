@@ -273,6 +273,15 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     function renderGroups(groups) {
       const host = $('settings'); host.innerHTML = '';
       REMOVED_KEYS.clear();
+      // A held default survives a draw from the host (the load, or a rebuild's reply) only where
+      // that draw gives its key an env reference: otherwise the request it answers sent none,
+      // because the setting was removed, emptied or switched to a literal. Dropped here, when the
+      // reply is drawn, not when the request is sent, so a setting kept again before the reply
+      // arrives keeps its default (BACKLOG #8243 items 18 and 20). A reference under another key
+      // keeps it, so the original key typed back still finds it.
+      const envRefKeys = new Set();
+      for (const g of groups) for (const f of g.fields) if (f.envKey !== undefined || f.envDefault !== undefined) envRefKeys.add(f.key);
+      for (const k of [...HELD_DEFAULTS.keys()]) if (!envRefKeys.has(k)) HELD_DEFAULTS.delete(k);
       for (const g of groups) {
         const box = document.createElement('details'); box.open = !g.collapsed;
         const sum = document.createElement('summary');
@@ -299,12 +308,8 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     /** Ask the extension to rebuild the descriptors when the transport or direction changes. */
     function requestFields() {
       if (!FIELD_GROUPS) { prefillHints(); return; }
-      // A setting removed before a rebuild is gone: its held default does not return with its key.
-      // So is one whose env key box is empty: the request leaves it out, as it does a removed one.
-      for (const k of REMOVED_KEYS) HELD_DEFAULTS.delete(k);
-      for (const el of document.querySelectorAll('#settings [data-key][data-env="1"]')) {
-        if (!el.value.trim()) HELD_DEFAULTS.delete(el.dataset.key);
-      }
+      // A setting this request leaves out (removed, or its env key box empty) loses its held default
+      // when the reply is drawn (renderGroups), not here.
       // The request names this page's render, so the host can drop a reply that would reach a
       // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
@@ -403,11 +408,14 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // engine's validator refuses what the user typed rather than this page guessing.
     const DECIMAL_TEXT = /^-?(\\d+(\\.\\d+)?|\\.\\d+)([eE][-+]?\\d+)?$/;
     function typedValue(f, raw) {
-      if (f.control === 'table' || (f.value !== null && typeof f.value === 'object')) return parseTable(raw);
+      // A select's picked choice first, with its own type: a select whose recorded value was a table
+      // must not JSON-parse a choice such as "2" into a number (BACKLOG #8243 item 31).
+      const tableValued = f.control === 'table' || (f.value !== null && typeof f.value === 'object');
       if (f.control === 'select') {
         const hit = (f.choices || []).find((c) => String(c) === raw);
-        return hit !== undefined ? hit : raw;
+        return hit !== undefined ? hit : tableValued ? parseTable(raw) : raw;
       }
+      if (tableValued) return parseTable(raw);
       // Only decimal text, the text a number box accepted: Number() also reads hex, binary, octal
       // and a leading '+', which would post a number the user never typed. An exponent that
       // overflows is posted as typed too, since Infinity would cross to the host as null, and so is
@@ -445,12 +453,16 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
             if (heldSecret(f) !== undefined) settings[key] = HELD_MARK;
             continue;
           }
-          const ref = { env: envKey };
+          // An untouched box writes back the recorded key exactly, spaces and line breaks included:
+          // the engine looks the key up as written, so a trimmed key names another variable
+          // (BACKLOG #8243 item 19). A key the user typed is trimmed.
+          const untouchedKey = f.envKey !== undefined && el.value === SHOWN.get(el);
+          const ref = { env: untouchedKey ? f.envKey : envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
           // A held inline default goes back only with the env key it was recorded under, compared
           // trimmed, so an untouched key and the original key typed back after a rebuild keep it,
           // and a replaced key does not take the old credential as its default. A setting the user
-          // removed loses its held default when the fields are rebuilt (requestFields).
+          // removed loses its held default when the rebuild is drawn (renderGroups).
           // A secret's default is never written from the descriptor: only as the mark, so resolveHeld
           // decides it and a clone never copies it.
           const held = HELD_DEFAULTS.get(key);
