@@ -669,7 +669,8 @@ def test_quoted_prose_naming_a_walk_is_still_allowed(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
 
 
-# THE POWERSHELL TOOL KEEPS THE PLAIN QUOTE TOGGLE. Its escape is the backtick and a backslash is
+# THE POWERSHELL TOOL KEEPS THE PLAIN QUOTE TOGGLE, beside its own escape reading (BACKLOG #5451,
+# tests/test_fs_scan_escaped_quotes.py), never the bash one. Its escape is the backtick and a backslash is
 # literal, so reading these as bash would open a substitution or an escape that never closes and
 # blank the walk after it. Each was denied before the bash masker and must stay denied.
 POWERSHELL_QUOTE_DENY = [

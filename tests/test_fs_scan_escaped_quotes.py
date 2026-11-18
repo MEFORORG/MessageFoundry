@@ -8,7 +8,10 @@ does, and tests/test_unbounded_fs_scan_guard.py pins that. The PowerShell tool k
 quote toggle, where a backtick-escaped quote (`"` inside or outside a string) still opened or closed
 a span, so the separator and the unbounded walk after it were blanked and allowed.
 
-The allow rows pin prose the PowerShell reading must keep blanked.
+The same reading blanks a comment and a here-string body, so an apostrophe in either opens no
+span. The allow rows that carry a backtick, `#` or `@` are the ones the PowerShell reading runs on;
+each would be denied by a reading that escaped inside single quotes, treated an escaped backtick as
+escaping the quote after it, or read a backtick in a comment or a single-quoted here-string body.
 """
 
 from __future__ import annotations
@@ -30,12 +33,22 @@ POWERSHELL_DENY = [
     pytest.param('Write-Output `"; find /proc; Write-Output `"', id="escaped-quotes-outside"),
     pytest.param("Write-Output 'it`'; grep -r x /proc", id="backtick-is-literal-in-single-quotes"),
     pytest.param('Write-Output "x``"; grep -r x /proc', id="escaped-backtick-before-the-close"),
+    pytest.param("# don't walk\ngrep -r x /proc", id="apostrophe-in-a-line-comment"),
+    pytest.param("<# it's #>\ngrep -r x /proc", id="apostrophe-in-a-block-comment"),
+    pytest.param("git commit -m @'\ndon't\n'@\ngrep -r x /proc", id="apostrophe-in-a-here-string"),
 ]
 
 POWERSHELL_ALLOW = [
     pytest.param('Write-Output "say `"find /proc`" is blocked"', id="escaped-quotes-in-prose"),
     pytest.param("Write-Output 'never find /proc'", id="single-quoted-prose"),
     pytest.param('Write-Output "a ""find /proc"" b"', id="doubled-quotes-in-prose"),
+    pytest.param("Write-Output 'x`' '; find /proc'", id="backtick-literal-in-single-quotes"),
+    pytest.param('Write-Output "x``" "; find /proc"', id="escaped-backtick-then-a-string"),
+    pytest.param(
+        "git commit -m @'\nFix the guard's `\"; find /proc` masking\n'@",
+        id="backtick-quote-in-a-here-string",
+    ),
+    pytest.param("Write-Output 'a' # it`'s; grep -r x /proc", id="backtick-in-a-comment"),
 ]
 
 
