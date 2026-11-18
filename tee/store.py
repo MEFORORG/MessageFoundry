@@ -363,7 +363,7 @@ class RelayStore:
     ) -> list[CaptureRow]:
         """Captured full message **bodies** (PHI) for the #14 parity comparison — typically the
         Corepoint-output rows (``direction='corepoint_copy'``) the compare tool diffs against MEFOR's
-        transform output, carrying the MSH-10 control id for correlation, cut to ``_MAX_IDENTIFIER``.
+        transform output, carrying the MSH-10 control id for correlation.
 
         Unlike :meth:`export` (deliberately body-free), this returns raw bodies and is therefore
         **test-data-only**: never log it or redirect it to CI. ``direction``/``since``/``before`` narrow

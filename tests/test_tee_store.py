@@ -99,6 +99,8 @@ async def test_identifiers_are_bounded_before_they_are_stored(tmp_path: Path) ->
     # whole for every `naks` read to load and escape. A conformant identifier is kept as sent.
     huge_id = "9" * 1_000_000
     huge_type = "ADT^" * 250_000
+    bound = tee_store._MAX_IDENTIFIER  # noqa: SLF001 - the bound under test
+    assert bound >= 199  # MSH-10's longest conformant length, which the docs say is never cut
     store = await _open(tmp_path)
     try:
         await store.record_leg(
@@ -114,7 +116,7 @@ async def test_identifiers_are_bounded_before_they_are_stored(tmp_path: Path) ->
         await store.record_leg(
             direction="epic_to_corepoint",
             leg="mefor",
-            control_id="C" * 199,
+            control_id="C" * bound,
             message_type="ADT^A01^ADT_A01",
             size_bytes=1,
             outcome="transport_error",
@@ -124,13 +126,13 @@ async def test_identifiers_are_bounded_before_they_are_stored(tmp_path: Path) ->
         await store.record_capture(direction="epic_to_corepoint", control_id=huge_id, raw=b"MSH|")
         naks = await store.recent_naks()
         by_leg = {n.leg: n for n in naks}
-        assert by_leg["corepoint"].control_id == huge_id[:199]
-        assert by_leg["corepoint"].message_type == huge_type[:199]
-        assert by_leg["corepoint"].ack_code == ("AR" * 500_000)[:199]
-        assert by_leg["mefor"].control_id == "C" * 199
+        assert by_leg["corepoint"].control_id == huge_id[:bound]
+        assert by_leg["corepoint"].message_type == huge_type[:bound]
+        assert by_leg["corepoint"].ack_code == ("AR" * 500_000)[:bound]
+        assert by_leg["mefor"].control_id == "C" * bound
         assert by_leg["mefor"].message_type == "ADT^A01^ADT_A01"
         (capture,) = await store.captures()
-        assert capture.control_id == huge_id[:199]
+        assert capture.control_id == huge_id[:bound]
     finally:
         await store.close()
 
