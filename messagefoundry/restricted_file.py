@@ -205,8 +205,8 @@ _ONE_ACCOUNT_KINDS = frozenset({1, 9})
 #: one no token carries, so the grant would reach nobody. Kept apart from the handoff's
 #: ``_ONE_ACCOUNT_KINDS``: the two gates have different callers and may change apart.
 _GRANT_NAME_KINDS = frozenset({1, 5, 9})
-#: The SID_NAME_USE an owner NAME may resolve to: a user or a well-known account. Any other kind of
-#: owner is named by its SID.
+#: The SID_NAME_USE an owner NAME may resolve to: a user or a well-known account. An owner of a
+#: kind in :data:`_OWNER_BY_SID_KINDS` is named by its SID.
 _OWNER_NAME_KINDS = frozenset({1, 5})
 #: SidTypeDeletedAccount, SidTypeInvalid and SidTypeUnknown: a name that resolves to no live account.
 _NOT_A_LIVE_ACCOUNT_KINDS = frozenset({6, 7, 8})
@@ -479,6 +479,10 @@ _MORE_BROAD_GROUP_SIDS: frozenset[str] = frozenset(
         "S-1-5-1000",  # Other Organization
         "S-1-5-65-1",  # This Organization Certificate
         "S-1-5-90-0",  # Window Manager\Window Manager Group
+        "S-1-5-9",  # Enterprise Domain Controllers
+        "S-1-5-83-0",  # NT VIRTUAL MACHINE\Virtual Machines
+        "S-1-5-84-0-0-0-0-0",  # USER MODE DRIVERS
+        "S-1-5-96-0",  # Font Driver Host
     }
 )
 #: The relative id of Domain Computers, in any domain: every machine account holds it.

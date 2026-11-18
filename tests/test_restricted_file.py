@@ -476,6 +476,10 @@ def test_a_broad_account_that_can_read_is_a_problem(ace: tuple[int, int, str], n
         "S-1-5-1000",  # Other Organization
         "S-1-5-65-1",  # This Organization Certificate
         "S-1-5-90-0",  # Window Manager Group
+        "S-1-5-9",  # Enterprise Domain Controllers
+        "S-1-5-83-0",  # Virtual Machines
+        "S-1-5-84-0-0-0-0-0",  # USER MODE DRIVERS
+        "S-1-5-96-0",  # Font Driver Host
     ],
 )
 def test_more_well_known_groups_are_broad(sid: str) -> None:
@@ -1351,7 +1355,9 @@ def test_windows_a_computer_account_grant_name_is_written(
 
 
 @windows_only
-@pytest.mark.parametrize("grant", [f"*{_USERS}", "*S-1-1-0", "*S-1-5-11", "*S-1-5-15"])
+@pytest.mark.parametrize(
+    "grant", [f"*{_USERS}", "*S-1-1-0", "*S-1-5-11", "*S-1-5-15", "*S-1-5-1000", "*S-1-18-3"]
+)
 def test_windows_refuses_a_read_grant_to_a_broad_group(tmp_path: Path, grant: str) -> None:
     # A grant that would make the key file broadly readable is not a restricted create. The control
     # is the per-service grant in the test above, which is created.
