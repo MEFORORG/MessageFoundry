@@ -995,7 +995,8 @@ the caller then receives a fixed-JSON `502`. An error the outbound retries, such
 keeps the caller waiting. Retries are finite here, so one of three things ends the wait. A later
 attempt that succeeds returns its reply. The last failed attempt dead-letters the delivery, and the
 caller gets the fixed-JSON `502`. If neither happens within `reply_timeout`, the caller gets the
-`reply_on_timeout` answer. The same fixed-JSON `502`, `delivery_failed`, also answers a message
+`reply_on_timeout` answer. The same fixed-JSON `502`, `delivery_failed`, answers at least two
+other cases: every `reply_from` row cancelled, for example by an operator cancelling the queued delivery, and a message
 that has reached a terminal status while every `reply_from` row is settled (`done`, `dead` or
 `cancelled`) and at least one is `done` with no captured reply. A reply the outbound captured as a
 rejection, at least a SOAP fault in a 2xx body, is the exception: it comes back as a `502` that

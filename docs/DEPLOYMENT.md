@@ -430,7 +430,7 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   body. A delivery that dead-letters captures no reply, so a caller still waiting gets a fixed-JSON
   `502` without the partner's status or body. Most partner `4xx` statuses dead-letter the delivery
   at once. That `502`, `delivery_failed`, is not only for a dead-lettered delivery: it also answers
-  a message that has reached a terminal status while every `reply_from` row is settled and at least
+  at least a cancelled one, and a message that has reached a terminal status while every `reply_from` row is settled and at least
   one is `done` with no captured reply.
   `check_http_sync_reply` refuses a `reply_from` it cannot serve safely. Examples are an outbound
   that does not capture its response, and one that would retry forever. See
