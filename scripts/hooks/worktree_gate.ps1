@@ -3738,7 +3738,14 @@ if ($tool -in @("Bash", "PowerShell")) {
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
     # The valueless read options rule 3c's read exemptions accept between `config` and the key
     # (BACKLOG #5588, #5589). Exact spellings only: an abbreviation or a value-taking option is no read.
-    $readOpts = '--(?:get|get-all|get-regexp|local|global|system|worktree|includes|no-includes|null|name-only|show-origin|show-scope)|-z'
+    $readOpts = '--(?:get|get-all|get-regexp|local|global|system|worktree|includes|no-includes|null|name-only|show-origin|show-scope|all|show-names|bool|int|bool-or-int|path|expiry-date)|-z'
+    # ONE SHELL WORD THAT IS PLAIN TEXT IN BOTH HOSTS: no quote, escape, sigil, glob, bracket,
+    # redirect, comment or newline, and no leading `-`, so it cannot be an option or hide a second
+    # command. Used for an option's value below and for a --get read's value pattern (BACKLOG #5589).
+    $plainWord = '[A-Za-z0-9._/:+%^][A-Za-z0-9._/:+=%^-]*'
+    # The read options that take a value, each with a plain-word value and spaces or tabs only, never
+    # a CR, which PowerShell runs as a statement break (#8240 item 51). `--type` takes only its types.
+    $readValueOpts = "--type(?:=|[ \t]+)(?:bool|int|bool-or-int|path|expiry-date|color)|(?:--default|--file)(?:=|[ \t]+)$plainWord|-f[ \t]+$plainWord"
     # EVERY DISARM ON A SEGMENT IS JUDGED, not only the first (review round 3411eb8641 on BACKLOG #5642,
     # #5655). The first match is judged first and exactly as before; each later one runs the same body,
     # whose every exit is a `continue` or a deny, so judging more matches can only add a deny.
@@ -3794,12 +3801,18 @@ if ($tool -in @("Bash", "PowerShell")) {
         # `\--unset` and `--""unset`, and $via starts at the FIRST `config` word on the line, which can
         # sit in a `-c foo.config=1` key or a `.../config/...` path, so an anchored `unset` test missed
         # `git -c foo.config=1 config unset <key>`. So the read exemptions apply only when every token
-        # between `config` and the key is an exact, valueless read option -- an optional leading `get`
+        # between `config` and the key is an exact read option -- an optional leading `get`
         # subcommand, then scope and display flags and the `--get` modes. Anything else, a write mode
-        # included, is not a read here. That denies some odd reads (`--file <f>`, an abbreviation,
-        # `get --all`). None of these tokens takes a value or sets anything; what follows the key is
-        # $rest, and the one exemption left requires it empty.
-        $viaRead = $viaConfig -and ($via -cmatch "^config(?:\s+get)?(?:\s+(?:$readOpts))*\s+$")
+        # included, is not a read here. That still denies some odd reads (an abbreviation, a quoted
+        # option value). None of these tokens sets anything, and the few that take a value take one
+        # plain word ($readValueOpts); what follows the key is $rest, judged below.
+        # Spaces and tabs only between tokens: a CR there is a PowerShell statement break, and with the
+        # value-taking options it would let a second statement start between `config` and the key.
+        $viaRead = $viaConfig -and ($via -cmatch "^config(?:[ \t]+get)?(?:[ \t]+(?:$readOpts|$readValueOpts))*[ \t]+\z")
+        # A --get MODE IN $via makes what follows the key a value PATTERN, never a value to store
+        # (BACKLOG #5589; measured in tests/test_worktree_gate.py). A display flag alone does not:
+        # real git stores `/nope` for `git config --show-names core.hooksPath /nope`.
+        $viaGet = $viaRead -and ($via -cmatch '(?:^|\s)--(?:get|get-all|get-regexp)(?=\s)')
         # For the refusal's wording only: a config-form disarm that is not the plain `config <key> <v>`
         # shape may REMOVE the key, so "setting" would misdescribe it. The wording can still misname a
         # refused read; see KNOWN WRONG REFUSAL TEXT under THE ADDED READINGS.
@@ -3821,6 +3834,12 @@ if ($tool -in @("Bash", "PowerShell")) {
         # `$rest` stops at the next `|;&` because those start a new command, so a trailing separator
         # cannot be mistaken for a value.
         if ($viaRead -and $rest -notmatch '\S') { continue }
+        # THE MULTI-ARGUMENT READ (BACKLOG #5589): `git config --get <key> <pattern>`. $rest is split
+        # the way both hosts split it only where that is unambiguous: spaces or tabs, then ONE plain
+        # word ($plainWord), then spaces or tabs to the end. A sigil, substitution, redirect, CR, second
+        # word or a quote the scan kept is not split here, so it stays denied; the note after
+        # $ownCmdWin says why.
+        if ($viaGet -and $rest -cmatch "^[ \t]+$plainWord[ \t]*\z") { continue }
 
         $at = [regex]::Match($seg.Raw, $gitInvocation)
         $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
@@ -3914,15 +3933,17 @@ if ($tool -in @("Bash", "PowerShell")) {
         #   * $ownCmdWin ends where $via starts, at the `config` word, so the flag in `git config --get
         #     <key> <pattern>` was in neither half and that read was refused.
         #
-        # THERE IS NO MULTI-ARGUMENT READ EXEMPTION, AND TWO ATTEMPTS AT ONE ARE WHY. Any text after the
-        # key is $rest, and $rest is where a second command hides: a flag search excused
+        # THE MULTI-ARGUMENT READ EXEMPTION IS NARROW, AND TWO ATTEMPTS AT A WIDER ONE ARE WHY. Any text
+        # after the key is $rest, and $rest is where a second command hides: a flag search excused
         # `--comment --get <key> v` (the `--get` is the comment's VALUE, and git stores v), a negated
         # `--show-origin`, and a write in a substitution; an allowlist over $via with a character
         # filter on $rest was then measured excusing a second PowerShell statement after a lone CR,
-        # which neither the segment split nor $rest stops at. So `git config --get <key> <pattern>`
-        # stays DENIED, as it was before #5589. That false deny is the clause of #5589 left open;
-        # closing it needs $rest split as the host shell splits it, not a filter. The only read
-        # excused here is the bare one above, `config [read options] <key>` with nothing after it.
+        # which neither the segment split nor $rest stops at. So the exemption above (BACKLOG #5589)
+        # takes $rest only where both hosts split it the same way into exactly one word: spaces or
+        # tabs, one $plainWord, which holds no quote, sigil, bracket, redirect or CR, and nothing
+        # else. It needs every token of $via on the allowlist and a --get mode among them. A second
+        # word stays DENIED, and so does a quoted pattern, except one the scan unmasks because it holds
+        # one bare word (BACKLOG #1069), which the shell reads as that word.
         # ===============================================================================================
 
         # ===============================================================================================
