@@ -2091,9 +2091,10 @@ def _load_allowlist() -> list[re.Pattern[str]]:
         # a leak written inside the padding exactly as an unanchored entry did (BACKLOG #5445).
         # This refuses the common spellings only; a quantified group, a positive class such as
         # ``[0-9.]+`` or a bounded ``.{1,500}`` still passes it, and review is what stops those.
-        # A verbose entry, ``(?x)``, may part a wildcard from its quantifier with whitespace
-        # (``. *``), which the piece-by-piece read below takes for a literal; refused outright.
-        if _absorbs_any_text(line) or pat.flags & re.VERBOSE:
+        # A verbose entry, ``(?x)`` or a scoped ``(?x:...)``, may part a wildcard from its
+        # quantifier with whitespace (``. *``), which the piece-by-piece read below takes for a
+        # literal; refused outright.
+        if _absorbs_any_text(line) or pat.flags & re.VERBOSE or _VERBOSE_FLAG.search(line):
             print(
                 f"scan_forbidden: scan-allowlist.txt line {lineno}: pattern has an unbounded wildcard "
                 "(at least ., \\S, \\W, \\D, \\w or a class holding one or negated, repeated without "
@@ -2106,9 +2107,13 @@ def _load_allowlist() -> list[re.Pattern[str]]:
     return out
 
 
-#: The escapes that match any text when repeated, or any word token (``\w``): ``\S``, ``\W`` and
-#: ``\D`` each cover all of their complement's letters and punctuation.
+#: The escapes refused under an unbounded quantifier. ``\S`` absorbs any run without a space (a
+#: name, an IP, a site code), ``\D`` any run without a digit (a name), ``\w`` any word token.
+#: ``\W`` absorbs only spaces and punctuation, not a name; it is here so that ``[\w\W]``, which with
+#: ``\w`` matches anything, is caught, and as the conservative choice for a bare ``\W+``.
 _ABSORBING_ESCAPES = frozenset("SWDw")
+#: An inline verbose flag, global (``(?x)``) or scoped (``(?ix:...)``); ``(?-x:...)`` turns it off.
+_VERBOSE_FLAG = re.compile(r"\(\?[aiLmsux]*x")
 #: A quantifier with no upper bound.
 _UNBOUNDED = re.compile(r"[*+]|\{\d*,\}")
 
