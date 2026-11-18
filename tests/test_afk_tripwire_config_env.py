@@ -11,6 +11,11 @@ both accepted with the value in the NEXT argument, as well as in the ``=`` form.
 * ``git --config-env x=VAR push --force`` resolved its subcommand to ``x=VAR``, and the push went
   unrecorded; ``--attr-source <tree>`` did the same.
 
+The fix keeps origin/main's parse beside the corrected one and records what either sees, so no act
+origin/main recorded goes unrecorded. ``--shallow-file`` also takes a separate value; ``--exec-path``
+takes none. A ``-c``/``--config-env`` override of ``include.path``, ``includeIf.*`` or ``alias.*`` is
+recorded beside ``core.hooksPath``.
+
 The hit arm and the pass arm are both here, for the reason ``tests/test_afk_tripwire.py`` gives: a hook
 that trips on everything passes the first alone. This is a new file so this row's PR edits no shared
 test file; the harness is the same one ``tests/test_afk_tripwire.py`` uses.
@@ -82,12 +87,67 @@ MUST_HIT = [
         "git push --force",
         id="attr-source-equals-then-push-force",
     ),
+    # A tripwire only tightens: origin/main's parse, which skips no value after --attr-source, reads
+    # `reset` as the subcommand here and records it, so the corrected parse must not lose that record.
+    pytest.param(
+        "git --attr-source reset log --hard",
+        "git reset --hard",
+        id="old-parse-record-kept-attr-source",
+    ),
+    pytest.param(
+        "git --config-env reset log --hard",
+        "git reset --hard",
+        id="old-parse-record-kept-config-env",
+    ),
+    # --shallow-file takes its value as the next argument (measured on git 2.55.0).
+    pytest.param(
+        "git --shallow-file x push --force origin b",
+        "git push --force",
+        id="shallow-file-separate-then-push-force",
+    ),
+    # --exec-path takes no separate value: alone it prints the path and exits, so the word after it
+    # is not its value. Reading `push` as the subcommand over-records, which a tripwire may do.
+    pytest.param(
+        "git --exec-path push --force origin b",
+        "git push --force",
+        id="exec-path-takes-no-separate-value",
+    ),
+    pytest.param(
+        "git --config-env=user.name=GN push --force origin b",
+        "git push --force",
+        id="config-env-equals-then-push-force",
+    ),
+    # Overrides that can bypass hooks or run another command as surely as core.hooksPath.
+    pytest.param(
+        "git -c include.path=evil.cfg commit -m x",
+        "include.path",
+        id="c-include-path",
+    ),
+    pytest.param(
+        "git --config-env includeIf.gitdir:/r/.path=V commit -m x",
+        "include.path",
+        id="config-env-include-if",
+    ),
+    pytest.param(
+        "git -c alias.ci=commit ci -m x",
+        "alias",
+        id="c-alias",
+    ),
+    pytest.param(
+        "git --config-env=Alias.ci=V ci -m x",
+        "alias",
+        id="config-env-equals-alias",
+    ),
 ]
 
 MUST_PASS = [
     pytest.param("git --config-env user.name=GN push origin b", id="config-env-plain-push"),
     pytest.param("git --config-env=core.editor=ED commit -m x", id="config-env-other-key"),
     pytest.param("git --attr-source HEAD status", id="attr-source-status"),
+    # git option names are case-sensitive: git refuses `--CONFIG-ENV=...` as an unknown option, so it
+    # sets nothing. Only the config key folds case.
+    pytest.param("git --CONFIG-ENV=core.hooksPath=V commit -m x", id="config-env-name-case-kept"),
+    pytest.param("git -c includes.path=x commit -m x", id="c-key-only-looks-like-include"),
 ]
 
 
