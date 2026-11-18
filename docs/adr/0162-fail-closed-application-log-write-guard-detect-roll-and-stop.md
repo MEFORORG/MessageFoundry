@@ -457,7 +457,8 @@ place a fixed notice naming the record's logger, its level and the exception's t
 formatter can format that notice. When the sink takes the notice, neither stage runs and the
 engine keeps processing. **The fault is reported on the stderr last-resort line only, at a bounded
 rate: no alert is raised and nothing shows on `GET /status`.** This is weaker than `main`, where
-such a record went to stage 2, and the owner ruled on 2026-11-17 to keep it. An alert and a
+such a record went to stage 2. Keeping it was decided by the Manager under the owner's
+delegation of 2026-11-17 (decision d20261118T002722950-fa0f70). An alert and a
 `/status` signal for it are not built. When the sink refuses the notice, the two stages decide, as
 for any write failure. When the formatter cannot format the notice either, the sink is recorded
 unwritable with a reason that names a formatter fault, and the file is not rolled or renamed;
