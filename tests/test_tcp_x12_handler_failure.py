@@ -355,3 +355,70 @@ def test_the_retry_schedule_backs_off_to_a_bounded_pause(monkeypatch: pytest.Mon
     delays = base_mod.HANDLER_RETRY_DELAYS
     assert all(later >= earlier > 0 for earlier, later in zip(delays, delays[1:], strict=False))
     assert delays[-1] <= 60
+
+
+# --- BACKLOG #5971: the X12 listener's pipelined remainder and its reply encode -----------------
+
+
+def _unhandled_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "messagefoundry.transports.x12"
+        and "not handed to the pipeline" in r.getMessage()
+    ]
+
+
+async def test_x12_a_close_mid_read_counts_the_interchanges_it_leaves_unhandled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Three interchanges pipelined into one read; the reply-owed fault on the first closes the
+    # connection. The two behind it were read off the socket and never handed on, so the close
+    # must say how many, or nothing records that they arrived.
+    seen: list[bytes] = []
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(
+            _replying(_x12), _ThenEof(EDI * 3), _Peer(), handler=_failing_for(99, seen)
+        )
+    assert seen == [EDI]
+    assert _kinds(events) == ["established", "handler_error"]
+    lines = _unhandled_lines(caplog)
+    assert len(lines) == 1 and "closed with 2 complete interchange(s)" in lines[0]
+    assert "ISA" not in lines[0], "a count, never frame content"
+
+
+async def test_x12_a_clean_read_reports_nothing_unhandled(caplog: pytest.LogCaptureFixture) -> None:
+    # The control for the count above: every interchange handled, so no line.
+    seen: list[bytes] = []
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(
+            _replying(_x12), _ThenEof(EDI * 3), _Peer(), handler=_failing_for(0, seen)
+        )
+    assert seen == [EDI] * 3
+    assert _kinds(events) == ["established", "closed"]
+    assert_capture_sees(caplog, "messagefoundry.transports.x12")
+    assert _unhandled_lines(caplog) == []
+
+
+async def test_x12_a_reply_that_will_not_encode_is_a_handler_error_not_a_framing_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The engine's own reply is the fault here, not the partner's bytes. In the shipped code it
+    # fell to the last-resort arm and would have read as `framing_error`.
+    source = _replying(lambda: _x12(encoding="ascii"))
+    seen: list[bytes] = []
+
+    async def unencodable_reply(raw: bytes) -> str:
+        seen.append(raw)
+        return "synthetic reply ’"
+
+    writer = _Peer()
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(source, _ThenEof(EDI * 2), writer, handler=unencodable_reply)
+    assert seen == [EDI], "the first interchange is recorded; the close stops the second"
+    assert _kinds(events) == ["established", "handler_error"]
+    assert not writer.written and writer.closed
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "does not encode as ascii" in errors[0]
+    lines = _unhandled_lines(caplog)
+    assert len(lines) == 1 and "closed with 1 complete interchange(s)" in lines[0]

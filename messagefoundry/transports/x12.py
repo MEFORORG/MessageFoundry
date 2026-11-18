@@ -31,7 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.parsing.x12.delimiters import (
@@ -864,6 +864,37 @@ class X12Source(SourceConnector):
             )
             raise
 
+    @staticmethod
+    def _report_unhandled(frames: Iterator[bytes], peer: object) -> None:
+        """Count, and log, the complete interchanges of the last read that a close leaves unhandled
+        (BACKLOG #5971).
+
+        A sender may pipeline several interchanges into one read. When the connection closes part
+        way through them (a handler fault, a failed reply, a stop or a reset), the rest were taken
+        off the socket but never handed to the pipeline, so nothing records them. Draining the
+        decoder's generator only reassembles bytes already in memory; it does no I/O and hands
+        nothing on. The count is the record: no frame content is logged.
+        """
+        left = 0
+        try:
+            for _ in frames:
+                left += 1
+        except X12FrameError:
+            pass  # an over-cap remainder ends the count; it is not a complete interchange
+        except Exception as exc:  # noqa: BLE001 -- this runs in a finally, maybe on a cancel
+            # Nothing raised here may replace the exception the close is already handling.
+            logger.warning(
+                "X12 count of unhandled interchanges from %s cut short: %s", peer, safe_exc(exc)
+            )
+        if left:
+            logger.warning(
+                "X12 connection from %s closed with %d complete interchange(s) from its last read "
+                "not handed to the pipeline; they are not recorded, and only a resend by the "
+                "sender delivers them",
+                peer,
+                left,
+            )
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         task = asyncio.current_task()
@@ -883,6 +914,9 @@ class X12Source(SourceConnector):
                     await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
                 return  # closed in the outer finally
             epoch = self._admission.admit(peer_host)
+            # The interchanges of the read in hand; whatever a close leaves in it is counted below.
+            frames: Iterator[bytes] = iter(())
+            peer = writer.get_extra_info("peername")  # fixed for the connection
             try:
                 # Inside the try whose finally releases the slot, so a cancellation delivered at
                 # this await cannot leak a per-host count.
@@ -897,7 +931,6 @@ class X12Source(SourceConnector):
                     max_frame_seconds=self.max_frame_seconds,
                     receive_timeout=self.receive_timeout,
                 )
-                peer = writer.get_extra_info("peername")  # fixed for the connection
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     # The engine's own waits (pacing, an intake pause) do not spend the frame budget.
@@ -920,7 +953,8 @@ class X12Source(SourceConnector):
                         break
                     try:
                         decoded = 0
-                        for interchange in decoder.feed(chunk):
+                        frames = decoder.feed(chunk)
+                        for interchange in frames:
                             decoded += 1
                             fault: str | None = None
                             try:
@@ -951,7 +985,25 @@ class X12Source(SourceConnector):
                                     break  # handler_error is recorded; close
                                 failed = False
                             if reply is not None:
-                                writer.write(reply.encode(self.encoding))  # verbatim reply
+                                try:
+                                    wire = reply.encode(self.encoding)
+                                except UnicodeEncodeError as exc:
+                                    # BACKLOG #5971: the engine's own reply will not encode in the
+                                    # declared charset. The interchange is recorded; the fault is
+                                    # the engine's, so it is `handler_error`, not `framing_error`.
+                                    logger.error(
+                                        "X12 reply to %s does not encode as %s: %s; the "
+                                        "interchange is recorded, closing the connection",
+                                        peer,
+                                        self.encoding,
+                                        safe_exc(exc),
+                                    )
+                                    failed = True
+                                    await self._emit_event(
+                                        "handler_error", peer_host=peer_host, reason=safe_exc(exc)
+                                    )
+                                    break
+                                writer.write(wire)  # verbatim reply
                                 await self._drain_reply(writer)
                         if failed:
                             break
@@ -973,9 +1025,10 @@ class X12Source(SourceConnector):
                     except OSError:
                         raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
                     except Exception as exc:
-                        # Last-resort (ASVS 16.5.4): an unexpected codec or reply-encoding error must
-                        # not let the per-connection task die silently or leak detail. Log redacted;
-                        # drop the conn. A handler fault is caught above and is `handler_error`.
+                        # Last-resort (ASVS 16.5.4): an unexpected codec error must not let the
+                        # per-connection task die silently or leak detail. Log redacted; drop the
+                        # conn. A handler fault and a reply that will not encode are caught above
+                        # and are `handler_error`.
                         logger.error(
                             "X12 connection from %s failed unexpectedly: %s", peer, safe_exc(exc)
                         )
@@ -996,7 +1049,10 @@ class X12Source(SourceConnector):
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
-                self._admission.release(peer_host, epoch)
+                try:
+                    self._report_unhandled(frames, peer)
+                finally:
+                    self._admission.release(peer_host, epoch)
         finally:
             self._clients.discard(writer)
             if task is not None:
