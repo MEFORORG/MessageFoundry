@@ -1642,11 +1642,13 @@ def test_windows_a_junction_at_the_holder_is_also_judged_by_its_own_list(
 
 
 @windows_only
+@pytest.mark.parametrize("spelling", ["Q:\\store.key", "\\\\?\\Q:\\store.key"])
 def test_windows_a_subst_root_onto_a_junction_is_also_judged_by_its_own_list(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
 ) -> None:
-    """The same junction's own list, reached as a ``subst`` drive root holding the key. The letter
-    is a stand-in: the readers answer it as ``subst`` would, so no drive is defined on the host."""
+    """The same junction's own list, reached as a ``subst`` drive root holding the key, however the
+    path is spelled. The letter is a stand-in: the readers answer it as ``subst`` would, so no
+    drive is defined on the host."""
     real = tmp_path / "real"
     real.mkdir()
     write_restricted_file(real / "store.key", b"KEY-MATERIAL-STAND-IN")
@@ -1655,11 +1657,27 @@ def test_windows_a_subst_root_onto_a_junction_is_also_judged_by_its_own_list(
     host = _host_judging_only_under(
         tmp_path, drive_target=lambda d: target if d.upper() == "Q:" else None
     )
+    _read_stand_in_letter_as_written(monkeypatch, tmp_path / "mine")
     surroundings = restricted_file._windows_surroundings_problem
-    assert surroundings(Path("Q:\\store.key"), host) is None  # the control
+    assert surroundings(Path(spelling), host) is None  # the control
     _icacls(tmp_path / "mine", "/L", "/grant", f"*{_USERS}:(DC)")  # the junction's own list
-    problem = str(surroundings(Path("Q:\\store.key"), host))
+    problem = str(surroundings(Path(spelling), host))
     assert f"Users ({_USERS}) can delete or replace a file in it" in problem
+
+
+def _read_stand_in_letter_as_written(monkeypatch: pytest.MonkeyPatch, folder: Path) -> None:
+    """Make the as-written holder read answer the stand-in letter ``Q:`` as the folder it stands
+    for, in any spelling of it, as Windows would for a real ``subst`` drive."""
+    as_written = restricted_file._windows_holder_as_written_problem
+
+    def read(holder_path: Path) -> str | None:
+        text = str(holder_path)
+        for head in ("\\\\?\\Q:", "\\\\.\\Q:", "Q:"):
+            if text.upper().startswith(head):
+                return as_written(Path(str(folder) + text[len(head) :]))
+        return as_written(holder_path)
+
+    monkeypatch.setattr(restricted_file, "_windows_holder_as_written_problem", read)
 
 
 @windows_only
@@ -1741,7 +1759,7 @@ def test_windows_a_junction_holding_a_key_on_a_share_is_refused(
 
 @windows_only
 def test_windows_a_subst_drive_on_the_path_gives_the_folders_above_no_link_rule(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """origin/main judged no folder above a ``subst`` drive's target by the link rule, so a key
     through ``subst`` with a broad group's delete right above the holder passed there. The branch
@@ -1758,6 +1776,7 @@ def test_windows_a_subst_drive_on_the_path_gives_the_folders_above_no_link_rule(
         return target if drive.upper() == "Q:" else None
 
     host = _host_judging_only_under(tmp_path, drive_target=drive_target)
+    _read_stand_in_letter_as_written(monkeypatch, secrets)
     surroundings = restricted_file._windows_surroundings_problem
     assert surroundings(Path("Q:\\store.key"), host) is None  # the control
     _icacls(top, "/grant", f"*{_USERS}:(DC)")  # Users may rename mid away, from above the holder

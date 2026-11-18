@@ -165,11 +165,10 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
     refuse a CSVFS or FAT volume, or one whose file system cannot be read, as it did not before
     this amendment.
   - Where the walk ends on a link back to a folder already on the path, `full.parent` is read by
-    its path as written, as before this amendment.
-  - Off a share, when the folder holding the path, or the folder a `subst` drive root holding it
-    stands for, is itself a reparse point, such as a junction or link, that folder's own owner
-    and access list are also read by its path as written, by the holder rule, as before this
-    amendment.
+    its path as written, as before this amendment; for a drive root no holder is read.
+  - Otherwise, off a share and for a path that is not a drive root, `full.parent` is also read
+    by its path as written, by the holder rule, as before this amendment. A junction or link
+    holding the path is then read by its own list.
   - The holder rule is unchanged: an inherit-only entry is counted, and any conditional, object
     or callback allow entry is refused.
   - A `subst` drive on the path gives no folder the link rule; as before, only a junction or
