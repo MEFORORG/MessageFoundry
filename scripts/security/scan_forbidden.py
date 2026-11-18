@@ -1982,6 +1982,9 @@ def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> st
     * the total must meet ``min_detectors`` when given (catches loss WITHIN a section, e.g. 7 names
       down to 3, which the section check alone cannot see).
 
+    A source that passes both is still refused when a ``[site_prefix]`` entry is not two digits
+    (BACKLOG #5366). That check runs after the two above, so its reason names a source that loaded.
+
     The expected total is deliberately supplied from OUTSIDE the token source (CI env / CLI arg). An
     ``[expect]`` count carried inside the file would be destroyed by the very mangling it is meant to
     detect -- self-referential, and vacuous in exactly the way this function exists to prevent.

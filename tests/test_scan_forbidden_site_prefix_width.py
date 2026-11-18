@@ -66,6 +66,14 @@ def test_a_wide_prefix_refuses_a_required_token_run(
     assert "731" not in err and "731" not in why, "a site prefix must never be echoed"
 
 
+def test_an_empty_section_is_named_before_a_wide_prefix(load: Callable[[str], None]) -> None:
+    """The width reason means a source that loaded, so a mangled one is named as mangled."""
+    load("[names]\n\\bZqwidthsynth\\b | synthetic | i\n[estate]\n[site_prefix]\n73\n731\n")
+    why = sfm.token_floor_failure()
+    assert why is not None and "EMPTY" in why
+    assert toolkit_surrogates.SITE_PREFIX_WIDTH_MARK not in why
+
+
 def test_a_wide_prefix_still_arms_the_file_scan(load: Callable[[str], None]) -> None:
     """The refusal is the fix; narrowing detection is not."""
     load(f"{_SECTIONS}[site_prefix]\n73\n731\n")
