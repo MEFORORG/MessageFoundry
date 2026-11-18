@@ -628,7 +628,12 @@ jobs:
           until npm ci --prefix ../ci/npm-tools --ignore-scripts --no-audit --no-fund; do
             n=$((n + 1)); [ "$n" -ge 3 ] && exit 1; sleep $((n * 15))
           done
+          # --spec-version 1.6 holds the extension SBOM on the spec the engine SBOMs and
+          # docs/SUPPLY-CHAIN.md state; cyclonedx-npm 7.x defaults to 1.7. --validate makes a missing
+          # validator a failure: without it, 7.x skips schema validation with only an INFO line when
+          # the optional ajv packages are absent. Guarded by tests/test_ci_tool_and_image_pins.py.
           ../ci/npm-tools/node_modules/.bin/cyclonedx-npm --package-lock-only \
+            --spec-version 1.6 --validate \
             --output-format JSON --output-file ../sbom-ide.cdx.json
           python ../scripts/security/sbom_finalize.py ../sbom-ide.cdx.json --phase build
       - name: Score SBOM quality (sbomqs — advisory)

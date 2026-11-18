@@ -175,7 +175,14 @@ def test_the_npm_tools_lock_pins_every_package_by_integrity() -> None:
     manifest = json.loads((_NPM_TOOLS / "package.json").read_text(encoding="utf-8"))
     declared = manifest["dependencies"]
     print(f"declared npm tools: {declared}")
-    assert set(declared) == {"jscpd", "@cyclonedx/cyclonedx-npm"}
+    # The three ajv packages are cyclonedx-npm's optional validator peers (why: the description).
+    assert set(declared) == {
+        "jscpd",
+        "@cyclonedx/cyclonedx-npm",
+        "ajv",
+        "ajv-formats",
+        "ajv-formats-draft2019",
+    }
     for name, version in declared.items():
         assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"{name} is not pinned exactly: {version!r}"
 
@@ -196,6 +203,33 @@ def test_the_npm_tools_lock_pins_every_package_by_integrity() -> None:
         assert str(entry.get("resolved", "")).startswith("https://registry.npmjs.org/"), (
             f"{path} resolves outside the npm registry: {entry.get('resolved')!r}"
         )
+
+
+def test_every_cyclonedx_npm_run_validates_and_pins_the_spec() -> None:
+    """cyclonedx-npm 7.x defaults to spec 1.7 and, without its optional ajv peers, skips schema
+    validation with only an INFO line. Every run passes `--spec-version 1.6`, the spec the engine
+    SBOMs and docs/SUPPLY-CHAIN.md state, and `--validate`, which turns a missing validator into a
+    failed step (why: security.yml's comment on that step)."""
+    run = re.compile(r"node_modules/\.bin/cyclonedx-npm(?![\w-])[^\n]*")
+    calls = [
+        (wf, job, match.group(0))
+        for wf, job, body in _run_bodies()
+        for match in run.finditer(_shell_code(body).replace("\\\n", " "))
+    ]
+    print(f"cyclonedx-npm runs: {calls}")
+    assert calls, "found no cyclonedx-npm run, so this scan checks nothing"
+    # Controls: the instrument sees each flag where it appears, and its absence where it does not.
+    assert re.search(r"--spec-version\s+1\.6(?!\S)", "x --spec-version 1.6 --validate")
+    assert not re.search(r"--spec-version\s+1\.6(?!\S)", "x --spec-version 1.61")
+    assert not re.search(r"--validate(?![\w-])", "x --validate-only")
+    bad = [
+        entry
+        for entry in calls
+        if not re.search(r"--spec-version\s+1\.6(?!\S)", entry[2])
+        or not re.search(r"--validate(?![\w-])", entry[2])
+        or "--no-validate" in entry[2]
+    ]
+    assert not bad, f"cyclonedx-npm runs without --spec-version 1.6 and --validate: {bad}"
 
 
 _PY_PIN = "ci/python-version"
