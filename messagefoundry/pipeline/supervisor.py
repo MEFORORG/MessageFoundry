@@ -353,21 +353,37 @@ class Supervisor:
         ]
         try:
             await asyncio.gather(*watchers)
-        except BaseException:
+        except BaseException as exc:
             # Cooperative shutdown, or one watcher raised: drain every child before the exception
-            # goes on. A second signal during the drain is absorbed rather than cutting it short.
-            await _finish_despite_cancel(self._drain(watchers))
+            # goes on. A second cancellation during the drain is absorbed rather than cutting it
+            # short, and is raised once the drain is done.
+            self._stop_watchers(watchers)
+            drain, cancelled = await _finish_despite_cancel(self._drain(watchers))
+            drain.result()  # a failed drain can leave a child running, which outranks ``exc``
+            if cancelled and not isinstance(exc, asyncio.CancelledError):
+                logger.error(
+                    "supervise: a shutdown signal arrived while draining after a shard watcher "
+                    "failed: %r",
+                    exc,
+                )
+                raise asyncio.CancelledError from exc
             raise
         else:
-            _, cancelled = await _finish_despite_cancel(self._drain(watchers))
+            self._stop_watchers(watchers)
+            drain, cancelled = await _finish_despite_cancel(self._drain(watchers))
+            drain.result()
             if cancelled:
                 raise asyncio.CancelledError
 
-    async def _drain(self, watchers: Sequence[asyncio.Task[None]]) -> None:
-        """Stop the watchers relaunching, wait for them to return, then stop every child."""
+    def _stop_watchers(self, watchers: Sequence[asyncio.Task[None]]) -> None:
+        """Stop the watchers relaunching, in the same step as the exit that ended the gather, so
+        no sibling wakes from its backoff and launches a new child before the drain starts."""
         self._stopping.set()
         for w in watchers:
             w.cancel()
+
+    async def _drain(self, watchers: Sequence[asyncio.Task[None]]) -> None:
+        """Wait for the stopped watchers to return, then stop every child."""
         await asyncio.gather(*watchers, return_exceptions=True)
         await self._terminate_all()
 
@@ -400,9 +416,6 @@ class Supervisor:
                     raise
                 rc: int | str = f"launch failed ({exc})"
             else:
-                logger.info(
-                    "shard %r started (pid=%s, port=%d)", spec.shard, process.pid, spec.port
-                )
                 exit_rc = await self._unless_stopped(process.wait())
                 if exit_rc is None:
                     return  # shutdown — leave the child for _terminate_all to drain
@@ -457,13 +470,19 @@ class Supervisor:
     async def _launch(self, spec: ShardSpec) -> asyncio.subprocess.Process:
         """Spawn ``spec``'s child and register it for :meth:`_terminate_all`, even when cancelled.
 
-        A launch's child can exist before its await returns, so a cancel landing mid-spawn would
-        lose the only handle to it and leave it running past the drain. The spawn is let finish,
-        the child registered, and only then is the cancellation raised."""
+        A launch's child can exist before its await returns. asyncio's own launch kills that child
+        when cancelled mid-spawn, which skips the graceful stop, and an injected spawn need not
+        clean up at all. So the spawn is let finish, the child registered and logged, and only
+        then is the cancellation raised, leaving :meth:`_terminate_all` to stop the child."""
         launch, cancelled = await _finish_despite_cancel(self.spawn(spec))
-        if not launch.cancelled() and launch.exception() is None:
-            self._children[spec.shard] = _Child(spec, launch.result())
+        failure = None if launch.cancelled() else launch.exception()
+        if failure is None and not launch.cancelled():
+            process = launch.result()
+            self._children[spec.shard] = _Child(spec, process)
+            logger.info("shard %r started (pid=%s, port=%d)", spec.shard, process.pid, spec.port)
         if cancelled:
+            if failure is not None:
+                logger.warning("shard %r: launch failed during shutdown (%s)", spec.shard, failure)
             raise asyncio.CancelledError
         return launch.result()
 
@@ -534,15 +553,27 @@ class Supervisor:
                     child.process.kill()
                 except ProcessLookupError:
                     pass
-                await child.process.wait()
+                # Bounded, because the drain absorbs shutdown signals: a child that outlives even
+                # the kill would otherwise hold the supervisor up with nothing able to end it.
+                try:
+                    await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
+                except TimeoutError:
+                    logger.error(
+                        "shard %r (pid=%s) still running %.0fs after the kill; leaving it",
+                        child.spec.shard,
+                        child.process.pid,
+                        self.terminate_grace,
+                    )
 
 
 async def _finish_despite_cancel[T](aw: Awaitable[T]) -> tuple[asyncio.Future[T], bool]:
     """Await ``aw`` to completion however often the caller is cancelled meanwhile.
 
     Returns the finished future, which the caller reads, and whether a cancellation arrived. The
-    caller owes that cancellation: it raises it once its own cleanup is done. ``aw`` itself is
-    never cancelled by this, so a shutdown signal cannot cut a drain or a spawn short."""
+    caller owes that cancellation: it raises it once its own cleanup is done. This never cancels
+    ``aw``, so cancelling the CALLER cannot cut a drain or a spawn short, which is how the POSIX
+    signal handlers stop the supervisor. A cancel aimed at ``aw``'s own task is not absorbed: on
+    Windows a second Ctrl-C makes ``asyncio.run``'s teardown cancel every task, this one too."""
     fut = asyncio.ensure_future(aw)
     cancelled = False
     while not fut.done():
