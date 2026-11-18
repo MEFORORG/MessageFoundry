@@ -891,22 +891,42 @@ def test_a_transient_file_not_found_on_a_segment_still_there_retires_nothing(
         spool.close()
 
 
-def _network_not_found(winerror: int) -> FileNotFoundError:
-    """A ``FileNotFoundError`` as Windows raises it for a network path out of reach. Built by hand
-    so the case runs on every platform."""
-    exc = FileNotFoundError(errno.ENOENT, "network path not found")
-    setattr(exc, "winerror", winerror)  # noqa: B010 - typeshed declares it on win32 only
+def _windows_not_found(winerror: int | None) -> FileNotFoundError:
+    """A ``FileNotFoundError`` as Windows raises it, ``winerror`` set (or not). Built by hand so
+    the case runs on every platform."""
+    exc = FileNotFoundError(errno.ENOENT, "not found")
+    if winerror is not None:
+        setattr(exc, "winerror", winerror)  # noqa: B010 - typeshed declares it on win32 only
     return exc
 
 
-@pytest.mark.parametrize("winerror", [53, 67, 64])
-def test_a_network_file_not_found_is_no_confirmation_and_retires_nothing(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+def _peek_with_segment_lstat_raising(
+    spool: LogSpool, monkeypatch: pytest.MonkeyPatch, exc: FileNotFoundError
+) -> SpoolEntry | None:
+    """``peek()`` with the head segment's open and its own lstat both raising ``exc``."""
+
+    class _Path:
+        def lstat(self) -> None:
+            raise exc
+
+    def refuse(seq: int) -> None:
+        raise exc
+
+    with monkeypatch.context() as patch:
+        patch.setattr(spool, "_open_reader", refuse)
+        patch.setattr(spool, "_path", lambda seq: _Path())
+        return spool.peek()
+
+
+@pytest.mark.parametrize("winerror", [None, 3, 53, 67, 64])
+def test_on_windows_only_winerror_2_confirms_a_segment_gone(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, winerror: int | None
 ) -> None:
-    """When the open and the segment's own lstat both raise a FileNotFoundError that names a
-    network path (53, 67) or a share out of reach (64), the segment is not confirmed gone:
-    nothing is retired or unlinked. NEGATIVE CONTROL: on d02d8b8f3e every head segment was
-    retired."""
+    """On Windows a FileNotFoundError from the segment's own lstat confirms it gone only with
+    ``winerror`` 2. Path-not-found (3), a network path (53, 67), a share out of reach (64) and
+    no ``winerror`` at all are read faults: nothing is retired or unlinked. NEGATIVE CONTROL: on
+    5c4efdd3a1 None and 3 retired the head segment."""
+    monkeypatch.setattr(log_spool, "_WINDOWS", True)
     spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
     spool.open()
     try:
@@ -914,25 +934,93 @@ def test_a_network_file_not_found_is_no_confirmation_and_retires_nothing(
             assert spool.append(_entry(n))
         segments = _segments(spool_dir)
         used = spool.bytes_used
-        real_open, real_path = spool._open_reader, spool._path
-
-        class _UnreachablePath:
-            def lstat(self) -> None:
-                raise _network_not_found(winerror)
-
-        def refuse(seq: int) -> None:
-            raise _network_not_found(winerror)
-
-        monkeypatch.setattr(spool, "_open_reader", refuse)
-        monkeypatch.setattr(spool, "_path", lambda seq: _UnreachablePath())
-        assert spool.peek() is None
+        assert (
+            _peek_with_segment_lstat_raising(spool, monkeypatch, _windows_not_found(winerror))
+            is None
+        )
         assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
         assert spool.bytes_used == used
-        monkeypatch.setattr(spool, "_open_reader", real_open)
-        monkeypatch.setattr(spool, "_path", real_path)
         assert _segments(spool_dir) == segments
         assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
     finally:
+        spool.close()
+
+
+def test_on_windows_winerror_2_does_confirm_a_segment_gone(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: ``winerror`` 2 retires the head segment."""
+    monkeypatch.setattr(log_spool, "_WINDOWS", True)
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        _peek_with_segment_lstat_raising(spool, monkeypatch, _windows_not_found(2))
+        assert spool.unreadable >= 1 and spool.read_errors == 0
+    finally:
+        spool.close()
+
+
+def test_a_directory_that_drops_between_the_checks_retires_nothing(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The segment's lstat says gone, but the directory is out of reach by the time it is checked
+    after it: a read fault that retires nothing and closes the writer. NEGATIVE CONTROL: on
+    5c4efdd3a1 the directory was checked first and read present, so the segment was retired."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        used = spool.bytes_used
+
+        class _DropsThenGone:
+            def lstat(self) -> None:
+                spool.directory = spool_dir / "dropped"  # the share drops here
+                raise _windows_not_found(2)
+
+        def refuse(seq: int) -> None:
+            raise _windows_not_found(2)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(spool, "_open_reader", refuse)
+            patch.setattr(spool, "_path", lambda seq: _DropsThenGone())
+            assert spool.peek() is None
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        assert spool._writer is None
+        spool.directory = spool_dir
+        assert _segments(spool_dir) == segments
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.close()
+
+
+def test_a_read_error_with_no_winerror_closes_the_writer_when_the_directory_is_unreachable(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows a read error from open() carries no ``winerror``, so the directory is probed:
+    one out of reach closes the writer. NEGATIVE CONTROL: on 5c4efdd3a1 the writer stayed open."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(3):
+            assert spool.append(_entry(n))
+        assert spool._writer is not None
+
+        def refuse(seq: int) -> None:
+            spool.directory = spool_dir / "dropped"
+            raise OSError(errno.EINVAL, "network fault")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(spool, "_open_reader", refuse)
+            assert spool.peek() is None
+        assert spool.read_faulted and spool.unreadable == 0
+        assert spool._writer is None
+    finally:
+        spool.directory = spool_dir
         spool.close()
 
 

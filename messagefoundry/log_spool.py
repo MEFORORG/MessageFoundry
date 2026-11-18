@@ -64,6 +64,7 @@ import contextlib
 import errno
 import json
 import os
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,9 +90,11 @@ _DIRECTORY_GONE_ERRNOS = frozenset(
 #: them from one bad argument; ``winerror`` can.
 _DIRECTORY_GONE_WINERRORS = frozenset({64, 59})
 
-#: Windows error codes Python raises as ``FileNotFoundError`` for a network path out of reach,
-#: not a file gone: ``ERROR_BAD_NETPATH`` (53) and ``ERROR_BAD_NET_NAME`` (67).
-_NETWORK_NOT_FOUND_WINERRORS = frozenset({53, 67})
+#: Whether this is Windows, where only ``ERROR_FILE_NOT_FOUND`` (2) on a segment's own ``lstat``
+#: confirms the file gone: Python raises ``FileNotFoundError`` for path-not-found (3) and for
+#: network paths out of reach (53, 67) too. A module global so a test can take either branch.
+_WINDOWS = sys.platform == "win32"
+_WINERROR_FILE_NOT_FOUND = 2
 
 
 def _directory_unreachable(exc: OSError) -> bool:
@@ -104,14 +107,6 @@ def _directory_unreachable(exc: OSError) -> bool:
         or exc.errno in _DIRECTORY_GONE_ERRNOS
         or getattr(exc, "winerror", None) in _DIRECTORY_GONE_WINERRORS
     )
-
-
-def _says_file_gone(exc: FileNotFoundError) -> bool:
-    """Whether a ``FileNotFoundError`` says the file itself is gone, rather than a network path
-    or the spool directory being out of reach."""
-    return getattr(
-        exc, "winerror", None
-    ) not in _NETWORK_NOT_FOUND_WINERRORS and not _directory_unreachable(exc)
 
 
 _SEGMENT_PREFIX = "spool-"
@@ -467,8 +462,13 @@ class LogSpool:
                 entry = self._peek()
                 self.read_faulted = False
                 return entry
-            except FileNotFoundError as exc:
-                if not self.directory.is_dir():
+            except FileNotFoundError:
+                # Only opening a segment's file raises this, so there is a first segment. Its own
+                # file is checked first and the directory after, so a directory that drops between
+                # the two reads as out of reach rather than confirming the segment gone.
+                seq = self._segments[0]
+                gone = self._segment_confirmed_missing(seq)
+                if not self._directory_present():
                     # The whole spool is out of reach, not one segment gone: retiring would drop
                     # every segment from the order and the cap while the files may still exist.
                     # The writer is closed, so the next append must create its file in the
@@ -479,12 +479,10 @@ class LogSpool:
                     self._close_reader()
                     self._close_writer()
                     return None
-                # Only opening a segment's file raises this, so there is a first segment.
-                seq = self._segments[0]
-                if not (_says_file_gone(exc) and self._segment_confirmed_missing(seq)):
-                    # The open said ENOENT but the file is there, or cannot be checked: a
-                    # transient fault (an SMB share reconnecting), never a reason to retire and
-                    # unlink records still undelivered.
+                if not gone:
+                    # The open said ENOENT but the file's own lstat did not confirm it: a
+                    # transient fault (an SMB share reconnecting), never a reason to retire
+                    # records still undelivered.
                     self.read_errors += 1
                     self.read_faulted = True
                     self._close_reader()
@@ -500,23 +498,35 @@ class LogSpool:
                 self.read_errors += 1
                 self.read_faulted = True
                 self._close_reader()
-                if _directory_unreachable(exc):
+                # On Windows a read error from open() or readline() carries no ``winerror``, so
+                # the directory is also probed, by a call that does.
+                if _directory_unreachable(exc) or not self._directory_present():
                     # The same case as a missing directory above, by another error: the writer is
                     # closed for the same reason.
                     self._close_writer()
                 return None
 
     def _segment_confirmed_missing(self, seq: int) -> bool:
-        """Whether segment ``seq``'s own file is confirmed gone: its ``lstat`` raises a
-        ``FileNotFoundError`` that :func:`_says_file_gone`. Any other answer, including another
-        ``OSError``, is not a confirmation."""
+        """Whether segment ``seq``'s own file is confirmed gone: its ``lstat`` raises
+        ``FileNotFoundError``, and on Windows with ``winerror`` 2 only. Any other answer,
+        including another ``OSError``, is not a confirmation."""
         try:
             self._path(seq).lstat()
         except FileNotFoundError as exc:
-            return _says_file_gone(exc)
+            if _WINDOWS:
+                return getattr(exc, "winerror", None) == _WINERROR_FILE_NOT_FOUND
+            return not _directory_unreachable(exc)
         except OSError:
             return False
         return False
+
+    def _directory_present(self) -> bool:
+        """Whether the spool directory can be reached and is a directory, read by ``stat``.
+        Any ``OSError`` reads as not present."""
+        try:
+            return stat.S_ISDIR(self.directory.stat().st_mode)
+        except OSError:
+            return False
 
     def _close_reader(self) -> None:
         if self._reader is not None:
