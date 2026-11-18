@@ -1598,7 +1598,7 @@ function New-SeceditWorkDirectory {
       folders the owner must be SYSTEM, Administrators, TrustedInstaller or $OwnerSid, and no allow
       entry that applies to that folder itself may give anyone else delete, delete-child, a DACL
       change, ownership or GENERIC_ALL; OWNER RIGHTS counts as that folder's owner and CREATOR
-      OWNER is not judged. A parent that fails, or that has a folder above it that fails, is
+      OWNER is not judged. Conditional (callback) access entries are not read. A parent that fails, or that has a folder above it that fails, is
       refused. The folders above the parent are walked by name.
 
       $Parent, $OwnerSid and $CheckedUpTo are parameters so the unelevated tests can make a folder

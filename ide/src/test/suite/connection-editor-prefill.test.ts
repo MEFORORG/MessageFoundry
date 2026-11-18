@@ -447,10 +447,11 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
   });
 
   test("edit: an untouched env key is saved as recorded, not trimmed (BACKLOG #8243 item 19)", () => {
-    for (const env of [" DB_PW ", "DB_\r\nPW"]) {
+    {
+      const env = " DB_PW ";
       const initial = { ...RECORD, settings: { ...RECORD.settings, db_password: { env, default: INLINE_DEFAULT } } };
       const p = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
-      assert.deepStrictEqual(saved(p, false).db_password, { env, default: INLINE_DEFAULT }, `the key was rewritten: ${JSON.stringify(env)}`);
+      assert.deepStrictEqual(saved(p, false).db_password, { env, default: INLINE_DEFAULT }, "the key was rewritten");
     }
     // A non-secret env reference too, and the key survives a transport round trip untouched.
     const initial = { ...RECORD, settings: { ...RECORD.settings, host: { env: " PEER_HOST ", default: "localhost" } } };
@@ -458,6 +459,14 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     switchTransport(p, "file");
     switchTransport(p, "mllp");
     assert.deepStrictEqual(saved(p, false).host, initial.settings.host, "a round trip rewrote the key");
+  });
+
+  test("edit: a recorded env key holding a line break is saved trimmed, as before, so it can be repaired", () => {
+    // The box cannot show a CR or LF, so leaving it and retyping what it shows look the same; the
+    // trimmed text is written, as origin/main wrote it, and the inline default stays with it.
+    const initial = { ...RECORD, settings: { ...RECORD.settings, db_password: { env: "DB_\r\nPW", default: INLINE_DEFAULT } } };
+    const p = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
+    assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW", default: INLINE_DEFAULT }, "the line break was written back");
   });
 
   test("edit: a default dropped by switching to a literal on another transport does not come back (BACKLOG #8243 item 20)", () => {
@@ -486,6 +495,19 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     assert.strictEqual(select.tagName, "SELECT", "level is not drawn as a select");
     select.value = "2";
     assert.strictEqual(saved(p, false).level, "2", "the picked choice was JSON-parsed");
+  });
+
+  test("edit: a select with a table among its choices parses the picked choice, as before", () => {
+    const schema: ConnectionSchema = {
+      ...SCHEMA,
+      transports: { mllp: { doc: "MLLP.", params: { level: param({ choices: [{ a: 1 }, { b: 2 }] }) } } },
+    };
+    const initial = { ...RECORD, settings: { level: { tier: 1 } } };
+    const p = load({ groups: buildForm(schema, "mllp", "outbound", initial.settings), initial, transports: ["mllp"] });
+    const select = p.window.document.querySelector('#settings [data-key="level"]');
+    assert.strictEqual(select.tagName, "SELECT", "level is not drawn as a select");
+    select.value = '{"b":2}';
+    assert.deepStrictEqual(saved(p, false).level, { b: 2 }, "the picked table was posted as text");
   });
 
   for (const how of ["removed", "cleared"]) {

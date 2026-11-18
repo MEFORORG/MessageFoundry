@@ -408,13 +408,16 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // engine's validator refuses what the user typed rather than this page guessing.
     const DECIMAL_TEXT = /^-?(\\d+(\\.\\d+)?|\\.\\d+)([eE][-+]?\\d+)?$/;
     function typedValue(f, raw) {
-      // A select's picked choice first, with its own type: a select whose recorded value was a table
-      // must not JSON-parse a choice such as "2" into a number (BACKLOG #8243 item 31).
-      if (f.control === 'select') {
-        const hit = (f.choices || []).find((c) => String(c) === raw);
-        return hit !== undefined ? hit : raw;
-      }
+      // A select of scalar choices takes the picked choice first, with its own type: a select whose
+      // recorded value was a table must not JSON-parse a choice such as "2" into a number (BACKLOG
+      // #8243 item 31). A select with a table or array among its choices cannot match one by its
+      // text, so it keeps the earlier order: a table-valued record parses the picked JSON.
+      const choices = f.choices || [];
+      const pick = () => { const hit = choices.find((c) => String(c) === raw); return hit !== undefined ? hit : raw; };
+      const scalarChoices = !choices.some((c) => c !== null && typeof c === 'object');
+      if (f.control === 'select' && scalarChoices) return pick();
       if (f.control === 'table' || (f.value !== null && typeof f.value === 'object')) return parseTable(raw);
+      if (f.control === 'select') return pick();
       // Only decimal text, the text a number box accepted: Number() also reads hex, binary, octal
       // and a leading '+', which would post a number the user never typed. An exponent that
       // overflows is posted as typed too, since Infinity would cross to the host as null, and so is
@@ -452,10 +455,12 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
             if (heldSecret(f) !== undefined) settings[key] = HELD_MARK;
             continue;
           }
-          // An untouched box writes back the recorded key exactly, spaces and line breaks included:
-          // the engine looks the key up as written, so a trimmed key names another variable
-          // (BACKLOG #8243 item 19). A key the user typed is trimmed.
-          const untouchedKey = f.envKey !== undefined && el.value === SHOWN.get(el);
+          // An untouched box writes back the recorded key exactly, surrounding spaces included: the
+          // engine looks the key up as written, so a trimmed key names another variable (BACKLOG
+          // #8243 item 19). A key the user typed is trimmed. A recorded key holding a CR or LF is
+          // the exception: the box cannot show it, so retyping what it shows cannot be told from
+          // leaving it, and the trimmed text is written, as before, so the key can be repaired.
+          const untouchedKey = f.envKey !== undefined && !/[\\r\\n]/.test(f.envKey) && el.value === SHOWN.get(el);
           const ref = { env: untouchedKey ? f.envKey : envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
           // A held inline default goes back only with the env key it was recorded under, compared
