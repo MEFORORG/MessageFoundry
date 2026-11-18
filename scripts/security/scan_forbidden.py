@@ -2094,6 +2094,14 @@ ALLOWLIST = _load_allowlist()
 reload_tokens()
 
 
+def _allowlisted(line: str) -> bool:
+    """Whether an allowlist entry excuses ``line``. An entry must match the WHOLE line, so it excuses
+    only the line it was written for: applied with ``search``, an entry missing its ``^``/``$`` excused
+    any line that merely CARRIED its shape, and so a leak beside that shape went past every detector
+    (BACKLOG #5445). ``fullmatch`` holds every entry to that, whatever anchors it was written with."""
+    return any(a.fullmatch(line) for a in ALLOWLIST)
+
+
 # --------------------------------------------------------------------------------------------------
 # Scanning
 # --------------------------------------------------------------------------------------------------
@@ -2400,7 +2408,7 @@ def _line_hits(text: str, posix: str, path: Path, show_context: bool) -> list[tu
             counts[key] = nth + 1
             out.append((lineno, f"{key}\0{nth}", hit + extra))
 
-        if any(a.search(line) for a in ALLOWLIST):
+        if _allowlisted(line):
             continue
         ctx = f": {line.strip()[:120]}" if show_context else ""
         before = len(out)
