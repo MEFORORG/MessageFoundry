@@ -194,6 +194,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if not 1 <= args.count <= _core.MAX_CORPUS_COUNT:
+        # write_corpus refuses it too; say so as a usage error rather than a traceback.
+        parser.error(f"--count must be between 1 and {_core.MAX_CORPUS_COUNT}")
     triggers = _parse_triggers(args.triggers)
     out_root = Path(args.out)
     total = 0
