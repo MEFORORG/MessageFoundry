@@ -2089,10 +2089,12 @@ def _load_allowlist() -> list[re.Pattern[str]]:
         # A whole-line match (``_allowlisted``) holds an entry to the line it was written for only
         # if no part of it can absorb arbitrary text: ``.*OIDC.*``, or ``^# keep .* here$``, excuses
         # a leak written inside the padding exactly as an unanchored entry did (BACKLOG #5445).
+        # This refuses the common spellings only; a quantified group, a positive class such as
+        # ``[0-9.]+`` or a bounded ``.{1,500}`` still passes it, and review is what stops those.
         if _ABSORBS_ANY_TEXT.search(line):
             print(
                 f"scan_forbidden: scan-allowlist.txt line {lineno}: pattern has an unbounded wildcard "
-                "(., \\S, \\W, \\D or a negated class, repeated without limit), so a leak written "
+                "(at least ., \\S, \\W, \\D or a negated class, repeated without limit), so a leak written "
                 "inside the line it excuses would pass every detector. IGNORED. Spell that part out.",
                 file=sys.stderr,
             )
@@ -2117,8 +2119,9 @@ def _allowlisted(line: str) -> bool:
     """Whether an allowlist entry excuses ``line``. An entry must match the WHOLE line: applied with
     ``search``, an entry missing its ``^``/``$`` excused any line that merely CARRIED its shape, so a
     leak beside that shape went past every detector (BACKLOG #5445). ``fullmatch`` removes the
-    dependence on anchors; the loader's wildcard refusal (``_ABSORBS_ANY_TEXT``) is what keeps an
-    entry from matching a whole line with a leak inside it."""
+    dependence on anchors. It does not stop an entry whose own pieces can absorb a leak: the
+    loader's wildcard refusal (``_ABSORBS_ANY_TEXT``) catches the common spellings of that, and
+    review of each entry is what catches the rest."""
     return any(a.fullmatch(line) for a in ALLOWLIST)
 
 
@@ -2217,13 +2220,15 @@ def _location(path: Path) -> str:
     case-folded as ``_path_key`` folds. Real, so a link, junction or subst drive into docs/security,
     a root named from inside ``docs``, or one reached by ``..``, is judged where it lands, in its
     on-disk case where the platform reports one. Relative to the work tree, so a clone that itself
-    sits under some ``docs/security`` directory is not a hit on every file. Empty for the top."""
+    sits under some ``docs/security`` directory is not a hit on every file. The OUTERMOST work
+    tree, so a nested clone or submodule under ``docs/security`` does not strip that prefix.
+    Empty for the top."""
     real = Path(os.path.realpath(path))
-    for top in (real, *real.parents):
-        if (top / ".git").exists():
-            rel = real.relative_to(top).as_posix()
-            return "" if rel == "." else _path_key(rel)
-    return _path_key(real.as_posix())
+    tops = [top for top in (real, *real.parents) if (top / ".git").exists()]
+    if not tops:
+        return _path_key(real.as_posix())
+    rel = real.relative_to(tops[-1]).as_posix()
+    return "" if rel == "." else _path_key(rel)
 
 
 #: How a --path hit for a named root that does not exist ends. ``main`` leaves such a hit out of the
@@ -2283,7 +2288,14 @@ def _walk(raw: str, out: list[_Candidate], errors: list[str]) -> None:
                 in_skip_dir and tracked is not None and _path_key(rel) not in tracked
             ):
                 continue
-            out.append((Path(top) / name, rel, f"{at}/{_path_key(rel)}" if at else _path_key(rel)))
+            path = Path(top) / name
+            # A link inside the root (a file link, or a junction the walk descended) is judged
+            # where it lands; everything else by the root's location joined to its path.
+            if os.path.realpath(path) != os.path.abspath(path):
+                where = _location(path)
+            else:
+                where = f"{at}/{_path_key(rel)}" if at else _path_key(rel)
+            out.append((path, rel, where))
 
 
 def _candidate_files(paths: list[str], *, path_mode: bool) -> tuple[list[_Candidate], list[str]]:
@@ -2415,7 +2427,10 @@ def _name_hits(path: Path, posix: str, where: str | None = None) -> tuple[list[s
     ``posix`` (BACKLOG #5446). In ``--path`` mode ``posix`` starts below the root the caller named, so
     naming ``docs/security`` itself, a file in it, or its parent ``docs`` dropped the prefix the rule
     keys on, and a private document read clean."""
-    if reason := forbidden_path_reason(posix) or (where and forbidden_path_reason(where)):
+    # Case-folded in every mode, so the staged and tracked scans agree with --path on Docs/Security.
+    if reason := forbidden_path_reason(_path_key(posix)) or (
+        where and forbidden_path_reason(where)
+    ):
         return [f"{path.as_posix()}:0: {reason}"], True
     hits: list[str] = []
     # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's

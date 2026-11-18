@@ -99,7 +99,7 @@ def test_every_allowlist_entry_excuses_only_a_whole_line(mod) -> None:
     probe fails here, which is the point -- it must be shown to be whole-line before it ships."""
     six = "".join(("1", "2", "3", "4", "5", "6"))
     probes = {
-        r"^\s*[A-Z0-9_]+\s+\d+ ms\s+\d+ tasks\s*$": "WRITELOG  12 ms  " + six + " tasks",
+        r"^\s*[A-Z_]+\s+\d+ ms\s+\d+ tasks\s*$": "WRITELOG  12 ms  " + six + " tasks",
         r"^ABUSE_\d{6}_ABUSE$": f"ABUSE_{six}_ABUSE",
         r"^lky_vipnyc_\d{6}$": f"lky_vipnyc_{six}",
         r"^dungklose_\d{6}$": f"dungklose_{six}",
@@ -115,6 +115,11 @@ def test_every_allowlist_entry_excuses_only_a_whole_line(mod) -> None:
             probe = probes[pat.pattern]
         assert mod._allowlisted(probe), pat.pattern
         for line in _insertions(probe, _routable_ip()):
+            assert not mod._allowlisted(line), (pat.pattern, line)
+        # An identifier in the estate shape, butted against either end with no space: an entry
+        # whose first or last piece is a word class would otherwise absorb it.
+        estate = "PT_" + "99" + "0210" + "_ADT"
+        for line in (estate + probe.lstrip(), probe.rstrip() + estate):
             assert not mod._allowlisted(line), (pat.pattern, line)
 
 
@@ -133,7 +138,8 @@ def test_the_loader_refuses_an_entry_with_an_unbounded_wildcard(
     """Under a whole-line match, a wildcard is where a leak would sit: ``^# keep .* here$`` excuses
     ``# keep <a routable IP> here``. The bounded control loads, so the refusal is the wildcard."""
     dst = tmp_path / "security"
-    shutil.copytree(_SECURITY_DIR, dst)
+    # Never the git-ignored real token list: a copy would sit in pytest's kept temp directories.
+    shutil.copytree(_SECURITY_DIR, dst, ignore=shutil.ignore_patterns("scan-tokens.local.txt"))
     (dst / "scan-allowlist.txt").write_text(entry + "\n", encoding="utf-8")
     loaded = _load_scanner(dst / "scan_forbidden.py", f"scan_forbidden_5445_{keep}_{len(entry)}")
     assert bool(loaded.ALLOWLIST) is keep, entry

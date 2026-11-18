@@ -109,6 +109,39 @@ def test_a_link_into_docs_security_is_judged_where_it_lands(
         assert _REASON in out
 
 
+def test_a_link_inside_a_walked_root_is_judged_where_it_lands(
+    mod, tree: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file link inside the named root, pointing into docs/security, is a location hit."""
+    snap = tmp_path / "elsewhere"
+    snap.mkdir()
+    (snap / "plain.md").write_text("plain prose\n", encoding="utf-8")
+    try:
+        os.symlink(tree / "docs" / "security" / "notes.md", snap / "notes.md")
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create a file link here ({type(exc).__name__})")
+    code, out = _run(mod, capsys, str(snap))
+    assert code == 1, out
+    assert _REASON in out
+
+
+def test_a_nested_work_tree_under_docs_security_keeps_the_prefix(
+    mod, tree: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``.git`` under docs/security (a nested clone) must not strip the prefix the rule keys on."""
+    (tree / ".git").write_text("gitdir: nowhere\n", encoding="utf-8")
+    (tree / "docs" / "security" / ".git").write_text("gitdir: nowhere\n", encoding="utf-8")
+    code, out = _run(mod, capsys, str(tree / "docs" / "security"))
+    assert code == 1, out
+    assert _REASON in out
+
+
+def test_a_case_variant_tracked_path_is_a_hit_in_every_mode(mod) -> None:
+    """The staged and tracked scans fold case as --path does, so the gates agree."""
+    hits, stop = mod._name_hits(Path("Docs/Security/x.md"), "Docs/Security/x.md")
+    assert stop and _REASON in hits[0]
+
+
 def test_control_a_sibling_directory_stays_clean(
     mod, tree: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

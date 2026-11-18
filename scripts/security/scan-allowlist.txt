@@ -10,7 +10,9 @@
 # site-code range (e.g. WRITELOG ... 993496 tasks) collides with the site-code guard (99\d{4}) despite
 # being a pure engine perf counter with no customer-data path. This row shape is unambiguous DMV output,
 # so a real site code embedded in a path/HL7 field/prose (PT_<site>_ADT, ^<site>^) does NOT match it.
-^\s*[A-Z0-9_]+\s+\d+ ms\s+\d+ tasks\s*$
+# The wait type is letters and underscores only (every row in the artifacts is), so an identifier
+# carrying a site code cannot stand in the first column either.
+^\s*[A-Z_]+\s+\d+ ms\s+\d+ tasks\s*$
 
 # The OIDC Core spec-section citation in the federated-SSO claim ladder (ADR 0142,
 # messagefoundry/auth/oidc/claims.py) reads as a dotted quad: the azp rule's section number has four
