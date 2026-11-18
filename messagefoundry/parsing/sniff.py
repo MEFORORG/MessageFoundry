@@ -357,11 +357,12 @@ def windows_member_name_reason(name: str) -> str | None:
     A colon anywhere (``a.hl7:x`` names an NTFS alternate data stream of ``a.hl7``) and a component
     ending in a dot or space (``a.hl7.`` opens ``a.hl7``, and its extension would read as ``.`` and
     skip the content check) are refused. So is a component :func:`ntpath.isreserved` names: a
-    reserved device stem (``NUL``, ``con.hl7``, ``COM1``, ``CONIN$``) or a character Windows refuses
-    in a name. That arm is a static list and refuses at least the names ntpath.isreserved reports,
-    since which names Windows
-    rewrites differs by build; the measurement is recorded once, on
-    :func:`messagefoundry.pipeline.dr_backup._win_opens_another`. These arms do NOT refuse every
+    reserved device name, bare or with any extension (``NUL``, ``COM1``, ``CONIN$``, ``con.hl7``),
+    or a component holding a character Windows refuses in a name. That arm is a fixed list in the
+    standard library, not a question put to the OS, so it refuses the same names on every platform
+    and build, ordinary member names such as ``con.hl7`` and ``aux.json`` included.
+    :func:`messagefoundry.pipeline.dr_backup._win_opens_another` asks the OS instead, and records
+    which of these names one Windows build's path rewrite changed. These arms do NOT refuse every
     alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or a long name beside its
     8.3 short form still pass, so a Handler writing members on Windows keeps its own collision
     check."""

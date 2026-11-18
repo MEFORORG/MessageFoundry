@@ -2124,12 +2124,15 @@ def _win_opens_another(path: Path) -> bool:
     as ``path.name`` (BACKLOG #2420).
 
     Win32 rewrites a path before it opens it. At least it drops a trailing dot or space from a name,
-    so ``a.tar.`` opens ``a.tar`` or nothing, and it opens a reserved device name as the device. Of
-    ``NUL``, ``AUX``, ``COM1``, ``CONIN$`` and ``con.txt``, Windows 11 build 26300 rewrote only
-    ``NUL`` (measured), and the set differs by build, so this asks the OS's own rewrite
-    (``os.path.abspath``, which is ``GetFullPathNameW``) rather than keep a list. A name it changes
-    is reported: the open would reach some other object, and the listed file
-    would keep its bytes while the report called it empty. The final-path compare on the opened
+    so ``a.tar.`` opens ``a.tar`` or nothing, and it opens a reserved device name as the device.
+    This asks the OS's own path rewrite (``os.path.abspath``, which is ``GetFullPathNameW``) rather
+    than keep a list. A name it changes is reported: the open would reach some other object, and the
+    listed file would keep its bytes while the report called it empty.
+
+    That rewrite does not change every name an open reaches a device by. Of ``NUL``, ``AUX``,
+    ``COM1``, ``CONIN$`` and ``con.txt``, ``GetFullPathNameW`` on Windows 11 build 26300 changed only
+    ``NUL`` (measured), and the set differs by build. A bare ``AUX``, ``COM1`` or ``PRN`` still opens
+    the device, so this check does not flag every device name. The final-path compare on the opened
     handle backs this up (:func:`_open_unfollowed`)."""
     # The trailing dot or space is tested as such too: `abspath` falls back to a pure-Python join that
     # rewrites nothing if `GetFullPathNameW` raises, and this must not then pass the name.

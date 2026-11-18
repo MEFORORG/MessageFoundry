@@ -530,8 +530,9 @@ SITES: dict[str, Site] = {
     "messagefoundry/checks.py::_ruff_binary": Site(
         1,
         INTERNAL,
-        "The literal program name ruff plus the platform's executable suffix, under an install "
-        "location: a scripts folder sysconfig names for this interpreter (BACKLOG #5375).",
+        "The literal program name ruff plus the platform's executable suffix, under a scripts "
+        "folder sysconfig names: this interpreter's environment's, its base installation's, or the "
+        "user scheme's, which belongs to the user rather than to this interpreter (BACKLOG #5375).",
     ),
     "messagefoundry/checks.py::_unread_working_dir_toml": Site(
         1, INTERNAL, "A fixed name in the working directory."

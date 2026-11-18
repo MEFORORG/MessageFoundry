@@ -81,10 +81,9 @@ rules:
     metadata: {asvs: "15.2.5", note: "CLAUDE.md §8 validate before it reaches SQL"}
     message: >
       Message-derived data flows into the db_lookup/fhir_lookup STATEMENT/QUERY argument, or into a
-      FhirRaw value or the system half of a FhirToken. Keep the statement and query constant; pass
-      message values through the parameterized `params` dict, as a plain str or as the FhirToken code
-      half, which this rule does not flag. Never interpolate them, and never put them in FhirRaw or a
-      FhirToken system (SQL / FHIR injection).
+      FhirRaw value or the system half of a FhirToken. Keep the statement and query constant, pass
+      message values through the parameterized `params` dict, and never interpolate them (SQL / FHIR
+      injection).
     pattern-sources:
       - patterns:
           - pattern-either:
@@ -124,9 +123,10 @@ rules:
                 - pattern: messagefoundry.config.db_lookup.db_lookup
                 - pattern: messagefoundry.config.fhir_lookup.fhir_lookup
           - focus-metavariable: $STMT
-      # FHIR search values that are AUTHOR syntax: the whole of a FhirRaw, and the system half of a
-      # FhirToken. Message data there is injection. The FhirToken code half is not flagged by this
-      # rule.
+      # FHIR search syntax that is the AUTHOR's includes the whole of a FhirRaw, the system half of a
+      # FhirToken, and a `params` dict key (the search parameter's name). Message data there is
+      # injection. This sink flags the first two only: a `params` key is not flagged, and neither is
+      # the FhirToken code half.
       - patterns:
           - pattern-either:
               - patterns:

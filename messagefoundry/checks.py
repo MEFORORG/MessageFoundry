@@ -4320,10 +4320,19 @@ def _tool_command(module: str) -> list[str] | None:
     return python_module_argv(module, extra_flags=("-X", "utf8"))
 
 
+#: :func:`_run_tool`'s skip detail when :func:`_tool_command` finds no copy to start.
+_TOOL_NOT_FOUND = (
+    "not found beside this interpreter or in the user scripts folder; a copy on PATH is not used"
+)
+
+
 def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
-    """Advisory: run lint tool ``module`` with ``args``, only when it is installed for this
-    interpreter (:func:`_tool_command`); an absent tool is skipped and never blocks. A ``ruff`` or ``mypy``
-    installed only elsewhere on ``PATH`` is not run.
+    """Advisory: run lint tool ``module`` with ``args``, only where :func:`_tool_command` finds it;
+    a tool it does not find is skipped and never blocks. ``mypy`` must be importable by this
+    interpreter. ``ruff`` is looked for in three scripts folders (:func:`_ruff_binary`): this
+    interpreter's environment, its base installation, and the user scheme's, which belongs to the
+    user rather than to this interpreter (on Linux ``~/.local/bin``, shared by every Python and by
+    a pipx or ``uv tool`` install). A copy found only through ``PATH`` is not run.
 
     The child gets :func:`~messagefoundry.childenv.worker_environment` plus
     :data:`_LINT_TOOL_NAMES`, not the caller's whole environment (BACKLOG #5375), with
@@ -4333,7 +4342,7 @@ def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
 
     cmd = _tool_command(module)
     if cmd is None:
-        return CheckResult(name, ok=True, required=False, skipped=True, detail="not installed")
+        return CheckResult(name, ok=True, required=False, skipped=True, detail=_TOOL_NOT_FOUND)
     try:
         # nosec: an absolute program or interpreter path, no shell; args are repo paths.
         proc = subprocess.run(  # nosec B603

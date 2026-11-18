@@ -876,7 +876,9 @@ or compression library:
   before or after the archive, or an entry compressed with any method but STORED or DEFLATED. The
   ceiling holds as it goes only for those two methods, because stdlib `zipfile` does not bound one
   read's output for the others (BACKLOG #5535). Each member's name must be a safe relative path, and its bytes must match the
-  type its extension names. Members come back as bytes in memory; this module writes no file.
+  type its extension names. A zip member's name must also pass the Windows name check,
+  `windows_member_name_reason` in `parsing/sniff.py`, which refuses a colon, a component ending in a
+  dot or space, and a reserved device name such as `con.hl7` (BACKLOG #5369). Members come back as bytes in memory; this module writes no file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.
 - `parsing/dicom/_deps.py` imports `zlib` only to name `zlib.error` in the tuple of parse errors
@@ -887,7 +889,8 @@ or compression library:
   as a path: it streams the store member into one fixed file name. The reader accepts only an
   uncompressed tar, and both a member's declared size and the bytes actually read are capped. With
   `--config-to`, the restore writes the archive's config files under their own relative names. Each
-  name must pass the zip-member safe-path check, `archive_member_name_reason`, and must resolve inside the destination.
+  name must pass the archive-member safe-path check, `archive_member_name_reason`, and must resolve inside the destination.
+  The restore uses only that check: it does not run the Windows name check, `windows_member_name_reason`.
   A member-count cap and a total-size cap apply too. An encrypted backup must decrypt with a store
   key, and every block of it must authenticate, so a tampered one fails before anything is
   extracted. With a store key configured, a plaintext backup is refused; one restores only on a

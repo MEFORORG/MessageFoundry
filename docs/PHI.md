@@ -1857,7 +1857,7 @@ rest §3 describes and the read-side field gate in [SECURITY.md](SECURITY.md), a
 a log line. For the engine's own authors the convention is a rule, not a check: the
 `raise-fstring` lint above is a nudge, and nothing refuses text that breaks it.
 
-**Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** **At least five** handler filters run, **on every record emitted by the engine process and by the ADR 0087 sandbox worker child**, in this
+**Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** **Five** handler filters run, **on every record emitted by the engine process and by the ADR 0087 sandbox worker child**, in this
 order, on **every** emitted record and on **every** handler — stdout *and* the off-box forwarder —
 installed by `_install_phi_filters`, reached through `configure_logging` in the engine and
 `configure_stderr_logging` in the child

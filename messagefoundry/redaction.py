@@ -1099,7 +1099,7 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 #: run unit, a second pass can extend a run over text glued after the padding, so
 #: :func:`redact_binary_carriage` repeats until nothing changes, for at most
 #: :data:`_CARRIAGE_ROUNDS` rounds, so two handlers that share one record write the same text
-#: unless more pieces than that are glued after the padding.
+#: unless more than ``_CARRIAGE_ROUNDS - 1`` pieces are glued after the padding.
 #:
 #: Residuals, at least these: a carriage broken by whitespace keeps every piece after the first
 #: break (``encode`` never writes one); a URL-safe (``-``/``_``) carriage keeps the part after its
@@ -1135,8 +1135,9 @@ def redact_binary_carriage(text: str) -> str:
     return text
 
 
-#: The most rounds :func:`redact_binary_carriage` runs. Each round that changes the text joins at
-#: least one run to the placeholder before it, so a fixed point comes within a round or two.
+#: The most rounds :func:`redact_binary_carriage` runs. The first round replaces the run, and each
+#: later round extends it over at most one more piece glued after the padding, so at most
+#: ``_CARRIAGE_ROUNDS - 1`` glued pieces are taken; a piece past those is left as it was.
 _CARRIAGE_ROUNDS = 8
 
 

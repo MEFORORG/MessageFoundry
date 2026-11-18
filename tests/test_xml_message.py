@@ -113,6 +113,20 @@ def test_doctype_that_fails_to_parse_is_a_security_refusal(payload: bytes | str)
     assert ei.value.__cause__ is None and ei.value.__context__ is None
 
 
+def test_failed_parse_doctype_refusal_has_its_own_message() -> None:
+    # A malformed document opening `<!DOCTYPE html>` defines no entity, so its refusal names the
+    # DOCTYPE and the failed parse, not an entity-definition carrier; a well-formed DOCTYPE keeps
+    # the shared message.
+    with pytest.raises(XmlSecurityError) as ei:
+        parse_bytes(b"<!DOCTYPE html><html><body></html>")
+    assert str(ei.value) == (
+        "refusing an XML document that opens a DOCTYPE in its prolog and is not well-formed XML"
+    )
+    assert "entity-definition" not in str(ei.value)
+    with pytest.raises(XmlSecurityError, match=r"\(entity-definition carrier\)"):
+        parse_bytes(b"<!DOCTYPE x><x/>")
+
+
 @pytest.mark.parametrize(
     "payload",
     [

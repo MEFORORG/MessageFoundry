@@ -634,8 +634,8 @@ def test_windows_member_name_reason_admits_near_miss_windows_names(name: str) ->
     ],
 )
 def test_archive_member_name_reason_keeps_its_earlier_arms(name: str, refused: bool) -> None:
-    # BACKLOG #5369 adds the Windows-name arms in their own function, so the shared guard, which
-    # the DR config restore also calls, refuses what it refused before and no more.
+    # BACKLOG #5369 adds the Windows-name arms in their own function, not in this shared guard,
+    # which the DR config restore also calls.
     assert (archive_member_name_reason(name) is not None) is refused
 
 

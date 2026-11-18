@@ -207,7 +207,9 @@ def h_file_forms(msg, mode):
     with open("/tmp/e.log", "w") as fh2:
         # ok: mf-handler-phi-to-file
         fh2.write("processed")
-    # A tainted fd with a constant payload, and a shutil call that writes nothing, are not PHI egress.
+    # A tainted fd with a constant payload is not PHI egress, and neither is a shutil call that
+    # writes no message bytes: shutil.which writes nothing, and shutil.move moves a constant source
+    # file, with the message only in the destination name.
     # ok: mf-handler-phi-to-file
     os.write(len(body), b"ok")
     # ok: mf-handler-phi-to-file
