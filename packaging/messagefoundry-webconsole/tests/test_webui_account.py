@@ -300,6 +300,11 @@ async def test_mfa_confirm_form_is_unlock_reentry(engine: Engine) -> None:
         assert r.status_code == 200
         assert secret is not None and secret not in r.text  # the secret is never re-shown
         assert 'action="/ui/account/mfa/verify"' in r.text
+        # Nor on the code-form variant, which the page renders once the confirm proof is held.
+        await _mint_action(c, "/ui/account/mfa/confirm")
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and 'name="code"' in r.text
+        assert secret not in r.text
 
 
 async def test_first_enrolment_code_is_accepted_after_the_confirm_reauth(engine: Engine) -> None:
@@ -482,6 +487,7 @@ async def test_the_confirm_page_offers_continue_while_no_confirm_proof_is_held(
         r = await c.get("/ui/account/mfa/confirm")
         assert r.status_code == 200 and "Confirm enrollment" in r.text
         assert ">Continue<" in r.text and 'name="code"' not in r.text
+        assert "To enter a code" in r.text and "try a code again" not in r.text
         await _mint_action(c, "/ui/account/mfa/confirm")
         r = await c.get("/ui/account/mfa/confirm")
         assert r.status_code == 200 and 'name="code"' in r.text and ">Continue<" not in r.text
@@ -649,6 +655,9 @@ async def test_enroll_page_keeps_the_code_form_under_the_opt_out(engine: Engine)
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
         assert secret is not None
+        # The confirm page keeps the form too: under the opt-out the window is the proof.
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and 'name="code"' in r.text and ">Continue<" not in r.text
         # A wrong code keeps the form too: the window still holds, so no re-auth is owed.
         r = await c.post(
             "/ui/account/mfa/verify",

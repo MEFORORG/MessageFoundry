@@ -602,11 +602,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui_reauth_only()),
     ) -> HTMLResponse:
         # The unlock re-entry point: the secret is already staged server-side (and in the user's
-        # authenticator), so this form only collects the code — the secret is never re-shown.
-        # Reached with a fresh window but no confirm proof held (Back after a refused code, the
-        # reauth_open_first fallback link, an engine restart), a code form would post into the gate
-        # and the code would be lost, so the page offers the Continue to a fresh re-auth instead,
-        # as the enroll page and the refusal re-renders do (BACKLOG #5931).
+        # authenticator), so it is never re-shown here. The window can be fresh while no confirm
+        # proof is held, for example after Back from a refused code or an engine restart. A code
+        # form would then post into the gate, which drops the code. So without the proof the page
+        # offers the Continue to a fresh re-auth, as the enroll page does (BACKLOG #5931).
         code_form = await _confirm_proof_held(request)
         owed = code_form and await service.enrolment_code_required(session_token(request), identity)
         return HTMLResponse(pages.mfa_confirm_page(enrolment_code=owed, code_form=code_form))

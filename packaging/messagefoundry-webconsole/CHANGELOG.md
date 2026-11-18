@@ -286,7 +286,9 @@ this line.**
   Continue button that takes the operator through that re-auth to the code form first. Enroll and
   confirm still each take their own proof (ADR 0077), and a refused code still needs a fresh one:
   the re-rendered page offers the same Continue instead of a form that would drop the next code.
-  The confirm page itself is unchanged. A Continue can be posted while the confirm proof is
+  The confirm page, opened while no confirm proof is held (after Back from a refused code, or
+  after an engine restart), offers the same Continue instead of a code form. A Continue can be
+  posted while the confirm proof is
   already held, from another tab or after Back. It now goes to the re-auth and leaves that proof
   unspent. No code is checked and no failed attempt is recorded. The verify route's gate chain
   grew by that check, so the engine seam moves. (BACKLOG #5931)
