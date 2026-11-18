@@ -273,6 +273,8 @@ def test_once_row_still_passes_with_a_skipped_suite() -> None:
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SERVER_GATE_VARS = frozenset(SERVER_SUITE_GATES.values())
+#: A string that ends in the shared prefix builds a gate name at run time (``f"MEFOR_TEST_{db}"``).
+_BUILT_GATE_NAME = re.compile(r"MEFOR_TEST_?$")
 
 
 def _strip_docstrings(tree: ast.AST) -> None:
@@ -289,40 +291,29 @@ def _strip_docstrings(tree: ast.AST) -> None:
             body[0] = ast.Pass()
 
 
-def _reads(node: ast.AST, aliases: dict[str, set[str]]) -> set[str]:
-    """The gate variables ``node`` reads: a string naming one, or a module-level name bound to one."""
-    found: set[str] = set()
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
-            found |= {v for v in _SERVER_GATE_VARS if re.search(rf"(?<!\w){v}(?!\w)", sub.value)}
-        elif isinstance(sub, ast.Name):
-            found |= aliases.get(sub.id, set())
-    return found
+def _named_gates(text: str) -> set[str]:
+    return {v for v in _SERVER_GATE_VARS if re.search(rf"(?<!\w){v}(?!\w)", text)}
 
 
-def _parse_for_gates(source: str) -> tuple[ast.Module, dict[str, set[str]]]:
-    """Parse ``source`` without docstrings, plus each module-level name whose value reads a gate."""
+def server_gates(source: str) -> list[tuple[int, str]]:
+    """Each place ``source`` names a server-backend variable outside a docstring, as (line, name).
+
+    Any mention counts, not only a skip condition: whatever shape a gate takes (a ``skipif`` or
+    ``xfail`` mark, ``pytest.skip`` or a raised ``SkipTest`` under an ``if``, a local, a class
+    attribute or a module name bound to the read) spells its variable somewhere in the file. A
+    string ending in ``MEFOR_TEST_`` counts as a name built at run time. A gate that lives in an
+    imported helper or a conftest fixture is not in the file, and this does not see it.
+    """
     tree = ast.parse(source)
     _strip_docstrings(tree)
-    aliases: dict[str, set[str]] = {}
-    for _ in range(len(tree.body) + 1):  # to a fixpoint, so a chain of names resolves
-        before = {k: set(v) for k, v in aliases.items()}
-        for stmt in tree.body:
-            value: ast.AST
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                names, value = [stmt.name], stmt
-            elif isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None:
-                targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-                names = [t.id for t in targets if isinstance(t, ast.Name)]
-                value = stmt.value
-            else:
-                continue
-            read = _reads(value, aliases)
-            for name in names if read else ():
-                aliases.setdefault(name, set()).update(read)
-        if aliases == before:
-            break
-    return tree, aliases
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            names = sorted(_named_gates(node.value))
+            if not names and _BUILT_GATE_NAME.search(node.value):
+                names = ["a MEFOR_TEST_ name built at run time"]
+            hits.extend((node.lineno, name) for name in names)
+    return hits
 
 
 def _callee(call: ast.Call) -> str:
@@ -330,58 +321,57 @@ def _callee(call: ast.Call) -> str:
     return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
 
 
-def _skip_condition_reads(call: ast.Call, aliases: dict[str, set[str]]) -> set[str]:
-    """The gates a ``skipif``-style call's condition reads (its first argument or ``condition=``)."""
-    conditions = [*call.args[:1], *(k.value for k in call.keywords if k.arg == "condition")]
-    return set().union(*(_reads(c, aliases) for c in conditions))
+def _is_unset_test(cond: ast.expr, var: str) -> bool:
+    """Whether ``cond`` is true exactly when ``var`` is unset, in one of the shapes the suites use.
 
-
-_SKIPIF = frozenset({"skipif", "skipIf", "skipUnless"})
-_SKIP = frozenset({"skip", "skipTest"})
-
-
-def server_gates(source: str) -> list[str]:
-    """Every skip in ``source`` whose condition reads a server-backend gate, as ``line N: VAR``.
-
-    At least these shapes count: a ``skipif`` mark anywhere (a decorator, ``pytestmark``, a
-    ``pytest.param`` mark), and a ``pytest.skip`` call under an ``if`` that reads a gate or whose own
-    arguments name one. A read goes through a module-level name or function bound to a gate.
+    ``not os.getenv(VAR)``, ``not os.environ.get(VAR)`` and ``VAR not in os.environ``. Anything else
+    reads as not proven, so an inverted or diluted condition fails the check.
     """
-    tree, aliases = _parse_for_gates(source)
-    hits: list[str] = []
-    for node in ast.walk(tree):
-        read: set[str] = set()
-        if isinstance(node, ast.Call) and _callee(node) in _SKIPIF:
-            read = _skip_condition_reads(node, aliases)
-        elif isinstance(node, ast.Call) and _callee(node) in _SKIP:
-            read = _reads(node, aliases)
-        elif isinstance(node, ast.If):
-            branch = ast.Module(body=[*node.body, *node.orelse], type_ignores=[])
-            skips = any(isinstance(n, ast.Call) and _callee(n) in _SKIP for n in ast.walk(branch))
-            read = _reads(node.test, aliases) if skips else set()
-        hits.extend(f"line {getattr(node, 'lineno', '?')}: {var}" for var in sorted(read))
-    return hits
-
-
-def module_pytestmark_gates(source: str) -> set[str]:
-    """The gates a module-level ``pytestmark`` skipif's condition reads, so the file skips whole."""
-    tree, aliases = _parse_for_gates(source)
-    read: set[str] = set()
-    for stmt in tree.body:
-        targets = (
-            stmt.targets
-            if isinstance(stmt, ast.Assign)
-            else [stmt.target]
-            if isinstance(stmt, ast.AnnAssign)
-            else []
+    if isinstance(cond, ast.UnaryOp) and isinstance(cond.op, ast.Not):
+        call = cond.operand
+        return (
+            isinstance(call, ast.Call)
+            and ast.unparse(call.func) in ("os.getenv", "os.environ.get")
+            and len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value == var
         )
-        if not any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in targets):
-            continue
-        assert isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None
-        for node in ast.walk(stmt.value):
-            if isinstance(node, ast.Call) and _callee(node) in _SKIPIF:
-                read |= _skip_condition_reads(node, aliases)
-    return read
+    return (
+        isinstance(cond, ast.Compare)
+        and isinstance(cond.left, ast.Constant)
+        and cond.left.value == var
+        and len(cond.ops) == 1
+        and isinstance(cond.ops[0], ast.NotIn)
+        and ast.unparse(cond.comparators[0]) == "os.environ"
+    )
+
+
+def skips_whole_unless(source: str, var: str) -> bool:
+    """Whether the module's last ``pytestmark`` binding carries a skipif on ``var`` being unset."""
+    value: ast.expr | None = None
+    for stmt in ast.parse(source).body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in stmt.targets)
+            or (
+                isinstance(stmt, ast.AnnAssign)
+                and isinstance(stmt.target, ast.Name)
+                and stmt.target.id == "pytestmark"
+                and stmt.value is not None
+            )
+        ):
+            value = stmt.value
+    if value is None:
+        return False
+    marks = value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
+    return any(
+        isinstance(mark, ast.Call)
+        and ast.unparse(mark.func) == "pytest.mark.skipif"
+        and len(mark.args) >= 1
+        and _is_unset_test(mark.args[0], var)
+        for mark in marks
+    )
 
 
 def _per_db_pytest_refs() -> set[str]:
@@ -397,16 +387,19 @@ def _per_db_pytest_refs() -> set[str]:
 def test_every_server_suite_skips_whole_on_its_own_gate(ref: str) -> None:
     assert ref in _per_db_pytest_refs(), f"{ref} is registered but no Per-DB row names it"
     source = (_REPO_ROOT / ref).read_text(encoding="utf-8")
-    assert SERVER_SUITE_GATES[ref] in module_pytestmark_gates(source)
+    own = SERVER_SUITE_GATES[ref]
+    assert skips_whole_unless(source, own)
+    # Gated whole on one backend, the file must not gate some tests on another backend too.
+    assert [hit for hit in server_gates(source) if hit[1] != own] == []
 
 
 def test_no_other_per_db_file_gates_a_test_on_a_server_backend() -> None:
     # The no-mixed-file invariant: a file outside the registry that gated some tests on a server
     # backend would read PASS on its SQLite tests alone, with the server tests skipped.
     offenders = {
-        ref: gates
+        ref: hits
         for ref in sorted(_per_db_pytest_refs() - SERVER_SUITE_GATES.keys())
-        if (gates := server_gates((_REPO_ROOT / ref).read_text(encoding="utf-8")))
+        if (hits := server_gates((_REPO_ROOT / ref).read_text(encoding="utf-8")))
     }
     assert offenders == {}
 
@@ -425,12 +418,24 @@ def server():
     if "MEFOR_TEST_POSTGRES" not in os.environ:
         pytest.skip("no server")
 """,
-    "through a name": """
+    "through a local": """
+import os, unittest
+def test_server():
+    on = os.getenv("MEFOR_TEST_SQLSERVER")
+    if not on:
+        raise unittest.SkipTest("no server")
+""",
+    "xfail mark": """
 import os, pytest
-_ON = bool(os.getenv("MEFOR_TEST_SQLSERVER"))
-_GATED = not _ON
-@pytest.mark.skipif(condition=_GATED, reason="server")
+@pytest.mark.xfail(not os.getenv("MEFOR_TEST_POSTGRES"), run=False, reason="server")
 def test_server(): pass
+""",
+    "built at run time": """
+import os, pytest
+@pytest.fixture(params=["sqlite", "postgres"])
+def backend(request):
+    if request.param != "sqlite" and not os.getenv(f"MEFOR_TEST_{request.param.upper()}"):
+        pytest.skip("no server")
 """,
 }
 
@@ -440,7 +445,37 @@ def test_the_mixed_file_check_catches_a_per_test_server_gate(shape: str) -> None
     # Negative control: each shape is a SQLite-plus-server file the invariant must refuse.
     source = _MIXED_SOURCES[shape]
     assert server_gates(source) != []
-    assert module_pytestmark_gates(source) == set()  # nor does it skip whole
+    assert not skips_whole_unless(source, "MEFOR_TEST_SQLSERVER")
+    assert not skips_whole_unless(source, "MEFOR_TEST_POSTGRES")
+
+
+_GATED = 'pytest.mark.skipif(not os.getenv("MEFOR_TEST_SQLSERVER"), reason="server")'
+
+
+@pytest.mark.parametrize(
+    ("pytestmark", "whole"),
+    [
+        (f"pytestmark = {_GATED}", True),
+        (f"pytestmark = [pytest.mark.asyncio, {_GATED}]", True),
+        (f"pytestmark: object = {_GATED}", True),
+        (
+            'pytestmark = pytest.mark.skipif(bool(os.getenv("MEFOR_TEST_SQLSERVER")), reason="x")',
+            False,
+        ),
+        (
+            'pytestmark = pytest.mark.skipif(not os.getenv("MEFOR_TEST_SQLSERVER") and False, reason="x")',
+            False,
+        ),
+        (f"pytestmark = {_GATED}\npytestmark = pytest.mark.asyncio", False),
+        (f"pytestmark = pytest.mark.asyncio({_GATED})", False),
+        ("pytestmark: object", False),
+    ],
+)
+def test_the_whole_file_check_reads_the_condition_not_a_mention(
+    pytestmark: str, whole: bool
+) -> None:
+    source = f"import os, pytest\n{pytestmark}\n"
+    assert skips_whole_unless(source, "MEFOR_TEST_SQLSERVER") is whole
 
 
 def test_the_mixed_file_check_ignores_prose_and_other_variables() -> None:

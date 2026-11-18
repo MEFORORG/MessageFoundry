@@ -102,10 +102,11 @@ def _row(
 
 
 #: Each server-backend test file a Per-DB row names, mapped to the ``MEFOR_TEST_*`` variable that gates
-#: it. A file listed here skips whole, through a module-level ``pytestmark``, unless its variable is
-#: set; no other file a Per-DB row names gates a test on a server-backend variable. So no row file
-#: mixes SQLite tests with per-test server gates, and a listed file that reads PASS ran on its server.
-#: ``tests/test_acceptance_framework.py`` holds both halves of that invariant.
+#: it, so that no row file mixes SQLite tests with per-test server gates.
+#: ``tests/test_acceptance_framework.py`` checks the files' own source, and nothing they import: a
+#: file listed here skips whole through a module-level ``pytestmark`` unless its variable is set, and
+#: names no other server variable; no other file a Per-DB row names mentions a server variable
+#: outside its docstrings.
 SERVER_SUITE_GATES: dict[str, str] = {
     "tests/test_sqlserver_store.py": "MEFOR_TEST_SQLSERVER",
     "tests/test_cluster_failover_sqlserver.py": "MEFOR_TEST_SQLSERVER",

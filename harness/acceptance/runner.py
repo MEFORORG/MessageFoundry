@@ -7,8 +7,8 @@ JUnit parsing — no extra dependency, no pytest re-entrancy) and each row's ver
 its file(s). Server-DB suites self-skip off-server via their ``MEFOR_TEST_*`` gates, so a row backed
 by ``test_postgres_store.py`` reports ``SKIP`` on a box without Postgres rather than failing.
 A server suite counts as exercised when its gated file has at least one PASS: each file in
-:data:`~harness.acceptance.matrix.SERVER_SUITE_GATES` skips whole while its gate is closed, so a
-pass there means the gate was open. A file that ran partly reads ``PASS`` with its counts beside it.
+:data:`~harness.acceptance.matrix.SERVER_SUITE_GATES` is checked to skip whole while its gate is
+closed, so a pass there means the gate was open. A file that ran partly reads ``PASS`` with its counts beside it.
 
 ``HARNESS`` and ``MANUAL`` rows are reported ``MANUAL`` with the command / instruction — never
 auto-passed.
@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,7 +41,11 @@ _COLLECTION_FAILURE = "collection failure"
 
 @dataclass(frozen=True)
 class FileCounts:
-    """How many of one file's testcases passed, skipped, and failed (a JUnit error counts as failed)."""
+    """How many of one file's JUnit testcases passed, skipped, and failed.
+
+    These count ``<testcase>`` elements as pytest wrote them: an error counts as failed, an xfail
+    as skipped, and a test that fails and then errors in teardown twice.
+    """
 
     passed: int = 0
     skipped: int = 0
@@ -85,16 +90,16 @@ def _parse_junit_by_file(
 ) -> tuple[dict[str, Status], list[str], dict[str, FileCounts]]:
     """Aggregate a pytest JUnit XML into one :class:`Status` per source file.
 
-    Also returns each file's :class:`FileCounts`, and the names of failing testcases that carry no ``file`` attribute (a
-    collection error in a file outside the repo root, say), which no row can own. Raises
-    :class:`ElementTree.ParseError` on truncated XML and :class:`OSError` on an unreadable file.
+    Also returns each file's :class:`FileCounts`, and the names of failing testcases that carry no
+    ``file`` attribute (a collection error in a file outside the repo root, say), which no row can
+    own. Raises :class:`ElementTree.ParseError` on truncated XML and :class:`OSError` on an
+    unreadable file.
     """
     if not junit_path.is_file():
         return {}, [], {}
     tree = ElementTree.parse(junit_path)
     # Collect each file's testcase outcomes; precedence within a file: FAIL > ERROR > PASS > SKIP.
-    per_file: dict[str, set[Status]] = {}
-    tallies: dict[str, list[int]] = {}  # passed, skipped, failed
+    per_file: dict[str, Counter[Status]] = {}
     unattributed: list[str] = []
     for case in tree.iter("testcase"):
         failed = case.find("failure") is not None or case.find("error") is not None
@@ -113,14 +118,7 @@ def _parse_junit_by_file(
             outcome = Status.SKIP
         else:
             outcome = Status.PASS
-        per_file.setdefault(key, set()).add(outcome)
-        tally = tallies.setdefault(key, [0, 0, 0])
-        if outcome is Status.PASS:
-            tally[0] += 1
-        elif outcome is Status.SKIP:
-            tally[1] += 1
-        else:
-            tally[2] += 1
+        per_file.setdefault(key, Counter())[outcome] += 1
 
     result: dict[str, Status] = {}
     for key, outcomes in per_file.items():
@@ -132,7 +130,14 @@ def _parse_junit_by_file(
             result[key] = Status.PASS
         else:  # only skips collected
             result[key] = Status.SKIP
-    counts = {key: FileCounts(*tally) for key, tally in tallies.items()}
+    counts = {
+        key: FileCounts(
+            passed=c[Status.PASS],
+            skipped=c[Status.SKIP],
+            failed=c[Status.FAIL] + c[Status.ERROR],
+        )
+        for key, c in per_file.items()
+    }
     return result, unattributed, counts
 
 
