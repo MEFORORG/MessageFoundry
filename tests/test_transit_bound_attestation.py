@@ -2016,17 +2016,41 @@ def test_a_raising_report_of_an_escaped_warning_fault_keeps_the_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #6707: when a fault in :data:`_READ_FAULTS` escapes the unconfirmed warning and the
-    stderr line reporting it raises too, the 400 keeps the unconfirmed label."""
+    report of it raises too, the report was attempted and the 400 keeps the unconfirmed label."""
     from messagefoundry.store import crypto_transit
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     def short_of_memory(*_a: Any, **_kw: Any) -> None:
         raise MemoryError
 
+    reported: list[BaseException] = []
+
+    def report_fails(fault: BaseException, *_a: Any, **_kw: Any) -> None:
+        reported.append(fault)
+        raise MemoryError
+
     monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
-    monkeypatch.setattr(crypto_transit, "_last_resort", short_of_memory)
+    monkeypatch.setattr(crypto_transit, "_report_unlogged", report_fails)
     refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
+    assert len(reported) == 1 and isinstance(reported[0], MemoryError)
+
+
+def test_repeated_escapes_from_the_unconfirmed_warning_report_once_per_interval(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: five faults escaping the unconfirmed warning within one interval write at
+    most one stderr line."""
+    from messagefoundry.store import crypto_transit
+
+    def short_of_memory(*_a: Any, **_kw: Any) -> None:
+        raise MemoryError
+
+    monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
+    for _ in range(5):
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    lines = [line for line in capsys.readouterr().err.splitlines() if "could not be" in line]
+    assert len(lines) <= 1, lines
 
 
 @pytest.mark.parametrize("fault", [MemoryError, RecursionError])
