@@ -1711,10 +1711,9 @@ record is refused only after two failing reads that name the same account, or wh
 closed as this paragraph says below. One exception: a `users` row with a timestamp or counter cell
 that does not parse is refused on the first read, with no re-read, on a store with or without an
 integrity key, and a list read lists it as failing even when the row is restored before its check
-(BACKLOG #5505). The `totp_recovery_codes` cell is parsed only when its codes are read. On a
-store with an integrity key, a cell changed outside the store fails the record's seal first; on a
-store without one, a cell that does not parse as a JSON list reads as holding no codes. A check
-whose row is
+(BACKLOG #5505). A `totp_recovery_codes` cell that does not parse as a JSON list reads as
+holding no codes; on a store with an integrity key, one changed outside the store fails the
+record's seal first. A check whose row is
 deleted, renamed, rebound or re-keyed while it is read is unreported and read again by id, up to
 three checks: one that then passes is served, or listed as it now reads, and one absent on a
 re-read reads as gone, a 404 or left out of the list. **A row still there after every check raced

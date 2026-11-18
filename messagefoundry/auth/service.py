@@ -3001,9 +3001,7 @@ class LockableAccountCensus:
     #: (:func:`~messagefoundry.store.store.listed_users` says which), by its stored id (BACKLOG
     #: #5505). Its record fails its integrity check, so whether it is lockable is unknown: it is
     #: named here and in no other list, since every other list would read fields the store could
-    #: not read. A bad recovery-code cell is not named here: on a store with an integrity key its
-    #: record fails its seal, which this census does not check; on a store without one it reads as
-    #: holding no codes.
+    #: not read. The census does not parse the recovery-code cell.
     integrity_failed: tuple[str, ...] = ()
 
     @property
