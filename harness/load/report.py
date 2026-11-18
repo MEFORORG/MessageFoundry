@@ -1108,6 +1108,9 @@ def compare_to_baseline(current: object, baseline: object, *, tolerance: float) 
     # Per message sent, not raw totals: a faster backend sends more on a closed loop, so the same
     # NAK rate is a larger count.
     sent = _pair("sent", _get(baseline, "totals", "sent"), _get(current, "totals", "sent"), out)
+    if sent is not None and (sent[0] < 0 or sent[1] < 0):
+        # Named here, not in the counter loop: a zero counter skips that loop before it reads sent.
+        out.append(f"sent: negative count ({sent[0]:.0f} baseline, {sent[1]:.0f} current)")
     for label, path in (
         ("errors", ("totals", "errors")),
         ("NAKs", ("totals", "nak")),
@@ -1163,8 +1166,12 @@ def _compare_phase(
         return
     (b_n, c_n), (b_p99, c_p99) = count, p99
     # An empty histogram reports p99 0.0, so the sample count, not the p99, says whether a side
-    # measured anything. A baseline with no samples has nothing to compare against.
-    if b_n <= 0:
+    # measured anything. A baseline with no samples has nothing to compare against; a negative
+    # count is a malformed report, not an empty histogram.
+    if b_n < 0 or c_n < 0:
+        out.append(f"{name}: negative e2e count ({b_n:.0f} baseline, {c_n:.0f} current)")
+        return
+    if b_n == 0:
         return
     if c_n <= 0:
         out.append(f"{name}: no e2e samples in the current run, the baseline had {b_n:.0f}")

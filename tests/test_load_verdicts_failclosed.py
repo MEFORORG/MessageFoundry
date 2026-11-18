@@ -347,6 +347,31 @@ def test_timeouts_and_negative_counters_are_flagged() -> None:
     assert any("dead letters: negative count" in r for r in reset), reset
 
 
+@pytest.mark.parametrize(
+    ("side", "count"),
+    [pytest.param("baseline", -5, id="baseline"), pytest.param("current", -5, id="current")],
+)
+def test_a_negative_e2e_count_is_flagged(side: str, count: int) -> None:
+    # A sample count below zero is a malformed report, not "the baseline measured nothing".
+    bad = _with(("phases", 1, "e2e_ms"), {"count": count, "p99": 0.0})
+    if side == "baseline":
+        regressions = compare_to_baseline(_load_report(), bad, tolerance=0.1)
+    else:
+        empty = _with(("phases", 1, "e2e_ms"), {"count": 0, "p99": 0.0})
+        regressions = compare_to_baseline(bad, empty, tolerance=0.1)
+    assert any("steady: negative e2e count" in r for r in regressions), regressions
+
+
+@pytest.mark.parametrize("side", ["baseline", "current"])
+def test_a_negative_sent_is_flagged_with_no_counters(side: str) -> None:
+    # Every counter is zero, so the per-sent rate check never runs; the negative sent must still
+    # be named rather than skipped.
+    bad = _with(("totals", "sent"), -10)
+    pair = (_load_report(), bad) if side == "baseline" else (bad, _load_report())
+    regressions = compare_to_baseline(pair[0], pair[1], tolerance=0.1)
+    assert any("sent: negative count" in r for r in regressions), regressions
+
+
 def test_a_phase_named_like_a_repeat_is_still_compared() -> None:
     report = {**_load_report(), "phases": [_phase("a"), _phase("a (2)"), _phase("a")]}
     assert compare_to_baseline(report, report, tolerance=0.1) == []
