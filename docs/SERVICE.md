@@ -1071,9 +1071,11 @@ alert.
 Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
 *and* outbounds — from the web console, or by restarting the service. Restarting an inbound the halt
 stopped also re-arms a router, transform or response lane of it that is STOPPED, for example one the
-infra-fault bound stopped while the log was down. Under the pooled claim mode only, a lane that
-still holds claimed rows whose return to the queue never landed stays STOPPED; a service restart recovers that one, because the engine
-returns its in-flight rows to the queue as it starts.
+infra-fault bound stopped while the log was down. Under the pooled claim mode only, a connection
+restart leaves STOPPED a lane that still holds claimed rows whose return to the queue never landed.
+A reload re-arms such a lane, and it would then claim past those rows; only a service restart
+returns them to the queue first, because the engine does that as it starts, so restart the service
+to recover it.
 **Fix the disk first — the restart is refused while the log is still unwritable.** The engine
 re-checks by writing a real record to each dead sink at the moment you ask, so a restart issued
 against a still-broken disk leaves the connection halted (and its listener down) and raises another

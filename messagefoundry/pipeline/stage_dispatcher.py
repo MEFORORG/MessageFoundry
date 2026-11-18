@@ -313,9 +313,11 @@ class _LaneState:
     # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
     # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
     claimer_deaths: int = 0
-    # BACKLOG #5704: the STOP that set this lane STOPPED left claimed rows whose re-pend did not
-    # land, so they are still in flight. Written by _to_stopped, read through
-    # StageDispatcher.stopped_holding_rows only while the lane is STOPPED.
+    # BACKLOG #5704: while the lane is STOPPED, whether the STOP that set it left claimed rows whose
+    # re-pend did not land, so they are still in flight. _to_stopped writes it on every STOP, and
+    # _run_lane's RETRY branch also writes it before _apply_retry, which passes it to a T17 STOP;
+    # so on a lane that is not STOPPED it can hold a stale value. Read only through
+    # StageDispatcher.stopped_holding_rows, which checks the phase.
     unlanded: bool = False
 
 

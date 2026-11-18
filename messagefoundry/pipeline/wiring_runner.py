@@ -4792,7 +4792,7 @@ class RegistryRunner:
         With no dispatcher yet (boot, as ``_start_outbound`` runs first), the owner's pause waits
         for :meth:`_replay_pooled_pauses`. The exception: a lane whose ownership check raises is
         paused here as if owned (:meth:`_owns_for_pause`), so this dispatcher may hold a lane
-        another shard owns, and the matching resume raises while the check keeps raising."""
+        another engine shard owns, and the matching resume raises while the check keeps raising."""
         if not self._owns_for_pause(name):
             self._mark_outbound_quiesced(name)
             return
@@ -6671,7 +6671,7 @@ class RegistryRunner:
         Scoped to the lanes this process owns (ADR 0073), because pausing another shard's lane would
         report a stop that did not happen — the same narrowest-honest-scope rule
         :meth:`_stop_all_for_log_failure` states at length. A lane whose ownership check raises is
-        paused too (:meth:`_owns_for_pause`), so it may be another shard's."""
+        paused too (:meth:`_owns_for_pause`), so it may be another engine shard's."""
         self._pause_delivery_lanes(
             [name for name in self.registry.outbound if self._owns_for_pause(name)]
         )
