@@ -193,9 +193,10 @@ def load_policy(path: Path) -> dict[str, Any]:
                 _key(entry)
             except PolicyError as exc:
                 raise PolicyError(f"the policy at {path} has a bad {key!r} entry: {exc}") from exc
-    # Every number below is read with int() by evaluate() and receipt_lines(), the second outside any
-    # handler, so a null or a string here crashed the run to exit 1 -- the FINDINGS code, which the CI
-    # canary loop reads as a detection (BACKLOG #5443). Checked here, it is could-not-measure.
+    # Every number below is read with int() by evaluate() and receipt_lines(). Both now run inside
+    # main's catch-all around _report, which turns a raise into exit 2; before that handler, a null or
+    # a string here crashed the run to exit 1 -- the FINDINGS code, which the CI canary loop reads as
+    # a detection (BACKLOG #5443). Checked here, the run refuses before the sweep and names the field.
     for key in ("floors", "canary_floors"):
         section = parsed[key]
         if not isinstance(section, dict):

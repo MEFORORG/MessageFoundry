@@ -15,6 +15,7 @@ thing that can change the exit code is the policy under test.
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Callable, Coroutine
 from pathlib import Path
@@ -227,3 +228,12 @@ def test_a_reporting_crash_still_writes_the_receipt(
     written = json.loads(out.read_text(encoding="utf-8"))
     assert written["verdict"] == "COULD NOT MEASURE (fail closed)"
     assert written["gated_http_rows"] == 99
+
+
+def test_load_policy_does_not_claim_its_readers_run_outside_a_handler() -> None:
+    """The comment on load_policy's number checks said receipt_lines ran outside any handler.
+    main's catch-all around _report covers it, as the reporting-crash tests above exercise, so the
+    comment must say so rather than give a reason that is no longer true."""
+    source = inspect.getsource(sweep.load_policy)
+    assert "outside any" not in source
+    assert "catch-all around _report" in source
