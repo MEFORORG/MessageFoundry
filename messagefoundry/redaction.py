@@ -71,6 +71,7 @@ import encodings.aliases
 import hashlib
 import json
 import logging
+import os
 import pkgutil
 import re
 import traceback
@@ -1309,20 +1310,27 @@ def _json_scalar(match: re.Match[str], policy: int, widened: bool) -> str:
     return f"{prefix}{quote}{_REDACTED}{closer}"
 
 
+class _MismatchedJsonCloser(Exception):
+    """Raised by :func:`_scrub_json_value` on a closer of another kind than the open container's, and
+    caught only by :func:`redact` (BACKLOG #5814)."""
+
+
 def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[str, int]:
     """``(replacement, end)`` for the JSON value starting at ``pos``, scrubbed under ``policy``.
 
     An explicit stack rather than recursion, because the nesting depth is the peer's choice. The walk
     visits each character once. A structure that never closes runs to the end of the text, so a cut
-    inside it strands nothing (the fail-closed rule on the section comment above).
+    inside it strands nothing (the fail-closed rule on the section comment above). A container ends
+    only on its own closer; a closer of another kind raises :class:`_MismatchedJsonCloser`.
 
     **Object KEYS are always kept**, which is what keeps the output legible, so a structure that uses
     PHI as its keys (``{"name": {"DOE": 1}}``) is a residual. A bare token straight before ``(`` is a
     callable's name (``date(``, ``frozenset(``) and is kept too; its arguments are the value."""
     out: list[str] = []
-    #: One frame per open container: ``(is_object, policy)``. An object's policy is LEAF or INHERIT
-    #: (searched); an array's or a call's is the policy its elements take.
-    frames: list[tuple[bool, int]] = []
+    #: One frame per open container: ``(is_object, policy, closer)``. An object's policy is LEAF or
+    #: INHERIT (searched); an array's or a call's is the policy its elements take. ``closer`` is the
+    #: one delimiter that ends the frame.
+    frames: list[tuple[bool, int, str]] = []
     pending = policy
     n = len(text)
     while pos < n:
@@ -1344,12 +1352,15 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
             out.append(token)
             if punct == "{":
                 leaf = pending in (_LEAF, _STRUCTURE_ONLY)
-                frames.append((True, _LEAF if leaf else _INHERIT))
+                frames.append((True, _LEAF if leaf else _INHERIT, "}"))
                 pending = frames[-1][1]
             elif punct in "[(":
-                frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending))
+                closer = "]" if punct == "[" else ")"
+                frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending, closer))
                 pending = frames[-1][1]
             elif punct in "}])":
+                if punct != frames[-1][2]:
+                    raise _MismatchedJsonCloser
                 frames.pop()
                 if not frames:
                     return "".join(out), pos
@@ -1952,7 +1963,20 @@ def redact(text: str) -> str:
     call can scrub what the first kept, but only while the key is still there. A run that took a
     key glued to its token left that value in view on the second call, where the stages alone scrub
     it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
-    and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels."""
+    and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
+
+    **A JSON value with a mismatched closer makes the whole text redacted (BACKLOG #5814)**: the
+    result is the placeholder alone. The JSON pass reads what the passes before it left, so this
+    holds for a closer that pass still sees as mismatched."""
+    try:
+        return _redact_unguarded(text)
+    except _MismatchedJsonCloser:
+        return _REDACTED
+
+
+def _redact_unguarded(text: str) -> str:
+    """:func:`redact` without its mismatched-closer rule, which raises :class:`_MismatchedJsonCloser`
+    out of here."""
     out = _redact_stages(text)
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
@@ -2624,8 +2648,11 @@ def safe_exc(
     (BACKLOG #1748), so swapping :func:`safe_name` in has to happen where the name is known. Without
     it, routing a file source's error arm through this function would keep the OS diagnostic and leak
     the name anyway: a control that reports success while the hole stays open. The basename is
-    replaced wherever it appears, so a full path is covered; the directory part is operator
-    configuration, not partner-chosen, and stays.
+    replaced as written and in at least the forms one level of ``repr()``, ``ascii()``, a bytes
+    ``repr()`` or a JSON string renders it as (:func:`_name_forms`), so a full path is
+    covered; the directory part is operator configuration, not partner-chosen, and stays. A name
+    escaped twice, as ``repr(str(oserror))`` renders it, or encoded any other way, is NOT replaced,
+    and only :func:`safe_text`'s patterns stand between it and the output.
 
     A ``UnicodeError`` never reaches :func:`redact` as text (vault BACKLOG #3033). Its ``str()`` quotes
     the character or byte it failed on, which is a character of the message, and no pattern can tell
@@ -2646,9 +2673,49 @@ def safe_exc(
         return f"{name}: {_HOLDER_TEXT}"
     raw = str(exc)
     if file_name and (base := _basename(file_name)):
-        raw = raw.replace(base, safe_name(file_name))
+        label = safe_name(file_name)
+        # An OSError quotes its path with repr(), so a name holding a control, a non-printable or a
+        # quote character appears escaped and the raw name alone matches nothing (BACKLOG #5815).
+        for form in _name_forms(base):
+            raw = raw.replace(form, label)
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
+
+
+def _name_forms(text: str) -> list[str]:
+    """``text`` and the bodies one level of ``repr()``, ``ascii()``, a bytes ``repr()`` or a JSON
+    string can render it as inside a longer quoted string, longest first, so a form never shadows a
+    longer one it is a prefix of. Every form but ``text`` holds a backslash, so none is a substring
+    of a :func:`safe_name` label.
+
+    repr picks its quote from the WHOLE string, a path whose directory the name does not decide: it
+    quotes with ``'`` and escapes it, unless the string holds ``'`` and no ``"``, when it quotes with
+    ``"`` and escapes neither. Appending ``"`` forces the first choice, so both forms are read off the
+    interpreter itself rather than reimplemented. The bytes come from each encoding a path can take:
+    the filesystem encoding, and UTF-8 with either surrogate handler, since Windows passes a lone
+    surrogate through and POSIX escapes it. One a name cannot be encoded in is skipped, never raised:
+    this runs on an error arm, and a lone surrogate is a name a partner can choose."""
+    forms = {
+        text,
+        repr(text)[1:-1],
+        repr(text + '"')[1:-2],
+        ascii(text)[1:-1],
+        ascii(text + '"')[1:-2],
+        json.dumps(text)[1:-1],
+        json.dumps(text, ensure_ascii=False)[1:-1],
+    }
+    encoders: list[Callable[[str], bytes]] = [
+        os.fsencode,
+        lambda s: s.encode("utf-8", "surrogatepass"),
+        lambda s: s.encode("utf-8", "surrogateescape"),
+    ]
+    for encode in encoders:
+        try:
+            encoded = encode(text)
+        except UnicodeEncodeError:
+            continue
+        forms.update((repr(encoded)[2:-1], repr(encoded + b'"')[2:-2]))
+    return sorted(forms, key=lambda form: (-len(form), form))
 
 
 #: ``encodings`` modules that are no text codec: the alias table, the bytes-to-bytes and str-to-str
