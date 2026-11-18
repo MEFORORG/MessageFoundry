@@ -865,7 +865,6 @@ async def test_a_refused_read_after_the_session_cap_loses_neither_its_row_nor_th
     ``closed`` is the bare ``ValueError`` aiosqlite raises for a closed connection, which the
     session-write set does not take."""
     import json
-    import sqlite3
 
     store = await MessageStore.open(":memory:")
     try:

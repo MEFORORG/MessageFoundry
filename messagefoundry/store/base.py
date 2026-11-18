@@ -2558,8 +2558,8 @@ class AuthStore(Protocol):
         ...
 
     async def list_users(self) -> Sequence[UserRecord]:
-        """Every account but one whose row does not parse and whose id cell is empty or not text,
-        which is left out. Any other whose row does not parse
+        """Every account except each one whose row does not parse and whose id cell is empty or not
+        text, which is left out. Any other whose row does not parse
         (:func:`~messagefoundry.store.store.listed_users` says which) is listed as
         :meth:`~messagefoundry.store.store.UserRecord.unreadable_row`, whose fields other than the
         id are invented (BACKLOG #5505); the single-row user readers raise
