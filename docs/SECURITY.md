@@ -4716,12 +4716,16 @@ unconditional dedicated rows (`message_view`, `message_search`) regardless, and 
 stored preset while loading it, naming the preset id, the status and the error class (BACKLOG
 #5523). The write is best effort: a failed write does not change the answer, and it is logged at
 ERROR at most once per hour per preset, cause and failure class, so later failures in that window
-leave no row and no log line. A refusal of the composed layers writes no such row. A refusal row has `refused` in its detail,
-which tells it from a search that ran. A NULL, empty or non-text criteria cell is refused by the
-store itself, which logs a WARNING and writes the `integrity.preset_tag_failed` row on every store,
-and on a keyed store raises the `integrity_drift` alert, as for a moved preset. Each of the three
-fires once per row and refusal class per hour, not once per refusal. A keyless store's cipher has
-no alert hook.
+leave no row and no log line. A refusal of the composed layers writes no such row. A refusal row
+has `refused` in its detail, which tells it from a search that ran. A NULL, empty or non-text
+criteria cell is refused by the store itself, which logs a WARNING and writes the
+`integrity.preset_tag_failed` row on every store, and on a keyed store raises the
+`integrity_drift` alert, as for a moved preset. The WARNING and the alert fire once per row and
+refusal class per hour. The row is written once per row and refusal class per hour too, but that
+hour starts only when a write succeeds, so a failed write is tried again at the next refusal.
+Every once-per-hour limit in this paragraph is held in memory by each engine process, so N engine
+shards can each log, alert and write once in the same hour, and a restart starts every window
+afresh.
 
 **Roles and visibility.** `messages:view_raw` is **not** a superset of `messages:view_summary` —
 `Identity.has()` is a flat membership check. The built-in roles happen to grant them nested
