@@ -1707,7 +1707,12 @@ def _bool_settings() -> _BoolSettings:
     defaults: dict[str, set[object]] = {}
     other_names: set[str] = set()
     factories: set[str] = set()
-    for obj in globals().values():
+    # A copy, so a global bound or removed mid-scan cannot raise "dictionary changed size during
+    # iteration". Writers include at least another thread, a test patch, and a warning attributed to
+    # a frame of this module, which adds __warningregistry__ here even when the warning is ignored.
+    # list(), not tuple(): on a free-threaded build only list() copies a dict view under the dict's
+    # lock; on a GIL build both are one uninterrupted copy.
+    for obj in list(globals().values()):
         if not inspect.isfunction(obj) or obj.__module__ != __name__:
             continue
         if (
