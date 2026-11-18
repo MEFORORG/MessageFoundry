@@ -87,7 +87,9 @@ _DIRECTORY_GONE_ERRNOS = frozenset(
 
 #: Windows error codes that say the same of a network share: ``ERROR_NETNAME_DELETED`` (64) and
 #: ``ERROR_UNEXP_NET_ERR`` (59). Python maps both to ``EINVAL``, so ``errno`` alone cannot tell
-#: them from one bad argument; ``winerror`` can.
+#: them from one bad argument, and only an exception that carries ``winerror`` can. One raised by
+#: ``open()`` or ``readline()`` does not, so on the read path :meth:`LogSpool.peek` probes the
+#: directory with ``stat`` instead.
 _DIRECTORY_GONE_WINERRORS = frozenset({64, 59})
 
 #: Whether this is Windows, where only ``ERROR_FILE_NOT_FOUND`` (2) on a segment's own ``lstat``
@@ -107,6 +109,15 @@ def _directory_unreachable(exc: OSError) -> bool:
         or exc.errno in _DIRECTORY_GONE_ERRNOS
         or getattr(exc, "winerror", None) in _DIRECTORY_GONE_WINERRORS
     )
+
+
+def _not_found_confirms(exc: FileNotFoundError) -> bool:
+    """Whether a ``FileNotFoundError`` from a segment's own ``lstat`` or ``stat`` confirms its
+    file gone. On Windows only ``winerror`` 2 does. On POSIX it is always ENOENT, which cannot
+    tell a gone file from a directory gone: the caller checks the directory after this."""
+    if _WINDOWS:
+        return getattr(exc, "winerror", None) == _WINERROR_FILE_NOT_FOUND
+    return True
 
 
 _SEGMENT_PREFIX = "spool-"
@@ -508,14 +519,22 @@ class LogSpool:
 
     def _segment_confirmed_missing(self, seq: int) -> bool:
         """Whether segment ``seq``'s own file is confirmed gone: its ``lstat`` raises
-        ``FileNotFoundError``, and on Windows with ``winerror`` 2 only. Any other answer,
+        ``FileNotFoundError``, or it is a symlink whose ``stat`` does (a dangling link, which
+        ``open()`` can never read). On Windows only ``winerror`` 2 confirms. Any other answer,
         including another ``OSError``, is not a confirmation."""
+        path = self._path(seq)
         try:
-            self._path(seq).lstat()
+            mode = path.lstat().st_mode
         except FileNotFoundError as exc:
-            if _WINDOWS:
-                return getattr(exc, "winerror", None) == _WINERROR_FILE_NOT_FOUND
-            return not _directory_unreachable(exc)
+            return _not_found_confirms(exc)
+        except OSError:
+            return False
+        if not stat.S_ISLNK(mode):
+            return False
+        try:
+            path.stat()
+        except FileNotFoundError as exc:
+            return _not_found_confirms(exc)
         except OSError:
             return False
         return False

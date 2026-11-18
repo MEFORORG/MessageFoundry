@@ -16,6 +16,7 @@ import os
 import queue
 import socket
 import ssl
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -958,6 +959,57 @@ def test_on_windows_winerror_2_does_confirm_a_segment_gone(
             assert spool.append(_entry(n))
         _peek_with_segment_lstat_raising(spool, monkeypatch, _windows_not_found(2))
         assert spool.unreadable >= 1 and spool.read_errors == 0
+    finally:
+        spool.close()
+
+
+def test_a_segment_that_is_a_dangling_symlink_is_retired_not_wedged(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A head segment whose path is a dangling symlink (lstat shows a link, stat says not found)
+    can never be opened, so it counts as gone: it is retired, not unlinked, and the read moves on,
+    as main retired it. NEGATIVE CONTROL: on 5dc6d1b359 lstat succeeded, nothing was confirmed and
+    every peek returned None."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        assert len(segments) >= 2
+        head_seq = spool._segments[0]
+        lost = [json.loads(line)["line"] for line in segments[0].read_bytes().splitlines()]
+        real_open, real_path, real_unlink = spool._open_reader, spool._path, spool._unlink
+        unlinked: list[int] = []
+
+        class _DanglingLink:
+            def lstat(self) -> os.stat_result:
+                return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
+            def stat(self) -> None:
+                raise _windows_not_found(2)
+
+        def open_reader(seq: int) -> None:
+            if seq == head_seq:
+                raise _windows_not_found(2)
+            real_open(seq)
+
+        def path_for(seq: int) -> Any:
+            return _DanglingLink() if seq == head_seq else real_path(seq)
+
+        def record_unlink(seq: int) -> bool:
+            unlinked.append(seq)
+            return real_unlink(seq)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(spool, "_open_reader", open_reader)
+            patch.setattr(spool, "_path", path_for)
+            patch.setattr(spool, "_unlink", record_unlink)
+            entry = spool.peek()
+            assert entry is not None and entry.line not in lost
+            assert spool.unreadable == 1 and spool.read_errors == 0
+            assert head_seq not in unlinked
+        assert segments[0].exists()  # never unlinked
     finally:
         spool.close()
 
