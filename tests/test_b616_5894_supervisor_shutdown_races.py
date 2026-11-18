@@ -29,12 +29,14 @@ class _Proc:
         exit_on_terminate: bool = False,
         exit_on_kill: bool = True,
         terminate_error: BaseException | None = None,
+        kill_error: BaseException | None = None,
     ) -> None:
         self.returncode: int | None = None
         self._exited = asyncio.Event()
         self._exit_on_terminate = exit_on_terminate
         self._exit_on_kill = exit_on_kill
         self._terminate_error = terminate_error
+        self._kill_error = kill_error
         self.terminated = asyncio.Event()
         self.waiting = asyncio.Event()
         self.killed = False
@@ -59,6 +61,8 @@ class _Proc:
 
     def kill(self) -> None:
         self.killed = True
+        if self._kill_error is not None:
+            raise self._kill_error
         if self._exit_on_kill:
             self._finish(-9)
 
@@ -134,25 +138,45 @@ async def test_cancel_during_a_stop_drain_still_forces_the_child_then_raises() -
 
 
 @pytest.mark.asyncio
-async def test_a_failed_drain_is_raised_not_swallowed() -> None:
-    # A terminate() that raises (Windows can refuse one) aborts the drain. That failure must reach
-    # the caller, not end as a clean shutdown with a child still running.
+async def test_a_failed_drain_is_raised_and_still_stops_the_siblings() -> None:
+    # Engine shard "a" refuses both the stop request and the kill (Windows can refuse either). That
+    # must reach the caller, not end as a clean shutdown, and must not stop "b" being drained.
+    a = _Proc(terminate_error=PermissionError("refused"), kill_error=PermissionError("refused"))
+    b = _Proc(exit_on_terminate=True)
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        return a if spec.shard == "a" else b
+
+    sup = Supervisor([_spec("a"), _spec("b", 1)], spawn=_spawner(spawn), terminate_grace=0.2)
+    runner = asyncio.create_task(sup.run())
+    await asyncio.wait_for(a.waiting.wait(), 5)
+    await asyncio.wait_for(b.waiting.wait(), 5)
+    sup.stop()
+    with pytest.raises(PermissionError):
+        await asyncio.wait_for(runner, 5)
+    assert b.terminated.is_set()
+    assert b.returncode == -15
+
+
+@pytest.mark.asyncio
+async def test_a_refused_stop_request_falls_through_to_the_kill() -> None:
     proc = _Proc(terminate_error=PermissionError("refused"))
 
     async def spawn(spec: ShardSpec) -> _Proc:
         return proc
 
-    sup = Supervisor([_spec("default")], spawn=_spawner(spawn), terminate_grace=0.2)
+    sup = Supervisor([_spec("default")], spawn=_spawner(spawn), terminate_grace=0.1)
     runner = asyncio.create_task(sup.run())
     await asyncio.wait_for(proc.waiting.wait(), 5)
     sup.stop()
-    with pytest.raises(PermissionError):
-        await asyncio.wait_for(runner, 5)
+    await asyncio.wait_for(runner, 5)
+    assert proc.killed
+    assert proc.returncode == -9
 
 
 @pytest.mark.asyncio
 async def test_a_cancel_during_the_drain_after_a_watcher_failed_raises_cancelled() -> None:
-    # restart=False: shard "b"'s launch raises, so run() drains shard "a". A shutdown signal during
+    # restart=False: engine shard "b"'s launch raises, so run() drains "a". A shutdown signal during
     # that drain is still owed to the caller, which treats CancelledError as a shutdown.
     proc = _Proc()
 
@@ -176,6 +200,7 @@ async def test_a_cancel_during_the_drain_after_a_watcher_failed_raises_cancelled
 
 @pytest.mark.asyncio
 async def test_a_child_that_outlives_the_kill_does_not_hang_the_drain() -> None:
+    # The drain gives up on it after the grace, and says so rather than ending as a clean shutdown.
     proc = _Proc(exit_on_kill=False)
 
     async def spawn(spec: ShardSpec) -> _Proc:
@@ -185,6 +210,34 @@ async def test_a_child_that_outlives_the_kill_does_not_hang_the_drain() -> None:
     runner = asyncio.create_task(sup.run())
     await asyncio.wait_for(proc.waiting.wait(), 5)
     sup.stop()
-    await asyncio.wait_for(runner, 5)
+    with pytest.raises(RuntimeError, match="still running"):
+        await asyncio.wait_for(runner, 5)
     assert proc.killed
     assert proc.returncode is None
+
+
+@pytest.mark.asyncio
+async def test_a_fatal_watcher_exit_is_not_replaced_by_a_cancel_during_the_drain() -> None:
+    class _Fatal(BaseException):
+        pass
+
+    proc = _Proc()
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        if spec.shard == "b":
+            await proc.waiting.wait()
+            raise _Fatal
+        return proc
+
+    sup = Supervisor([_spec("a"), _spec("b", 1)], spawn=_spawner(spawn), terminate_grace=0.2)
+    runner = asyncio.create_task(sup.run())
+    await asyncio.wait_for(proc.terminated.wait(), 5)
+    runner.cancel()
+    with pytest.raises(_Fatal):
+        await asyncio.wait_for(runner, 5)
+    assert proc.killed
+
+
+def test_a_non_finite_terminate_grace_is_refused() -> None:
+    with pytest.raises(ValueError, match="terminate_grace"):
+        Supervisor([_spec("default")], terminate_grace=float("inf"))
