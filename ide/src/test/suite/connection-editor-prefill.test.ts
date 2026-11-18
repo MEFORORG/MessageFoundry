@@ -675,6 +675,36 @@ suite("connection editor: create mode shows the transport whose fields are drawn
     assert.strictEqual(p.window.document.getElementById("direction").value, "outbound");
   });
 
+  test("create: a save writes no checkbox left at its default, and a typed table as a table (BACKLOG #5976)", () => {
+    // BACKLOG #5976 claimed a create save wrote every checkbox default into connections.toml and
+    // posted a table as a string. Neither holds; this pins both on the create path, where no
+    // recorded value can mask the default rule.
+    const p = load({
+      initial: null,
+      groups: buildForm(SCHEMA, "mllp", "outbound", {}),
+      fieldGroupsFor: { transport: "mllp", direction: "outbound" },
+    });
+    const doc = p.window.document;
+    doc.getElementById("name").value = "OB_SYNTH_CREATE";
+    doc.querySelector('#settings [data-key="headers"]').value = '{"X-Feed":"adt"}';
+    doc.getElementById("save").click();
+    const save = p.posted.filter((m) => m.command === "save");
+    assert.strictEqual(save.length, 1);
+    const settings = JSON.parse(JSON.stringify(save[0].conn.settings)) as Payload;
+    assert.deepStrictEqual(settings, { headers: { "X-Feed": "adt" } });
+    // A checkbox moved off its default is written.
+    const q = load({
+      initial: null,
+      groups: buildForm(SCHEMA, "mllp", "outbound", {}),
+      fieldGroupsFor: { transport: "mllp", direction: "outbound" },
+    });
+    q.window.document.getElementById("name").value = "OB_SYNTH_CREATE";
+    q.window.document.querySelector('#settings [data-key="verify"]').checked = false;
+    q.window.document.getElementById("save").click();
+    const qs = q.posted.filter((m) => m.command === "save");
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(qs[0].conn.settings)), { verify: false });
+  });
+
   test("no create path leaves the settings area empty", () => {
     const cases: Array<[string, Parameters<typeof load>[0]]> = [
       ["fields for a listed transport", {
