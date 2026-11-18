@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.17.4"
+$GateVersion = "2026.11.17.5"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -826,12 +826,11 @@ function Get-ScanRawIndexMap($Seg) {
 # chdirs, a relative chdir after an earlier line's) where the invocation's `-C` does not make that
 # directory irrelevant -- an absolute `-C` is read past such a chdir, under the conditions in
 # Get-InvocationReading and the resolver's -OwnWindow branch; git options after the verb; and a git
-# word the token pattern misses (`git.EXE reset --hard`, or `GIT` on Windows), unless an earlier
-# command on the line both matches that pattern and carries a verb (`git -C <o> stash list ; git.EXE
-# reset --hard` from the primary is refused). That gap is origin/main's too. Also, at least: any line
-# after an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
-# nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
-# dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the PowerShell tool
+# word the token pattern misses (`git.EXE reset --hard`, or `GIT` on Windows): a command whose git is
+# spelled that way is allowed unless another reading happens to refuse it, origin/main's gap too, and
+# no rule here states when one does. Also, at least: any line after an earlier line whose chdir sits
+# in parentheses, which makes the earlier-line reading answer nothing, unless the invocation's `-C`
+# fold ends absolute and its window names no work tree or git dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the PowerShell tool
 # `(Set-Location <p>)` DOES move the shell, so `(Set-Location <p>)` then `git -C . reset --hard` is
 # allowed (fail-open, f0e49f45c5c has it too).
 # And after such a line, a `-C` window that also names a work tree or git dir is not read: git roots a
