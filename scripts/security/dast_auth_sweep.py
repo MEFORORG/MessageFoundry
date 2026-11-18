@@ -187,7 +187,36 @@ def load_policy(path: Path) -> dict[str, Any]:
             raise PolicyError(
                 f"the policy at {path} has {key!r} as {type(parsed[key]).__name__}, not a list"
             )
+        for entry in parsed[key]:
+            try:
+                _key(entry)
+            except PolicyError as exc:
+                raise PolicyError(f"the policy at {path} has a bad {key!r} entry: {exc}") from exc
+    # Every number below is read with int() by evaluate() and receipt_lines(), the second outside any
+    # handler, so a null or a string here crashed the run to exit 1 -- the FINDINGS code, which the CI
+    # canary loop reads as a detection (BACKLOG #5443). Checked here, it is could-not-measure.
+    for key in ("floors", "canary_floors"):
+        section = parsed[key]
+        if not isinstance(section, dict):
+            raise PolicyError(
+                f"the policy at {path} has {key!r} as {type(section).__name__}, not an object"
+            )
+        for name, value in section.items():
+            if not _is_count(value):
+                raise PolicyError(
+                    f"the policy at {path} has {key}.{name} as {value!r}, not a whole number >= 0"
+                )
+    for key in ("max_unexplained_unreached", "max_write_session_rebuilds"):
+        if key in parsed and not _is_count(parsed[key]):
+            raise PolicyError(
+                f"the policy at {path} has {key!r} as {parsed[key]!r}, not a whole number >= 0"
+            )
     return parsed
+
+
+def _is_count(value: object) -> bool:
+    """A floor or cap: an int, not a bool (``True`` is an int to Python), and not negative."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _key(entry: object) -> tuple[str, str]:
@@ -1120,6 +1149,36 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    try:
+        code, errors = _report(receipt, policy, args.canary, args.summary)
+    except Exception as exc:  # noqa: BLE001 - deliberate catch-all; see below
+        # The same reason as the sweep's catch-all above (BACKLOG #5443): load_policy checks the
+        # policy's shape, but whatever still raises while judging or reporting the receipt must exit 2,
+        # not CPython's 1, which the canary loop would read as a detection.
+        print(
+            f"::error::{_PREFIX}: judging or reporting the sweep failed "
+            f"({type(exc).__name__}: {exc}). Refusing to report a result (fail closed).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.receipt is not None:
+        try:
+            args.receipt.write_text(
+                json.dumps(receipt, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            print(f"::error::{_PREFIX}: could not write {args.receipt}: {exc}", file=sys.stderr)
+            return 2
+
+    return code
+
+
+def _report(
+    receipt: dict[str, Any], policy: dict[str, Any], canary: str | None, summary: Path | None
+) -> tuple[int, list[str]]:
+    """Judge ``receipt``, record the verdict and floors in it, and emit the receipt lines and the
+    annotations. ``main`` runs it under one handler, so nothing here can exit 1 by raising."""
     code, errors = evaluate(receipt, policy)
     verdict = {0: "PASS", 1: "FINDINGS", 2: "COULD NOT MEASURE (fail closed)"}[code]
     receipt["verdict"] = verdict
@@ -1141,22 +1200,12 @@ def main(argv: list[str] | None = None) -> int:
         "observed": receipt["unreached_unexplained"],
     }
 
-    _emit(receipt_lines(receipt, policy, verdict), args.summary)
+    _emit(receipt_lines(receipt, policy, verdict), summary)
 
-    level = annotation_level(canary=args.canary, code=code)
+    level = annotation_level(canary=canary, code=code)
     for error in errors:
         print(f"::{level}::{_PREFIX}: {error}", file=sys.stderr)
-
-    if args.receipt is not None:
-        try:
-            args.receipt.write_text(
-                json.dumps(receipt, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-            )
-        except OSError as exc:
-            print(f"::error::{_PREFIX}: could not write {args.receipt}: {exc}", file=sys.stderr)
-            return 2
-
-    return code
+    return code, errors
 
 
 if __name__ == "__main__":
