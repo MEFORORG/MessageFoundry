@@ -128,6 +128,10 @@ assert "direction" not in _SCALAR_FIELDS + _SUB_TABLES
 
 Validate = Callable[[Path], None]
 
+#: The phrase :func:`remove_connection` refuses a name held by both an inbound and an outbound with,
+#: so the CLI can add its own flag to the advice without the library naming one.
+SHARED_NAME_REFUSAL = "is both an inbound and an outbound"
+
 
 @contextlib.contextmanager
 def locked(config_dir: str | Path) -> Iterator[None]:
@@ -240,10 +244,13 @@ def remove_connection(
     """Remove the data-authored connection ``name``. Raises :class:`WiringError` if it isn't in
     ``connections.toml`` (a code-first connection can't be removed here).
 
-    An inbound and an outbound may share a name (:func:`~messagefoundry.config.wiring.case_twins`),
-    so ``direction`` says which one to remove. Without it, a name held in both directions is refused
+    An inbound and an outbound may share a name, since the :class:`~messagefoundry.config.wiring.
+    Registry` keeps inbounds and outbounds in separate tables, so ``direction`` says which one to
+    remove. Without it, a name held in both directions is refused (:data:`SHARED_NAME_REFUSAL`)
     rather than resolved to the first match, which removed the inbound when the outbound was meant
-    (BACKLOG #5898)."""
+    (BACKLOG #5898). Within one direction the first match is removed, as before."""
+    if direction not in (None, "inbound", "outbound"):
+        raise WiringError(f"direction must be 'inbound' or 'outbound', not {direction!r}")
     path = _path(config_dir)
     if not atomic_edit.is_file(path, refused_error=WiringError):
         raise WiringError(f"no {CONNECTIONS_FILE_NAME} in {config_dir}")
@@ -251,34 +258,35 @@ def remove_connection(
         text, crlf = atomic_edit.read_text(path, refused_error=WiringError)
         doc = tomlkit.parse(text)
 
-        matches = [
-            (where, aot, index)
-            for where in ("inbound", "outbound")
-            if (aot := doc.get(where)) is not None
-            for index in range(len(aot))
-            if aot[index].get("name") == name
-        ]
-        held = [where for where, _aot, _index in matches]
-        if direction is not None:
-            if held and direction not in held:
-                raise WiringError(
-                    f"{direction} connection {name!r} is not in {CONNECTIONS_FILE_NAME}; "
-                    f"it holds {name!r} only as an {held[0]} (nothing was removed)"
-                )
-            matches = [match for match in matches if match[0] == direction]
-        if not matches:
+        # Each direction whose array holds the name, with the index of its first match.
+        held: dict[str, tuple[Any, int]] = {}
+        for where in ("inbound", "outbound"):
+            tables = doc.get(where)
+            if tables is None:
+                continue
+            for index in range(len(tables)):
+                if tables[index].get("name") == name:
+                    held[where] = (tables, index)
+                    break
+        if direction is not None and held and direction not in held:
+            (other,) = held
+            raise WiringError(
+                f"{direction} connection {name!r} is not in {CONNECTIONS_FILE_NAME}; "
+                f"it holds {name!r} only as an {other} (nothing was removed)"
+            )
+        if direction is None and len(held) > 1:
+            raise WiringError(
+                f"connection {name!r} {SHARED_NAME_REFUSAL} in {CONNECTIONS_FILE_NAME}; name the "
+                "direction to remove (nothing was removed)"
+            )
+        removed_direction = direction if direction is not None else next(iter(held), None)
+        if removed_direction is None or removed_direction not in held:
             raise WiringError(
                 f"connection {name!r} is not in {CONNECTIONS_FILE_NAME} "
                 "(a code-authored connection can't be removed here)"
             )
-        if len(matches) > 1:
-            raise WiringError(
-                f"connection {name!r} is both an inbound and an outbound in "
-                f"{CONNECTIONS_FILE_NAME}; name the direction to remove, with --direction inbound "
-                "or --direction outbound on the CLI (nothing was removed)"
-            )
-        removed_direction, aot, index = matches[0]
-        del aot[index]
+        tables, index = held[removed_direction]
+        del tables[index]
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "remove", "direction": removed_direction, "name": name}

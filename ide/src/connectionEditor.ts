@@ -8,7 +8,13 @@
 import * as vscode from "vscode";
 import { configDir, writerConfigTarget, runJson, workspaceDir } from "./cli";
 import { type ConnObj, type Direction, nameCollisionError, planSave } from "./connectionMerge";
-import { connectionRemoveArgs, connectionUpsertArgs, removalDirection } from "./connectionWizardModel";
+import {
+  connectionRemoveArgs,
+  connectionUpsertArgs,
+  removalDirection,
+  removeConfirmText,
+  sharedNameRemovalError,
+} from "./connectionWizardModel";
 import { type FieldGroup, buildForm } from "./connectionForm";
 import { connectionSchema } from "./connectionSchema";
 import { STARTUP_BANNERS, openChannel, postToSameRender, postToWebview, requestToken } from "./webviewMessaging";
@@ -127,6 +133,10 @@ export async function openConnectionEditor(
       if (m?.command === "save" && m.conn) {
         await save(m.conn, current, { editName: opts.editName, cloneFrom: opts.cloneFrom }, opts.onSaved);
       } else if (m?.command === "delete" && m.name) {
+        if (deleteDirection === undefined) {
+          postToWebview(current.webview, { command: "error", message: sharedNameRemovalError(m.name) });
+          return;
+        }
         await remove(m.name, deleteDirection, current, opts.onSaved);
       } else if (m?.command === "cancel") {
         current.dispose();
@@ -223,7 +233,7 @@ async function save(
 
 async function remove(
   name: string,
-  direction: Direction | undefined,
+  direction: Direction,
   current: vscode.WebviewPanel,
   onSaved?: () => void,
 ): Promise<void> {
@@ -236,7 +246,7 @@ async function remove(
     return;
   }
   const confirm = await vscode.window.showWarningMessage(
-    `Remove ${direction === undefined ? "" : `${direction} `}connection "${name}" from connections.toml?`,
+    removeConfirmText(name, direction),
     { modal: true },
     "Remove",
   );

@@ -13,7 +13,9 @@ import {
   connectionUpsertArgs,
   planWizardSave,
   removalDirection,
+  removeConfirmText,
   settingIsSet,
+  sharedNameRemovalError,
   settingKeysFor,
   shouldSaveConnection,
   validateName,
@@ -362,7 +364,7 @@ suite("connection writers — every upsert and remove names the service settings
 
 suite("connectionWizardModel — remove argv", () => {
   test("matches `connection remove --config <dir> --service-config <toml> --name <name>` (runJson appends --json)", () => {
-    const args = connectionRemoveArgs("samples/config", "env/prod.toml", "OB_ACME_ADT");
+    const args = connectionRemoveArgs("samples/config", "env/prod.toml", "OB_ACME_ADT", "outbound");
     assert.deepStrictEqual(args, [
       "connection",
       "remove",
@@ -372,13 +374,15 @@ suite("connectionWizardModel — remove argv", () => {
       "env/prod.toml",
       "--name",
       "OB_ACME_ADT",
+      "--direction",
+      "outbound",
     ]);
     assert.ok(!args.includes("--json"));
   });
 
-  test("names the direction when given, since an inbound and an outbound may share a name (BACKLOG #5898)", () => {
-    const args = connectionRemoveArgs("samples/config", undefined, "X", "outbound");
-    assert.deepStrictEqual(args, ["connection", "remove", "--config", "samples/config", "--name", "X", "--direction", "outbound"]);
+  test("the confirmation and the shared-name refusal name the connection (BACKLOG #5898)", () => {
+    assert.strictEqual(removeConfirmText("X", "outbound"), 'Remove outbound connection "X" from connections.toml?');
+    assert.ok(sharedNameRemovalError("X").includes("--name X --direction inbound|outbound"));
   });
 
   test("removalDirection names the direction only when one connection holds the name (BACKLOG #5898)", () => {

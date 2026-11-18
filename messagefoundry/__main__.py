@@ -13468,6 +13468,8 @@ def _connection(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
     except WiringError as exc:
         message = str(exc)
+        if connections_edit.SHARED_NAME_REFUSAL in message:
+            message += ": pass --direction inbound or --direction outbound"
         # At least these three refusals say which settings file the edit was checked against and
         # what to change there: the deny default's unlisted outbound (vault BACKLOG #2605), the
         # keep-forever retention refusal (vault BACKLOG #2368) and the exposure refusal. They say it

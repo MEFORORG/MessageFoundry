@@ -18,7 +18,13 @@ import { configDir, writerConfigTarget, runJson, workspaceDir, writerPathSetting
 import { postToSameRender, postToWebview, requestToken } from "./webviewMessaging";
 import { connectionFormHtml, formSchemaFor } from "./connectionEditor";
 import { type ConnObj, type Direction, nameCollisionError, planSave } from "./connectionMerge";
-import { connectionRemoveArgs, connectionUpsertArgs, removalDirection } from "./connectionWizardModel";
+import {
+  connectionRemoveArgs,
+  connectionUpsertArgs,
+  removalDirection,
+  removeConfirmText,
+  sharedNameRemovalError,
+} from "./connectionWizardModel";
 import { Detail, codeSetFormHtml } from "./codeSetEditor";
 import {
   ConnectionListItem,
@@ -238,11 +244,18 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           if (target === undefined) {
             return;
           }
-          // The direction of the connection the form is showing, when the name says which one it
-          // is: an inbound and an outbound may share a name (BACKLOG #5898; removalDirection).
-          const direction = m.name === renderedName ? renderedDirection : undefined;
+          if (m.name !== renderedName) {
+            return; // posted by a page a re-render has since replaced; it names no form shown now
+          }
+          // An inbound and an outbound may share a name, and the form cannot say which it shows
+          // (BACKLOG #5898; removalDirection).
+          const direction = renderedDirection;
+          if (direction === undefined) {
+            postToWebview(panel.webview, { command: "error", message: sharedNameRemovalError(m.name) });
+            return;
+          }
           const confirm = await vscode.window.showWarningMessage(
-            `Remove ${direction === undefined ? "" : `${direction} `}connection "${m.name}" from connections.toml?`,
+            removeConfirmText(m.name, direction),
             { modal: true },
             "Remove",
           );

@@ -111,7 +111,9 @@ def test_ambiguous_name_without_direction_is_refused_and_nothing_removed(
     config_dir, svc = cfg
     before = (config_dir / "connections.toml").read_bytes()
     assert _remove(config_dir, svc) == 1
-    assert "both an inbound and an outbound" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "both an inbound and an outbound" in out
+    assert "pass --direction inbound or --direction outbound" in out
     assert (config_dir / "connections.toml").read_bytes() == before
 
 
@@ -138,3 +140,42 @@ def test_direction_is_refused_outside_remove(
     )
     assert rc == 1
     assert "--direction applies only to `connection remove`" in capsys.readouterr().out
+
+
+def test_a_name_repeated_in_one_direction_still_removes_its_first_match(tmp_path: Path) -> None:
+    # A hand-written duplicate the loader refuses; `remove` stays the repair for it, and the
+    # shared-name refusal is only for a name held in BOTH directions.
+    (tmp_path / "connections.toml").write_text(
+        textwrap.dedent(
+            """
+            [[inbound]]
+            name = "X"
+            transport = "mllp"
+            router = "r"
+              [inbound.settings]
+              port = 2600
+            [[inbound]]
+            name = "X"
+            transport = "mllp"
+            router = "r"
+              [inbound.settings]
+              port = 2601
+            """
+        ),
+        encoding="utf-8",
+    )
+    result = connections_edit.remove_connection(tmp_path, "X", validate=_noop)
+    assert result["direction"] == "inbound"
+    text = (tmp_path / "connections.toml").read_text(encoding="utf-8")
+    assert text.count('name = "X"') == 1 and "port = 2601" in text
+
+
+def test_a_bad_direction_is_refused_as_the_argument(cfg: tuple[Path, Path]) -> None:
+    config_dir, _svc = cfg
+    with pytest.raises(WiringError, match="direction must be 'inbound' or 'outbound'"):
+        connections_edit.remove_connection(
+            config_dir,
+            "X",
+            validate=_noop,
+            direction="Inbound",  # type: ignore[arg-type]
+        )
