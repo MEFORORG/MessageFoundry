@@ -2259,9 +2259,14 @@ def _locations(path: Path) -> tuple[str, ...]:
     """Where ``path`` is, as the location rule judges it in ``--path`` mode (BACKLOG #5446): both its
     path as named, made absolute, and its real path, whole, NFC and case-folded as ``_path_key``
     folds. A file is a hit if EITHER falls under a docs/security directory. The real path, so a
-    link, junction or subst drive into docs/security, a root named from inside ``docs``, or one
-    reached by ``..``, is judged where it lands. The named path, so a link that sits under
-    docs/security and points out of it is judged where it sits as well.
+    named root or file that is, or sits behind, a link, junction or subst drive into docs/security,
+    a root named from inside ``docs``, or one reached by ``..``, is judged where it lands; ``_walk``
+    asks this of a file link it lists, and of a file under a junction it descends. The named path,
+    so a link that sits under docs/security and points out of it is judged where it sits as well.
+
+    A directory symbolic link BELOW a named root is not followed: ``os.walk`` lists it and does not
+    descend it, so the files behind it are not judged at all, by this rule or any other. That
+    route is left open.
 
     Whole, not relative to a work tree: no ``.git`` entry, planted in a commit snapshot at ``docs``,
     at ``docs/security`` or below it, can strip the prefix the rule keys on. The cost is that a
@@ -2455,6 +2460,19 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     return _scan_file(path, rel_posix, show_context=show_context)[0]
 
 
+def _location_reason(posix: str, where: tuple[str, ...] = ()) -> str | None:
+    """Why the location rule forbids a file, judged by ``posix`` and each of ``where``
+    (``_name_hits`` says what those are), or ``None``. Case-folded in every mode, so the staged and
+    tracked scans agree with --path on Docs/Security.
+
+    Asked BEFORE any skip rule (``_is_skipped``) wherever one applies: a skip keys on the
+    root-relative path, which in ``--path`` mode starts below the root the caller named, so a file
+    under a named docs/security whose relative path happened to match SKIP_PATHS or the
+    vendored-bundle pattern was dropped unjudged and the run exited 0 (BACKLOG #5446)."""
+    judged = (_path_key(posix), *where)
+    return next(filter(None, map(forbidden_path_reason, judged)), None)
+
+
 def _name_hits(path: Path, posix: str, where: tuple[str, ...] = ()) -> tuple[list[str], bool]:
     """The hits a file earns by its path and name alone, and whether its content is not to be read.
     Judged whatever its bytes are. ``_scan_file`` keeps them when the content cannot be read, and the
@@ -2468,9 +2486,7 @@ def _name_hits(path: Path, posix: str, where: tuple[str, ...] = ()) -> tuple[lis
     ``posix`` (BACKLOG #5446). In ``--path`` mode ``posix`` starts below the root the caller named, so
     naming ``docs/security`` itself, a file in it, or its parent ``docs`` dropped the prefix the rule
     keys on, and a private document read clean."""
-    # Case-folded in every mode, so the staged and tracked scans agree with --path on Docs/Security.
-    judged = (_path_key(posix), *where)
-    if reason := next(filter(None, map(forbidden_path_reason, judged)), None):
+    if reason := _location_reason(posix, where):
         return [f"{path.as_posix()}:0: {reason}"], True
     hits: list[str] = []
     # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
@@ -2591,7 +2607,8 @@ def _scan_file(
     and location only, so the run must not count it as scanned, and an unreadable one is an instrument
     failure, not a clean file (BACKLOG #5583)."""
     posix = rel_posix if rel_posix is not None else path.as_posix()
-    if _is_skipped(posix):
+    # The location rule first: a skipped name under docs/security is still a hit (_location_reason).
+    if _is_skipped(posix) and _location_reason(posix, where) is None:
         return [], "unread"
     # LOCATION before content, and deliberately before the binary/unreadable early-return below: a
     # forbidden path is a hit whatever its bytes are, and a PDF or an image under docs/security/ is
@@ -3229,8 +3246,9 @@ def main(argv: list[str]) -> int:
     unreadable = len(hits)
     for abs_path, rel, where in candidates:
         # SKIP_DIRS is applied by the --path walk alone (_walk); the tracked and staged scans prune no
-        # directory.
-        if _is_skipped(rel):
+        # directory. The location rule is asked before the skip (_location_reason), so a skipped
+        # name under docs/security goes on to be judged by it below.
+        if _is_skipped(rel) and _location_reason(rel, where) is None:
             continue
         if not abs_path.is_file():
             # Not a regular file, or one is_file() could not stat (it hides that error). In every mode,

@@ -276,3 +276,53 @@ def test_a_missing_path_beside_a_real_one_refuses(
     code, out = _run(mod, capsys, str(tree / "docs" / "other"), str(tree / "missing"))
     assert code == 2, out
     assert "does not exist" in out
+
+
+@pytest.mark.parametrize(
+    "skipped",
+    [
+        pytest.param(("scripts", "security", "scan-tokens.local.txt"), id="skip-path"),
+        pytest.param((".github", "actions", "act", "dist", "index.js"), id="vendored-bundle"),
+    ],
+)
+def test_a_skipped_name_under_docs_security_is_still_a_location_hit(
+    mod, tmp_path: Path, capsys: pytest.CaptureFixture[str], skipped: tuple[str, ...]
+) -> None:
+    """The location rule runs before any skip rule: a file whose root-relative path matches
+    SKIP_PATHS or the vendored-bundle pattern, walked from a named docs/security, used to be
+    dropped by the skip and the run exited 0 over a private document (BACKLOG #5446)."""
+    sec = tmp_path / "snap" / "docs" / "security"
+    held = sec.joinpath(*skipped)
+    held.parent.mkdir(parents=True)
+    held.write_text("plain prose\n", encoding="utf-8")
+    # A clean root named beside it, so the unfixed run exits 0 rather than refusing an empty scan.
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    (clean / "readme.md").write_text("plain prose\n", encoding="utf-8")
+    code, out = _run(mod, capsys, str(sec), str(clean))
+    assert code == 1, out
+    assert _REASON in out
+    assert held.name in out, out
+
+
+@pytest.mark.parametrize(
+    "skipped",
+    [
+        pytest.param(("scripts", "security", "scan-tokens.local.txt"), id="skip-path"),
+        pytest.param((".github", "actions", "act", "dist", "index.js"), id="vendored-bundle"),
+    ],
+)
+def test_control_a_skipped_name_elsewhere_is_still_skipped(
+    mod, tmp_path: Path, capsys: pytest.CaptureFixture[str], skipped: tuple[str, ...]
+) -> None:
+    """Control: the same file one directory over from docs/security is still skipped, so the hit
+    above is the location rule and the skip rules are unchanged elsewhere."""
+    other = tmp_path / "snap" / "docs" / "other"
+    held = other.joinpath(*skipped)
+    held.parent.mkdir(parents=True)
+    # Content that would be a hit if it were read, so a skip is told from a clean read.
+    held.write_text("connect(" + repr(".".join(("8", "8", "4", "4"))) + ")\n", encoding="utf-8")
+    (tmp_path / "snap" / "readme.md").write_text("plain prose\n", encoding="utf-8")
+    code, out = _run(mod, capsys, str(other), str(tmp_path / "snap" / "readme.md"))
+    assert code == 0, out
+    assert _REASON not in out
