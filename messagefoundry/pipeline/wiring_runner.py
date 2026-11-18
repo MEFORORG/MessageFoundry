@@ -6462,8 +6462,11 @@ class RegistryRunner:
         :meth:`_resume_pooled_lane`, which re-arms a PAUSED or STOPPED one and lifts the inbound's
         hold when it does. That covers at least a lane the halt's hand-back STOPPED at T17 or on
         leadership loss. A lane STOPPED with claimed rows still in flight
-        (:meth:`StageDispatcher.stopped_holding_rows`) is left STOPPED, because a re-arm would
-        claim past them. Under per_lane the waiting workers are woken here, and the start that
+        (:meth:`StageDispatcher.stopped_holding_rows`) is not re-armed here, because a re-arm would
+        claim past them. That leaves it STOPPED only when the recovery is not a reload: a reload
+        calls this as it rebinds the listener, and its ``notify_work`` broadcast
+        (:meth:`_broadcast_to`) then re-arms that lane in the same pass, with the mark already
+        lifted, and the lane claims past those rows. Under per_lane the waiting workers are woken here, and the start that
         called this respawns any that a STOP ended (:meth:`_ensure_inbound_workers`)."""
         self._log_halted.discard(name)
         if self._claim_mode != "pooled":
@@ -6478,8 +6481,10 @@ class RegistryRunner:
         kept = [stage for stage, d in lanes if d.stopped_holding_rows(name)]
         for stage in kept:
             log.warning(
-                "%s lane %r stays STOPPED after the log halt lifted: it holds claimed rows whose "
-                "re-pend did not land, and a re-arm would claim past them",
+                "%s lane %r was not re-armed as the log halt lifted: it holds claimed rows whose "
+                "re-pend did not land, and a re-arm would claim past them. It stays STOPPED "
+                "unless this recovery is a reload, whose broadcast re-arms it and claims past "
+                "those rows; a service restart returns them to the queue first",
                 stage.value,
                 name,
             )

@@ -316,8 +316,8 @@ class _LaneState:
     # BACKLOG #5704: while the lane is STOPPED, whether the STOP that set it left claimed rows whose
     # re-pend did not land, so they are still in flight. _to_stopped writes it on every STOP, and
     # _run_lane's RETRY branch also writes it before _apply_retry, which passes it to a T17 STOP;
-    # so on a lane that is not STOPPED it can hold a stale value. Read only through
-    # StageDispatcher.stopped_holding_rows, which checks the phase.
+    # so on a lane that is not STOPPED it can hold a stale value. Read by _apply_retry, for that
+    # T17 STOP, and by StageDispatcher.stopped_holding_rows, which checks the phase.
     unlanded: bool = False
 
 
