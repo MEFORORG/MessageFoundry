@@ -767,8 +767,8 @@ def store_path_refusal(
     (BACKLOG #5926). ``name`` is the setting or flag the refusal names.
 
     It refuses at least these shapes, by their spelling; it cannot see whether a plain name such
-    as ``data`` is an existing directory. A value of only blanks is refused as blank, since a blank
-    is a legal POSIX file name. A path whose last part is empty, ``.`` or ``..`` (an empty path,
+    as ``data`` is an existing directory. A value of only whitespace is refused as a mistake, under
+    its own reason, since on POSIX it is a legal file name. A path whose last part is empty, ``.`` or ``..`` (an empty path,
     ``data/``, ``data/..``) names a directory, which passes an exists() guard as if it were a
     store. On Windows, where a backslash also separates parts, a last part ending in a dot or a
     space (Win32 trims it, so ``...`` is the working directory), and a colon
@@ -779,12 +779,16 @@ def store_path_refusal(
     from the refusal, as the file source's path refusals withhold theirs."""
     if value == ":memory:":
         return None
+    if value.isspace():
+        # Taken as a mistake, such as an env var set to spaces. Not "names no file": on POSIX
+        # such a value is a legal file name, so that reason would be false there.
+        return (
+            f"{name} holds only whitespace (value withheld); name the SQLite file, e.g. "
+            "'messagefoundry.db'"
+        )
     windows = os.name == "nt"
     # The last part as written: Win32 trims a trailing dot or space, so it is tested unstripped.
     last = re.split(r"[\\/]", value)[-1] if windows else value.split("/")[-1]
-    if value and not value.strip():
-        # Blank is a legal POSIX file name, so "names no file" would be false there; refused anyway.
-        return f"{name} is blank (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
     if last in ("", ".", ".."):
         return (
             f"{name} names no file (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
