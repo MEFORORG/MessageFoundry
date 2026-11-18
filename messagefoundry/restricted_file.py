@@ -488,9 +488,7 @@ _MORE_BROAD_GROUP_SIDS: frozenset[str] = frozenset(
         "S-1-5-84-0-0-0-0-0",  # USER MODE DRIVERS
     }
 )
-#: The relative ids of groups of machine accounts, in any domain: Domain Computers (515), which
-#: every machine account holds, Domain Controllers (516), Read-only Domain Controllers (521) and
-#: Enterprise Read-only Domain Controllers (498).
+#: Relative ids of at least these groups of machine accounts (498 exists only in the forest root domain).
 _DOMAIN_MACHINE_GROUP_RIDS = frozenset({"515", "516", "521", "498"})
 
 
