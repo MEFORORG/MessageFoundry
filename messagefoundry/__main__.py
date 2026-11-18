@@ -7247,7 +7247,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     except RowSealError:
         # BACKLOG #3510: the store's write helper refused the clear, writing nothing.
         return _emit_error(
-            _seal_refusal(named[0], "unlock") + ". Nothing was written", as_json=args.json
+            _seal_refusal(wanted, "unlock") + ". Nothing was written", as_json=args.json
         )
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):

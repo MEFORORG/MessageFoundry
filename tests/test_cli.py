@@ -4137,11 +4137,12 @@ def test_admin_unlock_names_the_stored_username(
     async def forged(*_a: object, **_k: object) -> None:
         raise RowSealError("user")
 
-    # The seal refusal names it as stored too.
+    # The seal refusal names the argument as typed, as on main, so neither it nor its WARNING
+    # prints a value from a record that failed its seal (`_seal_refusal`).
     monkeypatch.setattr(store_module, "require_user_seal_for_write", forged)
     assert main(["admin-unlock", "--username", "ADMIN", "--db", str(db), "--json"]) == 1
     sealed = json.loads(capsys.readouterr().out)["error"]
-    assert "the unlock for 'admin'" in sealed and "'ADMIN'" not in sealed
+    assert "the unlock for 'ADMIN'" in sealed and "'admin'" not in sealed
     monkeypatch.undo()
     assert [d["username"] for d in _unlock_audit_details(db)] == ["admin", "admin"]
 
