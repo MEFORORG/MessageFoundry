@@ -173,7 +173,7 @@ def request_token(
         # Raised outside the handler, so no __context__ keeps the reply's frame alive. Fixed text:
         # the endpoint label is the redacted URL, and no reply byte is read.
         raise NegativeAckError(
-            f"{TOKEN_REPLY_CODED_CODE}, not sent again. {endpoint} answered in a content coding the "
+            f"{TOKEN_REPLY_CODED_CODE}. {endpoint} answered in a content coding the "
             "engine does not decode",
             code=TOKEN_REPLY_CODED_CODE,
             permanent=True,
