@@ -2265,7 +2265,8 @@ class RegistryRunner:
         # Per-outbound-lane health (#46), for the edge-triggered connection_lost/restored events. True
         # (or unset) = healthy; flipped on the FIRST transport DeliveryError and back on the next
         # success, so a retry storm emits one transition pair, not one per delivery. A partner reject
-        # (NegativeAckError) is not a transport failure and never flips it.
+        # (NegativeAckError) is not a transport failure and does not flip it, except a permanent one
+        # a send raised marked ``lane_wide``, which every queued row would meet.
         self._lane_healthy: dict[str, bool] = {}
         # Connections that FAILED to build/bind at start ((kind, name) → FailedLine). A failed connection is
         # isolated, never fatal — the rest of the graph still comes up (a failed connection must not
@@ -3136,8 +3137,8 @@ class RegistryRunner:
     def _note_lane_unhealthy(self, name: str, message_id: str, exc: BaseException) -> None:
         """Edge-trigger ``connection_lost`` + a throttled ``connection_error`` alert on the FIRST
         transport ``DeliveryError`` after the lane was healthy (#46) — not per retry — or the first
-        permanent ``NegativeAckError`` marked ``lane_wide``, which every queued row would meet. No-op when capture
-        is off (byte-identical) or the lane is already marked down."""
+        permanent ``NegativeAckError`` marked ``lane_wide``, which every queued row would meet. No-op
+        when capture is off (byte-identical) or the lane is already marked down."""
         if not self._connection_events or not self._lane_healthy.get(name, True):
             return
         self._lane_healthy[name] = False
@@ -11423,6 +11424,11 @@ class RegistryRunner:
                 await self._stop_lane_retaining(name, [item.id], exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
+                # Read before the dead-letter's await, as the success arm reads it before any: a
+                # reload landing in the write does not make the live connector's refusal retired's.
+                lane_wide = getattr(exc, "lane_wide", False) and not self._connector_retired(
+                    name, connector
+                )
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
                 # BACKLOG #3043: this arm used to dead-letter with no log line at all. Class name
                 # and code only, never the text: see _RefusalLog for why, and for the throttle.
@@ -11439,9 +11445,7 @@ class RegistryRunner:
                 # A refusal every queued row would meet (the transport's own marker, never its
                 # code) also marks the lane down, so the drain into the DLQ alerts once. Not from a
                 # connector a reload retired: as the success arm, it says nothing of the new one.
-                if getattr(exc, "lane_wide", False) and not self._connector_retired(
-                    name, connector
-                ):
+                if lane_wide:
                     self._note_lane_unhealthy(name, item.id, exc)
             else:
                 failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
@@ -11911,6 +11915,10 @@ class RegistryRunner:
                 await self._stop_lane_retaining(name, ids, exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
+                # As the single row: read before the await, and never for a retired connector.
+                lane_wide = getattr(exc, "lane_wide", False) and not self._connector_retired(
+                    name, connector
+                )
                 await self.store.dead_letter_batch(ids, safe_exc(exc))
                 # BACKLOG #3043, the batch twin of the single-row line. `ids` is never empty here:
                 # a send only happens with a member kept, and an earlier refusal keeps every id.
@@ -11924,10 +11932,7 @@ class RegistryRunner:
                     len(ids),
                     ids[0],
                 )
-                # As the single row, retired connector included.
-                if getattr(exc, "lane_wide", False) and not self._connector_retired(
-                    name, connector
-                ):
+                if lane_wide:
                     self._note_lane_unhealthy(name, ids[0], exc)
             else:
                 failed = await self._mark_batch_failed_and_arm(

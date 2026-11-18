@@ -617,21 +617,50 @@ async def test_the_lane_alert_resolves_on_the_next_successful_delivery(
     assert len(sink.errors) == 1
 
 
-async def test_a_lane_wide_batch_refusal_alerts_the_lane_once(store: MessageStore) -> None:
+class _RetiredMidBatch(_MintsThroughACodedTokenEndpoint):
+    """Swaps itself out of the lane while it mints, as a reload landing mid-send would."""
+
+    def __init__(self, runner: RegistryRunner | None = None) -> None:
+        super().__init__()
+        self.runner = runner
+
+    async def send(self, payload: str) -> None:
+        assert self.runner is not None
+        self.runner._destinations[OUT] = cast(DestinationConnector, _UnmarkedRefusal())
+        await super().send(payload)
+
+
+@pytest.mark.parametrize(
+    ("case", "alerts"),
+    [("coded-token-reply", True), ("unmarked-reject", False), ("retired-mid-send", False)],
+)
+async def test_a_lane_wide_batch_refusal_alerts_the_lane_once(
+    store: MessageStore, case: str, alerts: bool
+) -> None:
     sink = _RecordsLaneAlerts()
-    runner = _batch_runner(store, _MintsThroughACodedTokenEndpoint())
+    connector: object
+    if case == "coded-token-reply":
+        connector = _MintsThroughACodedTokenEndpoint()
+    elif case == "unmarked-reject":
+        connector = _UnmarkedRefusal()
+    else:
+        connector = _RetiredMidBatch()
+    runner = _batch_runner(store, connector)
+    if isinstance(connector, _RetiredMidBatch):
+        connector.runner = runner
     runner._alert_sink = sink
     await _run_one_batch(store, runner, [_adt(n) for n in (1, 2, 3)])
 
-    assert await store.count_dead(allowed_channels=None) == 3
-    assert sink.errors == [(OUT, "connection_lost", "NegativeAckError")]
+    assert await store.count_dead(allowed_channels=None) == 3  # dead-lettered in every case
+    assert sink.errors == ([(OUT, "connection_lost", "NegativeAckError")] if alerts else [])
 
 
 async def test_a_lane_wide_refusal_from_a_retired_connector_does_not_alert_the_new_lane(
-    store: MessageStore, tmp_path: Path
+    store: MessageStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # A reload that swaps the connector mid-send may be the fix, so the old connector's refusal says
     # nothing of the new lane: no page against it. The row still dead-letters, as any refusal kept.
+    caplog.set_level(logging.WARNING, logger="messagefoundry")
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     sink = _RecordsLaneAlerts()
@@ -654,6 +683,9 @@ async def test_a_lane_wide_refusal_from_a_retired_connector_does_not_alert_the_n
     try:
         (inbox / "1.hl7").write_bytes(_adt(1).encode("utf-8"))
         await _until_dead(store, 1)
+        # The refusal line is written after the dead-letter and before the lane check, with no
+        # await between them, so once it is seen the check has run: the absence below is measured.
+        await until(lambda: len(_refusal_lines(caplog)) == 1, "the refusal line")
     finally:
         await runner.stop()
     assert sink.errors == []

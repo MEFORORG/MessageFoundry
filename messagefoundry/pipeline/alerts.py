@@ -423,7 +423,8 @@ class AlertSink(Protocol):
         a permanent one a send raises carrying ``lane_wide``, which every queued row would meet (at
         least a token endpoint's reply in a content coding the engine does not decode). It marks the
         lane down as its row dead-letters, edge-triggered like a transport failure, so it fires this
-        with ``error_class`` ``NegativeAckError`` only when the lane was healthy. A lane-stopping
+        with ``error_class`` ``NegativeAckError`` only when the lane was healthy, and only with
+        connection-event capture on (``NegativeAckError`` states the conditions). A lane-stopping
         credential or configuration fault never fires this."""
         ...
 

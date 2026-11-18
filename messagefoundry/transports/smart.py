@@ -159,7 +159,7 @@ def request_token(
     :class:`~messagefoundry.transports.base.NegativeAckError` coded
     :data:`TOKEN_REPLY_CODED_CODE`, so the delivery dead-letters rather than retries. Owner ruling
     2026-11-18 on BACKLOG #5910 step 4: "Dead-letter, no retry". It carries ``lane_wide``, so the
-    lane's ``connection_error`` alert fires once as the rows dead-letter."""
+    delivery worker also marks the lane down; ``NegativeAckError`` says when that alerts."""
     coded = False
     try:
         body = _read_token_reply(
