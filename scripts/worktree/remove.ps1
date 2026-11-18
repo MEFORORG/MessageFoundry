@@ -1440,9 +1440,16 @@ $leftover = [bool]$leftoverWhy
 if ($removeCode -ne 0) {
     $after = @(Get-RepoWorktrees $GitRoot)
     if ($leftover -and $after.Count -gt 0 -and -not ($after | Where-Object { $targetNorms -contains (ConvertTo-Norm $_.Path) })) {
-        Write-Host ("WARNING: git dropped the registration of '$WorktreePath' but could not delete all of it; " +
-            "something may hold a file open there. What is left is no longer a worktree. Delete it by " +
-            "hand once nothing uses it.") -ForegroundColor Yellow
+        if ($leftoverWhy -eq 'is still there') {
+            Write-Host ("WARNING: git dropped the registration of '$WorktreePath' but could not delete all of it; " +
+                "something may hold a file open there. What is left is no longer a worktree. Delete it by " +
+                "hand once nothing uses it.") -ForegroundColor Yellow
+        }
+        else {
+            Write-Host ("WARNING: git dropped the registration of '$WorktreePath', but the directory " +
+                "$leftoverWhy. Anything still there is no longer a worktree. Look at it, and delete what " +
+                "is left by hand once nothing uses it.") -ForegroundColor Yellow
+        }
     }
     throw "git worktree remove failed (exit $removeCode)"
 }
@@ -1506,9 +1513,16 @@ if ($DeleteBranch) {
 }
 
 if ($leftover) {
-    Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and exited 0, but the directory " +
-        "$leftoverWhy. Anything left there is no longer a worktree; a junction inside it is one known cause. Look " +
-        "at it, then delete it by hand.") -ForegroundColor Yellow
+    if ($leftoverWhy -eq 'is still there') {
+        Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and exited 0, but the directory is " +
+            "still there. What is left is no longer a worktree; a junction inside it is one known cause. Look " +
+            "at it, then delete it by hand.") -ForegroundColor Yellow
+    }
+    else {
+        Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and exited 0, but the directory " +
+            "$leftoverWhy. Anything still there is no longer a worktree. Look at it, and delete what is left " +
+            "by hand.") -ForegroundColor Yellow
+    }
 }
 else { Write-Host "Removed worktree '$WorktreePath'." -ForegroundColor Green }
 if ($keptBranch) {
