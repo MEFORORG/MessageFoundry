@@ -399,6 +399,11 @@ def _run_one(
                 items = handler_result_items(result)
                 if items is not None:
                     result = items
+                # Encode each Send's message here too, for the same reason (BACKLOG #5890): a custom
+                # message's encode() is user code, and the codec calls it from `_respond`, outside
+                # the run context and outside every arm below, where any raise its narrow guard
+                # misses, sys.exit() included, ended the worker instead of failing this Handler.
+                result = _encode_sends(result)
             elif phase == "router" and result is not None and not isinstance(result, str):
                 # The same for a generator Router: iterate it here, inside the run context and the
                 # arms below, so a raise or a sys.exit() in its body is this Router's error rather
@@ -450,6 +455,31 @@ def _run_one(
     except Exception as exc:  # noqa: BLE001 — a handler raise is content, reported not crashed
         return False, None, "error", _error_text(exc)
     return True, result, "", ""
+
+
+def _encode_sends(result: object) -> object:
+    """``result`` with every :class:`Send` carrying its message as an exact ``str``, encoded here
+    so its user code runs inside the caller's run context and exception arms (BACKLOG #5890).
+
+    A list stays a list and a single item a single item. An exact ``str`` copy also stops a ``str``
+    subclass's own methods running later in the codec. A raise, ``sys.exit()`` included, is the
+    Handler's, as at ``mode=off``, where dry-run makes the same ``encode()`` call."""
+    from messagefoundry.config.wiring import Send
+
+    def encoded(item: object) -> object:
+        if not isinstance(item, Send):
+            return item  # the codec applies the admissibility rule, with its own text
+        message = item.message
+        if type(message) is str:
+            return item
+        text = message if isinstance(message, str) else message.encode()
+        if not isinstance(text, str):
+            raise TypeError(f"Send message encoded to {type(text).__name__}, expected a str")
+        return Send(item.to, str.__str__(text))
+
+    if isinstance(result, list):
+        return [encoded(item) for item in result]
+    return encoded(result)
 
 
 def _error_text(exc: BaseException) -> str:

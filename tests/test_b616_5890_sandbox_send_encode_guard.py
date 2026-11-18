@@ -6,9 +6,10 @@ At ``mode=off`` dry-run calls ``send.message.encode()`` inside ``transform_one``
 ``sys.exit()`` included, is that Handler's content fault and the message dead-letters. In the
 worker the same call runs at describe time, in the codec's ``_enc_item``, which caught only
 ``AttributeError``, ``TypeError`` and ``ValueError``; any other raise escaped ``_respond`` and ended
-the worker, so the parent read a crash and the next message paid a respawn. The generator Router
-half of the finding was closed earlier (vault BACKLOG #3134); its RuntimeError case is pinned here
-too. Synthetic HL7 only.
+the worker, so the parent read a crash and the next message paid a respawn. The worker now encodes
+each Send inside ``_run_one``'s run context and exception arms, so the raise is reported in
+``mode=off``'s words. The generator Router half of the finding was closed earlier (vault BACKLOG
+#3134); its RuntimeError case is pinned here too. Synthetic HL7 only.
 """
 
 from __future__ import annotations
@@ -20,9 +21,10 @@ import pytest
 from messagefoundry import Send
 from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.wiring import Registry, load_config
-from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, _Blobs, enc_result
+from messagefoundry.pipeline._sandbox_worker import _encode_sends
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.pipeline.sandbox import SandboxError, SandboxMode, SandboxPolicy, SandboxSession
+from messagefoundry.pipeline.wiring_runner import UserCodeCalledSysExit
 from tests.test_sandbox import RAW, _deliveries, _session
 
 _GRAPH = """
@@ -43,6 +45,20 @@ class _RaisingMessage:
 class _ExitingMessage:
     def encode(self):
         sys.exit("PID-5 was DOE^JANE")
+
+
+class _LoudText(str):
+    # A str subclass whose own methods are user code: none of them may run outside the arms.
+    def __len__(self):
+        raise RuntimeError("len failed")
+
+    def encode(self, *args, **kwargs):
+        raise RuntimeError("str encode failed")
+
+
+class _LoudTextMessage:
+    def encode(self):
+        return _LoudText("DELIVERED-LOUD")
 
 
 @router("r_ok")
@@ -69,6 +85,11 @@ def h_raise(msg):
 @handler("h_exit")
 def h_exit(msg):
     return Send("OB", _ExitingMessage())
+
+
+@handler("h_loud_text")
+def h_loud_text(msg):
+    return [Send("OB", _LoudTextMessage()), Send("OB", _LoudText("DIRECT-LOUD"))]
 """
 
 _DIRS = ("inbox_ok", "inbox_gen", "outbox", "cfg")
@@ -97,11 +118,31 @@ class _Raises:
         raise self.exc
 
 
-@pytest.mark.parametrize("exc", [RuntimeError("boom"), KeyError("k"), SystemExit(2)])
-def test_the_codec_refuses_a_send_whose_encode_raises_anything(exc: BaseException) -> None:
-    send = Send("OB", _Raises(exc))  # type: ignore[arg-type]
-    with pytest.raises(SandboxCodecError, match="Send message is not encodable"):
-        enc_result("transform", send, _Blobs())
+class _Bytes:
+    def encode(self) -> bytes:
+        return b"x"
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("boom"), KeyError("k"), SystemExit(2), MemoryError()])
+def test_encode_sends_lets_any_encode_raise_reach_the_callers_arms(exc: BaseException) -> None:
+    with pytest.raises(type(exc)):
+        _encode_sends([Send("OB", _Raises(exc))])  # type: ignore[arg-type]
+
+
+def test_encode_sends_carries_exact_text_and_keeps_the_shape() -> None:
+    class _Text(str):
+        pass
+
+    class _Msg:
+        def encode(self) -> str:
+            return _Text("BODY")
+
+    one = _encode_sends(Send("OB", _Msg()))  # type: ignore[arg-type]
+    assert isinstance(one, Send) and type(one.message) is str and one.message == "BODY"
+    many = _encode_sends([Send("OB", _Text("A")), "not a send"])
+    assert isinstance(many, list) and type(many[0].message) is str and many[1] == "not a send"
+    with pytest.raises(TypeError, match="encoded to bytes, expected a str"):
+        _encode_sends(Send("OB", _Bytes()))  # type: ignore[arg-type]
 
 
 def test_mode_off_reports_the_encode_raise_as_the_handlers_error(
@@ -127,13 +168,23 @@ def test_an_encode_raise_in_the_worker_is_reported_and_the_worker_survives(
         pid = _worker_pid(session)
         assert pid is not None
 
-        for name in ("h_raise", "h_exit"):
+        exited = str(UserCodeCalledSysExit.from_exit(SystemExit("text")))
+        for name, tail in (
+            ("h_raise", "RuntimeError: encode failed"),
+            ("h_exit", f"UserCodeCalledSysExit: {exited}"),
+        ):
             with pytest.raises(SandboxError, match=f"sandbox failed transform '{name}'") as info:
                 _deliveries(registry, name, sandbox=session, run_context=RunContext())
-            assert "Send message is not encodable" in str(info.value)
-            assert "crash" not in str(info.value)
+            assert str(info.value).endswith(tail)
             assert "DOE" not in str(info.value) and "PID-5" not in str(info.value)
             assert _worker_pid(session) == pid
+
+        # A str subclass, returned by encode() or carried directly, crosses as its exact text.
+        assert _deliveries(registry, "h_loud_text", sandbox=session, run_context=RunContext()) == [
+            ("OB", "DELIVERED-LOUD"),
+            ("OB", "DIRECT-LOUD"),
+        ]
+        assert _worker_pid(session) == pid
 
         ic = registry.inbound["IB_GEN"]
         with pytest.raises(SandboxError, match="sandbox failed router 'r_gen_raise'") as routed:
