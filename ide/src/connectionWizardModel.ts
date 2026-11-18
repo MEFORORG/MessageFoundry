@@ -234,13 +234,25 @@ export function connectionUpsertArgs(
 }
 
 /** The `messagefoundry connection remove` argv (sans `--json`). A remove is validated against the
- *  same settings as an upsert -- the remaining graph is re-checked -- so it names them too. */
+ *  same settings as an upsert -- the remaining graph is re-checked -- so it names them too. An inbound
+ *  and an outbound may share a name, so `direction` says which one goes; the engine refuses a shared
+ *  name without it rather than removing the inbound (BACKLOG #5898). */
 export function connectionRemoveArgs(
   configDir: string,
   serviceConfig: string | undefined,
   name: string,
+  direction?: ConnObj["direction"],
 ): string[] {
-  return ["connection", "remove", "--config", configDir, ...serviceConfigArgs(serviceConfig), "--name", name];
+  return [
+    "connection",
+    "remove",
+    "--config",
+    configDir,
+    ...serviceConfigArgs(serviceConfig),
+    "--name",
+    name,
+    ...(direction === undefined ? [] : ["--direction", direction]),
+  ];
 }
 
 /**

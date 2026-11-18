@@ -374,4 +374,9 @@ suite("connectionWizardModel — remove argv", () => {
     ]);
     assert.ok(!args.includes("--json"));
   });
+
+  test("names the direction when given, since an inbound and an outbound may share a name (BACKLOG #5898)", () => {
+    const args = connectionRemoveArgs("samples/config", undefined, "X", "outbound");
+    assert.deepStrictEqual(args, ["connection", "remove", "--config", "samples/config", "--name", "X", "--direction", "outbound"]);
+  });
 });

@@ -86,6 +86,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
     // The connection the currently-shown form was rendered from (null → the blank "new" form) — the
     // save-time merge source AND the name an in-place save is allowed to replace (#234).
     let renderedName: string | null = null;
+    let renderedDirection: ConnObj["direction"] | undefined;
     let savingFromWebview = false;
     let guardTimer: ReturnType<typeof setTimeout> | undefined;
     let lastRendered: string | undefined;
@@ -130,6 +131,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
       const current = desired === null ? undefined : pickCurrentConnection(items, desired);
       const initial = current ? entries.find((c) => c.name === current) : undefined;
       renderedName = current ?? null;
+      renderedDirection = initial?.direction;
       // The custom editor shares the one form body, so it needs the engine-derived field catalogue
       // too — otherwise opening connections.toml as a tab would silently fall back to the legacy
       // free-text rows while the command-opened panel showed typed fields.
@@ -246,7 +248,10 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           }
           markSaving();
           try {
-            await runJson(connectionRemoveArgs(target.configDir, target.serviceConfig, m.name), ws);
+            // The direction of the connection the form is showing: an inbound and an outbound may
+            // share a name, and the delete is for this one (BACKLOG #5898).
+            const direction = m.name === renderedName ? renderedDirection : undefined;
+            await runJson(connectionRemoveArgs(target.configDir, target.serviceConfig, m.name, direction), ws);
           } catch (e) {
             clearGuard();
             postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });

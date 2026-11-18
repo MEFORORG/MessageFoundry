@@ -486,6 +486,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     connection.add_argument("--name", default=None, help="connection name (for remove)")
     connection.add_argument(
+        "--direction",
+        choices=["inbound", "outbound"],
+        default=None,
+        help="which connection to remove when an inbound and an outbound share --name",
+    )
+    connection.add_argument(
         "--data", default=None, help="connection JSON for upsert (default: read from stdin)"
     )
     connection.add_argument("--json", action="store_true", help="emit JSON")
@@ -13451,7 +13457,9 @@ def _connection(args: argparse.Namespace) -> int:
         else:  # remove
             if not args.name:
                 return _emit_error("--name is required for `connection remove`", as_json=args.json)
-            result = connections_edit.remove_connection(args.config, args.name, validate=validate)
+            result = connections_edit.remove_connection(
+                args.config, args.name, validate=validate, direction=args.direction
+            )
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)
     except WiringError as exc:

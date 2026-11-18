@@ -29,7 +29,7 @@ import contextlib
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import tomlkit
 
@@ -230,9 +230,20 @@ def upsert_connection(
     return {"op": "upsert", "direction": direction, "name": obj["name"]}
 
 
-def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) -> dict[str, Any]:
+def remove_connection(
+    config_dir: str | Path,
+    name: str,
+    *,
+    validate: Validate,
+    direction: Literal["inbound", "outbound"] | None = None,
+) -> dict[str, Any]:
     """Remove the data-authored connection ``name``. Raises :class:`WiringError` if it isn't in
-    ``connections.toml`` (a code-first connection can't be removed here)."""
+    ``connections.toml`` (a code-first connection can't be removed here).
+
+    An inbound and an outbound may share a name (:func:`~messagefoundry.config.wiring.case_twins`),
+    so ``direction`` says which one to remove. Without it, a name held in both directions is refused
+    rather than resolved to the first match, which removed the inbound when the outbound was meant
+    (BACKLOG #5898)."""
     path = _path(config_dir)
     if not atomic_edit.is_file(path, refused_error=WiringError):
         raise WiringError(f"no {CONNECTIONS_FILE_NAME} in {config_dir}")
@@ -240,26 +251,30 @@ def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) 
         text, crlf = atomic_edit.read_text(path, refused_error=WiringError)
         doc = tomlkit.parse(text)
 
-        removed = False
-        for direction in ("inbound", "outbound"):
-            aot = doc.get(direction)
-            if aot is None:
-                continue
-            for index in range(len(aot)):
-                if aot[index].get("name") == name:
-                    del aot[index]
-                    removed = True
-                    break
-            if removed:
-                break
-        if not removed:
+        directions = ("inbound", "outbound") if direction is None else (direction,)
+        matches = [
+            (where, aot, index)
+            for where in directions
+            if (aot := doc.get(where)) is not None
+            for index in range(len(aot))
+            if aot[index].get("name") == name
+        ]
+        if not matches:
+            scope = "" if direction is None else f"{direction} "
             raise WiringError(
-                f"connection {name!r} is not in {CONNECTIONS_FILE_NAME} "
+                f"{scope}connection {name!r} is not in {CONNECTIONS_FILE_NAME} "
                 "(a code-authored connection can't be removed here)"
             )
+        if len({where for where, _aot, _index in matches}) > 1:
+            raise WiringError(
+                f"connection {name!r} is both an inbound and an outbound in "
+                f"{CONNECTIONS_FILE_NAME}; name the direction to remove (nothing was removed)"
+            )
+        removed_direction, aot, index = matches[0]
+        del aot[index]
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
-    return {"op": "remove", "name": name}
+    return {"op": "remove", "direction": removed_direction, "name": name}
 
 
 # --- internals ---------------------------------------------------------------
