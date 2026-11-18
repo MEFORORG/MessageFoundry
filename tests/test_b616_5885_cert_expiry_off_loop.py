@@ -11,6 +11,7 @@ loop-bound."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -119,24 +120,67 @@ def test_a_row_that_raises_does_not_drop_the_alerts_judged_before_it(
     assert len(sink.cert_threads) == 1
 
 
-def test_a_stopped_pass_ends_at_the_next_row(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_pass_stopped_mid_scan_raises_no_alert_and_ends_at_the_next_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sink = _ThreadRecordingSink()
     runner = _runner(
         sink, MonitoredCert("a", "synthetic/a.pem"), MonitoredCert("b", "synthetic/b.pem")
     )
+    monkeypatch.setattr(runner, "_held_snapshot", lambda: HeldCrlSnapshot(()))
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     seen: list[str] = []
 
     def inspect(cert: MonitoredCert, *args: Any, **kwargs: Any) -> CertCheck:
         seen.append(cert.label)
-        runner._stop.set()  # stop() lands while the first row is judged
+        entered.set()
+        release.wait(timeout=5.0)
         return _in_window(cert)
 
     monkeypatch.setattr(runner, "_inspect", inspect)
-    checks, _ = runner._collect(
-        0.0, list(runner._cert_source()), HeldCrlSnapshot(()), stoppable=True
-    )
+    real_collect = runner._collect
+
+    def collect(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return real_collect(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(runner, "_collect", collect)
+    runner.start()
+    assert await asyncio.to_thread(entered.wait, 5.0)
+    await runner.stop()  # lands while the first row is judged
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 5.0)
+    await asyncio.sleep(0)
     assert seen == ["a"]
-    assert [c.label for c in checks] == ["a"]
+    assert sink.cert_threads == []
+
+
+async def test_a_slow_pass_is_logged_and_still_alerts(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    sink = _ThreadRecordingSink()
+    runner = _runner(sink, MonitoredCert("api", "synthetic/api.pem"))
+    monkeypatch.setattr(runner, "_held_snapshot", lambda: HeldCrlSnapshot(()))
+    monkeypatch.setattr(cert_expiry, "_SLOW_PASS_SECONDS", 0.05)
+    release = threading.Event()
+
+    def inspect(cert: MonitoredCert, *args: Any, **kwargs: Any) -> CertCheck:
+        release.wait(timeout=5.0)
+        return _in_window(cert)
+
+    monkeypatch.setattr(runner, "_inspect", inspect)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.cert_expiry"):
+        task = asyncio.create_task(runner._pass())
+        for _ in range(200):
+            if any("still running" in r.getMessage() for r in caplog.records):
+                break
+            await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.wait_for(task, timeout=5.0)
+    assert any("still running" in r.getMessage() for r in caplog.records)
+    assert len(sink.cert_threads) == 1
 
 
 @pytest.mark.parametrize(("held", "collects"), [(False, 0), (True, 1)])

@@ -29,6 +29,7 @@ import gc
 import logging
 import os
 import ssl
+import threading
 import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
@@ -85,6 +86,8 @@ log = logging.getLogger(__name__)
 #: asserts the parity) so a cert observed at the mTLS handshake and the same cert read from a PEM file
 #: report the SAME days-remaining — otherwise the two 6.4.5 monitor arms could disagree by a day.
 _SECONDS_PER_DAY = 86_400
+#: How long a supervised pass may run before it is logged as stalled (vault BACKLOG #5885).
+_SLOW_PASS_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -402,14 +405,30 @@ class CertExpiryRunner:
         Vault BACKLOG #5885: the cert and CRL file reads, parsing and CRL staging ran on the event
         loop, stalling message processing and a cluster leader's heartbeat for their length. The
         cert source reads the live registry, which a reload swaps on the loop, so it is read here.
-        The held-copy snapshot stays here too: its ``gc.collect`` runs the finalizers of whatever
-        it frees, such as a discarded connector's transport, and those must run on the loop. The
-        alert sinks are loop-bound (a notifier enqueues onto an ``asyncio.Queue``), so they are
-        called back here as well. A cancel while the thread runs abandons its result, so a stopped
-        pass raises no alert, and the thread stops at its next row."""
+        The held-copy snapshot stays here too, so the finalizers its explicit ``gc.collect`` runs,
+        such as a discarded connector's transport, run on the loop. The alert sinks are loop-bound
+        (a notifier enqueues onto an ``asyncio.Queue``), so they are called back here as well. A
+        pass still running after :data:`_SLOW_PASS_SECONDS` is logged, since a row blocked in a
+        read would otherwise silence the monitor without a word. A cancel while the thread runs
+        abandons its result, so a cancelled pass raises no alert, and the thread stops at its
+        next row."""
         rows = list(self._cert_source())
         held = self._held_snapshot()
-        checks, said = await asyncio.to_thread(self._collect, None, rows, held, stoppable=True)
+        abandoned = threading.Event()
+        work = asyncio.ensure_future(asyncio.to_thread(self._collect, None, rows, held, abandoned))
+        try:
+            try:
+                checks, said = await asyncio.wait_for(asyncio.shield(work), _SLOW_PASS_SECONDS)
+            except TimeoutError:
+                log.error(
+                    "cert expiry scan still running after %gs: a certificate or CRL read may be "
+                    "blocked, and no alert is raised until it returns",
+                    _SLOW_PASS_SECONDS,
+                )
+                checks, said = await asyncio.shield(work)
+        except asyncio.CancelledError:
+            abandoned.set()
+            raise
         self._emit(checks, said)
 
     def _collect(
@@ -417,25 +436,26 @@ class CertExpiryRunner:
         now: float | None,
         rows: list[MonitoredCert],
         held: HeldCrlSnapshot,
-        *,
-        stoppable: bool = False,
+        abandoned: threading.Event | None = None,
     ) -> tuple[list[CertCheck], _HeldCopyLog]:
         """The file half of a pass: judge ``rows`` and the unlisted held CRLs, alerting nothing.
 
-        It touches only the files, per-pass state and the ``held`` snapshot, so it is safe in a
-        worker thread. ``now`` defaults to the clock read here, so a pass that queued behind a
-        busy executor judges by the time it runs. A row that raises is logged and skipped, so the
-        rows judged before it still alert. A ``stoppable`` pass ends at the next row once
-        :meth:`stop` is called, since nobody reads its result."""
+        It reads the files, the clock, per-pass state and the ``held`` snapshot, never the loop,
+        so it can run in a worker thread. ``now`` defaults to the clock read here, so a pass that
+        queued behind a busy executor judges by the time it runs. A row that raises is logged and
+        skipped, so the rows judged before it still alert. Once ``abandoned`` is set the pass ends
+        at the next row, since nobody reads its result."""
         now = self._clock() if now is None else now
         rows = self._rows(held, rows)
         said = _HeldCopyLog.for_rows(rows)
         checks: list[CertCheck] = []
         for cert in rows:
-            if stoppable and self._stop.is_set():
+            if abandoned is not None and abandoned.is_set():
                 break
             try:
                 check = self._inspect(cert, now, held, said=said)
+            # A cert check must never take the engine down, nor one row's failure cost the others
+            # their alerts, so any error is logged with its traceback and the row skipped.
             except Exception:
                 log.exception("cert_expiry: could not judge %r (%s)", cert.label, cert.path)
                 continue
@@ -482,8 +502,9 @@ class CertExpiryRunner:
 
         The engine's monitor collects garbage first, so a probe or discarded connector caught in a
         reference cycle does not read as a live hop holding a copy. Only while some context holds a
-        copy, since with none there is nothing a collect could remove: a full collect holds the
-        GIL, so no thread keeps the loop serving through it (vault BACKLOG #5885). A failure is
+        copy, since with none there is nothing a collect could remove: a full collect pauses
+        every thread of the process, so a worker thread would not keep the loop serving through it
+        either (vault BACKLOG #5885). A failure is
         logged and yields an empty snapshot, which leaves each file's own verdict standing."""
         try:
             if self._watch_unlisted_held_crls and has_held_copies():
