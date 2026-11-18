@@ -954,8 +954,8 @@ class TransitCipher(_UnmarkedPolicy):
             unverified = AuditKeyVersionUnverifiedError(version)
             # Making the warning's closures runs outside _warn_when_due's guard, so a fault there
             # writes a fixed literal on stderr in place of the warning. A fault in _READ_FAULTS
-            # escaping the warning or that write is dropped, unreported, so the label and the
-            # row's break survive it; reporting it would need the memory or stack that ran out.
+            # escaping the warning or that write gets one attempt at a stderr line naming its
+            # class; the label and the row's break survive a second fault in that attempt.
             try:
                 try:
                     kind, build = _unconfirmed_warning(self._audit_key, version, reason, raised)
@@ -963,8 +963,11 @@ class TransitCipher(_UnmarkedPolicy):
                     _last_resort(_WARNING_UNBUILT)
                 else:
                     _warn_when_due(kind, build)
-            except _READ_FAULTS:
-                pass
+            except _READ_FAULTS as fault:
+                try:  # noqa: SIM105 -- constructing contextlib.suppress can itself raise here
+                    _last_resort(f"{_WARNING_UNLOGGED} ({ascii(type(fault).__name__)})")
+                except _READ_FAULTS:
+                    pass
             return unverified
         if self._is_outage(exc):
             return self._verify_failed(exc)
