@@ -34,6 +34,9 @@ _MESSAGES = _ref.MESSAGES
 _SEGMENTS = _ref.SEGMENTS
 
 DEFAULT_SEED = "messagefoundry-hl7-2.5.1"
+#: The largest ``count`` :func:`write_corpus` accepts. Files are named ``NNNN.hl7`` and the stale-file
+#: cleanup matches exactly four digits, so a fifth digit would write files no later run clears.
+MAX_CORPUS_COUNT = 9999
 # Fixed epoch so a given seed reproduces identical bytes (no wall-clock nondeterminism).
 BASE_DT = datetime(2026, 1, 1, 0, 0, 0)
 
@@ -589,15 +592,22 @@ def write_corpus(
     corpus_root: str | Path | None = None,
 ) -> CorpusResult:
     """Generate + strict-validate ``count`` messages per trigger and write them as
-    ``<out>/<TRIGGER>/NNNN.hl7`` (all-or-nothing per trigger; stale generated files are cleared first).
+    ``<out>/<TRIGGER>/NNNN.hl7``. A trigger's whole batch is generated and validated before anything
+    is written, so a validation failure leaves its files alone; stale generated files are then cleared
+    and the batch written, and an :class:`OSError` there can leave the trigger partly rewritten, after
+    earlier triggers were already replaced.
 
     ``triggers`` defaults to every trigger of ``code``. The cleanup is **scoped**: it deletes only
     its own ``NNNN.hl7`` files, never arbitrary ``*.hl7`` a user placed there (GEN-1). When
     ``corpus_root`` is given, ``out`` must resolve **within** it — a containment guard for
     programmatic callers (the CLI writes the user's explicit ``--out``). Raises :class:`ValueError`
     for an out-of-root path, :class:`KeyError` for an unknown type/trigger, and
-    :class:`GenerationError` if any message fails validation.
+    :class:`GenerationError` if any message fails validation. A ``count`` outside 1 to
+    :data:`MAX_CORPUS_COUNT` raises :class:`ValueError` before anything is cleared or written
+    (BACKLOG #5819): a zero count would otherwise delete the previous corpus and write nothing.
     """
+    if not 1 <= count <= MAX_CORPUS_COUNT:
+        raise ValueError(f"count must be between 1 and {MAX_CORPUS_COUNT}, got {count}")
     if code not in _REGISTRY:
         raise KeyError(f"unknown message type {code!r}; registered: {', '.join(message_codes())}")
     chosen = list(triggers) if triggers else triggers_for(code)
@@ -614,7 +624,7 @@ def write_corpus(
     total = 0
     for trigger in chosen:
         structure = structure_for(code, trigger)
-        # Build + validate the whole batch before writing (all-or-nothing per trigger).
+        # Build + validate the whole batch before writing, so a validation failure writes nothing.
         messages: list[str] = []
         for index in range(1, count + 1):
             msg = generate_message(code, trigger, index, seed=seed)
