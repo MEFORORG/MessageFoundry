@@ -367,7 +367,7 @@ def test_only_writer_txn_and_the_read_snapshot_open_a_transaction() -> None:
     scan = _txn_sites(STORE.read_text(encoding="utf-8"))
 
     # Receipts: report what was EXAMINED. A walker that matched nothing would pass vacuously.
-    # Measured at ec32c96a8: 356 carrying calls, 51 f-strings, 463 statements, 3 unreadable.
+    # Measured at 2359804c3: 467 carrying calls, 84 f-strings, 615 statements, 6 unreadable.
     assert scan.calls > 200, (
         f"liveness: only {scan.calls} SQL-carrying calls -- the walker is broken"
     )
@@ -384,7 +384,7 @@ def test_only_writer_txn_and_the_read_snapshot_open_a_transaction() -> None:
         f"executescript arm is not resolving `_SCHEMA`, so the one multi-statement call is unread"
     )
     # PINNED, not floored: an unreadable argument is the exact shape an evasion takes, so a NEW one
-    # has to be looked at. The three today are `cancel_queued` and `delivery_latency_histogram`,
+    # has to be looked at. The first three are `cancel_queued` and `delivery_latency_histogram`,
     # each building a SELECT in a local variable, and `get_transit_bound_attestation`'s read-only
     # `fetch`, which runs only the SELECTs `load_transit_bound_attestation` passes it, on a `_read()`
     # connection (BACKLOG #2337). `revoke_user_sessions` was a fourth until BACKLOG #2592 spelled

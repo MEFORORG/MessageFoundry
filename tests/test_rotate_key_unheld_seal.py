@@ -12,7 +12,8 @@ user's seal covers, and leave the record verifying under no key.
 
 A record whose seal fails under a key the run holds, or is malformed, is the control. No key
 re-seals it, so failing on it would fail every later run too (the BACKLOG #3181 precedent); the
-run completes and says so in a note. The SQLite store contract runs here too; the Postgres and SQL
+run completes and says so in a note. The note's count is read back without verifying, so it
+also holds a sound seal a running engine wrote under a held retired key, and the note says so. The SQLite store contract runs here too; the Postgres and SQL
 Server suites run it on their own legs.
 """
 
@@ -236,6 +237,11 @@ def test_a_role_whose_seal_no_key_reseals_does_not_fail_the_run(
     captured = capsys.readouterr()
     assert "OK:" in captured.out and "PARTIAL:" not in captured.out
     assert "note: 1 user, role, open approval or directory-map record(s) were left" in captured.out
+    # Items 5, 14 and 15: the log counts only what each pass refused, so the note does not send
+    # the operator there; and a sound seal a running engine wrote is counted here too, so the
+    # note says to re-run with every engine stopped before dropping the prior key.
+    assert "The log names each kind" not in captured.out
+    assert "stop every engine using this store and re-run before dropping" in captured.out
     assert "rotation aborted" not in captured.err
     rows = asyncio.run(_rows(db, key_b))
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))

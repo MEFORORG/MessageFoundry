@@ -12308,16 +12308,21 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if seals.refused:
-        # Vault BACKLOG #5635: a seal that fails under a key this run holds, or is malformed, is
-        # left as it is. No key re-seals it, so it must not fail the run, or every later run would
-        # fail on it too (the BACKLOG #3181 precedent). Said here, not only logged.
+        # Vault BACKLOG #5635: a seal that names a key this run holds other than the active one, or
+        # is malformed, is left as it is. One that fails no key re-seals, so it must not fail the
+        # run, or every later run would fail on it too (the BACKLOG #3181 precedent). The read-back
+        # does not verify, so a sound seal an engine wrote during the run under a held retired key
+        # is counted here too, and a re-run with no engine re-seals it (items 14 and 15). Said
+        # here, not only logged.
         print(
             f"note: {seals.refused} user, role, open approval or directory-map record(s) were left "
-            "as they are: their seal fails under a key this run holds, or is malformed. The "
-            "causes include at least a change made outside the store and, if an engine was still "
-            "running, a write it made during this run. A record changed outside the store is "
-            "refused on every read and no key re-seals it, so it does not hold this rotation open; "
-            "recreate or remove it. The log names each kind."
+            "as they are: their seal names a key this run holds other than the active one, or is "
+            "malformed. The causes include at least a change made outside the store and, if an "
+            "engine was still running, a write it made during this run. A record changed outside "
+            "the store is refused on every read and no key re-seals it, so it does not hold this "
+            "rotation open; recreate or remove it. A write an engine made during this run may be "
+            "sound and still under the prior key: stop every engine using this store and re-run "
+            "before dropping that key."
         )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under
