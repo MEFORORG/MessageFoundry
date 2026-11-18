@@ -760,18 +760,20 @@ function Get-TargetClaimsDirs {
 # Test-ConfirmedGoneOrThrow decides by listing the nearest folder above it, so a registry under a dead
 # link or an unreachable share is not "no records". The nightly also requires the folder above to be
 # there (Test-RegistryPresentOrThrow); this does not, because a clone that never used coordination has
-# no such folder. $true when it is there as a plain directory, and a throw for anything else, a file or a
-# link where the registry should be included. A clone with no coordination folder at all still reads as
-# absent, because its git dir lists without it. Anything other than a plain directory is listed first,
-# as $ListWhat, so a file or an unlistable link keeps the listing's own "Could not list" refusal
-# (tests/test_worktree_remove_in_use.py pins it); only one that lists, a link to a directory, reaches
-# the plain-directory refusal.
-function Test-RegistryDirPresent([string]$Dir, [string]$What, [string]$ListWhat) {
+# no such folder. $true when it is there as a plain directory, a throw when a link is there.
+# A FILE THERE RETURNS $true, as Test-PresentOrThrow did before, so the caller's own listing refuses it
+# with "Could not list ..." and tests/test_worktree_remove_in_use.py's planted file drives the real
+# readers (Read-ClaimFiles, the allocation walk), the fallback the two ACL tests there lean on. A link
+# is refused from its own attributes, without being followed. A clone with no coordination folder at
+# all still reads as absent, because its git dir lists without it.
+function Test-RegistryDirPresent([string]$Dir, [string]$What) {
     if (Test-ConfirmedGoneOrThrow $Dir $What -Plain) { return $false }
     $item = Get-ItemOrThrow $Dir $What
-    if (-not $item -or -not (Test-PlainDirectoryItem $item)) {
-        if ($item) { $null = Get-EntriesOrThrow $Dir $ListWhat -Max 0 }
-        throw "$What ('$Dir') exists but is not a plain directory (a file or a link), so what it holds is unknown. Nothing was removed."
+    if (-not $item) {
+        throw "$What ('$Dir') was there and then could not be found, so what it holds is unknown. Nothing was removed."
+    }
+    if ($item -is [System.IO.DirectoryInfo] -and -not (Test-PlainDirectoryItem $item)) {
+        throw "$What ('$Dir') is a link, not a plain directory, so what it holds is unknown. Nothing was removed."
     }
     return $true
 }
@@ -779,7 +781,7 @@ function Test-RegistryDirPresent([string]$Dir, [string]$What, [string]$ListWhat)
 # Every claim file in every registry this target's claims can be in, or none.
 function Read-TargetClaims {
     foreach ($d in $claimsDirs) {
-        if (Test-RegistryDirPresent $d 'the claims directory' 'claims') { Read-ClaimFiles $d }
+        if (Test-RegistryDirPresent $d 'the claims directory') { Read-ClaimFiles $d }
     }
 }
 
@@ -1249,7 +1251,7 @@ function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     return $null
 }
 
-if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory' 'allocations') {
+if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
     $atRisk = @()
     $allocUnreadable = @()
     foreach ($f in @(Get-EntriesOrThrow $allocDirRoot 'allocations' '*.json' -Recurse -FilesOnly | Sort-Object FullName)) {
