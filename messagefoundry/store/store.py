@@ -7132,7 +7132,8 @@ _TIMEOUT_WARNING_UNLOGGED: Final = "an audit row check that timed out could not 
 
 def _log_timeout_read_as_unverified(exc: AuditVerifyTimedOutError) -> None:
     """Log that a row check outside the walk timed out and is read as a MAC that does not verify.
-    A failure of the log call is reported on stderr by its class alone (BACKLOG #6707).
+    A failure of the log call is reported on stderr by its class alone (BACKLOG #6707), except out
+    of memory or stack, where that report can itself raise.
     :func:`settle_audit_ranges`' own log calls are not guarded, so the store open
     can still fail when a failing filter meets them."""
     try:
