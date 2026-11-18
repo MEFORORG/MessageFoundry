@@ -1707,7 +1707,9 @@ def _bool_settings() -> _BoolSettings:
     defaults: dict[str, set[object]] = {}
     other_names: set[str] = set()
     factories: set[str] = set()
-    for obj in globals().values():
+    # A snapshot: a module global bound mid-scan, by another thread or a call the scan makes, would
+    # otherwise raise "dictionary changed size during iteration" out of the live dict.
+    for obj in tuple(globals().values()):
         if not inspect.isfunction(obj) or obj.__module__ != __name__:
             continue
         if (

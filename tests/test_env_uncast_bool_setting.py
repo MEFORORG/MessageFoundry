@@ -1303,6 +1303,38 @@ def test_the_bool_scan_reads_every_connections_toml_transport() -> None:
     assert {factory.__name__ for factory in _TRANSPORTS.values()} <= _bool_settings().factories
 
 
+def test_a_module_global_bound_mid_scan_leaves_the_bool_scan_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CI saw the first scan on an xdist worker raise "dictionary changed size during iteration":
+    # it walked wiring's LIVE module dict. Bind a new wiring global from inside the scan, on its
+    # first factory, so the next step of a live walk raises every time rather than on a race.
+    from messagefoundry.config import connections_file
+
+    undisturbed = _bool_settings()
+    real = connections_file._factory_signature
+    name = "_test_global_bound_during_the_bool_scan"
+    assert name not in vars(wiring)
+    bound: list[bool] = []
+
+    def binding(factory: Any) -> inspect.Signature | None:
+        if not bound:
+            bound.append(True)
+            monkeypatch.setattr(wiring, name, object(), raising=False)  # undone at teardown
+        return real(factory)
+
+    # _bool_settings imports _factory_signature inside its body, so it reads this patched attribute.
+    monkeypatch.setattr(connections_file, "_factory_signature", binding)
+    _bool_settings.cache_clear()
+    try:
+        disturbed = _bool_settings()
+    finally:
+        # The next caller rescans with the real resolver, never this test's result.
+        _bool_settings.cache_clear()
+    assert bound, "the scan never called the patched resolver, so nothing was bound mid-scan"
+    assert disturbed == undisturbed  # a NamedTuple; its MappingProxyType compares by content
+
+
 # --- the flags inbound() and outbound() take themselves (#3234 step 1, engine PR 2929 deferred) -----
 #
 # The engine reads these with plain truthiness and never resolves an env() on them, so a quoted
