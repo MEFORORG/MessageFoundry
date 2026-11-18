@@ -9,7 +9,7 @@ end, so `--watch;` was no flag; and its forever-loop list held `while true`, `wh
 `while ($true)` and `until`, so `while (1)` and `for (;;)` were no loop.
 
 The deny arm pins at least those shapes; it does not claim every way to run gh or to loop, and the
-open bypasses are listed beside $ASSIGN in the guard. The allow arm pins the ordinary work the
+open bypasses are listed beside $GHN, the tied --watch rule and Test-LoopPoll in the guard. The allow arm pins the ordinary work the
 widened anchors must still pass, including the commands origin/main allowed that the first cuts of
 this change denied. The guard is driven as a subprocess with a real PreToolUse payload, through the
 helpers of tests/test_api_burn_guard.py.
@@ -52,6 +52,13 @@ MUST_DENY = [
     pytest.param("for ((;;)); do gh pr view 1; done", id="bash-for-ever"),
     pytest.param("while ((1)); do gh pr view 1; done", id="bash-while-arith-1"),
     pytest.param("do { gh pr view 1 --json state } while (1)", id="powershell-do-while-1"),
+    pytest.param(
+        "for (;;) { if ($x) { echo y }; $r = gh pr view 1 }", id="forever-nested-body-assignment"
+    ),
+    pytest.param(
+        "for x in a; do for y in b; do :; done; s=`gh pr view 1`; sleep 5; done",
+        id="bash-nested-do-done-body",
+    ),
     pytest.param(
         "do { $r = gh pr view 1 --json state; Start-Sleep 30 } while ($true)",
         id="powershell-do-while-assignment",
@@ -126,19 +133,27 @@ MUST_ALLOW = [
     pytest.param(
         'echo "never do this; $y = gh run watch 5"', id="assignment-after-quoted-separator"
     ),
-    # STILL DENIED, AND PINNED SO A FIX SHOWS. The guard cannot find where a loop body ends, so a
-    # gh after a while (1) or for (;;) loop reads as inside it. That gh runs once at most, so each
-    # is a false deny; a body-end rule would lose the deny on a nested body such as
-    # `for (;;) { if (x) { y }; gh ... }`.
+    # Review round 8d518b6d: a gh outside a loop body, and loop text that is quoted.
+    pytest.param("while (1) { echo tick }; gh pr view 5", id="gh-after-a-forever-loop"),
     pytest.param(
-        "while (1) { echo tick }; gh pr view 5",
-        id="gh-after-a-forever-loop",
-        marks=pytest.mark.xfail(strict=True, reason="loop body end is not parsed"),
+        "while (1) { if (Test-Path x) { break } }; gh pr view 5", id="gh-after-a-loop-that-breaks"
     ),
     pytest.param(
-        "while (1) { if (Test-Path x) { break } }; gh pr view 5",
-        id="gh-after-a-loop-that-breaks",
-        marks=pytest.mark.xfail(strict=True, reason="loop body end is not parsed"),
+        "for n in 1 2 3; do gh pr view $n; done; for ((;;)); do date; done",
+        id="bounded-gh-loop-then-a-forever-loop",
+    ),
+    pytest.param(
+        "foreach ($p in 1..3) { $r = gh pr view $p }; Start-Sleep 5",
+        id="bounded-assigned-loop-then-one-sleep",
+    ),
+    pytest.param(
+        'git commit -m "Deny polls (while (1) { gh pr view 1 }) too"', id="forever-loop-in-prose"
+    ),
+    pytest.param('for (;;) { Write-Host "(gh pr view 1)" }', id="gh-quoted-in-a-forever-body"),
+    pytest.param('gh pr checks 5 --watch="false"', id="watch-quoted-false"),
+    pytest.param("gh pr checks 5 --watch=no", id="watch-value-gh-refuses"),
+    pytest.param(
+        'Write-Host "a `"x; $r = gh run watch 5`" b"', id="escaped-quote-inside-one-string"
     ),
 ]
 
@@ -151,3 +166,13 @@ def test_polling_shape_is_denied(command: str) -> None:
 @pytest.mark.parametrize("command", MUST_ALLOW)
 def test_ordinary_gh_work_is_still_allowed(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
+
+
+def test_powershell_backtick_continuation_is_joined() -> None:
+    command = "$r = gh pr checks 5 `\n  --watch"
+    assert "BLOCKED" in assert_denied(run_guard(bash(command, tool="PowerShell")))
+
+
+def test_powershell_path_ending_in_a_backslash_is_not_joined() -> None:
+    command = "gh pr view 5 > C:\\work\\\nnpx jest --watch;"
+    assert_allowed(run_guard(bash(command, tool="PowerShell")))

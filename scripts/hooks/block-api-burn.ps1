@@ -96,17 +96,25 @@ try {
     # gh behind a wrapper such as `env`, `time` or `xargs`, gh inside an interpreter string other
     # than the three $INTERP names, and gh at the start of any line but the first.
     $GHN = "(?:$POS(?:(?:while|until|if|!)\s+|[A-Za-z_]\w*=``|\`$[\w:.]+\s*=\s*)?|$INTERP)gh(?:\.exe)?\s"
-    $Q = '^(?:[^"'']|"[^"]*"|''[^'']*'')*?'
+    # A quoted string, whole: inside double quotes a backslash or a backtick escapes the next
+    # character, so `"a `"x; gh`" b"` is one string. $QSPAN is text that ends outside any quote.
+    $DQ = '"(?:[^"\\`]|[\\`].)*"'
+    $QSPAN = "(?:[^`"']|$DQ|'[^']*')*?"
+    $Q = '^' + $QSPAN
     $GHQ = $Q + $GHN
     $wide = $c -match $GH0
     # $lines keeps each line break as a \x01, which no rule reads as a separator, so a tied rule
     # stops at the end of gh's line: `gh pr view 5`, then `npx jest --watch;` on the next line, is
-    # not gh's flag. A backslash line continuation is joined first.
-    $lines = (($cmd -replace '\\\r?\n', ' ') -replace '\r?\n', " $([char]1) " -replace '\s+', ' ').Trim()
+    # not gh's flag. The tool's own line continuation is joined first: a backtick for PowerShell,
+    # a backslash otherwise, so a PowerShell path ending in `\` is not glued to the next line.
+    $tool = ''
+    if ($j.PSObject.Properties['tool_name']) { $tool = [string]$j.tool_name }
+    $cont = if ($tool -eq 'PowerShell') { '`\r?\n' } else { '\\\r?\n' }
+    $lines = (($cmd -replace $cont, ' ') -replace '\r?\n', " $([char]1) " -replace '\s+', ' ').Trim()
     if (-not $wide -and $lines -notmatch $GHQ) { exit 0 }
     # From gh to its own flag: no separator, bracket, comment, backtick or line end, and a quoted
     # argument whole, so `-R 'o/r' --watch;` is read and `--body "never --watch"` is not.
-    $SPAN = '(?:[^"''`;&|(){}#\x01]|"[^"]*"|''[^'']*'')*?'
+    $SPAN = "(?:[^`"'``;&|(){}#\x01]|$DQ|'[^']*')*?"
 
     # `gh run watch` -- the measured 1200/hr offender.
     if (($wide -and $c -match ($GH0 + '.*\brun\s+watch\b')) -or
@@ -125,14 +133,17 @@ try {
     # command owns it, so `gh pr checkout 5 && npx jest --watch` is denied as it was before.
     #
     # The tied rule also ends the flag at a shell delimiter, a redirect, a backtick, a line end or
-    # an `=value` other than one of gh's false spellings (false, f, 0), and reads a flag only
-    # where $SPAN reaches it from gh (BACKLOG #5449). So a later command's own `--watch;`, as in
-    # `gh pr checkout 5 && npx jest --watch;` or `if (gh pr view 1) { echo --watch; }`, and gh
-    # inside quoted prose or after a `#` are not read. A `)` is not a delimiter:
-    # `"polling (gh pr checks --watch)"` is prose, so `$(gh pr checks --watch)` passes.
+    # an `=value` that is one of pflag's true spellings (true, t, 1, optionally quoted), and reads
+    # a flag only where $SPAN reaches it from gh (BACKLOG #5449). So a later command's own
+    # `--watch;`, as in `gh pr checkout 5 && npx jest --watch;` or
+    # `if (gh pr view 1) { echo --watch; }`, gh inside quoted prose or after a `#`, and
+    # `--watch=0`, `--watch="false"` or a value gh refuses are not read. Still open, at least:
+    # `$(gh ... --watch)` and `(gh ... --watch)`, because a `)` is not a delimiter here, and a
+    # redirect such as `2>&1` between gh and the flag, because its `&` ends $SPAN.
     if (($wide -and $c -match '(^|\s)--watch(\s|$)') -or
         $c -match ("$INTERP" + 'gh(?:\.exe)?\s[^"'']*\s--watch["'']') -or
-        $lines -match ($GHQ + $SPAN + '\s--watch(?=$|[\s;&|}>`\x01]|=(?!(?:false|f|0)\b))')) {
+        $lines -match ($GHQ + $SPAN +
+            '\s--watch(?=$|[\s;&|}<>`\x01]|=["'']?(?:true|t|1)["'']?(?:$|[\s;&|}<>`\x01]))')) {
         Deny ("BLOCKED: a `--watch` flag on a `gh` command polls in a loop and draws on the fleet's " +
               "shared 5000/hr GitHub API budget. Drop `--watch` and read once. For a run: " +
               "`gh run view <run-id>`. For a PR's checks: `gh pr checks <N>` or " +
@@ -154,21 +165,46 @@ try {
     # On a line $GH0 reads, those rules stand as they were, with gh anywhere on the line.
     #
     # `while (1)`, bash `while ((1))`, and `for (;;)` or `for ((;;))` never end on their own either
-    # (BACKLOG #5449). Those, and every loop on a line only $GHN reads, count only with a gh from
-    # $GHN AFTER a loop opener, so reading a PR once and then running some other loop is not a
-    # poll; `do { gh ... } while (1)` is one, because `do {` opens it. Nothing here finds where a
-    # loop body ends, so a gh after the loop reads as inside it. That is a false deny whenever
-    # the gh is after the loop, as in `while (1) { if ($x) { break } }; gh pr view 5`; reading a
-    # body end would lose the deny on a nested body such as `for (;;) { if ($x) { y }; gh ... }`.
-    # The `{` of `do {` and `% {` is only looked at, so a gh right after it is still in command
-    # position for $LOOPGH.
+    # (BACKLOG #5449). Those, and every loop that only $GHN's shapes put gh in, are read per loop
+    # instead (Test-LoopPoll): the loop runs from its keyword, outside any quote, to the end of its
+    # balanced `{ }` or `do ... done` body, or to the end of the line when the body does not close
+    # there. It is a poll when that region holds a gh outside quotes and either a sleep or a
+    # forever spelling, including `do { } while (1)` or `while ($true)` after a `do` body. So
+    # reading a PR once before or after another loop, a bounded loop and then one sleep, and gh
+    # in a loop's quoted text are not polls. Still open, at least: a loop keyword or gh at the
+    # start of any line but the first, and `for (;;$i++)`. Only the first 32 loop keywords on a
+    # command are read, and a match that runs past its timeout fails open, as every error here does.
     $LOOP = "(?:$POS(?:while|until|for|foreach|ForEach-Object)\b|\bdo\s*(?=\{)|\|\s*%\s*(?=\{))"
     $FOREVER = "$POS(?:while\s+(?:true|:)(?:\s|;|$)|while\s*\(\s*\`$true\s*\)|until\s)"
-    $FOREVER1 = $POS + '(?:while\s*\(\(?\s*1\s*\)\)?|for\s*\(\(?\s*;\s*;\s*\)\)?)'
-    $LOOPGH = $LOOP + '.*' + $GHN
+    $FOREVER_ANY = "^$POS(?:while\s+(?:true|:)(?:\s|;|$)|while\s*\(\s*\`$true\s*\)|until\s|" +
+                   'while\s*\(\(?\s*1\s*\)\)?|for\s*\(\(?\s*;\s*;\s*\)\)?)'
+    $BRACE = "\{(?:(?>\}(?<-d>)|\{(?<d>)|$DQ|'[^']*'|[^`"'{}]+))*?(?(d)(?!))\}"
+    $DODONE = "\bdo\b(?:(?>\bdone\b(?<-d>)|\bdo\b(?<d>)|$DQ|'[^']*'|[^`"']))*?(?(d)(?!))\bdone\b"
+    $timeout = [timespan]::FromSeconds(2)
+    $opt = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    $reBody = [regex]::new("\G(?:$DQ|'[^']*'|[^`"'{])*?(?:$BRACE|$DODONE)", $opt, $timeout)
+    $reTail = [regex]::new('\G\s*while\s*\(\s*(?:\$true|1)\s*\)', $opt, $timeout)
+    $reGh = [regex]::new($Q + $GHN, $opt, $timeout)
+    $reSleep = [regex]::new($Q + '\b(?:sleep|Start-Sleep)\b', $opt, $timeout)
+    $reOutside = [regex]::new("^$QSPAN`$", $opt, $timeout)
+    function Test-LoopPoll {
+        $seen = 0
+        foreach ($m in [regex]::Matches($lines, $LOOP, $opt, $timeout)) {
+            if (++$seen -gt 32) { break }
+            if (-not $reOutside.IsMatch($lines.Substring(0, $m.Index))) { continue }
+            $from = $m.Index + $m.Length
+            $body = $reBody.Match($lines, $from)
+            $end = if ($body.Success) { $body.Index + $body.Length } else { $lines.Length }
+            $region = $lines.Substring($m.Index, $end - $m.Index)
+            if (-not $reGh.IsMatch($region)) { continue }
+            $forever = ($lines.Substring($m.Index) -match $FOREVER_ANY) -or
+                       ($body.Success -and $reTail.IsMatch($lines, $end))
+            if ($forever -or $reSleep.IsMatch($region)) { return $true }
+        }
+        return $false
+    }
     if (($wide -and ($c -match ($LOOP + '.*\b(sleep|Start-Sleep)\b') -or $c -match $FOREVER)) -or
-        ($lines -match ($LOOP + '(?=.*' + $GHN + ')(?=.*\b(?:sleep|Start-Sleep)\b)')) -or
-        (($c -match $FOREVER -or $c -match $FOREVER1) -and $lines -match $LOOPGH)) {
+        (Test-LoopPoll)) {
         Deny ("BLOCKED: this is a hand-rolled polling loop around `gh`, which costs the fleet's shared " +
               "GitHub API budget the same way `gh run watch` does. Make ONE call per turn and let the " +
               "next turn make the next one. If you must wait inside a turn, sleep once and then read " +
