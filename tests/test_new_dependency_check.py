@@ -1121,6 +1121,7 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
         ("[tool.hatch.build.hooks.custom]\n", "in-tree build hook"),
         ("[tool.hatch.build.targets.wheel.hooks.custom]\npath = 'hook.py'\n", "in-tree build hook"),
         ("[tool.hatch.build.targets.custom]\npath = 'hatch_build.py'\n", "in-tree build target"),
+        ("[tool.uv.pip]\nallow-insecure-host = ['example.invalid:8080']\n", "insecure host"),
         ("[tool.uv]\nallow-insecure-host = ['example.invalid']\n", "insecure host"),
         ("[project]\ndynamic = 'dependencies'\n", "not a list"),
         ("[tool.uv.dependency-metadata]\nname = 'x'\n", "not a list"),
@@ -1141,6 +1142,7 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
         "hatch-target-custom-hook",
         "hatch-custom-target",
         "uv-allow-insecure-host",
+        "uv-pip-allow-insecure-host",
         "dynamic-not-a-list",
         "dependency-metadata-not-an-array",
     ],
@@ -1215,11 +1217,6 @@ def test_a_custom_target_in_hatch_toml_is_refused() -> None:
 def test_an_empty_allow_insecure_host_is_not_refused() -> None:
     """An empty list turns off nothing, so it is not a finding."""
     assert _gate.scan("[tool.uv]\nallow-insecure-host = []\n") == ({}, [])
-
-
-def test_allow_insecure_host_under_uv_pip_is_not_read_so_not_refused() -> None:
-    """uv 0.13.1 rejects the key under [tool.uv.pip] as unknown, so only [tool.uv] is refused."""
-    assert _gate.scan("[tool.uv.pip]\nallow-insecure-host = ['example.invalid']\n") == ({}, [])
 
 
 def test_a_failed_check_beside_an_unreachable_pypi_exits_2_not_1(

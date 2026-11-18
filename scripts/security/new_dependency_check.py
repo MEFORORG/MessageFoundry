@@ -31,15 +31,16 @@ REFUSED RATHER THAN VETTED (each a finding, never a silent skip; ``unnameable_en
 entry the gate cannot name (a bare URL, a path, a non-string, a table or list of the wrong TOML
 type); a direct reference (``name @ url``), whose bytes come from the URL rather than from the PyPI
 project the name would be vetted against; ``[project].dynamic`` naming the dependency lists, which a
-build plugin fills from a file this gate never opens; an in-tree build backend (``backend-path``),
+build plugin fills from a file this gate never opens; an in-tree build backend (``backend-path``) or
 an in-tree hatch ``custom`` build or metadata hook, any of which can return requirements from code;
 a hatch ``custom`` build target (``[tool.hatch.build.targets.custom]``), whose in-tree builder runs
 when that target is built (this repo's PEP 517 builds consult only the wheel and sdist targets, so
 this one is refused as a precaution); a non-empty source or index key in ``[tool.uv]`` or
 ``[tool.uv.pip]``, which sends a vetted name somewhere other than pypi.org; a non-empty
-``[tool.uv].allow-insecure-host``, which lets uv fetch from that host without verifying TLS, so the
-bytes need not be what pypi.org serves; and a ``[tool.uv].workspace``, whose members this gate does
-not sweep.
+``allow-insecure-host`` in either, which under ``[tool.uv]`` lets uv fetch from that host without
+verifying TLS, so the bytes need not be what pypi.org serves (uv 0.13.1 rejects the key under
+``[tool.uv.pip]`` as unknown; it is refused there too, so a uv that reads it there cannot open the
+hole); and a ``[tool.uv].workspace``, whose members this gate does not sweep.
 
 EXEMPT FROM THE AGE FLOOR ONLY: this repository's own distributions (``FIRST_PARTY``), by exact PEP
 503 name, wherever declared. Every other check still runs on them; the comment above ``FIRST_PARTY``
@@ -100,11 +101,13 @@ above all), a proxy refusal, and a body that is not UTF-8 JSON naming an object 
 When the retries are spent the last error propagates and the run exits 2 exactly as before; a retry
 never turns an unreachable PyPI into a pass.
 
-EXIT CODES, as ``main`` returns them. 0: every distribution examined passed and nothing was refused.
-2, "could not see", at least: the default sweep found no ``packaging/*/pyproject.toml``; a pyproject
-or its ``hatch.toml`` could not be read or parsed; the default sweep's root runtime tables yielded no
-name; PyPI could not be reached or sent an unreadable reply once the retries were spent; and zero
-distributions were examined with nothing refused. argparse also exits 2 on a bad command line. 1: a
+EXIT CODES. 0: every distribution examined passed and nothing was refused. 2, "could not see", at
+least: the default sweep found no ``packaging/*/pyproject.toml``; a pyproject or its ``hatch.toml``
+could not be read or parsed; the default sweep's root runtime tables yielded no name; a PyPI request
+failed (a transient failure once the retries are spent, any other failure, such as a certificate
+error, a 4xx other than 404 or 429, or a proxy refusal, at once) or got an unreadable reply; and zero
+distributions were examined with nothing refused. argparse also exits 2 on a bad command line, by
+raising SystemExit rather than through ``main``'s return. 1: a
 refusal or a failed check, when none of the exit-2 cases above occurred: beside one of them the run
 exits 2, and a refusal or failed check found before it is not always printed. An exception ``main``
 does not catch, such as a PyPI reply of a shape ``vet`` does not expect, ends the run with Python's
@@ -377,15 +380,16 @@ def scan(
                     "this redirects where uv fetches a distribution from, and this gate vets names "
                     "against pypi.org only, so what it passes is not what would be installed.",
                 )
-    # [tool.uv] only: uv 0.13.1 rejects the key under [tool.uv.pip] as an unknown field.
-    if uv.get("allow-insecure-host"):
-        refuse(
-            "[tool.uv].allow-insecure-host",
-            "insecure host",
-            "this lets uv fetch from a host without verifying TLS, so the bytes installed need not "
-            "be what pypi.org serves for the name this gate vetted. Remove it, and fix the host's "
-            "certificate chain or trust store instead.",
-        )
+        # uv 0.13.1 reads this under [tool.uv] only and rejects it under [tool.uv.pip]; refusing it
+        # in both costs nothing and holds if a later uv reads it there.
+        if settings.get("allow-insecure-host"):
+            refuse(
+                f"{where}.allow-insecure-host",
+                "insecure host",
+                "this lets uv fetch from a host without verifying TLS, so the bytes installed need "
+                "not be what pypi.org serves for the name this gate vetted. Remove it, and fix the "
+                "host's certificate chain or trust store instead.",
+            )
     if uv.get("workspace"):
         refuse(
             "[tool.uv].workspace",
