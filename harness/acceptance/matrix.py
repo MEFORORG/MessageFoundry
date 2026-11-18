@@ -101,6 +101,19 @@ def _row(
     )
 
 
+#: Each server-backend test file a Per-DB row names, mapped to the ``MEFOR_TEST_*`` variable that gates
+#: it. A file listed here skips whole, through a module-level ``pytestmark``, unless its variable is
+#: set; no other file a Per-DB row names gates a test on a server-backend variable. So no row file
+#: mixes SQLite tests with per-test server gates, and a listed file that reads PASS ran on its server.
+#: ``tests/test_acceptance_framework.py`` holds both halves of that invariant.
+SERVER_SUITE_GATES: dict[str, str] = {
+    "tests/test_sqlserver_store.py": "MEFOR_TEST_SQLSERVER",
+    "tests/test_cluster_failover_sqlserver.py": "MEFOR_TEST_SQLSERVER",
+    "tests/test_database_connector_integration.py": "MEFOR_TEST_SQLSERVER",
+    "tests/test_postgres_store.py": "MEFOR_TEST_POSTGRES",
+    "tests/test_cluster_failover_postgres.py": "MEFOR_TEST_POSTGRES",
+}
+
 # The store-parity rows share the same three suites: the SQLite suite always runs; the two server-DB
 # suites self-skip unless MEFOR_TEST_SQLSERVER / MEFOR_TEST_POSTGRES (+ MEFOR_STORE_*) are set.
 _STORE_SUITES = (

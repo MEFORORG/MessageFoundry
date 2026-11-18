@@ -9,6 +9,8 @@ small suite, because only a real run shows what pytest's JUnit actually carries.
 
 from __future__ import annotations
 
+import ast
+import re
 import subprocess
 from collections.abc import Sequence
 from dataclasses import replace
@@ -17,7 +19,15 @@ from typing import Any
 
 import pytest
 
-from harness.acceptance.matrix import MATRIX, ONCE, PER_DB, Coverage, MatrixRow, Status
+from harness.acceptance.matrix import (
+    MATRIX,
+    ONCE,
+    PER_DB,
+    SERVER_SUITE_GATES,
+    Coverage,
+    MatrixRow,
+    Status,
+)
 from harness.acceptance.report import (
     exit_code,
     render_console,
@@ -25,6 +35,7 @@ from harness.acceptance.report import (
     render_markdown,
 )
 from harness.acceptance.runner import (
+    FileCounts,
     PytestRun,
     RowResult,
     _aggregate,
@@ -51,15 +62,17 @@ _JUNIT = """<?xml version="1.0" encoding="utf-8"?>
 def test_parse_junit_aggregates_per_file(tmp_path: Path) -> None:
     junit = tmp_path / "junit.xml"
     junit.write_text(_JUNIT, encoding="utf-8")
-    status, unattributed = _parse_junit_by_file(junit)
+    status, unattributed, counts = _parse_junit_by_file(junit)
     assert unattributed == []
+    assert counts["tests/test_a.py"] == FileCounts(passed=1, skipped=1)
+    assert counts["tests/test_b.py"] == FileCounts(failed=1)
     assert status["tests/test_a.py"] is Status.PASS  # one pass + one skip -> PASS
     assert status["tests/test_b.py"] is Status.FAIL
     assert status["tests/test_c.py"] is Status.SKIP  # all skipped
 
 
 def test_parse_junit_missing_file_is_empty(tmp_path: Path) -> None:
-    assert _parse_junit_by_file(tmp_path / "nope.xml") == ({}, [])
+    assert _parse_junit_by_file(tmp_path / "nope.xml") == ({}, [], {})
 
 
 def test_aggregate_precedence() -> None:
@@ -174,7 +187,10 @@ def test_collection_error_in_a_row_file_reads_error_not_fail(
     broken += '<error message="collection failure">ImportError</error></testcase>'
     _fake_pytest(monkeypatch, _passing_plus(broken), pytest.ExitCode.TESTS_FAILED)
     run = default_pytest_runner(["tests/test_a.py", "tests/test_b.py"])
-    assert run == PytestRun({"tests/test_a.py": Status.PASS, "tests/test_b.py": Status.ERROR})
+    assert run == PytestRun(
+        {"tests/test_a.py": Status.PASS, "tests/test_b.py": Status.ERROR},
+        counts={"tests/test_a.py": FileCounts(passed=1), "tests/test_b.py": FileCounts(failed=1)},
+    )
 
 
 def test_broken_run_exit_leads_the_run_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,7 +215,9 @@ def test_default_runner_accepts_exit_1_a_row_file_explains(monkeypatch: pytest.M
 
 def test_default_runner_clean_exit_has_no_run_error(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_pytest(monkeypatch, _PASSING, pytest.ExitCode.OK)
-    assert default_pytest_runner(["tests/test_a.py"]) == PytestRun({"tests/test_a.py": Status.PASS})
+    assert default_pytest_runner(["tests/test_a.py"]) == PytestRun(
+        {"tests/test_a.py": Status.PASS}, counts={"tests/test_a.py": FileCounts(passed=1)}
+    )
 
 
 def test_default_runner_drops_pytest_addopts_from_the_child_env(
@@ -251,6 +269,213 @@ def test_once_row_still_passes_with_a_skipped_suite() -> None:
     assert _pytest_row_result(once, mixed).status is Status.PASS
     per_db = replace(once, per_db=PER_DB)
     assert _pytest_row_result(per_db, mixed).status is Status.SKIP
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SERVER_GATE_VARS = frozenset(SERVER_SUITE_GATES.values())
+
+
+def _strip_docstrings(tree: ast.AST) -> None:
+    """Drop every docstring, so a gate named only in prose (tests/test_cluster_lease.py) reads none."""
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if (
+            isinstance(body, list)
+            and body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body[0] = ast.Pass()
+
+
+def _reads(node: ast.AST, aliases: dict[str, set[str]]) -> set[str]:
+    """The gate variables ``node`` reads: a string naming one, or a module-level name bound to one."""
+    found: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            found |= {v for v in _SERVER_GATE_VARS if re.search(rf"(?<!\w){v}(?!\w)", sub.value)}
+        elif isinstance(sub, ast.Name):
+            found |= aliases.get(sub.id, set())
+    return found
+
+
+def _parse_for_gates(source: str) -> tuple[ast.Module, dict[str, set[str]]]:
+    """Parse ``source`` without docstrings, plus each module-level name whose value reads a gate."""
+    tree = ast.parse(source)
+    _strip_docstrings(tree)
+    aliases: dict[str, set[str]] = {}
+    for _ in range(len(tree.body) + 1):  # to a fixpoint, so a chain of names resolves
+        before = {k: set(v) for k, v in aliases.items()}
+        for stmt in tree.body:
+            value: ast.AST
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names, value = [stmt.name], stmt
+            elif isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None:
+                targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                names = [t.id for t in targets if isinstance(t, ast.Name)]
+                value = stmt.value
+            else:
+                continue
+            read = _reads(value, aliases)
+            for name in names if read else ():
+                aliases.setdefault(name, set()).update(read)
+        if aliases == before:
+            break
+    return tree, aliases
+
+
+def _callee(call: ast.Call) -> str:
+    func = call.func
+    return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+
+
+def _skip_condition_reads(call: ast.Call, aliases: dict[str, set[str]]) -> set[str]:
+    """The gates a ``skipif``-style call's condition reads (its first argument or ``condition=``)."""
+    conditions = [*call.args[:1], *(k.value for k in call.keywords if k.arg == "condition")]
+    return set().union(*(_reads(c, aliases) for c in conditions))
+
+
+_SKIPIF = frozenset({"skipif", "skipIf", "skipUnless"})
+_SKIP = frozenset({"skip", "skipTest"})
+
+
+def server_gates(source: str) -> list[str]:
+    """Every skip in ``source`` whose condition reads a server-backend gate, as ``line N: VAR``.
+
+    At least these shapes count: a ``skipif`` mark anywhere (a decorator, ``pytestmark``, a
+    ``pytest.param`` mark), and a ``pytest.skip`` call under an ``if`` that reads a gate or whose own
+    arguments name one. A read goes through a module-level name or function bound to a gate.
+    """
+    tree, aliases = _parse_for_gates(source)
+    hits: list[str] = []
+    for node in ast.walk(tree):
+        read: set[str] = set()
+        if isinstance(node, ast.Call) and _callee(node) in _SKIPIF:
+            read = _skip_condition_reads(node, aliases)
+        elif isinstance(node, ast.Call) and _callee(node) in _SKIP:
+            read = _reads(node, aliases)
+        elif isinstance(node, ast.If):
+            branch = ast.Module(body=[*node.body, *node.orelse], type_ignores=[])
+            skips = any(isinstance(n, ast.Call) and _callee(n) in _SKIP for n in ast.walk(branch))
+            read = _reads(node.test, aliases) if skips else set()
+        hits.extend(f"line {getattr(node, 'lineno', '?')}: {var}" for var in sorted(read))
+    return hits
+
+
+def module_pytestmark_gates(source: str) -> set[str]:
+    """The gates a module-level ``pytestmark`` skipif's condition reads, so the file skips whole."""
+    tree, aliases = _parse_for_gates(source)
+    read: set[str] = set()
+    for stmt in tree.body:
+        targets = (
+            stmt.targets
+            if isinstance(stmt, ast.Assign)
+            else [stmt.target]
+            if isinstance(stmt, ast.AnnAssign)
+            else []
+        )
+        if not any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in targets):
+            continue
+        assert isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None
+        for node in ast.walk(stmt.value):
+            if isinstance(node, ast.Call) and _callee(node) in _SKIPIF:
+                read |= _skip_condition_reads(node, aliases)
+    return read
+
+
+def _per_db_pytest_refs() -> set[str]:
+    return {
+        ref
+        for row in MATRIX
+        if row.is_per_db and row.coverage is Coverage.PYTEST
+        for ref in row.refs
+    }
+
+
+@pytest.mark.parametrize("ref", sorted(SERVER_SUITE_GATES))
+def test_every_server_suite_skips_whole_on_its_own_gate(ref: str) -> None:
+    assert ref in _per_db_pytest_refs(), f"{ref} is registered but no Per-DB row names it"
+    source = (_REPO_ROOT / ref).read_text(encoding="utf-8")
+    assert SERVER_SUITE_GATES[ref] in module_pytestmark_gates(source)
+
+
+def test_no_other_per_db_file_gates_a_test_on_a_server_backend() -> None:
+    # The no-mixed-file invariant: a file outside the registry that gated some tests on a server
+    # backend would read PASS on its SQLite tests alone, with the server tests skipped.
+    offenders = {
+        ref: gates
+        for ref in sorted(_per_db_pytest_refs() - SERVER_SUITE_GATES.keys())
+        if (gates := server_gates((_REPO_ROOT / ref).read_text(encoding="utf-8")))
+    }
+    assert offenders == {}
+
+
+_MIXED_SOURCES = {
+    "decorator": """
+import os, pytest
+def test_sqlite(): pass
+@pytest.mark.skipif(not os.getenv("MEFOR_TEST_SQLSERVER"), reason="server")
+def test_server(): pass
+""",
+    "skip under if": """
+import os, pytest
+@pytest.fixture
+def server():
+    if "MEFOR_TEST_POSTGRES" not in os.environ:
+        pytest.skip("no server")
+""",
+    "through a name": """
+import os, pytest
+_ON = bool(os.getenv("MEFOR_TEST_SQLSERVER"))
+_GATED = not _ON
+@pytest.mark.skipif(condition=_GATED, reason="server")
+def test_server(): pass
+""",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_MIXED_SOURCES))
+def test_the_mixed_file_check_catches_a_per_test_server_gate(shape: str) -> None:
+    # Negative control: each shape is a SQLite-plus-server file the invariant must refuse.
+    source = _MIXED_SOURCES[shape]
+    assert server_gates(source) != []
+    assert module_pytestmark_gates(source) == set()  # nor does it skip whole
+
+
+def test_the_mixed_file_check_ignores_prose_and_other_variables() -> None:
+    source = '''
+"""Gated elsewhere on ``MEFOR_TEST_SQLSERVER``; this module is not."""
+import os, pytest
+def test_doc():
+    """Mentions MEFOR_TEST_POSTGRES in prose only."""
+@pytest.mark.skipif(os.getenv("MEFOR_TEST_SQLSERVER_STRICT") != "1", reason="strict")
+def test_strict(): pass
+'''
+    assert server_gates(source) == []
+
+
+_MIXED_JUNIT = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" tests="3">
+  <testcase classname="tests.test_mixed" name="test_sqlite" file="tests/test_mixed.py" time="0.1"/>
+  <testcase classname="tests.test_mixed" name="test_sqlserver" file="tests/test_mixed.py" time="0.1">
+    <skipped message="set MEFOR_TEST_SQLSERVER"/></testcase>
+  <testcase classname="tests.test_mixed" name="test_postgres" file="tests/test_mixed.py" time="0.1">
+    <skipped message="set MEFOR_TEST_POSTGRES"/></testcase>
+</testsuite></testsuites>
+"""
+
+
+def test_a_mixed_file_reads_pass_with_its_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Why the no-mixed-file invariant exists: within a file PASS outranks SKIP, so a Per-DB row whose
+    # file mixed SQLite tests with skipped server tests would read PASS. The counts show the skips.
+    _fake_pytest(monkeypatch, _MIXED_JUNIT, pytest.ExitCode.OK)
+    run = default_pytest_runner(["tests/test_mixed.py"])
+    assert run.counts["tests/test_mixed.py"] == FileCounts(passed=1, skipped=2)
+    row = MatrixRow("Z2", "Z", "t", PER_DB, Coverage.PYTEST, ("tests/test_mixed.py",))
+    result = _pytest_row_result(row, run)
+    assert result.status is Status.PASS
+    assert result.detail == "test_mixed.py=PASS (1 passed, 2 skipped)"
 
 
 def test_default_runner_flags_a_report_that_attributes_nothing(
