@@ -81,6 +81,9 @@ async def test_a_row_deleted_before_the_change_is_refused(store: MessageStore) -
     await store.delete_user("u1")
     with pytest.raises(ValueError, match="no such user"):
         await service.change_password(identity, _NEW_PASSWORD)
+    # The answer does not depend on the password typed: a weak one is not a policy refusal here.
+    with pytest.raises(ValueError, match="no such user"):
+        await service.change_password(identity, "weak")
     assert await _changed_rows(store) == []
 
 
@@ -146,19 +149,17 @@ async def test_an_unusable_corpus_is_a_named_503_and_no_change(
         await c.aclose()
     assert r.status_code == 503, r.text
     assert "password screening is unavailable" in r.json()["detail"]
-    assert str(tmp_path) not in r.text
+    # The decoded detail: a Windows path in the raw JSON body carries escaped backslashes.
+    assert str(tmp_path) not in r.json()["detail"]
     assert await _changed_rows(engine.store) == []
 
 
 async def test_a_deleted_account_is_a_401_not_a_success(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    c, service, headers = await _signed_in(engine)
-
-    async def gone(*_a: Any, **_k: Any) -> list[str]:
-        raise ValueError("no such user")
-
-    monkeypatch.setattr(service, "change_password", gone)
+    c, _service, headers = await _signed_in(engine)
+    # The row goes after the gate and the current-password check, as the store write starts.
+    _delete_during_write(monkeypatch, engine.store, "u1")
     try:
         r = await c.post(
             "/me/password",
@@ -168,3 +169,5 @@ async def test_a_deleted_account_is_a_401_not_a_success(
     finally:
         await c.aclose()
     assert r.status_code == 401, r.text
+    assert r.json()["detail"] == "session ended; sign in again"
+    assert await _changed_rows(engine.store) == []

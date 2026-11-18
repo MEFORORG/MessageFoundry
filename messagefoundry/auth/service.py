@@ -16383,14 +16383,15 @@ class AuthService:
         before the current password. Without the ``[webauthn]`` extra the write counts no passkey,
         as :meth:`_has_way_past` counts none.
         """
+        lookup = await self._lookup_user(identity.user_id)
+        if not lookup.held:
+            # BACKLOG #5902: the caller's row was deleted after its session was resolved. Asked
+            # before the policy, so the answer does not depend on the password typed, and before the
+            # hash, so no password_changed row is written for an absent account.
+            raise ValueError("no such user")
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
-        lookup = await self._lookup_user(identity.user_id)
-        if not lookup.held:
-            # BACKLOG #5902: the caller's row was deleted after its session was resolved. Refused
-            # here, before the hash, so no password_changed row is written for an absent account.
-            raise ValueError("no such user")
         user = lookup.user
         covered = user is not None and self._covered_by_requirement(user, identity.roles)
         if covered and user is not None:
