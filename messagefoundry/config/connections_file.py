@@ -37,6 +37,8 @@ from functools import cache
 from pathlib import Path
 from typing import Any, TypeVar
 
+from pydantic import BaseModel
+
 from messagefoundry.config.models import (
     AckAfter,
     AckMode,
@@ -225,7 +227,7 @@ _OUTBOUND_KEYS = frozenset(
 )
 
 _E = TypeVar("_E", bound=Enum)
-_M = TypeVar("_M")  # a policy model (RetryPolicy/BuildupThreshold/StallThreshold) — not an Enum
+_M = TypeVar("_M", bound=BaseModel)  # a policy model (RetryPolicy, BuildupThreshold, ...)
 
 
 def load_connections_file(path: Path, registry: Registry) -> None:
@@ -337,15 +339,17 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
     return build_outbound_connection(
         name,
         spec,
-        retry=_policy(RetryPolicy, _coerce_retry_forever(table.get("retry")), "retry", where),
+        retry=_policy(
+            RetryPolicy, _coerce_retry_forever(table.get("retry")), "retry", where, strict=True
+        ),
         ordering=_enum(OrderingMode, table["ordering"], "ordering", where)
         if table.get("ordering") is not None
         else None,
         internal_error=_enum(InternalErrorPolicy, table["internal_error"], "internal_error", where)
         if table.get("internal_error") is not None
         else None,
-        buildup=_policy(BuildupThreshold, table.get("buildup"), "buildup", where),
-        stall=_policy(StallThreshold, table.get("stall"), "stall", where),
+        buildup=_policy(BuildupThreshold, table.get("buildup"), "buildup", where, strict=True),
+        stall=_policy(StallThreshold, table.get("stall"), "stall", where, strict=True),
         batch=_policy(BatchConfig, table.get("batch"), "batch", where),
         simulate=_require_bool(table, "simulate", where),
         dead_letter_days=_optional_int(table, "dead_letter_days", where),
@@ -1014,13 +1018,20 @@ def _enum(enum_cls: type[_E], value: Any, key: str, where: str) -> _E:  # noqa: 
         raise WiringError(f"{where}: invalid {key} {value!r} (allowed: {allowed})") from exc
 
 
-def _policy(model_cls: Callable[..., _M], raw: Any, key: str, where: str) -> _M | None:  # noqa: UP047
+def _policy(  # noqa: UP047
+    model_cls: type[_M], raw: Any, key: str, where: str, *, strict: bool = False
+) -> _M | None:
+    """Build one policy sub-table. ``strict`` (BACKLOG #5899) refuses a value of the wrong TOML type
+    instead of coercing it, so ``max_attempts = "3"`` or ``max_depth = true`` is a load error rather
+    than a number. The retry, buildup and stall tables take it; their models also refuse an unknown
+    key. ``schedule`` and ``batch`` stay lax, because a schedule's ``days`` arrive as a TOML array
+    and strict mode refuses a list for its ``frozenset``."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise WiringError(f"{where}: [{key}] must be a table")
     try:
-        return model_cls(**raw)
+        return model_cls.model_validate(raw, strict=strict)
     except (ValueError, TypeError) as exc:
         raise WiringError(f"{where}: invalid {key} — {exc}") from exc
 

@@ -494,8 +494,9 @@ class RetryPolicy(BaseModel):
     permanent, no-retry failure, and the operator-facing floor lives on the ``[delivery]`` twin."""
 
     # Assignment is validated too, so a code-first ``policy.backoff_seconds = 0`` cannot step around
-    # the bounds below.
-    model_config = ConfigDict(validate_assignment=True)
+    # the bounds below. An unknown key is refused (BACKLOG #5899): a typo'd ``[outbound.retry]`` key
+    # was dropped and the default kept, with no error.
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
 
     max_attempts: int | None = 100
     backoff_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
@@ -538,6 +539,9 @@ class BuildupThreshold(BaseModel):
     over five minutes is a problem in any environment); depth is opt-in (a healthy ceiling depends on
     the connection's throughput, so there's no safe universal default)."""
 
+    # BACKLOG #5899: an unknown key is refused rather than dropped, as on RetryPolicy.
+    model_config = ConfigDict(extra="forbid")
+
     max_depth: int | None = None
     max_oldest_seconds: float | None = 300.0
 
@@ -553,6 +557,9 @@ class StallThreshold(BaseModel):
     configures a threshold (it overlaps ``queue_buildup``'s age dimension, so it is opt-in to avoid
     double-paging by default). Resolution mirrors the other per-lane policies: per-connection
     ``stall=`` override > the ``[delivery]`` global default > built-in (off)."""
+
+    # BACKLOG #5899: an unknown key is refused rather than dropped, as on RetryPolicy.
+    model_config = ConfigDict(extra="forbid")
 
     max_oldest_seconds: float | None = None
 

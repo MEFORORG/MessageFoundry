@@ -25,11 +25,12 @@ after the deleted setting, so that test keeps passing while establishing nothing
 
 **Scope: models that do NOT already self-protect.** Pydantic v2's default -- an *unset* ``extra``
 -- behaves identically to an explicit ``extra="ignore"`` (verified below against
-:class:`~messagefoundry.config.settings.RetryPolicy`, which sets no ``extra`` at all and still
+:class:`~messagefoundry.config.settings.SaturationThreshold`, which sets no ``extra`` at all and still
 drops an unknown keyword silently). So the hazard set is "every model visible on
 ``messagefoundry.config.settings`` that is not ``extra="forbid"``", not the narrower set spelled
-``extra="ignore"`` in source. The three that opt out on purpose --``AlertRule``, ``EscalationTier``,
-``Schedule`` -- are excluded deliberately: they already fail loudly at construction, and
+``extra="ignore"`` in source. The ones that opt out on purpose -- at least ``AlertRule``,
+``EscalationTier``, ``Schedule``, and since BACKLOG #5899 ``RetryPolicy``, ``BuildupThreshold`` and
+``StallThreshold`` -- are excluded deliberately: they already fail loudly at construction, and
 ``tests/test_alert_rules.py`` relies on exactly that, constructing
 ``AlertRule(extra_field="x")`` inside a ``pytest.raises(ValidationError)`` block as a negative
 control proving the forbid works. Scanning them too would fail this scanner on that legitimate
@@ -96,7 +97,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 import messagefoundry.config.settings as _settings_module
-from messagefoundry.config.models import RetryPolicy, Schedule
+from messagefoundry.config.models import SaturationThreshold, Schedule
 
 # The modules a test file legitimately imports a settings model (or the settings module itself)
 # from, today. See the docstring's "false-negative boundary" for what falling outside this list
@@ -123,7 +124,7 @@ def _target_models() -> dict[str, frozenset[str]]:
 
     ``.get("extra")`` returning ``None`` (unset) is treated the same as ``"ignore"`` -- both drop an
     unrecognized keyword silently; only an explicit ``"forbid"`` raises. Verified live rather than
-    assumed: ``RetryPolicy(bogus_kwarg_xyz=123)`` succeeds, ``hasattr`` is ``False`` and
+    assumed: ``SaturationThreshold(bogus_kwarg_xyz=123)`` succeeds, ``hasattr`` is ``False`` and
     ``model_extra`` is ``None``, and it sets no ``extra`` at all.
     """
     out: dict[str, frozenset[str]] = {}
@@ -320,7 +321,7 @@ def test_default_extra_behaves_like_ignore_not_like_forbid() -> None:
     walk, so this pin does not trip the tree-wide scan below on itself.
     """
     bogus_kwargs = {"bogus_kwarg_xyz": 123}
-    rp = RetryPolicy(**bogus_kwargs)  # the class settings.py re-imports from models
-    assert not hasattr(rp, "bogus_kwarg_xyz")
-    assert rp.model_extra is None
-    assert RetryPolicy.model_config.get("extra") is None
+    st = SaturationThreshold(**bogus_kwargs)  # the class settings.py re-imports from models
+    assert not hasattr(st, "bogus_kwarg_xyz")
+    assert st.model_extra is None
+    assert SaturationThreshold.model_config.get("extra") is None
