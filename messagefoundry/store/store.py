@@ -3171,10 +3171,11 @@ def _listed_user(d: Mapping[str, Any]) -> UserRecord:
 
 def listed_users(rows: Iterable[Mapping[str, Any]]) -> list[UserRecord]:
     """The accounts a list read returned, in order (BACKLOG #5505). An account whose row does not
-    parse stays in the list as :meth:`UserRecord.unreadable_row`, so the admin list shows it as
-    failing. The list is the only reader that returns the stand-in: the single-row user readers
-    raise :class:`RowSealError` for such a row, which the service's loaders answer as a failed
-    seal, and the write helpers refuse it. A caller iterating a list read checks ``unreadable``
+    parse when read (not the recovery-code cell) stays in the list as
+    :meth:`UserRecord.unreadable_row`, so the admin list shows it as failing. The list is the
+    only reader that returns the stand-in: the single-row user readers raise
+    :class:`RowSealError` for such a row, which the service's loaders answer as a failed seal, and
+    the write helpers refuse it. A caller iterating a list read checks ``unreadable``
     before it acts on a field."""
     return decoded_rows(rows, _listed_user)
 

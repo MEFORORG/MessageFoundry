@@ -2996,9 +2996,11 @@ class LockableAccountCensus:
     #: discoverable or not. The cure is the store key for a cell that does not open, and removing
     #: and enrolling the app again for an enrolment this release refuses.
     reset_would_remove_a_passkey: tuple[str, ...] = ()
-    #: Every account whose users row does not parse, by its stored id (BACKLOG #5505). Its record
-    #: fails its integrity check, so whether it is lockable is unknown: it is named here and in
-    #: no other list, since every other list would read fields the store could not read.
+    #: Every account whose users row does not parse when read, by its stored id (BACKLOG #5505).
+    #: The read does not parse the recovery-code cell (``totp_recovery_codes``), which is judged
+    #: only when its codes are read, so a bad value there alone is not named. A named record fails
+    #: its integrity check, so whether it is lockable is unknown: it is named here and in no other
+    #: list, since every other list would read fields the store could not read.
     integrity_failed: tuple[str, ...] = ()
 
     @property
@@ -20276,10 +20278,11 @@ class AuthService:
     ) -> frozenset[str]:
         """The account ids whose sessions a group-wide save ends (BACKLOG #3401, #5505): each
         listed ``users`` row ``named`` answers yes for, read with no seal checked, and each listed
-        row whose cells do not parse. With ``checked``, also each listed account whose integrity
-        check fails, whatever its row says. So on a store with an integrity key a row tampered to
-        read as outside the save is still named, and its sessions are revoked rather than only
-        refused, so a later repair of its row does not bring them back. With no key no seal is
+        row whose cells do not parse when read (not the recovery-code cell). With ``checked``, also
+        each listed account whose integrity check fails, whatever its row says. So on a store with
+        an integrity key a row tampered to read as outside the save is still named, and its
+        sessions are revoked rather than only refused, so a later repair of its row does not bring
+        them back. With no key no seal is
         checked, so such a row is taken as it reads. A row the list read leaves out is not named,
         at least one whose id cell does not read.
 

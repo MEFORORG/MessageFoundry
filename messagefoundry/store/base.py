@@ -2558,10 +2558,10 @@ class AuthStore(Protocol):
         ...
 
     async def list_users(self) -> Sequence[UserRecord]:
-        """Every account. One whose row does not parse is listed as
-        :meth:`~messagefoundry.store.store.UserRecord.unreadable_row`, whose fields other than the
-        id are invented (BACKLOG #5505); the single-row user readers raise ``RowSealError`` for
-        such a row instead."""
+        """Every account. One whose row does not parse when read (not the recovery-code cell) is
+        listed as :meth:`~messagefoundry.store.store.UserRecord.unreadable_row`, whose fields
+        other than the id are invented (BACKLOG #5505); the single-row user readers raise
+        ``RowSealError`` for such a row instead."""
         ...
 
     async def count_users(self) -> int: ...
