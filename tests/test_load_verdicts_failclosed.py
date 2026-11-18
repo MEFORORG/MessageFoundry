@@ -7,17 +7,24 @@ attribution showed a cross-engine lane steal, an unattributed or idle engine, a 
 nothing sent still exited 0. Each case below starts from a clean record that PASSES and changes one
 field, so a FAIL here is that field's doing.
 
+#5439: the load baseline comparison raised on a malformed baseline, and returned no regression for
+a missing phase, a boolean or non-finite metric, a p99 regression from a zero baseline, and more
+errors, NAKs or dead letters. The same control-first shape applies.
+
 Synthetic metrics only; no message bodies.
 """
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+from typing import Any
 
 import pytest
 
 from harness.load.connscale.report import NoLoss
 from harness.load.multishard import EngineAttribution, MultiShardRecord, MultiShardReport
+from harness.load.report import compare_to_baseline
 
 _C = 3  # inbound lanes per engine
 
@@ -136,3 +143,91 @@ def test_multishard_one_bad_step_fails_a_sweep() -> None:
 
 def test_multishard_empty_sweep_fails() -> None:
     assert not MultiShardReport(store_backend="sqlite", cluster_enabled=False).result_ok
+
+
+# --- #5439: the load baseline comparison -------------------------------------
+
+
+def _phase(name: str, *, rate: object = 100.0, p99: object = 20.0) -> dict[str, Any]:
+    return {"name": name, "measured": True, "achieved_msg_s": rate, "e2e_ms": {"p99": p99}}
+
+
+def _load_report() -> dict[str, Any]:
+    return {
+        "phases": [_phase("warmup", rate=50.0), _phase("steady")],
+        "totals": {"errors": 0, "nak": 0},
+        "engine_side": {"dead_letters": 0},
+        "no_loss": {"ok": True},
+    }
+
+
+def _with(path: tuple[str | int, ...], value: object) -> dict[str, Any]:
+    doc = copy.deepcopy(_load_report())
+    cur: Any = doc
+    for key in path[:-1]:
+        cur = cur[key]
+    cur[path[-1]] = value
+    return doc
+
+
+def test_baseline_identical_reports_pass() -> None:
+    assert compare_to_baseline(_load_report(), _load_report(), tolerance=0.1) == []
+
+
+@pytest.mark.parametrize(
+    "baseline",
+    [
+        pytest.param([], id="list"),
+        pytest.param("x", id="string"),
+        pytest.param(None, id="null"),
+        pytest.param({"phases": "x"}, id="phases-not-list"),
+        pytest.param({"phases": [1]}, id="phase-not-object"),
+        pytest.param({"phases": [{"name": ["unhashable"]}]}, id="phase-name-unhashable"),
+        pytest.param({"phases": [{"achieved_msg_s": 1.0}]}, id="phase-no-name"),
+        pytest.param({"phases": [_phase("steady"), _phase("steady")]}, id="duplicate-phase"),
+        pytest.param({"phases": []}, id="no-phases"),
+    ],
+)
+def test_malformed_baseline_is_a_regression_not_a_crash(baseline: object) -> None:
+    assert compare_to_baseline(_load_report(), baseline, tolerance=0.1)
+
+
+@pytest.mark.parametrize(
+    ("current", "needle"),
+    [
+        pytest.param(
+            {**_load_report(), "phases": [_phase("warmup", rate=50.0)]},
+            "steady: phase is in the baseline but missing",
+            id="missing-phase",
+        ),
+        pytest.param(_with(("phases", 1, "achieved_msg_s"), True), "not a finite", id="bool-rate"),
+        pytest.param(
+            _with(("phases", 1, "achieved_msg_s"), float("nan")), "not a finite", id="nan-rate"
+        ),
+        pytest.param(
+            _with(("phases", 1, "e2e_ms", "p99"), float("inf")), "not a finite", id="inf-p99"
+        ),
+        pytest.param(_with(("phases", 1, "e2e_ms"), None), "not a finite", id="missing-p99"),
+        pytest.param(_with(("totals", "errors"), 3), "errors worsened", id="errors"),
+        pytest.param(_with(("totals", "nak"), 2), "NAKs worsened", id="naks"),
+        pytest.param(
+            _with(("engine_side", "dead_letters"), 1), "dead letters worsened", id="dead-letters"
+        ),
+    ],
+)
+def test_current_run_regression_is_flagged(current: dict[str, Any], needle: str) -> None:
+    regressions = compare_to_baseline(current, _load_report(), tolerance=0.1)
+    assert any(needle in r for r in regressions), regressions
+
+
+def test_p99_regression_from_a_zero_baseline_is_flagged() -> None:
+    baseline = _with(("phases", 1, "e2e_ms", "p99"), 0.0)
+    regressions = compare_to_baseline(_load_report(), baseline, tolerance=0.1)
+    assert any("steady: e2e p99 regressed" in r for r in regressions), regressions
+    assert compare_to_baseline(baseline, baseline, tolerance=0.1) == []
+
+
+def test_non_finite_baseline_metric_is_flagged() -> None:
+    baseline = _with(("phases", 1, "achieved_msg_s"), float("nan"))
+    regressions = compare_to_baseline(_load_report(), baseline, tolerance=0.1)
+    assert any("baseline value nan is not a finite number" in r for r in regressions), regressions

@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 from dataclasses import dataclass, field
 from itertools import pairwise
 
@@ -1074,26 +1075,53 @@ def _lat(s: LatencySummary) -> dict[str, float | int]:
 # --- baseline comparison -----------------------------------------------------
 
 
-def compare_to_baseline(
-    current: dict[str, object], baseline: dict[str, object], *, tolerance: float
-) -> list[str]:
+def compare_to_baseline(current: object, baseline: object, *, tolerance: float) -> list[str]:
     """Return regression messages comparing a current report dict to a saved baseline dict. A
     regression is throughput below ``baseline*(1-tolerance)``, p99 above ``baseline*(1+tolerance)``,
-    or any worsening of error/loss. Empty list = no regression."""
+    or any worsening of error/loss. Empty list = no regression.
+
+    It fails closed (BACKLOG #5439): a report that is not a JSON object, a baseline with no phases,
+    a baseline phase the current run lacks, and a metric that is missing, boolean or not finite in
+    either report each come back as a message rather than a pass or a traceback, because a
+    comparison that cannot be made is not evidence of no regression."""
     out: list[str] = []
-    cur_phases = {p["name"]: p for p in _as_list(current.get("phases"))}
-    base_phases = {p["name"]: p for p in _as_list(baseline.get("phases"))}
+    if not isinstance(baseline, dict):
+        return [f"baseline is not a JSON object (got {type(baseline).__name__})"]
+    if not isinstance(current, dict):
+        return [f"current report is not a JSON object (got {type(current).__name__})"]
+    base_phases = _phases("baseline", baseline, out)
+    cur_phases = _phases("current", current, out)
+    if base_phases is None or cur_phases is None:
+        return out
+    if not base_phases:
+        out.append("baseline has no phases to compare")
     for name, bp in base_phases.items():
         cp = cur_phases.get(name)
         if cp is None:
+            out.append(f"{name}: phase is in the baseline but missing from the current run")
             continue
-        b_rate, c_rate = _f(bp.get("achieved_msg_s")), _f(cp.get("achieved_msg_s"))
-        if b_rate > 0 and c_rate < b_rate * (1.0 - tolerance):
-            out.append(f"{name}: throughput regressed {c_rate:.0f} < {b_rate:.0f} msg/s")
-        b_p99 = _f(_get(bp, "e2e_ms", "p99"))
-        c_p99 = _f(_get(cp, "e2e_ms", "p99"))
-        if b_p99 > 0 and c_p99 > b_p99 * (1.0 + tolerance):
-            out.append(f"{name}: e2e p99 regressed {c_p99:.1f} > {b_p99:.1f} ms")
+        rate = _pair(
+            f"{name}: achieved_msg_s", bp.get("achieved_msg_s"), cp.get("achieved_msg_s"), out
+        )
+        if rate is not None:
+            b_rate, c_rate = rate
+            if b_rate > 0 and c_rate < b_rate * (1.0 - tolerance):
+                out.append(f"{name}: throughput regressed {c_rate:.0f} < {b_rate:.0f} msg/s")
+        p99 = _pair(f"{name}: e2e p99", _get(bp, "e2e_ms", "p99"), _get(cp, "e2e_ms", "p99"), out)
+        if p99 is not None:
+            b_p99, c_p99 = p99
+            # No `b_p99 > 0` guard: a zero baseline is a real floor, and the old guard let any
+            # current latency pass against it.
+            if c_p99 > b_p99 * (1.0 + tolerance):
+                out.append(f"{name}: e2e p99 regressed {c_p99:.1f} > {b_p99:.1f} ms")
+    for label, path in (
+        ("errors", ("totals", "errors")),
+        ("NAKs", ("totals", "nak")),
+        ("dead letters", ("engine_side", "dead_letters")),
+    ):
+        counts = _pair(label, _get(baseline, *path), _get(current, *path), out)
+        if counts is not None and counts[1] > counts[0]:
+            out.append(f"{label} worsened: {counts[1]:.0f} > {counts[0]:.0f}")
     if _loss_ok(baseline) and not _loss_ok(current):
         nl = current.get("no_loss")
         if isinstance(nl, dict) and nl.get("inconclusive"):
@@ -1103,8 +1131,37 @@ def compare_to_baseline(
     return out
 
 
-def _as_list(value: object) -> list[dict[str, object]]:
-    return value if isinstance(value, list) else []
+def _phases(
+    which: str, report: dict[str, object], out: list[str]
+) -> dict[str, dict[str, object]] | None:
+    """The report's phases by name, or None after naming why they cannot be read."""
+    raw = report.get("phases")
+    if not isinstance(raw, list):
+        out.append(f"{which} report has no phases list")
+        return None
+    phases: dict[str, dict[str, object]] = {}
+    for p in raw:
+        name = p.get("name") if isinstance(p, dict) else None
+        if not isinstance(p, dict) or not isinstance(name, str):
+            out.append(f"{which} report has a phase with no name")
+            return None
+        if name in phases:
+            out.append(f"{which} report has two phases named {name!r}")
+            return None
+        phases[name] = p
+    return phases
+
+
+def _pair(label: str, base: object, cur: object, out: list[str]) -> tuple[float, float] | None:
+    """Both values as finite numbers, or None after naming the one that is not."""
+    b, c = _f(base), _f(cur)
+    if b is None:
+        out.append(f"{label}: baseline value {base!r} is not a finite number")
+        return None
+    if c is None:
+        out.append(f"{label}: current value {cur!r} is not a finite number")
+        return None
+    return b, c
 
 
 def _get(d: dict[str, object], *path: str) -> object:
@@ -1116,8 +1173,16 @@ def _get(d: dict[str, object], *path: str) -> object:
     return cur
 
 
-def _f(value: object) -> float:
-    return float(value) if isinstance(value, (int, float)) else 0.0
+def _f(value: object) -> float | None:
+    """A finite number, or None. A bool is an int to ``isinstance`` and is refused, as is NaN, which
+    every comparison answers False and so would pass any threshold."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:  # an int past float range, which JSON allows
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _loss_ok(report: dict[str, object]) -> bool:
