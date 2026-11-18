@@ -472,6 +472,17 @@ def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str,
         ("git -C '{p}' log $(git rev-parse HEAD) -- config core.hooksPath x", "outside", "Bash"),
         # $absC folds the `-C` inside the closed `$( )` as the outer invocation's.
         ("(cd {tmp} && ls)\ngit -c a=$(git -C '{p}' log -1) config {k}", "outside", "Bash"),
+        # Rule 3c's owning-word reading compares bracket counts, not nesting, so the owner git in an
+        # earlier closed `$( )` decides the disarm in a later one.
+        ("echo $(git -C '{p}' log -1) $(/usr/bin/git config {k})", "outside", "Bash"),
+        # After an earlier line's chdir in parentheses, the $absC fallback refuses these.
+        ("(cd {tmp} && ls)\ngit -C '{p}' stash list", "outside", "Bash"),
+        ("(cd {tmp} && ls)\ngit -C '{p}' ''--git-dir={o}/.git config {k}", "outside", "Bash"),
+        (
+            "(cd {tmp} && ls)\ngit -C '{o}' log $(git -C '{p}' rev-parse HEAD) -- config core.hooksPath x",
+            "outside",
+            "Bash",
+        ),
     ],
 )
 def test_known_false_denies_of_the_added_readings_still_deny(

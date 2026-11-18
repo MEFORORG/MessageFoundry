@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.17.3"
+$GateVersion = "2026.11.17.4"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -825,14 +825,12 @@ function Get-ScanRawIndexMap($Seg) {
 # (Test-ShellLiteralPath); a chdir the resolver cannot follow (popd, a chdir in parentheses, two
 # chdirs, a relative chdir after an earlier line's) where the invocation's `-C` does not make that
 # directory irrelevant -- an absolute `-C` is read past such a chdir, under the conditions in
-# Get-InvocationReading and the resolver's -OwnWindow branch; git options after the verb; and a line
-# whose ONLY git word is a spelling the token pattern misses (`git.EXE reset --hard`, or `GIT` on
-# Windows), which these readings never reach. That last one is
-# origin/main's too. Also, at least: any line after an earlier line whose chdir sits in parentheses,
-# which makes the earlier-line reading answer nothing, unless the invocation's `-C` fold ends absolute
-# and its window names no work tree or git dir. Under Bash `(cd x && ls)` is a subshell and the shell
-# does not move; under the PowerShell tool `(Set-Location <p>)` DOES move the shell, so
-# `(Set-Location <p>)` then `git -C . reset --hard` is allowed (fail-open, f0e49f45c5c has it too).
+# Get-InvocationReading and the resolver's -OwnWindow branch; and git options after the verb. Also, at
+# least: any line after an earlier line whose chdir sits in parentheses, which makes the earlier-line
+# reading answer nothing, unless the invocation's `-C` fold ends absolute and its window names no work
+# tree or git dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the
+# PowerShell tool `(Set-Location <p>)` DOES move the shell, so `(Set-Location <p>)` then `git -C .
+# reset --hard` is allowed (fail-open, f0e49f45c5c has it too).
 # And after such a line, a `-C` window that also names a work tree or git dir is not read: git roots a
 # relative `--git-dir` or `--work-tree` against the `-C` directory, not against the unknown one, but
 # the $absC test excludes every such window, so `git -C '<p>' --work-tree=<rel> reset --hard` and
@@ -853,9 +851,8 @@ function Get-ScanRawIndexMap($Seg) {
 #   * a later disarm judged by rule 3c's first chain can take an earlier command's `-C`;
 #   * an earlier bracket-joined command's `-C` or `--git-dir` can decide (`if (git -C <p> diff
 #     --quiet) { git reset --hard }` from outside);
-#   * rule 3c's later-disarm filter counts `.git` as a git word, so the grep fix above misses a grep
-#     naming `.git` (`git config core.hooksPath ; grep --exclude-dir=.git -c alias.lg f` from the
-#     primary);
+#   * rule 3c's later-disarm filter counts `.git` as a git word (`git config core.hooksPath ; grep
+#     --exclude-dir=.git -c alias.lg f` from the primary);
 #   * a chdir in an earlier line's heredoc, here-string or multi-line `bash -c` body is read as a
 #     real one;
 #   * a `config` pathspec after a closed `$( )` reads as a config disarm (`git -C '<p>' log $(git
@@ -866,7 +863,14 @@ function Get-ScanRawIndexMap($Seg) {
 #     config <key>` from the primary; origin/main's too);
 #   * the $absC fold reads a `-C` inside a closed `$( )` as the outer invocation's, after an earlier
 #     line's chdir in parentheses (`(cd <tmp> && ls)`, then `git -c a=$(git -C '<p>' log -1) config
-#     <key>` from outside).
+#     <key>` from outside);
+#   * rule 3c's owning-word reading compares bracket COUNTS, not nesting, so an owner git in an
+#     earlier closed `$( )` decides a disarm in a later one (`echo $(git -C '<p>' log -1)
+#     $(/usr/bin/git config <key>)` from outside);
+#   * after an earlier line's chdir in parentheses, the $absC fallback refuses commands origin/main
+#     f0e49f45c5c allows (`(cd <tmp> && ls)`, then any of `git -C '<p>' stash list`, `git -C '<p>'
+#     ''--git-dir=<o>/.git config <key>` or `git -C '<o>' log $(git -C '<p>' rev-parse HEAD) --
+#     config <key> x`, from outside).
 #
 # KNOWN WRONG REFUSAL TEXT, left open, origin/main's too: rule 3c words its refusal from the disarm
 # match, not from what the command does, so it can call a refused read "changing" or "setting" (`git
