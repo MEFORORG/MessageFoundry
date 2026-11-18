@@ -358,7 +358,7 @@ class _TokenEndpointProvider(abc.ABC):
         # setup could never answer a challenge on this hop (ADR 0095 B.1). Some REST and FHIR
         # outbounds meet it earlier; http_auth.refuse_a_digest_proxy_on_the_token_hop says which.
         # Every other token provider meets it here, at least a SOAP outbound's, a FhirLookup's and
-        # one built directly. Both read the one rule, so a token host the proxy bypasses builds.
+        # one built directly. Both read the one rule.
         if (
             proxy is not None
             and ech_sidecar is None
