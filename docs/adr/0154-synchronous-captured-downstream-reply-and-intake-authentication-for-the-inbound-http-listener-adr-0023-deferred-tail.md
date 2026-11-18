@@ -2,6 +2,10 @@
 
 - **Status:** **Accepted (2026-07-31) — owner-ratified at revision 5. BOTH increments are now authorised, built and merged: increment A 2026-08-01 (`f2ef0ea9`, PR #109), increment B 2026-08-01 (PR #119). `AC-18` was deliberately deferred and remains outstanding — see the note below.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-30 (rev 1–4), 2026-07-31 (rev 5, ratified)
+- **Amended 2026-11-18 (BACKLOG #5893):** D5's pre-close drain reaches only the stopping listener's
+  own turns, and its draining flag refuses only that listener's later arms. D5 keeps its original
+  text, with a dated note in place. See
+  [Amendment 2026-11-18](#amendment-2026-11-18-the-drain-is-scoped-to-one-listener-start).
 - **Amended 2026-09-26 (BACKLOG #1960, owner ruling):** a body the receipt handler refuses at ingress
   is now answered **`422`** on the `202` receipt path too, not only on the sync path. D5's note on the
   `None` return and **AC-8** said the receipt path kept its "`202` without a `message_id`". Both keep
@@ -661,7 +665,10 @@ The rejection stands on the field being untyped free text, which is the honest r
 - `_respond` gains a **bounded** drain (`reply_write_timeout`) — it now carries a partner-sized PHI body to a
   possibly slow reader; today it drains unbounded.
 - `HttpSource` calls `_set_tcp_nodelay` as `MLLPSource` does.
-- `stop()` gains an explicit **pre-close drain phase**: set a draining flag the rendezvous observes, wake
+- `stop()` gains an explicit **pre-close drain phase** (*note 2026-11-18: the flag and the wake are
+  scoped to the stopping listener; see
+  [Amendment 2026-11-18](#amendment-2026-11-18-the-drain-is-scoped-to-one-listener-start)*): set a
+  draining flag the rendezvous observes, wake
   every waiter with `shutting_down`, let each `_serve_one` write its `503` + `Retry-After` through the
   **still-open** writer under a sub-budget of `_CLIENT_SHUTDOWN_GRACE`, and only then run today's
   close-writers → bounded `wait_closed()` → cancel sequence. Revision 1 promised the `503` while also
@@ -1777,3 +1784,21 @@ also reads as an address and a port is keyed on each of its readings that CONNEC
 kept, so one failure may charge a second key beside the recorded address's. The socket peer's key
 follows the same rules. The HTTP listener's `trusted_proxies` row in
 [CONNECTIONS.md](../CONNECTIONS.md) says how the header is read.
+
+## Amendment 2026-11-18: the drain is scoped to one listener start
+
+D5's pre-close drain phase sets "a draining flag the rendezvous observes". The runner holds one
+rendezvous, and before this amendment every `reply_from` listener bound its drain to it. Stopping
+any one listener would therefore have woken every sibling listener's waiting turns with
+`shutting_down` and latched the flag, so every later arm on every listener would have resolved
+`degraded` until the process restarted (BACKLOG #5893).
+
+The runner now hands each listener start its own scope of the one rendezvous
+(`ReplyRendezvous.scope()` in `messagefoundry/pipeline/reply_wait.py`). Every scope shares the
+waiter table and the cap, so a delivery hint still reaches a waiter whichever listener armed it. A
+scope's drain wakes only the waiters armed through it and refuses only its own later arms, and the
+next start of the listener gets a fresh scope. No runner path drains the root itself. The drain
+still runs before any client writer is closed, as D5 requires.
+
+The fresh state comes from the runner building a new source, and so a new scope, on every start.
+A restart of the same source instance would keep its drained scope; the runner does not do that.
