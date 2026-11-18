@@ -1629,13 +1629,16 @@ def build_rung_outcome(
     fragile ``report`` (ENGINE_RUNG_REPORT, posted only after fleet teardown + node-log aggregation). This is
     the fix for the false-ceiling defect: a late/lost ENGINE_RUNG_REPORT no longer looks like a store-truth
     collapse — the verdict rests on the drain gate, and ENGINE_RUNG_REPORT only ADDS the phase-timing + soak
-    slope. Store-truth is ``engine_reported`` only if AT LEAST ONE of the two arrived; with neither, the rung
-    is classified INCONCLUSIVE (a coord glitch, never a fabricated collapse)."""
+    slope. Store-truth is ``engine_reported`` only if AT LEAST ONE of the two arrived and NEITHER marks itself
+    invalid (``aborted`` / ``valid: false``, BACKLOG #5442); otherwise the rung is classified INCONCLUSIVE (a
+    coord glitch or a torn-down rung, never a fabricated collapse)."""
     notes: list[str] = list(drive.notes)
     truth = gate if gate is not None else report  # prefer the reliable drain gate for store-truth
     # BACKLOG #5442: the engine marks a rung whose drive tore its sinks down mid-delivery `aborted` /
     # `valid: false`. Its store-truth is a teardown artifact (engine_ok false, counts unread), which the
-    # classifier would score COLLAPSED and let bracket a ceiling. It is not a confirmed store-truth.
+    # classifier would score COLLAPSED and let bracket a ceiling. It is not a confirmed store-truth. The
+    # live drive breaks on its own abort path before calling this, so the guard covers a late or replayed
+    # payload and any other caller.
     invalidated = _store_truth_invalidated(gate) or _store_truth_invalidated(report)
     engine_reported = truth is not None and not invalidated
     engine_drain_seconds: float | None = (
@@ -1735,7 +1738,8 @@ def build_rung_outcome(
             "processes; this run's pool is NOT the one it claims"
         )
 
-    drain_gated = gate is not None and drive.tallied_behind_gate
+    # An invalidated gate is not a completed drain barrier, so the sinks did not tally behind one.
+    drain_gated = gate is not None and not invalidated and drive.tallied_behind_gate
     verdict = classify_rung(
         engine_reported=engine_reported,
         engine_ok=engine_ok,
@@ -2466,7 +2470,8 @@ class ConsolidatedLadderReport:
         (``lanes_observed >= 2``). The ceiling/collapse is a throughput MEASUREMENT, not a verdict failure —
         so the non-vacuity gate is NOT applied to a COLLAPSED/FROZEN_TAIL rung (a near-zero-delivery collapse
         legitimately observes <2 lanes; failing the verdict on it would mislabel a throughput ceiling as a
-        correctness break). Mirrors the single-box ShardCertLadderReport.ok, which never gates on lanes."""
+        correctness break). Mirrors the single-box ShardCertLadderReport.ok, which since BACKLOG #5441 gates
+        lanes on its sustained (non-ceiling) rungs only, for the same reason."""
         recs = self.all_records
         if not recs:
             return False
@@ -3029,7 +3034,8 @@ class ConsolidatedLadderReport:
             #
             # v10 (BACKLOG #5442) — no new key; two SCORING changes, each only ever moves a run away from PASS:
             # (1) a rung whose engine payload says `aborted` / `valid: false` is INCONCLUSIVE with
-            # `engine.reported` false (v9 scored it COLLAPSED, so it could bracket a ceiling); (2) a rung
+            # `engine.reported` false (v9's classifier scored it COLLAPSED; run_drive_ladder breaks on its own
+            # abort path before building the outcome, so only a late or replayed payload reached it); (2) a rung
             # whose ENGINE_RUNG_REPORT was lost reads `store_pool` from the drain gate (v9 left it unmeasured,
             # so the pool tripwire could not fire and a pool-bound run could exit 0).
             "schema_version": 10,

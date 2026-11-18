@@ -922,6 +922,32 @@ def _copies_missing(tracker: FailoverTracker, *, routing: str, dests: int, deliv
     )
 
 
+def _invariants_held(
+    *,
+    acked: int,
+    lossless: bool,
+    lane_inversions: int,
+    duplicates_ok: bool,
+    engine_dead: int,
+    dead_total: int,
+    stranded_nonterminal: int,
+) -> bool:
+    """The correctness terms the single-run verdict (:attr:`ShardCertReport.ok`) and the co-located
+    ladder's per-rung bar (:attr:`ShardCertStepRecord.correctness_ok`) share, kept in ONE place so a new
+    term reaches both (BACKLOG #5441: the ladder bar had drifted to three of them). Something was
+    acknowledged, nothing was lost, per-lane FIFO held, no duplicate the caller does not excuse, no dead
+    letter at any stage (``-1`` = not measured fails), and no stranded row."""
+    return (
+        acked > 0
+        and lossless
+        and lane_inversions == 0
+        and duplicates_ok
+        and engine_dead == 0
+        and dead_total == 0
+        and stranded_nonterminal == 0
+    )
+
+
 @dataclass
 class ShardCertReport:
     """The certification outcome — sink/drain-derived, plus store diagnostics."""
@@ -1043,15 +1069,17 @@ class ShardCertReport:
         stranded non-terminal rows. Duplicates are allowed only across a kill."""
         dup_ok = self.lane_repeats == 0 if self.killed_shard is None else True
         return (
-            self.acked > 0
-            and self.lossless
+            _invariants_held(
+                acked=self.acked,
+                lossless=self.lossless,
+                lane_inversions=self.lane_inversions,
+                duplicates_ok=dup_ok,
+                engine_dead=self.engine_dead,
+                dead_total=self.dead_total,
+                stranded_nonterminal=self.stranded_nonterminal,
+            )
             and self.in_pipeline_final == 0
-            and self.engine_dead == 0
-            and self.dead_total == 0
-            and self.lane_inversions == 0
             and self.lanes_observed >= 2
-            and self.stranded_nonterminal == 0
-            and dup_ok
         )
 
     def render(self) -> str:
@@ -1920,7 +1948,8 @@ async def run_shardcert(
         lanes_observed=tracker.lanes_observed,
         lane_repeats=tracker.lane_repeats,
         engine_done=(final.done if final else 0),
-        engine_dead=(final.dead if final else 0),
+        # -1 = no poller sample, so an unmeasured dead count fails the pass bars rather than reading clean.
+        engine_dead=(final.dead if final else -1),
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This value
         # feeds ShardCertReport.ok/drained, unlike the advisory drive-side poller cross-checks (left as N×).
         in_pipeline_final=(final.in_pipeline // max(1, len(ids_list)) if final else -1),
@@ -2053,20 +2082,21 @@ class ShardCertStepRecord:
 
     @property
     def correctness_ok(self) -> bool:
-        """The rung held the correctness invariants of :attr:`ShardCertReport.ok`: no acknowledged loss,
-        something was acknowledged, per-lane FIFO over at least two lanes, no duplicate delivery (a ladder
-        rung never kills a shard), no dead letters at any stage and no stranded rows. The ceiling terms
-        (intake shortfall, filling) are NOT here: a ceiling is a measurement, not a failure."""
-        return (
-            self.no_loss
-            and self.achieved_intake > 0
-            and self.lane_inversions == 0
-            and self.lanes_observed >= 2
-            and self.lane_repeats == 0
-            and self.engine_dead == 0
-            and self.dead_total == 0
-            and self.stranded_nonterminal == 0
-        )
+        """The rung held the invariants :attr:`ShardCertReport.ok` also checks (:func:`_invariants_held`),
+        with no duplicate delivery (a ladder rung never kills an engine shard). Two terms differ, on purpose:
+        ``in_pipeline_final`` is not carried, because ``no_loss`` requires the drain, which the poller only
+        reports at an empty pipeline; and the two-lane FIFO bar applies to a SUSTAINED rung only, as on the
+        two-box ladder, because a ceiling rung is a throughput measurement and a near-empty one may honestly
+        see one lane. The ceiling terms themselves (intake shortfall, filling) are not failures."""
+        return _invariants_held(
+            acked=self.achieved_intake,
+            lossless=self.no_loss,
+            lane_inversions=self.lane_inversions,
+            duplicates_ok=self.lane_repeats == 0,
+            engine_dead=self.engine_dead,
+            dead_total=self.dead_total,
+            stranded_nonterminal=self.stranded_nonterminal,
+        ) and (self.ceiling or self.lanes_observed >= 2)
 
     @property
     def inbound_bands(self) -> int:
@@ -2452,7 +2482,8 @@ class ShardCertLadderReport:
     def pinned_record(self) -> ShardCertStepRecord | None:
         """The highest-rate rung that both SUSTAINED (not a ceiling) and was actually DRIVEN — the honest
         FLOOR this climb proved. ``None`` when nothing sustained admissibly."""
-        held = [r for r in self.admissible_records if not r.ceiling]
+        # BACKLOG #5441: a rung that broke correctness pins nothing, even on a ladder already reading FAIL.
+        held = [r for r in self.admissible_records if not r.ceiling and r.correctness_ok]
         return max(held, key=lambda r: r.aggregate_rate) if held else None
 
     @property
@@ -2812,6 +2843,15 @@ async def run_shardcert_ladder(
             report.notes.append(
                 f"ceiling at {rate:g} msg/s ({fid.value}): intake {rec.achieved_intake} of offered "
                 f"{rec.offered} (no_loss={rec.no_loss}; sustain bar = offered*(1-{_INTAKE_TOL:g}))"
+            )
+            break
+        if not rec.correctness_ok:
+            # BACKLOG #5441: the ladder already reads FAIL on this rung, so every higher rung is a full fresh
+            # fleet spent on a run that cannot pass.
+            report.notes.append(
+                f"CLIMB STOPPED at {rate:g} msg/s: the rung broke correctness "
+                f"(repeats={rec.lane_repeats} lanes={rec.lanes_observed} dead={rec.engine_dead}/"
+                f"{rec.dead_total} intake={rec.achieved_intake})"
             )
             break
     return report

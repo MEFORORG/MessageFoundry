@@ -8,6 +8,8 @@ Unit tests over synthetic counters: no load run, no database, no fleet.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from harness.load.enginepoll import PoolStats
@@ -162,6 +164,39 @@ def test_step_record_without_the_pass_bar_fields_fails_closed() -> None:
     assert ShardCertLadderReport(records=[rec]).ok is False
 
 
+def test_single_lane_ceiling_rung_is_a_measurement_not_a_break() -> None:
+    """The two-lane FIFO bar holds on a sustained rung only, as on the two-box ladder: a ceiling rung whose
+    engine took a handful of messages may honestly see one lane."""
+    ceiling = _report(lanes_observed=1, achieved_intake=500, acked=500, delivered_distinct=500)
+    rec = ShardCertStepRecord.from_report(20.0, ceiling)
+    assert rec.ceiling is True
+    assert rec.correctness_ok is True
+    assert _ladder(_report(), ceiling).ok is True
+
+
+def test_broken_rung_pins_nothing_and_stops_the_climb(monkeypatch: pytest.MonkeyPatch) -> None:
+    from harness.load import shardcert
+
+    plan = {
+        10.0: ShardCertStepRecord.from_report(10.0, _report(), hold_seconds=60.0),
+        20.0: ShardCertStepRecord.from_report(20.0, _report(dead_total=5), hold_seconds=60.0),
+        30.0: ShardCertStepRecord.from_report(30.0, _report(), hold_seconds=60.0),
+    }
+    seen: list[float] = []
+
+    async def fake_step(*, rate: float, **_kw: object) -> ShardCertStepRecord:
+        seen.append(rate)
+        return plan[rate]
+
+    monkeypatch.setattr(shardcert, "_run_ladder_step", fake_step)
+    lad = asyncio.run(shardcert.run_shardcert_ladder(rates=[10, 20, 30]))
+    assert seen == [10.0, 20.0]  # the 30 msg/s rung is never driven
+    assert lad.exit_code == 1
+    assert lad.pinned_rate == 10.0  # the dead-lettering 20 msg/s rung pins nothing
+    assert lad.ceiling_rate is None
+    assert any("CLIMB STOPPED" in n for n in lad.notes)
+
+
 # --- BACKLOG #5442: the two-box ladder reads the abort marker and the gate's pool -------------------------
 
 _DESTS = 4
@@ -283,6 +318,7 @@ def test_aborted_store_truth_is_inconclusive_not_collapsed(where: str) -> None:
     out = build_rung_outcome(_rung(1, 24.0), drive, gate, report)
     assert out.verdict is RungVerdict.INCONCLUSIVE
     assert out.engine_reported is False
+    assert out.drain_gated is False  # an aborted gate is not a completed drain barrier
     assert any("INVALID" in n for n in out.notes)
 
 
