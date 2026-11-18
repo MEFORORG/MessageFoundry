@@ -20,7 +20,7 @@ import pytest
 import harness.sinks.file as file_sink
 from harness.bounded_file import NOT_REGULAR
 from harness.scenarios import SCENARIOS
-from harness.scenarios._core import Scenario, _verify_sink
+from harness.scenarios._core import Scenario, _verify_sink, sink_faults
 from harness.scenarios.internal import TimerScenario
 from harness.scenarios.remotefile import RemoteFileScenario, verify_written
 from harness.sinks import Record, Sink
@@ -199,6 +199,25 @@ def test_a_root_swapped_after_start_is_reported_and_not_scanned(
         records = sink.records()
         assert sink.records() == records  # reported once, not on every scan
     assert [(r.payload, r.meta["refused"]) for r in records] == [(b"", ROOT_CHANGED)]
+
+
+@pytest.mark.parametrize("by_path", [False, True], ids=["native-walk", "by-path-walk"])
+def test_a_root_briefly_missing_is_retried_not_reported_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, by_path: bool
+) -> None:
+    """The sink directory missing for a poll (a dropped share, a rename away and back) is not
+    ``ROOT_CHANGED``: back with the same identity, scanning carries on and nothing is at fault."""
+    if by_path:
+        monkeypatch.setattr(file_sink, "_DIR_FD", False)
+    out = tmp_path / "out"
+    with FileSink(out) as sink:
+        out.rename(tmp_path / "out-away")
+        assert sink.records() == []
+        (tmp_path / "out-away").rename(out)
+        (out / "a.hl7").write_bytes(_BODY)
+        records = sink.records()
+    assert [r.payload for r in records] == [_BODY]
+    assert sink_faults(records) == ""
 
 
 def test_a_root_swapped_for_a_link_after_start_is_reported_and_not_scanned(

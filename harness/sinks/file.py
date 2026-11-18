@@ -16,9 +16,11 @@ here; a scenario that tests for an escape must look where it would land, and a l
 records unread carries no control id, so a scenario must check ``meta["symlink"]`` itself.
 
 **The walk, and the race it closes where the OS allows.** The sink directory itself must be a plain
-directory, not a link or a junction: :meth:`FileSink.start` refuses one. A scan that finds it gone, or swapped for another directory or a link, records the
-:data:`ROOT_CHANGED` refusal once and scans nothing; one that cannot open or list it for another
-reason (permissions, no free handle) logs it and is retried on the next scan. Where the OS lets a directory be opened and listed by handle (``dir_fd``, at least Linux
+directory, not a link or a junction: :meth:`FileSink.start` refuses one.
+`FileSink.start` refuses a root it cannot read. A scan that finds it swapped for another
+directory, a link or a non-directory records the :data:`ROOT_CHANGED` refusal once and scans
+nothing; one that cannot open or list it for another reason (missing for now, permissions, no free
+handle) logs it once and is retried on the next scan. Where the OS lets a directory be opened and listed by handle (``dir_fd``, at least Linux
 and macOS), the walk holds each folder open: a sub-folder is opened by name relative to its parent's
 handle with ``O_NOFOLLOW`` and checked to be the one its ``lstat`` saw, and each file is opened
 the same way, so a folder or file swapped for a link during the scan is not followed. Windows has
@@ -240,10 +242,10 @@ class FileSink(Sink):
 
     def _scan(self, visit: _Visit) -> _Scan | None:
         """Walk the directory, calling ``visit`` for each candidate while its folder is held, and
-        return the scan's state; or None, with nothing visited, when the directory is no longer the
-        plain directory :meth:`start` found. A directory that cannot be opened or listed for
-        another reason (permissions, no free handle) is a failed scan, retried next time, not a
-        replaced one. Each listed name is checked before it is joined onto its folder. A link, a
+        return the scan's state; or None, with nothing visited, when something is at the path and
+        it is not the plain directory :meth:`start` found. A directory that cannot be opened or
+        listed for another reason (missing for now, permissions, no free handle) is a failed
+        scan, retried next time, not a replaced one. Each listed name is checked before it is joined onto its folder. A link, a
         junction included, is a candidate whatever its name and is not entered. A path gone
         before its ``lstat``, or a folder gone before it is listed, is left out: nothing is there
         to record or to ignore."""
@@ -251,12 +253,17 @@ class FileSink(Sink):
         if _DIR_FD:
             try:
                 root_fd = os.open(self.directory, _DIR_FLAGS)
-            except (FileNotFoundError, NotADirectoryError) as exc:
-                return self._root_gone(exc)
             except OSError as exc:
-                if exc.errno in _LINK_ERRNOS:
+                if exc.errno in _LINK_ERRNOS or isinstance(exc, NotADirectoryError):
+                    # A link or a non-directory, if something is at the path: present, and not
+                    # the directory start() took. Otherwise an ancestor is missing or not a
+                    # folder, and the next poll tries again.
+                    try:
+                        self.directory.lstat()
+                    except OSError:
+                        return self._root_unreadable(scan, exc)
                     return self._root_gone(exc)
-                return self._root_unreadable(scan, exc)
+                return self._root_unreadable(scan, exc)  # missing now, or unreadable: retried
             try:
                 st = os.fstat(root_fd)
                 if not self._root_is(st):
@@ -272,10 +279,8 @@ class FileSink(Sink):
             return scan
         try:
             st = self.directory.lstat()
-        except FileNotFoundError as exc:
-            return self._root_gone(exc)
         except OSError as exc:
-            return self._root_unreadable(scan, exc)
+            return self._root_unreadable(scan, exc)  # missing now, or unreadable: retried
         if _is_link(st) or not stat.S_ISDIR(st.st_mode) or not self._root_is(st):
             return self._root_gone(None)
         if (identity := _identity(st)) is not None:
@@ -285,7 +290,7 @@ class FileSink(Sink):
         return scan
 
     def _root_gone(self, exc: OSError | None) -> _Scan | None:
-        """Log, once, that the directory is gone, a link, or another directory now; None, the
+        """Log, once, that the path is a link, a non-directory or another directory now; None, the
         scan's answer for that."""
         reason = f" ({_why(exc)})" if exc is not None else ""
         self._warn(
