@@ -12,12 +12,14 @@ from __future__ import annotations
 import copy
 import json
 import pickle
+from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
 import pytest
 
-from messagefoundry.config.code_sets import CodeSet, parse_code_set
+from messagefoundry.config.code_sets import CodeSet, CodeSetError, parse_code_set
+from messagefoundry.pipeline._sandbox_codec import _Blobs, _Reader, dec_code_sets, enc_code_sets
 
 _CSV = b"code,display,system\nM,Male,HL7\nF,Female,HL7\n"
 _TOML = b'[A]\nlabel = "Alpha"\ntags = ["x", "y"]\n[A.inner]\nlevel = 1\n'
@@ -55,21 +57,81 @@ def test_a_csv_row_refuses_mutation_and_the_table_is_unchanged(
     assert cs["M"] == {"display": "Male", "system": "HL7"}
 
 
-def test_nested_toml_tables_and_arrays_refuse_mutation() -> None:
+def _iadd(tags: Any) -> None:
+    tags += ["z"]
+
+
+def _imul(tags: Any) -> None:
+    tags *= 2
+
+
+_LIST_MUTATIONS: list[Callable[[Any], object]] = [
+    lambda tags: tags.append("z"),
+    lambda tags: tags.__setitem__(0, "z"),
+    lambda tags: tags.__delitem__(0),
+    lambda tags: tags.extend(["z"]),
+    lambda tags: tags.insert(0, "z"),
+    lambda tags: tags.pop(),
+    lambda tags: tags.remove("x"),
+    lambda tags: tags.sort(),
+    lambda tags: tags.reverse(),
+    lambda tags: tags.clear(),
+    lambda tags: tags.__init__(["z"]),
+    _iadd,
+    _imul,
+]
+
+
+@pytest.mark.parametrize("mutate", _LIST_MUTATIONS)
+def test_a_toml_array_refuses_mutation(mutate: Callable[[Any], object]) -> None:
     cs = _toml_set()
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="read-only"):
+        mutate(cs["A"]["tags"])
+    assert cs["A"]["tags"] == ["x", "y"]
+
+
+def test_a_nested_toml_table_refuses_mutation() -> None:
+    cs = _toml_set()
+    with pytest.raises(TypeError, match="read-only"):
         cs["A"]["inner"]["level"] = 2
-    for mutate in (
-        lambda tags: tags.append("z"),
-        lambda tags: tags.__setitem__(0, "z"),
-        lambda tags: tags.extend(["z"]),
-        lambda tags: tags.__iadd__(["z"]),
-        lambda tags: tags.sort(),
-        lambda tags: tags.clear(),
-    ):
-        with pytest.raises(TypeError):
-            mutate(cs["A"]["tags"])
+    with pytest.raises(TypeError, match="read-only"):
+        cs["A"].__init__(label="Changed")
     assert cs["A"] == {"label": "Alpha", "tags": ["x", "y"], "inner": {"level": 1}}
+
+
+def test_tuples_and_sets_are_frozen_and_subclasses_are_kept() -> None:
+    cs = CodeSet("direct", {"T": ({"a": 1},), "S": {1, 2}, "D": defaultdict(int)})
+    with pytest.raises(TypeError, match="read-only"):
+        cs["T"][0]["a"] = 2
+    assert isinstance(cs["S"], frozenset) and cs["S"] == {1, 2}
+    assert cs["D"]["missing"] == 0  # a deliberate dict subclass is stored as given
+
+
+def test_a_value_nested_past_the_recursion_limit_is_a_code_set_error() -> None:
+    deep = "x = 1"
+    for _ in range(900):  # under tomllib's 1000-part key cap, over the freeze's depth
+        deep = "a." + deep
+    with pytest.raises(CodeSetError, match="nested too deeply"):
+        parse_code_set("deep.toml", ("[K]\n" + deep + "\n").encode())
+
+
+@pytest.mark.parametrize(
+    "make_copy", [copy.copy, copy.deepcopy, lambda c: pickle.loads(pickle.dumps(c))]
+)
+def test_a_copied_code_set_keeps_its_rows_frozen(make_copy: Callable[[Any], Any]) -> None:
+    clone = make_copy(_csv_set())
+    assert isinstance(clone, CodeSet) and clone["M"] == {"display": "Male", "system": "HL7"}
+    with pytest.raises(TypeError, match="read-only"):
+        clone["M"]["display"] = "Changed"
+
+
+def test_the_sandbox_child_rebuild_is_frozen_too() -> None:
+    blobs = _Blobs()
+    node = enc_code_sets({"cs": _toml_set()}, blobs)
+    rebuilt = dec_code_sets(node, _Reader(blobs.items))
+    assert rebuilt is not None
+    with pytest.raises(TypeError, match="read-only"):
+        rebuilt["cs"]["A"]["tags"].append("z")
 
 
 def test_a_frozen_row_still_reads_like_the_plain_value() -> None:
@@ -94,6 +156,12 @@ def test_a_copy_of_a_row_is_mutable_and_leaves_the_table_alone(
     mine = make_copy(cs["F"])
     mine["display"] = "Changed"
     assert cs["F"]["display"] == "Female"
+
+
+def test_a_shallow_copy_keeps_nested_values_read_only() -> None:
+    mine = dict(_toml_set()["A"])
+    with pytest.raises(TypeError, match="deepcopy"):
+        mine["tags"].append("z")
 
 
 def test_a_deep_copy_unfreezes_nested_values() -> None:
