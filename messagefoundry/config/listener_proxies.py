@@ -22,7 +22,7 @@ from messagefoundry.config.settings import (
     _classify_proxy_entries,
     _parse_trusted_proxy,
 )
-from messagefoundry.netaddr import IPV4_EMBEDDING_PREFIXES, SIX_TO_FOUR, ipv4_meaning
+from messagefoundry.netaddr import IPV4_EMBEDDING_PREFIXES, IPV4_MAPPED, SIX_TO_FOUR, ipv4_meaning
 
 __all__ = [
     "IPV6_KEY_PREFIX",
@@ -49,10 +49,10 @@ IPV6_KEY_PREFIX = 64
 _PROXY_SPAN_LIMIT = 1 << 16
 
 #: How many validated lists :func:`read_trusted_proxies` keeps. A list the span limit admits may
-#: hold 65,536 entries, so the bound is kept small: enough for the listeners one config holds to be
-#: read again by each posture read without parsing, few enough that lists a reload replaced do not
-#: stay pinned in quantity.
-_CACHED_LISTS = 8
+#: hold 65,536 entries, so the bound is far below the 64 it was: posture and audit read every
+#: listener's list in turn, so a config with more distinct lists than this re-parses them on each
+#: read, and lists a reload replaced stay pinned until evicted, at most this many.
+_CACHED_LISTS = 32
 
 
 class TrustedProxies:
@@ -153,6 +153,9 @@ def _validated(value: tuple[str, ...]) -> TrustedProxies:
             parsed = _parse_trusted_proxy(entry)
         except TrustedProxyRefusal as exc:
             reason = exc.reason
+        except ValueError:
+            # Any other refusal may carry ipaddress's text, which quotes the entry: never pass it on.
+            reason = "is not a valid IP address or CIDR network"
         if reason is not None:
             # Raised outside the parse's handler and never quoted: the parse's message echoes the
             # entry, and no factory refusal may quote a configured value (vault BACKLOG #3249,
@@ -175,8 +178,9 @@ def _validated(value: tuple[str, ...]) -> TrustedProxies:
     )
     for version, floor, keys in spans:
         if keys > _PROXY_SPAN_LIMIT:
-            # Every whole-family list spans more than the limit, so the classifier, which parses
-            # the list again, runs on this refusal path only, to say which refusal it is.
+            # Every whole-family list spans more than the limit (see _v6_key_count), so the
+            # classifier, which parses the list again, runs on this refusal path only, to say
+            # which refusal it is.
             whole_family, _ = _classify_proxy_entries(value)
             if whole_family:
                 raise ValueError(
@@ -197,9 +201,17 @@ def _validated(value: tuple[str, ...]) -> TrustedProxies:
 def _v6_key_count(network: ipaddress.IPv6Network) -> int:
     """How many budget keys an IPv6 range holds: its ``/64`` networks, or, where it overlaps an
     IPv4-embedding prefix, where a key is an address or an embedded IPv4 client, its addresses,
-    which bound the keys there. Inside 6to4 a key is one ``/48``, its IPv4 holder's site."""
+    which bound the keys there. Inside 6to4 a key is one ``/48``, its IPv4 holder's site.
+
+    A range holding the IPv4-mapped block counts its addresses too: each mapped address keys as
+    the IPv4 address it names, so ``::fffe:0:0/95`` holds every IPv4 key. That is also what makes
+    every list ``_classify_proxy_entries`` calls whole-family exceed the span limit, which
+    :func:`_validated` relies on to run the classifier on the refusal path only. A range inside
+    the mapped block never reaches here: it is read as the IPv4 range it names."""
     if network.subnet_of(SIX_TO_FOUR):
         return max(1, network.num_addresses >> 80)
-    if any(network.overlaps(prefix) for prefix in IPV4_EMBEDDING_PREFIXES):
+    if network.overlaps(IPV4_MAPPED) or any(
+        network.overlaps(prefix) for prefix in IPV4_EMBEDDING_PREFIXES
+    ):
         return network.num_addresses
     return max(1, network.num_addresses >> (128 - IPV6_KEY_PREFIX))

@@ -981,20 +981,51 @@ def test_a_validated_list_parses_each_entry_once(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(reader, "_parse_trusted_proxy", counting)
     monkeypatch.setattr(reader, "_classify_proxy_entries", refused)
+    reader._validated.cache_clear()
     entries = ["10.9.0.5", "10.9.1.0/24"]
     proxies = reader.read_trusted_proxies(entries)
     assert calls == entries
     assert ipaddress.ip_address("10.9.1.7") in proxies
     assert ipaddress.ip_address("10.9.2.7") not in proxies
+    reader._validated.cache_clear()  # drop the entry built under the patch
 
 
-def test_the_cache_holds_few_lists() -> None:
-    """Items 9 and 16: a list may hold 65,536 entries, so lists a reload replaced are not kept by
-    the dozen for the life of the process."""
+def test_the_cache_holds_fewer_lists() -> None:
+    """Items 9 and 16: a list may hold 65,536 entries, so the cache keeps half the 64 lists it
+    kept, which bounds what a reload leaves pinned."""
     import messagefoundry.config.listener_proxies as reader
 
     maxsize = reader._validated.cache_info().maxsize
-    assert maxsize is not None and maxsize <= 8
+    assert maxsize is not None and maxsize <= 32
+
+
+@pytest.mark.parametrize("entry", ["::fffe:0:0/95", "::ff00:0:0/88", "::8000:0:0/81"])
+def test_a_range_holding_the_mapped_block_is_refused(entry: str) -> None:
+    """An IPv6 range around the IPv4-mapped block trusts the mapped hop of every IPv4 host, so it is
+    the whole IPv4 family. Its mapped addresses count toward the span as the IPv4 keys they are,
+    which is what sends it to the whole-family refusal; counted as /64 networks it would load."""
+    with pytest.raises(ValueError, match="whole address family"):
+        trusted_proxy_networks([entry])
+
+
+async def test_a_hop_whose_whole_reading_is_a_phantom_stays_the_client() -> None:
+    """The reverse of the inner-proxy skip: a client sourcing ``64:ff9b::c000:221:1234`` makes its
+    hop's port-stripped reading the listed inner proxy ``64:ff9b::c000:221``. The hop is not skipped
+    on that reading, so the client cannot reach the text it wrote on its left; it keys on the
+    reading kept, as on origin/main."""
+    limiter = _CountingLimiter()
+    src = await _proxied(trusted_proxies=[PROXY, "64:ff9b::c000:221"])
+    src.intake_rate_limiter = limiter
+    try:
+        await _request(
+            src.sockport,
+            raw=_raw_with(
+                ["x-api-key: wrong", "X-Forwarded-For: 198.51.100.77, 64:ff9b::c000:221:1234"]
+            ),
+        )
+    finally:
+        await src.stop()
+    assert limiter.charges == ["192.0.2.33"]
 
 
 def test_the_hop_parameter_has_no_default() -> None:

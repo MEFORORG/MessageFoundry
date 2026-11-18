@@ -1649,13 +1649,15 @@ class HttpSource(SourceConnector):
         cannot choose it; everything left of it is the client's own text and is never read.
         uvicorn takes the left-most hop when every hop is listed, and this walk does not: it falls
         back to the socket peer then, as it does for a missing header or a hop that is not an
-        address, so no budget is ever keyed on text a client wrote. Each hop is read as
-        :func:`_client_readings` reads it, so a phantom reading no host can hold is dropped first,
-        and a hop is a listed hop only where every reading left is listed; otherwise it is the
-        client, so no reading a client can steer onto a listed address moves the walk past it. A
-        listed inner proxy whose hop's other reading is a phantom is skipped, as its plain hop is;
-        before, the phantom kept it from being skipped, and every client behind it keyed on its
-        budget (BACKLOG #5525). The readings returned are the ones the budget is keyed on."""
+        address, so no budget is ever keyed on text a client wrote. An ambiguous hop is a listed
+        hop only where every reading is listed, with one exception: where its port-stripped
+        reading is a phantom :func:`_client_readings` drops, its whole-address reading alone
+        decides, so a listed inner proxy whose bare hop misreads to a phantom is skipped as its
+        plain hop is (BACKLOG #5525). The reverse is never so: a hop whose whole-address reading
+        is the phantom stays the client however its port-stripped reading is listed, since the
+        whole-address reading is the one a client may have chosen to make the other land on a
+        listed proxy. Otherwise no reading a client can steer onto a listed address moves the walk
+        past it. The readings returned are the ones the budget is keyed on."""
         if not self._trusted_proxies or not head.forwarded_header:
             return ()
         if peer is None or not self._is_trusted_proxy(peer):
@@ -1667,10 +1669,13 @@ class HttpSource(SourceConnector):
         end = len(header)
         for _ in range(_MAX_FORWARDED_HOPS):
             start = header.rfind(",", 0, end)
-            readings = _client_readings(_hop_readings(header[start + 1 : end]))
+            read = _hop_readings(header[start + 1 : end])
+            readings = _client_readings(read)
             if not readings:
                 return ()
-            if not all(self._is_trusted_proxy(reading) for reading in readings):
+            # Only the whole-address reading may stand for the hop alone; the guard above.
+            listed = readings[0] == read[0] and all(map(self._is_trusted_proxy, readings))
+            if not listed:
                 return readings
             if start < 0:
                 return ()
