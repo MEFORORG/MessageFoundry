@@ -196,6 +196,7 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     MEASURED, with the consequence read back from the governed config rather than inferred from a verdict:
 
         \\?\C:\<governed>            git rc=0, the write LANDED in the governed config. UNCONDITIONAL.
+        \\.\C:\<governed>            git rc=0 too (BACKLOG #5454, measured 2026-11-18). UNCONDITIONAL.
         \\localhost\C$\<governed>     git rc=128 "dubious ownership" -- blocked TODAY, and rc=0 with the
                                     write landing the moment an operator adds one safe.directory entry.
 
@@ -219,8 +220,13 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
 
     # ORDER MATTERS: the extended-UNC form carries BOTH prefixes, so the `//?/unc/` case must reduce to a
     # plain UNC path before the admin-share fold below can see it.
-    $cmp = $cmp -replace '^//\?/unc/', '//'
-    $cmp = $cmp -replace '^//\?/', ''
+    #
+    # THE DOS-DEVICE PREFIX `\\.\` FOLDS THE SAME WAY (BACKLOG #5454). GetFullPath returns it unchanged,
+    # and git accepts it: measured 2026-11-18, `git -C '\\.\D:\<worktree>' rev-parse --git-common-dir`
+    # exits 0 and names the real common dir. So `\\.\C:\<governed>` and `\\.\UNC\localhost\C$\<governed>`
+    # reach a governed root with no setup, exactly as the `\\?\` forms do, and must compare as that root.
+    $cmp = $cmp -replace '^//[?.]/unc/', '//'
+    $cmp = $cmp -replace '^//[?.]/', ''
     if ($cmp -match '^//([^/]+)/([a-z])\$(?=/|$)') {
         if ($script:LocalHostSpellings -contains $Matches[1]) {
             $cmp = $Matches[2] + ':' + $cmp.Substring($Matches[0].Length)
