@@ -584,9 +584,9 @@ class ReferenceSyncRunner:
         except WiringError as exc:
             # Vault BACKLOG #3139: sync_all logs only the error class, since a source error can hold
             # a reference key. These refusals' text is config only: the set's name, the setting, a
-            # type name and a fixed remedy, never a value or the reason. So it is logged whole, or
-            # the operator learns
-            # nothing beyond "WiringError".
+            # type name and a remedy chosen by the setting and the value's type, which may say a
+            # quoted string is a false spelling but never which. Never a value or the reason. So it
+            # is logged whole, or the operator learns nothing beyond "WiringError".
             # The text already leads with "reference set '<name>': ", so it is not repeated.
             log.error("%s (not synced)", exc)
             raise
