@@ -449,6 +449,25 @@ class Ledger:
         m = ADR_FILE.match(src) if src else None
         return src if m and m.group(1) == number else None
 
+    def _renames_a_number_new_on_this_branch(self, path: str, number: str) -> bool:
+        """Is this add a same-number rename of an ADR this branch itself introduced (BACKLOG #5453)?
+
+        Such a rename allocates nothing, so the ownership arm grants it. The grant needs a POSITIVE
+        fact, and every doubt refuses: git must pair the file with a same-number ADR, and the fork
+        point with the base must hold no ADR under that number. A branch cut while the base still
+        held the number fails the second test, because renaming its copy revives a number the base
+        lost, which is the restore rule's to judge. A merge-base git cannot compute, as in a shallow
+        clone whose graft hides the fork point, is a doubt.
+        """
+        if self.same_number_source(path, number) is None:
+            return False
+        try:
+            fork = git("merge-base", self.base, "HEAD").strip()
+            names = _paths(git("ls-tree", "-z", "--name-only", fork, "docs/adr/"))
+        except OSError:
+            return False
+        return not any((m := ADR_FILE.match(n)) and m.group(1) == number for n in names)
+
     def head_text(self, path: str) -> str:
         """The file as it will exist after this commit — the INDEX, not the working tree."""
         return git("show", f"HEAD:{path}") if self.ci else git("show", f":{path}")
@@ -842,11 +861,11 @@ class Ledger:
                 not self.ci
                 and not self.owns("adr", number)
                 and not self._carried_by_a_merge_parent(path)
+                and not self._renames_a_number_new_on_this_branch(path, number)
             ):
                 # LAST, AND THE ORDER IS THE COST CONTROL. Everything above is cheap or memoized; the
                 # history walk is not. Reaching it means the commit was already headed for a refusal,
-                # so the walk is never paid on a passing commit (BACKLOG #1468), except the
-                # same-number rename below, which needs the walk to tell a rename from a revival.
+                # so the walk is never paid on a passing commit (BACKLOG #1468).
                 #
                 # ***IT MUST NOT `continue`, AND WRITING IT THAT WAY ONCE IS WHY THIS SAYS SO.*** The
                 # index-row rule below is the second half of THIS iteration, and a restore needs its
@@ -854,12 +873,7 @@ class Ledger:
                 # went missing. Skipping the loop body on a granted restore would have shipped the
                 # dropped-row defect through the restore door.
                 seen = self._history_of_this_number(path, number)
-                # A same-number rename of an ADR the parent carries allocates nothing (BACKLOG
-                # #5453), UNLESS the base once held this number and lost it: then the file is a
-                # revival, and rule 2 passes only the lost bytes. A walk cut short by a shallow
-                # clone reads as "never held", the case a branch-new number is in every time.
-                renamed = self.same_number_source(path, number) is not None
-                if not seen.restores_lost_bytes and not (renamed and not seen.number_is_historical):
+                if not seen.restores_lost_bytes:
                     self.fail(*self._ownership_refusal(number, seen))
 
             # Only ADDED files are checked here, the right scope for a commit-time gate. The whole

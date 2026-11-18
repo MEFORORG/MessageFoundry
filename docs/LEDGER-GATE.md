@@ -192,11 +192,14 @@ It blocks a commit that:
 
 A file that arrives by **rename or copy** onto an ADR path is an added ADR to every rule above: the gate
 turns git's rename detection off, so a `git mv` cannot hide it (BACKLOG #5453). Where git itself pairs
-the new file with a removed ADR of the same number, the change is a rename: it allocates nothing, so
-the ownership rule does not refuse it, but its row must link the new name in the same commit, and the
-refusal says so rather than calling it a reuse. A number the base once held and lost is the exception:
-renaming a branch's copy of it is a revival, and rule 2 still passes only the lost bytes. The gate asks
-git for that pairing with no rename limit, over `docs/adr/` alone, so the size of the rest of the
+the new file with a removed ADR of the same number, the change is a rename, and its row must link the
+new name in the same commit; the refusal says so rather than calling it a reuse. A rename allocates
+nothing, so rule 2 grants it, but only on a positive fact: the fork point between the branch and the
+base holds no ADR under that number. Where the fork point held one, as on a branch cut before the base
+deleted that ADR, the rename revives a number the base lost, and rule 2's restore test judges it; that
+test matches bytes at the path that lost them, so a revival under a new name is refused. Where git
+cannot find the fork point, as in a clone too shallow to reach it, the rename is refused too. The gate
+asks git for the pairing with no rename limit, over `docs/adr/` alone, so the size of the rest of the
 change cannot cost a rename its pairing. A rename onto a different number is a new number and owes an
 allocation like any other.
 

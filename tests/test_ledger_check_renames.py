@@ -410,3 +410,72 @@ def test_a_rename_that_revives_a_number_the_base_LOST_is_a_restore_not_a_rename(
     code, out = run_check(repo)
     assert code == 1, out
     assert "ADR 0002 is a RESTORE" in out
+
+
+def test_a_revival_by_rename_in_a_SHALLOW_clone_is_refused(repo: Path, tmp_path: Path) -> None:
+    """The grant needs the fork point with the base. A clone too shallow to reach it cannot show
+    that the number is new on the branch, and a doubt refuses."""
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    second = BODY.replace("synthetic", "second")
+    write(repo, "docs/adr/0002-second.md", second)
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="second", title="S") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the base takes 0002")
+    git(repo, "switch", "-q", "-c", "stale")
+    write(repo, "docs/notes/branch.md", "A branch-only note.\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the branch moves on")
+    git(repo, "switch", "-q", "main")
+    git(repo, "rm", "-q", "docs/adr/0002-second.md")
+    write(repo, "docs/adr/README.md", rows)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the base drops 0002")
+
+    clone = tmp_path / "shallow"
+    clone_args = ["clone", "-q", "--depth", "1", "--no-single-branch", "--branch", "stale"]
+    subprocess.run(["git", *clone_args, repo.as_uri(), str(clone)], capture_output=True, check=True)
+    for key, value in (("user.email", "t@t"), ("user.name", "t"), ("diff.renames", "true")):
+        git(clone, "config", key, value)
+    assert git(clone, "rev-parse", "--is-shallow-repository").strip() == "true"
+
+    git(clone, "mv", "docs/adr/0002-second.md", "docs/adr/0002-revived.md")
+    write(clone, "docs/adr/0002-revived.md", second + "Edited.\n")
+    write(
+        clone, "docs/adr/README.md", rows + ROW.format(n="0002", slug="revived", title="S") + "\n"
+    )
+    git(clone, "add", "-A")
+    assert _staged_status(clone).startswith("R"), _staged_status(clone)
+
+    code, out = run_check(clone)
+    assert code == 1, out
+    assert "ADR 0002" in out
+
+
+def test_several_adr_renames_past_the_rename_limit_still_pair(repo: Path) -> None:
+    """Two edited ADR renames against a limit of one: the docs/adr/ pathspec alone does not bring
+    the pair count under it, so this pins -l0."""
+    git(repo, "config", "diff.renameLimit", "1")
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    # Bodies with no line in common, so git cannot pair 0002's old path with 0003's new one.
+    bodies = {
+        n: f"# Decision {n}\n\n" + f"A line only decision {n} has.\n" * 20 for n in ("0002", "0003")
+    }
+    before = "".join(ROW.format(n=n, slug="x", title=n) + "\n" for n in bodies)
+    for n, body in bodies.items():
+        write(repo, f"docs/adr/{n}-x.md", body)
+    write(repo, "docs/adr/README.md", rows + before)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the branch carries 0002 and 0003")
+
+    for n, body in bodies.items():
+        git(repo, "mv", f"docs/adr/{n}-x.md", f"docs/adr/{n}-y.md")
+        write(repo, f"docs/adr/{n}-y.md", body + "Edited.\n")
+    after = "".join(ROW.format(n=n, slug="y", title=n) + "\n" for n in bodies)
+    write(repo, "docs/adr/README.md", rows + after)
+    git(repo, "add", "-A")
+    assert not any(line.startswith("R") for line in _staged_status(repo).splitlines()), (
+        _staged_status(repo)
+    )
+
+    code, out = run_check(repo)
+    assert code == 0, out
