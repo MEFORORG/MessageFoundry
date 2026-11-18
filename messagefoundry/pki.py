@@ -488,6 +488,7 @@ def _out_of_scope(read: _CrlExtensions) -> str | None:
 #: long CRL each time would cost that much per connection. Bounded, and cleared when full.
 _ENTRY_VERDICTS: dict[bytes, str | None] = {}
 _ENTRY_VERDICTS_MAX = 256
+_UNKEPT = object()
 
 
 def _unhandled_critical(
@@ -501,29 +502,32 @@ def _unhandled_critical(
     time on a long CRL: measured 2026-11-18 on Windows, CPython 3.14, about 31 ms for 20,000
     entries that each carry a reason code. So the entries' verdict is kept by ``fingerprint``.
     **An entry whose extensions ``cryptography`` cannot read, at least a duplicate extension or a
-    reason code it does not know, ends the entry check with no verdict**: this adds a diagnosis,
-    and such a CRL loaded before it. OpenSSL still refuses a critical extension it meets there."""
+    reason code it does not know, gives no verdict, and the check goes on to the next entry**:
+    this adds a diagnosis, and such a CRL loaded before it. OpenSSL still refuses a critical
+    extension it meets there."""
     for ext in read.extensions:
         if ext.critical and ext.oid not in _HANDLED_CRITICAL:
             return str(ext.oid.dotted_string)
-    if fingerprint in _ENTRY_VERDICTS:
-        return _ENTRY_VERDICTS[fingerprint]
+    # One read, never ``in`` then ``[]``: another thread may clear the cache between the two.
+    if (kept := _ENTRY_VERDICTS.get(fingerprint, _UNKEPT)) is not _UNKEPT:
+        return kept  # type: ignore[return-value]
     verdict: str | None = None
-    try:
-        for entry in crl:
-            found = next(
-                (
-                    ext
-                    for ext in entry.extensions
-                    if ext.critical and ext.oid != CRLEntryExtensionOID.CERTIFICATE_ISSUER
-                ),
-                None,
-            )
-            if found is not None:
-                verdict = f"{found.oid.dotted_string} on a revoked entry"
-                break
-    except (ValueError, x509.DuplicateExtension, *_UNREAD_EXTENSIONS):
-        verdict = None
+    for entry in crl:
+        try:
+            extensions = entry.extensions
+        except (ValueError, x509.DuplicateExtension, *_UNREAD_EXTENSIONS):
+            continue  # this entry gives no verdict; a later one still may
+        found = next(
+            (
+                ext
+                for ext in extensions
+                if ext.critical and ext.oid != CRLEntryExtensionOID.CERTIFICATE_ISSUER
+            ),
+            None,
+        )
+        if found is not None:
+            verdict = f"{found.oid.dotted_string} on a revoked entry"
+            break
     if len(_ENTRY_VERDICTS) >= _ENTRY_VERDICTS_MAX:
         _ENTRY_VERDICTS.clear()
     _ENTRY_VERDICTS[fingerprint] = verdict

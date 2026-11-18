@@ -2437,10 +2437,13 @@ Each CRL in the file is judged on its own, as for an expired CRL. So a badly sig
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
 such a file was measured to pass its handshakes. Remove the bad copy.
 
-A start also refuses a CRL whose signature verifies, when every listed CA whose key verifies it
-carries a key usage extension without `cRLSign` (vault BACKLOG #5896, RFC 5280 section 6.3.3).
-OpenSSL refuses to take a CRL from such a CA, so every handshake judged by that CRL would fail
-with `key usage does not include CRL signing`. A CA with no key usage extension is not refused.
+A start also refuses a CRL whose signature verifies, on a hop that checks the whole client
+chain, when every listed CA the engine judges it by, as above, and whose key verifies it carries
+a key usage extension without `cRLSign` (vault BACKLOG #5896, RFC 5280 section 6.3.3). OpenSSL
+refuses to take a CRL from such a CA, so every handshake judged by that CRL would fail with
+`key usage does not include CRL signing`. A CA with no key usage extension is not refused. On a
+hop that checks only the peer's own certificate, the engine logs a WARNING instead: there a
+root that signs only intermediates is never judged by its own CRL, so the file can still pass.
 Sign the CRL with a CA whose key usage includes `cRLSign`, or reissue the CA with it. The
 running-hop reload and the expiry scan do not make this check.
 

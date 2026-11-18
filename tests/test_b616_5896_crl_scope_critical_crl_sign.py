@@ -5,11 +5,12 @@
 Three shapes the start used to load clean, each of which then failed every handshake it judged
 with a TLS error that does not name the CRL file:
 
-* an Issuing Distribution Point that limits the CRL to CA certificates, attribute certificates,
-  some reasons, or makes it indirect (RFC 5280 section 5.2.5), which the engine's OpenSSL, with
-  no extended CRL support, never applies to a leaf;
+* an Issuing Distribution Point that limits the CRL to attribute certificates or some reasons,
+  or makes it indirect (RFC 5280 section 5.2.5), which the engine's OpenSSL, with no extended CRL
+  support, never judges a certificate by. A CRL of CA certificates only is not refused;
 * a critical extension OpenSSL does not handle, on the CRL or on an entry (sections 5.2, 5.3);
-* a signing CA whose key usage does not include cRLSign (section 6.3.3).
+* a signing CA whose key usage does not include cRLSign (section 6.3.3), refused on a
+  whole-chain hop and logged at WARNING on a leaf hop.
 
 The instrument for each is ``judge_crl_bytes`` or ``harden_crl_check``, and its control is
 OpenSSL itself: the same bytes, loaded with the engine's checks left out, refuse a real handshake
@@ -19,6 +20,7 @@ that the full-scope, correctly profiled CRL passes. All material is synthetic an
 from __future__ import annotations
 
 import datetime
+import logging
 import ssl
 import time
 import weakref
@@ -32,7 +34,7 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry import pki as pki_module
 from messagefoundry.config import loaded_crls
-from messagefoundry.config.tls_policy import judge_crl_bytes
+from messagefoundry.config.tls_policy import harden_crl_check, judge_crl_bytes
 from messagefoundry.pki import NO_CRL_SIGN, judge_crl_signatures
 from tests.test_crl_reload import _key_pem, _leaf
 from tests.test_crl_signature_at_start import _ders, _hop, _raw_hop
@@ -292,7 +294,9 @@ def test_an_unhandled_critical_entry_extension_refuses_at_start(tmp_path: Path) 
     _handshake(pki.hop(pki.crl_file(calm, "calm.pem")), pki.server())
 
 
-def test_a_crl_from_a_ca_without_crl_sign_refuses_at_start(tmp_path: Path) -> None:
+def test_a_crl_from_a_ca_without_crl_sign_refuses_a_whole_chain_start(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     pki = _Pki(tmp_path, crl_sign=False)
     pem = _crl(pki.key)
     crl = pki.crl_file(pem)
@@ -300,10 +304,17 @@ def test_a_crl_from_a_ca_without_crl_sign_refuses_at_start(tmp_path: Path) -> No
     _judge(pem)  # no CA list there: the signature check is where it is caught
     [signature] = judge_crl_signatures(pem, _ders(pki.ca_file))
     assert signature.state == "verified" and signature.without_crl_sign
+    whole_chain = ssl.create_default_context(cafile=str(pki.ca_file))
     with pytest.raises(ValueError, match="does not include cRLSign") as refused:
-        pki.hop(crl)
+        harden_crl_check(whole_chain, str(crl), setting=_SETTING, chain=True)
     assert NO_CRL_SIGN in str(refused.value)
     assert str(refused.value).startswith(_SETTING)
+
+    # A leaf check warns and loads: a root that signs only intermediates is never judged by its
+    # own CRL there, so the engine cannot tell this file fails.
+    with caplog.at_level(logging.WARNING, logger="messagefoundry"):
+        pki.hop(crl)
+    assert any(NO_CRL_SIGN in r.getMessage() for r in caplog.records)
 
     # Control: OpenSSL loads it, and the handshake fails on the key usage.
     with pytest.raises(ssl.SSLError, match="(?i)key ?usage"):

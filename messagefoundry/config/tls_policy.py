@@ -503,6 +503,7 @@ def harden_crl_check(
         label=label,
         crl_file=crl_file,
         refusal=own_crl_reason(anchors, pem) if chain else None,
+        chain=chain,
     )
     if chain:
         ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN  # carries the leaf bit too
@@ -629,15 +630,19 @@ def _check_crl_signatures(
     label: str,
     crl_file: str,
     refusal: str | None = None,
+    chain: bool = False,
 ) -> None:
     """Check the signature of each CRL in the judged bytes ``pem`` against ``anchors``, the hop's
     own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
 
     **Only the proven case refuses.** That is :class:`~messagefoundry.pki.CrlSignature` state
     ``bad``, and that class says what counts as proof. A ``verified`` CRL whose
-    :attr:`~messagefoundry.pki.CrlSignature.without_crl_sign` is set refuses too, after that:
-    OpenSSL refuses to take a CRL from a CA whose key usage lacks ``cRLSign`` (vault BACKLOG
-    #5896).
+    :attr:`~messagefoundry.pki.CrlSignature.without_crl_sign` is set refuses too, after that,
+    with ``chain`` only: OpenSSL refuses to take a CRL from a CA whose key usage lacks
+    ``cRLSign`` (vault BACKLOG #5896). A whole-chain check judges each listed CA by its own CRL,
+    so that CRL is always read there. Without ``chain`` it is logged at WARNING instead: a root
+    that signs only intermediates is never judged by its own CRL on a leaf check, so such a file
+    can pass every handshake.
     OpenSSL checks a CRL's signature only at the handshake. Before this, such a file started clean
     and then failed every handshake it judged, with a TLS error that does not name the CRL. An
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
@@ -696,7 +701,8 @@ def _check_crl_signatures(
         # verdicts already reached are used below: a proof refuses, and the unconfirmed warn.
         # Not logged where the caller's ``refusal`` refuses the start anyway, since the line says
         # the file is loaded (vault BACKLOG #5511).
-        if refusal is None and first_unconfirmed_signature(
+        refuses = refusal is not None or (chain and any(s.without_crl_sign for s in judged))
+        if not refuses and first_unconfirmed_signature(
             crl_file, fingerprint, ("unjudged", type(exc).__name__)
         ):
             logger.error(
@@ -716,10 +722,20 @@ def _check_crl_signatures(
         )
     if (unable := next((s for s in judged if s.without_crl_sign), None)) is not None:
         # Vault BACKLOG #5896: proven as a bad signature is, since the CA that verifies it is one
-        # OpenSSL refuses to take a CRL from.
-        raise ValueError(
-            f"{label}: {unable.where} {NO_CRL_SIGN}. Give this setting a CRL signed by a CA "
-            "whose key usage includes cRLSign, or reissue that CA with it"
+        # OpenSSL refuses to take a CRL from. Read on a leaf check only where that CA issues
+        # leaves, which the engine cannot tell, so it warns there.
+        remedy = (
+            "Give this setting a CRL signed by a CA whose key usage includes cRLSign, or reissue "
+            "that CA with it"
+        )
+        if chain:
+            raise ValueError(f"{label}: {unable.where} {NO_CRL_SIGN}. {remedy}")
+        logger.warning(
+            "%s: %s %s, where OpenSSL judges a peer by it, as for a CA that issues leaves. %s",
+            label,
+            unable.where,
+            NO_CRL_SIGN,
+            remedy,
         )
     if refusal is not None:
         raise ValueError(f"{label}: {refusal}")
