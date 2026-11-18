@@ -243,8 +243,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     store open would refuse, the pin's size and validity period included
     (:func:`_server_pin_warning`), **warn and do not refuse**: a WARNING and a
     ``pin_content_warning`` row whose ``reason`` names the check. A repeat with unchanged
-    fingerprint and outcome writes no further row (:data:`_STORE_CONTENT_RECORDED`). ACL, path
-    and unreadable findings behave as for every anchor (items 1, 3 and 4; the spec has no pin).
+    fingerprint and outcome writes no further row (:data:`_STORE_CONTENT_RECORDED`). The ACL, a
+    change and the path (items 1, 3 and 4) behave as for every anchor; the spec has no pin.
     The store open refuses as before. At ``warn`` the start logs the pin's ACL or path warning
     once: the preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
 
@@ -759,7 +759,7 @@ def _server_pin_warning(data: bytes, spec: AnchorSpec) -> PinReason | None:
     except ValueError as exc:  # a date the parser read but Python cannot hold: content, not I/O
         return PinReason(
             f"{spec.setting} {spec.path!r} is not a usable SQL Server pin: its validity period "
-            f"could not be read ({type(exc).__name__}).",
+            f"could not be read ({type(exc).__name__}), and the store open fails on it.",
             "unreadable_validity",
         )
     if moment > not_after.timestamp():
