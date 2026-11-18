@@ -998,8 +998,8 @@ of the maps. Instead, a save that would end the caller's own sessions takes a si
 to `save_ends_own_sessions`, which only a re-proof made after sign-in mints, and an MFA-pending one
 never (the owner's #1149 Reading B). Any other save keeps the session window. The set it tests is
 read from the stored accounts and handed to the save, whose revoke ends that set, so the caller's
-integrity check is read once for both (BACKLOG #5505). The revoke also reads the accounts again
-after the save, with no integrity check, and ends the caller's own sessions too, so the edit applies
+integrity check is read once for both (BACKLOG #5505). The revoke also reads the accounts again,
+with no integrity check, and ends the caller's own sessions too, so the edit applies
 to them at once (BACKLOG #1154).
 On the console, such a save lands on the sign-in page. Those four write no
 `auth.self_target_refused` row, because they refuse nothing.
