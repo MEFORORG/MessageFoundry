@@ -2272,8 +2272,8 @@ async def test_an_intact_package_directory_linked_out_is_attested_nothing_and_re
                     IntegrityError,
                     match=rf"^{noun} integrity attestation verified nothing \({_LINKED_OUT}\): "
                     rf"loaded {noun} path {pkg} links out of the install root, so files read "
-                    r"through it are not counted as verified; install the package under the "
-                    r"install root, or accept this warning",
+                    r"through a link out are not counted as verified; install the package under "
+                    r"the install root, or accept that this pass verifies nothing",
                 ):
                     await run_startup_attestation(store, sink, fail_closed_on_drift=True)
             else:
@@ -2294,6 +2294,7 @@ async def test_an_intact_package_directory_linked_out_is_attested_nothing_and_re
         assert detail == {
             "attested": False,
             "checked": 0,
+            "linked_out_paths": [pkg],
             "read_through_link": files,
             "drift_count": 0,
             "unattested_reason": _LINKED_OUT,
@@ -2400,7 +2401,8 @@ def test_a_pass_whose_listed_files_none_opened_says_none_was_read(
 
 def test_the_audit_row_of_a_verified_pass_is_unchanged() -> None:
     """The BACKLOG #5376 row rules touch only a pass that verified nothing: a clean pass, and a
-    drift pass that read files, keep the row origin/main wrote, with no ``read_through_link``."""
+    drift pass with no ``unattested_reason``, keep the row they wrote before that item, with no
+    ``read_through_link``. A linked-out drift pass is pinned with the read-through-the-link tests."""
     clean = AttestationResult(attested=True, editable=False, no_record=False, checked=7)
     assert clean.audit_detail() == {"attested": True, "checked": 7, "drift_count": 0}
     drifted = AttestationResult(
@@ -2440,9 +2442,10 @@ async def test_a_nested_path_entry_linked_out_is_named(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A ``__path__`` entry below the package directory, linked out of the install root: the result
-    and the refusal name that entry, not the package directory. The walk of the package directory
-    also reports the link itself as drift here, so the message is read from :func:`_act_on` on the
-    linked-out result without that drift."""
+    and the audit row name that entry, not the package directory, and count only the files read
+    through it. In a real pass the walk of the package directory also reports the link itself as
+    ``missing`` drift, so the drift branch runs and the row is where the entry is named; the
+    linked-out text is read from :func:`_act_on` on the same result without that drift."""
     console_root = _install_engine_and_console(tmp_path, monkeypatch)
     package_dir = console_root / _CONSOLE_PKG
     _link_out(package_dir / "static", tmp_path / "outside" / "static")
@@ -2452,6 +2455,10 @@ async def test_a_nested_path_entry_linked_out_is_named(
     assert console is not None
     assert console.unattested_reason == _LINKED_OUT
     assert console.linked_out_paths == (f"{_CONSOLE_PKG}/static",)
+    row = console.audit_detail()
+    assert row["linked_out_paths"] == [f"{_CONSOLE_PKG}/static"]
+    assert row["read_through_link"] == 2 and console.checked == 4
+    assert row["checked"] == 0
 
     store = await open_store(
         sqlite_settings(str(tmp_path / "nested.db")), create=True, keyless_chain_refusal=None

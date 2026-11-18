@@ -71,7 +71,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from importlib import machinery, metadata
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, TypeGuard
 
 from messagefoundry.audit_write import write_audit_soft
 
@@ -248,7 +248,9 @@ class AttestationResult:
     ``drift`` list on its own cannot tell **attested clean** from **attested nothing**, and the second
     shape is what a competent in-place edit leaves behind."""
 
-    attested: bool  # True only when a real RECORD baseline was compared against
+    #: True only when a real RECORD baseline was compared against. The audit row's ``attested`` key is
+    #: narrower: :meth:`audit_detail` writes it ``False`` for a pass that is :attr:`attested_nothing`.
+    attested: bool
     editable: bool
     no_record: bool
     checked: int
@@ -261,6 +263,9 @@ class AttestationResult:
     #: root (``package_directory_links_out_of_install_root``), so the warning can name which one;
     #: empty otherwise.
     linked_out_paths: tuple[str, ...] = ()
+    #: How many of the ``checked`` files were read through a package directory linked out of the
+    #: install root; ``0`` for every other shape.
+    read_through_link: int = 0
 
     @property
     def attested_nothing(self) -> bool:
@@ -297,17 +302,19 @@ class AttestationResult:
 
         The row must not read as a verified pass when the pass verified nothing (BACKLOG #5376), so
         here ``attested`` is ``False`` whenever :attr:`attested_nothing` holds, and ``checked`` counts
-        only verified files: ``0`` for a pass with an ``unattested_reason``. A pass through a package
-        directory linked out of the install root still read files; their count goes under
-        ``read_through_link``, which no other shape carries."""
+        only verified files: ``0`` for a pass with an ``unattested_reason``, drift or not. A pass with
+        a package directory linked out of the install root names it under ``linked_out_paths`` and
+        counts the files it read through it under ``read_through_link``; no other shape carries
+        either key."""
         unverified = self.attested_nothing
         detail: dict[str, object] = {
             "attested": self.attested and not unverified,
             "checked": 0 if unverified else self.checked,
             "drift_count": len(self.drift),
         }
-        if self.unattested_reason == "package_directory_links_out_of_install_root":
-            detail["read_through_link"] = self.checked
+        if self.linked_out_paths:
+            detail["linked_out_paths"] = list(self.linked_out_paths)
+            detail["read_through_link"] = self.read_through_link
         if self.editable:
             detail["editable"] = True
         if self.no_record:
@@ -835,7 +842,7 @@ def _attest_distribution(
 
     prefix = f"{package}/"
 
-    def in_package(rel: str | None) -> bool:
+    def in_package(rel: str | None) -> TypeGuard[str]:
         return rel is not None and (rel == package or rel.startswith(prefix))
 
     # Where each loaded root's files sit in `RECORD`. A root that resolves under the install root is
@@ -844,8 +851,9 @@ def _attest_distribution(
     # directory in the install root is compared as that directory. A root that resolves outside the
     # install root is read through the link at its record place when that place is in the package (a
     # package directory linked out of the install root), and is otherwise not compared at all.
-    anchors: list[tuple[Path, Path | None]] = []
-    linked_out: list[str] = []
+    # Each anchor is (record place, where its files are compared, whether that is through a link out).
+    anchors: list[tuple[Path, Path | None, bool]] = []
+    linked_out: set[str] = set()
     rooted = False
     for root in package_roots:
         place, resolved = _record_place(root), Path(root).resolve()
@@ -853,27 +861,28 @@ def _attest_distribution(
         resolved_rel = _record_relpath(resolved, install_root)
         rooted = rooted or in_package(place_rel) or in_package(resolved_rel)
         if resolved_rel is not None:
-            anchors.append((place, resolved))
-        elif place_rel is not None and in_package(place_rel):
-            anchors.append((place, place))
-            linked_out.append(place_rel)
+            anchors.append((place, resolved, False))
+        elif in_package(place_rel):
+            anchors.append((place, place, True))
+            linked_out.add(place_rel)
         else:
-            anchors.append((place, None))
+            anchors.append((place, None, False))
     anchors.sort(key=lambda anchor: len(anchor[0].parts), reverse=True)  # the deepest root wins
 
-    def record_rel(file: Path) -> str | None:
-        for place, anchor_root in anchors:
+    def record_rel(file: Path) -> tuple[str | None, bool]:
+        for place, anchor_root, through_link in anchors:
             if file.is_relative_to(place):
                 if anchor_root is None:
-                    return None
-                return _record_relpath(anchor_root / file.relative_to(place), install_root)
-        return _record_relpath(file, install_root)
+                    return None, False
+                rel = _record_relpath(anchor_root / file.relative_to(place), install_root)
+                return rel, through_link
+        return _record_relpath(file, install_root), False
 
     drift: list[DriftEntry] = []
-    checked = 0
+    checked = via_link = 0
     seen: set[str] = set()
     for file in attested_files():
-        rel = record_rel(file)
+        rel, through_link = record_rel(file)
         if rel is None:
             continue  # loaded from outside the install root — not attestable against this RECORD
         if rel in seen:
@@ -898,6 +907,7 @@ def _attest_distribution(
             drift.append(DriftEntry(path=rel, reason="missing"))
             continue
         checked += 1
+        via_link += through_link
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
 
@@ -930,7 +940,8 @@ def _attest_distribution(
         # A real baseline was read and still nothing was verified. `UnattestedReason` says which value
         # names which shape; `_act_on` decides the outcome.
         unattested_reason=reason,
-        linked_out_paths=tuple(sorted(set(linked_out))),
+        linked_out_paths=tuple(sorted(linked_out)),
+        read_through_link=via_link,
     )
 
 
@@ -1081,11 +1092,17 @@ async def _act_on(
         reason = result.unattested_reason or "unknown"
         if reason == "package_directory_links_out_of_install_root":
             # Files were compared here, through the link, so "no file was compared" would be false.
-            paths = ", ".join(result.linked_out_paths) or "a package directory"
+            paths = result.linked_out_paths
+            named = (
+                f"path {paths[0]} links"
+                if len(paths) == 1
+                else f"paths {', '.join(paths) or '(unnamed)'} link"
+            )
             what = (
-                f"loaded {arm.noun} path {paths} links out of the install root, so files read "
-                "through it are not counted as verified; install the package under the install "
-                "root, or accept this warning ([integrity].fail_closed_on_drift refuses to start)"
+                f"loaded {arm.noun} {named} out of the install root, so files read through a link "
+                "out are not counted as verified; install the package under the install root, or "
+                "accept that this pass verifies nothing, which [integrity].fail_closed_on_drift "
+                "refuses to start on"
             )
             log.warning(
                 "startup integrity: attestation verified NOTHING (%s) — %s (fail_closed=%s)",
