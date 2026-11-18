@@ -396,6 +396,29 @@ def test_a_negative_e2e_count_is_flagged(side: str, count: int) -> None:
     assert any("steady: negative e2e count" in r for r in regressions), regressions
 
 
+@pytest.mark.parametrize(
+    ("path", "value", "needle"),
+    [
+        pytest.param(("phases", 1, "achieved_msg_s"), -5.0, "negative throughput", id="rate"),
+        pytest.param(("phases", 1, "e2e_ms", "p99"), -1.0, "negative e2e p99", id="p99"),
+    ],
+)
+@pytest.mark.parametrize("side", ["baseline", "current"])
+def test_a_negative_phase_metric_is_flagged(
+    side: str, path: tuple[str | int, ...], value: float, needle: str
+) -> None:
+    bad = _with(path, value)
+    pair = (_load_report(), bad) if side == "baseline" else (bad, _load_report())
+    regressions = compare_to_baseline(pair[0], pair[1], tolerance=0.1)
+    assert any(f"steady: {needle}" in r for r in regressions), regressions
+
+
+@pytest.mark.parametrize("tolerance", [False, True])
+def test_a_bool_tolerance_is_refused(tolerance: bool) -> None:
+    regressions = compare_to_baseline(_load_report(), _load_report(), tolerance=tolerance)
+    assert any("is not a fraction in [0, 1)" in r for r in regressions), regressions
+
+
 @pytest.mark.parametrize("side", ["baseline", "current"])
 def test_a_negative_sent_is_flagged_with_no_counters(side: str) -> None:
     # Every counter is zero, so the per-sent rate check never runs; the negative sent must still

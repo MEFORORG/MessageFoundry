@@ -1077,8 +1077,13 @@ def _lat(s: LatencySummary) -> dict[str, float | int]:
 
 def tolerance_problem(tolerance: object) -> str | None:
     """Why ``tolerance`` cannot be a baseline tolerance, or None when it is a fraction in
-    ``[0, 1)``. The CLI asks before the run so a bad value refuses at once (BACKLOG #5439)."""
-    if isinstance(tolerance, (int, float)) and 0.0 <= tolerance < 1.0:
+    ``[0, 1)``. The CLI asks before the run so a bad value refuses at once (BACKLOG #5439). A bool
+    is refused, as :func:`_f` refuses one as a metric."""
+    if (
+        not isinstance(tolerance, bool)
+        and isinstance(tolerance, (int, float))
+        and 0.0 <= tolerance < 1.0
+    ):
         return None
     return f"tolerance {tolerance!r} is not a fraction in [0, 1)"
 
@@ -1165,7 +1170,10 @@ def _compare_phase(
     rate = _pair(f"{name}: achieved_msg_s", bp.get("achieved_msg_s"), cp.get("achieved_msg_s"), out)
     if rate is not None:
         b_rate, c_rate = rate
-        if b_rate > 0 and c_rate < b_rate * (1.0 - tolerance):
+        if b_rate < 0 or c_rate < 0:
+            # A zero rate may be a phase that sends nothing; a negative one is a malformed report.
+            out.append(f"{name}: negative throughput ({b_rate:.0f} baseline, {c_rate:.0f} current)")
+        elif b_rate > 0 and c_rate < b_rate * (1.0 - tolerance):
             out.append(f"{name}: throughput regressed {c_rate:.0f} < {b_rate:.0f} msg/s")
     count = _pair(
         f"{name}: e2e count", _get(bp, "e2e_ms", "count"), _get(cp, "e2e_ms", "count"), out
@@ -1179,6 +1187,9 @@ def _compare_phase(
     # count is a malformed report, not an empty histogram.
     if b_n < 0 or c_n < 0:
         out.append(f"{name}: negative e2e count ({b_n:.0f} baseline, {c_n:.0f} current)")
+        return
+    if b_p99 < 0 or c_p99 < 0:
+        out.append(f"{name}: negative e2e p99 ({b_p99:.1f} baseline, {c_p99:.1f} current)")
         return
     if b_n == 0:
         return

@@ -228,7 +228,8 @@ class MultiShardRecord:
                 out.append(f"{e.node_id}: read nothing on its own lanes")
             if e.failed_lanes:
                 # The count only. The reasons come from the audited `/connections` reveal, a PHI
-                # read, so they stay in the JSON artifact and never reach the console or a CI log.
+                # read, so this line and the console report leave them to the JSON failed_lanes.
+                # The dataclass repr still carries them, so do not print a record or attribution.
                 out.append(
                     f"{e.node_id}: {len(e.failed_lanes)} inbound lanes not listening "
                     "(reasons in the JSON failed_lanes)"
