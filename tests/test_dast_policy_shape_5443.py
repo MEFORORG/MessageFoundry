@@ -230,6 +230,16 @@ def test_a_reporting_crash_still_writes_the_receipt(
     assert written["gated_http_rows"] == 99
 
 
+def test_a_policy_that_is_not_utf8_cannot_measure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A policy file that does not decode is unread, exit 2, not a UnicodeDecodeError to 1."""
+    path = tmp_path / "policy.json"
+    path.write_bytes(b"\xff\xfe{}")
+    assert sweep.main(["--policy", str(path)]) == 2
+    assert "fail closed" in capsys.readouterr().err
+
+
 def test_load_policy_does_not_claim_its_readers_run_outside_a_handler() -> None:
     """load_policy's comments said its readers ran outside a handler and would crash to exit 1.
     main's catch-alls now cover every later reader, as the reporting-crash tests above exercise,

@@ -126,7 +126,25 @@ def dependabot_prs(repo: str, limit: int) -> list[dict[str, Any]] | None:
             "number,title,body,state,createdAt,mergedAt,labels",
         ]
     )
-    return data if isinstance(data, list) else None
+    if not isinstance(data, list) or not all(_pr_shaped(p) for p in data):
+        return None
+    return data
+
+
+def _pr_shaped(pr: object) -> bool:
+    """Whether ``pr`` has the field types the metrics read. A list holding one that does not
+    crashed the run to exit 1 with no row written, so the list is an unread source instead."""
+    if not isinstance(pr, dict):
+        return False
+    labels = pr.get("labels", [])
+    return (
+        isinstance(pr.get("title", ""), str)
+        and isinstance(pr.get("body"), str | None)
+        and isinstance(pr.get("createdAt"), str | None)
+        and isinstance(pr.get("mergedAt"), str | None)
+        and isinstance(labels, list)
+        and all(isinstance(lbl, dict) and isinstance(lbl.get("name", ""), str) for lbl in labels)
+    )
 
 
 def _is_security_pr(pr: dict[str, Any]) -> bool:
@@ -180,12 +198,12 @@ def _norm_ver(v: str) -> str:
     return v.strip().lstrip("vV").lower()
 
 
-def _version_key(v: str) -> tuple[int, ...] | str:
-    """A comparison key under which a plain release equals itself padded with zeros, as PEP 440
-    has it (``1.2`` is ``1.2.0``); any other version compares by its normalized text."""
+def _release_tuple(v: str) -> tuple[int, ...] | None:
+    """A plain release (``v1.2.0``, ``1.2``) as a key under which it equals itself padded with
+    zeros, as PEP 440 has it; ``None`` for anything else (a pre-release, another tag scheme)."""
     norm = _norm_ver(v)
     if not re.fullmatch(r"\d+(?:\.\d+)*", norm):
-        return norm
+        return None
     parts = [int(x) for x in norm.split(".")]
     while len(parts) > 1 and parts[-1] == 0:
         parts.pop()
@@ -217,15 +235,32 @@ def adopter_lag(
     """
     if not adopter_repos:
         return "n/a: needs --adopter-repos (config-repo pin history)"
-    rel = _gh(
-        ["api", f"repos/{repo}/releases/latest", "--jq", "{tag: .tag_name, at: .published_at}"]
+    # Not releases/latest: the repo also publishes other distributions (webconsole-v...), and
+    # whichever is newest is "latest", so the engine release is picked out by its plain v-tag.
+    rels = _gh(
+        [
+            "api",
+            f"repos/{repo}/releases?per_page=100",
+            "--jq",
+            "[.[] | {tag: .tag_name, at: .published_at, draft: .draft, pre: .prerelease}]",
+        ]
     )
-    if rel is None:
-        return "n/a: gh could not read the latest engine release"
-    if not isinstance(rel, dict) or not isinstance(rel.get("tag"), str) or not rel["tag"]:
+    if rels is None:
+        return "n/a: gh could not read the engine releases"
+    if not isinstance(rels, list) or not all(isinstance(r, dict) for r in rels):
+        return "n/a: the releases answer is not a list of releases"
+    engine = [
+        (key, r)
+        for r in rels
+        if not r.get("draft")
+        and not r.get("pre")
+        and isinstance(r.get("tag"), str)
+        and (key := _release_tuple(r["tag"])) is not None
+    ]
+    if not engine:
         return "n/a: no engine release to compare against"
-    latest = _version_key(rel["tag"])
-    published = _parse_dt(rel.get("at"))
+    latest, rel = max(engine, key=lambda kr: kr[0])
+    published = _parse_dt(rel.get("at")) if isinstance(rel.get("at"), str) else None
     lags: list[float] = []
     for ar in adopter_repos:
         # The whole JSON answer, not `--jq .content`: jq prints a string raw, which is not JSON.
@@ -244,7 +279,7 @@ def adopter_lag(
         # messagefoundry line at all is not "up to date", so it is n/a, never a lag of 0.
         if pin is None:
             return f"n/a: {ar}/requirements.txt has no single exact messagefoundry== pin"
-        if _version_key(pin) != latest:
+        if _release_tuple(pin) != latest:
             if published is None:
                 return "n/a: the latest engine release has no publish date"
             lags.append((now - published).total_seconds() / 86400)
@@ -257,9 +292,10 @@ _ENGINE_REQ_RE = re.compile(r"messagefoundry(?![\w.-])\s*(?:\[[^\]]*\])?(.*)", r
 
 
 def _exact_pin(text: str) -> str | None:
-    """The version of the one ``messagefoundry==X`` requirement in ``text``, or ``None`` when there
-    is no messagefoundry requirement, more than one, or it is not an exact ``==`` pin."""
-    pins: list[str | None] = []
+    """The version every ``messagefoundry==X`` requirement in ``text`` pins, or ``None`` when there
+    is no messagefoundry requirement, one is not an exact ``==`` pin, or two pin different
+    versions (marker-split lines that agree, one per platform, are one pin)."""
+    pins: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
         req = _ENGINE_REQ_RE.match(line)
@@ -268,8 +304,12 @@ def _exact_pin(text: str) -> str | None:
         # Cut an environment marker, a comment, a line continuation, or a trailing option.
         spec = re.split(r"[;#\\]|\s--", req.group(1), maxsplit=1)[0].strip()
         exact = re.fullmatch(r"==\s*([\w.+!-]+)", spec)
-        pins.append(exact.group(1) if exact else None)
-    return pins[0] if len(pins) == 1 else None
+        if exact is None:
+            return None
+        pins.append(exact.group(1))
+    if not pins or len({_norm_ver(p) for p in pins}) != 1:
+        return None
+    return pins[0]
 
 
 #: The metrics each source feeds, so a source that could not be read blanks exactly these.

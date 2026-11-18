@@ -164,7 +164,8 @@ def load_policy(path: Path) -> dict[str, Any]:
     """Read and structurally validate the policy. Every failure here is fatal by design."""
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    # UnicodeDecodeError too: a policy that is not UTF-8 escaped main as CPython's exit 1.
+    except (OSError, UnicodeDecodeError) as exc:
         raise PolicyError(f"cannot read the policy at {path}: {exc}") from exc
     try:
         parsed = json.loads(raw)

@@ -251,16 +251,19 @@ def _adopter(
     *,
     content: str | None = None,
     release: dict[str, Any] | None = None,
+    others: list[dict[str, Any]] | None = None,
 ) -> str:
     """``adopter_lag`` over one synthetic adopter whose requirements.txt holds ``requirements``,
-    or whose contents answer carries the raw ``content`` string."""
+    or whose contents answer carries the raw ``content`` string. The releases answer holds
+    ``release`` (the engine's) after ``others``, newest first as the API lists them."""
     if content is None:
         assert requirements is not None
         content = base64.b64encode(requirements.encode()).decode()
+    releases = [*(others or []), release or _RELEASE]
 
     def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
-        if "releases/latest" in argv[2]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps(release or _RELEASE), "")
+        if argv[2].startswith("repos/example/repo/releases"):
+            return subprocess.CompletedProcess(argv, 0, json.dumps(releases), "")
         return subprocess.CompletedProcess(argv, 0, json.dumps({"content": content}), "")
 
     monkeypatch.setattr(mod.subprocess, "run", run)
@@ -277,6 +280,7 @@ def _adopter(
         pytest.param("httpx==0.28.1\n", id="no-engine-line"),
         pytest.param("messagefoundry-toolkit==0.1\n", id="toolkit-only"),
         pytest.param("messagefoundry==1.1\nmessagefoundry==1.2.0\n", id="two-lines"),
+        pytest.param("messagefoundry==1.2.0\nmessagefoundry>=1.0\n", id="exact-and-range"),
     ],
 )
 def test_adopter_lag_is_never_zero_without_an_exact_pin(
@@ -316,13 +320,65 @@ def test_adopter_content_that_is_not_base64_is_na(monkeypatch: pytest.MonkeyPatc
     "requirements",
     [
         pytest.param("messagefoundry==1.2\n", id="padded-release"),
-        pytest.param("﻿messagefoundry==1.2.0\n", id="bom"),
+        pytest.param("\ufeffmessagefoundry==1.2.0\n", id="bom"),
     ],
 )
 def test_an_up_to_date_pin_is_not_a_lag(monkeypatch: pytest.MonkeyPatch, requirements: str) -> None:
     """``1.2`` is ``1.2.0`` under PEP 440, and a BOM does not hide a first-line pin."""
     mod = _load()
     assert _adopter(monkeypatch, mod, requirements) == "0"
+
+
+def test_another_distribution_released_later_is_not_the_engine_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The repo's newest release can be another distribution's (webconsole-v...), or a draft or
+    pre-release; the lag is measured against the engine release, so a current pin is still 0."""
+    mod = _load()
+    later = (_NOW - timedelta(days=1)).isoformat()
+    others: list[dict[str, Any]] = [
+        {"tag": "webconsole-v9.0.0", "at": later},
+        {"tag": "v1.3.0", "at": later, "draft": True},
+        {"tag": "v1.3.0rc1", "at": later, "pre": True},
+    ]
+    assert _adopter(monkeypatch, mod, "messagefoundry==1.2.0\n", others=others) == "0"
+
+
+def test_marker_split_pins_that_agree_are_one_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = _load()
+    requirements = (
+        'messagefoundry==1.1.0 ; sys_platform == "win32"\n'
+        'messagefoundry==1.1.0 ; sys_platform != "win32"\n'
+    )
+    assert _adopter(monkeypatch, mod, requirements) == "6.0"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param({"labels": None}, id="null-labels"),
+        pytest.param({"labels": [{"name": None}]}, id="null-label-name"),
+        pytest.param({"title": None}, id="null-title"),
+        pytest.param({"createdAt": 7}, id="numeric-date"),
+    ],
+)
+def test_a_pr_list_with_a_malformed_item_is_an_unread_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad: dict[str, Any]
+) -> None:
+    """A PR item whose fields the metrics cannot read crashed the run to exit 1 with no row; the
+    list is an unread source instead, n/a and exit 2."""
+    mod = _load()
+    _stub(monkeypatch, mod)
+
+    def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        prs = _prs()
+        prs[0].update(bad)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(prs), "")
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    code, row = _main(mod, tmp_path)
+    assert code == 2, row
+    assert row["dependabot_prs_window"].startswith("n/a"), row
 
 
 def test_an_unread_release_is_not_no_release(monkeypatch: pytest.MonkeyPatch) -> None:
