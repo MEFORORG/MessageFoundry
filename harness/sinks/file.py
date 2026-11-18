@@ -16,8 +16,7 @@ here; a scenario that tests for an escape must look where it would land, and a l
 records unread carries no control id, so a scenario must check ``meta["symlink"]`` itself.
 
 **The walk, and the race it closes where the OS allows.** The sink directory itself must be a plain
-directory, not a link or a junction: :meth:`FileSink.start` refuses one, and one it cannot scan
-whole. A scan that finds it gone, or swapped for another directory or a link, records the
+directory, not a link or a junction: :meth:`FileSink.start` refuses one. A scan that finds it gone, or swapped for another directory or a link, records the
 :data:`ROOT_CHANGED` refusal once and scans nothing; one that cannot open or list it for another
 reason (permissions, no free handle) logs it and is retried on the next scan. Where the OS lets a directory be opened and listed by handle (``dir_fd``, at least Linux
 and macOS), the walk holds each folder open: a sub-folder is opened by name relative to its parent's
@@ -38,8 +37,7 @@ bounded: a large output directory starts and is polled whole.
 Reading is bounded the way the GUI's folder watcher is, through the same reader
 (:func:`harness.bounded_file.read_fd_capped`): regular files only, nothing read through a
 symbolic link or junction on platforms with ``dir_fd``, each
-capped at the engine's per-message cap, checked on the open handle, and an over-cap file (or one
-that grows past the cap while read) recorded with an empty payload and a ``refused`` reason rather
+capped at the engine's per-message cap, checked on the open handle, and an over-cap file recorded with an empty payload and a ``refused`` reason rather
 than read. Only a plain directory is skipped: a symlink (``meta["symlink"]``), FIFO or device is
 recorded unread with the :data:`~harness.bounded_file.NOT_REGULAR` reason, so a link out of the
 directory reads as an escape, not as nothing. A listed name that :func:`_unsafe_listed_name` refuses
