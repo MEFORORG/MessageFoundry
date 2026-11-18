@@ -2614,20 +2614,28 @@ class ConsolidatedLadderReport:
 
         A pool bind that is the ONLY degradation does not outrank a correctness break: the break is exit 1
         (BACKLOG #5442 made a gate-only rung's pool readable, which would otherwise relabel a FIFO break as
-        a pool-sizing setup issue)."""
-        if self.setup_degraded and not self._pool_bound_only_over_a_break:
+        a pool-sizing setup issue). Nor does a SOAK degradation outrank a break on a CLIMB rung: that break
+        was measured before the soak ran, so an aborted or un-driven soak must not hide it behind exit 2."""
+        if self.setup_degraded and not self._break_outranks_degradation:
             return 2
         return 0 if self.ok else 1
 
     @property
-    def _pool_bound_only_over_a_break(self) -> bool:
-        """Correctness broke, and the only degradation is the pool tripwire: the break is the answer."""
-        return not self.ok and not (
-            self.climb_aborted
-            or self.soak_aborted
-            or self.store_truth_unconfirmed
-            or self.soak_drive_shortfall
+    def _climb_broken(self) -> bool:
+        """A CLIMB rung broke correctness: the same terms :attr:`correctness_ok` applies, read on the climb
+        alone, so the soak's state cannot touch it."""
+        return any(r.verdict is RungVerdict.CORRECTNESS_FAIL for r in self.climb) or any(
+            r.lanes_observed < 2 for r in self.climb if r.verdict is RungVerdict.SUSTAINED
         )
+
+    @property
+    def _break_outranks_degradation(self) -> bool:
+        """Correctness broke and no CLIMB-side degradation (a climb rendezvous abort, an unconfirmed climb
+        store-truth) leaves the break unproven. Then the break is the answer when the only other degradation
+        is the pool tripwire, or when the break is on a climb rung, whatever the soak's state."""
+        if self.ok or self.climb_aborted or self.store_truth_unconfirmed:
+            return False
+        return self._climb_broken or not (self.soak_aborted or self.soak_drive_shortfall)
 
     @property
     def result_label(self) -> str:
@@ -2655,7 +2663,8 @@ class ConsolidatedLadderReport:
           column, from the pooled-claim wall it would have been blamed on).
         * ``PASS`` — correctness held, and the soak either sustained (DRIVEN, and the engine took it) or was
           legitimately skipped."""
-        if self.setup_degraded:
+        # A correctness break that outranks the degradation is FAIL (see :attr:`exit_code`).
+        if self.setup_degraded and not self._break_outranks_degradation:
             # POOL_BOUND is NAMED rather than flattened into SETUP_DEGRADED — but only when it is the SOLE
             # degradation. An abort / unconfirmed store-truth / un-driven soak means NOTHING was measured,
             # and that dominates: attributing a ceiling to the pool on a run that never produced one would
@@ -2666,10 +2675,7 @@ class ConsolidatedLadderReport:
                 or self.store_truth_unconfirmed
                 or self.soak_drive_shortfall
             )
-            if nothing_measured:
-                return "SETUP_DEGRADED"
-            # A correctness break outranks a pool bind (see :attr:`exit_code`).
-            return "FAIL" if not self.ok else "POOL_BOUND"
+            return "SETUP_DEGRADED" if nothing_measured else "POOL_BOUND"
         if not self.ok:
             return "FAIL"
         if self.soak_not_sustained:
@@ -3066,7 +3072,8 @@ class ConsolidatedLadderReport:
             # replayed payload reached it), and such a soak counts as `soak_aborted`; (2) a rung whose
             # ENGINE_RUNG_REPORT was lost reads `store_pool` from the drain gate (v9 left it unmeasured, so the
             # pool tripwire could not fire and a pool-bound run could exit 0); (3) a correctness break whose
-            # only companion degradation is a pool bind is FAIL / exit 1, not POOL_BOUND / exit 2.
+            # only companion degradation is a pool bind, or a break on a CLIMB rung whatever the soak's state,
+            # is FAIL / exit 1, not POOL_BOUND or SETUP_DEGRADED / exit 2.
             "schema_version": 10,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,

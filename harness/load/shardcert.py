@@ -2595,7 +2595,8 @@ class ShardCertLadderReport:
             # `aborted_reason` names a climb a failed store reset stopped (exit 2, the rungs before it kept).
             #
             # v4 (BACKLOG #5440, #5441): `ok`/`result`/`exit_code` hold each rung to the single-run pass bar
-            # (duplicates, at least two lanes, no dead letters at any stage, something acknowledged). Per
+            # (duplicates, no dead letters at any stage, and on a SUSTAINED rung at least two lanes and
+            # something acknowledged; a ceiling rung is a measurement and is waived both). Per
             # record: `lanes_observed`, `engine_dead`, `dead_total` and `correctness_ok` are new. A rung that
             # breaks that bar pins nothing (`pinned_rate` skips it) and stops the climb, so a v4 FAIL may
             # carry fewer records than a v3 one.

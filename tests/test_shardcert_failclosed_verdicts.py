@@ -493,6 +493,54 @@ def test_break_over_a_pool_bind_renders_fail_not_setup_degraded() -> None:
     assert line.endswith("-> exit 1")
 
 
+@pytest.mark.parametrize("soak_state", ["engine-aborted", "drive-aborted"])
+def test_climb_break_is_fail_whatever_the_soak_state(soak_state: str) -> None:
+    """A climb rung broke FIFO. Whatever happened to the soak afterwards, that break was MEASURED, so the run
+    is FAIL / exit 1; a torn-down soak must not hide it behind SETUP_DEGRADED / exit 2."""
+    broken = build_rung_outcome(_rung(1, 24.0), _drive(24.0), _clean_gate(_HEALTHY_POOL), None)
+    broken = dataclasses.replace(broken, lane_inversions=3, verdict=RungVerdict.CORRECTNESS_FAIL)
+    soak: RungOutcome | None = None
+    if soak_state == "engine-aborted":
+        soak_rung = LadderRung(
+            index=9, ingress_rate=20.0, hold_seconds=900.0, drain_timeout=150.0, is_soak=True
+        )
+        soak = build_rung_outcome(
+            soak_rung, _drive(20.0, sink_short=500, drained=False), _ABORTED_GATE, None
+        )
+    rep = build_consolidated_report(
+        shards=("a", "b"),
+        dests=_DESTS,
+        handlers=_DESTS,
+        delivering=_DESTS,
+        routing="broadcast",
+        lanes_per_shard=1,
+        driver_count=2,
+        sink_count=_DESTS,
+        climb=[_sustained(0, 20.0), broken],
+        soak=soak,
+        climb_aborted=False,
+        soak_aborted=soak_state == "drive-aborted",
+    )
+    assert rep.soak_aborted is True
+    assert rep.exit_code == 1
+    assert rep.result_label == "FAIL"
+    assert _result_line(rep).startswith("RESULT: FAIL")
+
+
+def test_held_climb_under_an_aborted_soak_stays_setup_degraded() -> None:
+    """Only a CLIMB break outranks a soak degradation; a climb that held over an aborted soak is still
+    exit 2, as the engine-aborted-soak test above it pins."""
+    soak_rung = LadderRung(
+        index=9, ingress_rate=20.0, hold_seconds=900.0, drain_timeout=150.0, is_soak=True
+    )
+    soak = build_rung_outcome(
+        soak_rung, _drive(20.0, sink_short=500, drained=False), _ABORTED_GATE, None
+    )
+    rep = _consolidated([_sustained(0, 20.0), _sustained(1, 24.0)], soak=soak)
+    assert rep.exit_code == 2
+    assert rep.result_label == "SETUP_DEGRADED"
+
+
 def test_report_pool_still_wins_over_the_gate() -> None:
     """The report's pool block is read first; the gate's is the fallback only."""
     report = {**_clean_gate(), "store_pool": _TRIPPED_POOL.to_json_dict()}
