@@ -16373,7 +16373,9 @@ class AuthService:
         ``ValueError("no such user")`` when a re-read finds the caller's row gone, as it does when
         the row is gone before the write; :class:`FactorEnrolmentRequired` for a covered account
         whose row is still there; and :class:`PasswordChangeNotApplied` otherwise. A deletion that
-        lands after the write has committed is not caught: that change is reported as made.
+        lands after the write has committed is not caught: that change is reported as made. A row
+        that fails its seal on two reads raises :class:`UserSealRefused` before the policy check,
+        and nothing is written.
         :class:`BreachCorpusUnavailable` propagates from the policy check unchanged: the password
         is refused, never accepted unscreened.
 
@@ -16395,18 +16397,23 @@ class AuthService:
         before the current password. Without the ``[webauthn]`` extra the write counts no passkey,
         as :meth:`_has_way_past` counts none.
         """
-        lookup = await self._lookup_user(identity.user_id)
+        lookup = await self._lookup_user_settled(identity.user_id)
         if not lookup.held:
             # BACKLOG #5902: the caller's row was deleted after its session was resolved. Asked
             # before the policy, so the answer does not depend on the password typed, and before the
             # hash, so no password_changed row is written for an absent account.
             raise ValueError("no such user")
+        user = lookup.user
+        if user is None:
+            # BACKLOG #5902: the row is there and fails its seal on a second read too. Refused, as
+            # every other read of such a row is: with no checked record, coverage by the MFA
+            # requirement cannot be judged, so writing would drop the way-past condition below.
+            raise UserSealRefused(USER_SEAL_REFUSED)
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
-        user = lookup.user
-        covered = user is not None and self._covered_by_requirement(user, identity.roles)
-        if covered and user is not None:
+        covered = self._covered_by_requirement(user, identity.roles)
+        if covered:
             await self._refuse_rotation_without_way_past(user)
         written = await self._store.set_password(
             identity.user_id,

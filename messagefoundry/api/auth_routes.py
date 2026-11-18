@@ -869,6 +869,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             ) from exc
         except PasswordChangeNotApplied as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except UserSealRefused as exc:
+            # BACKLOG #5902: the caller's record fails its seal, so nothing was set. The admin
+            # reads' 423, with the same fixed text, which names no field of the record.
+            raise HTTPException(status.HTTP_423_LOCKED, str(exc)) from exc
         except ValueError as exc:
             if str(exc) != "no such user":
                 raise

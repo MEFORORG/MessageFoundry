@@ -6,12 +6,14 @@ An unusable bundled breach corpus raised ``BreachCorpusUnavailable`` out of the 
 500; it is now a named 503 that still refuses the change. And a caller whose user row was deleted
 after its session was resolved, before or during the write, got a success and an
 ``auth.password_changed`` row, or an enrolment refusal, for an account that no longer exists; the
-service now refuses with ``ValueError("no such user")``, which the route answers as a 401. Synthetic
-accounts only.
+service now refuses with ``ValueError("no such user")``, which the route answers as a 401. A row
+that fails its integrity seal is refused (423) rather than written as an account the MFA
+requirement does not cover, and a write that lost its compare is a 409. Synthetic accounts only.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -21,10 +23,16 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.passwords import hash_password
-from messagefoundry.auth.service import AuthService, PasswordChangeNotApplied
+from messagefoundry.auth.service import (
+    AuthService,
+    PasswordChangeNotApplied,
+    UserSealRefused,
+    _UserLookup,
+)
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import Store
+from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests.test_api_auth import _auth, _login
 from tests.test_password_corpus_guard import bundled_corpus as bundled_corpus  # noqa: F401
@@ -189,3 +197,82 @@ async def test_a_write_that_lost_a_race_is_not_reported_as_a_change(
     assert await _changed_rows(store) == []
     after = await store.get_user("u1")
     assert after is not None and after.password_hash == before.password_hash
+
+
+def _stored_hash(path: Path, user_id: str) -> str:
+    """The password hash as the file holds it, read on a keyless stdlib connection."""
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute("SELECT password_hash FROM users WHERE id=?", (user_id,)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    return str(row[0])
+
+
+async def test_a_row_that_fails_its_seal_cannot_change_its_password(tmp_path: Path) -> None:
+    path = tmp_path / "sealed.db"
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
+    try:
+        service, identity = await _account(store, require_mfa=True)
+        before = _stored_hash(path, "u1")
+        # Bend a sealed field behind the store's back, so the record fails its seal on every read.
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("UPDATE users SET display_name=? WHERE id=?", ("bent", "u1"))
+            conn.commit()
+        finally:
+            conn.close()
+        with pytest.raises(UserSealRefused):
+            await service.change_password(identity, _NEW_PASSWORD)
+        # Refused before the policy check, so the password typed does not change the answer.
+        with pytest.raises(UserSealRefused):
+            await service.change_password(identity, "weak")
+        assert _stored_hash(path, "u1") == before
+        assert await _changed_rows(store) == []
+    finally:
+        await store.close()
+
+
+async def _post_change(c: httpx.AsyncClient, headers: dict[str, str]) -> httpx.Response:
+    return await c.post(
+        "/me/password",
+        headers=headers,
+        json={"current_password": _PASSWORD, "new_password": _NEW_PASSWORD},
+    )
+
+
+async def test_a_lost_write_is_a_409_on_the_route(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, _service, headers = await _signed_in(engine)
+
+    async def lost(_uid: str, **_kwargs: Any) -> bool:
+        return False  # the row is still there; the write's compare lost to another writer
+
+    monkeypatch.setattr(engine.store, "set_password", lost)
+    try:
+        r = await _post_change(c, headers)
+    finally:
+        await c.aclose()
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == str(PasswordChangeNotApplied())
+    assert await _changed_rows(engine.store) == []
+
+
+async def test_a_seal_refused_row_is_a_423_on_the_route(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, service, headers = await _signed_in(engine)
+
+    async def refused(_uid: str) -> _UserLookup:
+        return _UserLookup(None, True)  # the row is there and fails its seal on both reads
+
+    # Patched after sign-in, so the gate and the current-password check read the row as sealed.
+    monkeypatch.setattr(service, "_lookup_user_settled", refused)
+    try:
+        r = await _post_change(c, headers)
+    finally:
+        await c.aclose()
+    assert r.status_code == 423, r.text
+    assert await _changed_rows(engine.store) == []
