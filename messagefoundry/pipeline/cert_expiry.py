@@ -12,7 +12,8 @@ content (no PHI).
 
 Engine-owned (started in :meth:`Engine.start`, stopped in :meth:`Engine.stop`) and modelled on the
 :class:`~messagefoundry.pipeline.retention.RetentionRunner`: an injected clock + a pure :meth:`run_once`
-make it deterministically testable; the loop only governs cadence. The set of certs to watch is supplied
+make it deterministically testable. The loop runs the same steps, with the file reads in a worker
+thread and the alerts on the loop (vault BACKLOG #5885). The set of certs to watch is supplied
 by an injected **callable** so it is recomputed each pass — a config reload that adds or removes a TLS
 connection is picked up automatically — and so tests can drive it with a literal list.
 
@@ -39,6 +40,7 @@ from messagefoundry.config.loaded_crls import (
     ca_bundle_fingerprint,
     crl_fingerprint,
     crl_path_key,
+    has_held_copies,
 )
 from messagefoundry.config.loaded_crls import snapshot as held_crl_snapshot
 from messagefoundry.config.settings import CertMonitorSettings, StoreBackend
@@ -384,42 +386,59 @@ class CertExpiryRunner:
 
     def run_once(self, now: float | None = None) -> list[CertCheck]:
         """Inspect every served cert for ``now`` (default: the injected clock), emitting a
-        ``cert_expiry`` alert for each expired or within-window cert. Synchronous, so a single
-        deterministic pass (tests); the supervised loop runs :meth:`_pass` instead. Returns one :class:`CertCheck` per cert it could judge. An unreadable or missing file
-        is logged, and skipped unless it is a CRL a live TLS context still holds a copy of, which is
-        then judged by that copy (BACKLOG #299). A typo'd path must not silence the others."""
-        now = self._clock() if now is None else now
-        checks, said = self._collect(now, list(self._cert_source()))
+        ``cert_expiry`` alert for each expired or within-window cert before it returns.
+        Synchronous, so a single deterministic pass (tests); the supervised loop runs
+        :meth:`_pass` instead. Returns one :class:`CertCheck` per cert it could judge. An
+        unreadable or missing file is logged, and skipped unless it is a CRL a live TLS context
+        still holds a copy of, which is then judged by that copy (BACKLOG #299). A typo'd path
+        must not silence the others."""
+        checks, said = self._collect(now, list(self._cert_source()), self._held_snapshot())
         self._emit(checks, said)
         return checks
 
     async def _pass(self) -> None:
-        """One supervised pass: the blocking half in a worker thread, the alerts on the loop.
+        """One supervised pass: the file work in a worker thread, the rest on the loop.
 
-        Vault BACKLOG #5885: the collection (``gc.collect``, the cert and CRL file reads, parsing,
-        the CRL staging) ran on the event loop, stalling message processing and a cluster leader's
-        heartbeat for its length. The cert source reads the live registry, which a reload swaps on
-        the loop, so it is read here. The alert sinks are loop-bound (a notifier enqueues onto an
-        ``asyncio.Queue``), so they are called back here too. A cancel while the thread runs
-        abandons its result, so a stopped pass raises no alert."""
-        now = self._clock()
+        Vault BACKLOG #5885: the cert and CRL file reads, parsing and CRL staging ran on the event
+        loop, stalling message processing and a cluster leader's heartbeat for their length. The
+        cert source reads the live registry, which a reload swaps on the loop, so it is read here.
+        The held-copy snapshot stays here too: its ``gc.collect`` runs the finalizers of whatever
+        it frees, such as a discarded connector's transport, and those must run on the loop. The
+        alert sinks are loop-bound (a notifier enqueues onto an ``asyncio.Queue``), so they are
+        called back here as well. A cancel while the thread runs abandons its result, so a stopped
+        pass raises no alert, and the thread stops at its next row."""
         rows = list(self._cert_source())
-        checks, said = await asyncio.to_thread(self._collect, now, rows)
+        held = self._held_snapshot()
+        checks, said = await asyncio.to_thread(self._collect, None, rows, held, stoppable=True)
         self._emit(checks, said)
 
     def _collect(
-        self, now: float, rows: list[MonitoredCert]
+        self,
+        now: float | None,
+        rows: list[MonitoredCert],
+        held: HeldCrlSnapshot,
+        *,
+        stoppable: bool = False,
     ) -> tuple[list[CertCheck], _HeldCopyLog]:
-        """The blocking half of a pass: judge ``rows`` and the unlisted held CRLs, alerting nothing.
+        """The file half of a pass: judge ``rows`` and the unlisted held CRLs, alerting nothing.
 
-        It touches only the files, per-pass state and the held-CRL registry, which holds its own
-        lock, so it is safe in a worker thread."""
-        held = self._held_snapshot()
+        It touches only the files, per-pass state and the ``held`` snapshot, so it is safe in a
+        worker thread. ``now`` defaults to the clock read here, so a pass that queued behind a
+        busy executor judges by the time it runs. A row that raises is logged and skipped, so the
+        rows judged before it still alert. A ``stoppable`` pass ends at the next row once
+        :meth:`stop` is called, since nobody reads its result."""
+        now = self._clock() if now is None else now
         rows = self._rows(held, rows)
         said = _HeldCopyLog.for_rows(rows)
         checks: list[CertCheck] = []
         for cert in rows:
-            check = self._inspect(cert, now, held, said=said)
+            if stoppable and self._stop.is_set():
+                break
+            try:
+                check = self._inspect(cert, now, held, said=said)
+            except Exception:
+                log.exception("cert_expiry: could not judge %r (%s)", cert.label, cert.path)
+                continue
             if check is not None:
                 checks.append(check)
         return checks, said
@@ -462,10 +481,12 @@ class CertExpiryRunner:
         """One snapshot of the CRL copies live contexts hold, taken once per pass (BACKLOG #299).
 
         The engine's monitor collects garbage first, so a probe or discarded connector caught in a
-        reference cycle does not read as a live hop holding a copy. A failure is logged and yields
-        an empty snapshot, which leaves each file's own verdict standing."""
+        reference cycle does not read as a live hop holding a copy. Only while some context holds a
+        copy, since with none there is nothing a collect could remove: a full collect holds the
+        GIL, so no thread keeps the loop serving through it (vault BACKLOG #5885). A failure is
+        logged and yields an empty snapshot, which leaves each file's own verdict standing."""
         try:
-            if self._watch_unlisted_held_crls:
+            if self._watch_unlisted_held_crls and has_held_copies():
                 gc.collect()
             return held_crl_snapshot()
         except Exception:
@@ -481,8 +502,10 @@ class CertExpiryRunner:
         if not self._watch_unlisted_held_crls:
             return rows
         unwatched = held.unwatched(row.path for row in rows if row.kind == "crl")
-        rows.extend(MonitoredCert(held_crl_label(path), path, kind="crl") for path in unwatched)
-        return rows
+        return [
+            *rows,
+            *(MonitoredCert(held_crl_label(path), path, kind="crl") for path in unwatched),
+        ]
 
     def _inspect(
         self,
