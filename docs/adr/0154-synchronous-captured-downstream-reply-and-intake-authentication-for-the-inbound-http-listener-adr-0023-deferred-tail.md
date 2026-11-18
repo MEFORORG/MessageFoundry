@@ -598,7 +598,7 @@ two rows with no outcome and one that needed a body it might not have.
 | `reply` | captured `accepted` | `200` | partner reply verbatim |
 | `empty` | captured `no_reply` | `204` (or `200` per `reply_on_empty`) | none |
 | `rejected` | captured `rejected` / `unparseable` | `502` | partner reply verbatim |
-| `failed` | outbound row `dead`/`cancelled` (the common partner-4xx case) | `502` | fixed non-PHI JSON + `message_id` |
+| `failed` | every outbound row settled (`dead`/`cancelled`, the common partner-4xx case, or `done` with no captured reply) | `502` | fixed non-PHI JSON + `message_id` |
 | `purged` | captured row exists, body nulled by retention | `502` | fixed non-PHI JSON |
 | `no_route` | `UNROUTED` / `FILTERED` / `NOT_DEPLOYED` | `reply_on_timeout` status, **immediately** | fixed JSON |
 | `timeout` | `reply_timeout` expired | `504` (default) / `202` | `{"status":"timeout","message_id":…}` |
