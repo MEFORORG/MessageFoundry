@@ -3672,3 +3672,71 @@ async def test_login_supersedes_ends_the_named_token_before_the_cap(engine: Engi
             "/auth/login", json={"username": "sup", "password": PW, "supersedes": "x" * 257}
         )
         assert too_long.status_code == 422
+
+
+# --- vault BACKLOG #5342: a NUL in the sign-in name ---------------------------------------------
+
+
+@pytest.mark.parametrize("username", ["sup\x00", "\x00", "s\x00up"])
+async def test_login_answers_a_nul_username_as_an_audited_unknown_name(
+    engine: Engine, username: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A NUL name answers as an unknown name does, both sign-ins are charged, it writes one
+    escaped ``auth.login_failed`` row, and it is never looked up."""
+    service = await _service(engine, AuthSettings(require_mfa=False))
+    await _add(service, "sup", Role.VIEWER)
+    looked_up: list[str] = []
+    real_lookup = engine.store.get_user_by_username
+
+    async def _lookup(name: str) -> Any:
+        looked_up.append(name)
+        return await real_lookup(name)
+
+    monkeypatch.setattr(engine.store, "get_user_by_username", _lookup)
+    charged: list[str | None] = []
+    real_allow = service.allow_login_attempt
+
+    def _allow(client: str | None) -> bool:
+        charged.append(client)
+        return real_allow(client)
+
+    monkeypatch.setattr(service, "allow_login_attempt", _allow)
+    async with _client(engine, service) as c:
+        unknown = await c.post("/auth/login", json={"username": "ghost", "password": PW})
+        assert "ghost" in looked_up, looked_up  # the spy sees a lookup that happens
+        looked_up.clear()
+        r = await c.post("/auth/login", json={"username": username, "password": PW})
+    assert looked_up == [], looked_up
+    assert unknown.status_code == 401
+    assert (r.status_code, r.json()) == (unknown.status_code, unknown.json())
+    assert len(charged) == 2, "the NUL sign-in was not charged to the limiter"
+    actors = [
+        dict(row)["actor"] for row in await engine.store.list_audit(action="auth.login_failed")
+    ]
+    assert actors.count(username.replace("\x00", "\\u0000")) == 1, actors
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"username": "s\x01up"}, {"username": ""}, {"supersedes": "tok\x00en"}, {"supersedes": ""}],
+)
+async def test_login_still_reaches_the_service_for_other_unusual_values(
+    engine: Engine, fields: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another control character, an empty name, and a NUL or empty ``supersedes`` reach the
+    service and answer 200 or 401."""
+    service = await _service(engine, AuthSettings(require_mfa=False))
+    await _add(service, "sup", Role.VIEWER)
+    reached: list[str] = []
+    real_login = service.login
+
+    async def _spy(username: str, *args: Any, **kwargs: Any) -> Any:
+        reached.append(username)
+        return await real_login(username, *args, **kwargs)
+
+    monkeypatch.setattr(service, "login", _spy)
+    async with _client(engine, service) as c:
+        body = {"username": "sup", "password": PW, **fields}
+        r = await c.post("/auth/login", json=body)
+        assert reached == [body["username"]]
+        assert r.status_code == (200 if "supersedes" in fields else 401)

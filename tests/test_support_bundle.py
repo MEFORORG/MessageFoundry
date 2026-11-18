@@ -59,7 +59,23 @@ def test_bundle_version_and_manifest(tmp_path: Path) -> None:
     assert manifest["version"] == __version__
     assert manifest["generated_at"] == 1_700_000_000.0
     assert "phi_contract" in manifest
-    assert "no raw message bodies" in manifest["phi_contract"]
+    assert "no member reads a message body from the store" in manifest["phi_contract"]
+    # BACKLOG #5385: a DEBUG log can hold a body the redaction does not read, so the contract names it.
+    assert "DEBUG" in manifest["phi_contract"]
+    assert "no raw message bodies" not in manifest["phi_contract"]
+
+
+def test_manifest_phi_contract_does_not_claim_the_bundle_secret_free(tmp_path: Path) -> None:
+    """BACKLOG #5385: the contract is machine-readable, so it must not open with an unqualified "no
+    secrets" while the app-log tail it lists is only best-effort redacted. It names that residual."""
+    out = tmp_path / "bundle.zip"
+    build_bundle(out, config_dir=None, settings=None)
+    contract = json.loads(_members(out)["manifest.json"])["phi_contract"]
+    assert "no secrets" not in contract.lower()
+    assert "best-effort" in contract.lower()
+    assert "username" in contract
+    assert "at least" in contract  # a residual is a floor, not an enumeration (SDS-3.6)
+    assert "not as secret-free or phi-free" in contract.lower()
 
 
 def test_status_snapshot_uses_real_models() -> None:

@@ -96,6 +96,265 @@ def test_decode_helpers_map_bad_body_to_apierror() -> None:
         _decode_list(httpx.Response(200, json={"not": "a list"}), ChannelInfo)
 
 
+#: A synthetic value that stands in for message content in a malformed reply (BACKLOG #5344).
+_REPLY_MARKER = "DOE^JANE^SYNTHETIC"
+
+
+@contextlib.contextmanager
+def _client_answering(content: bytes) -> Iterator[EngineClient]:
+    """A loopback client whose transport seam answers every request 200 with ``content``."""
+    client = EngineClient("http://127.0.0.1:8765")
+
+    def _send(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        return httpx.Response(200, content=content, request=request)
+
+    client._http.send = _send  # type: ignore[method-assign]
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "call",
+    [lambda c: c.list_dead_letters(), lambda c: c.list_connection_events()],
+    ids=["dead_letters", "connection_events"],
+)
+@pytest.mark.parametrize(
+    "content",
+    [
+        # Not JSON at all: json.loads' error carries the whole body as ``.doc``.
+        f"{{not json {_REPLY_MARKER}".encode(),
+        # JSON of the wrong shape: str(ValidationError) quotes each failing input.
+        json.dumps({"total": _REPLY_MARKER, "events": _REPLY_MARKER}).encode(),
+    ],
+    ids=["not_json", "wrong_shape"],
+)
+def test_list_readers_map_a_malformed_reply_to_a_value_free_apierror(
+    call: Callable[[EngineClient], object], content: bytes
+) -> None:
+    """The dead-letter and connection-event readers decode through ``_decode`` (BACKLOG #5344), so
+    a malformed reply raises only :class:`ApiError`, quotes no value from the body, and chains no
+    error that holds one.
+
+    Mutation: put ``DeadLetterList.model_validate(response.json())`` (or the event twin) back.
+    Red: a raw ``JSONDecodeError`` or ``ValidationError`` escapes instead of ``ApiError``."""
+    with (
+        _client_answering(content) as client,
+        pytest.raises(ApiError, match="invalid response from engine") as excinfo,
+    ):
+        call(client)
+    assert _REPLY_MARKER not in str(excinfo.value)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("call", "body"),
+    [
+        (
+            lambda c: c.list_dead_letters(),
+            {
+                "total": 0,
+                "limit": 50,
+                "offset": 0,
+                "dead_letters": [],
+                "replay_targets": [],
+                "replayable_in_scope": False,
+            },
+        ),
+        (
+            lambda c: c.list_connection_events(),
+            {"total": 0, "limit": 200, "offset": 0, "before_id": None, "events": []},
+        ),
+    ],
+    ids=["dead_letters", "connection_events"],
+)
+def test_list_readers_still_decode_a_well_formed_reply(
+    call: Callable[[EngineClient], Any], body: dict[str, object]
+) -> None:
+    """NEGATIVE CONTROL for the test above: a reader that refused every reply would pass it."""
+    with _client_answering(json.dumps(body).encode()) as client:
+        result = call(client)
+    assert result.total == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"token": "\xff\xfe"}',
+        b"[" * 100_000,
+        b"not json",
+        b"null",
+        b"[]",
+        b'{"detail": "ok"}',
+        b'{"token": ""}',
+        b'{"token": null}',
+        json.dumps({"token": "caf\u00e9"}).encode(),
+        json.dumps({"token": "abc\r\nX-Injected: 1"}).encode(),
+        json.dumps({"token": "   "}).encode(),
+        json.dumps({"token": "a" * 8186}).encode(),
+    ],
+    ids=[
+        "non_utf8",
+        "deep_nesting",
+        "not_json",
+        "null",
+        "list",
+        "no_token",
+        "empty_token",
+        "null_token",
+        "non_ascii_token",
+        "crlf_token",
+        "space_only_token",
+        "oversize_token",
+    ],
+)
+def test_a_rotation_reply_without_a_usable_token_raises_a_value_free_apierror(
+    content: bytes,
+) -> None:
+    """A 2xx elevation reply with no usable token is not a success (BACKLOG #5344): the engine may
+    have rotated the session, so the held token may be dead. It raises an :class:`ApiError` with
+    ``status`` None that quotes no reply content and chains nothing, and the token is left as it
+    was. A bare list or a tokenless object used to pass silently as version skew.
+
+    Mutation: return instead of raising for a reply with no usable token. Red: DID NOT RAISE."""
+    client = EngineClient("http://127.0.0.1:8765")
+    try:
+        client._token = "before"
+        with pytest.raises(ApiError, match="invalid response from engine") as excinfo:
+            client._adopt_rotated(httpx.Response(200, content=content))
+        assert client.token == "before"
+    finally:
+        client.close()
+    assert excinfo.value.status is None
+    assert "\ufffd" not in str(excinfo.value) and "not json" not in str(excinfo.value)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["after", "tok-rotated_~.+/", "YWJj==", "a" * 8185],
+    ids=["word", "token68_punctuation", "padding", "longest_that_fits"],
+)
+def test_a_well_formed_rotation_reply_is_adopted(token: str) -> None:
+    """NEGATIVE CONTROL: a reply carrying a sendable token, with other fields beside it, is
+    adopted, up to the longest token whose ``Bearer`` header fits the bound."""
+    client = EngineClient("http://127.0.0.1:8765")
+    try:
+        client._token = "before"
+        client._adopt_rotated(httpx.Response(200, json={"detail": "ok", "token": token}))
+        assert client.token == token
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["töken", "tok\r\nen", " ", "a" * 8186],
+    ids=["non_ascii", "crlf", "space_only", "oversize"],
+)
+def test_confirm_mfa_returns_the_recovery_codes_when_the_token_is_unusable(token: str) -> None:
+    """The engine commits the one-time recovery codes before it replies, so a confirm reply whose
+    rotated token fails the sendable-token check must still hand the caller its codes (BACKLOG
+    #5344). The token is not adopted, ``token_adopted`` says so, and the held token is left.
+
+    Mutation: check the token before reading the codes, as ``_adopt_rotated(response)`` ahead of
+    the decode did. Red: ApiError, and the codes are lost."""
+    reply = json.dumps(
+        {"recovery_codes": ["code-one", "code-two"], "token": token, "other_sessions": 2}
+    ).encode()
+    with _client_answering(reply) as client:
+        client._token = "before"
+        confirmed = client.confirm_mfa("123456")
+        assert confirmed.recovery_codes == ("code-one", "code-two")
+        assert confirmed.other_sessions == 2
+        assert confirmed.token_adopted is False
+        assert client.token == "before"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"recovery_codes": ["code-one", "code-two"]},
+        {"recovery_codes": ["code-one", "code-two"], "token": None},
+        {"recovery_codes": ["code-one", "code-two"], "token": 7},
+    ],
+    ids=["no_token", "null_token", "non_string_token"],
+)
+def test_confirm_mfa_returns_the_recovery_codes_when_the_token_is_missing(
+    reply: dict[str, object],
+) -> None:
+    """A missing, null or non-string token loses the codes no less than a malformed string one
+    does, so the codes are read without requiring the token (BACKLOG #5344, review round one).
+
+    Mutation: decode the codes with ``MfaConfirmResponse``, whose ``token`` is a required str.
+    Red: ApiError ``token: Field required``."""
+    with _client_answering(json.dumps(reply).encode()) as client:
+        client._token = "before"
+        confirmed = client.confirm_mfa("123456")
+        assert confirmed.recovery_codes == ("code-one", "code-two")
+        assert confirmed.other_sessions is None
+        assert confirmed.token_adopted is False
+        assert client.token == "before"
+
+
+def test_confirm_mfa_adopts_a_sendable_token_even_when_the_codes_do_not_decode() -> None:
+    """The engine has rotated the session by the time it replies, so a sendable token is adopted
+    before the rest of the reply is read: codes that do not decode then raise ApiError, but the
+    client stays signed in on the new token (BACKLOG #5344, review round one).
+
+    Mutation: adopt the token only after the codes decode. Red: the token is still ``before``."""
+    reply = {"recovery_codes": "code-one", "token": "rotatedOK"}
+    with _client_answering(json.dumps(reply).encode()) as client:
+        client._token = "before"
+        with pytest.raises(ApiError, match="invalid response from engine") as excinfo:
+            client.confirm_mfa("123456")
+        assert client.token == "rotatedOK"
+    assert "code-one" not in str(excinfo.value) and "rotatedOK" not in str(excinfo.value)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+def test_confirm_mfa_reads_an_unreadable_session_count_as_unknown() -> None:
+    """``other_sessions`` is advisory, so a count this client cannot read is None ("unknown") and
+    the codes beside it are kept (BACKLOG #5344, review round two).
+
+    Mutation: drop the wrap validator on ``other_sessions``. Red: ApiError, the codes lost."""
+    reply = {"recovery_codes": ["code-one"], "token": "rotatedOK", "other_sessions": "many"}
+    with _client_answering(json.dumps(reply).encode()) as client:
+        confirmed = client.confirm_mfa("123456")
+        assert confirmed.recovery_codes == ("code-one",)
+        assert confirmed.other_sessions is None
+        assert confirmed.token_adopted is True
+        assert client.token == "rotatedOK"
+
+
+def test_confirm_mfa_logs_no_confirmation_for_a_reply_that_does_not_decode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A reply that is not JSON raises ApiError, and no WARNING claims the enrolment was confirmed
+    (BACKLOG #5344, review round two).
+
+    Mutation: log the missing-token warning before the codes decode. Red: the warning is logged."""
+    with (
+        _client_answering(b"not json") as client,
+        caplog.at_level("WARNING"),
+        pytest.raises(ApiError, match="invalid response from engine"),
+    ):
+        client.confirm_mfa("123456")
+    assert not [r for r in caplog.records if "MFA enrolment confirmed" in r.getMessage()]
+
+
+def test_confirm_mfa_adopts_a_sendable_token() -> None:
+    """NEGATIVE CONTROL: a confirm reply with a sendable token is adopted and says so."""
+    reply = json.dumps({"recovery_codes": ["code-one"], "token": "after"}).encode()
+    with _client_answering(reply) as client:
+        client._token = "before"
+        confirmed = client.confirm_mfa("123456")
+        assert confirmed.recovery_codes == ("code-one",)
+        assert confirmed.token_adopted is True
+        assert client.token == "after"
+
+
 # --- ASVS 4.2.5: the client's own outbound length bound --------------------------------------------
 
 
@@ -440,19 +699,20 @@ def test_apiclient_still_accepts_an_integer_identifier() -> None:
 def test_transport_guard_refuses_a_non_http_url_scheme(base_url: str) -> None:
     """ASVS 1.2.2 clause 2: only safe URL protocols are permitted, as a POSITIVE allow-list.
 
-    The shipped check is host-keyed -- it returns early when the host is loopback OR empty. None of
-    these four URLs has a hostname, so ``host == ""`` and every one of them builds a client today,
+    The check before BACKLOG #1107 was host-keyed -- it returned early when the host was loopback
+    OR empty. None of these four URLs has a hostname, so every one of them built a client then,
     including the two schemes the ASVS verb names by name.
 
-    Mutation: move the allow-list below the ``host == ""`` early return. Red: DID NOT RAISE."""
+    Mutation: delete the allow-list. Red: the no-host refusal answers instead, and its message does
+    not match ``scheme``."""
     with pytest.raises(ApiError, match="scheme"):
         EngineClient(base_url)
 
 
 def test_transport_guard_refuses_a_base_url_with_no_scheme() -> None:
-    """A schemeless base_url is a typo, and today it builds a client that can never work: urlsplit
-    reads ``127.0.0.1:8765`` as scheme ``""`` and ``localhost:8765`` as scheme ``localhost``, both
-    with no hostname, so both slip through the ``host == ""`` early return.
+    """A schemeless base_url is a typo, and before BACKLOG #1107 it built a client that could never
+    work: ``127.0.0.1:8765`` parses as scheme ``""`` and ``localhost:8765`` as scheme
+    ``localhost``, both with no hostname, so both slipped through the old empty-host early return.
 
     This is a DELIBERATE behavior change, pinned here so it stays a decision rather than a side
     effect: an allow-list admitting only ``http`` and ``https`` refuses both. Failing at
@@ -472,6 +732,135 @@ def test_transport_guard_permits_https_and_loopback_http() -> None:
     ``http`` has to clear the allow-list and then still meet that check, message intact."""
     EngineClient("https://engine.example.com:8765").close()
     EngineClient("http://127.0.0.1:8765").close()
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http:////engine.example.com:8765",
+        "http:///engine.example.com",
+        "http://",
+        "http://:8765",
+        "http://user@:8765",
+        "https:////x",
+    ],
+)
+@pytest.mark.parametrize("allow_insecure", [False, True], ids=["strict", "allow_insecure"])
+def test_transport_guard_refuses_a_base_url_with_no_host(
+    base_url: str, allow_insecure: bool
+) -> None:
+    """An empty host is not loopback (BACKLOG #5343). httpx still dials such a URL, so an empty host
+    waved through as loopback would skip the plaintext refusal and the cleartext credential refusal.
+
+    ``allow_insecure`` does not rescue it: a URL with no host names no engine at all.
+
+    Mutation: delete the no-host refusal and restore ``or host == ""`` on the loopback early
+    return. Red: DID NOT RAISE."""
+    with pytest.raises(ApiError, match="no host"):
+        EngineClient(base_url, allow_insecure=allow_insecure)
+
+
+def test_httpx_dials_a_base_url_with_no_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The premise of the no-host refusal: httpx does not refuse a hostless URL, it dials the empty
+    host, which the resolver may map to a non-loopback address of this machine.
+
+    Measured at httpcore's TCP connect, which is where the request goes; the URL's string form is
+    not, since ``str()`` reads ``//engine...`` back as an authority. A future httpx or httpcore
+    that refused such a URL would turn this red and make the refusal belt-and-braces."""
+    import httpcore
+    from httpcore._backends.sync import SyncBackend
+
+    dialed: list[tuple[str, int]] = []
+
+    def _connect_tcp(self: object, host: str, port: int, *args: object, **kwargs: object) -> None:
+        dialed.append((host, port))
+        raise httpcore.ConnectError("not dialed in a test")
+
+    monkeypatch.setattr(SyncBackend, "connect_tcp", _connect_tcp)
+    with (
+        httpx.Client(base_url="http:////engine.example.com:8765", trust_env=False) as http,
+        pytest.raises(httpx.ConnectError),
+    ):
+        http.get("/health")
+    assert dialed == [("", 80)]
+
+
+def test_transport_guard_refuses_a_base_url_carrying_userinfo() -> None:
+    """httpx would send ``user:password@`` as Basic auth on every request, over whatever hop the
+    URL names, so the gate refuses it before anything is built (BACKLOG #5343).
+
+    Mutation: delete the userinfo refusal. Red: DID NOT RAISE."""
+    for base_url in ("http://user:s3cret@10.0.0.5:8765", "https://user@engine.example.com:8765"):
+        with pytest.raises(ApiError, match="user name or password") as excinfo:
+            EngineClient(base_url, allow_insecure=True)
+        assert "s3cret" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("base_url", ["https://xn--ab-.example:8765", "http://xn--ab-.example"])
+def test_transport_guard_refuses_a_malformed_idna_host(base_url: str) -> None:
+    """A host with a malformed ``xn--`` label is refused at construction with the chain-free
+    :class:`ApiError` (BACKLOG #5343). httpx builds the request URL through ``url.host``, which
+    IDNA-decodes, so such a client used to construct and then raise a raw ``idna.IDNAError`` on
+    every request, out of the ApiError-only client.
+
+    Mutation: read only ``raw_host`` and drop the ``url.host`` read. Red: DID NOT RAISE."""
+    with pytest.raises(ApiError, match="does not parse") as excinfo:
+        EngineClient(base_url, allow_insecure=True)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+def test_the_exposure_evaluation_names_how_the_client_cert_reaches_httpx() -> None:
+    """docs/CONTAINER-EXPOSURE-EVALUATION.md said the client cert came from ``--client-cert`` /
+    ``--client-key`` threaded into ``httpx.Client(cert=...)``. No such flags exist, and the cert is
+    loaded into the SSLContext ``_build_verify_context`` builds, passed as ``verify=`` (BACKLOG
+    #5343). Red when either false claim comes back."""
+    doc = (
+        pathlib.Path(__file__).resolve().parents[1] / "docs" / "CONTAINER-EXPOSURE-EVALUATION.md"
+    ).read_text(encoding="utf-8")
+    assert "--client-cert" not in doc and "--client-key" not in doc
+    assert "httpx.Client(cert=" not in doc
+    assert "_build_verify_context" in doc
+
+
+@pytest.mark.parametrize("base_url", ["http://localhost", "http://[::1]", "http://127.0.0.1"])
+def test_transport_guard_permits_every_loopback_host_name(base_url: str) -> None:
+    """NEGATIVE CONTROL for the IDNA refusal: each loopback spelling still constructs as loopback
+    http, with no cleartext-hop posture."""
+    client = EngineClient(base_url)
+    try:
+        assert client._cleartext_hop is False
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://user:s3cret@[::1:8765",
+        "http://user:s3cret@127.0.0.1:abc",
+        "http://user:s3cret@127.0.0.1:8765/\x01",
+        "http://user:s3cret@127.0.0.1:8765/\udcff",
+        "http://user:s3cret\udcff@127.0.0.1:8765",
+    ],
+    ids=["bracket", "port", "control_character", "surrogate_path", "surrogate_userinfo"],
+)
+def test_transport_guard_refuses_an_unparsable_base_url_as_api_error(base_url: str) -> None:
+    """A URL httpx cannot parse raises :class:`ApiError`, the client's only error type (BACKLOG
+    #5343), not ``httpx.InvalidURL``, and chains nothing that could quote the URL."""
+    with pytest.raises(ApiError, match="does not parse") as excinfo:
+        EngineClient(base_url)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+    assert "s3cret" not in str(excinfo.value)
+
+
+def test_transport_guard_reads_the_url_as_httpx_does() -> None:
+    """A leading space: ``urllib.parse`` strips it and reads loopback http, while httpx, which
+    dials, reads a schemeless relative URL. The guard parses with httpx, so it refuses the URL
+    rather than pass a URL the transport reads differently (BACKLOG #5343).
+
+    Mutation: parse with ``urlsplit`` again. Red: DID NOT RAISE."""
+    with pytest.raises(ApiError, match="no scheme"):
+        EngineClient(" http://127.0.0.1:8765")
 
 
 # --- ASVS 14.2.1 (BACKLOG #1184): the search needle never rides the query string -------------------

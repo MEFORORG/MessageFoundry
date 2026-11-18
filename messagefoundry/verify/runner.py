@@ -24,7 +24,13 @@ from messagefoundry.verify.checks import (
     check_lockable_accounts,
     run_host_checks,
 )
-from messagefoundry.verify.model import CheckResult, Status
+from messagefoundry.verify.model import (
+    DRIVER_DETAIL_LIMIT,
+    CheckResult,
+    Status,
+    safe_detail_text,
+    safe_exc_detail,
+)
 from messagefoundry.verify.smoke import (
     check_store_connectivity,
     smoke_self,
@@ -200,7 +206,10 @@ def _buildable_entries(
         reg = graph()
     except (WiringError, OSError, ImportError, SyntaxError, ValueError, SystemExit) as exc:
         # SystemExit: a config module that exits at import must not end the verify run.
-        return [], f"the config dir {config_dir!r} did not load: {codec_safe_str(exc)[:200]}"
+        return (
+            [],
+            f"the config dir {config_dir!r} did not load: {safe_detail_text(codec_safe_str(exc))}",
+        )
     entries: list[tuple[str, str | None, str | None]] = []
     for kind, name, dialect, driver in odbc_hops(reg):
         if dialect is not None and dialect not in _DIALECTS:
@@ -316,7 +325,7 @@ def _driver_hops(
         _log.warning("host.odbc: the graph read raised %s", type(exc).__name__)
         entries, unread = (
             [],
-            f"the graph read raised {type(exc).__name__}: {codec_safe_str(exc)[:200]}",
+            f"the graph read raised {type(exc).__name__}: {safe_detail_text(codec_safe_str(exc))}",
         )
     # Reasons a listed Driver 18 answers: the store's backend, and with no --config given the
     # graph, so the fast host check on a host with Driver 18 reads PASS as before.
@@ -414,10 +423,10 @@ def _run_live_smoke(
                 # BACKLOG #1708: the read-only open refuses a store it cannot read as it is, such
                 # as another application's SQLite file. Never fall back to no baseline: the
                 # synthetic control id is fixed, so a prior run's message would then match.
-                # Class named, and a codec error never printed raw (vault BACKLOG #3185).
-                from messagefoundry.redaction import codec_safe_line
-
-                baseline_error = codec_safe_line(exc)
+                # Class named, a codec error never printed raw (vault BACKLOG #3185), and the PHI
+                # and credential passes with the driver bound, as the sibling arms that open the
+                # same store take (BACKLOG #5395).
+                baseline_error = safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
                 _log.warning("verify: the pre-send baseline read failed: %s", baseline_error)
 
     ctx = live_smoke_ssl_context(ca_file=smoke_tls_ca) if smoke_tls else None

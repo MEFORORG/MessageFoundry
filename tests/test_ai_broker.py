@@ -491,7 +491,6 @@ def test_a_malformed_ai_reply_raises_the_broker_error(exc: Exception) -> None:
     assert not issubclass(type(exc), (OSError, urllib.error.URLError))  # the reason it is named
     with pytest.raises(AiBrokerError) as ei:
         _raising_broker(exc).chat("synthetic prompt")
-    assert ei.value.__cause__ is exc
     # Pinned as an EQUALITY: the class name only, never the reply bytes the exception carries.
     assert str(ei.value) == (
         f"AI endpoint {_ENDPOINT} sent a malformed HTTP reply ({type(exc).__name__})"
@@ -511,6 +510,25 @@ def test_an_invalid_ai_request_value_is_not_echoed(exc: Exception) -> None:
     with pytest.raises(AiBrokerError) as ei:
         _raising_broker(exc).chat("synthetic prompt")
     assert str(ei.value) == f"AI endpoint {_ENDPOINT} rejected an invalid request value"
+
+
+def test_an_ai_http_error_names_the_status_and_never_the_provider_body() -> None:
+    """Pinned as an EQUALITY, with the provider's body planted: the refusal names the status only.
+    Vault BACKLOG #5356 keeps the HTTPError off the chain; tests/test_refusals_carry_no_chain.py
+    measures that."""
+    import email.message
+    import io
+
+    err = urllib.error.HTTPError(
+        _ENDPOINT,
+        500,
+        "Server Error",
+        email.message.Message(),
+        io.BytesIO(b"SYNTHETICPLANTED provider detail"),
+    )
+    with pytest.raises(AiBrokerError) as ei:
+        _raising_broker(err).chat("synthetic prompt")
+    assert str(ei.value) == f"AI endpoint {_ENDPOINT} returned HTTP 500"
 
 
 def test_the_ai_malformed_reply_arm_leaves_remote_disconnected_alone() -> None:

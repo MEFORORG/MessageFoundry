@@ -616,6 +616,102 @@ async def test_unknown_user_login_runs_password_verify(
     assert calls["n"] >= 1  # the dummy verify ran for the unknown user
 
 
+async def test_a_username_with_a_nul_is_an_unknown_name_on_both_sign_in_surfaces(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5342: at least a PostgreSQL store refuses a NUL in a text bind, so a username
+    carrying one would escape the sign-in as an unhandled error, outside the failure pad. The
+    service refuses it as an unknown name before the account lookup: at the seam itself, and
+    through the console form, which charges the limiter first. The answer is an unknown name's,
+    and the ``auth.login_failed`` row names it with the NUL escaped. The JSON route is driven at
+    the seam here; over HTTP: ``tests/test_api_auth.py::
+    test_login_answers_a_nul_username_as_an_audited_unknown_name``."""
+    service = await _service(engine)
+    await _add(service, "bob")
+    looked_up: list[str] = []
+    real_lookup = engine.store.get_user_by_username
+
+    async def lookup(username: str) -> object:
+        looked_up.append(username)
+        return await real_lookup(username)
+
+    monkeypatch.setattr(engine.store, "get_user_by_username", lookup)
+    charged: list[str | None] = []
+    real_allow = service.allow_login_attempt
+
+    def allow(client: str | None) -> bool:
+        charged.append(client)
+        return real_allow(client)
+
+    monkeypatch.setattr(service, "allow_login_attempt", allow)
+    unknown = await service.login("ghost-user-does-not-exist", PW, client="10.0.0.9")
+    looked_up.clear()
+    nul = await service.login("bo\x00b", PW, client="10.0.0.9")
+    assert (nul.ok, nul.error, nul.token) == (unknown.ok, unknown.error, unknown.token)
+    async with _client(engine, service, serve_ui=True) as c:
+        ui = await c.post(
+            "/ui/login",
+            data={"username": "bo\x00b", "password": PW},
+            headers={"Origin": "http://t"},
+            follow_redirects=False,
+        )
+        assert ui.status_code == 303 and ui.headers["location"] == "/ui/login?e=bad"
+    assert all("\x00" not in name for name in looked_up), looked_up
+    assert len(charged) == 1, "the console sign-in was not charged to the limiter"
+    actors = [
+        row["actor"]
+        for row in await engine.store.list_audit()
+        if row["action"] == "auth.login_failed" and "bo" in str(row["actor"])
+    ]
+    assert actors == ["bo\\u0000b", "bo\\u0000b"], actors
+
+
+async def test_a_long_nul_username_writes_an_actor_every_store_column_holds(
+    engine: Engine,
+) -> None:
+    """BACKLOG #5342: the escape writes each NUL as six characters, so 200 of them made a
+    1200-character actor, which SQL Server's ``audit_log.actor NVARCHAR(256)`` refuses, and the
+    sign-in would raise instead of writing its row. The actor is cut to 256 UTF-16 units with a
+    marker naming the SHA-256 of the name as typed, the same cut every time."""
+    import hashlib
+    import inspect
+    import re
+
+    from messagefoundry.auth.service import _AUDIT_ACTOR_MAX, _storable_actor
+    from messagefoundry.store import sqlserver
+    from messagefoundry.store.transit_attestation import utf16_units as _utf16_units
+
+    # The bound is the SQL Server DDL's, read from its source rather than restated here.
+    ddl = re.search(
+        r"CREATE TABLE audit_log \(.*?\bactor NVARCHAR\((\d+)\)",
+        inspect.getsource(sqlserver),
+        re.DOTALL,
+    )
+    assert ddl is not None and int(ddl.group(1)) == _AUDIT_ACTOR_MAX, ddl
+
+    service = await _service(engine)
+    name = "\x00" * 200
+    out = await service.login(name, PW, client="10.0.0.9")
+    assert not out.ok
+    actors = [
+        str(row["actor"])
+        for row in await engine.store.list_audit()
+        if row["action"] == "auth.login_failed" and "sha256:" in str(row["actor"])
+    ]
+    assert len(actors) == 1, actors
+    assert _utf16_units(actors[0]) <= _AUDIT_ACTOR_MAX, len(actors[0])
+    assert actors[0] == _storable_actor(name), "the cut is not deterministic"
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
+    assert actors[0].endswith("...sha256:" + digest), "the marker is not the typed name's digest"
+    assert len(actors[0].encode("utf-16-le")) // 2 <= 256  # counted apart from the code's helper
+    prefix = actors[0].split("...sha256:")[0]
+    assert prefix and prefix == "\\u0000" * (len(prefix) // 6), "an escape was split"
+    assert _storable_actor("\x00" * 201) != actors[0], "two long names share one actor"
+    # Past the BMP each character is two units, so the bound counts units, not characters.
+    wide = _storable_actor("\x00" + "\U0001f600" * 200)
+    assert len(wide) < _utf16_units(wide) <= _AUDIT_ACTOR_MAX
+
+
 # --- #1167 (ASVS 11.2.4): the recovery-code walk must cost the same whatever is presented --------
 
 

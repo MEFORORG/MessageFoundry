@@ -325,13 +325,16 @@ fingerprint+git-HEAD covers more cheaply for now.
   engine starts, THE SYSTEM SHALL treat attestation as a no-op/advisory and SHALL NOT fail or alert — dev is
   never bricked.
   → `tests/test_startup_attestation.py::test_editable_install_is_noop`
-- **AC-13** — WHERE `[integrity].fail_closed_on_drift` is true, IF startup attestation compared **no** file
-  against a baseline on an install that does not declare itself editable — an absent, empty or
-  package-row-less `RECORD`, an unresolvable install root, or a package loaded from outside the install
-  root — THEN THE SYSTEM SHALL log at WARNING, record the `startup_integrity` row, fire the `AlertSink`,
-  and **refuse to start**. Under the default alert-only posture it SHALL still log, record and alert.
+- **AC-13** — WHERE `[integrity].fail_closed_on_drift` is true, IF startup attestation verified **no** file
+  against a baseline, and found no drift, on an install that does not declare itself editable — at
+  least an absent, empty or package-row-less `RECORD`, an unresolvable install root, a package loaded from
+  outside the install root, or a package directory that is a link out of it (since BACKLOG #5376, the
+  `_attest_distribution` docstring in `messagefoundry/integrity.py` states which loads count) — THEN
+  THE SYSTEM SHALL log at WARNING, record the `startup_integrity` row, fire the `AlertSink`, and
+  **refuse to start**. Under the default alert-only posture it SHALL still log, record and alert.
   → `tests/test_startup_attestation.py::test_attested_nothing_fails_closed_when_opted_in`
   → `tests/test_startup_attestation.py::test_attested_nothing_warns_records_and_alerts_under_alert_only`
+  → `tests/test_startup_attestation.py::test_an_intact_package_directory_linked_out_is_attested_nothing_and_refused`
 - **AC-14** — WHERE `[integrity].fail_closed_on_drift` is true AND the install declares itself editable,
   WHEN the engine starts, THE SYSTEM SHALL log at WARNING naming the reason — the opted-in enforcement
   cannot be honoured on this install — and SHALL still start, record nothing and alert nothing (AC-12 is
@@ -366,6 +369,8 @@ fingerprint+git-HEAD covers more cheaply for now.
   before refusing. WHERE the console is not loaded, THE SYSTEM SHALL NOT attest it.
   → `tests/test_startup_attestation.py::test_console_tamper_is_detected_recorded_and_fails_closed`
   → `tests/test_startup_attestation.py::test_a_deleted_console_file_is_missing_drift`
+  → `tests/test_startup_attestation.py::test_an_emptied_console_under_the_install_root_is_missing_drift`
+  → `tests/test_startup_attestation.py::test_a_console_package_directory_linked_out_of_the_root_is_read_through_the_link`
   → `tests/test_startup_attestation.py::test_a_loaded_console_that_cannot_be_attested_fails_like_the_engine`
   → `tests/test_startup_attestation.py::test_console_absent_changes_nothing_even_under_fail_closed`
   → `tests/test_startup_attestation.py::test_the_engine_arm_text_is_unchanged`
@@ -464,6 +469,34 @@ fingerprint+git-HEAD covers more cheaply for now.
 > name is not listed by the engine walk unless it sits at a `RECORD` path. The console arm's walk still
 > skips a directory it cannot list; this amendment changed only the engine arm. The D3 trust-domain
 > residual applies unchanged: an adversary who also re-seals `RECORD` passes clean.
+
+> **Note 2026-11-17 (BACKLOG #5376) — what changed in the two amendments above, recorded here rather
+> than edited into them.** Their text stands as written on its date. Since BACKLOG #5376:
+>
+> - **Both arms walk each package root at its `RECORD` place**: the root's parent is resolved and
+>   its own name is not (`_record_place` in `messagefoundry/integrity.py`), so the walk reads through a
+>   package directory that is a link, and the console arm no longer resolves the directories under
+>   the root. A walked file is still compared where its root resolves when that is under the install
+>   root, as before, so a link into the package is compared as the package.
+> - **A package directory swapped for a link out of the install root is read through the link and
+>   compared** at its `RECORD` place, so a changed file the arm attests there is `hash_mismatch`
+>   drift and a deleted one whose row the arm reads back is `missing` drift (AC-15, AC-16 say which). Before, the resolved root put every file outside the install root and
+>   none was compared. An intact one is still attested-nothing
+>   (`package_directory_links_out_of_install_root`, AC-13): a package directory linked out of the
+>   install root does not make the pass clean, however its files compare. A single file swapped for a
+>   link out of the install root is hashed in place, as the 2026-10-06 amendment says, and an intact
+>   one reads clean.
+> - **The read-back of unmatched `RECORD` rows has a second trigger**, a loaded package root; the
+>   `_attest_distribution` docstring states both triggers. So an emptied package is `missing` drift
+>   for each row the arm reads back. The 2026-09-25 amendment's FIFO sentence held only while the walk listed some
+>   console file under the install root; it now holds for an emptied console too.
+> - **The console arm's walk names a directory it cannot list**, as `missing` drift, as the engine
+>   arm's does; the 2026-10-06 amendment's residual *"The console arm's walk still skips a directory it
+>   cannot list"* no longer holds.
+> - **The `startup_integrity` row of a pass that verified nothing and found no drift reads
+>   `attested: false` and `checked: 0`**, so it cannot read as a verified pass; a pass with drift
+>   keeps both as compared. A pass with a package directory linked out of the install root adds
+>   `linked_out_paths` and `read_through_link` (`AttestationResult.audit_detail`).
 
 ## Options considered
 

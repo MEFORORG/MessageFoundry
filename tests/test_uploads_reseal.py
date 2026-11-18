@@ -427,7 +427,7 @@ async def test_the_scan_names_each_failure_cause_distinctly(
         assert await store.list_files() == []
     assert len(caplog.messages) == 3, caplog.messages
     by_id = {m.split()[2].rstrip(":"): m for m in caplog.messages}
-    assert "malformed metadata (JSONDecodeError)" in by_id["1" * 32]
+    assert "malformed metadata: not valid JSON" in by_id["1" * 32]
     assert "cipher declined it" in by_id["2" * 32]
     assert "unreadable on disk" in by_id["3" * 32]
 
@@ -437,21 +437,26 @@ async def test_the_scan_never_logs_a_decrypted_body(
 ) -> None:
     """PHI rule (CLAUDE.md section 9): naming the cause must not start printing content.
 
-    The malformed branch logs the exception TYPE only, because a ``ValueError`` raised coercing a
-    metadata field embeds that field's value in its message.
+    The malformed branch logs only the field and the defect, never the value, because a value
+    planted in a metadata field can carry content (BACKLOG #5387).
     """
     root = tmp_path / "uploads"
     root.mkdir(parents=True)
     key = generate_key()
     store = _keyed_store(root, key)
     fid = "4" * 32
-    _write_sealed_meta(root, fid, key, json.dumps({"file_id": fid, "size": "MRN123-NOT-AN-INT"}))
+    _write_sealed_meta(
+        root,
+        fid,
+        key,
+        json.dumps({"file_id": fid, "uploaded_at": 1.0e9, "size": "MRN123-NOT-AN-INT"}),
+    )
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
         assert await store.list_files() == []
     joined = " ".join(caplog.messages)
     assert "MRN123" not in joined, joined
-    assert "malformed metadata (ValueError)" in joined
+    assert "malformed metadata: field 'size' is not a count in range" in joined
 
 
 # --- the converted trigger: the refusal, and what the reseal still does --------------------------

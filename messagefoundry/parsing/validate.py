@@ -37,7 +37,8 @@ is listed in :attr:`ValidationResult.unvalidated_segments`, but only when the co
 which is when no earlier check refused the message (a Z-segment is listed whenever hl7apy parsed
 the message, and nothing is listed for a size, segment-cap or parse refusal). A dropped ID
 the version does not define, and a dropped bare defined ID with no field separator, are still
-refused. The exemption is per structure, not per slot: it does not count against the slot's
+refused, and so is a dropped MSH, DSC, MSA, ERR, QAK or MFA line (``_NEVER_EXEMPT`` says why).
+The exemption is per structure, not per slot: it does not count against the slot's
 cardinality or position. It holds only where MSH-9.1 names the structure's own message code, so a
 structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none; one
 borrowed under the same code (``MFN^M02^MFN_M01``) still gets it. Where the slot sits inside a
@@ -364,6 +365,15 @@ def _exempts_defined_segments(message: Any) -> bool:
     )
 
 
+# Six IDs a dropped line of which is refused even in a structure with the "any HL7 segment" slot
+# (BACKLOG #5920): MSH opens a message, DSC points at a continuation, and MSA, ERR, QAK and MFA
+# answer another message, so none of the six is the data that slot carries. The list is not every
+# header, continuation or acknowledgment segment the standard defines: at least ADD, SFT, UAC,
+# QPD, QRD, QRF and RCP are not on it and keep the exemption. The batch and file envelope (BHS,
+# BTS, FHS, FTS) is not here either: split_batch cuts only at MSH, so a member can carry its
+# batch's trailers or the next batch's header.
+_NEVER_EXEMPT = frozenset({"MSH", "DSC", "MSA", "ERR", "QAK", "MFA"})
+
 # Structures whose tree the dropped-segment check could not read, so each is logged once.
 _compare_failures: set[tuple[str, str | None]] = set()
 
@@ -377,7 +387,8 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
     ``unknown segment``, the rule ``docs/PHI.md`` sets for the anonymization report. Which
     occurrence of a repeated ID was dropped is not knowable from the tree, so the later ones are
     named; the count per ID is exact. In a structure with an "any HL7 segment" slot, a defined ID
-    followed by a field separator is not refused, as the module docstring says.
+    followed by a field separator is not refused, as the module docstring says, unless it is one
+    of :data:`_NEVER_EXEMPT`.
     """
     import hl7apy
 
@@ -401,7 +412,7 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         elif name in defined:
             if exempts is None:
                 exempts = _exempts_defined_segments(message)
-            if exempts and number not in lines.bare:
+            if exempts and number not in lines.bare and name not in _NEVER_EXEMPT:
                 exempted.append((name, number))
             else:
                 refusals.append(

@@ -395,6 +395,7 @@ from messagefoundry.store.store import (
     roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
+    run_open_store_hook,
     scope_if_source,
     scope_withdrawal,
     seal_approval_async,
@@ -2230,6 +2231,7 @@ class PostgresStore:
             await store._ensure_schema(create=create, read_only=read_only)
             if not read_only:
                 await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
+                await run_open_store_hook(store)  # BACKLOG #4936: after the pin, before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.

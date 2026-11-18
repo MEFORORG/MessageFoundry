@@ -6,12 +6,14 @@ The script used to build one ``X509Certificate2`` from the path and then hand th
 ``Import-Certificate``. An unsigned ``.p7b`` chain, the shape the help advertises, made the
 constructor throw ``Cannot find the original signer``; a PEM bundle showed the operator only its
 first certificate. Now the bytes are read once into a collection, every certificate in it is shown
-and checked, and the whole file is refused when any one is not a CA or carries a private key. A
-root goes into the machine Root store and any other CA into the intermediate store.
+and checked, and the whole file is refused when any one is not a CA or carries a private key, or
+when .NET's chain engine (``X509Chain``, given the file as its extra store) does not build each
+one's chain to a self-signed root in the same file, or a root in it is outside its validity
+period. A root goes into the machine Root store and any other CA into the intermediate store.
 
 NOTHING HERE WRITES A CERTIFICATE STORE. The fixtures are generated in a pytest temporary
 directory. The function-level tests lift ``Read-CaBundle``, ``Get-CaRefusal`` and
-``Get-CaStoreName`` (and the console helpers they call) out of the script's AST and call them, as
+``Get-CaChainCheck`` (and the console helpers they call) out of the script's AST and call them, as
 ``tests/test_import_db_ca_console_text.py`` does. The whole-script tests run it with ``-WhatIf``
 only, where ``ShouldProcess`` declines every import, so the store is never opened; they are also
 skipped in an elevated session, so even a regression that ignored ``-WhatIf`` would meet the
@@ -35,7 +37,7 @@ from pathlib import Path
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.serialization import pkcs7, pkcs12
 from cryptography.x509.oid import NameOID
 
@@ -66,10 +68,13 @@ def _cert(
     issuer: tuple[x509.Certificate, _Key] | None = None,
     *,
     cert_sign: bool | None = None,
+    valid_days: tuple[int, int] = (-1, 30),
+    key: _Key | None = None,
 ) -> tuple[x509.Certificate, _Key]:
     """A synthetic certificate. ``ca`` None leaves the basic constraints extension out, and
-    ``cert_sign`` None leaves the key usage extension out."""
-    key = ec.generate_private_key(ec.SECP256R1())
+    ``cert_sign`` None leaves the key usage extension out. ``valid_days`` is its validity period,
+    in days from now, and ``key`` its own key, a fresh one when None."""
+    key = key or ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     now = datetime.datetime.now(datetime.UTC)
     builder = (
@@ -78,8 +83,9 @@ def _cert(
         .issuer_name(issuer[0].subject if issuer else name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=30))
+        .not_valid_before(now + datetime.timedelta(days=valid_days[0]))
+        .not_valid_after(now + datetime.timedelta(days=valid_days[1]))
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
     )
     if ca is not None:
         builder = builder.add_extension(x509.BasicConstraints(ca=ca, path_length=None), True)
@@ -113,7 +119,7 @@ def _pem(*certs: x509.Certificate) -> bytes:
 @pytest.fixture(scope="module")
 def chain() -> dict[str, tuple[x509.Certificate, _Key]]:
     root = _cert("Synthetic Test Root CA", True)
-    return {
+    certs = {
         "root": root,
         "intermediate": _cert("Synthetic Test Issuing CA", True, root),
         "leaf": _cert("db.test.invalid", False, root),
@@ -123,16 +129,36 @@ def chain() -> dict[str, tuple[x509.Certificate, _Key]]:
         # A DER CA whose bytes spell PEM armour inside its subject.
         "armour_in_subject": _cert("-----BEGIN NOTE-----", True),
     }
+    other_root = _cert("Synthetic Other Root CA", True)
+    second_root = _cert("Synthetic Second Root CA", True)
+    expired_root = _cert("Synthetic Expired Root CA", True, valid_days=(-60, -1))
+    certs.update(
+        {
+            "other_root": other_root,
+            # An issuing CA whose root is not in the files it is put in.
+            "foreign": _cert("Synthetic Foreign Issuing CA", True, other_root),
+            # Names the root as its issuer, but another key signed it.
+            "forged": _cert("Synthetic Forged CA", True, (root[0], other_root[1])),
+            "second_root": second_root,
+            # The second root's name and key, signed by the first root: a cross-certificate.
+            "cross": _cert("Synthetic Second Root CA", True, root, key=second_root[1]),
+            "expired_root": expired_root,
+            "future_root": _cert("Synthetic Future Root CA", True, valid_days=(1, 30)),
+            "expired_root_inter": _cert("Synthetic Issuing CA Of Expired", True, expired_root),
+        }
+    )
+    return certs
 
 
 @pytest.fixture(scope="module")
 def extra(chain: dict[str, tuple[x509.Certificate, _Key]]) -> dict[str, x509.Certificate]:
-    """An RSA self-signed root, and a re-key certificate: self-issued (its subject and issuer are
-    the root's name) but signed by the root's old key, so it is not self-signed."""
+    """An RSA self-signed root, the same key's root signed with RSA-PSS, and a re-key
+    certificate: self-issued (its subject and issuer are the root's name) but signed by the root's
+    old key, so it is not self-signed."""
     root, root_key = chain["root"]
     now = datetime.datetime.now(datetime.UTC)
 
-    def build(name: x509.Name, public: object, signer: object) -> x509.Certificate:
+    def build(name: x509.Name, public: object) -> x509.CertificateBuilder:
         return (
             x509.CertificateBuilder()
             .subject_name(name)
@@ -142,15 +168,29 @@ def extra(chain: dict[str, tuple[x509.Certificate, _Key]]) -> dict[str, x509.Cer
             .not_valid_before(now - datetime.timedelta(days=1))
             .not_valid_after(now + datetime.timedelta(days=30))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
-            .sign(signer, hashes.SHA256())  # type: ignore[arg-type]
+            # OpenSSL reads a certificate with matching names and no subject key identifier as
+            # self-signed, so the re-key certificate needs one to be linked to its signer there.
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(public), False)  # type: ignore[arg-type]
         )
 
     rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     rsa_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic RSA Root CA")])
     new_key = ec.generate_private_key(ec.SECP384R1())
+    pss_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic RSA-PSS Root CA")])
+    # The authority key identifier names the root's key, as a CA's re-key certificate does: it is
+    # what tells a chain engine that a self-issued certificate is not self-signed. Without it, the
+    # Windows engine reads the re-key certificate as self-signed with a signature that fails.
+    root_ski = root.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
+    rekey = build(root.subject, new_key.public_key()).add_extension(
+        x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(root_ski), False
+    )
+    pss = padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32)
     return {
-        "rsa_root": build(rsa_name, rsa_key.public_key(), rsa_key),
-        "rekey": build(root.subject, new_key.public_key(), root_key),
+        "rsa_root": build(rsa_name, rsa_key.public_key()).sign(rsa_key, hashes.SHA256()),
+        "rekey": rekey.sign(root_key, hashes.SHA256()),
+        "pss_root": build(pss_name, rsa_key.public_key()).sign(
+            rsa_key, hashes.SHA256(), rsa_padding=pss
+        ),
     }
 
 
@@ -209,6 +249,16 @@ def files(
         "rsa_root": _pem(extra["rsa_root"]),
         "rekey_only": _pem(extra["rekey"]),
         "root_and_rekey": _pem(root, extra["rekey"]),
+        "pss_root": _pem(extra["pss_root"]),
+        # A root, beside an issuing CA that chains to another root, or names the root as its
+        # issuer but was signed by another key: the CA does not chain to a root in the file.
+        "root_and_foreign": _pem(root, chain["foreign"][0]),
+        "root_and_forged": _pem(root, chain["forged"][0]),
+        # Two roots and a cross-certificate between them: each chains to a root in the file.
+        "cross": _pem(root, chain["second_root"][0], chain["cross"][0]),
+        "expired_root": _pem(chain["expired_root"][0]),
+        "future_root": _pem(chain["future_root"][0]),
+        "expired_root_chain": _pem(chain["expired_root"][0], chain["expired_root_inter"][0]),
         # DER that does not end where its bytes end, and DER in front of PEM: refused.
         "der_trailing": root.public_bytes(der) + b"\x00trailing",
         "der_concat": root.public_bytes(der) + inter.public_bytes(der),
@@ -231,14 +281,14 @@ def _psq(value: str) -> str:
 
 
 def _read_all(tmp_path: Path, paths: dict[str, Path]) -> dict[str, dict[str, object]]:
-    """Each file through ``Read-CaBundle``, then ``Get-CaRefusal`` and ``Get-CaStoreName``, as the
+    """Each file through ``Read-CaBundle``, then ``Get-CaRefusal`` and ``Get-CaChainCheck``, as the
     script does."""
     script = f"""
 $ErrorActionPreference = 'Stop'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     {_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
 foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-DerHeader',
-                    'Read-CaBundle', 'Get-CaRefusal', 'Test-SelfSigned', 'Get-CaStoreName')) {{
+                    'Read-CaBundle', 'Get-CaRefusal', 'Invoke-CaChainBuild', 'Get-CaChainCheck')) {{
   $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
       $args[0].Name -eq $name }}, $true)
   if (-not $def) {{ throw "missing function $name" }}
@@ -249,9 +299,12 @@ $out = @{{}}
 foreach ($k in $paths.Keys) {{
   try {{
     $bundle = Read-CaBundle -Bytes ([System.IO.File]::ReadAllBytes($paths[$k]))
+    $checks = Get-CaChainCheck -Bundle $bundle -Now ([datetime]::UtcNow)
     $out[$k] = @{{ certs = @(foreach ($c in $bundle) {{
-      @{{ thumb = $c.Thumbprint; refusal = (Get-CaRefusal -Certificate $c);
-          store = (Get-CaStoreName -Certificate $c) }} }}) }}
+      $check = $checks[$c.Thumbprint]
+      $why = Get-CaRefusal -Certificate $c
+      if (-not $why) {{ $why = $check.Refusal }}
+      @{{ thumb = $c.Thumbprint; refusal = $why; store = $check.Store }} }}) }}
   }} catch {{
     $out[$k] = @{{ error = $_.Exception.Message }}
   }}
@@ -299,7 +352,6 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert certs("pem_one") == [(root, None)]
     assert certs("b64_der") == [(root, None)]
     assert certs("der_armour_in_subject") == [(_thumb(chain["armour_in_subject"][0]), None)]
-    assert full("inter_only") == [(inter, None, "CertificateAuthority")]
     for name in ("p7b_der", "p7b_pem", "pem_bundle", "pem_zero_first", "pem_utf16", "adcs_p7b"):
         assert sorted(full(name)) == sorted(
             [(root, None, "Root"), (inter, None, "CertificateAuthority")]
@@ -307,14 +359,46 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert certs("pem_x509_label") == [(root, None)]
     assert certs("pem_duplicate") == [(root, None)]
 
-    # Root means self-signed: an RSA root's signature verifies under its own key, and a
-    # self-issued re-key certificate another key signed goes to the intermediate store.
+    # Root means self-signed, as the chain engine reads it: an RSA root's signature verifies under
+    # its own key, in PKCS#1 v1.5 or PSS, and a self-issued re-key certificate another key signed
+    # goes to the intermediate store.
     assert full("rsa_root") == [(_thumb(extra["rsa_root"]), None, "Root")]
+    assert full("pss_root") == [(_thumb(extra["pss_root"]), None, "Root")]
     rekey = _thumb(extra["rekey"])
-    assert full("rekey_only") == [(rekey, None, "CertificateAuthority")]
     assert sorted(full("root_and_rekey")) == sorted(
         [(root, None, "Root"), (rekey, None, "CertificateAuthority")]
     )
+    second = _thumb(chain["second_root"][0])
+    assert sorted(full("cross")) == sorted(
+        [
+            (root, None, "Root"),
+            (second, None, "Root"),
+            (_thumb(chain["cross"][0]), None, "CertificateAuthority"),
+        ]
+    )
+
+    # Every CA must chain to a self-signed root in the same file, whatever else the file holds.
+    unchained = "it does not chain to a self-signed root in this file"
+    assert full("inter_only") == [(inter, unchained, "CertificateAuthority")]
+    assert full("rekey_only") == [(rekey, unchained, "CertificateAuthority")]
+    assert sorted(full("root_and_foreign")) == sorted(
+        [(root, None, "Root"), (_thumb(chain["foreign"][0]), unchained, "CertificateAuthority")]
+    )
+    # The Windows engine links the forged CA to the root by name and then finds the signature
+    # false; another platform's engine may not link it at all. Either refuses it.
+    forged = {t: (why, store) for t, why, store in full("root_and_forged")}
+    assert forged[root] == (None, "Root")
+    assert forged[_thumb(chain["forged"][0])] in {
+        (unchained, "CertificateAuthority"),
+        ("the chain engine reports NotSignatureValid on its chain", "CertificateAuthority"),
+    }
+
+    # A root outside its validity period is refused, and so the whole file with it.
+    outside = "it is a self-signed root outside its validity period"
+    expired = _thumb(chain["expired_root"][0])
+    assert full("expired_root") == [(expired, outside, "Root")]
+    assert full("future_root") == [(_thumb(chain["future_root"][0]), outside, "Root")]
+    assert dict(certs("expired_root_chain"))[expired] == outside
 
     # Read in full, so the non-CA among them is seen and refused.
     leaf = _thumb(chain["leaf"][0])
@@ -353,7 +437,66 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert "control character outside its PEM blocks" in error("der_then_pem")
 
 
-def _run_whatif(ca_path: Path) -> subprocess.CompletedProcess[str]:
+def test_a_chain_ending_outside_the_file_or_unbuilt_is_refused(
+    tmp_path: Path, chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
+) -> None:
+    # A chain the engine ends at a root the machine already trusts, or cannot build at all, needs a
+    # machine store this test must not write. So Get-CaChainCheck is run over a stand-in for
+    # Invoke-CaChainBuild that reports those chains, and the verdict is read.
+    outside = "F" * 40
+    root = _thumb(chain["root"][0])
+    inter = _thumb(chain["intermediate"][0])
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    {_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
+foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-DerHeader',
+                    'Read-CaBundle', 'Get-CaChainCheck')) {{
+  $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+      $args[0].Name -eq $name }}, $true)
+  if (-not $def) {{ throw "missing function $name" }}
+  . ([scriptblock]::Create($def.Extent.Text))
+}}
+$script:mode = $null
+function Invoke-CaChainBuild {{
+  param($Certificate, $Bundle, $Anchors)
+  if ($Certificate.Thumbprint -eq {_psq(root)}) {{ return @{{ Flags = 32; Path = @({_psq(root)}) }} }}
+  if ($script:mode -eq 'error') {{ return @{{ Error = 'stand-in failure' }} }}
+  return @{{ Flags = 0; Path = @({_psq(inter)}, {_psq(outside)}) }}
+}}
+$bundle = Read-CaBundle -Bytes ([System.IO.File]::ReadAllBytes({_psq(str(files["pem_bundle"]))}))
+$out = @{{}}
+foreach ($m in 'outside', 'error') {{
+  $script:mode = $m
+  $checks = Get-CaChainCheck -Bundle $bundle -Now ([datetime]::UtcNow)
+  $out[$m] = @{{ root = $checks[{_psq(root)}].Refusal; inter = $checks[{_psq(inter)}].Refusal }}
+}}
+$out | ConvertTo-Json -Compress
+"""
+    f = tmp_path / f"dbca-{uuid.uuid4().hex}.ps1"
+    f.write_text(script, encoding="utf-8")
+    proc = subprocess.run(
+        [_pwsh(), "-NoProfile", "-NonInteractive", "-File", str(f)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"harness failed: {proc.stdout}\n{proc.stderr}"
+    got = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert got["outside"] == {
+        "root": None,
+        "inter": f"its chain ends at {outside}, which is not a self-signed root in this file",
+    }
+    assert got["error"] == {
+        "root": None,
+        "inter": "the chain engine could not build its chain: stand-in failure",
+    }
+
+
+def _run_whatif(
+    ca_path: Path, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     if _elevated():
         pytest.skip("SKIP (nothing run): elevated session; the script is run only unelevated")
     return subprocess.run(
@@ -371,6 +514,7 @@ def _run_whatif(ca_path: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         encoding="utf-8",
         timeout=120,
+        env=env,
     )
 
 
@@ -394,16 +538,47 @@ def test_whatif_shows_and_offers_every_certificate_of_an_unsigned_p7b(
     assert "Imported" not in out
 
 
-@pytest.mark.parametrize("name", ["inter_only", "rekey_only"])
-def test_a_file_without_a_self_signed_root_imports_nothing(
-    name: str, files: dict[str, Path]
+@pytest.mark.parametrize(
+    ("name", "key", "why"),
+    [
+        # An issuing CA alone, or a self-issued certificate another key signed: no root.
+        ("inter_only", "intermediate", "it does not chain to a self-signed root in this file"),
+        ("rekey_only", "rekey", "it does not chain to a self-signed root in this file"),
+        # A root, but not the one the issuing CA chains to.
+        ("root_and_foreign", "foreign", "it does not chain to a self-signed root in this file"),
+        # A root whose validity period is over, or has not begun.
+        ("expired_root", "expired_root", "it is a self-signed root outside its validity period"),
+        ("future_root", "future_root", "it is a self-signed root outside its validity period"),
+    ],
+)
+def test_a_ca_without_a_valid_root_in_the_file_imports_nothing(
+    name: str,
+    key: str,
+    why: str,
+    chain: dict[str, tuple[x509.Certificate, _Key]],
+    extra: dict[str, x509.Certificate],
+    files: dict[str, Path],
 ) -> None:
-    # An issuing CA alone, or a self-issued certificate another key signed: no root, so refused.
+    cert = extra[key] if key in extra else chain[key][0]
     proc = _run_whatif(files[name])
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
-    assert "Nothing was imported. The file holds no self-signed root." in out
+    assert "Nothing was imported" in out
+    assert f"  {_thumb(cert)}: {why}" in proc.stdout.splitlines(), out
     assert "What if" not in out
+
+
+def test_not_after_is_printed_in_utc(
+    chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
+) -> None:
+    # The 'u' format writes a 'Z' suffix whatever the time's kind, so a local time printed with it
+    # reads as a UTC time that is wrong by the zone's offset. TZ sets the zone for .NET on Linux and
+    # macOS. Windows ignores it and uses the host's own zone, so on a Windows host running in UTC,
+    # as hosted runners do, this test cannot fail for the bug it guards; the Linux leg guards it.
+    proc = _run_whatif(files["der"], dict(os.environ, TZ="Pacific/Chatham"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    want = chain["root"][0].not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%SZ")
+    assert f"  Not after  : {want}" in proc.stdout.splitlines(), proc.stdout
 
 
 _NOT_A_CA = "its basic constraints say it is not a CA"
@@ -464,3 +639,40 @@ def test_the_script_adds_through_the_store_and_never_by_path() -> None:
     assert body.index("IsInRole(") < body.index("ReadAllBytes(")
     assert body.index("Get-CaRefusal -Certificate") < body.index("ShouldProcess(")
     assert body.index("ShouldProcess(") < body.index(".Store.Add(")
+
+
+_NEEDS_PWSH_71 = "This script needs PowerShell 7.1 or later."
+
+
+def test_the_runtime_guard_runs_before_any_store_or_chain() -> None:
+    code = "\n".join(
+        ln
+        for ln in _SCRIPT.read_text(encoding="utf-8").splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    body = code.split("[CmdletBinding(", 1)[1]
+    guard = body.index("PSObject.Properties['TrustMode']")
+    assert "PSObject.Properties['DisableCertificateDownloads']" in body[guard : guard + 200]
+    assert _NEEDS_PWSH_71 in body[guard : guard + 400]
+    # Before the stores are built, elevation is checked, a chain is built or the file is read.
+    for later in ("X509Store]::new(", "IsInRole(", "X509Chain]::new(", "ReadAllBytes("):
+        assert guard < body.index(later), later
+    # Nothing past the guard asks the runtime again, so no fallback path is left behind it.
+    assert body.count("PSObject.Properties[") == 2
+
+
+def test_windows_powershell_is_refused_before_anything_is_read(files: dict[str, Path]) -> None:
+    exe = shutil.which("powershell")
+    if exe is None or sys.platform != "win32":
+        pytest.skip("SKIP (nothing run): no Windows PowerShell 5.1 here")
+    proc = subprocess.run(
+        [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(_SCRIPT)]
+        + ["-CaPath", str(files["p7b_der"]), "-WhatIf"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert _NEEDS_PWSH_71 in " ".join(out.split()), out
+    assert "The file holds" not in out and "What if" not in out

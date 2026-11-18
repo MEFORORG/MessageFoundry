@@ -649,7 +649,7 @@ suite("engine control — Start runs against the service TOML the fork guard jud
       /buildServeInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
       /buildAdminProbeInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
       /buildProvisionInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
-      /serveCommandLine\(configDir\(\),\s*startServiceConfig\(\)\)/,
+      /serveCommandLine\(launch\.configDir,\s*launch\.serviceConfig\)/,
     ];
     for (const call of calls) {
       assert.ok(call.test(code), `not handed the service config: ${call}`);
@@ -657,14 +657,19 @@ suite("engine control — Start runs against the service TOML the fork guard jud
     // The control: the call the file carried before the fix must fail its predicate.
     assert.ok(!calls[0].test("buildServeInvocation({ python, configDir: configDir() })"));
     // One read in launchEngine feeds the guard and all three effects of the Start plan.
-    const launch = /private async launchEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
+    const launch = /private async launchEngine\(prior\?: LaunchTarget\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
     assert.ok(launch, "launchEngine moved — re-point this scan before trusting it");
-    assert.strictEqual((launch[0].match(/startServiceConfig\(\)/g) ?? []).length, 1, "read it once");
+    // Read once, as a launch (BACKLOG #5404): writerConfigTarget refuses a dropped value.
+    assert.strictEqual((launch[0].match(/writerConfigTarget\(\)/g) ?? []).length, 1, "read it once");
+    // A Restart's target, judged before its stop, is used as given rather than read again.
+    assert.match(launch[0], /const launch = prior \?\? writerConfigTarget\(\);/);
+    assert.strictEqual((launch[0].match(/startServiceConfig\(\)|configDir\(\)/g) ?? []).length, 0, "a reader read");
+    assert.match(launch[0], /const serviceConfigArg = launch\.serviceConfig;/);
     for (const use of [
       /this\.controlContextFor\(serviceConfigArg\)\.hasStore/,
       /this\.probeAdmin\(python, ws, serviceConfigArg\)/,
       /this\.provisionInTerminal\(python, ws, admin, serviceConfigArg\)/,
-      /this\.serveEngine\(python, ws, serviceConfigArg\)/,
+      /this\.serveEngine\(python, ws, launch\.configDir, serviceConfigArg\)/,
     ]) {
       assert.ok(use.test(launch[0]), `launchEngine does not pass the one value: ${use}`);
     }
@@ -695,7 +700,13 @@ suite("engine control — Start runs against the service TOML the fork guard jud
     const stops = body.search(/term\.dispose\(\)/);
     assert.ok(refused >= 0, "restartEngine must check the service config");
     assert.ok(stops > refused, "the check must come before the running engine is stopped");
-    assert.ok(/serviceConfigRefusal\(ws, startServiceConfig\(\)\)/.test(body));
+    assert.ok(/serviceConfigRefusal\(ws, launch\.serviceConfig\)/.test(body));
+    // The launch read refuses a dropped value before the stop too (BACKLOG #5404).
+    const read = body.search(/const launch = writerConfigTarget\(\);\s*if \(launch === undefined\) \{\s*return;/);
+    assert.ok(read >= 0 && stops > read, "restartEngine must read its target as a launch, before the stop");
+    // And it starts with that target, so a setting changed during the stop cannot turn it into Stop.
+    assert.match(body, /await this\.startEngine\(launch\);/);
+    assert.match(code, /async startEngine\(prior\?: LaunchTarget\)[\s\S]*?await this\.launchEngine\(prior\);/);
   });
 
   test("Restart refuses a remote target and an untrusted workspace before it stats the service config", () => {
@@ -736,7 +747,7 @@ suite("engine control — Start runs against the service TOML the fork guard jud
       " const refusal = serviceConfigRefusal(ws, startServiceConfig());\n";
     assert.strictEqual(gatedFirst(readFirst), "a filesystem read runs before the refusals");
     // Start's launchEngine carries the same two messages, so the two refusals read alike.
-    const launch = /private async launchEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
+    const launch = /private async launchEngine\(prior\?: LaunchTarget\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
     assert.ok(launch, "launchEngine moved — re-point this scan before trusting it");
     for (const message of [
       "is a remote engine — the IDE can only start a local (loopback) engine.`",

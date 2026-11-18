@@ -134,6 +134,31 @@ def test_check_dryrun_fails_on_missing_messages_path(
     assert dr["ok"] is False and dr["required"] is True and dr["skipped"] is False
 
 
+def test_check_dryrun_fails_a_missing_config_dir_without_aborting_the_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing config dir raises ConfigDirMissing, a FileNotFoundError and not a WiringError. Its
+    traceback must not abort the remaining legs and the --json report (BACKLOG #5810)."""
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), None)
+    missing = tmp_path / "no-such-config"
+    rc = main(["check", "--config", str(missing), "--messages", str(msgs), "--no-lint", "--json"])
+    assert rc == 1
+    report = _out_json(capsys)
+    assert _check(report, "validate")["ok"] is False
+    dr = _check(report, "dryrun")
+    assert dr["ok"] is False and dr["required"] is True and dr["skipped"] is False
+    assert dr["detail"].startswith("config did not load")
+
+
+def test_check_dryrun_alone_fails_closed_on_a_missing_config_dir(tmp_path: Path) -> None:
+    """With no validate leg to report the missing directory, the required dry-run leg still fails
+    rather than skips, so it cannot pass a gate whose fixtures never ran."""
+    result = checks._check_dryrun(
+        tmp_path / "no-such-config", _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), None)
+    )
+    assert result.ok is False and result.required is True and result.skipped is False
+
+
 def test_check_dryrun_accepts_single_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

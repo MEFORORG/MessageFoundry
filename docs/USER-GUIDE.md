@@ -221,6 +221,7 @@ Some `messagefoundry` and `messagefoundry-toolkit` commands refuse a set of opti
 |---|---|---|---|
 | `messagefoundry-toolkit impact` | `--rename-to` and `--delete` | Never both. Either one alone is fine, and so is neither. | An error message and a non-zero exit |
 | `messagefoundry-toolkit impact` | `--apply` | Valid only with `--rename-to`. | An error message and a non-zero exit |
+| `messagefoundry-toolkit impact` | `--apply` and a kind of `code_set` | Never together, because the code set's file would not move. Use `messagefoundry codeset rename`. | An error message and a non-zero exit |
 | `messagefoundry-toolkit lens rewrite` | `--edit` and a `module` of `-` | When the source comes from stdin, the edit must come from `--edit`. | An error message and a non-zero exit |
 | `audit-verify` | `--expected-anchor` and `--expected-anchor-file` | Never both, because they carry the same anchor. Neither is required. | The argument parser refuses the command |
 | `audit-verify` | `--expected-row` and `--expected-rows-file` | Together they may not give one sequence number two different row hashes. | An error message and exit code 2 |

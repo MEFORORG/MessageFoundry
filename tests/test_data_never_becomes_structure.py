@@ -289,7 +289,7 @@ def h(msg):
 """
 
 
-def _lens_insert_copy(src: str | dict[str, str], dst: str) -> str:
+def _lens_insert_copy(src: str | dict[str, str], dst: str, **extra: object) -> str:
     anchor = parse_source(LENS_SOURCE)[0]["rows"][0]
     return rewrite_source(
         LENS_SOURCE,
@@ -299,7 +299,7 @@ def _lens_insert_copy(src: str | dict[str, str], dst: str) -> str:
             "line_end": anchor["line_end"],
             "position": "after",
             "action": "copy_field",
-            "params": {"src": src, "dst": dst},
+            "params": {"src": src, "dst": dst, **extra},
         },
     )
 
@@ -322,6 +322,46 @@ def test_the_lens_keeps_set_for_a_whole_field_or_an_expression_source(
     out = _lens_insert_copy(src, "PV1-19")
     assert "msg.set(" in out and "set_data" not in out
     assert len(_copy_rows(out)) == 1
+
+
+def test_the_lens_inserts_a_whole_field_copy_into_a_component_as_the_action_call() -> None:
+    # Round-6f70971d finding 2 (BACKLOG #5821). A native msg.set would escape the field's escape
+    # sequences a second time, so the insert is the copy_field call, which reads back as the row.
+    # NEGATIVE CONTROL: on d97051786 the insert was msg.set("NK1-2.1", msg.field("PID-5") or "").
+    out = _lens_insert_copy("PID-5", "NK1-2.1")
+    assert '    copy_field(msg, "PID-5", "NK1-2.1")\n' in out
+    assert "from messagefoundry import copy_field\n" in out
+    assert "msg.set" not in out
+    ast.parse(out)
+    rows = _copy_rows(out)
+    assert len(rows) == 1 and rows[0]["params"] == {"src": "PID-5", "dst": "NK1-2.1"}
+
+
+# Each line is what origin/main's lens emitted for the same insert. The copy_field call takes no
+# other argument, so an insert carrying another key keeps main's native form.
+# NEGATIVE CONTROL: on 92cd0425d0 the occurrence and repetition cases raised LensRewriteError,
+# and the note case emitted copy_field(msg, "PID-5", "NK1-2.1", note="x"), a TypeError at run time.
+@pytest.mark.parametrize(
+    ("extra", "line"),
+    [
+        (
+            {"occurrence": 2},
+            'msg.set("NK1-2.1", msg.field("PID-5", occurrence=2) or "", occurrence=2)',
+        ),
+        (
+            {"repetition": 2},
+            'msg.set("NK1-2.1", msg.field("PID-5", repetition=2) or "", repetition=2)',
+        ),
+        ({"note": "x"}, 'msg.set("NK1-2.1", msg.field("PID-5") or "")'),
+    ],
+)
+def test_a_whole_field_copy_with_another_key_keeps_the_native_form(
+    extra: dict[str, object], line: str
+) -> None:
+    out = _lens_insert_copy("PID-5", "NK1-2.1", **extra)
+    assert f"    {line}\n" in out
+    assert "copy_field(" not in out
+    ast.parse(out)
 
 
 def test_a_set_data_call_that_is_not_a_copy_is_a_code_row() -> None:

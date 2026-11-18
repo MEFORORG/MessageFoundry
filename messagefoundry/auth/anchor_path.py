@@ -606,7 +606,8 @@ def windows_chain(
 
     At least these end the walk with a cause, since Windows would open another object than the text
     names (vault BACKLOG #5197): a drive-relative spelling (:func:`_drive_relative`), in the path, a
-    link target or a ``subst`` target joined to the rest of the path; a name ending in a space or a
+    link target or a ``subst`` target joined to the rest of the path, or in the path joined to the
+    working directory (vault BACKLOG #5337); a name ending in a space or a
     dot; and a link target rooted with no drive (:data:`_ROOTED_LINK`); a
     device prefix written with forward slashes (``//?/S:/x``); and a stream name after a link.
 
@@ -680,6 +681,12 @@ def windows_chain(
         if len(drive) != 2 and not rest:
             # A volume GUID with no separator after it (``//?/Volume{x}``) opens the volume device.
             return chain, WalkCause.plain(_DEVICE_PATH)
+        if _drive_relative(norm):
+            # Checked on every pass, not only on the text the caller gave: a drive-relative working
+            # directory (``C:``) joined to ``ca.pem`` reads ``C:ca.pem``, which the loop below
+            # would walk from the drive root, and which a subst splice would join to its target
+            # with no separator (vault BACKLOG #5337). So ``rest`` below is rooted or empty.
+            return chain, WalkCause.plain(_DRIVE_RELATIVE)
         try:
             substituted = drive_target(drive) if len(drive) == 2 else None
         except OSError as exc:
@@ -700,9 +707,8 @@ def windows_chain(
                 )
             # The target with the rest of the path, not the target alone: a letter defined onto a
             # bare drive (``\??\C:``) makes ``S:\ca.pem`` read as ``C:\ca.pem``, which is rooted.
+            # A drive-relative result (``\??\C:certs``) is refused at the top of the next pass.
             pending = target + rest
-            if _drive_relative(pending):
-                return chain, WalkCause.plain(_DRIVE_RELATIVE)
             continue
         root = drive + "\\"
         why = volume_cause(root)

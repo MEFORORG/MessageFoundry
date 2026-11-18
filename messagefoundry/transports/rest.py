@@ -79,7 +79,7 @@ from messagefoundry.config.tls_policy import (
     urllib_handler_context,
 )
 from messagefoundry.controlchars import strip_control_chars
-from messagefoundry.secretscrub import credential_query_params
+from messagefoundry.secretscrub import credential_query_params, has_credential_like_segment
 from messagefoundry.transports.base import (
     ECH_UNSUPPORTED_DESTINATION_MSG,
     DeliveryError,
@@ -161,6 +161,32 @@ DYNAMIC_HEADER_PREFIX = "http.header."
 # this screen exists to keep out of the header block. ``\Z`` matches only at the true end of the
 # string. Measured on the pre-fix literal: ``match("X-Foo\n")`` was truthy; with ``\Z`` it is None.
 _HEADER_NAME_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
+
+#: Lowercased header names a message may never set under ``dynamic_headers``, beside the
+#: proxy-credential spellings (BACKLOG #5352). ``Authorization`` is connection config only (vault
+#: BACKLOG #3416). ``Host`` names the upstream, and on an ECH connection the sidecar routes by it.
+#: ``Content-Length`` and ``Transfer-Encoding`` frame the body, which ``http.client`` already
+#: frames, so a second value would send conflicting framing. The hop-by-hop fields of RFC 9110
+#: section 7.6.1, RFC 2616's ``Trailer`` and ``Expect`` belong to the connection, not to one
+#: message. ``Cookie`` is dropped as a session credential: the redaction screen already masks it
+#: by name, so :func:`refuse_held_dynamic_headers` refused it on a verify-off or off-box cleartext
+#: hop, but on any other hop a Handler's Cookie was sent.
+PER_MESSAGE_DENIED_HEADERS = frozenset(
+    {
+        "authorization",
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "upgrade",
+        "expect",
+        "cookie",
+    }
+)
 
 
 def _latin1_refusal_position(value: str) -> int | None:
@@ -247,7 +273,9 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
     :func:`_strip_header_control_chars`, so a message-derived value cannot split the request or inject an
     extra header. **``Authorization`` and ``Proxy-Authorization`` are never settable per-message** —
     auth is connection config only, so a message-derived value can neither weaken nor replace the
-    connection's credential, nor ride a proxy handler's admission (vault BACKLOG #3416). **Pure:** the
+    connection's credential, nor ride a proxy handler's admission (vault BACKLOG #3416). Nor is any
+    name in :data:`PER_MESSAGE_DENIED_HEADERS`, in any letter case: ``Host``, the framing and
+    hop-by-hop fields and ``Cookie`` are dropped like ``Authorization`` (BACKLOG #5352). **Pure:** the
     result is a deterministic function of ``metadata`` (itself pure from the transform), so an
     at-least-once re-run yields byte-identical headers. ``None``/empty → ``{}`` (the default,
     byte-identical) — no per-message headers.
@@ -283,10 +311,23 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
         name = key[len(DYNAMIC_HEADER_PREFIX) :]
         if not name or not _HEADER_NAME_TOKEN.match(name):
             continue  # not a valid header-name token — never emit it (can't inject a header line)
-        if name.lower() == "authorization" or is_proxy_credential_header_name(name):
-            # Auth is connection-configured only: a message never sets or overrides it. A proxy
-            # handler's admission covers the connection's own proxy_user header, so a message must
-            # not be able to supply one (vault BACKLOG #3416).
+        if (lowered := name.lower()) in PER_MESSAGE_DENIED_HEADERS:
+            # Auth, routing, framing and hop-by-hop fields are the connection's alone (vault
+            # BACKLOG #3416, #5352). Logged by the set's own spelling, never the Handler's key.
+            # DEBUG, not WARNING: this runs on every send and retry, so a Handler stamping the
+            # header on every message would flood the log at feed rate.
+            logger.debug(
+                # No ':' or '=' after the name, so the log scrubber never reads it as a label
+                # (BACKLOG #4998, on egress.warn_url_query_credentials).
+                "a Handler set the per-message header %r, which dynamic_headers never sends; "
+                "it was dropped",
+                lowered,
+            )
+            continue
+        if is_proxy_credential_header_name(name):
+            # A proxy handler's admission covers the connection's own proxy_user header, so a
+            # message must not be able to supply one (vault BACKLOG #3416). Its spelling may carry
+            # a credential, so nothing about it is logged.
             continue
         if not isinstance(value, str):
             continue  # SetMeta enforces str, but stay defensive against a hand-built bag
@@ -1325,7 +1366,11 @@ def http_credentials_sent(
     and value are both harmless, such as ``X-Routing-Key``, refuses a verify-off hop too, and on a
     hop that already turned verification off that is the cheaper error. A credential-looking query
     parameter in ``url`` counts too, by the reader ``query_credential_hops`` uses, and so does a
-    ``code`` parameter, which that reader leaves out (vault BACKLOG #3533 item 7). A
+    ``code`` parameter, which that reader leaves out (vault BACKLOG #3533 item 7). So does a
+    credential-looking name in any ``name=value`` segment of what urllib sends of ``url``, read
+    from its first ``;``, ``?`` or ``#`` up to the last ``#`` (:func:`_url_segments_sent`,
+    :func:`_query_credentials_sent`, BACKLOG #5353); a ``code`` name there is not counted. The FHIR destination adds its
+    ``conditional_query``, which crosses the hop too, by the same reader at its own call sites. A
     ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
     CONNECT, not across this hop.
 
@@ -1348,8 +1393,9 @@ def http_credentials_sent(
 
     It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
     not seen here; :func:`refuse_held_dynamic_headers` judges those at send. Nor is a secret in
-    the path of ``url``; docs/SECURITY-LOOSENING.md lists it among the hops the rule does not
-    reach."""
+    the path of ``url`` before its first ``;``, ``?`` or ``#``, nor in the fragment after its last
+    ``#``, which urllib never sends; docs/SECURITY-LOOSENING.md lists the path among the hops the
+    rule does not reach."""
     # Lazy: it imports config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
 
@@ -1371,10 +1417,53 @@ def http_credentials_sent(
                     else _shown_header_key(key)
                 )
                 sent.append(f"{shown}{held}")
-    url = settings.get("url")
-    if isinstance(url, str) and (names := credential_query_params(url, refusal=True)):
-        sent.append(f"url query parameter {', '.join(names)}")
+    sent.extend(_query_credentials_sent("url", settings.get("url"), query_only=False))
     return sent
+
+
+def _query_credentials_sent(setting: str, value: Any, *, query_only: bool) -> list[str]:
+    """The credential entry :func:`http_credentials_sent` adds for one URL-shaped ``setting``, or
+    nothing. ``query_only`` says ``value`` is a bare query string, such as a FHIR
+    ``conditional_query``, rather than a whole URL.
+
+    A credential-looking query parameter is named, by the reader ``credential_query_params`` gives
+    the refusals. A name the ``&``-split query does not reach is counted too, unnamed: a ``;``-split
+    segment (``;jsessionid=``) or one after a second ``?``, by
+    :func:`~messagefoundry.secretscrub.has_credential_like_segment` (BACKLOG #5353). That reader
+    knows no ``code`` parameter, so a ``;code=`` segment is not counted. Nor is ``code`` in a
+    bare query: there it is FHIR's own search parameter (``Observation?code=...``), not the
+    function key the refusals count it as in a ``url``."""
+    if not isinstance(value, str) or not value:
+        return []
+    names = (
+        credential_query_params(f"?{value}")
+        if query_only
+        else credential_query_params(value, refusal=True)
+    )
+    if names:
+        noun = "parameter" if query_only else "query parameter"
+        return [f"{setting} {noun} {', '.join(names)}"]
+    if has_credential_like_segment(value if query_only else _url_segments_sent(value)):
+        return [f"{setting} segment with a credential-looking name"]
+    return []
+
+
+#: Where a ``name=value`` segment of a whole URL can start: a ``;`` path parameter, the query, or
+#: a ``#`` that urllib sends because a later ``#`` starts the fragment.
+_URL_SEGMENT_START = re.compile(r"[;?#]")
+
+
+def _url_segments_sent(url: str) -> str:
+    """The part of ``url`` :func:`_query_credentials_sent` screens for a segment credential: what
+    urllib sends, cut at the LAST ``#``, where its ``Request`` splits off the fragment it never
+    sends, and read from the first ``;``, ``?`` or ``#`` before that cut. So any earlier ``#`` is
+    sent and starts the read: ``/x#a=1&api_key=S#b`` sends ``/x#a=1&api_key=S``. The scheme, host
+    and the path before that first ``;``, ``?`` or ``#`` are left out, so a path predicate there,
+    such as OData's ``Orders(OrderKey=5)``, is not read as one (the rule does not read the path,
+    owner ruling 2026-10-26). Everything after it is read, path or not."""
+    sent = url.rpartition("#")[0] if "#" in url else url
+    start = _URL_SEGMENT_START.search(sent)
+    return "" if start is None else sent[start.start() :]
 
 
 def refuse_verify_off(
@@ -2160,17 +2249,17 @@ class ProxyConfig:
         The record states the fact and names the connection, and nothing else. It carries no
         part of the proxy URL and no part of ``host``. Both are read out of the settings mapping
         that also holds the connection's credentials, and a proxy URL can carry userinfo."""
-        host = urllib.parse.urlsplit(url).hostname or ""
-        if _is_loopback_target(host):
+        route = _proxy_route(url, self.bypass)
+        if route == "loopback":
             logger.info(
                 "connection %s; the configured web proxy is not used for a loopback target, "
                 "because a loopback hop is always dialled direct",
                 audit_connection_name(self.connection),
             )
             return None
-        if _proxy_bypasses(host, self.bypass):
+        if route == "bypassed":
             return None
-        if _urllib_bypasses(url):
+        if route == "urllib-bypassed":
             # proxy_url = "default" carries no credential and means "follow the system's settings",
             # bypass list included, so following that list is no override and is not logged.
             if not self.use_default:
@@ -2185,6 +2274,43 @@ class ProxyConfig:
                 )
             return _HostProxy(self, credentialed=False)
         return _HostProxy(self)
+
+
+def _proxy_route(
+    url: str, bypass: tuple[str, ...]
+) -> Literal["loopback", "bypassed", "urllib-bypassed", "proxied"]:
+    """How :meth:`ProxyConfig.for_host` routes a request for ``url``, before it logs anything: a
+    loopback host, a host ``bypass`` names, a host urllib's own bypass list names, or the proxy. One
+    reading for that method and for :func:`digest_proxy_meets_the_token_connect`."""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if _is_loopback_target(host):
+        return "loopback"
+    if _proxy_bypasses(host, bypass):
+        return "bypassed"
+    if _urllib_bypasses(url):
+        return "urllib-bypassed"
+    return "proxied"
+
+
+def digest_proxy_meets_the_token_connect(token_url: object, no_proxy: object) -> bool:
+    """Whether a token request to ``token_url`` meets an explicit web proxy set up for Digest on a
+    ``CONNECT``, where Digest cannot answer the proxy's 407 (vault BACKLOG #2989, ADR 0095 B.1).
+
+    It reads no proxy and no Digest setting, so the caller checks that a proxy set up for Digest
+    exists. True for an ``https`` token URL that is not loopback and that neither ``no_proxy`` nor
+    urllib's own bypass list names, as :meth:`ProxyConfig.for_host` routes it. The token hop's build
+    refusals of a Digest proxy read it (``http_auth.refuse_a_digest_proxy_on_the_token_hop`` and
+    ``smart._TokenEndpointProvider._open_token_hop``). A value that is not a string, or that does not parse, answers ``False``."""
+    if not isinstance(token_url, str):
+        return False
+    try:
+        if urllib.parse.urlsplit(token_url).scheme.lower() != "https":
+            return False
+        return _proxy_route(token_url, _normalize_no_proxy(no_proxy)) == "proxied"
+    except ValueError:
+        # Value-free: a URL can carry userinfo.
+        logger.debug("token URL does not parse; the Digest proxy rule does not apply to it")
+        return False
 
 
 def _urllib_bypasses(url: str) -> bool:
@@ -2221,9 +2347,7 @@ class _HostProxy:
 
     @property
     def answers_digest(self) -> bool:
-        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener. The
-        token hop's build refusal of a Digest proxy for an https token endpoint reads it, so the two
-        decide from one rule (BACKLOG #2989)."""
+        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener."""
         return self.credentialed and self.config.digest is not None
 
     def auth_headers(self) -> dict[str, str]:
@@ -2266,6 +2390,7 @@ def proxy_auth_handler_from_settings(
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
+    builds_token_hop: bool = False,
 ) -> tuple[tuple[tuple[str, str], ...], _ProxyDigestRecipe | None]:
     """The #127 proxy-credential-type dispatch: returns ``(pre-emptive auth header, reactive digest
     recipe)`` for an already-``env()``-resolved settings mapping ``s``. (Named per the phase doc; lives
@@ -2286,7 +2411,13 @@ def proxy_auth_handler_from_settings(
     ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
     destination's own credentials (:func:`refuse_cleartext_credential_hop`, vault BACKLOG #3533
     item 4), this leg can be declared, with ``cleartext_accepted`` and a reason alone.
-    ``docs/CONNECTIONS.md`` states the owner's rulings on this credential (vault BACKLOG #3007)."""
+    ``docs/CONNECTIONS.md`` states the owner's rulings on this credential (vault BACKLOG #3007).
+
+    ``builds_token_hop`` is set by the REST and FHIR outbounds only. For them a Digest credential
+    also meets ``http_auth.refuse_a_digest_proxy_on_the_token_hop`` here, before the guard below.
+    Every other caller leaves it unset, the SOAP outbound included, although it builds its bearer
+    the same way: its token hop, if any, keeps the later refusal in
+    ``smart._TokenEndpointProvider._open_token_hop``, after the guard."""
     user = s.get("proxy_user")
     password = s.get("proxy_password")
     auth_type = s.get("proxy_auth_type")
@@ -2331,6 +2462,14 @@ def proxy_auth_handler_from_settings(
                 "challenge arrives inside the CONNECT tunnel (digest-over-CONNECT is unsupported); use "
                 "proxy_auth_type='basic' (pre-emptive) or a local authenticating proxy (ADR 0126)"
             )
+        if builds_token_hop:
+            # The token hop's half of the same rule (vault BACKLOG #2989 items 11, 20 and 21), here
+            # so it runs before the guard below records the credential's crossing. Only for a
+            # caller that builds the provider these settings name. Lazy: http_auth and smart import
+            # this module.
+            from messagefoundry.transports.http_auth import refuse_a_digest_proxy_on_the_token_hop
+
+            refuse_a_digest_proxy_on_the_token_hop(s, connection=connection)
         result = (), _ProxyDigestRecipe(proxy_url, str(user), str(password))
     elif kind in ("ntlm", "windows"):
         raise ValueError(
@@ -2483,12 +2622,13 @@ def proxy_config_from_settings(
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
+    builds_token_hop: bool = False,
 ) -> ProxyConfig | None:
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
     (#128), and ``proxy_user``/``proxy_password``/``proxy_auth_type`` (#127). ``dest_scheme`` is the
-    target's scheme (for the digest-over-https refusal; a token hop's https endpoint is refused
-    for Digest in ``smart._TokenEndpointProvider._open_token_hop``).
+    target's scheme (for the digest-over-https refusal). ``builds_token_hop`` is passed on to
+    :func:`proxy_auth_handler_from_settings`, which says what it adds.
 
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
     (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.
@@ -2554,6 +2694,7 @@ def proxy_config_from_settings(
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
         connection=connection,
+        builds_token_hop=builds_token_hop,
     )
     return ProxyConfig(
         proxies=(("http", proxy_url), ("https", proxy_url)),
@@ -2698,7 +2839,9 @@ def ech_readdressed_request(
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
-    h = dict(headers)
+    # Any spelling of Host goes first (BACKLOG #5352): urllib folds header names with capitalize(),
+    # so a ``host`` entry after ``Host`` in this dict would replace the pinned upstream.
+    h = {name: value for name, value in headers.items() if name.strip().lower() != "host"}
     h["Host"] = parsed.netloc  # tell the sidecar the real upstream (host[:port])
     return urllib.request.Request(  # noqa: S310  # nosec B310 — http to a validated loopback sidecar
         sidecar + path, data=data, headers=h, method=method
@@ -2712,6 +2855,7 @@ def egress_route_from_settings(
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
     connection: str | None,
+    builds_token_hop: bool = False,
 ) -> ProxyConfig | None:
     """Resolve the per-connection forward/egress **proxy** (ADR 0126) from ``proxy_url``, or ``None``
     (byte-identical). **Fails closed on ``ech_egress``:** the ECH SNI-hiding send-path (ADR 0139) is
@@ -2725,7 +2869,8 @@ def egress_route_from_settings(
     than only the ones routing through here. This one stays for the callers that are **not** destinations
     and so never reach that seam — ``FhirLookupExecutor`` (ADR 0043, ``fhir.py``) is the live case. Both
     raise the **same** message, so a doubly-covered connector never shows an operator two different
-    explanations for one key."""
+    explanations for one key. ``builds_token_hop`` is
+    :func:`proxy_auth_handler_from_settings`'s."""
     if s.get("ech_egress"):
         raise ValueError(ECH_UNSUPPORTED_DESTINATION_MSG)
     return proxy_config_from_settings(
@@ -2734,7 +2879,37 @@ def egress_route_from_settings(
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
         connection=connection,
+        builds_token_hop=builds_token_hop,
     )
+
+
+def _refuse_unsendable_static_auth(s: Mapping[str, Any], *, connection: str | None) -> None:
+    """Refuse at construction a static REST credential :meth:`RestDestination._build_headers`
+    could not send as configured (BACKLOG #5354). Read on the resolved settings, since the
+    factory sees ``env()`` references and cannot tell one that resolves empty from a set value.
+
+    One Basic half without the other, or a half that resolves empty, would send no Authorization
+    at all. A ``:`` in ``basic_user`` would move the rest of the user into the password, since RFC
+    7617 splits the pair at the first colon. ``bearer_token`` beside a Basic pair would be replaced
+    by it without a word. Each refusal names settings, never a value. Digest beside either was
+    already refused by ``refuse_http_digest_conflicts``."""
+    prefix = hop_name_prefix(connection)
+    user, password = s.get("basic_user"), s.get("basic_password")
+    if bool(user) != bool(password):
+        raise HttpAuthError(
+            f"{prefix}REST destination basic_user and basic_password must be set together; one "
+            "without the other, or one that resolves empty, would send no HTTP Basic credential"
+        )
+    if user and ":" in str(user):
+        raise HttpAuthError(
+            f"{prefix}REST destination basic_user must not contain ':'; HTTP Basic splits the "
+            "user from the password at the first colon (RFC 7617)"
+        )
+    if user and s.get("bearer_token"):
+        raise HttpAuthError(
+            f"{prefix}REST destination sets both bearer_token and basic_user/basic_password; "
+            "they share the Authorization header, so configure exactly one"
+        )
 
 
 class RestDestination(DestinationConnector):
@@ -2785,6 +2960,7 @@ class RestDestination(DestinationConnector):
         )
 
         digest_selected = refuse_http_digest_conflicts(s)
+        _refuse_unsendable_static_auth(s, connection=config.name)
         # ADR 0139 (ASVS 12.1.5): opt-in ECH SNI-hiding. When set, this connection re-addresses each
         # request to a loopback terminating sidecar at send time (see _ech_request); destination TLS +
         # ECH are the sidecar's, so no forward proxy is used. Off (default) → None → byte-identical.
@@ -2825,6 +3001,7 @@ class RestDestination(DestinationConnector):
                 cleartext_accepted=accepted,
                 cleartext_reason=accept_reason,
                 connection=config.name,
+                builds_token_hop=True,  # bearer_provider_from_settings, below
             )
         )
         proxy_dest = self._proxy.for_host(self.url) if self._proxy is not None else None
@@ -3030,13 +3207,15 @@ class RestDestination(DestinationConnector):
         extra = s.get("headers") or {}
         if isinstance(extra, dict):
             headers.update({str(k): str(v) for k, v in extra.items()})
+        # The constructor's _refuse_unsendable_static_auth refuses a half pair and bearer_token
+        # beside Basic; the guard stays so a direct call never builds 'user:None'.
         token = s.get("bearer_token")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
         user, password = s.get("basic_user"), s.get("basic_password")
         if user and password:
             raw = f"{user}:{password}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+        elif token:
+            headers["Authorization"] = f"Bearer {token}"
         return headers
 
     async def send(

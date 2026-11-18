@@ -103,6 +103,7 @@ from typing import Any, Literal
 
 import requests
 import requests.adapters
+import requests.auth
 import requests.utils
 import urllib3.connection
 import urllib3.connectionpool
@@ -1603,6 +1604,53 @@ def _refuse_an_insecure_vault_hop(
     return sent, proxy
 
 
+class _NoAmbientAuth(requests.auth.AuthBase):
+    """A session auth that reads no netrc file (vault BACKLOG #5355).
+
+    ``Session.prepare_request`` reads the netrc file (``NETRC``, else ``~/.netrc`` or ``~/_netrc``)
+    whenever ``trust_env`` is on and neither the request nor the session carries a truthy auth,
+    and would attach a matching entry as an ``Authorization: Basic`` header. No Vault client
+    authenticates that way: the token rides in ``X-Vault-Token``. This auth is truthy, so that
+    read is skipped. It still turns userinfo in the URL into Basic auth, which is what
+    ``prepare_auth`` did with no auth set, so only the netrc read changes.
+
+    ``trust_env`` itself stays on, because it also carries the proxy variables and the system
+    proxy that docs/CONFIGURATION.md documents for the Vault clients, and ``REQUESTS_CA_BUNDLE``
+    and ``CURL_CA_BUNDLE``, which ``store/keyprovider_vault.py`` records as the fallback anchor
+    when no CA file is set. Both are left as they were.
+
+    Measured against requests 2.34.2, at least one more netrc read exists:
+    ``Session.rebuild_auth``, which runs on any 3xx reply even with redirects refused, since
+    ``Session.send`` still prepares ``Response.next``. :class:`_NetrcFreeSession` covers it.
+    tests/test_vault_strict_reply.py pins both reads; another requests version may add one."""
+
+    def __call__(self, r: requests.PreparedRequest) -> requests.PreparedRequest:
+        user, password = requests.utils.get_auth_from_url(r.url or "")
+        if user or password:
+            return requests.auth.HTTPBasicAuth(user, password)(r)
+        return r
+
+
+class _NetrcFreeSession(requests.Session):
+    """``requests.Session`` whose ``rebuild_auth`` reads no netrc file (vault BACKLOG #5355).
+
+    The mount swaps a Vault session's class to this one, rather than storing a bound override on
+    the session, which would make a reference cycle and keep a discarded client's pool and socket
+    open until the cyclic GC runs. ``rebuild_auth`` keeps the stock strip, an ``Authorization``
+    header dropped when the next URL is another host, and drops the stock netrc read, which would
+    put the netrc credential of whatever host a 3xx names on ``Response.next``."""
+
+    def rebuild_auth(
+        self, prepared_request: requests.PreparedRequest, response: requests.Response
+    ) -> None:
+        headers = prepared_request.headers
+        original = response.request.url if response.request is not None else None
+        if "Authorization" in headers and self.should_strip_auth(
+            original or "", prepared_request.url or ""
+        ):
+            del headers["Authorization"]
+
+
 def mount_strict_reply_adapter(
     client: Any,
     *,
@@ -1647,6 +1695,10 @@ def mount_strict_reply_adapter(
     credentials and is not ``https://``, which would send those credentials in cleartext (BACKLOG
     #2547), and when requests would send it through a proxy whose URL requests cannot read or
     send, since requests' own error would carry that URL or its credentials (vault BACKLOG #3454).
+
+    It also stops the session's netrc reads, at least those :class:`_NoAmbientAuth` names (vault
+    BACKLOG #5355).
+
     At least the three Vault clients the engine builds today call this; a new one must too.
     """
     session = getattr(getattr(client, "adapter", None), "session", None)
@@ -1654,6 +1706,13 @@ def mount_strict_reply_adapter(
         raise ValueError(
             f"{connector}: cannot mount the strict reply reader, because the Vault client exposes "
             f"no requests session at client.adapter.session"
+        )
+    # A subclass is refused rather than swapped, which would drop its own behaviour: hvac builds
+    # a plain requests.Session, so an engine client never meets this (vault BACKLOG #5355).
+    if type(session) not in (requests.Session, _NetrcFreeSession):
+        raise ValueError(
+            f"{connector}: cannot mount the strict reply reader, because the Vault client's "
+            f"requests session is a {type(session).__name__}, not a plain requests.Session"
         )
     # hvac keeps the proxies it passes with every request in `_kwargs`, private but the only place
     # they live. Read here so the build-time proxy is the one the send picks; when the attribute
@@ -1679,5 +1738,10 @@ def mount_strict_reply_adapter(
     # Before the adapter is mounted, so a refused hop leaves the session as hvac built it. The
     # adapter runs the check, so this one and each send's share its one read of the CRL flag.
     adapter.refuse_an_unrevoked_hop(sent, proxy)
+    # A caller-set truthy auth also skips the netrc read in prepare_request, so it is kept.
+    # requests tests truthiness there, so this does too.
+    if not session.auth:
+        session.auth = _NoAmbientAuth()
+    session.__class__ = _NetrcFreeSession
     for prefix in ("https://", "http://"):
         session.mount(prefix, adapter)

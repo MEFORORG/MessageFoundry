@@ -5678,7 +5678,10 @@ def _apply_insert_row(
     The three actions the ADR 0089 Phase A recognizer reads back (``set_field``/``copy_field``/
     ``delete_segment``) are emitted in their NATIVE Message-API form (``msg.set`` / ``msg.delete_segments``
     via :func:`_render_native_insert_call`) — no vocabulary import needed, and the inserted line round-
-    trips to the same editable row. Every OTHER action/lookup is rendered as its wrapper call from the
+    trips to the same editable row. A Copy Field from a literal whole field into a literal component
+    or subcomponent, with no parameter but ``src`` and ``dst``, is rendered as its wrapper call
+    (BACKLOG #5821; :func:`_copy_needs_wrapper`). Every
+    OTHER action/lookup is rendered as its wrapper call from the
     ``actions.py`` signature + ``params``; every existing line is byte-preserved (gate 2). Refuses an
     unknown vocabulary name, a missing required parameter (wrapper actions), a rendered line that would
     exceed ruff's line length, or — for a WRAPPER action — a name the module does not import (which would
@@ -5697,7 +5700,8 @@ def _apply_insert_row(
         raise LensRewriteError("insert_row 'params' must be an object of {name: value}")
     scope = _message_scope(handler_node, module_tree)
     needs_import = False
-    if action in _NATIVE_INSERT_ACTIONS:
+    wrapped_copy = action == "copy_field" and _copy_needs_wrapper(params)
+    if action in _NATIVE_INSERT_ACTIONS and not wrapped_copy:
         # ADR 0089: the three actions the Phase A recognizer reads back are inserted in their NATIVE
         # Message-API form (``msg.set`` / ``msg.delete_segments``). That references only ``msg`` — no
         # vocabulary import — so it matches a native estate AND skips the import-scope check below
@@ -6888,8 +6892,30 @@ def _copy_write_method(src: Any) -> str:
     """The ``Message`` write a native Copy Field from ``src`` uses (ADR 0206 rule 1): ``set_data`` for
     a literal component or subcomponent path, whose read is decoded, as ``actions.copy_field`` does;
     ``set`` otherwise. A ``src`` given as an expression cannot be classified and keeps ``set``; the
-    handler-security lint cannot see that one either."""
+    handler-security lint cannot see that one either. An insert of a literal whole-field ``src``
+    into a literal component or subcomponent ``dst`` with no other parameter writes no native form
+    at all (:func:`_copy_needs_wrapper`)."""
     return "set_data" if _is_leaf_literal(src) else "set"
+
+
+#: A literal HL7 path to a whole field, the grammar of ``parsing.peek.parse_path`` with no component.
+_WHOLE_FIELD_PATH_RE = re.compile(r"^[A-Z][A-Z0-9]{2}-\d+$")
+
+
+def _copy_needs_wrapper(params: dict[str, Any]) -> bool:
+    """Whether an inserted Copy Field must be the ``actions.copy_field`` call rather than a native
+    write: a literal whole-field ``src`` into a literal component or subcomponent ``dst``, with no
+    parameter but ``src`` and ``dst``. No ``Message`` write copies that the way ``copy_field`` does
+    (BACKLOG #5821): ``set`` would escape the field's escape sequences a second time. The call takes
+    no other argument, so an insert carrying any other key (``occurrence``, ``repetition``, or one
+    neither form reads) keeps the native form, as before the wrapper existed."""
+    src = params.get("src")
+    return (
+        set(params) <= {"src", "dst"}
+        and isinstance(src, str)
+        and _WHOLE_FIELD_PATH_RE.match(src) is not None
+        and _is_leaf_literal(params.get("dst"))
+    )
 
 
 #: The characters that template text carries as structure the author meant: the HL7 component,
@@ -7030,7 +7056,10 @@ def _render_native_insert_call(
     * ``set_field {path, value}`` renders ``msg.set(<path>, <value>)``, or ``msg.set_data`` when the
       value copies a decoded leaf (:func:`_native_write_method`, ADR 0206)
     * ``copy_field {src, dst}`` renders ``msg.set(<dst>, msg.field(<src>) or "")``, or ``msg.set_data``
-      in place of ``msg.set`` when ``src`` is a literal component or subcomponent path (ADR 0206)
+      in place of ``msg.set`` when ``src`` is a literal component or subcomponent path (ADR 0206);
+      the caller sends a literal whole-field ``src`` into a literal component or subcomponent
+      ``dst`` here only when the insert carries a key besides ``src`` and ``dst``
+      (:func:`_copy_needs_wrapper`)
     * ``delete_segment {segment_id}`` renders ``msg.delete_segments(<segment_id>)``
     * ``add_segment {line}`` renders ``msg.add_segment(<line>)`` (ADR 0106 section 3, Group 1)
     * ``add_repetition {path, value}`` renders ``msg.add_repetition(<path>, <value>)`` (ADR 0106 section 3, Group 1)

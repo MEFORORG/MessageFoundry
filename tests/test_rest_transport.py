@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import email.message
 import http.client
+import logging
 import urllib.error
 import urllib.request
+from typing import Any
 
 import pytest
 
@@ -143,6 +145,45 @@ def test_rest_rejects_non_http_scheme() -> None:
 def test_rest_basic_auth_header() -> None:
     dest = _dest(basic_user="u", basic_password="p")
     assert dest._headers["Authorization"] == "Basic dTpw"  # base64("u:p")
+
+
+_AUTH_SECRET = "ZZAUTHSECRET5354"
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"basic_user": "svc"},
+        {"basic_password": _AUTH_SECRET},
+        {"basic_user": "svc", "basic_password": ""},  # an env() value that resolved empty
+        {"basic_user": "", "basic_password": _AUTH_SECRET},
+    ],
+)
+def test_rest_half_basic_pair_is_refused(over: dict[str, Any]) -> None:
+    """BACKLOG #5354: one Basic half alone used to build and send no Authorization at all."""
+    with pytest.raises(rest_mod.HttpAuthError, match="must be set together") as ei:
+        _dest(**over)
+    assert "connection 'OB_REST'" in str(ei.value)
+    assert _AUTH_SECRET not in str(ei.value)
+
+
+def test_rest_basic_user_with_a_colon_is_refused() -> None:
+    """RFC 7617 splits the pair at the first colon, so the server would read a different user."""
+    with pytest.raises(rest_mod.HttpAuthError, match="must not contain ':'") as ei:
+        _dest(basic_user="svc:x", basic_password=_AUTH_SECRET)
+    assert _AUTH_SECRET not in str(ei.value) and "svc:x" not in str(ei.value)
+
+
+def test_rest_bearer_token_beside_basic_is_refused() -> None:
+    """Basic used to replace the configured bearer_token in the one Authorization header, silently."""
+    with pytest.raises(rest_mod.HttpAuthError, match="configure exactly one") as ei:
+        _dest(bearer_token=_AUTH_SECRET, basic_user="svc", basic_password=_AUTH_SECRET)
+    assert _AUTH_SECRET not in str(ei.value)
+
+
+def test_rest_bearer_token_alone_still_sends_it() -> None:
+    dest = _dest(bearer_token="tok")
+    assert dest._headers["Authorization"] == "Bearer tok"
 
 
 def test_rest_rejects_over_length_url() -> None:
@@ -609,6 +650,79 @@ def test_outbound_headers_from_metadata_is_pure_and_sanitizing() -> None:
     assert first == {"X-Trace-Id": "t-1", "X-Bad": "line1line2"}
     assert outbound_headers_from_metadata(None) == {}
     assert outbound_headers_from_metadata({}) == {}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Host",
+        "HOST",
+        "Content-Length",
+        "transfer-encoding",
+        "Connection",
+        "Keep-Alive",
+        "Proxy-Connection",
+        "TE",
+        "Trailer",
+        "Upgrade",
+        "Expect",
+        "Authorization",
+        "Cookie",
+        "cookie",
+    ],
+)
+def test_a_message_cannot_set_routing_framing_hop_by_hop_or_cookie_headers(
+    name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5352: these are dropped in any letter case, as Authorization is, and each drop is
+    logged by the set's own spelling; the rest of the bag still projects."""
+    bag = {f"http.header.{name}": "v", "http.header.X-Trace-Id": "t-1"}
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.rest"):
+        assert outbound_headers_from_metadata(bag) == {"X-Trace-Id": "t-1"}
+    assert f"per-message header {name.lower()!r}" in caplog.text
+
+
+def test_the_per_message_denied_headers_are_pinned() -> None:
+    """Narrowing the set lets a message set one of these again, so it is a reviewed change."""
+    from messagefoundry.transports.rest import PER_MESSAGE_DENIED_HEADERS
+
+    assert (
+        frozenset(
+            {
+                "authorization",
+                "host",
+                "content-length",
+                "transfer-encoding",
+                "connection",
+                "keep-alive",
+                "proxy-connection",
+                "te",
+                "trailer",
+                "upgrade",
+                "expect",
+                "cookie",
+            }
+        )
+        == PER_MESSAGE_DENIED_HEADERS
+    )
+
+
+@pytest.mark.parametrize("spelling", ["host", "HOST", "Host", "Host ", " host"])
+def test_ech_readdressing_pins_the_upstream_host_over_any_spelling(spelling: str) -> None:
+    """BACKLOG #5352: urllib folds header names with capitalize(), so a lowercase ``host`` after the
+    pinned ``Host`` used to replace it, and the sidecar would route to the wrong upstream."""
+    from messagefoundry.transports.rest import ech_readdressed_request
+
+    req = ech_readdressed_request(
+        "http://127.0.0.1:9000",
+        "https://partner.example.com:8443/api?x=1",
+        data=b"{}",
+        headers={"Host": "attacker.example", spelling: "attacker.example", "X-A": "1"},
+        method="POST",
+    )
+    assert req.get_header("Host") == "partner.example.com:8443"
+    assert req.full_url == "http://127.0.0.1:9000/api?x=1"
+    assert req.get_header("X-a") == "1"
 
 
 # --- BACKLOG #1663: an illegal request value is a permanent NAK, not an escaping internal error ----

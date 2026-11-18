@@ -27,6 +27,7 @@ def make_sr_part10(
         ("8480-6", "Systolic blood pressure", "120", "mm[Hg]"),
     ),
     sop_instance_uid: str | None = None,
+    study_date: str = "20260620",
 ) -> bytes:
     """Build a synthetic Basic Text SR Part-10 object (preamble + ``DICM`` + file meta) with a small
     ``ContentSequence`` of ``NUM`` measurements, returning its bytes. The second measurement is nested
@@ -42,7 +43,7 @@ def make_sr_part10(
     ds.StudyInstanceUID = generate_uid()
     ds.SeriesInstanceUID = generate_uid()
     ds.AccessionNumber = accession
-    ds.StudyDate = "20260620"
+    ds.StudyDate = study_date
     ds.StudyTime = "101500"
     ds.StudyDescription = study_description
 

@@ -6,9 +6,11 @@ CRUD + the bounded AND-compose layered query over search_messages. SQLite here; 
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -249,7 +251,9 @@ async def test_layered_compose_and_conflicts(engine: Engine) -> None:
 
 
 @pytest.mark.parametrize("stored", ['{"content": "MRN999', "[]", "5"], ids=["bad", "list", "int"])
-async def test_malformed_stored_criteria_are_still_a_400(engine: Engine, stored: str) -> None:
+async def test_malformed_stored_criteria_are_still_a_400(
+    engine: Engine, stored: str, caplog: pytest.LogCaptureFixture
+) -> None:
     """BACKLOG #2085 moved this decode to ``json_loads_or_refusal`` so its 400 chains nothing. The
     chain itself is not visible over HTTP, and the source gate in
     ``tests/test_from_none_is_not_redaction.py`` pins it; this pins that the refusal is unchanged."""
@@ -270,9 +274,17 @@ async def test_malformed_stored_criteria_are_still_a_400(engine: Engine, stored:
             "UPDATE search_presets SET criteria=? WHERE id=?", (stored, pid)
         )
         await engine.store._db.commit()
+        caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
         r = await c.get("/search/layered", params={"presets": pid}, headers=h)
     assert r.status_code == 400, r.text
     assert r.json()["detail"] == f"preset {pid} has malformed criteria"
+    # BACKLOG #5523: the store never writes it, so the refusal is logged and audited, not silent.
+    assert [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)] == [
+        (logging.WARNING, f"layered search refused preset {pid}: its criteria are malformed")
+    ]
+    assert await _refusal_audits(engine) == [
+        {"presets": 1, "refused": pid, "status": 400, "cause": "malformed"}
+    ]
 
 
 def _keep_raised(app: FastAPI) -> list[StarletteHTTPException]:
@@ -286,6 +298,13 @@ def _keep_raised(app: FastAPI) -> list[StarletteHTTPException]:
 
     app.add_exception_handler(StarletteHTTPException, _keep)
     return raised
+
+
+async def _refusal_audits(engine: Engine) -> list[dict[str, Any]]:
+    """The details of the route's ``preset.layered_search`` rows that record a refusal (#5523)."""
+    rows = await engine.store.list_audit(action="preset.layered_search")
+    details = [json.loads(a["detail"] or "{}") for a in rows]
+    return [d for d in details if "refused" in d]
 
 
 def _layered_refusal_log(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -382,7 +401,7 @@ async def test_a_preset_planted_in_the_callers_account_answers_423(tmp_path: Pat
 
 @pytest.mark.parametrize("stored", ["", None], ids=["empty", "null"])
 async def test_a_blanked_criteria_cell_answers_423_rather_than_widening(
-    engine: Engine, stored: str | None
+    engine: Engine, stored: str | None, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5523: a narrowing preset whose criteria cell is blanked outside the store is refused,
     never read as an empty filter. Read as ``{}``, it dropped out of the compose and the layered
@@ -421,7 +440,11 @@ async def test_a_blanked_criteria_cell_answers_423_rather_than_widening(
         await engine.store._db.execute(
             "UPDATE search_presets SET criteria=? WHERE id=?", (stored, narrow)
         )
+        await engine.store._db.execute(
+            "UPDATE search_presets SET last_used_at=NULL WHERE id=?", (narrow,)
+        )
         await engine.store._db.commit()
+        caplog.set_level(logging.WARNING, logger="messagefoundry.store.cell_tag")
         r = await c.get("/search/layered", params=layered, headers=h)
     assert r.status_code == 423, r.text
     assert (
@@ -429,10 +452,27 @@ async def test_a_blanked_criteria_cell_answers_423_rather_than_widening(
         == f"preset {narrow} has blank criteria, written outside the store, and cannot be used"
     )
     assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+    # BACKLOG #5523: refused at the store, so it is audited and logged there, and the refused
+    # recall is not stamped as a use; the route's own row names who asked.
+    audited = await engine.store.list_audit(action=PRESET_TAG_FAILED_ACTION)
+    assert len(audited) == 1 and narrow[:12] in (audited[0]["detail"] or ""), audited
+    assert [
+        rec.levelno
+        for rec in caplog.records
+        if rec.name == "messagefoundry.store.cell_tag" and "is blank" in rec.getMessage()
+    ] == [logging.WARNING]
+    cur = await engine.store._db.execute(
+        "SELECT last_used_at FROM search_presets WHERE id=?", (narrow,)
+    )
+    stamped = await cur.fetchone()
+    assert stamped is not None and stamped["last_used_at"] is None  # not recorded as a use
+    assert await _refusal_audits(engine) == [
+        {"presets": 2, "refused": narrow, "status": 423, "cause": "BlankCellError"}
+    ]
 
 
 async def test_a_planted_unmarked_criteria_cell_is_an_audited_integrity_refusal(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #5523, then #5650: an unmarked value planted in a keyed store's criteria cell escaped
     as a 500, then answered 423 through the route's plain ``CipherError`` arm, unaudited. Since
@@ -445,6 +485,12 @@ async def test_a_planted_unmarked_criteria_cell_is_an_audited_integrity_refusal(
 
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
+    from messagefoundry.store import cell_tag, crypto
+
+    # The unmarked WARNINGs are logged once per cell column per hour, process-wide, so an earlier
+    # refusal must not mute the control below (as tests/test_cell_tag.py resets them).
+    monkeypatch.setattr(cell_tag, "_reported", {})
+    monkeypatch.setattr(crypto, "_unmarked_logged", {})
 
     db = tmp_path / "keyed.db"
     store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
@@ -467,12 +513,15 @@ async def test_a_planted_unmarked_criteria_cell_is_an_audited_integrity_refusal(
                 "UPDATE search_presets SET criteria=? WHERE id=?", ('{"content": "MRN999"}', pid)
             )
             side.commit()
-            caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
+            # Every logger at DEBUG, so the MRN999 check below reads every record any module
+            # writes on this recall, not only the route's WARNINGs (BACKLOG #5523).
+            caplog.set_level(logging.DEBUG)
             r = await c.get("/search/layered", params={"presets": pid}, headers=h)
             assert r.status_code == 423, r.text
             assert r.json()["detail"] == (
                 f"preset {pid} failed its integrity check and cannot be used"
             )
+            assert any("unmarked" in rec.getMessage() for rec in caplog.records)  # control
             assert "unmarked" not in r.text and "MRN999" not in r.text
             assert raised[-1].__context__ is None and raised[-1].__cause__ is None
             logged = [rec for rec in caplog.records if rec.name == "messagefoundry.api.app"]
@@ -484,8 +533,24 @@ async def test_a_planted_unmarked_criteria_cell_is_an_audited_integrity_refusal(
             side.execute("UPDATE search_presets SET criteria='' WHERE id=?", (pid,))
             side.commit()
             r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+            assert r.status_code == 423, r.text
+            assert r.json()["detail"].startswith(f"preset {pid} has blank criteria")
+
+            # BACKLOG #5523: a planted BLOB reached AesGcmCipher.decrypt as bytes and answered 500.
+            side.execute("UPDATE search_presets SET criteria=? WHERE id=?", (b"{}", pid))
+            side.commit()
+            r = await c.get("/search/layered", params={"presets": pid}, headers=h)
         assert r.status_code == 423, r.text
-        assert r.json()["detail"].startswith(f"preset {pid} has blank criteria")
+        assert r.json()["detail"] == (
+            f"preset {pid} has non-text criteria, written outside the store, and cannot be used"
+        )
+        assert sorted(d["cause"] for d in await _refusal_audits(keyed)) == [
+            "BlankCellError",
+            "NonTextCellError",
+            "UnmarkedCellError",
+        ]
+        # Each is drift, so each also wrote the store's tag-failed row.
+        assert len(await store.list_audit(action=PRESET_TAG_FAILED_ACTION)) == 3
     finally:
         side.close()
         await keyed.stop()
@@ -496,10 +561,14 @@ async def _layered_with_decrypt_raising(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     exc: CipherError,
+    recalls: int = 1,
+    audit_raises: bool = False,
 ) -> tuple[httpx.Response, list[StarletteHTTPException], str]:
-    """One layered recall of a fresh preset whose criteria ``decrypt`` raises ``exc``: the
-    response, the HTTP exceptions the app raised, and the preset id. Vault Transit's cipher has no
-    ``holds_key_for``, so ``open_tagged_cell`` keeps its errors as they are, except its
+    """``recalls`` layered recalls of a fresh preset whose criteria ``decrypt`` raises ``exc``: the
+    last response, the HTTP exceptions the app raised, and the preset id. Control: the same preset
+    recalls with 200 before ``decrypt`` is patched. With ``audit_raises``, the route's own audit
+    write raises ``exc`` too, as a Transit store's audit MAC does in an outage. Vault Transit's
+    cipher has no ``holds_key_for``, so ``open_tagged_cell`` keeps its errors as they are, except its
     ``UnauthenticatedCipherError`` and ``UnmarkedCipherError`` (BACKLOG #5650). The keyless store's
     cipher has none either, so its ``decrypt`` stands in for Transit's, and the error takes the
     store's real path."""
@@ -516,6 +585,8 @@ async def _layered_with_decrypt_raising(
         )
         assert r.status_code == 200, r.text
         pid = str(r.json()["id"])
+        r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+        assert r.status_code == 200, r.text  # control: unpatched, the preset recalls
 
         assert isinstance(engine.store, MessageStore)
         cipher = engine.store._cipher
@@ -533,7 +604,17 @@ async def _layered_with_decrypt_raising(
             patched.setattr(cipher, "is_encrypted", lambda _stored: True)
             # And it declares, as Transit does, that it cannot name its keys.
             patched.setattr(cipher, "names_no_keys", True, raising=False)
-            r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+            if audit_raises:
+                record_audit = engine.store.record_audit
+
+                async def _audit_raise(action: str, *a: Any, **kw: Any) -> None:
+                    if action == "preset.layered_search":
+                        raise exc
+                    await record_audit(action, *a, **kw)  # the sign-in's own rows still land
+
+                patched.setattr(engine.store, "record_audit", _audit_raise)
+            for _ in range(recalls):
+                r = await c.get("/search/layered", params={"presets": pid}, headers=h)
     return r, raised, pid
 
 
@@ -562,26 +643,52 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
     ]
 
 
+async def test_an_outage_answers_503_when_the_refusal_audit_cannot_be_written(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5523: on a Vault Transit store the audit MAC is Transit's, so the outage that
+    answers 503 fails the route's refusal audit too. The refusal still answers 503 with
+    Retry-After, not a 500, and the failed write is logged by type name."""
+    outage = CipherUnavailableError("Transit unreachable for key mf-store-secret")
+    r, _raised, pid = await _layered_with_decrypt_raising(
+        engine, monkeypatch, caplog, outage, audit_raises=True
+    )
+    assert r.status_code == 503, r.text
+    assert "Retry-After" in r.headers
+    assert (
+        logging.ERROR,
+        f"layered search could not audit its refusal of preset {pid}"
+        " (503 CipherUnavailableError; CipherUnavailableError)",
+    ) in [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)]
+
+
 async def test_a_transit_refusal_on_the_criteria_is_logged_at_error(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5523: a Transit refusal that is not the value's AEAD tag, a key-version refusal say,
     stays a plain ``CipherError``, not a ``CellTagError``, so it writes no integrity audit row and
-    raises no alert, and its log record is the engine's only record of it. It is a 423, logged at
-    ERROR with the type name alone: no exception object, cipher text or criteria. The cipher raises
-    the error by hand, so this pins the route's arm, not how ``TransitCipher`` classifies a
-    refusal. Transit's AEAD refusal takes the integrity arm (BACKLOG #5650; the next test)."""
+    raises no alert. It is a 423, and the route writes its own ``preset.layered_search`` row for
+    each refused recall. It is logged at ERROR with the type name alone, once per preset and error
+    class per interval: no exception object, cipher text or criteria. The cipher raises the error
+    by hand, so this pins the route's arm, not how ``TransitCipher`` classifies a refusal.
+    Transit's AEAD refusal takes the integrity arm (BACKLOG #5650; the next test)."""
     refusal = CipherError("Transit decrypt refused (key='mf-store-secret'): MRN999")
-    r, raised, pid = await _layered_with_decrypt_raising(engine, monkeypatch, caplog, refusal)
+    r, raised, pid = await _layered_with_decrypt_raising(
+        engine, monkeypatch, caplog, refusal, recalls=2
+    )
     assert r.status_code == 423, r.text
     assert "mf-store-secret" not in r.text and "MRN999" not in r.text
     assert r.json()["detail"].startswith(f"preset {pid} cannot be opened with the store's keys")
     assert raised[-1].__context__ is None and raised[-1].__cause__ is None
     assert "mf-store-secret" not in repr(raised[-1].args) and "MRN999" not in repr(raised[-1].args)
-    # _layered_refusal_log also checks no record carries exc_info or a non-str arg.
+    # _layered_refusal_log also checks no record carries exc_info or a non-str arg. Two refusals,
+    # one ERROR: the second falls inside the interval.
     assert [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)] == [
         (logging.ERROR, f"layered search refused preset {pid}: CipherError")
     ]
+    refused = {"presets": 1, "refused": pid, "status": 423, "cause": "CipherError"}
+    assert await _refusal_audits(engine) == [refused, refused]
+    assert await engine.store.list_audit(action=PRESET_TAG_FAILED_ACTION) == []
 
 
 async def test_a_transit_tag_refusal_on_the_criteria_is_an_audited_integrity_refusal(
@@ -629,8 +736,9 @@ async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> 
         h = await _login(c, "op")
         ids = []
         for name, needle in (("miss", "NOSUCHNEEDLE"), ("hit", "MRN999")):
+            criteria = {"content": needle, "channel_id": "ch1"}
             r = await c.post(
-                "/search/presets", json={"name": name, "criteria": {"content": needle}}, headers=h
+                "/search/presets", json={"name": name, "criteria": criteria}, headers=h
             )
             assert r.status_code == 200, r.text
             ids.append(r.json()["id"])
@@ -644,6 +752,11 @@ async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> 
         await app.state.summary_auditor.flush(engine.store)
     rows = await engine.store.list_audit(action="summary_access")
     assert [a["actor"] for a in rows] == ["op"]
+    # The one returned summary, under the channel the preset scoped. A list returns it
+    # display-masked to a holder (BACKLOG #2346), so it counts as masked, not as read.
+    assert rows[0]["channel_id"] == "ch1"
+    detail = json.loads(rows[0]["detail"])
+    assert (detail["count"], detail["masked"]) == (0, 1), detail
 
 
 async def test_layered_requires_read_permission(engine: Engine) -> None:

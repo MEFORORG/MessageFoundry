@@ -7,12 +7,11 @@
 // answer→ConnObj mapping, argv, and validators live in the vscode-free connectionWizardModel (tested
 // node-side); this file is just the Extension-Host plumbing.
 import * as vscode from "vscode";
-import { configDir, runJson, serviceConfig, serviceConfigIsSet, workspaceDir } from "./cli";
+import { writerConfigTarget, runJson, workspaceDir } from "./cli";
 import { type ConnObj, nameCollisionError } from "./connectionMerge";
 import {
   WIZARD_TRANSPORTS,
   buildConnObj,
-  connectionServiceConfig,
   connectionUpsertArgs,
   planWizardSave,
   settingKeysFor,
@@ -230,9 +229,13 @@ async function saveConnection(
   // wizard on an EXISTING name would silently overwrite that connection — the same overwrite hole the
   // webview form closed via planSave (#234/#1081). Reuse the ONE policy so the wizard refuses
   // identically. A list failure aborts the save (upserting blind could clobber an existing table).
+  const target = writerConfigTarget();
+  if (target === undefined) {
+    return;
+  }
   let entries: ConnObj[];
   try {
-    entries = await runJson<ConnObj[]>(["connection", "list", "--config", configDir()], ws);
+    entries = await runJson<ConnObj[]>(["connection", "list", "--config", target.configDir], ws);
   } catch (e) {
     void vscode.window.showErrorMessage(
       `MessageFoundry: could not re-read connections.toml before saving ${conn.name} (nothing was written) — ${e instanceof Error ? e.message : String(e)}`,
@@ -245,7 +248,7 @@ async function saveConnection(
     return;
   }
   try {
-    await runJson(connectionUpsertArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), conn), ws);
+    await runJson(connectionUpsertArgs(target.configDir, target.serviceConfig, conn), ws);
   } catch (e) {
     void vscode.window.showErrorMessage(
       `MessageFoundry: could not save ${conn.name} — ${e instanceof Error ? e.message : String(e)}`,

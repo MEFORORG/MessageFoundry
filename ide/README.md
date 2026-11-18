@@ -183,6 +183,10 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 
 ## Settings
 
+In an untrusted workspace (Restricted Mode), VS Code ignores the workspace's own values for
+`configDir`, `serviceConfig`, `messageSetsDir`, `liveStatus.enabled` and `liveStatus.intervalSeconds`,
+and uses your user value or the default instead, until you trust the workspace (BACKLOG #5404).
+
 - `messagefoundry.pythonPath` (default `python`) — interpreter used to run the CLI. When left at the
   default, the extension auto-detects a workspace `.venv` (`.venv/Scripts/python.exe` on Windows,
   `.venv/bin/python` elsewhere), so no setup is needed in a typical repo checkout. **Machine-scoped**, so
@@ -191,8 +195,25 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   the separate `messagefoundry-toolkit` distribution (ADR 0201), installed at the engine's own version
   (`pip install "messagefoundry-toolkit==<version>"`, or `pip install -r requirements-dev.txt` in a
   scaffolded config repo). Without it, both say so and name the distribution. In this repository's
-  checkout the toolkit imports from the source tree, so nothing extra is installed.
-- `messagefoundry.configDir` (default `samples/config`) — config modules directory.
+  checkout the toolkit imports from the source tree, through the editable install in the
+  checkout's own `.venv`, so nothing extra is installed. Every CLI run passes
+  `-P -X disable-remote-debug` as serve does, so the working directory is not put on the import
+  path: a config module can import its `_`-prefixed siblings, but not a top-level workspace package
+  that the interpreter cannot otherwise import. The Test Bench's Debug launch goes through debugpy
+  and does not take these options.
+- `messagefoundry.configDir` (default `samples/config`) — config modules directory. This,
+  `serviceConfig` and `messageSetsDir` are relative to the workspace folder. A value set in workspace
+  settings whose spelling names a path outside the first workspace folder is not used, nor is a user
+  value that is not text: the next value down applies instead, with a warning, in a trusted window
+  too. A command that writes or starts something under one of these settings refuses instead, with
+  an error naming the setting, rather than act on the value used in its place: at least the alert,
+  code set and connection edits, Generate Samples, Promote, Start, Restart, copying the start
+  command, New Route, version-control setup and the security editor. A user value does not lift
+  that refusal; to use a path elsewhere, remove the workspace value and set the path in user
+  settings. Version-control setup writes no commit hook when either folder lies outside the
+  workspace, because the hook is committed; it still sets up the rest. The check reads the spelling only, so it does not catch a link or junction inside
+  the folder that leads out of it; the New Route wizard and the security editor make their own link
+  checks before they write.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
@@ -204,7 +225,7 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   the `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
   user or workspace settings (a folder value is ignored), every connection edit passes it, unless
-  it is blank, as `--service-config`, whether or not the file exists, so a missing file fails the edit with
+  it is blank (a value that is not used refuses the edit, above), as `--service-config`, whether or not the file exists, so a missing file fails the edit with
   `service config not found` rather than letting it be checked against another file. A blank
   setting leaves the flag off for connection edits, as it does for Start and Restart. A blank
   workspace value still hides a user value, so the default file applies, not the user's. Setting it to the default name, in
@@ -255,7 +276,10 @@ anything into your OS certificate store. If it cannot verify, the request fails 
 
 This happens at startup and again whenever you change `messagefoundry.engineUrl`,
 `messagefoundry.environments` or `messagefoundry.serviceConfig`. Every part of it fails soft — with no engine on `PATH`, an untrusted
-workspace, or a `serviceConfig` that names nothing, the extension simply trusts nothing extra.
+workspace, or a `serviceConfig` that names nothing, the extension simply trusts nothing extra. A
+workspace `serviceConfig` that names a path outside the workspace folder, or a user value that is not
+text, is not replaced by another file here: the extension runs no `cert inventory`, trusts no engine
+certificate from it, and says so in the MessageFoundry Engine output. A `caFile` pin still applies.
 
 If a request reports that it cannot verify the certificate, check two things: that
 `messagefoundry.serviceConfig` names the settings TOML of the engine you are pointing at, and that
