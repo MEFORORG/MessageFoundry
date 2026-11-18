@@ -68,7 +68,7 @@ import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Literal
 
 from messagefoundry import file_lock
 
@@ -97,6 +97,7 @@ _DIRECTORY_GONE_WINERRORS = frozenset({64, 59})
 #: network paths out of reach (53, 67) too. A module global so a test can take either branch.
 _WINDOWS = sys.platform == "win32"
 _WINERROR_FILE_NOT_FOUND = 2
+_WINERROR_PATH_NOT_FOUND = 3
 
 
 def _directory_unreachable(exc: OSError) -> bool:
@@ -111,12 +112,17 @@ def _directory_unreachable(exc: OSError) -> bool:
     )
 
 
-def _not_found_confirms(exc: FileNotFoundError) -> bool:
-    """Whether a ``FileNotFoundError`` from a segment's own ``lstat`` or ``stat`` confirms its
-    file gone. On Windows only ``winerror`` 2 does. On POSIX it is always ENOENT, which cannot
-    tell a gone file from a directory gone: the caller checks the directory after this."""
+def _not_found_confirms(exc: FileNotFoundError, *, link_target: bool = False) -> bool:
+    """Whether a ``FileNotFoundError`` from a segment's own ``lstat``, or from ``stat`` on a
+    segment that is a symlink (``link_target``), confirms it gone. On Windows only ``winerror``
+    2 does, and 3 too for a link's target, since a link into a missing directory gives 3. On
+    POSIX it is always ENOENT, which cannot tell a gone file from a directory gone: the caller
+    checks the directory after this."""
     if _WINDOWS:
-        return getattr(exc, "winerror", None) == _WINERROR_FILE_NOT_FOUND
+        winerror = getattr(exc, "winerror", None)
+        return winerror == _WINERROR_FILE_NOT_FOUND or (
+            link_target and winerror == _WINERROR_PATH_NOT_FOUND
+        )
     return True
 
 
@@ -490,7 +496,7 @@ class LogSpool:
                     self._close_reader()
                     self._close_writer()
                     return None
-                if not gone:
+                if gone is None:
                     # The open said ENOENT but the file's own lstat did not confirm it: a
                     # transient fault (an SMB share reconnecting), never a reason to retire
                     # records still undelivered.
@@ -502,9 +508,11 @@ class LogSpool:
                 # Each pass retires one, so the loop ends with the segments.
                 if seq == self._write_seq:
                     self._close_writer()
-                # Not unlinked: its file is confirmed gone, and a delete that later succeeded
-                # through reclaim() could only ever destroy a file the confirmation missed.
-                self._retire(seq, unlink=False)
+                # A gone file is not unlinked: a delete that later succeeded through reclaim()
+                # could only ever destroy a file the confirmation missed. A dangling link is: it
+                # holds no records, and left in place it would make the next open() refuse the
+                # whole spool.
+                self._retire(seq, unlink=gone == "link")
             except OSError as exc:
                 self.read_errors += 1
                 self.read_faulted = True
@@ -517,27 +525,27 @@ class LogSpool:
                     self._close_writer()
                 return None
 
-    def _segment_confirmed_missing(self, seq: int) -> bool:
-        """Whether segment ``seq``'s own file is confirmed gone: its ``lstat`` raises
-        ``FileNotFoundError``, or it is a symlink whose ``stat`` does (a dangling link, which
-        ``open()`` can never read). On Windows only ``winerror`` 2 confirms. Any other answer,
-        including another ``OSError``, is not a confirmation."""
+    def _segment_confirmed_missing(self, seq: int) -> Literal["file", "link"] | None:
+        """How segment ``seq`` is confirmed gone: ``"file"`` when its ``lstat`` raises
+        ``FileNotFoundError``, ``"link"`` when it is a symlink whose ``stat`` does (a dangling
+        link, which ``open()`` can never read), as :func:`_not_found_confirms` reads each. Any
+        other answer, including another ``OSError``, is ``None``: not a confirmation."""
         path = self._path(seq)
         try:
             mode = path.lstat().st_mode
         except FileNotFoundError as exc:
-            return _not_found_confirms(exc)
+            return "file" if _not_found_confirms(exc) else None
         except OSError:
-            return False
+            return None
         if not stat.S_ISLNK(mode):
-            return False
+            return None
         try:
             path.stat()
         except FileNotFoundError as exc:
-            return _not_found_confirms(exc)
+            return "link" if _not_found_confirms(exc, link_target=True) else None
         except OSError:
-            return False
-        return False
+            return None
+        return None
 
     def _directory_present(self) -> bool:
         """Whether the spool directory can be reached and is a directory, read by ``stat``.

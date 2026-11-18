@@ -963,13 +963,16 @@ def test_on_windows_winerror_2_does_confirm_a_segment_gone(
         spool.close()
 
 
-def test_a_segment_that_is_a_dangling_symlink_is_retired_not_wedged(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("winerror", [2, 3])
+def test_a_dangling_symlink_segment_is_retired_and_its_link_unlinked(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
 ) -> None:
     """A head segment whose path is a dangling symlink (lstat shows a link, stat says not found)
-    can never be opened, so it counts as gone: it is retired, not unlinked, and the read moves on,
-    as main retired it. NEGATIVE CONTROL: on 5dc6d1b359 lstat succeeded, nothing was confirmed and
-    every peek returned None."""
+    can never be opened, so it counts as gone: it is retired, the link itself is unlinked, and
+    the read moves on. On Windows a link into a missing directory gives winerror 3, which counts
+    here too. NEGATIVE CONTROL: on cf6bfe2d12 the link was not unlinked, and winerror 3 wedged
+    the spool."""
+    monkeypatch.setattr(log_spool, "_WINDOWS", True)
     spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
     spool.open()
     try:
@@ -979,7 +982,7 @@ def test_a_segment_that_is_a_dangling_symlink_is_retired_not_wedged(
         assert len(segments) >= 2
         head_seq = spool._segments[0]
         lost = [json.loads(line)["line"] for line in segments[0].read_bytes().splitlines()]
-        real_open, real_path, real_unlink = spool._open_reader, spool._path, spool._unlink
+        real_open, real_path = spool._open_reader, spool._path
         unlinked: list[int] = []
 
         class _DanglingLink:
@@ -987,7 +990,7 @@ def test_a_segment_that_is_a_dangling_symlink_is_retired_not_wedged(
                 return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
             def stat(self) -> None:
-                raise _windows_not_found(2)
+                raise _windows_not_found(winerror)
 
         def open_reader(seq: int) -> None:
             if seq == head_seq:
@@ -999,7 +1002,7 @@ def test_a_segment_that_is_a_dangling_symlink_is_retired_not_wedged(
 
         def record_unlink(seq: int) -> bool:
             unlinked.append(seq)
-            return real_unlink(seq)
+            return True
 
         with monkeypatch.context() as patch:
             patch.setattr(spool, "_open_reader", open_reader)
@@ -1008,10 +1011,41 @@ def test_a_segment_that_is_a_dangling_symlink_is_retired_not_wedged(
             entry = spool.peek()
             assert entry is not None and entry.line not in lost
             assert spool.unreadable == 1 and spool.read_errors == 0
-            assert head_seq not in unlinked
-        assert segments[0].exists()  # never unlinked
+            assert unlinked == [head_seq]
     finally:
         spool.close()
+
+
+def test_a_spool_with_a_retired_dangling_link_opens_again_and_sends_the_rest(
+    spool_dir: Path, tmp_path: Path
+) -> None:
+    """A real dangling symlink at the head: peek retires it and removes the link, so the next
+    start's open() does not refuse the spool, and every other undelivered segment is sent.
+    NEGATIVE CONTROL: on cf6bfe2d12 the link stayed and the restart raised SpoolUnavailable."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        head = _segments(spool_dir)[0]
+        lost = [json.loads(line)["line"] for line in head.read_bytes().splitlines()]
+        head.unlink()
+        try:
+            os.symlink(tmp_path / "nowhere" / "target.jsonl", head)
+        except (OSError, NotImplementedError) as exc:  # Windows without symlink rights
+            pytest.skip(f"cannot create a symlink here: {type(exc).__name__}")
+        entry = spool.peek()
+        assert entry is not None and entry.line not in lost
+        assert not os.path.lexists(head)
+    finally:
+        spool.close()
+    restarted = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    restarted.open()
+    try:
+        expected = [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
+        assert _drain(restarted) == expected
+    finally:
+        restarted.close()
 
 
 def test_a_directory_that_drops_between_the_checks_retires_nothing(
