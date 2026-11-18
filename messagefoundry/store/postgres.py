@@ -2062,6 +2062,11 @@ class PostgresStore:
     # complete_with_response), with the same single-transaction atomicity as SQLite.
     supports_response_capture = True
 
+    # The per-namespace state_version bump makes converge_state_cache a real read-through of another
+    # process's transform-state writes (Track B Step 6b), so the engine runs the convergence loop over
+    # this backend in a cluster AND across engine shards on one node (BACKLOG #5984).
+    converges_transform_state = True
+
     # Pass-through (PT) re-ingress (the `pt_deliveries` branch of transform_handoff, ADR 0013
     # generalized) is implemented at full SQLite parity: the atomic PT-child + parent-marker branch runs
     # inside transform_handoff's transaction (see _insert_passthrough_child_pg / _insert_passthrough_
@@ -3438,10 +3443,17 @@ class PostgresStore:
         return refreshed
 
     def enable_state_convergence(self) -> None:
-        """Turn on per-namespace state-version bumping (Track B Step 6b). The engine calls this in a
-        cluster (is_clustered()) BEFORE workers start, so a sibling's converge_state_cache sees every
-        write. Single-node never calls it → no state_version writes → byte-identical."""
+        """Turn on per-namespace state-version bumping (Track B Step 6b). The engine calls this whenever
+        another process shares the store, in a cluster (is_clustered()) or on an engine shard of a
+        multi-shard config (BACKLOG #5984), BEFORE workers start, so a sibling's converge_state_cache
+        sees every write. A lone process never calls it → no state_version writes → byte-identical."""
         self._cluster_state_convergence = True
+
+    async def reload_state_cache(self) -> None:
+        """No-op on Postgres (BACKLOG #5984): a sibling's writes already reach this handle through
+        :meth:`converge_state_cache`, whose runner is live before any promotion, and a whole-cache
+        reload racing that runner could only regress it."""
+        return None
 
     async def converge_state_cache(self) -> list[str]:
         """Pull any newer shared transform-state writes into this node's local cache (Track B Step 6b).

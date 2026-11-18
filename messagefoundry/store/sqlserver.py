@@ -3498,6 +3498,10 @@ class SqlServerStore:
     # re-ingress worker on this backend.
     supports_response_capture = True
 
+    # No per-namespace state version, so converge_state_cache is a no-op and the engine must not run or
+    # announce a convergence loop over this backend (BACKLOG #5984).
+    converges_transform_state = False
+
     # Pass-through (PT) re-ingress (the `pt_deliveries` branch of transform_handoff, ADR 0013
     # generalized) is implemented at full SQLite parity: the atomic PT-child + parent-marker branch runs
     # inside transform_handoff's transaction (see _insert_passthrough_child_mssql / _insert_passthrough_
@@ -9715,15 +9719,27 @@ class SqlServerStore:
         return refreshed
 
     async def converge_state_cache(self) -> list[str]:
-        """No-op on the SQL Server backend (Track B Step 6b): a single-node backend with no cross-node
-        state convergence (transform state IS written here via transform_handoff, but never converged
-        across nodes). Present for ``Store`` protocol completeness; returns ``[]``."""
+        """No-op on the SQL Server backend (Track B Step 6b): this backend has no per-namespace state
+        version, so it cannot read through another process's transform-state writes. Returns ``[]``.
+        :attr:`converges_transform_state` is ``False`` here, so the engine never runs the convergence
+        loop over it and warns instead where several processes share the store (BACKLOG #5984). An
+        active-passive promotion re-reads the whole cache through :meth:`reload_state_cache`."""
         return []
 
     def enable_state_convergence(self) -> None:
         """No-op on the SQL Server backend (Track B Step 6b): there is no cross-node convergence here, so
         there is no per-namespace version to bump. Present for ``Store`` protocol completeness."""
         return None
+
+    async def reload_state_cache(self) -> None:
+        """Re-read the whole transform-state cache from the shared ``state`` table (BACKLOG #5984).
+
+        SQL Server HA is active-passive: only the leader runs transforms, but a standby warmed its cache
+        at open, so on promotion it would serve state as of its own start while the prior leader went on
+        writing. The engine calls this on promotion, before the graph's workers start, so nothing reads
+        the cache mid-swap. It fails closed like the open-time warm: a row it cannot decrypt raises, and
+        the cache in place is kept."""
+        await self._load_state_cache()
 
     async def dead_letter_missing_handlers(
         self, valid_names: set[str], now: float | None = None

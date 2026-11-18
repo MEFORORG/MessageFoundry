@@ -155,6 +155,15 @@ byte-identical. Cross-node reads remain eventually-consistent (bounded by the he
 fine for the read-mostly correlation use cases (the same non-linearization caveat the read side already
 documents).
 
+**Engine shards and SQL Server (BACKLOG #5984).** Engine shards of a multi-shard config run as separate
+processes over one unified store, each with its own cache, so the engine also turns the bump and the
+runner on for an engine shard, not only for a cluster node. Only Postgres has the `state_version` token
+(`converges_transform_state` on the store); SQL Server's `converge_state_cache()` is a no-op, so over it
+the engine starts no runner and logs a warning that transform state does not converge across the
+processes sharing the store. SQL Server HA is active-passive, so a promoted standby re-reads its whole
+cache (`reload_state_cache()`) before its workers start; a write the prior leader commits while it winds
+down, after that read, is still missed. Engine shards over SQL Server do not converge at all.
+
 ## Build plan (separate PR)
 
 1. `SetState` + widened `HandlerFn` union; `transform_one` returns `(deliveries, state_ops)`; `_sends`
