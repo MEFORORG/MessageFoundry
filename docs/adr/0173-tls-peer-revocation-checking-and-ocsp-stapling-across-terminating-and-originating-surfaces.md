@@ -832,7 +832,11 @@ attestation stays visible elsewhere: `messagefoundry check` lists a connection's
 FTPS directions, the kept line on a `tls_allow_expired` hop now says what it lacks. Each passes
 `RevocationHopGuard.capture` the context it dials with and `expiry_relaxed=True`. That one flag
 settles both halves of §13's rule where the caller passes no remedy of its own: `crl_checked` is
-False whatever CRL the context loads, and the record names `EXPIRY_RELAXED_WAYS_ACROSS`. A remedy
+False whatever CRL the context loads, and the record names `EXPIRY_RELAXED_WAYS_ACROSS`, or, on a
+context whose `verify_mode` is `CERT_NONE`, `PEER_NOT_VERIFIED_WAYS_ACROSS` with the
+`CrlNoCredit.PEER_NOT_VERIFIED` words. *(CORRECTED 2026-11-18, vault BACKLOG #4912: this sentence
+ended "the record names `EXPIRY_RELAXED_WAYS_ACROSS`", with no `CERT_NONE` exception; that
+exception exists since #4912.)* A remedy
 the caller does pass is used as given, so it could still name the CRL whose credit the flag
 dropped; nothing in `capture` refuses that. Before this note those hops handed the guard no context
 instead, which gave the same disposition; where an older passage of this ADR says one of them hands
@@ -1738,10 +1742,13 @@ on first deployment, with no attestation.
   2026-10-30, and it has changed. The two sites, and both FTPS directions, now pass the guard the
   context they dial with and `expiry_relaxed=True`; FTPS still reads the setting, the two sites the
   flag. `RevocationHopGuard.capture` gained that keyword, which drops the CRL credit and makes an
-  omitted remedy `EXPIRY_RELAXED_WAYS_ACROSS`, and the guard gained a `context_skips_validity`
+  omitted remedy `EXPIRY_RELAXED_WAYS_ACROSS`, or `PEER_NOT_VERIFIED_WAYS_ACROSS` on a context whose
+  `verify_mode` is `CERT_NONE`, and the guard gained a `context_skips_validity`
   field that feeds `crl_is_a_check`. `context_checks_revocation` itself is unchanged. The
   disposition on these hops is the same: refused under an enforcing posture unless attested. §4.3's
-  note of 2026-11-03 says what the record now reads.)*
+  note of 2026-11-03 says what the record now reads. CORRECTED 2026-11-18, vault BACKLOG #4912: this
+  said the keyword "makes an omitted remedy `EXPIRY_RELAXED_WAYS_ACROSS`", with no `CERT_NONE`
+  exception; that exception exists since #4912.)*
   *(Note 2026-11-04, BACKLOG #5086: the `context_skips_validity` field and `crl_is_a_check` are
   gone. `capture` reads `skips_validity_period` off any context it is handed and, on True, drops
   the CRL credit and treats the hop as relaxed whether or not the caller passed the flag, so these
