@@ -65,6 +65,13 @@ class _OutageCipher:
         return self._inner.decrypt(stored, aad=aad)
 
 
+class _TransitVerdictCipher(_OutageCipher):
+    """An :class:`_OutageCipher` that, as Vault Transit, cannot name its keys, so a key service's
+    verdict on a marked cell reads as a tag failure rather than a corrupt cell (BACKLOG #5884)."""
+
+    holds_key_for = None
+
+
 Claim = Callable[[MessageStore], Awaitable[list[Any]]]
 
 
@@ -94,10 +101,12 @@ _ALL_CLAIMS = pytest.mark.parametrize(
 )
 
 
-async def _open(tmp_path: pathlib.Path) -> tuple[MessageStore, _OutageCipher, pathlib.Path]:
+async def _open(
+    tmp_path: pathlib.Path, cipher_cls: type[_OutageCipher] = _OutageCipher
+) -> tuple[MessageStore, _OutageCipher, pathlib.Path]:
     inner = make_cipher(generate_key(), write_v2=True)
     assert isinstance(inner, AesGcmCipher)
-    cipher = _OutageCipher(inner)
+    cipher = cipher_cls(inner)
     db = tmp_path / "claim.db"
     store = await MessageStore.open(db, cipher=cipher)  # type: ignore[arg-type]
     await store.enqueue_message(channel_id="IB", raw="MSH|r", deliveries=[(_DEST, "B1")])
@@ -348,7 +357,7 @@ async def test_a_verdict_is_still_dead_lettered_and_reported(
 ) -> None:
     """BACKLOG #5765: a 400 and a 413 are Vault's verdict on the row, so the claim
     dead-letters and reports it as before, never sets it aside to retry with no cap."""
-    store, cipher, db = await _open(tmp_path)
+    store, cipher, db = await _open(tmp_path, _TransitVerdictCipher)
     try:
         cipher.fault = _transit_error(kind)
         cipher.healthy_opens = 0

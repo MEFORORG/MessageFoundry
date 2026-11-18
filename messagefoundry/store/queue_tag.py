@@ -62,6 +62,7 @@ __all__ = [
     "queue_open_fault",
     "release_unreturned",
     "set_aside_deadline",
+    "CorruptQueueCellError",
     "QueueTagError",
     "alert_queue_tag_failure",
     "is_tag_failure",
@@ -205,6 +206,23 @@ class QueueTagError(CipherError):
     :class:`CipherError`, so every claim path that already dead-letters an undecryptable row
     dead-letters this one the same way. Carries no row value."""
 
+    #: Whether the refusal is drift, which is audited and alerted. :class:`CorruptQueueCellError`
+    #: is not.
+    drift: bool = True
+
+
+class CorruptQueueCellError(QueueTagError):
+    """A queue row's ``payload`` under a key this process holds that no tag check can judge,
+    because the cell is corrupt: bad base64, a ciphertext too short to hold a tag, or a plaintext
+    whose tag VERIFIED but is not UTF-8 (BACKLOG #5884), as
+    :class:`~messagefoundry.store.cell_tag.CorruptCellError` is for a tagged cell.
+
+    It is not drift, so it writes no tag-failed audit row and raises no ``integrity_drift`` alert;
+    it is only logged. It is still a :class:`QueueTagError`, so every claim and read contains it
+    the same way: a claim dead-letters the row, a read is refused."""
+
+    drift = False
+
 
 def queue_payload_aad(
     *,
@@ -265,6 +283,11 @@ def is_tag_failure(cipher: Cipher, stored: str) -> bool:
         return False
     holds = getattr(cipher, "holds_key_for", None)
     return bool(holds(stored)) if callable(holds) else True
+
+
+def _names_its_keys(cipher: object) -> bool:
+    """Whether ``cipher`` can say which keys it holds (Vault Transit cannot)."""
+    return callable(getattr(cipher, "holds_key_for", None))
 
 
 #: The only HTTP statuses that are the key service's verdict on the row (BACKLOG #5765): 400 and
@@ -410,7 +433,8 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
 
     Raises :class:`QueueTagError` when the cell does not open under the row's tag (see
     :func:`_names_tag_failure`; a key or format problem raises the cipher's own error, and so does
-    a key service that gave no verdict, :func:`is_transient_open_failure`), when a keyed
+    a key service that gave no verdict, :func:`is_transient_open_failure`), its subclass
+    :class:`CorruptQueueCellError` when a cell under a held key is corrupt, when a keyed
     store's row (or any ``ref`` row) holds a blank ``payload``, or when a ``ref`` row's sealed key
     differs from its ``body_ref`` column. A keyless store writes plaintext and has no tag to check,
     so there only the reference comparison binds anything."""
@@ -428,6 +452,13 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     except CipherError as exc:
         if not _names_tag_failure(cipher, payload, exc):
             raise  # a key, format or key-service problem, which the cipher's own error names
+        if not isinstance(exc, UnauthenticatedCipherError) and _names_its_keys(cipher):
+            # Under a key this process holds, only a failed AEAD check means the cell was sealed
+            # for another row. Any other refusal is the cell itself being unreadable. A cipher that
+            # cannot name its keys keeps every refusal as a tag failure (see _names_tag_failure).
+            raise CorruptQueueCellError(
+                f"the queue row's payload is corrupt and cannot be read under the key it names ({exc})"
+            ) from exc
         raise QueueTagError(
             f"integrity: the queue row's payload does not open under its own tag ({exc})"
         ) from exc
@@ -451,7 +482,12 @@ class _AuditSink(Protocol):
 
 
 async def report_queue_tag_failure(
-    store: _AuditSink, cipher: object, row: Any, *, outcome: str = "was dead-lettered"
+    store: _AuditSink,
+    cipher: object,
+    row: Any,
+    *,
+    error: QueueTagError,
+    outcome: str = "was dead-lettered",
 ) -> None:
     """Record that ``row`` failed its queue tag: a WARNING, a :data:`QUEUE_TAG_FAILED_ACTION` audit
     row and an ``integrity_drift`` alert through the cipher's tag-failure hook (BACKLOG #2593).
@@ -460,28 +496,44 @@ async def report_queue_tag_failure(
     ``ERROR``. A caller whose dead-letter write failed reports the tag failure all the same, with
     ``outcome`` saying so (BACKLOG #5735). Names the row by a short id prefix and its stage, never
     a row value. An audit or alert failure is logged and swallowed: reporting must never undo the
-    dead-letter."""
-    ref = str(row["id"])[:_ROW_REF_LEN]
-    stage = row["stage"]
-    try:
-        await store.record_audit(
-            QUEUE_TAG_FAILED_ACTION,
-            actor="system",
-            channel_id=row["channel_id"],
-            detail=json.dumps({"queue_row": ref, "stage": stage}, sort_keys=True),
-        )
-    except Exception:  # noqa: BLE001 -- the dead-letter stands whatever the audit write does
-        _log.exception("the %s audit row could not be written", QUEUE_TAG_FAILED_ACTION)
-    alert_queue_tag_failure(cipher, row, outcome=outcome)
+    dead-letter. A corrupt cell (``error`` is not drift, :class:`CorruptQueueCellError`) is only
+    logged."""
+    if error.drift:
+        ref = str(row["id"])[:_ROW_REF_LEN]
+        try:
+            await store.record_audit(
+                QUEUE_TAG_FAILED_ACTION,
+                actor="system",
+                channel_id=row["channel_id"],
+                detail=json.dumps({"queue_row": ref, "stage": row["stage"]}, sort_keys=True),
+            )
+        except Exception:  # noqa: BLE001 -- the dead-letter stands whatever the audit write does
+            _log.exception("the %s audit row could not be written", QUEUE_TAG_FAILED_ACTION)
+    alert_queue_tag_failure(cipher, row, error=error, outcome=outcome)
 
 
-def alert_queue_tag_failure(cipher: object, row: Any, *, outcome: str) -> None:
+def _log_corrupt(row: Any, outcome: str) -> None:
+    _log.warning(
+        "a %s queue row's payload is corrupt and %s (row %s)",
+        row["stage"],
+        outcome,
+        str(row["id"])[:_ROW_REF_LEN],
+    )
+
+
+def alert_queue_tag_failure(
+    cipher: object, row: Any, *, error: QueueTagError, outcome: str
+) -> None:
     """Log a WARNING and raise the ``integrity_drift`` alert for ``row`` through the cipher's
     tag-failure hook, with no audit row (BACKLOG #2593).
 
     The audit-free form is for a read that runs inside a writer transaction (an operator resend's
     source), which cannot take the writer lock again; that read is refused, and ``outcome`` says
-    so. Names the row by its stage and a short id prefix, never a row value. Never raises."""
+    so. Names the row by its stage and a short id prefix, never a row value. A corrupt cell
+    (``error`` is not drift, :class:`CorruptQueueCellError`) is only logged. Never raises."""
+    if not error.drift:
+        _log_corrupt(row, outcome)
+        return
     reason = (
         f"a {row['stage']} queue row failed its integrity tag and {outcome}"
         f" (row {str(row['id'])[:_ROW_REF_LEN]})"
