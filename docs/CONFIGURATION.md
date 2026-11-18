@@ -2345,7 +2345,11 @@ hop's context, with no restart (BACKLOG #299). OpenSSL then uses the newest CRL 
 issuer. The engine applies a replaced file only when all three of these hold:
 
 1. The file passes the rules a start applies. Every CRL parses, has a `nextUpdate`, is not a delta CRL
-   and has not expired. Its BEGIN line starts a line: OpenSSL skips an indented CRL block, so the
+   and has not expired. No issuing distribution point limits it to CA certificates, attribute
+   certificates or some revocation reasons, or makes it indirect, and it carries no critical
+   extension OpenSSL does not handle, on the CRL or on an entry (vault BACKLOG #5896): OpenSSL,
+   with no extended CRL support turned on, judges no peer by such a CRL and refuses the peers it
+   would have covered. Give full-scope base CRLs. Its BEGIN line starts a line: OpenSSL skips an indented CRL block, so the
    engine refuses one. A `-----BEGIN X509 CRL-----` marker inside a comment line refuses the file
    too, on purpose: the engine cannot tell that text from a CRL the file is meant to hold. Take
    the marker text out of the comment. The file carries no certificate the hop does not already
@@ -2390,7 +2394,7 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 
 **A start checks each CRL's signature too (vault BACKLOG #2905).** When a hop builds its TLS context,
 the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
-the file in one case only, where it has proof. Three things all hold then. A listed CA has the
+the file for its signature in one case only, where it has proof. Three things all hold then. A listed CA has the
 CRL's issuer name, compared as OpenSSL compares it for the case of ASCII letters and exactly
 otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its
 key identifier. The engine ran the signature check with that key, and the check failed. Where
@@ -2431,6 +2435,13 @@ checks. OpenSSL still checks the signature at each handshake it judges.
 Each CRL in the file is judged on its own, as for an expired CRL. So a badly signed copy refuses
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
 such a file was measured to pass its handshakes. Remove the bad copy.
+
+A start also refuses a CRL whose signature verifies, when every listed CA whose key verifies it
+carries a key usage extension without `cRLSign` (vault BACKLOG #5896, RFC 5280 section 6.3.3).
+OpenSSL refuses to take a CRL from such a CA, so every handshake judged by that CRL would fail
+with `key usage does not include CRL signing`. A CA with no key usage extension is not refused.
+Sign the CRL with a CA whose key usage includes `cRLSign`, or reissue the CA with it. The
+running-hop reload and the expiry scan do not make this check.
 
 Anything short of that proof passes this check, and the engine logs one WARNING for the file. The
 file then loads unless another rule refuses it; on the API listener one such rule refuses some of

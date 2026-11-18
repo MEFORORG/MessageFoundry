@@ -629,7 +629,10 @@ def _check_crl_signatures(
     own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
 
     **Only the proven case refuses.** That is :class:`~messagefoundry.pki.CrlSignature` state
-    ``bad``, and that class says what counts as proof.
+    ``bad``, and that class says what counts as proof. A ``verified`` CRL whose
+    :attr:`~messagefoundry.pki.CrlSignature.without_crl_sign` is set refuses too, after that:
+    OpenSSL refuses to take a CRL from a CA whose key usage lacks ``cRLSign`` (vault BACKLOG
+    #5896).
     OpenSSL checks a CRL's signature only at the handshake. Before this, such a file started clean
     and then failed every handshake it judged, with a TLS error that does not name the CRL. An
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
@@ -667,6 +670,7 @@ def _check_crl_signatures(
     first logs that the file is loaded (vault BACKLOG #5511)."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
     from messagefoundry.pki import (
+        NO_CRL_SIGN,
         PROVEN_BAD_SIGNATURE,
         UNCONFIRMED_SIGNATURE,
         UNLISTED_SIGNATURE,
@@ -704,6 +708,13 @@ def _check_crl_signatures(
         raise ValueError(
             f"{label}: {bad.where} {PROVEN_BAD_SIGNATURE}. Give this setting the CRL that CA "
             "signed, or remove this CRL if a good one from that issuer is already in the file"
+        )
+    if (unable := next((s for s in judged if s.without_crl_sign), None)) is not None:
+        # Vault BACKLOG #5896: proven as a bad signature is, since the CA that verifies it is one
+        # OpenSSL refuses to take a CRL from.
+        raise ValueError(
+            f"{label}: {unable.where} {NO_CRL_SIGN}. Give this setting a CRL signed by a CA "
+            "whose key usage includes cRLSign, or reissue that CA with it"
         )
     if refusal is not None:
         raise ValueError(f"{label}: {refusal}")
