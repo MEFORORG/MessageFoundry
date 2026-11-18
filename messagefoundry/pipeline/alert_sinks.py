@@ -2562,7 +2562,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     async def aclose(self) -> None:
         """Drain and stop the delivery task, then cancel every control task still running and wait
-        for it to end (BACKLOG #5909), so none outlives the sink. The lifespan closes this sink
+        for it to end (BACKLOG #5909). The lifespan closes this sink
         after engine.stop(), so such a task can only meet a stopped runner. Runs even when the sink
         was never started. A close cancelled while its sentinel waits on a full queue cancels the
         delivery task too and waits for it (BACKLOG #5907), so the startup unwind's cut does not
@@ -2580,8 +2580,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     await asyncio.gather(drain, return_exceptions=True)
             finally:
                 # In a finally of its own (BACKLOG #5907 step 3), so a second cancel landing on
-                # the drain's wait still reaches every control task. Read after that wait, so a
-                # task dispatched during it is cancelled too.
+                # the drain's wait still cancels the control tasks dispatched before the drain wait
+                # ends. Read after that wait, so a task dispatched during it is cancelled too.
                 pending = [task for task in self._control_tasks if not task.done()]
                 for task in pending:
                     task.cancel()
