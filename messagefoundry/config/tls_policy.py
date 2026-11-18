@@ -385,6 +385,11 @@ def harden_crl_check(
     so it hides none of the refusals above. A signature it cannot confirm, short of proof, loads
     with one warning for the file.
 
+    Since vault BACKLOG #5896, :func:`judge_crl_bytes` also refuses a CRL OpenSSL never judges a
+    certificate by and one with a critical extension OpenSSL does not handle, and the signature
+    check refuses a CRL from a CA whose key usage lacks ``cRLSign``, after a proven bad signature
+    and before the refusal below.
+
     A seventh, with ``chain`` only, since vault BACKLOG #5627 and #5511: a loaded CA with no CRL of
     its own in the file (:func:`messagefoundry.pki.own_crl_reason`). It is the last refusal. It
     is raised inside :func:`_check_crl_signatures`, after a proven bad signature refuses and before

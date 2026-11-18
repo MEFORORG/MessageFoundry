@@ -2345,11 +2345,12 @@ hop's context, with no restart (BACKLOG #299). OpenSSL then uses the newest CRL 
 issuer. The engine applies a replaced file only when all three of these hold:
 
 1. The file passes the rules a start applies. Every CRL parses, has a `nextUpdate`, is not a delta CRL
-   and has not expired. No issuing distribution point limits it to CA certificates, attribute
-   certificates or some revocation reasons, or makes it indirect, and it carries no critical
-   extension OpenSSL does not handle, on the CRL or on an entry (vault BACKLOG #5896): OpenSSL,
-   with no extended CRL support turned on, judges no peer by such a CRL and refuses the peers it
-   would have covered. Give full-scope base CRLs. Its BEGIN line starts a line: OpenSSL skips an indented CRL block, so the
+   and has not expired. No issuing distribution point limits it to attribute certificates or
+   some revocation reasons, or makes it indirect: with no extended CRL support turned on,
+   OpenSSL never judges a certificate by such a CRL. It carries no critical extension OpenSSL
+   does not handle, on the CRL or on an entry: OpenSSL refuses every peer it judges by such a CRL
+   (vault BACKLOG #5896). A CRL of CA certificates only, or of user certificates only, is not
+   refused, though a hop whose chain needs the other kind fails at the handshake. Its BEGIN line starts a line: OpenSSL skips an indented CRL block, so the
    engine refuses one. A `-----BEGIN X509 CRL-----` marker inside a comment line refuses the file
    too, on purpose: the engine cannot tell that text from a CRL the file is meant to hold. Take
    the marker text out of the comment. The file carries no certificate the hop does not already
@@ -2443,7 +2444,7 @@ with `key usage does not include CRL signing`. A CA with no key usage extension 
 Sign the CRL with a CA whose key usage includes `cRLSign`, or reissue the CA with it. The
 running-hop reload and the expiry scan do not make this check.
 
-Anything short of that proof passes this check, and the engine logs one WARNING for the file. The
+Anything short of a proof of a bad signature passes this check, and the engine logs one WARNING for the file. The
 file then loads unless another rule refuses it; on the API listener one such rule refuses some of
 these cases after that WARNING (the paragraph after this list says which). At least these three cases warn:
 

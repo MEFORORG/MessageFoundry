@@ -362,10 +362,11 @@ def judge_every_crl(
     the delta aside, so revocations only the delta lists are dropped. Give the setting base CRLs
     only.
 
-    **So does a CRL OpenSSL would judge no leaf by** (vault BACKLOG #5896): one whose Issuing
-    Distribution Point limits its scope (:func:`_out_of_scope`), and one carrying a critical
-    extension OpenSSL does not handle, on the CRL or on an entry (:func:`_unhandled_critical`).
-    Each failed closed at every handshake it judged, with an error that does not name the file."""
+    **So do two shapes OpenSSL fails closed on** (vault BACKLOG #5896): a CRL whose Issuing
+    Distribution Point means OpenSSL never judges a certificate by it (:func:`_out_of_scope`),
+    and one carrying a critical extension OpenSSL does not handle, on the CRL or on an entry
+    (:func:`_unhandled_critical`), which refuses every peer OpenSSL judges by it. Both started
+    clean before, and the handshake error does not name the file."""
     blocks = list(_crl_blocks(pem))
     # Refused, never skipped, even when the uncounted marker is only text in a comment line and
     # OpenSSL loads the file (vault BACKLOG #2866, decided 2026-10-12). Two reasons. The engine
@@ -408,15 +409,8 @@ def judge_every_crl(
                 )
             if (why := _out_of_scope(extensions)) is not None:
                 raise ValueError(why)
-            try:
-                critical = _unhandled_critical(crl, extensions)
-            except _UNREAD_EXTENSIONS as exc:
-                if not refuse_unread_extensions:
-                    raise
-                raise ValueError(
-                    f"its entries' extensions do not read ({type(exc).__name__}: {exc})"
-                ) from exc
-            if critical is not None:
+            fingerprint = crl.fingerprint(hashes.SHA256())
+            if (critical := _unhandled_critical(crl, extensions, fingerprint)) is not None:
                 raise ValueError(
                     f"it carries the critical extension {critical}, which OpenSSL does not "
                     "handle, so OpenSSL refuses every peer it judges by this CRL with "
@@ -433,7 +427,7 @@ def judge_every_crl(
                         issuer_key=_crl_issuer_key(crl.issuer),
                         this_update=crl.last_update_utc,
                         next_update=nxt,
-                        fingerprint=crl.fingerprint(hashes.SHA256()),
+                        fingerprint=fingerprint,
                         selection=_selection(extensions),
                     ),
                 )
@@ -457,52 +451,83 @@ _HANDLED_CRITICAL = frozenset(
 
 
 def _out_of_scope(read: _CrlExtensions) -> str | None:
-    """Why the Issuing Distribution Point of the CRL ``read`` came from keeps it from covering the
-    certificates a hop judges, or ``None`` (vault BACKLOG #5896, RFC 5280 section 5.2.5).
+    """Why OpenSSL would never judge a certificate by the CRL ``read`` came from, read from its
+    Issuing Distribution Point, or ``None`` (vault BACKLOG #5896, RFC 5280 section 5.2.5).
 
-    The engine turns on no extended CRL support, so OpenSSL never uses a reason-partitioned or an
-    indirect CRL, and a CRL of CA certificates only, or of attribute certificates only, is out of
-    scope for a leaf. Each fails closed at the handshake, with 'unable to get certificate CRL' or
-    'Different CRL scope', and that error does not name the file. A CRL of user certificates only
-    is not refused here: it covers the leaves a leaf check judges."""
-    for ext in read.extensions:
-        if not isinstance(ext.value, x509.IssuingDistributionPoint):
-            continue
-        idp = ext.value
-        if idp.only_contains_ca_certs:
-            shape = "covers CA certificates only"
-        elif idp.only_contains_attribute_certs:
-            shape = "covers attribute certificates only"
-        elif idp.only_some_reasons is not None:
-            shape = "covers only some revocation reasons"
-        elif idp.indirect_crl:
-            shape = "is an indirect CRL"
-        else:
-            continue
-        return (
-            f"its issuing distribution point says it {shape}, and the engine turns on no "
-            "extended CRL support, so OpenSSL judges no leaf by it and refuses each peer whose "
-            "issuer has no other CRL. Give a full-scope base CRL: one with no issuing "
-            "distribution point, or one that does not limit what it covers"
-        )
-    return None
+    The engine turns on no extended CRL support, so OpenSSL scores a reason-partitioned or an
+    indirect CRL zero and never uses it, and it puts a CRL of attribute certificates only out of
+    scope for every certificate. Such a CRL is never of use, and where it is its issuer's only
+    CRL each peer under that issuer is refused with an error that does not name the file.
+
+    **A CRL of CA certificates only, an ARL, is not refused**, nor one of user certificates only.
+    Each is in scope for some certificates, and which ones a hop judges by it depends on the
+    chain: a root's ARL beside its intermediate's full CRL passes a whole-chain check, measured
+    by review on CPython 3.14 with OpenSSL 3.5.7. This has no chain to judge them against."""
+    try:
+        idp = read.extensions.get_extension_for_class(x509.IssuingDistributionPoint).value
+    except x509.ExtensionNotFound:
+        return None
+    if idp.only_contains_attribute_certs:
+        shape = "covers attribute certificates only"
+    elif idp.only_some_reasons is not None:
+        shape = "covers only some revocation reasons"
+    elif idp.indirect_crl:
+        shape = "is an indirect CRL"
+    else:
+        return None
+    return (
+        f"its issuing distribution point says it {shape}, and the engine turns on no extended "
+        "CRL support, so OpenSSL never judges a certificate by it, and refuses each peer whose "
+        "issuer has no other CRL. Give a base CRL whose issuing distribution point, if it has "
+        "one, does not do that"
+    )
 
 
-def _unhandled_critical(crl: x509.CertificateRevocationList, read: _CrlExtensions) -> str | None:
-    """The dotted OID of a critical extension OpenSSL does not handle, on the CRL ``read`` came
-    from or on one of its entries, or ``None`` (vault BACKLOG #5896, RFC 5280 sections 5.2, 5.3).
+#: :func:`_unhandled_critical`'s verdict on a CRL's entries, by the SHA-256 of its DER. A hop
+#: such as the PostgreSQL store builds a context per connection, and reading every entry of a
+#: long CRL each time would cost that much per connection. Bounded, and cleared when full.
+_ENTRY_VERDICTS: dict[bytes, str | None] = {}
+_ENTRY_VERDICTS_MAX = 256
+
+
+def _unhandled_critical(
+    crl: x509.CertificateRevocationList, read: _CrlExtensions, fingerprint: bytes
+) -> str | None:
+    """Where the CRL ``read`` came from carries a critical extension OpenSSL does not handle, on
+    the CRL or on one of its entries, as the extension's dotted OID, or ``None`` (vault BACKLOG
+    #5896, RFC 5280 sections 5.2 and 5.3). OpenSSL then refuses every peer it judges by the CRL.
+
     On an entry, OpenSSL handles only the certificate issuer extension. Reading every entry costs
     time on a long CRL: measured 2026-11-18 on Windows, CPython 3.14, about 31 ms for 20,000
-    entries that each carry a reason code. :func:`judge_every_crl` pays it once per block. An
-    entry extension ``cryptography`` cannot read raises as it raised it."""
+    entries that each carry a reason code. So the entries' verdict is kept by ``fingerprint``.
+    **An entry whose extensions ``cryptography`` cannot read, at least a duplicate extension or a
+    reason code it does not know, ends the entry check with no verdict**: this adds a diagnosis,
+    and such a CRL loaded before it. OpenSSL still refuses a critical extension it meets there."""
     for ext in read.extensions:
         if ext.critical and ext.oid not in _HANDLED_CRITICAL:
             return str(ext.oid.dotted_string)
-    for entry in crl:
-        for ext in entry.extensions:
-            if ext.critical and ext.oid != CRLEntryExtensionOID.CERTIFICATE_ISSUER:
-                return f"{ext.oid.dotted_string} on a revoked entry"
-    return None
+    if fingerprint in _ENTRY_VERDICTS:
+        return _ENTRY_VERDICTS[fingerprint]
+    verdict: str | None = None
+    try:
+        for entry in crl:
+            found = next(
+                (
+                    ext
+                    for ext in entry.extensions
+                    if ext.critical and ext.oid != CRLEntryExtensionOID.CERTIFICATE_ISSUER
+                ),
+                None,
+            )
+            if found is not None:
+                verdict = f"{found.oid.dotted_string} on a revoked entry"
+                break
+    except (ValueError, x509.DuplicateExtension, *_UNREAD_EXTENSIONS):
+        verdict = None
+    if len(_ENTRY_VERDICTS) >= _ENTRY_VERDICTS_MAX:
+        _ENTRY_VERDICTS.clear()
+    _ENTRY_VERDICTS[fingerprint] = verdict
+    return verdict
 
 
 def _selection(
@@ -1186,7 +1211,10 @@ def crl_signature_finding(pem: bytes, ca_ders: Iterable[bytes]) -> CrlSignatureF
     after a CA renews its key. Before #3506 the reload read one flag that folded those three
     states together.
 
-    **It holds back more than a start refuses (vault BACKLOG #2905).** A start refuses only
+    **It does not hold back a CRL from a CA without cRLSign**, which a start refuses (vault
+    BACKLOG #5896, :attr:`CrlSignature.without_crl_sign`): that CRL reads ``verified`` here.
+
+    **Otherwise it holds back more than a start refuses (vault BACKLOG #2905).** A start refuses only
     ``bad``, the proven case, and loads ``unproven`` and ``uncheckable`` with a warning. So the
     reload holds back some files that a start would load, at least a genuine SHA-1 CRL from a
     judged CA, whose revocations then wait for a restart (the ``uncheckable`` state says why).

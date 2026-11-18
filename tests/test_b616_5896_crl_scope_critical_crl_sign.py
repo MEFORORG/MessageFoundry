@@ -30,6 +30,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from messagefoundry import pki as pki_module
 from messagefoundry.config import loaded_crls
 from messagefoundry.config.tls_policy import judge_crl_bytes
 from messagefoundry.pki import NO_CRL_SIGN, judge_crl_signatures
@@ -157,7 +158,6 @@ def _judge(pem: bytes) -> None:
 
 
 _OUT_OF_SCOPE = {
-    "ca-only": (_idp(only_contains_ca_certs=True), "covers CA certificates only"),
     "attribute-only": (
         _idp(only_contains_attribute_certs=True),
         "covers attribute certificates only",
@@ -199,6 +199,46 @@ def test_a_full_scope_crl_and_a_user_only_crl_still_load(tmp_path: Path) -> None
         crl = pki.crl_file(pem, name)
         _handshake(pki.raw_hop(crl), pki.server())  # OpenSSL passes it
         _handshake(pki.hop(crl), pki.server())  # and so does the engine's hop
+
+
+def test_a_ca_only_crl_is_not_refused(tmp_path: Path) -> None:
+    """An ARL, a CRL of CA certificates only, is in scope for the CAs of a chain: a root's ARL
+    beside its intermediate's full CRL passes a whole-chain check. The engine has no chain to
+    judge it against, so it loads (code review round 1 of this row)."""
+    pki = _Pki(tmp_path)
+    _judge(_crl(pki.key, extensions=[(_idp(only_contains_ca_certs=True), True)]))
+
+
+def test_an_entry_that_does_not_read_gives_no_verdict() -> None:
+    """An entry whose extensions ``cryptography`` refuses, such as a duplicate extension or an
+    unknown reason code, loaded before #5896, so the entry check gives no verdict on it rather
+    than refusing the start. Stood in by an entry whose extensions raise each such error."""
+
+    class _Entry:
+        def __init__(self, error: Exception) -> None:
+            self._error = error
+
+        @property
+        def extensions(self) -> x509.Extensions:
+            raise self._error
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    crl = x509.load_pem_x509_crl(_crl(key))
+    read = pki_module._crl_extensions(crl)
+    for n, error in enumerate(
+        (
+            x509.DuplicateExtension("twice", _PRIVATE),
+            ValueError("Unsupported reason code: 7"),
+            x509.UnsupportedGeneralNameType("x400Address"),
+        )
+    ):
+
+        class _Crl:
+            def __iter__(self, error: Exception = error) -> object:
+                return iter([_Entry(error)])
+
+        stand_in: x509.CertificateRevocationList = _Crl()  # type: ignore[assignment]
+        assert pki_module._unhandled_critical(stand_in, read, b"stand-in %d" % n) is None
 
 
 def test_an_unhandled_critical_crl_extension_refuses_at_start(tmp_path: Path) -> None:
