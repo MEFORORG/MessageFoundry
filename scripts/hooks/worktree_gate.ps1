@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.17.9"
+$GateVersion = "2026.11.17.10"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -826,8 +826,9 @@ function Get-ScanRawIndexMap($Seg) {
 # chdirs, a relative chdir after an earlier line's) where the invocation's `-C` does not make that
 # directory irrelevant -- an absolute `-C` is read past such a chdir, under the conditions in
 # Get-InvocationReading and the resolver's -OwnWindow branch; and git options after the verb.
-# Rules 3 and 3c do not reliably read a git word the case-sensitive `$gitInvocation` pattern misses,
-# such as `git.EXE` or `GIT`. At least these are ALLOWED from the primary (measured 2026-11-18):
+# Rules 3 and 3c do not reliably read a git word that rules 3 and 3c's case-sensitive match of
+# `$gitInvocation` misses, such as `git.EXE` or `GIT`. At least these are ALLOWED from the primary
+# (measured 2026-11-18):
 # `git.EXE reset --hard` and `git.EXE config core.hooksPath /nope` under Bash, and `GIT reset
 # --hard` and `GIT config core.hooksPath /nope` under the PowerShell tool. Also, at least: any line
 # after an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer

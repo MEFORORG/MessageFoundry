@@ -598,7 +598,7 @@ def test_a_bash_payload_on_an_earlier_line_does_not_hide_a_later_lines_payload(
 ) -> None:
     # Review round 462e4285: an intermediate head emitted line 1's payload ahead of line 2's, so rule
     # 3b judged line 1's checkout (in an ungoverned repository) and never reached line 2's. Measured
-    # ALLOW at a6da3c77526 and DENY on origin/main f0e49f45c5c.
+    # ALLOW on that head (2026-11-17) and DENY on origin/main f0e49f45c5c.
     who = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
     for args in (["commit", "-q", "--allow-empty", "-m", "x"], ["branch", rig.other]):
         subprocess.run(
