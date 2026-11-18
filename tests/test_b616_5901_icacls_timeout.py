@@ -2,10 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The trust-anchor DACL read bounds its ``icacls`` run (vault BACKLOG #5901).
 
-An anchor on a stalled share, or behind a stalled filter driver, kept ``icacls`` waiting with no
-bound, and so did every caller of :func:`dacl_is_owner_only`. The read now passes a timeout, and
-running out answers ``None``, the undeterminable verdict, never a pass. ``subprocess.run`` is
-faked: no real share is stalled.
+A stalled ``icacls`` run held every caller of :func:`dacl_is_owner_only` with no bound. The read
+now passes a timeout, and running out answers ``None``, the undeterminable verdict. The bound
+covers icacls only: the in-process reads :func:`evaluate_anchor` makes before it are not bounded
+here, and ``_ICACLS_TIMEOUT_S``'s comment names what else stays open. ``subprocess.run`` is faked:
+no real share or child is stalled.
 """
 
 from __future__ import annotations

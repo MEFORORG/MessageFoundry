@@ -1235,16 +1235,15 @@ def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool | None:
 
 #: How long :func:`dacl_is_owner_only` lets ``icacls`` run (vault BACKLOG #5901). A local read
 #: answers in well under a second, and with no bound a stall in icacls held its caller forever.
-#: Running out answers ``None``, the undeterminable verdict, which ``enforce`` refuses unless a pin
-#: matches and ``warn`` warns about and loads, as for every other ``None``.
+#: Running out answers ``None``, the undeterminable verdict, handled as every other ``None`` is
+#: (module item 6).
 #:
 #: It bounds icacls only, and not fully. :func:`evaluate_anchor` reads the anchor's bytes and its
 #: path in-process before this runs, with no bound, so a share that stalls those reads still holds
-#: the caller. And ``subprocess.run`` kills the child on the timeout, then on Windows waits for its
-#: pipes with no bound, so a child that cannot be terminated, for example one held in a
-#: non-cancellable I/O request, still holds it. A caller on the event loop should run the
-#: evaluation in a worker thread, as the lane check, the audited preflight and the connector
-#: builds do (engine PR 2815), so such a stall holds that thread and not the loop.
+#: the caller. And ``subprocess.run`` kills the child on the timeout, then waits for it to exit, and
+#: on Windows for its pipes, with no bound, so a child that cannot be terminated, for example one
+#: held in a non-cancellable I/O request, still holds it. :func:`evaluate_anchor` says how a caller
+#: on the event loop keeps such a stall off the loop.
 _ICACLS_TIMEOUT_S = 30.0
 
 
@@ -1292,7 +1291,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
             )
         except subprocess.TimeoutExpired:
             log.warning(
-                "icacls did not read the DACL of %r within %.0f seconds; the DACL could not be "
+                "icacls did not read the DACL of %r within %g seconds; the DACL could not be "
                 "determined",
                 name,
                 _ICACLS_TIMEOUT_S,
