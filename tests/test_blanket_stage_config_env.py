@@ -70,6 +70,7 @@ _QUOTED_VALUE_OPEN = pytest.mark.xfail(
 )
 QUOTED_VALUE_STILL_ALLOWED = [
     pytest.param('git --config-env "user.name=GN" add "-A"', id="config-env-quoted-value"),
+    pytest.param('git -C "x" add "-A"', id="dash-C-quoted-value-quoted-flag"),
     pytest.param("git --attr-source 'status' add '-A'", id="attr-source-single-quoted-value"),
     pytest.param('git -C "D:/repo" add "."', id="dash-C-quoted-value-quoted-pathspec"),
     pytest.param('git -c "user.name=x" add "-A"', id="dash-c-quoted-value"),

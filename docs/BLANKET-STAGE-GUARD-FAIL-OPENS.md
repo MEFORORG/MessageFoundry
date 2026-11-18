@@ -668,18 +668,23 @@ the cap, every payload family measured for section 4a finished well inside the l
 machine, or a payload shape nobody has measured, could still take longer. This page does not claim
 that none exists.
 
-**A quoted global-option value is a residual too (BACKLOG #5450).** At least these are allowed:
-`git -C "x" add "-A"`, `git --config-env "user.name=GN" add "-A"`, `git --attr-source 'status' add
-'-A'`, `git -C "D:/repo" add "."`, and the glued forms `git --config-env="a=B" add "-A"` and
-`git --git-dir=".git" add "-A"`. A glued value opens the hole for any global option, listed or not.
-The guard finds the subcommand on the view with quoted text blanked to spaces, so the quoted value
-splits into two words. The resolver skips at most one, then reads the closing quote as the
-subcommand, and the arguments are read from the blanked view, where the quoted `"-A"` or `"."` is
-not seen. The guard verdicts were measured; what git did was not run for this page. A loop that
-skipped to the closing quote was tried and reverted: the blanker ignores escapes, so that loop
-could skip past the real subcommand onto a read-only word and turn a deny into an allow. Closing
-this needs a reading that knows the shell's quoting. tests/test_blanket_stage_config_env.py pins
-these forms as strict xfails, so a repair shows up as an unexpected pass.
+**A quoted global-option value is a residual too (BACKLOG #5450).** Unlike the rows above, these
+forms were measured for the guard's verdict only: git was not run on them for this page. The guard
+allows at least `git -C "x" add "-A"`, `git --config-env "user.name=GN" add "-A"`,
+`git -C "D:/repo" add "."`, and the glued forms `git --config-env="a=B" add "-A"` and
+`git --git-dir=".git" add "-A"`; it also allows `git --attr-source 'status' add '-A'`, which git
+could run as a stage only where a ref named `status` exists. The guard finds the subcommand on the
+view with quoted text blanked to spaces, so a quoted value leaves its two quotes as two words.
+After a separate value (`-C "x"`) the resolver skips the opening quote as the value and reads the
+closing quote as the subcommand. After a glued value (`--git-dir=".git"`) the option word itself
+ends in the opening quote and is on neither skip list, so the closing quote is read as the
+subcommand; that is why a glued value opens the hole for any global option, listed or not. Either
+way the arguments are then read from the blanked view, where the quoted `"-A"` or `"."` is not
+seen. A loop that skipped to the closing quote was tried and reverted: the blanker ignores
+escapes, so that loop could skip past the real subcommand onto a read-only word and turn a deny
+into an allow. Closing this needs a reading that knows the shell's quoting.
+tests/test_blanket_stage_config_env.py pins these forms as strict xfails, so a repair shows up as
+an unexpected pass.
 
 **5.2 Forms next to an accepted one, where the answer's words do not fit.** Each has a nearest
 accepted line. This page does not sort them under it, because the words differ.
