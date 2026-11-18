@@ -60,11 +60,13 @@ IPV4_MAPPED_BASE: Final = int(IPV4_MAPPED.network_address)
 
 #: IPv6 prefixes whose addresses carry an IPv4 client: the NAT64 well-known and local-use prefixes
 #: (RFC 6052, RFC 8215), Teredo (RFC 4380), 6to4 (RFC 3056) and the deprecated IPv4-compatible
-#: form. Only the span limit on the HTTP listener's ``trusted_proxies`` reads this tuple
-#: (BACKLOG #5525). The listener's budget keying (``_budget_key``, ``_embedded_client``,
-#: ``_is_phantom``) reads the single prefixes and ``ipaddress``'s Teredo and 6to4 readings instead,
-#: and :func:`allowlist_restricts` reads :data:`_IPV4_EMBEDDING_RANGES`, which holds the
-#: IPv4-mapped block and SIIT (``::ffff:0:0:0/96``) and leaves out 6to4.
+#: form. Only the span limit on the HTTP listener's ``trusted_proxies``
+#: (``config.listener_proxies``) reads ``IPV4_EMBEDDING_PREFIXES`` (BACKLOG #5525). The listener's
+#: budget keying, at least ``_budget_key``, ``_embedded_client`` and ``_is_phantom``, reads
+#: ``NAT64_WELL_KNOWN``, ``NAT64_LOCAL_USE``, ``IPV4_COMPATIBLE`` and ``ipaddress``'s Teredo and
+#: 6to4 readings instead. :func:`allowlist_restricts` reads :data:`_IPV4_EMBEDDING_RANGES`, which,
+#: unlike ``IPV4_EMBEDDING_PREFIXES``, also holds the IPv4-mapped block and SIIT
+#: (``::ffff:0:0:0/96``) and leaves out 6to4.
 NAT64_WELL_KNOWN: Final = ipaddress.IPv6Network("64:ff9b::/96")
 NAT64_LOCAL_USE: Final = ipaddress.IPv6Network("64:ff9b:1::/48")
 SIX_TO_FOUR: Final = ipaddress.IPv6Network("2002::/16")
