@@ -21,7 +21,12 @@ from messagefoundry.api.auth_models import (
     NotifyEmailRequest,
     PasswordChangeRequest,
 )
-from messagefoundry.api.security import client_ip, pending_credential_deadline_for
+from messagefoundry.api.security import (
+    account_read_errors,
+    client_ip,
+    pending_credential_deadline_for,
+)
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth import AuthProvider, Identity
 from messagefoundry.auth import webauthn as webauthn_mod
 from messagefoundry.auth.service import (
@@ -37,6 +42,7 @@ from messagefoundry.auth.service import (
     NotifyEmailAlreadySet,
 )
 from messagefoundry.auth.tokens import hash_token
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 
 from .. import pages
@@ -505,6 +511,31 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         clear_session_cookie(resp, request)
         return resp
 
+    async def _checked_profile_email(identity: Identity, service: AuthService) -> str | None:
+        """The caller's profile ``email``, read through the JSON plane's checked account read
+        (``AdminHandlers.checked_user``), never a store row nobody checked (BACKLOG #5559). When
+        that read raises ``HTTPException`` or one of ``account_read_errors()`` other than
+        ``AUDIT_WRITE_DEFECTS``, the form offers no suggestion and a WARNING names the account.
+        Any other exception raises."""
+        try:
+            user = await admin.checked_user(service=service, user_id=identity.user_id)
+        except HTTPException as exc:
+            reason = f"answered {exc.status_code}"
+        except account_read_errors() as exc:
+            if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                raise
+            reason = f"failed ({type(exc).__name__})"
+        else:
+            email: str | None = user.email
+            return email
+        _log.warning(
+            "the notification address form for account %s offers no suggestion: its checked "
+            "read %s",
+            scrub_log_argument(identity.user_id),
+            reason,
+        )
+        return None
+
     @app.get("/ui/account/notify-address", response_class=HTMLResponse)
     async def ui_notify_address_form(
         # identity BEFORE service, as on the password form: require_ui's redirects answer first.
@@ -518,13 +549,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
         The form starts with the account's profile ``email`` where it passes the submit's own
         checks. On a directory account that is the last ``mail`` the directory supplied. THIS GET
-        WRITES NOTHING. The address reaches ``notify_email`` only when the holder submits it,
+        SETS NOTHING ON THE ACCOUNT, though its checked read may report a record that fails its
+        seal. The address reaches ``notify_email`` only when the holder submits it,
         through the POST below and ``fill_own_notify_email``, so a directory writer can shape the
         suggestion but cannot set the target."""
         if not identity.must_set_notify_email:
             return RedirectResponse("/ui/account", status_code=303)
-        user = await service.store.get_user(identity.user_id)
-        suggested = service.suggested_notify_email(user.email if user is not None else None)
+        suggested = service.suggested_notify_email(await _checked_profile_email(identity, service))
         if suggested is not None:
             try:
                 NotifyEmailRequest(email=suggested)  # the POST's length bound

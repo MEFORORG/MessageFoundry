@@ -199,6 +199,56 @@ async def test_a_refused_delete_of_a_failing_account_answers_its_own_refusal(
     assert await engine.store.get_user(victim) is not None
 
 
+async def test_a_refused_delete_keeps_its_own_refusal_when_the_page_read_is_unavailable(
+    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused delete re-renders the detail page. When that page's checked read answers 503 (a
+    Vault transit Outage), the delete's own refusal is still the answer rather than the 503. The
+    control is the 423 case in the test above."""
+    from messagefoundry.store.row_seal import TransitSealUnavailableError
+
+    engine, _path = keyed
+    service, _alerts, intact, _victim = await _setup(engine)
+    refusal = "stand-in: this would leave no enabled administrator"
+
+    async def refused(user_id: str, *, actor: str) -> None:
+        raise LastAdministratorRefused(refusal)
+
+    async def outage(user_id: str) -> None:
+        raise TransitSealUnavailableError()
+
+    monkeypatch.setattr(service, "delete_user", refused)
+    monkeypatch.setattr(service, "checked_user", outage)
+    async with _client(engine, service) as c:
+        await cookie_login(c, "root")
+        r = await c.post(f"/ui/users/{intact}/delete", headers=SAME_ORIGIN)
+    assert r.status_code == 400 and refusal in r.text
+    assert await engine.store.get_user(intact) is not None
+
+
+async def test_a_refused_delete_of_an_account_gone_since_answers_404(
+    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused delete whose page read finds no account answers 404, not the stale refusal. The
+    control is the 503 case above."""
+    engine, _path = keyed
+    service, _alerts, intact, _victim = await _setup(engine)
+    refusal = "stand-in: this would leave no enabled administrator"
+
+    async def refused(user_id: str, *, actor: str) -> None:
+        raise LastAdministratorRefused(refusal)
+
+    async def gone(user_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(service, "delete_user", refused)
+    monkeypatch.setattr(service, "checked_user", gone)
+    async with _client(engine, service) as c:
+        await cookie_login(c, "root")
+        r = await c.post(f"/ui/users/{intact}/delete", headers=SAME_ORIGIN)
+    assert r.status_code == 404 and refusal not in r.text
+
+
 @pytest.mark.parametrize(
     "failure",
     [UserSealRefused(USER_SEAL_REFUSED), RuntimeError("stand-in: a store read failed")],

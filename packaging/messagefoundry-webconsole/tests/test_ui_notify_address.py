@@ -13,6 +13,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from _ui_clients import PW, SAME_ORIGIN, cookie_login, provision
 from starlette.datastructures import Headers
 
@@ -20,7 +21,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.notifications import NOTIFY_EMAIL_SET, SecurityEvent
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import USER_SEAL_REFUSED, AuthService, UserSealRefused
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
@@ -290,6 +291,70 @@ async def test_a_suggested_address_is_escaped_in_the_route(engine: Engine) -> No
     assert 'value="o&#x27;b&amp;c@example.org"' in _email_input(page.text)
     user = await engine.store.get_user(user_id)
     assert user is not None and user.notify_email is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [UserSealRefused(USER_SEAL_REFUSED), RuntimeError("stand-in: a store read failed")],
+    ids=["refused", "read-failed"],
+)
+async def test_the_suggestion_comes_only_from_a_checked_read(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
+) -> None:
+    """BACKLOG #5559: the form reads the caller's record through the checked account read, never
+    the store row, so a record that fails its seal, or a read that fails, offers no suggestion and
+    the page still renders. The failure is stood in for at the service's checked reader."""
+    service = await _service(engine, notifier=_FakeNotifier())
+    user_id = await provision(service, "bare", [Role.OPERATOR.value])
+    await engine.store.update_user_profile(
+        user_id, display_name=None, email=DIRECTORY_ADDRESS, audits=()
+    )
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        ok = await c.get(PAGE)
+        assert f'value="{DIRECTORY_ADDRESS}"' in _email_input(ok.text)  # control
+
+        async def failing(user_id: str) -> None:
+            raise failure
+
+        monkeypatch.setattr(service, "checked_user", failing)
+        page = await c.get(PAGE)
+    assert page.status_code == 200
+    assert DIRECTORY_ADDRESS not in page.text
+    assert "value=" not in _email_input(page.text)
+    assert any(
+        rec.levelname == "WARNING"
+        and user_id in rec.getMessage()
+        and "offers no suggestion" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [TypeError("stand-in: a defect"), NotImplementedError("stand-in: a listed defect")],
+    ids=["outside-the-refusals", "listed-defect"],
+)
+async def test_a_defect_in_the_suggestion_read_raises(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, defect: Exception
+) -> None:
+    """The fallback takes only a refusal. An error outside the refusal set, and a listed defect
+    inside it (``AUDIT_WRITE_DEFECTS``; NotImplementedError is a RuntimeError), raise. The control
+    is the test above."""
+    service = await _service(engine, notifier=_FakeNotifier())
+    await provision(service, "bare", [Role.OPERATOR.value])
+
+    async def failing(user_id: str) -> None:
+        raise defect
+
+    async with _client(engine, service) as c:
+        await cookie_login(c, "bare")
+        monkeypatch.setattr(service, "checked_user", failing)
+        with pytest.raises(type(defect), match="stand-in"):
+            await c.get(PAGE)
 
 
 def test_the_page_escapes_quote_and_angle_brackets_in_a_suggestion() -> None:
