@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.17.8"
+$GateVersion = "2026.11.17.9"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -826,15 +826,15 @@ function Get-ScanRawIndexMap($Seg) {
 # chdirs, a relative chdir after an earlier line's) where the invocation's `-C` does not make that
 # directory irrelevant -- an absolute `-C` is read past such a chdir, under the conditions in
 # Get-InvocationReading and the resolver's -OwnWindow branch; and git options after the verb.
-# Rules 3 and 3c do not reliably read a git word spelled other than lowercase `git`, such as
-# `git.EXE` or `GIT`. At least these are ALLOWED from the primary (measured at 62167dfb331):
-# `git.EXE reset --hard` and `git.EXE config core.hooksPath /nope` under Bash, and `GIT reset --hard`
-# and `GIT config core.hooksPath /nope` under the PowerShell tool. Also, at least: any line after
-# an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
+# Rules 3 and 3c do not reliably read a git word the case-sensitive `$gitInvocation` pattern misses,
+# such as `git.EXE` or `GIT`. At least these are ALLOWED from the primary (measured 2026-11-18):
+# `git.EXE reset --hard` and `git.EXE config core.hooksPath /nope` under Bash, and `GIT reset
+# --hard` and `GIT config core.hooksPath /nope` under the PowerShell tool. Also, at least: any line
+# after an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
 # nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
-# dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the
-# PowerShell tool `(Set-Location <p>)` DOES move the shell, so `(Set-Location <p>)` then `git -C .
-# reset --hard` is allowed (fail-open, f0e49f45c5c has it too).
+# dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the PowerShell
+# tool `(Set-Location <p>)` DOES move the shell, so `(Set-Location <p>)` then `git -C . reset
+# --hard` is allowed (fail-open, f0e49f45c5c has it too).
 # And after such a line, a `-C` window that also names a work tree or git dir is not read: git roots a
 # relative `--git-dir` or `--work-tree` against the `-C` directory, not against the unknown one, but
 # the $absC test excludes every such window, so `git -C '<p>' --work-tree=<rel> reset --hard` and
@@ -848,7 +848,7 @@ function Get-ScanRawIndexMap($Seg) {
 # word sits in a closed `$( )` (`git -C '<p>' -c user.name=$(git config user.name) config <key>`):
 # rule 3c's added reading reads only the inner invocation, so it is allowed from outside (fail-open,
 # f0e49f45c5c has it too). And, at least, these fail-opens of rule 3c's owning-word reading, each
-# measured ALLOW from outside at 62167dfb331. A repository token in the owning window is not
+# measured ALLOW from outside on 2026-11-18. A repository token in the owning window is not
 # promoted when the first chain's window starts inside the `$( )`: `git --git-dir='<p>/.git' -c
 # user.name=$( git log -1) config <key>` and `GIT_DIR='<p>/.git' git -c user.name=$( git log -1)
 # config <key>`. And the owning-word search skips a path-qualified or escaped outer git:
