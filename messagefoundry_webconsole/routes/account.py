@@ -605,8 +605,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # authenticator), so it is never re-shown here. The window can be fresh while no confirm
         # proof is held, for example after Back from a refused code or an engine restart. A code
         # form would then post into the gate, which drops the code. So without the proof the page
-        # offers the Continue to a fresh re-auth, as the enroll page does (BACKLOG #5931).
-        code_form = await _confirm_proof_held(request)
+        # offers the Continue to a fresh re-auth, as the enroll page does (BACKLOG #5931). Under the
+        # require_action_step_up opt-out the page keeps main's code form: there the Continue's
+        # empty post is not sent to the re-auth, so it would be checked as a wrong code.
+        code_form = not service.action_step_up_required or await _confirm_proof_held(request)
         owed = code_form and await service.enrolment_code_required(session_token(request), identity)
         return HTMLResponse(pages.mfa_confirm_page(enrolment_code=owed, code_form=code_form))
 

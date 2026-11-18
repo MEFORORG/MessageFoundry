@@ -1125,8 +1125,9 @@ def _mfa_code_form(enrolment_code: bool, reauth_prompt: str | None) -> Markup:
 
     The button stands in for the form while the session holds no confirm proof (BACKLOG #5931): a
     code posted then would be refused at the gate and lost. It posts to the same verify route with
-    no code. The route answers a code-less post ahead of its gate with the re-auth, which lands on
-    the confirm form with the proof held, so a proof already held is not spent on it."""
+    no code. Except under the require_action_step_up opt-out, the route answers a code-less post
+    ahead of its gate with the re-auth, which lands on the confirm form with the proof held, so a
+    proof already held is not spent on it."""
     if reauth_prompt is not None:
         return el(
             "form",
@@ -1264,9 +1265,10 @@ def mfa_confirm_page(
     """The standalone confirm-code form (the unlock re-entry point after a step-up re-auth): the
     secret is already staged server-side and in the user's authenticator, so it is NOT re-shown.
     ``enrolment_code`` adds the ADR 0207 field, for a session that owes one. ``code_form=False``
-    puts the Continue button to a fresh re-auth in the form's place (:func:`_mfa_code_form`). The
-    routes pass it whenever no confirm proof is held: after a refused code spent the proof, and on
-    a visit that arrives without one (BACKLOG #5931)."""
+    puts the Continue button to a fresh re-auth in the form's place (:func:`_mfa_code_form`).
+    Except under the require_action_step_up opt-out, the routes pass it whenever no confirm proof
+    is held: for example after a refused code spent the proof, or on a visit that arrives without
+    one (BACKLOG #5931)."""
     banner = el("p", error, class_="banner") if error else Markup("")
     prompt = (
         "To try a code again, first confirm it's you again."

@@ -493,6 +493,30 @@ async def test_the_confirm_page_offers_continue_while_no_confirm_proof_is_held(
         assert r.status_code == 200 and 'name="code"' in r.text and ">Continue<" not in r.text
 
 
+async def test_the_confirm_page_keeps_the_code_form_under_the_opt_out_while_binding_is_blocked(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``[auth].require_action_step_up = false`` the confirm GET keeps main's code form even
+    when the factor-binding refusal blocks the confirm proof, as for an MFA-pending session on an
+    account that holds a factor (BACKLOG #5931). There the code-less Continue's post is not sent to
+    the re-auth, so once the block cleared it would be checked as a wrong code.
+
+    RED when: the confirm GET decides the form from the proof peek alone under the opt-out."""
+    service = await _opt_out_service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+
+        async def blocked(_token: str | None, _action: str) -> bool:
+            return True
+
+        monkeypatch.setattr(service, "factor_binding_is_blocked", blocked)
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and 'name="code"' in r.text and ">Continue<" not in r.text
+
+
 async def test_empty_code_continue_with_a_held_grant_spends_nothing(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
