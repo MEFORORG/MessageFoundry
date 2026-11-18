@@ -51,11 +51,22 @@ _ZERO_SUMMARY = (
 )
 
 
-def _ns(scorecard: Path, root: Path, *, detail: bool = False) -> argparse.Namespace:
+@pytest.fixture(autouse=True)
+def summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the job summary at a scratch file, so a run under Actions writes nothing to the real
+    one, and the tests can read what a run would have published."""
+    dest = tmp_path / "step-summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(dest))
+    return dest
+
+
+def _ns(
+    scorecard: Path, root: Path, *, detail: bool = False, python: str = "python"
+) -> argparse.Namespace:
     return argparse.Namespace(
         scorecard=str(scorecard),
         root=str(root),
-        python="python",
+        python=python,
         timeout=60.0,
         detail=detail,
         strict=False,
@@ -87,12 +98,38 @@ def _fake_prover(
     ],
 )
 def test_a_record_with_nothing_to_scan_is_an_instrument_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, summary: Path, text: str
 ) -> None:
     sc = tmp_path / "scorecard.toml"
     sc.write_text(text, encoding="utf-8")
     _fake_prover(monkeypatch, 0, _ZERO_SUMMARY)
     assert run(_ns(sc, tmp_path)) == EXIT_INSTRUMENT
+    assert "MEASURED NOTHING CHECKABLE" in summary.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b"\xff\xfe not utf-8", id="not-utf8"),
+        pytest.param(b"[[cell]]\nid = '99.1.1'\nabsence = 'x'\n", id="absence-not-a-table"),
+        pytest.param(b"cell = [1]\n", id="cell-not-a-table"),
+    ],
+)
+def test_an_unreadable_record_is_an_instrument_failure_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+) -> None:
+    """Uncaught, each of these exited 1, which a findings run exits too."""
+    sc = tmp_path / "scorecard.toml"
+    sc.write_bytes(content)
+    _fake_prover(monkeypatch, 0, _CLEAN_SUMMARY)
+    assert run(_ns(sc, tmp_path)) == EXIT_INSTRUMENT
+
+
+def test_a_prover_that_cannot_start_is_an_instrument_failure(tmp_path: Path) -> None:
+    sc = tmp_path / "scorecard.toml"
+    sc.write_text(_ONE_CLAIM, encoding="utf-8")
+    missing = str(tmp_path / "no-such-python")
+    assert run(_ns(sc, tmp_path, python=missing)) == EXIT_INSTRUMENT
 
 
 def test_the_one_claim_fixture_is_a_clean_pass(
@@ -145,7 +182,7 @@ def test_an_ordinary_findings_run_is_still_advisory(
 
 
 @pytest.mark.parametrize(
-    ("summary", "stderr"),
+    ("prover_summary", "stderr"),
     [
         pytest.param(
             _ONE_PROBLEM,
@@ -160,12 +197,12 @@ def test_an_ordinary_findings_run_is_still_advisory(
     ],
 )
 def test_a_crash_during_a_findings_run_is_an_instrument_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, summary: str, stderr: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prover_summary: str, stderr: str
 ) -> None:
     """A crash while printing the FAIL lines also exits 1, which a findings run exits too."""
     sc = tmp_path / "scorecard.toml"
     sc.write_text(_ONE_CLAIM, encoding="utf-8")
-    _fake_prover(monkeypatch, 1, summary, stderr)
+    _fake_prover(monkeypatch, 1, prover_summary, stderr)
     assert run(_ns(sc, tmp_path)) == EXIT_INSTRUMENT
 
 
@@ -180,6 +217,7 @@ def test_raw_prover_streams_stay_out_of_the_log_without_detail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    summary: Path,
     rc: int,
     stdout: str,
     stderr: str,
@@ -192,6 +230,9 @@ def test_raw_prover_streams_stay_out_of_the_log_without_detail(
     hidden = capsys.readouterr()
     assert _SECRET not in hidden.out + hidden.err
     assert "SUPPRESSED" in hidden.err
+    published = summary.read_text(encoding="utf-8")
+    assert "MEASURED NOTHING CHECKABLE" in published
+    assert _SECRET not in published
 
     # The opt-in still works: the suppression is a choice, not a lost stream.
     assert run(_ns(sc, tmp_path, detail=True)) == EXIT_INSTRUMENT
@@ -213,4 +254,21 @@ def test_a_non_latin1_line_survives_a_cp1252_environment(
     monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
     rc, stdout, _ = prove_report._invoke_prover(tmp_path / "s.toml", tmp_path, sys.executable, 60.0)
     assert rc == 0
-    assert "Ж" in stdout
+    assert chr(0x416) in stdout
+
+
+def test_a_byte_the_locale_cannot_decode_does_not_crash_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The parent's half of the fix, which the test above cannot see on a UTF-8 runner: the child
+    writes a byte no UTF-8 decoder accepts. Decoded by the locale on a UTF-8 runner it raised, and
+    on cp1252 it read as a different character; decoded as UTF-8 with `replace` it is U+FFFD."""
+    child = tmp_path / "child.py"
+    child.write_text(
+        'import sys\nsys.stdout.buffer.write(b"\\xff ok\\n")\nsys.stdout.flush()\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(prove_report, "SCORECARD_PY", child)
+    rc, stdout, _ = prove_report._invoke_prover(tmp_path / "s.toml", tmp_path, sys.executable, 60.0)
+    assert rc == 0
+    assert stdout == chr(0xFFFD) + " ok" + chr(10)

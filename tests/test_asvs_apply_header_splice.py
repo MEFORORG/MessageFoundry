@@ -17,11 +17,13 @@ import json
 import sys
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "asvs"))
 
+from scripts.asvs import apply as apply_mod  # noqa: E402
 from scripts.asvs.apply import block_spans, main  # noqa: E402
 
 _HEAD = """[scorecard]
@@ -160,3 +162,90 @@ def test_a_table_inside_a_rewritten_span_refuses_the_write(
     assert rc == 1
     assert rec.read_bytes() == before
     assert "top-level key extra" in capsys.readouterr().out
+
+
+def test_header_and_id_lines_inside_a_string_are_prose(tmp_path: Path) -> None:
+    """A padded header and an id line quoted in a multi-line string are not structure. Taken as a
+    header, the bogus block made every write to the record refuse."""
+    body = _SECOND_BODY.replace(
+        'residual = "second synthetic cell, never in the payload"\n',
+        'residual = """quoted prose\n[[cell]]  \nid = "99.1.9"\nmore prose"""\n',
+    )
+    assert body != _SECOND_BODY
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_HEAD + _FIRST + "[[cell]]\n" + body, encoding="utf-8")
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 0
+    cells = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert set(cells) == {"99.1.1", "99.1.2"}
+    assert cells["99.1.2"]["residual"].startswith("quoted prose\n[[cell]]")
+
+
+def test_an_indented_id_line_is_read(tmp_path: Path) -> None:
+    body = _SECOND_BODY.replace('id = "99.1.2"\n', '  id = "99.1.2"\n')
+    assert body != _SECOND_BODY
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_HEAD + _FIRST + "[[cell]]\n" + body, encoding="utf-8")
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 0
+    cells = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert cells["99.1.2"]["residual"] == "second synthetic cell, never in the payload"
+
+
+def test_an_id_the_span_reader_cannot_read_is_a_refusal_not_a_crash(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An escaped id is valid TOML the id pattern does not take. `main` refuses with rc 1."""
+    body = _SECOND_BODY.replace('id = "99.1.2"\n', 'id = "99.1\\u002e2"\n')
+    assert body != _SECOND_BODY
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_HEAD + _FIRST + "[[cell]]\n" + body, encoding="utf-8")
+    before = rec.read_bytes()
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "has no id" in capsys.readouterr().out
+
+
+def _span_to_eof(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the first cell's span run to the end of the file while every id stays found: wrong
+    boundaries that the pre-splice id check cannot see, so only the post-splice check can."""
+    real = apply_mod.block_spans
+
+    def wide(text: str) -> dict[str, tuple[int, int]]:
+        spans = real(text)
+        spans["99.1.1"] = (spans["99.1.1"][0], len(text))
+        return spans
+
+    monkeypatch.setattr(apply_mod, "block_spans", wide)
+
+
+def test_the_post_splice_check_names_a_lost_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = _record(tmp_path, "[[cell]]\n")
+    before = rec.read_bytes()
+    _span_to_eof(monkeypatch)
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "the cell list" in out
+    assert "99.1.2" in out
+
+
+def test_the_post_splice_check_names_an_altered_untouched_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The cell list survives, so only the comparison of each untouched cell can see the change."""
+    rec = _record(tmp_path, "[[cell]]\n")
+    before = rec.read_bytes()
+    _span_to_eof(monkeypatch)
+    real_render = apply_mod.render
+    altered = "[[cell]]\n" + _SECOND_BODY.replace("never in the payload", "altered")
+
+    def render_and_alter(cell: dict[str, Any], live: dict[str, Any]) -> str:
+        return real_render(cell, live) + altered
+
+    monkeypatch.setattr(apply_mod, "render", render_and_alter)
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "untouched cell 99.1.2" in out
+    assert "the cell list" not in out
