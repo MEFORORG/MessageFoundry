@@ -40,12 +40,13 @@ import weakref
 from collections.abc import Coroutine
 from typing import Any
 
-from messagefoundry.api.approvals import _outlive_caller, log_orphaned
+from messagefoundry.api.approvals import OperationInterrupted, _outlive_caller, log_orphaned
 from messagefoundry.pipeline.dr import _HOOK_REAP_SECONDS
 
 __all__ = [
     "CANCEL_GRACE_SECONDS",
     "DRAIN_TIMEOUT_SECONDS",
+    "OperationInterrupted",
     "OutlivingOperations",
     "cancel_grace_left",
 ]
@@ -111,37 +112,49 @@ class OutlivingOperations:
 
         A cancellation delivered while this awaits reaches the caller at once, and the operation
         goes on. Its result or error is then logged once, with ``label``, which names the operation
-        and nothing from the request body."""
+        and nothing from the request body.
+
+        An operation cancelled while the caller was NOT, at least by :meth:`drain`, raises
+        :class:`OperationInterrupted` here rather than its ``CancelledError``, which would tell a
+        caller nobody cancelled that it had been (BACKLOG #5903). A caller that was cancelled still
+        gets its ``CancelledError``."""
+        caller = asyncio.current_task()
+        # The caller's own pending cancels on entry, so one delivered while this awaits is told
+        # apart from the operation's cancel, which task.result() also raises as CancelledError.
+        baseline = 0 if caller is None else caller.cancelling()
         task = asyncio.ensure_future(coro)
         self._inflight[task] = label
         task.add_done_callback(self._forget)
         try:
             return await _outlive_caller(task)
         except asyncio.CancelledError:
-            # A task that was itself cancelled raised this through task.result(); its own
-            # cancellation arm has already run, and there is nothing left to read.
-            if not task.cancelled():
-                if not task.done():
-                    log.warning(
-                        "%s: the caller was cancelled (at least a request timeout does this); "
-                        "the operation continues and records its own outcome",
-                        label,
-                    )
-                # Logged once, all at WARNING, and a failure as its safe_exc text: the operation's
-                # own outcome row is the record (vault BACKLOG #3193 N4 folded this logger).
-                task.add_done_callback(
-                    lambda t: log_orphaned(
-                        t,
-                        label,
-                        cancelled="cancelled after its caller had gone",
-                        finished="finished after its caller had gone; its audit row records the "
-                        "outcome",
-                        failed="failed after its caller had gone",
-                        level=logging.WARNING,
-                        redact=True,
-                        logger=log,
-                    )
+            if task.cancelled():
+                # The operation was cancelled and raised this through task.result(); its own
+                # cancellation arm has already run, and there is nothing left to read.
+                if caller is not None and caller.cancelling() <= baseline:
+                    raise OperationInterrupted(label) from None
+                raise
+            if not task.done():
+                log.warning(
+                    "%s: the caller was cancelled (at least a request timeout does this); "
+                    "the operation continues and records its own outcome",
+                    label,
                 )
+            # Logged once, all at WARNING, and a failure as its safe_exc text: the operation's
+            # own outcome row is the record (vault BACKLOG #3193 N4 folded this logger).
+            task.add_done_callback(
+                lambda t: log_orphaned(
+                    t,
+                    label,
+                    cancelled="cancelled after its caller had gone",
+                    finished="finished after its caller had gone; its audit row records the "
+                    "outcome",
+                    failed="failed after its caller had gone",
+                    level=logging.WARNING,
+                    redact=True,
+                    logger=log,
+                )
+            )
             raise
 
     def _forget(self, task: asyncio.Future[Any]) -> None:
