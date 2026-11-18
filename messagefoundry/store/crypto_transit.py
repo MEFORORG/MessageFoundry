@@ -326,7 +326,7 @@ def _names_aead_failure(exc: Exception) -> bool:
     return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
 
 
-#: The seconds within which each warning about how a 400 was read is logged at most once per
+#: The seconds within which each :func:`_warn_when_due` warning is logged at most once per
 #: process (BACKLOG #5650, #6707). A proxy can cause one on every read or every row; once is the
 #: signal.
 _WARNING_LOG_INTERVAL_S = 3600.0
@@ -396,12 +396,13 @@ def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = N
 def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
     """:func:`_warn_quietly`, unless the warning ``kind()`` was logged in the last
     :data:`_WARNING_LOG_INTERVAL_S`. The slot is taken before the warning, so concurrent callers
-    emit it at most once. When building or logging the warning fails, the slot is given back, to
-    the time it held before or to empty, unless a later caller has taken it since; when giving it
-    back fails too, the slot stays taken for the interval. A failure building the key, or in the
-    slot's bookkeeping, is reported by :func:`_report_unlogged` naming that step, and the warning
-    is then not logged. Where :func:`_report_unlogged` itself raises, out of memory or stack, the
-    exception propagates, and a slot taken for the failed warning stays taken."""
+    emit it at most once. When building or logging the warning fails, except as the last sentence
+    says, the slot is given back, to the time it held before or to empty, unless a later caller
+    has taken it since; when giving it back fails too, the slot stays taken for the interval. A
+    failure building the key, or in the slot's bookkeeping, is reported by
+    :func:`_report_unlogged` naming that step, and the warning is then not logged. Where
+    :func:`_report_unlogged` itself raises, out of memory or stack, the exception propagates, and
+    a slot taken for the failed warning stays taken."""
     try:
         key = kind()
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
@@ -454,7 +455,7 @@ def _unconfirmed_warning(
         lambda: ("unconfirmed", audit_key, cause, raised),
         lambda: (
             "an audit MAC verify at key version %d got a 400 labelled unconfirmed, because %s%s "
-            "(key=%r); logged at most once in %d seconds for this key and this cause",
+            "(key=%r); logged at most once in %d seconds per process for this key and this cause",
             version,
             cause,
             " " + raised if raised else "",
@@ -949,13 +950,18 @@ class TransitCipher(_UnmarkedPolicy):
                 return AuditKeyVersionRefusedError(version)
             unverified = AuditKeyVersionUnverifiedError(version)
             # Making the warning's closures runs outside _warn_when_due's guard, so a fault there
-            # writes a fixed literal on stderr in place of the warning. Only that step is caught.
+            # writes a fixed literal on stderr in place of the warning.
             try:
                 kind, build = _unconfirmed_warning(self._audit_key, version, reason, raised)
             except _READ_FAULTS:
                 _last_resort(_WARNING_UNBUILT)
             else:
-                _warn_when_due(kind, build)
+                # A fault in _READ_FAULTS escaping the warning must not drop the label, so the
+                # walk keeps the row's break; reporting it is what just failed.
+                try:  # noqa: SIM105 -- constructing contextlib.suppress can itself raise here
+                    _warn_when_due(kind, build)
+                except _READ_FAULTS:
+                    pass
             return unverified
         if self._is_outage(exc):
             return self._verify_failed(exc)

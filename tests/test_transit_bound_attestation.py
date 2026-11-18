@@ -1690,13 +1690,13 @@ def _raising_log_filter() -> Any:
 
 
 @pytest.mark.usefixtures("_raising_log_filter")
-def test_a_raising_log_filter_never_turns_a_break_into_could_not_run(
+def test_a_raising_log_filter_keeps_the_ciphers_break(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """BACKLOG #6707: the Transit cipher's audit verify paths that log beside a break keep the
-    break when the log call itself raises: at least the unconfirmed label, a row refused twice,
-    and a malformed stored MAC whose cost-only call failed. A failure is reported by its class
-    on stderr."""
+    break when the log call itself raises, except out of memory or stack: at least the
+    unconfirmed label, a row refused twice, and a malformed stored MAC whose cost-only call
+    failed. A failure is reported by its class on stderr."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
@@ -1732,10 +1732,9 @@ class _RaisingStream:
         raise OSError("stderr is gone")
 
 
-def test_the_unlogged_report_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """BACKLOG #6707: the stderr report of a warning that could not be logged never raises, even
-    when stderr fails or the failure's class name cannot be rendered, so the warning helpers keep
-    their never-raise contract."""
+def test_the_unlogged_report_survives_a_failing_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #6707: the stderr report of a warning that could not be logged does not raise when
+    stderr fails or the failure's class name cannot be rendered."""
     import sys
 
     from messagefoundry.store import crypto_transit
@@ -1804,7 +1803,8 @@ def test_a_fault_in_the_unconfirmed_throttle_keeps_the_label(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """BACKLOG #6707: the throttle's key and its slot are built inside the warning's guard, so a
-    fault there leaves the unconfirmed label standing and is reported on stderr."""
+    fault there leaves the unconfirmed label standing and, except out of memory or stack, is
+    reported on stderr."""
     from messagefoundry.store import crypto_transit
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
@@ -1871,9 +1871,9 @@ def test_a_fault_rendering_a_break_warning_keeps_the_break(
 def test_a_fault_rendering_vault_failure_text_keeps_a_malformed_mac_a_break(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #6707: ``vault_failure_text`` never raises, so a fault rendering the cost-only
-    call's failure beside a malformed stored MAC still leaves the row's break, rather than an
-    error the verify does not read as a cipher failure; the text falls back to the type name."""
+    """BACKLOG #6707: a fault rendering the cost-only call's failure beside a malformed stored MAC
+    falls back to the type name, so the row's break stands, rather than an error the verify does
+    not read as a cipher failure."""
     from messagefoundry.store import keyprovider_vault
     from messagefoundry.store.crypto_transit import TransitCipher
     from messagefoundry.transports import strict_requests
@@ -1917,8 +1917,8 @@ def test_classifier_faults_log_through_the_guard(
 
 
 def test_a_failed_unconfirmed_log_is_tried_again(caplog: pytest.LogCaptureFixture) -> None:
-    """BACKLOG #6707: only a warning that was emitted uses up its interval, so one whose log
-    failed is logged on the next unconfirmed 400."""
+    """BACKLOG #6707: a warning whose log failed does not use up its interval, so it is logged on
+    the next unconfirmed 400, except out of memory or stack."""
     from messagefoundry.store import crypto_transit
 
     caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
@@ -1995,16 +1995,17 @@ def test_a_fault_making_the_unconfirmed_warning_keeps_the_label(
 def test_a_fault_inside_warn_when_due_is_not_reported_as_unbuilt(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #6707: only making the closures is caught beside :func:`_warn_when_due`, so a fault
-    that escapes the call itself is not written as the warning that could not be built."""
+    """BACKLOG #6707: a fault in :data:`_READ_FAULTS` escaping :func:`_warn_when_due` keeps the
+    unconfirmed label, and is not written as the warning that could not be built."""
     from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     def short_of_memory(*_a: Any, **_kw: Any) -> None:
         raise MemoryError
 
     monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
-    with pytest.raises(MemoryError):
-        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
     assert crypto_transit._WARNING_UNBUILT not in capsys.readouterr().err
 
 

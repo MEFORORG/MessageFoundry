@@ -507,8 +507,8 @@ class _RaisingFilter(logging.Filter):
 def test_a_raising_log_filter_never_fails_the_switch_to_sending_alone(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #6707: the warning that batching is off goes through the never-raising helper, so
-    a log filter that raises leaves every value opened and batching off, and is reported on
+    """BACKLOG #6707: the warning that batching is off goes through :func:`_warn_quietly`, so a
+    log filter that raises leaves every value opened and batching off, and is reported on
     stderr."""
     monkeypatch.setattr(crypto_transit, "_logged_at", {})
     transit = _BatchTransit()
