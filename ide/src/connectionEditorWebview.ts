@@ -281,7 +281,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // keeps it, so the original key typed back still finds it.
       const envRefKeys = new Set();
       for (const g of groups) for (const f of g.fields) if (f.envKey !== undefined || f.envDefault !== undefined) envRefKeys.add(f.key);
-      for (const k of [...HELD_DEFAULTS.keys()]) if (!envRefKeys.has(k)) HELD_DEFAULTS.delete(k);
+      for (const k of HELD_DEFAULTS.keys()) if (!envRefKeys.has(k)) HELD_DEFAULTS.delete(k);
       for (const g of groups) {
         const box = document.createElement('details'); box.open = !g.collapsed;
         const sum = document.createElement('summary');

@@ -3356,9 +3356,11 @@ def test_the_secedit_files_sit_in_a_fresh_folder_only_administrators_can_change(
         # Modify holds DELETE on the parent itself but no FILE_DELETE_CHILD, so the parent, with
         # the private folder inside, can be renamed away and a planted one put at its name.
         ("parent", "*S-1-5-32-545:M"),
-        # Full control on the folder ABOVE the parent, on that folder only: delete-child there
-        # renames the parent away, though the parent's own DACL grants nothing.
-        ("above", "*S-1-5-32-545:F"),
+        # Delete-child alone on the folder ABOVE the parent, on that folder only: it renames the
+        # parent away, though the parent's own DACL grants nothing.
+        ("above", "*S-1-5-32-545:(DC)"),
+        # An entry that applies to the parent and is also inherited still applies to the parent.
+        ("parent-inheritable", "*S-1-5-32-545:(OI)(CI)F"),
     ],
 )
 def test_the_work_folder_is_refused_when_the_parent_or_a_folder_above_can_be_renamed(
@@ -3447,8 +3449,6 @@ def test_the_secedit_folder_defaults_to_the_windows_temp_not_the_users(tmp_path:
     assert re.search(rf"\b{_WORKDIR_FN}\b", code), (
         "Remove-ServiceLogonRight does not call the helper"
     )
-    # The walk to the root is the production check; -CheckedUpTo, which ends it early, is a test seam.
-    assert "CheckedUpTo" not in code, "Remove-ServiceLogonRight cuts the ancestor walk short"
     assert re.search(r'Join-Path \(\[Environment\]::GetFolderPath\("Windows"\)\) "Temp"', helper), (
         "the helper's default parent must be the Windows folder's Temp, asked of the system"
     )
@@ -3461,6 +3461,49 @@ def test_the_secedit_folder_defaults_to_the_windows_temp_not_the_users(tmp_path:
         "the user can set SystemRoot and windir for their own processes, so neither may name the "
         "trusted parent"
     )
+
+
+def test_no_caller_cuts_the_secedit_folder_walk_short() -> None:
+    """STATIC. The walk to the root is the production check; -CheckedUpTo, which ends it early, is
+    a test seam, so neither script names it outside the helper's own definition."""
+    assert _SCRIPT is not None and _UNINSTALL is not None
+    for script in (_SCRIPT, _UNINSTALL):
+        text = script.read_text(encoding="utf-8-sig")
+        start = text.index(f"function {_WORKDIR_FN} {{")
+        end = text.index("\nfunction ", start)
+        rest = text[:start] + text[end:]
+        assert "CheckedUpTo" not in rest, f"{script.name} cuts the ancestor walk short"
+
+
+@_windows_only
+def test_the_work_folder_is_refused_under_a_reparse_point_above_the_parent(tmp_path: Path) -> None:
+    """A junction above the parent makes the walk read the junction's own ACL, not the folders that
+    hold the parent, so the helper refuses it."""
+    assert _UNINSTALL is not None
+    real = tmp_path / "real"
+    (real / "parent").mkdir(parents=True)
+    link = tmp_path / "link"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(real)], capture_output=True, text=True
+    )
+    assert made.returncode == 0, made.stdout + made.stderr
+    body = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $out = [ordered]@{{}}
+  foreach ($p in @({_psq(str(link / "parent"))}, {_psq(str(real / "parent"))})) {{
+    try {{ $out[$p] = {_WORKDIR_FN} -Parent $p -OwnerSid $me.User.Value -CheckedUpTo {_psq(str(tmp_path))} }}
+    catch {{ $out[$p] = "ERR $($_.Exception.Message)" }}
+  }}
+  [pscustomobject]$out | ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_UNINSTALL, [_WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
+    )
+    through_link = got[str(link / "parent")]
+    assert str(through_link).startswith("ERR") and "reparse point" in through_link, through_link
+    # POSITIVE CONTROL: the same parent reached by its real path is accepted.
+    direct = got[str(real / "parent")]
+    assert direct and not str(direct).startswith("ERR"), direct
 
 
 def test_both_scripts_carry_the_same_secedit_folder_helper(tmp_path: Path) -> None:

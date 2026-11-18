@@ -459,11 +459,10 @@ function New-SeceditWorkDirectory {
       WHAT IS CHECKED, before anything is made, and nothing more. The parent must be a folder, and
       neither it nor any folder above it, up to the root, may be a reparse point. On each of those
       folders the owner must be SYSTEM, Administrators, TrustedInstaller or $OwnerSid, and no allow
-      entry that applies
-      to that folder itself may give anyone else delete, delete-child, a DACL change, ownership or
-      GENERIC_ALL; OWNER RIGHTS counts as that folder's owner and CREATOR OWNER is not judged. A
-      parent that fails, or that has a folder above it that fails, is refused. The folders above
-      the parent are walked by name.
+      entry that applies to that folder itself may give anyone else delete, delete-child, a DACL
+      change, ownership or GENERIC_ALL; OWNER RIGHTS counts as that folder's owner and CREATOR
+      OWNER is not judged. A parent that fails, or that has a folder above it that fails, is
+      refused. The folders above the parent are walked by name.
 
       $Parent, $OwnerSid and $CheckedUpTo are parameters so the unelevated tests can make a folder
       they own. $CheckedUpTo ends the walk at that folder, which must be the parent or a folder
