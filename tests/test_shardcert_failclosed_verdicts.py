@@ -223,6 +223,41 @@ def test_unsent_ceiling_rung_is_setup_degraded_not_a_break(monkeypatch: pytest.M
     assert lad.result_label == "SETUP_DEGRADED"
 
 
+def test_driven_ceiling_rung_that_acknowledged_nothing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The acked waiver covers a rung the RIG did not drive. Here the drive pushed all 1000 messages and the
+    engine acknowledged none (ENGINE_INTAKE_BIND): an engine that never ACKs must not certify PASS with a
+    published ceiling."""
+    from harness.load import shardcert
+
+    refused = ShardCertStepRecord.from_report(
+        20.0,
+        _report(
+            sent=1000,
+            acked=0,
+            achieved_intake=0,
+            offered=1000,
+            delivered_distinct=0,
+            sink_received=0,
+            lanes_observed=0,
+        ),
+        hold_seconds=60.0,
+    )
+    assert refused.ceiling is True
+    assert refused.fidelity.driven is True
+    assert refused.correctness_ok is False
+    assert "nothing acknowledged" in refused.correctness_faults()
+
+    async def fake_step(*, rate: float, **_kw: object) -> ShardCertStepRecord:
+        return refused
+
+    monkeypatch.setattr(shardcert, "_run_ladder_step", fake_step)
+    lad = asyncio.run(shardcert.run_shardcert_ladder(rates=[20]))
+    assert lad.exit_code == 1
+    assert lad.result_label == "FAIL"
+
+
 def test_sustained_rung_still_needs_something_acknowledged() -> None:
     """The acked waiver is for ceiling rungs only: a sustained rung that acknowledged nothing still FAILs."""
     empty = ShardCertStepRecord(

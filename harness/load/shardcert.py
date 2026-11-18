@@ -2086,14 +2086,16 @@ class ShardCertStepRecord:
         """The rung held the invariants :attr:`ShardCertReport.ok` also checks (:func:`_invariants_held`),
         with no duplicate delivery (a ladder rung never kills an engine shard). Two terms differ, on purpose:
         ``in_pipeline_final`` is not carried, because ``no_loss`` requires the drain, which the poller only
-        reports at an empty pipeline; and the two-lane FIFO bar and the something-acknowledged bar apply to a
-        SUSTAINED rung only, as on the two-box ladder, because a ceiling rung is a throughput measurement: a
-        near-empty one may honestly see one lane, and one the rig never drove (DRIVE_SHORTFALL) acknowledges
-        nothing because nothing arrived, which the fidelity gate already reads as SETUP_DEGRADED (exit 2). The
-        ceiling terms themselves (intake shortfall, filling) are not failures."""
+        reports at an empty pipeline; and the two-lane FIFO bar applies to a SUSTAINED rung only, as on the
+        two-box ladder, because a ceiling rung is a throughput measurement and a near-empty one may honestly
+        see one lane. The something-acknowledged bar is waived on a ceiling rung the rig did NOT drive
+        (:attr:`RungFidelity.not_driven`, e.g. DRIVE_SHORTFALL): nothing arrived, so nothing was acknowledged,
+        and the fidelity gate already reads that rung as SETUP_DEGRADED (exit 2). A DRIVEN rung that
+        acknowledged nothing (the engine took none of an offer that reached it) still fails. The ceiling terms
+        themselves (intake shortfall, filling) are not failures."""
         return _invariants_held(
             acked=self.achieved_intake,
-            require_acked=not self.ceiling,
+            require_acked=not self._acked_waived,
             lossless=self.no_loss,
             lane_inversions=self.lane_inversions,
             duplicates_ok=self.lane_repeats == 0,
@@ -2102,12 +2104,17 @@ class ShardCertStepRecord:
             stranded_nonterminal=self.stranded_nonterminal,
         ) and (self.ceiling or self.lanes_observed >= 2)
 
+    @property
+    def _acked_waived(self) -> bool:
+        """The something-acknowledged bar does not apply: a ceiling rung whose offer never reached the engine."""
+        return self.ceiling and self.fidelity.not_driven
+
     def correctness_faults(self) -> list[str]:
         """The terms of :attr:`correctness_ok` this rung broke, named for an operator note (empty when it
         held). Kept beside the predicate so a note never shows only the clean values."""
         terms = [
             ("loss or undrained pipeline", not self.no_loss),
-            ("nothing acknowledged", not self.ceiling and self.achieved_intake <= 0),
+            ("nothing acknowledged", not self._acked_waived and self.achieved_intake <= 0),
             (f"lane_inversions={self.lane_inversions}", self.lane_inversions != 0),
             (f"lane_repeats={self.lane_repeats}", self.lane_repeats != 0),
             (f"engine_dead={self.engine_dead}", self.engine_dead != 0),
@@ -2595,8 +2602,8 @@ class ShardCertLadderReport:
             # `aborted_reason` names a climb a failed store reset stopped (exit 2, the rungs before it kept).
             #
             # v4 (BACKLOG #5440, #5441): `ok`/`result`/`exit_code` hold each rung to the single-run pass bar
-            # (duplicates, no dead letters at any stage, and on a SUSTAINED rung at least two lanes and
-            # something acknowledged; a ceiling rung is a measurement and is waived both). Per
+            # (duplicates, no dead letters at any stage, at least two lanes on a SUSTAINED rung, and
+            # something acknowledged unless the rung is a ceiling the rig did not drive). Per
             # record: `lanes_observed`, `engine_dead`, `dead_total` and `correctness_ok` are new. A rung that
             # breaks that bar pins nothing (`pinned_rate` skips it) and stops the climb, so a v4 FAIL may
             # carry fewer records than a v3 one.

@@ -3318,7 +3318,8 @@ class ConsolidatedLadderReport:
             # v6: `soak_ok` now carries a FIDELITY term — a soak nobody drove, or one the engine short-took,
             # cannot certify the ceiling. See `fidelity.soak_*`.
             "soak_ok": self.soak_ok,
-            "soak_drive_shortfall": self.soak_drive_shortfall,  # a RIG failure ⇒ setup_degraded (exit 2)
+            # A RIG failure ⇒ setup_degraded: exit 2, unless a climb rung broke correctness (exit 1).
+            "soak_drive_shortfall": self.soak_drive_shortfall,
             "soak_engine_intake_bind": self.soak_engine_intake_bind,  # a real PRODUCT finding
             "climb": [r.to_json_dict() for r in self.climb],
             "notes": self.notes,
