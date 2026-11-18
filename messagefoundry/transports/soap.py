@@ -1179,6 +1179,9 @@ class SoapDestination(DestinationConnector):
                 # reachability check be turned into a memory exhaustion. The peer chooses the body.
                 drain_bounded(resp, connector=f"{self._hop} probe")
         except urllib.error.HTTPError as exc:
+            # BACKLOG #5881: an HTTPError owns the open response socket; the status is all a probe
+            # reads, so close it on both arms rather than leave it to the garbage collector.
+            exc.close()
             if exc.code in (401, 403):
                 raise DeliveryError(
                     f"SOAP {_redact_url(self.url)} returned HTTP {exc.code} (check credentials)"
