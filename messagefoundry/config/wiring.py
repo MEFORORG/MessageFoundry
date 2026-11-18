@@ -7060,7 +7060,7 @@ class Registry:
         refused graph never runs. Here and not only in the factories, because a ``with_*`` composer
         writes its ``enabled`` flag onto a spec after its factory returns, a ``FhirLookup`` already
         registered. ``inbound()``/``outbound()`` refuse a connection's literals at declaration, and
-        at least ``MLLP``, ``DICOM``, ``DICOMweb`` and ``Http`` refuse the one flag a check of their
+        at least ``MLLP``, ``DICOM``, ``DICOMweb`` and ``Http`` refuse a flag a check of their
         own reads first (:func:`refuse_bool_literals`), as ``Ftp`` refuses its ``tls``, ``None``
         included, by its own check; this pass sees the rest, a lookup's and a composer's
         included. ``None`` passes where the setting has one default on every factory: there an
