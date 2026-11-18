@@ -448,9 +448,9 @@ Each tick:
 | Observed | Action |
 |---|---|
 | a `reply_from` row is **`done`** *via capture* | **one** `correlate_response(message_id)` read; filter `kind == "response"` **and** `destination_name == reply_from`; take `max(response_seq)`; then map the captured row's **`outcome`** field: `accepted` → `reply`, `no_reply` → `empty`, `rejected`/`unparseable` → `rejected` |
-| a `reply_from` row is `done` but **no qualifying `response` row** (a plain `mark_done`, or retention nulled the body) | `purged` if the row exists with a null body, else `failed` — distinguished, not conflated |
-| **every** `reply_from` row is terminal-failed (**`dead`** or **`cancelled`**) and none is `done` | **fail immediately** (`failed`) |
-| `messages.status` is **terminal** — defined as **anything other than `RECEIVED` or `ROUTED`**, which therefore includes `PROCESSED` — **and** no qualifying `response` row exists | **fail immediately** (`no_route`) |
+| a `reply_from` row is `done` but **no qualifying `response` row** (a plain `mark_done`, or retention nulled the body) | `purged` if the row exists with a null body; else, once **every** `reply_from` row is settled (`done`/`dead`/`cancelled`) **and** the message is terminal, `failed` — distinguished, not conflated |
+| **every** `reply_from` row is terminal-failed (**`dead`** or **`cancelled`**) and none is `done` | **fail immediately** (`failed`); one such row beside a `pending`/`inflight` sibling row keeps waiting |
+| `messages.status` is **terminal** — defined as **anything other than `RECEIVED` or `ROUTED`**, which therefore includes `PROCESSED` — **and** no `reply_from` row and no qualifying `response` row exists | **fail immediately** (`no_route`) |
 | a `reply_from` row is `pending`/`inflight`, **or** the message is still `RECEIVED`/`ROUTED` | keep waiting |
 | no `reply_from` row yet and the message is still `RECEIVED`/`ROUTED` | **keep waiting** — a sibling handler may simply not have transformed yet |
 

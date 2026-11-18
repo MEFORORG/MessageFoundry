@@ -39,13 +39,12 @@ _POLL_CEILING_SECONDS: Final = 0.25
 #: therefore scales with load rather than being a constant an operator has to reason about.
 _POLL_SCALE_AFTER_WAITERS: Final = 8
 
-#: Settled delivery states for an awaited destination's row: that row can capture no further reply.
-#: ``done`` belongs here because capture commits in the same transaction as the ``done`` flip
-#: (``complete_with_response``), so a ``done`` row with no captured reply will never gain one. Any
-#: other state, including one this module does not know, counts as live and keeps the turn waiting.
-_SETTLED_ROW_STATES: Final = frozenset(
-    {OutboxStatus.DONE.value, OutboxStatus.DEAD.value, OutboxStatus.CANCELLED.value}
-)
+#: Failed delivery states for an awaited destination's row: that row will never capture a reply.
+_FAILED_ROW_STATES: Final = frozenset({OutboxStatus.DEAD.value, OutboxStatus.CANCELLED.value})
+#: Settled delivery states: the failed ones plus ``done``. Capture commits in the same transaction as
+#: the ``done`` flip (``complete_with_response``), so a ``done`` row with no captured reply will never
+#: gain one. Any other state, including one this module does not know, counts as live.
+_SETTLED_ROW_STATES: Final = _FAILED_ROW_STATES | {OutboxStatus.DONE.value}
 
 
 def poll_period(waiters: int) -> float:
@@ -183,9 +182,11 @@ class SyncReplyResolverImpl:
                 f"dest={self._destination} waited_ms={reply.waited_ms} fallback={self._on_timeout}",
             )
         else:
-            # Every other outcome already has its own disposition trail — the settled outbound rows
-            # behind ``failed``, an UNROUTED message, or (for degraded) the metric label. Minting a second record of the
-            # same fact would make the timeline read as two events where one thing happened.
+            # Every other outcome already has its own disposition trail — a dead/cancelled row, an
+            # UNROUTED message, or (for degraded) the metric label. Minting a second record of the
+            # same fact would make the timeline read as two events where one thing happened. The
+            # exception is ``failed`` from a ``done`` row with no capture: its row reads delivered,
+            # so the ``failed`` answer is recorded only in the metric.
             return
 
         try:
@@ -235,14 +236,18 @@ class SyncReplyResolverImpl:
                             message_id, state.latest_response_seq, elapsed_ms()
                         )
 
-                    if state.row_states:
-                        # Fail fast on a PROVEN-terminal delivery, but only once EVERY row for this
-                        # destination has settled: a dead or cancelled row says nothing while a
-                        # sibling row to the same destination is still pending or inflight and may
-                        # yet capture the reply. A settled set with no captured reply is ``failed``
-                        # whether a row went dead or was marked done without a capture (ADR 0154
-                        # D3), never ``no_route``: something WAS routed here.
-                        if all(s in _SETTLED_ROW_STATES for s in state.row_states):
+                    rows = state.row_states
+                    if rows:
+                        # Decide only on the WHOLE row set: a dead or cancelled row says nothing
+                        # while a sibling row to the same destination is still pending or inflight.
+                        # Every row failed is ``failed`` at once (ADR 0154 D3). A settled set that
+                        # holds a ``done`` row with no capture is ``failed`` too, never ``no_route``
+                        # since something WAS routed here, but only once the message is terminal: a
+                        # sibling handler still upstream may yet emit a row that captures the reply.
+                        if all(s in _FAILED_ROW_STATES for s in rows) or (
+                            state.message_is_terminal
+                            and all(s in _SETTLED_ROW_STATES for s in rows)
+                        ):
                             return self._done(ReplyOutcome.FAILED, elapsed_ms())
                     elif state.message_is_terminal:
                         # Only on the ABSENCE of rows plus the message's own terminal status. A

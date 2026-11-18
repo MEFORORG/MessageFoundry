@@ -4738,7 +4738,7 @@ def test_the_thirteenth_sweep_second_round_probes_reply_logging_and_opt_in() -> 
         listener, InboundReply(outcome=ReplyOutcome.FAILED), "m1"
     )
     assert (status, "delivery_failed" in fixed, "partner" in fixed) == (502, True, False)
-    assert {OutboxStatus.DEAD.value} <= sync_reply._SETTLED_ROW_STATES
+    assert {OutboxStatus.DEAD.value} <= sync_reply._FAILED_ROW_STATES
 
     async def committed(outcome: str) -> InboundReply:
         async def correlate_response(message_id: str) -> list[SimpleNamespace]:
