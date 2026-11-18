@@ -68,7 +68,8 @@ seen:
   Code inside a hole reads as template text, so a real call in a hole that the per-line view does
   not also see is marked ``(not code)``, and so is a real call the per-line view skips inside any
   region the lexer misreads as a literal (the misreads listed above). The per-line view's own false
-  positives (a trailing comment, a mention inside a quoted string) are confirmed as before #5578.
+  positives (at least a trailing comment or a mention inside a quoted string) are confirmed as
+  before #5578.
   A cipher-string word's mark follows the file's admission rule, not the word's own position, so
   a real word is marked when the only suite that admits it is unconfirmed;
 * for the scope-aware Python reading (BACKLOG #5578), at least: a PEP 695 type-parameter scope
@@ -78,6 +79,8 @@ seen:
 * A union token is confirmed by its callee before ``[`` file-wide, so an out-of-scope label
   variant of a callee confirmed in scope elsewhere in the same file stays confirmed; per-site
   judgment would close it.
+* A provider ``via`` token is marked out of scope when the module's only direct operation is out
+  of scope, though the call reaches crypto in scope.
 * a parameter or local assignment that shadows an imported name. Only imports are bindings, so a
   ``def go(sig): sig.verify(d)`` in a module that imports a first-party ``sig`` reads as a call to
   that first-party function and skips the method rule.
