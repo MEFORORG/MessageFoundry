@@ -70,6 +70,7 @@ class _TransitVerdictCipher(_OutageCipher):
     verdict on a marked cell reads as a tag failure rather than a corrupt cell (BACKLOG #5884)."""
 
     holds_key_for = None
+    names_no_keys = True  # as the Transit cipher declares
 
 
 Claim = Callable[[MessageStore], Awaitable[list[Any]]]
@@ -364,6 +365,24 @@ async def test_a_verdict_is_still_dead_lettered_and_reported(
         assert all(i.payload != "B1" for i in await claim(store))
         assert _rows(db)[0][0] == "dead"
         assert _audited(db) >= 1
+    finally:
+        await store.close()
+
+
+@_ALL_CLAIMS
+async def test_a_corrupt_cell_under_a_held_key_is_dead_lettered_unaudited(
+    tmp_path: pathlib.Path, claim: Claim
+) -> None:
+    """BACKLOG #5884: a cipher that names its keys refusing a held-key cell for a reason other than
+    its AEAD check reads a corrupt cell, not drift, so the claim dead-letters it with no tag-failed
+    audit row."""
+    store, cipher, db = await _open(tmp_path)
+    try:
+        cipher.fault = lambda: CipherError("synthetic corrupt envelope")
+        cipher.healthy_opens = 0
+        assert all(i.payload != "B1" for i in await claim(store))
+        assert _rows(db)[0][0] == "dead"
+        assert _audited(db) == 0
     finally:
         await store.close()
 

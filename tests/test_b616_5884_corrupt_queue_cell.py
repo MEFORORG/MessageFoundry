@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from typing import Any
 
 import pytest
@@ -98,7 +99,10 @@ def test_a_corrupt_payload_under_a_held_key_is_corrupt_not_drift() -> None:
         assert cause in str(corrupt.value.__cause__)
 
 
-def test_a_corrupt_payload_is_logged_never_audited_or_alerted() -> None:
+def test_a_corrupt_payload_is_logged_never_audited_or_alerted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="messagefoundry.store.queue_tag")
     cipher, key_b64, seen = _cipher_and_hook()
     row = _row()
     sealed = cipher.encrypt("SYNTH-BODY", aad=queue_row_aad(row))
@@ -109,6 +113,10 @@ def test_a_corrupt_payload_is_logged_never_audited_or_alerted() -> None:
         asyncio.run(report_queue_tag_failure(sink, cipher, row, error=corrupt.value))
         alert_queue_tag_failure(cipher, row, error=corrupt.value, outcome="the read was refused")
     assert sink.audits == [] and seen == []
+    # The log line is the only signal left, so it must be there, naming no payload.
+    corrupt_lines = [r.getMessage() for r in caplog.records if "is corrupt" in r.getMessage()]
+    assert len(corrupt_lines) == 2 * len(_corrupt_payloads(cipher, key_b64, sealed))
+    assert all("outbound" in m and "SYNTH" not in m for m in corrupt_lines)
 
     # Control: drift is still audited and alerted.
     with pytest.raises(QueueTagError) as moved:

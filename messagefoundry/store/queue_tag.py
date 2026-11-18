@@ -278,7 +278,9 @@ def is_tag_failure(cipher: Cipher, stored: str) -> bool:
     key that is not configured is a key-configuration fault. Neither is a tag failure. A cipher that
     cannot say which keys it holds (Vault Transit) counts every marked value as held. This reads the
     VALUE only: whether a given failed open was the key service failing instead is the caller's
-    question, :func:`is_transient_open_failure` (BACKLOG #5765)."""
+    question, :func:`is_transient_open_failure` (BACKLOG #5765). Nor does it tell a corrupt cell
+    from one sealed for another row: :func:`open_queue_cell` makes that split after this check
+    (BACKLOG #5884)."""
     if not cipher.is_encrypted(stored):
         return False
     holds = getattr(cipher, "holds_key_for", None)
@@ -431,12 +433,13 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     """Open ``row``'s ``payload`` under its own tag: the body for an inline row, the sealed
     ``shared_body`` key for a ``ref`` row.
 
-    Raises :class:`QueueTagError` when the cell does not open under the row's tag (see
-    :func:`_names_tag_failure`; a key or format problem raises the cipher's own error, and so does
-    a key service that gave no verdict, :func:`is_transient_open_failure`), its subclass
-    :class:`CorruptQueueCellError` when a cell under a held key is corrupt, when a keyed
+    Raises :class:`QueueTagError`, which is drift, when the cell does not open under the row's
+    tag (see :func:`_names_tag_failure`; a key or format problem raises the cipher's own error, and
+    so does a key service that gave no verdict, :func:`is_transient_open_failure`), when a keyed
     store's row (or any ``ref`` row) holds a blank ``payload``, or when a ``ref`` row's sealed key
-    differs from its ``body_ref`` column. A keyless store writes plaintext and has no tag to check,
+    differs from its ``body_ref`` column. Raises its subclass :class:`CorruptQueueCellError`, which
+    is not drift, only when a cipher that names its keys refuses a cell under a key it holds for a
+    reason other than a failed AEAD check. A keyless store writes plaintext and has no tag to check,
     so there only the reference comparison binds anything."""
     payload = row["payload"]
     body_ref = row["body_ref"]
