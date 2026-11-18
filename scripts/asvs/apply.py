@@ -528,7 +528,9 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     # `id` and `verdict` share the line, but `main`'s checks on them are STILL NEEDED: an id that
     # `toml_str` had to escape would not be found again by `block_spans`'s plain regex, so the record
     # could not be rewritten on the next run. Quoting keeps a bad id out of the TOML structure; it
-    # does not make one usable.
+    # does not make one usable. A literal-string id the regex does read is escaped here too, so
+    # `main` re-reads the spliced text's blocks and refuses a write that would lose one (BACKLOG
+    # #5455).
     out = ["[[cell]]"]
     for key in _ORDERED:
         if key == "level":
@@ -622,6 +624,9 @@ _HEADER_RE = re.compile(r"^\[\[cell\]\][ \t]*(?:#.*)?$", re.M)
 _ID_RE = re.compile(
     r"""^[ \t]*(?:id|"id"|'id')[ \t]*=[ \t]*(?:"([^"\\\n]+)"|'([^'\n]+)')[ \t]*(?:#.*)?$""", re.M
 )
+#: Any table header line, a cell's own sub-tables included. A cell's id is read only above the
+#: first one, so an `id` key in an evidence or absence entry never stands in for the cell's own.
+_TABLE_RE = re.compile(r"^[ \t]*\[", re.M)
 
 
 def _lines_in_strings(text: str) -> set[int]:
@@ -704,7 +709,15 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
     spans: dict[str, tuple[int, int]] = {}
     for i, s in enumerate(starts):
         e = starts[i + 1] if i + 1 < len(starts) else len(text)
-        m = next((x for x in _ID_RE.finditer(text, s, e) if structural(x.start())), None)
+        # The cell's own keys end at its first table header after its own. Searched to `e`, an
+        # entry's `id` keyed a cell whose own id was unreadable, and the refusal named the wrong fix.
+        body = text.find("\n", s, e)
+        own_end = (
+            next((x.start() for x in _TABLE_RE.finditer(text, body, e) if structural(x.start())), e)
+            if body >= 0
+            else e
+        )
+        m = next((x for x in _ID_RE.finditer(text, s, own_end) if structural(x.start())), None)
         if not m:
             raise BlockSpanError(
                 f"the [[cell]] block at line {text.count(chr(10), 0, s) + 1} has no id",
@@ -1329,6 +1342,16 @@ def main(argv: list[str] | None = None) -> int:
             f"{_printable(str(sorted(set(live_ids) - set(after_ids), key=str)))}, gained "
             f"{_printable(str(sorted(set(after_ids) - set(live_ids), key=str)))}, or reordered)"
         )
+    # THE NEXT RUN MUST STILL FIND EVERY CELL'S BLOCK. `render` writes an id through `toml_str`,
+    # which escapes a backslash or a quote that a literal-string id carried, and `block_spans` reads
+    # no escaped id. TOML reads the written id as the same one, so every check above agreed, and the
+    # next run then refused every write to the record.
+    try:
+        unreadable = list(block_spans(new_text)) != live_ids
+    except BlockSpanError:
+        unreadable = True
+    if unreadable:
+        drift.append("the cell blocks a later run reads, which would no longer name every cell")
     drift += [
         f"untouched cell {_printable(str(x['id']))}"
         for x in live_list

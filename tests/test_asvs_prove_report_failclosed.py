@@ -313,7 +313,7 @@ def test_the_crash_reason_carries_no_problem_or_line_count(
 def test_a_non_latin1_line_survives_a_cp1252_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Not the locale: a cp1252 runner could neither print nor decode a non-Latin-1 claim.
+    """Not the locale: a cp1252 runner could neither print nor decode a claim cp1252 cannot encode.
 
     A real child, standing in for the prover, prints a Cyrillic letter under an inherited cp1252
     stdio setting. Unfixed, the child dies with an encoding error and its line never arrives.

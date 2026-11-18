@@ -185,7 +185,7 @@ def _invoke_prover(
         ],
         capture_output=True,
         # UTF-8 BOTH WAYS, NOT THE LOCALE (BACKLOG #5456). On a cp1252 console the child could not
-        # print a claim's non-Latin-1 text and the parent could not decode it, so the run died on an
+        # print claim text cp1252 cannot encode and the parent could not decode it, so the run died on an
         # encoding error rather than reporting. `replace` keeps a stray byte from doing the same.
         # PYTHONIOENCODING overrides an inherited setting, which takes precedence over UTF-8 mode.
         # The observables inherit it, so their stdio is UTF-8, which the prover in UTF-8 mode reads.
@@ -302,10 +302,13 @@ def _instrument_failure(reason: str, *raw: tuple[str, str], detail: bool = False
     The prover's raw streams print only under ``--detail`` (BACKLOG #5456). They hold the problem
     lines and more: a failing load names the cell, and a traceback can quote a claim. These paths
     printed them unconditionally, so a public run log carried exactly the text ``_report``
-    suppresses. Without ``--detail`` a note says each was suppressed, in words only: a stream's size
-    is a figure about the record, which a public log must not carry either. The reason, which
-    carries no claim text and no count, also goes to the job summary, so a red run says which
-    failure it was.
+    suppresses. Without ``--detail`` a note says each was suppressed, in words only. The reason, which
+    carries no claim text, also goes to the job summary, so a red run says which failure it was.
+
+    THESE FAILURE MESSAGES ADD NO COUNT TO THE LOG: no stream size, problem count or FAIL-line
+    count. That is a rule for this function's callers only. It does not make the log count-free:
+    the census and counter table ``_report`` prints on a completed run, and the ``RECONCILE`` lines,
+    are unchanged by it.
     """
     print(f"error: {reason}", file=sys.stderr)
     for name, text in raw:
@@ -419,8 +422,8 @@ def run(args: argparse.Namespace) -> int:
 
     # A RECORD WITH NOTHING TO SCAN IS NOT A CLEAN RECORD (BACKLOG #5456). An empty file, a file
     # with no cells, or cells with no absence claim all reconcile against a prover that saw zero, so
-    # without this the run reported a pass having examined nothing. No count is printed: the log is
-    # public.
+    # without this the run reported a pass having examined nothing. Like every failure message,
+    # this one adds no count (see `_instrument_failure`).
     if c.claims == 0:
         return _instrument_failure(
             "the scorecard holds no absence claim -- refusing to report a pass on a run that "
@@ -454,7 +457,7 @@ def run(args: argparse.Namespace) -> int:
     # problem and 1 on a problem, and prints one FAIL line per problem after the summary. A crash
     # after the summary also exits 1: with zero problems it was read as a clean run, and with some it
     # was read as an ordinary findings run whose FAIL lines were cut short.
-    # The reason names which condition failed in words, never a count: the log is public.
+    # The reason names which condition failed in words, with no count (see `_instrument_failure`).
     crashed = any(ln.startswith("Traceback (most recent call last)") for ln in stderr.splitlines())
     why = [
         text

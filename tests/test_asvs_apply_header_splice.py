@@ -298,3 +298,44 @@ def test_a_repeated_id_refuses_with_a_hint_about_the_repeat(
     assert "two [[cell]] blocks carry id" in out
     assert "no escapes" not in out
     assert "distinct id" in out
+
+
+def test_an_entry_id_does_not_stand_in_for_an_unreadable_cell_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The id search ran into the cell's evidence entries, so an entry's `id` keyed a cell whose
+    own id was unreadable, and the refusal named a repeated id rather than the unreadable one."""
+    body = _SECOND_BODY.replace('id = "99.1.2"\n', 'id = "99.1\\u002e2"\n').replace(
+        '  path = "messagefoundry/m.py"\n  line = 20\n',
+        '  id = "99.1.1"\n  path = "messagefoundry/m.py"\n  line = 20\n',
+    )
+    assert body.count("99.1.1") == 1
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_HEAD + _FIRST + "[[cell]]\n" + body, encoding="utf-8")
+    before = rec.read_bytes()
+    assert main([str(_payload(tmp_path)), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "has no id" in out
+    assert "two [[cell]] blocks" not in out
+
+
+def test_a_write_that_a_later_run_could_not_read_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A literal-string id is read, but `render` writes it back escaped, which the span reader does
+    not read. TOML reads the same id either way, so every other check passed, and the next run
+    refused every write to the record."""
+    lit_id = "99.1\\1"
+    first = _FIRST.replace('id = "99.1.1"\n', f"id = '{lit_id}'\n")
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_HEAD + first + "[[cell]]\n" + _SECOND_BODY, encoding="utf-8")
+    assert tomllib.loads(rec.read_text(encoding="utf-8"))["cell"][0]["id"] == lit_id
+    payload = _payload(tmp_path)
+    cells = json.loads(payload.read_text(encoding="utf-8"))
+    cells[0]["id"] = lit_id
+    payload.write_text(json.dumps(cells), encoding="utf-8")
+    before = rec.read_bytes()
+    assert main([str(payload), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "a later run reads" in capsys.readouterr().out
