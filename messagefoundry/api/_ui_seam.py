@@ -890,9 +890,10 @@ from typing import Any
 #:
 #: BACKLOG #5930: the console's edit-resend form parser ``_resubmit_form`` now restores the
 #: original's line endings through ``restore_eol`` and reads the body through ``_form_pairs``. Both
-#: are globals of ``routes/core.py``, so the snapshot hashes their bodies with the closure's. It
-#: does not hash at least the ``EDIT_EOL_TERMINATORS`` mapping, which is module data, or the route's refusal
-#: of an unknown ``eol``, which sits in the endpoint body. No engine surface changed.
+#: are globals of ``routes/core.py``, so the snapshot hashes their bodies with the closure's. What
+#: it leaves unhashed includes at least the ``EDIT_EOL_TERMINATORS`` mapping, which is module
+#: data, and the route's refusal of an unknown ``eol``, which sits in the endpoint body. No engine
+#: surface changed.
 #: Re-derived with ``--write``, on the branch from ``4b5769ef2c675677`` to ``8386df80553a4313``,
 #: and over the merge with #5931 from ``6737556a16ce6d15`` to ``c537067c6952d93c``.
 #:
