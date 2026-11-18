@@ -1015,8 +1015,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             except HTTPException as page_exc:
                 # BACKLOG #5559: the users list offers the delete for a record that fails its
                 # seal, whose detail page answers 423. The delete's own refusal is the answer, and
-                # it stays the answer when the page's read is refused otherwise (a 503 Vault
-                # Outage, say), which would replace it. An account gone since answers 404.
+                # it stays the answer when the page's read is refused on an HTTP refusal from the
+                # re-render (a 503 Vault Outage, say), which would replace it. An account gone
+                # since answers 404.
                 if page_exc.status_code == status.HTTP_404_NOT_FOUND:
                     raise
                 _log.warning(

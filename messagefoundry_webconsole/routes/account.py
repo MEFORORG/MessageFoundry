@@ -515,8 +515,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         """The caller's profile ``email``, read through the JSON plane's checked account read
         (``AdminHandlers.checked_user``), never a store row nobody checked (BACKLOG #5559). When
         that read raises ``HTTPException`` or one of ``account_read_errors()`` other than
-        ``AUDIT_WRITE_DEFECTS``, the form offers no suggestion and a WARNING names the account; a
-        seal failure is also reported by the read itself. Any other exception raises."""
+        ``AUDIT_WRITE_DEFECTS``, the form offers no suggestion and a WARNING names the account.
+        Any other exception raises."""
         try:
             user = await admin.checked_user(service=service, user_id=identity.user_id)
         except HTTPException as exc:
