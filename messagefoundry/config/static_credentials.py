@@ -314,7 +314,6 @@ def _http_literal_static(
     from messagefoundry.transports.egress import URL_QUERY_REFUSED_DESTINATIONS
 
     url = _db_setting(settings, "url", None, values)
-    # A type whose build refuses any url query never sends that query, so it is not named here.
     if (
         ctype not in URL_QUERY_REFUSED_DESTINATIONS
         and isinstance(url, str)

@@ -1090,8 +1090,9 @@ def test_dicomweb_query_credential_is_not_reported_as_a_hop(
     caplog: pytest.LogCaptureFixture,
 ) -> None:  # vault BACKLOG #5358
     """The build refuses any url query, so these readers do not report a DICOMweb url-query
-    credential: the census's url-query label, ``query_credential_hops`` and the pre-build WARNING.
-    REST with the same url is the positive control for each reader."""
+    credential: ``_http_literal_static``'s url-query label, ``query_credential_hops`` and both
+    url-query WARNINGs. REST with the same url is the positive control for the label,
+    ``query_credential_hops`` and the build-time WARNING."""
     from messagefoundry.config.static_credentials import _http_literal_static
     from messagefoundry.config.wiring import (
         Registry,
