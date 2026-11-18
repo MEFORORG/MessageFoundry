@@ -14,7 +14,10 @@ proves the line does not log the refusal's text either.
 from __future__ import annotations
 
 import asyncio
+import http.client
+import io
 import logging
+import urllib.request
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
@@ -30,10 +33,12 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports.base import ENCODING_CODE, DestinationConnector, NegativeAckError
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
+from messagefoundry.transports.http_auth import OAuth2ClientCredentialsProvider
 from tests._mllp_recorder import MllpRecorder, run_one_batch
 from tests._refusal_log_capture import TOKEN, until
 from tests._refusal_log_capture import assert_no_token as _assert_no_token
@@ -468,3 +473,153 @@ def test_the_table_forgets_only_pairs_that_carry_nothing(
     assert set(refusals._state) == {("a", "AR", False), ("d", "AR", False)}  # b, c held nothing
     refusals.warning("a", _nak("AR"), 1, "refused on %s", "a")
     assert "(5 more row(s) refused with this code" in caplog.records[-1].getMessage()
+
+
+# --- a permanent refusal every queued row would meet alerts the lane once (PR 3069 hold, b) -------
+#
+# A token endpoint answering in a content coding refuses every row the lane holds, permanently, so
+# each row dead-letters (owner ruling 2026-11-18 on BACKLOG #5910 step 4). Before the hold's fix
+# nothing paged: the permanent arm never marked the lane down. The refusal carries the transport's
+# own lane_fault marker, and the worker reads that marker, never the refusal's code.
+
+_CODED_TOKEN_REPLY = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
+
+
+class _CodedTokenOpener:
+    """Answers every token request with a fresh reply in a content coding."""
+
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> object:
+        class _Sock:
+            def makefile(self, *a: object, **k: object) -> io.BytesIO:
+                return io.BytesIO(_CODED_TOKEN_REPLY)
+
+            def close(self) -> None:
+                pass
+
+        resp = http.client.HTTPResponse(_Sock(), method="POST")  # type: ignore[arg-type]
+        resp.begin()
+        return resp
+
+
+class _MintsThroughACodedTokenEndpoint:
+    """A connector that mints its bearer through the real token path before each send, as the HTTP
+    family does, against an endpoint whose every reply is content-coded."""
+
+    def __init__(self) -> None:
+        self.provider = OAuth2ClientCredentialsProvider(
+            token_url="https://auth.example.com/token", client_id="cid", client_secret="s3cr3t"
+        )
+        self.provider._opener = _CodedTokenOpener()  # type: ignore[assignment]
+        self.calls = 0
+
+    async def send(self, payload: str) -> None:
+        self.calls += 1
+        self.provider.access_token()
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _UnmarkedRefusal:
+    """A connector whose permanent refusal carries no lane marker: an ordinary partner reject."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def send(self, payload: str) -> None:
+        self.calls += 1
+        raise NegativeAckError("negative ACK (MSA-1=AR)", code="AR", permanent=True)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _RecordsLaneAlerts(LoggingAlertSink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.errors: list[tuple[str, str, str | None]] = []
+        self.restored: list[str] = []
+
+    def connection_error(
+        self, name: str, *, kind: str, detail: str | None = None, error_class: str | None = None
+    ) -> None:
+        self.errors.append((name, kind, error_class))
+
+    def connection_restored(self, name: str) -> None:
+        self.restored.append(name)
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["coded-token-reply", "unmarked-reject"])
+async def test_a_lane_wide_refusal_dead_letters_each_row_and_alerts_the_lane_once(
+    store: MessageStore, tmp_path: Path, marked: bool
+) -> None:
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    sink = _RecordsLaneAlerts()
+    runner = RegistryRunner(
+        _registry(inbox, outdir),
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    dest: _MintsThroughACodedTokenEndpoint | _UnmarkedRefusal = (
+        _MintsThroughACodedTokenEndpoint() if marked else _UnmarkedRefusal()
+    )
+    await runner._destinations[OUT].aclose()  # the File connector start() built
+    runner._destinations[OUT] = cast(DestinationConnector, dest)
+    try:
+        for n in (1, 2, 3):
+            (inbox / f"{n}.hl7").write_bytes(_adt(n).encode("utf-8"))
+        await _until_dead(store, 3)  # every row still dead-letters: the owner's ruling stands
+    finally:
+        await runner.stop()
+
+    assert dest.calls == 3
+    if marked:
+        # Once for the lane, not once per row: the edge trigger holds across all three refusals.
+        assert sink.errors == [(OUT, "connection_lost", "NegativeAckError")]
+    else:
+        assert sink.errors == []  # an ordinary reject is no connection error
+    assert sink.restored == []
+
+
+async def test_the_lane_alert_resolves_on_the_next_successful_delivery(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # As on main, where the same failure was a transient DeliveryError: the next delivery that
+    # succeeds marks the lane up and resolves the open connection_error.
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    sink = _RecordsLaneAlerts()
+    runner = RegistryRunner(
+        _registry(inbox, outdir),
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    file_out = runner._destinations[OUT]
+    runner._destinations[OUT] = cast(DestinationConnector, _MintsThroughACodedTokenEndpoint())
+    try:
+        (inbox / "1.hl7").write_bytes(_adt(1).encode("utf-8"))
+        await _until_dead(store, 1)
+        assert sink.errors == [(OUT, "connection_lost", "NegativeAckError")]
+        runner._destinations[OUT] = file_out  # the endpoint is fixed
+        (inbox / "2.hl7").write_bytes(_adt(2).encode("utf-8"))
+        await until(lambda: sink.restored == [OUT], "the lane restored")
+    finally:
+        await runner.stop()
+    assert len(sink.errors) == 1
+
+
+async def test_a_lane_wide_batch_refusal_alerts_the_lane_once(store: MessageStore) -> None:
+    sink = _RecordsLaneAlerts()
+    runner = _batch_runner(store, _MintsThroughACodedTokenEndpoint())
+    runner._alert_sink = sink
+    await _run_one_batch(store, runner, [_adt(n) for n in (1, 2, 3)])
+
+    assert await store.count_dead(allowed_channels=None) == 3
+    assert sink.errors == [(OUT, "connection_lost", "NegativeAckError")]

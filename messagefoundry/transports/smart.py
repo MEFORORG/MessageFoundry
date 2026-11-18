@@ -158,7 +158,8 @@ def request_token(
     A reply in a content coding the engine does not decode is a permanent
     :class:`~messagefoundry.transports.base.NegativeAckError` coded
     :data:`TOKEN_REPLY_CODED_CODE`, so the delivery dead-letters rather than retries. Owner ruling
-    2026-11-18 on BACKLOG #5910 step 4: "Dead-letter, no retry"."""
+    2026-11-18 on BACKLOG #5910 step 4: "Dead-letter, no retry". It carries ``lane_fault``, so the
+    lane's ``connection_error`` alert fires once as the rows dead-letter."""
     coded = False
     try:
         body = _read_token_reply(
@@ -176,6 +177,9 @@ def request_token(
             "engine does not decode",
             code=TOKEN_REPLY_CODED_CODE,
             permanent=True,
+            # Every queued row mints through this endpoint, so the lane alerts once rather than
+            # draining silently into the dead-letter store (hold on PR 3069, option b).
+            lane_fault=True,
         )
     return _parse_token_reply(body, endpoint=endpoint)
 

@@ -11435,6 +11435,10 @@ class RegistryRunner:
                     item.id,
                     item.message_id,
                 )
+                # A refusal every queued row would meet (the transport's own marker, never its
+                # code) also marks the lane down, so the drain into the DLQ alerts once.
+                if getattr(exc, "lane_fault", False):
+                    self._note_lane_unhealthy(name, item.id, exc)
             else:
                 failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
                 retry_until = failed.retry_at
@@ -11916,6 +11920,8 @@ class RegistryRunner:
                     len(ids),
                     ids[0],
                 )
+                if getattr(exc, "lane_fault", False):  # as the single row
+                    self._note_lane_unhealthy(name, ids[0], exc)
             else:
                 failed = await self._mark_batch_failed_and_arm(
                     name, ids, _member_error(safe_exc(exc), current), retry
