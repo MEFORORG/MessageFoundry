@@ -73,6 +73,11 @@ class _Resp(io.BytesIO):
         self.close()
 
 
+def _epss_answer(rows: list[dict[str, Any]]) -> bytes:
+    """An EPSS answer in the live API's shape: ``status`` OK and a ``total`` counting its rows."""
+    return json.dumps({"status": "OK", "total": len(rows), "data": rows}).encode()
+
+
 def _stub(
     monkeypatch: pytest.MonkeyPatch,
     mod,
@@ -96,7 +101,7 @@ def _stub(
             if not epss_ok:
                 raise TimeoutError("synthetic EPSS timeout")
             rows = [{"cve": _CVE_KEV, "epss": "0.9"}, {"cve": _CVE_OTHER, "epss": "0.1"}]
-            return _Resp(json.dumps({"data": rows}).encode())
+            return _Resp(_epss_answer(rows))
         raise AssertionError(f"unexpected fetch {url}")
 
     monkeypatch.setattr(mod.subprocess, "run", run)
@@ -194,7 +199,7 @@ def test_epss_rows_with_renamed_fields_are_unread(
         if req.full_url.startswith(mod.EPSS_URL):
             # One good row beside one that does not parse: a partial answer, not a measurement.
             rows = [{"cve": _CVE_OTHER, "epss": "0.1"}, {"cve_id": _CVE_KEV, "score": "0.9"}]
-            return _Resp(json.dumps({"data": rows}).encode())
+            return _Resp(_epss_answer(rows))
         return real(req, timeout)
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
@@ -360,6 +365,12 @@ def test_marker_split_pins_that_agree_are_one_pin(monkeypatch: pytest.MonkeyPatc
         pytest.param({"labels": [{"name": None}]}, id="null-label-name"),
         pytest.param({"title": None}, id="null-title"),
         pytest.param({"createdAt": 7}, id="numeric-date"),
+        pytest.param({"state": ["OPEN"]}, id="list-state"),
+        pytest.param({"state": {"name": "OPEN"}}, id="dict-state"),
+        pytest.param({"state": None}, id="null-state"),
+        pytest.param({"state": "open"}, id="unknown-state"),
+        pytest.param({"createdAt": "2026-11-08T12:00:00"}, id="naive-date"),
+        pytest.param({"createdAt": "last week"}, id="unparsable-date"),
     ],
 )
 def test_a_pr_list_with_a_malformed_item_is_an_unread_source(
@@ -430,7 +441,7 @@ def test_epss_rows_for_cves_not_asked_do_not_count(
                 {"cve": _CVE_OTHER, "epss": "0.1"},
                 {"cve": "CVE-2099-0003", "epss": "0.95"},
             ]
-            return _Resp(json.dumps({"data": rows}).encode())
+            return _Resp(_epss_answer(rows))
         return real(req, timeout)
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
@@ -445,3 +456,197 @@ def test_a_stale_pin_against_an_undated_release_is_na(monkeypatch: pytest.Monkey
     mod = _load()
     lag = _adopter(monkeypatch, mod, "messagefoundry==1.1.0\n", release={"tag": "v1.2.0"})
     assert lag.startswith("n/a"), lag
+
+
+@pytest.mark.parametrize("stdout", [pytest.param("", id="empty"), pytest.param(" \n", id="blank")])
+def test_a_gh_call_that_prints_nothing_is_an_unread_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stdout: str
+) -> None:
+    """``gh`` prints ``[]`` for an empty list, so exit 0 with no output is not a clean empty week."""
+    mod = _load()
+    _stub(monkeypatch, mod)
+
+    def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    code, row = _main(mod, tmp_path)
+    assert code == 2, row
+    assert row["dependabot_prs_window"].startswith("n/a"), row
+    assert row["kev_exposure_max_age_days"].startswith("n/a"), row
+
+
+def test_control_an_empty_pr_list_is_a_clean_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Control: ``[]`` from ``gh`` is a real empty window, so the run exits 0."""
+    mod = _load()
+    _stub(monkeypatch, mod)
+
+    def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, "[]\n", "")
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    code, row = _main(mod, tmp_path)
+    assert code == 0, row
+    assert row["dependabot_prs_window"] == "0", row
+
+
+@pytest.mark.parametrize(
+    "now",
+    [pytest.param("2026-11-18T12:00:00", id="naive"), pytest.param("noon", id="unparsable")],
+)
+def test_a_now_without_an_offset_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, now: str
+) -> None:
+    """A naive ``--now`` crashed the run to exit 1 against the aware PR dates; it is refused, 2."""
+    mod = _load()
+    _stub(monkeypatch, mod)
+    out = tmp_path / "m.csv"
+    with pytest.raises(SystemExit) as exc:
+        mod.main(["--repo", "example/repo", "--csv", str(out), "--now", now])
+    assert exc.value.code == 2
+    assert not out.exists(), "a refused argument writes no row"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param({"data": []}, id="bare-empty"),
+        pytest.param({"data": [{"cve": _CVE_OTHER, "epss": "0.1"}]}, id="bare-short"),
+        pytest.param({"status": "OK", "total": 2, "data": []}, id="total-disagrees"),
+        pytest.param({"status": "OK", "total": True, "data": []}, id="bool-total"),
+        pytest.param({"status": "error", "total": 0, "data": []}, id="error-status"),
+    ],
+)
+def test_an_epss_answer_that_does_not_account_for_its_rows_is_unread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answer: dict[str, Any]
+) -> None:
+    """A bare or short ``data`` list recorded 0 or 50 percent coverage with exit 0."""
+    mod = _load()
+    _stub(monkeypatch, mod)
+    real = mod.urllib.request.urlopen
+
+    def urlopen(req: Any, timeout: float = 0) -> _Resp:
+        if req.full_url.startswith(mod.EPSS_URL):
+            return _Resp(json.dumps(answer).encode())
+        return real(req, timeout)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
+    code, row = _main(mod, tmp_path)
+    assert code == 2, row
+    assert row["epss_coverage_pct"].startswith("n/a"), row
+    assert row["epss_ge_0_7_count"].startswith("n/a"), row
+
+
+@pytest.mark.parametrize(
+    ("rows", "coverage"),
+    [
+        pytest.param([], "0", id="none-known"),
+        pytest.param([{"cve": _CVE_OTHER, "epss": "0.1"}], "50", id="one-known"),
+    ],
+)
+def test_control_epss_saying_it_knows_fewer_cves_is_measured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rows: list[dict[str, Any]], coverage: str
+) -> None:
+    """Control: EPSS has no score for a CVE it does not know yet, and says so with ``status`` OK
+    and a ``total`` counting only the rows it found. That is the coverage the metric measures."""
+    mod = _load()
+    _stub(monkeypatch, mod)
+    real = mod.urllib.request.urlopen
+
+    def urlopen(req: Any, timeout: float = 0) -> _Resp:
+        if req.full_url.startswith(mod.EPSS_URL):
+            return _Resp(_epss_answer(rows))
+        return real(req, timeout)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
+    code, row = _main(mod, tmp_path)
+    assert code == 0, row
+    assert row["epss_coverage_pct"] == coverage, row
+
+
+def _main_with_adopter(
+    monkeypatch: pytest.MonkeyPatch,
+    mod,
+    tmp_path: Path,
+    contents: subprocess.CompletedProcess[str] | Exception,
+    release: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, str]]:
+    """``main`` with ``--adopter-repos`` opted in; the adopter's contents call answers ``contents``."""
+    _stub(monkeypatch, mod)
+
+    def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        if argv[1:3] == ["pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(_prs()), "")
+        if argv[2].startswith("repos/example/repo/releases"):
+            return subprocess.CompletedProcess(argv, 0, json.dumps([release or _RELEASE]), "")
+        if isinstance(contents, Exception):
+            raise contents
+        return contents
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    out = tmp_path / "m.csv"
+    code = mod.main(
+        [
+            "--repo",
+            "example/repo",
+            "--csv",
+            str(out),
+            "--now",
+            _NOW.isoformat(),
+            "--adopter-repos",
+            "example/adopter",
+        ]
+    )
+    with out.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 1
+    return code, rows[0]
+
+
+def _contents(requirements: str) -> subprocess.CompletedProcess[str]:
+    body = json.dumps({"content": base64.b64encode(requirements.encode()).decode()})
+    return subprocess.CompletedProcess(["gh"], 0, body, "")
+
+
+@pytest.mark.parametrize(
+    ("contents", "release"),
+    [
+        pytest.param(
+            subprocess.CalledProcessError(1, ["gh"], "", "gh: 404"), None, id="unreadable-file"
+        ),
+        pytest.param(
+            subprocess.CompletedProcess(["gh"], 0, json.dumps({"content": "abc"}), ""),
+            None,
+            id="not-base64",
+        ),
+        pytest.param(
+            _contents("messagefoundry==1.1.0\n"),
+            {"tag": "v1.2.0", "at": "2026-11-12T12:00:00"},
+            id="naive-release-date",
+        ),
+    ],
+)
+def test_an_unread_adopter_source_reds_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    contents: subprocess.CompletedProcess[str] | Exception,
+    release: dict[str, Any] | None,
+) -> None:
+    """Once ``--adopter-repos`` opts in, an adopter source that could not be read was n/a with
+    exit 0; it now exits 2 like the other sources."""
+    mod = _load()
+    code, row = _main_with_adopter(monkeypatch, mod, tmp_path, contents, release)
+    assert code == 2, row
+    assert row["adopter_patch_lag_days"].startswith("n/a"), row
+
+
+def test_control_a_read_adopter_pin_exits_clean(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Control: an adopter whose pin was read and measured leaves the run at exit 0."""
+    mod = _load()
+    code, row = _main_with_adopter(monkeypatch, mod, tmp_path, _contents("messagefoundry==1.1.0\n"))
+    assert code == 0, row
+    assert row["adopter_patch_lag_days"] == "6.0", row

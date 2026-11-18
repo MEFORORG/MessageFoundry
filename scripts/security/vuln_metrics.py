@@ -23,9 +23,10 @@ alone (adopter patch-lag, reachability ratio) are emitted as `n/a` with the reas
 them, rather than faked.
 
 A source that could not be READ is not a source that answered nothing (BACKLOG #5447). A failed `gh`
-call listing the Dependabot PRs, or a failed CISA KEV or FIRST EPSS fetch, leaves the metrics it feeds as `n/a` naming the
-source, never `0`, and the run exits 2 after writing the CSV and summary, so the weekly job goes red
-rather than recording a feed outage as zero exposure.
+call listing the Dependabot PRs, a failed CISA KEV or FIRST EPSS fetch, or an answer from one in a
+shape this cannot read, leaves the metrics it feeds as `n/a` naming the source, never `0`. So does
+an unread adopter source once `--adopter-repos` opts in. The run then exits 2 after writing the CSV
+and summary, so the weekly job goes red rather than recording a feed outage as zero exposure.
 """
 
 from __future__ import annotations
@@ -56,7 +57,8 @@ _GH_TIMEOUT = 120.0
 
 def _gh(args: list[str]) -> Any:
     """Run a `gh` command that emits JSON; return the parsed value, or ``None`` when the call failed
-    or its output was not JSON. ``None`` and an empty list are different answers (BACKLOG #5447)."""
+    or its output was empty or not JSON. ``None`` and an empty list are different answers (BACKLOG
+    #5447): `gh` prints ``[]`` for an empty list, so no output at all is not one."""
     try:
         out = subprocess.run(  # nosec B603 B607 - fixed argv (`gh`), no shell, args are literals
             ["gh", *args],
@@ -72,8 +74,11 @@ def _gh(args: list[str]) -> Any:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         print(f"warning: gh {' '.join(args)} failed: {exc}", file=sys.stderr)
         return None
+    if not out or not out.strip():
+        print(f"warning: gh {' '.join(args)} printed nothing", file=sys.stderr)
+        return None
     try:
-        return json.loads(out) if out and out.strip() else []
+        return json.loads(out)
     except json.JSONDecodeError as exc:
         print(f"warning: gh {' '.join(args)} returned non-JSON: {exc}", file=sys.stderr)
         return None
@@ -100,12 +105,15 @@ def _http_json(url: str, timeout: float) -> Any:
 
 
 def _parse_dt(value: str | None) -> datetime | None:
+    """``value`` as an aware datetime, or ``None`` when it is empty, not ISO, or carries no offset:
+    a naive one cannot be subtracted from an aware one, and its zone would be a guess."""
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def dependabot_prs(repo: str, limit: int) -> list[dict[str, Any]] | None:
@@ -140,11 +148,23 @@ def _pr_shaped(pr: object) -> bool:
     return (
         isinstance(pr.get("title", ""), str)
         and isinstance(pr.get("body"), str | None)
-        and isinstance(pr.get("createdAt"), str | None)
-        and isinstance(pr.get("mergedAt"), str | None)
+        # A state the metrics do not name would drop an open PR from the KEV exposure age, and a
+        # list or dict one is unhashable.
+        and isinstance(pr.get("state"), str)
+        and pr.get("state") in _PR_STATES
+        # A timestamp that does not parse, or has no offset, would drop the PR or crash the run.
+        and all(_timestamp_or_null(pr.get(f)) for f in ("createdAt", "mergedAt"))
         and isinstance(labels, list)
         and all(isinstance(lbl, dict) and isinstance(lbl.get("name", ""), str) for lbl in labels)
     )
+
+
+#: The states `gh pr list --json state` reports.
+_PR_STATES = frozenset({"OPEN", "CLOSED", "MERGED"})
+
+
+def _timestamp_or_null(value: object) -> bool:
+    return value is None or (isinstance(value, str) and _parse_dt(value) is not None)
 
 
 def _is_security_pr(pr: dict[str, Any]) -> bool:
@@ -173,7 +193,11 @@ def kev_cves(timeout: float) -> set[str] | None:
 
 def epss_scores(cves: set[str], timeout: float) -> dict[str, float] | None:
     """EPSS scores for ``cves``, or ``None`` when any chunk could not be fetched or is not shaped as
-    an EPSS answer: a partial or empty answer would understate the coverage."""
+    an EPSS answer: a partial or empty answer would understate the coverage.
+
+    EPSS has no score for a CVE it does not know yet, and says so: its answer carries
+    ``"status": "OK"`` and a ``total`` that counts only the rows it found. Only an answer carrying
+    both, with ``total`` matching its rows, is one; a bare or short ``data`` list is not."""
     if not cves:
         return {}
     out: dict[str, float] = {}
@@ -181,8 +205,16 @@ def epss_scores(cves: set[str], timeout: float) -> dict[str, float] | None:
     for i in range(0, len(ordered), 100):  # EPSS API caps the cve list per call
         chunk = ordered[i : i + 100]
         data = _http_json(f"{EPSS_URL}?cve={','.join(chunk)}", timeout)
-        rows = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(rows, list):
+        if not isinstance(data, dict):
+            return None
+        rows, total = data.get("data"), data.get("total")
+        if (
+            not isinstance(rows, list)
+            or data.get("status") != "OK"
+            or not isinstance(total, int)
+            or isinstance(total, bool)
+            or total != len(rows)
+        ):
             return None
         for row in rows:
             try:
@@ -226,15 +258,23 @@ def adopter_lag(
     adopter_repos: list[str],
     now: datetime,
     timeout: float,
+    failures: list[str] | None = None,
 ) -> str:
     """Max days the newest engine release has been out that an adopter isn't yet pinned to.
 
     Best-effort: needs read access to the adopter repos (a CI GITHUB_TOKEN is scoped to one repo, so this
     is `n/a` there unless a cross-repo token is supplied; it computes locally / with a PAT that can read
-    the config repos).
+    the config repos). Once ``--adopter-repos`` opts in, a source that could not be read, or answered
+    in a shape this cannot read, is appended to ``failures`` so the run exits 2 (BACKLOG #5447).
     """
     if not adopter_repos:
         return "n/a: needs --adopter-repos (config-repo pin history)"
+
+    def _unread(why: str) -> str:
+        if failures is not None:
+            failures.append(f"adopter patch-lag: {why}")
+        return f"n/a: {why}"
+
     # Not releases/latest: the repo also publishes other distributions (webconsole-v...), and
     # whichever is newest is "latest", so the engine release is picked out by its plain v-tag.
     rels = _gh(
@@ -246,9 +286,9 @@ def adopter_lag(
         ]
     )
     if rels is None:
-        return "n/a: gh could not read the engine releases"
+        return _unread("gh could not read the engine releases")
     if not isinstance(rels, list) or not all(isinstance(r, dict) for r in rels):
-        return "n/a: the releases answer is not a list of releases"
+        return _unread("the releases answer is not a list of releases")
     engine = [
         (key, r)
         for r in rels
@@ -267,13 +307,13 @@ def adopter_lag(
         answer = _gh(["api", f"repos/{ar}/contents/requirements.txt"])
         content = answer.get("content") if isinstance(answer, dict) else None
         if not isinstance(content, str) or not content:
-            return f"n/a: can't read {ar}/requirements.txt (cross-repo access?)"
+            return _unread(f"can't read {ar}/requirements.txt (cross-repo access?)")
         try:
             # utf-8-sig: a BOM would otherwise hide a pin on the first line.
             text = base64.b64decode(content).decode("utf-8-sig", "replace")
         # binascii.Error is a ValueError, and so is a non-ASCII str: either is an unread file.
         except ValueError:
-            return f"n/a: {ar}/requirements.txt content is not base64"
+            return _unread(f"{ar}/requirements.txt content is not base64")
         pin = _exact_pin(text)
         # Only an exact pin can be compared. A range, an extras pin this did not parse, or no
         # messagefoundry line at all is not "up to date", so it is n/a, never a lag of 0.
@@ -281,7 +321,8 @@ def adopter_lag(
             return f"n/a: {ar}/requirements.txt has no single exact messagefoundry== pin"
         if _release_tuple(pin) != latest:
             if published is None:
-                return "n/a: the latest engine release has no publish date"
+                # A published release always has a date; a missing or naive one is malformed.
+                return _unread("the latest engine release has no publish date with an offset")
             lags.append((now - published).total_seconds() / 86400)
     return f"{max(lags):.1f}" if lags else "0"
 
@@ -413,7 +454,7 @@ def compute(
         m["epss_ge_0_7_count"] = "0"
 
     # 5. adopter patch-lag — days the newest release has been out that an adopter isn't yet pinned to.
-    m["adopter_patch_lag_days"] = adopter_lag(repo, adopter_repos, now, timeout)
+    m["adopter_patch_lag_days"] = adopter_lag(repo, adopter_repos, now, timeout, failed)
 
     # 6. auto-merge health — share of Dependabot PRs that merged + median time-to-merge (hours).
     if closed:
@@ -452,7 +493,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="write a Markdown summary to this path (e.g. $GITHUB_STEP_SUMMARY)",
     )
-    p.add_argument("--now", default=None, help="ISO timestamp for the run (default: current UTC)")
+    p.add_argument(
+        "--now",
+        default=None,
+        help="ISO timestamp with an offset for the run (default: current UTC)",
+    )
     p.add_argument(
         "--adopter-repos",
         default="",
@@ -461,7 +506,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reachability", default=None, help="triaged reachable/total, e.g. 3/5")
     args = p.parse_args(argv)
 
-    now = _parse_dt(args.now) or datetime.now(UTC)
+    if args.now is None:
+        now = datetime.now(UTC)
+    elif (parsed := _parse_dt(args.now)) is None:
+        # Exits 2. A naive or unparsable --now was a crash to 1, or silently the current time.
+        p.error(f"--now {args.now!r} is not an ISO timestamp with an offset")
+    else:
+        now = parsed
     adopter_repos = [r.strip() for r in args.adopter_repos.split(",") if r.strip()]
     failures: list[str] = []
     row = compute(
