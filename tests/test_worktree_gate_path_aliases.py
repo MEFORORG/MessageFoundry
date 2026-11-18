@@ -27,8 +27,8 @@ together. The fold below closes the case exactly when git will answer, which is 
 becomes possible.
 
 **THE FOLD MOSTLY ADDS DENIES**: it makes more spellings resolve onto a governed root. Since BACKLOG
-#5454 it also resolves ``..`` behind the extended-length prefix, which moves one class from DENY to
-ALLOW -- a ``..`` that climbs out of a governed root, a false deny that git does not share.
+#5454 it also resolves ``..`` behind the extended-length prefix, which moves at least one class from DENY
+to ALLOW -- a ``..`` that climbs out of a governed root, a false deny that git does not share.
 ``Get-ComparablePath``'s docstring states it, and ``tests/test_worktree_gate_dos_device.py`` pins it. The
 fold sits at the shared comparison point, so a rule inherits it wherever that rule reaches it.
 """
@@ -87,8 +87,11 @@ def _brace_block(src: str, name: str) -> str:
         i += 1
 
 
-def comparable(paths: list[str]) -> list[str]:
-    """Run the SHIPPED ``Get-ComparablePath`` over each path and return what it produced."""
+def comparable(paths: list[str], prelude: str = "") -> list[str]:
+    """Run the SHIPPED ``Get-ComparablePath`` over each path and return what it produced.
+
+    ``prelude`` is PowerShell run before the first call, for example to set the thread culture.
+    """
     src = GATE_SOURCE.read_text(encoding="utf-8")
     # The host-spellings list lives outside both functions and the fold consults it. An earlier version
     # of this helper omitted it, and every UNC row came back UNFOLDED -- a clean, wrong result that
@@ -107,7 +110,7 @@ def comparable(paths: list[str]) -> list[str]:
     block = var + "\n".join(_brace_block(src, n) for n in ("Get-FullPathRaw", "Get-ComparablePath"))
     body = "\n".join(f"Get-ComparablePath '{p}'" for p in paths)
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", block + "\n" + body],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", block + "\n" + prelude + "\n" + body],
         capture_output=True,
         text=True,
         encoding="utf-8",

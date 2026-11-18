@@ -10,8 +10,9 @@ NT-namespace prefix (backslash question-mark question-mark backslash) or the GLO
 any rule that compares through ``Get-ComparablePath``.
 
 MEASURED 2026-11-18 on Windows: ``git -C <spelling> rev-parse --git-common-dir`` exits 0 and names the
-real common dir for the dot-device, NT-namespace and dot-device GLOBALROOT spellings of a worktree, and
-for an extended-length spelling with a trailing dot or a ``..`` segment. None needs any setup.
+real common dir for the dot-device, NT-namespace (either separator), dot-device ``Global`` and dot-device
+GLOBALROOT spellings of a worktree, and for an extended-length spelling with a trailing dot or a ``..``
+segment. None needs any setup.
 
 The comparison helper is imported from ``tests/test_worktree_gate_path_aliases.py``, so it runs the
 SHIPPED functions; the end-to-end rows drive the real hook through ``tests/test_worktree_gate.py``.
@@ -53,11 +54,25 @@ def test_the_device_spellings_of_a_local_path_compare_equal() -> None:
             dev("//./", "GLOBALROOT/??/C:/Repo"),
             dev("//?/", "GLOBALROOT/??/C:/Repo"),
             "/??/C:/Repo",
+            dev("//?/", "Global/C:/Repo"),
+            dev("//./", "Global/C:/Repo"),
+            dev("//?/", "GLOBALROOT/Global??/C:/Repo"),
+            dev("//?/", "GLOBALROOT/DosDevices/C:/Repo"),
+            dev("//?/", "C:/Repo/a" + chr(10) + "b/.."),
             dev("//?/", "C:"),
         ]
     )
-    assert got[:9] == ["c:/repo"] * 9, got
-    assert got[9] == "c:", got
+    assert got[:14] == ["c:/repo"] * 14, got
+    assert got[14] == "c:", got
+
+
+def test_the_device_fold_does_not_depend_on_the_current_culture() -> None:
+    """Under tr-TR a culture-folding ``-match`` does not match ``I:`` against ``[a-z]``."""
+    got = comparable(
+        [dev("//?/", "I:/Repo"), dev("//./", "I:/Repo"), dev("/??/", "I:/Repo")],
+        prelude="[System.Globalization.CultureInfo]::CurrentCulture = 'tr-TR'",
+    )
+    assert got == ["i:/repo"] * 3, got
 
 
 def test_an_extended_length_path_is_normalised_the_way_git_normalises_it() -> None:
@@ -76,7 +91,7 @@ def test_an_extended_length_path_is_normalised_the_way_git_normalises_it() -> No
 
 
 def test_a_dot_dot_that_climbs_OUT_of_the_root_resolves_where_git_lands() -> None:
-    """The one class the fold moves from DENY to ALLOW, pinned so it stays a decision.
+    """At least one class the fold moves from DENY to ALLOW, pinned so it stays a decision.
 
     Before the fold this compared lexically as ``c:/repo/../elsewhere`` and matched ``c:/repo``. git
     resolves it to ``C:\\Elsewhere``, and the plain drive spelling already compared that way.
@@ -127,7 +142,7 @@ def test_a_device_path_that_is_not_a_drive_keeps_its_prefix() -> None:
 # --------------------------------------------------------------------------- rule 1, end to end
 
 
-@pytest.mark.parametrize("prefix", ["//./", "/??/", "//./GLOBALROOT/??/"])
+@pytest.mark.parametrize("prefix", ["//./", "/??/", "//./GLOBALROOT/??/", "//?/Global/"])
 def test_an_edit_through_a_device_spelling_of_the_primary_is_denied(
     tmp_path: Path, primary: Path, repos_file: Path, prefix: str
 ) -> None:
@@ -143,11 +158,23 @@ def test_an_edit_through_an_extended_length_dot_dot_spelling_is_denied(
     assert_denied(run_gate(edit(target, cwd=tmp_path / "Repo-alerts"), repos_file))
 
 
-def test_an_edit_through_an_extended_length_trailing_dot_spelling_is_denied(
+def test_an_edit_through_a_newline_segment_that_dot_dot_removes_is_denied(
     tmp_path: Path, primary: Path, repos_file: Path
 ) -> None:
-    target = B + B + "?" + B + str(primary) + "." + B + "src" + B + "app.py"
+    """A newline in a removed segment must not stop the prefix match. The pre-#5454 gate denied this."""
+    target = (
+        B + B + "?" + B + str(primary / "src") + B + "a" + chr(10) + "b" + B + ".." + B + "app.py"
+    )
     assert_denied(run_gate(edit(target, cwd=tmp_path / "Repo-alerts"), repos_file))
+
+
+@pytest.mark.parametrize("prefix", ["//./", "/??/", "//?/"])
+def test_an_edit_through_a_device_spelling_of_an_UNGOVERNED_path_is_allowed(
+    tmp_path: Path, repos_file: Path, prefix: str
+) -> None:
+    """Control: a gate that denied every device spelling would pass the deny rows above."""
+    target = prefix.replace("/", B) + str(tmp_path / "Elsewhere" / "app.py")
+    assert run_gate(edit(target, cwd=tmp_path / "Elsewhere"), repos_file) is None
 
 
 # --------------------------------------------------------------------------- rule 3c, end to end
@@ -155,45 +182,58 @@ def test_an_edit_through_an_extended_length_trailing_dot_spelling_is_denied(
 
 @pytest.fixture
 def repo(tmp_path: Path) -> SimpleNamespace:
-    """A REAL governed repo: rule 3c asks git for the common dir of the ``-C`` target."""
+    """A REAL governed repo and a real UNGOVERNED one: rule 3c asks git for the ``-C`` common dir."""
     if shutil.which("git") is None:
         pytest.skip("needs git on PATH")
     primary = tmp_path / "Primary"
+    elsewhere = tmp_path / "Elsewhere"
     for args in (
         ["init", "-b", "main", str(primary)],
-        ["-C", str(primary), "config", "user.email", "t@example.com"],
-        ["-C", str(primary), "config", "user.name", "t"],
-        ["-C", str(primary), "commit", "--allow-empty", "-m", "seed"],
+        ["init", "-b", "main", str(elsewhere)],
     ):
         subprocess.run(["git", *args], check=True, capture_output=True, text=True)
-    elsewhere = tmp_path / "Elsewhere"
-    elsewhere.mkdir()
     repos = tmp_path / "repos.txt"
     repos.write_text(str(primary) + chr(10), encoding="utf-8")
     return SimpleNamespace(primary=primary, elsewhere=elsewhere, repos=repos)
 
 
-@pytest.mark.parametrize(
-    ("prefix", "suffix"),
-    [
-        ("//./", ""),
-        ("/??/", ""),
-        ("//./GLOBALROOT/??/", ""),
-        ("//?/", "."),
-    ],
-)
+# Each spelling is a template over the governed path: {b} with backslashes, {f} with forward slashes.
+DISARM_SPELLINGS = [
+    B + B + "." + B + "{b}",
+    B + "??" + B + "{b}",
+    "/??/{f}",
+    B + B + "." + B + "GLOBALROOT" + B + "??" + B + "{b}",
+    # git refuses the question-mark Global form (rc=128) but takes this one (rc=0, measured 2026-11-18).
+    B + B + "." + B + "Global" + B + "{b}",
+    B + B + "." + B + "GLOBALROOT" + B + "Global??" + B + "{b}",
+    B + B + "?" + B + "{b}.",
+]
+
+
+@pytest.mark.parametrize("spelling", DISARM_SPELLINGS)
 def test_an_unquoted_device_spelled_git_C_disarm_is_denied(
-    repo: SimpleNamespace, prefix: str, suffix: str
+    repo: SimpleNamespace, spelling: str
 ) -> None:
     """The exploit the item measured, under the PowerShell tool, which passes the token unquoted."""
-    target = prefix.replace("/", B) + str(repo.primary) + suffix
+    target = spelling.format(b=str(repo.primary), f=str(repo.primary).replace(B, "/"))
     cmd = "git -C " + target + " config core.hooksPath x"
     reason = assert_denied(run_gate(bash(cmd, repo.elsewhere, tool="PowerShell"), repo.repos))
     assert "SHARED git configuration" in reason
 
 
+@pytest.mark.parametrize("spelling", DISARM_SPELLINGS[:3])
+def test_a_device_spelled_git_C_into_an_UNGOVERNED_repo_is_allowed(
+    repo: SimpleNamespace, spelling: str
+) -> None:
+    """Control: the same spellings of a repository nobody governs pass, so the deny is the fold's."""
+    target = spelling.format(b=str(repo.elsewhere), f=str(repo.elsewhere).replace(B, "/"))
+    cmd = "git -C " + target + " config core.hooksPath x"
+    assert run_gate(bash(cmd, repo.elsewhere, tool="PowerShell"), repo.repos) is None
+
+
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
         "OPEN, named in Get-ComparablePath's docstring: Test-ShellLiteralPath refuses a quoted -C value "
         "before the fold sees it, so a quoted device spelling is still allowed. A pass here means the gap "
