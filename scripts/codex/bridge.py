@@ -50,10 +50,37 @@ def user_skill_directory() -> Path:
     return (Path(config_root) if config_root else Path.home() / ".claude") / "skills"
 
 
+def repo_skill_directories(root: Path) -> list[Path]:
+    """This checkout's skills, then the primary checkout's for a linked worktree.
+
+    .gitignore keeps .claude/skills out of git, so a linked worktree holds none of its own.
+    """
+    directories = [root / ".claude/skills"]
+    query = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]
+    try:
+        lines = subprocess.run(  # nosec B603 B607 - fixed git query, no shell
+            ["git", "-C", str(root), *query],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return directories
+    # Only for a checkout's own top level, never a directory nested in some other repository. A bare
+    # repository has no primary checkout; its common dir is not named .git.
+    if len(lines) != 2 or Path(lines[0]).resolve() != root.resolve():
+        return directories
+    common = Path(lines[1])
+    if common.name == ".git" and common.parent.resolve() != root.resolve():
+        directories.append(common.parent / ".claude/skills")
+    return directories
+
+
 def source_skill(root: Path, name: str, *, user_skills: Path | None = None) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise ValueError("Skill name must be a single directory name")
-    for directory in (root / ".claude/skills", user_skills or user_skill_directory()):
+    for directory in (*repo_skill_directories(root), user_skills or user_skill_directory()):
         source = directory / name / "SKILL.md"
         if source.is_file():
             return source
@@ -67,9 +94,9 @@ def sync_skills(
     sources_by_name = {}
     if user_skills is not None:
         sources_by_name.update((path.parent.name, path) for path in user_skills.glob("*/SKILL.md"))
-    sources_by_name.update(
-        (path.parent.name, path) for path in (root / ".claude/skills").glob("*/SKILL.md")
-    )
+    # Later updates win, so the order runs from lowest precedence to highest.
+    for directory in reversed(repo_skill_directories(root)):
+        sources_by_name.update((path.parent.name, path) for path in directory.glob("*/SKILL.md"))
     sources = [sources_by_name[name] for name in sorted(sources_by_name)]
     if not sources:
         raise FileNotFoundError("No skill sources found under .claude/skills")
@@ -387,7 +414,10 @@ def main() -> int:
             if not (ROOT / path).is_file():
                 raise FileNotFoundError(path)
             print(f"source: {path}")
-        print("Skills: .agents pointers read the current repo and user-level Claude sources.")
+        print(
+            "Skills: .agents pointers read the current repo, the primary checkout of a linked "
+            "worktree, and user-level Claude sources."
+        )
         print("Hook activation still requires Codex project and hook trust.")
         return 0
     if not rest:
