@@ -99,15 +99,15 @@ def test_sync_in_a_linked_worktree_writes_pointers_for_primary_skills(bridge, li
 
 def test_the_primary_checkout_reads_only_its_own_skills(bridge, linked):
     primary, _ = linked
-    assert bridge.repo_skill_directories(primary) == [primary / ".claude/skills"]
+    assert bridge.repo_skill_directories(primary) == (primary / ".claude/skills",)
 
 
 def test_a_directory_nested_in_a_repository_is_not_given_its_skills(bridge, linked):
     primary, _ = linked
     nested = primary / "sub"
     nested.mkdir()
-    assert bridge.repo_skill_directories(nested) == [nested / ".claude/skills"]
+    assert bridge.repo_skill_directories(nested) == (nested / ".claude/skills",)
 
 
 def test_outside_any_repository_only_the_root_is_searched(bridge, tmp_path):
-    assert bridge.repo_skill_directories(tmp_path) == [tmp_path / ".claude/skills"]
+    assert bridge.repo_skill_directories(tmp_path) == (tmp_path / ".claude/skills",)

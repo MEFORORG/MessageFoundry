@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import json
 import os
 import re
@@ -50,12 +51,15 @@ def user_skill_directory() -> Path:
     return (Path(config_root) if config_root else Path.home() / ".claude") / "skills"
 
 
-def repo_skill_directories(root: Path) -> list[Path]:
+@functools.cache
+def repo_skill_directories(root: Path) -> tuple[Path, ...]:
     """This checkout's skills, then the primary checkout's for a linked worktree.
 
-    .gitignore keeps .claude/skills out of git, so a linked worktree holds none of its own.
+    .gitignore keeps .claude/skills out of git, so a linked worktree holds none of its own. Cached,
+    because sync_skills resolves every pointer through source_skill and each would ask git again.
     """
-    directories = [root / ".claude/skills"]
+    own = (root / ".claude/skills",)
+    top = root.resolve()
     query = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]
     try:
         lines = subprocess.run(  # nosec B603 B607 - fixed git query, no shell
@@ -66,15 +70,15 @@ def repo_skill_directories(root: Path) -> list[Path]:
             check=True,
         ).stdout.splitlines()
     except (OSError, subprocess.SubprocessError):
-        return directories
+        return own
     # Only for a checkout's own top level, never a directory nested in some other repository. A bare
     # repository has no primary checkout; its common dir is not named .git.
-    if len(lines) != 2 or Path(lines[0]).resolve() != root.resolve():
-        return directories
+    if len(lines) != 2 or Path(lines[0]).resolve() != top:
+        return own
     common = Path(lines[1])
-    if common.name == ".git" and common.parent.resolve() != root.resolve():
-        directories.append(common.parent / ".claude/skills")
-    return directories
+    if common.name == ".git" and common.parent.resolve() != top:
+        return (*own, common.parent / ".claude/skills")
+    return own
 
 
 def source_skill(root: Path, name: str, *, user_skills: Path | None = None) -> Path:
@@ -180,12 +184,13 @@ def find_bash() -> str:
             return found
         raise FileNotFoundError("bash not found for a shell: bash hook")
     candidates = []
-    if os.environ.get("CLAUDE_CODE_GIT_BASH_PATH"):
-        candidates.append(Path(os.environ["CLAUDE_CODE_GIT_BASH_PATH"]))
-    git = shutil.which("git")
-    if git:
-        # Git for Windows keeps git.exe in cmd/ or bin/, and bash.exe in bin/.
-        candidates += [Path(git).parent.parent / "bin/bash.exe", Path(git).parent / "bash.exe"]
+    if configured := os.environ.get("CLAUDE_CODE_GIT_BASH_PATH"):
+        candidates.append(Path(configured))
+    if git := shutil.which("git"):
+        # The candidate order of tests/_bash_resolver.py: git.exe sits at several depths, and
+        # usr/bin/bash.exe is the real shell, where bin/bash.exe is a wrapper that rewrites PATH.
+        for parent in Path(git).resolve().parents:
+            candidates += [parent / "usr/bin/bash.exe", parent / "bin/bash.exe"]
     # System32's and WindowsApps' bash.exe launch WSL, which does not see this environment.
     if found and not re.search(r"[\\/](system32|windowsapps)[\\/]", found, re.IGNORECASE):
         candidates.append(Path(found))
