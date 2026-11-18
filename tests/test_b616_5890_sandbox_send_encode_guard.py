@@ -14,17 +14,22 @@ each Send inside ``_run_one``'s run context and exception arms, so the raise is 
 
 from __future__ import annotations
 
+import importlib
+import logging
+import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from messagefoundry import Send
 from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.wiring import Registry, load_config
-from messagefoundry.pipeline._sandbox_worker import _encode_sends
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.pipeline.sandbox import SandboxError, SandboxMode, SandboxPolicy, SandboxSession
 from messagefoundry.pipeline.wiring_runner import UserCodeCalledSysExit
+from tests._root_logging import root_logging_restored
 from tests.test_sandbox import RAW, _deliveries, _session
 
 _GRAPH = """
@@ -138,13 +143,71 @@ class _Bytes:
         return b"x"
 
 
+_WORKER = "messagefoundry.pipeline._sandbox_worker"
+
+
+def _root_state() -> tuple[list[logging.Handler], int, list[Any]]:
+    root = logging.getLogger()
+    return list(root.handlers), root.level, list(root.filters)
+
+
+def _import_encode_sends() -> Callable[[object], object]:
+    """Import the worker's ``_encode_sends`` with the root logger put back afterwards.
+
+    The worker's import calls ``configure_stderr_logging()``. That call replaces every root handler,
+    pytest's capture handlers included, and sets the root level. It is right in the worker's child
+    process and wrong here. A module-level import would leave that state from collection onward.
+    """
+    with root_logging_restored():
+        from messagefoundry.pipeline._sandbox_worker import _encode_sends
+    return _encode_sends
+
+
+@pytest.fixture(scope="module")
+def encode_sends() -> Callable[[object], object]:
+    return _import_encode_sends()
+
+
+def _forget_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the worker module, so the next import runs its module code again."""
+    import messagefoundry.pipeline as pipeline_pkg
+
+    monkeypatch.delitem(sys.modules, _WORKER, raising=False)
+    monkeypatch.delattr(pipeline_pkg, "_sandbox_worker", raising=False)
+
+
+def test_import_encode_sends_restores_the_root_logger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control: the helper's fresh import leaves the root as it was, whatever test ran first.
+
+    The positive control proves a bare fresh import does change the root. The identity check proves
+    the helper's own import ran the module code again, so an unchanged root is the restore working.
+    Monkeypatch undoes the module swaps. If the worker was never imported before this test, a fresh
+    copy stays in ``sys.modules`` afterwards.
+    """
+    _forget_worker(monkeypatch)
+    with root_logging_restored():
+        before = _root_state()
+        first = importlib.import_module(_WORKER)
+        changed = _root_state() != before
+    assert changed, "the bare import no longer touches the root, so this control proves nothing"
+    _forget_worker(monkeypatch)
+    before = _root_state()
+    _import_encode_sends()
+    assert sys.modules[_WORKER] is not first
+    assert _root_state() == before
+
+
 @pytest.mark.parametrize("exc", [RuntimeError("boom"), KeyError("k"), SystemExit(2), MemoryError()])
-def test_encode_sends_lets_any_encode_raise_reach_the_callers_arms(exc: BaseException) -> None:
+def test_encode_sends_lets_any_encode_raise_reach_the_callers_arms(
+    encode_sends: Callable[[object], object], exc: BaseException
+) -> None:
     with pytest.raises(type(exc)):
-        _encode_sends([Send("OB", _Raises(exc))])  # type: ignore[arg-type]
+        encode_sends([Send("OB", _Raises(exc))])  # type: ignore[arg-type]
 
 
-def test_encode_sends_carries_exact_text_and_keeps_the_shape() -> None:
+def test_encode_sends_carries_exact_text_and_keeps_the_shape(
+    encode_sends: Callable[[object], object],
+) -> None:
     class _Text(str):
         pass
 
@@ -152,15 +215,15 @@ def test_encode_sends_carries_exact_text_and_keeps_the_shape() -> None:
         def encode(self) -> str:
             return _Text("BODY")
 
-    one = _encode_sends(Send("OB", _Msg()))  # type: ignore[arg-type]
+    one = encode_sends(Send("OB", _Msg()))  # type: ignore[arg-type]
     assert isinstance(one, Send) and type(one.message) is str and one.message == "BODY"
-    many = _encode_sends([Send("OB", _Text("A")), Send("OB", "B")])
+    many = encode_sends([Send("OB", _Text("A")), Send("OB", "B")])
     assert isinstance(many, list) and [type(m.message) for m in many] == [str, str]
     # An inadmissible item leaves the whole result to the codec, so no encode() runs first.
     held = [Send("OB", _Raises(RuntimeError("never called"))), "not a send"]  # type: ignore[arg-type]
-    assert _encode_sends(held) is held
+    assert encode_sends(held) is held
     with pytest.raises(TypeError, match="encoded to bytes, expected a str"):
-        _encode_sends(Send("OB", _Bytes()))  # type: ignore[arg-type]
+        encode_sends(Send("OB", _Bytes()))  # type: ignore[arg-type]
 
 
 def test_mode_off_reports_the_encode_raise_as_the_handlers_error(
