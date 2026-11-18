@@ -1206,3 +1206,34 @@ async def test_keyless_open_of_encrypted_reference_raises_operator_error(tmp_pat
     with pytest.raises(StoreKeylessError) as ei:
         await MessageStore.open(db)  # keyless open — the reference load fails closed
     assert "reference" in str(ei.value)
+
+
+def test_cell_aad_spells_a_number_by_its_value_not_its_type() -> None:
+    # BACKLOG #5962: a REAL/DOUBLE/FLOAT timestamp column returns 1000.0 for an int 1000 written into
+    # it, so the writer's int and the reader's float must bind the same bytes, or the cell never opens.
+    assert cell_aad("connection_event", "reason", "IB", 1000, "k") == cell_aad(
+        "connection_event", "reason", "IB", 1000.0, "k"
+    )
+    # A non-integral float is spelled exactly (repr round-trips), and stays distinct from its neighbours.
+    ts = 1763400000.123456
+    assert cell_aad("message_events", "detail", "m", ts, "e") == cell_aad(
+        "message_events", "detail", "m", float(repr(ts)), "e"
+    )
+    assert cell_aad("message_events", "detail", "m", ts, "e") != cell_aad(
+        "message_events", "detail", "m", 1763400000, "e"
+    )
+    # The spelling of every value a store already bound is unchanged.
+    assert cell_aad("t", "c", 5, "x", ts) == cell_aad("t", "c", "5", "x", repr(ts))
+
+
+@pytest.mark.parametrize("bad", [None, True, False, b"x", object()])
+def test_cell_aad_refuses_a_component_str_would_collide_or_misspell(bad: object) -> None:
+    # str(None) == "None" and str(True) == "True" would bind the same AAD as those strings.
+    with pytest.raises(TypeError):
+        cell_aad("t", "c", bad)
+
+
+def test_cell_aad_binds_a_lone_surrogate_instead_of_raising() -> None:
+    lone = "k\ud800"
+    assert cell_aad("state", "value", "ns", lone) == cell_aad("state", "value", "ns", lone)
+    assert cell_aad("state", "value", "ns", lone) != cell_aad("state", "value", "ns", "k")

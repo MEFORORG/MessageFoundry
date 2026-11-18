@@ -341,17 +341,46 @@ def cell_aad(table: str, column: str, *pk: object) -> bytes:
 
     The byte form is (a) **unambiguous**: every field is length-prefixed (4-byte big-endian) so no two
     distinct field tuples collide (``("a","bc")`` != ``("ab","c")``); (b) **versioned**: the ``_AAD_SCHEME``
-    tag leads; (c) **backend-agnostic**: each component is ``str(...)``-encoded, so the same logical cell
+    tag leads; (c) **backend-agnostic**: each component is spelled as text, so the same logical cell
     yields identical AAD whether the PK is a SQLite ``INTEGER`` id or a Postgres/SQL Server ``BIGINT`` —
     the re-encrypt/rotation and cross-backend restore paths must reconstruct the same value. AAD length is
-    irrelevant to GCM (it is hashed into the tag), so a verbose, collision-free form is free."""
+    irrelevant to GCM (it is hashed into the tag), so a verbose, collision-free form is free.
+
+    A component must be a ``str``, an ``int`` or a ``float`` (:func:`_aad_component` says why each
+    other type is refused and how a number is spelled). A ``TypeError`` here is a caller bug."""
     fields = (
         _AAD_SCHEME,
         table.encode("utf-8"),
         column.encode("utf-8"),
-        *(str(p).encode("utf-8") for p in pk),
+        *(_aad_component(p) for p in pk),
     )
     return b"".join(len(f).to_bytes(4, "big") + f for f in fields)
+
+
+def _aad_component(value: object) -> bytes:
+    """One :func:`cell_aad` key component as bytes, spelled the same at seal time and at every read.
+
+    A writer binds what it has in hand, and a reader binds what the column hands back, so a number
+    is spelled by its value, not its Python type: a timestamp column (SQLite ``REAL``, Postgres
+    ``DOUBLE PRECISION``, SQL Server ``FLOAT``) returns ``1000.0`` for an ``int`` 1000 written into
+    it, and both must bind ``1000``. An integral float is therefore spelled as its integer, and any
+    other float by ``repr``, which round-trips exactly. ``None`` and ``bool`` are refused: ``str()``
+    would bind ``None`` and ``True`` to the same bytes as the strings ``"None"`` and ``"True"``, and
+    no key column holds either. Any other type is refused rather than ``str()``-spelled, since its
+    text form need not match what the column returns. A string is UTF-8 with ``surrogatepass``, so a
+    lone surrogate binds bytes no valid string produces instead of raising here; the backend's own
+    write still refuses to store one."""
+    if isinstance(value, str):
+        return value.encode("utf-8", "surrogatepass")
+    if isinstance(value, bool) or value is None:
+        raise TypeError(f"cell_aad key component must not be {value!r}")
+    if isinstance(value, int):
+        return str(value).encode("ascii")
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value)).encode("ascii")
+        return repr(value).encode("ascii")
+    raise TypeError(f"cell_aad key component must be str, int or float, not {type(value).__name__}")
 
 
 def aad_cell_name(aad: bytes | None) -> tuple[str, str]:

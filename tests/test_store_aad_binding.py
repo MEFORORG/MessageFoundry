@@ -200,6 +200,33 @@ async def test_totp_connection_event_alert_roundtrip(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_an_integer_timestamp_still_opens_its_connection_event(tmp_path: Path) -> None:
+    # BACKLOG #5962: the writer binds the int it was given, the REAL column hands back a float, and
+    # both must spell the same AAD, or the reason never opens on read or on rotate-key.
+    db, old = tmp_path / "int_ts.db", generate_key()
+    store = await _open_bound(db, old)
+    try:
+        await store.record_connection_event(
+            connection="IB",
+            transport="mllp",
+            direction="inbound",
+            kind="framing_error",
+            reason="bad MLLP frame",
+            now=1_763_400_000,
+        )
+        evs = await store.list_connection_events(connection="IB", allowed_channels=None)
+        assert evs and evs[0].reason == "bad MLLP frame"
+    finally:
+        await store.close()
+    store = await _open_bound(db, generate_key(), retired=[old])
+    try:
+        assert await store.reencrypt_to_active() >= 1
+        evs = await store.list_connection_events(connection="IB", allowed_channels=None)
+        assert evs and evs[0].reason == "bad MLLP frame"
+    finally:
+        await store.close()
+
+
 # --- fail-closed: a ciphertext moved to a DIFFERENT cell fails the tag ----------------------------
 
 

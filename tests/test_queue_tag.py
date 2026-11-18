@@ -78,13 +78,14 @@ def test_each_routing_field_changes_the_tag(field: str, value: object) -> None:
 
 
 def test_a_null_destination_is_not_the_text_none_or_blank() -> None:
-    """AC-10: ``cell_aad`` str()-encodes, so NULL and ``"None"`` once built the same bytes."""
+    """AC-10: ``cell_aad`` once str()-encoded, so NULL and ``"None"`` built the same bytes."""
     tags = {
         queue_payload_aad(**{**_BASE, "destination_name": value}) for value in (None, "None", "")
     }
     assert len(tags) == 3
-    # The control that shows why the encoder matters: the id-only cell_aad conflates them.
-    assert cell_aad("queue", "payload", None) == cell_aad("queue", "payload", "None")
+    # cell_aad now refuses a None component rather than spell it "None" (BACKLOG #5962).
+    with pytest.raises(TypeError):
+        cell_aad("queue", "payload", None)
 
 
 def test_the_tag_still_names_its_cell_and_reads_off_a_row() -> None:
