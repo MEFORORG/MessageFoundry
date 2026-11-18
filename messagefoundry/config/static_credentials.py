@@ -355,9 +355,13 @@ def _http_hop(
 def _dicomweb_build_refused(
     settings: Mapping[str, Any], env_values: Mapping[str, Any] | None
 ) -> bool:
-    """Whether DICOMweb's credential refusal (vault BACKLOG #5359) stops this hop's build, so the
-    census leaves it out: a refused build is not listed. A value this reading cannot resolve
-    leaves the hop listed."""
+    """Whether ``dicomweb_credential_problem`` (vault BACKLOG #5359) refuses this connection's
+    ``bearer_token``, ``basic_user``, ``basic_password`` and ``headers``. When it does, the census
+    lists neither the connection nor its proxy hop, whichever build refusal fires first. No other
+    DICOMweb build refusal leaves the connection out, at least a credential, query or fragment in
+    its ``url``, cleartext credentials or ``verify_tls`` off. An ``env()`` value among the four
+    that this reading cannot resolve, which is every one without ``env_values``, returns False
+    whatever the others hold."""
     # Lazy, like ``_smart``: the transport owns the refusal, and this reads it rather than
     # restating it.
     from messagefoundry.transports.dicomweb import dicomweb_credential_problem
@@ -758,13 +762,8 @@ def static_credential_hops(
     ``env_values``, when the caller has the running instance's, resolves at least a database
     hop's ``env()`` dialect as the build does (see ``static_credential_db_hops``), and an
     HTTP-family hop's ``env()`` ``headers`` table or ``url`` (see ``_http_literal_static``), and
-    the ``bearer_token``, ``basic_user``, ``basic_password`` and ``headers`` that
-    ``_dicomweb_build_refused`` reads for a DICOMweb connection. Of its build refusals, only
-    ``dicomweb_credential_problem``'s over those four leave a DICOMweb connection and its proxy hop
-    out. A refusal on any other ground, at least a credential, query or fragment in its ``url``,
-    cleartext credentials or ``verify_tls`` off, does not, and nor does one of the four that is an
-    ``env()`` reference this reading cannot resolve, which is every one without ``env_values``,
-    whatever the others hold."""
+    the DICOMweb settings ``_dicomweb_build_refused`` reads, whose docstring says when that leaves a
+    DICOMweb connection and its proxy hop out."""
     out: list[StaticCredentialHop] = []
     if registry is not None:
         site_proxy = None if settings is None else (settings.egress.proxy_url or "")
