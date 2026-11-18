@@ -248,7 +248,7 @@ list.** How the search ran, and what it could miss, is below the table.
 | API | `content` and `field_path`, on `POST /messages/search` | Send exactly one. | 400 |
 | API | The same pair, on `POST /messages/export` with no `ids` | Send exactly one. With `ids`, the engine reads neither. | 400 |
 | API | The same pair, on `POST /uploads/{file_id}/messages/search` and in the criteria on `POST /search/presets` | Send one or neither. Both together are refused. | 400 |
-| API | `field_value`, beside that pair | The engine reads it only beside `field_path`. Beside `content`, or with neither, it is refused, except on an export by `ids`, which reads none of them. A `field_value` that is empty or only whitespace counts as not sent, on every route. | 400 |
+| API | `field_value`, beside that pair | The engine reads it only beside `field_path`. Beside `content`, or with neither, it is refused, except on an export by `ids`, which reads none of them, and except one of only whitespace the model admits, spaces at least, which counts as not sent (see *Blank values* below the table). | 400 |
 | API | The presets named in `presets`, on `GET /search/layered` | Exactly one preset carries a content term. | 400 |
 | API | The same presets | Two presets that both set `channel_id`, `status`, `message_type` or `control_id` must set the same value. | 400 |
 | API | `to` and `reroute`, on `POST /messages/{message_id}/edit-resend` | With `to`, the engine delivers to that outbound and ignores `reroute`. Without `to`, `reroute` must be true. | 400 |
@@ -262,11 +262,16 @@ Where each rule lives:
   [`messagefoundry/store/content_search.py`](../messagefoundry/store/content_search.py). The routes
   in the first three rows call it. `GET /messages/search` takes `field_path` alone, so the pair
   cannot clash there.
-- Blank values in a content search: `make_spec` counts a value of only spaces as not sent. It
+- Blank values in a content search: `make_spec` counts a value that is empty or only whitespace
+  as not sent, wherever it is called. An empty `content` or `field_value` never reaches it, nor
+  one holding at least a tab, CR or LF: the model refuses each with a 422. So a `field_value` of
+  only spaces beside `content` is accepted, not refused, and on the two one-or-neither routes one
+  with neither term is too. It
   keeps any other `content` or `field_value` exactly as sent, spaces included, because a leading
-  or trailing space narrows the match. It strips `field_path`, which is a locator. An empty
-  `content` never reaches it: the model refuses that with a 422. On the two one-or-neither routes,
-  a pair holding only spaces gets a 400, and a `field_value` of only spaces counts as not sent.
+  or trailing space narrows the match. It strips `field_path`, which is a locator. On the two
+  one-or-neither routes, a request that sends a non-empty `content` or `field_path`, but neither
+  with anything besides whitespace, gets a 400 where the model has not refused it first. A blank one beside a real term counts as not sent,
+  so that request is accepted.
 - The console search form: it calls the API's search handler, so a clash gets the same answer.
   With no criteria at all it shows the empty form and does not search.
 - Layered search: `_compose_preset_layers`, in

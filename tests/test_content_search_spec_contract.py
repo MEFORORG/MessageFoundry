@@ -31,6 +31,7 @@ from messagefoundry.store.content_search import (
     make_spec,
     newest_first,
     row_matches,
+    sends_a_needle,
 )
 from messagefoundry.store.store import MessageStore
 
@@ -116,6 +117,30 @@ def test_a_blank_field_value_beside_content_is_still_accepted() -> None:
         assert spec.field_value is None
 
 
+@pytest.mark.parametrize(
+    ("content", "field_path", "accepted"),
+    [
+        ("DOE", "   ", True),
+        ("   ", "PID-3", True),
+        ("   ", None, False),
+        (None, "   ", False),
+        ("   ", "   ", False),
+    ],
+)
+def test_a_blank_term_on_a_one_or_neither_route(
+    content: str | None, field_path: str | None, accepted: bool
+) -> None:
+    """docs/API-INPUT-VALIDATION.md, *Blank values*: on a route where a needle is optional, a blank
+    ``content`` or ``field_path`` beside a real term counts as not sent, and a request whose only
+    terms are blank is sent on to ``make_spec`` and refused there (a 400)."""
+    assert sends_a_needle(content, field_path, None)
+    if accepted:
+        make_spec(content=content, field_path=field_path, field_value=None)
+    else:
+        with pytest.raises(ContentSearchError, match="exactly one"):
+            make_spec(content=content, field_path=field_path, field_value=None)
+
+
 # --- BACKLOG #6700: scan_limit type -----------------------------------------------------------
 
 
@@ -196,4 +221,91 @@ def test_a_spec_built_outside_make_spec_refuses_a_non_int_cap(bad: Any) -> None:
             field_value=None,
             target=SearchTarget.BOTH,
             scan_limit=bad,
+        )
+
+
+@pytest.mark.parametrize(
+    ("substring", "field_path", "field_value"),
+    [
+        (None, None, None),  # no needle
+        ("x", "PID-3", None),  # two needles
+        ("   ", None, None),  # a blank substring
+        ("", None, None),
+        (None, "", None),  # an empty path
+        (None, " PID-3", None),  # a padded path, which make_spec strips
+        ("x", None, "v"),  # a field_value beside a substring
+        (None, "PID-3", "  "),  # a blank field_value, which make_spec drops
+    ],
+)
+def test_a_spec_built_outside_make_spec_holds_the_needle_rules(
+    substring: str | None, field_path: str | None, field_value: str | None
+) -> None:
+    """``SearchSpec`` holds the needle rules ``make_spec`` enforces (BACKLOG #6700 item 4)."""
+    with pytest.raises(ContentSearchError, match="a spec"):
+        SearchSpec(
+            substring=substring,
+            field_path=field_path,
+            field_value=field_value,
+            target=SearchTarget.BOTH,
+            scan_limit=10,
+        )
+
+
+@pytest.mark.parametrize(
+    ("substring", "field_path", "field_value"),
+    [(" x ", None, None), (None, "PID-3", None), (None, "PID-3", " v ")],
+)
+def test_a_spec_built_outside_make_spec_admits_what_make_spec_builds(
+    substring: str | None, field_path: str | None, field_value: str | None
+) -> None:
+    """Control for the test above: each shape ``make_spec`` returns still builds directly."""
+    SearchSpec(
+        substring=substring,
+        field_path=field_path,
+        field_value=field_value,
+        target=SearchTarget.BOTH,
+        scan_limit=10,
+    )
+
+
+def test_a_spec_built_outside_make_spec_refuses_a_malformed_field_path() -> None:
+    """The path is parsed at construction, as ``make_spec`` parsed it, so a bad one never reaches
+    a scan as a per-row no-match."""
+    with pytest.raises(ContentSearchError):
+        SearchSpec(
+            substring=None,
+            field_path="NOT A PATH",
+            field_value=None,
+            target=SearchTarget.BOTH,
+            scan_limit=10,
+        )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"substring": 5, "field_path": None, "field_value": None, "target": SearchTarget.BOTH},
+        {"substring": None, "field_path": b"PID-3", "field_value": None, "target": "both"},
+        {"substring": "x", "field_path": None, "field_value": None, "target": "bogus"},
+    ],
+    ids=["non-text-needle", "bytes-path", "bad-target"],
+)
+def test_a_spec_built_outside_make_spec_refuses_what_make_spec_refuses(
+    fields: dict[str, Any],
+) -> None:
+    """A non-text needle or a target that is not a ``SearchTarget`` is a 400, not a 500 or a scan
+    that silently matches nothing."""
+    with pytest.raises(ContentSearchError):
+        SearchSpec(**fields, scan_limit=10)
+
+
+def test_an_out_of_range_cap_is_a_content_search_error() -> None:
+    """The range refusal is the type the routes catch for a 400, as the type refusal is (item 16)."""
+    with pytest.raises(ContentSearchError, match="scan_limit must be in"):
+        SearchSpec(
+            substring="x",
+            field_path=None,
+            field_value=None,
+            target=SearchTarget.BOTH,
+            scan_limit=MAX_SCAN_LIMIT + 1,
         )

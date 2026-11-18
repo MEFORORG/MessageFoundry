@@ -3723,7 +3723,7 @@ def _summary(row: Row) -> MessageSummary:
         summary=d.get("summary"),
         # Surface ONLY the operator/handler user bag (ADR 0081, #150) — user_metadata strips the
         # engine-internal ADR-0013 correlation-lineage keys so they never leak to the API.
-        metadata=user_metadata(d.get("metadata")),
+        metadata=user_metadata(d.get("metadata"), row_id=d["id"]),
     )
 
 

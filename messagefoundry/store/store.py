@@ -14573,7 +14573,7 @@ class MessageStore:
             # metadata and a re-run re-derives the identical merged bag (purity). Reuses the single read
             # above; correlation lineage (other keys) is preserved by merge_user_metadata.
             if meta_ops:
-                merged = merge_user_metadata(pmeta_json, meta_ops)
+                merged = merge_user_metadata(pmeta_json, meta_ops, row_id=message_id)
                 await self._db.execute(
                     "UPDATE messages SET metadata=? WHERE id=?",
                     (
@@ -16337,7 +16337,8 @@ class MessageStore:
                             r["destination_name"],
                             r["response_seq"],
                         ),
-                    )
+                    ),
+                    row_id=r["message_id"],
                 ),
             )
             for r in rows

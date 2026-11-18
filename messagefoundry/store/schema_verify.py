@@ -81,9 +81,12 @@ _KEYED_DETAIL = (
     " you set [secret_rotation].store_key_last_rotated, update it."
 )
 
-# Every read skips virtual tables: a pragma on one whose module is not loaded here raises "no such
-# module" (BACKLOG #6719). The store builds none, and a test pins that, so an expected name held by a
-# virtual table reads as a missing table and is refused rather than skipped.
+# The reads below skip a table whose stored SQL is LIKE 'CREATE VIRTUAL TABLE%', because a pragma
+# on a virtual table whose module is not loaded here can raise "no such module" (BACKLOG #6719).
+# The store builds none, and a test pins that, so an expected name held by a virtual table reads
+# as a missing table and is refused rather than skipped.
+# THIS BUILD CREATES NO VIRTUAL TABLE AND NO VIEW, which tests/test_schema_verify_6719_6720.py
+# pins; the other notes in this module rely on that and point here.
 _ORDINARY_TABLE = "m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
 # table names travel as bound parameters rather than being spliced into SQL. Only tables the EXPECTED
@@ -351,8 +354,8 @@ async def verify_live_schema(
 #: by recreating the store, so the code alone is not enough. An expected name held by an object of
 #: another kind is not "already exists": SQLite names the kind, or refuses the index or ALTER the
 #: script or a migration then runs on it (BACKLOG #6720; the texts are measured in
-#: tests/test_schema_verify_6719_6720.py). "no such module" names a virtual table in the file:
-#: this build creates none, which that test file pins, so the module is never this build's own.
+#: tests/test_schema_verify_6719_6720.py). "no such module" names a virtual table in the file,
+#: which is never this build's own (see _ORDINARY_TABLE).
 _SHAPE_MESSAGES = (
     "no such column",
     "no such table",
@@ -377,10 +380,10 @@ def is_schema_step_error(exc: BaseException) -> bool:
     Two tests, both needed. The code must be SQLite's generic ``SQLITE_ERROR``: a busy or locked
     file, a read-only file, an I/O error, a full disk and a corrupt file each carry their own primary
     code. And the message must name a missing or clashing table, column or index, or a virtual
-    table's module, because a syntax error is ``SQLITE_ERROR`` too. This build creates no virtual
-    table, so a missing module is always an object some other tool left in the file (BACKLOG
-    #6719). None of the others is fixed by recreating the store, so each keeps its own error rather
-    than getting this remedy (BACKLOG #2101)."""
+    table's module, because a syntax error is ``SQLITE_ERROR`` too. A missing module is always an
+    object some other tool left in the file (see ``_ORDINARY_TABLE``, BACKLOG #6719). None of the
+    others is fixed by recreating the store, so each keeps its own error rather than getting this
+    remedy (BACKLOG #2101)."""
     code = getattr(exc, "sqlite_errorcode", None)
     return (
         isinstance(exc, sqlite3.OperationalError)
@@ -425,8 +428,9 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
 
     The two tables are read separately. When the schema script itself failed (BACKLOG #2101), an
     older file may have no ``store_salt`` table at all, and that too means no salt was ever minted.
-    So does a view or a virtual table under its name (BACKLOG #6719): this build creates neither,
-    so only an ordinary table can hold a salt this build minted."""
+    So does a view under its name, or a virtual table ``_ORDINARY_TABLE`` skips (BACKLOG #6719):
+    only an ordinary table can hold a salt this build minted. ``cipher_meta`` is read whatever object
+    holds the name, so a readable count leans toward the new-key remedy rather than a reset."""
     try:
         async with db.execute("SELECT EXISTS (SELECT 1 FROM cipher_meta)") as cur:
             row = await cur.fetchone()

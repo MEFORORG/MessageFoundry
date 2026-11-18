@@ -235,6 +235,78 @@ async def test_a_failed_audit_write_does_not_mute_the_cells_next_report(
     assert rows == [MESSAGE_TAG_FAILED_ACTION]  # written, so muted for the interval
 
 
+def _failing_sink(exc: Exception) -> Any:
+    class _Sink:
+        async def record_audit(self, action: str, **_kwargs: object) -> None:
+            raise exc
+
+    return _Sink()
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_the_audit_failure_line_names_the_cell_and_a_checked_error_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6697 items 4 and 10: the ERROR line names the cell and row reference, and logs
+    SQLite's error name only when it has SQLite's own shape."""
+    good = sqlite3.OperationalError("synthetic-driver-text")
+    good.sqlite_errorname = "SQLITE_BUSY"
+    bad = sqlite3.OperationalError("synthetic-driver-text")
+    bad.sqlite_errorname = "not-a-name synthetic-planted"
+    with caplog.at_level("ERROR", logger=cell_tag.__name__):
+        await report_cell_tag_failure(
+            _failing_sink(good), CellTagError("messages", "summary", "au-name-1", "A")
+        )
+        await report_cell_tag_failure(
+            _failing_sink(bad), CellTagError("messages", "summary", "au-name-2", "A")
+        )
+    first, second = (r.getMessage() for r in caplog.records if r.name == cell_tag.__name__)
+    assert "messages.summary" in first and "au-name-1" in first and "SQLITE_BUSY" in first
+    assert "synthetic-planted" not in second and "code None" in second
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_an_audit_failure_from_our_own_bug_keeps_its_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6697 item 7: a TypeError is not a driver's, so its frames are logged; a driver
+    error's are not. Neither logs the message or the chain, which may hold a driver's text."""
+    bug_exc = TypeError("synthetic-bug-text")
+    bug_exc.__context__ = sqlite3.OperationalError("synthetic-driver-text")
+    with caplog.at_level("ERROR", logger=cell_tag.__name__):
+        await report_cell_tag_failure(
+            _failing_sink(bug_exc), CellTagError("messages", "raw", "au-bug", "A")
+        )
+        await report_cell_tag_failure(
+            _failing_sink(sqlite3.OperationalError("x")),
+            CellTagError("messages", "raw", "au-drv", "A"),
+        )
+    bug, driver = (r for r in caplog.records if r.name == cell_tag.__name__)
+    assert "frames only" in bug.getMessage() and "record_audit" in bug.getMessage()
+    assert "synthetic" not in bug.getMessage() and bug.exc_info is None
+    assert "frames only" not in driver.getMessage() and driver.exc_info is None
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_a_failing_error_code_lookup_does_not_escape_the_audit_report(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6697 item 5: an audit failure is logged and swallowed even when reading its driver
+    code raises."""
+    from messagefoundry.store import base
+
+    def _boom(_exc: BaseException) -> str | None:
+        raise RuntimeError("synthetic lookup failure")
+
+    monkeypatch.setattr(base, "driver_sqlstate", _boom)
+    with caplog.at_level("ERROR", logger=cell_tag.__name__):
+        await report_cell_tag_failure(
+            _failing_sink(sqlite3.OperationalError("x")),
+            CellTagError("messages", "raw", "au-lookup", "A"),
+        )
+    assert any("au-lookup" in r.getMessage() for r in caplog.records)
+
+
 @pytest.mark.usefixtures("fresh_audit_memo")
 async def test_a_concurrent_report_is_not_lost_when_the_first_write_fails_or_is_cancelled() -> None:
     """BACKLOG #6697: a report that runs while another write of the same cell is in flight writes
@@ -339,14 +411,27 @@ async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
     async def positional(self: _DeadLetterSink, routed_id: str) -> bool:
         return True
 
-    with pytest.raises(TypeError, match="keyword-only"):
+    # Each refusal has its own message, so `match=` pins which branch refused (BACKLOG #6698).
+    with pytest.raises(TypeError, match="must take routed_id as a keyword-only parameter$"):
         dead_letters_on_cell_tag(positional)
 
     async def defaulted(self: _DeadLetterSink, *, routed_id: str = "") -> bool:
         return True
 
-    with pytest.raises(TypeError, match="no default"):  # a call could omit it from kwargs
+    with pytest.raises(TypeError, match="no default$"):  # a call could omit it from kwargs
         dead_letters_on_cell_tag(defaulted)
+
+    async def absent(self: _DeadLetterSink, *, other: str) -> bool:
+        return True
+
+    with pytest.raises(TypeError, match="must take routed_id as a keyword-only parameter$"):
+        dead_letters_on_cell_tag(absent)
+
+    import functools
+
+    # No code object to read: the signature read refuses it, as before the walk.
+    with pytest.raises(TypeError, match="keyword-only parameter with no default$"):
+        dead_letters_on_cell_tag(functools.partial(absent, other="x"))
     # An annotation naming a TYPE_CHECKING-only type, in a module without the future import, is not
     # evaluated at decoration.
     namespace: dict[str, Any] = {}
@@ -359,6 +444,115 @@ async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
     sink = _DeadLetterSink()
     assert await dead_letters_on_cell_tag(keyword)(sink, routed_id="r-1") is False
     assert sink.dead == ["r-1"] and sink.audits == [MESSAGE_TAG_FAILED_ACTION]
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_the_handoff_wrapper_reads_every_layer_of_a_wraps_chain() -> None:
+    """A ``functools.wraps`` layer that takes ``routed_id`` positionally, or with a default, is
+    refused at decoration even when the innermost function takes it keyword-only, so the wrapper
+    never meets a call whose ``kwargs`` lack it (BACKLOG #6698)."""
+    import functools
+
+    async def inner(self: _DeadLetterSink, *, routed_id: str) -> bool:
+        raise CellTagError("messages", "raw", "kw-2", "A")
+
+    @functools.wraps(inner)
+    async def positional(self: _DeadLetterSink, routed_id: str) -> bool:
+        return await inner(self, routed_id=routed_id)
+
+    # The refusal names the layer that failed, not the innermost name wraps copied onto it.
+    with pytest.raises(TypeError, match=r"\.positional must take routed_id as a keyword-only"):
+        dead_letters_on_cell_tag(positional)
+
+    @functools.wraps(inner)
+    async def defaulted(self: _DeadLetterSink, *, routed_id: str = "") -> bool:
+        return await inner(self, routed_id=routed_id)
+
+    with pytest.raises(TypeError, match=r"\.defaulted must give .* no default$"):
+        dead_letters_on_cell_tag(defaulted)
+
+    @functools.wraps(inner)
+    async def passes_on(self: _DeadLetterSink, *args: Any, **kwargs: Any) -> bool:
+        return await inner(self, *args, **kwargs)
+
+    sink = _DeadLetterSink()
+    assert await dead_letters_on_cell_tag(passes_on)(sink, routed_id="r-2") is False
+    assert sink.dead == ["r-2"]
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_a_wraps_layer_without_code_is_skipped_not_refused() -> None:
+    """A layer with no code object (an lru_cache wrapper, a callable object) is skipped, and the
+    layers that have code are judged."""
+    import functools
+
+    async def inner(self: _DeadLetterSink, *, routed_id: str) -> bool:
+        raise CellTagError("messages", "raw", "kw-3", "A")
+
+    cached = functools.lru_cache(inner)
+    assert not hasattr(cached, "__code__")
+    dead_letters_on_cell_tag(cached)  # type: ignore[type-var]
+
+    class Forwarder:
+        def __init__(self, target: Any) -> None:
+            self.__wrapped__ = target
+
+        async def __call__(self, *args: Any, **kwargs: Any) -> bool:
+            return bool(await self.__wrapped__(*args, **kwargs))
+
+    sink = _DeadLetterSink()
+    assert await dead_letters_on_cell_tag(Forwarder(inner))(sink, routed_id="r-3") is False
+    assert sink.dead == ["r-3"]
+
+    async def positional(self: _DeadLetterSink, routed_id: str) -> bool:
+        return True
+
+    # The layers with code are still judged through a layer without it.
+    with pytest.raises(TypeError, match=r"\.positional must take routed_id as a keyword-only"):
+        dead_letters_on_cell_tag(functools.lru_cache(positional))  # type: ignore[type-var]
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_the_signature_read_decides_where_the_code_objects_cannot() -> None:
+    """Shapes the signature read accepted before the walk are still accepted: a wraps chain whose
+    innermost layer is a callable object with no code, and a ``mock.create_autospec`` function,
+    whose code takes ``*args, **kwargs`` while its declared signature names ``routed_id``."""
+    import functools
+    from unittest import mock
+
+    class Impl:
+        async def __call__(self, sink: _DeadLetterSink, *, routed_id: str) -> bool:
+            raise CellTagError("messages", "raw", "kw-4", "A")
+
+    impl = Impl()
+
+    @functools.wraps(impl)
+    async def outer(*args: Any, **kwargs: Any) -> bool:
+        return await impl(*args, **kwargs)
+
+    sink = _DeadLetterSink()
+    assert await dead_letters_on_cell_tag(outer)(sink, routed_id="r-4") is False
+    assert sink.dead == ["r-4"]
+
+    async def spec(self: _DeadLetterSink, *, routed_id: str) -> bool:
+        return True
+
+    dead_letters_on_cell_tag(mock.create_autospec(spec))
+
+    # The signature read still refuses what it refused before: a callable object whose call takes
+    # routed_id positionally.
+    class Positional:
+        async def __call__(self, sink: _DeadLetterSink, routed_id: str) -> bool:
+            return True
+
+    positional = Positional()
+
+    @functools.wraps(positional)
+    async def outer_positional(*args: Any, **kwargs: Any) -> bool:
+        return await positional(*args, **kwargs)
+
+    with pytest.raises(TypeError, match="keyword-only parameter with no default$"):
+        dead_letters_on_cell_tag(outer_positional)
 
 
 class _NoKeyringView:

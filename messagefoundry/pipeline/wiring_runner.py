@@ -11238,7 +11238,7 @@ class RegistryRunner:
         raw_meta = await _read_from_store(
             "metadata read", lambda: self.store.message_metadata_json(message_id)
         )
-        user_json = user_metadata(raw_meta)
+        user_json = user_metadata(raw_meta, row_id=message_id)
         if not user_json:
             return None
         try:

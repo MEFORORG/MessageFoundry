@@ -30,9 +30,10 @@ module imports ``cryptography`` / ``hashlib``, it is registered in
         ctlen      = uint32                       # length of (ciphertext ‖ GCM tag)
         ciphertext = AESGCM.encrypt(nonce, chunk, aad)   # ‖ 16-byte tag appended by AESGCM
 
-The per-chunk **AAD binds**: ``header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)``. So a
-reordered, dropped, truncated, or appended chunk — or a tampered header (the ``key_id`` / ``chunk_size``)
-— changes the AAD and **fails the GCM tag** (fail-closed). ``final_flag = 1`` on the last frame and the
+The per-chunk **AAD binds**: ``header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)``, where
+the header digest is over the canonical header bytes the writer emits. The reader refuses a header
+not in that exact form, so a header changed in any byte is refused or fails closed. A reordered,
+dropped, truncated, or appended chunk changes the AAD and **fails the GCM tag** (fail-closed). ``final_flag = 1`` on the last frame and the
 decoder requires it, so a truncation that drops the tail frame is detected as a missing terminator, not
 silently accepted. The frame counter is **monotonic from 0**, re-derived on decode, so a frame replayed
 out of order authenticates against the wrong counter and fails the tag.
@@ -143,7 +144,9 @@ def key_fingerprint(key: bytes) -> str:
 
 @dataclass(frozen=True)
 class ArchiveHeader:
-    """The PHI-free, plaintext (but AAD-bound) header at the front of a ``.mfbak`` archive. Carries only
+    """The PHI-free, plaintext header at the front of a ``.mfbak`` archive. :func:`read_header`
+    refuses any spelling but the canonical form (:meth:`to_json_bytes`), and the frames' AAD hashes
+    the header bytes as read. Carries only
     enough to identify the archive + drive decryption; the rich manifest (row counts, fingerprints, …)
     lives INSIDE the encrypted tar. ``key_id`` is a one-way fingerprint — **never** key bytes."""
 
@@ -186,8 +189,9 @@ def _validate_key(key: bytes) -> None:
 
 def _aad(header_digest: bytes, frame_index: int, *, final: bool) -> bytes:
     """The per-frame AAD: ``header_sha256 ‖ frame_index(uint64) ‖ final_flag(uint8)``. Binds the header
-    (so a tampered key_id/chunk_size fails the tag), the frame order (so a reorder/drop fails), and the
-    terminator (so a tail-truncation fails as a missing final frame)."""
+    bytes (a changed header is refused before decrypt or fails the tag; see :func:`decrypt_stream`),
+    the frame order (so a reorder/drop fails), and the terminator (so a tail-truncation fails as a
+    missing final frame)."""
     return header_digest + _U64.pack(frame_index) + (b"\x01" if final else b"\x00")
 
 
@@ -202,8 +206,8 @@ def encrypt_stream(
 ) -> str:
     """Encrypt the byte stream ``src`` into the ``.mfbak`` stream ``dst`` under ``key`` (the resolved
     32-byte store DEK), returning the key's ``key_id`` fingerprint (recorded in the manifest by the
-    caller). Streaming: two chunks of plaintext are held between reads (the one-ahead read below),
-    plus a transient copy while a short-reading source fills one — never the whole archive.
+    caller). Streaming: a small, fixed number of chunk-sized buffers is held at a time (the one-ahead
+    read below, the frame being sealed and its ciphertext), and never the whole archive.
     Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``).
 
     ``on_frames`` receives the number of AES-GCM invocations this run performed — one per frame, each
@@ -255,11 +259,13 @@ def encrypt_stream(
     # Counted separately from frame_index and incremented only AFTER a successful aes.encrypt, so the
     # figure is the invocations actually performed rather than the frames intended.
     performed = 0
-    current = _read_up_to(src, size)
+    current, eof = _read_up_to(src, size, "source chunk")
     try:
         while True:
-            # A short chunk means _read_up_to already saw EOF; do not read the source past it again.
-            nxt = _read_up_to(src, size) if len(current) == size else b""
+            # Once _read_up_to has seen the end of stream, the source is not read past it again.
+            nxt: bytes | bytearray = b""
+            if not eof:
+                nxt, eof = _read_up_to(src, size, "source chunk")
             final = not nxt  # this is the last frame iff there is no more plaintext after it
             nonce = os.urandom(_NONCE_BYTES)
             ct = aes.encrypt(nonce, current, _aad(header_digest, frame_index, final=final))
@@ -267,6 +273,8 @@ def encrypt_stream(
             dst.write(nonce)
             dst.write(_U32.pack(len(ct)))
             dst.write(ct)
+            # Not kept alive across the next read, which would hold one more buffer than needed.
+            del ct
             if final:
                 break
             current = nxt
@@ -315,45 +323,74 @@ def _header_salt(obj: dict[str, object], version: int) -> bytes | None:
         raise ValueError(str(exc)) from exc
 
 
-def _read_once(src: BinaryIO, n: int) -> bytes:
+def _header_int(obj: dict[str, object], name: str) -> int:
+    """The header's integer field ``name``, taken as written.
+
+    ``int()`` would accept ``1024.0``, ``"1024"`` or ``true`` and turn each into a number the
+    writer never wrote. :func:`read_header` also refuses any header that is not in the writer's
+    exact form; this check makes a wrong type its own refusal before that."""
+    value = obj[name]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer")
+    return value
+
+
+def _read_once(src: BinaryIO, n: int, what: str) -> bytes:
     """One ``src.read(n)``, refused where it breaks the stream contract the codec relies on.
 
     ``None`` is a non-blocking source with no data ready: refused rather than read as EOF, which on
     the write side would seal a silently truncated backup as a complete one. More than ``n`` bytes
     would let a frame outgrow the ``chunk_size`` its header declares, and so would let the writer
-    produce an archive its own reader rejects."""
+    produce an archive its own reader rejects. A ``memoryview`` or ``bytearray`` is copied to
+    ``bytes``, because the source may reuse its buffer for the next read while this chunk is still
+    held for the one-ahead read; anything else that is not ``bytes`` is refused."""
     chunk = src.read(n)
     if chunk is None:
-        raise BackupCodecError("the source stream had no data ready (non-blocking source)")
+        raise BackupCodecError(
+            f"the source stream had no data ready reading the {what} (non-blocking source)"
+        )
+    if isinstance(chunk, (memoryview, bytearray)):
+        chunk = bytes(chunk)
+    elif not isinstance(chunk, bytes):
+        raise BackupCodecError(
+            f"the source stream returned {type(chunk).__name__}, not bytes, reading the {what}"
+        )
     if len(chunk) > n:
-        raise BackupCodecError(f"the source stream returned {len(chunk)} bytes for a {n}-byte read")
+        raise BackupCodecError(
+            f"the source stream returned {len(chunk)} bytes for a {n}-byte read of the {what}"
+        )
     return chunk
 
 
-def _read_up_to(src: BinaryIO, n: int) -> bytes:
-    """Read ``n`` bytes, or fewer only at end of stream.
+def _read_up_to(src: BinaryIO, n: int, what: str) -> tuple[bytes | bytearray, bool]:
+    """Read ``n`` bytes, or fewer only at end of stream, and say whether the end was seen.
 
     One ``read(n)`` may legally return fewer bytes without being at EOF (a raw pipe or socket), so
     this keeps reading until ``n`` bytes or an empty read. Each request asks for no more than what is
     still missing, so a bound checked before the call bounds every read it makes. A buffered file
     returns all ``n`` at once, so the common case is one read and no copy; a short-reading source
-    fills one ``bytearray`` rather than a list of fragments."""
-    first = _read_once(src, n)
-    if len(first) == n or not first:
-        return first
+    fills one ``bytearray`` rather than a list of fragments, and that buffer is returned uncopied.
+
+    The flag is True only once an empty read has been seen, so a caller decides end of stream from
+    the reads themselves rather than from the length of what came back."""
+    first = _read_once(src, n, what)
+    if len(first) == n:
+        return first, False
+    if not first:
+        return first, True
     buf = bytearray(first)
     while len(buf) < n:
-        chunk = _read_once(src, n - len(buf))
+        chunk = _read_once(src, n - len(buf), what)
         if not chunk:
-            break
+            return buf, True
         buf += chunk
-    return bytes(buf)
+    return buf, False
 
 
-def _read_exact(src: BinaryIO, n: int, what: str) -> bytes:
-    """Read exactly ``n`` bytes or raise — only a true end of stream short of ``n`` is a
-    truncated/corrupt archive."""
-    data = _read_up_to(src, n)
+def _read_exact(src: BinaryIO, n: int, what: str) -> bytes | bytearray:
+    """Read exactly ``n`` bytes or raise. Only a true end of stream short of ``n`` is a truncated or
+    corrupt archive."""
+    data, _ = _read_up_to(src, n, what)
     if len(data) != n:
         raise BackupCodecError(f"truncated .mfbak archive (short read on {what})")
     return data
@@ -363,6 +400,11 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
     """Parse + validate the magic/version/header at the front of ``src``, returning the
     :class:`ArchiveHeader`. Does NOT decrypt — used by the key-fingerprint precheck (AC-5) to read the
     ``key_id`` before attempting any decryption."""
+    return _read_header(src)[0]
+
+
+def _read_header(src: BinaryIO) -> tuple[ArchiveHeader, bytes]:
+    """:func:`read_header`, also returning the header bytes as read, which the frames' AAD hashes."""
     magic = _read_exact(src, len(MAGIC), "magic")
     if magic != MAGIC:
         raise BackupCodecError("not a .mfbak archive (bad magic)")
@@ -383,7 +425,7 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
             f"malformed .mfbak header (declared length {hdrlen} exceeds the {MAX_HEADER_BYTES}-byte "
             "maximum)"
         )
-    header_bytes = _read_exact(src, hdrlen, "header")
+    header_bytes = bytes(_read_exact(src, hdrlen, "header"))
     # No chain (BACKLOG #2085), and bytes that are not UTF-8, or JSON nested past the decoder, are the
     # same refusal: neither is a JSONDecodeError, so both used to escape this arm.
     obj, refused = json_loads_or_refusal(header_bytes)
@@ -393,16 +435,17 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
         raise BackupCodecError("malformed .mfbak header (not an object)")
     try:
         header = ArchiveHeader(
-            format_version=int(obj["format_version"]),
+            format_version=_header_int(obj, "format_version"),
             alg=str(obj["alg"]),
             key_id=str(obj["key_id"]),
-            chunk_size=int(obj["chunk_size"]),
+            chunk_size=_header_int(obj, "chunk_size"),
             salt=_header_salt(obj, version),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise BackupCodecError("malformed .mfbak header (missing/invalid field)") from exc
     if header.format_version != version:
-        # The JSON copy is AAD-bound and the byte is not; a disagreement is a tampered prefix.
+        # The frames' AAD hashes the JSON copy as read, and the version byte is not in it; a
+        # disagreement is a tampered prefix.
         raise BackupCodecError(
             f"malformed .mfbak header (format_version {header.format_version} != version byte "
             f"{version})"
@@ -418,7 +461,12 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
             f"malformed .mfbak header (chunk_size must be in 1..{MAX_CHUNK_SIZE} bytes, got "
             f"{header.chunk_size})"
         )
-    return header
+    # The writer emits exactly header.to_json_bytes(); any other spelling of the same fields is
+    # refused here, so a re-spelled header is a header refusal rather than a tag failure, and a
+    # caller of read_header alone (the key precheck) sees only the writer's own form.
+    if header_bytes != header.to_json_bytes():
+        raise BackupCodecError("malformed .mfbak header (not in the form this format writes)")
+    return header, header_bytes
 
 
 def archive_key_id(path: str | Path) -> str:
@@ -434,8 +482,15 @@ def decrypt_stream(
 ) -> ArchiveHeader:
     """Decrypt the ``.mfbak`` stream ``src`` into the plaintext (tar) stream ``dst`` under ``key``,
     returning the parsed header. Re-derives the monotonic frame counter and requires the AAD-bound
-    ``final`` terminator, so a reordered/dropped/truncated/appended chunk or a tampered header **fails
-    the GCM tag** (``BackupCodecError``). Fail-closed: nothing decrypts unless every frame authenticates.
+    ``final`` terminator, so a reordered/dropped/truncated/appended chunk **fails the GCM tag**
+    (``BackupCodecError``). A changed header is refused or fails closed, at least: by
+    :func:`read_header` before any decrypt when it is re-spelled, its ``alg`` is not AES-256-GCM,
+    its ``format_version`` differs from the version byte, or its ``chunk_size`` is out of range;
+    as a key mismatch when its ``key_id`` changed; by the frame-length bound when a lowered
+    ``chunk_size`` is below a real frame; and at the tag, which covers the header bytes as read.
+    Each frame's plaintext is written to ``dst`` once that frame authenticates, before the next
+    frame is read, so a refusal can leave earlier frames' plaintext in ``dst``: discard ``dst`` on
+    any error.
 
     Raises :class:`BackupKeyMismatch` when the header ``key_id`` does not match ``key`` — checked first,
     so a wrong key is a clean early error, not an opaque tag failure.
@@ -449,7 +504,7 @@ def decrypt_stream(
     from cryptography.exceptions import InvalidTag
 
     _validate_key(key)
-    header = read_header(src)
+    header, header_bytes = _read_header(src)
     expected_kid = key_fingerprint(key)
     # Constant-time (ASVS 11.2.4, BACKLOG #1167). `expected_kid` is a one-way fingerprint of the key
     # and is public (the header carries it, and the refusal below prints it), so this hides no
@@ -459,7 +514,8 @@ def decrypt_stream(
             f"the resolved store key (key_id={expected_kid}) does not match the archive's key "
             f"(key_id={header.key_id}); the DR site must hold the same DEK to restore (ADR 0049)"
         )
-    header_digest = hashlib.sha256(header.to_json_bytes()).digest()
+    # The bytes as read, so the binding does not rest on the canonical-form check alone.
+    header_digest = hashlib.sha256(header_bytes).digest()
     aes = _frame_aes(header, key)
     # AESGCM appends EXACTLY _TAG_BYTES to a chunk of at most chunk_size, so this bound is exact and
     # holds no slack. The min() is redundant WHILE read_header caps chunk_size, and it is kept anyway:
@@ -512,6 +568,9 @@ def decrypt_stream(
             )
         dst.write(plaintext)
         written += len(plaintext)
+        # Not kept alive across the next frame's read. `candidate` is bound here: the loop above
+        # set `plaintext` from it, so at least one decrypt returned.
+        del ct, plaintext, candidate
         if this_final:
             saw_final = True
             break
@@ -519,6 +578,7 @@ def decrypt_stream(
     if not saw_final:  # defensive — the loop only exits on a final frame or a raise
         raise BackupCodecError("truncated .mfbak archive (no final frame)")
     # A trailing byte after the authenticated final frame is an append-tampering attempt — reject it.
-    if _read_up_to(src, 1):
+    trailing, _ = _read_up_to(src, 1, "trailing bytes")
+    if trailing:
         raise BackupCodecError("trailing bytes after the final .mfbak frame (tampered archive)")
     return header
