@@ -647,6 +647,12 @@ def test_a_url_segment_credential_the_query_misses_is_refused_over_verify_off(
     query reader does not reach, and it used to cross a verify-off hop."""
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     url = f"{_HTTPS[cell][2]}{suffix}"
+    if cell not in _QUERY_CELLS and "?" in suffix:
+        # A DICOMweb base url refuses any query first (vault BACKLOG #5358); see _QUERY_CELLS.
+        with active_hop_posture(_STAGING), pytest.raises(ValueError, match="no query string") as q:
+            _build_raw(cell, {"verify_tls": False, "url": url})
+        assert _SECRET not in str(q.value)
+        return
     with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
         _build_raw(cell, {"verify_tls": False, "url": url})
     assert "url segment with a credential-looking name" in str(exc.value)
