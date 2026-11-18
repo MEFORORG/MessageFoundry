@@ -13529,7 +13529,7 @@ class AuthService:
         if user.unreadable:
             # The stand-in for a row that does not parse (store.listed_users says which; BACKLOG
             # #5505), from a list read or read_user_or_unreadable: it fails as a forged record
-            # does, on a keyless store too.
+            # does, on a keyless store too. It is not read again here.
             await self._user_seal_failed(user.id)
             return _SealCheck(failed=True)
         sealer = self._store.row_sealer()

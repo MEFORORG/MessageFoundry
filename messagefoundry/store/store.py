@@ -2788,7 +2788,9 @@ async def admin_guard_counts(
         try:
             record = await read_record(holder_id)
         except RowSealError:
-            continue  # a holder whose users or role rows do not parse fails (BACKLOG #5505)
+            # A holder whose users row has a timestamp or counter cell that does not parse, or
+            # whose role rows do not parse, fails (BACKLOG #5505).
+            continue
         if record is None or not await user_seal_ok_async(sealer, record):
             continue
         if record.row.disabled or role_id not in record.role_ids:
@@ -3176,9 +3178,10 @@ def listed_users(rows: Iterable[Mapping[str, Any]]) -> list[UserRecord]:
     :meth:`UserRecord.unreadable_row`, so the admin list shows it as failing. The read coerces the
     flag cells with ``bool()`` and copies the text cells, at least ``totp_recovery_codes`` and
     ``channel_scope``, without parsing them, so a bad value in one leaves the account listed as it
-    reads. The single-row user readers raise :class:`RowSealError` for such a row instead; the
-    service's loaders answer it as a failed seal, and the write helpers refuse it. A caller
-    iterating a list read checks ``unreadable`` before it acts on a field."""
+    reads. The single-row user readers raise :class:`RowSealError` for a row with such a
+    timestamp or counter cell instead; the service's loaders answer it as a failed seal, and the
+    write helpers refuse it. A caller iterating a list read checks ``unreadable`` before it acts on
+    a field."""
     return decoded_rows(rows, _listed_user)
 
 
