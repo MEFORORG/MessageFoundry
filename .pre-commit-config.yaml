@@ -195,10 +195,10 @@ repos:
       - id: forbidden-content
         name: forbidden-content (customer/PHI leak guard)
         entry: python scripts/security/scan_forbidden.py
-        args: [--require-tokens]
+        args: [--require-tokens, --]
         language: system
         pass_filenames: true
-        types: [text]
+        types: [file]
         exclude: ^scripts/security/scan-tokens\.local\.txt$
       # LICENCE HEADER (BACKLOG #1010): every first-party source must declare the project's SPDX
       # identifier. It asserts the VALUE, not the presence of the string -- five files declared
