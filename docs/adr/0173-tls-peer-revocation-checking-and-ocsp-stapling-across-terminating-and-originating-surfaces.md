@@ -1738,10 +1738,13 @@ on first deployment, with no attestation.
   2026-10-30, and it has changed. The two sites, and both FTPS directions, now pass the guard the
   context they dial with and `expiry_relaxed=True`; FTPS still reads the setting, the two sites the
   flag. `RevocationHopGuard.capture` gained that keyword, which drops the CRL credit and makes an
-  omitted remedy `EXPIRY_RELAXED_WAYS_ACROSS`, and the guard gained a `context_skips_validity`
+  omitted remedy `EXPIRY_RELAXED_WAYS_ACROSS`, or `PEER_NOT_VERIFIED_WAYS_ACROSS` on a context whose
+  `verify_mode` is `CERT_NONE`, and the guard gained a `context_skips_validity`
   field that feeds `crl_is_a_check`. `context_checks_revocation` itself is unchanged. The
   disposition on these hops is the same: refused under an enforcing posture unless attested. §4.3's
-  note of 2026-11-03 says what the record now reads.)*
+  note of 2026-11-03 says what the record now reads. CORRECTED 2026-11-18, vault BACKLOG #4912: this
+  said the keyword "makes an omitted remedy `EXPIRY_RELAXED_WAYS_ACROSS`", with no `CERT_NONE`
+  exception; that exception exists since #4912.)*
   *(Note 2026-11-04, BACKLOG #5086: the `context_skips_validity` field and `crl_is_a_check` are
   gone. `capture` reads `skips_validity_period` off any context it is handed and, on True, drops
   the CRL credit and treats the hop as relaxed whether or not the caller passed the flag, so these
