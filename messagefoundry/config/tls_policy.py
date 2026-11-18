@@ -390,8 +390,8 @@ def harden_crl_check(
     entry whose extensions ``cryptography`` reads. With ``chain`` only, the signature check also
     refuses a CRL whose signature verifies only with listed CAs whose key usage lacks
     ``cRLSign``, after a proven bad signature and before the refusal below. Without ``chain`` that
-    CRL is not refused: the file loads, with one WARNING per version of the file
-    (:attr:`~messagefoundry.pki.CrlSignature.without_crl_sign`).
+    CRL is not refused: the file loads with a WARNING, logged as :func:`_check_crl_signatures`
+    says (:attr:`~messagefoundry.pki.CrlSignature.without_crl_sign`).
 
     A seventh, with ``chain`` only, since vault BACKLOG #5627 and #5511: a loaded CA with no CRL of
     its own in the file (:func:`messagefoundry.pki.own_crl_reason`). It is the last refusal. It
@@ -643,11 +643,11 @@ def _check_crl_signatures(
     :attr:`~messagefoundry.pki.CrlSignature.without_crl_sign` is set refuses too, after that,
     with ``chain`` only: OpenSSL refuses to take a CRL from a CA whose key usage lacks
     ``cRLSign`` (vault BACKLOG #5896). A whole-chain check judges each listed CA by its own CRL,
-    so that CRL is always read there. Without ``chain`` it is logged at WARNING instead, once per
-    version of the file through
-    :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature`: a root that signs only
+    so that CRL is always read there. Without ``chain`` it is logged at WARNING instead, after
+    ``refusal``, and :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature`
+    decides how often, as for the unconfirmed warning below: a root that signs only
     intermediates is never judged by its own CRL on a leaf check, so such a file can pass every
-    handshake.
+    handshake. Only the first such CRL in the file is named.
     OpenSSL checks a CRL's signature only at the handshake. Before this, such a file started clean
     and then failed every handshake it judged, with a TLS error that does not name the CRL. An
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
@@ -725,30 +725,33 @@ def _check_crl_signatures(
             f"{label}: {bad.where} {PROVEN_BAD_SIGNATURE}. Give this setting the CRL that CA "
             "signed, or remove this CRL if a good one from that issuer is already in the file"
         )
-    if (unable := next((s for s in judged if s.without_crl_sign), None)) is not None:
-        # Vault BACKLOG #5896: proven as a bad signature is, since the CA that verifies it is one
-        # OpenSSL refuses to take a CRL from. Read on a leaf check only where that CA issues
-        # leaves, which the engine cannot tell, so it warns there.
-        remedy = (
-            "Give this setting a CRL signed by a CA whose key usage includes cRLSign, or reissue "
-            "that CA with it"
-        )
-        if chain:
-            raise ValueError(f"{label}: {unable.where} {NO_CRL_SIGN}. {remedy}")
-        # Once per version of the file, as the unconfirmed warning below: the Postgres store
-        # builds a context per connection, and an AD bind one per bind.
-        if first_unconfirmed_signature(crl_file, fingerprint, ("no-crl-sign", unable.where)):
-            logger.warning(
-                "%s: the file is loaded and revocation checking is on, but %s %s. This hop checks "
-                "only the peer's own certificate, so it fails only peers that CA issued directly; "
-                "a CA that signs only intermediates fails none. %s",
-                label,
-                unable.where,
-                NO_CRL_SIGN,
-                remedy,
-            )
+    # Vault BACKLOG #5896: proven as a bad signature is, since the CA that verifies it is one
+    # OpenSSL refuses to take a CRL from. Read on a leaf check only where that CA issues leaves,
+    # which the engine cannot tell, so it warns there.
+    unable = next((s for s in judged if s.without_crl_sign), None)
+    remedy = (
+        "Give this setting a CRL signed by a CA whose key usage includes cRLSign, or reissue "
+        "that CA with it"
+    )
+    if unable is not None and chain:
+        raise ValueError(f"{label}: {unable.where} {NO_CRL_SIGN}. {remedy}")
     if refusal is not None:
         raise ValueError(f"{label}: {refusal}")
+    # After the refusal, so a refused start never first logs that the file is loaded (vault
+    # BACKLOG #5511). Deduplicated as the unconfirmed warning below: the Postgres store builds a
+    # context per connection, and an AD bind one per bind.
+    if unable is not None and first_unconfirmed_signature(
+        crl_file, fingerprint, ("no-crl-sign", unable.where)
+    ):
+        logger.warning(
+            "%s: the file is loaded and revocation checking is on, but %s %s. This hop checks "
+            "only the peer's own certificate. So it fails only peers that CA issued directly, "
+            "and a CA that signs only intermediates fails none. %s",
+            label,
+            unable.where,
+            NO_CRL_SIGN,
+            remedy,
+        )
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
     finding = tuple(signature.state for signature in judged)
     if not unconfirmed or not first_unconfirmed_signature(crl_file, fingerprint, finding):

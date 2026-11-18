@@ -185,7 +185,9 @@ def first_unconfirmed_signature(
     whose bytes have ``fingerprint`` (vault BACKLOG #2905). Records it either way.
 
     ``finding`` is what a start could not confirm about the signatures of the CRLs in the file:
-    one state per CRL, or a note that the judgment itself failed. ``harden_crl_check`` logs only
+    one state per CRL, or a note that the judgment itself failed. Since vault BACKLOG #5896 it is
+    also a leaf hop's note of a verified CRL from a CA without ``cRLSign``, which shares this
+    record and its reset on a new version of the file. ``harden_crl_check`` logs only
     when this is True. It runs once per TLS context, and the Postgres store builds a context per
     connection, so a line per call would repeat for as long as the engine runs. This keeps the
     findings of one version of the file, the last one it was asked about, and logs each of them

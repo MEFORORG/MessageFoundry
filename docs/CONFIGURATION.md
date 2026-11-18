@@ -2347,12 +2347,13 @@ issuer. The engine applies a replaced file only when all three of these hold:
 1. The file passes the rules a start applies. Every CRL parses, has a `nextUpdate`, is not a delta CRL
    and has not expired. No issuing distribution point limits it to attribute certificates or
    some revocation reasons, or makes it indirect: with no extended CRL support turned on,
-   OpenSSL never judges a certificate by such a CRL. The CRL itself carries no critical extension
-   OpenSSL does not handle, and nor does any entry whose extensions the engine can read: OpenSSL
-   refuses every peer it judges by such a CRL (vault BACKLOG #5896). An entry whose extensions do
-   not read is skipped, so a critical extension there is still left to the handshake. One such
-   CRL refuses the whole file, even beside a usable CRL from the same issuer, so remove it from
-   the file. A CRL of CA certificates only, or of user certificates only, is not
+   OpenSSL never judges a certificate by such a CRL. No critical extension OpenSSL does not
+   handle is on the CRL itself. None is on an entry whose extensions the engine can read.
+   OpenSSL refuses every peer it judges by a CRL with one (vault BACKLOG #5896). The engine skips
+   an entry whose extensions do not read, so a critical extension there is left to the handshake.
+   A CRL refused by either of these two rules refuses the whole file, even beside a usable CRL
+   from the same issuer. Where such a usable CRL is in the file, remove the refused one.
+   Otherwise replace it. A CRL of CA certificates only, or of user certificates only, is not
    refused, though a hop whose chain needs the other kind fails at the handshake. Its BEGIN line starts a line: OpenSSL skips an indented CRL block, so the
    engine refuses one. A `-----BEGIN X509 CRL-----` marker inside a comment line refuses the file
    too, on purpose: the engine cannot tell that text from a CRL the file is meant to hold. Take
@@ -2444,10 +2445,11 @@ A start also refuses a CRL whose signature verifies, on a hop that checks the wh
 chain, when every listed CA the engine judges it by, as above, and whose key verifies it carries
 a key usage extension without `cRLSign` (vault BACKLOG #5896, RFC 5280 section 6.3.3). OpenSSL
 refuses to take a CRL from such a CA, so every handshake judged by that CRL would fail with
-`key usage does not include CRL signing`. A CA with no key usage extension is not refused. On a
-hop that checks only the peer's own certificate, the file loads and the engine logs a WARNING
-instead, once per version of the file however many connections build that hop: there a
-root that signs only intermediates is never judged by its own CRL, so the file can still pass.
+`key usage does not include CRL signing`. A CA with no key usage extension is not refused. A
+hop that checks only the peer's own certificate loads the file and logs a WARNING instead.
+There, a root that signs only intermediates is never judged by its own CRL, so the file can
+still pass. The WARNING is logged as the one for an unconfirmed signature is, not once per
+connection, and names only the first such CRL in the file.
 Sign the CRL with a CA whose key usage includes `cRLSign`, or reissue the CA with it. The
 running-hop reload and the expiry scan do not make this check.
 
