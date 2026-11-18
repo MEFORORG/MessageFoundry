@@ -26,7 +26,6 @@ monkeypatched here.
 from __future__ import annotations
 
 import base64
-import dataclasses
 import hashlib
 import importlib.machinery
 import json
@@ -1933,7 +1932,10 @@ def test_a_console_package_directory_linked_out_of_the_root_is_read_through_the_
     assert console.attested_nothing and not console.ok
     assert console.linked_out_paths == (_CONSOLE_PKG,)
     row = console.audit_detail()
-    assert row["attested"] is False and row["checked"] == 0
+    if shape == "intact":
+        assert row["attested"] is False and row["checked"] == 0
+    else:  # a pass with drift keeps its compare counts in the row
+        assert row["attested"] is True and row["checked"] == console.checked
     assert row["read_through_link"] == console.checked
     if shape == "emptied":
         assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
@@ -2036,7 +2038,10 @@ def test_an_engine_package_directory_linked_out_of_the_root_is_read_through_the_
     assert result.attested_nothing and not result.ok
     assert result.linked_out_paths == (_ENGINE_PKG,)
     row = result.audit_detail()
-    assert row["attested"] is False and row["checked"] == 0
+    if shape == "intact":
+        assert row["attested"] is False and row["checked"] == 0
+    else:  # a pass with drift keeps its compare counts in the row
+        assert row["attested"] is True and row["checked"] == result.checked
     assert row["read_through_link"] == result.checked
     if shape == "emptied":
         assert _drift(result) == [(rel, "missing") for rel in sorted(_ENGINE_FILES)]
@@ -2273,7 +2278,7 @@ async def test_an_intact_package_directory_linked_out_is_attested_nothing_and_re
                     match=rf"^{noun} integrity attestation verified nothing \({_LINKED_OUT}\): "
                     rf"loaded {noun} path {pkg} links out of the install root, so files read "
                     r"through a link out are not counted as verified; install the package under "
-                    r"the install root\. Left linked, this warning repeats on every start",
+                    r"the install root \(\[integrity\]\.fail_closed_on_drift=true",
                 ):
                     await run_startup_attestation(store, sink, fail_closed_on_drift=True)
             else:
@@ -2282,9 +2287,16 @@ async def test_an_intact_package_directory_linked_out_is_attested_nothing_and_re
         records = [r for r in caplog.records if r.name == "messagefoundry.integrity"]
         assert [r.levelno for r in records] == [logging.WARNING], caplog.messages
         assert f"path {pkg} links out of the install root" in records[0].getMessage()
+        outcome = (
+            "fail_closed_on_drift refuses to start while it stays linked"
+            if fail_closed
+            else "left linked, this warning and alert repeat on every start"
+        )
+        assert outcome in records[0].getMessage()
         assert "replace the link" not in records[0].getMessage()
         assert [event[0] for event in sink.events] == [label]
         assert f"path {pkg} links out of the install root" in sink.events[0][1]
+        assert outcome in sink.events[0][1]
         assert sink.events[0][2] == 0
         rows = _startup_rows(await store.list_audit())
         assert len(rows) == 1
@@ -2400,9 +2412,9 @@ def test_a_pass_whose_listed_files_none_opened_says_none_was_read(
 
 
 def test_the_audit_row_of_a_verified_pass_is_unchanged() -> None:
-    """The BACKLOG #5376 row rules touch only a pass that verified nothing: a clean pass, and a
-    drift pass with no ``unattested_reason``, keep the row they wrote before that item, with no
-    ``read_through_link``. A linked-out drift pass is pinned with the read-through-the-link tests."""
+    """The BACKLOG #5376 row rules touch only a pass that verified nothing and found no drift: a
+    clean pass and a drift pass keep the row they wrote before that item. A linked-out pass adds
+    ``linked_out_paths`` and ``read_through_link``, pinned with the read-through-the-link tests."""
     clean = AttestationResult(attested=True, editable=False, no_record=False, checked=7)
     assert clean.audit_detail() == {"attested": True, "checked": 7, "drift_count": 0}
     drifted = AttestationResult(
@@ -2438,14 +2450,14 @@ def test_the_audit_row_of_a_pass_that_read_nothing_is_not_attested(reason: str) 
     }
 
 
-async def test_a_nested_path_entry_linked_out_is_named(
+def test_a_nested_path_entry_linked_out_is_named_in_the_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A ``__path__`` entry below the package directory, linked out of the install root: the result
     and the audit row name that entry, not the package directory, and count only the files read
-    through it. In a real pass the walk of the package directory also reports the link itself as
-    ``missing`` drift, so the drift branch runs and the row is where the entry is named; the
-    linked-out text is read from :func:`_act_on` on the same result without that drift."""
+    through it. The walk of the package directory also reports the link itself as ``missing``
+    drift, so the row keeps its compare counts and the drift branch, not the linked-out text, is
+    what the operator reads."""
     console_root = _install_engine_and_console(tmp_path, monkeypatch)
     package_dir = console_root / _CONSOLE_PKG
     _link_out(package_dir / "static", tmp_path / "outside" / "static")
@@ -2455,25 +2467,8 @@ async def test_a_nested_path_entry_linked_out_is_named(
     assert console is not None
     assert console.unattested_reason == _LINKED_OUT
     assert console.linked_out_paths == (f"{_CONSOLE_PKG}/static",)
+    assert _drift(console) == [(f"{_CONSOLE_PKG}/static", "missing")]
     row = console.audit_detail()
     assert row["linked_out_paths"] == [f"{_CONSOLE_PKG}/static"]
-    assert row["read_through_link"] == 2 and console.checked == 4
-    assert row["checked"] == 0
-    # The drift the docstring says a real pass reports, before it is stripped below.
-    assert _drift(console) == [(f"{_CONSOLE_PKG}/static", "missing")]
-
-    store = await open_store(
-        sqlite_settings(str(tmp_path / "nested.db")), create=True, keyless_chain_refusal=None
-    )
-    try:
-        refusal = await integ._act_on(
-            dataclasses.replace(console, drift=[]),
-            integ._CONSOLE_ARM,
-            store,
-            _RecordingSink(),
-            fail_closed_on_drift=True,
-        )
-    finally:
-        await store.close()
-    assert refusal is not None
-    assert f"loaded web console path {_CONSOLE_PKG}/static links out of the install root" in refusal
+    assert row["read_through_link"] == 2
+    assert row["attested"] is True and row["checked"] == console.checked == 4

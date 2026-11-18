@@ -493,6 +493,10 @@ fingerprint+git-HEAD covers more cheaply for now.
 > - **The console arm's walk names a directory it cannot list**, as `missing` drift, as the engine
 >   arm's does; the 2026-10-06 amendment's residual *"The console arm's walk still skips a directory it
 >   cannot list"* no longer holds.
+> - **The `startup_integrity` row of a pass that verified nothing and found no drift reads
+>   `attested: false` and `checked: 0`**, so it cannot read as a verified pass; a pass with drift
+>   keeps both as compared. A pass with a package directory linked out of the install root adds
+>   `linked_out_paths` and `read_through_link` (`AttestationResult.audit_detail`).
 
 ## Options considered
 

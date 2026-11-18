@@ -249,8 +249,9 @@ class AttestationResult:
     ``drift`` list on its own cannot tell **attested clean** from **attested nothing**, and the second
     shape is what a competent in-place edit leaves behind."""
 
-    #: True when a real RECORD baseline was read, whether or not any file was then verified against
-    #: it. The audit row's ``attested`` key is not this field; :meth:`audit_detail` says what it is.
+    #: ``False`` for every early exit of :func:`_attest_distribution`; ``True`` once it reaches the
+    #: file comparison, whether or not it then verifies any file. The audit row's ``attested`` key is
+    #: not always this field; :meth:`audit_detail` says when.
     attested: bool
     editable: bool
     no_record: bool
@@ -301,13 +302,13 @@ class AttestationResult:
     def audit_detail(self) -> dict[str, object]:
         """A PHI-free JSON-able summary for the ``startup_integrity`` audit detail / alert payload.
 
-        The row must not read as a verified pass when the pass verified nothing (BACKLOG #5376), so
-        here ``attested`` is ``False`` whenever :attr:`attested_nothing` holds, and ``checked``, the
-        count of files compared, is written ``0`` for a pass with an ``unattested_reason``, drift or
-        not. A pass with a package directory linked out of the install root names it under
-        ``linked_out_paths`` and counts the files it read through it under ``read_through_link``;
-        both keys are written only when ``linked_out_paths`` is non-empty."""
-        unverified = self.attested_nothing
+        A pass that verified nothing and found no drift must not read as a verified pass (BACKLOG
+        #5376), so for it ``attested`` is written ``False`` and ``checked`` ``0``. A pass with drift
+        writes both fields as they are, so a compare that found a mismatch says it compared. A pass
+        with a package directory linked out of the install root names it under ``linked_out_paths``
+        and counts the files it read through it under ``read_through_link``; both keys are written
+        only when ``linked_out_paths`` is non-empty."""
+        unverified = self.attested_nothing and not self.drift
         detail: dict[str, object] = {
             "attested": self.attested and not unverified,
             "checked": 0 if unverified else self.checked,
@@ -1101,17 +1102,22 @@ async def _act_on(
             )
             what = (
                 f"loaded {arm.noun} {named} out of the install root, so files read through a link "
-                "out are not counted as verified; install the package under the install root. Left "
-                "linked, this warning repeats on every start, and [integrity].fail_closed_on_drift "
-                "refuses to start"
+                "out are not counted as verified; install the package under the install root"
+            )
+            # The refusal adds its own fail-closed clause, so only the log line and alert say it.
+            outcome = (
+                "[integrity].fail_closed_on_drift refuses to start while it stays linked"
+                if fail_closed_on_drift
+                else "left linked, this warning and alert repeat on every start"
             )
             log.warning(
-                "startup integrity: attestation verified NOTHING (%s) — %s (fail_closed=%s)",
+                "startup integrity: attestation verified NOTHING (%s) — %s. %s (fail_closed=%s)",
                 reason,
                 what,
+                outcome,
                 fail_closed_on_drift,
             )
-            alert_reason = f"startup attestation verified nothing: {what} ({reason})"
+            alert_reason = f"startup attestation verified nothing: {what}. {outcome} ({reason})"
         else:
             what = f"no {arm.noun} file was compared against the installed {arm.wheel} RECORD"
             log.warning(
