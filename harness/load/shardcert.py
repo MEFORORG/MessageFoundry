@@ -931,14 +931,15 @@ def _invariants_held(
     engine_dead: int,
     dead_total: int,
     stranded_nonterminal: int,
+    require_acked: bool = True,
 ) -> bool:
     """The correctness terms the single-run verdict (:attr:`ShardCertReport.ok`) and the co-located
     ladder's per-rung bar (:attr:`ShardCertStepRecord.correctness_ok`) share, kept in ONE place so a new
     term reaches both (BACKLOG #5441: the ladder bar had drifted to three of them). Something was
-    acknowledged, nothing was lost, per-lane FIFO held, no duplicate the caller does not excuse, no dead
-    letter at any stage (``-1`` = not measured fails), and no stranded row."""
+    acknowledged (unless ``require_acked`` is false), nothing was lost, per-lane FIFO held, no duplicate the
+    caller does not excuse, no dead letter at any stage (``-1`` = not measured fails), and no stranded row."""
     return (
-        acked > 0
+        (acked > 0 or not require_acked)
         and lossless
         and lane_inversions == 0
         and duplicates_ok
@@ -2085,11 +2086,14 @@ class ShardCertStepRecord:
         """The rung held the invariants :attr:`ShardCertReport.ok` also checks (:func:`_invariants_held`),
         with no duplicate delivery (a ladder rung never kills an engine shard). Two terms differ, on purpose:
         ``in_pipeline_final`` is not carried, because ``no_loss`` requires the drain, which the poller only
-        reports at an empty pipeline; and the two-lane FIFO bar applies to a SUSTAINED rung only, as on the
-        two-box ladder, because a ceiling rung is a throughput measurement and a near-empty one may honestly
-        see one lane. The ceiling terms themselves (intake shortfall, filling) are not failures."""
+        reports at an empty pipeline; and the two-lane FIFO bar and the something-acknowledged bar apply to a
+        SUSTAINED rung only, as on the two-box ladder, because a ceiling rung is a throughput measurement: a
+        near-empty one may honestly see one lane, and one the rig never drove (DRIVE_SHORTFALL) acknowledges
+        nothing because nothing arrived, which the fidelity gate already reads as SETUP_DEGRADED (exit 2). The
+        ceiling terms themselves (intake shortfall, filling) are not failures."""
         return _invariants_held(
             acked=self.achieved_intake,
+            require_acked=not self.ceiling,
             lossless=self.no_loss,
             lane_inversions=self.lane_inversions,
             duplicates_ok=self.lane_repeats == 0,
@@ -2103,7 +2107,7 @@ class ShardCertStepRecord:
         held). Kept beside the predicate so a note never shows only the clean values."""
         terms = [
             ("loss or undrained pipeline", not self.no_loss),
-            ("nothing acknowledged", self.achieved_intake <= 0),
+            ("nothing acknowledged", not self.ceiling and self.achieved_intake <= 0),
             (f"lane_inversions={self.lane_inversions}", self.lane_inversions != 0),
             (f"lane_repeats={self.lane_repeats}", self.lane_repeats != 0),
             (f"engine_dead={self.engine_dead}", self.engine_dead != 0),

@@ -120,8 +120,16 @@ def test_healthy_ladder_passes() -> None:
         pytest.param({"lanes_observed": 1}, id="single-lane"),
         pytest.param({"engine_dead": 2}, id="outbound-dead-letters"),
         pytest.param({"dead_total": 2}, id="routed-dead-letters"),
+        # offered 0 keeps the rung SUSTAINED: the acked bar is waived on a ceiling rung (see
+        # test_unsent_ceiling_rung_is_setup_degraded_not_a_break).
         pytest.param(
-            {"acked": 0, "achieved_intake": 0, "delivered_distinct": 0, "sink_received": 0},
+            {
+                "acked": 0,
+                "achieved_intake": 0,
+                "offered": 0,
+                "delivered_distinct": 0,
+                "sink_received": 0,
+            },
             id="nothing-acked",
         ),
     ],
@@ -173,6 +181,70 @@ def test_single_lane_ceiling_rung_is_a_measurement_not_a_break() -> None:
     assert rec.ceiling is True
     assert rec.correctness_ok is True
     assert _ladder(_report(), ceiling).ok is True
+
+
+def test_unsent_ceiling_rung_is_setup_degraded_not_a_break(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The rig sent nothing at the second rung (a DRIVE SHORTFALL): the engine acknowledged nothing because
+    nothing arrived. That is a ceiling rung that measured the RIG, so the run is SETUP_DEGRADED (exit 2), as
+    it was before BACKLOG #5441, not a correctness FAIL. The acked term is waived on a ceiling rung the same
+    way the two-lane term is."""
+    from harness.load import shardcert
+
+    unsent = ShardCertStepRecord.from_report(
+        20.0,
+        _report(
+            sent=0,
+            acked=0,
+            achieved_intake=0,
+            offered=1000,
+            delivered_distinct=0,
+            sink_received=0,
+            lanes_observed=0,
+            deferred_schedule=1000,
+            deferred_backpressure=0,
+        ),
+        hold_seconds=60.0,
+    )
+    assert unsent.ceiling is True
+    assert unsent.correctness_ok is True
+    assert "nothing acknowledged" not in unsent.correctness_faults()
+    plan = {
+        10.0: ShardCertStepRecord.from_report(10.0, _report(sent=1000), hold_seconds=60.0),
+        20.0: unsent,
+    }
+
+    async def fake_step(*, rate: float, **_kw: object) -> ShardCertStepRecord:
+        return plan[rate]
+
+    monkeypatch.setattr(shardcert, "_run_ladder_step", fake_step)
+    lad = asyncio.run(shardcert.run_shardcert_ladder(rates=[10, 20]))
+    assert lad.ceiling_void_reason is not None
+    assert lad.exit_code == 2
+    assert lad.result_label == "SETUP_DEGRADED"
+
+
+def test_sustained_rung_still_needs_something_acknowledged() -> None:
+    """The acked waiver is for ceiling rungs only: a sustained rung that acknowledged nothing still FAILs."""
+    empty = ShardCertStepRecord(
+        aggregate_rate=10.0,
+        offered=0,
+        achieved_intake=0,
+        delivered=0,
+        in_pipeline_peak=0,
+        ack_p50_ms=1.0,
+        ack_p99_ms=2.0,
+        drain_seconds=1.0,
+        no_loss=True,
+        lane_inversions=0,
+        lane_repeats=0,
+        stranded_nonterminal=0,
+        lanes_observed=4,
+        engine_dead=0,
+        dead_total=0,
+    )
+    assert empty.ceiling is False
+    assert empty.correctness_ok is False
+    assert "nothing acknowledged" in empty.correctness_faults()
 
 
 def test_broken_rung_pins_nothing_and_stops_the_climb(monkeypatch: pytest.MonkeyPatch) -> None:
