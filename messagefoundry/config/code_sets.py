@@ -28,12 +28,13 @@ exactly like a missing ``env()`` key — surfaced by ``validate`` / ``check`` / 
 * **CSV** — a header row; the **first column is the lookup key**. If exactly one other column remains,
   the value is that scalar (``str``); if several remain, the value is a ``dict`` ``{header: cell}``.
   Read via :class:`csv.DictReader`. A duplicate key is a load error (fail loud).
-  A multi-column row, a nested TOML table and a TOML array are **read-only** once loaded (a mutation
-  raises :class:`TypeError`; take ``copy.deepcopy`` to edit one), because one table serves every
-  message until reload (BACKLOG #5897).
 * **TOML** — a flat table ``key = value`` → ``{key: scalar}`` (mirroring
   :mod:`messagefoundry.config.environments`); a nested table value → ``{key: {…}}``. Read via
   :mod:`tomllib`.
+
+**Rows are read-only.** A multi-column CSV row, a nested TOML table and a TOML array are frozen once
+loaded: a mutation raises :class:`TypeError`, and ``copy.deepcopy`` gives a copy to edit. One table
+serves every message until reload (BACKLOG #5897).
 
 **Resolution.** :func:`~messagefoundry.config.wiring.load_config` loads every code set into a registry
 and makes it the **active** set *before* importing config modules (so a module-top-level
@@ -56,7 +57,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePath
-from typing import Any
+from typing import Any, NoReturn
 
 from messagefoundry.redaction import codec_safe_str
 
@@ -334,10 +335,16 @@ def _drain_capture(buffer: UnmappedCapture, message_id: str | None) -> None:
 # --- code set ----------------------------------------------------------------
 
 
-def _read_only(self: object, *args: object, **kwargs: object) -> Any:
+#: How deep :func:`_freeze` walks. A fixed bound, the sandbox codec's ``_MAX_DEPTH``, so whether a
+#: table loads does not depend on how deep the caller's stack already is.
+_MAX_FREEZE_DEPTH = 256
+
+
+def _read_only(self: object, *args: object, **kwargs: object) -> NoReturn:
+    shallow = "list(value)" if isinstance(self, list) else "dict(value) or value.copy()"
     raise TypeError(
-        f"{type(self).__name__} is a read-only code-set value; "
-        "take copy.deepcopy(value) to modify it (dict() or .copy() keeps nested values read-only)"
+        f"{type(self).__name__} is a read-only code-set value; take copy.deepcopy(value) to "
+        f"modify it ({shallow} is shallow, so nested values stay read-only)"
     )
 
 
@@ -350,13 +357,23 @@ class _FrozenDict(dict[str, Any]):
     back a plain, mutable copy all the way down; ``dict(row)`` and ``row.copy()`` are shallow, so
     their nested values stay read-only.
 
-    The freeze refuses the mutating methods and operators, ``__init__`` included. It guards against
-    an accidental edit, not a hostile Handler: a C-level writer that bypasses the overrides, such as
-    an unbound ``dict.__setitem__(row, ...)``, is not stopped. Build one with :func:`_freeze`."""
+    The contents are set in ``__new__`` and ``__init__`` does nothing, so ``type(row)(items)`` (as
+    :func:`dataclasses.asdict` calls it) builds a new frozen row and a second ``__init__`` call
+    changes nothing. The freeze guards against an accidental edit, not a hostile Handler: a C-level
+    writer that bypasses the overrides, such as an unbound ``dict.__setitem__(row, ...)``, is not
+    stopped."""
 
     __slots__ = ()
-    __init__ = __setitem__ = __delitem__ = __ior__ = _read_only
+    __setitem__ = __delitem__ = __ior__ = _read_only
     clear = pop = popitem = setdefault = update = _read_only
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> _FrozenDict:
+        row = dict.__new__(cls)
+        dict.__init__(row, *args, **kwargs)
+        return row
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass  # filled in __new__; a re-init must not rewrite the row
 
     def __reduce__(self) -> tuple[Any, ...]:
         # Copy/pickle rebuild a plain dict: the default protocol would call the refused __setitem__.
@@ -370,39 +387,45 @@ class _FrozenList(list[Any]):
     through the C list API and are not stopped."""
 
     __slots__ = ()
-    __init__ = __setitem__ = __delitem__ = __iadd__ = __imul__ = _read_only
+    __setitem__ = __delitem__ = __iadd__ = __imul__ = _read_only
     append = extend = insert = pop = remove = clear = sort = reverse = _read_only
+
+    def __new__(cls, *args: Any) -> _FrozenList:
+        arr = list.__new__(cls)
+        list.__init__(arr, *args)
+        return arr
+
+    def __init__(self, *args: Any) -> None:
+        pass  # filled in __new__; a re-init must not rewrite the array
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (list, (list(self),))
 
 
 #: The container types :func:`_freeze` rebuilds. Matched by exact type, so a subclass a caller built
-#: on purpose (a ``defaultdict``, a ``NamedTuple``) keeps its own behaviour and is stored as given.
-_FREEZABLE: frozenset[type] = frozenset({dict, list, tuple, set})
-_FROZEN: frozenset[type] = frozenset({_FrozenDict, _FrozenList})
+#: on purpose (a ``defaultdict``, a ``NamedTuple``), a ``set`` and any other value are stored as
+#: given. The loaders produce only plain dicts and lists; a tuple arrives by direct construction.
+_FREEZABLE: frozenset[type] = frozenset({dict, list, tuple})
 
 
-def _freeze(value: Any) -> Any:
+def _freeze(value: Any, depth: int = 0) -> Any:
     """Freeze a loaded value recursively, once at construction, so a lookup returns the stored
     object at no per-call cost and the table it came from refuses an ordinary edit (BACKLOG #5897).
 
-    A plain dict or list becomes its read-only subclass, a tuple is rebuilt from frozen members, and
-    a set becomes a ``frozenset``. A value already frozen is returned as it is."""
+    A plain dict or list becomes its read-only subclass and a tuple is rebuilt from frozen members.
+    Past :data:`_MAX_FREEZE_DEPTH` it raises :class:`RecursionError`, which :class:`CodeSet` reports
+    as a :class:`CodeSetError`."""
     kind = type(value)
     if kind not in _FREEZABLE:
         return value
+    if depth >= _MAX_FREEZE_DEPTH:
+        raise RecursionError
+    depth += 1
     if kind is dict:
-        frozen_dict = dict.__new__(_FrozenDict)
-        dict.__init__(frozen_dict, ((k, _freeze(v)) for k, v in value.items()))
-        return frozen_dict
+        return _FrozenDict((k, _freeze(v, depth)) for k, v in value.items())
     if kind is list:
-        frozen_list = list.__new__(_FrozenList)
-        list.__init__(frozen_list, (_freeze(v) for v in value))
-        return frozen_list
-    if kind is tuple:
-        return tuple(_freeze(v) for v in value)
-    return frozenset(value)
+        return _FrozenList(_freeze(v, depth) for v in value)
+    return tuple(_freeze(v, depth) for v in value)
 
 
 class CodeSet(Mapping[str, Any]):
@@ -425,15 +448,15 @@ class CodeSet(Mapping[str, Any]):
         self._name = name
         # Rows are frozen here, not copied per lookup: a Handler that mutated a returned row would
         # otherwise alter the table shared by every later message until reload (BACKLOG #5897).
-        # The C-level copy keeps a flat scalar table as cheap as before; only containers are walked.
+        # One pass over the values at load; only container values are rebuilt.
         frozen: dict[str, Any] = dict(data)
         try:
             for key, value in frozen.items():
-                if type(value) in _FREEZABLE and type(value) not in _FROZEN:
+                if type(value) in _FREEZABLE:
                     frozen[key] = _freeze(value)
         except RecursionError:
-            # A TOML table nested past the interpreter's limit: fail loud as a code-set error, which
-            # every loader catches, rather than escape as a bare RecursionError.
+            # Nested past the freeze's bound (or the interpreter's): fail loud as a code-set error,
+            # which every loader catches, rather than escape as a bare RecursionError.
             raise CodeSetError(f"code set {name!r}: a value is nested too deeply to load") from None
         self._data = frozen
         self._policy: UnmappedPolicy = policy if policy is not None else UnmappedPolicy()
@@ -501,7 +524,7 @@ class CodeSet(Mapping[str, Any]):
 
     def __reduce__(self) -> tuple[Any, ...]:
         # A copy or unpickle goes back through __init__, so its rows are frozen as this one's are.
-        return (CodeSet, (self._name, self._data, self._policy))
+        return (type(self), (self._name, self._data, self._policy))
 
 
 # --- loading -----------------------------------------------------------------
@@ -740,7 +763,8 @@ def _parse_toml(name: str, data: bytes) -> dict[str, Any]:
     """Flat TOML table → ``{key: scalar}``; a nested table value → ``{key: {…}}`` (mirrors environments)."""
     try:
         raw = tomllib.loads(data.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, RecursionError) as exc:
+        # RecursionError: tomllib's own bound on a deeply nested array, table or dotted key.
         invalid = f"code set {name!r}: invalid TOML — {codec_safe_str(exc)}"
     else:
         # tomllib already rejects duplicate keys (TOMLDecodeError), so no extra dup check is needed.

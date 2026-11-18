@@ -18,12 +18,13 @@ code sets); the directory is created on the first `upsert`.
 - **CSV** (`<name>.csv`) — the editable, GUI-canonical format. A header row; the **first column is the
   lookup key**. One other column → the value is that scalar (`str`); several other columns → the value
   is a `dict` `{header: cell}`. A duplicate key is a **load error** (fail loud).
-- **Rows are read-only.** A multi-column row, a nested TOML table and a TOML array come back from a
-  lookup read-only: an edit such as `row["display"] = ...` raises `TypeError`, because one loaded
-  table serves every message until reload. Take `copy.deepcopy(row)` to get a copy you can change;
-  `dict(row)` is shallow, so its nested values stay read-only.
 - **TOML** (`<name>.toml`) — hand-authored / legacy. Summarized by `list` and shown **read-only** in
   the grid; the CLI never *writes* TOML. (A TOML-in-grid editor is a fast-follow.)
+
+**Rows are read-only.** A multi-column row, a nested TOML table and a TOML array come back from a
+lookup read-only: an edit such as `row["display"] = ...` raises `TypeError`, because one loaded table
+serves every message until reload. Take `copy.deepcopy(row)` to get a copy you can change;
+`dict(row)` is shallow, so its nested values stay read-only.
 
 Both editors — a hand edit and a GUI save — write the same `codesets/<name>.csv`, so they are
 interchangeable.

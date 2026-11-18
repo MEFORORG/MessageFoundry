@@ -10,6 +10,7 @@ data only."""
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import pickle
 from collections import defaultdict
@@ -76,7 +77,6 @@ _LIST_MUTATIONS: list[Callable[[Any], object]] = [
     lambda tags: tags.sort(),
     lambda tags: tags.reverse(),
     lambda tags: tags.clear(),
-    lambda tags: tags.__init__(["z"]),
     _iadd,
     _imul,
 ]
@@ -94,25 +94,48 @@ def test_a_nested_toml_table_refuses_mutation() -> None:
     cs = _toml_set()
     with pytest.raises(TypeError, match="read-only"):
         cs["A"]["inner"]["level"] = 2
-    with pytest.raises(TypeError, match="read-only"):
-        cs["A"].__init__(label="Changed")
+    cs["A"].__init__(label="Changed")  # a re-init is a no-op, not a rewrite
+    cs["A"]["tags"].__init__(["z"])
     assert cs["A"] == {"label": "Alpha", "tags": ["x", "y"], "inner": {"level": 1}}
 
 
-def test_tuples_and_sets_are_frozen_and_subclasses_are_kept() -> None:
+def test_a_row_serialises_through_dataclasses_asdict() -> None:
+    @dataclasses.dataclass
+    class Out:
+        row: dict[str, Any]
+
+    assert dataclasses.asdict(Out(_toml_set()["A"]))["row"]["tags"] == ["x", "y"]
+
+
+def test_tuples_are_frozen_and_other_values_are_stored_as_given() -> None:
     cs = CodeSet("direct", {"T": ({"a": 1},), "S": {1, 2}, "D": defaultdict(int)})
     with pytest.raises(TypeError, match="read-only"):
         cs["T"][0]["a"] = 2
-    assert isinstance(cs["S"], frozenset) and cs["S"] == {1, 2}
+    assert type(cs["S"]) is set
     assert cs["D"]["missing"] == 0  # a deliberate dict subclass is stored as given
 
 
 def test_a_value_nested_past_the_recursion_limit_is_a_code_set_error() -> None:
     deep = "x = 1"
-    for _ in range(900):  # under tomllib's 1000-part key cap, over the freeze's depth
+    for _ in range(300):  # over the freeze's bound of 256, under tomllib's own limit
         deep = "a." + deep
     with pytest.raises(CodeSetError, match="nested too deeply"):
         parse_code_set("deep.toml", ("[K]\n" + deep + "\n").encode())
+
+
+def test_a_toml_file_nested_past_tomllibs_limit_is_a_code_set_error() -> None:
+    deep = "1"
+    for _ in range(2000):
+        deep = "[" + deep + "]"
+    with pytest.raises(CodeSetError, match="invalid TOML"):
+        parse_code_set("deep.toml", ("v = " + deep + "\n").encode())
+
+
+def test_a_copied_subclass_keeps_its_type() -> None:
+    class Sub(CodeSet):
+        __slots__ = ()
+
+    assert type(copy.copy(Sub("s", {"K": "V"}))) is Sub
 
 
 @pytest.mark.parametrize(
