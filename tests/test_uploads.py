@@ -1850,3 +1850,89 @@ async def test_a_sidecar_under_a_key_not_held_is_not_reported(tmp_path: Path) ->
     (tmp_path / "uploads" / f"{elsewhere.file_id}.meta").write_text(meta, encoding="utf-8")
     assert await store.list_files() == []
     assert reports == []
+
+
+async def test_a_tag_failure_seen_with_no_hook_armed_is_reported_once_one_is(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5552 item 6 (b): a scan with no hook armed used up the upload's hourly slot, so a
+    hook armed later in the hour never heard of the failure."""
+    store = _store(tmp_path, key=True, aad=True)
+    a = await store.save(data=b"a\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    b = await store.save(data=b"b\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    root = tmp_path / "uploads"
+    (root / f"{b.file_id}.meta").write_text(
+        (root / f"{a.file_id}.meta").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    assert [m.file_id for m in await store.list_files()] == [a.file_id]  # no hook armed yet
+    reports: list[tuple[str, str]] = []
+    store._cipher.set_tag_failure_hook(lambda table, reason: reports.append((table, reason)))  # type: ignore[attr-defined]
+    assert [m.file_id for m in await store.list_files()] == [a.file_id]
+    assert [table for table, _ in reports] == ["uploaded_file"]
+
+
+async def test_a_sidecar_that_is_not_read_is_logged_once_per_interval(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5552 item 5 (a): a pair left for an operator was logged on every scan, so every
+    listing, quota check and prune named it again. A directory stands in for a link, which cannot
+    be made everywhere; both take the same branch."""
+    store = _store(tmp_path, key=False)
+    await store.save(data=b"kept\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    fid = "9a" * 16
+    (tmp_path / "uploads" / f"{fid}.meta").mkdir()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        await store.list_files()
+        await store.list_files()
+    assert sum(fid in r.getMessage() for r in caplog.records) == 1
+
+
+async def test_a_sidecar_link_is_logged_once_per_interval(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5552 item 5 (a), the link reason: a sidecar link was logged on every scan."""
+    store = _store(tmp_path, key=False)
+    await store.save(data=b"kept\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    fid = "9b" * 16
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    _link(tmp_path / "uploads" / f"{fid}.meta", outside)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        await store.list_files()
+        await store.list_files()
+    assert sum(fid in r.getMessage() and "link" in r.getMessage() for r in caplog.records) == 1
+
+
+async def test_a_pair_holding_a_link_is_logged_once_by_the_prune(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5552 item 5 (a): the prune named a pair whose body is a link on every pass."""
+    store = _store(tmp_path, key=True, aad=True)
+    mine = await store.save(data=_ADT.encode(), filename="a.hl7", uploader="op", uploader_id="u-op")
+    other = await store.save(
+        data=_BATCH.encode(), filename="b.hl7", uploader="op", uploader_id="u-op"
+    )
+    root = tmp_path / "uploads"
+    _link(root / f"{mine.file_id}.blob", root / f"{other.file_id}.blob")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert store._prune_pair_sync(mine) is False
+        assert store._prune_pair_sync(mine) is False
+    assert sum(mine.file_id in r.getMessage() for r in caplog.records) == 1
+    assert await store.read_bytes(other.file_id) == _BATCH.encode()
+
+
+def test_the_once_per_interval_memo_forgets_a_key_after_the_interval() -> None:
+    """BACKLOG #5552 items 5 (a) and 6 (b): the memo mutes a key for the interval only, so a pair
+    still left, or a tag failure still there, is named again once it passes."""
+    from messagefoundry.uploads import _OncePerInterval
+
+    clock = [1000.0]
+    memo = _OncePerInterval(interval_s=60.0, max_keys=2, clock=lambda: clock[0])
+    assert memo.first("a") is True
+    assert memo.first("a") is False
+    clock[0] += 59.0
+    assert memo.first("a") is False
+    clock[0] += 2.0
+    assert memo.first("a") is True
+    assert memo.first("b") is True and memo.first("c") is True
+    assert memo.first("a") is True  # forgotten first, as the oldest recorded

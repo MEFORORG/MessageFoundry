@@ -1443,11 +1443,12 @@ POST `/uploads` (or the web-console delegate POST `/ui/uploaded-logs/upload`, wh
 core handler) to browse/re-send it offline. It is **off unless `[store].uploads_dir` is set**, and its
 upload chokepoint enforces a fixed policy independent of the directory-source policy above:
 
-- **Permitted types — text only.** The upload chokepoint (`UploadStore.save`) first refuses any
+- **Permitted types — text only.** The upload chokepoint (`UploadStore.save`) refuses
   **non-text or metadata-bearing container** body with **HTTP 415** (ASVS 14.2.8): a body that begins
   with JPEG/PNG/PDF/ZIP (incl. DOCX)/GIF/TIFF magic bytes, holds a NUL byte anywhere, or has a
-  control-character-dense 8 KiB window. Past the leading signature, the check refuses only a NUL
-  anywhere and a control-dense window, so a NUL-free binary payload after a text head can pass.
+  control-character-dense 8 KiB window. It does not refuse every binary body: at least a NUL-free
+  binary payload after a text head, a NUL-free body of a format with no signature listed here,
+  and a dense run of control bytes split across two windows can pass.
   Then an extension allowlist (`.hl7`, `.hl7v2`, `.txt`, `.xml`) is
   enforced on the sanitized display filename **and** the content is sniffed against it: `.hl7`/`.hl7v2`
   must begin with an HL7 header segment (`MSH`/`FHS`/`BHS`), `.xml` with a leading `<` (ASVS 5.2.2). A

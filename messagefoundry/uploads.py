@@ -226,30 +226,48 @@ def _is_inflight(name: str) -> bool:
         return name in _inflight_names
 
 
-#: How long one upload's sidecar tag failure is reported once (BACKLOG #5553). Every listing,
-#: quota check and prune meets the same sidecar, so without this each would raise the alert again.
-_TAG_REPORT_INTERVAL_S = 3600.0
-#: The most upload ids remembered; the oldest is forgotten first.
-_TAG_REPORTED_MAX = 4096
+#: How long one upload's report is given once (BACKLOG #5552, #5553). Every listing, quota check and
+#: prune meets the same sidecar, so without this each would raise the alert, or log the line, again.
+_REPORT_INTERVAL_S = 3600.0
+#: The most keys one memo remembers; the oldest recorded is forgotten first.
+_REPORTED_MAX = 4096
 #: How much of an upload id a tag-failure alert names, as ``store/cell_tag.py`` names a row.
 _TAG_REF_LEN = 12
-_tag_reported: dict[str, float] = {}
-# Scans run on worker threads, so the read-modify-write holds this lock.
-_tag_reported_lock = threading.Lock()
 
 
-def _first_tag_report(fid: str) -> bool:
-    """Whether upload ``fid``'s tag failure has not been reported within the interval; records it."""
-    now = time.monotonic()
-    with _tag_reported_lock:
-        last = _tag_reported.get(fid)
-        if last is not None and now - last < _TAG_REPORT_INTERVAL_S:
-            return False
-        _tag_reported.pop(fid, None)
-        _tag_reported[fid] = now
-        while len(_tag_reported) > _TAG_REPORTED_MAX:
-            _tag_reported.pop(next(iter(_tag_reported)))
-    return True
+class _OncePerInterval:
+    """Which keys were reported within ``interval_s``, remembering at most ``max_keys``, on the
+    ``clock`` given. Scans run on worker threads, so the read-modify-write holds a lock."""
+
+    def __init__(
+        self,
+        interval_s: float = _REPORT_INTERVAL_S,
+        max_keys: int = _REPORTED_MAX,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._interval_s = interval_s
+        self._max_keys = max_keys
+        self._clock = clock
+        self._seen: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def first(self, key: str) -> bool:
+        """Whether ``key`` has not been reported within the interval; records it."""
+        now = self._clock()
+        with self._lock:
+            last = self._seen.get(key)
+            if last is not None and now - last < self._interval_s:
+                return False
+            self._seen.pop(key, None)
+            self._seen[key] = now
+            while len(self._seen) > self._max_keys:
+                self._seen.pop(next(iter(self._seen)))
+        return True
+
+
+#: Upload ids whose sidecar tag failure was reported (BACKLOG #5553). One memo for the process,
+#: whichever cipher instance reported.
+_tag_reported = _OncePerInterval()
 
 
 def _not_a_plain_file(path: Path) -> str | None:
@@ -1083,6 +1101,9 @@ class UploadStore:
         self._body_checks: dict[str, tuple[tuple[int, int], bool]] = {}
         # The running UploadRetentionRunner's wake, or None (BACKLOG #3184). See wake_retention.
         self._retention_wake: Callable[[], bool] | None = None
+        # The scan's and the prune's lines for a pair left for an operator, keyed by upload id and
+        # reason, so each is not logged on every pass (BACKLOG #5552).
+        self._link_logged = _OncePerInterval()
 
     def wake_retention(self) -> bool:
         """Ask the running :class:`UploadRetentionRunner` over this store to sweep now, and return
@@ -1145,7 +1166,7 @@ class UploadStore:
         act on the other upload. **A hard link is not refused:** it is a second name for the same
         file and resolves to itself. Nor is a symbolic link that loops back to itself, which
         resolves to itself too; it reaches no other file, and its own read fails. A refused pair
-        is left to an operator, and the prune logs each one it leaves."""
+        is left to an operator."""
         blob, meta = self._paths_unfollowed(file_id)
         if blob.resolve() != blob or meta.resolve() != meta:
             raise UploadPathError(
@@ -1303,15 +1324,15 @@ class UploadStore:
         message.
 
         **A sidecar whose tag fails under a key the cipher holds is reported (BACKLOG #5553),**
-        through the cipher's tag-failure hook, once per upload per hour
-        (:meth:`_report_tag_failure`). That is a value sealed under this store's key for some other
-        place, such as another upload's sidecar moved under this id. A value under a key that is
-        not configured is a key fault, not that, and is only logged.
+        through the cipher's tag-failure hook, once per upload per hour, while a tag-failure hook
+        is armed (:meth:`_report_tag_failure`). That is a value sealed under this store's key for
+        some other place, such as another upload's sidecar moved under this id. A value under a key
+        that is not configured is a key fault, not that, and is only logged.
 
         **A sidecar that is a link, or is not a regular file, is not read (BACKLOG #5552).** It is
-        logged and skipped: a followed link read a file outside the root, or another upload's
-        sidecar, and a FIFO would block the scan, and the ``_quota_lock`` a save holds over it, for
-        good. One planted between that check and the read is still opened."""
+        skipped, and its log line is rate-limited per upload: a followed link read a file outside
+        the root, or another upload's sidecar, and a FIFO would block the scan, and the
+        ``_quota_lock`` a save holds over it, for good. One planted between that check and the read is still opened."""
         out: list[UploadedFileMeta] = []
         sink = held if self._refuses_plaintext else None
         bodies: set[str] = set()
@@ -1320,7 +1341,8 @@ class UploadStore:
                 bodies.add(f"{fid}{_BLOB_SUFFIX}")
             refused = _not_a_plain_file(entry)
             if refused is not None:
-                _log.warning("uploaded-file sidecar %s: %s, so it was not read", fid, refused)
+                if self._link_logged.first(f"scan {fid} {refused}"):
+                    _log.warning("uploaded-file sidecar %s: %s, so it was not read", fid, refused)
                 continue
             classify = False
             broken = False
@@ -1384,22 +1406,28 @@ class UploadStore:
 
     def _report_tag_failure(self, fid: str, stored: str, exc: CipherError) -> None:
         """Raise the cipher's tag-failure alert for sidecar ``fid`` when ``exc`` is its AEAD tag
-        failing under a key the cipher holds, once per upload per :data:`_TAG_REPORT_INTERVAL_S`
-        (BACKLOG #5553). The tests are ``store/cell_tag.py``'s ``_tag_failure_kind``, inlined
-        because that module imports beyond this leaf's set: a verdict was given, a cipher that names
+        failing under a key the cipher holds, once per upload per :data:`_REPORT_INTERVAL_S`
+        and only while its hook is armed (BACKLOG #5553). The tests are ``store/cell_tag.py``'s
+        ``_tag_failure_kind``, inlined because that module imports beyond this leaf's set: a verdict was given, a cipher that names
         its keys holds the one the marker names, and one that cannot (Vault Transit) declares that
         its refusal is the value's own tag. The reason names a prefix of the upload id, as
         ``cell_tag`` names a row: the id is random and carries no PHI, and the WARNING the scan logs
         beside it names the whole id."""
+        cipher = self._cipher
+        report = getattr(cipher, "report_tag_failure", None)
+        # A report with no hook armed goes nowhere, so it must not use up the upload's slot: a hook
+        # armed later in the interval would then never hear of it. A cipher with no such attribute,
+        # such as one forwarding to an inner cipher, is taken as armed, as before. Checked first, as
+        # the cheapest test.
+        if not callable(report) or getattr(cipher, "_tag_failure_hook", True) is None:
+            return
         if not isinstance(exc, UnauthenticatedCipherError) or gave_no_verdict(exc):
             return
-        cipher = self._cipher
         if not cipher.is_encrypted(stored):
             return
         holds = getattr(cipher, "holds_key_for", None)
         held = holds(stored) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
-        report = getattr(cipher, "report_tag_failure", None)
-        if not (held and callable(report) and _first_tag_report(fid)):
+        if not (held and _tag_reported.first(fid)):
             return
         report(
             "uploaded_file",
@@ -3102,11 +3130,12 @@ class UploadStore:
         try:
             blob_path, meta_path = self._paths(meta.file_id)
         except UploadPathError:
-            _log.warning(
-                "uploaded-logs prune left %r for an operator: its id fails the path guard or its "
-                "pair holds a link",
-                meta.file_id[:40],
-            )
+            if self._link_logged.first(f"prune {meta.file_id[:40]}"):
+                _log.warning(
+                    "uploaded-logs prune left %r for an operator: its id fails the path guard or "
+                    "its pair holds a link",
+                    meta.file_id[:40],
+                )
             return False
         except OSError as exc:
             _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
