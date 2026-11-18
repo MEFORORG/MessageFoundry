@@ -91,7 +91,8 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # BASH ONLY. The PowerShell tool is screened too, and there the backtick is the escape and a
 # backslash is literal, so `"done`n"` and `"D:\dir\"` would read as a substitution and an escaped
 # quote and blank the command after them. -Plain keeps the toggle this guard had before, which
-# reads neither PowerShell's `"$(...)"` subexpression nor a backtick-escaped quote. The same toggle
+# reads neither PowerShell's `"$(...)"` subexpression nor a backtick-escaped quote; -PowerShell,
+# below, reads the escape and still not the subexpression. The same toggle
 # also runs beside the bash reading, as a floor; the call site says why.
 #
 # A HEREDOC BODY IS DATA, and it is blanked here too, line for line. Hide-HeredocBodies runs on the
@@ -100,12 +101,27 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # commit-message form. Arithmetic, `$((...))`, is blanked for the same reason: `1 << n` would read
 # as a heredoc opener. A substitution inside it still runs, so that is left visible, and so is the
 # `#` of a comment, whose body is blanked.
-function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
+#
+# -PowerShell READS POWERSHELL'S ESCAPE (BACKLOG #5451). Outside single quotes a backtick escapes
+# the next character, so `"a`"b"` is one string and `` `" `` outside a string opens nothing. The
+# plain toggle reads both as quotes, which shifts every later span by one and blanks the walk after
+# it. This reading runs BESIDE the plain toggle for the PowerShell tool, never instead of it.
+function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$PowerShell) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
-    if ($Plain) {
+    if ($Plain -or $PowerShell) {
         $sb = [System.Text.StringBuilder]::new($Text.Length)
         $quote = $null
-        foreach ($ch in $Text.ToCharArray()) {
+        for ($n = 0; $n -lt $Text.Length; $n++) {
+            $ch = $Text[$n]
+            if ($PowerShell -and $ch -ceq '`' -and $quote -cne "'" -and $n + 1 -lt $Text.Length) {
+                # The escaped character is kept as it is outside a string and blanked inside one,
+                # except a newline, which Hide-HeredocBodies counts.
+                $esc = $Text[$n + 1]
+                if ($null -eq $quote) { [void]$sb.Append($ch); [void]$sb.Append($esc) }
+                else { [void]$sb.Append(' '); [void]$sb.Append($(if ($esc -ceq "`n") { $esc } else { ' ' })) }
+                $n++
+                continue
+            }
             if ($null -ne $quote) {
                 if ($ch -ceq $quote) { $quote = $null; [void]$sb.Append($ch) }
                 elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
@@ -376,6 +392,11 @@ try {
     if ($tool -cne 'PowerShell') {
         $bashScan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd)
         if ($bashScan -cne $scans[0]) { $scans += $bashScan }
+    } else {
+        # The PowerShell tool gets its own escape reading beside the toggle, under the same rule:
+        # it can only add denies (BACKLOG #5451).
+        $psScan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -PowerShell)
+        if ($psScan -cne $scans[0]) { $scans += $psScan }
     }
 
     # Split into simple commands. `(`, `)` and the backtick are separators too, or `$(find /proc)`,
