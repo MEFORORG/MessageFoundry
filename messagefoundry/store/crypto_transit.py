@@ -150,7 +150,7 @@ _NO_ERRORS_LIST = "it carries no errors list"
 _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
 #: The failures caught while a 400 is read, which then picks the unconfirmed label, and while that
-#: label's warning is made (BACKLOG #6707): a step short of memory or stack. Anything else the read
+#: label's warning is made and logged (BACKLOG #6707): a step short of memory or stack. Anything else the read
 #: raises propagates. No reply is known to cause either: a body past
 #: :data:`_REPARSED_BODY_MAX_CHARS` is not read, and the parser,
 #: :func:`~messagefoundry.redaction.json_loads_or_refusal`, returns its ``RecursionError`` refusal
@@ -326,9 +326,9 @@ def _names_aead_failure(exc: Exception) -> bool:
     return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
 
 
-#: The seconds within which each :func:`_warn_when_due` warning is logged at most once per
-#: process (BACKLOG #5650, #6707). A proxy can cause one on every read or every row; once is the
-#: signal.
+#: The seconds within which each :func:`_warn_when_due` warning, and each :func:`_report_unlogged`
+#: line, is logged at most once per process (BACKLOG #5650, #6707). A proxy can cause one on every
+#: read or every row; once is the signal.
 _WARNING_LOG_INTERVAL_S = 3600.0
 #: When each such warning, by kind, was last logged.
 _logged_at: dict[object, float] = {}
@@ -396,13 +396,12 @@ def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = N
 def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
     """:func:`_warn_quietly`, unless the warning ``kind()`` was logged in the last
     :data:`_WARNING_LOG_INTERVAL_S`. The slot is taken before the warning, so concurrent callers
-    emit it at most once. When building or logging the warning fails, except as the last sentence
-    says, the slot is given back, to the time it held before or to empty, unless a later caller
-    has taken it since; when giving it back fails too, the slot stays taken for the interval. A
-    failure building the key, or in the slot's bookkeeping, is reported by
-    :func:`_report_unlogged` naming that step, and the warning is then not logged. Where
-    :func:`_report_unlogged` itself raises, out of memory or stack, the exception propagates, and
-    a slot taken for the failed warning stays taken."""
+    emit it at most once. When building or logging the warning fails, or a fault escapes it, the
+    slot is given back, to the time it held before or to empty, unless a later caller has taken it
+    since; when giving it back fails too, the slot stays taken for the interval. A failure building
+    the key, or in the slot's bookkeeping, is reported by :func:`_report_unlogged` naming that
+    step, and the warning is then not logged. Where :func:`_report_unlogged` itself raises, out of
+    memory or stack, the exception propagates."""
     try:
         key = kind()
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
@@ -418,16 +417,20 @@ def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
         _report_unlogged(fault, kind, _WARNING_UNTHROTTLED)
         return
-    if not _warn_quietly(build, stacklevel=3, site=key):
-        try:
-            with _logged_at_lock:
-                if _logged_at.get(key) == now:  # give the slot back unless a later caller took it
-                    if last is None:
-                        del _logged_at[key]
-                    else:
-                        _logged_at[key] = last
-        except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
-            _report_unlogged(fault, kind, _WARNING_UNTHROTTLED)
+    emitted = False
+    try:
+        emitted = _warn_quietly(build, stacklevel=3, site=key)
+    finally:
+        if not emitted:
+            try:
+                with _logged_at_lock:
+                    if _logged_at.get(key) == now:  # give it back unless a later caller took it
+                        if last is None:
+                            del _logged_at[key]
+                        else:
+                            _logged_at[key] = last
+            except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+                _report_unlogged(fault, kind, _WARNING_UNTHROTTLED)
 
 
 def _log_unread_decrypt_body(length: int) -> None:
@@ -950,18 +953,18 @@ class TransitCipher(_UnmarkedPolicy):
                 return AuditKeyVersionRefusedError(version)
             unverified = AuditKeyVersionUnverifiedError(version)
             # Making the warning's closures runs outside _warn_when_due's guard, so a fault there
-            # writes a fixed literal on stderr in place of the warning.
-            try:
-                kind, build = _unconfirmed_warning(self._audit_key, version, reason, raised)
-            except _READ_FAULTS:
-                _last_resort(_WARNING_UNBUILT)
-            else:
-                # A fault in _READ_FAULTS escaping the warning must not drop the label, so the
-                # walk keeps the row's break; reporting it is what just failed.
-                try:  # noqa: SIM105 -- constructing contextlib.suppress can itself raise here
-                    _warn_when_due(kind, build)
+            # writes a fixed literal on stderr in place of the warning. A fault in _READ_FAULTS
+            # escaping the warning or that write is dropped, unreported, so the label and the
+            # row's break survive it; reporting it would need the memory or stack that ran out.
+            try:  # noqa: SIM105 -- constructing contextlib.suppress can itself raise here
+                try:
+                    kind, build = _unconfirmed_warning(self._audit_key, version, reason, raised)
                 except _READ_FAULTS:
-                    pass
+                    _last_resort(_WARNING_UNBUILT)
+                else:
+                    _warn_when_due(kind, build)
+            except _READ_FAULTS:
+                pass
             return unverified
         if self._is_outage(exc):
             return self._verify_failed(exc)

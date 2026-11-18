@@ -2009,6 +2009,35 @@ def test_a_fault_inside_warn_when_due_is_not_reported_as_unbuilt(
     assert crypto_transit._WARNING_UNBUILT not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError])
+def test_a_fault_escaping_the_unconfirmed_warning_keeps_the_label_and_frees_the_slot(
+    fault: type[Exception], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707: when the warning's log call raises and its stderr report then raises a
+    fault in :data:`_READ_FAULTS`, the 400 keeps the unconfirmed label, and the slot is given
+    back, so the next unconfirmed 400 logs the warning."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def report_fails(*_a: Any, **_kw: Any) -> None:
+        raise fault
+
+    monkeypatch.setattr(crypto_transit, "_logged_at", {})
+    caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
+    raising = _RaisingFilter()
+    crypto_transit.log.addFilter(raising)
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(crypto_transit, "_report_unlogged", report_fails)
+            refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    finally:
+        crypto_transit.log.removeFilter(raising)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
+    _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
+    assert len(logged) == 1, logged
+
+
 def test_a_body_hvac_parsed_past_the_bound_is_not_read() -> None:
     """BACKLOG #6707: the bound covers a list hvac already parsed too, so an oversized body gets
     the same label whatever its Content-Type; its refusal text is not read."""
