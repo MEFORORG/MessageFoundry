@@ -766,49 +766,29 @@ function Get-OwnInvocationWindow([string]$Scan, [int]$At, [switch]$SeparatorInTo
     }
 }
 
-# RULE 3d's VICTIM TAIL, CUT ONLY WHERE THE CUT STANDS OUTSIDE QUOTES (BACKLOG #5643, a finding left
-# open by its first PR). The added reading cut the raw tail at the first `}`, `)` or lone `&`, even one
-# INSIDE a quoted path, so `git worktree remove "<tmp>/Primary-wt2 (2)"` was cut to `"<tmp>/Primary-wt2
-# (2`, the victim scan read `<tmp>/Primary-wt2` off it, and an ungoverned directory was refused for the
-# name of a governed one beside it. Returns the tail up to the first $Pattern match that stands outside
-# a quoted span, or the whole tail when there is none.
-#
-# THE QUOTE TRACKING IS PLAIN: a `'` opens or closes a span outside a `"` span and the other way round.
-# It reads no escape, so a backslash- or backtick-escaped quote flips the state where the shell would
-# not. A wrong state can only leave a closer uncut, which is the first reading's behaviour.
-function Get-VictimTailOutsideQuotes([string]$Tail, [string]$Pattern) {
-    $inQuote = [bool[]]::new($Tail.Length + 1)
-    $single = $false
-    $double = $false
-    for ($i = 0; $i -lt $Tail.Length; $i++) {
-        $inQuote[$i] = ($single -or $double)
-        $c = $Tail[$i]
-        if ($c -eq "'" -and -not $double) { $single = -not $single }
-        elseif ($c -eq '"' -and -not $single) { $double = -not $double }
-    }
-    foreach ($m in [regex]::Matches($Tail, $Pattern)) {
-        if (-not $inQuote[$m.Index]) { return $Tail.Substring(0, $m.Index) }
-    }
-    $Tail
-}
-
-# Does $Text leave a `(` or `{` open at its end? Rule 3d asks it of the flags between a git token and a
-# `worktree remove|move` (BACKLOG #5643, a finding left open by its first PR): `git log $(echo worktree
-# remove <wt>)` puts the match inside a substitution that `echo` runs, so it is not git's subcommand,
-# while `git -c x.y=$(echo z) worktree remove <wt>` closes its substitution first and still is. An
-# unmatched closer is ignored, because the window can start inside a substitution that opened before it.
-function Test-OpenGroupAtEnd([string]$Text) {
-    $round = 0
-    $curly = 0
-    foreach ($c in $Text.ToCharArray()) {
-        switch ($c) {
-            '(' { $round++ }
-            ')' { if ($round -gt 0) { $round-- } }
-            '{' { $curly++ }
-            '}' { if ($curly -gt 0) { $curly-- } }
+# Does $Text, the flags between a git token and a `worktree remove|move` (rule 3d, BACKLOG #5643, a
+# finding left open by its first PR), cross the edge of the git command's own group? Two shapes do:
+#   * A `$(` (or PowerShell's `@(`) still open at its end: `git log $(echo worktree remove <wt>)` puts
+#     the match inside a substitution `echo` runs, while `git -c x.y=$(echo z) worktree remove <wt>`
+#     closes its substitution first, and the match is still git's.
+#   * A `)` with no opener in $Text: `echo $(git -C <d> log -1) worktree remove <wt>` closes the
+#     substitution git ran in, and the match belongs to `echo`. The FIRST reading still judges that
+#     line, so it is still refused for what it names.
+# A bare `(` is tracked only so that its `)` is not read as the second shape. Braces are not read at
+# all: `x{y` is an ordinary unquoted path, and a `{` counted as an opener once let `git -C <d>/x{y
+# worktree remove <wt>` skip the invocation.
+function Test-CrossesOwnGroup([string]$Text) {
+    $stack = [System.Collections.Generic.Stack[bool]]::new()  # $true for a substitution opener
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $c = $Text[$i]
+        if ($c -eq '(') {
+            $stack.Push(($i -gt 0) -and ('$@'.Contains([string]$Text[$i - 1])))
+        } elseif ($c -eq ')') {
+            if ($stack.Count -eq 0) { return $true }
+            [void]$stack.Pop()
         }
     }
-    ($round -gt 0) -or ($curly -gt 0)
+    $stack.Contains($true)
 }
 
 # SCAN INDEX -> RAW INDEX for one segment (BACKLOG #5643). Remove-QuotedSpans does not preserve length,
@@ -4382,8 +4362,8 @@ What to do instead:
     # WHERE A VICTIM ENDS (review round cfbde907): at a command separator, and also at a `}` or `)` that
     # closes a script block or substitution, and at a lone `&`. Without the last three `& {git worktree
     # remove <wt>}`, `$(git worktree remove <wt>)` and `git worktree remove <wt>&` read `<wt>}`, `<wt>)`
-    # and `<wt>&`, which name nothing, and were allowed. A closer inside a quoted span is not a cut
-    # (Get-VictimTailOutsideQuotes says how far that reading goes).
+    # and `<wt>&`, which name nothing, and were allowed. The cut is found on SCAN, so a closer inside a
+    # quoted span the scan blanks is not a cut (the added reading, below, says how).
     # A `}` or `)` that closes the shell's own `${...}` or `$(...)` inside the victim is not a closer.
     $wtVictimSplit = '(?:&&|\|\||;|\||(?<!\$\{[^}]*)\}|(?<!\$\([^)]*)\)|(?<![<>&])&(?![>&]))'
     $wtTargets = foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
@@ -4468,9 +4448,9 @@ What to do instead:
                     if ($ownEnd -gt $sm.Index) { break }
                     $between = $seg.Scan.Substring($ownEnd, $sm.Index - $ownEnd)
                     if ($between -match '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))') { break }
-                    # NOR ONE INSIDE A SUBSTITUTION OR BLOCK STILL OPEN after the git token: in `git log
-                    # $(echo worktree remove <wt>)` it is `echo`'s argument.
-                    if (Test-OpenGroupAtEnd $between) { break }
+                    # NOR ONE ACROSS THE EDGE OF THE git COMMAND'S OWN GROUP: in `git log $(echo
+                    # worktree remove <wt>)` it is `echo`'s argument (Test-CrossesOwnGroup).
+                    if (Test-CrossesOwnGroup $between) { break }
                     # AND THE git WORD MUST START ITS COMMAND (review round cfbde907): `git worktree
                     # remove <o>/nope ; echo git worktree remove <wt>` read the printed `git` as an
                     # invocation and refused the line for what it named. Between the window start and the
@@ -4503,7 +4483,16 @@ What to do instead:
                 # only invocation is still judged without repeating the first reading's own victims.
                 $sameAsOld = ($rawEnd -eq $oldEnd)
                 if ($sameAsOld) { $oldWindow = $win }
-                $a2 = Get-VictimTailOutsideQuotes $seg.Raw.Substring($rawEnd) $wtVictimSplit
+                # THE CUT IS FOUND ON SCAN AND MAPPED BACK (BACKLOG #5643, a finding left open by its
+                # first PR). Cut on RAW, `git worktree remove "<tmp>/Primary-wt2 (2)"` ended at the `)`
+                # inside the quotes, the victim scan read the governed `<tmp>/Primary-wt2` off the front,
+                # and an ungoverned directory was refused. The scan blanks a quoted span holding
+                # whitespace under the host's own escape rules. A quoted span holding ONE bare word is
+                # unquoted there, so a closer inside it is still a cut.
+                $tailAt = $sm.Index + $sm.Length
+                $cut = [regex]::Match($seg.Scan.Substring($tailAt), $wtVictimSplit)
+                $rawStop = $(if ($cut.Success) { $map[$tailAt + $cut.Index] } else { $seg.Raw.Length })
+                $a2 = $seg.Raw.Substring($rawEnd, [Math]::Max(0, $rawStop - $rawEnd))
                 foreach ($v in @(Get-WorktreeVictimTokens $a2)) {
                     if ($sameAsOld -and @($oldVictims | Where-Object {
                                 [string]::Equals($_, $v, [System.StringComparison]::Ordinal) }).Count -gt 0) { continue }
@@ -4614,9 +4603,9 @@ What to do instead:
         #   * THE PRE-SPLITTERS ARE NOT QUOTE-AWARE. The first reading splits with
         #     `(?:&&|\|\||;|\|)`, so a quoted victim path containing `;` or `&&` is truncated before the
         #     quote-aware scan runs. The added reading splits with $wtVictimSplit, defined above the
-        #     segment loop, which also cuts at a `}`, `)` or lone `&`, but only at one that stands
-        #     outside a quoted span as Get-VictimTailOutsideQuotes reads quotes, which is without
-        #     escapes. An escaped quote can still leave a closer uncut there.
+        #     segment loop, which also cuts at a `}`, `)` or lone `&`. It finds the cut on the scan,
+        #     so a quoted span holding whitespace is not cut there; a quoted span holding one bare
+        #     word still is, and only the first reading judges it.
         #
         # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
         # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.

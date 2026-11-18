@@ -358,3 +358,16 @@ def test_a_worktree_verb_inside_another_commands_substitution_is_not_judged(
 def test_a_git_inside_a_substitution_is_still_judged(rig: SimpleNamespace) -> None:
     reason = _reason(rig, f"git log $(git worktree remove {rig.wt2.as_posix()})", rig.outside)
     assert "worktree remove" in reason, reason
+
+
+@pytest.mark.parametrize("leaf", ["x{y", "x}y", "x{y}"])
+def test_a_brace_in_an_unquoted_dash_C_path_does_not_hide_the_invocation(
+    rig: SimpleNamespace, leaf: str
+) -> None:
+    """DENY on origin/main; a review round measured ALLOW when a `{` was read as an open group."""
+    (rig.primary / leaf).mkdir()
+    cmd = (
+        f"git -C {rig.outside.as_posix()} status ; "
+        f"git -C {rig.primary.as_posix()}/{leaf} worktree remove ../../Primary-wt2"
+    )
+    assert "worktree remove" in _reason(rig, cmd, rig.outside)
