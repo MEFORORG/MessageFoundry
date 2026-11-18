@@ -23,8 +23,8 @@ module is that second half.
 
 **And a third thing, which is not a stage but is half the enforcement: UN-stopping.** Recovery is an
 operator assertion — *"I fixed the disk"* — and a fail-closed control that simply believes it is a
-control with an off switch. :meth:`LogWriteGuard.revalidate` therefore re-tests dead sinks **by
-writing a real record to them**, as its docstring says: *repaired* and *still broken* are
+control with an off switch. :meth:`LogWriteGuard.revalidate` therefore re-tests dead sinks, as
+its docstring says: *repaired* and *still broken* are
 indistinguishable from memory, which is exactly the distinction recovery has to make. The engine
 gates every re-arm path on that answer.
 
@@ -183,6 +183,9 @@ class LogWriteGuard:
         #: Sinks whose current break fired a stage-2 event that was not delivered, so the event is
         #: fired again later; see :meth:`record_unwritable`.
         self._unanswered: set[str] = set()
+        #: Sinks whose current break already wrote the stderr line for a stage-2 event whose
+        #: responder raised, so an owed event fired again on every later failure writes no more.
+        self._escalation_failure_said: set[str] = set()
         #: sink -> "write one record to yourself and raise if you still cannot", see :meth:`revalidate`.
         self._probes: dict[str, SinkProbe] = {}
         self._escalation: EscalationCallback | None = None
@@ -322,6 +325,7 @@ class LogWriteGuard:
             self._latch_after_roll(sink, now=now, tripped=tripped)
             if self._sinks[sink].state == "rolled":
                 self._unanswered.discard(sink)  # the break is over, owed event or not
+                self._escalation_failure_said.discard(sink)
         if tripped:
             # The precondition holds through this join: ``reason`` arrived scrubbed and everything
             # appended is a literal plus two formatted numbers, so nothing new needs escaping.
@@ -455,6 +459,7 @@ class LogWriteGuard:
             # A record landed, so the flap latch has nothing left to hold either.
             self._flap_latch.pop(sink, None)
             self._unanswered.discard(sink)
+            self._escalation_failure_said.discard(sink)
 
     def _latch_after_roll(self, sink: str, *, now: float, tripped: bool) -> None:
         """Move the flap latch for one roll. Called under the lock, after the bound has run.
@@ -500,7 +505,7 @@ class LogWriteGuard:
         return not all(self._reads_unwritable(s) for s in self._sinks.values())
 
     def revalidate(self) -> bool:
-        """Re-test sinks whose own state is unwritable BY WRITING TO THEM, and report whether the
+        """Re-test sinks whose own state is unwritable, and report whether the
         process can log, as :meth:`can_log` answers after the probes. The loop's comments say which
         such sinks are probed.
 
@@ -555,7 +560,8 @@ class LogWriteGuard:
     def _fire(self, event: LogSinkEvent) -> bool:
         """Hand ``event`` to the responder, and report whether it was delivered: False when no
         responder is wired, the responder returned False, which it does when it dropped the
-        event, or the responder raised."""
+        event, or the responder raised. A raise writes a stderr line, for a stage-2 event at most
+        once per break of the sink."""
         with self._lock:
             callback = self._escalation
         if callback is None:
@@ -563,6 +569,15 @@ class LogWriteGuard:
         try:
             delivered = callback(event)
         except Exception as exc:  # never-raise: we are already handling a logging failure
+            if event.stage == "unwritable":
+                # An owed event is fired again on every later failure of the break, so a
+                # responder that keeps raising would otherwise write one line per dropped record.
+                with self._lock:
+                    if event.sink in self._escalation_failure_said:
+                        return False
+                    current = self._sinks.get(event.sink)
+                    if current is not None and current.state == "unwritable":
+                        self._escalation_failure_said.add(event.sink)
             # Scrubbed for the reason the stage strings are: this line goes straight to stderr,
             # below every handler filter (BACKLOG #1591).
             _last_resort(
@@ -808,9 +823,9 @@ class _GuardedSinkMixin(_SinkBase):
     """The two-stage ``handleError`` shared by every guarded sink.
 
     Subclasses supply :meth:`_roll` — how *this* kind of sink is rolled. Everything after the roll
-    (write the rollover notice, re-write the record whose emit failed or its stand-in, decide stage 1
-    vs stage 2) is identical, because "is the replacement writable?" is answered the same way for every sink: by
-    writing to it and seeing whether that raises."""
+    (write the rollover notice, re-write the record whose emit failed or its stand-in) is identical,
+    because "is the replacement writable?" is answered the same way for every sink: by writing to
+    it and seeing whether that raises."""
 
     _guard: LogWriteGuard
     _sink_label: str
@@ -852,8 +867,9 @@ class _GuardedSinkMixin(_SinkBase):
             failure = sys.exception()
             # A record that cannot be formatted is no reason to roll a healthy sink (BACKLOG
             # #5813). When the formatter can format the stand-in, it is written in the record's
-            # place: if the sink takes it, neither stage runs and the fault is only counted for the
-            # stderr line; if the sink refuses it, the two stages below decide. When the formatter
+            # place: if the sink takes it, neither stage runs and the fault is reported on the
+            # stderr line only, with no alert and nothing on /status; if the sink refuses it, the
+            # two stages below decide. When the formatter
             # cannot format the stand-in either, the sink is recorded unwritable without a roll,
             # because a roll cannot clear a formatter fault.
             stand_in = self._stand_in_for(record)

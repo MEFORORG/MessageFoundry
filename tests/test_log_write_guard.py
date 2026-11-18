@@ -1154,6 +1154,32 @@ def test_a_stage2_event_whose_responder_raised_is_fired_again(
     assert "log-sink escalation for file failed" in capsys.readouterr().err
 
 
+def test_a_responder_that_keeps_raising_writes_one_stderr_line_per_break(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The owed event is fired again on every later failure, but the line saying the responder
+    # raised is written once per break, as main wrote it. A new break says it again.
+    # NEGATIVE CONTROL: on c4167a6e38 every failed record wrote the line.
+    guard = LogWriteGuard()
+    guard.register("file")
+    calls: list[LogSinkEvent] = []
+
+    def responder(event: LogSinkEvent) -> bool:
+        calls.append(event)
+        raise RuntimeError("responder broke")
+
+    guard.set_escalation(responder)
+    for n in range(5):
+        guard.record_unwritable("file", reason=f"disk gone {n}")
+    assert len(calls) == 5  # the owed event is still fired on every failure
+    assert capsys.readouterr().err.count("log-sink escalation for file failed") == 1
+
+    guard.record_healthy("file")
+    guard.record_unwritable("file", reason="a second break")
+    guard.record_unwritable("file", reason="still the second break")
+    assert capsys.readouterr().err.count("log-sink escalation for file failed") == 1
+
+
 async def test_the_runners_responder_reports_an_event_it_dropped(store: MessageStore) -> None:
     # The guard learns of a drop only from the responder's return. NEGATIVE CONTROL: on
     # 0a71e8b23f it returned None in every case, which the guard read as delivered.
