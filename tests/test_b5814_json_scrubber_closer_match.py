@@ -47,12 +47,19 @@ def test_a_mismatched_closer_does_not_end_the_scrub(scrub: Callable[[str], str],
 @pytest.mark.parametrize(
     "text",
     [
-        # An INHERIT frame (the kept members of an identifier) still ends on any closer, so the
-        # identifier's value after it, and the keys after the identifier, are scrubbed as on main.
+        # A frame that keeps what it holds (the INHERIT members of an identifier or telecom) and an
+        # identifier array both rise to LEAF on a stray closer rather than ending or staying as they
+        # were, so neither the identifier's own value nor a later key's value is kept.
         '{"identifier": {"system": [1, 2), "value": "Qmrnxq"}}',
         '{"identifier": [{"system": "x" ] "Qmrnxq"}]',
+        '{"identifier": {"system": "x" ) , "value": "Qmrnxq"}}',
+        '{"identifier": {"system": "x" ] , "value": "Qmrnxq"}}',
+        '{"telecom": {"system": "phone" ] , "value": "Qmrnxq"}}',
+        '{"identifier": {"type": {"text": "x" ] }, "value": "Qmrnxq"}}',
         f'{{"identifier": {{"system": [1, 2)}}, "family": "{FAMILY}", "birthDate": "Qmrnxq"}}',
         f'{{"telecom": [{{"use": f(]}}], "given": "{GIVEN}", "family": "{FAMILY}"}}',
+        f'{{"identifier": [{{"system": "urn:x", "value": "1"}}}}, "name": [{{"text": "{FAMILY}"}}]}}',
+        f"{{'identifier': ['x' }}, 'family': {{'{FAMILY}'}}}}",
     ],
 )
 def test_a_mismatched_closer_never_lowers_the_scrub_level(
