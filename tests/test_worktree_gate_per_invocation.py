@@ -289,3 +289,72 @@ def test_a_quoted_victim_holding_a_closer_character_is_still_judged(
 def test_a_printed_upper_case_git_is_not_judged_on_windows(rig: SimpleNamespace) -> None:
     """ALLOW on origin/main; the case-insensitive token test caught a word `echo` prints."""
     assert _allowed(rig, f"echo Git worktree remove {rig.wt2.as_posix()}", rig.tmp)
+
+
+# ------------------------------------------------------------------ findings left open by PR 2931
+
+
+@pytest.mark.parametrize(
+    ("flag", "victim"),
+    [
+        ("-C {p}/git", "../../Primary-wt2"),
+        ("--work-tree={p}/git -C {p}/git", "../../Primary-wt2"),
+        ("-C {p}/git", "../../Primary-wt2 ; git -C {o2} status"),
+    ],
+)
+def test_a_flag_value_whose_leaf_is_git_does_not_hide_the_real_invocation(
+    rig: SimpleNamespace, flag: str, victim: str
+) -> None:
+    """Measured ALLOW on origin/main: the `/git` leaf was taken as the git token and failed the
+    command-position test, so the invocation was skipped and another command's `-C` decided."""
+    (rig.primary / "git").mkdir()
+    fmt = {"p": rig.primary.as_posix(), "o": rig.outside.as_posix(), "o2": rig.outside2.as_posix()}
+    cmd = f"git -C {{o}} status ; git {flag} worktree remove {victim}".format(**fmt)
+    assert "worktree remove" in _reason(rig, cmd, rig.outside)
+
+
+def test_a_flag_value_whose_leaf_is_git_still_allows_an_ungoverned_victim(
+    rig: SimpleNamespace,
+) -> None:
+    (rig.primary / "git").mkdir()
+    cmd = (
+        f"git -C {rig.outside.as_posix()} status ; "
+        f"git -C {rig.primary.as_posix()}/git worktree remove ../../nope"
+    )
+    assert _allowed(rig, cmd, rig.outside)
+
+
+@pytest.mark.parametrize("leaf", ["Primary-wt2 (2)", "Primary-wt2 {2}", "Primary-wt2 & co"])
+def test_a_quoted_ungoverned_victim_holding_a_space_and_a_closer_is_not_cut_short(
+    rig: SimpleNamespace, leaf: str
+) -> None:
+    """A false DENY on origin/main: the added reading cut the quoted path at the closer, and the
+    victim scan then read the governed `<tmp>/Primary-wt2` off the front of it."""
+    other = rig.tmp / leaf
+    subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True, capture_output=True)
+    for quote in ('"', "'"):
+        cmd = f"git worktree remove {quote}{other.as_posix()}{quote}"
+        assert _allowed(rig, cmd, rig.outside), cmd
+
+
+def test_a_quoted_governed_victim_with_a_closer_after_the_quote_is_still_judged(
+    rig: SimpleNamespace,
+) -> None:
+    reason = _reason(rig, f'echo $(git worktree remove "{rig.wt2.as_posix()}")', rig.tmp)
+    assert "worktree remove" in reason, reason
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["git log $(echo worktree remove {w})", "git status ; git log $(echo worktree remove {w})"],
+)
+def test_a_worktree_verb_inside_another_commands_substitution_is_not_judged(
+    rig: SimpleNamespace, template: str
+) -> None:
+    """A false DENY on origin/main: `echo` prints the words, git runs `log`."""
+    assert _allowed(rig, template.format(w=rig.wt2.as_posix()), rig.outside)
+
+
+def test_a_git_inside_a_substitution_is_still_judged(rig: SimpleNamespace) -> None:
+    reason = _reason(rig, f"git log $(git worktree remove {rig.wt2.as_posix()})", rig.outside)
+    assert "worktree remove" in reason, reason
