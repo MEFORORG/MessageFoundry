@@ -1179,9 +1179,17 @@ class SoapDestination(DestinationConnector):
                 # reachability check be turned into a memory exhaustion. The peer chooses the body.
                 drain_bounded(resp, connector=f"{self._hop} probe")
         except urllib.error.HTTPError as exc:
-            # BACKLOG #5881: an HTTPError owns the open response socket; the status is all a probe
-            # reads, so close it on both arms rather than leave it to the garbage collector.
-            exc.close()
+            # BACKLOG #5881: the HTTPError owns the final response; the status is all a probe reads,
+            # so close it on both arms. The 401/403 DeliveryError chains it, which would otherwise
+            # keep that socket open as long as the error lives. A Digest challenge response urllib
+            # retried past is not closed here.
+            try:
+                exc.close()
+            except OSError as close_exc:
+                # A teardown fault must not replace the verdict the status already gives.
+                logger.debug(
+                    "SOAP probe: closing the HTTP %s response failed: %s", exc.code, close_exc
+                )
             if exc.code in (401, 403):
                 raise DeliveryError(
                     f"SOAP {_redact_url(self.url)} returned HTTP {exc.code} (check credentials)"

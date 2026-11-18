@@ -7,7 +7,8 @@ The bearer half of the row was fixed by BACKLOG #5526 (the probe mints as ``_pos
 probe reads only its status, so both arms (credential failure and reachable) close it. The
 credential arm is the one that leaked: its ``DeliveryError`` chains the ``HTTPError`` as
 ``__cause__``, so the open response lived as long as the error did. The reachable arm is pinned
-too, so a refactor that keeps a reference there cannot reopen the leak.
+too. The stub raises from ``open()`` without urllib's handler chain, so a Digest challenge response
+urllib retried past is outside what these tests see.
 """
 
 from __future__ import annotations
@@ -33,9 +34,15 @@ class _RaisingOpener:
     def __init__(self, code: int) -> None:
         self.code = code
         self.body = io.BytesIO(b"synthetic fault body")
+        self.raised: urllib.error.HTTPError | None = None
 
     def open(self, req: urllib.request.Request, timeout: float | None = None) -> object:
-        raise urllib.error.HTTPError(req.full_url, self.code, "synthetic", Message(), self.body)
+        # Holding the raised error stands in for any reference that outlives the probe, so
+        # reference-counting cannot close the body on the probe's behalf.
+        self.raised = urllib.error.HTTPError(
+            req.full_url, self.code, "synthetic", Message(), self.body
+        )
+        raise self.raised
 
 
 def _dest() -> SoapDestination:
