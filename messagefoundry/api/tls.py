@@ -261,7 +261,10 @@ def _generated_cert_names(host: str) -> tuple[str, list[str]]:
         return host, list(_LOOPBACK_NAMES)
     if address is None or not address.is_unspecified:
         return host, []
-    machine = socket.gethostname()
+    try:
+        machine = socket.gethostname()
+    except OSError:
+        machine = ""  # no host name to read: the loopback names still serve a first run
     if machine and machine.isascii() and len(machine) <= _CN_MAX:
         return machine, [host, *_LOOPBACK_NAMES]
     return host, list(_LOOPBACK_NAMES)

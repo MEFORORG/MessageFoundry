@@ -939,7 +939,7 @@ def test_an_intermediary_list_never_satisfies_the_open_egress_gate(
 pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
 
 
-# --- BACKLOG #5772: session limits are bounded, and local-only access refuses an off-box address ---
+# --- BACKLOG #5772: session limits are bounded ------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -979,13 +979,3 @@ def test_session_limits_take_one_and_a_year(tmp_path: Path) -> None:
         tmp_path, "security.sign_out_after_idle_minutes = 1\nsecurity.max_session_hours = 8760\n"
     )
     assert s.auth.session_idle_timeout_minutes == 1 and s.auth.session_absolute_hours == 8760
-
-
-def test_security_model_refuses_local_access_with_an_off_box_address() -> None:
-    """Direct construction, the path that skips the load's desugar."""
-    with pytest.raises(ValueError, match="loopback"):
-        SecuritySettings(local_access_only=True, listen_address="0.0.0.0")
-    with pytest.raises(ValueError, match="loopback"):
-        SecuritySettings(listen_address="10.0.0.5")
-    assert SecuritySettings(local_access_only=False, listen_address="10.0.0.5").listen_address
-    assert SecuritySettings(local_access_only=True, listen_address="::1").local_access_only

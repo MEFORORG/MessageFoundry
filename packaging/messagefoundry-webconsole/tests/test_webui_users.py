@@ -472,6 +472,15 @@ async def test_the_console_saves_over_a_stored_name_the_request_model_refuses(
         assert r.status_code == 400
         user = await service.store.get_user(uid)
         assert user is not None and user.display_name == "Dir" + chr(9) + "Name"
+        # A stored line break: the text input posts the name without it, the hidden copy with it.
+        stored = "Dir" + chr(10) + chr(9) + "Name"
+        await service.store.update_user_profile(uid, display_name=stored, email=None, audits=())
+        shown = "Dir" + chr(13) + chr(10) + chr(9) + "Name"
+        typed = "Dir" + chr(9) + "Name"
+        r = await _save_profile(c, uid, {"display_name": typed, "display_name_shown": shown})
+        assert r.status_code == 303, r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name == stored
 
 
 async def test_the_console_refuses_a_profile_email_creation_would_refuse(engine: Engine) -> None:

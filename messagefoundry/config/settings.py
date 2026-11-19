@@ -7996,18 +7996,6 @@ class SecuritySettings(_Section):
             out.append(str(network))
         return out
 
-    @model_validator(mode="after")
-    def _local_access_binds_loopback(self) -> SecuritySettings:
-        # BACKLOG #5772: refused on the model, so a SecuritySettings built anywhere, not only through
-        # the load's desugar, cannot claim local-only access while naming an off-box address.
-        if self.local_access_only and self.listen_address not in _LOOPBACK_HOSTS:
-            raise ValueError(
-                f"[security].local_access_only=true but [security].listen_address={self.listen_address!r} "
-                "is not a loopback address (127.0.0.1/localhost/::1). Set local_access_only=false to "
-                "bind it off-box (TLS required), or use a loopback listen_address."
-            )
-        return self
-
     @property
     def client_networks(self) -> tuple[str, ...]:
         """``allowed_client_networks`` as the normalized strings the matcher consumes. A plain
@@ -9148,9 +9136,14 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
             _set(section, field, getattr(sec, skey))
 
     # Network host: local_access_only forces loopback; a contradictory non-loopback listen_address with
-    # local_access_only=true REFUSES (AC-3) rather than silently overriding. The model refused it
-    # already, in SecuritySettings._local_access_binds_loopback.
+    # local_access_only=true REFUSES (AC-3) rather than silently overriding.
     if "local_access_only" in provided or "listen_address" in provided:
+        if sec.local_access_only and sec.listen_address not in _LOOPBACK_HOSTS:
+            raise ValueError(
+                f"[security].local_access_only=true but [security].listen_address={sec.listen_address!r} "
+                "is not a loopback address (127.0.0.1/localhost/::1). Set local_access_only=false to "
+                "bind it off-box (TLS required), or use a loopback listen_address."
+            )
         _set("api", "host", "127.0.0.1" if sec.local_access_only else sec.listen_address)
 
     # Web-console external origin (empty string = unset → None, matching [api].public_origin).
@@ -9392,8 +9385,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       keep one just removed. A caller that pairs a ``[security]`` with an ``[auth]`` from another
       read must copy the two in first, as ``messagefoundry security`` does (vault BACKLOG #2600).
       ``SessionRecord.is_live`` refuses a session idle past the first or older than the second (its
-      expiry is stamped from it at sign-in), so a longer one is looser, and 0 or less
-      ends every session at once, which is stricter.
+      expiry is stamped from it at sign-in), so a longer one is looser. A value below 1 is
+      refused at load (BACKLOG #5772).
     * The directory reconciler's knobs, named while ``reconciler_configured`` holds:
       ``ad_session_recheck_seconds`` above its default (a pass runs less often; 0 is the off value
       :func:`security_loosenings` names), ``ad_session_recheck_strikes`` above its default

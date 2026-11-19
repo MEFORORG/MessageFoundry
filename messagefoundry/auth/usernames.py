@@ -93,6 +93,19 @@ def _unprintable(ch: str) -> bool:
     )
 
 
+def renders_as_nothing(ch: str) -> bool:
+    """Whether ``ch`` draws no glyph: a format character (category Cf), a default-ignorable code
+    point (:data:`_DEFAULT_IGNORABLE`) or a blank glyph (:data:`_BLANK_GLYPHS`). The account and
+    role name rule in ``api.auth_models`` sets these aside before it asks whether a name is blank
+    or reads as a built-in role's (BACKLOG #5784, #5785)."""
+    point = ord(ch)
+    return (
+        unicodedata.category(ch) == "Cf"
+        or point in _BLANK_GLYPHS
+        or any(low <= point <= high for low, high in _DEFAULT_IGNORABLE)
+    )
+
+
 def username_refusal(username: str) -> str | None:
     """Why a new account may not be named ``username``, or ``None`` when it may. The reason is
     fixed text that never echoes the value, which may hold a control character."""

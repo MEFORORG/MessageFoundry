@@ -20,16 +20,15 @@ from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
     PRINTABLE_TEXT_OR_EMPTY_PATTERN,
+    PRINTABLE_TEXT_PATTERN,
     ChannelScopeEntry,
     PermissionId,
-    PrintableName,
     RoleId,
-    visible_text,
 )
 from messagefoundry.auth.permissions import ROLE_METADATA, Role
 from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
-from messagefoundry.auth.usernames import username_refusal
+from messagefoundry.auth.usernames import renders_as_nothing, username_refusal
 from messagefoundry.password_bounds import PASSWORD_MAX as _PASSWORD_MAX
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
@@ -277,6 +276,44 @@ class ChannelScope(RequestModel):
     #: GET payload: this class is also the reader an older client validates that payload with, and it
     #: forbids a key it does not know.
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
+
+
+#: Categories a name may not hold anywhere: a line or paragraph separator, a lone surrogate, a
+#: private-use or an unassigned code point (BACKLOG #5784).
+_NAME_REFUSED_CATEGORIES = frozenset({"Zl", "Zp", "Cs", "Co", "Cn"})
+#: The bidi embeddings, overrides and isolates, which reorder how a name and the text beside it
+#: display, so a reversed spelling could render as a built-in role's name (BACKLOG #5785).
+_BIDI_CONTROLS = frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A))
+
+
+def visible_text(value: str) -> str:
+    """``value`` without the characters that draw nothing (``renders_as_nothing``), such as a
+    zero-width space, a soft hyphen or a Hangul filler: what a reader sees of it."""
+    return "".join(c for c in value if not renders_as_nothing(c))
+
+
+def _printable_name(value: str) -> str:
+    if any(
+        unicodedata.category(c) in _NAME_REFUSED_CATEGORIES or ord(c) in _BIDI_CONTROLS
+        for c in value
+    ):
+        raise ValueError("must not hold a line separator, bidi control or unassigned character")
+    if not visible_text(value).strip():
+        raise ValueError("must not be blank")
+    return value
+
+
+#: A name an administrator types for an account or a custom role, or a directory account's name
+#: (BACKLOG #5784, #5785). Refused: a C0, DEL or C1 control (:data:`PRINTABLE_TEXT_PATTERN`), at
+#: least the characters :func:`_printable_name` names, and a name that is blank once white space
+#: and the characters that draw nothing are set aside. A joiner some scripts need inside a word,
+#: such as U+200C, is kept. A request model holds this rule; a name another writer stores, such as
+#: a directory sync, does not pass through it.
+PrintableName = Annotated[
+    str,
+    Field(max_length=_NAME_MAX, pattern=PRINTABLE_TEXT_PATTERN),
+    AfterValidator(_printable_name),
+]
 
 
 def _valid_new_username(username: str) -> str:
@@ -570,8 +607,8 @@ class RoleInfo(BaseModel):
 
 
 def _fold_role_name(name: str) -> str:
-    """A role name as a reader would see it: format characters dropped, then NFKC, case-folded,
-    and runs of whitespace as one space."""
+    """A role name as a reader would see it: the characters that draw nothing dropped, then NFKC,
+    case-folded, and runs of whitespace as one space."""
     return " ".join(unicodedata.normalize("NFKC", visible_text(name)).casefold().split())
 
 

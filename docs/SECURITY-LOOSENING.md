@@ -197,8 +197,8 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `require_memory_encryption_declaration` | `false` (*not* a loosening either — it TIGHTENS, turning that warning into a refusal. Opt-in because the property is a host property most Windows hosts cannot provide: a Windows guest gets it only as an Azure or Azure Local confidential VM ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md#hardware-memory-encryption--required-for-an-asvs-level-3-phi-deployment))) |
 | Sign-in & identity | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
-| | `sign_out_after_idle_minutes` | `30` (a value above `30` is named. a value below `1` is refused at load) |
-| | `max_session_hours` | `12` (a value above `12` is named. a value below `1` is refused at load) |
+| | `sign_out_after_idle_minutes` | `30` (a value above `30` is named. A value below `1` or above `525600` minutes is refused at load) |
+| | `max_session_hours` | `12` (a value above `12` is named. A value below `1` or above `8760` hours is refused at load) |
 | Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
 | Store principal | `allow_over_granted_store_principal` | `false` (ADR 0199: accept an over-granted store login under `enforce`, audited) |
 | Vault token | `allow_over_granted_vault_token` | `false` (ADR 0216: accept a Vault token holding the root policy or an administrative grant under `enforce`, audited) |

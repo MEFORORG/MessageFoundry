@@ -14,7 +14,8 @@ from messagefoundry.api.auth_models import (
     UserUpdateRequest,
 )
 
-#: Blank, blank once format characters are set aside, or carrying a control character.
+#: Blank once white space and characters that draw nothing are set aside, or holding a control
+#: character, a line or paragraph separator or a bidi control.
 _BAD_NAMES = [
     "",
     " ",
@@ -26,6 +27,12 @@ _BAD_NAMES = [
     "a\rb",
     "a\x7fb",
     "a\x85b",
+    "\u3164",
+    "\u2800",
+    "\u034f \ufe0f",
+    "Name\u2028",
+    "Lab\u2029Ops",
+    "Lab\u202dOps",
 ]
 
 
@@ -83,10 +90,14 @@ def test_custom_role_refuses_a_blank_or_control_character_name(name: str) -> Non
         "Viewer",
         "auditor",
         "Coding",
-        "Admin­istrator",
-        "Admin​istrator",
-        "‮Administrator",
-        "Ａdministrator",
+        "Admin\u00adistrator",
+        "Admin\u200bistrator",
+        "\u202eAdministrator",
+        "\uff21dministrator",
+        "\u202erotartsinimdA",
+        "Admin\u034fistrator",
+        "Administrator\ufe0f",
+        "Admin\u3164istrator",
     ],
 )
 def test_custom_role_refuses_a_built_in_role_name(name: str) -> None:
@@ -104,4 +115,4 @@ def test_custom_role_refuses_a_control_character_in_the_description() -> None:
 def test_custom_role_takes_an_ordinary_name() -> None:
     assert _role(display_name="Administrators of lab").display_name == "Administrators of lab"
     # A joiner some scripts need is a format character, and is kept within a name.
-    assert _role(display_name="Lab‌Ops").display_name == "Lab‌Ops"
+    assert _role(display_name="Lab\u200cOps").display_name == "Lab\u200cOps"

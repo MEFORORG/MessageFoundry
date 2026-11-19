@@ -1635,23 +1635,27 @@ def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Ide
 #: The fallback's verified read, kept per TLS connection, keyed on its ``ssl_object`` (BACKLOG #5788).
 #: The read parses the leaf and checks its issuer, so making it on every request would repeat that
 #: work on the event loop; the shim makes it once, at ``connection_made``. Weak keys, so an entry
-#: goes when its connection does. A read that found no certificate, or no verified issuer, is not
-#: kept, so a fault the issuer lookup swallowed is retried on the next request rather than kept.
-_FALLBACK_PEERCERTS: weakref.WeakKeyDictionary[Any, Mapping[str, Any]] = weakref.WeakKeyDictionary()
+#: goes when its connection does. Each entry carries the leaf's DER, and a request whose peer now
+#: presents another leaf, as a renegotiation can, is read afresh. A read that found no certificate,
+#: or no verified issuer, is not kept, so a fault the issuer lookup swallowed is retried.
+_FALLBACK_PEERCERTS: weakref.WeakKeyDictionary[Any, tuple[bytes, Mapping[str, Any]]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _fallback_peercert(ssl_object: Any) -> Mapping[str, Any] | None:
-    """:func:`peercert_from_ssl_object`, read once per connection (BACKLOG #5788). An object that
-    cannot take a weak reference is read each time, as before."""
+    """:func:`peercert_from_ssl_object`, read once per connection and leaf (BACKLOG #5788). An
+    object that cannot take a weak reference, or whose leaf cannot be read, is read in full."""
     try:
+        der = ssl_object.getpeercert(binary_form=True)
         cached = _FALLBACK_PEERCERTS.get(ssl_object)
-    except TypeError:
+    except (TypeError, ValueError):
         return peercert_from_ssl_object(ssl_object)
-    if cached is not None:
-        return cached
+    if cached is not None and isinstance(der, bytes) and cached[0] == der:
+        return cached[1]
     cert = peercert_from_ssl_object(ssl_object)
-    if cert is not None and cert.get(VERIFIED_ISSUER_KEY):
-        _FALLBACK_PEERCERTS[ssl_object] = cert
+    if cert is not None and isinstance(der, bytes) and cert.get(VERIFIED_ISSUER_KEY):
+        _FALLBACK_PEERCERTS[ssl_object] = (der, cert)
     return cert
 
 

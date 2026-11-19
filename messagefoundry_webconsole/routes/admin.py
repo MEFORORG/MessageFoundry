@@ -461,9 +461,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # BACKLOG #5784: the name the page showed, posted back unchanged, is left out, so the
             # PATCH keeps the stored one. A name another writer stored, such as a directory sync,
             # may hold a character the request model refuses, and re-posting it must not block an
-            # unrelated save. A form with no shown value sends the name as typed.
+            # unrelated save. A form with no shown value sends the name as typed. A browser drops
+            # CR and LF from a text input's value but not from a hidden one, so they are dropped
+            # from the shown value before the two are compared.
             shown_name = form.get("display_name_shown")
-            if shown_name is not None and fields["display_name"] == (shown_name.strip() or None):
+            if shown_name is not None:
+                shown_name = shown_name.replace("\r", "").replace("\n", "").strip()
+            if shown_name is not None and fields["display_name"] == (shown_name or None):
                 del fields["display_name"]
             body = UserUpdateRequest.model_validate(fields)
             await admin.update_user(

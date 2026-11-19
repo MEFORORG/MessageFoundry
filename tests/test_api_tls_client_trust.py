@@ -917,6 +917,13 @@ def test_the_resolvers_transport_fallback_reads_a_connection_once(
         cert = peer_cert_from_request(Request(scope))
         assert cert is not None and cert["subject"] == _CERT["subject"]
     assert reads == [first._ssl, second._ssl, third._ssl, third._ssl]
+    # A connection whose peer now presents another leaf, as a renegotiation can, is read again.
+    monkeypatch.setattr(
+        first._ssl, "getpeercert", lambda binary_form=False: b"another" if binary_form else _CERT
+    )
+    scope = {"type": "http", "headers": [], "app": app, "transport": first}
+    assert peer_cert_from_request(Request(scope)) is not None
+    assert reads[-1] is first._ssl and len(reads) == 5
 
 
 @pytest.mark.usefixtures("clean_anchor_checks")
