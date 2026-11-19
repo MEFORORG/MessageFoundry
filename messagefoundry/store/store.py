@@ -1020,6 +1020,15 @@ REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 #: the row, so this is damage rather than an erasure, and the reference itself opened: named apart
 #: from a reference that did not, so an operator knows which row to look for (BACKLOG #4996).
 REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
+#: The ``last_error`` of a re-ingress token whose own ``payload`` failed its queue tag at the handoff
+#: (BACKLOG #5982): its routing fields changed outside the store after the claim opened it. Named apart
+#: from a corrupt reference, because it is audited and alerted as a tag failure. The server backends
+#: import it.
+REINGRESS_TOKEN_TAG_FAILED: Final = "integrity: the re-ingress work-row failed its queue tag"
+#: The ``outcome`` that tag failure is reported with. It says the handoff refused the token rather
+#: than that the token is dead: a commit that fails after the dead-letter write leaves the token
+#: claimed, to be refused and reported again on the next pass.
+REINGRESS_TAG_FAILURE_OUTCOME: Final = "was refused at the re-ingress handoff"
 #: The ``error`` of a re-ingress child whose body failed its HL7 peek, when the worker passes no reason
 #: of its own. The server backends import it, and so does the re-ingress worker, which leads it with
 #: the refused-body allowance note when it stores only the head (vault BACKLOG #4796).
@@ -15930,6 +15939,7 @@ class MessageStore:
         is dead-lettered under :data:`REINGRESS_ARTIFACT_MISSING` and keeps its reference as the
         evidence."""
         tag_failures: list[CellTagError] = []
+        queue_tag_rows: list[aiosqlite.Row] = []
         try:
             return await self._ingress_handoff_txn(
                 response_row_id=response_row_id,
@@ -15944,9 +15954,14 @@ class MessageStore:
                 refused_metadata=refused_metadata,
                 now=time.time() if now is None else now,
                 tag_failures=tag_failures,
+                queue_tag_rows=queue_tag_rows,
             )
         finally:
             await report_cell_tag_failures(self, tag_failures)
+            for row in queue_tag_rows:  # BACKLOG #5982: after the writer lock, as above
+                await report_queue_tag_failure(
+                    self, self._cipher, row, outcome=REINGRESS_TAG_FAILURE_OUTCOME
+                )
 
     async def _ingress_handoff_txn(
         self,
@@ -15963,9 +15978,12 @@ class MessageStore:
         refused_metadata: Mapping[str, Any] | None,
         now: float,
         tag_failures: list[CellTagError],
+        queue_tag_rows: list[aiosqlite.Row],
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
-        ``tag_failures`` for the caller to audit after the writer lock is released."""
+        ``tag_failures``, and a work-row whose own payload failed its queue tag, once dead-lettered,
+        to ``queue_tag_rows`` (BACKLOG #5982), for the caller to audit after the writer lock is
+        released."""
         async with _writer_txn(self._db, self._lock):
             # 1. The work-row must still be INFLIGHT (the claim set it so); it carries the artifact ref.
             cur = await self._db.execute(
@@ -16000,9 +16018,18 @@ class MessageStore:
                 return True
 
             try:
-                ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
+                ref = open_queue_cell(self._cipher, wr) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)
+            except QueueTagError:
+                # BACKLOG #5982: the token's routing fields no longer build the tag its payload was
+                # sealed under. Dead-lettered like a corrupt reference, then audited and alerted as
+                # a claim reports a tag failure, once the writer lock is released.
+                dead = await _consume_dead(
+                    REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
+                )
+                queue_tag_rows.append(wr)
+                return dead
             except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
                 # A corrupt/undecryptable work-row reference (DB corruption, a cipher/key failure)
                 # can NEVER be re-ingressed. Mirrors the depth-cap branch (a different
@@ -16203,7 +16230,10 @@ class MessageStore:
             row = await cur.fetchone()
             if row is None:
                 return None
-            ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
+            try:
+                ref = open_queue_cell(self._cipher, row) or ""
+            except QueueTagError:
+                return None  # BACKLOG #5982: `ingress_handoff` dead-letters, audits and alerts it
             try:
                 mid, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)

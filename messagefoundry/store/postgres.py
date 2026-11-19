@@ -241,7 +241,9 @@ from messagefoundry.store.store import (
     REINGRESS_ARTIFACT_ERASED,
     REINGRESS_ARTIFACT_MISSING,
     REINGRESS_PEEK_FAILED,
+    REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
+    REINGRESS_TOKEN_TAG_FAILED,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
     VIEWED_EVENT,
@@ -6214,6 +6216,7 @@ class PostgresStore:
         # breaking count-and-log.
         guard, guard_args = self._resolve_guard(6)
         tag_failures: list[CellTagError] = []
+        queue_tag_rows: list[Any] = []  # BACKLOG #5982: reported after the transaction
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction():
@@ -6255,9 +6258,19 @@ class PostgresStore:
                         return True
 
                     try:
-                        ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
+                        ref = open_queue_cell(self._cipher, wr) or ""
                         origin_msg_id, dest, seq_s = ref.split("\x1f")
                         seq = int(seq_s)
+                    except QueueTagError:
+                        # BACKLOG #5982: dead-lettered like a corrupt reference, then audited and
+                        # alerted as a claim reports a tag failure, after the transaction.
+                        dead = await _consume_dead(
+                            "ingress_handoff(tag-failed)",
+                            REINGRESS_TOKEN_TAG_FAILED,
+                            "re-ingress work-row failed its integrity check",
+                        )
+                        queue_tag_rows.append(wr)
+                        return dead
                     except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
                         # A corrupt/undecryptable work-row reference can never be re-ingressed.
                         # Mirrors the SQLite branch and the depth-cap branch.
@@ -6458,6 +6471,10 @@ class PostgresStore:
         finally:
             # BACKLOG #2593: after the transaction, never inside it.
             await report_cell_tag_failures(self, tag_failures)
+            for row in queue_tag_rows:
+                await report_queue_tag_failure(
+                    self, self._cipher, row, outcome=REINGRESS_TAG_FAILURE_OUTCOME
+                )
         return True
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
@@ -6470,7 +6487,10 @@ class PostgresStore:
         )
         if row is None:
             return None
-        ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
+        try:
+            ref = open_queue_cell(self._cipher, row) or ""
+        except QueueTagError:
+            return None  # BACKLOG #5982: `ingress_handoff` dead-letters, audits and alerts it
         try:
             mid, dest, seq_s = ref.split("\x1f")
             seq = int(seq_s)

@@ -243,7 +243,9 @@ from messagefoundry.store.store import (
     REINGRESS_ARTIFACT_ERASED,
     REINGRESS_ARTIFACT_MISSING,
     REINGRESS_PEEK_FAILED,
+    REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
+    REINGRESS_TOKEN_TAG_FAILED,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
     VIEWED_EVENT,
@@ -9117,6 +9119,7 @@ class SqlServerStore:
         child stores ``refused_raw`` and ``refused_metadata`` as :meth:`QueueStore.ingress_handoff`
         says (vault BACKLOG #4796)."""
         tag_failures: list[CellTagError] = []
+        queue_tag_rows: list[dict[str, Any]] = []
         try:
             return await self._ingress_handoff_txn(
                 response_row_id=response_row_id,
@@ -9131,9 +9134,14 @@ class SqlServerStore:
                 refused_metadata=refused_metadata,
                 now=time.time() if now is None else now,
                 tag_failures=tag_failures,
+                queue_tag_rows=queue_tag_rows,
             )
         finally:
             await report_cell_tag_failures(self, tag_failures)
+            for row in queue_tag_rows:  # BACKLOG #5982: after the transaction, as above
+                await report_queue_tag_failure(
+                    self, self._cipher, row, outcome=REINGRESS_TAG_FAILURE_OUTCOME
+                )
 
     async def _ingress_handoff_txn(
         self,
@@ -9150,9 +9158,11 @@ class SqlServerStore:
         refused_metadata: Mapping[str, Any] | None,
         now: float,
         tag_failures: list[CellTagError],
+        queue_tag_rows: list[dict[str, Any]],
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
-        ``tag_failures`` for the caller to audit."""
+        ``tag_failures``, and a work-row whose own payload failed its queue tag, once dead-lettered,
+        to ``queue_tag_rows`` (BACKLOG #5982), for the caller to audit."""
         # ADR 0157 C1: every DEAD branch below is TERMINAL on a claimed RESPONSE work-row AND
         # finalize the origin, so each is guarded. The SUCCESS path is deliberately NOT guarded: it
         # ADMITS a message, and fencing it would turn a permitted duplicate into a LOST re-ingress.
@@ -9206,11 +9216,19 @@ class SqlServerStore:
 
                 # (2) Decrypt + parse the artifact ref; ANY failure -> consume-and-dead-letter.
                 try:
-                    ref = (
-                        self._cipher.decrypt(work_row["payload"], aad=queue_row_aad(work_row)) or ""
-                    )
+                    ref = open_queue_cell(self._cipher, work_row) or ""
                     origin_msg_id, dest, seq_s = ref.split("\x1f")
                     seq = int(seq_s)
+                except QueueTagError:
+                    # BACKLOG #5982: dead-lettered like a corrupt reference, then audited and
+                    # alerted as a claim reports a tag failure, after the transaction.
+                    dead = await _consume_dead(
+                        "ingress_handoff(tag-failed)",
+                        REINGRESS_TOKEN_TAG_FAILED,
+                        "re-ingress work-row failed its integrity check",
+                    )
+                    queue_tag_rows.append(work_row)
+                    return dead
                 except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
                     return await _consume_dead(
                         "ingress_handoff(corrupt-ref)",
@@ -9447,7 +9465,10 @@ class SqlServerStore:
         )
         if row is None:
             return None
-        ref = self._cipher.decrypt(row["payload"], aad=queue_row_aad(row)) or ""
+        try:
+            ref = open_queue_cell(self._cipher, row) or ""
+        except QueueTagError:
+            return None  # BACKLOG #5982: `ingress_handoff` dead-letters, audits and alerts it
         try:
             mid, dest, seq_s = ref.split("\x1f")
             seq = int(seq_s)
