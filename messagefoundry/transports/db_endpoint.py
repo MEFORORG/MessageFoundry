@@ -14,7 +14,9 @@ that string is outside this module: docs/CONNECTIONS.md says so once.
 
 A leaf module on purpose. :mod:`messagefoundry.transports.egress` and
 :mod:`messagefoundry.transports.database` both read it, and it imports neither, so neither has to
-import the other to share it. It imports nothing outside the standard library.
+import the other to share it. It imports nothing outside the standard library but the leaf
+:mod:`messagefoundry.hostlist`, whose :func:`~messagefoundry.hostlist.port_or_zero` is the port
+rule the allowlist entries are read with too.
 """
 
 from __future__ import annotations
@@ -23,6 +25,8 @@ import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, NamedTuple
+
+from messagefoundry.hostlist import port_or_zero
 
 #: The port the SQL Server preset's connection string uses when ``port`` is not set.
 SQLSERVER_DEFAULT_PORT = 1433
@@ -41,23 +45,6 @@ def odbc_keyword_name(key: str) -> str:
 def odbc_param(params: Mapping[str, Any], keyword: str) -> object | None:
     """The value ``params`` gives ``keyword``, matched as the build matches it, or ``None``."""
     return next((v for k, v in params.items() if odbc_keyword_name(str(k)) == keyword), None)
-
-
-def port_or_zero(text: str) -> int:
-    """``text`` as a port number, or 0 when it is not one: the ONE definition of "is this a port",
-    used by every reading in this module.
-
-    A port is 1 to 65535, written in ASCII decimal digits, leading zeros allowed as drivers allow
-    them. ``isdigit`` alone also passes a superscript digit, which ``int()`` then refuses with a
-    ValueError. The five-digit bound, counted after the leading zeros, keeps ``int()`` away from
-    CPython's string-to-int digit limit on an absurd operator value, which would turn a log detail
-    into a crash."""
-    text = text.strip()
-    digits = text.lstrip("0")
-    if not (text.isascii() and text.isdecimal() and len(digits) <= 5):
-        return 0
-    port = int(digits or "0")
-    return port if port <= 65535 else 0
 
 
 def _preset_port(value: object) -> int | None:

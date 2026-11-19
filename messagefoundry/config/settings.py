@@ -111,6 +111,7 @@ from messagefoundry.domainshape import (
     is_canonical_ipv4,
     upn_suffix_key,
 )
+from messagefoundry.hostlist import allow_entry_problem, parse_allow_entry
 from messagefoundry.logging_setup import LOG_LEVELS
 
 # Moved to netaddr, the neutral leaf, so the HTTP listener reads them without importing private
@@ -4917,6 +4918,31 @@ _KNOWN_ENV_POSTURE: dict[str, bool] = {
 _SERVICEABLE_AI_PROVIDERS = frozenset({"claude"})
 
 
+def _host_list_entries(value: list[str], setting: str) -> list[str]:
+    """``value``, a ``host[:port]`` allowlist, with each entry stripped and blank ones skipped, or a
+    refusal naming ``setting`` and the first entry no host can match (BACKLOG #5915).
+
+    The matcher reads every entry with :func:`~messagefoundry.hostlist.parse_allow_entry`, and an
+    entry it cannot read matches nothing, so it would load and quietly admit nothing. The refusal
+    names the entry by position among the non-blank ones, not by text, as the
+    ``allowed_ech_sidecar`` refusal does: an operator who pasted a URL, credential and all, would
+    otherwise find it in the error."""
+    cleaned: list[str] = []
+    for raw in value:
+        item = raw.strip()
+        if not item:
+            continue
+        problem = allow_entry_problem(item)
+        if problem is not None:
+            raise ValueError(
+                f"{setting} entry {len(cleaned) + 1} (counting non-blank entries) is refused: "
+                f"{problem}. Write each entry as 'host', 'host:port', '[v6]' or '[v6]:port', such "
+                "as 'db.example.org:5432' or '[2001:db8::10]:6661'"
+            )
+        cleaned.append(item)
+    return cleaned
+
+
 class AiSettings(_Section):
     """Central AI-assistance policy plus the instance's active **environment name** and security
     **posture**. The two AI axes (mode + data scope) are bounded by the production-posture ceiling
@@ -4954,7 +4980,8 @@ class AiSettings(_Section):
     # The broker credential (the LLM provider API key). SECRET — env only (MEFOR_AI_API_KEY), listed in
     # _FILE_SECRET_KEYS (warns if placed in the file) and _SECRET_SETTING_KEYS (redacted). Never logged.
     api_key: str | None = None
-    # SSRF fail-closed allowlist (ADR 0135): each entry is "host" (any port) or "host:port". The broker
+    # SSRF fail-closed allowlist (ADR 0135): each entry is "host" or "[v6]" (any port), or
+    # "host:port" or "[v6]:port"; an entry no host can match is refused at load. The broker
     # validates its configured `endpoint` against THIS list ITSELF — an un-listed host (or an empty list)
     # is REFUSED. Deliberately independent of [egress].allowed_http, which, when empty, allows any
     # host under the audited `[security].block_unlisted_outbound = false` opt-out (see
@@ -4989,6 +5016,12 @@ class AiSettings(_Section):
             "what was relied on",
         )
         return self
+
+    @field_validator("allowed_endpoints", mode="after")
+    @classmethod
+    def _endpoint_entries_are_read(cls, value: list[str]) -> list[str]:
+        """Refuse at load an entry the broker's host match cannot read (BACKLOG #5915)."""
+        return _host_list_entries(value, "[ai].allowed_endpoints")
 
     @field_validator("provider")
     @classmethod
@@ -5504,23 +5537,25 @@ class EgressSettings(_Section):
     The comment on ``deny_by_default`` says what else it covers and how operators set it.
     """
 
-    # Allowed MLLP outbound destinations: each entry is "host" (any port) or "host:port".
+    # Allowed MLLP outbound destinations: each entry is "host" or "[v6]" (any port), or "host:port"
+    # or "[v6]:port". An entry no host can match is refused at load, in every host list below.
     allowed_mllp: list[str] = []
-    # Allowed raw-TCP outbound destinations: each entry is "host" (any port) or "host:port".
+    # Allowed raw-TCP outbound destinations: each entry is an MLLP-style host entry.
     allowed_tcp: list[str] = []
     # Allowed File outbound directories: a destination's directory must resolve at/under one of these.
     allowed_file_dirs: list[str] = []
-    # Allowed REST/SOAP (HTTP) outbound hosts: each entry is "host" (any port) or "host:port".
+    # Allowed REST/SOAP (HTTP) outbound hosts: each entry is an MLLP-style host entry.
     allowed_http: list[str] = []
-    # Allowed DATABASE outbound servers: each entry is "host" (any port) or "host:port".
+    # Allowed DATABASE outbound servers: each entry is "host" (any port) or "host:port". An IPv6
+    # entry is refused at load: a server holding a ':' is never listed (docs/CONNECTIONS.md).
     allowed_db: list[str] = []
     # Allowed REMOTEFILE (SFTP/FTP/FTPS) hosts — gates the connector in BOTH directions (the source
-    # dials out to poll, the destination dials out to upload). Each entry is "host" or "host:port".
+    # dials out to poll, the destination dials out to upload). Each entry is an MLLP-style host entry.
     allowed_remote: list[str] = []
-    # Allowed EMAIL (SMTP) outbound hosts: each entry is "host" (any port) or "host:port" (ADR 0029).
+    # Allowed EMAIL (SMTP) outbound hosts: each entry is an MLLP-style host entry (ADR 0029).
     allowed_smtp: list[str] = []
-    # Allowed DIRECT (S/MIME-over-SMTP HISP relay) outbound hosts: each entry is "host" (any port) or
-    # "host:port" (ADR 0085). Kept SEPARATE from allowed_smtp so an operator can permit a Direct HISP
+    # Allowed DIRECT (S/MIME-over-SMTP HISP relay) outbound hosts: each entry is an MLLP-style host
+    # entry (ADR 0085). Kept SEPARATE from allowed_smtp so an operator can permit a Direct HISP
     # relay without opening generic email egress (a distinct trust relationship carrying encrypted PHI).
     allowed_direct: list[str] = []
     # Allowed EMAIL recipient domains (vault BACKLOG #2616): every address an Email destination
@@ -5557,7 +5592,7 @@ class EgressSettings(_Section):
     # that matches nothing sends that host through the proxy; that rule ignores a port and reads
     # '*:443' as '*', so a malformed entry can also bypass the proxy for every host.
     proxy_no_proxy: list[str] = []
-    # The forward-PROXY host allowlist (BACKLOG #1659). Each entry is "host" (any port) or "host:port".
+    # The forward-PROXY host allowlist (BACKLOG #1659). Each entry is an MLLP-style host entry.
     # NOT a destination list: it gates the operator-chosen transport INTERMEDIARY an http-family
     # connection dials through, which under `proxy_auth_type = basic` receives a pre-emptive
     # `Proxy-Authorization` header on both destination schemes (ADR 0126) and so is a second
@@ -5596,7 +5631,7 @@ class EgressSettings(_Section):
     # MEFOR_EGRESS_ALLOWED_ECH_SIDECAR.
     allowed_ech_sidecar: list[str] = []
     # Allowed SYSLOG collectors for the off-box log forwarder (``[logging].forward_host`` and
-    # ``forward_port``; BACKLOG #2356): each entry is "host" (any port) or "host:port". The forwarder
+    # ``forward_port``; BACKLOG #2356): each entry is an MLLP-style host entry. The forwarder
     # is not a connection, so no graph check sees it; ``serve`` and ``supervise`` check it at start,
     # before the forwarder opens a socket, through ``syslog_forward_refusal`` in
     # messagefoundry/transports/egress.py. Empty and unset mean what they mean for ``allowed_tcp``:
@@ -5640,6 +5675,36 @@ class EgressSettings(_Section):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator(
+        "allowed_mllp",
+        "allowed_tcp",
+        "allowed_http",
+        "allowed_db",
+        "allowed_remote",
+        "allowed_smtp",
+        "allowed_direct",
+        "allowed_proxy",
+        "allowed_syslog",
+        mode="after",
+    )
+    @classmethod
+    def _host_entries_are_read(cls, value: list[str], info: ValidationInfo) -> list[str]:
+        """Refuse at load an entry the host matcher cannot read (BACKLOG #5915). An ``allowed_db``
+        entry naming an IPv6 address is refused too: the DATABASE check refuses every server
+        holding a ``:``, so such an entry could never admit one."""
+        setting = f"[egress].{info.field_name}"
+        cleaned = _host_list_entries(value, setting)
+        if info.field_name == "allowed_db":
+            for position, item in enumerate(cleaned, start=1):
+                parsed = parse_allow_entry(item)
+                if parsed is not None and isinstance(parsed[0], ipaddress.IPv6Address):
+                    raise ValueError(
+                        f"{setting} entry {position} (counting non-blank entries) is refused: it "
+                        "names an IPv6 address, and a DATABASE server holding a ':' is never "
+                        "listed, so name the server by host name and list that name"
+                    )
+        return cleaned
 
     @field_validator("proxy_url", mode="after")
     @classmethod

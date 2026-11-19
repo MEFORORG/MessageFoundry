@@ -168,13 +168,13 @@ def test_zone_id_in_the_host_matches_nothing() -> None:
 )
 def test_the_same_zone_on_both_sides_matches_nothing(host: str, entry: str) -> None:
     # ipaddress reads both sides as one scoped address, so only the `%` refusal stops this; why it
-    # must is in `_canonical_host`'s docstring.
+    # must is in `messagefoundry.hostlist.canonical_host`'s docstring.
     assert host_port_allowed(host, 8443, [entry]) is False
     assert endpoint_host_allowed(f"https://[{host}]:8443/x", [entry]) is False
 
 
 def test_a_percent_encoded_zone_is_dialled_as_another_address() -> None:
-    # The premise `_canonical_host`'s docstring states for refusing a `%`.
+    # The premise `messagefoundry.hostlist.canonical_host`'s docstring states for refusing a `%`.
     url = "https://[::1%31]:8443/x"
     read = urllib.parse.urlsplit(url).hostname
     assert read == "::1%31"
@@ -185,6 +185,8 @@ def test_a_percent_encoded_zone_is_dialled_as_another_address() -> None:
 # --- the DATABASE arm reads the same parse, and lists no IPv6 server ----------------------------
 
 _UNLISTED = r"is not in the \[egress\]\.allowed_db allowlist$"
+# A server holding a colon is refused as unlisted, saying why (BACKLOG #5915).
+_COLON = r"is not in the \[egress\]\.allowed_db allowlist: a server holding a ':'"
 
 
 _DIALECTS = ("generic", "sqlserver")
@@ -207,31 +209,32 @@ def _check_db(server: str, entry: str, *, dialect: str = "generic") -> None:
 
 
 @pytest.mark.parametrize("dialect", _DIALECTS)
-@pytest.mark.parametrize(
-    ("server", "entry"),
-    [
-        # Each entry names the server's address, so only the database arm's colon rule refuses it.
-        ("::1", "[::1]"),
-        ("::1", "[::1]:6432"),
-        ("0:0:0:0:0:0:0:1", "[::1]"),
-        ("fe80::1", "[FE80::1]:6432"),
-        ("2001:db8::5", "[2001:db8::5]"),
-        # A bracketed server is unlisted as the matcher already reads it, before the colon rule.
-        ("[::1]", "[::1]"),
-    ],
-)
-def test_database_ipv6_server_is_unlisted(server: str, entry: str, dialect: str) -> None:
-    # docs/CONNECTIONS.md, allowed_db, says why.
-    with pytest.raises(WiringError, match=_UNLISTED):
-        _check_db(server, entry, dialect=dialect)
+@pytest.mark.parametrize("server", ["::1", "0:0:0:0:0:0:0:1", "fe80::1", "2001:db8::5", "[::1]"])
+def test_database_ipv6_server_is_unlisted_saying_why(server: str, dialect: str) -> None:
+    # docs/CONNECTIONS.md, allowed_db, says why it is refused. On origin/main the refusal was the
+    # plain unlisted one, which reads as if an entry naming the address would admit it.
+    with pytest.raises(WiringError, match=_COLON):
+        _check_db(server, "db.example.org", dialect=dialect)
+
+
+@pytest.mark.parametrize("entry", ["[::1]", "[::1]:6432", "[FE80::1]:6432", "[2001:db8::5]"])
+def test_database_ipv6_entry_is_refused_at_load(entry: str) -> None:
+    # On origin/main such an entry loaded and could never admit a server.
+    with pytest.raises(ValueError, match=r"\[egress\]\.allowed_db entry 1 .* IPv6 address"):
+        EgressSettings(allowed_db=[entry])
+
+
+def test_database_ipv6_entry_refusal_counts_its_position() -> None:
+    with pytest.raises(ValueError, match=r"\[egress\]\.allowed_db entry 2 "):
+        EgressSettings(allowed_db=["db.example.org", " ", "[::1]"])
 
 
 @pytest.mark.parametrize("server", ["::1", "[::1]"])
 def test_database_lookup_ipv6_server_is_unlisted(server: str) -> None:
     # db_lookup and DatabaseRef always build the SQL Server preset, through their own gate.
-    with pytest.raises(WiringError, match=_UNLISTED):
+    with pytest.raises(WiringError, match=_COLON):
         check_lookup_allowed(
-            "LK_V6", _db_settings(server, "sqlserver"), EgressSettings(allowed_db=["[::1]"])
+            "LK_V6", _db_settings(server, "sqlserver"), EgressSettings(allowed_db=["127.0.0.1"])
         )
 
 
@@ -239,3 +242,9 @@ def test_database_lookup_ipv6_server_is_unlisted(server: str) -> None:
 def test_database_named_server_still_matches_its_entry(dialect: str) -> None:
     _check_db("db.example.org", "DB.Example.Org:6432", dialect=dialect)
     _check_db("127.0.0.1", "127.0.0.1:6432", dialect=dialect)  # an IPv4 literal is still listed
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_database_unlisted_named_server_keeps_the_plain_refusal(dialect: str) -> None:
+    with pytest.raises(WiringError, match=_UNLISTED):
+        _check_db("other.example.org", "db.example.org", dialect=dialect)

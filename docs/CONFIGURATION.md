@@ -1695,19 +1695,24 @@ literal compares as an address, so `[0:0:0:0:0:0:0:1]` names `::1`; a name compa
 to case. Nothing looser matches: an IPv4-mapped IPv6 address does not name its IPv4 address, and
 `127.1` is a name, not `127.0.0.1`. An entry matches nothing at least when it is unbracketed and holds
 more than one colon (write `::1` as `[::1]`), when its brackets hold anything but an IPv6
-literal, when a colon has no port after it, or when it carries a `%` zone id. The lists named here
-load such an entry without error, so check each entry against the forms above. The host being
-checked must name an IPv6 literal bare, as `::1`, at least in a connection's `host` setting and in
+literal, when a colon has no port after it, when its port is not a number from 1 to 65535, or when
+it carries a `%` zone id. The lists named here refuse such an entry at config load, naming the
+list and the entry's position (BACKLOG #5915). A host being checked that carries a `%` zone id
+matches no entry either, so while its list is set a zoned IPv6 destination is refused whatever
+the entries say. The host being checked must name an IPv6 literal bare, as `::1`, at least in a connection's `host` setting and in
 `[logging].forward_host`: a bracketed `[::1]` there matches no entry. A URL brackets its IPv6 host,
 and that is read correctly.
 
-**How a pinned port is matched.** Write a pinned port in plain digits, and give a connection's own
-`port` as a number: a port that reaches the check as text, such as an uncast `env()` value supplied by a `MEFOR_VALUE_*` variable or by a quoted string in `<env>.toml`, is
-compared as written, so `06661` matches neither `host:6661` nor `[::1]:6661`. A URL that names no
-port matches only an entry that names no port, although the connector then dials a default such as
-443. `Sftp()` and `Ftp()` write their default port, 22 or 21, into the settings, and an `Email()` or
-`Direct()` connection with no `port` is checked as port 587, so those compare like a pinned port.
-`allowed_db` reads its entries this way but matches them differently; its row says how.
+**How a pinned port is matched.** Ports compare as numbers on both sides, so a port that reaches the
+check as text, such as an uncast `env()` value supplied by a `MEFOR_VALUE_*` variable or by a
+quoted string in `<env>.toml`, matches the entry for the port it names: `06661` matches
+`host:6661` (BACKLOG #5915). An `http://` or `https://` URL that names no port is matched at the
+port the connector dials for it, 80 or 443, so `host:443` admits `https://host/`. `Sftp()` and
+`Ftp()` write their default port, 22 or 21, into the settings, and an `Email()` or `Direct()`
+connection with no `port` is checked as port 587, so those compare like a pinned port.
+`allowed_db` reads its entries this way, but refuses an IPv6 entry at load, never lists a
+`server` holding a colon, and compares the port the connection string sends, not the `port`
+setting alone ([CONNECTIONS.md](CONNECTIONS.md#the-port-an-allowed_db-entry-binds)).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -1715,7 +1720,7 @@ port matches only an entry that names no port, although the connector then dials
 | `allowed_tcp` | list | `[]` | allowed raw-TCP destinations; each entry names a host, and optionally a port, as the paragraphs above this table state. **Covers three connectors, not one:** `Tcp(...)`, `X12(...)` and the **DICOM C-STORE SCU** (`DICOM()` outbound) all resolve to this list — they are all raw sockets ([`transports/egress.py`](../messagefoundry/transports/egress.py), `_allowlist_for`). Populate it for every one of them, or under the deny default your X12/PACS destinations are refused at load. An inbound `Tcp(...)`/`X12(...)`/`DICOM()` is a local listener and is not connect-gated. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_TCP` |
 | `allowed_file_dirs` | list | `[]` | allowed File output directories; a destination's directory must resolve at/under one of these |
 | `allowed_http` | list | `[]` | allowed HTTP destination hosts; each entry names a host, and optionally a port, as the paragraphs above this table state (ADR 0003). **Covers the whole HTTP family, not just REST/SOAP:** `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` (STOW-RS), the read-only `fhir_lookup` / `FhirLookup(...)` (ADR 0043), **and** the SMART / OAuth2 **token endpoints** — a token endpoint is a second egress host and is checked against this same list, so list it too. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_HTTP` |
-| `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry names a host, and optionally a port, as the paragraphs above this table state (ADR 0003). While this list is set, a `server` that holds a colon, an IPv6 literal included, is refused as unlisted whatever the entries say, so name such a server by host name. How the check reads a connection's server and port, and how a pinned port is compared, is in [CONNECTIONS.md](CONNECTIONS.md#the-port-an-allowed_db-entry-binds). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
+| `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry names a host, and optionally a port, as the paragraphs above this table state (ADR 0003). While this list is set, a `server` that holds a colon, an IPv6 literal included, is refused as unlisted whatever the entries say, so name such a server by host name; an entry naming an IPv6 address, such as `[::1]`, is refused at config load, since it could never admit one. How the check reads a connection's server and port, and how a pinned port is compared, is in [CONNECTIONS.md](CONNECTIONS.md#the-port-an-allowed_db-entry-binds). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
 | `allowed_remote` | list | `[]` | allowed RemoteFile (SFTP/FTP/FTPS) hosts — gates the connector in **both** directions (source poll + destination upload); each entry names a host, and optionally a port, as the paragraphs above this table state. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_REMOTE` |
 | `allowed_smtp` | list | `[]` | allowed **email (SMTP)** destination hosts for the `Email(...)` outbound ([ADR 0029](adr/0029-email-smtp-destination.md)); each entry names a host, and optionally a port, as the paragraphs above this table state. Distinct from `[alerts].smtp_allowed_hosts`, which gates the **alert notifier's** own SMTP dial. **Whether it counts toward the open-egress startup gate depends on `[security].block_unlisted_outbound`**; see "Which lists the startup gate counts" above the key table. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_SMTP` |
 | `allowed_direct` | list | `[]` | allowed **Direct** (S/MIME-over-SMTP HISP relay) destination hosts ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)); each entry names a host, and optionally a port, as the paragraphs above this table state. Kept deliberately **separate from `allowed_smtp`** so an operator can permit a Direct HISP relay without opening generic email egress — a distinct trust relationship carrying encrypted PHI. **Counts toward the open-egress startup gate on the same terms as `allowed_smtp`**. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DIRECT` |
@@ -1818,15 +1823,19 @@ port matches only an entry that names no port, although the connector then dials
      about how the proxy reuses its connections to the partner, so a misframed reply could otherwise
      be read as the answer to the next engine request through that proxy;
   4. pass each partner reply on without adding a content coding, and each engine request on
-     without removing or changing `Accept-Encoding`. The engine decodes no content coding, so a
-     coded 2xx delivery reply is refused or its body dropped (BACKLOG #5910); the REST section of
-     [CONNECTIONS.md](CONNECTIONS.md#rest--rest) says which, under *A 2xx reply body in a content
+     without removing or changing `Accept-Encoding`. The engine decodes no content coding, so at
+     least some coded 2xx delivery replies are refused or have their body dropped (BACKLOG #5910);
+     the REST section of [CONNECTIONS.md](CONNECTIONS.md#rest--rest) says which, under *A 2xx reply body in a content
      coding*.
 
 **An `Accept-Encoding` request header you set is not overridden, proxy or no proxy,** whether in
 the connection's headers or, on a REST or FHIR connection that sets `dynamic_headers = true`, per
-message from a Handler through an `http.header.` metadata key. A `verify_tls = false` hop refuses
-a header that is off its allowlist, `Accept-Encoding` included. With none
+message from a Handler through an `http.header.` metadata key. That holds where the engine sends
+the header at all: on an `https://` hop with `verify_tls = false`, `Accept-Encoding` is off the
+header allowlist that
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
+states. In the connection's headers it refuses the connection when it is built, and stamped per
+message it refuses that send, and the message dead-letters; neither drops the header. With none
 set, a delivery request asks for `identity`. A partner that honours yours and codes its reply gets
 the treatment item 4 describes, so leave `Accept-Encoding` unset.
 
