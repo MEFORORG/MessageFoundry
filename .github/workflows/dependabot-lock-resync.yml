@@ -147,6 +147,7 @@ jobs:
           uv export --all-extras --no-emit-project --format requirements.txt -o requirements.lock
           uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
+          uv export --no-emit-project --no-dev --extra postgres --format requirements.txt -o docker/locks/requirements-postgres.lock
           # Not an image lock: the harness closure (security/runtime-closure-harness.txt) copies it.
           uv export --no-emit-project --no-dev --extra harness --format requirements.txt -o security/locks/requirements-harness.lock
           # The hashless constraint export every CI install pins against (`--constraint constraints.lock`,
@@ -190,11 +191,11 @@ jobs:
           set -euo pipefail
           git config user.name 'dependabot[bot]'
           git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
-          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-harness.txt; then
+          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-harness.txt; then
             echo 'Exported lock files and the closure files already in sync; nothing to push.'
             exit 0
           fi
-          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-harness.txt
+          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-harness.txt
           git commit -m 'chore(deps): resync exported lock files (DEP-1)'
           # Push with the persisted App-token credential (NOT GITHUB_TOKEN). An App-token push emits a
           # synchronize event so the required checks (DEP-1, ci.yml) re-run on the new commit; a

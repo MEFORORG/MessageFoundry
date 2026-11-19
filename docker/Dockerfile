@@ -15,8 +15,11 @@
 # Build the SQL Server variant (adds the OS-level MS ODBC Driver 18 + the [sqlserver] extra, for the
 # SQL Server store OR the DATABASE / db_lookup connectors):
 #     docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver .
+# Build the Postgres variant (adds the [postgres] extra, asyncpg, for the Postgres store that the `ha`
+# compose profile and docker/k8s/ha-postgres.yaml run; the slim default carries no asyncpg):
+#     docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres .
 #
-# Both install from per-profile, hash-locked requirements (docker/locks/*.lock) — NOT the all-extras
+# Each installs from per-profile, hash-locked requirements (docker/locks/*.lock) — NOT the all-extras
 # requirements.lock, which would drag the harness's PySide6 + dev tools into a runtime image. The locks
 # are kept in sync with uv.lock by the DEP-1 step in .github/workflows/security.yml.
 
@@ -108,6 +111,11 @@ COPY docker/locks/requirements-sqlserver.lock /tmp/req.lock
 RUN python -m venv /opt/venv \
  && /opt/venv/bin/pip install --require-hashes -r /tmp/req.lock \
  && /opt/venv/bin/pip install --no-deps /wheels/messagefoundry-*.whl
+
+# ---- builder-postgres: venv = core+postgres deps (hash-locked) + the engine wheel ----------------
+FROM builder-base AS builder-postgres
+COPY docker/locks/requirements-postgres.lock /tmp/req.lock
+RUN python -m venv /opt/venv  && /opt/venv/bin/pip install --require-hashes -r /tmp/req.lock  && /opt/venv/bin/pip install --no-deps /wheels/messagefoundry-*.whl
 
 # ---- runtime-base: hardened common runtime (no venv yet — copied by the final stages) ------------
 FROM python-base AS runtime-base
@@ -215,6 +223,14 @@ RUN apt-get update \
 # Root-owned, like the slim stage below: see the note at the useradd step.
 COPY --from=builder-sqlserver --chown=0:0 /opt/venv /opt/venv
 USER 10001
+
+# ---- runtime-postgres: the default runtime + asyncpg, for the Postgres store ----------------------
+# asyncpg ships manylinux wheels, so unlike the SQL Server variant there is no OS-level layer. The
+# Postgres store (MEFOR_STORE_BACKEND=postgres, the `ha` compose profile, docker/k8s/ha-postgres.yaml)
+# imports it at store open, so the slim image below cannot run that store.
+FROM runtime-base AS runtime-postgres
+# Root-owned, like the slim stage below: see the note at the useradd step.
+COPY --from=builder-postgres --chown=0:0 /opt/venv /opt/venv
 
 # ---- runtime (slim default) — LAST stage, so a bare `docker build` produces the slim image -------
 FROM runtime-base AS runtime
