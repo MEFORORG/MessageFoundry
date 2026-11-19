@@ -904,7 +904,7 @@ def test_a_relative_service_config_anchors_under_the_project_root(tmp_path: Path
     repo = tmp_path / "repo"
     reg = ServiceRegistryInfo(
         app_directory=str(install),
-        app_parameters=f"serve --project-root {repo} --service-config conf/mf.toml",
+        app_parameters=f'serve --project-root "{repo}" --service-config conf/mf.toml',
     )
     assert service_toml_path(reg) == repo / "conf" / "mf.toml"
     # A relative --project-root is itself taken against the working directory, as serve takes it.
@@ -917,14 +917,20 @@ def test_a_relative_service_config_anchors_under_the_project_root(tmp_path: Path
     absolute = tmp_path / "elsewhere" / "mf.toml"
     reg = ServiceRegistryInfo(
         app_directory=str(install),
-        app_parameters=f"serve --project-root {repo} --service-config {absolute}",
+        app_parameters=f'serve --project-root "{repo}" --service-config "{absolute}"',
     )
     assert service_toml_path(reg) == absolute
     # With no --service-config, serve reads messagefoundry.toml in its working directory.
     reg = ServiceRegistryInfo(
-        app_directory=str(install), app_parameters=f"serve --project-root {repo}"
+        app_directory=str(install), app_parameters=f'serve --project-root "{repo}"'
     )
     assert service_toml_path(reg) == install / "messagefoundry.toml"
+    # A drive-relative root joins the working directory, as serve's resolve_values_base_dir does.
+    reg = ServiceRegistryInfo(
+        app_directory=str(install),
+        app_parameters="serve --project-root \\estate --service-config mf.toml",
+    )
+    assert service_toml_path(reg) == install / "\\estate" / "mf.toml"
 
 
 def test_load_config_reads_the_bind_from_the_file_under_the_project_root(tmp_path: Path) -> None:
@@ -938,7 +944,7 @@ def test_load_config_reads_the_bind_from_the_file_under_the_project_root(tmp_pat
     reader = _FakeReader(
         ServiceRegistryInfo(
             app_directory=str(install),
-            app_parameters=f"serve --project-root {repo} --service-config mf.toml",
+            app_parameters=f'serve --project-root "{repo}" --service-config mf.toml',
         )
     )
     assert load_config(tmp_path, reader).engine_url == "https://127.0.0.1:7002"

@@ -622,8 +622,7 @@ def service_toml_path(reg: ServiceRegistryInfo | None) -> Path | None:
     relative path resolves under ``--project-root`` when one is given and otherwise against the
     service's working directory, which NSSM records as ``AppDirectory``; else
     ``<AppDirectory>/messagefoundry.toml``. A relative ``--project-root`` is itself taken against
-    ``AppDirectory``; a rooted but not absolute one (a Windows drive-relative ``\\repo``) answers
-    ``None`` rather than guess its drive. Under a root, a drive-relative ``--service-config`` keeps
+    ``AppDirectory``, a Windows drive-relative ``\\repo`` included. Under a root, a drive-relative ``--service-config`` keeps
     its tail under the root, as ``serve``'s anchor does. The inputs are untrusted registry strings,
     already length/NUL-validated by :func:`_clean_path_hint`; the result is only ever *read*.
     """
@@ -640,8 +639,10 @@ def service_toml_path(reg: ServiceRegistryInfo | None) -> Path | None:
         if root is not None:
             anchor = Path(root)
             if not anchor.is_absolute():
-                if anchor.anchor or not base:
+                if not base:
                     return None
+                # serve's resolve_values_base_dir joins it to the working directory, drive-relative
+                # or not (it warns on a drive-relative one and still uses it).
                 anchor = Path(base) / anchor
             # Drop a drive-relative leading separator so the tail stays under the root.
             return anchor.joinpath(*candidate.parts[1:] if candidate.anchor else candidate.parts)
