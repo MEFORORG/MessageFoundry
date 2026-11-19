@@ -871,9 +871,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    and a sidecar larger than 128 KiB on disk. A plaintext sidecar longer than the longest whose
    seal still fits 128 KiB, about 96 KiB once its padding is skipped, is refused the same way, on
    every cipher. Each reader bounds what it reads of a sidecar, so a planted large one cannot
-   exhaust memory under the quota lock: the listing scan, the by-id reads, the startup count and
-   `rotate-key` read no more than about 128 KiB, and the check that classes an upload
-   `rotate-key` cannot seal reads up to 64 Ki characters, at most about 256 KiB. The floor is before this engine's first release, so no
+   exhaust memory under the quota lock. The listing scan, the by-id reads, the startup count and
+   `rotate-key` read no more than about 128 KiB. The check that classes an upload `rotate-key`
+   cannot seal reads up to 64 Ki characters, at most about 256 KiB. The floor is before this engine's first release, so no
    sidecar the store wrote is older. The check reads no clock: an `uploaded_at` far ahead is not a defect, since after a
    host clock is stepped back every genuine upload is dated ahead, so such an upload is still
    listed, billed by the quota and readable by its owner. A missing `uploaded_at`, or one before
@@ -888,10 +888,11 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    **A UTF-8 byte-order mark and JSON whitespace around a sidecar's value are skipped (BACKLOG
    #5387).** Every reader skips them, `rotate-key` and the startup count included, so a sealed
    sidecar that gained them still reads as sealed under its key and is never taken for a damaged
-   one. A sidecar that holds nothing else is blank, the damaged kind. A plaintext sidecar longer
-   than that seal bound is left as it is by `rotate-key`, which counts it apart from `skipped`, so
-   it does not hold the rotation open; the command's output does not report that count, and the
-   log names each such upload.
+   one. A sidecar that holds nothing else is blank, the damaged kind. `rotate-key` leaves as it is
+   a sidecar every reader refuses before decrypting. At least one over 128 KiB, a plaintext one
+   past that seal bound, a blank one and one that is not UTF-8 are such. It counts each apart from
+   `skipped`, so none holds the rotation open. The command's output does not report that count,
+   and the log names each such upload.
    **A part the filesystem refuses the engine is not damaged (BACKLOG #5388).** At least a
    permission or an ACL the engine lacks, and on Windows a file another program holds open, are
    answered on a by-id read where a damaged file's 423 would be, with a 423 whose own text says

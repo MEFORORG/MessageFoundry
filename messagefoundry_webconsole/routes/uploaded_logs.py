@@ -229,7 +229,7 @@ RESEND_DAMAGED_NOTICE = f"{_RESEND_LEAD} {_DAMAGED_CAUSE} {_MAY_DELETE}"
 DELETE_DAMAGED_NOTICE = (
     f"{_DELETE_LEAD} {_DAMAGED_CAUSE} Deleting it again is refused the same way. Where "
     "uploaded-file retention is on, the engine removes some damaged files once they are old "
-    "enough on disk, but not every one: at least a file that is a link or is not a regular "
+    "enough on disk, but not every one. At least a file that is a link or is not a regular "
     "file, or whose body is a folder, stays until an administrator removes it on the server."
 )
 

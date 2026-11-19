@@ -100,7 +100,7 @@ async def test_rotate_key_counts_a_too_long_plaintext_sidecar_apart_and_complete
     planted = _too_long(sidecar)
     sidecar.write_text(planted, encoding="utf-8")
     result = await _store(root, generate_key()).reseal_to_active()
-    assert (result.skipped, result.too_long) == (0, 1)
+    assert (result.skipped, result.damaged) == (0, 1)
     assert not result.incomplete
     assert sidecar.read_text(encoding="utf-8") == planted
 
@@ -276,23 +276,94 @@ async def test_a_sidecar_that_grew_after_its_fstat_is_read_bounded(
 
     monkeypatch.setattr(uploads, "_open_plain", _stale)
     result = await _store(root, generate_key()).reseal_to_active()
-    assert result.too_long == 1 and not result.incomplete
+    assert result.damaged == 1 and not result.incomplete
     assert sum(read) <= uploads._SIDECAR_LIMIT + 1
 
 
-async def test_a_padding_only_sidecar_over_a_lost_body_is_left_unsealable(
-    tmp_path: Path,
+@pytest.mark.parametrize("lost_body", [True, False])
+@pytest.mark.parametrize("planted", [b" \r\n", b"", b'{"file_id": "\xff"}'])
+async def test_a_sidecar_every_reader_refuses_is_left_as_damaged(
+    tmp_path: Path, planted: bytes, lost_body: bool
 ) -> None:
-    # Review round 1: unpadding made it blank, so it was not plaintext and was sealed as an empty
-    # value, with a fresh mtime that restarted the prune's window.
+    # Review rounds 1 and 2: a padding-only sidecar was sealed as an empty value, or sealed as
+    # plaintext, with a fresh mtime that restarted the prune's window; one not UTF-8 was a skip
+    # that failed every run. Every reader refuses each of these, so none is written or skipped.
     root = tmp_path / "uploads"
     meta = await _saved(_store(root))
     sidecar = root / f"{meta.file_id}.meta"
-    sidecar.write_bytes(b" \r\n")
-    (root / f"{meta.file_id}.blob").unlink()
+    sidecar.write_bytes(planted)
+    if lost_body:
+        (root / f"{meta.file_id}.blob").unlink()
     result = await _store(root, generate_key()).reseal_to_active()
-    assert result.unsealable == 1 and result.resealed == 0
-    assert sidecar.read_bytes() == b" \r\n"
+    assert result.damaged == 1 and result.unsealable == 0 and not result.incomplete
+    assert result.resealed == (0 if lost_body else 1)  # the body alone, when there is one
+    assert sidecar.read_bytes() == planted
+
+
+async def test_a_current_sidecar_padded_past_the_cap_is_damaged_not_current(
+    tmp_path: Path,
+) -> None:
+    # Review round 2: the active-marker test ran before the cap, so this read as CURRENT.
+    key = generate_key()
+    root = tmp_path / "uploads"
+    meta = await _saved(_store(root, key))
+    sidecar = root / f"{meta.file_id}.meta"
+    padded = sidecar.read_bytes() + b" " * (uploads._SIDECAR_LIMIT + 1)
+    sidecar.write_bytes(padded)
+    result = await _store(root, key).reseal_to_active()
+    assert result.damaged == 1 and not result.incomplete
+    assert sidecar.read_bytes() == padded
+
+
+async def test_the_reseal_read_is_sized_by_the_file_not_the_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review round 2: read(limit + 1) allocates the whole limit, about twice max_upload_bytes,
+    # for every body however small.
+    root = tmp_path / "uploads"
+    await _saved(_store(root))
+    real = uploads._open_plain
+    asked: list[int] = []
+
+    class _Asked:
+        def __init__(self, handle: Any) -> None:
+            self._h = handle
+
+        def read(self, n: int = -1) -> bytes:
+            asked.append(n)
+            data: bytes = self._h.read(n)
+            return data
+
+        def __enter__(self) -> _Asked:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._h.close()
+
+    def _spy(path: Path) -> Any:
+        handle, st = real(path)
+        return _Asked(handle), st
+
+    monkeypatch.setattr(uploads, "_open_plain", _spy)
+    result = await _store(root, generate_key()).reseal_to_active()
+    assert result.resealed == 2
+    assert asked and max(asked) <= 4096
+
+
+def test_a_permission_error_on_a_folder_is_damage(tmp_path: Path) -> None:
+    # Review round 2: Windows answers an open of a folder with a PermissionError.
+    folder = tmp_path / "x.meta"
+    folder.mkdir()
+    assert uploads._refused_read(PermissionError(13, "denied", str(folder))) == "damaged"
+    plain = tmp_path / "y.meta"
+    plain.write_bytes(b"synthetic")
+    assert uploads._refused_read(PermissionError(13, "denied", str(plain))) == "denied"
+    assert uploads._refused_read(PermissionError(13, "denied")) == "denied"
+
+
+def test_the_plain_open_sets_o_noctty_where_there_is_one() -> None:
+    noctty = getattr(os, "O_NOCTTY", 0)
+    assert uploads._PLAIN_OPEN_FLAGS & noctty == noctty
 
 
 async def test_a_keyless_save_refuses_a_sidecar_past_the_plaintext_bound(

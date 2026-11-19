@@ -48,7 +48,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISLNK, S_ISREG
+from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISDIR, S_ISLNK, S_ISREG
 from typing import Any, BinaryIO, Literal, NamedTuple, Protocol, TypeGuard
 
 from messagefoundry.config.atomic_edit import _REFUSED, LOCK_FILE_NAME, edit_lock, lock_path_for
@@ -319,7 +319,15 @@ def _names_a_link(info: os.stat_result) -> bool:
 #: has neither flag, so there :func:`_open_plain` checks the name again once it is open.
 _O_NOFOLLOW: int = getattr(os, "O_NOFOLLOW", 0)
 _O_NONBLOCK: int = getattr(os, "O_NONBLOCK", 0)
-_PLAIN_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK
+# O_NOCTTY, as auth/trust_anchors.read_if_regular sets it, so a terminal swapped in after the
+# lstat never becomes the engine's controlling terminal before the fstat refuses it.
+_PLAIN_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_BINARY", 0)
+    | getattr(os, "O_NOCTTY", 0)
+    | _O_NOFOLLOW
+    | _O_NONBLOCK
+)
 
 
 class _NotPlainError(OSError):
@@ -422,13 +430,20 @@ def _refused_read(exc: OSError) -> _ReadRefusal | None:
     2). ``"damaged"`` for a part that is not a plain file, or a link the open would not follow.
     ``"denied"`` for a ``PermissionError``: at least a permission or an ACL the engine lacks, and
     on Windows a file another program holds open (a sharing violation). That is not damage, so it
-    is never answered as a file an operator should delete. ``None`` for any other ``OSError``,
+    is never answered as a file an operator should delete. A ``PermissionError`` whose path is now
+    a folder is ``"damaged"``, since Windows refuses an open of a folder that way. ``None`` for any other ``OSError``,
     such as too many open files or an I/O error, which may pass on a retry, so the caller
     re-raises it."""
     if isinstance(exc, _NotPlainError) or exc.errno == errno.ELOOP:
         return "damaged"
     if isinstance(exc, PermissionError):
-        return "denied"
+        # Windows answers an open of a folder with a PermissionError too, so a folder swapped in
+        # after the lstat is a part that is not a plain file, not one the engine may not open.
+        try:
+            folder = exc.filename is not None and S_ISDIR(os.lstat(exc.filename).st_mode)
+        except (OSError, TypeError, ValueError):
+            folder = False
+        return "damaged" if folder else "denied"
     return None
 
 
@@ -1148,14 +1163,15 @@ class ResealResult:
     #: removes it by hand. A symlink is not counted here: its target may be under the prior key, so
     #: it is a skip.
     not_regular: int = 0
-    #: How many UPLOADS have a sidecar every reader refuses for its size (BACKLOG #5387 added item
-    #: 1): larger than :data:`_SIDECAR_LIMIT` on disk, or PLAINTEXT and longer than
-    #: :data:`_PLAIN_SIDECAR_LIMIT`, so that no seal of it fits that cap. No store writes one. It is
-    #: refused before anything is decrypted, so nothing of it is readable under any key, retiring
-    #: the prior key loses nothing, and no re-run changes it: not a skip, and it does not keep
-    #: ``rotate-key`` from completing. The sidecar is left as it is, and its body is still re-sealed
-    #: as any other. ``rotate-key``'s output does not report this count; the log names each one.
-    too_long: int = 0
+    #: How many UPLOADS have a sidecar every reader refuses as damaged before it decrypts anything
+    #: (BACKLOG #5387 added item 1): at least one larger than :data:`_SIDECAR_LIMIT` on disk, one
+    #: PLAINTEXT and longer than :data:`_PLAIN_SIDECAR_LIMIT`, so that no seal of it fits that cap,
+    #: one that is blank once its padding is skipped, and one that is not UTF-8. Nothing of it is
+    #: readable under any key, retiring the prior key loses nothing, and no re-run changes it: not
+    #: a skip, and it does not keep ``rotate-key`` from completing. The sidecar is left as it is,
+    #: and its body is still re-sealed as any other. ``rotate-key``'s output does not report this
+    #: count; the log names each one.
+    damaged: int = 0
     #: True when the uploads root could not be listed, as when it is missing or is not a directory
     #: (BACKLOG #4940). ``rotate-key`` refuses such a root before it writes anything, so this is a
     #: backstop. A root that stays listable is not missing, so an empty mount point over a volume
@@ -1182,7 +1198,7 @@ class _Half(Enum):
     LOST = auto()  # a body that is missing or is not text
     UNSEALABLE = auto()  # a plaintext sidecar over a lost body
     NOT_REGULAR = auto()  # no regular file or link, or a plaintext sidecar over one; left as is
-    TOO_LONG = auto()  # a sidecar every reader refuses for its size; left as is
+    DAMAGED = auto()  # a sidecar every reader refuses before decrypting; left as is
     SKIPPED = auto()  # it may still be under the prior key
 
 
@@ -1720,6 +1736,12 @@ class UploadStore:
         instead."""
         return 2 * self._max_bytes + 4096
 
+    def _body_unread(self, blob: Path, exc: OSError) -> None:
+        """Log a body the check could not read, once per interval per body, since the quota scan
+        meets the same one on every save and listing."""
+        if self._link_logged.first(f"body {blob.name}"):
+            _log.warning("uploaded file %s: could not check the body: %s", blob.name, exc)
+
     def _lost_body_size(self, blob: Path) -> int | None:
         """The bytes on disk of a body no key can read, or ``None`` when the body is readable text.
 
@@ -1739,7 +1761,7 @@ class UploadStore:
         except FileNotFoundError:
             return 0
         except OSError as exc:
-            _log.warning("uploaded file %s: could not check the body: %s", blob.name, exc)
+            self._body_unread(blob, exc)
             return None
         if _names_a_link(before) or not S_ISREG(before.st_mode):
             _log.warning("uploaded file %s: not a regular file; it was not read", blob.name)
@@ -1758,7 +1780,7 @@ class UploadStore:
             _log.warning("uploaded file %s: not a regular file; it was not read", blob.name)
             return None
         except OSError as exc:
-            _log.warning("uploaded file %s: could not check the body: %s", blob.name, exc)
+            self._body_unread(blob, exc)
             return None
         with handle:
             if stat.st_size > self._stored_limit:
@@ -2938,7 +2960,7 @@ class UploadStore:
             )
             return ResealResult(root_missing=True)
         gate = _ResealLockCheck(self._root / LOCK_FILE_NAME)
-        resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = too_long = 0
+        resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = damaged = 0
         for fid, _sidecar in pairs:
             try:
                 blob_path, meta_path = self._paths_unfollowed(fid)
@@ -2972,25 +2994,25 @@ class UploadStore:
                 unsealable += 1
             elif _Half.SKIPPED in (body, meta):
                 skipped += 1
-            elif meta is _Half.TOO_LONG:
-                too_long += 1
+            elif meta is _Half.DAMAGED:
+                damaged += 1
             elif _Half.NOT_REGULAR in (body, meta):
                 not_regular += 1
             elif body is _Half.LOST:
                 body_lost += 1
-        if resealed or skipped or unsealable or body_lost or not_regular or too_long:
+        if resealed or skipped or unsealable or body_lost or not_regular or damaged:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
                 "upload(s) (%d upload(s) skipped, %d that cannot be sealed, %d whose body is lost, "
-                "%d holding a file that is not regular, %d whose sidecar every reader refuses "
-                "for its size)",
+                "%d holding a file that is not regular, %d whose sidecar every reader refuses as "
+                "damaged)",
                 resealed,
                 sealed_plaintext,
                 skipped,
                 unsealable,
                 body_lost,
                 not_regular,
-                too_long,
+                damaged,
             )
         return ResealResult(
             resealed=resealed,
@@ -2999,8 +3021,22 @@ class UploadStore:
             unsealable=unsealable,
             body_lost=body_lost,
             not_regular=not_regular,
-            too_long=too_long,
+            damaged=damaged,
         )
+
+    @staticmethod
+    def _damaged_meta(fid: str, cause: str) -> _Half:
+        """Log and answer a sidecar every reader refuses as damaged before it decrypts anything
+        (BACKLOG #5387 added item 1): at least one over the cap, a plaintext one too long to seal,
+        one that is blank and one that is not UTF-8. Nothing of it is readable under any key and
+        no re-run changes that, so it is not a skip, which would fail every later run and hold
+        the rotation record open for good. It is left as it is."""
+        _log.warning(
+            "uploaded file %s (meta): left as it is for good, %s; every read refuses it as damaged",
+            fid,
+            cause,
+        )
+        return _Half.DAMAGED
 
     def _reseal_half(
         self,
@@ -3056,29 +3092,27 @@ class UploadStore:
             active = cipher.active_marker_prefix.encode("ascii")
             handle, opened = _open_plain(path)
             with handle:
+                limit = _SIDECAR_LIMIT if kind == "meta" else self._stored_limit
+                # A sidecar over the cap is refused before the marker test, since every reader
+                # refuses it whatever its marker. A body is not: a lowered max_upload_bytes must
+                # not turn an already-current one into a skip.
+                if kind == "meta" and opened.st_size > limit:
+                    return self._damaged_meta(fid, f"{opened.st_size} bytes is over the cap")
                 head = handle.read(len(active))
                 if head == active:
                     return _Half.CURRENT  # already under the active key in the active format
-                limit = _SIDECAR_LIMIT if kind == "meta" else self._stored_limit
-                data = head
-                if opened.st_size <= limit:
-                    # Bounded, so a file that grew since the fstat is read only to one byte past
+                size = opened.st_size
+                if size <= limit:
+                    # Sized by the fstat, as _read_plain_text is, so no read allocates the whole
+                    # limit for a small file. One that grew since is read only to one byte past
                     # its limit, and refused below, never read whole (BACKLOG #3737).
-                    data += handle.read(limit + 1 - len(head))
-                size = max(opened.st_size, len(data))
+                    # Never negative: a file that grew may have given a head longer than its fstat.
+                    data = head + handle.read(max(size + 1 - len(head), 0))
+                    if len(data) > size:
+                        data += handle.read(limit + 1 - len(data))
+                    size = len(data)
                 if kind == "meta" and size > limit:
-                    # BACKLOG #5387 added item 1: every reader refuses a sidecar this large as
-                    # damaged before it decrypts anything, so nothing of it is readable under any
-                    # key and no re-run changes that. Not a skip, which would fail every later run
-                    # and hold the rotation record open for good. A sidecar is held to this cap,
-                    # not to the body's limit below, so a small max_upload_bytes skips none.
-                    _log.warning(
-                        "uploaded file %s (meta): left as it is for good, %d bytes is larger than "
-                        "any sidecar can be; every read refuses it as damaged",
-                        fid,
-                        size,
-                    )
-                    return _Half.TOO_LONG
+                    return self._damaged_meta(fid, f"{size} bytes is over the cap")
                 if size > limit:
                     # BACKLOG #3737: a read of the whole file could raise MemoryError, which no
                     # handler takes, so a planted one would abort the pass. A skip and not a loss:
@@ -3093,19 +3127,18 @@ class UploadStore:
                     )
                     return _Half.SKIPPED
                 stored = data.decode("utf-8")
-            # Judged on the text as stored, so a sidecar of padding alone, which every reader
-            # refuses as blank, is still plaintext here, as it was before the padding tolerance:
-            # over a lost body it stays UNSEALABLE and is not rewritten.
-            plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
+                del data  # free the raw copy before the decrypt and the encrypt make two more
             if kind == "meta":
                 # As the reader unpads it, so a sealed sidecar that gained a byte-order mark or
                 # whitespace is re-sealed, never sealed a second time as plaintext (BACKLOG #5387
-                # added item 1). Padding alone is kept as it is, never turned into an empty value.
-                unpadded = _unpadded(stored)
-                if unpadded:
-                    stored = unpadded
-                plaintext = plaintext and not unpadded.startswith(MARKER_PREFIX)
+                # added item 1).
+                stored = _unpadded(stored)
+                if not stored:
+                    return self._damaged_meta(fid, "it is blank")
+            plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
         except (OSError, UnicodeDecodeError) as exc:
+            if kind == "meta" and isinstance(exc, UnicodeDecodeError):
+                return self._damaged_meta(fid, "it is not UTF-8")
             if kind == "body" and isinstance(exc, FileNotFoundError | UnicodeDecodeError):
                 # BACKLOG #3181: the body is missing or is not text, so no key reads it and no
                 # re-run changes that. It holds nothing under the OLD key, so it is not a skip;
@@ -3148,16 +3181,8 @@ class UploadStore:
                 _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
                 return _Half.SKIPPED
         if kind == "meta" and plaintext and len(stored.encode("utf-8")) > _PLAIN_SIDECAR_LIMIT:
-            # BACKLOG #5387 added item 1: checked before encrypting, because no seal of it fits
-            # _SIDECAR_LIMIT, and every reader refuses it as damaged already (_read_sidecar). It
-            # is plaintext, so nothing of it is under the prior key and no re-run changes it: not
-            # a skip, which would fail every later run and hold the rotation record open for good.
-            _log.warning(
-                "uploaded file %s (meta): left unsealed for good, the plaintext sidecar is longer "
-                "than any sidecar can be once sealed; every read refuses it as damaged",
-                fid,
-            )
-            return _Half.TOO_LONG
+            # Checked before encrypting, because no seal of it fits _SIDECAR_LIMIT (_read_sidecar).
+            return self._damaged_meta(fid, "it is plaintext too long to seal")
         blocked = gate.check()
         if blocked == "gone":
             # Not a skip: the pass ends as root_missing once this pair is done, and _pair_lock
@@ -3191,7 +3216,7 @@ class UploadStore:
         del stored  # the write holds its own copy, so free this file-sized buffer before it
         if kind == "meta" and len(sealed.encode("utf-8")) > _SIDECAR_LIMIT:
             # A backstop (BACKLOG #5387 added item 1): a plaintext sidecar this would grow past the
-            # cap was left as TOO_LONG above, so this is a sealed one whose re-seal grew it. The
+            # cap was left as DAMAGED above, so this is a sealed one whose re-seal grew it. The
             # readers refuse a sidecar this long as damaged, so it is not written. It is still
             # under the prior key, so it is a skip: retiring that key would lose it.
             _log.warning(
@@ -3318,7 +3343,7 @@ class UploadStore:
         A file that cannot be read is not counted here; the listing scan names it on its own. The
         sidecar is read first: one every reader refuses as oversized is never counted as one
         ``rotate-key`` can seal, whatever its body holds, since ``rotate-key`` leaves it as it is
-        (``too_long``). It is counted as one it cannot seal only where the class check holds it."""
+        (``damaged``). It is counted as one it cannot seal only where the class check holds it."""
         count = unsealable = 0
         for fid, sidecar in self._iter_sidecars():
             try:

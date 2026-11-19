@@ -327,7 +327,23 @@ async def test_a_skipped_plaintext_body_leaves_its_sidecar_untouched_and_unliste
     assert await keyed.list_files() == []
 
 
-async def test_an_unreadable_sidecar_still_counts_its_pair_once(tmp_path: Path) -> None:
+def _deny_open(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
+    """Make ``denied`` one the filesystem refuses to open. A sidecar that is not UTF-8 is not this:
+    every reader refuses it as damaged, so the reseal leaves it as ``damaged``, not a skip
+    (BACKLOG #5387 added item 1 follow-up)."""
+    real_open = uploads_mod._open_plain
+
+    def _open(path: Path) -> Any:
+        if path == denied:
+            raise PermissionError("held open by another process")
+        return real_open(path)
+
+    monkeypatch.setattr(uploads_mod, "_open_plain", _open)
+
+
+async def test_an_unreadable_sidecar_still_counts_its_pair_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The other half of the unit: a readable body is sealed, and the failed sidecar adds ONE skip.
 
     The plaintext body it sealed counts in ``sealed_plaintext`` too (BACKLOG #3240). It used not
@@ -336,7 +352,7 @@ async def test_an_unreadable_sidecar_still_counts_its_pair_once(tmp_path: Path) 
     """
     root = tmp_path / "uploads"
     fid = await _seed(_keyed_store(root, None))
-    _garble(root / f"{fid}.meta")
+    _deny_open(monkeypatch, root / f"{fid}.meta")
 
     result = await _keyed_store(root, generate_key()).reseal_to_active()
     assert result == ResealResult(resealed=1, skipped=1, sealed_plaintext=1)
@@ -374,13 +390,15 @@ async def test_a_planted_body_under_a_sealed_sidecar_is_counted_when_its_read_fa
     assert first == ResealResult(resealed=1, skipped=1, sealed_plaintext=1)
 
 
-async def test_a_pair_with_both_halves_unreadable_counts_once(tmp_path: Path) -> None:
+async def test_a_pair_with_both_halves_unreadable_counts_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``skipped`` counts uploads, so two failed halves of one pair still add one."""
     root = tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     fid = await _seed(_keyed_store(root, key_a))
     (root / f"{fid}.blob").unlink()
-    _garble(root / f"{fid}.meta")
+    _deny_open(monkeypatch, root / f"{fid}.meta")
 
     result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
     assert result == ResealResult(resealed=0, skipped=1)
