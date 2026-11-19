@@ -291,11 +291,16 @@ def test_each_engine_shard_gets_its_store_path_as_one_argv_token(
     monkeypatch.delenv("MEFOR_API_PORT", raising=False)
     svc = tmp_path / "messagefoundry.toml"
     svc.write_text('[store]\npath = "-x.db"\n', encoding="utf-8")
-    captured = _supervise_captured(tmp_path, monkeypatch, ["--service-config", str(svc)])
+    # Under a project root, so the TLS pair the start mints lands in tmp_path, not the cwd.
+    root = tmp_path / "repo"
+    root.mkdir()
+    argv = ["--service-config", str(svc), "--project-root", str(root)]
+    captured = _supervise_captured(tmp_path, monkeypatch, argv)
     db_base = str(captured["db_base"])
-    assert db_base == "-x.db"
-    for shards in (["a"], ["a", "b"]):
-        for spec in build_shard_specs(shards, config="c", db_base=db_base, base_port=8765):
+    assert db_base == str(root / "-x.db")
+    # With no project root the base stays as written, leading "-" and all.
+    for base, shards in [(b, s) for b in (db_base, "-x.db") for s in (["a"], ["a", "b"])]:
+        for spec in build_shard_specs(shards, config="c", db_base=base, base_port=8765):
             serve_argv = list(spec.argv)[list(spec.argv).index("serve") :]
             args = cli._build_parser()[0].parse_args(serve_argv)
             assert args.db == spec.db_path, serve_argv
