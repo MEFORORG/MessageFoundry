@@ -1095,3 +1095,87 @@ def test_apply_with_claims_dir_is_refused(repo: Path, tmp_path: Path) -> None:
     proc = reconcile(repo, "-Apply", "-ClaimsDir", str(audit))
     assert proc.returncode == 2, proc.stdout
     assert live.exists()
+
+
+def _ps_quote(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def test_apply_rereads_a_gone_holder_claim_and_keeps_one_that_changed(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A gone holder's release takes -Force, so -Apply re-reads the claim file before it.
+
+    The gh stub rewrites two claim files while the scan probes their pull requests, so the scan
+    judges both RELEASABLE from what it read before the edit. One edit re-spells the key, the other
+    names another holder; both must survive with the outcome NOT released. The landed claim in the
+    same run, which nothing edits, is the positive control and IS released.
+    """
+    unmerged_branch(repo, "respelled")
+    unmerged_branch(repo, "retaken")
+    landed_branch(repo, "landed")
+    respelled = write_claim(repo, "k-respelled", tmp_path / "vanished", "respelled")
+    retaken = write_claim(repo, "k-retaken", tmp_path / "vanished", "retaken")
+    control = write_claim(repo, "k-control", tmp_path / "vanished", "landed")
+    github_origin(repo)
+    tips = [git(repo, "rev-parse", b).strip() for b in ("respelled", "retaken")]
+    payload = json.dumps([json.loads(_merged_pr(t))[0] for t in tips])
+    other = str(tmp_path / "someone-else").replace("\\", "/")
+    # Each edit fires only on the probe for its own branch, which runs after the scan read that file.
+    edits = [
+        ("respelled", respelled, '"key": "k-respelled"', '"key": "K-Respelled"'),
+        (
+            "retaken",
+            retaken,
+            json.dumps({"worktree": json.loads(retaken.read_bytes())["worktree"]})[1:-1],
+            json.dumps({"worktree": other})[1:-1],
+        ),
+    ]
+    side_effect = "\n".join(
+        f"if ($a -like '*--head {branch} *') {{ $p = {_ps_quote(str(p))}; "
+        f"[IO.File]::WriteAllText($p, [IO.File]::ReadAllText($p).Replace({_ps_quote(a)}, {_ps_quote(b)})) }}"
+        for branch, p, a, b in edits
+    )
+    stub = gh_router(tmp_path, head=payload, on_head=side_effect)
+
+    proc = reconcile(repo, "-Json", "-Apply", "-GhCommand", str(stub))
+    assert proc.returncode == 0, proc.stderr
+    out = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}
+
+    assert respelled.exists() and retaken.exists(), out
+    assert "K-Respelled" in respelled.read_text(encoding="utf-8"), "the edit must have landed"
+    assert "someone-else" in retaken.read_text(encoding="utf-8"), "the edit must have landed"
+    for key, reason in (
+        ("k-respelled", "another spelling of its key"),
+        ("k-retaken", "held by another worktree"),
+    ):
+        assert out[key]["verdict"] == "CHANGED-SINCE-SCAN", out[key]
+        assert reason in out[key]["why"], out[key]
+        assert out[key]["outcome"].startswith("NOT released"), out[key]
+    assert not control.exists(), out["k-control"]
+    assert out["k-control"]["outcome"] == "released", out["k-control"]
+    history = (claims_dir(repo) / ".history").read_text(encoding="utf-8").strip().splitlines()
+    assert [json.loads(line)["key"] for line in history] == ["k-control"]
+
+
+def test_apply_reports_not_released_when_claim_ps1_finds_no_claim(
+    repo: Path, tmp_path: Path
+) -> None:
+    """claim.ps1 exits 0 on "No claim on <key>", so only its success line shows a release happened.
+
+    The sandbox's claim.ps1 is replaced by one that prints that line and touches nothing, so the
+    file stays and the row must read NOT released rather than released.
+    """
+    landed_branch(repo, "landed")
+    p = write_claim(repo, "k-vanishing", tmp_path / "vanished", "landed")
+    (repo / "scripts" / "coord" / "claim.ps1").write_text(
+        "param([string]$Release, [switch]$Force)\n"
+        "Write-Host \"No claim on '$Release' -- nothing to release.\"\nexit 0\n",
+        encoding="utf-8",
+    )
+    proc = reconcile(repo, "-Json", "-Apply")
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert row["verdict"] == "RELEASABLE", row
+    assert row["outcome"] == "NOT released -- claim.ps1 found no claim under that key", row
+    assert p.exists(), row
