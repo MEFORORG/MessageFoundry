@@ -15428,7 +15428,7 @@ def _build_check_connectors(
         database_source_dsn(rsettings, connection=reference_connection_name(rname))
         # BACKLOG #3432: the sync reads acquire_timeout by this rule, so an env() value it would
         # refuse fails check here rather than as a failed sync after start. max_rows the same way
-        # (BACKLOG #2617), and statement_timeout (BACKLOG #5756).
+        # (BACKLOG #2617), and statement_timeout (BACKLOG #5891).
         reference_acquire_timeout(rsettings)
         reference_max_rows(rsettings)
         reference_statement_timeout(rsettings)

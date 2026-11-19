@@ -1245,8 +1245,8 @@ def DatabaseRef(
     it fails that sync, and the last-good snapshot stays. Checked when declared, like ``max_rows``.
 
     A result that does not fit ``key_column`` and ``value_column`` fails the sync too, rather than
-    replacing the last-good snapshot: a column the result lacks, a NULL key, or two rows with one
-    key.
+    replacing the last-good snapshot. At least these do: a named column the result lacks or holds
+    twice, a column name held twice with no ``value_column``, a NULL key, or two rows with one key.
 
     ``tls_hop_attested`` with its mandatory ``tls_hop_attested_reason`` attests that this source's
     database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR

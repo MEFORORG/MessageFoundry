@@ -2666,11 +2666,13 @@ A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the
   value fails it as `ReferenceStatementTimeoutRefused`. The 30 s default was chosen for one
   statement per message, and a large set's statement can need more. At `0`, an uncancelled
   statement holds the sequential sync pass, and every other set's sync behind it, until it returns.
-- **The result must fit the declared columns.** A `key_column` or `value_column` the result lacks,
-  or holds twice, as a join can, fails the sync as `ReferenceColumnMismatch`. A NULL key, or two
-  rows with one key, fails it as `ReferenceKeyRefused`. The last-good snapshot keeps serving in
-  each case, rather than being replaced by `None` values, a `"None"` key, whichever duplicate came
-  last, or a column the operator did not mean.
+- **The result must fit the declared columns.** At least these refusals apply. A `key_column` or
+  `value_column` the result lacks, or holds twice, as a join can, fails the sync as
+  `ReferenceColumnMismatch`, and so does a result with no `value_column` set that holds any column
+  name twice. A NULL key, or two rows with one key, fails it as `ReferenceKeyRefused`. The
+  last-good snapshot keeps serving in each case, rather than being replaced by `None` values, a
+  `"None"` key, whichever duplicate came last, or a column the operator did not mean. A set that
+  never synced stays unloaded, here and on a timed-out statement alike.
 
 The sync's log line and alert carry the error's class name only, never its text, because a source
 error can hold a reference key. The class names above are what tell those failures apart. The two

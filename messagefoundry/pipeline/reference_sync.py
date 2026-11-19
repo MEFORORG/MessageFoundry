@@ -104,9 +104,12 @@ class ReferenceStatementTimeoutRefused(ReferenceSyncError):
 
 
 class ReferenceColumnMismatch(ReferenceSyncError):
-    """A ``DatabaseRef`` result lacks its ``key_column`` or ``value_column``, or holds either twice.
+    """A ``DatabaseRef`` result does not fit its ``key_column`` and ``value_column``.
 
-    The message holds the set's name and which setting failed, never a column's name, so
+    At least: the result lacks either, holds either twice, or, with no ``value_column``, holds one
+    column name twice.
+
+    The message holds the set's name and which check failed, never a column's name, so
     ``_sync_one`` logs it whole, as it does ``ReferenceKeyCollision``."""
 
 
@@ -310,6 +313,10 @@ async def _load_database_source(
     :class:`ReferenceRowCeilingExceeded`. The set is never built from a truncated result. The runner
     then keeps the last-good snapshot, as for any source failure.
 
+    It fails in at least these classes too (BACKLOG #5891), each class's docstring saying when:
+    :class:`ReferenceStatementTimedOut`, :class:`ReferenceStatementTimeoutRefused`,
+    :class:`ReferenceColumnMismatch` and :class:`ReferenceKeyRefused`.
+
     ``posture`` is the instance hop posture (vault BACKLOG #2354). A sync runs after start, outside
     every ``active_hop_posture`` scope, so it is handed down and stamped here. Since vault BACKLOG
     #3533 item 2 no cell under that stamp reads it, so it is inert: a DatabaseRef is always the SQL
@@ -453,12 +460,13 @@ def _rows_to_snapshot(
 ) -> dict[str, Any]:
     """Build a DATABASE source's ``{key: value}`` set, or refuse it whole.
 
-    A result that does not fit the declared columns is refused rather than built: a
+    A result that does not fit the declared columns is refused rather than built. The refusals are
+    listed on :class:`ReferenceColumnMismatch` and :class:`ReferenceKeyRefused`; a
     ``value_column`` the result lacks, a NULL key, or two rows with one key would otherwise replace
-    the last-good snapshot with ``None`` values, a ``"None"`` key, or whichever duplicate came last.
-    A ``key_column`` or ``value_column`` the result holds twice, as a join can, is refused too,
-    since which of the two is meant cannot be told. The refusals name the setting and row
-    ordinals, never a column's name or a key: a key may be PHI, and the sync logs these whole."""
+    the last-good snapshot with ``None`` values, a ``"None"`` key, or whichever duplicate came last,
+    and a column held twice, as a join can, leaves which one is meant untold. The refusals name the
+    set and, where one applies, a setting or row ordinals, never a column's name or a key: a key may
+    be PHI, and the sync logs these whole."""
     where = "" if name is None else f"reference set {name!r}: "
     for role, col in (("key_column", key_col), ("value_column", value_col)):
         if col is None:
