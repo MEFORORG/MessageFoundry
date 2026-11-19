@@ -2974,7 +2974,26 @@ class RestDestination(DestinationConnector):
         self.timeout: float = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="REST destination"
         )
-        self.encoding: str = s.get("encoding", "utf-8")
+        # BACKLOG #5796: float_setting returns zero and negatives as they are. urllib reads a zero
+        # timeout as a non-blocking socket and refuses a negative one, so either would build and
+        # then fail every send.
+        if self.timeout <= 0:
+            raise ValueError("REST destination 'timeout_seconds' must be greater than zero")
+        encoding = s.get("encoding", "utf-8")
+        # BACKLOG #5796: "".encode is the probe the config-load encoding checks use, the same call
+        # the send makes, so a non-text codec such as base64 is refused too. Checked here as well,
+        # so a destination built without those checks, a direct construction at least, refuses it.
+        try:
+            "".encode(encoding)
+        except (LookupError, UnicodeError, TypeError):
+            usable = False
+        else:
+            usable = True
+        if not usable:
+            raise ValueError(
+                "REST destination 'encoding' must name a Python text codec, such as utf-8"
+            )
+        self.encoding: str = encoding
         # ADR 0013: capture the HTTP response body. Default False → returns None, byte-identical. A 2xx
         # with a body → outcome='accepted'; a 2xx with an empty body → outcome='no_reply' (a successful
         # round-trip, not an error). Non-2xx keeps today's DeliveryError/NegativeAckError classification.
