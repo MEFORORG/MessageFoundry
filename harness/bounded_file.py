@@ -58,21 +58,27 @@ def read_capped(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[
             return b"", NOT_REGULAR
         raise
     try:
-        fh = os.fdopen(fd, "rb")
-    except OSError:
+        return read_fd_capped(fd, cap)
+    finally:
         os.close(fd)
-        raise
-    with fh:
-        # Judge what is open, not what was stat'ed: the path may name a different file by now.
-        st = os.fstat(fh.fileno())
-        if not stat.S_ISREG(st.st_mode):
-            return b"", NOT_REGULAR
-        if st.st_size > cap:
-            return b"", _over(st.st_size, cap)
-        if hasattr(os, "O_NONBLOCK"):
-            # Non-blocking was only for the open; a filesystem that honoured it on a regular file
-            # could otherwise answer a read with nothing (EAGAIN), which a buffered read returns as None.
-            os.set_blocking(fh.fileno(), True)
+
+
+def read_fd_capped(fd: int, cap: int) -> tuple[bytes, str]:
+    """:func:`read_capped`'s checks and read, on a handle the caller has already opened and still
+    owns: it is not closed here. The type and size are judged by ``fstat`` on the handle itself, so
+    a caller that opened the file relative to a held directory handle, or that compares the handle's
+    identity with an earlier ``lstat``, reads exactly the file it checked."""
+    # Judge what is open, not what was stat'ed: the path may name a different file by now.
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        return b"", NOT_REGULAR
+    if st.st_size > cap:
+        return b"", _over(st.st_size, cap)
+    if hasattr(os, "O_NONBLOCK"):
+        # Non-blocking was only for the open; a filesystem that honoured it on a regular file
+        # could otherwise answer a read with nothing (EAGAIN), which a buffered read returns as None.
+        os.set_blocking(fd, True)
+    with open(fd, "rb", closefd=False) as fh:
         # One byte past the size it reported, then top up to one past the cap only if it grew, so
         # a small file costs a small read and a growing one is caught without reading it whole.
         data = fh.read(st.st_size + 1)

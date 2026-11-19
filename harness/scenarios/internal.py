@@ -38,6 +38,7 @@ from harness.scenarios._core import (
     ScenarioResult,
     _send_error_suffix,
     control_id_of,
+    sink_faults,
 )
 from harness.sinks.mllp import MLLPSink
 from messagefoundry.apiclient import ApiError, EngineClient
@@ -79,22 +80,24 @@ class TimerScenario(BaseScenario):
                     statuses = self._statuses_since(ctx.client, started)
                 except ApiError as exc:
                     return ScenarioResult(self, False, f"API error: {exc}")
-                delivered = sum(
-                    1 for r in sink.records() if control_id_of(r.payload) == self.control_id
-                )
+                records = sink.records()
+                delivered = sum(1 for r in records if control_id_of(r.payload) == self.control_id)
                 processed = statuses.count(_PROCESSED)
                 done = processed >= self.arrivals and delivered >= self.arrivals
                 if done or time.monotonic() >= deadline:
                     break
                 time.sleep(0.2)
         others = sorted({s for s in statuses if s in _TERMINAL and s != _PROCESSED})
-        ok = processed >= self.arrivals and delivered >= self.arrivals and not others
+        links = sink_faults(records)
+        ok = processed >= self.arrivals and delivered >= self.arrivals and not others and not links
         detail = (
             f"{processed}/{self.arrivals} timer messages since start reached {_PROCESSED!r} on "
             f"{self.inbound}; {delivered}/{self.arrivals} delivered to the file sink"
         )
         if others:
             detail += f"; other terminal statuses seen: {others}"
+        if links:
+            detail += f"; {links}"
         return ScenarioResult(self, ok, detail)
 
     def _statuses_since(self, client: EngineClient, started: float) -> list[str]:
