@@ -56,8 +56,10 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
     that chain reaches neither the scrub failure nor an exception the caller is handling, either
     of which could quote the text. An ``Exception`` raised by the log call itself, such as one from
     a log filter or a record factory, is dropped, so this still returns the withheld row, and one
-    fixed line naming only its type goes to stderr. The log call is the last resort, and letting
-    its failure propagate would carry frames holding the raw ``exc`` and ``before`` out of here and
+    line naming only the three exceptions' types, each through ``ascii``, is written to stderr,
+    best effort: where stderr is missing or broken, nothing records the drop. A handler that ran
+    before the raise may already have emitted the warning. The log call is the last resort, and
+    letting its failure propagate would carry frames holding the raw ``exc`` and ``before`` out of here and
     break the contract that a probe never raises. A ``BaseException`` such as ``KeyboardInterrupt``
     is not caught, so it still propagates with those frames. A1 exists to report an interpreter the
     engine cannot run on, and there the engine's modules may not even parse, so a scrub that fails
@@ -107,12 +109,14 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
             # The log call is the last resort: logging has no channel left to report its own
             # failure, and propagating would leak frames holding the raw exc and before and break
             # the probe contract that run_probe and run_matrix rely on. So the failure is dropped,
-            # and one fixed line of type names goes to stderr, under its own guard, so the drop is
-            # not silent. The failure's text is not printed: it could quote the record's args.
+            # and one line of type names goes to stderr, under its own guard, so the drop is not
+            # silent where stderr works. The failure's text is not printed: a filter or factory
+            # can quote anything it saw. ascii() keeps a crafted type name to one printable line.
             with contextlib.suppress(Exception):
                 sys.stderr.write(
-                    "harness.acceptance.probes: the scrub-failure warning was not logged: "
-                    f"{type(log_failure).__name__}; the row's {exc_name} detail is withheld\n"
+                    f"{_log.name}: the scrub-failure warning's log call raised "
+                    f"{ascii(type(log_failure).__name__)}; the scrub failed with "
+                    f"{ascii(failure_name)}, and the row's {ascii(exc_name)} detail is withheld\n"
                 )
     return f"{exc_name} (detail withheld: the detail scrub failed with {failure_name})"
 

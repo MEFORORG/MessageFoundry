@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from typing import Any
 
 import pytest
 
@@ -160,24 +161,31 @@ def _inside_except(typed: bool) -> str:
 
 @contextmanager
 def _raising_log_call(
-    monkeypatch: pytest.MonkeyPatch, where: str, ran: list[str]
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+    ran: list[str],
+    error: Callable[[str], BaseException] = ValueError,
 ) -> Iterator[None]:
-    """A broken scrub, and a log call on the probes logger that raises from ``where``: a logger
-    filter, or the record factory. Each appends the formatted message to ``ran`` first, which is
-    the positive control that it was called."""
+    """A broken scrub, and a log call on the probes logger that raises ``error`` from ``where``: a
+    logger filter, or the record factory. Each appends the formatted message to ``ran`` first,
+    which is the positive control that it was called. The factory is process-global, so it
+    intercepts only the probes logger's records and hands every other logger's to the previous
+    factory."""
 
     def broken(*_args: object, **_kwargs: object) -> str:
         raise RuntimeError(_FILTER_SCRUB)
 
     def refuse(record: logging.LogRecord) -> bool:
         ran.append(record.getMessage())
-        raise ValueError("the filter refuses")
+        raise error("the filter refuses")
 
-    def factory(*args: object, **_kwargs: object) -> logging.LogRecord:
-        msg, msg_args = args[4], args[5]
-        assert isinstance(msg, str) and isinstance(msg_args, tuple)
-        ran.append(msg % msg_args)
-        raise ValueError("the factory refuses")
+    previous_factory = logging.getLogRecordFactory()
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        if args[0] != probes.__name__:
+            return previous_factory(*args, **kwargs)
+        ran.append(args[4] % args[5])
+        raise error("the factory refuses")
 
     monkeypatch.setattr(verify_leaf, "safe_exc_text", broken)
     monkeypatch.setattr(verify_leaf, "safe_detail_text", broken)
@@ -185,12 +193,13 @@ def _raising_log_call(
     monkeypatch.setattr(logger, "disabled", False)
     monkeypatch.setattr(logger, "level", logging.DEBUG)
     previous = logging.root.manager.disable
-    previous_factory = logging.getLogRecordFactory()
     logging.disable(logging.NOTSET)
     if where == "filter":
         logger.addFilter(refuse)
-    else:
+    elif where == "factory":
         logging.setLogRecordFactory(factory)
+    else:
+        raise AssertionError(f"unknown raiser {where!r}")
     try:
         yield
     finally:
@@ -199,10 +208,16 @@ def _raising_log_call(
         logging.disable(previous)
 
 
+_STDERR_LINE = (
+    "harness.acceptance.probes: the scrub-failure warning's log call raised 'ValueError'; the "
+    "scrub failed with 'RuntimeError', and the row's 'OSError' detail is withheld\n"
+)
+
+
 def _assert_nothing_planted(row: str, err: str, ran: list[str]) -> None:
     assert len(ran) == 1 and "RuntimeError" in ran[0] and "OSError" in ran[0]
-    # Positive control for the stderr capture: the fixed line naming the log failure's type.
-    assert "the scrub-failure warning was not logged: ValueError" in err
+    # Positive control for the stderr capture, and the whole of what was written: one line.
+    assert err == _STDERR_LINE
     for fragment in (*_FILTER_PLANTED, "refuses"):
         assert fragment not in row
         assert fragment not in err
@@ -244,3 +259,18 @@ def test_run_probe_reports_an_error_row_when_the_scrub_and_its_log_both_fail(
     assert result.status is Status.ERROR
     assert result.detail == "OSError (detail withheld: the detail scrub failed with RuntimeError)"
     _assert_nothing_planted(result.detail, capsys.readouterr().err, ran)
+
+
+def test_a_base_exception_from_the_log_call_still_propagates(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The documented boundary: only an ``Exception`` is dropped, so an interrupt is not
+    swallowed. ``ran`` shows the filter, not something before it, raised the interrupt."""
+    ran: list[str] = []
+    with (
+        _raising_log_call(monkeypatch, "filter", ran, KeyboardInterrupt),
+        pytest.raises(KeyboardInterrupt, match="the filter refuses"),
+    ):
+        probes.scrubbed_exc(OSError(_FILTER_ORIG))
+    assert len(ran) == 1
+    assert capsys.readouterr().err == ""
