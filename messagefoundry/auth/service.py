@@ -2548,8 +2548,8 @@ def _holds_lockout_state(user: UserRecord) -> bool:
 
 
 #: What :meth:`AuthService._clear_after_reauth` did: wrote the reset with its rows, found only a
-#: lockout column changed, was refused by the store or a Vault transit Outage (so the caller's own
-#: row is written, hard), or found the account gone, disabled, re-bound, its sessions ended or its
+#: lockout column changed, was refused by a Vault transit Outage (so the caller's own row is
+#: written, hard; a store error the read-back does not settle raises instead), or found the account gone, disabled, re-bound, its sessions ended or its
 #: record failing its seal, so the re-auth must grant nothing (BACKLOG #5900).
 _ReauthClear = Literal["cleared", "kept", "refused", "denied"]
 

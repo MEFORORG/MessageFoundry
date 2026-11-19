@@ -998,3 +998,30 @@ async def test_a_write_landing_during_the_transit_work_is_kept(tmp_path: Any) ->
         assert not await store.list_audit(action="auth.reauth")
     finally:
         await store.close()
+
+
+async def test_a_write_outside_the_guard_during_the_transit_work_redoes_it(tmp_path: Any) -> None:
+    """A write that leaves every guarded column as it was, here the login-time rehash, landing
+    while the reset's seal is computed, makes the reset redo its seal work rather than read as the
+    account changing: the reset lands over the rehash, which it keeps."""
+    store, expected = await _conditional_reset_store(tmp_path)
+    try:
+        before = await store.get_user("u-carol")
+        assert before is not None
+
+        async def a_rehash() -> None:
+            if store._lock.locked():
+                return
+            await store.set_password_hash("u-carol", password_hash=hash_password(WRONG))
+
+        store._row_sealer = _LockProbeSealer(store, a_rehash)  # type: ignore[assignment]
+        answer = await store.record_login_success(
+            "u-carol", expected=expected, audits=[AuditAppend("auth.reauth", actor="carol")]
+        )
+        assert answer == "written"
+        user = await store.get_user("u-carol")
+        assert user is not None and user.failed_attempts == 0
+        assert user.password_hash != before.password_hash
+        assert len(await store.list_audit(action="auth.reauth")) == 1
+    finally:
+        await store.close()
