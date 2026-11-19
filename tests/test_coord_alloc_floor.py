@@ -739,10 +739,25 @@ def test_a_warning_on_a_clean_sweep_call_is_echoed_not_swallowed(tmp_path: Path)
     assert "git for-each-ref exited 0" in proc.stderr, proc.stderr
 
 
+def _quoting_git_env() -> dict[str, str]:
+    """The environment with git's path quoting forced ON, whatever the developer's global config.
+
+    A machine with ``core.quotePath=false`` never quotes a non-ASCII name, so the pre-``-z`` code
+    would pass the case below there and it would no longer pin the regression.
+    """
+    return dict(
+        os.environ,
+        GIT_CONFIG_COUNT="1",
+        GIT_CONFIG_KEY_0="core.quotePath",
+        GIT_CONFIG_VALUE_0="true",
+    )
+
+
 def test_a_non_ascii_adr_name_on_a_branch_still_raises_the_floor(tmp_path: Path) -> None:
-    """MUST TRIP on ``ls-tree --name-only`` without ``-z``: git quotes a name holding a non-ASCII byte,
-    the leading quote defeats the four-digit ``^NNNN-`` anchor, and 95 would read FREE. The control is the
-    same shape with an ASCII name in ``test_the_failing_git_shim_passes_every_other_call_through``.
+    """MUST TRIP on ``ls-tree --name-only`` without ``-z``: git quotes a name holding a non-ASCII
+    byte, the leading quote defeats the four-digit ``^NNNN-`` anchor, and 95 would read FREE. The
+    control is the same shape with an ASCII name in ``test_a_side_branch_number_raises_the_floor``
+    below, which runs on every platform this one does.
     """
     repo = _checkout(tmp_path / "repo", {"0001-first.md": "# First\n"})
     _git("checkout", "-q", "-b", "side", cwd=repo)
@@ -752,4 +767,26 @@ def test_a_non_ascii_adr_name_on_a_branch_still_raises_the_floor(tmp_path: Path)
     _git("add", "-A", cwd=repo)
     _git("commit", "-m", "side adr", "--no-verify", cwd=repo)
     _git("checkout", "-q", "main", cwd=repo)
-    assert _floor(repo) == 95
+    assert _floor(repo, env=_quoting_git_env()) == 95
+
+
+def test_a_side_branch_number_raises_the_floor(tmp_path: Path) -> None:
+    """THE CONTROL for the two non-ASCII cases: an ASCII name on an ASCII branch is swept, so a floor
+    of 1 there would be the fixture, not the name or the branch."""
+    repo = _repo_with_90_on_a_side_branch(tmp_path / "repo")
+    assert _floor(repo, env=_quoting_git_env()) == 90
+
+
+def test_a_number_on_a_non_ascii_branch_still_raises_the_floor(tmp_path: Path) -> None:
+    """A number on a non-ASCII branch is swept. Interactively, under an OEM console code page, a sweep
+    that decoded git's output with that page got the ref name back garbled, cat-file answered
+    ``missing`` for it and exited 0, and 90 read FREE. NOT A TRIPPING CONTROL: measured 2026-11-19,
+    this case also passes on the pre-decode wrapper when pytest runs pwsh with no console, so it
+    pins the outcome, not the UTF-8 decode itself."""
+    repo = _checkout(tmp_path / "repo", {"0001-first.md": "# First\n"})
+    _git("checkout", "-q", "-b", "caf\N{LATIN SMALL LETTER E WITH ACUTE}", cwd=repo)
+    (repo / "docs" / "adr" / "0090-only-on-a-branch.md").write_text("# Side\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "side adr", "--no-verify", cwd=repo)
+    _git("checkout", "-q", "main", cwd=repo)
+    assert _floor(repo, env=_quoting_git_env()) == 90

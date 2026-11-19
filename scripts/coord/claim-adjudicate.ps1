@@ -180,9 +180,14 @@ function Invoke-NamespaceGit([string[]]$GitArgs, [string]$What, [string]$Why) {
     $global:LASTEXITCODE = -1
     $all = @(& git -C $repo @GitArgs 2>&1)
     $code = $LASTEXITCODE
+    $detail = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n  ").Trim()
     if ($code -ne 0) {
-        $detail = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n  ").Trim()
         throw "could not read $What (git $($GitArgs[0]) exited $code): cannot adjudicate any key against a namespace that was $Why. git said:`n  $detail"
+    }
+    # A clean exit can still carry a warning (a broken or ambiguous ref, say). Echoed to stderr, so
+    # it neither disappears nor lands in the -Json document on stdout; not refused, git answered.
+    if ($detail) {
+        [Console]::Error.WriteLine("claim-adjudicate.ps1: WARNING -- git $($GitArgs[0]) exited 0 but wrote to stderr while reading $What. git said:`n  $detail")
     }
     @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
 }

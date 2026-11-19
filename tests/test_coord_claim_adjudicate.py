@@ -546,7 +546,16 @@ def test_a_non_ascii_backlog_file_name_is_read_not_quoted_away(repo: Path, tmp_p
     backlog(repo, f"## 12. Something else\n\n> {PRIORITIZED} open\n\nbody\n")
     unmerged_branch(repo, "seat")
     write_claim(repo, "11", tmp_path / "gone", "seat")
-    r = rows(repo)["11"]
+    # Quoting forced ON, so a developer's core.quotePath=false cannot hide the regression.
+    env = dict(
+        os.environ,
+        GIT_CONFIG_COUNT="1",
+        GIT_CONFIG_KEY_0="core.quotePath",
+        GIT_CONFIG_VALUE_0="true",
+    )
+    proc = _adjudicate_env(repo, env, "-Json")
+    assert proc.returncode == 0, proc.stderr
+    r = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}["11"]
     assert r["verdict"] == "SUPERSEDED", r
 
 

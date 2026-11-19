@@ -503,16 +503,30 @@ function Get-Floor {
     # Both preferences are pinned in this function's own scope, for the pre-flight block's reason:
     # under "Stop", with $PSNativeCommandUseErrorActionPreference true, git's first stderr line or
     # its exit code throws a generic error and the refusal below, with git's own words, never prints.
+    #
+    # DECODED AS UTF-8, because git writes names as UTF-8 bytes and pwsh otherwise decodes native
+    # output with the console's code page. Under the OEM page a non-ASCII ref name came back
+    # garbled, cat-file answered `missing` for it and exited 0, and that branch's numbers dropped out
+    # of the floor; under a DBCS page a trailing lead byte can swallow ls-tree's NUL terminator and
+    # glue two names together. unbacked_check.ps1's Invoke-Git records the same garbling (BACKLOG
+    # #5502). Restored in `finally`, so a refusal does not leave the console re-encoded.
+    $sweepWarnings = [System.Collections.Generic.List[string]]::new()
     function Invoke-SweepGit([string[]]$GitArgs, [string]$Stdin) {
         $ErrorActionPreference = "Continue"
         $PSNativeCommandUseErrorActionPreference = $false
         $global:LASTEXITCODE = -1
-        $all = if ($PSBoundParameters.ContainsKey('Stdin')) {
-            @($Stdin | & git -C $repo @GitArgs 2>&1)
-        } else {
-            @(& git -C $repo @GitArgs 2>&1)
+        $previousEncoding = [Console]::OutputEncoding
+        try {
+            try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
+            $all = if ($PSBoundParameters.ContainsKey('Stdin')) {
+                @($Stdin | & git -C $repo @GitArgs 2>&1)
+            } else {
+                @(& git -C $repo @GitArgs 2>&1)
+            }
+            $code = $LASTEXITCODE
+        } finally {
+            try { [Console]::OutputEncoding = $previousEncoding } catch { }
         }
-        $code = $LASTEXITCODE
         $detail = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n  ").Trim()
         if ($code -ne 0) {
             throw "alloc.ps1: $refusal -- git $($GitArgs[0]) exited $code while sweeping refs for the ADR floor. An incomplete sweep would understate the floor and could re-issue a number already in use, so nothing was read as a floor or allocated. Fix the clone and re-run. git said:`n  $detail"
@@ -522,7 +536,8 @@ function Get-Floor {
         # `warning: ignoring broken ref` was seen; 2>&1 alone would drop it. Echoed, not refused:
         # git still answered, and the warning names a clone problem the operator should fix.
         if ($detail) {
-            [Console]::Error.WriteLine("alloc.ps1: WARNING -- git $($GitArgs[0]) exited 0 but wrote to stderr while sweeping refs for the ADR floor. git said:`n  $detail")
+            $w = "alloc.ps1: WARNING -- git $($GitArgs[0]) exited 0 but wrote to stderr while sweeping refs for the ADR floor. git said:`n  $detail"
+            if (-not $sweepWarnings.Contains($w)) { $sweepWarnings.Add($w) }
         }
         @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
     }
@@ -540,9 +555,9 @@ function Get-Floor {
     # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
     # pre-dedupe spelling produced. `-z` because without it git QUOTES a name holding a non-ASCII
     # byte or a control character (an e-acute prints as `"0095-caf\303\251.md"`), the leading
-    # quote defeats the anchor,
-    # and that number reads FREE. With `-z` each name is NUL-terminated and never quoted; pwsh still
-    # splits native output on newlines, so rejoin on newline before splitting on NUL.
+    # quote defeats the anchor, and that number reads FREE. With `-z` each name is NUL-terminated
+    # and never quoted; pwsh still splits native output on newlines, so rejoin on newline before
+    # splitting on NUL.
     $rx = [regex]::new('^(\d{4})-')
     foreach ($t in $trees) {
         $names = ((Invoke-SweepGit @('ls-tree', '-z', '--name-only', $t)) -join "`n") -split "`0"
@@ -551,6 +566,9 @@ function Get-Floor {
             if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
         }
     }
+    # Once per distinct text, after the sweep: a warning git prints on every call (a config
+    # deprecation, say) would otherwise repeat once per tree, hundreds of times on a big clone.
+    foreach ($w in $sweepWarnings) { [Console]::Error.WriteLine($w) }
 
 
     foreach ($f in (Get-ChildItem $alloc -Filter *.json -EA SilentlyContinue)) {
