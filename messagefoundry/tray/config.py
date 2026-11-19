@@ -56,6 +56,13 @@ _POLL_MIN_S = 1.0
 _POLL_MAX_S = 3600.0
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# The engine's own [api] defaults, which a bind that names only one of host and port keeps for the
+# other (BACKLOG #5936).
+_DEFAULT_BIND_HOST = "127.0.0.1"
+_DEFAULT_BIND_PORT = 8765
+# A wildcard bind accepts on every interface of its family, but it is no address a client can
+# connect to. The loopback of the same family is one the bind accepts on (BACKLOG #5936).
+_WILDCARD_PROBE_HOSTS = {"0.0.0.0": "127.0.0.1", "::": "::1", "[::]": "::1"}  # nosec B104
 _ENGINE_SCHEMES = frozenset({"http", "https"})
 _VALID_HOST = re.compile(r"^[A-Za-z0-9._:\[\]-]{1,255}$")
 _MAX_PATH_LEN = 4096
@@ -309,6 +316,38 @@ def _last_path_option(app_parameters: str, flags: frozenset[str]) -> str | None:
     return found
 
 
+def service_toml_bind(service_toml: dict[str, object] | None) -> tuple[str | None, int | None]:
+    """The API bind host and port the engine's settings file sets, ``None`` for each it leaves unset.
+
+    The file sets the host through ``[security]``, as ``serve`` desugars it: ``local_access_only``
+    pins loopback, and ``listen_address`` is the bind only when ``local_access_only`` is false. It
+    sets the port as ``[api].port``. A value of the wrong type or shape reads as unset, so the
+    default applies, as the tray treats every other untrusted hint. ``serve --host``/``--port`` and
+    ``MEFOR_*`` variables in the service's environment both outrank the file in ``serve``; this
+    reads neither (BACKLOG #5936).
+    """
+    if not service_toml:
+        return None, None
+    host: str | None = None
+    security = service_toml.get("security")
+    if isinstance(security, dict) and (
+        "local_access_only" in security or "listen_address" in security
+    ):
+        local_only = security.get("local_access_only", True)
+        address = security.get("listen_address", _DEFAULT_BIND_HOST)
+        if local_only is True:
+            host = _DEFAULT_BIND_HOST
+        elif local_only is False and isinstance(address, str) and _valid_host(address):
+            host = address
+    port: int | None = None
+    api = service_toml.get("api")
+    if isinstance(api, dict):
+        raw_port = api.get("port")
+        if isinstance(raw_port, int) and not isinstance(raw_port, bool) and 1 <= raw_port <= 65535:
+            port = raw_port
+    return host, port
+
+
 def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -> str | None:
     """A validated ``http(s)://host:port`` URL, or ``None`` if either part is missing/invalid.
 
@@ -322,6 +361,7 @@ def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -
         return None
     # A bare IPv6 literal must be bracketed or the ':'s read as the port separator — `serve
     # --host ::1` would otherwise yield the unparseable "http://::1:8765".
+    host = _WILDCARD_PROBE_HOSTS.get(host, host)
     authority = f"[{host}]" if ":" in host and not host.startswith("[") else host
     return f"{'https' if tls else 'http'}://{authority}:{port}"
 
@@ -432,8 +472,14 @@ def compose_config(
     *,
     engine_tls: bool = True,
     engine_cacert: str | None = None,
+    service_bind: tuple[str | None, int | None] = (None, None),
 ) -> TrayConfig:
     """Merge built-in defaults ← registry hints ← TOML (TOML wins). Pure.
+
+    ``service_bind`` is the host and port the engine's own settings file sets
+    (:func:`service_toml_bind`). ``serve``'s ``--host``/``--port`` in the registry outrank it, and
+    a part neither sets keeps the engine's default, so a bind named only in part still yields the
+    engine's URL (BACKLOG #5936).
 
     ``engine_tls`` scheme-corrects the *registry-derived* URL only; an explicit ``engine_url`` in
     ``tray.toml`` already carries its own scheme and always wins. It defaults to True for the same
@@ -455,9 +501,15 @@ def compose_config(
     # Registry hints (untrusted; validated).
     if reg is not None:
         host_hint, port_hint = parse_serve_args(reg.app_parameters or "")
-        url_hint = build_engine_url(host_hint, port_hint, tls=engine_tls)
-        if url_hint is not None:
-            engine_url = url_hint
+        file_host, file_port = service_bind
+        host_hint = host_hint or file_host
+        port_hint = port_hint or file_port
+        if host_hint is not None or port_hint is not None:
+            url_hint = build_engine_url(
+                host_hint or _DEFAULT_BIND_HOST, port_hint or _DEFAULT_BIND_PORT, tls=engine_tls
+            )
+            if url_hint is not None:
+                engine_url = url_hint
         repo_path = (
             parse_project_root_arg(reg.app_parameters or "")
             or _clean_path_hint(reg.app_directory)
@@ -554,6 +606,7 @@ def load_config(config_dir: Path, reader: RegistryReader | None = None) -> TrayC
         reg,
         engine_tls=engine_serves_https(service_toml),
         engine_cacert=generated_cert_path(service_toml, reg),
+        service_bind=service_toml_bind(service_toml),
     )
 
 

@@ -23,6 +23,7 @@ from messagefoundry.tray.config import (
     load_config,
     parse_serve_args,
     parse_service_config_arg,
+    service_toml_bind,
     service_toml_path,
 )
 
@@ -687,3 +688,92 @@ def test_load_config_an_operator_chain_pins_nothing(tmp_path: Path) -> None:
     cfg = load_config(tmp_path, reader)
     assert cfg.engine_url == "https://127.0.0.1:8765"
     assert cfg.engine_cacert is None
+
+
+# --- BACKLOG #5936: the engine bind from messagefoundry.toml, a partial bind, a wildcard bind -----
+
+
+@pytest.mark.parametrize(
+    ("data", "bind"),
+    [
+        (None, (None, None)),
+        ({}, (None, None)),
+        # local_access_only pins loopback, whatever listen_address says.
+        ({"security": {"local_access_only": True}}, ("127.0.0.1", None)),
+        # listen_address is the bind only with local_access_only explicitly false.
+        (
+            {"security": {"local_access_only": False, "listen_address": "10.0.0.5"}},
+            ("10.0.0.5", None),
+        ),
+        ({"security": {"local_access_only": False}}, ("127.0.0.1", None)),
+        ({"security": {"listen_address": "::1"}}, ("127.0.0.1", None)),
+        (
+            {"security": {"local_access_only": False, "listen_address": "0.0.0.0"}},
+            ("0.0.0.0", None),
+        ),
+        ({"api": {"port": 9443}}, (None, 9443)),
+        # Wrong types and shapes read as unset, so the default applies.
+        ({"security": {"local_access_only": "false", "listen_address": "10.0.0.5"}}, (None, None)),
+        ({"security": {"local_access_only": False, "listen_address": "bad host"}}, (None, None)),
+        ({"api": {"port": True}}, (None, None)),
+        ({"api": {"port": 0}}, (None, None)),
+        ({"api": {"port": "9443"}}, (None, None)),
+        ({"security": "x", "api": "y"}, (None, None)),
+    ],
+)
+def test_service_toml_bind(
+    data: dict[str, object] | None, bind: tuple[str | None, int | None]
+) -> None:
+    assert service_toml_bind(data) == bind
+
+
+def test_build_engine_url_probes_loopback_for_a_wildcard_bind() -> None:
+    """0.0.0.0 and :: accept on loopback too, and neither is an address a client can connect to."""
+    assert build_engine_url("0.0.0.0", 9100, tls=True) == "https://127.0.0.1:9100"
+    assert build_engine_url("::", 9100, tls=True) == "https://[::1]:9100"
+    assert build_engine_url("[::]", 9100, tls=True) == "https://[::1]:9100"
+    assert is_local_engine(build_engine_url("0.0.0.0", 9100) or "") is True
+
+
+def test_compose_a_port_only_bind_keeps_the_default_host() -> None:
+    reg = ServiceRegistryInfo(app_parameters="serve --config C:\\cfg --port 9100")
+    assert compose_config(None, reg).engine_url == "https://127.0.0.1:9100"
+
+
+def test_compose_a_host_only_bind_keeps_the_default_port() -> None:
+    reg = ServiceRegistryInfo(app_parameters="serve --config C:\\cfg --host 0.0.0.0")
+    assert compose_config(None, reg).engine_url == "https://127.0.0.1:8765"
+
+
+def test_compose_the_command_line_bind_outranks_the_settings_file() -> None:
+    reg = ServiceRegistryInfo(app_parameters="serve --host 127.0.0.1 --port 9100")
+    cfg = compose_config(None, reg, service_bind=("10.0.0.5", 9443))
+    assert cfg.engine_url == "https://127.0.0.1:9100"
+    # Each part separately: the file fills only the part the command line leaves unset.
+    reg = ServiceRegistryInfo(app_parameters="serve --port 9100")
+    assert compose_config(None, reg, service_bind=("10.0.0.5", 9443)).engine_url == (
+        "https://10.0.0.5:9100"
+    )
+
+
+def test_compose_tray_toml_engine_url_outranks_the_settings_file_bind() -> None:
+    reg = ServiceRegistryInfo(app_parameters="serve")
+    cfg = compose_config(
+        {"engine_url": "https://127.0.0.1:7000"}, reg, service_bind=("0.0.0.0", 9443)
+    )
+    assert cfg.engine_url == "https://127.0.0.1:7000"
+
+
+def test_load_config_reads_the_bind_from_the_service_toml(tmp_path: Path) -> None:
+    """The row's first case: the bind lives in messagefoundry.toml and AppParameters names none."""
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[security]\nlocal_access_only = false\nlisten_address = "0.0.0.0"\n'
+        '[api]\nport = 9443\ntls_cert_file = "engine.pem"\n',
+        encoding="utf-8",
+    )
+    reader = _FakeReader(
+        ServiceRegistryInfo(app_directory=str(tmp_path), app_parameters="serve --config C:\\cfg")
+    )
+    cfg = load_config(tmp_path, reader)
+    assert cfg.engine_url == "https://127.0.0.1:9443"
+    assert cfg.monitor_only is False
