@@ -5538,8 +5538,29 @@ def _supervise(args: argparse.Namespace) -> int:
     # Each engine shard's store path is derived from the merged [store].path, from --db or the
     # settings (BACKLOG #5817). The load already refused a SQLite path no anchor can place
     # (BACKLOG #5926): the raw --db went in unanchored, so the load tested the value itself.
+    from messagefoundry.config.settings import store_path_names_a_directory
+
     db_base = anchor_under_root(settings.store.path, root, cwd=cwd)
     assert db_base is not None  # [store].path is a str, never None
+    if store_path_names_a_directory(settings.store.path) and not store_path_names_a_directory(
+        db_base
+    ):
+        # Joining under the root drops a trailing separator ("state/" becomes "<root>/state"), and
+        # "" becomes the root itself. Keep the directory shape, so the supervisor's derivation of
+        # several engine shards' names refuses it as it would the value written.
+        db_base += "/"  # a separator on every platform
+    # BACKLOG #5817: [api].port has no range check at load, and every engine shard's port counts
+    # up from it, so a value no socket takes is refused here, before the TLS renewal below writes
+    # anything. How many engine shards the graph has is known only once the supervisor loads it,
+    # so the range several of them need is checked there.
+    if not 0 <= settings.api.port <= 65535:
+        source = "--base-port" if args.base_port is not None else "[api].port"
+        print(
+            f"error: {source} {settings.api.port} is not a port from 0 to 65535; refusing to "
+            "start the fleet.",
+            file=sys.stderr,
+        )
+        return 2
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
     # below: every shard would refuse, and the supervisor would only restart them.

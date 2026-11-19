@@ -248,27 +248,92 @@ def test_supervise_takes_store_path_and_api_port_from_settings_without_flags(
     assert captured == {"db_base": str(root / db_name), "base_port": port}
 
 
-@pytest.mark.parametrize(
-    ("db_base", "names"),
-    [
-        pytest.param("site.db", ["site_a.db", "site_b.db"], id="file"),
-        pytest.param("", ["messagefoundry_a.db", "messagefoundry_b.db"], id="empty"),
-        pytest.param(".", ["messagefoundry_a.db", "messagefoundry_b.db"], id="dot"),
-    ],
-)
-def test_build_shard_specs_names_engine_shards_inside_a_directory_base(
-    db_base: str, names: list[str]
+@pytest.mark.parametrize("db_base", ["", ".", "..", "state/", "data/..", "C:/srv/repo/"])
+def test_build_shard_specs_refuses_a_directory_base_for_several_engine_shards(
+    db_base: str,
 ) -> None:
-    """A server store's [store].path may name a directory such as "" or ".", which has no stem for
-    each engine shard's ``<stem>_<shard>`` name. With --db no longer defaulted (BACKLOG #5817) that
-    path is the base, so the names go inside it rather than raising."""
-    specs = build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
-    assert [Path(s.db_path).name for s in specs] == names
-    folder = Path(db_base) if not Path(db_base).name else Path(db_base).parent
-    assert all(Path(s.db_path).parent == folder for s in specs)
-    # One engine shard keeps the bare base, as a plain `serve` does.
+    """A server store's [store].path may name a directory, which has no stem for each engine
+    shard's ``<stem>_<shard>`` name. With --db no longer defaulted (BACKLOG #5817) that path is the
+    base, so several engine shards are refused; one keeps the bare base, as a plain `serve` does."""
+    with pytest.raises(ValueError, match="names a directory"):
+        build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
     (single,) = build_shard_specs(["a"], config="c", db_base=db_base, base_port=8765)
     assert single.db_path == db_base
+    # A file base still derives each name from its stem.
+    specs = build_shard_specs(["a", "b"], config="c", db_base="site.db", base_port=8765)
+    assert [Path(s.db_path).name for s in specs] == ["site_a.db", "site_b.db"]
+
+
+def test_supervise_refuses_an_api_port_no_socket_takes_before_the_tls_renewal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """[api].port is now the default base (BACKLOG #5817) and has no range check at load, so
+    supervise refuses a value no socket takes before the TLS renewal can write anything."""
+    from messagefoundry import __main__ as cli
+
+    def _no_renewal(*args: object, **kwargs: object) -> Path:
+        raise AssertionError("the TLS renewal ran before the port refusal")
+
+    monkeypatch.setattr(cli, "_renew_api_tls_before_spawning", _no_renewal)
+    monkeypatch.delenv("MEFOR_API_PORT", raising=False)
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[store]\npath = "site.db"\n\n[api]\nport = 70000\n', encoding="utf-8")
+    args = cli._build_parser()[0].parse_args(
+        ["supervise", "--env", "prod", "--service-config", str(svc)]
+    )
+    assert cli._supervise(args) == 2
+    err = capsys.readouterr().err
+    assert "[api].port 70000 is not a port from 0 to 65535" in err, err
+
+
+class _AtTheRenewal(Exception):
+    """Raised in place of the TLS renewal, so a test reads the base the supervisor derived."""
+
+
+@pytest.mark.parametrize("path", ["", "state/", "."])
+def test_supervise_keeps_a_directory_shaped_store_path_through_the_root_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Joining under --project-root drops a trailing separator, and "" becomes the root itself,
+    which would turn a directory into a file stem; the supervisor keeps the shape, so several
+    engine shards are refused (BACKLOG #5817)."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config.settings import store_path_names_a_directory
+    from messagefoundry.store.crypto import generate_key
+    from tests._phi_gate_provisions import (
+        make_syslog_ca_and_crl,
+        setenv_declared_egress,
+        setenv_verified_log_forwarding,
+    )
+
+    seen: list[str] = []
+
+    def _at_renewal(settings: object, db_base: str) -> Path:
+        seen.append(db_base)
+        raise _AtTheRenewal
+
+    monkeypatch.setattr(cli, "_renew_api_tls_before_spawning", _at_renewal)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(tmp_path))
+    setenv_declared_egress(monkeypatch)
+    monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: False)
+    monkeypatch.delenv("MEFOR_STORE_PATH", raising=False)
+    root = tmp_path / "repo"
+    root.mkdir()
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text(
+        f'[store]\nbackend = "postgres"\npath = "{path}"\nserver = "db.example.invalid"\n'
+        'database = "mf"\nusername = "mefor"\n',
+        encoding="utf-8",
+    )
+    argv = ["supervise", "--env", "prod", "--service-config", str(svc)]
+    args = cli._build_parser()[0].parse_args([*argv, "--project-root", str(root)])
+    with pytest.raises(_AtTheRenewal):
+        cli._supervise(args)
+    (db_base,) = seen
+    assert store_path_names_a_directory(db_base), db_base
+    with pytest.raises(ValueError, match="names a directory"):
+        build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
 
 
 @pytest.mark.parametrize(

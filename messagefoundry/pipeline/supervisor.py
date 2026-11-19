@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from messagefoundry.childenv import engine_environment, python_child_argv
-from messagefoundry.config.settings import StoreBackend
+from messagefoundry.config.settings import StoreBackend, store_path_names_a_directory
 from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _config_preflight
@@ -107,11 +107,15 @@ def _shard_db_path(db_base: str, shard: str, *, single: bool) -> str:
     """
     if single:
         return db_base
+    if store_path_names_a_directory(db_base):
+        # A server store's [store].path may name a directory, and with --db no longer defaulted
+        # that path is the base (BACKLOG #5817). It has no stem to derive each engine shard's name
+        # from, so several engine shards are refused rather than named beside it.
+        raise ValueError(
+            "--db or [store].path names a directory (value withheld); several engine shards each "
+            "derive their file name from it, so name a file, e.g. 'messagefoundry.db'"
+        )
     p = Path(db_base)
-    if not p.name:
-        # A server store's [store].path may name a directory such as "" or "." (BACKLOG #5817),
-        # which has no stem to derive from; the engine shards' names then go inside it.
-        p = p / "messagefoundry.db"
     return str(p.with_name(f"{p.stem}_{shard}{p.suffix}"))
 
 
@@ -142,7 +146,7 @@ def build_shard_specs(
     lowest = 0 if single else 1
     if not lowest <= base_port <= 65536 - max(len(ordered), 1):
         raise ValueError(
-            f"base port {base_port} gives {len(ordered)} engine shard(s) ports "
+            f"API port {base_port} gives {len(ordered)} engine shard(s) ports "
             f"{base_port}..{base_port + len(ordered) - 1}; each needs a port from {lowest} to "
             "65535"
         )
