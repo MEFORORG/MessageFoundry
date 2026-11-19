@@ -2547,7 +2547,7 @@ def _holds_lockout_state(user: UserRecord) -> bool:
 
 #: What :meth:`AuthService._clear_after_reauth` did: wrote the reset with its rows, found only a
 #: lockout column changed, was refused by the store or a Vault transit Outage (so the caller's own
-#: row is written softly), or found the account gone, disabled, re-bound, its sessions ended or its
+#: row is written, hard), or found the account gone, disabled, re-bound, its sessions ended or its
 #: record failing its seal, so the re-auth must grant nothing (BACKLOG #5900).
 _ReauthClear = Literal["cleared", "kept", "refused", "denied"]
 
@@ -7964,10 +7964,10 @@ class AuthService:
         was lost at the rotation itself, the lapse check or the re-key (decision
         d20261110T004916856-814db8, Q1), and when the re-auth's deferred lockout clear could not
         establish the account and asked the store to end the rotated session, whether or not that
-        revoke landed, when the password re-auth raised after its proof (BACKLOG #5900), so the
-        row never replaces the exception propagating, and when that re-auth's clear was refused by
-        the store or an Outage, whose fault may refuse this row too. Never for a failed re-proof
-        that finished, whose row stays hard."""
+        revoke landed, and when the password re-auth raised from its stamp onward (BACKLOG
+        #5900), so a store fault on the row does not replace the exception propagating. Hard when
+        that re-auth's clear was refused, so a step-up it grants is never left unaudited. Never
+        soft for a failed re-proof that finished."""
 
         async def row() -> None:
             await self._audit("auth.reauth", actor=actor, detail=detail, client=client)
@@ -15473,9 +15473,9 @@ class AuthService:
         reported. The caller then grants nothing, as the same seal answer did when it raised inside
         the re-proof.
 
-        A store refusal is logged and answered ``"refused"``: the session has already rotated and
-        its new token must still reach the caller, nothing was written, and the caller writes its
-        own row softly, since the fault that refused these rows may refuse that one too. So is a
+        A store refusal is logged and answered ``"refused"``: the session has already rotated,
+        nothing was written, and the caller writes its own row, hard, so the step-up is granted
+        only once that row is in. So is a
         Vault transit Outage, which is paged (ADR 0217's Outage row ends nothing). A seal refusal
         of another kind than the account's record raises, as on the login leg, and so does a
         defect."""
@@ -15540,8 +15540,7 @@ class AuthService:
         (BACKLOG #3025). Refused twice, it is logged and answered False: the elevated session may
         then stay live, unreachable, because the caller answers ``session_lost`` either way and
         its new token is never handed back. The caller records the answer on its ``auth.reauth``
-        row. At the session cap the rotation may already have ended the account's oldest session,
-        and that stays ended."""
+        row."""
         rotated = hash_token(rotated_token)
         for attempt in ("retrying", "and could not end the session it rotated"):
             ended = await write_audit_soft(
@@ -15611,7 +15610,7 @@ class AuthService:
         is granted nothing: the store is asked to end the rotated session, and the answer is
         ``session_lost``. A success that clears a run of failures is labelled
         ``auth.login_after_failures``; that row and the ``auth.reauth`` row commit with the clear.
-        The ``auth.reauth`` row is written even when the ceremony raises after a correct proof."""
+        The ``auth.reauth`` row is written even when the ceremony raises from its stamp onward."""
         if await self.session_steps_up_at_idp(token):
             # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at the
             # IdP and NEVER by a password. Refused before any verify, so the password is not sent to
@@ -15672,8 +15671,6 @@ class AuthService:
         # #5900), as confirm_mfa_enrollment writes its refusal row.
         row_written = False
         finished = False
-        # The clear was refused by the store or an Outage: the row is then written softly.
-        clear_refused = False
 
         def reauth_detail(*, interrupted: bool = False) -> str:
             return _json(
@@ -15683,11 +15680,12 @@ class AuthService:
                     "purpose": purpose,
                     # The session is gone: a good password on a session that vanished
                     # mid-ceremony, or (with session_revoked) one revoked by its re-proof budget.
-                    "session_lost": elevation.session_lost,
+                    # An interrupted ceremony handed back no token, so it reads as lost.
+                    "session_lost": elevation.session_lost or interrupted,
                     # A good password whose purpose grant was refused (a pending session on an
                     # account with a factor). Without it the row reads as a granted re-proof.
-                    # Null when the session was lost before the check ran.
-                    "grant_refused": grant_refused,
+                    # Null when the session was lost before the check ran, or it never ran.
+                    "grant_refused": grant_refused if grant_checked or not ok else None,
                     # This failure spent the session's re-proof budget, so it is revoked
                     # (BACKLOG #1138). A session already gone reads session_lost alone.
                     "session_revoked": proof.session_revoked,
@@ -15773,7 +15771,6 @@ class AuthService:
                         )
                     clear = await self._clear_after_reauth(proof.user, audits)
                     cleared = row_written = clear == "cleared"
-                    clear_refused = clear == "refused"
                     if cleared and flag:
                         # The rows went in with the clear; the notice follows them at once, the
                         # order _record_suspicious_login keeps, so a later raise cannot skip it.
@@ -15809,10 +15806,12 @@ class AuthService:
         finally:
             # A raise after a row that went in with the clear still writes one interrupted row.
             if not row_written or not finished:
-                # Soft on a raise, so the row never replaces the exception propagating, and soft
-                # after a refused clear, whose fault may refuse this row too.
+                # Soft on a raise, so a store fault on the row does not replace the exception
+                # propagating (a defect the soft write re-raises still does). Hard after a refused
+                # clear: the step-up is granted only once its row is in, and a fault that refuses
+                # the row too fails the re-auth closed, its rotated token never handed back.
                 await self._write_reauth_row(
-                    lost=lost or clear_refused or not finished,
+                    lost=lost or not finished,
                     actor=identity.username,
                     detail=reauth_detail(interrupted=not finished),
                     client=client,

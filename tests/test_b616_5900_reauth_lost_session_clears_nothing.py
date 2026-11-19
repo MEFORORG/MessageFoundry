@@ -476,17 +476,20 @@ async def test_a_raise_after_the_rotation_still_writes_the_reauth_row(
         assert len(rows) == before + 1, "a raise after the rotation skipped the auth.reauth row"
         detail = json.loads(str(dict(rows[0])["detail"]))
         assert detail["ok"] is True and detail["interrupted"] is True
+        # No token reached the caller, so the row reads the session as lost.
+        assert detail["session_lost"] is True
         user = await store.get_user("u-bob")
         assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
     finally:
         await store.close()
 
 
-async def test_a_refused_clear_writes_the_reauth_row_softly(
+async def test_a_refused_clear_and_a_refused_row_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The store refuses the clear and then the row too, as one fault would. The row is written
-    softly, so the rotated token still reaches the caller rather than a 500."""
+    hard, so the step-up is never granted unaudited: the re-auth raises, no token is handed back,
+    and nothing is cleared."""
     store = await MessageStore.open(":memory:")
     try:
         service, _, identity, token = await _setup(store)
@@ -497,13 +500,13 @@ async def test_a_refused_clear_writes_the_reauth_row_softly(
 
         async def refuse_reauth_row(action: str, **kwargs: Any) -> Any:
             if action == "auth.reauth":
-                raise OSError("synthetic store refusal")
+                raise OSError("synthetic row refusal")
             return await real_audit(action, **kwargs)
 
         monkeypatch.setattr(store, "record_login_success", refused)
         monkeypatch.setattr(store, "record_audit", refuse_reauth_row)
-        out = await service.reauth(identity, GOOD, token=token)
-        assert out.ok and out.token is not None
+        with pytest.raises(OSError, match="synthetic row refusal"):
+            await service.reauth(identity, GOOD, token=token)
         user = await store.get_user("u-bob")
         assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
     finally:

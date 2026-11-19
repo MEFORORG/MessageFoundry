@@ -20585,11 +20585,11 @@ class MessageStore:
         when the reset is written, so a refused append rolls the reset back; a reset that writes
         nothing appends nothing.
 
-        The conditional form runs in one deferred writer transaction, so the compare and the write
-        see one snapshot: a writer in another process that commits between them fails this write
-        with ``SQLITE_BUSY_SNAPSHOT``, which raises and writes nothing. Deferred rather than
-        ``IMMEDIATE`` so the file's write lock is not held across the seal's Vault transit round
-        trips. The plain form stays a short writer, as every login leg has always called it."""
+        The conditional form runs under ``BEGIN IMMEDIATE``, so no writer in another process can
+        commit between the read the compare uses and the write, and the compare decides that race
+        rather than a refusal. The cost: the file's write lock is held across the seal's Vault
+        transit round trips. The plain form stays a short writer, as every login leg has always
+        called it."""
         now = time.time() if now is None else now
         write = FullAuthenticationWrite(now, expected)
         if expected is None and not audits:
@@ -20598,7 +20598,7 @@ class MessageStore:
                 await self._commit()
             return write.answer(written)
         appended: list[AppendedAuditRow] = []
-        async with _writer_txn(self._db, self._lock):
+        async with _writer_txn(self._db, self._lock, immediate=True):
             written = await self._write_user(user_id, write)
             if written is not None and audits:
                 appended = await self._append_audits(audits, now=now)

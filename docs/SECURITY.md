@@ -3778,8 +3778,9 @@ every backend it writes only while the account row, read inside the write's own 
 holds the six lockout columns, `disabled`, `auth_provider`, `directory_object_id` and
 `session_epoch` of the row the proof decided on. So a failure, a lock, a disable, a re-bind or an
 end-every-session raise that any writer commits after that read, on this engine shard or another,
-leaves the counters as they are. A SQLite writer in another process that commits between the
-compare and the write makes the write fail, which is answered as a refusal below. At least these
+leaves the counters as they are; on SQLite the conditional write takes the write lock before its
+read, so another process cannot commit in between. The compare reads the account row only: a revoke
+of the rotated session itself, after the rotation and before the clear, is not seen. At least these
 outcomes follow, and **only on a re-auth whose clear is due**; a re-auth with nothing to clear makes
 no such check:
 
@@ -3790,14 +3791,16 @@ no such check:
   `auth.reauth` row carries `clear_denied` and `session_ended`, which says whether that revoke
   landed as far as the re-auth saw; when it did not, the rotated session may still exist, its
   token never handed back.
-- A store refusal, or a Vault transit Outage, which is paged, clears nothing and ends nothing; the
-  re-auth keeps its rotated session and writes its `auth.reauth` row softly.
+- A store refusal, or a Vault transit Outage, which is paged, clears nothing and ends nothing. The
+  re-auth then writes its `auth.reauth` row hard: refused too, the re-auth raises and its rotated
+  token is never handed back.
 - The `auth.reauth` row, and the `auth.login_after_failures` row when the clear ends a run of
   failures, are appended in the reset's own transaction, so the counters are not reset without
   them, and a refused append rolls the reset back. The out-of-band notice is sent right after
   that commit.
-- A raise after a correct proof writes an `auth.reauth` row marked `interrupted`, softly, beside
-  any row the clear already committed.
+- A raise from the stamp onward writes an `auth.reauth` row marked `interrupted`, softly, beside
+  any row the clear already committed. A raise inside the re-proof itself, after the password
+  verified, writes no `auth.reauth` row.
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
 (BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP
