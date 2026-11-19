@@ -27,8 +27,21 @@ from harness._async import AsyncRunner
 from harness._console_widgets import ERROR_COLOR
 from messagefoundry.api.auth_models import LoginResponse, ProvidersInfo
 from messagefoundry.apiclient import ApiError, EngineClient
+from messagefoundry.apiclient.client import _REVOKE_LOG_CHARS
 
 log = logging.getLogger(__name__)
+
+
+def _log_text(exc: BaseException, token: str | None = None) -> str:
+    """An error's text, made safe to log the way the client's revoke path makes it.
+
+    The text can carry an engine-supplied detail, which falls back to a whole response body. A
+    bearer is scrubbed out, the text is cut to ``_REVOKE_LOG_CHARS``, and the caller logs it with
+    ``%r`` so a CR or LF in it cannot forge a log line."""
+    text = f"{type(exc).__name__}: {exc}"
+    if token:
+        text = text.replace(token, "[token]")
+    return text[:_REVOKE_LOG_CHARS]
 
 
 class LoginDialog(QDialog):
@@ -45,7 +58,8 @@ class LoginDialog(QDialog):
     directory leaves the dialog responsive rather than frozen. While one is in flight the Sign in
     action is idle, and a close is held until the call answers, then taken as a rejection. A
     sign-in that succeeded after a held close is logged out off the GUI thread before the dialog
-    rejects; a failed logout is logged.
+    rejects; a failed logout is logged, and :attr:`session_may_remain` tells the caller the
+    session may stay valid until it expires.
     """
 
     def __init__(self, client: EngineClient, parent: QWidget | None = None) -> None:
@@ -61,6 +75,9 @@ class LoginDialog(QDialog):
         # verified (WP-14); the monitor's _ensure_auth asks for it.
         self.mfa_required = False
         self.entered_password = ""  # nosec B105 (empty seam init, not a credential)
+        # Set when a cancelled sign-in's session could not be ended: it may stay valid until it
+        # expires, and the caller says so.
+        self.session_may_remain = False
 
         self._username = QLineEdit()
         self._password = QLineEdit()
@@ -113,7 +130,7 @@ class LoginDialog(QDialog):
         try:
             return self._client.providers()
         except ApiError as exc:
-            log.info("sign-in providers unavailable; offering Local only: %s", exc)
+            log.info("sign-in providers unavailable; offering Local only: %r", _log_text(exc))
             return None
 
     def _on_providers(self, providers: ProvidersInfo | None) -> None:
@@ -176,6 +193,9 @@ class LoginDialog(QDialog):
             log.error("sign-in failed unexpectedly", exc_info=exc)
         self._idle()
         if self._close_requested:
+            if isinstance(exc, ApiError):
+                # The error is not shown once the close is taken, so it is logged instead (R8).
+                log.info("sign-in failed after the dialog was closed: %r", _log_text(exc))
             self._close_if_requested()
             return
         if isinstance(exc, ApiError):
@@ -183,8 +203,13 @@ class LoginDialog(QDialog):
         else:
             self._error.setText(f"Sign-in failed: {exc}")
 
-    def _on_cancelled_logout_error(self, exc: BaseException) -> None:
-        log.error("could not end the session of a cancelled sign-in", exc_info=exc)
+    def _on_cancelled_logout_error(self, exc: BaseException, token: str | None) -> None:
+        log.error(
+            "could not end the session of a cancelled sign-in, so it may stay valid until it "
+            "expires: %r",
+            _log_text(exc, token),
+        )
+        self.session_may_remain = True
         self._end_cancelled()
 
     def _end_cancelled(self) -> None:
@@ -197,10 +222,11 @@ class LoginDialog(QDialog):
             # ended here, off the GUI thread like the sign-in, and the dialog then rejects whether
             # or not the logout succeeds. The dialog stays busy meanwhile, so a close still waits.
             self._signing_in = False
+            token = self._client.token
             self._runner.submit(
                 self._client.logout,
                 on_done=lambda _result: self._end_cancelled(),
-                on_error=self._on_cancelled_logout_error,
+                on_error=lambda exc: self._on_cancelled_logout_error(exc, token),
             )
             return
         self._idle()

@@ -10,6 +10,7 @@ timeout. Each fake call here blocks until the test releases it: on the old code 
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Any
@@ -27,6 +28,28 @@ from messagefoundry.api.auth_models import (  # noqa: E402
 from messagefoundry.apiclient import ApiError  # noqa: E402
 
 _WAIT = 10.0
+_TOKEN = "synthetic-session-token"  # nosec B105 (a fake for the gated client)
+# A forged log line, then a body far past the bound. Synthetic text only.
+_HOSTILE = "refused\r\nFORGED harness._login: signed in as admin\n" + "x" * 5000
+
+
+def _one_bounded_quoted_record(
+    caplog: pytest.LogCaptureFixture, *, hostile: bool = True
+) -> logging.LogRecord:
+    """The dialog logged exactly one record for the hostile text: cut to the client's bound and
+    quoted with %r, so no CR or LF reaches the formatted line."""
+    from messagefoundry.apiclient.client import _REVOKE_LOG_CHARS
+
+    logged = [r for r in caplog.records if r.name == "harness._login"]
+    assert len(logged) == 1
+    record = logged[0]
+    assert record.exc_info is None  # a traceback would carry the raw text again
+    line = record.getMessage()
+    assert "\r" not in line and "\n" not in line
+    if hostile:
+        assert "FORGED" in line  # quoted, not dropped
+    assert len(line) < _REVOKE_LOG_CHARS + 200
+    return record
 
 
 @pytest.fixture(scope="module")
@@ -49,19 +72,25 @@ class _GatedClient:
         self.logout_gate = threading.Event()
         self.logout_gate.set()
         self.token: str | None = None
+        self.providers_error: BaseException | None = None
+        self.login_error: BaseException | None = None
 
     def providers(self) -> ProvidersInfo:
         if not self.providers_gate.wait(_WAIT):
             raise TimeoutError("providers gate never opened")
+        if self.providers_error is not None:
+            raise self.providers_error
         return ProvidersInfo(local=True, ad=True)
 
     def login(self, *_a: object, **_kw: object) -> LoginResponse:
         self.login_threads.append(threading.current_thread())
         if not self.login_gate.wait(_WAIT):
             raise TimeoutError("login gate never opened")
-        self.token = "t"
+        if self.login_error is not None:
+            raise self.login_error
+        self.token = _TOKEN
         return LoginResponse(
-            token="t",
+            token=_TOKEN,
             must_change_password=False,
             user=CurrentUser(
                 user_id="u", username="op", auth_provider="local", roles=[], permissions=[]
@@ -177,14 +206,16 @@ def test_an_unexpected_sign_in_error_is_logged(qapp: Any, caplog: pytest.LogCapt
 
 @pytest.mark.parametrize(
     "error",
-    [ApiError("engine refused", status=500), TimeoutError("timed out")],
-    ids=["refused", "stalled"],
+    [
+        ApiError("engine refused", status=500),
+        TimeoutError("timed out"),
+        ApiError(_HOSTILE, status=500),
+    ],
+    ids=["refused", "stalled", "hostile-text"],
 )
 def test_a_failed_logout_after_a_cancelled_sign_in_is_logged_and_still_rejects(
     qapp: Any, caplog: pytest.LogCaptureFixture, error: BaseException
 ) -> None:
-    import logging
-
     client = _GatedClient()
     client.providers_gate.set()
     client.logout_gate.clear()
@@ -206,12 +237,64 @@ def test_a_failed_logout_after_a_cancelled_sign_in_is_logged_and_still_rejects(
             assert finished == []
             client.logout_gate.set()
             assert _until(qapp, lambda: finished == [dialog.DialogCode.Rejected.value])
-        logged = [r for r in caplog.records if r.name == "harness._login"]
-        assert len(logged) == 1
-        assert logged[0].exc_info is not None and logged[0].exc_info[1] is error
+        record = _one_bounded_quoted_record(caplog, hostile=error.args[0] == _HOSTILE)
+        assert type(error).__name__ in record.getMessage()
+        assert "until it expires" in record.getMessage()
+        assert dialog.session_may_remain  # the caller is told, not only the log
         assert client.logout_threads[0] is not threading.main_thread()
         assert client.token is None
     finally:
         client.login_gate.set()
         client.logout_gate.set()
         dialog.done(dialog.DialogCode.Rejected)
+
+
+def test_a_provider_read_refusal_is_logged_bounded_and_quoted(
+    qapp: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = _GatedClient()
+    client.providers_error = ApiError(_HOSTILE, status=503)
+    with caplog.at_level(logging.INFO, logger="harness._login"):
+        dialog = LoginDialog(client)  # type: ignore[arg-type]
+        try:
+            client.providers_gate.set()
+            assert _until(qapp, lambda: not dialog._busy)
+        finally:
+            client.login_gate.set()
+            dialog.done(dialog.DialogCode.Rejected)
+            # The raised error's traceback holds the dialog's frame; drop it so no Qt cycle is left.
+            if client.providers_error is not None:
+                client.providers_error.__traceback__ = None
+    _one_bounded_quoted_record(caplog)
+    assert dialog._provider.count() == 1  # Local only
+
+
+def test_a_sign_in_refusal_after_a_held_close_is_logged_bounded_and_quoted(
+    qapp: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The close is taken when the refusal lands, so nothing shows it: the log is its only trace (R8).
+    client = _GatedClient()
+    client.providers_gate.set()
+    client.login_error = ApiError(_HOSTILE, status=403)
+    dialog = LoginDialog(client)  # type: ignore[arg-type]
+    finished: list[int] = []
+    dialog.finished.connect(finished.append)
+    try:
+        assert _until(qapp, lambda: not dialog._busy)
+        dialog._username.setText("op")
+        dialog._password.setText("pw")
+        dialog._attempt()
+        dialog.reject()
+        with caplog.at_level(logging.INFO, logger="harness._login"):
+            client.login_gate.set()
+            assert _until(qapp, lambda: finished == [dialog.DialogCode.Rejected.value])
+        _one_bounded_quoted_record(caplog)
+        assert client.logout_threads == []  # no session was made, so none is ended
+        assert not dialog.session_may_remain
+    finally:
+        client.login_gate.set()
+        dialog.done(dialog.DialogCode.Rejected)
+        # The raised error's traceback holds the worker's frames; drop it so no Qt cycle is left.
+        if client.login_error is not None:
+            client.login_error.__traceback__ = None
+        client.login_error = None

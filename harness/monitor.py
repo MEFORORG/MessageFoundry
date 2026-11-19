@@ -334,7 +334,14 @@ class MonitorPanel(QWidget):
                 return False
         dialog = LoginDialog(client, self)
         if not dialog.exec():
-            self._set_status("sign-in cancelled")
+            if dialog.session_may_remain:
+                self._set_status(
+                    "sign-in cancelled, but its session could not be ended and may stay valid "
+                    "until it expires",
+                    error=True,
+                )
+            else:
+                self._set_status("sign-in cancelled")
             return False
         if dialog.must_change_password:
             # The token works but is restricted to the password-change routes, so every poll/action

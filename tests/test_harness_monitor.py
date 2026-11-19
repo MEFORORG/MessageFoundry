@@ -442,6 +442,7 @@ class _RefusedClient:
 def _cancelled_dialog(client: object, parent: object = None) -> Any:
     class _Dialog:
         must_change_password = False
+        session_may_remain = False
 
         def exec(self) -> bool:
             return False
@@ -542,12 +543,14 @@ def _settle_login(qapp: Any, dialog: Any) -> None:
     assert not dialog._busy
 
 
+@pytest.mark.parametrize("logout_fails", [False, True], ids=["logged-out", "logout-failed"])
 def test_a_cancel_during_sign_in_wins_and_the_monitor_does_not_connect(
-    qapp: Any, monkeypatch: pytest.MonkeyPatch
+    qapp: Any, monkeypatch: pytest.MonkeyPatch, logout_fails: bool
 ) -> None:
     """A Cancel pressed while the sign-in is in flight is held until it answers. If the sign-in
     then succeeds, the dialog is still rejected: the monitor does not connect, and it ends the
-    session the client was handed."""
+    session the client was handed. When that logout fails, the status bar says the session may
+    stay valid until it expires."""
     from harness import _login
 
     login_gate = threading.Event()
@@ -582,6 +585,8 @@ def test_a_cancel_during_sign_in_wins_and_the_monitor_does_not_connect(
         def logout(self) -> None:
             self.logouts += 1
             self.token = None
+            if logout_fails:
+                raise ApiError("engine unreachable", status=None)
 
         def for_polling(self) -> Any:
             self.polled += 1
@@ -615,7 +620,13 @@ def test_a_cancel_during_sign_in_wins_and_the_monitor_does_not_connect(
     try:
         panel._connect()
         assert panel._client is None
-        assert panel._status.text() == "sign-in cancelled"
+        if logout_fails:
+            assert panel._status.text() == (
+                "sign-in cancelled, but its session could not be ended and may stay valid "
+                "until it expires"
+            )
+        else:
+            assert panel._status.text() == "sign-in cancelled"
         assert clients and clients[0].polled == 0
         assert clients[0].logouts == 1 and clients[0].token is None
     finally:
