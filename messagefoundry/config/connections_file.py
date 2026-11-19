@@ -73,6 +73,7 @@ from messagefoundry.config.wiring import (
     WiringError,
     build_inbound_connection,
     build_outbound_connection,
+    finite_seconds,
     parse_env_setting,
 )
 from messagefoundry.redaction import codec_safe_str
@@ -993,17 +994,14 @@ def _optional_int(table: dict[str, Any], key: str, where: str) -> int | None:
 def _optional_float(table: dict[str, Any], key: str, where: str) -> float | None:
     """A tri-state float: absent/None → ``None`` (inherit the engine default), else the number. Used for
     the per-connection ``strict_timeout_s`` strict-validation backstop (#89), where ``None`` means
-    "inherit ``_STRICT_VALIDATE_TIMEOUT_SECONDS``" and ``<= 0`` disables it. A ``bool`` is rejected
-    (TOML ``true``/``false`` is an int subclass but never a valid duration); an int is accepted and
-    widened to float (TOML ``5`` and ``5.0`` are equivalent seconds)."""
+    "inherit ``_STRICT_VALIDATE_TIMEOUT_SECONDS``" and ``<= 0`` disables it, and for
+    ``waiting_display_delay``. The number is read by :func:`~messagefoundry.config.wiring.finite_seconds`,
+    which holds the rule (BACKLOG #5321): a bool, a non-number, a NaN, an infinity and an integer too
+    large for a float are refused (``tomllib`` spells ``nan`` and ``inf``, and reads an integer of any
+    size); an int is widened to float (TOML ``5`` and ``5.0`` are equivalent seconds)."""
     if key not in table or table[key] is None:
         return None
-    value = table[key]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise WiringError(
-            f"{where}: {key!r} must be a number of seconds (<= 0 disables the backstop)"
-        )
-    return float(value)
+    return finite_seconds(table[key], key=key, where=where)
 
 
 def _enum(enum_cls: type[_E], value: Any, key: str, where: str) -> _E:  # noqa: UP047
