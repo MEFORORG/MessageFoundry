@@ -14,7 +14,17 @@ from pydantic import ValidationError
 from messagefoundry.config.settings import LoggingSettings
 
 
-@pytest.mark.parametrize("host", ["255.255.255.255", "255.255.255.255.", "[255.255.255.255]"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "255.255.255.255",
+        "255.255.255.255.",
+        "[255.255.255.255]",
+        # Code review round 1: the IPv4-mapped spelling reaches the same IPv4 send.
+        "::ffff:255.255.255.255",
+        "[::ffff:255.255.255.255]",
+    ],
+)
 def test_the_limited_broadcast_address_is_refused(host: str) -> None:
     with pytest.raises(ValidationError) as ei:
         LoggingSettings(forward_host=host)
@@ -22,7 +32,9 @@ def test_the_limited_broadcast_address_is_refused(host: str) -> None:
     assert "[logging].forward_host" in text and "broadcast" in text
 
 
-@pytest.mark.parametrize("host", ["siem.local", "10.0.0.255", "192.0.2.10", "255.255.255.254"])
+@pytest.mark.parametrize(
+    "host", ["siem.local", "10.0.0.255", "192.0.2.10", "255.255.255.254", "::ffff:192.0.2.10"]
+)
 def test_a_collector_address_still_loads(host: str) -> None:
     """The negative control: a name, a host address, and an address that only looks like a
     directed subnet broadcast, which this check does not read, all load as before."""

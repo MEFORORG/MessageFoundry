@@ -3119,7 +3119,10 @@ class LoggingSettings(_Section):
         # sets SO_BROADCAST, so the OS refuses each UDP send there (EACCES on Linux) and a spool
         # would hold every record behind it; a stream connect to it fails too. A directed subnet
         # broadcast cannot be told from a host address without the netmask, so it is not read here.
-        if checked is not None and _host_ip_literal(_bare_host(checked)) == _LIMITED_BROADCAST:
+        addr = None if checked is None else _host_ip_literal(_bare_host(checked))
+        if isinstance(addr, ipaddress.IPv6Address):
+            addr = addr.ipv4_mapped  # ::ffff:255.255.255.255 is the same IPv4 send
+        if addr == _LIMITED_BROADCAST:
             raise ValueError(
                 "[logging].forward_host is the broadcast address, which names no collector"
             )
