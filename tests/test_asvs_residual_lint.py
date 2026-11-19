@@ -112,7 +112,9 @@ residual = "The gate reads messagefoundry/__main__.py:1125 but the prose says __
         ),
         ("a css file", "static/app.css:153", [("static/app.css", "153")]),
         ("a cs file", "net-helper/NetOps.cs:85", [("net-helper/NetOps.cs", "85")]),
-        ("a go module file", "sidecar/go.mod:4", [("sidecar/go.mod", "4")]),
+        # Not the retired ECH sidecar tree: test_ech_record_premise refuses that path anywhere
+        # under tests/ unless it carries the retrieval SHA.
+        ("a go module file", "tools/go-proxy/go.mod:4", [("tools/go-proxy/go.mod", "4")]),
     ],
 )
 def test_the_citation_shapes_that_occur_are_detected(
