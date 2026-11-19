@@ -29,8 +29,9 @@ only while the shell has not exited; the sandbox stops on ``EMPTY`` and tries
 :func:`kill_process_group`'s own outcomes only a failed signal is logged: at least a group that
 cannot be read, a group ``pid`` does not lead, and, with ``started_as_leader=True``, the caller's
 own group return ``NOT_SENT`` with nothing logged, and an empty group returns ``EMPTY`` with nothing
-logged. :func:`kill_reaped_leader_group` has no process left to fall back to, and says so in its
-return value; it logs a failed signal and nothing else.
+logged unless the caller passes ``warn_empty=True``, as the DR hook does.
+:func:`kill_reaped_leader_group` has no process left to fall back to, and says so in its return
+value; it logs a failed signal and nothing else.
 
 Standard library only (``ctypes``), so ``pipeline/`` modules may import it.
 """
@@ -288,14 +289,18 @@ class GroupKill(enum.Enum):
         return self is GroupKill.SENT
 
 
-def kill_process_group(pid: int, *, started_as_leader: bool = False) -> GroupKill:
+def kill_process_group(
+    pid: int, *, started_as_leader: bool = False, warn_empty: bool = False
+) -> GroupKill:
     """``SIGKILL`` the process group that ``pid`` leads, on POSIX, and say what happened.
 
     Returns :attr:`GroupKill.SENT` when the signal was sent, :attr:`GroupKill.EMPTY` when
     ``killpg`` found the group empty, and :attr:`GroupKill.NOT_SENT`, signalling nothing, at least
     on Windows, when ``pid`` leads no group of its own, when its group cannot be read, with
     ``started_as_leader=True`` when ``pid`` is the caller's own group, or when the signal fails.
-    Only the failed signal is logged. The module docstring says what each caller does next.
+    Only the failed signal is logged, and, with ``warn_empty=True``, an empty group too, under the
+    line a failed signal wrote before :class:`GroupKill` existed. The DR hook passes it so its
+    empty-group ``WARNING`` stays as it was. The module docstring says what each caller does next.
 
     The leadership check reads ``pid``'s group, so it needs ``pid`` to still be a live process.
     ``started_as_leader=True`` is for a caller that started ``pid`` with
@@ -315,16 +320,22 @@ def kill_process_group(pid: int, *, started_as_leader: bool = False) -> GroupKil
             return GroupKill.NOT_SENT
         if pgid != pid:
             return GroupKill.NOT_SENT
-    return _killpg(pgid)
+    return _killpg(pgid, warn_empty=warn_empty)
 
 
-def _killpg(pgid: int) -> GroupKill:
+def _killpg(pgid: int, *, warn_empty: bool = False) -> GroupKill:
     """``SIGKILL`` group ``pgid``, telling a group found empty (``ESRCH``) from a failed signal."""
     if sys.platform == "win32":  # no process groups; the callers return before this
         return GroupKill.NOT_SENT
     try:
         os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
+    except ProcessLookupError as exc:
+        if warn_empty:
+            log.warning(
+                "could not signal process group %d (%s); kill degrades to a single-process kill",
+                pgid,
+                exc.strerror or type(exc).__name__,
+            )
         return GroupKill.EMPTY  # no process is left in the group
     except OSError as exc:
         # The caller, not this module, decides what follows, so the line says only what is known.
