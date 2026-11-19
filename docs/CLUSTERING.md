@@ -140,12 +140,11 @@ cluster coordinates the parts that must not double-run or interleave:
   On SQL Server the claim/renew is clamped at `[cluster].lease_renew_timeout_seconds`, derived from
   the margin unless set. There its wait for a pooled connection and its statement each get the full
   clamp, rather than sharing one deadline as on Postgres, so a renew can land up to about twice the
-  clamp after it is issued, while the validator compares the clamp alone with the margin. The
-  statement timeout counts whole seconds, so a clamp under 1 s is refused on that backend. A config
-  whose pool wait plus whole-second statement timeout reaches the margin is refused on that backend
-  too, so a fence/TTL pair leaving 2 s or less of margin does not load there at the stock
-  `[store].acquire_timeout`. `serve` logs a warning at start-up when twice the clamp reaches the
-  margin, which the shipped `10 / 20 / 30` does. The `lease_renew_timeout_seconds` row of [`CONFIGURATION.md`](CONFIGURATION.md) gives the
+  clamp after it is issued, while the cluster section's own margin check compares the clamp alone
+  with the margin. The statement timeout counts whole seconds, so a clamp under 1 s is refused on
+  that backend, and the engine also checks the pool wait plus the statement against the margin,
+  stepping a derived clamp down or refusing the config. `serve` logs a warning at start-up when
+  twice the clamp reaches the margin, which the shipped `10 / 20 / 30` does. The `lease_renew_timeout_seconds` row of [`CONFIGURATION.md`](CONFIGURATION.md) gives the
   arithmetic and what the clamp leaves unbounded.
 - **Store-checked leader epoch (fencing token).** The self-fence above is *temporal* — it relies on a
   paused/partitioned old leader noticing it has fallen behind and demoting itself before the lease TTL

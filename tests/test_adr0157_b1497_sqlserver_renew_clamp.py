@@ -972,8 +972,12 @@ def test_the_settings_reach_is_what_the_store_applies(
 def test_a_clamp_inside_the_margin_whose_two_windows_reach_it_is_refused(tmp_path: Path) -> None:
     """The defect: 5.0 < 9.0 passes ClusterSettings._renew_fits_the_margin, but on SQL Server the
     claim waits up to 5 s for a connection and then runs a 5 s statement, 10 s past its issue."""
-    with pytest.raises(ValidationError, match=r"run 10 s .* reaches the demotion detection margin"):
+    with pytest.raises(ValidationError) as caught:
         _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 5.0\n")
+    text = str(caught.value)
+    assert "for up to 10 s, which reaches the demotion detection margin (9 s)" in text
+    # Set by the operator, and a 1 s clamp would fit, so lowering it is offered.
+    assert "Lower lease_renew_timeout_seconds or unset it" in text
 
 
 def test_the_same_clamp_loads_on_postgres(tmp_path: Path) -> None:
@@ -997,9 +1001,57 @@ def test_a_tight_pair_whose_derived_clamp_cannot_fit_is_refused_on_sqlserver(
         "heartbeat_seconds = 1.0\nleader_fence_timeout_seconds = 4.0\n"
         "leader_lease_ttl_seconds = 6.0\n"
     )
-    with pytest.raises(ValidationError, match=r"= 1, derived\).*margin \(1\.2 s\)"):
+    with pytest.raises(ValidationError) as caught:
         _load(tmp_path, _SQLSERVER + timings)
+    text = str(caught.value)
+    assert "lease_renew_timeout_seconds is not set, and no clamp of at least 1 s" in text
+    assert "margin (1.2 s)" in text
+    # Derived, so the message never tells the operator to lower a value they did not write.
+    assert "Lower lease_renew_timeout_seconds" not in text
     assert _load(tmp_path, _POSTGRES + timings).cluster.lease_renew_timeout_seconds == 1.0
+
+
+def test_a_set_clamp_at_a_margin_no_clamp_fits_names_widening_alone(tmp_path: Path) -> None:
+    """Fence 4.0 / TTL 6.0 with 1.0 set by hand: even the 1 s floor runs as 2 s of a 1.2 s margin,
+    so lowering is not offered."""
+    timings = (
+        "heartbeat_seconds = 1.0\nleader_fence_timeout_seconds = 4.0\n"
+        "leader_lease_ttl_seconds = 6.0\nlease_renew_timeout_seconds = 1.0\n"
+    )
+    with pytest.raises(ValidationError) as caught:
+        _load(tmp_path, _SQLSERVER + timings)
+    text = str(caught.value)
+    assert "even a 1 s clamp, the SQL Server floor, runs for 2 s" in text
+    assert "Lower lease_renew_timeout_seconds" not in text
+
+
+@pytest.mark.parametrize(
+    ("fence", "ttl", "expected"),
+    [
+        (10.0, 15.0, 1.0),  # margin 4.0: derived 2.0 runs as 2 + 2 s, so it steps to 1
+        (20.0, 27.0, 2.0),  # margin 6.0: derived 3.0 runs as 3 + 3 s
+        (20.0, 31.0, 4.0),  # margin 10.0: derived 5.0 (the ceiling) runs as 5 + 5 s
+        (20.0, 30.0, 4.5),  # control: the stock margin 9.0 keeps 4.5, which runs as 4.5 + 4 s
+    ],
+)
+def test_a_derived_clamp_steps_down_to_fit_an_even_margin(
+    tmp_path: Path, fence: float, ttl: float, expected: float
+) -> None:
+    """An even margin derives half of itself, which on SQL Server runs as exactly the margin. Such a
+    pair must load at a smaller whole-second clamp rather than be refused: the operator set no
+    clamp, and lowering all three timings proportionally is the documented way to tighten them.
+    Postgres is the control: there the derived value stands."""
+    timings = (
+        f"heartbeat_seconds = 5.0\nleader_fence_timeout_seconds = {fence}\n"
+        f"leader_lease_ttl_seconds = {ttl}\n"
+    )
+    s = _load(tmp_path, _SQLSERVER + timings)
+    clamp = s.cluster.lease_renew_timeout_seconds
+    assert clamp == expected
+    margin = _detection_margin_seconds(fence, ttl)
+    assert _sqlserver_renew_reach_seconds(clamp, 30.0, 30) < margin
+    pg = _load(tmp_path, _POSTGRES + timings).cluster.lease_renew_timeout_seconds
+    assert pg == min(5.0, margin / 2)
 
 
 # --- the start-up warning on the SQL Server bound --------------------------------
