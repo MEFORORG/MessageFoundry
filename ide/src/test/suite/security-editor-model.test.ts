@@ -421,7 +421,8 @@ suite("security editor host checks", () => {
     // THE CONTROL: every switch at once, one value of each type, and null.
     const updates: Record<string, unknown> = {};
     for (const f of FIELDS) {
-      updates[f.key] = f.type === "int" ? 0 : f.type === "string" ? "x" : f.type === "tristate" ? null : true;
+      // An int at its own minimum (the session limits take 1), or 0 where it declares none.
+      updates[f.key] = f.type === "int" ? (f.min ?? 0) : f.type === "string" ? "x" : f.type === "tristate" ? null : true;
     }
     assert.strictEqual(saveUpdatesProblem(updates, FIELDS), null);
     assert.strictEqual(saveUpdatesProblem({}, FIELDS), null);
@@ -442,6 +443,8 @@ suite("security editor host checks", () => {
       ["a string as a number", { listen_address: 0 }],
       ["an int as text", { delete_message_bodies_after_days: "0" }],
       ["a negative int", { delete_message_bodies_after_days: -1 }],
+      ["a session limit below 1", { max_session_hours: 0 }],
+      ["an idle limit below 1", { sign_out_after_idle_minutes: 0 }],
       ["a fraction", { max_session_hours: 1.5 }],
       ["an unsafe int", { max_session_hours: 2 ** 60 }],
       ["NaN", { max_session_hours: Number.NaN }],
