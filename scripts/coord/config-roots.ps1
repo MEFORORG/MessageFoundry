@@ -278,33 +278,37 @@ function Get-RootUnavailability {
         effective_from = $null
         marker_path    = $path
     }
-    # A DIRECTORY AT THE MARKER PATH IS NOT AN ABSENT MARKER. Somebody put something there, so it takes
-    # the damaged-marker verdict below rather than the silent AVAILABLE arm.
     if (-not (Test-Path -LiteralPath $path)) { return $o }
 
+    # One cause per damaged shape, so the operator is told what to fix. Every one reads MALFORMED.
+    $damage = $null
     $doc = $null
     $flagCount = 0
-    if (Test-Path -LiteralPath $path -PathType Leaf) {
-        # -NoEnumerate: unrolled, a one-element array would reach the object check below as its element.
-        # A read or parse that throws leaves $doc $null, which the object check refuses with the rest.
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        # A DIRECTORY AT THE MARKER PATH IS NOT AN ABSENT MARKER. Somebody put something there, so it
+        # takes the damaged-marker verdict rather than the silent AVAILABLE arm.
+        $damage = 'is a directory, not a file; remove it by hand'
+    }
+    else {
         try {
             $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+            # -NoEnumerate: unrolled, a one-element array would reach the object check below as its element.
             $doc = $raw | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
-            # A REPEATED `unavailable` KEY IS DAMAGED TOO. ConvertFrom-Json keeps the last value
-            # silently, so `{"unavailable": true, "unavailable": false}` read as AVAILABLE. JsonDocument
-            # keeps every top-level property, so it can count them; a case-variant repeat already throws
-            # in ConvertFrom-Json. Options match ConvertFrom-Json's leniency, and a parse it still
-            # refuses lands in the catch, so the marker reads MALFORMED rather than counted as clean.
+            # A REPEATED `unavailable` KEY IS DAMAGED TOO. ConvertFrom-Json keeps the last value silently,
+            # so `{"unavailable": true, "unavailable": false}` read as AVAILABLE. Newtonsoft's reader is
+            # the grammar ConvertFrom-Json parses with, so it accepts exactly what that accepted, and it
+            # yields every property name; depth 1 is the marker's own keys. A case-variant repeat already
+            # throws in ConvertFrom-Json.
             if ($doc -is [System.Management.Automation.PSCustomObject]) {
-                $opts = [System.Text.Json.JsonDocumentOptions]@{ CommentHandling = 'Skip'; AllowTrailingCommas = $true }
-                $jd = [System.Text.Json.JsonDocument]::Parse([string]$raw, $opts)
-                try {
-                    foreach ($p in $jd.RootElement.EnumerateObject()) { if ($p.Name -ieq 'unavailable') { $flagCount++ } }
+                $r = [Newtonsoft.Json.JsonTextReader]::new([System.IO.StringReader]::new([string]$raw))
+                $r.MaxDepth = $null
+                $r.DateParseHandling = 'None'
+                while ($r.Read()) {
+                    if ($r.TokenType -eq 'PropertyName' -and $r.Depth -eq 1 -and $r.Value -ieq 'unavailable') { $flagCount++ }
                 }
-                finally { $jd.Dispose() }
             }
         }
-        catch { $doc = $null }
+        catch { $damage = "could not be read as JSON ($($_.Exception.Message -replace '\s+', ' '))" }
     }
     # A MARKER THAT PARSES TO ANYTHING BUT AN OBJECT IS DAMAGED TOO. An empty or whitespace-only file
     # and JSON null parse to $null without throwing, and an array or a scalar parses cleanly, so the
@@ -318,22 +322,30 @@ function Get-RootUnavailability {
     # meant a cancellation, and the collector suppresses publishing only on UNAVAILABLE, so reading it as
     # MALFORMED would let a cancelled account publish. Every other non-boolean is MALFORMED.
     $flag = $null
-    $truthy = $false
-    if ($doc -is [System.Management.Automation.PSCustomObject]) { $flag = $doc.PSObject.Properties['unavailable'] }
+    if (-not $damage) {
+        if ($doc -isnot [System.Management.Automation.PSCustomObject]) { $damage = 'is not a JSON object' }
+        elseif ($flagCount -gt 1) { $damage = "repeats the 'unavailable' key" }
+        else { $flag = $doc.PSObject.Properties['unavailable'] }
+    }
     if ($flag) {
         $v = $flag.Value
-        if ($v -is [string]) { $truthy = $v -ieq 'true' }
+        # A JSON boolean is the answer as written; `false` is the explicit all-clear below.
+        if ($v -is [bool]) { if (-not $v) { return $o } }
         # The three types ConvertFrom-Json gives a JSON number.
-        elseif ($v -is [long] -or $v -is [double] -or $v -is [System.Numerics.BigInteger]) { $truthy = $v -ne 0 }
+        elseif ($v -is [long] -or $v -is [double] -or $v -is [System.Numerics.BigInteger]) {
+            if ($v -eq 0) { $damage = "carries an 'unavailable' flag of 0, which is no JSON boolean" }
+        }
+        elseif ($v -is [string] -and $v -ieq 'true') { }
+        else { $damage = "carries an 'unavailable' flag that is no JSON boolean" }
     }
-    if ($doc -isnot [System.Management.Automation.PSCustomObject] -or $flagCount -gt 1 -or ($flag -and $flag.Value -isnot [bool] -and -not $truthy)) {
+    # A MARKER SAYING `unavailable: false` IS AN ANSWER, not a broken file, which is why it returned
+    # AVAILABLE above. It is what -Clear could leave behind, and honouring it is what lets an operator
+    # record "checked, still live" explicitly.
+    if ($damage) {
         $o.state = 'MALFORMED'
-        $o.reason = "the availability marker at $path could not be read, or is not a JSON object with one boolean 'unavailable', so this account is treated as UNAVAILABLE rather than assumed spendable"
+        $o.reason = "the availability marker at $path $damage, so this account is treated as UNAVAILABLE rather than assumed spendable"
         return $o
     }
-    # A MARKER SAYING `unavailable: false` IS AN ANSWER, not a broken file. It is what -Clear could
-    # leave behind, and honouring it is what lets an operator record "checked, still live" explicitly.
-    if ($flag -and $flag.Value -is [bool] -and -not $flag.Value) { return $o }
 
     $o.reason = [string]$doc.reason
     if (-not $o.reason) { $o.reason = 'no reason recorded in the marker' }

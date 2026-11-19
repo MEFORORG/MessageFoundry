@@ -82,7 +82,11 @@ function Get-ClaimHostToken {
     # value. It is coord-root.ps1's Get-CoordHost rule, read inline rather than through Get-BoxKeyHost:
     # that loader throws when coord-root.ps1 is missing, which this file's no-throw contract forbids,
     # and it caches the first answer, which would hide a later change from the tests that pin this.
-    $n = [Environment]::MachineName.ToLowerInvariant()
+    # MachineName is documented to throw InvalidOperationException when the name cannot be read. That
+    # falls back to the empty name rather than throwing: the worst a shared token does is the visible
+    # stranded/ sweep above, and a throw here would break the no-throw contract.
+    $n = ''
+    try { $n = [Environment]::MachineName.ToLowerInvariant() } catch [System.InvalidOperationException] { $n = '' }
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { $b = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($n)) }
     finally { $sha.Dispose() }

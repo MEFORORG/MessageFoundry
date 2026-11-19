@@ -3788,6 +3788,12 @@ _WELL_FORMED = {
     "flag-big": ('{"unavailable": 123456789012345678901234567890}', "UNAVAILABLE"),
     "flag-true-string": ('{"unavailable": "true"}', "UNAVAILABLE"),
     "flag-true-upper": ('{"unavailable": "TRUE"}', "UNAVAILABLE"),
+    # ConvertFrom-Json's own grammar: comments, single quotes, a bare key, a raw newline in a string
+    # and a trailing comma. The repeat count must accept what the parse accepted.
+    "lenient-grammar": (
+        "{'unavailable': true, /* c */ reason: 'cancelled\nby owner',}",
+        "UNAVAILABLE",
+    ),
     # A nested flag is not the marker's own, so it cannot count as a repeat.
     "nested-flag": ('{"unavailable": false, "detail": {"unavailable": true}}', "AVAILABLE"),
 }
@@ -3816,6 +3822,9 @@ def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_p
                 f"$out['{name}'] = (Get-RootUnavailability -StateDir '{tmp_path / name}').state"
                 for name in names
             ),
+            # The reason names the cause, so the operator knows what to fix.
+            f"$out['directory-reason'] = (Get-RootUnavailability -StateDir '{tmp_path / 'directory'}').reason",
+            f"$out['flag-repeated-reason'] = (Get-RootUnavailability -StateDir '{tmp_path / 'flag-repeated'}').reason",
             "$out | ConvertTo-Json -Compress | Write-Output",
         ]
     )
@@ -3828,6 +3837,8 @@ def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_p
     )
     assert proc.returncode == 0, proc.stderr
     states = json.loads(proc.stdout)
+    assert "is a directory" in states.pop("directory-reason"), states
+    assert "repeats the 'unavailable' key" in states.pop("flag-repeated-reason"), states
     expected = dict.fromkeys(_NOT_AN_OBJECT, "MALFORMED")
     expected.update({name: state for name, (_, state) in _WELL_FORMED.items()})
     expected.update({"directory": "MALFORMED", "absent": "AVAILABLE"})
