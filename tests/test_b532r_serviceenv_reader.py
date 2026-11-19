@@ -82,10 +82,75 @@ def test_a_retired_keys_list_on_the_line_below_an_empty_name_refuses(key: str) -
 def test_an_empty_store_key_item_above_an_ordinary_item_does_not_refuse(key: str) -> None:
     """The control: an empty key is harmless when the next item sets an ordinary variable, or is
     empty-named like Windows' own ``=C:`` entries."""
-    for follower in ("MEFOR_AI_ENVIRONMENT=prod", "ProgramFiles(x86)=C:\\x", "=C:=C:\\x"):
+    followers = (
+        "MEFOR_AI_ENVIRONMENT=prod",
+        "ProgramFiles(x86)=C:\\x",
+        "=C:=C:\\x",
+        "HTTP_PROXY=",  # an ordinary variable set to nothing still ends the value above
+        "MEFOR_SECRETS_DIRECTORY=",
+        "MIIBshort==",  # padded base64 that is not a store key
+    )
+    for follower in followers:
         posture = _read([f"{key}=", follower])
         assert posture.listed_keys == (), follower
         assert service_env_refusal(posture) is None, follower
+
+
+@pytest.mark.parametrize("item", [f'"{_KEY_B64}"', f",{_KEY_B64},{_KEY_B64}"])
+def test_a_quoted_or_comma_led_key_item_continues_the_empty_key(item: str) -> None:
+    key = KEY_CLASS_NAMES[1]
+    assert _read([f"{key}=", item]).listed_keys == (key,)
+    assert _read([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\n{item}"]).listed_keys == (key,)
+
+
+def test_the_refusal_says_to_remove_the_strings_a_value_runs_on_into() -> None:
+    key = KEY_CLASS_NAMES[0]
+    posture = _read([f"{key}=", _KEY_B64])
+    assert posture.value_runs_on
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "runs on into the strings after it in the same registry value" in refusal
+    one_line = _read([f"{key}={_KEY_B64}"])
+    assert not one_line.value_runs_on
+    assert "runs on into" not in str(service_env_refusal(one_line))
+
+
+def test_a_broken_value_name_item_does_not_continue_an_empty_key() -> None:
+    """``MEFOR_VALUE_A<LF>MEFOR_VALUE_B=1`` starts a variable under the whole-string reading, so
+    the empty store key above it stays empty."""
+    posture = _read([f"{KEY_CLASS_NAMES[0]}=", "MEFOR_VALUE_A\nMEFOR_VALUE_B=1"])
+    assert posture.listed_keys == ()
+    assert posture.listed_value_names == ("MEFOR_VALUE_B",)
+
+
+def test_a_path_form_oidc_key_does_not_take_the_next_item_as_its_value() -> None:
+    """Only an empty value runs on, so a path stays a path, as before vault BACKLOG #5394."""
+    pem = "-----BEGIN " + "PRIVATE KEY-----"
+    posture = _read(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\k.pem", f"{pem} x"])
+    assert posture.listed == ()
+    empty = _read(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=", f"{pem} x"])
+    assert empty.listed_directory_names == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
+
+
+def test_an_empty_env_value_whose_value_is_the_next_item_is_not_called_empty() -> None:
+    posture = _read(["MEFOR_VALUE_X=", "synthetic"])
+    assert posture.listed_value_names == ("MEFOR_VALUE_X",)
+    assert posture.empty_value_names == ()
+
+
+def test_a_later_line_of_a_continuing_item_is_still_read() -> None:
+    key = KEY_CLASS_NAMES[0]
+    posture = _read([f"{key}=", f"{_KEY_B64}\nMEFOR_VALUE_X=1"])
+    assert posture.listed_keys == (key,)
+    assert posture.listed_value_names == ("MEFOR_VALUE_X",)
+
+
+def test_a_continued_variable_replaces_its_empty_reading_in_place() -> None:
+    key = KEY_CLASS_NAMES[0]
+    read = serviceenv._variables([(_EXTRA, f"{key}="), (_EXTRA, _KEY_B64)])
+    keyed = [v for v in read if v.written == key]
+    assert len(keyed) == 2  # the line reading and the whole-string reading, each once
+    assert all(v.value.strip() and v.runs_on for v in keyed)
 
 
 def test_an_item_continues_only_the_value_its_own_registry_value_ends_on() -> None:
@@ -164,9 +229,11 @@ def test_the_value_count_is_grouped_by_registry_value_not_by_line() -> None:
 # --- item 7: no value in a repr --------------------------------------------------------------------
 
 
-def test_a_variable_repr_holds_no_value() -> None:
-    variable = serviceenv._Variable(_EXTRA, "MEFOR_STORE_PASSWORD", "synthetic-repr-value")
+def test_a_variable_repr_holds_no_value_and_no_name() -> None:
+    """The text before an equals sign may be key material, as a line of ``<key>,<key>`` is."""
+    variable = serviceenv._Variable(_EXTRA, _KEY_B64[:43], "synthetic-repr-value")
     assert "synthetic-repr-value" not in repr(variable)
+    assert _KEY_B64[:43] not in repr(variable)
 
 
 def test_a_posture_repr_holds_no_registry_name() -> None:
@@ -186,6 +253,8 @@ def test_a_posture_repr_holds_no_registry_name() -> None:
         ("MEFOR_VALUE_A\n{key}=v", 2),  # the first line is not an entry
         ("\n\nMEFOR_AI_ENVIRONMENT=prod\n{key}=v", 4),  # blank lines above count
         ("\n{key}=v", 2),  # the key is the first non-blank line
+        # Empty on its own line, so the whole-string reading is the one kept.
+        ("\n{key}=\nMEFOR_AI_ENVIRONMENT=prod", 2),
     ],
 )
 def test_the_refusal_names_the_line_of_the_string_that_sets_the_key(entry: str, line: int) -> None:
@@ -216,6 +285,11 @@ def test_a_line_whose_value_is_only_equals_signs_and_blanks_continues_the_value(
 # --- item 11: no wording that goes stale on merge --------------------------------------------------
 
 
+_STALE_BASELINE = re.compile(r"``main``|\bthe head\b", re.IGNORECASE)
+
+
 def test_the_module_names_no_branch_or_head_as_its_baseline() -> None:
-    source = inspect.getsource(serviceenv)
-    assert not re.search(r"``main``|\bthe head\b", source)
+    # The positive control: the pattern finds the wording it is for.
+    assert _STALE_BASELINE.search("as ``main`` read it")
+    assert _STALE_BASELINE.search("The head read the rest")
+    assert not _STALE_BASELINE.search(inspect.getsource(serviceenv))
