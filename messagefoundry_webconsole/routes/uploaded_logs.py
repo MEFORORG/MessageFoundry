@@ -222,11 +222,17 @@ _ENGINE_DAMAGED_DETAIL = (
 #: no removal, as the engine's text does not: some damaged files are refused by the delete too.
 _DAMAGED_CAUSE = (
     "The engine found the file damaged, so it does not read or serve it. No encryption key and no "
-    "command repairs it. It may be deleted, but the engine may refuse that too."
+    "command repairs it."
 )
-BROWSE_DAMAGED_NOTICE = f"{_BROWSE_LEAD} {_DAMAGED_CAUSE}"
-RESEND_DAMAGED_NOTICE = f"{_RESEND_LEAD} {_DAMAGED_CAUSE}"
-DELETE_DAMAGED_NOTICE = f"{_DELETE_LEAD} {_DAMAGED_CAUSE}"
+_MAY_DELETE = "It may be deleted, but the engine may refuse that too."
+BROWSE_DAMAGED_NOTICE = f"{_BROWSE_LEAD} {_DAMAGED_CAUSE} {_MAY_DELETE}"
+RESEND_DAMAGED_NOTICE = f"{_RESEND_LEAD} {_DAMAGED_CAUSE} {_MAY_DELETE}"
+#: A refused delete is not answered with advice to delete. Where uploaded-file retention is on,
+#: the engine's prune removes a damaged file by its age on disk.
+DELETE_DAMAGED_NOTICE = (
+    f"{_DELETE_LEAD} {_DAMAGED_CAUSE} Deleting it again is refused the same way. Where "
+    "uploaded-file retention is on, the engine removes it once it is old enough on disk."
+)
 
 #: Three more engine answers the routes used to let escape as JSON (BACKLOG #1169, PR 1506
 #: follow-up A). Each is this module's own text. The engine's detail for each names config keys and

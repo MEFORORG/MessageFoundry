@@ -363,9 +363,12 @@ def _read_plain_text(path: Path, limit: int | None = None) -> str:
         else:
             if info.st_size > limit:
                 raise _OversizedFileError(limit)
-            # Sized by the file, not the limit, so a small file costs a small buffer. One byte
-            # more, so a file that grew past the limit since the fstat is still refused.
+            # Sized by the file, not the limit, so a small file costs a small buffer. A file
+            # that grew since the fstat is read on, up to one byte past the limit, so it is
+            # either read whole or refused, never cut short.
             data = handle.read(info.st_size + 1)
+            if info.st_size < len(data) <= limit:
+                data += handle.read(limit + 1 - len(data))
             if len(data) > limit:
                 raise _OversizedFileError(limit)
     return data.decode("utf-8")
@@ -376,6 +379,17 @@ def _read_plain_text(path: Path, limit: int | None = None) -> str:
 #: store writes neither. Stripped, a sealed sidecar that gained them still reads as sealed, and is
 #: never mistaken for a damaged one, which the prune ages on disk.
 _SIDECAR_PAD = " \t\r\n"
+
+
+def _is_refused_read(exc: BaseException) -> bool:
+    """Whether ``exc``, raised reading an upload's part, is the file's own refusal: a permission
+    the engine lacks, a part that is not a plain file, or a link the open would not follow
+    (BACKLOG #5388 added item 2). Any other ``OSError``, such as too many open files or an I/O
+    error, may pass on a retry, so it is never answered as a damaged file, which an operator
+    may then delete."""
+    if isinstance(exc, PermissionError | _NotPlainError):
+        return True
+    return isinstance(exc, OSError) and exc.errno == errno.ELOOP
 
 
 def _unpadded(text: str) -> str:
@@ -572,8 +586,9 @@ def _refuse_still_sealed(text: str, part: str) -> None:
     keyless cipher does with a value it cannot open. Such a file is not damaged: the key it was
     sealed under recovers it. So it must take the cipher-declined path, which the prune never
     removes, rather than the damaged one, which the prune ages on disk (BACKLOG #5387, #5388). No
-    sidecar JSON and no base64 body ever starts with the marker, so a sound file never trips it."""
-    if _unpadded(text).startswith(MARKER_PREFIX):
+    sidecar JSON and no base64 body ever starts with the marker, so a sound file never trips it.
+    A sidecar's padding is skipped, as its reader skips it; a body has none (BACKLOG #5387)."""
+    if (_unpadded(text) if part == "sidecar" else text).startswith(MARKER_PREFIX):
         raise CipherError(_STILL_SEALED.format(part=part))
 
 
@@ -2593,8 +2608,10 @@ class UploadStore:
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
             except (OSError, UnicodeDecodeError, _MalformedSidecarError) as exc:
-                # An OSError too, such as a permission the engine lacks, which answered a server
-                # error (BACKLOG #5388 added item 2).
+                # An OSError only when it is the file's own refusal, such as a permission the
+                # engine lacks, which answered a server error (BACKLOG #5388 added item 2).
+                if isinstance(exc, OSError) and not _is_refused_read(exc):
+                    raise
                 defect = codec_safe_str(exc)
             # Raised after the handler, so the error holding the file is on no chain.
             raise _damaged(file_id, "sidecar", defect)
@@ -2620,8 +2637,10 @@ class UploadStore:
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
             except (OSError, UnicodeError, binascii.Error) as exc:
-                # Not readable on disk (BACKLOG #5388 added item 2), not UTF-8, not ASCII, or not
-                # the strict base64 the body is stored as.
+                # Refused on disk (BACKLOG #5388 added item 2), not UTF-8, not ASCII, or not the
+                # strict base64 the body is stored as.
+                if isinstance(exc, OSError) and not _is_refused_read(exc):
+                    raise
                 defect = codec_safe_str(exc)
             raise _damaged(file_id, "body", defect)
 
@@ -2674,8 +2693,11 @@ class UploadStore:
                 except CipherError as exc:
                     refusal = str(exc)
                 except (OSError, UnicodeDecodeError, _MalformedSidecarError) as exc:
-                    # An OSError too, such as a permission the engine lacks, which answered a
-                    # server error (BACKLOG #5388 added item 2). It is never classed.
+                    # An OSError only when it is the file's own refusal, such as a permission the
+                    # engine lacks, which answered a server error (BACKLOG #5388 added item 2).
+                    # It is never classed.
+                    if isinstance(exc, OSError) and not _is_refused_read(exc):
+                        raise
                     defect = codec_safe_str(exc)
                     classed = isinstance(exc, UnicodeDecodeError | _OversizedFileError)
             # Damaged, never trusted, and raised after the handler, so the error holding the file
@@ -2696,6 +2718,8 @@ class UploadStore:
                     except FileNotFoundError as exc:
                         raise UploadNotFoundError(file_id) from exc
                     except OSError as exc:
+                        if not _is_refused_read(exc):
+                            raise
                         defect = codec_safe_str(exc)
                     if defect is not None:
                         raise _damaged(file_id, "sidecar", defect)
@@ -2999,6 +3023,14 @@ class UploadStore:
             )
             return _Half.SKIPPED
         del stored  # the write holds its own copy, so free this file-sized buffer before it
+        if kind == "meta" and len(sealed.encode("utf-8")) > _SIDECAR_LIMIT:
+            # The readers refuse a sidecar this long as damaged, which the prune ages on disk, so
+            # the plaintext one is left as it is and counted a skip (BACKLOG #5387 added item 1).
+            _log.warning(
+                "uploaded file %s (meta): skipped, sealed it would be larger than a sidecar can be",
+                fid,
+            )
+            return _Half.SKIPPED
         try:
             _atomic_write_text(self._root, path, sealed, seen=info)
         except _ChangedUnderReseal as changed:
@@ -3110,9 +3142,10 @@ class UploadStore:
     def _count_unsealed_sync(self) -> tuple[int, int]:
         """How many uploads have a non-blank half with no ``mfenc:`` marker, as two counts: those
         ``rotate-key`` can seal, and those it cannot (:meth:`_unsealable_sync`). Reads the first
-        ``len(MARKER_PREFIX)`` characters of each file, past a sidecar's byte-order mark and
-        whitespace, and a plaintext sidecar's body whole. A file that cannot be read is not counted
-        here; the listing scan names it on its own."""
+        ``len(MARKER_PREFIX)`` characters of each body, and of each sidecar past its byte-order
+        mark and whitespace, reading no more of a sidecar than :data:`_SIDECAR_LIMIT`. Each file is
+        opened by :func:`_open_plain`, so a link is not followed and a FIFO does not block startup.
+        A file that cannot be read is not counted here; the listing scan names it on its own."""
         count = unsealable = 0
         for fid, sidecar in self._iter_sidecars():
             try:
@@ -3121,16 +3154,17 @@ class UploadStore:
                 continue
             for path in paths:
                 try:
-                    with path.open(encoding="utf-8") as handle:
-                        head = handle.read(len(MARKER_PREFIX))
-                        if path.name.endswith(_META_SUFFIX):
-                            # The reader's padding is skipped, so a padded sealed sidecar is not
-                            # counted as plaintext (BACKLOG #5387 added item 1).
-                            while head and not _lstrip_pad(head):
-                                head = handle.read(len(MARKER_PREFIX))
-                            head = _lstrip_pad(head)
-                            head += handle.read(len(MARKER_PREFIX) - len(head))
-                except (OSError, UnicodeDecodeError):
+                    if path.name.endswith(_META_SUFFIX):
+                        # The reader's padding is skipped, so a padded sealed sidecar is not
+                        # counted as plaintext, and one the reader refuses as oversized is not
+                        # counted at all (BACKLOG #5387 added item 1).
+                        head = _unpadded(_read_plain_text(path, _SIDECAR_LIMIT))
+                        head = head[: len(MARKER_PREFIX)]
+                    else:
+                        handle, _ = _open_plain(path)
+                        with io.TextIOWrapper(handle, encoding="utf-8") as text_handle:
+                            head = text_handle.read(len(MARKER_PREFIX))
+                except (OSError, UnicodeDecodeError, _MalformedSidecarError):
                     continue
                 if head and head != MARKER_PREFIX:
                     if self._unsealable_sync(fid, sidecar) is None:

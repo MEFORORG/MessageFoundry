@@ -9,6 +9,7 @@ not a server error. Synthetic data only."""
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -346,3 +347,66 @@ async def test_a_body_stored_under_a_larger_upload_limit_is_still_served(tmp_pat
         data=data, filename="a.txt", uploader="op", uploader_id="u-op"
     )
     assert await UploadStore(root, make_cipher(None), max_bytes=10).read_bytes(meta.file_id) == data
+
+
+# --- review round 2 --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("part", ["meta", "blob"])
+async def test_a_transient_os_error_is_not_answered_as_a_damaged_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, part: str
+) -> None:
+    # Review round 2: too many open files may pass on a retry, so it propagates rather than read
+    # as damage an operator may then delete for good.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    busy = store._root / f"{meta.file_id}.{part}"  # noqa: SLF001
+
+    def _emfile(path: Any, flags: int, *args: Any) -> int:
+        if Path(path) == busy:
+            raise OSError(errno.EMFILE, "Too many open files", str(path))
+        return os.open(path, flags, *args)
+
+    monkeypatch.setattr(uploads, "os", _OsWith(_emfile))
+    if part == "meta":
+        with pytest.raises(OSError) as raised:
+            await store.get_meta(meta.file_id)
+        assert not isinstance(raised.value, UploadDamagedError)
+        with pytest.raises(OSError):
+            await store.delete(meta.file_id)
+        assert busy.exists() and _blob(store, meta.file_id).exists()
+    else:
+        with pytest.raises(OSError):
+            await store.read_bytes(meta.file_id)
+
+
+async def test_the_startup_count_does_not_count_an_oversized_padded_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review round 2: the count read past any amount of padding, and called a sidecar the reader
+    # refuses as oversized a sealed one. It is now read as the reader reads it, or not counted.
+    key = generate_key()
+    store = _store(tmp_path / "uploads", key)
+    meta = await _saved(store)
+    sidecar = _sidecar(store, meta.file_id)
+    sealed = sidecar.read_text(encoding="utf-8")
+    monkeypatch.setattr(uploads, "_SIDECAR_LIMIT", len(sealed) + 64)
+    sidecar.write_text(" " * 32 + sealed, encoding="utf-8")
+    assert await store.warn_if_unsealed() == 0
+    sidecar.write_text("x" * (len(sealed) + 128), encoding="utf-8")
+    assert await store.warn_if_unsealed() == 0
+
+
+async def test_rotate_key_leaves_a_sidecar_that_would_seal_past_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review round 2: sealing grows a sidecar by a third, so a plaintext one under the cap could be
+    # written past it, then refused by every read and aged out by the prune.
+    root = tmp_path / "uploads"
+    meta = await _saved(_store(root))
+    sidecar = root / f"{meta.file_id}.meta"
+    plain = sidecar.read_text(encoding="utf-8")
+    monkeypatch.setattr(uploads, "_SIDECAR_LIMIT", len(plain) + 8)
+    result = await _store(root, generate_key()).reseal_to_active()
+    assert result.skipped == 1
+    assert sidecar.read_text(encoding="utf-8") == plain
