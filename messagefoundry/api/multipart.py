@@ -160,10 +160,11 @@ class _Part:
         )
 
 
-#: What may follow a boundary on its delimiter line (RFC 2046): the close marker ``--``, or
-#: optional transport padding (spaces and tabs) and the line break. The end of the body is admitted
-#: too, so a body cut short right after a delimiter is refused as unclosed, not read as content.
-_DELIMITER_TAIL = re.compile(rb"--|[ \t]*\r?\n|[ \t]*\Z")
+#: What may follow a boundary on its delimiter line (RFC 2046): an optional close marker ``--``,
+#: optional transport padding (spaces and tabs), then the line break. The end of the body stands in
+#: for the line break, so a body cut short right after a delimiter is refused as unclosed, not read
+#: as content.
+_DELIMITER_TAIL = re.compile(rb"(?:--)?[ \t]*(?:\r?\n|\Z)")
 
 
 def _next_delimiter(body: bytes, delim: bytes, start: int) -> int:
@@ -233,7 +234,7 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             first = _NOT_CRLF.search(body, start, end)
             start = end if first is None else first.start()
         if nxt == -1 and start == end:
-            break  # a last delimiter line with no close marker and nothing after it: not a part
+            break  # a last delimiter line with nothing after it: refused below as unclosed
         # A part with no header separator is skipped below, but it is counted: each one costs a
         # find, so the cap has to bound them too, or a body of empty parts would walk unbounded.
         count += 1

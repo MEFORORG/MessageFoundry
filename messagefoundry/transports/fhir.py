@@ -1569,12 +1569,17 @@ class FhirDestination(DestinationConnector):
         headers = self._headers
         if self._token_provider is not None:
             # Acquire a real SMART token so reachability reflects the actual credentials. BACKLOG
-            # #5795: a token request that cannot be built is a classified DeliveryError.
-            bearer = mint_bearer(
-                self._token_provider.access_token,
-                f"FHIR {_redact_url(self.base_url)} probe",
-                probe=True,
-            )
+            # #5795: a token request that cannot be built is a classified DeliveryError, and a
+            # NegativeAckError from the token hop (a refused Digest challenge) is retyped to one,
+            # since a probe raises only a plain DeliveryError, as the REST probe does.
+            try:
+                bearer = mint_bearer(
+                    self._token_provider.access_token,
+                    f"FHIR {_redact_url(self.base_url)} probe",
+                    probe=True,
+                )
+            except NegativeAckError as exc:
+                raise DeliveryError(str(exc)) from exc
             headers = {**self._headers, "Authorization": f"Bearer {bearer}"}
         try:
             req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
@@ -1604,7 +1609,7 @@ class FhirDestination(DestinationConnector):
         except NegativeAckError as exc:
             if exc.credential_fault and self._token_provider is not None:
                 self._token_provider.invalidate()
-            raise
+            raise DeliveryError(str(exc)) from exc  # BACKLOG #5795: as the REST probe retypes it
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the probe body is discarded, but draining it unbounded would let a

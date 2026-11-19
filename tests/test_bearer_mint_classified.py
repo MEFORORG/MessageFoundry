@@ -115,14 +115,15 @@ async def test_an_unbuildable_token_request_fails_the_probe_as_a_delivery_error(
     assert opener.calls == 0
 
 
-async def test_the_rest_probe_retypes_the_length_gate_refusal() -> None:
-    """BACKLOG #5797: the probe's send-time length gate raises NegativeAckError; the probe raises
-    only a plain DeliveryError, and still drops the over-length cached token."""
-    dest = _rest()
+@pytest.mark.parametrize("make", [_rest, _fhir], ids=["rest", "fhir"])
+async def test_the_probe_retypes_the_length_gate_refusal(make: object) -> None:
+    """BACKLOG #5795, #5797: the probe's send-time length gate raises NegativeAckError; the probe
+    raises only a plain DeliveryError, and still drops the over-length cached token."""
+    dest = make()  # type: ignore[operator]
     provider = _LongToken()
     dest._token_provider = provider
     opener = _Opener()
-    dest._opener = opener  # type: ignore[assignment]
+    dest._opener = opener
     with pytest.raises(DeliveryError) as err:
         await dest.test_connection()
     assert type(err.value) is DeliveryError
@@ -137,11 +138,11 @@ class _RefusingRequest:
         raise ValueError("unknown url type")
 
 
-async def test_a_rest_request_urllib_cannot_build_is_a_configuration_fault(
+async def test_a_rest_request_urllib_cannot_build_is_classified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #5797: building the delivery Request sat outside the classifying try. What urllib
-    can refuse there is the configured URL, the same for every queued row."""
+    """BACKLOG #5797: building the delivery Request sat outside the classifying try. Its ValueError
+    is now a permanent bad-request-value, as the open's ValueError arm does."""
     dest = _rest()
     opener = _Opener()
     dest._opener = opener  # type: ignore[assignment]
@@ -151,7 +152,7 @@ async def test_a_rest_request_urllib_cannot_build_is_a_configuration_fault(
     assert (err.value.code, err.value.permanent, err.value.config_fault) == (
         "bad-request-value",
         True,
-        True,
+        False,
     )
     assert opener.calls == 0
 

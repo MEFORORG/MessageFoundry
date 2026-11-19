@@ -463,7 +463,7 @@ def test_an_oversized_field_refusal_copies_nothing_of_the_field() -> None:
     assert peak < _BIG // 4, f"the refusal allocated {peak} bytes for a {len(body)}-byte body"
 
 
-def test_a_trailing_delimiter_line_without_a_close_marker_is_not_a_part() -> None:
+def test_a_trailing_delimiter_line_without_a_close_marker_is_refused() -> None:
     """#5520 item 22: a body at the part cap that ends with a delimiter line but no ``--`` close
     marker is not over the cap, since that last line has no part after it to count. Since BACKLOG
     #5787 it is refused for the missing close marker instead, not for the part count."""
@@ -510,7 +510,7 @@ def test_a_line_that_only_starts_with_the_boundary_is_content() -> None:
     """BACKLOG #5787: a delimiter is the boundary alone on its line, or the close marker. A content
     line that merely starts with the boundary text used to split the file part, cutting it short
     while the body still closed, so the cut file was kept as if whole."""
-    content = f"line1\r\n--{_B}x more\r\n--{_B}\tpadded-not\r\nend".encode()
+    content = f"line1\r\n--{_B}x more\r\n--{_B}\tpadded-not\r\n--{_B}--not-a-close\r\nend".encode()
     body = _body([_FILE_PART_HEAD + content])
     file = parse_single_file_upload(
         f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024

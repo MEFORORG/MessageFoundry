@@ -422,12 +422,12 @@ def mint_bearer(access_token: Callable[[], str], label: str, *, probe: bool = Fa
     """Call a bearer provider's ``access_token`` for ``label``'s hop (BACKLOG #5795, #5797).
 
     The provider raises ``DeliveryError`` for a failed mint, but a token request it cannot build or
-    send raises a plain ``ValueError``: at least an over-length token URL or proxy credential
+    encode raises a plain ``ValueError``: at least an over-length token URL or proxy credential
     (``enforce_outbound_length_limits``) and a header value ``http.client`` refuses. That is the
     connection's fault, the same for every queued row, so for a delivery it becomes a permanent
     configuration fault: under the default ``credential_fault_policy`` the delivery worker stops
-    the lane and keeps the queue. A ``probe`` raises a plain :class:`DeliveryError` instead, the
-    only failure type a test-connection probe raises.
+    the lane and keeps the queue. A ``probe`` raises a plain :class:`DeliveryError` instead: a
+    REST or FHIR test-connection probe raises only that type.
 
     Named by class only, and raised outside the handler so nothing chains the ValueError: an
     ``http.client`` header refusal quotes the value, which on the token hop can be the proxy
@@ -436,7 +436,7 @@ def mint_bearer(access_token: Callable[[], str], label: str, *, probe: bool = Fa
         return access_token()
     except ValueError as exc:
         text = (
-            f"{label} could not build or send its bearer-token request "
+            f"{label} could not build or encode its bearer-token request "
             f"({type(exc).__name__}); check the connection's token settings"
         )
     if probe:
@@ -3432,14 +3432,11 @@ class RestDestination(DestinationConnector):
                 )
             )
         except ValueError as exc:
-            # BACKLOG #5797: the open's ValueError arm below, but a configuration fault: urllib
-            # checks no header here, so what it can refuse is the configured URL (or the ECH
-            # sidecar's), the same for every queued row.
+            # BACKLOG #5797: classified as the open's ValueError arm below classifies it.
             raise NegativeAckError(
                 f"REST {_redact_url(self.url)} rejected an invalid request value",
                 code="bad-request-value",
                 permanent=True,
-                config_fault=True,
             ) from exc
         # ASVS 4.2.5: bound what ACTUALLY ships. The construction gate saw only the static config; the
         # per-message headers, the SMART bearer and the JWS headers above are all added after it.
