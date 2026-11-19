@@ -26,36 +26,23 @@ silently deleted by the next GUI/CLI save (the #234 data-loss bug this closes).
 from __future__ import annotations
 
 import contextlib
-import logging
 import math
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, time
-from functools import cache
 from pathlib import Path
 from typing import Any
 
 import tomlkit
-from pydantic import BaseModel
+from tomlkit.items import Float, Trivia
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.connections_file import (
     _INBOUND_KEYS,
     _OUTBOUND_KEYS,
-    _TRANSPORTS,
     CONNECTIONS_FILE_NAME,
-    _classify,
-    _factory_signature,
-    _is_env_marker,
     validating_candidate,
 )
-from messagefoundry.config.models import (
-    BatchConfig,
-    BuildupThreshold,
-    RetryPolicy,
-    Schedule,
-    StallThreshold,
-)
-from messagefoundry.config.wiring import WiringError, inbound, outbound
+from messagefoundry.config.wiring import WiringError
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 
 # Scalar (and array — TOML requires a table's key-values before its sub-table headers) fields,
@@ -143,8 +130,6 @@ assert "direction" not in _SCALAR_FIELDS + _SUB_TABLES
 
 Validate = Callable[[Path], None]
 
-_log = logging.getLogger(__name__)
-
 
 @contextlib.contextmanager
 def locked(config_dir: str | Path) -> Iterator[None]:
@@ -185,30 +170,72 @@ def list_connections(config_dir: str | Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for direction in ("inbound", "outbound"):
         for table in doc.get(direction, []):
-            entry = {key: _jsonable(value) for key, value in table.unwrap().items()}
+            plain = table.unwrap()
+            where = f"{direction} connection {plain.get('name')!r}"
+            entry = {key: _jsonable(value, where) for key, value in plain.items()}
             entry["direction"] = direction
             out.append(entry)
     return out
 
 
-def _jsonable(value: Any) -> Any:
+#: The key of the tag a non-finite float is listed as, ``{"$toml": "inf"}``. TOML's inf / -inf /
+#: nan have no JSON literal: json.dumps would print a bare Infinity or NaN token that a strict
+#: parser (the IDE's JSON.parse) refuses, and a plain string would lose the type (BACKLOG #5778).
+NON_FINITE_TAG = "$toml"
+
+#: The spellings the tag carries, mapped to the float each one decodes to.
+_NON_FINITE: dict[str, float] = {
+    "inf": math.inf,
+    "-inf": -math.inf,
+    "nan": math.nan,
+    "-nan": -math.nan,
+}
+
+
+def _non_finite_spelling(value: float) -> str:
+    if math.isnan(value):
+        return "-nan" if math.copysign(1.0, value) < 0 else "nan"
+    return "inf" if value > 0 else "-inf"
+
+
+def _is_tag_shaped(value: Any) -> bool:
+    return isinstance(value, dict) and len(value) == 1 and NON_FINITE_TAG in value
+
+
+def _jsonable(value: Any, where: str = "connection") -> Any:
     """Canonicalize a TOML-unwrapped value for the list boundary: ``datetime``/``date``/``time``
-    become ISO-8601 strings (``HH:MM:SS`` for a time), a non-finite float (TOML ``inf`` / ``nan``)
-    its string form, containers recurse, everything else passes verbatim, so the result is
-    ``json.dumps``-able as standard JSON, with no bare ``Infinity`` or ``NaN`` token."""
+    become ISO-8601 strings (``HH:MM:SS`` for a time), a non-finite float becomes the tag
+    ``{"$toml": "inf"}`` (``-inf``, ``nan``, ``-nan``), containers recurse, and everything else
+    passes verbatim, so the result is standard JSON with no bare ``Infinity`` or ``NaN`` token.
+
+    A table in the file whose only key is ``$toml`` would list as a tag and come back as a float,
+    so it is refused here rather than listed ambiguously."""
+    if _is_tag_shaped(value):
+        raise WiringError(
+            f"{where}: a table whose only key is {NON_FINITE_TAG!r} is reserved for the "
+            "non-finite number tag and cannot be listed; rename the key"
+        )
     if isinstance(value, dict):
-        return {key: _jsonable(item) for key, item in value.items()}
+        return {key: _jsonable(item, where) for key, item in value.items()}
     if isinstance(value, list):
-        return [_jsonable(item) for item in value]
+        return [_jsonable(item, where) for item in value]
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
     if isinstance(value, float) and not math.isfinite(value):
-        # TOML's inf / -inf / nan have no JSON literal: json.dumps would print a bare Infinity or
-        # NaN token a strict parser (the IDE's JSON.parse) refuses. On the way back in,
-        # _decode_non_finite turns the string into the float again before upsert compares and
-        # writes. A null instead would drop the key
-        # on re-save, turning an `inf` (off) alert age back into its default (BACKLOG #5778).
-        return str(value)
+        return {NON_FINITE_TAG: _non_finite_spelling(value)}
+    return value
+
+
+def _decode_tags(value: Any) -> Any:
+    """``value`` with each exact non-finite tag (one key, ``$toml``, one of the four spellings)
+    decoded to its float, at any depth. Nothing else is decoded: a plain ``"inf"`` string stays a
+    string, and the read schema refuses it in a float field as it always has."""
+    if _is_tag_shaped(value) and value[NON_FINITE_TAG] in _NON_FINITE:
+        return _NON_FINITE[value[NON_FINITE_TAG]]
+    if isinstance(value, dict):
+        return {key: _decode_tags(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_tags(item) for item in value]
     return value
 
 
@@ -224,7 +251,11 @@ def upsert_connection(
     before persisting; raises :class:`WiringError` on bad input (including any key the direction's
     read schema does not accept — never silently dropped, #234) or a config that wouldn't load (a
     duplicate vs. a code-first name, unknown router, egress-denied host, …) — leaving
-    ``connections.toml`` untouched."""
+    ``connections.toml`` untouched.
+
+    A non-finite float arrives as the tag :func:`_jsonable` lists it as, and is decoded here,
+    before anything checks a value's type. A plain ``"inf"`` string is never decoded."""
+    obj = _decode_tags(obj)
     _validate_input(obj)
     path = _path(config_dir)
     with locked(config_dir):
@@ -237,8 +268,7 @@ def upsert_connection(
             aot = tomlkit.aot()
             doc[direction] = aot
         index = next((i for i, table in enumerate(aot) if table.get("name") == obj["name"]), None)
-        existing = aot[index].unwrap() if index is not None else None
-        new_table = _build_table(_decode_non_finite(obj, existing))
+        new_table = _build_table(obj)
         if index is not None:
             # Update the EXISTING table object key-wise. Assigning ``aot[index] = new_table``
             # swaps the whole table out, and tomlkit discards the trivia around it: the edited
@@ -325,126 +355,6 @@ def _validate_input(obj: Any) -> None:
             raise WiringError(
                 f"{direction} connection {obj['name']!r}: [{key}] must be a table (a JSON object)"
             )
-
-
-#: The non-finite spellings decoded by TYPE alone. "nan" is not one: a fresh NaN in a float field
-#: stays refused, as on main (``nan > 0`` is false, so it would switch a backstop off unseen). A
-#: "nan" decodes only where the file already holds a NaN there.
-_BY_TYPE: dict[str, float] = {"inf": math.inf, "-inf": -math.inf}
-
-#: The sub-tables whose keys a pydantic model types. ``settings`` is typed by the transport factory,
-#: and ``metadata`` by nothing. tests/test_connections_cli.py pins this against _SUB_TABLES.
-_POLICY_MODELS: dict[str, type[BaseModel]] = {
-    "retry": RetryPolicy,
-    "buildup": BuildupThreshold,
-    "stall": StallThreshold,
-    "batch": BatchConfig,
-    "schedule": Schedule,
-}
-
-
-@cache
-def _parameter_annotations(factory: Callable[..., Any]) -> dict[str, Any]:
-    """``factory``'s parameter annotations, resolved; empty, logged once, when they will not."""
-    signature = _factory_signature(factory)
-    if signature is None:
-        _log.warning(
-            "connections editor: %s annotations did not resolve; its float fields are not "
-            "decoded by type",
-            getattr(factory, "__name__", factory),
-        )
-        return {}
-    return {name: param.annotation for name, param in signature.parameters.items()}
-
-
-def _field_annotations(key: str, transport: Any) -> dict[str, Any]:
-    """The annotation of each key inside sub-table ``key``, from the schema that reads it."""
-    if key in _POLICY_MODELS:
-        return {name: field.annotation for name, field in _POLICY_MODELS[key].model_fields.items()}
-    if key == "settings" and isinstance(transport, str) and transport in _TRANSPORTS:
-        return _parameter_annotations(_TRANSPORTS[transport])
-    return {}
-
-
-def _accepted(annotations: tuple[Any, ...]) -> list[Any]:
-    return [accepted for accepted in map(_classify, annotations) if accepted is not None]
-
-
-def _decode_non_finite(obj: dict[str, Any], existing: dict[str, Any] | None) -> dict[str, Any]:
-    """``obj`` with the strings :func:`_jsonable` lists a non-finite float as decoded back to the
-    float, so upsert compares and writes the float (BACKLOG #5778).
-
-    ``"inf"`` / ``"-inf"`` decode where the schema types the value as a float: the ``inbound()`` /
-    ``outbound()`` keyword, the policy model field, the transport's settings parameter, an env()
-    reference's ``default`` under one, or a typed mapping or array element. All three spellings
-    decode where ``existing`` (the same-named table in the file) holds that float, matched by key,
-    or by value within an array. An untyped value with no such match, such as a cloned ``metadata``
-    float, stays a string, and so does a string the file already holds."""
-    direction = obj["direction"]
-    top = _parameter_annotations(inbound if direction == "inbound" else outbound)
-    transport = obj.get("transport")
-    prior = existing or {}
-    return {
-        key: _decode_value(
-            value,
-            (top.get(key),),
-            prior.get(key),
-            _field_annotations(key, transport) if key in _SUB_TABLES else None,
-        )
-        for key, value in obj.items()
-    }
-
-
-def _decode_value(
-    value: Any, annotations: tuple[Any, ...], prior: Any, fields: dict[str, Any] | None = None
-) -> Any:
-    if isinstance(value, str):
-        if _is_listed_as(prior, value):
-            return prior  # the float the file holds, a NaN's sign included
-        typed_float = any(float in accepted.scalars for accepted in _accepted(annotations))
-        if value in _BY_TYPE and prior != value and typed_float:
-            return _BY_TYPE[value]
-        return value
-    if isinstance(value, list):
-        items = tuple(
-            item for accepted in _accepted(annotations) for item in accepted.sequence_items
-        )
-        prior_items = prior if isinstance(prior, list) else []
-        # Match a listed string to the file's float by VALUE, not index: an insert or delete
-        # shifts every position after it.
-        pool = [item for item in prior_items if isinstance(item, float) and not math.isfinite(item)]
-        out = []
-        for index, element in enumerate(value):
-            element_prior = prior_items[index] if index < len(prior_items) else None
-            if isinstance(element, str):
-                match = next((i for i, item in enumerate(pool) if str(item) == element), None)
-                element_prior = pool.pop(match) if match is not None else None
-            out.append(_decode_value(element, items, element_prior))
-        return out
-    if isinstance(value, dict):
-        prior_map = prior if isinstance(prior, dict) else {}
-        values = tuple(
-            item for accepted in _accepted(annotations) for item in accepted.mapping_values
-        )
-        env_ref = _is_env_marker(value)
-
-        def child(name: str) -> tuple[Any, ...]:
-            if fields is not None:
-                return (fields.get(name),)
-            if env_ref:
-                return annotations if name == "default" else ()
-            return values
-
-        return {
-            name: _decode_value(item, child(name), prior_map.get(name))
-            for name, item in value.items()
-        }
-    return value
-
-
-def _is_listed_as(prior: Any, value: str) -> bool:
-    """Is ``value`` the string :func:`_jsonable` lists the non-finite float ``prior`` as?"""
-    return isinstance(prior, float) and not math.isfinite(prior) and str(prior) == value
 
 
 def _build_table(obj: dict[str, Any]) -> Any:
@@ -535,6 +445,8 @@ def _toml_value(value: Any) -> Any:
         for item in value:
             array.append(_toml_value(item))
         return array
+    if isinstance(value, float) and math.isnan(value) and math.copysign(1.0, value) < 0:
+        return Float(value, Trivia(), "-nan")  # tomlkit renders a bare -nan float as `nan`
     return value
 
 
