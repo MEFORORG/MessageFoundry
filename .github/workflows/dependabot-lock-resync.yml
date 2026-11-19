@@ -104,11 +104,15 @@ jobs:
             echo "::warning title=lock-resync skipped (misconfiguration)::This run WAS triggered by dependabot[bot], yet LOCK_RESYNC_APP_ID is empty. The App credentials must live under Settings > Secrets and variables > *Dependabot* (not Actions) for a Dependabot-triggered run to read them. Skipping the re-export; DEP-1 lock sync is still enforced by the pip-audit job in security.yml."
           fi
 
-      # MINTED FIRST, BEFORE ANY STEP RUNS ON THE DEPENDABOT-CHANGED TREE. The mint step holds the App's
-      # long-lived PRIVATE KEY, which must never share a runner with code an earlier step could have
-      # planted. The short-lived token it mints then exists while uv and the repository script run, but
-      # is in neither their environment nor .git/config (BACKLOG #5477). Separating the two fully, with
-      # the re-export in a job that holds no secret, is a larger change than that row.
+      # MINTED FIRST, BEFORE ANY STEP RUNS ON THE DEPENDABOT-CHANGED TREE. Ordering is all this buys:
+      # the mint runs before any code from that tree could tamper with it. It does NOT keep the App's
+      # long-lived PRIVATE KEY off the runner while that code runs. The key is a secret of this job, so
+      # it is on the runner for the whole job, and create-github-app-token's post step (which revokes
+      # the token) runs at job end with the key in its inputs, after uv and the repository script ran.
+      # The short-lived token it mints is live on the runner from here on too; what BACKLOG #5477 holds
+      # is that only the push step is handed it, and that it is never written to .git/config. The full
+      # fix is a separate job that runs the re-export with no secret at all and hands its output to a
+      # push-only job; that is a follow-up, not built here.
       - name: Mint a scoped GitHub App token
         id: app-token
         if: steps.creds.outputs.present == 'true'
@@ -128,8 +132,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           # NO CREDENTIAL IN THE CHECKOUT (BACKLOG #5477). The fetch uses the run's read-only token,
           # and nothing is persisted into .git/config, so uv and the repository script below run on a
-          # Dependabot-changed tree with no write credential on disk to read. The App token reaches
-          # the push step alone, through that step's environment.
+          # Dependabot-changed tree with no write credential in the checkout's git config. The App
+          # token is handed to the push step alone, through that step's environment; it and the App
+          # key are still on the runner for the whole job (see the mint step above).
           persist-credentials: false
 
       - name: Set up uv
@@ -221,9 +226,12 @@ jobs:
           # the required checks (DEP-1, ci.yml) re-run on the new commit; a GITHUB_TOKEN push would
           # leave them pending and the PR unmergeable.
           # The credential goes in as an http.extraheader through a third GIT_CONFIG_* entry, set
-          # on the push command alone: never on a command line or in the process table, and never
-          # written to .git/config. printf is a shell builtin and base64 reads stdin, so the token is
-          # in no argv. The encoded form is masked too, since the runner masks only the raw token.
+          # on the push command alone, and is never written to .git/config. printf is a shell builtin
+          # and base64 reads stdin, so the token is in no command's argv. It IS in this step's
+          # environment (APP_TOKEN, and the encoded header in git's), which any process running as the
+          # runner user can read while the step runs; the step-level env keeps it out of every other
+          # step's environment, not out of reach of the user. The encoded form is masked too, since
+          # the runner masks only the raw token.
           auth="$(printf 'x-access-token:%s' "${APP_TOKEN}" | base64 -w0)"
           echo "::add-mask::${auth}"
           # Fully qualified: the checkout is a detached SHA, so HEAD has no branch to infer a name from.

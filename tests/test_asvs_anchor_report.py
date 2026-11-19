@@ -499,23 +499,43 @@ def test_it_runs_on_a_bare_interpreter_from_an_unrelated_directory(tmp_path: Pat
 # --------------------------------------------------------------------------------------------
 
 
+_PR_EVENTS = frozenset({"pull_request", "pull_request_target"})
+
+
 def _evaluate_job_if(
-    expression: str, *, event_name: str, vault_repo: str, ref: str = "refs/heads/main"
+    expression: str,
+    *,
+    event_name: str,
+    vault_repo: str,
+    ref: str = "refs/heads/main",
+    extra: dict[str, str] | None = None,
 ) -> bool:
-    """Evaluate the report job's ``if:`` for one event, without a runner, through the evaluator
-    tests/test_dependabot_automerge_guardrails.py already holds (it refuses any construct it does
-    not understand, so an edit reaching for one fails here instead of reading as true)."""
+    """Evaluate the report job's ``if:`` for one event, without a runner, through the shared
+    evaluator in tests/_workflow_contexts.py. It refuses any construct it does not understand, so an
+    edit reaching for one fails here instead of reading as true.
+
+    ITS LIMIT: a context name not seeded here reads as the empty string, so this sees a term only on
+    a name it seeds. It seeds the event name, the ref, the vault variable and, on a pull request
+    event, a non-empty ``github.head_ref`` and ``github.base_ref`` as a real run has; any other name
+    a loosened condition reaches for (``github.actor``, ``github.event.*``) reads empty and could pass
+    unseen. ``extra`` seeds more, and overrides these.
+    """
     # Imported here, not at module scope, so the stdlib instrument tests above never depend on that
     # module's imports.
-    from tests.test_dependabot_automerge_guardrails import _evaluate_expression
+    from tests._workflow_contexts import evaluate_if_expression
 
     body = expression.strip()
     if body.startswith("${{") and body.endswith("}}"):
         body = body[3:-2]
-    return _evaluate_expression(
-        body,
-        {"github.event_name": event_name, "github.ref": ref, "vars.ASVS_VAULT_REPO": vault_repo},
-    )
+    context = {
+        "github.event_name": event_name,
+        "github.ref": ref,
+        "vars.ASVS_VAULT_REPO": vault_repo,
+    }
+    if event_name in _PR_EVENTS:
+        context |= {"github.head_ref": "feature", "github.base_ref": "main"}
+    context |= extra or {}
+    return evaluate_if_expression(body, context)
 
 
 @pytest.mark.parametrize(
@@ -558,6 +578,30 @@ def test_the_report_job_runs_only_on_main(event_name: str) -> None:
     assert not _evaluate_job_if(
         expression, event_name=event_name, vault_repo="owner/vault", ref="refs/heads/feature"
     )
+
+
+def test_a_pull_request_with_a_head_ref_never_runs_the_report_job() -> None:
+    """RED when: a pull_request run whose ``github.head_ref`` is set reaches the record.
+
+    The evaluator reads an unseeded name as empty, so a term such as ``|| github.head_ref != ''``
+    would pass unseen unless the case seeds it. This seeds it, with ``github.ref`` on main as the
+    worst case, and the control shows the seeding is what lets that loosening read as a run.
+    """
+    from tests._workflow_contexts import load_workflow
+
+    expression = str(load_workflow("asvs-anchor-report.yml")["jobs"]["report"]["if"])
+    seeded = {"github.head_ref": "refs/heads/main"}
+    assert not _evaluate_job_if(
+        expression, event_name="pull_request", vault_repo="owner/vault", extra=seeded
+    )
+    body = expression.strip().removeprefix("${{").removesuffix("}}")
+    loosened = f"({body}) || github.head_ref != ''"
+    assert _evaluate_job_if(
+        loosened, event_name="pull_request", vault_repo="owner/vault", extra=seeded
+    ), "control: the loosened condition must read as a run once head_ref is seeded"
+    assert not _evaluate_job_if(
+        loosened, event_name="pull_request", vault_repo="owner/vault", extra={"github.head_ref": ""}
+    ), "control: unseeded, the same loosening reads as no run -- the limit this case covers"
 
 
 def test_every_step_reading_the_vault_sits_behind_the_job_gate() -> None:

@@ -353,13 +353,24 @@ def test_the_resync_installs_the_uv_the_gate_pins() -> None:
 
 
 def test_the_app_key_is_used_before_any_step_runs_on_the_pr_tree() -> None:
-    """RED when: the mint step, which holds the App's long-lived private key, runs after the checkout.
+    """RED when: the mint step, which takes the App's long-lived private key, runs after the checkout,
+    or another step is handed the key.
 
     Every step from the checkout on can run code from the Dependabot-changed tree as the runner user,
-    who could tamper with a later step's action or environment. The key must have been used and gone
-    before then; the short-lived token it mints is what later steps share a runner with.
+    who could tamper with a later step's action or environment. Minting first means that code cannot
+    tamper with the mint itself. It does NOT keep the key off the runner while that code runs: the key
+    is a secret of this job, on the runner for the whole job, and create-github-app-token's post step
+    runs at job end with the key in its inputs. The minted token is live on the runner from the mint
+    on and is handed only to the push step (pinned above). Keeping the key and token away from that
+    code entirely needs the re-export in a separate job holding no secret, a follow-up not built.
     """
     steps = _resync_steps()
     position = {str(s.get("id") or s.get("name")): i for i, s in enumerate(steps)}
     checkout = position["Check out the PR head"]
     assert position["app-token"] < checkout, "the App private key is used after the PR checkout"
+    key_readers = [
+        str(s.get("id") or s.get("name"))
+        for s in steps
+        if "secrets.LOCK_RESYNC_APP_PRIVATE_KEY" in repr(s)
+    ]
+    assert key_readers == ["app-token"], f"steps handed the App private key: {key_readers}"
