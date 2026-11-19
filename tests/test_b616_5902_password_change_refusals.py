@@ -13,6 +13,7 @@ requirement does not cover, and a write that lost its compare is a 409. Syntheti
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
@@ -22,6 +23,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.auth.notifications import PASSWORD_CHANGED
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import (
     AUTHORITY_SEAL_FAILED_ACTION,
@@ -35,12 +37,13 @@ from messagefoundry.auth.service import (
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import Store
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     USER_KIND,
     RowSealError,
     RowSealUnverifiableError,
     TransitSealUnavailableError,
+    TransitSealUnverifiableError,
 )
 from messagefoundry.store.store import MessageStore
 from tests.test_api_auth import _auth, _login
@@ -365,20 +368,142 @@ async def test_an_outage_at_the_write_propagates_and_changes_nothing(
     assert await _changed_rows(store) == []
 
 
-async def test_an_outage_on_the_notice_read_still_reports_the_change(
+def _after_commit(monkeypatch: pytest.MonkeyPatch, store: Store) -> list[bool]:
+    """Run the store's real password write, then mark it committed in the list returned."""
+    real = store.set_password
+    committed: list[bool] = []
+
+    async def write(uid: str, **kwargs: Any) -> bool:
+        written = await real(uid, **kwargs)
+        committed.append(written)
+        return written
+
+    monkeypatch.setattr(store, "set_password", write)
+    return committed
+
+
+def _unverifiable_once_committed(service: AuthService, committed: list[bool]) -> Any:
+    real = service.checked_user
+
+    async def checked(uid: str) -> Any:
+        if committed:
+            raise TransitSealUnverifiableError(USER_KIND, 1, 2)
+        return await real(uid)
+
+    return checked
+
+
+async def test_a_transit_unverifiable_after_the_commit_still_reports_the_change(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After the write has committed, an Outage on the read for the notice address does not turn a
-    made change into a refusal."""
+    """After the write has committed, a record read that Vault transit cannot verify does not turn
+    a made change into a refusal: no read after the commit is made at all."""
     service, identity = await _account(store)
+    committed = _after_commit(monkeypatch, store)
+    real_load = service._load_user
 
-    async def outage(_uid: str) -> Any:
-        raise TransitSealUnavailableError()
+    async def load(uid: str) -> Any:
+        if committed:
+            raise TransitSealUnverifiableError(USER_KIND, 1, 2)
+        return await real_load(uid)
 
-    monkeypatch.setattr(service, "_load_user", outage)
-    monkeypatch.setattr(service, "_user_seal_outage", lambda _refused="read": None)
+    monkeypatch.setattr(service, "_load_user", load)
+    monkeypatch.setattr(service, "checked_user", _unverifiable_once_committed(service, committed))
     assert await service.change_password(identity, _NEW_PASSWORD) == []
+    assert committed == [True]
     assert len(await _changed_rows(store)) == 1
+
+
+async def test_the_notice_goes_to_the_checked_address(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, identity = await _account(store)
+    committed = _after_commit(monkeypatch, store)
+    sent: list[tuple[str, str | None]] = []
+
+    async def notify(event_type: str, *, email: str | None, **_kwargs: Any) -> bool:
+        sent.append((event_type, email))
+        return True
+
+    async def no_read(_uid: str) -> Any:
+        raise AssertionError("the record was read again after the commit")
+
+    real_checked = service.checked_user
+
+    async def checked(uid: str) -> Any:
+        if committed:
+            return await no_read(uid)
+        return await real_checked(uid)
+
+    monkeypatch.setattr(service, "_notify_security", notify)
+    monkeypatch.setattr(service, "checked_user", checked)
+    real_load = service._load_user
+
+    async def load(uid: str) -> Any:
+        if committed:
+            return await no_read(uid)
+        return await real_load(uid)
+
+    monkeypatch.setattr(service, "_load_user", load)
+    assert await service.change_password(identity, _NEW_PASSWORD) == []
+    assert sent == [(PASSWORD_CHANGED, "bob@example.org")]
+
+
+@pytest.mark.parametrize("refusal", [CipherError, TransitSealUnavailableError])
+async def test_a_refused_audit_row_after_the_commit_still_reports_the_change(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    refusal: type[Exception],
+) -> None:
+    service, identity = await _account(store)
+    sent: list[str | None] = []
+
+    real_audit = service._audit
+
+    async def refused(action: str, **kwargs: Any) -> None:
+        if action == "auth.password_changed":
+            raise refusal()
+        await real_audit(action, **kwargs)
+
+    async def notify(_event_type: str, *, email: str | None, **_kwargs: Any) -> bool:
+        sent.append(email)
+        return True
+
+    monkeypatch.setattr(service, "_audit", refused)
+    monkeypatch.setattr(service, "_notify_security", notify)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+        assert await service.change_password(identity, _NEW_PASSWORD) == []
+    assert sent == ["bob@example.org"]
+    assert any("audit row was refused" in r.getMessage() for r in caplog.records)
+    assert (await service.login("bob", _NEW_PASSWORD)).ok
+
+
+async def test_a_passkey_only_row_deleted_at_the_re_judge_is_gone_not_an_enrolment_refusal(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A covered write that lost its compare re-judges the way past. A passkey-only row deleted
+    while that re-judge runs takes its passkey with it; it is answered as gone (the route's 401),
+    not as an account that must enrol (the route's 403)."""
+    service, identity = await _account(store, require_mfa=True)
+    calls: list[int] = []
+
+    async def judged(_user: Any) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            return None  # the early check: the passkey counts
+        await store.delete_user("u1")
+        raise FactorEnrolmentRequired()
+
+    async def lost(_uid: str, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(service, "_refuse_rotation_without_way_past", judged)
+    monkeypatch.setattr(store, "set_password", lost)
+    with pytest.raises(ValueError, match="no such user"):
+        await service.change_password(identity, _NEW_PASSWORD)
+    assert len(calls) == 2
+    assert await _changed_rows(store) == []
 
 
 async def test_a_lost_write_is_a_409_on_the_route(

@@ -16382,9 +16382,10 @@ class AuthService:
         seal refusal is answered as the read's is. A write that matched no row re-reads the record:
         gone is ``ValueError("no such user")``; a covered account with no way past left is
         :class:`FactorEnrolmentRequired`; anything else is :class:`PasswordChangeNotApplied`. A
-        covered row deleted while the early way-past check runs is ``ValueError("no such user")``
+        covered row deleted while either way-past check runs is ``ValueError("no such user")``
         too, not an enrolment refusal. A deletion that lands after the write has committed is not
-        caught: that change is reported as made.
+        caught: that change is reported as made. So is one whose ``auth.password_changed`` row the
+        audit MAC refuses, logged at ERROR; the notice goes to the address the checked read held.
         :class:`BreachCorpusUnavailable` propagates from the policy check unchanged: the password
         is refused, never accepted unscreened.
 
@@ -16465,22 +16466,35 @@ class AuthService:
             if after is None:
                 raise ValueError("no such user")
             if covered:
-                await self._refuse_rotation_without_way_past(after)
+                try:
+                    await self._refuse_rotation_without_way_past(after)
+                except FactorEnrolmentRequired:
+                    # As at the early check: a row deleted during this re-judge is gone, not an
+                    # account that must enrol (BACKLOG #5902).
+                    if await self.checked_user(identity.user_id) is not None:
+                        raise
+                    gone = True
+            if gone:
+                raise ValueError("no such user")
             raise PasswordChangeNotApplied()
         await self._revoke_after_commit(
             identity.user_id, change="password_changed", actor=identity.username, client=client
         )
-        await self._audit("auth.password_changed", actor=identity.username, client=client)
         try:
-            current = await self._load_user(identity.user_id)
-            email = current.notify_email if current is not None else None
-        except TransitSealUnavailableError:
-            # The change has committed, so an Outage here must not turn it into a retryable
-            # refusal (BACKLOG #5902): the notice goes to the address the checked read above held.
-            self._user_seal_outage("password-change notice read")
-            email = user.notify_email
+            await self._audit("auth.password_changed", actor=identity.username, client=client)
+        except (CipherError, TransitSealUnavailableError) as exc:
+            # The change has committed, so a refused audit MAC must not report it as failed
+            # (BACKLOG #5902). The class name only: a CipherError's text can quote Vault's reply.
+            _log.error(
+                "auth: the password change of account %s committed, but its"
+                " auth.password_changed audit row was refused (%s)",
+                identity.user_id,
+                type(exc).__name__,
+            )
+        # The address the checked read above held: a re-read after the commit could only turn a
+        # committed change into a refusal (BACKLOG #5902).
         await self._notify_security(
-            PASSWORD_CHANGED, username=identity.username, email=email, client=client
+            PASSWORD_CHANGED, username=identity.username, email=user.notify_email, client=client
         )
         return []
 
