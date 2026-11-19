@@ -65,7 +65,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from messagefoundry import engine_secrets as _setting_names
 from messagefoundry.service_status import is_safe_service_name
@@ -369,6 +369,20 @@ def _refused_name(name: str) -> bool:
     return name in _REFUSED_CLASS_NAMES or name.startswith(_VALUE_PREFIX)
 
 
+def _line_start(line: str) -> Literal["kept", "ends"] | None:
+    """How a line below a registry string's first is read: ``"kept"`` when it sets a name the
+    refusal is about, so it is a variable of its own; ``"ends"`` when it sets an ordinary
+    variable (:func:`_is_ordinary_line`), which ends the value above and is not kept; ``None``
+    when it starts no variable and so belongs to the value above. :func:`_continues_string`
+    applies it to a string's first line, with the one exception it names."""
+    written, equals, _rest = line.partition("=")
+    if not equals:
+        return None
+    if _refused_name(written.strip().upper()):
+        return "kept"
+    return "ends" if _is_ordinary_line(line) else None
+
+
 @dataclass(frozen=True, slots=True)
 class _Variable:
     """One variable as :func:`_variables` reads it from a registry string. Kept only while the
@@ -388,7 +402,8 @@ class _Variable:
     #: Whether :func:`_names` counts it. A variable the line reading also describes under another
     #: name is not counted twice, but :func:`_value_entry_shapes` still reads its spelling.
     counted: bool = True
-    #: Whether it was read from strings joined because a value ran on (:func:`_variables`).
+    #: Whether its value, blank in its own string, takes the strings after it, which
+    #: :func:`_variables` joins to that string.
     runs_on: bool = False
 
 
@@ -410,17 +425,16 @@ def _read_string(where: str, entry: str) -> tuple[list[_Variable], bool]:
     starts_seen = False  # whether any later line starts a variable, kept or ordinary
     parts = first_parts  # the value the current line belongs to
     for number, line in enumerate(rest_lines, skip + 2):
-        written, equals, rest = line.partition("=")
-        written = written.strip()
-        if equals and _refused_name(written.upper()):
-            parts = [rest]
-            later.append((number, written, parts))
-            starts_seen = True
-        elif equals and _is_ordinary_line(line):
-            parts = [rest]  # ends the value above, and is not kept
-            starts_seen = True
-        else:
+        start = _line_start(line)
+        if start is None:
             parts.append(line)
+            continue
+        written, _equals, rest = line.partition("=")
+        parts = [rest]
+        starts_seen = True
+        if start == "kept":
+            later.append((number, written.strip(), parts))
+        # an ordinary line ends the value above, and is not kept
     read: list[_Variable] = []
     ending: _Variable | None = None  # the kept variable the last line belongs to
     if first_equals:
@@ -448,8 +462,9 @@ def _read_string(where: str, entry: str) -> tuple[list[_Variable], bool]:
             _Variable(where, name, whole_value, line=first_line, broken=broken, counted=counted)
         )
         # Its value ends with the string, so it is the one the string ends on when no line of
-        # the line reading starts a variable, as with ``KEY<LF>=``.
-        if not first_equals and not starts_seen and not broken:
+        # the line reading starts a variable, as with ``KEY<LF>=``, or ``MEFOR_VALUE_A<LF>X=``,
+        # whose name holds a line break.
+        if not first_equals and not starts_seen:
             ending = read[-1]
     read.extend(later_variables)
     if later and parts is later[-1][2]:
@@ -461,29 +476,26 @@ def _read_string(where: str, entry: str) -> tuple[list[_Variable], bool]:
 
 
 def _continues_string(entry: str) -> bool:
-    """Whether the registry string ``entry`` is read as the rest of an empty value the string
-    above it ends on (:func:`_variables`). Only when it starts no variable of its own:
+    """Whether the registry string ``entry`` may be read as the rest of an empty value the string
+    above it ends on (:func:`_variables`). It may when it holds a non-blank line, no name the
+    refusal is about starts it under the whole-string reading, as one starts
+    ``MEFOR_VALUE_A<LF>X=1``, and its first non-blank line starts no variable under
+    :func:`_line_start`, the rule :func:`_read_string` applies to a later line of one string.
 
-    * no name the refusal is about starts it, under the whole-string reading either, as
-      ``MEFOR_VALUE_A<LF>X=1`` does;
-    * its first non-blank line holds no equals sign, or its name holds a store key
-      (:data:`_KEY_SHAPED_RUN`), or its value is only base64 padding, as a padded secret's is;
-    * no later line sets an ordinary variable (:func:`_is_ordinary_line`).
+    One shape differs from that rule: a first line whose name is empty, as in Windows' own
+    ``=C:=C:\\x`` entries, ends the value above, since NSSM reads each item as its own variable.
+    As a later line of one string it belongs to the value above, as it always has.
 
-    So an item that sets an ordinary variable, even to nothing, ends the value above it, and so
-    does one shaped like Windows' own ``=C:=C:\\x`` entries, whose name is empty."""
-    lines = [line for line in _LINE_BREAK.split(entry) if line.strip()]
-    if not lines or _refused_name(entry.partition("=")[0].strip().upper()):
+    So, on a first line not shaped like that, no equals sign, a padded base64 secret with one
+    ``=`` of padding or two, ``NAME=`` with an empty value or a value of only equals signs and
+    blanks, and a name holding a store-key-sized base64 run each continue the value, an error
+    toward refusing, unless the name is one the refusal is about. A name the refusal is about,
+    or an ordinary variable set to a value, ends it. Only the first non-blank line decides: the
+    item's later lines are read when the strings are joined, as later lines of one string."""
+    first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), None)
+    if first is None or _refused_name(entry.partition("=")[0].strip().upper()):
         return False
-    written, equals, rest = lines[0].partition("=")
-    padding = bool(rest.strip()) and not rest.strip("= \t")
-    if equals and not (written.strip() and (_holds_key_run(written) or padding)):
-        return False
-    for line in lines[1:]:
-        name = line.partition("=")[0].strip().upper()
-        if _is_ordinary_line(line) and not _refused_name(name):
-            return False
-    return True
+    return _line_start(first) is None and not first.lstrip().startswith("=")
 
 
 def _item_line(starts: Sequence[int], line: int | None) -> int | None:
@@ -521,15 +533,16 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
 
     From one string to the next string of one ``REG_MULTI_SZ`` value the rule is narrower, since
     NSSM reads each item as its own variable. When a string ends on a name the refusal is about
-    whose value is empty or blank, and the next non-blank string of the same registry value
-    starts no variable of its own (:func:`_continues_string`), the two are joined and read as one
-    string, so ``MEFOR_STORE_ENCRYPTION_KEY=`` as one item and the key as the next refuses, as
-    ``nssm set`` writes a key split from its name. An empty store key above an item that sets any
-    other variable does not, and a value that is not empty in its own string does not run on, so
+    whose value is empty or blank, and the next non-blank string of the same registry value may
+    continue it (:func:`_continues_string`), the two are joined and read as one string, so
+    ``MEFOR_STORE_ENCRYPTION_KEY=`` as one item and the key as the next refuses, as ``nssm set``
+    writes a key split from its name. An empty store key above an item whose first line sets an
+    ordinary variable to a value, or a name the refusal is about, does not, and a value that is
+    not empty in its own string does not run on, so
     a path-form OIDC key above an item of PEM armour is still a path. Each string is read alone
     first to decide this, and a joined group is read once more, so the work stays linear."""
-    # Each group: its registry value, its strings, and each one read alone.
-    groups: list[tuple[str, list[str], list[_Variable]]] = []
+    # Each group: its registry value, its strings, and each string's variables read alone.
+    groups: list[tuple[str, list[str], list[list[_Variable]]]] = []
     ends_empty = False
     for where, entry in entries:
         alone, ends = _read_string(where, entry)
@@ -537,24 +550,36 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             continue  # a blank string sets nothing, and ends no value above it
         if groups and ends_empty and groups[-1][0] == where and _continues_string(entry):
             groups[-1][1].append(entry)
+            groups[-1][2].append(alone)
         else:
-            groups.append((where, [entry], alone))
+            groups.append((where, [entry], [alone]))
         ends_empty = ends
     read: list[_Variable] = []
-    for where, strings, alone in groups:
+    for where, strings, alones in groups:
         if len(strings) == 1:
-            read.extend(alone)
+            read.extend(alones[0])
             continue
         starts: list[int] = []
         line = 1
         for string in strings:
             starts.append(line)
             line += len(_LINE_BREAK.split(string))
+        # A variable ran on when its value is blank read alone and not blank joined: only then
+        # does the refusal's remedy say to remove the strings after it with it.
+        blank_alone = {
+            (index, variable.written, variable.line, variable.broken)
+            for index, string_alone in enumerate(alones)
+            for variable in string_alone
+            if not variable.value.strip()
+        }
         joined, _ends = _read_string(where, "\n".join(strings))
-        read.extend(
-            replace(variable, line=_item_line(starts, variable.line), runs_on=True)
-            for variable in joined
-        )
+        for variable in joined:
+            index = bisect.bisect_right(starts, variable.line or 1) - 1
+            line_on_string = _item_line(starts, variable.line)
+            ran_on = bool(variable.value.strip()) and (
+                (index, variable.written, line_on_string, variable.broken) in blank_alone
+            )
+            read.append(replace(variable, line=line_on_string, runs_on=ran_on))
     return read
 
 

@@ -80,15 +80,14 @@ def test_a_retired_keys_list_on_the_line_below_an_empty_name_refuses(key: str) -
 
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
 def test_an_empty_store_key_item_above_an_ordinary_item_does_not_refuse(key: str) -> None:
-    """The control: an empty key is harmless when the next item sets an ordinary variable, or is
-    empty-named like Windows' own ``=C:`` entries."""
+    """The control: an empty key is harmless when the next item's first line sets an ordinary
+    variable to a value, or is empty-named like Windows' own ``=C:`` entries. An item whose first
+    line sets a variable to nothing continues the key, as the same line would below it in one
+    string (tests/test_b532r_serviceenv_classifier.py)."""
     followers = (
         "MEFOR_AI_ENVIRONMENT=prod",
         "ProgramFiles(x86)=C:\\x",
         "=C:=C:\\x",
-        "HTTP_PROXY=",  # an ordinary variable set to nothing still ends the value above
-        "MEFOR_SECRETS_DIRECTORY=",
-        "foo\nPATH=C:\\x",  # a later line of the item sets an ordinary variable
         "A" * 42 + "_B=1",  # a base64 run one short of a key's, so this is a name
     )
     for follower in followers:
