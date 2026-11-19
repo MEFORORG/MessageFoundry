@@ -301,8 +301,9 @@ class ConnScaleRecord:
     fd_probe_degraded: tuple[str, ...] = ()
     # How many of `fd_probe_ticks` the probe's make-up floor took AFTER its window closed, because every
     # reading in the window was an exhausted budget (BACKLOG #1488). Zero on a window that measured. A
-    # peak read on such a tick still comes from the step, with all N connections held, but not from
-    # inside the hold, and a reader choosing a verdict should be able to see that. Reported, never graded.
+    # peak read on such a tick comes from the step's engine with its connections still open, but after
+    # the hold, with no traffic offered, and a reader choosing a verdict should be able to see that.
+    # Reported, never graded.
     fd_probe_floor_ticks: int = 0
     # --- BACKLOG #1210: which processes the FD and RSS peaks were summed over ---
     # The PIDs the tick that set `fd_count_peak` covered, sorted, and the same for
@@ -1483,9 +1484,15 @@ class ConnScaleReport:
         for r in self.records:
             if r.fd_probe_degraded_ticks:
                 causes = ", ".join(r.fd_probe_degraded) or "cause not recorded"
+                # BACKLOG #1488: a make-up tick is in that count but not in the window.
+                floor = (
+                    f"; {r.fd_probe_floor_ticks} tick(s) taken after the window by the make-up floor"
+                    if r.fd_probe_floor_ticks
+                    else ""
+                )
                 lines.append(
                     f"fd probe: {r.step_label} -- {r.fd_probe_degraded_ticks} of "
-                    f"{r.fd_probe_ticks} tick(s) measured nothing [{causes}]"
+                    f"{r.fd_probe_ticks} tick(s) measured nothing [{causes}]{floor}"
                 )
         # BACKLOG #1292: the per-message attribution, printed whenever it says anything beyond "clean".
         # A `no_loss` shortfall renders as a bare count in the table above, which is exactly the

@@ -579,6 +579,11 @@ def test_the_console_names_the_mechanism_beside_the_n_a() -> None:
     # And a clean record adds no noise.
     clean = dataclasses.replace(report, records=[_record()])
     assert "measured nothing" not in clean.render_console()
+    assert "make-up floor" not in text
+    # BACKLOG #1488: a make-up tick is counted in `fd_probe_ticks` but taken after the window.
+    floored = dataclasses.replace(report.records[0], fd_probe_floor_ticks=1)
+    floored_text = dataclasses.replace(report, records=[floored]).render_console()
+    assert "1 tick(s) taken after the window by the make-up floor" in floored_text
 
 
 # --- the smoke test's verdict ------------------------------------------------------------------------

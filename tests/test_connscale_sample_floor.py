@@ -45,6 +45,7 @@ import pytest
 
 from harness.load.connscale import runner
 from harness.load.connscale.probe import _PROBE_TIMEOUT_S, ProbeDegraded, ProcSample, _gap
+from harness.load.connscale.profile import ConnScaleProfile
 from harness.load.connscale.report import ConnScaleRecord, monotonic_lane
 from harness.load.connscale.runner import (
     _FD_PROBE_MAKEUP_ATTEMPTS,
@@ -56,8 +57,9 @@ from harness.load.connscale.runner import (
     _sample_loop,
 )
 from harness.load.enginepoll import EngineSample
+from tests import test_connscale_smoke as smoke
 from tests.test_connscale_probe_degradation import _record
-from tests.test_connscale_smoke import _SMOKE_COUNTS, _assert_fd_probe
+from tests.test_connscale_smoke import _assert_fd_probe
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -321,7 +323,9 @@ def _measured(handles: int) -> ProcSample:
 class _ScriptedSampler:
     """An `FdSampler` stand-in that answers from a script of `(cost_s, sample)` entries, the last one
     repeating. It counts the calls made after the window's `stop`, which are the floor's make-up
-    attempts read off the loop's own behaviour rather than off a stopwatch."""
+    attempts read off the loop's own behaviour rather than off a stopwatch, and refuses one past
+    `_FD_PROBE_MAKEUP_ATTEMPTS`, so an unbounded floor fails at once instead of spinning to the
+    timeout, as `_FakePoller` does for the engine sampler."""
 
     def __init__(self, script: list[tuple[float, ProcSample]], stop: asyncio.Event) -> None:
         self._script = script
@@ -332,10 +336,25 @@ class _ScriptedSampler:
     def sample_proc(self) -> ProcSample:
         if self._stop.is_set():
             self.calls_after_stop += 1
+            assert self.calls_after_stop <= _FD_PROBE_MAKEUP_ATTEMPTS, (
+                f"the probe was called {self.calls_after_stop} times after its stop against a bound "
+                f"of {_FD_PROBE_MAKEUP_ATTEMPTS} -- the make-up floor is unbounded"
+            )
         cost, sample = self._script[min(self.calls, len(self._script) - 1)]
         self.calls += 1
         time.sleep(cost)
         return sample
+
+
+async def _hold_from_first_call(sampler: _ScriptedSampler, stop: asyncio.Event) -> None:
+    """End the window `_STARVED_HOLD_S` after the first probe call STARTS, not after the loop does.
+
+    The sampler reads `stop` on its worker thread, so a hold timed from the loop's start could end
+    before a late-scheduled thread made the in-window call, and that call would count as a make-up
+    one. Timing the hold from the call's own start removes that race on a loaded runner."""
+    while not sampler.calls:
+        await asyncio.sleep(0.005)
+    await _hold(stop, _STARVED_HOLD_S)
 
 
 async def _probe_step(script: list[tuple[float, ProcSample]]) -> tuple[list[ProcReading], int]:
@@ -346,7 +365,7 @@ async def _probe_step(script: list[tuple[float, ProcSample]]) -> tuple[list[Proc
     readings: list[ProcReading] = []
     floor_ticks, _ = await asyncio.gather(
         _probe_loop(sampler, _INTERVAL_S, stop, readings, time.perf_counter()),  # type: ignore[arg-type]
-        _hold(stop, _STARVED_HOLD_S),
+        _hold_from_first_call(sampler, stop),
     )
     assert floor_ticks == sampler.calls_after_stop, (
         f"the loop reported {floor_ticks} make-up attempt(s) but probed {sampler.calls_after_stop} "
@@ -436,21 +455,41 @@ async def test_a_collapse_measured_on_makeup_readings_still_fails_the_fd_slo() -
     assert not check.ok, check.observed
 
 
-#: The `smoke_report` fixture's setup time on the failing windows-2022 merge-queue job of 2026-11-19
-#: (job 135856508516, pytest's slowest-durations line). A measurement, not a contract: the one reading
-#: of that fixture on a runner contended enough to time the walk out on every step.
+#: The smoke fixture's setup time on the failing job (135856508516), from pytest's slowest-durations
+#: line. A measurement, not a contract.
 _SMOKE_SETUP_MEASURED_S = 53.41
 
 
 def test_the_makeup_floor_fits_inside_the_smokes_watchdog() -> None:
-    """The arithmetic `_FD_PROBE_MAKEUP_ATTEMPTS` rests on, pinned so it cannot drift silently. One
-    make-up attempt can cost a walk and a per-PID read, each up to `_PROBE_TIMEOUT_S`. Every smoke
-    step may need its floor, and the smoke runs under `pytest.mark.timeout(120)` with the thread
-    method, where a timeout ends the worker process rather than one test."""
-    steps = len(_SMOKE_COUNTS) * 2  # sweep_mode = "both": fixed_aggregate and fixed_per_conn
-    worst_floor_s = steps * _FD_PROBE_MAKEUP_ATTEMPTS * 2 * _PROBE_TIMEOUT_S
-    assert _SMOKE_SETUP_MEASURED_S + worst_floor_s < 120, (
-        f"{steps} smoke steps x {_FD_PROBE_MAKEUP_ATTEMPTS} make-up attempt(s) can add "
-        f"{worst_floor_s:.0f}s to a fixture measured at {_SMOKE_SETUP_MEASURED_S}s, past the "
-        f"smoke's 120s watchdog"
+    """Pins the arithmetic in the comment on `_FD_PROBE_MAKEUP_ATTEMPTS`, reading the smoke's own
+    watchdog and step axes, so a longer sweep or a shorter timeout fails here rather than in a killed
+    worker."""
+    (watchdog_s,) = smoke.pytestmark.args
+    profile = smoke._smoke_profile(30000)  # any valid port: only the axes are read
+    assert isinstance(profile, ConnScaleProfile)
+    steps = (
+        len(profile.counts)
+        * (2 if profile.sweep_mode == "both" else 1)
+        * len(profile.claim_modes)
+        * len(profile.fuse_modes)
+        * len(profile.batch_modes)
+        * len(profile.sandbox_modes)
+        * profile.trials
     )
+    # A walk just inside its budget, then a read that spends all of it.
+    attempt_s = 2 * _PROBE_TIMEOUT_S
+    # The in-window attempt can exceed the walk timeouts the measured run spent by one more budget.
+    worst_s = _SMOKE_SETUP_MEASURED_S + steps * (
+        _PROBE_TIMEOUT_S + _FD_PROBE_MAKEUP_ATTEMPTS * attempt_s
+    )
+    assert worst_s < watchdog_s, (
+        f"{steps} smoke steps x {_FD_PROBE_MAKEUP_ATTEMPTS} make-up attempt(s) put the worst case at "
+        f"{worst_s:.0f}s against the smoke's {watchdog_s}s watchdog"
+    )
+
+
+def test_an_empty_window_is_not_a_timed_out_one() -> None:
+    """A window that took no reading at all did not time out, so `fd_probe_floor_ticks` must not say
+    it did."""
+    assert not runner._only_budget_gaps([])
+    assert runner._only_budget_gaps([ProcReading(0.0, _gap(ProbeDegraded.READ_TIMEOUT))])

@@ -1471,21 +1471,24 @@ async def _sample_loop(
 #: took was an exhausted budget (BACKLOG #1488).
 #:
 #: ONE, AND THE BOUND IS THE SMOKE'S WATCHDOG, NOT TASTE. One attempt can cost a walk that ends just
-#: inside ``_PROBE_TIMEOUT_S`` plus a per-PID read that spends all of it: under 10 s. The smoke runs four
-#: steps under ``pytest.mark.timeout(120)``, and the failing windows-2022 run of 2026-11-19 spent 53.41 s
-#: in that fixture, so four steps at one attempt each add at most 40 s and end near 93 s. Two attempts
-#: would allow 80 s and pass 120, and on this repository's ``--timeout-method=thread`` a timeout ends
-#: the whole worker process rather than one test.
+#: inside ``_PROBE_TIMEOUT_S`` plus a per-PID read that spends all of it: 2 x 5 s. The in-window attempt
+#: can cost the same, which is up to 5 s per step more than the walk timeouts the failing windows-2022
+#: run of 2026-11-19 spent. That run's smoke fixture took 53.41 s for four steps, so the worst case is
+#: 53.41 + 4 x 5 + 4 x 10 = about 113 s against ``pytest.mark.timeout(120)``. A second attempt would
+#: pass 120, and on this repository's ``--timeout-method=thread`` a timeout ends the whole worker
+#: process rather than one test. ``tests/test_connscale_sample_floor.py`` pins this arithmetic.
 _FD_PROBE_MAKEUP_ATTEMPTS = 1
 
 
 def _only_budget_gaps(readings: list[ProcReading]) -> bool:
-    """Is every reading a gap whose cause is an exhausted budget? True for an empty list.
+    """Did the window take at least one reading, and was every one a gap whose cause is an exhausted
+    budget?
 
     The make-up floor fires on this and nothing else. A spent budget measures the RUNNER, so a second
     draw is a fair retry. Any other cause means the probe ran and produced nothing usable, and a
-    retry there would give a broken probe a second chance to hide behind a reading."""
-    return all(
+    retry there would give a broken probe a second chance to hide behind a reading. An empty window
+    is not a timed-out one, so it does not fire the floor either."""
+    return bool(readings) and all(
         r.proc.degraded is not None and r.proc.degraded.is_budget_exhausted for r in readings
     )
 
@@ -1511,9 +1514,10 @@ async def _probe_loop(
     WALL #4 assertion then fails on the runner rather than the engine. So when every reading in
     ``out``, which is the step's own list, is a budget-exhausted gap, the loop keeps probing for at
     most ``_FD_PROBE_MAKEUP_ATTEMPTS`` more, stopping at the first reading that is not one. A
-    reading taken here still measures the step: the caller
-    sets ``stop`` only after the reload probe has seen every connection back, and stops the driver
-    only after this task returns, so all N connections are still held. ATTEMPTS are counted, so a
+    reading taken here still comes from the step's engine with its connections open: the caller
+    sets ``stop`` only after the reload probe returns, and stops the driver only after this task
+    returns. It is taken after the hold, with no traffic offered, and with any connection the reload
+    left down still down, as for an in-window reading after the reload. ATTEMPTS are counted, so a
     probe that never answers cannot hold the step open. The count is provenance, reported as
     ``fd_probe_floor_ticks``.
 
