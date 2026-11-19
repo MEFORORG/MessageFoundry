@@ -368,7 +368,8 @@ function Invoke-FinishedWorktreeRemoval {
 
     foreach ($path in @($Paths | Where-Object { $_ })) {
         $row = [pscustomobject]@{ Path = $path; Outcome = 'REFUSED'; Reason = ''; Command = "git -C `"$Primary`" worktree remove `"$path`"" }
-        if ($null -ne $StopAt -and [DateTime]::UtcNow -ge $StopAt.ToUniversalTime()) {
+        # A run-wide refusal still wins: it is the one line saying the setup is broken.
+        if (-not $allRefusal -and $null -ne $StopAt -and [DateTime]::UtcNow -ge $StopAt.ToUniversalTime()) {
             $row.Outcome = 'NOT-REACHED'
             $row.Reason = "the run's deadline ($($StopAt.ToLocalTime().ToString('HH:mm:ss'))) passed first; nothing was attempted"
             $row

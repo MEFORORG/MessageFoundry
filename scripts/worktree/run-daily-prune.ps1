@@ -48,7 +48,8 @@
     Minutes after this run starts at which it stops starting removals. Optional; without it the run has
     no deadline of its own. install-daily-prune.ps1 sets it inside the task's time limit; its header
     says why. Past the deadline the .claude/worktrees step starts no further tree, logs each one left as
-    NOT-REACHED (the next run lists them again), and writes the summary and exit line as usual. A
+    NOT-REACHED (the next run lists them again), and writes the summary and exit line as usual; past
+    it before the step's listing run, the step logs one SKIPPED line instead and lists nothing. A
     deadline stop is not a failure and leaves the exit code alone. It does NOT bound the two
     prune-merged.ps1 runs.
 
@@ -84,6 +85,7 @@ $ErrorActionPreference = 'Stop'
 # Set here so the trap below never reads a caller's variable of the same name.
 $log = $null
 $code = $null
+$pruneStarted = $false
 $savedPromptEnv = $null
 # In UTC: Task Scheduler's limit counts elapsed time, and a local clock repeats an hour at the DST
 # fall-back, which would put this deadline an hour past the kill.
@@ -128,7 +130,7 @@ $log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
 function Exit-Run([int]$Code) {
     $meaning = if ($EXIT_MEANING.ContainsKey($Code)) { $EXIT_MEANING[$Code] } else { "UNKNOWN exit code $Code" }
     try { "=== exit $Code ($meaning) at $(Get-Date -Format 'HH:mm:ss') ===" | Add-Content -LiteralPath $log }
-    catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+    catch [System.Management.Automation.RuntimeException], [System.IO.IOException], [System.UnauthorizedAccessException] {
         Write-Error -Message "exit $Code ($meaning); the log could not take this line: $($_.Exception.Message)" -ErrorAction Continue
     }
     # Keep the log directory bounded. -ErrorAction SilentlyContinue because a log a human has open must
@@ -149,14 +151,14 @@ trap {
     if (-not $log) { break }
     $fault = "$($_.Exception.Message) (at $($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))"
     try { "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') STOPPED on an unhandled error: $fault ===" | Add-Content -LiteralPath $log }
-    catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+    catch [System.Management.Automation.RuntimeException], [System.IO.IOException], [System.UnauthorizedAccessException] {
         Write-Error -Message "the log could not take the STOPPED line either: $($_.Exception.Message)" -ErrorAction Continue
     }
     Write-Error -Message $fault -ErrorAction Continue
-    # 2 promises nothing was removed: true before the prune ran ($code unset) and on a dry run. After an
-    # -Apply prune, 1, the rule the step's own refusal follows. Never below a code already set: an
-    # orphan's 3 must survive a later error.
-    Exit-Run ([math]::Max([int]$code, $(if ($null -eq $code -or -not $Apply) { 2 } else { 1 })))
+    # 2 promises nothing was removed: true before the prune started and on a dry run. Once an -Apply
+    # prune has started, even if it has not exited, 1, the rule the step's own refusal follows. Never
+    # below a code already set: an orphan's 3 must survive a later error.
+    Exit-Run ([math]::Max([int]$code, $(if (-not $pruneStarted -or -not $Apply) { 2 } else { 1 })))
 }
 
 # BEFORE ANYTHING ASKS GIT, the primary's resolution below included: the helper refuses these too, but
@@ -208,6 +210,7 @@ $deadlineText = if ($deadline) { " stopAfter=$($deadline.ToLocalTime().ToString(
 # A marker on each side of the prune-merged.ps1 run, which prints nothing between its fetch line and its
 # table. A log that ends after the first marker, with no exit marker, was stopped inside that run.
 "--- prune-merged.ps1 running ---" | Add-Content -LiteralPath $log
+$pruneStarted = $true
 & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @pruneArgs *>&1 |
     Add-Content -LiteralPath $log
 $code = $LASTEXITCODE
