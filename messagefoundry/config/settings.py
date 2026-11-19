@@ -40,6 +40,7 @@ import difflib
 import functools
 import ipaddress
 import logging
+import math
 import os
 import re
 import string
@@ -3145,8 +3146,11 @@ class LoggingSettings(_Section):
     @field_validator("time_sync_max_skew_seconds")
     @classmethod
     def _check_skew_threshold(cls, value: float) -> float:
-        if value <= 0:
-            raise ValueError("[logging].time_sync_max_skew_seconds must be > 0")
+        # NaN passes `value <= 0` and no offset compares above it, and infinity is above every
+        # offset, so either would leave the skew warning and the fail-closed refusal unable to fire
+        # (BACKLOG #5317).
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("[logging].time_sync_max_skew_seconds must be a finite number > 0")
         return value
 
     @model_validator(mode="after")

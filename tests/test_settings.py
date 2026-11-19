@@ -1056,6 +1056,29 @@ def test_logging_time_sync_skew_threshold_must_be_positive(tmp_path: Path) -> No
         load_settings(config_path=cfg, environ={})
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_logging_time_sync_skew_threshold_must_be_finite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """NaN passes a bare `<= 0` check, and no offset compares above NaN or infinity, so either
+    would silence the skew warning and the fail-closed refusal (BACKLOG #5317). Red under: the
+    finiteness check removed, where nan and inf load."""
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[logging]\nrequire_time_sync = true\nntp_peer = "ntp.local"\n'
+        f"time_sync_max_skew_seconds = {value}\n",
+    )
+    with pytest.raises(ValidationError, match=r"time_sync_max_skew_seconds must be a finite"):
+        load_settings(config_path=cfg, environ={})
+    # The control: the environment spelling reaches the same refusal, and a finite value loads.
+    (tmp_path / "empty").mkdir()
+    monkeypatch.chdir(tmp_path / "empty")  # no ./messagefoundry.toml for the loader to pick up
+    with pytest.raises(ValidationError, match=r"time_sync_max_skew_seconds must be a finite"):
+        load_settings(environ={"MEFOR_LOGGING_TIME_SYNC_MAX_SKEW_SECONDS": value})
+    finite = load_settings(environ={"MEFOR_LOGGING_TIME_SYNC_MAX_SKEW_SECONDS": "1e9"})
+    assert finite.logging.time_sync_max_skew_seconds == 1e9
+
+
 def test_logging_time_sync_default_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     log = load_settings(environ={}).logging
