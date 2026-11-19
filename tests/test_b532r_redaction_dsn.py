@@ -100,7 +100,8 @@ _MAX_GROWTH = 24.0
 
 #: Adversarial shapes, each a function of the run length. The first three reach no "@" the match
 #: could end at, so the scan walks the whole run and fails, which is the worst case. The fourth
-#: matches, over a run holding many "@"; the fifth packs scheme heads, each a match attempt.
+#: matches, over a run holding many "@"; the fifth packs scheme heads, each a match attempt. The
+#: last three are the alternatives added items 3 and 4 put in the segments, each a lookahead.
 _WIDE_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     # An empty user's first segment over a run both of its classes take: the split the possessive
     # quantifier exists to refuse.
@@ -113,6 +114,12 @@ _WIDE_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     ("user, at-sign run", lambda n: "postgres://svc:<redacted>" + ("@a" * n)[:n] + " "),
     # Many scheme heads glued together, so the scan starts a match at every one of them.
     ("glued scheme heads", lambda n: ("a.b-://:" * n)[:n]),
+    # An empty user's first segment over "%" and "[", each "%" a lookahead (added item 3).
+    ("empty user, percent run", lambda n: "redis://:" + ("%a[" * n)[:n]),
+    # The run after over ";", each a lookahead to the next ";" (added item 4).
+    ("user, semicolon run", lambda n: "postgres://svc:<redacted>" + (";a@" * n)[:n] + " "),
+    # One ";" whose lookahead walks the whole run, which reaches no "=" and no "@".
+    ("empty user, one long lookahead", lambda n: "redis://:" + ("a;" + "b" * n)[:n]),
 )
 
 
@@ -160,7 +167,8 @@ def test_the_widened_dsn_pattern_grows_linearly_in_line_length() -> None:
 def test_the_growth_shapes_reach_the_widened_pattern() -> None:
     """The shapes above are only evidence if the pattern reads them: each opens a scheme head the
     pattern starts on. The first three match once the run ends in "@"; the fourth matches as it
-    stands; the fifth starts a match at each of its heads."""
+    stands; the fifth starts a match at each of its heads. Of the last three, the sixth and eighth
+    match once the run ends in "@", and the seventh as it stands."""
     wide = scrub_mod._WIDE_DSN_PASSWORD
     shapes = dict(_WIDE_SHAPES)
     for label, shape in _WIDE_SHAPES[:3]:
@@ -168,6 +176,9 @@ def test_the_growth_shapes_reach_the_widened_pattern() -> None:
     assert wide.search(shapes["user, at-sign run"](64)) is not None
     glued = shapes["glued scheme heads"](64)
     assert len(wide.findall(glued.replace("://:", "://:x@"))) >= 4
+    for label in ("empty user, percent run", "empty user, one long lookahead"):
+        assert wide.search(shapes[label](64) + "@h") is not None, label
+    assert wide.search(shapes["user, semicolon run"](64)) is not None
 
 
 def test_both_readings_apply_the_same_widened_pattern() -> None:

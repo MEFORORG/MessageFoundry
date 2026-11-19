@@ -3165,7 +3165,7 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     # The widened reading (BACKLOG #5386) has no arm. With a user, its first segment takes one
     # character or more, each of them in the arm's class, and past it the pattern adds only a run
     # that cannot hold whitespace or "/", then the "@": so every text it rewrites with a user, the
-    # arm reads.
+    # arm reads. The run's second alternative is a ";" alone, which opens no member key.
     wide = secretscrub._WIDE_DSN_PASSWORD.pattern
     assert r"://[^\s:/@]*):" in wide
     first = secretscrub._DSN_USER_FIRST_SEGMENT
@@ -3173,8 +3173,8 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
         r"(?>\[[a-z]+\]|<[a-z]+>|(?:" + secretscrub._DSN_RUN_STOP + r"[^\s/@<>\[\]])++)"
     )
     tail = wide.split(r"(?<!//:)" + first + ")", 1)[1]
-    run_head = "(?:" + secretscrub._DSN_RUN_STOP + r"[^\s/"
-    assert tail.startswith(run_head) and tail.endswith("])*@"), tail
+    run_head = "(?:" + secretscrub._DSN_RUN_STOP + r"(?:[^\s/"
+    assert tail.startswith(run_head) and tail.endswith(r"]|;(?![^\s/;@=]*=)))*@"), tail
 
 
 def test_an_empty_user_dsn_does_not_switch_the_encoded_run_off() -> None:
