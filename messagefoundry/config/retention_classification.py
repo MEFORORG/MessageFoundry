@@ -636,24 +636,27 @@ def _keep_forever_remedy(kept: tuple[str, ...]) -> str:
     """What an operator does about a keep-forever override. The refusal and the ``AUDIT:`` line
     under ``enforcement = warn`` both end with it, so the two give the same advice.
 
-    Where ``kept`` holds an inbound override, the advice to set the global body window to explicit
-    days is not enough under engine shards: that bounded window is the one a ``serve --shard``
-    process that does not hold the inbound purges its bodies on (:func:`_override_scope`). The
-    last sentence says so, and names what does keep them: an unbounded global window, which keeps
-    every inbound's bodies from that purge, or plain ``serve``."""
+    Where ``kept`` holds an inbound override, the advice to give the global body window explicit
+    days does not keep that inbound's bodies wherever a ``serve --shard`` process that does not
+    hold it runs retention against the same store: those days bound the window that process purges
+    them on (:func:`_override_scope`). The sentences after that advice say so, keyed on that
+    process, and name a configuration that keeps them there and what it costs."""
     # Only the auto-bounded windows lose a default. Naming them keeps an operator from setting a
     # window on a tier where a window is the wrong answer, such as transform state.
     auto_bounded = ", ".join(w.setting for w in auto_bounded_windows())
     inbound, _ = _override_kinds(kept)
     body_global = _window_setting("messages_days")
     engine_shards = (
-        ". Under engine shards that does not keep an inbound override's bodies: a serve --shard "
-        "process that does not hold that inbound purges them on the global "
-        f"{body_global} window, and an explicit number of days bounds that window. No per-"
-        "connection setting keeps one inbound's bodies past a bounded global window there. Only "
-        f"an unbounded {body_global}, unset with the switch set or 0, keeps them, and it keeps "
-        "every inbound's bodies from that purge too; plain serve, which runs no such process, "
-        "keeps the override as written"
+        " Those explicit days do not keep an inbound override's bodies where a serve --shard "
+        "process that does not hold that inbound runs retention against the same store: they "
+        f"bound the global {body_global} window, and that process purges the bodies on it. No "
+        "setting on that inbound changes this. One configuration that keeps them there leaves "
+        f"{body_global} unbounded, unset with the switch set or 0, and gives every other inbound "
+        "a positive messages_days of its own, which the serve --shard process holding that "
+        "inbound applies. With the global window unbounded, at least every inbound that has no "
+        "positive override of its own, and the stored messages of an inbound no longer in the "
+        "graph, keep their bodies forever. Plain serve, which runs no such process, keeps the "
+        "override as written"
         if inbound
         else ""
     )
@@ -665,8 +668,8 @@ def _keep_forever_remedy(kept: tuple[str, ...]) -> str:
         "AUDIT line naming these connections for each graph its guard passes. That switch covers "
         "the whole instance: it also turns off the default bound on each of these windows that "
         f"is unset: {auto_bounded}. Set each of them to an explicit number of days first, or it "
-        "keeps its PHI forever too. The start gate writes an AUDIT line for such a window at 0 "
-        f"only under enforcement = enforce{engine_shards}"
+        f"keeps its PHI forever too.{engine_shards}{'.' if engine_shards else ''} The start gate "
+        "writes an AUDIT line for such a window at 0 only under enforcement = enforce"
     )
 
 

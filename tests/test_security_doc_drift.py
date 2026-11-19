@@ -3978,8 +3978,11 @@ _OVERRIDE_NOTE_FACTS = (
     "Subject to the engine shard limit next, it keeps forever what that override's purge holds",
     "The engine shard limit binds an inbound's override alone.",
     # BACKLOG #5967: the switch-plus-explicit-days remedy bounds the window a sibling purges on.
-    "**Under engine shards that does not keep an inbound override's bodies:**",
-    "No per-connection setting keeps one inbound's bodies past a bounded global window there.",
+    "**Those explicit days do not keep an inbound override's bodies where a `serve --shard` process "
+    "that does not hold that inbound runs retention against the same store:**",
+    "No setting on that inbound changes this.",
+    "at least every inbound that has no positive override of its own, and the stored messages of "
+    "an inbound no longer in the graph, keep their bodies forever.",
     "Plain `serve`, which runs no such process, keeps the override as written.",
     "where a `serve --shard` process that does not hold that inbound runs retention against the "
     "same store, it purges that inbound's message bodies on the global window, and where that "

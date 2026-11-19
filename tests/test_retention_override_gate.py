@@ -331,16 +331,26 @@ def test_the_remedy_says_explicit_days_do_not_keep_an_inbound_under_engine_shard
     )
     remedy = verdict.refusal if enforcing else verdict.report
     assert remedy is not None
+    named = inbound_days is not None
+    # Keyed on the process, never on "engine shards" alone: a lone serve --shard holding the
+    # inbound keeps its bodies with explicit days.
     caveat = (
-        "Under engine shards that does not keep an inbound override's bodies: a serve --shard "
-        "process that does not hold that inbound purges them on the global "
-        "[security].delete_message_bodies_after_days window, and an explicit number of days "
-        "bounds that window. No per-connection setting keeps one inbound's bodies past a bounded "
-        "global window there."
+        "Those explicit days do not keep an inbound override's bodies where a serve --shard "
+        "process that does not hold that inbound runs retention against the same store: they "
+        "bound the global [security].delete_message_bodies_after_days window, and that process "
+        "purges the bodies on it. No setting on that inbound changes this."
     )
-    assert (caveat in remedy) is (inbound_days is not None)
-    assert ("plain serve, which runs no such process, keeps the override as written" in remedy) is (
-        inbound_days is not None
+    assert (caveat in remedy) is named
+    # The configuration that keeps them, and its cost, stated with it.
+    assert ("gives every other inbound a positive messages_days of its own" in remedy) is named
+    cost = (
+        "With the global window unbounded, at least every inbound that has no positive override "
+        "of its own, and the stored messages of an inbound no longer in the graph, keep their "
+        "bodies forever."
+    )
+    assert (cost in remedy) is named
+    assert ("Plain serve, which runs no such process, keeps the override as written" in remedy) is (
+        named
     )
 
 
