@@ -299,9 +299,7 @@ $baseBranch = $mainRef -replace '^origin/', ''
 
 function Test-LandedByPullRequest {
     param([string]$Branch, [string]$Tip)
-    # Scoped like Find-MergedPullRequestCarrying: an unscoped `--head` answers from the caller's cwd
-    # or gh's default repo, and a branch of the same name merged into another repository or another
-    # base proves nothing about $mainRef. No GitHub origin means the question cannot be asked.
+    # Scoped as the block above says; a branch of this name merged elsewhere proves nothing here.
     if (-not $ghAvailable -or -not $ghRepo) { return $null }
     try {
         $raw = & $GhCommand pr list --repo $ghRepo --head $Branch --base $baseBranch --state merged --json number,headRefOid,mergedAt,mergeCommit,baseRefName --limit 5 2>$null
@@ -539,7 +537,6 @@ function Test-StillReleasable([object]$Row) {
 
 $rows = @()
 $script:prByKey = @{}
-$script:fileByKey = @{}
 foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)) {
     $verdict = "UNKNOWN"; $why = ""; $key = $f.BaseName; $holder = ""; $branch = ""
 
@@ -571,7 +568,6 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
             why = "the file is '$($f.Name)' but its key reads '$key', which names $names -- a release by that key would act on another file" }
         continue
     }
-    $script:fileByKey[$key] = $f.FullName
 
     if (-not $holder) {
         $rows += [pscustomobject]@{ key = $key; holder = ""; branch = $branch; note = $note; verdict = "UNKNOWN"; why = "claim names no worktree" }
@@ -677,8 +673,8 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
             }
             else {
                 $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HOLD"
-                    why = $(if ($listed) { "$ahead commit(s) not on $mainRef; PR #$($pr.Number) merged but this tip is not its head and the branch files differ from the landing commit" }
-                        else { "$ahead commit(s) not on $mainRef; PR #$($pr.Number) merged but this tip is not its head, and the files this branch touched could NOT be listed" }) }
+                    why = "$ahead commit(s) not on $mainRef; PR #$($pr.Number) merged but this tip is not its head and " +
+                        $(if ($listed) { "the branch files differ from the landing commit" } else { "the files this branch touched could NOT be listed" }) }
             }
         }
         elseif ($pr -is [pscustomobject]) {
@@ -795,7 +791,8 @@ if ($Apply) {
         # claim.ps1 exits 0 on "no claim -- nothing to release" too, so an exit code alone can report
         # a release that did not happen. Released means the file this row judged is gone.
         $outcome = if ($LASTEXITCODE -ne 0) { "release FAILED -- claim untouched" }
-        elseif (Test-Path -LiteralPath $script:fileByKey[$r.key]) { "release FAILED -- the claim file is still there" }
+        # The scan let through only keys that fold to their own file name, so the key names the file.
+        elseif (Test-Path -LiteralPath (Join-Path $claimsDir "$(Get-KeyFileName $r.key).json")) { "release FAILED -- the claim file is still there" }
         else { "released" }
         $r | Add-Member -NotePropertyName outcome -NotePropertyValue $outcome -Force
     }
