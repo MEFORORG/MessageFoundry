@@ -100,12 +100,23 @@ export function committedRelativePath(ws: string, value: string): string | undef
  * what the CLI opens, a link out of the folder included. Either separator splits `rel`, since Windows
  * takes both. Spelling only, with no I/O. Shared by {@link escapesByLink} and securityConfigTarget.
  *
- * Open limits: at least a name holding a colon, which a Win32 open reads as an NTFS stream on the
- * entry before it, and a reserved device name such as `nul`, are not refused here, so `cfg:x` with
- * `cfg` a link out of the folder still passes.
+ * Open limit: at least a reserved device name such as `nul` is not refused here. A name holding a
+ * colon is refused by {@link hasColonInName}.
  */
 export function hasTrailingDotOrSpaceName(rel: string, win32: boolean = path.sep === "\\"): boolean {
   return win32 && rel.split(/[\\/]/).some((part) => part !== "." && (part.endsWith(".") || part.endsWith(" ")));
+}
+
+/**
+ * Whether `rel`, a path relative to a folder, has a folder or file name holding a colon, when `win32`
+ * (by default, on Windows). `rel` is relative, so it carries no drive letter. A Win32 open reads
+ * `name:stream` as an NTFS alternate data stream on the entry `name`, so `cfg:x`, with `cfg` a
+ * junction out of the folder, writes to a stream on the folder outside, while Node reads the whole
+ * name as one missing entry and the real-path check passes it. Either separator splits `rel`. Spelling
+ * only, with no I/O. Shared by {@link escapesByLink} and securityConfigTarget (BACKLOG #5404 item 1).
+ */
+export function hasColonInName(rel: string, win32: boolean = path.sep === "\\"): boolean {
+  return win32 && rel.split(/[\\/]/).some((part) => part.includes(":"));
 }
 
 /** The workspace-relative path settings a writer checks. */
@@ -124,7 +135,8 @@ export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
  * Two spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
  * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
  * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a name
- * {@link hasTrailingDotOrSpaceName} names, which the real-path check would read as a missing path.
+ * {@link hasTrailingDotOrSpaceName} or {@link hasColonInName} names, which the real-path check would
+ * read as a missing path.
  *
  * Open limits. The check reads the named path only: a link BELOW it, such as a linked `codesets`
  * folder under `configDir`, is not caught here. The real-path reads are synchronous, because cli.ts
@@ -145,7 +157,7 @@ export function escapesByLink(ws: string | undefined, value: string, win32: bool
   if (value.split(win32 ? /[\\/]/ : /[/]/).includes("..")) {
     return true;
   }
-  if (hasTrailingDotOrSpaceName(rel, win32)) {
+  if (hasTrailingDotOrSpaceName(rel, win32) || hasColonInName(rel, win32)) {
     return true;
   }
   return resolveInsideWorkspace(ws, value) === undefined;
@@ -156,7 +168,8 @@ export function escapesByLink(ws: string | undefined, value: string, win32: bool
  * or the link's target (docs/REVIEW-STANDARDS.md R12). Its first remedy works for every writer. The
  * second, an absolute path in user settings, which {@link escapesByLink} does not check, is named
  * with the two writers that decline one: the New Route wizard writes only inside the workspace
- * folder, and version-control setup commits no hook for a folder outside it. `fallback` names the
+ * folder, and version-control setup commits no hook for a folder outside it. It also says to remove
+ * the workspace value, since a value the workspace sets inside the folder wins over the user's. `fallback` names the
  * file checked in place of a blank value, which the CLI opens then (cli.ts `writerSetting`).
  */
 export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): string {
@@ -168,10 +181,11 @@ export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): strin
     `MessageFoundry: nothing was written or started. ${subject} inside the workspace folder that may ` +
     "lead out of it, or that Windows may open as another name. At least one of these holds: a symbolic " +
     "link or junction on the path leads out, the path climbs with '..', a folder or file name on it " +
-    "ends in a dot or a space, or its real path cannot be read. Remove the link or the '..', rename the " +
-    "folder or file, or make the workspace folder readable, so the path is a plain folder or file " +
-    "inside the workspace folder. Commands other than New Route and the commit hook also take the " +
-    "target of a link, named with an absolute path in user settings."
+    "ends in a dot or a space or holds a colon, or its real path cannot be read. Remove the link or the " +
+    "'..', rename the folder or file, or make the workspace folder readable, so the path is a plain " +
+    "folder or file inside the workspace folder. Commands other than New Route and the commit hook " +
+    "also take the target of a link, named with an absolute path in user settings, once any value " +
+    "for the setting in workspace settings is removed, since a workspace value wins over a user value."
   );
 }
 

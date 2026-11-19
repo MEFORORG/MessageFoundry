@@ -218,14 +218,18 @@ and uses your user value or the default instead, until you trust the workspace (
   - a symbolic link or junction on the named path leads out of the folder;
   - the value climbs with `..`;
   - its real path cannot be read;
-  - on Windows, a folder or file name on it ends in a dot or a space.
+  - on Windows, a folder or file name on it ends in a dot or a space;
+  - on Windows, a folder or file name on it holds a colon, which Windows opens as a stream on
+    another entry.
 
   The fix is a plain folder or file inside the workspace folder. Commands other than New Route and
-  the commit hook also take a link's target as an absolute path in user settings. For a set but
+  the commit hook also take a link's target as an absolute path in user settings, once any
+  workspace value for the setting is removed, since a workspace value wins. For a set but
   blank `serviceConfig`, the check reads the CLI's own fallback, `messagefoundry.toml` in the
   workspace folder. The check reads the named path only, so a link below it is still followed, such
   as a linked folder under `configDir`. The security editor does not run this check. It makes its
-  own: it collapses a `..` rather than refusing it, and it refuses a link anywhere below the folder.
+  own: it collapses a `..` rather than refusing it, and it refuses a link anywhere on the named
+  path. On Windows it also refuses a name that ends in a dot or a space or holds a colon.
   The New Route wizard makes its own link check as well.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security

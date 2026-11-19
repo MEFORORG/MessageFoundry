@@ -98,9 +98,6 @@ export function isExecGated(): boolean {
  *  named once a session rather than on every CLI call, and a new dropped value is named again. */
 const droppedPathSettings = new Set<string>();
 
-/** The workspace-relative path settings {@link containedPathSetting} contains. */
-export type { PathSettingKey };
-
 /**
  * A workspace-relative path setting, contained to the workspace folder by
  * {@link containedPathSetting} (BACKLOG #5404): a workspace value that leaves the folder, or a user

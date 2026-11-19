@@ -271,7 +271,7 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
   test("the refusal's remedy names a fix every writer accepts first, and the two that decline the other", () => {
     const text = linkEscapeRefusal("configDir");
     assert.ok(text.includes("messagefoundry.configDir names a path inside"), text);
-    assert.ok(text.includes("ends in a dot or a space, or its real path cannot be read"), text);
+    assert.ok(text.includes("ends in a dot or a space or holds a colon, or its real path cannot be read"), text);
     assert.ok(text.includes("make the workspace folder readable"), text);
     const plain = text.indexOf("so the path is a plain folder or file inside the workspace folder.");
     const absolute = text.indexOf("absolute path in user settings");

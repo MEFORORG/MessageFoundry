@@ -201,7 +201,8 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     // would otherwise go to the network on Windows.
     for (const name of SPIED) {
       const spy = (p: fs.PathLike): boolean | string => {
-        // A writer's link check (cli.ts escapesByLink, BACKLOG #5404 item 1) reads the real path of
+        // A writer's link check (workspaceContainment.ts escapesByLink, which cli.ts writerSetting
+        // calls, BACKLOG #5404 item 1) reads the real path of
         // the workspace folder and of a path spelled inside it. Those are answered as a folder with
         // no links and kept apart, so `statted` still records every other call, a realpath of any
         // path outside the folder included.
@@ -272,9 +273,26 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     assert.strictEqual(notices.length, 1, JSON.stringify(notices));
     assert.ok(!notices[0].includes("[x](command:foo)"), notices[0]);
     assert.ok(!notices[0].includes("command:"), notices[0]);
-    // Control: the refusal fired for this value and names the setting.
-    assert.match(notices[0], /^MessageFoundry: messagefoundry\.serviceConfig names a path which is not a file in this workspace/);
+    // Control: the refusal fired for this value and names the setting. On Windows the writer's link
+    // check refuses the colon in the name, an NTFS stream spelling, before any file-system call
+    // (BACKLOG #5404 item 1); elsewhere a colon is part of a name and the later no-file refusal fires.
+    if (process.platform === "win32") {
+      assert.match(
+        notices[0],
+        /^MessageFoundry: nothing was written or started\. messagefoundry\.serviceConfig names a path inside the workspace folder/,
+      );
+      assert.ok(notices[0].includes("holds a colon"), notices[0]);
+      assert.deepStrictEqual(run.statted, [], "the colon refusal came after a file-system call");
+      // configDir is checked first and is read; the serviceConfig value never is.
+      assert.ok(
+        run.resolved.every((p) => !p.includes("command")),
+        `the colon refusal came after a real-path read: ${JSON.stringify(run.resolved)}`,
+      );
+    } else {
+      assert.match(notices[0], /^MessageFoundry: messagefoundry\.serviceConfig names a path which is not a file in this workspace/);
+    }
     assert.strictEqual(run.stopped, false);
+    assert.strictEqual(run.started, false);
   });
 
   test("no folder open: Restart gives Start's folder refusal and does not stop the engine", async () => {
