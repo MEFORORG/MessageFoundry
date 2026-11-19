@@ -56,7 +56,7 @@ from messagefoundry.controlchars import scrub_log_argument
 # Imported, not redefined: the cert->principal matchers live in the neutral package-root leaf, which
 # the inbound connectors' `intake_auth` control (ADR 0154 D6) shares. Both planes key by issuer first
 # (BACKLOG #2237 here, #2287 for the intake plane's intake_client_subjects).
-from messagefoundry.credential import client_cert_principal_under_issuer
+from messagefoundry.credential import VERIFIED_ISSUER_KEY, client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
 from messagefoundry.redaction import safe_exc
@@ -1635,7 +1635,8 @@ def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Ide
 #: The fallback's verified read, kept per TLS connection, keyed on its ``ssl_object`` (BACKLOG #5788).
 #: The read parses the leaf and checks its issuer, so making it on every request would repeat that
 #: work on the event loop; the shim makes it once, at ``connection_made``. Weak keys, so an entry
-#: goes when its connection does. A read that found no certificate is not kept.
+#: goes when its connection does. A read that found no certificate, or no verified issuer, is not
+#: kept, so a fault the issuer lookup swallowed is retried on the next request rather than kept.
 _FALLBACK_PEERCERTS: weakref.WeakKeyDictionary[Any, Mapping[str, Any]] = weakref.WeakKeyDictionary()
 
 
@@ -1649,7 +1650,7 @@ def _fallback_peercert(ssl_object: Any) -> Mapping[str, Any] | None:
     if cached is not None:
         return cached
     cert = peercert_from_ssl_object(ssl_object)
-    if cert is not None:
+    if cert is not None and cert.get(VERIFIED_ISSUER_KEY):
         _FALLBACK_PEERCERTS[ssl_object] = cert
     return cert
 
@@ -2283,8 +2284,9 @@ def _ws_origin_allowed(websocket: WebSocket) -> bool:
     A handshake the hook declines, or any handshake while the console is not mounted, comes here.
 
     Only an ABSENT header counts as a native client. An empty or whitespace-only ``Origin``, or more
-    than one ``Origin`` header, is refused (BACKLOG #5789): reading only the first value, or taking
-    a blank one for absent, would let such a handshake skip the allow-list."""
+    than one ``Origin`` header, is refused (BACKLOG #5789). Taking a blank one for absent would
+    pass a browser handshake as a native client's without the allow-list, and judging the first of
+    several copies would let this check and a reader of another copy disagree about the origin."""
     origins = websocket.headers.getlist("origin")
     if not origins:
         return True  # native client (no browser Origin)

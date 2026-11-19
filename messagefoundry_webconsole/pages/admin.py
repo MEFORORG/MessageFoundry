@@ -470,6 +470,9 @@ def user_detail_page(
             ),
         ),
         el("input", type="hidden", name="notify_email_shown", value=user.notify_email or ""),
+        # BACKLOG #5784: the route leaves the display name out when it equals this, so a stored
+        # name the request model refuses does not block a save of another field.
+        el("input", type="hidden", name="display_name_shown", value=user.display_name or ""),
         el(
             "p",
             "Where security notices for this account are sent. Changing it notifies the old "

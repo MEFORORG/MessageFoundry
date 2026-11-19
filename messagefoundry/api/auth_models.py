@@ -19,10 +19,12 @@ from pydantic import AfterValidator, BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
-    PRINTABLE_TEXT_PATTERN,
+    PRINTABLE_TEXT_OR_EMPTY_PATTERN,
     ChannelScopeEntry,
     PermissionId,
+    PrintableName,
     RoleId,
+    visible_text,
 )
 from messagefoundry.auth.permissions import ROLE_METADATA, Role
 from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
@@ -277,21 +279,6 @@ class ChannelScope(RequestModel):
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
-def _not_blank(value: str) -> str:
-    """Refuse a value that is only whitespace (BACKLOG #5784)."""
-    if not value.strip():
-        raise ValueError("must not be blank")
-    return value
-
-
-#: A name an administrator types for an account or a custom role (BACKLOG #5784, #5785): printable,
-#: so no C0 control, DEL or C1 control reaches the store (a NUL is a server error on PostgreSQL), and
-#: not blank or whitespace only.
-DisplayName = Annotated[
-    str, Field(max_length=_NAME_MAX, pattern=PRINTABLE_TEXT_PATTERN), AfterValidator(_not_blank)
-]
-
-
 def _valid_new_username(username: str) -> str:
     """BACKLOG #5521: the rule ``AuthService.create_local_user`` applies, checked here as well so a
     refused name never reaches the route."""
@@ -323,7 +310,7 @@ class UserCreateRequest(RequestModel):
 
     #: Refused, 422, by the new-username rule ``auth/usernames.py`` states (BACKLOG #5521).
     username: NewUsername
-    display_name: DisplayName | None = None
+    display_name: PrintableName | None = None
     #: REQUIRED (BACKLOG #2018, ASVS 6.3.7). It seeds both the profile address and ``notify_email``,
     #: where every security notice goes. An account born without one is told nothing about a change
     #: made to it before its holder's first sign-in, an administrator's password reset included. The
@@ -349,13 +336,13 @@ class DirectoryUserCreateRequest(RequestModel):
     # vault BACKLOG #5342, #5784: no control character and not blank. Pinned by
     # tests/test_auth_federated_identity_routes.py::
     # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory.
-    username: DisplayName
+    username: PrintableName
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 
 class UserUpdateRequest(RequestModel):
-    #: An explicit null clears it; a value takes the :data:`DisplayName` rule (BACKLOG #5784).
-    display_name: DisplayName | None = None
+    #: An explicit null clears it; a value takes the ``PrintableName`` rule (BACKLOG #5784).
+    display_name: PrintableName | None = None
     #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).
     #: Its shape rule is in ``AuthService.update_user`` (BACKLOG #3278).
     email: str | None = Field(default=None, max_length=_NAME_MAX)
@@ -583,8 +570,9 @@ class RoleInfo(BaseModel):
 
 
 def _fold_role_name(name: str) -> str:
-    """A role name as a reader would see it: NFKC, case-folded, runs of whitespace as one space."""
-    return " ".join(unicodedata.normalize("NFKC", name).casefold().split())
+    """A role name as a reader would see it: format characters dropped, then NFKC, case-folded,
+    and runs of whitespace as one space."""
+    return " ".join(unicodedata.normalize("NFKC", visible_text(name)).casefold().split())
 
 
 #: Every built-in role's id and label, folded. A custom role may not take one (BACKLOG #5785).
@@ -594,18 +582,13 @@ _BUILTIN_ROLE_NAMES = frozenset(
 
 
 def _not_a_builtin_role_name(name: str) -> str:
-    """Refuse a custom role name that reads as a built-in role's id or label in any case or spacing,
-    so a custom role named ``ADMINISTRATOR`` cannot pass for the built-in Administrator (BACKLOG
-    #5785). It compares after NFKC and case folding; a name that only looks alike, such as one with
-    a letter from another script, is not caught here."""
+    """Refuse a custom role name that reads as a built-in role's id or label, so a custom role named
+    ``ADMINISTRATOR`` cannot pass for the built-in Administrator (BACKLOG #5785). It compares as
+    :func:`_fold_role_name` folds; a name that only looks alike, such as one with a letter from
+    another script, is not caught here."""
     if _fold_role_name(name) in _BUILTIN_ROLE_NAMES:
         raise ValueError("a custom role cannot take a built-in role's name")
     return name
-
-
-def _distinct_permissions(permissions: list[str]) -> list[str]:
-    """A repeated permission is one grant, kept once in first-seen order (BACKLOG #5785)."""
-    return list(dict.fromkeys(permissions))
 
 
 class CustomRoleRequest(RequestModel):
@@ -613,17 +596,16 @@ class CustomRoleRequest(RequestModel):
     catalog. The engine validates the subset (recognized perms only, non-empty, no carved-out
     escalation primitive) and rejects otherwise.
 
-    The name takes the :data:`DisplayName` rule and may not be a built-in role's name; the
-    description may not carry a control character; a repeated permission is kept once (BACKLOG
-    #5785)."""
+    The name takes the ``PrintableName`` rule and may not be a built-in role's name, and the
+    description may not carry a control character (BACKLOG #5785)."""
 
-    display_name: Annotated[DisplayName, AfterValidator(_not_a_builtin_role_name)]
+    display_name: Annotated[PrintableName, AfterValidator(_not_a_builtin_role_name)]
     description: str | None = Field(
-        default=None, max_length=_NAME_MAX, pattern=r"^[^\x00-\x1f\x7f-\x9f]*$"
+        default=None, max_length=_NAME_MAX, pattern=PRINTABLE_TEXT_OR_EMPTY_PATTERN
     )
-    permissions: Annotated[list[PermissionId], AfterValidator(_distinct_permissions)] = Field(
-        max_length=64
-    )
+    #: A repeated permission is one grant: ``validate_custom_role_permissions`` collects them into
+    #: a set before anything is stored.
+    permissions: list[PermissionId] = Field(max_length=64)
 
 
 class CustomRoleInfo(BaseModel):

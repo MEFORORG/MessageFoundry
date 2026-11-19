@@ -447,6 +447,33 @@ async def _save_profile(c: httpx.AsyncClient, uid: str, form: dict[str, str]) ->
     )
 
 
+async def test_the_console_saves_over_a_stored_name_the_request_model_refuses(
+    engine: Engine,
+) -> None:
+    """BACKLOG #5784: a stored display name with a control character, as a directory sync may
+    write, is posted back by the form unchanged; that must not block a save of another field. A
+    newly typed name with one is still refused."""
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        stored = "Dir" + chr(9) + "Name"
+        await service.store.update_user_profile(uid, display_name=stored, email=None, audits=())
+        r = await _save_profile(
+            c, uid, {"display_name": stored, "display_name_shown": stored, "disabled": "on"}
+        )
+        assert r.status_code == 303, r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.disabled
+        assert user.display_name == "Dir" + chr(9) + "Name"
+        r = await _save_profile(
+            c, uid, {"display_name": "New" + chr(9) + "Name", "display_name_shown": stored}
+        )
+        assert r.status_code == 400
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name == "Dir" + chr(9) + "Name"
+
+
 async def test_the_console_refuses_a_profile_email_creation_would_refuse(engine: Engine) -> None:
     """BACKLOG #3278: the console form reaches the PATCH rule. A refused address re-renders with the
     field named and changes nothing; an accepted one saves."""

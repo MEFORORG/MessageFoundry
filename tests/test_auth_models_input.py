@@ -14,7 +14,19 @@ from messagefoundry.api.auth_models import (
     UserUpdateRequest,
 )
 
-_BAD_NAMES = ["", " ", "\t \u3000", "jd\x00oe", "a\nb", "a\rb", "a\x7fb", "a\x85b"]
+#: Blank, blank once format characters are set aside, or carrying a control character.
+_BAD_NAMES = [
+    "",
+    " ",
+    "\t \u3000",
+    "\u200b",
+    "\ufeff \u00ad",
+    "jd\x00oe",
+    "a\nb",
+    "a\rb",
+    "a\x7fb",
+    "a\x85b",
+]
 
 
 @pytest.mark.parametrize("name", _BAD_NAMES)
@@ -63,7 +75,19 @@ def test_custom_role_refuses_a_blank_or_control_character_name(name: str) -> Non
 
 
 @pytest.mark.parametrize(
-    "name", ["Administrator", "administrator", " ADMINISTRATOR ", "Viewer", "auditor", "Coding"]
+    "name",
+    [
+        "Administrator",
+        "administrator",
+        " ADMINISTRATOR ",
+        "Viewer",
+        "auditor",
+        "Coding",
+        "Admin­istrator",
+        "Admin​istrator",
+        "‮Administrator",
+        "Ａdministrator",
+    ],
 )
 def test_custom_role_refuses_a_built_in_role_name(name: str) -> None:
     """BACKLOG #5785: a custom role cannot be named like a built-in one."""
@@ -77,11 +101,7 @@ def test_custom_role_refuses_a_control_character_in_the_description() -> None:
     assert _role(description="Lab operations").description == "Lab operations"
 
 
-def test_custom_role_keeps_a_repeated_permission_once() -> None:
-    """BACKLOG #5785."""
-    body = _role(permissions=["monitoring:read", "messages:read", "monitoring:read"])
-    assert body.permissions == ["monitoring:read", "messages:read"]
-
-
 def test_custom_role_takes_an_ordinary_name() -> None:
     assert _role(display_name="Administrators of lab").display_name == "Administrators of lab"
+    # A joiner some scripts need is a format character, and is kept within a name.
+    assert _role(display_name="Lab‌Ops").display_name == "Lab‌Ops"

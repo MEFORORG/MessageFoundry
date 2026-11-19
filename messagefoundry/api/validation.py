@@ -45,9 +45,10 @@ the standard library.
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Annotated
 
-from pydantic import Field, StringConstraints
+from pydantic import AfterValidator, Field, StringConstraints
 
 # The redundant alias is an explicit re-export, which strict mypy requires for a bare import.
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN as CONNECTION_NAME_PATTERN
@@ -202,6 +203,36 @@ ALERT_SUSPEND_MINUTES_MAX = 43200
 
 #: Printable text: no C0 control, no DEL, no C1 control. One or more characters.
 PRINTABLE_TEXT_PATTERN = r"^[^\x00-\x1f\x7f-\x9f]+$"
+
+#: :data:`PRINTABLE_TEXT_PATTERN` with the empty string allowed, for an optional free-text field.
+PRINTABLE_TEXT_OR_EMPTY_PATTERN = r"^[^\x00-\x1f\x7f-\x9f]*$"
+
+#: The longest account or role name (BACKLOG #5784): the bound these fields already shipped.
+PRINTABLE_NAME_MAX = 256
+
+
+def visible_text(value: str) -> str:
+    """``value`` without its format characters (Unicode category Cf), such as a zero-width space, a
+    soft hyphen or a bidi control. They render as nothing, so a check of what a reader sees drops
+    them first (BACKLOG #5784, #5785)."""
+    return "".join(c for c in value if unicodedata.category(c) != "Cf")
+
+
+def _visibly_not_blank(value: str) -> str:
+    if not visible_text(value).strip():
+        raise ValueError("must not be blank")
+    return value
+
+
+#: A name an administrator types for an account or a custom role, or a directory account's name
+#: (BACKLOG #5784, #5785): printable, as :data:`PRINTABLE_TEXT_PATTERN` states, and not blank once
+#: whitespace and format characters are set aside. A request model holds it; a value another writer
+#: stores, such as a directory sync, does not pass through this rule.
+PrintableName = Annotated[
+    str,
+    StringConstraints(pattern=PRINTABLE_TEXT_PATTERN, max_length=PRINTABLE_NAME_MAX),
+    AfterValidator(_visibly_not_blank),
+]
 
 #: A member of one of the engine's own closed vocabularies -- ``MessageStatus``, ``OutboxStatus``,
 #: the connection-event kinds. Every member of all three is letters and underscores only. The

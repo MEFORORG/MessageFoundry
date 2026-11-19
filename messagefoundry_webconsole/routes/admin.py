@@ -458,6 +458,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             }
             if notify_changed:
                 fields["notify_email"] = typed_notify
+            # BACKLOG #5784: the name the page showed, posted back unchanged, is left out, so the
+            # PATCH keeps the stored one. A name another writer stored, such as a directory sync,
+            # may hold a character the request model refuses, and re-posting it must not block an
+            # unrelated save. A form with no shown value sends the name as typed.
+            shown_name = form.get("display_name_shown")
+            if shown_name is not None and fields["display_name"] == (shown_name.strip() or None):
+                del fields["display_name"]
             body = UserUpdateRequest.model_validate(fields)
             await admin.update_user(
                 user_id, body=body, request=request, service=service, identity=identity

@@ -243,12 +243,16 @@ _CN_MAX = 64
 
 def _generated_cert_names(host: str) -> tuple[str, list[str]]:
     """The common name and extra subject alternative names of the generated pair for ``host``
-    (BACKLOG #5790).
+    (BACKLOG #5790). The certificate always names ``host`` itself, as it did before.
 
-    A loopback bind lists every loopback name, so a client dialling ``localhost`` or ``::1`` verifies
+    A loopback bind adds every loopback name, so a client dialling ``localhost`` or ``::1`` verifies
     as one dialling ``127.0.0.1`` does. A wildcard bind (``0.0.0.0``, ``::``) names no host a client
-    can dial, so the certificate takes this machine's host name, when it is one the builder accepts,
-    and the loopback names, which that bind also serves. Any other host is named alone, as before."""
+    can dial, so the common name is this machine's host name, as ``socket.gethostname`` gives it,
+    when the builder accepts it, and the loopback names are added. A wildcard bind serves at least
+    one loopback family, not always both: ``0.0.0.0`` does not serve ``::1``. The host name is the
+    bare one, so a remote client dialling a fully qualified name or an address still needs an
+    operator certificate, ``[api].tls_cert_file``; and any peer can read the host name from the
+    certificate before it signs in. Any other host is named alone, as before."""
     try:
         address: ipaddress.IPv4Address | ipaddress.IPv6Address | None = ipaddress.ip_address(host)
     except ValueError:
@@ -259,8 +263,8 @@ def _generated_cert_names(host: str) -> tuple[str, list[str]]:
         return host, []
     machine = socket.gethostname()
     if machine and machine.isascii() and len(machine) <= _CN_MAX:
-        return machine, list(_LOOPBACK_NAMES)
-    return _LOOPBACK_NAMES[0], list(_LOOPBACK_NAMES)
+        return machine, [host, *_LOOPBACK_NAMES]
+    return host, list(_LOOPBACK_NAMES)
 
 
 #: Renew the generated pair at startup once less than this share of its OWN validity period is
@@ -965,9 +969,8 @@ def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> S
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
 
-    cert_pem, key_pem = pki.make_self_signed(
-        *_generated_cert_names(api.host), _GENERATED_LIFETIME_DAYS
-    )
+    common_name, sans = _generated_cert_names(api.host)
+    cert_pem, key_pem = pki.make_self_signed(common_name, sans, _GENERATED_LIFETIME_DAYS)
     _write_private_key(key_path, key_pem)
     paired = False
     try:
@@ -986,7 +989,7 @@ def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> S
         "no [api].tls_cert_file configured — minted a SELF-SIGNED certificate for %s at %s. It has "
         "no chain of trust and is a PLACEHOLDER: browsers will show a trust interstitial until it "
         "is imported, and it should be replaced with an operator-supplied chain.",
-        api.host,
+        ", ".join(dict.fromkeys([common_name, *sans])),
         cert_path,
     )
     return pki.read_self_signed_facts(cert_pem)

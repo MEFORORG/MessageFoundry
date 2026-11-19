@@ -889,29 +889,34 @@ def test_the_resolvers_transport_fallback_reads_a_connection_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #5788: the fallback's verified read runs once per connection, not per request; a
-    second connection is read on its own."""
+    second connection is read on its own, and a read with no verified issuer is not kept."""
     from types import SimpleNamespace
 
     from starlette.requests import Request
 
     import messagefoundry.api.security as security_module
     from messagefoundry.api.security import peer_cert_from_request
+    from messagefoundry.api.tls_client_cert import peercert_from_ssl_object
 
     reads: list[object] = []
-    real = security_module.peercert_from_ssl_object
+    unissued: list[object] = []
 
     def counting(ssl_object: Any) -> Any:
         reads.append(ssl_object)
-        return real(ssl_object)
+        cert = peercert_from_ssl_object(ssl_object)
+        issuer = "" if ssl_object in unissued else "CN=Service CA"
+        return None if cert is None else {**cert, VERIFIED_ISSUER_KEY: issuer}
 
     monkeypatch.setattr(security_module, "peercert_from_ssl_object", counting)
     app = SimpleNamespace(state=SimpleNamespace(trusted_proxies=()))
     first, second = _Transport(("10.0.0.6", 1), _CERT), _Transport(("10.0.0.7", 1), _CERT)
-    for transport in (first, first, first, second):
+    third = _Transport(("10.0.0.8", 1), _CERT)
+    unissued.append(third._ssl)
+    for transport in (first, first, first, second, third, third):
         scope = {"type": "http", "headers": [], "app": app, "transport": transport}
         cert = peer_cert_from_request(Request(scope))
         assert cert is not None and cert["subject"] == _CERT["subject"]
-    assert reads == [first._ssl, second._ssl]
+    assert reads == [first._ssl, second._ssl, third._ssl, third._ssl]
 
 
 @pytest.mark.usefixtures("clean_anchor_checks")

@@ -54,7 +54,7 @@ filesystem path, a log line or a CSV export.
 | Audit action filter | Printable text, no control characters, 1 to 128 characters | `action` on `GET /audit` and `GET /audit/export` |
 | Display label | Printable text, no control characters, 1 to 128 characters | `name` on `POST /search/presets` |
 | Filesystem path | Printable text, no control characters, 1 to 4096 characters | `config_dir` on `POST /config/reload`, and `archive` on `POST /dr/activate` |
-| Directory user name | No NUL, 1 to 256 characters. Pinned by `tests/test_auth_federated_identity_routes.py::test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory` | `username` on `POST /users/directory` |
+| Account or role name | Printable text, no control characters, 1 to 256 characters, and not blank once whitespace and format characters such as a zero-width space are set aside. A custom role name may not also read as a built-in role's id or label. Pinned by `tests/test_auth_models_input.py` | `username` on `POST /users/directory`; `display_name` on `POST /users` and `PATCH /users/{user_id}`; `display_name` on `POST /roles/custom` and `PUT /roles/custom/{role_id}` |
 | Layered preset ids | Resource ids joined by single commas with no spaces, up to 1024 characters in all | `presets` on `GET /search/layered` |
 
 The email-address row covers `recipient_override` only. The account email fields follow a different

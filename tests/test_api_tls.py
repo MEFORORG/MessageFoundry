@@ -4291,7 +4291,7 @@ def test_a_wildcard_bind_mints_for_this_machine_and_loopback(
     monkeypatch.setattr(api_tls_module.socket, "gethostname", lambda: "engine-host")
     common_names, sans = _minted_names(tmp_path, wildcard)
     assert common_names == ["engine-host"]
-    assert sans == ["engine-host", "127.0.0.1", "localhost", "::1"]
+    assert sans == ["engine-host", wildcard, "127.0.0.1", "localhost", "::1"]
 
 
 def test_a_named_bind_is_still_minted_for_that_name_alone(tmp_path: Path) -> None:

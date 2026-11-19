@@ -957,7 +957,7 @@ def test_session_limits_refuse_zero_negative_and_huge(tmp_path: Path, key: str, 
     with pytest.raises(ValueError, match=key):
         _load(tmp_path, f"security.{key} = {value}\n")
     with pytest.raises(ValueError):
-        SecuritySettings(**{key: value})
+        SecuritySettings.model_validate({key: value})
 
 
 @pytest.mark.parametrize(
@@ -971,7 +971,7 @@ def test_session_limits_refuse_zero_negative_and_huge(tmp_path: Path, key: str, 
 )
 def test_auth_session_fields_take_the_same_bounds(field: str, value: int) -> None:
     with pytest.raises(ValueError):
-        AuthSettings(**{field: value})
+        AuthSettings.model_validate({field: value})
 
 
 def test_session_limits_take_one_and_a_year(tmp_path: Path) -> None:
