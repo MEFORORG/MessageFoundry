@@ -213,10 +213,16 @@ def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> P
     path's text names a file under ``base_dir`` (BACKLOG #5322). The name check covers a caller that
     never ran the settings validator, such as the ``--project-root`` check of a raw ``--env``.
 
-    It checks the text and nothing else. At least two cases still reach outside ``base_dir`` and are
-    not refused anywhere: a link inside ``base_dir`` that leads out, since the ``serve`` start check
-    vets the owners along a link chain but not where it ends; and on Windows a reserved device name
-    such as ``NUL``, which the alphabet admits and the system opens as the device."""
+    It checks the text and nothing else. A link inside ``base_dir`` that leads out is not refused
+    anywhere: the ``serve`` and ``supervise`` start checks
+    (:func:`~messagefoundry.config.wiring.assert_trusted_start_paths`) vet the owner of each folder
+    holding a link on the way, of the object the chain ends at and of that object's folder, but
+    nothing checks that the end lies under ``base_dir``.
+
+    Nor does it refuse a Windows reserved device name such as ``NUL``, which the alphabet admits.
+    The file name always carries ``.toml``, and on Windows 11 (measured on build 26300) ``NUL.toml``
+    is an ordinary file name: it is created, listed and read as a regular file in its folder. Older
+    Windows releases were not measured."""
     # Imported here, so importing this module does not load the settings model.
     from messagefoundry.config.settings import _ENV_NAME_ALLOWED
 
