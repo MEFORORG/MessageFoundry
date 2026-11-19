@@ -90,9 +90,15 @@ so the task cannot hang a lane.
 
 ### §4 — Throttled per cooldown; independent of transport suppression
 
-The action fires at most once per `realert_seconds` (or the rule's `cooldown_seconds`) per
-`(event_type, connection)`, on a throttle of its own (amended below, owner ruling 2026-11-19), so a
-flapping lane cannot trigger a restart storm while the cooldown is above zero. It is **independent of transport suppression**: a rule
+The action is throttled per `(event_type, connection)`, on a throttle of its own (amended below,
+owner ruling 2026-11-19): a restart runs only when at least the current emit's cooldown, the rule's
+`cooldown_seconds` or else `[alerts].realert_seconds`, has passed since the last restart task the
+sink scheduled for that key. That bounds a flapping lane's restarts, with at least these limits.
+With `[alerts].realert_seconds = 0` and no rule `cooldown_seconds`, the window is zero and there is
+no throttle; a rule's `cooldown_seconds` cannot be zero. The window is judged against the current
+emit's rule cooldown, not the one in force at the last restart, so a `schedule` switch from a rule
+with a long cooldown to one with a short cooldown can let a restart come before the long window
+ends. It is **independent of transport suppression**: a rule
 may set `transports=[]` to auto-remediate **quietly** (restart, no page) or fire alongside a page. The control action requires the
 **notifier** to be active (≥1 transport configured), since it is a notifier outcome; a deployment that
 wants transportless remediation configures at least one transport (documented; a transportless-notifier
@@ -108,11 +114,11 @@ lists the operator starts that still raise nothing, so leave the window standing
 
 **Amendment (owner ruling 2026-11-19, PR 3069).** The control action runs on its own throttle, apart
 from the notification's. The sink records when it dispatched a control task for an
-`(event_type, connection)`, and decides the next control action from that time alone, whether or not
-the notification for the same emit is throttled. So the restart still fires at most once per
-connection per cooldown, for each event type. The key is the connection that raised the event, not
+`(event_type, connection)`, and decides the next control action from that time and the current
+emit's cooldown, whether or not the notification for the same emit is throttled. The bound and its
+limits are the ones §4 states above. The key is the connection that raised the event, not
 the one restarted, so a `control_target` that several connections' events name can be restarted
-once per cooldown for each of them. The time is recorded only when the sink schedules a control
+once per window for each of them. The time is recorded only when the sink schedules a control
 task: an emit whose action the sink skips (for example: no control callback wired, the engine
 shutting down, or an event that is not about a connection) records nothing. A scheduled task records
 the time even when the callback then restarts nothing. A restart can therefore fire on a throttled

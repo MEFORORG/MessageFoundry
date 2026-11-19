@@ -1349,8 +1349,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._last_sent: dict[str, float] = {}
         # ADR 0128 section 4 (owner ruling 2026-11-19): per "<event_type>:<connection>", when a rule's
         # control action was last dispatched. The control throttle reads only this map, apart from
-        # the notification throttle above, so a control action fires at most once per cooldown per
-        # (event_type, connection), whether or not that emit's page was throttled.
+        # the notification throttle above, whether or not that emit's page was throttled. ADR 0128
+        # section 4 states the bound per (event_type, connection) and at least its limits.
         self._last_control: dict[str, float] = {}
         # Durable alert-state (ADR 0044, #56): when wired, every emit upserts a resolvable instance on
         # the (type, connection) key BEFORE the throttle, and an inverse signal auto-resolves it. None =
