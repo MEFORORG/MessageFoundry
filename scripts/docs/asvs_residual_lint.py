@@ -81,9 +81,16 @@ from pathlib import Path
 # A source reference carrying a line number. The extension list is closed on purpose: an open
 # `\w+\.\w+:\d+` matches version strings, host:port pairs and ordinary sentences, and a citation
 # lint whose first delivery is false positives does not get a second one.
+#
+# The optional leading dot admits a dot-directory or dotfile (`.github/workflows/ci.yml:12`,
+# `.pre-commit-config.yaml:40`); without it the lookbehind refused the token's second character and
+# such a citation passed unseen (BACKLOG #5468). The list itself was re-measured against every
+# `file:line` shape in the record's residual and absence prose: `js`, `css`, `cs` and `mod` (as in
+# `go.mod`) occur there and were missing, so a new citation of those shapes passed the same way.
 CITATION = re.compile(
     r"(?<![\w/\\.-])"
-    r"([\w][\w./\\-]*\.(?:py|toml|md|yml|yaml|json|ts|tsx|ps1|sh|cfg|ini|txt|lock))"
+    r"(\.?[\w][\w./\\-]*\."
+    r"(?:py|toml|md|yml|yaml|json|ts|tsx|js|css|cs|ps1|sh|cfg|ini|txt|lock|mod))"
     r"\s*:\s*(\d+)\b"
 )
 

@@ -75,6 +75,35 @@ residual = "The gate reads messagefoundry/__main__.py:1125 but the prose says __
         ("a lockfile", "requirements.lock:961 pins it", [("requirements.lock", "961")]),
         ("spaced colon", "settings.py : 1359", [("settings.py", "1359")]),
         ("two on one line", "a.py:1 and b/c.py:22", [("a.py", "1"), ("b/c.py", "22")]),
+        # BACKLOG #5468: each shape below passed the lint unseen before the fix.
+        (
+            "a dot-directory",
+            "see .github/workflows/ci.yml:12 for the job",
+            [(".github/workflows/ci.yml", "12")],
+        ),
+        (
+            "a dotfile",
+            "pinned in .pre-commit-config.yaml:40",
+            [(".pre-commit-config.yaml", "40")],
+        ),
+        (
+            "a dot-directory below a plain one",
+            "see tools/.config/x.toml:3",
+            [("tools/.config/x.toml", "3")],
+        ),
+        (
+            "a dot-directory, windows separator",
+            r"see .github\workflows\ci.yml:12",
+            [(r".github\workflows\ci.yml", "12")],
+        ),
+        (
+            "a js file",
+            "messagefoundry_webconsole/static/app.js:88 renders it",
+            [("messagefoundry_webconsole/static/app.js", "88")],
+        ),
+        ("a css file", "static/app.css:153", [("static/app.css", "153")]),
+        ("a cs file", "net-helper/NetOps.cs:85", [("net-helper/NetOps.cs", "85")]),
+        ("a go module file", "tools/ech-sidecar/go.mod:4", [("tools/ech-sidecar/go.mod", "4")]),
     ],
 )
 def test_the_citation_shapes_that_occur_are_detected(
@@ -93,6 +122,12 @@ def test_the_citation_shapes_that_occur_are_detected(
         ("a bare number", "the value is 1125"),
         ("a time", "at 06:17 daily"),
         ("an unknown extension", "image.png:12"),
+        # Controls for the leading dot (BACKLOG #5468): a dot that is not the start of a path
+        # token must not start a match, and a dot-name with no line is still not a citation.
+        ("an ellipsis before a name", "and so on ...app.js:3"),
+        ("a double dot before a name", "path ..app.js:3"),
+        ("a dotfile with no line", "see .pre-commit-config.yaml for the hooks"),
+        ("a dot-word with no extension", "the .github directory: 3 workflows"),
         # A citation already inside a longer path token must not also match its own tail.
         ("no double-count of a suffix", "messagefoundry/config/settings.py:1359"),
     ],
