@@ -2962,6 +2962,8 @@ def test_a_repeating_segment_and_the_framing_fields_are_never_written() -> None:
         ("MSH-2", True),
         ("MSH-2.1", True),
         ("msh-1.1", True),
+        ("MSH-01", True),
+        ("MSH-02.1", True),
         ("BHS-2", True),
         ("FHS-1", True),
         ("MSH-3", False),
@@ -2978,6 +2980,23 @@ def test_a_framing_path_covers_components_and_batch_headers(path: str, framing: 
     assert _is_framing_path(path) is framing
     if framing:
         assert not _writable(path)
+
+
+@pytest.mark.parametrize(
+    ("verb", "operands"),
+    [
+        ("ItemClear", ["%ADT/MSH-2"]),
+        ("ItemCopy", ["%ADT/PID-5", "%ADT/MSH-2"]),
+        ("ItemCopy", ['"#"', "%ADT/MSH-1"]),
+        ("ItemAppend", ["%ADT/BHS-2", '"x"']),
+    ],
+)
+def test_the_flat_mapping_never_writes_a_framing_field(verb: str, operands: list[str]) -> None:
+    """The markup-free mapping declines a write to a delimiter field too (BACKLOG #5972)."""
+    from messagefoundry_toolkit.corepoint_import import UnmappedAction, _map_statement
+
+    mapped = _map_statement(verb, operands, f"{verb} {' '.join(operands)}")
+    assert isinstance(mapped, UnmappedAction)
 
 
 def test_a_declined_statement_emits_no_live_stub() -> None:

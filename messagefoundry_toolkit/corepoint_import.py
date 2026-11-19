@@ -112,7 +112,9 @@ from messagefoundry._vendor.defusedxml.common import DefusedXmlException
 from messagefoundry._vendor.defusedxml.ElementTree import fromstring as _xml_fromstring
 from messagefoundry.connection_names import CONNECTION_NAME_MAX_LENGTH, is_connection_name
 from messagefoundry.controlchars import strip_control_chars
+from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.peek import parse_path
 from messagefoundry.redaction import codec_safe_str, safe_exc
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
@@ -1331,7 +1333,7 @@ def _map_statement(verb: str, operands: list[str], statement: str) -> Action | U
     that would be confidently wrong."""
     if verb == "ItemCopy" and len(operands) == 2:
         dst = _message_path(operands[1])
-        if dst is not None:
+        if dst is not None and not _is_framing_path(dst):
             src = _message_path(operands[0])
             if src is not None:
                 return Action(verb, "copy_field", (_lit(src), _lit(dst)))
@@ -1342,13 +1344,13 @@ def _map_statement(verb: str, operands: list[str], statement: str) -> Action | U
                 return Action(verb, "set_field", (_lit(dst), _lit(literal)))
     elif verb == "ItemClear" and len(operands) == 1:
         target = _message_path(operands[0])
-        if target is not None:
+        if target is not None and not _is_framing_path(target):
             # Clearing a field is exactly setting it empty (``Message.set`` re-encodes structurally).
             return Action(verb, "set_field", (_lit(target), _lit("")))
     elif verb == "ItemAppend" and len(operands) == 2:
         target = _message_path(operands[0])
         suffix = _string_literal(operands[1])
-        if target is not None and suffix is not None:
+        if target is not None and suffix is not None and not _is_framing_path(target):
             return Action(verb, "append_to_field", (_lit(target), _lit(suffix)))
 
     reason = (
@@ -1396,8 +1398,8 @@ def _decline_reason(operands: tuple[Operand, ...], subject: frozenset[str]) -> s
     resolved = [p for p in (_corepoint_path(o.text) for o in paths) if p is not None]
     if any(_is_framing_path(p) for p in resolved):
         return (
-            "targets MSH-1/MSH-2 (field separator / encoding characters) — Message.set refuses "
-            "a write that would change a delimiter there"
+            "names a header's delimiter field (MSH-1/MSH-2, or field 1 or 2 of BHS/FHS) — "
+            "Message.set refuses a write that would change a delimiter there"
         )
     if any(p.split("-", 1)[0].upper() not in _SINGLE_OCCURRENCE for p in resolved):
         return (
@@ -1421,10 +1423,14 @@ _SINGLE_OCCURRENCE = frozenset(
 # would leave the rest of the message on the old delimiters, so ``Message.set`` now refuses one
 # (BACKLOG #5972); an emitted write would fail in the Handler at run time. Never emit a write to either.
 def _is_framing_path(path: str) -> bool:
-    """Whether ``path`` is MSH-1 or MSH-2 or a component of either (``MSH-2.1``), or field 1 or 2
-    of a ``BHS``/``FHS`` header: the delimiter fields ``Message.set`` guards."""
-    seg, _, rest = path.upper().partition("-")
-    return seg in ("MSH", "BHS", "FHS") and rest.split(".", 1)[0] in ("1", "2")
+    """Whether ``path`` is MSH-1 or MSH-2 or a component of either (``MSH-2.1``, ``MSH-02``), or
+    field 1 or 2 of a ``BHS``/``FHS`` header: the delimiter fields ``Message.set`` guards. Read
+    with the engine's own path parser, so the two cannot disagree on a spelling."""
+    try:
+        seg, fld, _comp, _sub = parse_path(path.upper())
+    except ValueError:
+        return False
+    return _builtin_hl7.is_delimiter_field(seg, fld)
 
 
 # The connectives each mappable verb is allowed to carry. Anything outside its set means the statement

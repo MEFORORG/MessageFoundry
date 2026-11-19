@@ -1120,8 +1120,9 @@ async def reattach_documents_in_hl7(
                     raise UnreattachableDocumentError(refused)
         separators = message._encoding_chars()
         # Under a base64 delimiter the splice below would escape it inside the stored document,
-        # so a handle to splice is refused before any read (_delimits_with_base64). A Handler
-        # that changed MSH-1 or MSH-2 after the detach reaches this too.
+        # so a handle to splice is refused before any read (_delimits_with_base64). A body
+        # whose MSH-1 or MSH-2 was rewritten below the Message API after the detach reaches this
+        # too; the API itself refuses such a write (BACKLOG #5972).
         base64_delimited = _delimits_with_base64(separators)
         if found and base64_delimited:
             raise UnreattachableDocumentError(_BASE64_DELIMITED_HANDLE)
@@ -1148,8 +1149,9 @@ async def reattach_documents_in_hl7(
     message, handles, markers, separators = scanned
 
     def _splice(occ: int, verbatim: str) -> None:
-        # The detach checks a value under the delimiters it arrived with; MSH-1 or MSH-2 rewritten
-        # below the Message API since, which refuses such a write (BACKLOG #5972), reaches this instead. Message.set would escape a character the value holds,
+        # The detach checks a value under the delimiters it arrived with; MSH-1 or MSH-2
+        # rewritten below the Message API since, which refuses such a write (BACKLOG #5972),
+        # reaches this instead. Message.set would escape a character the value holds,
         # so the partner would not get the sender's document.
         if _splice_alters(verbatim, separators):
             # Scanned only on this refusal path. The detach refuses a control character under any

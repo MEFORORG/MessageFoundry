@@ -63,13 +63,6 @@ _SEG_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{2}$")
 _STRUCTURE_REFUSED = ("\x0b", "\x1c", "\x00")
 
 
-def _builtin_hl7_order(m: _builtin_hl7.ParsedMessage) -> tuple[str, str, str, str, str]:
-    """The parsed separators in :meth:`Message._encoding_chars` order, ``(field, component,
-    repetition, escape, subcomponent)``; the parser stores them ``(..., subcomponent, escape)``."""
-    field_sep, comp_sep, rep_sep, sub_sep, esc = _builtin_hl7.separators(m)
-    return field_sep, comp_sep, rep_sep, esc, sub_sep
-
-
 def _refuse_frame_bytes(value: str) -> None:
     """Raise ``ValueError`` if ``value`` holds an MLLP frame byte or NUL (ADR 0205 rule 3)."""
     for char in _STRUCTURE_REFUSED:
@@ -322,9 +315,9 @@ class Message:
         delimiters, which the parser read once from the first line and every other line is written
         in. A write to one of them that would change a delimiter raises ``ValueError``, so a write
         there cannot leave a header advertising delimiters its body is not written in (BACKLOG
-        #5972). Accepted there: the text the field already holds, and, at field 2, a whole-field
-        value that keeps the four encoding characters and changes only what follows them (a v2.7
-        truncation character, say). To send under other delimiters, re-encode the whole message, as
+        #5972). Accepted there: a value equal to what :meth:`field` reads at that path, and, at field
+        2, a whole-field value that keeps the four encoding characters and adds, drops or changes
+        only the one v2.7 truncation character after them. To send under other delimiters, re-encode the whole message, as
         a per-outbound ``encoding_characters`` does."""
         self._write(path, value, occurrence, repetition, as_data=False)
 
@@ -346,7 +339,7 @@ class Message:
             where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
             raise KeyError(f"cannot set absent segment {where}")
         if _builtin_hl7.is_delimiter_field(seg, fld):
-            self._write_delimiter_field(seg, fld, occurrence, value, comp, repetition)
+            self._write_delimiter_field(path, seg, fld, occurrence, value, comp, repetition)
             return
 
         field_sep, comp_sep, rep_sep, esc, sub_sep = self._encoding_chars()
@@ -657,6 +650,7 @@ class Message:
 
     def _write_delimiter_field(
         self,
+        path: str,
         seg: str,
         fld: int,
         occurrence: int,
@@ -666,20 +660,33 @@ class Message:
     ) -> None:
         """Write a header's field 1 or 2, or refuse a write that would change a delimiter.
 
-        The text the field already holds passes, as a no-op, at any repetition 1 path, so a
-        passthrough copy of the header still works. At field 2, a whole-field value whose first four
-        characters are the message's own encoding characters is assigned: the separators the parser
-        read do not move, so the rest of the message stays written in them. Anything else raises."""
+        A value equal to what :meth:`field` reads at the same path, repetition and occurrence is a
+        no-op, so a read-then-write copy of the header still works. At field 2, a whole-field value
+        (or repetition 1) holding the line's own four encoding characters, alone or followed by one
+        v2.7 truncation character, is assigned: the delimiters do not move, so the rest of the
+        message stays written in them. The truncation character must be printable, not a space and
+        not a delimiter, as :func:`~messagefoundry.parsing._builtin_hl7.encode_with_separators`
+        requires of a batch header's. Anything else raises."""
         current = self._raw_field(seg, fld, occurrence)
-        if comp is None and repetition in (None, 1):
-            if value == current:
+        whole = comp is None and repetition in (None, 1)
+        if whole and value == current:
+            return
+        # field() reads an empty part as None, which a copy writes back as "".
+        if (comp is not None or repetition is not None) and value == (
+            self.field(path, occurrence=occurrence, repetition=repetition) or ""
+        ):
+            return
+        if whole and fld == 2 and len(current) >= 4 and value[:4] == current[:4]:
+            tail = value[4:]
+            delimiters = self._raw_field(seg, 1, occurrence) + current[:4]
+            if not tail or (
+                len(tail) == 1
+                and tail.isprintable()
+                and not tail.isspace()
+                and tail not in delimiters
+            ):
+                self._assign_field(seg, fld, occurrence, value)
                 return
-            if fld == 2:
-                field_sep, comp_sep, rep_sep, esc, sub_sep = _builtin_hl7_order(self._m)
-                if value[:4] == comp_sep + rep_sep + esc + sub_sep and field_sep not in value:
-                    _refuse_frame_bytes(value)
-                    self._assign_field(seg, fld, occurrence, value)
-                    return
         raise self._delimiter_write_refusal(seg, fld)
 
     @staticmethod

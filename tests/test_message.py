@@ -160,6 +160,8 @@ def test_a_repetition_1_passthrough_of_a_delimiter_field_changes_nothing() -> No
     m = Message.parse(ADT)
     before = m.encode()
     m.set("MSH-2", m["MSH-2"] or "", repetition=1)
+    m.set("MSH-2", m.field("MSH-2", repetition=1) or "", repetition=1)
+    m.set("MSH-2.1", m.field("MSH-2.1") or "")
     assert m.encode() == before
 
 
@@ -171,8 +173,12 @@ def test_msh_2_past_its_four_encoding_characters_can_change() -> None:
     m.set("MSH-2", "^~\\&#")
     assert Message.parse(m.encode())["MSH-2"] == "^~\\&#"
     assert m["PID-5.2"] == "JANE"
-    with pytest.raises(ValueError, match="holds the message's delimiters"):
-        m.set("MSH-2", "^~\\&|")
+    # The truncation character must be one printable, non-space, non-delimiter character, as a
+    # per-outbound re-encode of a batch header requires (BACKLOG #5802).
+    for refused in ("^~\\&|", "^~\\&^", "^~\\&~", "^~\\& ", "^~\\&\x07", "^~\\&##"):
+        with pytest.raises(ValueError, match="holds the message's delimiters"):
+            m.set("MSH-2", refused)
+    assert Message.parse(m.encode())["MSH-2"] == "^~\\&#"
 
 
 def test_a_delimiter_write_of_the_text_already_there_changes_nothing() -> None:

@@ -564,8 +564,8 @@ def copy_segment(
     Reads the ``occurrence``-th (1-based) ``segment_id`` from the message and re-adds an identical
     segment. The copy is appended by default, or inserted at 1-based ``index`` among segments (``1`` =
     just after MSH). Raises :class:`KeyError` if the source segment/occurrence is absent, and
-    :class:`ValueError` (from :meth:`Message.add_segment`) for an ``MSH`` copy or an out-of-range
-    ``index``."""
+    :class:`ValueError` (from :meth:`Message.add_segment`) for an ``MSH``, ``BHS`` or ``FHS`` copy
+    or an out-of-range ``index``."""
     line = _segment_line(msg, segment_id, occurrence)
     if line is None:
         where = segment_id + (f" occurrence {occurrence}" if occurrence > 1 else "")
