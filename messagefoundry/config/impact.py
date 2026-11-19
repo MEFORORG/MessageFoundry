@@ -43,7 +43,7 @@ import io
 import re
 import tokenize
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import FunctionType
 
@@ -268,7 +268,7 @@ def plan_rename(
             continue
         sites, complete = found
         in_dir = [
-            _Site(resolved, site.span, site.allowed, site.rewritable)
+            replace(site, file=resolved)
             for site in sites
             if (resolved := _under_config_dir(config_dir, site.file)) is not None
         ]
@@ -412,12 +412,15 @@ class _Site:
     ``rewritable``, when set, narrows the rewrite to the literals in a referent role (BACKLOG #5980): a
     site whose every equal literal is counted still rewrites only a ``Send()`` target, a returned
     handler name and the like, so an equal literal in another role is left alone and, being still
-    counted, reports its referrer unresolved."""
+    counted, reports its referrer unresolved. ``ignored`` holds the literals at the site that are not
+    a referent at all and so are neither rewritten nor counted: the referrer's own registering
+    ``@handler("name")`` argument, when the referrer is named like the target."""
 
     file: str
     span: _Span
     allowed: frozenset[tuple[int, int]] | None
     rewritable: frozenset[tuple[int, int]] | None = None
+    ignored: frozenset[tuple[int, int]] = frozenset()
 
     def rewrites(
         self,
@@ -426,7 +429,7 @@ class _Site:
         shared_kind: str | None,
     ) -> bool:
         """Whether the literal at ``pos`` is one of this site's referents."""
-        if self.rewritable is not None and pos not in self.rewritable:
+        if pos in self.ignored or (self.rewritable is not None and pos not in self.rewritable):
             return False
         if self.allowed is not None:
             return pos in self.allowed
@@ -446,6 +449,7 @@ class _Site:
             (self.file, line, col)
             for (line, col), kind in kinds.items()
             if self.span.start <= line <= self.span.end
+            and (line, col) not in self.ignored
             and not (shared_kind is not None and kind is not None and kind != shared_kind)
         }
 
@@ -482,7 +486,9 @@ def _referrer_sites(
         # A referrer whose own function cannot be read is unresolved. A predicate that is not a plain
         # function (a partial, a callable instance) is not: the index cannot read it either, so no
         # edge came from it.
-        complete = bool(reached_functions(fn))
+        own_reached = reached_functions(fn)
+        complete = bool(own_reached)
+        own = own_reached[0] if own_reached else None
         funcs: list[tuple[int, FunctionType, str, _Span]] = []
         reached: list[FunctionType] = []
         for root in roots:
@@ -498,14 +504,18 @@ def _referrer_sites(
         role_attrs = {name for scan in scans for name in scan.attrs}
         for (depth, func, file, span), scan in zip(funcs, scans, strict=True):
             rewritable = scan.positions
-            if depth == 0 and scan.body_start is not None:
-                # The referrer's own decorators name the referrer, not a referent: counting them
-                # would report a handler named like its outbound unresolved.
-                span = _Span(scan.body_start, span.end)
-            if table_kind is not None:
-                rewritable |= _default_positions(sources, func, file, span, old)
+            ignored: frozenset[tuple[int, int]] = frozenset()
+            if depth == 0 and func is own:
+                # The registering decorator's name argument names the referrer, not a referent:
+                # counting it would report a handler named like its outbound unresolved. Its other
+                # decorators stay in the site, so an equal literal there is still counted.
+                ignored = _decorator_positions(sources, file, span, fn, old, ref.referrer_kind)
+            # A non-table rename rewrites a default only for a parameter that reaches a referent
+            # role; a table rename rewrites every default equal to the old name.
+            role_params = None if table_kind is not None else {name for _i, name in scan.slots}
+            rewritable |= _default_positions(sources, func, file, span, old, role_params)
             if table_kind is None or depth == 0:
-                sites.append(_Site(file, span, None, frozenset(rewritable)))
+                sites.append(_Site(file, span, None, frozenset(rewritable), ignored))
             else:
                 allowed = _accessor_positions(sources, file, span, old, table_kind) | rewritable
                 sites.append(_Site(file, span, frozenset(allowed)))
@@ -550,10 +560,16 @@ def _accessor_positions(
 
 
 def _default_positions(
-    sources: SourceCache, func: FunctionType, file: str, span: _Span, old: str
+    sources: SourceCache,
+    func: FunctionType,
+    file: str,
+    span: _Span,
+    old: str,
+    params: set[str] | None = None,
 ) -> set[tuple[int, int]]:
     """The positions of ``old`` written as a default argument in ``func``'s own signature
-    (``def _lookup(code, table="diets")``), which the function reads as a captured value."""
+    (``def _lookup(code, table="diets")``), which the function reads as a captured value; with
+    ``params``, only the defaults of those parameters."""
     parsed = sources.parse(file)
     if parsed is None:
         return set()
@@ -565,7 +581,18 @@ def _default_positions(
             continue
         if not isinstance(node, ast.Lambda) and node.name != func.__name__:
             continue
-        defaults = [*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)]
+        args = node.args
+        positional = [*args.posonlyargs, *args.args]
+        # Defaults fill the last positional parameters; kw_defaults pair one-to-one with kwonlyargs.
+        pairs = [
+            *zip(positional[len(positional) - len(args.defaults) :], args.defaults, strict=True),
+            *(
+                (a, d)
+                for a, d in zip(args.kwonlyargs, args.kw_defaults, strict=True)
+                if d is not None
+            ),
+        ]
+        defaults = [d for a, d in pairs if params is None or a.arg in params]
         out |= {
             sources.position(file, c)
             for d in defaults
@@ -579,6 +606,14 @@ def _default_positions(
 
 #: Calls that hand back their first argument's elements, so a name inside it is still the value.
 _COPY_CALLS = frozenset({"list", "tuple", "set", "frozenset", "sorted", "reversed"})
+
+#: The keyword each table accessor takes its table name under (``code_set(name="diets")``).
+_ACCESSOR_NAME_PARAMS = {
+    "code_set": "name",
+    "reference": "name",
+    "db_lookup": "connection",
+    "fhir_lookup": "connection",
+}
 
 #: Methods through which a local list or set collects names (``handlers.append("h")``).
 _COLLECTOR_METHODS = frozenset({"append", "extend", "add", "insert"})
@@ -606,36 +641,41 @@ class _Flow:
 class _Scan:
     """One reached function's referent positions, the module names (bare, and as attributes of a
     module) its roles read, and the parameters (as ``(index, name)``, index -1 for keyword-only)
-    whose value reaches a role. ``body_start`` is the ``def`` line, past its own decorators."""
+    whose value reaches a role."""
 
     positions: set[tuple[int, int]]
     globals: set[str]
     attrs: set[str]
     calls: set[str]
     slots: set[tuple[int, str]]
-    body_start: int | None = None
 
 
 @dataclass(frozen=True)
 class _Names:
     """How one config module spells what the role scan matches by name: ``Send`` and any alias it
-    is imported under, and the modules it imports (so ``_shared.label(...)`` is a helper call while
-    ``LABELS.get(...)`` is a method)."""
+    is imported under, the table accessors it imports under an alias (``code_set as cs``, mapped to
+    the accessor's own name), and the modules it imports (so ``_shared.label(...)`` is a helper call
+    while ``LABELS.get(...)`` is a method)."""
 
     send: frozenset[str]
     modules: frozenset[str]
+    accessors: Mapping[str, str] = field(default_factory=dict)
 
 
 def _module_names(sources: SourceCache, file: str) -> _Names:
     parsed = sources.parse(file)
     send = {"Send"}
     modules: set[str] = set()
+    accessors: dict[str, str] = {}
     for node in ast.walk(parsed[0]) if parsed is not None else ():
         if isinstance(node, ast.ImportFrom):
             send |= {a.asname for a in node.names if a.name == "Send" and a.asname}
+            accessors |= {
+                a.asname: a.name for a in node.names if a.name in _TABLE_ACCESSORS and a.asname
+            }
         elif isinstance(node, ast.Import):
             modules |= {a.asname or a.name.split(".")[0] for a in node.names}
-    return _Names(frozenset(send), frozenset(modules))
+    return _Names(frozenset(send), frozenset(modules), accessors)
 
 
 def _helper_name(func: ast.expr, modules: frozenset[str]) -> str | None:
@@ -775,7 +815,6 @@ def _scan_function(
         flow.attrs,
         flow.calls,
         own_slots,
-        None if isinstance(node, ast.Lambda) else node.lineno,
     )
 
 
@@ -788,14 +827,14 @@ def _call_roots(call: ast.Call, role: _Role) -> list[ast.expr]:
         target = _first_or_keyword(call, "to")
         if target is not None:
             out.append(target)
+    accessor = role.names.accessors.get(called or "", called)
     if (
         role.accessor is not None
-        and called is not None
-        and _TABLE_ACCESSORS.get(called) == role.accessor
-        and call.args
-        and not isinstance(call.args[0], ast.Starred)
+        and accessor is not None
+        and _TABLE_ACCESSORS.get(accessor) == role.accessor
+        and (table := _first_or_keyword(call, _ACCESSOR_NAME_PARAMS[accessor])) is not None
     ):
-        out.append(call.args[0])
+        out.append(table)
     helper = _helper_name(call.func, role.names.modules)
     for index, name in role.slots.get(helper or "", ()):
         if 0 <= index < len(call.args) and not isinstance(call.args[index], ast.Starred):

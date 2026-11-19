@@ -514,6 +514,164 @@ def test_an_accepts_lambda_is_scanned_not_a_lambda_in_the_body(tmp_path: Path) -
     assert [e.new_literal for e in plan.edits] == ['"meals"']
 
 
+def test_a_stacked_decorator_literal_on_a_referrer_is_never_silently_left(tmp_path: Path) -> None:
+    """A referrer's stacked decorator is part of its definition: an equal literal there is either
+    rewritten or reports the referrer unresolved, never left behind while the plan passes clean.
+    Only the registering ``@handler(...)`` name argument is the referrer's own and is skipped."""
+    config_dir = _write_config(
+        tmp_path,
+        "import functools\n"
+        "\n"
+        "def uses(table):\n"
+        "    def deco(fn):\n"
+        "        @functools.wraps(fn)\n"
+        "        def wrapper(msg):\n"
+        "            code_set(table)\n"
+        "            return fn(msg)\n"
+        "        return wrapper\n"
+        "    return deco\n"
+        "\n"
+        'inbound("IB_K", MLLP(port=2818), router="r_k")\n'
+        'outbound("OB_K", MLLP(host="127.0.0.1", port=6971))\n'
+        "\n"
+        '@router("r_k")\n'
+        "def r_k(msg):\n"
+        '    return ["h_k"]\n'
+        "\n"
+        '@handler("h_k")\n'
+        '@uses("diets")\n'
+        "def h_k(msg):\n"
+        '    code_set("diets")\n'
+        '    return Send("OB_K", msg)\n',
+        codesets=("diets",),
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    apply_rename(plan)
+    assert '@uses("diets")' not in _mod(config_dir) or plan.unresolved, plan
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        "from messagefoundry import code_set as cs\n",
+        "",
+    ],
+    ids=["aliased", "keyword"],
+)
+def test_an_aliased_or_keyword_code_set_call_in_the_body_is_rewritten(
+    tmp_path: Path, head: str
+) -> None:
+    call = 'cs("diets")' if head else 'code_set(name="diets")'
+    config_dir = _write_config(
+        tmp_path,
+        head + 'inbound("IB_Q", MLLP(port=2819), router="r_q")\n'
+        'outbound("OB_Q", MLLP(host="127.0.0.1", port=6972))\n'
+        "\n"
+        '@router("r_q")\n'
+        "def r_q(msg):\n"
+        '    return ["h_q"]\n'
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        f'    tag = {call}.get("A")\n'
+        '    return Send("OB_Q", msg)\n',
+        codesets=("diets",),
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"diets"' not in _mod(config_dir)
+
+
+_DEFAULTS = {
+    "handler_default": (
+        "outbound",
+        "OB_OLD",
+        "OB_NEW",
+        '@router("r_f")\n'
+        "def r_f(msg):\n"
+        '    return ["h_f"]\n'
+        "\n"
+        '@handler("h_f")\n'
+        'def h_f(msg, dest="OB_OLD"):\n'
+        "    if msg is None:\n"
+        '        return Send("OB_OLD", msg)\n'
+        "    return Send(dest, msg)\n",
+    ),
+    "helper_default": (
+        "outbound",
+        "OB_OLD",
+        "OB_NEW",
+        'def _send(msg, dest="OB_OLD"):\n'
+        "    return Send(dest, msg)\n"
+        "\n"
+        '@router("r_f")\n'
+        "def r_f(msg):\n"
+        '    return ["h_f"]\n'
+        "\n"
+        '@handler("h_f")\n'
+        "def h_f(msg):\n"
+        "    if msg is None:\n"
+        '        return Send("OB_OLD", msg)\n'
+        "    return _send(msg)\n",
+    ),
+    "router_default": (
+        "handler",
+        "h_f",
+        "h_g",
+        '@router("r_f")\n'
+        'def r_f(msg, name="h_f"):\n'
+        '    return [name] if msg is None else ["h_f"]\n'
+        "\n"
+        '@handler("h_f")\n'
+        "def h_f(msg):\n"
+        '    return Send("OB_OLD", msg)\n',
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_DEFAULTS))
+def test_a_parameter_default_carrying_a_referent_is_rewritten(tmp_path: Path, case: str) -> None:
+    kind, old, new, body = _DEFAULTS[case]
+    config_dir = _write_config(
+        tmp_path,
+        'inbound("IB_F", MLLP(port=2820), router="r_f")\n'
+        'outbound("OB_OLD", MLLP(host="127.0.0.1", port=6973))\n'
+        "\n" + body,
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, kind, old, new)
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert f'"{old}"' not in _mod(config_dir)
+    load_config(config_dir)
+
+
+def test_a_parameter_default_read_only_in_a_comparison_is_left_and_reported(
+    tmp_path: Path,
+) -> None:
+    config_dir = _write_config(
+        tmp_path,
+        'inbound("IB_G", MLLP(port=2821), router="r_g")\n'
+        'outbound("OB_OLD", MLLP(host="127.0.0.1", port=6974))\n'
+        "\n"
+        '@router("r_g")\n'
+        "def r_g(msg):\n"
+        '    return ["h_g"]\n'
+        "\n"
+        '@handler("h_g")\n'
+        'def h_g(msg, skip="OB_OLD"):\n'
+        "    if str(msg) == skip:\n"
+        "        return None\n"
+        '    return Send("OB_OLD", msg)\n',
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    apply_rename(plan)
+    text = _mod(config_dir)
+    assert 'skip="OB_OLD"' in text
+    assert 'return Send("OB_NEW", msg)' in text
+    assert plan.unresolved == (Reference("handler", "h_g", "outbound", "OB_OLD"),)
+
+
 _UNRESOLVABLE = {
     "field_comparison": (
         "outbound",
