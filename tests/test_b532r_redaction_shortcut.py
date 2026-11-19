@@ -85,3 +85,30 @@ def test_a_line_the_reading_before_leaves_alone_still_takes_the_shortcut(line: s
     out = scrub_credentials(line)
     assert out == scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, folded)
     assert "Kv9q" not in out, out
+
+
+def test_a_shortcut_line_prints_nothing_the_widened_reading_before_hides() -> None:
+    """The shortcut's claim, measured: on every line of the camelCase differential corpus that
+    takes the union and leaves the narrow reading before unchanged, the shipped reading, which is
+    all the shortcut returns, prints no atom the widened reading before hid. The control: on some
+    of those lines the widened reading before hides something, so the claim is tested at all."""
+    from tests.test_secretscrub_camelcase_label import _ATOM, _DSN_LINES, _dense_lines, _prints
+
+    before = scrub_mod._pre_camel_sub
+    tested = 0
+    for line in _dense_lines(2000, 5386) + list(_DSN_LINES):
+        folded = scrub_mod._gate_fold(line)
+        if not scrub_mod._admits(folded, scrub_mod._ANY_HINT):
+            continue
+        if not scrub_mod._reads_camel(line, folded, CREDENTIAL_PLACEHOLDER):
+            continue
+        if scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, folded, before, wide=False) != line:
+            continue
+        widened = scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, folded, before)
+        if widened == line:
+            continue
+        tested += 1
+        out = scrub_credentials(line)
+        for atom in set(_ATOM.findall(line)):
+            assert not (_prints(atom, out) and not _prints(atom, widened)), (atom, line, out)
+    assert tested > 20, tested

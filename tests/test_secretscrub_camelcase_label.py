@@ -489,9 +489,11 @@ def _dense_lines(count: int, seed: int) -> list[str]:
 
 
 #: DSN lines for the differential, each beside a label of the corpus, built in order so the seeded
-#: lines above stay as they were. The widened DSN pass (BACKLOG #5386) reads each password; the
-#: label after it is what that pass must not take. In the last two heads the DSN is itself a
-#: camelCase label's value, whose end a later reading finds at a ";" (code review of #5386).
+#: lines above stay as they were. The widened DSN pass (BACKLOG #5386) reads the first and third
+#: heads' passwords whole, and the label after is what it must not take. The heads holding ";w"
+#: it reads only up to that ";", or not at all, a pinned residual: there the lines measure that a
+#: DSN with a ";" in it, the last two as a camelCase label's value, keeps that ";" for the readings
+#: after (code review of #5386).
 _DSN_LINES = tuple(
     f"connect {head}{sep}{label}{assign}vq2"
     for head in (

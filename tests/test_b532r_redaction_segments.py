@@ -4,7 +4,8 @@
 
 Synthetic values only. Item 3: an empty user's first password segment refused "%", "[" and "]",
 so a password-only DSN holding one printed whole. It admits a "%" now, except one that opens an
-encoded HL7 separator, which the PHI pass reads a run by. "[" and "]" it still refuses, so it
+encoded HL7 separator, which the PHI pass reads a run by, or the encoded form of a character it
+stops at for structure, such as ",". "[" and "]" it still refuses, so it
 never crosses a placeholder. Item 4, a ";" that opens no member in the run after the first segment,
 was built and declined: the declined form printed a value ``origin/main`` hides, pinned below. The
 comment on ``secretscrub._WIDE_DSN_PASSWORD`` says why each was kept or declined.
@@ -49,9 +50,12 @@ def test_a_percent_in_an_empty_users_password_is_hidden_whole(
 
 
 #: Residuals, each matching nothing, so the line prints as it did before #5386: an encoded HL7
-#: separator in either case, a bracket, and a ";" in the run after the first segment.
+#: separator in either case, an encoded "," or ";", a bracket, and a ";" in the run after the
+#: first segment.
 _STILL_STOPPED = (
     "connect redis://:p%7CKv9x@db.invalid failed",
+    "connect redis://:p%2CKv9x@db.invalid failed",
+    "connect redis://:p%3bKv9x@db.invalid failed",
     "connect redis://:p%7cKv9x@db.invalid failed",
     "connect redis://:p%5EKv9x@db.invalid failed",
     "connect redis://:p%26Kv9x@db.invalid failed",
@@ -95,3 +99,10 @@ def test_a_semicolon_separated_address_list_keeps_its_host() -> None:
     line = "notify smtp://ops:pw@mail.local:587;alerts@corp.example failed"
     out = scrub_credentials(line)
     assert "@mail.local:587;alerts@corp.example failed" in out and "pw@" not in out, out
+
+
+def test_an_encoded_comma_after_a_port_keeps_its_host() -> None:
+    """An encoded "," stops an empty user's first segment as a literal one does: taken, it read
+    the port and ``cc=admin`` as a password and named the recipient's domain as the host."""
+    line = "notify smtp://:587%2Ccc=admin@corp.example failed"
+    assert scrub_credentials(line) == line

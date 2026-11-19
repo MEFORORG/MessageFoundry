@@ -46,12 +46,11 @@ def test_the_reading_before_kept_whole_still_runs_the_widened_pass(
 
     monkeypatch.setattr(scrub_mod, "_run", spy)
     out = scrub_credentials(line)
-    # Control: two readings ran to the end, the first, the reading before, is what came back, and
-    # the second hid the ``;PWD=`` member key the first printed, which is what sends the line down
-    # this branch rather than the merged one. The shortcut's probe stops at its first match, by
-    # raising, so it returns nothing to the spy.
-    assert len(results) == 2 and out == results[0], (results, out)
-    assert ";PWD=" in results[0] and ";PWD=" not in results[1], results
+    # Control: what came back is a reading that printed the ``;PWD=`` member key, and another
+    # reading of the line hid it, which is what sends the line down this branch rather than the
+    # merged one.
+    assert out in results and ";PWD=" in out, (results, out)
+    assert any(";PWD=" not in result for result in results), results
     assert secret not in out, out
     assert CREDENTIAL_PLACEHOLDER in out
 
