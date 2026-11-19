@@ -38,19 +38,26 @@ measured that taking (a) first ships a silent green: it zeroes wall #3 while the
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 
 import pytest
 
 from harness.load.connscale import runner
-from harness.load.connscale.probe import ProcSample
+from harness.load.connscale.probe import _PROBE_TIMEOUT_S, ProbeDegraded, ProcSample, _gap
+from harness.load.connscale.report import ConnScaleRecord, monotonic_lane
 from harness.load.connscale.runner import (
+    _FD_PROBE_MAKEUP_ATTEMPTS,
     _MIN_IN_HOLD_SAMPLES,
     ProcReading,
+    _derive_proc,
+    _monotonic_slo,
     _probe_loop,
     _sample_loop,
 )
 from harness.load.enginepoll import EngineSample
+from tests.test_connscale_probe_degradation import _record
+from tests.test_connscale_smoke import _SMOKE_COUNTS, _assert_fd_probe
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -290,4 +297,160 @@ async def test_a_hold_with_room_to_spare_is_not_extended_by_the_floor() -> None:
     assert poller.calls_after_stop == 0, (
         f"a {_HOLD_S}s hold that already met the floor polled {poller.calls_after_stop} more time(s) "
         f"after it ended -- the make-up ticks are running when they are not needed"
+    )
+
+
+# --- BACKLOG #1488: the OS probe's make-up floor ------------------------------------------------------
+#
+# The failing windows-2022 merge-queue run of 2026-11-19 recorded `1/1 ('walk_timeout',)` on all four
+# steps: one probe attempt per step, and that attempt spent the walk's whole 5 s budget against a 1.5 s
+# hold. The stand-ins below keep that SHAPE at test scale. Their first attempt costs longer than the
+# hold, so the window holds exactly one reading, and what that reading is decides the arm.
+
+#: How long the stand-in's slow attempt blocks its worker thread. Longer than `_STARVED_HOLD_S`, which is
+#: the whole point: it is the walk that outlasts the window.
+_SLOW_ATTEMPT_S = 0.15
+_STARVED_HOLD_S = 0.05
+
+
+def _measured(handles: int) -> ProcSample:
+    """A reading that measured, naming the PID it summed as the runner's real probe does (#1210)."""
+    return ProcSample(handles, 1.0, 6_000_000, frozenset({4100}), None, frozenset({4100}))
+
+
+class _ScriptedSampler:
+    """An `FdSampler` stand-in that answers from a script of `(cost_s, sample)` entries, the last one
+    repeating. It counts the calls made after the window's `stop`, which are the floor's make-up
+    attempts read off the loop's own behaviour rather than off a stopwatch."""
+
+    def __init__(self, script: list[tuple[float, ProcSample]], stop: asyncio.Event) -> None:
+        self._script = script
+        self._stop = stop
+        self.calls = 0
+        self.calls_after_stop = 0
+
+    def sample_proc(self) -> ProcSample:
+        if self._stop.is_set():
+            self.calls_after_stop += 1
+        cost, sample = self._script[min(self.calls, len(self._script) - 1)]
+        self.calls += 1
+        time.sleep(cost)
+        return sample
+
+
+async def _probe_step(script: list[tuple[float, ProcSample]]) -> tuple[list[ProcReading], int]:
+    """Drive `_probe_loop` for one simulated step. Returns its readings and the make-up attempts it
+    reported, after checking that number against the sampler's own count."""
+    stop = asyncio.Event()
+    sampler = _ScriptedSampler(script, stop)
+    readings: list[ProcReading] = []
+    floor_ticks, _ = await asyncio.gather(
+        _probe_loop(sampler, _INTERVAL_S, stop, readings, time.perf_counter()),  # type: ignore[arg-type]
+        _hold(stop, _STARVED_HOLD_S),
+    )
+    assert floor_ticks == sampler.calls_after_stop, (
+        f"the loop reported {floor_ticks} make-up attempt(s) but probed {sampler.calls_after_stop} "
+        f"time(s) after its stop -- the provenance field miscounts the floor"
+    )
+    return readings, floor_ticks
+
+
+def _step_record(readings: list[ProcReading], *, count: int, floor_ticks: int) -> ConnScaleRecord:
+    """The wall #4 half of a record, derived from the probe's readings the way `_build_record` does."""
+    proc = _derive_proc(readings)
+    return dataclasses.replace(
+        _record(count=count),
+        fd_count_peak=proc.handles_peak,
+        fd_count_peak_pids=proc.handles_peak_pids,
+        fd_probe_ticks=proc.probe_ticks,
+        fd_probe_degraded_ticks=proc.probe_degraded_ticks,
+        fd_probe_degraded=proc.probe_degraded,
+        fd_probe_floor_ticks=floor_ticks,
+    )
+
+
+async def test_a_window_whose_only_reading_spent_its_budget_gets_a_makeup_reading() -> None:
+    """THE FLOOR, at the failing run's shape: the one in-window attempt is a spent budget, and the
+    step still ends with a measured reading because the floor took one more."""
+    readings, floor_ticks = await _probe_step(
+        [(_SLOW_ATTEMPT_S, _gap(ProbeDegraded.WALK_TIMEOUT)), (0.0, _measured(140))]
+    )
+    assert floor_ticks == 1, floor_ticks
+    assert [r.proc.handles for r in readings] == [None, 140], readings
+
+
+async def test_the_floor_is_bounded_and_a_probe_that_never_measures_still_fails_wall_four() -> None:
+    """THE BOUND, and the requirement the floor must not buy its way past. A probe that spends its
+    budget on every attempt ends after `_FD_PROBE_MAKEUP_ATTEMPTS` make-up attempts, and a run built
+    from such steps still fails WALL #4 NEVER COMPARED: the floor gives the probe another draw, it does
+    not turn a run that never measured into a pass."""
+    records = []
+    for count in (12, 24):
+        readings, floor_ticks = await _probe_step(
+            [
+                (_SLOW_ATTEMPT_S, _gap(ProbeDegraded.WALK_TIMEOUT)),
+                (0.0, _gap(ProbeDegraded.WALK_TIMEOUT)),
+            ]
+        )
+        assert floor_ticks == _FD_PROBE_MAKEUP_ATTEMPTS, floor_ticks
+        assert all(r.proc.handles is None for r in readings), readings
+        records.append(_step_record(readings, count=count, floor_ticks=floor_ticks))
+    with pytest.raises(AssertionError, match="WALL #4 NEVER COMPARED") as e:
+        _assert_fd_probe(records)
+    assert f"floor={_FD_PROBE_MAKEUP_ATTEMPTS}" in str(e.value)
+
+
+async def test_a_gap_that_did_not_spend_its_budget_gets_no_makeup_and_still_fails() -> None:
+    """A gap from any other cause means the probe RAN and produced nothing usable. The floor must not
+    retry it, or a broken probe would get a second chance to hide behind a later reading."""
+    readings, floor_ticks = await _probe_step(
+        [(_SLOW_ATTEMPT_S, _gap(ProbeDegraded.WALK_EMPTY)), (0.0, _measured(140))]
+    )
+    assert floor_ticks == 0, floor_ticks
+    broken = _step_record(readings, count=12, floor_ticks=floor_ticks)
+    with pytest.raises(AssertionError, match="PROBE DEFECT"):
+        _assert_fd_probe([broken, _record(count=24, fd=150)])
+
+
+async def test_a_window_that_measured_is_not_extended_by_the_floor() -> None:
+    """THE CONTROL. Without it, a loop that always probed once more past its stop would pass every
+    arm above."""
+    _, floor_ticks = await _probe_step([(0.0, _measured(140))])
+    assert floor_ticks == 0, floor_ticks
+
+
+async def test_a_collapse_measured_on_makeup_readings_still_fails_the_fd_slo() -> None:
+    """A make-up reading is a real reading, so it must be able to fail the SLO it now feeds. Both steps
+    of one lane measure only on their make-up attempt, and the FD count collapses from 1000 to 100
+    across N: the pair is compared, and `fd_count_monotonic` must go red."""
+    records = []
+    for count, handles in ((12, 1000), (24, 100)):
+        readings, floor_ticks = await _probe_step(
+            [(_SLOW_ATTEMPT_S, _gap(ProbeDegraded.WALK_TIMEOUT)), (0.0, _measured(handles))]
+        )
+        assert floor_ticks == 1, floor_ticks
+        records.append(_step_record(readings, count=count, floor_ticks=floor_ticks))
+    assert monotonic_lane(records[0]) == monotonic_lane(records[1])
+    _assert_fd_probe(records)  # a comparable pair exists, so the run-level bound is met
+    check = _monotonic_slo("fd_count_monotonic", records, lambda r: r.fd_count_peak)
+    assert not check.ok, check.observed
+
+
+#: The `smoke_report` fixture's setup time on the failing windows-2022 merge-queue job of 2026-11-19
+#: (job 135856508516, pytest's slowest-durations line). A measurement, not a contract: the one reading
+#: of that fixture on a runner contended enough to time the walk out on every step.
+_SMOKE_SETUP_MEASURED_S = 53.41
+
+
+def test_the_makeup_floor_fits_inside_the_smokes_watchdog() -> None:
+    """The arithmetic `_FD_PROBE_MAKEUP_ATTEMPTS` rests on, pinned so it cannot drift silently. One
+    make-up attempt can cost a walk and a per-PID read, each up to `_PROBE_TIMEOUT_S`. Every smoke
+    step may need its floor, and the smoke runs under `pytest.mark.timeout(120)` with the thread
+    method, where a timeout ends the worker process rather than one test."""
+    steps = len(_SMOKE_COUNTS) * 2  # sweep_mode = "both": fixed_aggregate and fixed_per_conn
+    worst_floor_s = steps * _FD_PROBE_MAKEUP_ATTEMPTS * 2 * _PROBE_TIMEOUT_S
+    assert _SMOKE_SETUP_MEASURED_S + worst_floor_s < 120, (
+        f"{steps} smoke steps x {_FD_PROBE_MAKEUP_ATTEMPTS} make-up attempt(s) can add "
+        f"{worst_floor_s:.0f}s to a fixture measured at {_SMOKE_SETUP_MEASURED_S}s, past the "
+        f"smoke's 120s watchdog"
     )

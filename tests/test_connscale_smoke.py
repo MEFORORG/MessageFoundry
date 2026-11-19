@@ -227,7 +227,7 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
     # over zero measurements.
     detail = "; ".join(
         f"{r.sweep_mode}@N={r.count} {r.fd_probe_degraded_ticks}/{r.fd_probe_ticks} "
-        f"{tuple(r.fd_probe_degraded)}"
+        f"{tuple(r.fd_probe_degraded)} floor={r.fd_probe_floor_ticks}"
         for r in records
     )
     # THE BOUND IS AT THE SLO'S GRANULARITY, NOT THE RUN'S, AND THE DIFFERENCE IS A REAL DEFECT THAT

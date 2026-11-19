@@ -299,6 +299,11 @@ class ConnScaleRecord:
     fd_probe_ticks: int = 0
     fd_probe_degraded_ticks: int = 0
     fd_probe_degraded: tuple[str, ...] = ()
+    # How many of `fd_probe_ticks` the probe's make-up floor took AFTER its window closed, because every
+    # reading in the window was an exhausted budget (BACKLOG #1488). Zero on a window that measured. A
+    # peak read on such a tick still comes from the step, with all N connections held, but not from
+    # inside the hold, and a reader choosing a verdict should be able to see that. Reported, never graded.
+    fd_probe_floor_ticks: int = 0
     # --- BACKLOG #1210: which processes the FD and RSS peaks were summed over ---
     # The PIDs the tick that set `fd_count_peak` covered, sorted, and the same for
     # `working_set_peak_bytes`. A peak is a SUM over a process subtree, and the number alone reads the
@@ -498,6 +503,7 @@ class ConnScaleRecord:
                     "ticks": self.fd_probe_ticks,
                     "degraded_ticks": self.fd_probe_degraded_ticks,
                     "degraded": list(self.fd_probe_degraded),
+                    "floor_ticks": self.fd_probe_floor_ticks,
                 },
             },
             # BACKLOG #1292. Sequence numbers and MSA-1 codes only -- never control ids, per the

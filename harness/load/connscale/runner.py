@@ -671,14 +671,12 @@ async def _run_started_step(
             _sample_loop(poller, profile.poll_interval_s, sampler_stop, samples)
         )
         sampler_tasks.append(sample_task)
+        probe_task: asyncio.Task[int] | None = None
         if fd_sampler is not None:
-            sampler_tasks.append(
-                asyncio.create_task(
-                    _probe_loop(
-                        fd_sampler, profile.poll_interval_s, probe_stop, proc_readings, origin
-                    )
-                )
+            probe_task = asyncio.create_task(
+                _probe_loop(fd_sampler, profile.poll_interval_s, probe_stop, proc_readings, origin)
             )
+            sampler_tasks.append(probe_task)
         reload_seconds: float | None = None
         reload_account: _ReloadAccount | None = None
         hold_started = asyncio.get_running_loop().time()
@@ -731,6 +729,7 @@ async def _run_started_step(
         for task in sampler_tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        fd_probe_floor_ticks = probe_task.result() if probe_task is not None else 0
         if reload_account is not None:
             # After the samplers, so the wait is not in the rate window; before the stop, so a slow
             # first reply after the reload is waited for rather than read as none (BACKLOG #1292).
@@ -873,6 +872,7 @@ async def _run_started_step(
             in_hold_floor_ticks=in_hold_floor_ticks,
             proc_readings=proc_readings,
             fd_probe_root_pid=pid,
+            fd_probe_floor_ticks=fd_probe_floor_ticks,
             drain_seconds=drain_seconds,
             reload_seconds=reload_seconds,
             audit_live=audit_live,
@@ -1467,20 +1467,55 @@ async def _sample_loop(
         await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
 
 
+#: The make-up attempts :func:`_probe_loop` may spend past its ``stop`` when every reading the window
+#: took was an exhausted budget (BACKLOG #1488).
+#:
+#: ONE, AND THE BOUND IS THE SMOKE'S WATCHDOG, NOT TASTE. One attempt can cost a walk that ends just
+#: inside ``_PROBE_TIMEOUT_S`` plus a per-PID read that spends all of it: under 10 s. The smoke runs four
+#: steps under ``pytest.mark.timeout(120)``, and the failing windows-2022 run of 2026-11-19 spent 53.41 s
+#: in that fixture, so four steps at one attempt each add at most 40 s and end near 93 s. Two attempts
+#: would allow 80 s and pass 120, and on this repository's ``--timeout-method=thread`` a timeout ends
+#: the whole worker process rather than one test.
+_FD_PROBE_MAKEUP_ATTEMPTS = 1
+
+
+def _only_budget_gaps(readings: list[ProcReading]) -> bool:
+    """Is every reading a gap whose cause is an exhausted budget? True for an empty list.
+
+    The make-up floor fires on this and nothing else. A spent budget measures the RUNNER, so a second
+    draw is a fair retry. Any other cause means the probe ran and produced nothing usable, and a
+    retry there would give a broken probe a second chance to hide behind a reading."""
+    return all(
+        r.proc.degraded is not None and r.proc.degraded.is_budget_exhausted for r in readings
+    )
+
+
 async def _probe_loop(
     fd_sampler: FdSampler,
     interval: float,
     stop: asyncio.Event,
     out: list[ProcReading],
     origin: float,
-) -> None:
-    """Read the OS-side process footprint every ``interval`` until ``stop``, on its OWN task.
+) -> int:
+    """Read the OS-side process footprint every ``interval`` until ``stop``, on its OWN task. Returns
+    how many MAKE-UP attempts it spent past ``stop``, which is zero on a window that measured.
 
     It rode the engine poll's tick until BACKLOG #1430, which made the step's ENGINE sample count a
     function of the probe's cost -- :func:`_sample_loop` carries the measurement. It still runs OFF
     the event loop either way; what changed is that a slow walk no longer delays the next engine
-    sample. It does not carry a floor of its own: `fd_probe_ticks` is reported as provenance and
-    grades nothing, and a probe that answers once per step is the same coarse gauge it was before.
+    sample.
+
+    THE MAKE-UP FLOOR (BACKLOG #1488). A walk that times out spends ``_PROBE_TIMEOUT_S`` (5 s), which
+    outlasts the CI cell's whole probe window, so on a contended runner a step got exactly one attempt
+    and that attempt was the gap. Four such steps leave no lane with two readings, and the smoke's
+    WALL #4 assertion then fails on the runner rather than the engine. So when every reading in
+    ``out``, which is the step's own list, is a budget-exhausted gap, the loop keeps probing for at
+    most ``_FD_PROBE_MAKEUP_ATTEMPTS`` more, stopping at the first reading that is not one. A
+    reading taken here still measures the step: the caller
+    sets ``stop`` only after the reload probe has seen every connection back, and stops the driver
+    only after this task returns, so all N connections are still held. ATTEMPTS are counted, so a
+    probe that never answers cannot hold the step open. The count is provenance, reported as
+    ``fd_probe_floor_ticks``.
 
     ONE PROBE AT A TIME. :class:`~harness.load.connscale.probe.FdSampler` holds the front-load counter
     and the resolved subtree as mutable state, so overlapping calls would race them. This loop is
@@ -1492,6 +1527,12 @@ async def _probe_loop(
         out.append(ProcReading(time.perf_counter() - origin, proc))
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=interval)
+    past_stop = 0
+    while past_stop < _FD_PROBE_MAKEUP_ATTEMPTS and _only_budget_gaps(out):
+        past_stop += 1
+        proc = await loop.run_in_executor(None, fd_sampler.sample_proc)
+        out.append(ProcReading(time.perf_counter() - origin, proc))
+    return past_stop
 
 
 async def _time_reload(poller: EnginePoller) -> tuple[float | None, bool]:
@@ -1783,6 +1824,7 @@ def _build_record(
     audit_final: IntakeAudit | None = None,
     reload_account: _ReloadAccount | None = None,
     fd_probe_root_pid: int | None = None,
+    fd_probe_floor_ticks: int = 0,
     per_lane_wake: bool | None = None,
     sandbox: SandboxReading | None = None,
     # Required, like the other axes: a default would file a forgotten trial as trial 0 and chain the
@@ -1895,6 +1937,7 @@ def _build_record(
         fd_probe_ticks=proc.probe_ticks,
         fd_probe_degraded_ticks=proc.probe_degraded_ticks,
         fd_probe_degraded=proc.probe_degraded,
+        fd_probe_floor_ticks=fd_probe_floor_ticks,
         fd_count_peak_pids=proc.handles_peak_pids,
         # The PID the harness spawned and the probe walked from, so a reader can anchor the set above:
         # every other member is meant to descend from it (BACKLOG #1210). On a Windows venv it is the
