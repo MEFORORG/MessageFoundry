@@ -152,7 +152,17 @@ spec:
             - { name: MEFOR_API_TLS_CERT_FILE, value: "/etc/mefor/tls/engine/api.crt" }
             - { name: MEFOR_API_TLS_KEY_FILE, value: "/etc/mefor/tls/engine/api.key" }
             # Off loopback serve also refuses this certificate bind until you attest revocation with
-            # MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
+            # MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate). Left unset, the engine
+            # would exit 2 there and the pod would crash-loop. So the value is REQUIRED from a ConfigMap you
+            # create, with no default and not optional: until it exists the kubelet refuses to start the
+            # container (CreateContainerConfigError, naming the ConfigMap) rather than the engine looping.
+            # The attestation is yours, so no manifest here writes it. Create it only if your PKI enforces
+            # revocation for the certificates the engine serves and accepts:
+            #     kubectl create configmap mefor-revocation-attestation --from-literal=attested=1
+            # A value the engine reads as false, such as 0, passes the kubelet and still loops. Outbound
+            # hops read the same variable with a different effect (docs/DEPLOYMENT.md, "Revocation-guard behavior").
+            - name: MEFOR_TLS_REVOCATION_ATTESTED
+              valueFrom: { configMapKeyRef: { name: mefor-revocation-attestation, key: attested } }
             - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # MLLP() must set tls=True (exposure gate)
             - { name: MEFOR_SECURITY_REQUIRE_MFA, value: "true" }       # covers directory accounts too; off + exposed = refused under enforce
             - { name: MEFOR_STORE_REQUIRE_ENCRYPTION, value: "true" }   # keeps the default keyless refusal past the audited opt-out (docs/PHI.md section 3)

@@ -7,20 +7,28 @@ attestation as a required substitution (BACKLOG #5400).
 revocation gate), and a container reached on a published port cannot bind loopback. Before this, the
 compose engines left the variable unset, so the engine would exit 2 and ``restart: unless-stopped``
 would restart it forever. The variable must reach the engine, and the value must stay the operator's:
-a ``${VAR:?...}`` substitution with no default, never a literal this file attests on their behalf."""
+a ``${VAR:?...}`` substitution with no default, never a literal this file attests on their behalf.
+
+A value the engine reads as false passes that substitution, so each engine also waits on a one-shot
+check that reads the value with the engine's own parser. The k8s manifests take the value from a
+required, non-optional reference for the same reason."""
 
 from __future__ import annotations
 
 import functools
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 import yaml
 
 from messagefoundry.config.settings import _LOOPBACK_HOSTS
-from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV
+from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV, tls_revocation_attested
 
 _COMPOSE = Path(__file__).resolve().parents[1] / "docker" / "compose.yaml"
 _FALSE = {"false", "0", "no", "off", "n", "f"}
@@ -91,3 +99,129 @@ def test_a_gated_engine_requires_the_operators_attestation(service: str) -> None
         f"{service} sets {TLS_REVOCATION_ATTESTED_ENV} to {value!r}. It must be a required compose "
         "substitution with no default, so the attestation stays the operator's own act."
     )
+
+
+# --- a value the engine reads as false (BACKLOG #5400 item 3) ------------------------------------
+
+_CHECK = "revocation-attestation-check"
+
+
+def _all_services() -> dict[str, dict[str, Any]]:
+    doc = yaml.safe_load(_COMPOSE.read_text(encoding="utf-8"))
+    return dict(doc.get("services") or {})
+
+
+def _check_argv() -> list[str]:
+    """The check service's argv after the image's interpreter, to run with this interpreter."""
+    entry = [str(a) for a in _all_services()[_CHECK]["entrypoint"]]
+    return entry[entry.index("/opt/venv/bin/python") + 1 :]
+
+
+@pytest.mark.parametrize("service", sorted(_serving_engines()))
+def test_a_gated_engine_waits_on_the_attestation_check(service: str) -> None:
+    # The required substitution refuses only unset or empty, so 0 would start an engine that exits
+    # 2 at the gate and restarts forever. Each gated engine must not start until the check passed.
+    svc = _serving_engines()[service]
+    if not _gated(svc):
+        pytest.skip(f"{service} does not bind in-process TLS off loopback")
+    dep = (svc.get("depends_on") or {}).get(_CHECK)
+    assert dep == {"condition": "service_completed_successfully"}, (
+        f"{service} does not wait on {_CHECK}, so a false attestation restarts it forever"
+    )
+
+
+def test_the_check_reads_the_same_required_value_and_never_restarts() -> None:
+    check = _all_services()[_CHECK]
+    assert _REQUIRED.match(str(_env(check).get(TLS_REVOCATION_ATTESTED_ENV)))
+    assert str(check.get("restart")) == "no"
+    assert not check.get("profiles"), "a profiled check would not run for every engine"
+
+
+@pytest.mark.parametrize(
+    ("value", "passes"),
+    [
+        ("1", True),
+        ("true", True),
+        (" Yes ", True),
+        ("on", True),
+        ("0", False),
+        ("false", False),
+        ("no", False),
+        ("attested", False),
+        ("", False),
+    ],
+)
+def test_the_check_accepts_exactly_what_serve_accepts(value: str, passes: bool) -> None:
+    # Run the check's own command with this interpreter, so the shipped text is what is tested,
+    # and compare it with the parser serve's gate calls.
+    env = {k: v for k, v in os.environ.items() if k != TLS_REVOCATION_ATTESTED_ENV}
+    env[TLS_REVOCATION_ATTESTED_ENV] = value
+    done = subprocess.run(
+        [sys.executable, *_check_argv()], env=env, capture_output=True, text=True, timeout=120
+    )
+    with mock.patch.dict(os.environ, {TLS_REVOCATION_ATTESTED_ENV: value}):
+        assert tls_revocation_attested() is passes
+    assert (done.returncode == 0) is passes, done.stderr
+    if not passes:
+        assert done.returncode == 1
+        assert "API revocation gate" in done.stderr
+
+
+# --- the env-file guidance (BACKLOG #5400 item 2) ------------------------------------------------
+
+_SUBSTITUTION = re.compile(r"\$\{(?P<var>[A-Z0-9_]+):\?(?P<msg>[^}]*)\}")
+
+
+def test_every_required_substitution_names_the_same_sources() -> None:
+    # Two messages that disagree on where compose reads a value send an operator to split them,
+    # and --env-file then leaves the .env holding the other one unread.
+    text = _COMPOSE.read_text(encoding="utf-8")
+    found = {m["var"]: m["msg"] for m in _SUBSTITUTION.finditer(text)}
+    assert {TLS_REVOCATION_ATTESTED_ENV, "MEFOR_STORE_PASSWORD"} <= set(found)
+    for var, msg in found.items():
+        for phrase in (".env beside compose.yaml", "--env-file", "env_file: does NOT feed it"):
+            assert phrase in msg, f"{var}'s message omits {phrase!r}"
+
+
+# --- the k8s manifests (BACKLOG #5400 item 1) ----------------------------------------------------
+
+_K8S = _COMPOSE.parent / "k8s"
+
+
+@functools.cache
+def _k8s_engine_containers() -> dict[str, dict[str, Any]]:
+    """Every container whose args are ``serve``, keyed ``<file>:<container>``."""
+    out: dict[str, dict[str, Any]] = {}
+    for path in sorted(_K8S.glob("*.yaml")):
+        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+            spec = ((doc or {}).get("spec") or {}).get("template", {}).get("spec") or {}
+            for c in spec.get("containers") or []:
+                if (c.get("args") or [])[:1] == ["serve"]:
+                    out[f"{path.name}:{c['name']}"] = c
+    return out
+
+
+def _k8s_gated(container: dict[str, Any]) -> bool:
+    env = {e["name"]: e.get("value") for e in container.get("env") or []}
+    return _gated({"command": container.get("args"), "environment": env})
+
+
+def test_the_k8s_manifests_have_gated_engines() -> None:
+    # Positive control for the per-container test below.
+    files = {n.split(":")[0] for n, c in _k8s_engine_containers().items() if _k8s_gated(c)}
+    assert {"statefulset.yaml", "ha-postgres.yaml"} <= files
+
+
+@pytest.mark.parametrize("name", sorted(_k8s_engine_containers()))
+def test_a_gated_k8s_engine_requires_the_operators_attestation(name: str) -> None:
+    container = _k8s_engine_containers()[name]
+    if not _k8s_gated(container):
+        pytest.skip(f"{name} does not bind in-process TLS off loopback")
+    entries = [e for e in container.get("env") or [] if e["name"] == TLS_REVOCATION_ATTESTED_ENV]
+    assert len(entries) == 1, f"{name} never passes {TLS_REVOCATION_ATTESTED_ENV}; the pod loops"
+    entry = entries[0]
+    assert "value" not in entry, "a literal attests on the operator's behalf"
+    source = entry.get("valueFrom") or {}
+    ref = source.get("configMapKeyRef") or source.get("secretKeyRef") or {}
+    assert ref.get("name") and ref.get("key"), f"{name} reads the value from nowhere"
+    assert not ref.get("optional"), "an optional ref starts the engine unset, and it loops"
