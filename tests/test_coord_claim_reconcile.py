@@ -1107,15 +1107,17 @@ def test_apply_rereads_a_gone_holder_claim_and_keeps_one_that_changed(
 ) -> None:
     """A gone holder's release takes -Force, so -Apply re-reads the claim file before it.
 
-    The gh stub changes three claims while the scan probes their pull requests, so the scan judges
+    The gh stub changes four claims while the scan probes their pull requests, so the scan judges
     each RELEASABLE from what it read before the change. One edit re-spells the key, one names
-    another holder, and one re-creates the holder directory with the file untouched; all three must
-    survive with the outcome NOT released. The landed claim in the same run, which nothing changes,
-    is the positive control and IS released.
+    another holder, one re-creates the holder directory with the file untouched, and one moves the
+    branch; all four must survive with the outcome NOT released. Two claims nothing changes, one
+    landed and one released through the pull-request arm, are the positive controls and ARE released.
     """
     unmerged_branch(repo, "respelled")
     unmerged_branch(repo, "retaken")
     unmerged_branch(repo, "recreated")
+    unmerged_branch(repo, "shifted")
+    unmerged_branch(repo, "squash-ok")
     landed_branch(repo, "landed")
     respelled = write_claim(repo, "k-respelled", tmp_path / "vanished", "respelled")
     retaken = write_claim(repo, "k-retaken", tmp_path / "vanished", "retaken")
@@ -1123,8 +1125,12 @@ def test_apply_rereads_a_gone_holder_claim_and_keeps_one_that_changed(
     # A bare -Take re-asserts a claim without writing it, so only the holder shows it is back.
     reborn = tmp_path / "reborn-holder"
     recreated = write_claim(repo, "k-recreated", reborn, "recreated")
+    shifted = write_claim(repo, "k-shifted", tmp_path / "vanished", "shifted")
+    # Released through the pull-request arm, so the re-check's branch-tip compare must hold there.
+    squash_ok = write_claim(repo, "k-squash-ok", tmp_path / "vanished", "squash-ok")
     github_origin(repo)
-    tips = [git(repo, "rev-parse", b).strip() for b in ("respelled", "retaken", "recreated")]
+    branches = ("respelled", "retaken", "recreated", "shifted", "squash-ok")
+    tips = [git(repo, "rev-parse", b).strip() for b in branches]
     payload = json.dumps([json.loads(_merged_pr(t))[0] for t in tips])
     other = str(tmp_path / "someone-else").replace("\\", "/")
     # Each edit fires only on the probe for its own branch, which runs after the scan read that file.
@@ -1146,6 +1152,10 @@ def test_apply_rereads_a_gone_holder_claim_and_keeps_one_that_changed(
         "if ($a -like '*--head recreated *') { "
         f"New-Item -ItemType Directory -Path {_ps_quote(str(reborn))} | Out-Null }}"
     )
+    lines.append(
+        "if ($a -like '*--head shifted *') { "
+        f"git -C {_ps_quote(str(repo))} branch -f shifted main | Out-Null }}"
+    )
     side_effect = "\n".join(lines)
     stub = gh_router(tmp_path, head=payload, on_head=side_effect)
 
@@ -1154,40 +1164,54 @@ def test_apply_rereads_a_gone_holder_claim_and_keeps_one_that_changed(
     out = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}
 
     assert respelled.exists() and retaken.exists() and recreated.exists(), out
+    assert shifted.exists(), out
     assert "K-Respelled" in respelled.read_text(encoding="utf-8"), "the edit must have landed"
     assert "someone-else" in retaken.read_text(encoding="utf-8"), "the edit must have landed"
     for key, reason in (
         ("k-respelled", "another spelling of its key"),
         ("k-retaken", "held by another worktree"),
         ("k-recreated", "holder directory exists again"),
+        ("k-shifted", "moved"),
     ):
         assert out[key]["verdict"] == "CHANGED-SINCE-SCAN", out[key]
         assert reason in out[key]["why"], out[key]
         assert out[key]["outcome"].startswith("NOT released"), out[key]
     assert not control.exists(), out["k-control"]
     assert out["k-control"]["outcome"] == "released", out["k-control"]
+    assert not squash_ok.exists(), out["k-squash-ok"]
+    assert out["k-squash-ok"]["outcome"] == "released", out["k-squash-ok"]
     history = (claims_dir(repo) / ".history").read_text(encoding="utf-8").strip().splitlines()
-    assert [json.loads(line)["key"] for line in history] == ["k-control"]
+    assert sorted(json.loads(line)["key"] for line in history) == ["k-control", "k-squash-ok"]
 
 
-def test_apply_reports_not_released_when_claim_ps1_finds_no_claim(
-    repo: Path, tmp_path: Path
+@pytest.mark.parametrize(
+    ("deletes", "outcome"),
+    [
+        (False, "NOT released -- claim.ps1 printed no release and the claim file is still there"),
+        (True, "NOT released -- claim.ps1 found no claim under that key"),
+    ],
+)
+def test_apply_reports_not_released_when_claim_ps1_prints_no_release(
+    repo: Path, tmp_path: Path, deletes: bool, outcome: str
 ) -> None:
     """claim.ps1 exits 0 on "No claim on <key>", so only its success line shows a release happened.
 
-    The sandbox's claim.ps1 is replaced by one that prints that line and touches nothing, so the
-    file stays and the row must read NOT released rather than released.
+    The sandbox's claim.ps1 is replaced by one that prints that line, and in one case first deletes
+    the file, as a peer's release in the gap would. Either way the row reads NOT released, and says
+    whether the file is still there.
     """
     landed_branch(repo, "landed")
     p = write_claim(repo, "k-vanishing", tmp_path / "vanished", "landed")
+    delete = f"Remove-Item -LiteralPath {_ps_quote(str(p))}\n" if deletes else ""
     (repo / "scripts" / "coord" / "claim.ps1").write_text(
         "param([string]$Release, [switch]$Force)\n"
-        "Write-Host \"No claim on '$Release' -- nothing to release.\"\nexit 0\n",
+        + delete
+        + "Write-Host \"No claim on '$Release' -- nothing to release.\"\nexit 0\n",
         encoding="utf-8",
     )
     proc = reconcile(repo, "-Json", "-Apply")
     assert proc.returncode == 0, proc.stderr
     row = json.loads(proc.stdout)["claims"][0]
     assert row["verdict"] == "RELEASABLE", row
-    assert row["outcome"] == "NOT released -- claim.ps1 found no claim under that key", row
-    assert p.exists(), row
+    assert row["outcome"] == outcome, row
+    assert p.exists() is not deletes, row
