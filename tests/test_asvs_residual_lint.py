@@ -112,7 +112,7 @@ residual = "The gate reads messagefoundry/__main__.py:1125 but the prose says __
         ),
         ("a css file", "static/app.css:153", [("static/app.css", "153")]),
         ("a cs file", "net-helper/NetOps.cs:85", [("net-helper/NetOps.cs", "85")]),
-        ("a go module file", "tools/ech-sidecar/go.mod:4", [("tools/ech-sidecar/go.mod", "4")]),
+        ("a go module file", "sidecar/go.mod:4", [("sidecar/go.mod", "4")]),
     ],
 )
 def test_the_citation_shapes_that_occur_are_detected(
