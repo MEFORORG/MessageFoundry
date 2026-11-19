@@ -15473,15 +15473,20 @@ class AuthService:
         reported. The caller then grants nothing, as the same seal answer did when it raised inside
         the re-proof.
 
-        A store refusal is logged and answered ``"refused"``: the session has already rotated,
-        nothing was written, and the caller writes its own row, hard, so the step-up is granted
-        only once that row is in. So is a
+        A store error from :func:`~messagefoundry.store.base.audit_write_errors` leaves the outcome
+        unknown, since at least an ``OSError`` for a connection lost at the socket can follow a
+        commit that landed. So the first of ``audits`` is read back by its action, actor and this
+        write's timestamp. Found, the reset and its rows are in, and the answer is ``"cleared"``.
+        Not found, the error is logged and answered ``"refused"``: the session has already
+        rotated, and the caller writes its own row, hard, so the step-up is granted only once that
+        row is in. So is a
         Vault transit Outage, which is paged (ADR 0217's Outage row ends nothing). A seal refusal
         of another kind than the account's record raises, as on the login leg, and so does a
         defect."""
+        now = time.time()
         try:
             answer = await self._store.record_login_success(
-                decided.id, expected=full_authentication_snapshot(decided), audits=audits
+                decided.id, now=now, expected=full_authentication_snapshot(decided), audits=audits
             )
         except RowSealError as exc:
             if exc.kind != USER_KIND:
@@ -15509,6 +15514,14 @@ class AuthService:
         except audit_write_errors() as exc:
             if isinstance(exc, AUDIT_WRITE_DEFECTS):
                 raise
+            if await self._reauth_clear_landed(decided, audits, now):
+                _log.warning(
+                    "a re-auth of account id %r had its lockout reset raise (%s) after the reset "
+                    "and its rows committed, so it reads as cleared",
+                    decided.id,
+                    type(exc).__name__,
+                )
+                return "cleared"
             _log.warning(
                 "a re-auth of account id %r rotated its session, but its lockout reset was refused "
                 "(%s) and wrote nothing",
@@ -15532,6 +15545,32 @@ class AuthService:
             "missing" if answer == "gone" else "changed",
         )
         return "denied"
+
+    async def _reauth_clear_landed(
+        self, decided: UserRecord, audits: Sequence[AuditAppend], now: float
+    ) -> bool:
+        """Whether a lockout reset whose write raised committed after all (BACKLOG #5900): the
+        first of ``audits`` is in the trail with the reset's own timestamp. It commits only with
+        the reset, so finding it finds both. A read the store refuses is logged and answered False,
+        so the caller keeps the refused path."""
+        if not audits:
+            return False
+        probe = audits[0]
+        try:
+            rows = await self._store.list_audit(
+                limit=1, actor=probe.actor, action=probe.action, since=now, until=now
+            )
+        except audit_write_errors() as exc:
+            if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                raise
+            _log.warning(
+                "a re-auth of account id %r could not read back whether its lockout reset "
+                "committed (%s), so it reads as refused",
+                decided.id,
+                type(exc).__name__,
+            )
+            return False
+        return bool(rows)
 
     async def _end_reauth_rotated_session(self, rotated_token: str, actor: str) -> bool:
         """Ask the store to end the session a re-auth rotated once :meth:`_clear_after_reauth`

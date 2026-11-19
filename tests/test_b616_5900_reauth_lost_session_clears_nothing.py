@@ -540,3 +540,56 @@ async def test_a_raise_after_a_committed_clear_adds_an_interrupted_row(
         assert len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]) == 1
     finally:
         await store.close()
+
+
+async def test_a_connection_lost_after_the_clear_committed_reads_as_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reset and its rows committed, then the store raised ``OSError``, the way a connection
+    lost at the socket after the commit answers. The outcome is unknown, so it is read back: the
+    rows are in, so the re-auth writes no second ``auth.reauth`` row and the notice is sent."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+        before = len(await store.list_audit(action="auth.reauth"))
+        real = store.record_login_success
+
+        async def committed_then_lost(user_id: str, **kwargs: Any) -> Any:
+            await real(user_id, **kwargs)
+            raise OSError("synthetic connection lost after the commit")
+
+        monkeypatch.setattr(store, "record_login_success", committed_then_lost)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        assert len(await store.list_audit(action="auth.reauth")) == before + 1
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == 0
+        assert len(await store.list_audit(action="auth.login_after_failures")) == 1
+        assert len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_connection_lost_before_the_clear_committed_reads_as_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: the same ``OSError`` with nothing committed. The read-back finds no row, so the
+    re-auth writes its one ``auth.reauth`` row itself, clears nothing and sends no notice."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+        before = len(await store.list_audit(action="auth.reauth"))
+
+        async def lost(user_id: str, **kwargs: Any) -> Any:
+            raise OSError("synthetic connection lost before the commit")
+
+        monkeypatch.setattr(store, "record_login_success", lost)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        assert len(await store.list_audit(action="auth.reauth")) == before + 1
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+        assert not await store.list_audit(action="auth.login_after_failures")
+        assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
+    finally:
+        await store.close()
