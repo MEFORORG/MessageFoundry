@@ -109,7 +109,7 @@ def test_set_security_reports_a_reset_that_finds_nothing_as_unchanged(tmp_path: 
         "keys": [],
         "unchanged": ["require_mfa"],
         "rewritten": False,
-        "detail": "no key changed; mf.toml does not exist, so none was created",
+        "detail": "no key changed; mf.toml does not exist, so no settings file was created",
     }
     assert not toml.exists() and seen == []
     # A file that is there goes through the validated replace like any set, and says so.
@@ -120,7 +120,8 @@ def test_set_security_reports_a_reset_that_finds_nothing_as_unchanged(tmp_path: 
         "keys": [],
         "unchanged": ["require_mfa"],
         "rewritten": True,
-        "detail": "no key changed; file rewritten and restricted to its owner",
+        "detail": "no key changed; file rewritten by the validated replace every set uses, which "
+        "restricts it to its owner where it can and logs a warning where it cannot",
     }
     assert len(seen) == 1 and seen[0] != toml and seen[0].name == toml.name
     # A value equal in Python but of another type is a change, not the value the file holds.
@@ -1093,17 +1094,31 @@ def test_cli_set_reports_a_malformed_edit_as_json_on_stdout_in_a_real_subprocess
 
 
 def test_a_reset_that_finds_nothing_on_an_absent_file_creates_none(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Through the CLI: no 0-byte file appears, and the result says nothing was written. With no
-    file there is no whole-file load, so the posture reported is the one ``show`` reports for an
-    absent file."""
+    file there is no whole-file load, so the report marks its loosenings partial rather than
+    omit a session limit only this command's environment loosens without saying so."""
     toml = tmp_path / "mf.toml"
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "99")
     rc, res = _set(toml, {"require_mfa": None}, capsys)
     assert rc == 0 and res["op"] == "unchanged" and res["rewritten"] is False
     assert "does not exist" in res["detail"]
     assert not toml.exists()
-    assert res["loosenings"] == _show(toml, capsys)["loosenings"]
+    assert res["loosenings_partial"] is True
+    assert "MEFOR_" in res["loosenings_partial_reason"]
+
+
+def test_a_reset_that_finds_nothing_on_a_directory_is_refused(tmp_path: Path) -> None:
+    """Only a path with nothing at it skips the replace; a directory there is refused as the
+    replace refuses it for any set, never reported as a file that does not exist."""
+    from messagefoundry.config import security_edit
+
+    toml = tmp_path / "mf.toml"
+    toml.mkdir()
+    with pytest.raises(security_edit.SecurityEditError):
+        security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
+    assert toml.is_dir()
 
 
 def test_a_security_table_holding_only_comments_is_kept(tmp_path: Path) -> None:

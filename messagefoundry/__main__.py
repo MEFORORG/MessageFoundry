@@ -14150,6 +14150,14 @@ def _security(args: argparse.Namespace) -> int:
         # The candidate the write validated, so the preview reports the posture the edit left.
         view = saved_sec[-1] if saved_sec else sec
         degraded = reread_failed[-1] if reread_failed else None
+        if not result["rewritten"]:
+            # No file and no key changed, so no whole-file load ran: the environment layer, a
+            # MEFOR_* session limit among it, is not in this report, and it says so.
+            degraded = (
+                "no settings file exists and no key changed, so none was written or loaded; the "
+                "loosenings omit any MEFOR_* environment override, which the first set that "
+                "changes a key loads"
+            )
         result.update(_posture(view, saved[-1] if saved else None, degraded=degraded))
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)

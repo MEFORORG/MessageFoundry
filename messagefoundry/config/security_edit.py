@@ -20,6 +20,7 @@ next engine restart (``POST /config/reload`` re-runs the ``--config`` graph, not
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -64,10 +65,10 @@ def set_security(
     ``unchanged`` the keys the edit left as they were, a ``None`` reset that found no such key or a
     value the file already holds. When no key changed, ``op`` is ``"unchanged"``. An existing file
     still goes through the same validated replace, so a file the engine would refuse, or a link, is
-    refused as it is for any edit, and the file is rewritten and restricted to its owner as every
-    set restricts it (best-effort, a failure logged as for any set); ``rewritten`` says so, and
-    ``detail`` says it in words when no key changed. With no file at the
-    path and no key changed, none is created and nothing is checked: ``rewritten`` is false. This
+    refused as it is for any edit, and the file is rewritten, the replace restricting it to its
+    owner where it can as for every set; ``rewritten`` says so, and ``detail`` says it in words
+    when no key changed. With nothing at the path and no key changed, no settings file is created
+    and nothing is checked: ``rewritten`` is false. This
     module cannot tell a known ``[security]`` key from a misspelled one, since it stays outside the
     settings import graph, so refusing a reset of an unknown key is the caller's job; the
     ``security`` CLI does it."""
@@ -99,15 +100,17 @@ def set_security(
             else:
                 sec[key] = value
                 changed.append(key)
-        if not changed and original is None:
+        if not changed and not os.path.lexists(path):
             # Only a reset can change nothing here, and there is no file to reset it in, so a
-            # 0-byte file would be the edit's only effect.
+            # 0-byte file would be the edit's only effect. Anything else at the path, a directory
+            # or a link among them, goes on to the replace, which refuses it as for any set.
             return {
                 "op": "unchanged",
                 "keys": [],
                 "unchanged": unchanged,
                 "rewritten": False,
-                "detail": f"no key changed; {path.name} does not exist, so none was created",
+                "detail": f"no key changed; {path.name} does not exist, so no settings file was "
+                "created",
             }
         # Drop a [security] table this edit emptied, or the bare one added above, so a full
         # reset-to-defaults leaves no header behind. A table that already held only comments is
@@ -123,8 +126,10 @@ def set_security(
         "keys": [],
         "unchanged": unchanged,
         "rewritten": True,
-        # The replace's restriction is best-effort, as for any set: a failure is logged as a warning.
-        "detail": "no key changed; file rewritten and restricted to its owner",
+        # The replace does not report whether its restriction took, so this names the step
+        # rather than claim its outcome.
+        "detail": "no key changed; file rewritten by the validated replace every set uses, which "
+        "restricts it to its owner where it can and logs a warning where it cannot",
     }
 
 
