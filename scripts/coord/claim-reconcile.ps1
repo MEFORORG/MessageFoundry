@@ -55,13 +55,17 @@
 
     -Apply RE-READS A GONE HOLDER'S CLAIM just before it releases one. The release takes -Force, which
     deletes whatever claim sits under the key by then, so a key re-taken between the scan and -Apply
-    would otherwise be released. The re-read compares the key, holder, host, branch, both stamps and
-    the file's whole text with what the scan read, and then re-tests that the holder directory is
-    still absent and unregistered and that the branch still names the commit the scan judged; a bare
-    `claim.ps1 -Take` on a held key writes nothing, so the file alone cannot show a re-assertion. On
-    any difference the row reads CHANGED-SINCE-SCAN with the outcome "NOT released", and nothing is
-    touched. A holder-present row that changed reads MERGED-HELD, with the same outcome. A window
-    remains between that re-read and claim.ps1's own read; it is narrowed, not closed.
+    would otherwise be released. The re-check first re-tests that the holder directory is still
+    absent and unregistered and that the branch still names the commit the scan judged, because a bare
+    `claim.ps1 -Take` on a held key writes nothing, so the file alone cannot show a re-assertion. It
+    then re-reads the file LAST, so the gap before claim.ps1's own read is as short as it can be, and
+    compares the key, holder, host, branch, both stamps and the file's whole text with what the scan
+    read. On any difference the row reads CHANGED-SINCE-SCAN with the outcome "NOT released", and
+    nothing is touched. A holder-present row that changed reads MERGED-HELD, with the same outcome. A
+    re-check that could not run -- the worktree list failed, the branch tip could not be read, or the
+    scan kept no copy to compare -- reads RECHECK-FAILED, with the outcome "NOT released -- the
+    re-check could not run", and is never released either. A window remains between the file's
+    re-read and claim.ps1's own read; it is narrowed, not closed.
 
     The gone-holder pull-request probe passes --repo, from origin's GitHub URL, and --base, the branch
     the reference names, and re-checks the base on each row it gets back. Without a GitHub origin it
@@ -581,46 +585,55 @@ function Read-ClaimAgain([string]$File, [object]$Row) {
     return $r
 }
 
-# The -Apply re-check for a holder-present row. Returns "" when the row still stands, otherwise why it
-# does not. It re-reads the claim file (another holder, or a new claim under the same key), refreshes
-# the worktree list and the fence, and runs the same predicate as the scan with the scan's evidence.
+# What an -Apply re-check found. Changed is why the row no longer stands; Unrun is why the re-check
+# could not run at all. Both empty means the row still stands. The two are kept apart because "the
+# claim changed" is a finding and "we could not look" is not, and a report must not say the first
+# when only the second is true. Either one keeps the claim.
+function New-Recheck([string]$Changed = "", [string]$Unrun = "") {
+    [pscustomobject]@{ Changed = $Changed; Unrun = $Unrun }
+}
+
+# The -Apply re-check for a holder-present row. It re-reads the claim file (another holder, or a new
+# claim under the same key), refreshes the worktree list and the fence, and runs the same predicate as
+# the scan with the scan's evidence.
 function Test-StillReleasable([object]$Row) {
     $again = Read-ClaimAgain $Row.claimFile $Row
-    if ($again.Why) { return $again.Why }
+    if ($again.Why) { return New-Recheck -Changed $again.Why }
     $fresh = Read-WorktreeRegistry
-    if (-not $fresh.Ok) { return "git worktree list failed on the re-check" }
+    if (-not $fresh.Ok) { return New-Recheck -Unrun "git worktree list failed" }
     $script:registered = $fresh.Registered
     $script:locked = $fresh.Locked
     Reset-Fence
     $v = Get-PresentHolderVerdict -Claim $again.Claim -Key $Row.key -Holder $Row.holder -Branch ([string]$again.Claim.branch) -KnownPr $script:prByKey[$Row.key]
-    if ($v.verdict -ne "RELEASABLE") { return $v.why }
-    if ($v.tip -ne $Row.tip) { return "the holder's tip moved" }
-    return ""
+    if ($v.verdict -ne "RELEASABLE") { return New-Recheck -Changed $v.why }
+    if ($v.tip -ne $Row.tip) { return New-Recheck -Changed "the holder's tip moved" }
+    return New-Recheck
 }
 
-# The -Apply re-check for a gone-holder row. Returns "" when the claim file still reads exactly as the
-# scan read it, otherwise what changed. That release goes through -Force, which deletes whatever claim
-# sits under the key by then, so without this a key re-taken between the scan and -Apply would be
+# The -Apply re-check for a gone-holder row. That release goes through -Force, which deletes whatever
+# claim sits under the key by then, so without this a key re-taken between the scan and -Apply would be
 # released. A session re-asserting a claim with a bare -Take writes nothing, so the holder's absence and
 # deregistration and the branch tip the verdict rested on are read again first. The file is read last,
 # so the gap between its read and claim.ps1's is as short as this process can make it.
 function Test-GoneHolderUnchanged([object]$Row) {
     $seen = $script:scannedByKey[$Row.key]
-    if (-not $seen) { return "the scan kept no copy of the claim to compare against" }
-    if (Test-Path -LiteralPath $Row.holder) { return "the holder directory exists again" }
+    if (-not $seen) { return New-Recheck -Unrun "the scan kept no copy of the claim to compare against" }
+    if (Test-Path -LiteralPath $Row.holder) { return New-Recheck -Changed "the holder directory exists again" }
     $fresh = Read-WorktreeRegistry
-    if (-not $fresh.Ok) { return "git worktree list failed on the re-check" }
-    if ($fresh.Registered.ContainsKey($Row.holder)) { return "the holder is a registered worktree again" }
-    if ((Get-BranchTip $Row.branch) -ne $seen.Tip) { return "the branch '$($Row.branch)' moved, or can no longer be read" }
+    if (-not $fresh.Ok) { return New-Recheck -Unrun "git worktree list failed" }
+    if ($fresh.Registered.ContainsKey($Row.holder)) { return New-Recheck -Changed "the holder is a registered worktree again" }
+    $tip = Get-BranchTip $Row.branch
+    if (-not $tip) { return New-Recheck -Unrun "the branch '$($Row.branch)' could no longer be read" }
+    if ($tip -ne $seen.Tip) { return New-Recheck -Changed "the branch '$($Row.branch)' moved" }
     $again = Read-ClaimAgain $seen.File $Row
-    if ($again.Why) { return $again.Why }
+    if ($again.Why) { return New-Recheck -Changed $again.Why }
     $c = $again.Claim
-    if ([string]$c.branch -cne $Row.branch) { return "the claim now names another branch" }
+    if ([string]$c.branch -cne $Row.branch) { return New-Recheck -Changed "the claim now names another branch" }
     foreach ($field in @("claimed", "refreshed")) {
-        if ([string]$c.$field -cne [string]$seen.Claim.$field) { return "the claim's '$field' stamp changed, so it was taken again" }
+        if ([string]$c.$field -cne [string]$seen.Claim.$field) { return New-Recheck -Changed "the claim's '$field' stamp changed, so it was taken again" }
     }
-    if ($again.Text -cne $seen.Text) { return "the claim file's text changed" }
-    return ""
+    if ($again.Text -cne $seen.Text) { return New-Recheck -Changed "the claim file's text changed" }
+    return New-Recheck
 }
 
 # The ref a claim's branch resolves to, local first, then origin's; "" when neither exists.
@@ -894,30 +907,29 @@ if ($Apply) {
     $notReleasedChanged = "NOT released -- the claim or its holder changed since the scan"
     foreach ($r in @($rows | Where-Object { $_.verdict -eq "RELEASABLE" })) {
         $releaseArgs = @("-Release", $r.key, "-Force")
-        if ($r.PSObject.Properties['tip']) {
-            $changed = Test-StillReleasable $r
-            if ($changed) {
-                $r.verdict = "MERGED-HELD"
-                $r.why = "$($r.why) -- but changed since the scan, so it was not released: $changed"
-                $r | Add-Member -NotePropertyName outcome -NotePropertyValue $notReleasedChanged -Force
-                continue
-            }
+        $present = [bool]$r.PSObject.Properties['tip']
+        $check = if ($present) { Test-StillReleasable $r } else { Test-GoneHolderUnchanged $r }
+        if ($check.Unrun) {
+            $r.verdict = "RECHECK-FAILED"
+            $r.why = "$($r.why) -- but the re-check before the release could not run: $($check.Unrun)"
+            $r | Add-Member -NotePropertyName outcome -NotePropertyValue "NOT released -- the re-check could not run: $($check.Unrun)" -Force
+            continue
+        }
+        if ($check.Changed) {
+            # A present holder that moved fails the holder-present arm, so it reads MERGED-HELD. A
+            # gone holder's claim that no longer reads as scanned reads CHANGED-SINCE-SCAN.
+            $r.verdict = if ($present) { "MERGED-HELD" } else { "CHANGED-SINCE-SCAN" }
+            $r.why = "$($r.why) -- but changed since the scan, so it was not released: $($check.Changed)"
+            $r | Add-Member -NotePropertyName outcome -NotePropertyValue $notReleasedChanged -Force
+            continue
+        }
+        if ($present) {
             # -AsWorktree and NO -Force: claim.ps1 re-tests that the holder still owns the key, in its
             # own process, just before it removes the file. -Force would delete whatever claim sits
-            # under the key by then, including one somebody else took a moment ago.
+            # under the key by then, including one somebody else took a moment ago. A gone holder
+            # cannot take -AsWorktree, so its release keeps -Force, and the re-read above is what
+            # stands in for that ownership test. A window remains between that read and claim.ps1's.
             $releaseArgs = @("-Release", $r.key, "-AsWorktree", $r.holder)
-        }
-        else {
-            # A gone holder cannot take -AsWorktree, so claim.ps1 cannot re-test ownership and -Force
-            # deletes whatever sits under the key. Re-read the file just before, and keep any claim
-            # that no longer reads as scanned. A window remains between this read and claim.ps1's.
-            $changed = Test-GoneHolderUnchanged $r
-            if ($changed) {
-                $r.verdict = "CHANGED-SINCE-SCAN"
-                $r.why = "$($r.why) -- but the claim changed since the scan: $changed"
-                $r | Add-Member -NotePropertyName outcome -NotePropertyValue $notReleasedChanged -Force
-                continue
-            }
         }
         # The ledger writer stays in one place. A gone holder's release needs -Force, because it is
         # held by a worktree that is not this one, which is the condition that defines that set.
@@ -941,7 +953,7 @@ if ($Apply) {
 
 $releasable = @($rows | Where-Object { $_.verdict -eq "RELEASABLE" })
 $hold = @($rows | Where-Object { $_.verdict -eq "HOLD" })
-$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "KEY-MISMATCH", "NOTE-POINTS-ELSEWHERE", "MERGED-HELD", "ELSEWHERE", "CHANGED-SINCE-SCAN") })
+$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "KEY-MISMATCH", "NOTE-POINTS-ELSEWHERE", "MERGED-HELD", "ELSEWHERE", "CHANGED-SINCE-SCAN", "RECHECK-FAILED") })
 
 if ($Json) {
     [pscustomobject]@{
