@@ -240,7 +240,9 @@ that record writes to the box the drain reads. Mail can still reach the worktree
 at least these ways: a peer that addresses that path, a record written there by a `seat.ps1
 -Declare` or `-Close` you ran from it, and a record written before the change. A session with no
 pin whose `cwd` is a linked worktree, for example after a /clear under the desktop app, gets no
-Stop record at all. Before the change,
+Stop record at all; each refusal is recorded instead as a line in `.writer-refusals.txt` in the
+seat registry of the checkout the hook started in, at most one per session key per hour, and
+never in `.writer-errors.txt`. Before the change,
 `scripts/coord/seat.ps1` recorded the toplevel of the hook `cwd`. Measured 2026-10-28 under that
 behaviour: a Lander launched in the primary, entered a sibling worktree, and fifteen messages waited
 there for fourteen hours with nothing saying so.

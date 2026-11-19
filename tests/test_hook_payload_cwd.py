@@ -779,3 +779,29 @@ def test_seat_ps1_says_why_it_refused_a_cwd(seat_clones: tuple[Path, Path, Path,
     common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     errors = common / "mefor-coord" / "seats" / ".writer-errors.txt"
     assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
+
+
+def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """seat-record.ps1 discards seat.ps1's stderr, so a refusal recorded only there left no trace,
+    and an unpinned session's record would stop refreshing in silence. Each refusal goes to
+    .writer-refusals.txt instead, one line per session key per hour, never to .writer-errors.txt."""
+    repo, _, sibling, _ = seat_clones
+    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    seats = common / "mefor-coord" / "seats"
+    refusals = seats / ".writer-refusals.txt"
+    errors = seats / ".writer-errors.txt"
+
+    _record_stop(repo, _stop("s1", sibling))
+    assert refusals.is_file(), "a refused hook input left no .writer-refusals.txt line"
+    lines = refusals.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, lines
+    cols = lines[0].split("\t")
+    assert cols[2] == "s1" and cols[3] == sibling.name, cols
+    assert str(sibling) not in lines[0], lines[0]
+
+    _record_stop(repo, _stop("s1", sibling))
+    assert refusals.read_text(encoding="utf-8").splitlines() == lines, "the hour's limit failed"
+    assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
+    assert _seat_records(repo) == []

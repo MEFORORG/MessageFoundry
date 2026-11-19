@@ -59,7 +59,11 @@
 
     2. A WRITER THAT DIES MUST NOT DIE SILENTLY. Every failure appends one line to
        seats/.writer-errors.txt and the script still exits 0. Exiting non-zero from a Stop hook is
-       its own hazard; leaving no trace is worse than either.
+       its own hazard; leaving no trace is worse than either. A -Record hook input refused under
+       scripts/hooks/_hookinput.ps1's rules is NOT a failure, so it never goes there. It goes to
+       stderr, which seat-record.ps1 discards, and to seats/.writer-refusals.txt in the registry of
+       the checkout the hook started in, at most one line per session key per hour. fleet.ps1 does
+       not read that file.
 
     3. TOUCH seats/.writer-alive/<boxKey>.txt ON EVERY INVOCATION, including no-op ones. "The writer
        ran" and "the seat had something to say" are different sentences, and a reader that cannot
@@ -163,6 +167,58 @@ function Write-WriterError {
         $f = Join-Path $script:SeatsDir '.writer-errors.txt'
         $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $env:COMPUTERNAME, $Stage, ($Message -replace '\s+', ' ')
         Add-Content -Path $f -Value $line -Encoding utf8 -EA SilentlyContinue
+    } catch { }
+}
+
+function Set-StartSeatsDir {
+    # Point $script:SeatsDir at the registry of the checkout this hook STARTED in, for a -Record
+    # whose input named no usable worktree. Mirrors the main path's resolution, the codex-seats
+    # branch included. Returns $false, writing nothing, where that checkout or its registry does not
+    # resolve. Never throws.
+    try {
+        $startWt = Resolve-Worktree -Hint $null
+        if (-not $startWt) { return $false }
+        $startLocal = Get-CoordLocalRoot -From $startWt
+        $startRes = Resolve-CoordSharedRoot -From $startWt -LocalRoot $startLocal
+        if ($startRes.Error) { return $false }
+        $dir = Join-Path $startRes.Path 'seats'
+        if ($env:KORUS_AGENT -eq 'codex') {
+            $dir = (Resolve-CoordDir -From $startWt -Kind 'codex-seats' -LocalRoot $startLocal).Path
+        }
+        $null = New-Item -ItemType Directory -Force -Path $dir -EA Stop
+        $script:SeatsDir = $dir
+        return $true
+    } catch { return $false }
+}
+
+function Write-WriterRefusal {
+    param([string]$SessionKey, [string]$Cwd, [string]$Reason)
+    # A refused hook input, recorded where a reader can find it. Never .writer-errors.txt (rule 2).
+    # At most one line per session key per hour, because an unpinned session is refused on EVERY
+    # Stop and one line says as much as a hundred. The refused cwd is written as its leaf only.
+    try {
+        if (-not $script:SeatsDir) { return }
+        $f = Join-Path $script:SeatsDir '.writer-refusals.txt'
+        $now = [DateTime]::UtcNow
+        if (Test-Path -LiteralPath $f -PathType Leaf) {
+            foreach ($l in [System.IO.File]::ReadLines($f)) {
+                $cols = $l -split "`t"
+                if ($cols.Count -lt 3 -or $cols[2] -ne $SessionKey) { continue }
+                $at = [DateTime]::MinValue
+                $ok = [DateTime]::TryParseExact($cols[0], 'yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture,
+                    ([Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal), [ref]$at)
+                if ($ok -and ($now - $at) -lt [TimeSpan]::FromHours(1)) { return }
+            }
+        }
+        $leaf = ''
+        if ($Cwd) {
+            $leaf = Split-Path -Leaf ($Cwd.TrimEnd('\', '/'))
+            $Reason = $Reason.Replace($Cwd, "<cwd $leaf>")
+        }
+        $why = $Reason -replace '\s+', ' '
+        if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
+        $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f $now.ToString('yyyy-MM-ddTHH:mm:ssZ'), $env:COMPUTERNAME, $SessionKey, $leaf, $why
+        Add-Content -LiteralPath $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
 }
 
@@ -939,25 +995,25 @@ try {
         if (-not $wtHint) {
             if ($hookIn.Reason) {
                 # Rule 1 again: input this cannot vouch for names no worktree, so NO RECORD, and exit
-                # 0 because this is the Stop path. Refused input is not a writer failure, so it goes
-                # to stderr only and NEVER to .writer-errors.txt, which fleet.ps1 counts as failures;
-                # an unpinned session would otherwise add one line there on every Stop (the same
-                # rule Invoke-ClearHandoff states). No .writer-alive heartbeat either: it is keyed
-                # by this session's box, and refused input names no box to key it by.
+                # 0 because this is the Stop path. Refused input is not a writer failure, so it
+                # NEVER goes to .writer-errors.txt, which fleet.ps1 counts as failures; an unpinned
+                # session would otherwise add one line there on every Stop (the same rule
+                # Invoke-ClearHandoff states). seat-record.ps1 discards stderr, so a refusal also
+                # goes to .writer-refusals.txt (rule 2), rate-limited per session key, or it would
+                # leave no trace at all. No .writer-alive heartbeat: it is keyed by this session's
+                # box, and refused input names no box to key it by. Both files go to the registry
+                # of the checkout this hook started in, where that checkout and its registry
+                # resolve.
                 $why = "the hook input was refused, so nothing was recorded: $($hookIn.Reason)"
                 [System.Console]::Error.WriteLine("seat.ps1: $why")
-                if ($hookIn.Fault) {
-                    # A missing or throwing helper IS a writer failure, and rule 2 wants a line for
-                    # it. seat-record.ps1 discards stderr, so it goes to the registry of the checkout
-                    # this hook started in, where that checkout and its registry resolve.
-                    $startWt = Resolve-Worktree -Hint $null
-                    if ($startWt) {
-                        $startRes = Resolve-CoordSharedRoot -From $startWt -LocalRoot (Get-CoordLocalRoot -From $startWt)
-                        if (-not $startRes.Error) {
-                            $script:SeatsDir = Join-Path $startRes.Path 'seats'
-                            $null = New-Item -ItemType Directory -Force -Path $script:SeatsDir -EA SilentlyContinue
-                            Write-WriterError -Stage 'hook-input' -Message $why
-                        }
+                if (Set-StartSeatsDir) {
+                    if ($hookIn.Fault) {
+                        # A missing or throwing helper IS a writer failure, and rule 2 wants a line.
+                        Write-WriterError -Stage 'hook-input' -Message $why
+                    } else {
+                        $cwd = ''
+                        if ($payload -and $payload.PSObject.Properties['cwd']) { $cwd = [string]$payload.PSObject.Properties['cwd'].Value }
+                        Write-WriterRefusal -SessionKey (Get-SessionKey -Payload $payload -Override $SessionId).Key -Cwd $cwd -Reason $hookIn.Reason
                     }
                 }
                 exit 0
