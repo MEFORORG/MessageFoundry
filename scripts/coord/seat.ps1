@@ -301,15 +301,19 @@ function Read-RecordHookInput {
       @{ Payload; Dir = <worktree root or $null>; FromPin = <bool>; Reason = <fault or ''> }.
       A Reason means NO WRITE. A $null Dir means the directory this script runs in.
 
-      THE PAYLOAD CWD IS WHERE THE SESSION IS NOW, NOT WHERE IT STARTED. Taken as it stood, a `cd`
-      put this session's record in a sibling's box or in another repository's registry (BACKLOG
-      #5961). scripts/hooks/_hookinput.ps1 holds the rule; it is read -ReadOnly, because a Stop
-      must never write a pin. Its reader also decodes stdin as UTF-8 and bounds the read in time.
+      Taken as it stood, the payload `cwd` after a `cd` put this session's record in a sibling's box
+      or in another repository's registry (BACKLOG #5961). scripts/hooks/_hookinput.ps1's header
+      gives the rule this follows instead. It is read -ReadOnly, because a Stop must never write a
+      pin.
 
       Without the helper (a sandbox that copies this script alone), input that names a `cwd` is a
       Reason rather than a fallback to the raw `cwd`, which is the defect. Other input is read as
       before.
     #>
+    # The helper is written for the hooks' 'Continue', as mail-drain and seat-unlock run it. Under
+    # this script's 'Stop', a non-terminating error inside it (a pin naming an unmapped drive, say)
+    # would refuse input the helper itself would answer.
+    $ErrorActionPreference = 'Continue'
     $helper = Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/_hookinput.ps1'
     if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
         $p = Read-HookPayload
@@ -933,10 +937,21 @@ try {
         $payload = $hookIn.Payload
         if (-not $wtHint) {
             if ($hookIn.Reason) {
-                # Rule 1 again: input this cannot vouch for names no worktree, so NO WRITE, and exit
-                # 0 because this is the Stop path. Like the no-worktree path below, it has no seats
-                # directory to log to, since that is found from the worktree.
-                [System.Console]::Error.WriteLine("seat.ps1: the hook input was refused, so nothing was recorded: $($hookIn.Reason)")
+                # Rule 1 again: input this cannot vouch for names no worktree, so NO RECORD, and exit
+                # 0 because this is the Stop path. Rule 2 still holds: seat-record.ps1 discards
+                # stderr, so the refusal goes to the registry of the checkout this hook started in,
+                # the same clone's, where that checkout and its registry resolve.
+                $why = "the hook input was refused, so nothing was recorded: $($hookIn.Reason)"
+                [System.Console]::Error.WriteLine("seat.ps1: $why")
+                $startWt = Resolve-Worktree -Hint $null
+                if ($startWt) {
+                    $startRes = Resolve-CoordSharedRoot -From $startWt -LocalRoot (Get-CoordLocalRoot -From $startWt)
+                    if (-not $startRes.Error) {
+                        $script:SeatsDir = Join-Path $startRes.Path 'seats'
+                        $null = New-Item -ItemType Directory -Force -Path $script:SeatsDir -EA SilentlyContinue
+                        Write-WriterError -Stage 'hook-input' -Message $why
+                    }
+                }
                 exit 0
             }
             $wtHint = $hookIn.Dir

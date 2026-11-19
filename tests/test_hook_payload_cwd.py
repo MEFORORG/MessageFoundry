@@ -774,3 +774,7 @@ def test_seat_ps1_says_why_it_refused_a_cwd(seat_clones: tuple[Path, Path, Path,
     assert proc.returncode == 0, proc.stderr
     assert b"the hook input was refused, so nothing was recorded" in proc.stderr, proc.stderr
     assert _seat_records(repo) == []
+    # Rule 2 of seat.ps1: the refusal also leaves a line in the start checkout's registry.
+    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    errors = common / "mefor-coord" / "seats" / ".writer-errors.txt"
+    assert "\thook-input\t" in errors.read_text(encoding="utf-8"), errors

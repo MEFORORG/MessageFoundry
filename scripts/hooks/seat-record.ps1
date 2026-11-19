@@ -37,9 +37,9 @@ try {
     # record on the literal string 'nosid' -- correct, but it collapses every unidentified session in
     # a worktree into one record, so the payload is worth forwarding carefully.
     #
-    # Read as UTF-8 through the shared reader where it is present: [Console]::In decodes with the
-    # console code page, which mangles a non-ASCII `cwd`, and seat.ps1 then refuses it. The pipe
-    # below re-encodes with $OutputEncoding, UTF-8 under pwsh 7. seat.ps1 resolves the `cwd`.
+    # Read through the shared reader where it is present; Read-CcxHookInput's header says why. The
+    # pipe below re-encodes with $OutputEncoding, UTF-8 under pwsh 7, so seat.ps1, which resolves
+    # the `cwd`, reads the path the harness wrote.
     $payload = ''
     $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
     if (Test-Path -LiteralPath $hookInput -PathType Leaf) {

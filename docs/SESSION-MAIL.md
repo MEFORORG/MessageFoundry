@@ -236,8 +236,11 @@ launch worktree, and every later event answers for the pin, so a `cd` into a sib
 consumes the sibling's mail. `EnterWorktree` looks like that `cd` to the drain.
 
 The Stop-hook seat record now follows the pin too (BACKLOG #5961), so a peer that addresses you by
-your seat record writes to the box the drain reads. Mail can still reach the worktree you moved
-into, from a peer that addresses that path, or from a record written before the change. Before it,
+that record writes to the box the drain reads. Mail can still reach the worktree you moved into in
+at least these ways: a peer that addresses that path, a record written there by a `seat.ps1
+-Declare` or `-Close` you ran from it, and a record written before the change. A session with no
+pin whose `cwd` is a linked worktree, for example after a /clear under the desktop app, gets no
+Stop record at all. Before the change,
 `scripts/coord/seat.ps1` recorded the toplevel of the hook `cwd`. Measured 2026-10-28 under that
 behaviour: a Lander launched in the primary, entered a sibling worktree, and fifteen messages waited
 there for fourteen hours with nothing saying so.
