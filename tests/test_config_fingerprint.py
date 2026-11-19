@@ -462,12 +462,112 @@ def test_a_git_file_pointer_that_is_not_utf8_reads_as_unknown(tmp_path: Path) ->
     assert "git_head" not in config_fingerprint_detail(cfg)
 
 
-def test_a_commondir_that_is_not_utf8_drops_only_the_shared_refs(tmp_path: Path) -> None:
-    """The gitdir's own refs still resolve."""
+def test_a_commondir_that_is_not_utf8_reads_as_unknown(tmp_path: Path) -> None:
+    """The shared refs live only where it points, so a ref in the gitdir is not read instead."""
     cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
     (git_dir / "commondir").write_bytes(_NOT_UTF8)
     (git_dir / "refs" / "heads" / "main").write_text(_SHA1, encoding="utf-8")
-    assert config_fingerprint_detail(cfg)["git_head"] == _SHA1
+    assert "git_head" not in config_fingerprint_detail(cfg)
+
+
+@pytest.mark.parametrize(
+    "ref", ["refs/heads/feature/x", "refs/remotes/origin/main", "refs/tags/v1"]
+)
+def test_git_head_resolves_a_ref_of_any_depth(tmp_path: Path, ref: str) -> None:
+    """The positive control for the confinement: a slash-named branch is still a ref."""
+    cfg, git_dir = _repo(tmp_path, f"ref: {ref}\n".encode())
+    (git_dir / ref).parent.mkdir(parents=True, exist_ok=True)
+    (git_dir / ref).write_text(f"{_SHA1}\n", encoding="utf-8")
+    assert _git_head(cfg) == _SHA1
+
+
+def _linked(tmp_path: Path, head: str) -> tuple[Path, Path, Path]:
+    """A linked worktree whose HEAD holds ``head``; returns (config dir, gitdir, commondir)."""
+    common = tmp_path / "main" / ".git"
+    (common / "refs" / "heads").mkdir(parents=True)
+    linked = common / "worktrees" / "wt"
+    (linked / "refs" / "heads").mkdir(parents=True)
+    (linked / "HEAD").write_text(head, encoding="utf-8")
+    (linked / "commondir").write_text("../..\n", encoding="utf-8")
+    cfg = tmp_path / "wt" / "cfg"
+    _bundle(cfg)
+    (tmp_path / "wt" / ".git").write_text(f"gitdir: {linked}\n", encoding="utf-8")
+    return cfg, linked, common
+
+
+def test_a_shared_ref_is_read_only_from_the_commondir(tmp_path: Path) -> None:
+    """git ignores a ``refs/heads`` file in a linked worktree's gitdir, and packed-refs there, so a
+    stale or crafted one does not shadow the shared ref."""
+    cfg, linked, common = _linked(tmp_path, "ref: refs/heads/topic\n")
+    (linked / "refs" / "heads" / "topic").write_text(_SHA256, encoding="utf-8")
+    (linked / "packed-refs").write_text("NOTANID refs/heads/topic\n", encoding="utf-8")
+    (common / "packed-refs").write_text(f"{_SHA1} refs/heads/topic\n", encoding="utf-8")
+    assert _git_head(cfg) == _SHA1
+
+
+def test_a_per_worktree_ref_is_read_from_the_gitdir(tmp_path: Path) -> None:
+    """A ``refs/bisect`` ref is the worktree's own."""
+    cfg, linked, common = _linked(tmp_path, "ref: refs/bisect/bad\n")
+    (linked / "refs" / "bisect").mkdir()
+    (linked / "refs" / "bisect" / "bad").write_text(_SHA1, encoding="utf-8")
+    (common / "refs" / "bisect").mkdir()
+    (common / "refs" / "bisect" / "bad").write_text(_SHA256, encoding="utf-8")
+    assert _git_head(cfg) == _SHA1
+
+
+def test_a_ref_name_elsewhere_in_packed_refs_that_is_not_utf8_does_not_hide_head(
+    tmp_path: Path,
+) -> None:
+    """git does not require UTF-8 ref names, so one Latin-1 branch must not drop provenance."""
+    cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
+    (git_dir / "packed-refs").write_bytes(
+        f"{_SHA256} refs/heads/caf".encode() + b"\xe9\n" + f"{_SHA1} refs/heads/main\n".encode()
+    )
+    assert _git_head(cfg) == _SHA1
+
+
+def test_a_loose_ref_that_is_a_directory_falls_through_to_packed_refs(tmp_path: Path) -> None:
+    """As git does: a folder of that name is no loose ref."""
+    cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
+    (git_dir / "refs" / "heads" / "main").mkdir()
+    (git_dir / "packed-refs").write_text(f"{_SHA1} refs/heads/main\n", encoding="utf-8")
+    assert _git_head(cfg) == _SHA1
+
+
+def test_a_loose_ref_that_cannot_be_stated_does_not_fall_back_to_packed_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A loose ref that is there but refused is not absent: packed-refs may hold a stale id."""
+    cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
+    loose = git_dir / "refs" / "heads" / "main"
+    loose.write_text(_SHA256, encoding="utf-8")
+    (git_dir / "packed-refs").write_text(f"{_SHA1} refs/heads/main\n", encoding="utf-8")
+    real = Path.stat
+
+    def _stat(self: Path, **kwargs: Any) -> os.stat_result:
+        if self == loose:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    assert _git_head(cfg) is None
+
+
+@pytest.mark.parametrize("rel", ["HEAD", "refs/heads/main"])
+def test_a_git_file_longer_than_any_git_writes_reads_as_unknown(tmp_path: Path, rel: str) -> None:
+    """Each is one line; a padded one is not read whole into memory and taken."""
+    cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
+    (git_dir / rel).write_text(_SHA1 + " " * 5000, encoding="utf-8")
+    assert _git_head(cfg) is None
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a POSIX FIFO")
+def test_a_fifo_head_reads_as_unknown_without_blocking(tmp_path: Path) -> None:
+    """Opening a FIFO for read blocks until a writer comes; it is not a regular file, so not read."""
+    cfg, git_dir = _repo(tmp_path, b"")
+    (git_dir / "HEAD").unlink()
+    os.mkfifo(git_dir / "HEAD")
+    assert _git_head(cfg) is None
 
 
 @pytest.mark.parametrize(
@@ -485,6 +585,11 @@ def test_a_commondir_that_is_not_utf8_drops_only_the_shared_refs(tmp_path: Path)
         "refs\\..\\..\\outside",
         "refs/heads/a:b",
         "refs/heads/a b",
+        "refs/heads/CON",
+        "refs/heads/com1",
+        "refs/heads/CONIN$",
+        "refs/heads/nul.txt",
+        "refs/heads/main.",
     ],
 )
 def test_a_symbolic_ref_outside_refs_is_not_followed(tmp_path: Path, ref: str) -> None:
@@ -508,13 +613,12 @@ def test_an_absolute_symbolic_ref_is_not_followed(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        "synthetic file text, not a commit",
+        "synthetic-file-text-not-a-commit",
         _SHA1.upper(),
         _SHA1[:-1],
         _SHA1 + "0",
         _SHA256 + "0",
         "g" * 40,
-        "ref: refs/heads/other",
     ],
 )
 @pytest.mark.parametrize(
@@ -526,18 +630,19 @@ def test_git_head_records_only_an_object_id(
 ) -> None:
     """Whatever text the ref file held became the git_head audit field. Only a 40- or 64-hex object
     id is recorded now; anything else reads as unknown. Writing HEAD replaces the symbolic ref with
-    the text, as a detached HEAD."""
+    the text, as a detached HEAD. No text holds a space, so each packed-refs line names the ref."""
     cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
     (git_dir / rel).write_text(template.format(text), encoding="utf-8")
     assert "git_head" not in config_fingerprint_detail(cfg)
 
 
+@pytest.mark.parametrize("text", ["not an id", "ref: refs/heads/other"])
 def test_a_loose_ref_that_is_no_object_id_does_not_fall_back_to_packed_refs(
-    tmp_path: Path,
+    tmp_path: Path, text: str
 ) -> None:
-    """git reads the loose ref over packed-refs, so a malformed loose ref is unknown, never the
-    stale packed value."""
+    """git reads the loose ref over packed-refs, so a malformed loose ref, or a nested symbolic ref
+    this reader does not follow, is unknown, never the stale packed value."""
     cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
-    (git_dir / "refs" / "heads" / "main").write_text("not an id", encoding="utf-8")
+    (git_dir / "refs" / "heads" / "main").write_text(text, encoding="utf-8")
     (git_dir / "packed-refs").write_text(f"{_SHA1} refs/heads/main\n", encoding="utf-8")
     assert _git_head(cfg) is None
