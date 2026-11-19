@@ -17,6 +17,12 @@ already capped count changes nothing, and an override passes through both.
 
 Both import it package-qualified, the house idiom ``tests/test_conftest_name_collision_guard.py``
 describes; the web console suite already reaches ``tests/_deadline_capture.py`` the same way.
+
+The cap is per run, not per machine: seven concurrent runs can still start 56 workers.
+
+WHY NOT xdist's ``--maxprocesses`` IN ``addopts``. It would cap without code, but it also caps an
+explicit ``-n N``, which this cap deliberately leaves alone, and a run under ``-p no:xdist`` (the web
+console suite's file-balance test spawns one) would refuse the unknown option.
 """
 
 from __future__ import annotations
@@ -27,10 +33,11 @@ from collections.abc import Generator
 import pytest
 
 #: The most workers ``-n auto`` (or ``-n logical``) may start in one run. Many sessions run pytest
-#: at once on one development PC, and each ``-n auto`` run sizes itself to the whole machine, so
-#: they fight for the same CPUs and memory. Measured 2026-11-18 on a 32-logical-CPU box: at least
-#: seven concurrent pytest runs, 85 python processes and 27.8 GB of private memory. The cap is an
-#: upper bound only: a machine with fewer CPUs, such as a 4 vCPU CI runner, keeps its own count.
+#: at once on one development PC, and each ``-n auto`` run sizes itself to the machine's physical
+#: cores (16 on that box), so they fight for the same CPUs and memory. Measured 2026-11-18 on a
+#: 32-logical-CPU box: at least seven concurrent pytest runs, 85 python processes and 27.8 GB of
+#: private memory. The cap is an upper bound only: a machine with fewer cores, such as a 4 vCPU CI
+#: runner, keeps its own count.
 MAX_AUTO_WORKERS = 8
 
 #: pytest-xdist's own per-run override. Its hook implementation returns this value ahead of any CPU
@@ -43,7 +50,8 @@ def capped_auto_workers(computed: int, env_value: str | None) -> int:
 
     A value xdist accepted from ``AUTO_WORKERS_ENV`` passes through unchanged, whatever its size.
     xdist ignores a non-integer value with a warning and falls back to its CPU count, so the cap
-    still applies then.
+    still applies then. This mirrors xdist 3.8.0's own parse (``if env_var: int(env_var)``), read
+    from its ``plugin.py``; it infers from the variable, not from which implementation answered.
     """
     try:
         int(env_value or "")

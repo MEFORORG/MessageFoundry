@@ -56,12 +56,17 @@ def test_the_root_conftest_registers_the_cap_in_this_run(pytestconfig: pytest.Co
 def test_the_console_conftest_registers_the_cap_too() -> None:
     """A run naming only the console tree never loads the root conftest; its own must bind the hook.
 
-    Read by AST, not run: importing that conftest here would load the console suite's fixtures.
+    Read by AST, not run: importing that conftest here would load the console suite's fixtures. It
+    proves the import is written at module level (inside its ModuleNotFoundError guard), not that a
+    console-rooted run resolves it; the smoke run recorded in the PR measured that.
     """
     tree = ast.parse(_CONSOLE_CONFTEST.read_text(encoding="utf-8"))
+    top = [
+        n for stmt in tree.body for n in ([stmt] if not isinstance(stmt, ast.Try) else stmt.body)
+    ]
     bound = {
         (node.module, alias.name, alias.asname)
-        for node in tree.body
+        for node in top
         if isinstance(node, ast.ImportFrom)
         for alias in node.names
     }
@@ -69,35 +74,40 @@ def test_the_console_conftest_registers_the_cap_too() -> None:
 
 
 @pytest.fixture
-def cpu_count(
+def hook_with_cpus(
     pytestconfig: pytest.Config, monkeypatch: pytest.MonkeyPatch
-) -> Callable[[int], None]:
-    """Set the CPU count xdist's own hook implementation reads, through psutil."""
+) -> Callable[[int], int]:
+    """Call the registered hook chain with psutil reporting ``n`` CPUs for that call only.
+
+    Patched only around the call, so no other thread in this worker reads the fake count.
+    """
     # Installed is not enough: under `-p no:xdist` the hook has no spec and returns a list.
     if not pytestconfig.pluginmanager.hasplugin("xdist"):
         pytest.skip("pytest-xdist is not active in this run, so no hook chain to drive")
     psutil = pytest.importorskip("psutil")
-    monkeypatch.delenv(cap.AUTO_WORKERS_ENV, raising=False)
 
-    def set_count(n: int) -> None:
-        monkeypatch.setattr(psutil, "cpu_count", lambda logical=True: n)
+    def call(n: int) -> int:
+        with monkeypatch.context() as patch:
+            patch.setattr(psutil, "cpu_count", lambda logical=True: n)
+            result: int = pytestconfig.hook.pytest_xdist_auto_num_workers(config=pytestconfig)
+        return result
 
-    return set_count
+    return call
 
 
 @pytest.mark.parametrize(
     ("cpus", "override", "expected"), [(32, None, 8), (4, None, 4), (32, "24", 24)]
 )
 def test_the_real_hook_chain_caps_xdists_count(
-    pytestconfig: pytest.Config,
-    cpu_count: Callable[[int], None],
+    hook_with_cpus: Callable[[int], int],
     monkeypatch: pytest.MonkeyPatch,
     cpus: int,
     override: str | None,
     expected: int,
 ) -> None:
     """Drive the registered hook chain: xdist's implementation computes, the wrapper bounds it."""
-    cpu_count(cpus)
-    if override is not None:
+    if override is None:
+        monkeypatch.delenv(cap.AUTO_WORKERS_ENV, raising=False)
+    else:
         monkeypatch.setenv(cap.AUTO_WORKERS_ENV, override)
-    assert pytestconfig.hook.pytest_xdist_auto_num_workers(config=pytestconfig) == expected
+    assert hook_with_cpus(cpus) == expected
