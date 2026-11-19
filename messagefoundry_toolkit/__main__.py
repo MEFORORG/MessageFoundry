@@ -754,6 +754,18 @@ def _impact(args: argparse.Namespace) -> int:
         except (WiringError, OSError) as exc:
             return _emit_error(str(exc), as_json=args.json)
         result = plan.as_dict()
+        if args.apply and plan.unresolved:
+            # A referrer the planner could not rewrite (a `**{"router": ...}` splat, a folded
+            # concat, a name used in another role) still reads the old name, so applying would
+            # leave a half-renamed config. Refuse before any write; the dry-run still shows the
+            # plan and this list (BACKLOG #5980).
+            named = ", ".join(f"{r.referrer_kind} {r.referrer!r}" for r in plan.unresolved)
+            return _emit_error(
+                f"--apply refused: {len(plan.unresolved)} reference(s) to {args.kind} "
+                f"{args.name!r} cannot be rewritten, so the rename would leave them reading the "
+                f"old name: {named}. Nothing was written; run without --apply to see the plan",
+                as_json=args.json,
+            )
         if args.apply:
             try:
                 applied = apply_rename(plan)
