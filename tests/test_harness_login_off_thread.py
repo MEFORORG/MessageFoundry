@@ -24,6 +24,7 @@ from messagefoundry.api.auth_models import (  # noqa: E402
     LoginResponse,
     ProvidersInfo,
 )
+from messagefoundry.apiclient import ApiError  # noqa: E402
 
 _WAIT = 10.0
 
@@ -43,6 +44,11 @@ class _GatedClient:
         self.providers_gate = threading.Event()
         self.login_gate = threading.Event()
         self.login_threads: list[threading.Thread] = []
+        self.logout_threads: list[threading.Thread] = []
+        self.logout_error: BaseException | None = None
+        self.logout_gate = threading.Event()
+        self.logout_gate.set()
+        self.token: str | None = None
 
     def providers(self) -> ProvidersInfo:
         if not self.providers_gate.wait(_WAIT):
@@ -53,6 +59,7 @@ class _GatedClient:
         self.login_threads.append(threading.current_thread())
         if not self.login_gate.wait(_WAIT):
             raise TimeoutError("login gate never opened")
+        self.token = "t"
         return LoginResponse(
             token="t",
             must_change_password=False,
@@ -60,6 +67,17 @@ class _GatedClient:
                 user_id="u", username="op", auth_provider="local", roles=[], permissions=[]
             ),
         )
+
+    def logout(self) -> None:
+        # As EngineClient.logout: the token is cleared after the attempt, whatever its outcome.
+        self.logout_threads.append(threading.current_thread())
+        try:
+            if not self.logout_gate.wait(_WAIT):
+                raise TimeoutError("logout gate never opened")
+            if self.logout_error is not None:
+                raise self.logout_error
+        finally:
+            self.token = None
 
 
 def _until(qapp: Any, cond: Any) -> bool:
@@ -103,6 +121,10 @@ def test_the_provider_read_and_the_sign_in_run_off_the_gui_thread(qapp: Any) -> 
         client.login_gate.set()
         assert _until(qapp, lambda: finished == [dialog.DialogCode.Rejected.value])
         assert dialog.entered_password == ""  # nothing handed back to the caller
+        # The cancelled sign-in's session was ended once, off the GUI thread, before the reject.
+        assert len(client.logout_threads) == 1
+        assert client.logout_threads[0] is not threading.main_thread()
+        assert client.token is None
     finally:
         client.providers_gate.set()
         client.login_gate.set()
@@ -150,4 +172,46 @@ def test_an_unexpected_sign_in_error_is_logged(qapp: Any, caplog: pytest.LogCapt
         assert dialog._error.text() == "Sign-in failed."
     finally:
         client.login_gate.set()
+        dialog.done(dialog.DialogCode.Rejected)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ApiError("engine refused", status=500), TimeoutError("timed out")],
+    ids=["refused", "stalled"],
+)
+def test_a_failed_logout_after_a_cancelled_sign_in_is_logged_and_still_rejects(
+    qapp: Any, caplog: pytest.LogCaptureFixture, error: BaseException
+) -> None:
+    import logging
+
+    client = _GatedClient()
+    client.providers_gate.set()
+    client.logout_gate.clear()
+    client.logout_error = error
+    dialog = LoginDialog(client)  # type: ignore[arg-type]
+    finished: list[int] = []
+    dialog.finished.connect(finished.append)
+    try:
+        assert _until(qapp, lambda: not dialog._busy)
+        dialog._username.setText("op")
+        dialog._password.setText("pw")
+        dialog._attempt()
+        dialog.reject()
+        with caplog.at_level(logging.ERROR, logger="harness._login"):
+            client.login_gate.set()
+            assert _until(qapp, lambda: bool(client.logout_threads))
+            # The logout is stalled: the dialog stays open and busy until it answers.
+            dialog.reject()
+            assert finished == []
+            client.logout_gate.set()
+            assert _until(qapp, lambda: finished == [dialog.DialogCode.Rejected.value])
+        logged = [r for r in caplog.records if r.name == "harness._login"]
+        assert len(logged) == 1
+        assert logged[0].exc_info is not None and logged[0].exc_info[1] is error
+        assert client.logout_threads[0] is not threading.main_thread()
+        assert client.token is None
+    finally:
+        client.login_gate.set()
+        client.logout_gate.set()
         dialog.done(dialog.DialogCode.Rejected)

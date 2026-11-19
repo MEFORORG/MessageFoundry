@@ -279,10 +279,11 @@ class MonitorPanel(QWidget):
             self._set_status(str(exc), error=True)
             return
         if not self._ensure_auth(client):
-            # A must-change sign-in, or one whose second factor was never verified, leaves the client
-            # holding a session it will never use. End it before dropping the client, or it stays
-            # live until it expires (BACKLOG #2091, #5568). The engine lets a must-change or an
-            # MFA-pending session reach /auth/logout.
+            # A sign-in this panel will not use can leave the client holding a session, for example
+            # a must-change one or one whose second factor was never verified. End it before
+            # dropping the client, or it stays live until it expires (BACKLOG #2091, #5568). The
+            # engine lets a must-change or an MFA-pending session reach /auth/logout. A cancelled
+            # sign-in's dialog logs out itself, which clears the token, so this skips it.
             if client.token is not None:
                 with contextlib.suppress(ApiError):
                     client.logout()

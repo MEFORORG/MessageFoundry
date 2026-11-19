@@ -34,8 +34,8 @@ log = logging.getLogger(__name__)
 class LoginDialog(QDialog):
     """Collects credentials and a provider, then calls :meth:`EngineClient.login`.
 
-    On success the client holds the session token; the caller persists it (OS keyring) and opens
-    the main window. ``providers()`` decides which provider options to offer.
+    When the dialog is accepted the client holds the session token; the caller persists it (OS
+    keyring) and opens the main window. ``providers()`` decides which provider options to offer.
 
     When the engine reports ``must_change_password`` the dialog still ``accept()``s so the
     entrypoint regains control, but exposes :attr:`must_change_password` and
@@ -43,9 +43,9 @@ class LoginDialog(QDialog):
 
     Both engine calls run off the Qt main thread (BACKLOG #5946), so a stalled engine or a slow
     directory leaves the dialog responsive rather than frozen. While one is in flight the Sign in
-    action is idle, and a close is held until the call answers: a sign-in may come back as a live
-    session, which only the accept path hands back to the caller, so a successful one is still
-    accepted, and a failed one or the provider read then closes the dialog.
+    action is idle, and a close is held until the call answers, then taken as a rejection. A
+    sign-in that succeeded after a held close is logged out off the GUI thread before the dialog
+    rejects; a failed logout is logged.
     """
 
     def __init__(self, client: EngineClient, parent: QWidget | None = None) -> None:
@@ -135,8 +135,7 @@ class LoginDialog(QDialog):
     def done(self, result: int) -> None:
         # While a call is in flight the dialog does not close: the client must not be closed under
         # a worker still using it. The close is remembered and taken when the call answers, as a
-        # rejection even when the sign-in succeeded; the caller ends a session a rejected dialog's
-        # client holds.
+        # rejection even when the sign-in succeeded; _on_login then tries a logout first.
         if self._busy and result != QDialog.DialogCode.Accepted:
             self._close_requested = True
             self._error.setText("Waiting for the engine to answer; the dialog then closes.")
@@ -184,12 +183,27 @@ class LoginDialog(QDialog):
         else:
             self._error.setText(f"Sign-in failed: {exc}")
 
-    def _on_login(self, result: LoginResponse, password: str) -> None:
+    def _on_cancelled_logout_error(self, exc: BaseException) -> None:
+        log.error("could not end the session of a cancelled sign-in", exc_info=exc)
+        self._end_cancelled()
+
+    def _end_cancelled(self) -> None:
         self._idle()
-        if self._close_if_requested():
-            # Cancelled while the sign-in was in flight: the cancel wins, so the dialog is
-            # rejected and the caller does not connect with the session.
+        self._close_if_requested()
+
+    def _on_login(self, result: LoginResponse, password: str) -> None:
+        if self._close_requested:
+            # Cancelled while the sign-in was in flight: the cancel wins. The session it made is
+            # ended here, off the GUI thread like the sign-in, and the dialog then rejects whether
+            # or not the logout succeeds. The dialog stays busy meanwhile, so a close still waits.
+            self._signing_in = False
+            self._runner.submit(
+                self._client.logout,
+                on_done=lambda _result: self._end_cancelled(),
+                on_error=self._on_cancelled_logout_error,
+            )
             return
+        self._idle()
         self._error.setText("")
         if result.must_change_password and result.user.auth_provider == "ad":
             # The harness can't rotate AD passwords (the server rejects /me/password for AD
