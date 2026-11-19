@@ -156,6 +156,8 @@ against one case that matters, described under
   For a local taste of the HA shape: `docker compose --profile ha up` (adds a Postgres + a PAIR of
   clustered engines — `engine-ha` + `engine-standby` — that share one leader lease, so you can stop the
   leader and watch the other promote; the default `docker compose up` stays single-node SQLite, unchanged).
+  Build the `-postgres` variant first (see *Image variants*): the `ha` engines run
+  `messagefoundry:postgres`, and compose has no `build:` key to make it for you.
 
 ## Exposure topologies (see the evaluation §1)
 
