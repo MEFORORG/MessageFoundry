@@ -49,6 +49,12 @@ _MALFORMED = (
     "[fe80::1%25eth0]:443",
     '["10.0.0.5"]',
     "https://user:secret@db.example.org/x",
+    "api.example.org/fhir",
+    "*.example.org",
+    "relay@mail.example.org",
+    "a b.example.org",
+    "db.example.org;x",
+    'db.example.org"',
 )
 
 
@@ -75,9 +81,32 @@ def test_refusal_does_not_quote_the_entry() -> None:
     assert "hunter2" not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    ("entry", "reason"),
+    [
+        ("http://h.example.org:8443", "is a URL or a path"),
+        ("https://u:p%40ss@h.example.org", "is a URL or a path"),
+        ("[fe80::1%eth0]", "zone id"),
+        ("fe80::1:443", r"more than one ':' outside brackets"),
+        ("*.example.org", "no pattern is read"),
+        ("h.example.org:99999", "port is not a number"),
+    ],
+)
+def test_refusal_names_the_reason(entry: str, reason: str) -> None:
+    with pytest.raises(ValidationError, match=reason):
+        EgressSettings(allowed_http=[entry])
+
+
 @pytest.mark.parametrize("field", _HOST_LISTS)
 def test_well_formed_entries_load_stripped_and_blanks_skipped(field: str) -> None:
-    good = [" db.example.org ", "db.example.org:5432", "", "10.0.0.5:06661"]
+    good = [
+        " db.example.org ",
+        "db.example.org:5432",
+        "",
+        "10.0.0.5:06661",
+        "my_host",
+        "xn--bcher-kva.example",
+    ]
     if field != "allowed_db":
         good += ["[::1]", "[2001:db8::10]:6661"]
     loaded = getattr(EgressSettings.model_validate({field: good}), field)

@@ -44,7 +44,7 @@ import os
 import re
 import string
 import tomllib
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
@@ -4918,9 +4918,13 @@ _KNOWN_ENV_POSTURE: dict[str, bool] = {
 _SERVICEABLE_AI_PROVIDERS = frozenset({"claude"})
 
 
-def _host_list_entries(value: list[str], setting: str) -> list[str]:
+def _host_list_entries(
+    value: list[str],
+    setting: str,
+    problem: Callable[[str], str | None] = allow_entry_problem,
+) -> list[str]:
     """``value``, a ``host[:port]`` allowlist, with each entry stripped and blank ones skipped, or a
-    refusal naming ``setting`` and the first entry no host can match (BACKLOG #5915).
+    refusal naming ``setting`` and the first entry ``problem`` refuses (BACKLOG #5915).
 
     The matcher reads every entry with :func:`~messagefoundry.hostlist.parse_allow_entry`, and an
     entry it cannot read matches nothing, so it would load and quietly admit nothing. The refusal
@@ -4932,15 +4936,30 @@ def _host_list_entries(value: list[str], setting: str) -> list[str]:
         item = raw.strip()
         if not item:
             continue
-        problem = allow_entry_problem(item)
-        if problem is not None:
+        why = problem(item)
+        if why is not None:
             raise ValueError(
                 f"{setting} entry {len(cleaned) + 1} (counting non-blank entries) is refused: "
-                f"{problem}. Write each entry as 'host', 'host:port', '[v6]' or '[v6]:port', such "
+                f"{why}. Write each entry as 'host', 'host:port', '[v6]' or '[v6]:port', such "
                 "as 'db.example.org:5432' or '[2001:db8::10]:6661'"
             )
         cleaned.append(item)
     return cleaned
+
+
+def _db_entry_problem(entry: str) -> str | None:
+    """:func:`~messagefoundry.hostlist.allow_entry_problem`, and an ``[egress].allowed_db`` entry
+    naming an IPv6 address, which no DATABASE server can match (BACKLOG #5915)."""
+    problem = allow_entry_problem(entry)
+    if problem is not None:
+        return problem
+    parsed = parse_allow_entry(entry)
+    if parsed is not None and isinstance(parsed[0], ipaddress.IPv6Address):
+        return (
+            "it names an IPv6 address, and while this list is set a DATABASE server holding a ':' "
+            "is refused whatever the entries say, so an IPv6 server cannot be listed"
+        )
+    return None
 
 
 class AiSettings(_Section):
@@ -5493,8 +5512,8 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     The one parse ``[egress].allowed_ech_sidecar`` is validated with at load and matched with at
     the gate, which reads the sidecar it dials back through it, so the two cannot read a host or a
     port differently (BACKLOG #5528). It splits at the LAST ``:``, so ``[::1]:8123`` reads as a
-    host and a port. The ``host[:port]`` lists have their own entry parse, in ``transports.egress``
-    (BACKLOG #5915), which differs at least in that a port is optional there. ``None`` for at
+    host and a port. The ``host[:port]`` lists have their own entry parse,
+    :func:`~messagefoundry.hostlist.parse_allow_entry` (BACKLOG #5915), which differs at least in that a port is optional there. ``None`` for at
     least: no port; a port that is not 1 to 65535 in at most five ASCII digits; a host holding a
     ``:`` outside brackets, or none inside them; and a host the
     sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
@@ -5538,7 +5557,8 @@ class EgressSettings(_Section):
     """
 
     # Allowed MLLP outbound destinations: each entry is "host" or "[v6]" (any port), or "host:port"
-    # or "[v6]:port". An entry no host can match is refused at load, in every host list below.
+    # or "[v6]:port". `_host_entries_are_read` names the lists that refuse at load an entry no host
+    # can match.
     allowed_mllp: list[str] = []
     # Allowed raw-TCP outbound destinations: each entry is an MLLP-style host entry.
     allowed_tcp: list[str] = []
@@ -5547,7 +5567,8 @@ class EgressSettings(_Section):
     # Allowed REST/SOAP (HTTP) outbound hosts: each entry is an MLLP-style host entry.
     allowed_http: list[str] = []
     # Allowed DATABASE outbound servers: each entry is "host" (any port) or "host:port". An IPv6
-    # entry is refused at load: a server holding a ':' is never listed (docs/CONNECTIONS.md).
+    # entry is refused at load: while this list is set a server holding a ':' is refused whatever
+    # the entries say (docs/CONNECTIONS.md).
     allowed_db: list[str] = []
     # Allowed REMOTEFILE (SFTP/FTP/FTPS) hosts — gates the connector in BOTH directions (the source
     # dials out to poll, the destination dials out to upload). Each entry is an MLLP-style host entry.
@@ -5691,20 +5712,12 @@ class EgressSettings(_Section):
     @classmethod
     def _host_entries_are_read(cls, value: list[str], info: ValidationInfo) -> list[str]:
         """Refuse at load an entry the host matcher cannot read (BACKLOG #5915). An ``allowed_db``
-        entry naming an IPv6 address is refused too: the DATABASE check refuses every server
-        holding a ``:``, so such an entry could never admit one."""
+        entry naming an IPv6 address is refused too: while the list is set the DATABASE check
+        refuses every server holding a ``:``, so such an entry could never admit one."""
         setting = f"[egress].{info.field_name}"
-        cleaned = _host_list_entries(value, setting)
         if info.field_name == "allowed_db":
-            for position, item in enumerate(cleaned, start=1):
-                parsed = parse_allow_entry(item)
-                if parsed is not None and isinstance(parsed[0], ipaddress.IPv6Address):
-                    raise ValueError(
-                        f"{setting} entry {position} (counting non-blank entries) is refused: it "
-                        "names an IPv6 address, and a DATABASE server holding a ':' is never "
-                        "listed, so name the server by host name and list that name"
-                    )
-        return cleaned
+            return _host_list_entries(value, setting, _db_entry_problem)
+        return _host_list_entries(value, setting)
 
     @field_validator("proxy_url", mode="after")
     @classmethod

@@ -1689,30 +1689,32 @@ transport's list is set, an outbound of that transport not on it is **refused at
 **How a host list's entry is read** (BACKLOG #5915). At least `allowed_mllp`, `allowed_tcp`,
 `allowed_http`, `allowed_db`, `allowed_remote`, `allowed_smtp`, `allowed_direct`, `allowed_syslog`,
 `allowed_proxy` and `[ai].allowed_endpoints` read their entries with one parser in
-[`transports/egress.py`](../messagefoundry/transports/egress.py). An entry is `host` (any port),
-`host:port`, `[v6]` (an IPv6 literal, any port) or `[v6]:port`, such as `[2001:db8::10]:6661`. An IP
-literal compares as an address, so `[0:0:0:0:0:0:0:1]` names `::1`; a name compares without regard
-to case. Nothing looser matches: an IPv4-mapped IPv6 address does not name its IPv4 address, and
-`127.1` is a name, not `127.0.0.1`. An entry matches nothing at least when it is unbracketed and holds
-more than one colon (write `::1` as `[::1]`), when its brackets hold anything but an IPv6
-literal, when a colon has no port after it, when its port is not a number from 1 to 65535, or when
-it carries a `%` zone id. The lists named here refuse such an entry at config load, naming the
-list and the entry's position (BACKLOG #5915). A host being checked that carries a `%` zone id
-matches no entry either, so while its list is set a zoned IPv6 destination is refused whatever
-the entries say. The host being checked must name an IPv6 literal bare, as `::1`, at least in a connection's `host` setting and in
-`[logging].forward_host`: a bracketed `[::1]` there matches no entry. A URL brackets its IPv6 host,
-and that is read correctly.
+[`hostlist.py`](../messagefoundry/hostlist.py). An entry is `host` (any port), `host:port`, `[v6]`
+(an IPv6 literal, any port) or `[v6]:port`, such as `[2001:db8::10]:6661`. An IP literal compares as
+an address, so `[0:0:0:0:0:0:0:1]` names `::1`; a name compares without regard to case. Nothing
+looser matches: an IPv4-mapped IPv6 address does not name its IPv4 address, and `127.1` is a name,
+not `127.0.0.1`. An entry matches nothing at least when it is unbracketed and holds more than one
+colon (write `::1` as `[::1]`), when its brackets hold anything but an IPv6 literal, when a colon
+has no port after it, when its port is not a number from 1 to 65535, when it carries a `%` zone id,
+when it is a URL or holds a `/` or `@`, or when its host holds anything but letters, digits, `.`,
+`-` and `_`, such as a `*` pattern. The lists named here refuse such an entry at config load, naming
+the list and the entry's position (BACKLOG #5915). A host being checked that carries a `%` zone id
+matches no entry either, so while its list is set a zoned IPv6 destination is refused whatever the
+entries say. The host being checked must name an IPv6 literal bare, as `::1`, at least in a
+connection's `host` setting and in `[logging].forward_host`: a bracketed `[::1]` there matches no
+entry. A URL brackets its IPv6 host, and that is read correctly.
 
 **How a pinned port is matched.** Ports compare as numbers on both sides, so a port that reaches the
-check as text, such as an uncast `env()` value supplied by a `MEFOR_VALUE_*` variable or by a
-quoted string in `<env>.toml`, matches the entry for the port it names: `06661` matches
-`host:6661` (BACKLOG #5915). An `http://` or `https://` URL that names no port is matched at the
-port the connector dials for it, 80 or 443, so `host:443` admits `https://host/`. `Sftp()` and
-`Ftp()` write their default port, 22 or 21, into the settings, and an `Email()` or `Direct()`
-connection with no `port` is checked as port 587, so those compare like a pinned port.
-`allowed_db` reads its entries this way, but refuses an IPv6 entry at load, never lists a
-`server` holding a colon, and compares the port the connection string sends, not the `port`
-setting alone ([CONNECTIONS.md](CONNECTIONS.md#the-port-an-allowed_db-entry-binds)).
+check as text, such as an uncast `env()` value supplied by a `MEFOR_VALUE_*` variable or by a quoted
+string in `<env>.toml`, matches the entry for the port it names: `06661` matches `host:6661`
+(BACKLOG #5915). An `http://` or `https://` URL that names no port is matched at the port the
+connector dials for it, 80 or 443, so `host:443` admits `https://host/`. At least a `proxy_url` is
+not read that way: with no port it matches only an entry that names no port. `Sftp()` and `Ftp()`
+write their default port, 22 or 21, into the settings, and an `Email()` or `Direct()` connection
+with no `port` is checked as port 587, so those compare like a pinned port. `allowed_db` reads its
+entries this way, but refuses an IPv6 entry at load, never lists a `server` holding a colon, and
+compares the port the connection string sends, not the `port` setting alone
+([CONNECTIONS.md](CONNECTIONS.md#the-port-an-allowed_db-entry-binds)).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|

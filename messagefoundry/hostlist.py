@@ -111,22 +111,39 @@ def parse_allow_entry(entry: str) -> tuple[HostKey, str] | None:
     return canonical, port
 
 
+def _is_host_name(text: str) -> bool:
+    """True if ``text`` holds only what a host name holds: letters, digits, ``.``, ``-`` and ``_``.
+    Letters of any script pass, so an internationalized name a connection writes unencoded is
+    still listed as written."""
+    return all(char.isalnum() or char in "._-" for char in text)
+
+
 def allow_entry_problem(entry: str) -> str | None:
-    """Why ``entry`` can never match a host, or ``None`` when :func:`parse_allow_entry` reads it
-    and any port it names is a number from 1 to 65535.
+    """Why ``entry`` can never match a host, or ``None`` when :func:`parse_allow_entry` reads it,
+    its host is an IP address or holds only what :func:`_is_host_name` admits, and any port it
+    names is a number from 1 to 65535.
 
     The reason never quotes the entry: an operator who pasted a URL, credential and all, would
     otherwise find it in the error."""
-    parsed = parse_allow_entry(entry)
+    text = entry.strip()
+    if "://" in text or "@" in text or "/" in text:
+        return "it is a URL or a path, not a host; list the host alone, with ':port' to pin a port"
+    parsed = parse_allow_entry(text)
     if parsed is None:
-        if "%" in entry:
+        if text.startswith("[") and "%" in text:
             return "it carries a '%' zone id, which no host is matched with"
-        if not entry.strip().startswith("[") and entry.count(":") > 1:
+        if not text.startswith("[") and text.count(":") > 1:
             return "it holds more than one ':' outside brackets; write an IPv6 address as [v6]"
         return (
             "it is not 'host', 'host:port', '[v6]' or '[v6]:port': brackets hold an IPv6 address "
             "alone, and a ':' needs a port after it"
         )
-    if parsed[1] and not port_or_zero(parsed[1]):
+    host, port = parsed
+    if isinstance(host, str) and not _is_host_name(host):
+        return (
+            "its host holds a character no host name does, such as '*', ',' or a space; list "
+            "each host by name, since no pattern is read"
+        )
+    if port and not port_or_zero(port):
         return "its port is not a number from 1 to 65535"
     return None

@@ -130,14 +130,19 @@ def test_generic_server_carrying_a_port_is_refused(
     # The host is matched as written, so only an entry naming the whole `server` text reaches the
     # port question. A port in `server` is refused whatever the entry says and whatever PORT says:
     # psqlODBC does not read it as a port, and libpq reads a comma there as a second host. The
-    # shipped code ADMITTED every one of these on a host-only entry; it read neither port.
+    # shipped code ADMITTED every one of these on a host-only entry; it read neither port. An entry
+    # holding a comma is refused at load (BACKLOG #5915), so the check is reached past that with
+    # model_construct.
     server = f"{HOST},6432"
     for entry in (server, f"{server}:6432"):
+        with pytest.raises(ValueError, match="no host name does"):
+            EgressSettings(allowed_db=[entry])
         with pytest.raises(
             WiringError, match="holds a comma, read as a port suffix or a host list"
         ):
             check(
-                _generic(server=server, odbc_params=odbc_params), EgressSettings(allowed_db=[entry])
+                _generic(server=server, odbc_params=odbc_params),
+                EgressSettings.model_construct(allowed_db=[entry]),
             )
 
 
@@ -153,11 +158,13 @@ def test_generic_server_holding_a_comma_anywhere_is_refused(check: Check, server
         if bracketed
         else "holds a comma, read as a port suffix or a host list"
     )
+    # An entry holding a comma is refused at load, so the unbracketed cases are checked past that
+    # with model_construct.
     for entry in (HOST, f"{HOST}:5432") if bracketed else (server, f"{server}:5432"):
         with pytest.raises(WiringError, match=refusal):
             check(
                 _generic(server=server, odbc_params={"PORT": "5432"}),
-                EgressSettings(allowed_db=[entry]),
+                EgressSettings.model_construct(allowed_db=[entry]),
             )
 
 

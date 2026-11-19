@@ -932,7 +932,8 @@ def _database_refusal(
         # Refused as unlisted, saying why, since an entry naming the address looks like it lists it.
         return (
             f"server {host!r} is not in the [egress].allowed_db allowlist: a server holding a "
-            "':', an IPv6 address included, is never listed, so name the server by host name"
+            "':' is never listed, so give a port in the port setting or the PORT keyword, not in "
+            "server, and name an IPv6 server by host name"
         )
     pins = _allowed_ports_for(host, allowed)
     if not pins:
