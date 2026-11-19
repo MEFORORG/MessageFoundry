@@ -2289,8 +2289,8 @@ def _decode_key(key_b64: str, name: str) -> bytearray:
 
 #: Why a keyring with retired keys and no active key is refused (BACKLOG #5310, #5308). The text
 #: reads only which settings are set, never a key. :func:`make_cipher` raises it, and the store's
-#: key seam (``store.base.resolve_decrypt_keys`` and ``build_store_cipher``) raises the same text by
-#: the same rule, so a DR restore and the store open cannot disagree about this configuration.
+#: key seam (``store.base._checked_active_key``, which every key resolve and the cipher build pass)
+#: raises the same text by the same rule, so a DR restore and the store open cannot disagree.
 RETIRED_WITHOUT_ACTIVE = (
     "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED is set but no active store key resolved "
     "(MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the [store].key_provider); "
@@ -2315,9 +2315,9 @@ def make_cipher(
     ``[store].aad_bind``, which defaults ON. Off here, the frozen v1 writer (CRYPTO-1: v1
     byte-identical). ``allow_unmarked`` is ``[store].allow_unmarked_ciphertext``: off, a keyed cipher
     refuses a non-blank unmarked value."""
-    retired_set = [k for k in retired_b64 if k]
+    retired = [k for k in retired_b64 if k]
     if not key_b64:
-        if retired_set:
+        if retired:
             raise ValueError(RETIRED_WITHOUT_ACTIVE)
         return IdentityCipher()
     # Every key decoded so far is wiped if a later one fails to decode (BACKLOG #5310): the cipher
@@ -2334,7 +2334,7 @@ def make_cipher(
                 "the [store].key_provider)",
             )
         )
-        for k in retired_set:
+        for k in retired:
             keys.append(_decode_key(k, "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"))
     except BaseException:
         for buf in keys:

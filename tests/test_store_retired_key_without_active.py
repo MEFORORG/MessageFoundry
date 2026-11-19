@@ -17,6 +17,7 @@ from messagefoundry.store import crypto
 from messagefoundry.store.base import (
     StoreCipherConfigError,
     build_store_cipher,
+    resolve_active_key,
     resolve_decrypt_keys,
 )
 from messagefoundry.store.crypto import (
@@ -55,8 +56,6 @@ def test_make_cipher_with_no_key_at_all_is_still_the_identity_cipher() -> None:
     # entries are not keys, as they never were.
     assert isinstance(make_cipher(None), IdentityCipher)
     assert isinstance(make_cipher("", ["", ""]), IdentityCipher)
-    # And an active key beside a retired one still builds the keyring cipher.
-    assert isinstance(make_cipher(generate_key(), [generate_key()]), AesGcmCipher)
 
 
 def test_a_key_that_fails_to_decode_leaves_the_decoded_keys_wiped(
@@ -104,12 +103,22 @@ def test_the_store_cipher_build_refuses_the_same_configuration_with_the_same_tex
     assert str(caught.value) == RETIRED_WITHOUT_ACTIVE
 
 
+def test_resolve_active_key_refuses_the_same_configuration() -> None:
+    # The DR backup and rotate-key resolve the active key alone; they get the same refusal, so a
+    # backup cannot take this configuration for a keyless store either.
+    with pytest.raises(StoreCipherConfigError) as caught:
+        resolve_active_key(StoreSettings(encryption_keys_retired=generate_key()))
+    assert str(caught.value) == RETIRED_WITHOUT_ACTIVE
+
+
 def test_resolve_decrypt_keys_still_returns_the_keyring_when_an_active_key_is_set() -> None:
     # The controls: an active key with a retired one, and no key at all, resolve as before.
     active, retired = generate_key(), generate_key()
     settings = StoreSettings(encryption_key=active, encryption_keys_retired=retired)
     assert resolve_decrypt_keys(settings) == [active, retired]
     assert isinstance(build_store_cipher(settings), AesGcmCipher)
+    assert resolve_active_key(settings) == active
     keyless = StoreSettings()
+    assert resolve_active_key(keyless) is None
     assert resolve_decrypt_keys(keyless) == []
     assert isinstance(build_store_cipher(keyless), IdentityCipher)
