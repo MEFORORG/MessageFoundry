@@ -767,9 +767,11 @@ async def reconcile_rotation_meta(
                 # The cipher refused: at least its AES-GCM invocation ceiling (CipherError), or a
                 # class id holding a lone surrogate. That id rides inside the sealed cell's
                 # plaintext, and encrypt's strict UTF-8 encode of the plaintext raises
-                # UnicodeEncodeError at seal time, before any ciphertext or row is written; cell_aad
-                # binds such an id via surrogatepass (BACKLOG #5962), so the AAD is not what refuses
-                # it. Only this class goes without a stamp, so the
+                # UnicodeEncodeError at seal time: after encrypt has charged one AES-GCM invocation,
+                # before any ciphertext or row is written. cell_aad binds such an id via
+                # surrogatepass (BACKLOG #5962), so the AAD is not what refuses it. Do not log or
+                # chain that error: its .object is the whole cell, the per-cell HMAC key included.
+                # Only this class goes without a stamp, so the
                 # others stay tracked and the DEK escalation below still runs; an opted-in class
                 # with no stamp refuses under ENFORCE, the fail-closed direction.
                 failed += 1
