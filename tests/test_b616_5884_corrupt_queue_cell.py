@@ -139,7 +139,7 @@ def test_a_corrupt_payload_keeps_its_audit_and_alert_naming_no_payload(
         open_queue_cell(cipher, {**row, "channel_id": "IB_B", "payload": sealed})
     asyncio.run(report_queue_tag_failure(sink, cipher, row, error=moved.value))
     assert sink.audits == ["integrity.queue_tag_failed"] and len(seen) == 1
-    assert json.loads(sink.details[0])["cause"] == "drift"
+    assert json.loads(sink.details[0])["cause"] == "tag"
     assert "failed its integrity tag" in seen[0]
 
 
@@ -175,3 +175,14 @@ def test_a_real_transit_cipher_verdict_stays_drift() -> None:
         with pytest.raises(QueueTagError) as refused:
             open_queue_cell(cipher, row)
         assert type(refused.value) is QueueTagError and refused.value.drift, text
+
+    # Positive control: the same non-AEAD verdict from a cipher that DOES name its keys is corrupt,
+    # so the split above is the missing ``holds_key_for`` and nothing else.
+    class _Naming(TransitCipher):
+        def holds_key_for(self, stored: str) -> bool:
+            return True
+
+    naming = _Naming(_Client(transit), "mefor-store")
+    transit.error = InvalidRequest(errors=[verdicts[0]])
+    with pytest.raises(CorruptQueueCellError):
+        open_queue_cell(naming, row)

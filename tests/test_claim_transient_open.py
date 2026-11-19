@@ -403,8 +403,13 @@ async def test_a_corrupt_cell_under_a_held_key_is_dead_lettered_and_reported(
             if r.name == "messagefoundry.store.queue_tag" and "is corrupt" in r.getMessage()
         ]
         assert len(warned) == 1 and "B1" not in warned[0].getMessage()
-        assert all(isinstance(a, str) for a in warned[0].args or ())
-        assert warned[0].exc_info is None
+        # Every WARNING the corrupt cell left, the store's dead-letter line included, carries no
+        # exception object and no traceback.
+        corrupt_lines = [r for r in caplog.records if "is corrupt" in r.getMessage()]
+        assert len(corrupt_lines) == 2
+        for record in corrupt_lines:
+            assert not any(isinstance(a, BaseException) for a in record.args or ())
+            assert record.exc_info is None
     finally:
         await store.close()
 

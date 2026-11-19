@@ -122,7 +122,7 @@ dead-lettered and alerted as before. Under a cipher that names its keys, as the 
 cipher does, a queue payload under a held key that the cipher refuses for any reason other than a
 failed AEAD check is read as corrupt, not drift. It is still dead-lettered or refused, alerted, and
 on a claim audited as `integrity.queue_tag_failed`, with the audit detail's `cause` reading
-`corrupt` rather than `drift` and the alert saying the payload is corrupt; its WARNING is not
+`corrupt` rather than `tag` and the alert saying the payload is corrupt; its WARNING is not
 rate-limited (BACKLOG #5884). That covers at least bad base64, a value too short to hold a tag, and a verified plaintext
 that is not UTF-8. A failure on which Transit gave no verdict about the row is
 no tag failure, and the claim does not dead-letter the row (BACKLOG #5765, #5735). Which failures

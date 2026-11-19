@@ -10844,7 +10844,9 @@ class SqlServerStore:
         the caller does with it."""
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
-        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
+        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], str(exc))
         row = {**d, "stage": stage}
         try:
             await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")

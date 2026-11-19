@@ -502,10 +502,12 @@ async def report_queue_tag_failure(
     ``outcome`` saying so (BACKLOG #5735). Names the row by a short id prefix and its stage, never
     a row value. An audit or alert failure is logged and swallowed: reporting must never undo the
     dead-letter. A corrupt cell (:class:`CorruptQueueCellError`) is reported the same way, with the
-    audit detail's ``cause`` reading ``corrupt`` where drift reads ``drift`` (BACKLOG #5884)."""
+    audit detail's ``cause`` reading ``corrupt`` where any other :class:`QueueTagError` reads
+    ``tag`` (BACKLOG #5884). ``tag`` says only that the cell did not open under its own tag: under
+    a cipher that cannot name its keys, a corrupt cell reads ``tag`` too."""
     ref = str(row["id"])[:_ROW_REF_LEN]
     stage = row["stage"]  # outside the try, so a missing column is not logged as the audit's
-    cause = "drift" if error.drift else "corrupt"
+    cause = "tag" if error.drift else "corrupt"
     try:
         await store.record_audit(
             QUEUE_TAG_FAILED_ACTION,

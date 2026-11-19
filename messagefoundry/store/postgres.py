@@ -5734,7 +5734,9 @@ class PostgresStore:
         the caller does with it."""
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
+        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
         except PROGRAMMING_ERRORS:
