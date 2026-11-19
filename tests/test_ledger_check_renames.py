@@ -779,3 +779,123 @@ def test_CONTROL_a_pathspec_switch_in_the_environment_does_not_crash_the_gate(
 
     code, out = run_check(repo, env={var: "1"})
     assert code == 0, out
+
+
+def _merge_base_fails(repo: Path) -> bool:
+    probe = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "origin/main", "HEAD"],
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode != 0
+
+
+def test_the_rename_wording_holds_in_the_REAL_CI_checkout_shape(repo: Path, tmp_path: Path) -> None:
+    """CI checks out the PR merge commit at depth 1, then fetches main shallow. That pair has no merge
+    base, so a rename probe that asked git for the fork point read every rename of a base ADR as a
+    reuse and told the author to allocate a new number. In CI the source is in the base by
+    construction, so the rename wording must hold here too."""
+    for name in ("one", "two"):
+        write(repo, f"docs/notes/{name}.md", f"Base note {name}.\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", f"the base adds note {name}")
+    git(repo, "switch", "-q", "-c", "pr")
+    git(repo, "mv", "docs/adr/0001-first.md", "docs/adr/0001-renamed.md")
+    git(repo, "commit", "-qm", "rename ADR 0001 without relinking its row")
+    git(repo, "switch", "-q", "main")
+    write(repo, "docs/notes/three.md", "Base note three.\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the base moves on")
+    git(repo, "switch", "-q", "-c", "pr-merge")
+    git(repo, "merge", "-q", "--no-ff", "-m", "Merge pr into main", "pr")
+    git(repo, "switch", "-q", "main")
+
+    clone = tmp_path / "ci"
+    clone_args = ["clone", "-q", "--depth", "1", "--branch", "pr-merge"]
+    subprocess.run(["git", *clone_args, repo.as_uri(), str(clone)], capture_output=True, check=True)
+    git(clone, "fetch", "-q", "--no-tags", "--depth=200", "origin", "main:refs/remotes/origin/main")
+    git(clone, "config", "diff.renames", "true")
+    # The premise: git finds no merge base in this shape, so only a CI answer that skips the fork
+    # point can keep the rename wording.
+    assert _merge_base_fails(clone)
+    assert _ci_status(clone).startswith("R"), _ci_status(clone)
+
+    code, out = run_check(clone, "--ci")
+    assert code == 1, out
+    assert "ADR 0001 was renamed from 0001-first.md" in out
+    assert "already exists" not in out
+    assert "alloc.ps1" not in out
+
+
+# The gate's restore check reads one blob per walked commit, so a capped walk is 200 git spawns,
+# and a spawn here costs tens to hundreds of milliseconds: well past the suite's 60s default.
+@pytest.mark.timeout(600)
+def test_a_branch_adr_rename_past_the_history_CAP_does_not_call_the_clone_shallow(
+    repo: Path,
+) -> None:
+    """The base touched 0002 more times than the walk's cap, then dropped it. The walk is truncated
+    by its cap, not by a graft, so the rename line must not say the clone is shallow."""
+    parts = []
+    for i in range(201):
+        content = f"Version {i} of a busy decision record.\n"
+        parts.append(
+            "commit refs/heads/main\n"
+            f"committer t <t@t> {1700000000 + i} +0000\n"
+            "data 4\nbusy\n"
+            + ("from refs/heads/main^0\n" if i == 0 else "")
+            + f"M 100644 inline docs/adr/0002-old.md\ndata {len(content)}\n{content}\n"
+        )
+    parts.append(
+        "commit refs/heads/main\ncommitter t <t@t> 1700001000 +0000\ndata 4\ndrop\n"
+        "D docs/adr/0002-old.md\n\n"
+    )
+    # One fast-import stream, not 200 commits: a git spawn costs tens of milliseconds here.
+    subprocess.run(
+        ["git", "-C", str(repo), "fast-import", "--quiet", "--force"],
+        input="".join(parts).encode("utf-8"),
+        capture_output=True,
+        check=True,
+    )
+    git(repo, "reset", "-q", "--hard", "main")
+    git(repo, "update-ref", "refs/remotes/origin/main", "main")
+    assert git(repo, "rev-parse", "--is-shallow-repository").strip() == "false"
+
+    git(repo, "switch", "-q", "-c", "stale")
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    write(repo, "docs/adr/0002-x.md", BODY.replace("synthetic", "branch"))
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="x", title="X") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the branch carries 0002")
+    git(repo, "mv", "docs/adr/0002-x.md", "docs/adr/0002-y.md")
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="y", title="X") + "\n")
+    git(repo, "add", "-A")
+    assert _staged_status(repo).startswith("R"), _staged_status(repo)
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 cannot be checked against origin/main -- the history is TRUNCATED" in out
+    assert "A RENAME is refused once the walk reaches its cap" in out
+    assert "shallow" not in out
+
+
+def test_a_branch_adr_rename_with_NO_FORK_POINT_is_not_sent_to_the_allocator(repo: Path) -> None:
+    """The base never held 0002 and the clone is not shallow; the grant declines only because git
+    finds no merge base. The number may well be allocated, so the refusal must name the fork point,
+    not tell the author to allocate."""
+    git(repo, "switch", "-q", "--orphan", "side")
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    write(repo, "docs/adr/0002-x.md", BODY.replace("synthetic", "branch"))
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="x", title="X") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "an unrelated history carries 0002")
+    git(repo, "mv", "docs/adr/0002-x.md", "docs/adr/0002-y.md")
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug="y", title="X") + "\n")
+    git(repo, "add", "-A")
+    assert _staged_status(repo).startswith("R"), _staged_status(repo)
+    assert _merge_base_fails(repo)
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 is a rename, but git found no fork point with origin/main" in out
+    assert "alloc.ps1" not in out
+    assert "was not allocated to this worktree" not in out

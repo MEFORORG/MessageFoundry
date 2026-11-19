@@ -365,6 +365,11 @@ def _coord_root() -> ModuleType | None:
     return None
 
 
+def _allocate_remedy(kind: str) -> str:
+    """The remedy for a number nobody holds: allocate a fresh one."""
+    return f'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind {kind} -Title "<title>"'
+
+
 class Ledger:
     def __init__(self, *, ci: bool, base: str = "origin/main") -> None:
         self.ci = ci
@@ -544,9 +549,15 @@ class Ledger:
 
         A local diff against the base reads an ADR the base added after the fork as removed by the
         branch, so a stale branch's similar-bodied ADR under that number would pair with it and read
-        as a rename. Only a source at HEAD or at the fork point is one this branch removed. In CI
-        HEAD contains the base, so the fork point is the base itself.
+        as a rename. Only a source at HEAD or at the fork point is one this branch removed.
+
+        CI ANSWERS TRUE WITHOUT ASKING GIT. There HEAD is the PR merged into the base and the pairing
+        diffs against the base, so the source is in the base by construction. Asking anyway broke the
+        real checkout: a depth-1 merge commit beside a shallow fetch of the base has no merge base,
+        so every rename of a base ADR read as a reuse and was told to allocate a new number.
         """
+        if self.ci:
+            return True
         if _obj_exists(f"HEAD:{src}"):
             return True
         fork = self._fork_point()
@@ -789,7 +800,7 @@ class Ledger:
         field and land in prose an agent then acts on -- the BACKLOG #1040 injection route, and a
         remedy block is precisely what that defect forged.
         """
-        allocate = f'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind {kind} -Title "<title>"'
+        allocate = _allocate_remedy(kind)
         # No record at all: nobody holds it, so allocating is the only move and the ONLY case where it
         # is the right one.
         if self.alloc is None:
@@ -830,7 +841,12 @@ class Ledger:
         return "\n      ".join(lines)
 
     def _ownership_refusal(
-        self, number: str, seen: _RestoreEvidence, *, renamed: bool = False
+        self,
+        number: str,
+        seen: _RestoreEvidence,
+        *,
+        renamed: bool = False,
+        fork_unknown: bool = False,
     ) -> tuple[str, str, str]:
         """Word an ownership refusal against what history actually showed (BACKLOG #1468).
 
@@ -851,7 +867,9 @@ class Ledger:
 
         ``renamed`` marks a file git pairs with a same-number ADR, which the rename grant declined
         (BACKLOG #5453). Only it gets the lines about a shallow clone and about renaming a restore,
-        because only for it do those lines change what will pass.
+        because only for it do those lines change what will pass. ``fork_unknown`` marks a renamed
+        file whose grant failed only because git found no fork point with the base: the number may
+        well be allocated, so that refusal names the fork point rather than the allocator.
         """
         if self.alloc is None:
             # Unresolved is not unowned. Refusing costs a retry; guessing hands out a spent number.
@@ -873,9 +891,16 @@ class Ledger:
                 "deepen the clone, then retry:\n"
                 "          git fetch --deepen=1000 origin\n"
                 + (
-                    "      A RENAME of an ADR the base never held is refused in ANY shallow clone,\n"
-                    "      deepened or not: only an unshallowed one (git fetch --unshallow origin)\n"
-                    "      can show the number is new. Committing from the allocating tree avoids it.\n"
+                    (
+                        "      A RENAME of an ADR the base never held is refused in ANY shallow clone,\n"
+                        "      deepened or not: only an unshallowed one (git fetch --unshallow origin)\n"
+                        "      can show the number is new. Committing from the allocating tree avoids it.\n"
+                        if self._is_shallow()
+                        else "      A RENAME is refused once the walk reaches its cap of "
+                        f"{RESTORE_HISTORY_DEPTH} commits under\n"
+                        "      this number, however deep the clone. Committing from the allocating tree\n"
+                        "      avoids it.\n"
+                    )
                     if renamed
                     else ""
                 )
@@ -900,6 +925,18 @@ class Ledger:
                     else ""
                 )
                 + f"      If a claim record still names a live tree, prefer that route:\n      {remedy}",
+            )
+        if fork_unknown:
+            # ownership_remedy returns the bare allocator when no record holds the number; only a
+            # record's recover-first advice is worth adding to this refusal.
+            recover = "" if remedy == _allocate_remedy("adr") else f"\n      {remedy}"
+            return (
+                f"ADR {number} is a rename, but git found no fork point with {self.base}",
+                "Without the commit this branch was cut from, the gate cannot tell whether "
+                f"{self.base} held this number then, so it refuses. The number itself may well be "
+                "allocated; this is not a request for a new one.",
+                f"fetch {self.base} so the two histories meet (git fetch origin), then retry, or\n"
+                "      commit from the worktree that allocated the number" + recover,
             )
         return (
             f"ADR {number} was not allocated to this worktree",
@@ -1013,7 +1050,12 @@ class Ledger:
                 seen = self._history_of_this_number(path, number)
                 if not seen.restores_lost_bytes:
                     renamed = self.same_number_source(path, number) is not None
-                    self.fail(*self._ownership_refusal(number, seen, renamed=renamed))
+                    fork_unknown = renamed and self._fork_point() is None
+                    self.fail(
+                        *self._ownership_refusal(
+                            number, seen, renamed=renamed, fork_unknown=fork_unknown
+                        )
+                    )
 
             # Only ADDED files are checked here, the right scope for a commit-time gate. The whole
             # corpus is adr_index_coverage's, and it needs no legacy exemption: 0077/0079/0080 have rows.
