@@ -13,11 +13,13 @@ carry a copy, and ``install-git-hooks.ps1`` puts it beside them.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
 import socket
 import subprocess  # nosec B404 - fixed argv, no shell
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -246,34 +248,40 @@ def resolve(
 
 # Windows' MAX_COMPUTERNAME_LENGTH: the NetBIOS name is at most this many characters.
 _NETBIOS_MAX = 15
+# The host is a Windows machine, so PowerShell on it writes the NetBIOS name. An MSYS2 or Cygwin
+# Python, which the git hooks can resolve from Git Bash, reports os.name 'posix' on that machine.
+_WINDOWS_HOST = os.name == "nt" or sys.platform.startswith(("cygwin", "msys"))
 
 
+@functools.cache
 def _windows_computer_name() -> str | None:
-    """The NetBIOS name from ``GetComputerNameW``, the call .NET's MachineName makes; None on failure."""
-    import ctypes  # Windows-only use; imported here so the module loads anywhere
+    """The NetBIOS name from ``GetComputerNameW``, the call .NET's MachineName makes; None on failure.
 
-    buf = ctypes.create_unicode_buffer(_NETBIOS_MAX + 1)
-    size = ctypes.c_uint32(len(buf))
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined,unused-ignore]
-    if not kernel32.GetComputerNameW(buf, ctypes.byref(size)):
+    Cached: the active NetBIOS name does not change until a reboot, and host() runs once per record.
+    """
+    try:
+        import ctypes  # Windows-only use; imported here so the module loads anywhere
+
+        buf = ctypes.create_unicode_buffer(_NETBIOS_MAX + 1)
+        size = ctypes.c_uint32(len(buf))
+        kernel32 = ctypes.WinDLL("kernel32")  # type: ignore[attr-defined,unused-ignore]
+        ok = kernel32.GetComputerNameW(buf, ctypes.byref(size))
+    except (ImportError, OSError, AttributeError):
         return None
-    return buf.value or None
+    return buf.value if ok and buf.value else None
 
 
 def host() -> str:
     """The name every shared record carries. Matches PowerShell's ``[Environment]::MachineName``.
 
-    It never reads ``COMPUTERNAME``: any process can set that variable, and a child inherits it, so a
-    hook reading it could name a machine other than the one PowerShell names and misjudge this
-    machine's own records. On Windows the name is the NetBIOS name, upper case and at most 15
-    characters, as .NET reads it; should that call fail, the DNS host's first label is cut the same
-    way. Elsewhere it is the host name's first label, case kept, which is what .NET returns there.
+    It never reads ``COMPUTERNAME``, which PowerShell's MachineName does not read either, so the two
+    twins cannot be split by that variable. On a Windows host the name is the NetBIOS name, upper case
+    and at most 15 characters, as .NET reads it; where that call is unavailable or fails, the DNS
+    host's first label is cut the same way. Elsewhere it is the host name's first label, case kept,
+    which is what .NET returns there.
     """
-    if os.name == "nt":
-        name = _windows_computer_name()
-        if name:
-            return name
-        return socket.gethostname().split(".")[0].upper()[:_NETBIOS_MAX]
+    if _WINDOWS_HOST:
+        return _windows_computer_name() or socket.gethostname().split(".")[0].upper()[:_NETBIOS_MAX]
     return socket.gethostname().split(".")[0]
 
 

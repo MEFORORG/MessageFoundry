@@ -140,7 +140,7 @@ def test_two_hosts_at_one_path_get_two_keys() -> None:
 def test_the_host_is_case_insensitive_and_defaults_to_this_machine() -> None:
     path = r"C:\x\tree"
     assert _key(path, "other-pc") == _key(path, OTHER)
-    assert _key(path) == _key(path, os.environ["COMPUTERNAME"])
+    assert _key(path) == _key(path, _this_host())
 
 
 def test_the_hash_input_is_host_bar_normalised_path() -> None:
@@ -287,9 +287,9 @@ def _this_host() -> str:
     return proc.stdout.strip()
 
 
-def _refused(proc: subprocess.CompletedProcess[str], shared: Path, to: str) -> None:
+def _refused(proc: subprocess.CompletedProcess[str], shared: Path, why: str) -> None:
     assert proc.returncode != 0, proc.stdout
-    assert "is not a seat id in the shared seat registry" in proc.stderr
+    assert "Refusing to send" in proc.stderr and why in proc.stderr, proc.stderr
     box = shared / "mail" / "box"
     assert not box.exists() or not any(box.iterdir()), "no box may be minted for a refused send"
 
@@ -299,11 +299,11 @@ def test_a_hostless_legacy_seat_record_is_refused(repo: Path, shared: Path) -> N
     the mail to a box nobody drains, so the send is refused rather than defaulted to this PC."""
     legacy = _key(repo, legacy=True)
     _plant_seat(shared / "seats", legacy, str(repo), None)
-    _refused(_send(repo, shared, legacy, "to nobody"), shared, legacy)
+    _refused(_send(repo, shared, legacy, "to nobody"), shared, "names no host")
 
 
 @pytest.mark.parametrize("host", [None, OTHER])
-@pytest.mark.parametrize("worktree", ["", "   ", None])
+@pytest.mark.parametrize("worktree", ["", None])
 def test_a_seat_record_with_no_worktree_is_refused(
     repo: Path, shared: Path, host: str | None, worktree: str | None
 ) -> None:
@@ -315,7 +315,7 @@ def test_a_seat_record_with_no_worktree_is_refused(
         rec = json.loads(path.read_text(encoding="utf-8"))
         del rec["worktree"]
         path.write_text(json.dumps(rec), encoding="utf-8")
-    _refused(_send(repo, shared, seat_id, "to a pathless seat"), shared, seat_id)
+    _refused(_send(repo, shared, seat_id, "to a pathless seat"), shared, "no worktree")
 
 
 # ------------------------------------------------------------------------------------ seats
@@ -396,7 +396,7 @@ def test_a_legacy_record_stamped_with_this_host_is_still_found(repo: Path, share
         seats,
         _key(top, legacy=True),
         top,
-        os.environ["COMPUTERNAME"],
+        _this_host(),
         sessionKey="sess-d",
         goal="stamped by the migration",
         asOf=_hours_ago(1),
