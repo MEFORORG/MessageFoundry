@@ -847,7 +847,9 @@ def test_the_refusal_limit_holds_under_a_culture_that_formats_time_differently(
     common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     refusals = common / "mefor-coord" / "seats" / ".writer-refusals.txt"
 
+    before = time.strftime("%Y", time.gmtime())
     _record_stop_in_culture(repo, _stop("s1", sibling), culture)
+    after = time.strftime("%Y", time.gmtime())
     lines = refusals.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1, lines
 
@@ -855,4 +857,4 @@ def test_the_refusal_limit_holds_under_a_culture_that_formats_time_differently(
     assert refusals.read_text(encoding="utf-8").splitlines() == lines, (culture, "limit failed")
     # The stamp is the invariant form the reader parses: a Gregorian year and ':' separators.
     stamp = lines[0].split("\t")[0]
-    assert stamp[:4] == time.strftime("%Y", time.gmtime()) and stamp[13] == ":", lines
+    assert stamp[:4] in (before, after) and stamp[13] == ":", lines
