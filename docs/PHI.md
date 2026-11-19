@@ -822,7 +822,7 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    looked inside, so it may hold a value under the prior key: do not retire that key until the sidecar is fixed, as by restoring
    it, or deliberately removed. The log names each skipped file. For a sealed value no key opens,
    it also says whether the key its marker names is configured, where the marker names one; for a
-   refused sidecar it names the refusal instead, and nothing about a key. A file
+   refused sidecar it names the refusal instead, not whether any key is configured. A file
    larger than an upload can be is skipped too, and only its first bytes are read. A body that
    starts with the active key's marker reads as already current instead, and is not reported; a
    sidecar does not, since it is decoded whole first. If a skipped

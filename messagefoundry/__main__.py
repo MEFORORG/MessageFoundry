@@ -12369,7 +12369,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
                 "it, so restore that upload, or remove its two files from the uploads directory, "
                 "before the re-run. "
                 + (
-                    "That does not apply to a sidecar every reader refuses, below. "
+                    "That does not apply to an upload with a sidecar every reader refuses, below. "
                     if uploads.refused_sidecars
                     else ""
                 )

@@ -426,7 +426,7 @@ def test_rotate_key_still_offers_removal_for_a_skip_that_is_not_a_refused_sideca
     given, and it says it does not cover the refused sidecar."""
     assert _rotate_over_a_refused_sidecar(tmp_path, monkeypatch, also_unopenable=True) == 1
     out = capsys.readouterr()
-    assert "That does not apply to a sidecar every reader refuses" in out.err
+    assert "That does not apply to an upload with a sidecar every reader refuses" in out.err
     note = [line for line in out.out.splitlines() if line.startswith("note: this run did not")]
     assert len(note) == 1, out.out
     assert "for a skip that is not a sidecar every reader refuses, remove the two files" in note[0]

@@ -412,9 +412,11 @@ def _too_long_to_seal(value: str) -> bool:
     """Whether unpadded sidecar text ``value`` is plaintext longer than
     :data:`_PLAIN_SIDECAR_LIMIT`, so no seal of it fits :data:`_SIDECAR_LIMIT` (BACKLOG #5387).
     The test the save, every reader through :func:`_read_sidecar` and ``rotate-key``'s
-    :meth:`UploadStore._reseal_half` apply. :meth:`UploadStore._unsealable_sync`, which classes an
-    upload as never sealable for at least the prune, the delete and the startup count, does not
-    call it."""
+    :meth:`UploadStore._reseal_half` apply. :meth:`UploadStore._unsealable_sync`, the test of an
+    upload as never sealable, does not call it, so where a caller asks that test after
+    :func:`_read_sidecar` refused a sidecar as too long, as at least the prune's listing scan and
+    the delete do, it can still class that upload as never sealable. The startup count does not
+    ask it for such a sidecar."""
     return not value.startswith(MARKER_PREFIX) and len(value.encode("utf-8")) > _PLAIN_SIDECAR_LIMIT
 
 
@@ -3028,9 +3030,9 @@ class UploadStore:
         if resealed or skipped or unsealable or body_lost or not_regular or damaged:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
-                "upload(s) (%d upload(s) skipped, %d of them over a sidecar every reader refuses, "
-                "which may hold a value under a prior key, so do not retire that key until each is "
-                "fixed or deliberately removed, %d that cannot be sealed, %d whose body is lost, "
+                "upload(s) (%d upload(s) skipped, %d of them over a sidecar every reader refuses "
+                "that may hold a value under a prior key, %d that cannot be sealed, %d whose body "
+                "is lost, "
                 "%d holding a file that is not regular, %d whose sidecar is blank and every reader "
                 "refuses as damaged)",
                 resealed,
