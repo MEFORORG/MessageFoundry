@@ -287,7 +287,8 @@ def test_an_unresolvable_ref_refuses_rather_than_reporting_everything_clean(
         timeout=TIMEOUT,
         check=False,
     )
-    assert proc.returncode != 0, "an unresolvable ref must not exit 0"
+    # 2, the refusal code: not 0 (clean) and not 1 (the AT-RISK verdict).
+    assert proc.returncode == 2, "an unresolvable ref must exit 2"
     combined = proc.stdout + proc.stderr
     assert "refusing" in combined.lower(), f"expected an explicit refusal, got:\n{combined}"
 
