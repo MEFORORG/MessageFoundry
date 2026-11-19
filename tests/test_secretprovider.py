@@ -163,7 +163,7 @@ def test_env_provider_refusal_never_repeats_the_reference(
             EnvSecretProvider(), ref=pasted, literal=None, label="[auth].ad_bind_password"
         )
     assert "0451" not in str(wired.value)
-    assert str(wired.value).startswith("[auth].ad_bind_password: ")
+    assert str(wired.value).startswith("[auth].ad_bind_password, its *_secret or *_ref reference: ")
 
 
 def test_unknown_provider_name_fails_closed() -> None:

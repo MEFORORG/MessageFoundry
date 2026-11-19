@@ -192,8 +192,8 @@ def resolve_connector_secret(
       on a missing/erroring secret).
 
     ``label`` names the credential (e.g. ``"[auth].ad_bind_password"``) for the error only — never a value.
-    A refusal that leaves the reference out (``env``, BACKLOG #5326) is re-raised with ``label`` in
-    front, so it still says which credential to correct.
+    A refusal that leaves the reference out (``env``, BACKLOG #5326) is re-raised naming ``label``'s
+    reference setting, so it still says which setting to correct.
     """
     if not ref:
         return literal
@@ -206,4 +206,4 @@ def resolve_connector_secret(
     try:
         return provider.resolve(ref)
     except _UnnamedReferenceError as exc:
-        raise SecretProviderError(f"{label}: {exc}") from exc
+        raise SecretProviderError(f"{label}, its *_secret or *_ref reference: {exc}") from exc
