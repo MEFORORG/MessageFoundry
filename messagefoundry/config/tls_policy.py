@@ -388,8 +388,8 @@ def harden_crl_check(
     Since vault BACKLOG #5896, :func:`judge_crl_bytes` also refuses a CRL OpenSSL never judges a
     certificate by, and one with a critical extension OpenSSL does not handle on the CRL or on an
     entry whose extensions ``cryptography`` reads. With ``chain`` only, the signature check also
-    refuses a CRL whose signature verifies only with listed CAs whose key usage lacks
-    ``cRLSign``, after a proven bad signature and before the refusal below. Without ``chain`` that
+    refuses a CRL whose signature verifies and every judged CA that verifies it carries a key
+    usage without ``cRLSign``, after a proven bad signature and before the refusal below. Without ``chain`` that
     CRL is not refused: the file loads with a WARNING, logged as :func:`_check_crl_signatures`
     says (:attr:`~messagefoundry.pki.CrlSignature.without_crl_sign`).
 
@@ -737,9 +737,9 @@ def _check_crl_signatures(
         raise ValueError(f"{label}: {unable.where} {NO_CRL_SIGN}. {remedy}")
     if refusal is not None:
         raise ValueError(f"{label}: {refusal}")
-    # After the refusal, so a refused start never first logs that the file is loaded (vault
-    # BACKLOG #5511). Deduplicated as the unconfirmed warning below: the Postgres store builds a
-    # context per connection, and an AD bind one per bind.
+    # After ``refusal``, as the unconfirmed warning below is (vault BACKLOG #5511); a caller can
+    # still refuse later, at least in its cipher checks. Deduplicated as that warning is: the
+    # Postgres store builds a context per connection, and an AD bind one per bind.
     if unable is not None and first_unconfirmed_signature(
         crl_file, fingerprint, ("no-crl-sign", unable.where)
     ):

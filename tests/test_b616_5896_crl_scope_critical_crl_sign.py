@@ -8,7 +8,8 @@ with a TLS error that does not name the CRL file:
 * an Issuing Distribution Point that limits the CRL to attribute certificates or some reasons,
   or makes it indirect (RFC 5280 section 5.2.5), which the engine's OpenSSL, with no extended CRL
   support, never judges a certificate by. A CRL of CA certificates only is not refused;
-* a critical extension OpenSSL does not handle, on the CRL or on an entry (sections 5.2, 5.3);
+* a critical extension OpenSSL does not handle, on the CRL or on an entry whose extensions
+  ``cryptography`` reads (sections 5.2, 5.3); an entry that does not read gives no verdict;
 * a signing CA whose key usage does not include cRLSign (section 6.3.3), refused on a
   whole-chain hop and logged at WARNING on a leaf hop.
 
@@ -321,11 +322,11 @@ def test_a_crl_from_a_ca_without_crl_sign_refuses_a_whole_chain_start(
         _handshake(pki.raw_hop(crl), pki.server())
 
 
-def test_the_leaf_hop_crl_sign_warning_logs_once_per_file_version(
+def test_the_leaf_hop_crl_sign_warning_is_not_repeated_per_build(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The Postgres store builds a context per connection and an AD bind one per bind, so the
-    leaf-hop warning is logged once per version of the file, not once per build."""
+    leaf-hop warning is logged once for the file's current bytes, not once per build."""
     pki = _Pki(tmp_path, crl_sign=False)
     crl = pki.crl_file(_crl(pki.key))
 

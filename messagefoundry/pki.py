@@ -418,8 +418,8 @@ def judge_every_crl(
                     "'unhandled critical CRL extension'. Give a CRL whose only critical "
                     "extensions are the issuing distribution point and the authority key "
                     "identifier, and whose entries' only critical extension is the certificate "
-                    "issuer. It refuses the whole file, even beside a usable CRL from the same "
-                    "issuer: where the file holds one, remove this CRL"
+                    "issuer. This CRL refuses the whole file, even beside a usable CRL from the "
+                    "same issuer: where the file holds one, remove this CRL"
                 )
             judged.append(
                 (
@@ -481,8 +481,8 @@ def _out_of_scope(read: _CrlExtensions) -> str | None:
         f"its issuing distribution point says it {shape}, and the engine turns on no extended "
         "CRL support, so OpenSSL never judges a certificate by it, and refuses each peer whose "
         "issuer has no other CRL. Give a base CRL whose issuing distribution point, if it has "
-        "one, does not do that. It refuses the whole file, even beside a usable CRL from the "
-        "same issuer: where the file holds one, remove this CRL"
+        "one, does not do that. This CRL refuses the whole file, even beside a usable CRL from "
+        "the same issuer: where the file holds one, remove this CRL"
     )
 
 

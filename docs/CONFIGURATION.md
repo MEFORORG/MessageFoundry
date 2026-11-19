@@ -2351,7 +2351,8 @@ issuer. The engine applies a replaced file only when all three of these hold:
    handle is on the CRL itself. None is on an entry whose extensions the engine can read.
    OpenSSL refuses every peer it judges by a CRL with one (vault BACKLOG #5896). The engine skips
    an entry whose extensions do not read, so a critical extension there is left to the handshake.
-   A CRL refused by either of these two rules refuses the whole file, even beside a usable CRL
+   A CRL refused for its issuing distribution point or for a critical extension refuses the
+   whole file, even beside a usable CRL
    from the same issuer. Where such a usable CRL is in the file, remove the refused one.
    Otherwise replace it. A CRL of CA certificates only, or of user certificates only, is not
    refused, though a hop whose chain needs the other kind fails at the handshake. Its BEGIN line starts a line: OpenSSL skips an indented CRL block, so the
@@ -2518,9 +2519,11 @@ the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
 engine process logs the WARNING once while the file keeps the same bytes, and the ERROR above
-once for each type of exception that ended the check. It keeps that record for one version only, the last one it logged either line for. So
+once for each type of exception that ended the check. A leaf hop's WARNING for a CA without
+`cRLSign`, above, shares this record. It keeps that record for one version only, the last one it
+logged any of these lines for. So
 an earlier version is logged again when it returns after another version that was logged. A
-version in between that logged neither line does not reset the record. That includes at least one
+version in between that logged none of these lines does not reset the record. That includes at least one
 that verified, and one refused with no failure in the check. A version refused after the check failed part way did log
 its ERROR, so it does reset the record. A hop whose CA list
 gives a different result for the same file logs its own line, and each engine shard logs its own. A system
