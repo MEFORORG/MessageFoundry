@@ -28,6 +28,7 @@ from messagefoundry.config.settings import (
     ServiceSettings,
     StoreBackend,
     StoreSettings,
+    SyslogProtocol,
     TlsSettings,
 )
 from messagefoundry.config.wiring import MLLP, InboundConnection, Registry
@@ -545,6 +546,16 @@ def test_an_inbound_tls_crl_file_is_collected_from_the_registry() -> None:
 # until the next context build refused it, or a handshake failed with "CRL has expired".
 
 
+def _verified_forward(crl: str) -> LoggingSettings:
+    """A forwarder naming ``crl``, on the verified TLS-syslog hop it applies to (BACKLOG #5316)."""
+    return LoggingSettings(
+        forward_host="siem.example.org",
+        forward_protocol=SyslogProtocol.TLS,
+        forward_tls_ca_file="siem-ca.pem",
+        forward_tls_crl_file=crl,
+    )
+
+
 def _all_crl_settings(tmp_path: Path, *, next_update: datetime.datetime) -> ServiceSettings:
     """Settings naming a DIFFERENT CRL file in each of the five settings-level knobs."""
     paths = {}
@@ -553,7 +564,7 @@ def _all_crl_settings(tmp_path: Path, *, next_update: datetime.datetime) -> Serv
         _write_crl(paths[knob], next_update=next_update)
     return ServiceSettings(
         tls=TlsSettings(crl_file=str(paths["tls"])),
-        logging=LoggingSettings(forward_tls_crl_file=str(paths["forward"])),
+        logging=_verified_forward(str(paths["forward"])),
         auth=AuthSettings(oidc_tls_crl_file=str(paths["oidc"])),
         # ssl_crl_file loads on either verifying postgres branch since BACKLOG #300; this is the pinned-CA
         # one, which the cert-expiry sweep reads the same way.
@@ -565,7 +576,12 @@ def _all_crl_settings(tmp_path: Path, *, next_update: datetime.datetime) -> Serv
             ssl_root_cert=str(paths["store"]),
             ssl_crl_file=str(paths["store"]),
         ),
-        api=ApiSettings(tls_client_crl_file=str(paths["api"])),
+        # The client CRL needs the client CA it acts on (BACKLOG #5315), which needs a server cert.
+        api=ApiSettings(
+            tls_cert_file="server.pem",
+            tls_client_ca_file="client-ca.pem",
+            tls_client_crl_file=str(paths["api"]),
+        ),
     )
 
 
@@ -639,7 +655,7 @@ def test_an_outbound_crl_past_next_update_raises_crl_expiry(tmp_path: Path) -> N
 def test_an_outbound_crl_inside_the_warn_window_warns(tmp_path: Path) -> None:
     crl = tmp_path / "forward_crl.pem"
     _write_crl(crl, next_update=_REF + datetime.timedelta(days=5))
-    settings = ServiceSettings(logging=LoggingSettings(forward_tls_crl_file=str(crl)))
+    settings = ServiceSettings(logging=_verified_forward(str(crl)))
     sink = _RecordingSink()
     _runner(crls_from_settings(settings), sink).run_once()
     assert [(c[0], c[3]) for c in sink.crl_calls] == [("logging.forward_tls_crl_file", 5)]

@@ -6520,7 +6520,7 @@ jobs:
             docker exec mefor curl -fsS --cacert "$cert" https://127.0.0.1:8765/health >/dev/null 2>&1 && break || sleep 0.5
           done
           docker exec mefor curl -fsS --cacert "$cert" https://127.0.0.1:8765/health
-          # Send one synthetic ADT^A01 over the in-container MLLP listener (loopback:2575); fails on a non-AA ACK.
+          # Send one synthetic ADT^A01 over the in-container MLLP listener (loopback:2575); fails unless MSA-1 is AA or CA.
           docker exec mefor python /smoke/send_adt.py 127.0.0.1 2575
           # Read the disposition via the container's own python, SIGNED IN (`rigadmin get`, stdlib
           # only — no host python/jq needed). Same pin as the curl above: a default context would

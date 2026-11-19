@@ -40,6 +40,7 @@ import difflib
 import functools
 import ipaddress
 import logging
+import math
 import os
 import re
 import string
@@ -2218,6 +2219,18 @@ class ApiSettings(_Section):
                 "[api].tls_client_cert_identities requires [api].tls_client_ca_file (in-process mTLS "
                 "verifies the client cert before its subject is resolved to a principal)"
             )
+        # The client-CA pin and the client CRL each act only on the client chain that
+        # tls_client_ca_file has the server verify. Without it no client certificate is asked for,
+        # so a pin or CRL would load while enforcing nothing. Fail loud at load (BACKLOG #5315).
+        for name, value in (
+            ("tls_client_ca_pin", self.tls_client_ca_pin),
+            ("tls_client_crl_file", self.tls_client_crl_file),
+        ):
+            if value is not None and not self.tls_client_ca_file:
+                raise ValueError(
+                    f"[api].{name} requires [api].tls_client_ca_file (in-process mTLS): without "
+                    "it no client certificate is verified, so the setting would enforce nothing"
+                )
         # A declared upstream terminator means nothing unless the engine knows (and trusts) the proxy
         # in front -- otherwise it's an unverifiable claim that XFF could spoof. It never satisfies
         # the off-loopback exposed-bind gate on its own (BACKLOG #4636; docs/SECURITY.md, Plaintext
@@ -3015,7 +3028,8 @@ class LoggingSettings(_Section):
     # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
     # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
     # would be the per-hop scoping error that item warns about. Applies only with
-    # forward_tls_verify=true: the opt-out arm is CERT_NONE, where there is no chain to check against.
+    # forward_tls_verify=true: the opt-out arm is CERT_NONE, where there is no chain to check against,
+    # so the load refuses it there and on any forward_protocol but "tls" (BACKLOG #5316).
     # Same fail-closed refusals as every other CRL: absent, unloadable or past nextUpdate refuses at
     # startup rather than at the first collector handshake.
     forward_tls_crl_file: str | None = None
@@ -3134,8 +3148,11 @@ class LoggingSettings(_Section):
     @field_validator("time_sync_max_skew_seconds")
     @classmethod
     def _check_skew_threshold(cls, value: float) -> float:
-        if value <= 0:
-            raise ValueError("[logging].time_sync_max_skew_seconds must be > 0")
+        # NaN passes `value <= 0` and no offset compares above it, and infinity is above every
+        # offset, so either would leave the skew warning and the fail-closed refusal unable to fire
+        # (BACKLOG #5317).
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("[logging].time_sync_max_skew_seconds must be a finite number > 0")
         return value
 
     @model_validator(mode="after")
@@ -3162,8 +3179,35 @@ class LoggingSettings(_Section):
             raise ValueError(
                 "[logging].forward_protocol='tls' with certificate verification requires "
                 "[logging].forward_tls_ca_file (a PEM trust anchor for the collector); set "
-                "[logging].forward_tls_verify=false to accept an unverified server (insecure)"
+                "[logging].forward_tls_verify=false to accept an unverified server (insecure; "
+                "a forward_tls_crl_file must then be removed, since nothing would check it)"
             )
+        # The TLS-only settings, refused where the forwarder's own protocol or verify setting means
+        # they could never take effect (BACKLOG #5316): a declared mTLS or revocation check for the
+        # SIEM hop would otherwise load and stay silently inactive. udp and tcp read none of the
+        # three. On the verify-off arm (CERT_NONE) the CA and the CRL have no chain to act on, but
+        # the client certificate is still loaded and presented to the collector
+        # (logging_setup._build_tls_context), so it is not refused there. A disabled forwarder is
+        # not what this check keys on: it refuses only on the protocol and verify settings.
+        for name, value, needs_verify in (
+            ("forward_tls_ca_file", self.forward_tls_ca_file, True),
+            ("forward_tls_client_cert", self.forward_tls_client_cert, False),
+            ("forward_tls_crl_file", self.forward_tls_crl_file, True),
+        ):
+            if value is None:
+                continue
+            if self.forward_protocol is not SyslogProtocol.TLS:
+                raise ValueError(
+                    f"[logging].{name} applies only to forward_protocol='tls', and it is "
+                    f"{self.forward_protocol.value!r}, so the setting would do nothing; remove "
+                    "it, or set [logging].forward_protocol='tls'"
+                )
+            if needs_verify and not self.forward_tls_verify:
+                raise ValueError(
+                    f"[logging].{name} applies only with forward_tls_verify=true, and it is "
+                    "false, so no certificate chain is checked and the setting would do nothing; "
+                    "remove it, or turn [logging].forward_tls_verify on"
+                )
         # The attestation pair is validated by the SAME shared rule connection-level tls_hop_attested
         # uses (a reason without the flag, or a blank reason, is a config mistake) — never re-forked.
         # Re-raised under the [logging] field names so the operator sees which setting is at fault

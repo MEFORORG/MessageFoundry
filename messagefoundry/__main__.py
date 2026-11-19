@@ -1438,6 +1438,8 @@ def _resolve_offline_anchor(
     service config is given); an absolute one is used as-is. The fail-loud trigger (AC-3) fires ONLY
     when an *explicit* ``--project-root`` is set AND the loaded graph references ``env()`` AND the
     selected ``<env>.toml`` is absent — a zero-``env()`` deployment, or a no-root launch, never trips it.
+    Under the same two conditions it also fails when ``[environments].dir`` or ``--env`` is one
+    :func:`~messagefoundry.config.environments.values_file_path` refuses (BACKLOG #5322).
     """
     from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
 
@@ -1529,7 +1531,11 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
         return None
     if not graph_references_env(reg):
         return None  # zero-env() deployment: the silent-empty contract is preserved (AC-3).
-    env_file = root / env_dir / f"{env_name}.toml"
+    # The one rule serve's load uses, so a dir or --env that leaves the root is refused here too
+    # rather than stated outside it (BACKLOG #5322).
+    env_file = _value_file_or_refusal(root, env_dir, env_name, lead="")
+    if env_file is None:
+        return 2
     if not env_file.is_file():
         print(
             f"error: the graph references env() but no value file was found at {env_file} under the "
@@ -2701,7 +2707,16 @@ def _read_environment_values(
     from messagefoundry.engine_secrets import SecretsDirectoryError
     from messagefoundry.redaction import safe_exc
 
-    env_file = values_file_path(base_dir, dir_name, environment)
+    # A WiringError, the type this function's callers arm (BACKLOG #5322). The start check and the
+    # reader's own constructor refuse these inputs first, so this is the backstop. The refusal is
+    # raised outside the handler, so it carries no exception chain.
+    path_refusal = ""
+    try:
+        env_file = values_file_path(base_dir, dir_name, environment)
+    except ValueError as exc:
+        path_refusal = str(exc)
+    if path_refusal:
+        raise WiringError(path_refusal)
     if snapshot is not None and not snapshot.covers_environment_file(env_file):
         # Before the vetting below, so the plain read the engine then makes vets the file once.
         raise NotInSnapshot(f"{env_file} is not a value file the config snapshot read")
@@ -2744,6 +2759,29 @@ def _read_environment_values(
     # bytes on .object, so chaining either would carry every credential the file holds. `from None`
     # would not do: it leaves __context__ set.
     raise WiringError(f"{failed_on}: {refusal}")
+
+
+def _value_file_or_refusal(
+    base_dir: Path,
+    dir_name: str,
+    environment: str,
+    *,
+    lead: str = "refusing to start: ",
+    fleet: str = "",
+) -> Path | None:
+    """The value file a command reads, or ``None`` with the refusal printed when
+    :func:`~messagefoundry.config.environments.values_file_path` refuses ``[environments].dir`` or
+    the environment name; that function says on what grounds (BACKLOG #5322). ``serve``
+    and ``supervise`` call it ahead of :func:`_start_files_refused`, and so does the
+    ``--project-root`` check. ``supervise`` passes no ``lead`` and a ``fleet`` sentence that already
+    says it refuses to start, and the ``--project-root`` check passes no ``lead``."""
+    from messagefoundry.config.environments import values_file_path
+
+    try:
+        return values_file_path(base_dir, dir_name, environment)
+    except ValueError as exc:
+        print(f"error: {lead}{exc}{f'. {fleet}' if fleet else ''}", file=sys.stderr)
+        return None
 
 
 def _start_files_refused(service_config: str | None, env_file: Path, *, fleet: str = "") -> bool:
@@ -3039,12 +3077,12 @@ def _serve(args: argparse.Namespace) -> int:
     # else the working directory (unchanged default). Resolved here, ahead of the trust check below
     # and of the startup log that names it, because the standalone-repo / NSSM footgun is a
     # silently-wrong path.
-    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
+    from messagefoundry.config.environments import resolve_values_base_dir
 
     env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
-    env_file = values_file_path(env_base, settings.environments.dir, env_name)
+    env_file = _value_file_or_refusal(env_base, settings.environments.dir, env_name)
 
-    if _start_files_refused(service_config, env_file):
+    if env_file is None or _start_files_refused(service_config, env_file):
         return 2
 
     # Vault BACKLOG #2595 and #2601: a store key, another secret-class setting, or (vault #8212)
@@ -5622,15 +5660,14 @@ def _supervise(args: argparse.Namespace) -> int:
     # account can write would refuse every engine shard, and the supervisor would only restart
     # them. The value file is anchored as each engine shard anchors it: the forwarded
     # --project-root, else [environments].base_dir.
-    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
+    from messagefoundry.config.environments import resolve_values_base_dir
 
+    fleet_refusal = "Every engine shard would refuse to start; refusing to start the fleet."
     env_base = resolve_values_base_dir(args.project_root or settings.environments.base_dir, cwd=cwd)
-    env_file = values_file_path(env_base, settings.environments.dir, env_name)
-    if _start_files_refused(
-        service_config,
-        env_file,
-        fleet="Every engine shard would refuse to start; refusing to start the fleet.",
-    ):
+    env_file = _value_file_or_refusal(
+        env_base, settings.environments.dir, env_name, lead="", fleet=fleet_refusal
+    )
+    if env_file is None or _start_files_refused(service_config, env_file, fleet=fleet_refusal):
         return 2
     for startup_entry in startup_loosenings(startup):
         security_lines.append(startup_entry)
@@ -8494,7 +8531,9 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
     """Is a store key configured? The at-rest gate's one test for "keyed". A local key or a DPAPI key
     file counts when ``[store].key_provider`` reads it (BACKLOG #2077), and an external provider such
     as ``vault`` counts on its own (BACKLOG #1998). The rule is
-    :func:`~messagefoundry.store.keyprovider.provider_reads_a_configured_key`.
+    :func:`~messagefoundry.store.keyprovider.provider_reads_a_configured_key`. A
+    ``MEFOR_STORE_ENCRYPTION_KEY`` of blanks only beside a retired key does not count
+    (BACKLOG #5310, #5308), so the gate refuses it.
 
     The test reads what is CONFIGURED, not what resolves: the gate runs before ``open_store`` and must
     not need the network. That is safe because a source that cannot resolve fails closed at
@@ -8511,9 +8550,14 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
     store open plaintext. The DR backup path DOES resolve it, and refuses an ignored key there
     through ``store.base._checked_active_key``. ``rotate-key`` refuses this mode before it resolves
     a key (BACKLOG #2109)."""
+    from messagefoundry.store.base import blank_active_key, retired_without_active_refusal
     from messagefoundry.store.keyprovider import provider_reads_a_configured_key
 
     store = settings.store
+    if blank_active_key(store) and retired_without_active_refusal(store) is not None:
+        # A key of blanks only beside a retired key is no key (BACKLOG #5310, #5308). Answered
+        # here, so ``serve``, which runs the gate only when this says unkeyed, refuses it too.
+        return False
     if store.cipher_provider == "vault_transit" and (
         store.encryption_key or store.encryption_key_file
     ):
@@ -8523,11 +8567,14 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
 
 def _unread_key_text(settings: ServiceSettings) -> str:
     """The refusal text when the gate returns ``KEYLESS_REFUSED_BY_UNREAD_KEY``: which key source the
-    pinned ``[store].key_provider`` reads, and that the one that is set would be ignored (#2077)."""
+    pinned ``[store].key_provider`` reads, and that the one that is set would be ignored (#2077), or
+    that a retired key is set with no active key (BACKLOG #5310, #5308)."""
+    from messagefoundry.store.base import retired_without_active_refusal
     from messagefoundry.store.keyprovider import unread_key_refusal
 
     return (
         unread_key_refusal(settings.store)
+        or retired_without_active_refusal(settings.store)
         or "[store].key_provider does not read the key that is set."
     )
 
@@ -8588,16 +8635,24 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     A key that IS set but that a pinned ``[store].key_provider`` does not read returns
     ``KEYLESS_REFUSED_BY_UNREAD_KEY`` before the opt-out is consulted (BACKLOG #2077). No opt-out
     waives it: the settings name a key, so a keyless open is not what anyone configured.
-    ``open_store`` refuses the same case, through ``store.base._checked_active_key``."""
+    ``open_store`` refuses the same case, through ``store.base._checked_active_key``. So does a
+    retired key with no active key, by the same return (BACKLOG #5310, #5308), an active key of
+    blanks only counting as none. That sentinel's value names ``[store].key_provider``, which is
+    not this case's setting, so no caller may print the value: each prints
+    :func:`_unread_key_text`, which names the cause."""
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         keyless_opt_out_refusal,
     )
+    from messagefoundry.store.base import retired_without_active_refusal
     from messagefoundry.store.keyprovider import unread_key_refusal
 
     if _store_key_configured(settings):
         return None
-    if unread_key_refusal(settings.store) is not None:
+    if (
+        unread_key_refusal(settings.store) is not None
+        or retired_without_active_refusal(settings.store) is not None
+    ):
         return KEYLESS_REFUSED_BY_UNREAD_KEY
     return keyless_opt_out_refusal(settings.store, settings.security)
 
