@@ -111,38 +111,62 @@ def test_the_changelog_claims_only_a_default_up_and_names_the_skips() -> None:
     ), entry
 
 
-_SKIPS = "At least `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip"
-_QUALIFIED_DOCS = (_REPO / "docs" / "CLOUD-DEPLOYMENT.md", _REPO / "docker" / "README.md")
+def _flat(path: Path) -> str:
+    return " ".join(path.read_text(encoding="utf-8").split())
 
 
-@pytest.mark.parametrize("doc", _QUALIFIED_DOCS, ids=lambda p: p.name)
-def test_each_doc_qualifies_the_compose_check_and_names_the_skips(doc: Path) -> None:
-    # BACKLOG #5400: the check runs on a default `up`, at least two commands skip it, and no k8s
-    # manifest checks the value. An unqualified "refused before any engine starts" would be a
-    # false control claim, so each doc must name the default `up` and both skips.
-    text = " ".join(doc.read_text(encoding="utf-8").split())
-    assert "on a default `docker compose up`" in text, doc.name
-    assert _SKIPS.casefold() in text.casefold(), doc.name
-    assert "checks the value before the engine starts" in text, doc.name
-    for stale in (
-        "is refused by the `revocation-attestation-check` service before any engine starts",
-        "`docker/compose.yaml` does, with its `revocation-attestation-check` service",
-        "as `compose.yaml` does with its `revocation-attestation-check` service",
-    ):
-        assert stale not in text, f"{doc.name} still carries the unqualified claim: {stale}"
-
-
-def test_the_readme_topology_a_text_names_a_default_up() -> None:
-    text = " ".join((_REPO / "docker" / "README.md").read_text(encoding="utf-8").split())
-    assert (
-        "stops a default `docker compose up` at the `revocation-attestation-check` service" in text
-    )
-
-
-def test_the_check_comment_opens_with_a_default_up() -> None:
+def _check_comment() -> str:
     compose = (_REPO / "docker" / "compose.yaml").read_text(encoding="utf-8")
     start = compose.index("# One-shot check that the attestation reads as TRUE")
     words = compose[start : compose.index("revocation-attestation-check:", start)].split()
-    comment = " ".join(w for w in words if w != "#")
-    assert "run by a default `up` before it starts any serving engine" in comment
-    assert "run before any serving engine starts" not in comment
+    return " ".join(w for w in words if w != "#")
+
+
+_SKIPS = (
+    "at least `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip it"
+)
+# The unqualified claims BACKLOG #5400 removed: each said a false value is refused before any
+# engine starts, which at least the two `--no-deps` commands and every k8s manifest contradict.
+_STALE = (
+    "is refused by the `revocation-attestation-check` service before any engine starts",
+    "`docker/compose.yaml` does, with its `revocation-attestation-check` service",
+    "as `compose.yaml` does with its `revocation-attestation-check` service",
+)
+
+
+@pytest.mark.parametrize("doc", _DOCS[:2], ids=lambda p: p.name)
+def test_no_deploy_doc_carries_the_unqualified_refusal_claim(doc: Path) -> None:
+    text = _flat(doc)
+    for stale in _STALE:
+        assert stale not in text, f"{doc.name} still carries the unqualified claim: {stale}"
+
+
+def test_cloud_deployment_says_no_manifest_checks_the_value() -> None:
+    text = _flat(_REPO / "docs" / "CLOUD-DEPLOYMENT.md")
+    assert "Neither Kubernetes manifest checks the value before the engine starts." in text
+
+
+def test_the_readme_k8s_bullet_points_at_the_compose_comment() -> None:
+    text = _flat(_REPO / "docker" / "README.md")
+    start = text.index("**Both Kubernetes manifests need a ConfigMap you create:**")
+    bullet = text[start : text.index(" - **", start + 1)]
+    assert "neither manifest checks the value before the engine starts" in bullet, bullet
+    assert "says which compose commands skip it" in bullet, bullet
+
+
+def test_the_readme_topology_a_bullet_names_the_skips() -> None:
+    # The sentence a compose user acts on: pinned inside the Topology A bullet, so another
+    # section's copy cannot satisfy it.
+    text = _flat(_REPO / "docker" / "README.md")
+    start = text.index("**(A) In-process TLS")
+    bullet = text[start : text.index(" - **(B)", start)]
+    assert "stops `docker compose up`, with or without `--profile ha`, at the" in bullet, bullet
+    assert _SKIPS in bullet, bullet
+
+
+def test_the_check_comment_opens_with_a_default_up() -> None:
+    comment = _check_comment()
+    assert comment.startswith(
+        "One-shot check that the attestation reads as TRUE, run by a default `up` before it starts"
+        " any serving engine; at least two commands skip it"
+    ), comment[:200]
