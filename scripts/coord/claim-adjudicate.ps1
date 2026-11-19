@@ -172,19 +172,19 @@ if (-not $backlogFiles.Count) {
     throw "no backlog file found on ${mainRef}: cannot adjudicate any key against a namespace that was not read"
 }
 
-$corpus = @{}
-foreach ($bf in $backlogFiles) {
-    $text = (& git -C $repo show "${mainRef}:$bf" 2>$null) -join "`n"
-    if ($text) { $corpus[$bf] = $text }
-}
-
 # A FILE NAMED BACKLOG IS NOT A LEDGER (BACKLOG #5480). The ledger left this repository on
 # 2026-09-13 and docs/BACKLOG.md is now a stub that holds no item, while other docs carry the word
 # in their names. Counting files therefore passed on a namespace that holds nothing, and every
-# numeric key then read NO-ITEM -- the same never-looked report the check above refuses. So the
-# test is the one Get-ItemBlock depends on: at least one item heading, in its own pattern.
+# numeric key then read NO-ITEM -- the same never-looked report the check above refuses. So a file
+# joins the corpus only if it holds an item heading, in the shape Get-ItemBlock matches, and a
+# corpus left empty refuses. A stub is then never listed as a source either.
 $itemHeading = '(?m)^##\s+\d+\.\s'
-if (-not @($corpus.Values | Where-Object { $_ -match $itemHeading }).Count) {
+$corpus = @{}
+foreach ($bf in $backlogFiles) {
+    $text = (& git -C $repo show "${mainRef}:$bf" 2>$null) -join "`n"
+    if ($text -match $itemHeading) { $corpus[$bf] = $text }
+}
+if (-not $corpus.Count) {
     throw ("no backlog item heading found in the $($backlogFiles.Count) backlog-named file(s) on ${mainRef}, " +
         "so there is no ledger here to adjudicate any key against. The ledger lives in the " +
         "maintainer-internal repository (the vault) since 2026-09-13, and docs/BACKLOG.md here is a " +
@@ -423,7 +423,7 @@ if ($Json) {
         scanned   = $true
         reference = $mainRef
         applied   = $false
-        sources   = [pscustomobject]@{ claims = $claimsDir; backlog = @($backlogFiles) }
+        sources   = [pscustomobject]@{ claims = $claimsDir; backlog = @($corpus.Keys | Sort-Object) }
         counts    = [pscustomobject]@{
             total      = $rows.Count
             superseded = @($rows | Where-Object verdict -eq 'SUPERSEDED').Count
@@ -446,7 +446,7 @@ if (-not $mainIsRemote) {
 
 Write-Host "CLAIM ADJUDICATION -- per key, against the durable protection on $mainRef" -ForegroundColor Cyan
 Write-Host "  claims  : $claimsDir"
-Write-Host "  backlog : $($backlogFiles -join ', ')"
+Write-Host "  backlog : $(($corpus.Keys | Sort-Object) -join ', ')"
 Write-Host "  writes  : NONE. This tool has no -Apply. The release lines below are for you to run."
 Write-Host ""
 
