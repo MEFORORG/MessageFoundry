@@ -12,6 +12,7 @@ Synthetic data only: the token, key names and plaintext are made up.
 
 from __future__ import annotations
 
+import gc
 import threading
 import time
 from collections.abc import Callable
@@ -28,6 +29,8 @@ from messagefoundry.store.crypto_transit import (
     TransitCipher,
     build_transit_cipher,
 )
+from messagefoundry.store.postgres import PostgresStore
+from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import MessageStore
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 from tests._vault_hop_env import STORE, supply_vault_hop
@@ -139,14 +142,17 @@ def test_many_threads_never_share_a_client() -> None:
     cipher, built = _cipher()
     stored = cipher.encrypt("synthetic", aad=b"cell")
     start = threading.Barrier(8)
+    failures: list[BaseException] = []
 
     def churn() -> None:
-        start.wait(timeout=10)
-        for _ in range(25):
-            assert cipher.decrypt(cipher.encrypt("synthetic", aad=b"cell"), aad=b"cell") == (
-                "synthetic"
-            )
-        assert cipher.decrypt(stored, aad=b"cell") == "synthetic"
+        try:
+            start.wait(timeout=10)
+            for _ in range(25):
+                opened = cipher.decrypt(cipher.encrypt("synthetic", aad=b"cell"), aad=b"cell")
+                assert opened == "synthetic"
+            assert cipher.decrypt(stored, aad=b"cell") == "synthetic"
+        except BaseException as exc:  # noqa: BLE001 -- re-raised on the test's thread
+            failures.append(exc)
 
     workers = [threading.Thread(target=churn) for _ in range(8)]
     for worker in workers:
@@ -154,6 +160,8 @@ def test_many_threads_never_share_a_client() -> None:
     for worker in workers:
         worker.join(timeout=60)
     assert not any(worker.is_alive() for worker in workers)
+    if failures:
+        raise failures[0]
     assert len(built) == 9  # the startup client, then one per worker
     assert all(len(client.threads) == 1 for client in built)
     assert len({next(iter(client.threads)) for client in built}) == 9
@@ -171,6 +179,17 @@ def test_close_releases_every_client_and_a_later_call_builds_a_fresh_one() -> No
     assert [client.adapter.closed for client in built] == [1, 1, 1]
 
 
+def test_a_thread_that_exits_closes_its_own_client() -> None:
+    """A worker thread's client is closed when the thread ends, not kept until the store closes,
+    so threads that come and go do not each leave a Vault socket open."""
+    cipher, built = _cipher()
+    _in_thread(lambda: cipher.encrypt("synthetic"))
+    gc.collect()
+    assert [client.adapter.closed for client in built] == [0, 1]
+    cipher.close_connections()
+    assert [client.adapter.closed for client in built] == [1, 1]  # closed once each
+
+
 def test_a_cipher_without_a_factory_keeps_its_one_client_across_close() -> None:
     client = _TrackedClient(_FakeTransit())
     cipher = TransitCipher(client, _KEY_NAME)
@@ -186,18 +205,40 @@ def test_a_client_close_that_raises_is_logged_and_the_rest_still_close(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     cipher, built = _cipher()
-    _in_thread(lambda: cipher.encrypt("synthetic"))
+    ready, done = threading.Event(), threading.Event()
 
-    def boom() -> None:
-        raise OSError("synthetic")
+    def hold() -> None:
+        cipher.encrypt("synthetic")
+        ready.set()
+        done.wait(timeout=10)  # alive, so its client is still held when the cipher closes
 
-    built[0].adapter.close = boom  # type: ignore[method-assign]
-    cipher.close_connections()
-    assert built[1].adapter.closed == 1
+    worker = threading.Thread(target=hold)
+    worker.start()
+    try:
+        assert ready.wait(timeout=10)
+
+        def boom() -> None:
+            raise OSError("synthetic")
+
+        built[0].adapter.close = boom  # type: ignore[method-assign]
+        cipher.close_connections()
+        assert built[1].adapter.closed == 1
+    finally:
+        done.set()
+        worker.join(timeout=10)
+    gc.collect()
+    assert built[1].adapter.closed == 1  # the thread's exit does not close it a second time
     assert "closing a Transit client's connections raised OSError" in caplog.text
 
 
-def test_a_thread_client_that_cannot_be_built_fails_closed_as_a_cipher_error() -> None:
+@pytest.mark.skipif(
+    not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
+    reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
+)
+def test_a_thread_client_that_cannot_be_built_is_an_outage_not_a_verdict() -> None:
+    """A thread whose own client cannot be built gave no verdict on the value, so it is the
+    no-verdict error, never a refusal that would read the value as damaged."""
+
     def refuse() -> Any:
         raise ValueError("synthetic refusal")
 
@@ -211,7 +252,8 @@ def test_a_thread_client_that_cannot_be_built_fails_closed_as_a_cipher_error() -
             failures.append(exc)
 
     _in_thread(encrypt)
-    assert len(failures) == 1 and isinstance(failures[0].__cause__, ValueError)
+    assert len(failures) == 1 and isinstance(failures[0], CipherUnavailableError)
+    assert isinstance(failures[0].__cause__.__cause__, ValueError)  # type: ignore[union-attr]
 
 
 async def test_closing_the_sqlite_store_releases_the_transit_clients(tmp_path: Path) -> None:
@@ -221,6 +263,25 @@ async def test_closing_the_sqlite_store_releases_the_transit_clients(tmp_path: P
     store = await MessageStore.open(tmp_path / "store.db", cipher=cipher)
     await store.close()
     assert built and all(client.adapter.closed == 1 for client in built)
+
+
+@pytest.mark.parametrize("store_class", [MessageStore, PostgresStore, SqlServerStore])
+async def test_every_store_close_releases_the_clients_even_when_a_close_step_raises(
+    store_class: type[Any],
+) -> None:
+    """All three backends: the release runs in a finally, so a close step that raises still
+    closes the Vault sockets, and the step's error still propagates. No database is opened."""
+    cipher, built = _cipher()
+    store = object.__new__(store_class)
+    store._cipher = cipher
+
+    async def broken() -> None:
+        raise OSError("synthetic close failure")
+
+    store._close_handles = broken
+    with pytest.raises(OSError, match="synthetic close failure"):
+        await store.close()
+    assert [client.adapter.closed for client in built] == [1]
 
 
 # --- a real hvac client --------------------------------------------------------------------------

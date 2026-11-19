@@ -5804,6 +5804,17 @@ class SqlServerStore:
         return bool(row is not None and row[0] == expected)
 
     async def close(self) -> None:
+        try:
+            await self._close_handles()
+        finally:
+            # BACKLOG #5963: release the pooled Vault sockets of a cipher that holds some (the
+            # Transit cipher), even when a step above raised. Read by name, so the store takes no
+            # import of the cipher's module.
+            release = getattr(self._cipher, "close_connections", None)
+            if callable(release):
+                release()
+
+    async def _close_handles(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
@@ -5831,11 +5842,6 @@ class SqlServerStore:
             if self._pool_executor is not None:
                 self._pool_executor.shutdown(wait=False)
                 self._pool_executor = None
-        # BACKLOG #5963: release the pooled Vault sockets of a cipher that holds some (the Transit
-        # cipher). Read by name, so the store takes no import of the cipher's module.
-        release = getattr(self._cipher, "close_connections", None)
-        if callable(release):
-            release()
 
     # --- ADR 0071 B5: synchronous fused-handoff connection source ------------
     def open_sync_handoff_pool(self, stage: str, size: int) -> _SyncHandoffPool:

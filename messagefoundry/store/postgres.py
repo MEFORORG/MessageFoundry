@@ -2918,6 +2918,17 @@ class PostgresStore:
         # --- end custom RBAC roles (ADR 0045) --------------------------------
 
     async def close(self) -> None:
+        try:
+            await self._close_handles()
+        finally:
+            # BACKLOG #5963: release the pooled Vault sockets of a cipher that holds some (the
+            # Transit cipher), even when a step above raised. Read by name, so the store takes no
+            # import of the cipher's module.
+            release = getattr(self._cipher, "close_connections", None)
+            if callable(release):
+                release()
+
+    async def _close_handles(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
@@ -2928,11 +2939,6 @@ class PostgresStore:
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         await self._pool.close()
-        # BACKLOG #5963: release the pooled Vault sockets of a cipher that holds some (the Transit
-        # cipher). Read by name, so the store takes no import of the cipher's module.
-        release = getattr(self._cipher, "close_connections", None)
-        if callable(release):
-            release()
 
     async def warm_pool(self) -> None:
         # Pre-open pooled connections so a connection burst (the post-promotion delivery workers, or a

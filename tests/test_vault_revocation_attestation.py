@@ -214,7 +214,7 @@ _BUILDERS = sorted(
     [
         ("config/secretprovider_vault.py", "resolve", "setting"),
         ("config/secretprovider_vault.py", "secrets_vault_client", "parameter"),
-        ("store/crypto_transit.py", "build_transit_cipher", "setting"),
+        ("store/crypto_transit.py", "build_client", "setting"),
         ("store/keyprovider_vault.py", "active_key", "setting"),
         ("store/keyprovider_vault.py", "store_vault_client", "parameter"),
     ]

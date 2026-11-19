@@ -159,6 +159,7 @@ def _build_client(
     posture: HopPosture | None = None,
     revocation_reason: str | None = None,
     timeout: float | tuple[float, float] | None = None,
+    ca_kwargs: Mapping[str, str] | None = None,
 ) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake Transit backend without
     a live Vault. ``addr`` and ``token`` are REQUIRED and always passed to hvac (BACKLOG #2851):
@@ -172,7 +173,9 @@ def _build_client(
     ``posture`` is the instance posture the caller was handed, or ``None``. ``None`` counts as
     enforcing, so leaving it out is the strict answer. ``revocation_reason`` is the attestation's
     reason, for the one line an attested crossing logs. ``timeout`` is the requests timeout every
-    request takes; ``None`` leaves hvac's own default (BACKLOG #5983)."""
+    request takes; ``None`` leaves hvac's own default (BACKLOG #5983). ``ca_kwargs`` is what
+    :func:`_vault_ca_kwargs` returned for ``addr`` when the caller read it once to build several
+    clients alike (BACKLOG #5963); ``None`` reads it here."""
     # The backstop for a caller that did not read through those two functions.
     if not addr:
         raise KeyProviderError(_ADDR_UNSET)
@@ -212,7 +215,7 @@ def _build_client(
         "url": addr,
         "token": token,
         "allow_redirects": False,
-        **_vault_ca_kwargs(addr),
+        **(_vault_ca_kwargs(addr) if ca_kwargs is None else ca_kwargs),
     }
     if timeout is not None:
         # Omitted when unset, so the stock construction is unchanged (BACKLOG #5983).

@@ -13454,6 +13454,17 @@ class MessageStore:
             )
 
     async def close(self) -> None:
+        try:
+            await self._close_handles()
+        finally:
+            # BACKLOG #5963: release the pooled Vault sockets of a cipher that holds some (the
+            # Transit cipher), even when a step above raised. Read by name, so the store takes no
+            # import of the cipher's module.
+            release = getattr(self._cipher, "close_connections", None)
+            if callable(release):
+                release()
+
+    async def _close_handles(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
@@ -13487,11 +13498,6 @@ class MessageStore:
         # threads are non-daemon, so a `close`d store could still hold threads interpreter exit has
         # to join. Wait them out so "the store is closed" means every thread it owned is gone.
         await _await_connection_worker_exit(self._db)
-        # BACKLOG #5963: release the pooled Vault sockets of a cipher that holds some (the Transit
-        # cipher). Read by name, so the store takes no import of the cipher's module.
-        release = getattr(self._cipher, "close_connections", None)
-        if callable(release):
-            release()
 
     # --- write path ----------------------------------------------------------
 

@@ -2030,7 +2030,8 @@ class Ldap3ContextFactory:
 #:
 #: Not one of them reaches the TLS context: ``url`` becomes the request URL, ``token`` an
 #: ``X-Vault-Token`` header, and ``allow_redirects`` and ``timeout`` are requests-level policies the
-#: adapter applies to each request, never to the context (``timeout``: BACKLOG #5983). ``verify`` is admitted separately, and only when its value is a CA bundle path
+#: adapter applies to each request, never to the context (``timeout``: BACKLOG #5983). ``verify``
+#: is admitted separately, and only when its value is a CA bundle path
 #: — see :data:`_HVAC_CLIENT_CA_BUNDLE_KWARG`. Every OTHER ``Client`` argument is REFUSED rather
 #: than ignored — ``session``, ``adapter``, ``cert`` and ``proxies`` each redirect where the context
 #: comes from, and the function's docstring says why ``session=`` in particular must never be quietly

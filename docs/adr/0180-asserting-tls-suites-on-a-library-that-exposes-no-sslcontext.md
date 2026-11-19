@@ -183,7 +183,8 @@ that only the real function tracks urllib3 if urllib3 ever narrows its own defau
 "the look-alike is measurably wrong" would have been a satisfying and false argument.
 
 **3. It REFUSES any `hvac.Client` argument it cannot replicate** (`_HVAC_CLIENT_REPLICABLE_KWARGS =
-{url, token, allow_redirects}`, plus `verify` on the condition below). `session=` is the one that
+{url, token, allow_redirects, timeout}`, plus `verify` on the condition below; `timeout` was
+admitted for BACKLOG #5983 as a per-request policy that never reaches the context). `session=` is the one that
 matters: it is the documented way to give this hop a different TLS context, and a replica that accepted
 it would keep reporting a clean suite list for a context the hop had stopped using.
 

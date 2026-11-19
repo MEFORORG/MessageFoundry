@@ -53,6 +53,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -86,6 +87,7 @@ from messagefoundry.store.keyprovider_vault import (
     TRANSIT_KEY_TYPES_DATA,
     TRANSIT_MOUNT,
     _build_client,
+    _vault_ca_kwargs,
     checked_transit_key_name,
     is_vault_bad_request,
     is_vault_forbidden,
@@ -109,11 +111,12 @@ log = logging.getLogger(__name__)
 PROVIDER_NAME = "vault_transit"
 
 #: The (connect, read) timeout, in seconds, of every Transit request this cipher sends (BACKLOG
-#: #5983). It is the engine's own bound rather than hvac's 30-second default, because the store
-#: calls the cipher on the event loop, so a Vault that stalls holds the loop for up to this long per
-#: request. requests applies the read figure to each socket read, not to the whole reply, so a reply
-#: that keeps trickling bytes is not cut off by it. A request it ends raises a requests timeout,
-#: which :func:`_transit_failure` reads as an outage that gave no verdict on the value.
+#: #5983). It is the engine's own figure rather than hvac's 30-second default. The store calls the
+#: cipher on the event loop, and this does NOT bound how long a stalled Vault can hold the loop:
+#: at least name resolution is not timed, the connect figure applies to each address tried, the
+#: read figure to each socket read rather than the whole reply, and one cipher call can send
+#: several requests (an audit MAC check sends up to six). A request it ends raises a requests
+#: timeout, which :func:`_transit_failure` reads as an outage that gave no verdict on the value.
 TRANSIT_REQUEST_TIMEOUT_S: tuple[float, float] = (5.0, 10.0)
 
 # Connection reuses the shared Vault wiring (a deployment runs one Vault): the address and token are read
@@ -384,6 +387,31 @@ def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
     return UnauthenticatedCipherError(refused) if unauthenticated else CipherError(refused)
 
 
+def _close_client(client: object) -> None:
+    """Close an hvac client's pooled connections, best-effort: a close that raises is logged by
+    the exception's type alone (BACKLOG #5963). A client with no adapter to close is left alone."""
+    closer = getattr(getattr(client, "adapter", None), "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except Exception as exc:  # noqa: BLE001 -- a close is best-effort; logged, not raised
+        log.warning("closing a Transit client's connections raised %s", type(exc).__name__)
+
+
+class _ThreadClient:
+    """One thread's own hvac client, from :class:`TransitCipher`'s factory (BACKLOG #5963). Its
+    connections are closed once, by :attr:`release` or when the thread drops it, as it does on
+    exit."""
+
+    __slots__ = ("__weakref__", "client", "generation", "release")
+
+    def __init__(self, client: Any, generation: int) -> None:
+        self.client = client
+        self.generation = generation
+        self.release = weakref.finalize(self, _close_client, client)
+
+
 class TransitCipher(_UnmarkedPolicy):
     """Bulk at-rest cipher whose crypto runs inside Vault/OpenBao Transit — the DEK never enters heap."""
 
@@ -411,12 +439,14 @@ class TransitCipher(_UnmarkedPolicy):
         self._client_factory = client_factory
         self._shared_client = client
         self._thread_clients = threading.local()
-        self._thread_clients.held = (0, client)
         self._clients_lock = threading.Lock()
-        #: Every client built so far, so :meth:`close` can release their pooled sockets.
-        self._clients: list[Any] = [client]
-        #: Bumped by :meth:`close`, so a thread holding a client from before it builds a new one.
+        #: The live per-thread clients, so :meth:`close_connections` can release their sockets. Held
+        #: weakly: a thread that exits drops its own, which closes that client's connections.
+        self._held: weakref.WeakSet[_ThreadClient] = weakref.WeakSet()
+        #: Bumped by :meth:`close_connections`, so a thread holding an older client builds anew.
         self._generation = 0
+        if client_factory is not None:
+            self._hold(client, 0)
         self._key = key_name
         # The same unmarked-value refusal as the in-process cipher (BACKLOG #1169, ASVS 11.3.3).
         self._init_unmarked_policy(allow_unmarked)
@@ -435,15 +465,29 @@ class TransitCipher(_UnmarkedPolicy):
         same way."""
         if self._client_factory is None:
             return self._shared_client
-        held: tuple[int, Any] | None = getattr(self._thread_clients, "held", None)
-        if held is not None and held[0] == self._generation:
-            return held[1]
-        # A build that raises propagates to the caller's own handler, as a failed request would.
-        client = self._client_factory()
+        held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
+        if held is not None and held.generation == self._generation:
+            return held.client
+        generation = self._generation
+        try:
+            client = self._client_factory()
+        except Exception as exc:
+            # Read as a connection that could not be made: an outage that gave no verdict on any
+            # value, unless its chain carries a refusal of the hop (is_vault_unavailable).
+            import requests  # noqa: PLC0415 -- the [vault] extra, present wherever a factory is
+
+            raise requests.exceptions.ConnectionError(
+                f"a Transit client could not be built for this thread: {type(exc).__name__}"
+            ) from exc
+        return self._hold(client, generation)
+
+    def _hold(self, client: Any, generation: int) -> Any:
+        """Keep ``client`` as the calling thread's own, closed when the thread drops it or when
+        :meth:`close_connections` runs, whichever is first."""
+        held = _ThreadClient(client, generation)
         with self._clients_lock:
-            self._clients.append(client)
-            generation = self._generation
-        self._thread_clients.held = (generation, client)
+            self._held.add(held)
+        self._thread_clients.held = held
         return client
 
     def close_connections(self) -> None:
@@ -452,18 +496,15 @@ class TransitCipher(_UnmarkedPolicy):
         store can share it: a later call on any thread builds a fresh client when this cipher has a
         factory, and otherwise reuses the one client, whose session opens a new connection. A client
         whose close raises is logged by the exception's type and the rest are still closed."""
+        if self._client_factory is None:
+            _close_client(self._shared_client)
+            return
         with self._clients_lock:
-            clients = self._clients
+            held = list(self._held)
+            self._held.clear()
             self._generation += 1
-            self._clients = [] if self._client_factory is not None else [self._shared_client]
-        for client in clients:
-            closer = getattr(getattr(client, "adapter", None), "close", None)
-            if not callable(closer):
-                continue
-            try:
-                closer()
-            except Exception as exc:  # noqa: BLE001 -- a close is best-effort; logged, not raised
-                log.warning("closing a Transit client's connections raised %s", type(exc).__name__)
+        for each in held:
+            each.release()
 
     @property
     def transit_key_name(self) -> str:
@@ -1182,6 +1223,9 @@ def build_transit_cipher(
     # process. A token replaced afterwards, in the environment or the secrets directory, is not
     # seen until the store is opened again.
     addr, token = store_vault_hop()
+    # Read once too, like the address and token, so a thread's own client is built from the same
+    # inputs as the first (BACKLOG #5963). A refused CA anchor raises here, before any client.
+    ca_kwargs = _vault_ca_kwargs(addr)
 
     def build_client() -> Any:
         # One construction for the first client and for each thread's own (BACKLOG #5963), so every
@@ -1194,6 +1238,7 @@ def build_transit_cipher(
             posture=posture,
             revocation_reason=settings.vault_revocation_attested_reason,
             timeout=TRANSIT_REQUEST_TIMEOUT_S,
+            ca_kwargs=ca_kwargs,
         )
 
     # OUTSIDE the try on purpose. `_build_client` asserts this hop's TLS suites (ADR 0180) and raises
