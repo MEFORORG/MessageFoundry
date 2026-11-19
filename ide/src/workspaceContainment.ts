@@ -91,17 +91,32 @@ export function committedRelativePath(ws: string, value: string): string | undef
   return rel === "" ? "." : rel.split(path.sep).join("/");
 }
 
+/** A Windows reserved device stem, which names a device in any folder and with any extension. The
+ *  superscript digits are the ones Windows also reserves after COM and LPT. */
+const WIN32_DEVICE_NAME = /^(con|prn|aux|nul|conin\$|conout\$|(com|lpt)[0-9¹²³])(\.|$)/i;
+
 /**
  * Whether `rel`, a path relative to a folder with its `.` and `..` components already collapsed, has
- * a folder or file name that ends in a dot or a space, when `win32` (by default, on Windows). Node
- * reads such a name as written, while a Win32 open, the CLI's among them, goes through Windows path
- * normalization, which can drop the ending and open another entry: a check Node makes on `cfg.` then
- * says nothing of the `cfg` the CLI opens. Either separator splits `rel`, since Windows takes both.
- * Spelling only, with no I/O. Shared by {@link escapesByLink} and securityConfigTarget.
+ * a folder or file name that a Win32 open may read as another entry than Node does, when `win32` (by
+ * default, on Windows): a name ending in a dot or a space, and a reserved device name such as `nul`
+ * or `con.toml`. Node reads each as written and, finding no such entry, reports a missing path, while
+ * the CLI's open goes through Windows path normalization: it can drop the ending and open `cfg` for
+ * `cfg.`, or open a device. A check Node makes on the name then says nothing of what the CLI opens, a
+ * link out of the folder included. Either separator splits `rel`, since Windows takes both. Spelling
+ * only, with no I/O. Shared by {@link escapesByLink} and securityConfigTarget.
+ *
+ * Open limit: a name holding a colon, which a Win32 open reads as an NTFS stream on the entry before
+ * it, is not refused here, so `cfg:x` with `cfg` a link out of the folder still passes.
  */
-export function hasTrailingDotOrSpaceName(rel: string, win32: boolean = path.sep === "\\"): boolean {
-  return win32 && rel.split(/[\\/]/).some((part) => part.endsWith(".") || part.endsWith(" "));
+export function hasAmbiguousWin32Name(rel: string, win32: boolean = path.sep === "\\"): boolean {
+  return (
+    win32 &&
+    rel.split(/[\\/]/).some((part) => part.endsWith(".") || part.endsWith(" ") || WIN32_DEVICE_NAME.test(part))
+  );
 }
+
+/** The workspace-relative path settings a writer checks. */
+export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
 
 /**
  * Whether a writer must refuse `value`, a path setting's value, because though its spelling lies
@@ -115,10 +130,8 @@ export function hasTrailingDotOrSpaceName(rel: string, win32: boolean = path.sep
  *
  * Two spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
  * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
- * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a
- * folder or file name ending in a dot or a space ({@link hasTrailingDotOrSpaceName}): Node finds no
- * `cfg.` and so reads it as a missing path inside the folder, while the CLI's open drops the dot and
- * follows a `cfg` link out of it.
+ * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a name
+ * {@link hasAmbiguousWin32Name} names, which the real-path check would read as a missing path.
  *
  * Open limits. The check reads the named path only: a link BELOW it, such as a linked `codesets`
  * folder under `configDir`, is not caught here. The real-path reads are synchronous, because cli.ts
@@ -139,7 +152,7 @@ export function escapesByLink(ws: string | undefined, value: string, win32: bool
   if (value.split(win32 ? /[\\/]/ : /[/]/).includes("..")) {
     return true;
   }
-  if (rel !== "." && hasTrailingDotOrSpaceName(rel, win32)) {
+  if (rel !== "." && hasAmbiguousWin32Name(rel, win32)) {
     return true;
   }
   return resolveInsideWorkspace(ws, value) === undefined;
@@ -147,17 +160,21 @@ export function escapesByLink(ws: string | undefined, value: string, win32: bool
 
 /**
  * The refusal a writer shows when {@link escapesByLink} holds. It names the setting, never the value
- * or the link's target (docs/REVIEW-STANDARDS.md R12). The remedy works for every writer: an absolute
- * path in user settings would not, since at least the New Route wizard writes only inside the
- * workspace folder and version-control setup commits no hook for a folder outside it.
+ * or the link's target (docs/REVIEW-STANDARDS.md R12). Its first remedy works for every writer. The
+ * second, an absolute path in user settings, which {@link escapesByLink} does not check, is named
+ * with the two writers that decline one: the New Route wizard writes only inside the workspace
+ * folder, and version-control setup commits no hook for a folder outside it.
  */
-export function linkEscapeRefusal(key: string): string {
+export function linkEscapeRefusal(key: PathSettingKey): string {
   return (
     `MessageFoundry: nothing was written or started. messagefoundry.${key} names a path inside the ` +
     "workspace folder that may lead out of it, or that Windows may open as another name. At least one of " +
     "these holds: a symbolic link or junction on the path leads out, the path climbs with '..', a folder " +
-    "or file name on it ends in a dot or a space, or its real path cannot be read. Remove the link or the " +
-    "'..', or the trailing dot or space, so the setting names a plain folder or file inside the workspace folder."
+    "or file name on it ends in a dot or a space or is a device name such as NUL, or its real path " +
+    "cannot be read. Remove the link or the '..', rename the folder or file, or make the " +
+    "workspace folder readable, so the setting names a plain folder or file inside the workspace folder. " +
+    "Other commands than New Route and the commit hook also take the folder a link leads to, named " +
+    "with an absolute path in user settings."
   );
 }
 

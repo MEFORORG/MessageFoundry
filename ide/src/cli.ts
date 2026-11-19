@@ -28,6 +28,7 @@ import {
   linkEscapeRefusal,
   writerRefusal,
   type ContainedPathSetting,
+  type PathSettingKey,
 } from "./workspaceContainment";
 
 // Parsing lives in cliJson.ts (no vscode, so the unit suite runs it). Every importer of CliResult
@@ -98,7 +99,7 @@ export function isExecGated(): boolean {
 const droppedPathSettings = new Set<string>();
 
 /** The workspace-relative path settings {@link containedPathSetting} contains. */
-export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
+export type { PathSettingKey };
 
 /**
  * A workspace-relative path setting, contained to the workspace folder by
@@ -181,7 +182,20 @@ export function writerConfigTarget(): { configDir: string; serviceConfig: string
     return undefined;
   }
   // Nothing was dropped, so the setting is set exactly when it did not come from the default.
-  return { configDir: dir, serviceConfig: connectionServiceConfig(file.value, file.source !== "default") };
+  const flag = connectionServiceConfig(file.value, file.source !== "default");
+  // A set but blank value drops the flag, so the CLI falls back to `./messagefoundry.toml` in the
+  // workspace folder, at least serve does, a file the check of the blank value (the folder itself)
+  // did not read (BACKLOG #5404 item 1). The default value was checked as that file already.
+  if (
+    flag === undefined &&
+    file.source !== "default" &&
+    !isExecGated() &&
+    escapesByLink(workspaceDir(), PATH_FALLBACK.serviceConfig)
+  ) {
+    void vscode.window.showErrorMessage(linkEscapeRefusal("serviceConfig"));
+    return undefined;
+  }
+  return { configDir: dir, serviceConfig: flag };
 }
 
 export function configDir(): string {

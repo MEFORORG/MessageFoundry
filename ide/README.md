@@ -215,8 +215,11 @@ and uses your user value or the default instead, until you trust the workspace (
   workspace, because the hook is committed; it still sets up the rest. Readers compare the spelling
   only. In a trusted window, a command that writes or starts also refuses a value spelled inside the
   folder whose named path is a symbolic link or junction leading out of it, climbs with `..`, cannot
-  have its real path read, or, on Windows, has a folder or file name ending in a dot or a space; the
-  fix is a plain folder or file inside the workspace folder. That check reads the named path only,
+  have its real path read, or, on Windows, has a folder or file name ending in a dot or a space or
+  naming a device such as `NUL`; the fix is a plain folder or file inside the workspace folder, and
+  commands other than New Route and the commit hook also take the link's target as an absolute path
+  in user settings. A set but blank `serviceConfig` has the CLI's own fallback,
+  `messagefoundry.toml` in the workspace folder, checked instead. That check reads the named path only,
   so a link below it, such as a linked folder under `configDir`, is still followed. The New Route
   wizard and the security editor make their own link checks too before they write.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine

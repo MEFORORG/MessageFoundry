@@ -13,7 +13,7 @@ import { INTERPRETER_OPTIONS } from "../../engineControlModel";
 import {
   containedPathSetting,
   escapesByLink,
-  hasTrailingDotOrSpaceName,
+  hasAmbiguousWin32Name,
   linkEscapeRefusal,
   resolveInsideWorkspace,
 } from "../../workspaceContainment";
@@ -43,6 +43,14 @@ function body(src: string, head: string): string {
   const end = src.indexOf(`\n${indent}}\n`, start);
   assert.ok(end > start, `end of ${head} not found`);
   return src.slice(start, end);
+}
+
+/** The manifest default of the setting `key`. */
+function pkgDefault(key: string): unknown {
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
+    contributes: { configuration: { properties: Record<string, { default?: unknown }> } };
+  };
+  return manifest.contributes.configuration.properties[key]?.default;
 }
 
 suite("b532r: a workspace may only lower ai.contextCharLimit (BACKLOG #5404 item 2)", () => {
@@ -151,63 +159,127 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
     });
   });
 
-  test("on Windows a name ending in a dot or a space is refused, a link beside it or not", function () {
+  test("on Windows, the CLI would follow a junction through `cfg.`, which the real-path check passes", function () {
+    if (process.platform !== "win32") {
+      this.skip(); // the control needs Windows path handling; the refusal itself is driven below
+    }
     withWorkspace((ws, outside) => {
       link(this, outside, path.join(ws, "cfg"));
-      if (process.platform === "win32") {
-        // THE CONTROL: Node reads `cfg.` as written, finds nothing and walks up to the folder, so the
-        // real-path check alone passes the name the CLI's Win32 open would follow through `cfg`.
-        assert.notStrictEqual(resolveInsideWorkspace(ws, "cfg."), undefined);
-      }
-      for (const v of ["cfg.", "cfg ", "cfg./new.toml", "messagefoundry.toml.", "messagefoundry.toml ", "a. /b"]) {
-        assert.strictEqual(escapesByLink(ws, v, true), true, JSON.stringify(v));
-      }
-      // Off Windows the dot and the space are part of the name, which the real-path check judges.
-      assert.strictEqual(escapesByLink(ws, "messagefoundry.toml.", false), false);
-      // The same names with nothing trailing pass, and `.` itself is the folder.
-      assert.strictEqual(escapesByLink(ws, "messagefoundry.toml", true), false);
-      assert.strictEqual(escapesByLink(ws, "./messagefoundry.toml", true), false);
-      assert.strictEqual(escapesByLink(ws, ".", true), false);
+      // THE CONTROL: Node reads `cfg.` as written, finds nothing and walks up to the folder, so the
+      // real-path check alone passes the name the CLI's Win32 open would follow through `cfg`.
+      assert.notStrictEqual(resolveInsideWorkspace(ws, "cfg."), undefined);
+      assert.strictEqual(escapesByLink(ws, "cfg."), true);
     });
   });
 
-  test("a '..' component is refused before any real-path read; '..conf' is a name", () => {
+  /** Runs `fn` with the synchronous file-system reads workspaceContainment makes replaced by spies that
+   *  record the call and throw, and returns what was recorded. */
+  function fsCalls(fn: () => void): string[] {
+    const mod: Record<string, unknown> = require("node:fs");
+    const names = ["realpathSync", "lstatSync", "statSync", "existsSync"];
+    const originals = names.map((n) => mod[n]);
+    const calls: string[] = [];
+    for (const n of names) {
+      const spy = (p: unknown): never => {
+        calls.push(`${n} ${String(p)}`);
+        throw Object.assign(new Error(`stubbed ${n}`), { code: "EACCES" });
+      };
+      mod[n] = Object.assign(spy, { native: spy });
+    }
+    try {
+      fn();
+    } finally {
+      names.forEach((n, i) => (mod[n] = originals[i]));
+    }
+    return calls;
+  }
+
+  test("a Windows-ambiguous name and a '..' are refused before any file-system call", () => {
+    const ws = path.resolve(path.sep, "b532r-ide-no-such-ws");
+    const refused = [
+      ["cfg.", true],
+      ["cfg ", true],
+      ["cfg./new.toml", true],
+      ["messagefoundry.toml.", true],
+      ["messagefoundry.toml ", true],
+      ["a. /b", true],
+      ["nul", true],
+      ["conf/con.toml", true],
+      ["COM1", true],
+      ["plain/../x", false],
+      ["plain\\..\\x", true],
+    ] as const;
+    for (const [v, win32] of refused) {
+      let answer: boolean | undefined;
+      const calls = fsCalls(() => (answer = escapesByLink(ws, v, win32)));
+      assert.strictEqual(answer, true, JSON.stringify(v));
+      assert.deepStrictEqual(calls, [], `${JSON.stringify(v)} touched the file system`);
+    }
+    // THE CONTROL: a plain name goes on to the real-path read, which the spies refuse.
+    let plain: boolean | undefined;
+    const calls = fsCalls(() => (plain = escapesByLink(ws, "messagefoundry.toml", true)));
+    assert.strictEqual(plain, true);
+    assert.notDeepStrictEqual(calls, []);
+  });
+
+  test("off Windows those names are names, and the folder itself is not refused by spelling", () => {
     withWorkspace((ws) => {
-      fs.mkdirSync(path.join(ws, "plain"));
-      // Control: the real-path check collapses it by spelling and passes it.
-      assert.notStrictEqual(resolveInsideWorkspace(ws, "plain/../x"), undefined);
-      assert.strictEqual(escapesByLink(ws, "plain/../x"), true);
-      assert.strictEqual(escapesByLink(ws, "plain\\..\\x", true), true);
+      for (const v of ["messagefoundry.toml.", "nul"]) {
+        assert.strictEqual(escapesByLink(ws, v, false), false, JSON.stringify(v));
+      }
+      assert.strictEqual(escapesByLink(ws, "messagefoundry.toml", true), false);
+      assert.strictEqual(escapesByLink(ws, "./messagefoundry.toml", true), false);
+      assert.strictEqual(escapesByLink(ws, "nullable.toml", true), false);
+      assert.strictEqual(escapesByLink(ws, "com10", true), false);
+      assert.strictEqual(escapesByLink(ws, ".", true), false);
       assert.strictEqual(escapesByLink(ws, "..conf"), false);
     });
   });
 
-  test("a value spelled outside the folder, or no folder open, is not checked", function () {
-    // The operator's own user value may point anywhere; a link outside the folder is theirs.
-    withWorkspace((ws, outside) => {
-      link(this, outside, path.join(path.dirname(ws), "away"));
-      assert.strictEqual(escapesByLink(ws, path.join(path.dirname(ws), "away")), false);
-      assert.strictEqual(escapesByLink(ws, "../away"), false);
-      assert.strictEqual(escapesByLink(undefined, "cfg"), false);
-    });
+  test("a value spelled outside the folder, or no folder open, is not checked", () => {
+    // The operator's own user value may point anywhere. The spies refuse every read, so a false
+    // answer means no read was made.
+    const ws = path.resolve(path.sep, "b532r-ide-no-such-ws");
+    for (const v of [path.resolve(path.sep, "b532r-ide-elsewhere", "cfg."), "../away"]) {
+      let answer: boolean | undefined;
+      const calls = fsCalls(() => (answer = escapesByLink(ws, v, true)));
+      assert.strictEqual(answer, false, JSON.stringify(v));
+      assert.deepStrictEqual(calls, []);
+    }
+    assert.strictEqual(escapesByLink(undefined, "cfg"), false);
   });
 
-  test("hasTrailingDotOrSpaceName reads every component, on Windows only", () => {
-    assert.strictEqual(hasTrailingDotOrSpaceName("a.\\b", true), true);
-    assert.strictEqual(hasTrailingDotOrSpaceName("a/b ", true), true);
-    assert.strictEqual(hasTrailingDotOrSpaceName("a/.b/c.toml", true), false);
-    assert.strictEqual(hasTrailingDotOrSpaceName("a./b", false), false);
+  test("hasAmbiguousWin32Name reads every component, on Windows only", () => {
+    assert.strictEqual(hasAmbiguousWin32Name("a.\\b", true), true);
+    assert.strictEqual(hasAmbiguousWin32Name("a/b ", true), true);
+    assert.strictEqual(hasAmbiguousWin32Name("a/aux.d/b", true), true);
+    assert.strictEqual(hasAmbiguousWin32Name("a/.b/c.toml", true), false);
+    assert.strictEqual(hasAmbiguousWin32Name("a./b", false), false);
   });
 
-  test("the refusal's remedy names a fix every writer accepts", () => {
+  test("a blank serviceConfig has the CLI's own fallback file checked", () => {
+    const fn = body(code("cli.ts"), "export function writerConfigTarget(");
+    assert.ok(fn.includes('file.source !== "default"'), fn);
+    assert.ok(fn.includes("escapesByLink(workspaceDir(), PATH_FALLBACK.serviceConfig)"), fn);
+    assert.ok(fn.indexOf("!isExecGated()") < fn.indexOf("escapesByLink("), fn);
+    assert.strictEqual(
+      pkgDefault("messagefoundry.serviceConfig"),
+      "messagefoundry.toml",
+      "the manifest default is the file the CLI falls back to",
+    );
+  });
+
+  test("the refusal's remedy names a fix every writer accepts first, and the two that decline the other", () => {
     const text = linkEscapeRefusal("configDir");
     assert.ok(text.includes("messagefoundry.configDir"), text);
-    assert.ok(text.includes("ends in a dot or a space"), text);
-    assert.ok(text.includes("inside the workspace folder."), text);
+    assert.ok(text.includes("ends in a dot or a space or is a device name"), text);
+    assert.ok(text.includes("make the workspace folder readable"), text);
+    const plain = text.indexOf("so the setting names a plain folder or file inside the workspace folder.");
+    const absolute = text.indexOf("absolute path in user settings");
+    assert.ok(plain > 0 && absolute > plain, text);
     // The New Route wizard refuses an absolute path outside the folder, and version-control setup
-    // commits no hook for one, so the remedy must not send the operator there.
-    assert.ok(!/absolute/i.test(text), text);
-    assert.ok(!/user settings/i.test(text), text);
+    // commits no hook for one, so the second remedy names both.
+    assert.ok(text.includes("Other commands than New Route and the commit hook"), text);
   });
 });
 

@@ -7,7 +7,7 @@
 import * as path from "node:path";
 
 import type { Field, FieldType } from "./securityEditorWebview";
-import { hasTrailingDotOrSpaceName, type ContainedPathSetting, type PathSettingScopes } from "./workspaceContainment";
+import { hasAmbiguousWin32Name, type ContainedPathSetting, type PathSettingScopes } from "./workspaceContainment";
 
 /**
  * The value and scope {@link securityConfigTarget} judges for `messagefoundry.serviceConfig`, from
@@ -91,10 +91,10 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  * 2. Workspace-set value (`scope.fromWorkspace` true: the workspace's own settings, which a
  *    repository's `.vscode/settings.json` can set): the path, as spelled, must lie inside the
  *    workspace folder. One that leaves it by `..`, is absolute elsewhere, or is the folder itself is
- *    refused. On Windows, a path whose folder or file name below the workspace folder ends in a dot
- *    or a space is refused before any file-system call. Node reads such a name as written, while
- *    the CLI's open goes through Windows path normalization, which can drop the ending and open
- *    another entry. Measured through Python 3.14.7's open, it dropped at least every trailing dot
+ *    refused. On Windows, a path whose folder or file name below the workspace folder a Win32 open
+ *    may read as another entry (workspaceContainment `hasAmbiguousWin32Name`: a trailing
+ *    dot or space, or a device name) is refused before any file-system call. Measured
+ *    through Python 3.14.7's open, it dropped at least every trailing dot
  *    and space from the file name and one trailing dot from a folder name, and kept a folder name's
  *    trailing space. The check refuses every such name, the ones kept as written included. Then
  *    every existing path below the workspace folder, down to the target, must lstat as not a link,
@@ -146,12 +146,13 @@ export function securityConfigTarget(
     }
     return { ok: true, path: target };
   }
-  if (hasTrailingDotOrSpaceName(rel)) {
+  if (hasAmbiguousWin32Name(rel)) {
     return {
       ok: false,
       problem:
         "messagefoundry.serviceConfig names a path in the workspace folder with a folder or file name that ends in " +
-        "a dot or a space, which Windows can open as a different name. Remove the trailing dot or space",
+        "a dot or a space or is a device name such as NUL, which Windows can open as a different " +
+        "name or a device. Rename the folder or file",
     };
   }
   if (!noLinkBelow(root, rel, fsx)) {
