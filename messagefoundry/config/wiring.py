@@ -6871,11 +6871,11 @@ class Registry:
     ) = None
     # EVERY inbound's explicit `messages_days` retention override in the deployment (NAME -> days,
     # 0 = keep forever; an inbound that inherits the global window is omitted), pinned beside the
-    # shard identity by pipeline.sharding (None on an unfiltered graph / single-shard config). Read
-    # through :meth:`inbound_messages_days`, at least by the retention runner's body purge, which
-    # runs over the UNIFIED store every shard shares (ADR 0063): keyed off `inbound` alone it would
-    # apply the global cutoff to a sibling shard's keep-forever or longer-window bodies (BACKLOG
-    # #5889).
+    # engine shard identity by pipeline.sharding (None on an unfiltered graph / single-engine-shard
+    # config). Read through :meth:`inbound_messages_days`, at least by the retention runner's body
+    # purge, which runs over the UNIFIED store every engine shard shares (ADR 0063): keyed off
+    # `inbound` alone it would apply the global cutoff to a sibling engine shard's keep-forever or
+    # longer-window bodies (BACKLOG #5889).
     all_inbound_messages_days: Mapping[str, int] | None = None
     # The directory :func:`load_config` read this graph from, or None for a graph built in code. A
     # `[sandbox].mode=subprocess` worker re-loads its Router/Handler functions from here, so after

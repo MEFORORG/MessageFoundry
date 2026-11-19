@@ -802,7 +802,7 @@ async def supervise(
     ``registry_guard`` refuses (:func:`discover_shard_specs`), and 3 when
     :attr:`Supervisor.drain_failure` is set, which outranks 0 and 1. Known limit: the BACKLOG
     #5894 note in ADR 0037 (``docs/adr/0037-multi-process-sharding-l3.md``) lists at least the cases
-    that can leave a child running with no exit 3, or to report exit 3 and still wait at teardown.
+    that can leave a child running with no exit 3, or report exit 3 and still wait at teardown.
 
     While the engine shards run, a :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`
     applies a replaced CRL file to this process's own TLS contexts, as an engine process's runner

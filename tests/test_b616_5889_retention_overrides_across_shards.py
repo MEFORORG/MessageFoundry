@@ -3,10 +3,10 @@
 """Per-connection body-retention overrides span every engine shard (BACKLOG #5889).
 
 Under ``serve --shard`` each engine shard's ``RetentionRunner`` reads a registry that holds only its
-own inbounds, while the body purge runs over the ONE unified store every shard shares (ADR 0063).
-Keyed off that filtered view, a shard applied the global cutoff to a sibling shard's keep-forever or
-longer-window bodies. The shard filter now pins the whole config's ``messages_days`` overrides, and
-the runner reads them. Synthetic HL7 only."""
+own inbounds, while the body purge runs over the ONE unified store every engine shard shares (ADR
+0063). Keyed off that filtered view, an engine shard applied the global cutoff to a sibling engine
+shard's keep-forever or longer-window bodies. The engine-shard filter now pins the whole config's
+``messages_days`` overrides, and the runner reads them. Synthetic HL7 only."""
 
 from __future__ import annotations
 
@@ -69,11 +69,11 @@ def _two_shard_registry() -> Registry:
 
 
 async def test_a_shard_purge_honours_a_sibling_shards_overrides(store: MessageStore) -> None:
-    """Shard s1's runner purges its own inheriting inbound at the global window and leaves sibling
-    shard s2's keep-forever and 365-day bodies alone.
+    """Engine shard s1's runner purges its own inheriting inbound at the global window and leaves
+    sibling engine shard s2's keep-forever and 365-day bodies alone.
 
     Mutation: read ``registry.inbound`` in ``RetentionRunner._resolve_overrides``, or drop
-    ``all_inbound_messages_days`` from the shard filter. Red."""
+    ``all_inbound_messages_days`` from the engine-shard filter. Red."""
     mine = await _delivered(store, channel_id="IB_MINE", control="S-MINE")
     keep = await _delivered(store, channel_id="IB_SIB_KEEP", control="S-KEEP")
     long_ = await _delivered(store, channel_id="IB_SIB_LONG", control="S-LONG")
@@ -89,13 +89,13 @@ async def test_a_shard_purge_honours_a_sibling_shards_overrides(store: MessageSt
     )
     await runner.run_once()
 
-    assert await _raw(store, mine) == ""  # this shard's inheriting inbound, global window
+    assert await _raw(store, mine) == ""  # this engine shard's inheriting inbound, global window
     assert await _raw(store, keep) == RAW  # sibling's keep-forever override
     assert await _raw(store, long_) == RAW  # sibling's 365-day override
 
 
 def test_a_single_shard_config_pins_nothing() -> None:
-    """A single-shard config stays byte-identical to plain ``serve``: nothing is pinned."""
+    """A single-engine-shard config stays byte-identical to plain ``serve``: nothing is pinned."""
     reg = Registry()
     reg.add_inbound(build_inbound_connection("IB_A", MLLP(port=2710), router="r", messages_days=0))
 
