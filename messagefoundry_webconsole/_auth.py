@@ -23,6 +23,7 @@ from urllib.parse import quote, urlsplit
 from fastapi import HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import RedirectResponse
 
+from messagefoundry.api.auth_models import LoginRequest
 from messagefoundry.api.security import (
     RepeatedCredentialError,
     client_ip,
@@ -87,6 +88,7 @@ __all__ = [
     "security_headers_context",
     "session_cookie_name",
     "session_token",
+    "superseded_session_token",
     "set_oidc_flow_cookie",
     "set_session_cookie",
     "spend_ui_action_step_up",
@@ -243,6 +245,38 @@ def session_token(conn: Request | WebSocket) -> str | None:
     if session_cookie_copies(conn) > 1:
         raise RepeatedCredentialError("session_cookie", REPEATED_SESSION_COOKIE_DETAIL)
     return conn.cookies.get(session_cookie_name(conn))
+
+
+def _max_length(model: type[LoginRequest], name: str) -> int:
+    """The ``max_length`` the field ``name`` of ``model`` declares, so this module keeps no second
+    copy of a bound the JSON route's model already holds."""
+    for item in model.model_fields[name].metadata:
+        bound = getattr(item, "max_length", None)
+        if isinstance(bound, int):
+            return bound
+    # An ImportError, so the engine's guarded import names a console that cannot pair with it.
+    raise ImportError(f"{model.__name__}.{name} declares no max_length")
+
+
+#: The longest session token a browser sign-in passes on as the one it replaces: the bound
+#: ``LoginRequest.supersedes`` puts on the JSON route's (BACKLOG #5397 added item 2).
+_SUPERSEDES_MAX = _max_length(LoginRequest, "supersedes")
+
+
+def superseded_session_token(request: Request) -> str | None:
+    """The session token a sign-in from this browser replaces (ASVS 7.2.4), for the
+    ``supersedes`` argument of a sign-in: the session cookie, or ``None`` when there is none or it
+    is longer than ``LoginRequest.supersedes`` allows (BACKLOG #5397 added item 2).
+
+    No session token is that long, so a longer cookie names no session, and passing it on would
+    only make the engine hash an unbounded value to end nothing. It is dropped rather than refused,
+    unlike the JSON route, whose model refuses the whole request: the browser's cookie is not the
+    operator's input, so a long one must not block a sign-in. Raises as :func:`session_token` does
+    for a repeated cookie."""
+    token = session_token(request)
+    if token is None or len(token) > _SUPERSEDES_MAX:
+        return None
+    return token
 
 
 async def has_live_session(request: Request, auth: AuthService | None) -> bool:

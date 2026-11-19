@@ -4085,6 +4085,26 @@ async def _reads_as_directory_account(raw: UserRecord) -> bool:
     return raw.auth_provider == AuthProvider.AD.value and not raw.disabled
 
 
+#: The longest session token a sign-in hashes as the one it replaces (ASVS 7.2.4): a password or
+#: Kerberos sign-in's ``supersedes`` and a federated start's ``prior_session`` (BACKLOG #5397 added
+#: item 2). The bound ``LoginRequest.supersedes`` puts on the JSON route, kept here because this
+#: package may not import ``api``; a test pins the two equal. A minted token is 43 characters
+#: (``auth/tokens.py``), so a longer value names no session.
+SUPERSEDES_MAX = 256
+
+
+def _superseded_hash(token: str | None) -> str | None:
+    """The hash of the session token a sign-in replaces, or ``None`` when there is none or it is
+    longer than :data:`SUPERSEDES_MAX` (BACKLOG #5397 added item 2). Dropped rather than refused:
+    such a value names no session, so it would end nothing, and hashing it would only spend work on
+    a value of any length from the browser's cookie. The sign-in itself is not refused, since the
+    cookie is not the operator's input. The callers include at least the web console's form
+    sign-in, its SSO route and its federated start, whose cookie no request model bounds."""
+    if not token or len(token) > SUPERSEDES_MAX:
+        return None
+    return hash_token(token)
+
+
 class AuthService:
     """Authentication + RBAC orchestration over an :class:`AuthStore` and the configured directory.
 
@@ -6400,7 +6420,7 @@ class AuthService:
                 seed_reauth=combined or (not mfa_required and address is not _LoginAddress.NEW),
                 mechanism=SessionMechanism.PASSWORD,
                 idp_auth_time=None,
-                supersedes_hash=hash_token(supersedes) if supersedes else None,
+                supersedes_hash=_superseded_hash(supersedes),
             )
         except _BindingChangedMidLogin:
             # BACKLOG #2733: the account was deleted after the load above, so no session was
@@ -6888,7 +6908,7 @@ class AuthService:
             client,
             mfa_verified=False,
             session_mechanism=SessionMechanism.KERBEROS,
-            supersedes_hash=hash_token(supersedes) if supersedes else None,
+            supersedes_hash=_superseded_hash(supersedes),
         )
 
     async def _stored_directory_object_id(self, username: str) -> str | None:
@@ -6998,7 +7018,7 @@ class AuthService:
             return_to="/ui",
             client_ip=client or "",
             ttl_seconds=self._settings.oidc_flow_ttl_seconds,
-            prior_session_hash=hash_token(prior_session) if prior_session else None,
+            prior_session_hash=_superseded_hash(prior_session),
         )
         challenge = oidc.pkce_challenge(flow.code_verifier)
         url = oidc.build_authorization_url(

@@ -91,6 +91,7 @@ from .._auth import (
     set_oidc_flow_cookie,
     set_session_cookie,
     settle_flow_claim,
+    superseded_session_token,
     take_flow_claim,
 )
 from .._external import display_host, is_allowlisted, is_external, is_idn_disguised
@@ -420,9 +421,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         try:
             # ASVS 7.2.4: hand over the session this browser holds NOW; the engine stages its hash
             # and ends it only once the IdP proof succeeds. Why here and not at the callback: see
-            # PendingFlow.prior_session_hash.
+            # PendingFlow.prior_session_hash. Bounded, as /ui/login bounds it and the engine does
+            # again (BACKLOG #5397 added item 2).
             flow_id, authorization_url = await auth.begin_oidc_login(
-                client=client, public_origin=public_origin, prior_session=session_token(request)
+                client=client,
+                public_origin=public_origin,
+                prior_session=superseded_session_token(request),
             )
         except FlowCacheFullError:
             # The bounded flow cache REJECTS rather than evicts (evict-oldest would make a start-leg

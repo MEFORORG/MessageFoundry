@@ -32,6 +32,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import uploads as uploads_mod
 from messagefoundry.store.crypto import (
     AesGcmCipher,
     Cipher,
@@ -285,14 +286,15 @@ async def test_a_body_unreadable_for_another_cause_is_still_a_skip(
     root = tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     fid = await _seed(_keyed_store(root, key_a))
-    real = Path.read_text
+    # The reseal opens each half through _open_plain (BACKLOG #5387 added item 1 follow-up).
+    real = uploads_mod._open_plain
 
-    def refuse_the_body(self: Path, *args: object, **kwargs: object) -> str:
-        if self.name == f"{fid}.blob":
+    def refuse_the_body(path: Path) -> Any:
+        if path.name == f"{fid}.blob":
             raise PermissionError("refused for the test")
-        return real(self, *args, **kwargs)  # type: ignore[arg-type]
+        return real(path)
 
-    monkeypatch.setattr(Path, "read_text", refuse_the_body)
+    monkeypatch.setattr(uploads_mod, "_open_plain", refuse_the_body)
     result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
     monkeypatch.undo()
     assert result == ResealResult(resealed=1, skipped=1)
@@ -325,7 +327,23 @@ async def test_a_skipped_plaintext_body_leaves_its_sidecar_untouched_and_unliste
     assert await keyed.list_files() == []
 
 
-async def test_an_unreadable_sidecar_still_counts_its_pair_once(tmp_path: Path) -> None:
+def _deny_open(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
+    """Make ``denied`` one the filesystem refuses to open. A sidecar that is not UTF-8 is not this:
+    every reader refuses it before decrypting, so the reseal counts it a skip in
+    ``refused_sidecars`` without opening it under any key (BACKLOG #5387)."""
+    real_open = uploads_mod._open_plain
+
+    def _open(path: Path) -> Any:
+        if path == denied:
+            raise PermissionError("held open by another process")
+        return real_open(path)
+
+    monkeypatch.setattr(uploads_mod, "_open_plain", _open)
+
+
+async def test_an_unreadable_sidecar_still_counts_its_pair_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The other half of the unit: a readable body is sealed, and the failed sidecar adds ONE skip.
 
     The plaintext body it sealed counts in ``sealed_plaintext`` too (BACKLOG #3240). It used not
@@ -334,7 +352,7 @@ async def test_an_unreadable_sidecar_still_counts_its_pair_once(tmp_path: Path) 
     """
     root = tmp_path / "uploads"
     fid = await _seed(_keyed_store(root, None))
-    _garble(root / f"{fid}.meta")
+    _deny_open(monkeypatch, root / f"{fid}.meta")
 
     result = await _keyed_store(root, generate_key()).reseal_to_active()
     assert result == ResealResult(resealed=1, skipped=1, sealed_plaintext=1)
@@ -353,31 +371,34 @@ async def test_a_planted_body_under_a_sealed_sidecar_is_counted_when_its_read_fa
     plain = await _seed(_keyed_store(root / "plain", None))
     (root / f"{fid}.blob").write_bytes((root / "plain" / f"{plain}.blob").read_bytes())
     sidecar = root / f"{fid}.meta"
-    real_open = Path.open
+    # The reseal opens each half through _open_plain (BACKLOG #5387 added item 1 follow-up).
+    real_open = uploads_mod._open_plain
     failed = False
 
-    def _open_failing_once(self: Path, *args: Any, **kwargs: Any) -> Any:
+    def _open_failing_once(path: Path) -> Any:
         nonlocal failed
-        if self == sidecar and not failed:
+        if path == sidecar and not failed:
             failed = True
             raise PermissionError("held open by another process")
-        return real_open(self, *args, **kwargs)
+        return real_open(path)
 
     with monkeypatch.context() as m:
-        m.setattr(Path, "open", _open_failing_once)
+        m.setattr(uploads_mod, "_open_plain", _open_failing_once)
         first = await _keyed_store(root, key).reseal_to_active()
     second = await _keyed_store(root, key).reseal_to_active()
     assert first.sealed_plaintext + second.sealed_plaintext == 1, (first, second)
     assert first == ResealResult(resealed=1, skipped=1, sealed_plaintext=1)
 
 
-async def test_a_pair_with_both_halves_unreadable_counts_once(tmp_path: Path) -> None:
+async def test_a_pair_with_both_halves_unreadable_counts_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``skipped`` counts uploads, so two failed halves of one pair still add one."""
     root = tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     fid = await _seed(_keyed_store(root, key_a))
     (root / f"{fid}.blob").unlink()
-    _garble(root / f"{fid}.meta")
+    _deny_open(monkeypatch, root / f"{fid}.meta")
 
     result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
     assert result == ResealResult(resealed=0, skipped=1)
@@ -449,7 +470,7 @@ async def test_the_scan_never_logs_a_decrypted_body(
         root,
         fid,
         key,
-        json.dumps({"file_id": fid, "uploaded_at": 1.0e9, "size": "MRN123-NOT-AN-INT"}),
+        json.dumps({"file_id": fid, "uploaded_at": 1.8e9, "size": "MRN123-NOT-AN-INT"}),
     )
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
@@ -482,7 +503,7 @@ async def test_a_planted_plaintext_sidecar_is_refused_until_resealed(tmp_path: P
                 "uploader": "attacker",
                 "uploader_id": "attacker-id",
                 "size": 3,
-                "uploaded_at": 1.0,
+                "uploaded_at": 1.8e9,
             }
         ),
         encoding="utf-8",

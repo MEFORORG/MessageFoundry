@@ -94,6 +94,7 @@ from .._auth import (
     set_session_cookie,
     settle_ui_action_step_up,
     spend_ui_action_step_up,
+    superseded_session_token,
     webauthn_rp,
 )
 from .._html import CSP_PROBE_SRC
@@ -203,9 +204,11 @@ def _form_fits(
     and authenticator code, the MFA and step-up codes, the step-up password, and the
     enrolment-confirm code. A field a caller does not pass, such as the sign-in passkey assertion,
     is not. Nor is the enrolment code at either binding step, which the engine bounds at the point
-    it reads the code, so every refusal the service gave before that read still comes first. Any
-    refusal by the model counts, except on a field named in ``length_only``, where only a too-long
-    one does.
+    it reads the code, so every refusal the service gave before that read still comes first. A
+    refusal counts only when it is of a field the caller passed, so a field the model requires that
+    the form does not carry, or a validator of the whole model, never refuses every form
+    (BACKLOG #5397 added item 1). On a passed field any refusal counts, except on a field named in
+    ``length_only``, where only a too-long one does.
     Every caller names its second-factor code there, and the sign-in authenticator code must be,
     because ``LoginRequest``'s digit pattern would refuse what the form has always passed on. The
     check only refuses and never normalises: each caller strips its code of surrounding space
@@ -223,8 +226,9 @@ def _form_fits(
         counted = [
             error
             for error in exc.errors(include_url=False, include_input=False)
-            if error["type"] in _TOO_LONG_ERRORS
-            or not (error["loc"] and error["loc"][0] in length_only)
+            if error["loc"]
+            and error["loc"][0] in fields
+            and (error["type"] in _TOO_LONG_ERRORS or error["loc"][0] not in length_only)
         ]
         if counted:
             _log_form_refusal(request, len(counted))
@@ -886,7 +890,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # ASVS 7.2.4: the Set-Cookie below REPLACES whatever session cookie this browser sent,
             # so the engine ends that one session as part of a SUCCESSFUL mint, rather than leave
             # it valid and unreachable until it expires. A failed sign-in ends nothing.
-            supersedes=session_token(request),
+            # Bounded, as the JSON route's model bounds it (BACKLOG #5397 added item 2).
+            supersedes=superseded_session_token(request),
             passkey=passkey,
             passkey_challenge=staged.challenge if staged is not None else None,
         )
