@@ -12,8 +12,8 @@
 import * as assert from "assert";
 import * as path from "node:path";
 
-const URL = "http://127.0.0.1:8765";
-const KEY = "messagefoundry.token:" + URL;
+const ENGINE_URL = "http://127.0.0.1:8765";
+const KEY = "messagefoundry.token:" + ENGINE_URL;
 /** Synthetic test values only. */
 const REPROOF_PASSWORD = "a-typed-password-never-echoed";
 const SIGN_IN_PASSWORD = "a-sign-in-password-never-echoed";
@@ -42,7 +42,11 @@ const vscodeStub = {
       if (prompt === "Password") {
         return Promise.resolve(SIGN_IN_PASSWORD);
       }
-      return Promise.resolve(""); // the optional authenticator code
+      if (prompt.startsWith("Authenticator code")) {
+        return Promise.resolve(""); // the optional authenticator code
+      }
+      // A prompt this stub does not know fails the test rather than being answered with a blank.
+      return Promise.reject(new Error(`unexpected prompt: ${prompt}`));
     },
   },
   env: { openExternal: (): Promise<boolean> => Promise.resolve(false) },
@@ -149,7 +153,7 @@ composedSuite("withStepUpAuth composed with withAuth, end to end (BACKLOG #5960)
 
   test("a 401 on the rotated token signs in again, without retrying the refused token", async () => {
     const used: string[] = [];
-    const out = await auth.withStepUpAuth(context, URL, (token) => {
+    const out = await auth.withStepUpAuth(context, ENGINE_URL, (token) => {
       used.push(token);
       if (token === "old") {
         return Promise.reject(stepUpRefusal());
@@ -174,7 +178,7 @@ composedSuite("withStepUpAuth composed with withAuth, end to end (BACKLOG #5960)
 
   test("control: a sign-in elsewhere after the re-proof is still picked up, with no new sign-in", async () => {
     const used: string[] = [];
-    const out = await auth.withStepUpAuth(context, URL, (token) => {
+    const out = await auth.withStepUpAuth(context, ENGINE_URL, (token) => {
       used.push(token);
       if (token === "old") {
         return Promise.reject(stepUpRefusal());
@@ -196,7 +200,7 @@ composedSuite("withStepUpAuth composed with withAuth, end to end (BACKLOG #5960)
 
   test("control: withAuth alone still retries a 401 with a newer cached token", async () => {
     const used: string[] = [];
-    const out = await auth.withAuth(context, URL, (token) => {
+    const out = await auth.withAuth(context, ENGINE_URL, (token) => {
       used.push(token);
       if (token === "old") {
         secrets.set(KEY, "elsewhere");

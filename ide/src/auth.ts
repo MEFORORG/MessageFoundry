@@ -53,8 +53,8 @@ function secretKey(url: string): string {
 /**
  * Refuse `url` when {@link assertTargetAllowed} would not send it credentials or a token (SEC-005),
  * and SHOW the refusal: returns true when refused. Not a silent predicate, so call it once per
- * interactive flow, never from a timer. At least signIn, signOut and withAuth (and withStepUpAuth
- * through it) call it before a password or a bearer leaves.
+ * interactive flow, never from a timer. At least signIn, signOut and withAuthAdopting (which withAuth
+ * and withStepUpAuth both run through) call it before a password or a bearer leaves.
  */
 function refuseDisallowedTarget(url: string): boolean {
   const gate = assertTargetAllowed(url);
@@ -271,7 +271,8 @@ export async function ensureToken(
  * propagates so the caller can surface it. Returns undefined if the user cancels a sign-in.
  *
  * A target {@link assertTargetAllowed} refuses gets no call at all, so a token cached for it is never
- * sent (BACKLOG #5407): the gate is checked here, before the cache is read, and not only inside
+ * sent (BACKLOG #5407): the gate is checked in {@link withAuthAdopting}, which this and
+ * {@link withStepUpAuth} both run through, before the cache is read, and not only inside
  * {@link signIn}, which a cached token skips. Returns undefined then, as for a refused sign-in.
  */
 export async function withAuth<T>(
@@ -279,15 +280,17 @@ export async function withAuth<T>(
   url: string,
   call: (token: string) => Promise<T>,
 ): Promise<T | undefined> {
-  return await withAuthAdopting(ctx, url, call);
+  // Wrapped, so a `call` with an optional second parameter never receives the adopt callback there.
+  return await withAuthAdopting(ctx, url, (token) => call(token));
 }
 
 /**
  * {@link withAuth}, for a `call` that may replace its own token mid-call, as a step-up re-proof
  * does. The call reports the token it now holds through `adopt` (BACKLOG #5960). A 401 on that
  * token then reads as this call's own session ending, and signs in again. Without it, the cache
- * holding the adopted token would read as a sign-in elsewhere, and the retry would spend one of the
- * three calls on a token the engine had just refused.
+ * holding the adopted token would read as a sign-in elsewhere, and the retry would spend one of its
+ * three runs of `call` on a token the engine had just refused. Each run is the whole `call`, so a
+ * step-up call may itself reach the engine more than once per run.
  */
 async function withAuthAdopting<T>(
   ctx: vscode.ExtensionContext,
@@ -302,14 +305,15 @@ async function withAuthAdopting<T>(
     return undefined; // sign-in cancelled
   }
   let token: string = first;
-  // At most three calls. A 401 is retried once with a NEWER cached token if a sign-in elsewhere
+  const adopt = (adopted: string): void => {
+    token = adopted;
+  };
+  // At most three runs of `call`. A 401 is retried once with a NEWER cached token if a sign-in elsewhere
   // replaced (and revoked) the one this call used -- clearing the cache then would strand that new
   // session on the engine with no client holding it -- and otherwise by signing in again.
   for (let attempt = 0; ; attempt++) {
     try {
-      return await call(token, (adopted) => {
-        token = adopted;
-      });
+      return await call(token, adopt);
     } catch (e) {
       if (!(e instanceof HttpError && e.status === 401) || attempt >= 2) {
         throw e;
