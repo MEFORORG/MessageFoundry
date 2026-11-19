@@ -152,7 +152,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
         async def open(self) -> None:
             return None
 
-        async def await_drain(self, *, timeout: float, interval: float) -> float:
+        async def await_drain(self, *, timeout: float, interval: float, stop: Any = None) -> float:
             return 0.01
 
         async def close(self) -> None:
