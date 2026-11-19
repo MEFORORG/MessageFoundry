@@ -65,8 +65,8 @@ class SecretProviderError(RuntimeError):
 
 class _UnnamedReferenceError(SecretProviderError):
     """A refusal that leaves the reference out of its text (BACKLOG #5326), so it does not say which
-    credential failed. :func:`resolve_connector_secret` re-raises it with the credential's setting in
-    front. Other providers' refusals pass through unchanged, since callers compare their text."""
+    credential failed. :func:`resolve_connector_secret` re-raises it with the credential's ``label``
+    in front. Other providers' refusals pass through unchanged, since callers compare their text."""
 
 
 @runtime_checkable
@@ -192,8 +192,9 @@ def resolve_connector_secret(
       on a missing/erroring secret).
 
     ``label`` names the credential (e.g. ``"[auth].ad_bind_password"``) for the error only — never a value.
-    A refusal that leaves the reference out (``env``, BACKLOG #5326) is re-raised naming ``label``'s
-    reference setting, so it still says which setting to correct.
+    A refusal that leaves the reference out (``env``, BACKLOG #5326) is re-raised with ``label`` in
+    front, so it names the credential whose ``*_secret`` or ``*_ref`` reference to correct; it does
+    not name that reference setting itself.
     """
     if not ref:
         return literal

@@ -151,8 +151,8 @@ def test_env_provider_refusal_never_repeats_the_reference(
 ) -> None:
     """BACKLOG #5326: a secret pasted where its variable name belongs must not reach the error
     text. Before the fix the refusal quoted the reference verbatim, through the credential point's
-    resolver too. That resolver names the credential's setting instead, so the operator still
-    knows which reference to correct."""
+    resolver too. That resolver puts the credential's label in front instead, so the operator
+    still knows which credential's reference to correct."""
     pasted = "s3cret-pasted-by-mistake 0451"
     monkeypatch.delenv(pasted, raising=False)
     with pytest.raises(SecretProviderError) as direct:

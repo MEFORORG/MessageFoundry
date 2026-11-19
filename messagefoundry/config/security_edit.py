@@ -20,6 +20,7 @@ next engine restart (``POST /config/reload`` re-runs the ``--config`` graph, not
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -61,11 +62,13 @@ def set_security(
 
     The result says what changed (BACKLOG #5327): ``keys`` lists the keys written or removed, and
     ``unchanged`` the keys the edit left as they were, a ``None`` reset that found no such key or a
-    value the file already holds. When nothing changed, ``op`` is ``"unchanged"``. The file still
-    goes through the same validated replace, so a file the engine would refuse, or a link, is refused
-    as it is for any edit, and the replace's housekeeping still runs. This module cannot tell a known
-    ``[security]`` key from a misspelled one, since it stays outside the settings import graph,
-    so refusing a reset of an unknown key is the caller's job; the ``security`` CLI does it."""
+    value the file already holds. When nothing changed, ``op`` is ``"unchanged"`` and nothing is
+    written. An existing file is left byte for byte and checked as it stands, so a file the engine
+    would refuse is still refused; a path that is a link is refused as the replace refuses it, and
+    one holding something other than a regular file is refused too. With nothing at the path, none
+    is created and nothing is checked. This module cannot tell a known ``[security]`` key from a
+    misspelled one, since it stays outside the settings import graph, so refusing a reset of an
+    unknown key is the caller's job; the ``security`` CLI does it."""
     if not isinstance(updates, Mapping):
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
@@ -93,12 +96,16 @@ def set_security(
             else:
                 sec[key] = value
                 changed.append(key)
-        # Drop an emptied [security] table so a full reset-to-defaults leaves no bare header behind.
+        if not changed:
+            _check_unchanged(path, exists=original is not None, validate=validate)
+            return {"op": "unchanged", "keys": [], "unchanged": unchanged}
+        # Drop a [security] table this edit emptied, so a full reset-to-defaults leaves no bare
+        # header behind. Only one it emptied: a table holding only comments is not a leftover.
         if not len(sec):
             del doc["security"]
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
-    return {"op": "set" if changed else "unchanged", "keys": changed, "unchanged": unchanged}
+    return {"op": "set", "keys": changed, "unchanged": unchanged}
 
 
 # --- internals ---------------------------------------------------------------
@@ -116,6 +123,40 @@ def _same(held: Any, value: Any) -> bool:
     return bool(held == value)
 
 
+def _check_unchanged(path: Path, *, exists: bool, validate: Validate) -> None:
+    """The refusals an edit that changes nothing keeps from the validated replace it skips.
+
+    A link is refused as the replace refuses it (vault BACKLOG #5619), and a path holding something
+    other than a regular file, which the replace could not have replaced, is refused too. A file
+    that is there is checked as it stands, under the edit lock the caller holds, so a file the
+    engine would refuse is never reported as left fine. With nothing at the path there is no file
+    to check, and none is created."""
+    # The replace's own link refusal, so the two refuse a link in the same words.
+    atomic_edit._refuse_a_link(path, SecurityEditError)
+    if exists:
+        _checked(validate)(path)
+    elif os.path.lexists(path):
+        raise SecurityEditError(
+            f"{path.name} was not changed: it is not a regular file, so it is no settings file to "
+            "edit. Point --service-config at the settings TOML file"
+        )
+
+
+def _checked(validate: Validate) -> Validate:
+    """``validate``, with any error it did not raise as :class:`SecurityEditError` converted to one;
+    see :func:`_write_validated` for why the callback owns the wording."""
+
+    def checked(candidate: Path) -> None:
+        try:
+            validate(candidate)
+        except SecurityEditError:
+            raise
+        except Exception as exc:
+            raise SecurityEditError(str(exc)) from exc
+
+    return checked
+
+
 def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
     """Validate ``data`` as a candidate and replace ``path`` with it only if it loads.
 
@@ -130,12 +171,4 @@ def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
     ``settings_error_detail``: this module stays outside the settings import graph, so it cannot
     render one, and the ``str(exc)`` below is only for an error the callback did not anticipate."""
 
-    def checked(candidate: Path) -> None:
-        try:
-            validate(candidate)
-        except SecurityEditError:
-            raise
-        except Exception as exc:
-            raise SecurityEditError(str(exc)) from exc
-
-    atomic_edit.replace_validated(path, data, checked, refused_error=SecurityEditError)
+    atomic_edit.replace_validated(path, data, _checked(validate), refused_error=SecurityEditError)

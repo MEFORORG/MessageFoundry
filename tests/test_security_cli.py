@@ -103,13 +103,90 @@ def test_set_security_reports_a_reset_that_finds_nothing_as_unchanged(tmp_path: 
     toml = tmp_path / "mf.toml"
     result = security_edit.set_security(toml, {"require_mfa": None}, validate=seen.append)
     assert result == {"op": "unchanged", "keys": [], "unchanged": ["require_mfa"]}
-    assert len(seen) == 1
+    # Nothing changed and no file was there, so none is created and there is nothing to check.
+    assert not toml.exists() and seen == []
+    # A file that is there is checked as it stands, and not rewritten.
+    toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
+    result = security_edit.set_security(toml, {"require_mfa": False}, validate=seen.append)
+    assert result["op"] == "unchanged" and seen == [toml]
     # A value equal in Python but of another type is a change, not the value the file holds.
     toml.write_text("[security]\nsign_out_after_idle_minutes = 1\n", encoding="utf-8")
     result = security_edit.set_security(
         toml, {"sign_out_after_idle_minutes": True}, validate=lambda _c: None
     )
     assert result["op"] == "set"
+
+
+def test_an_edit_that_changes_nothing_leaves_the_file_byte_for_byte(tmp_path: Path) -> None:
+    """BACKLOG #5327: an edit that changes nothing writes nothing. It once went through the
+    replace anyway, which turned mixed line endings into LF while reporting ``unchanged``."""
+    from messagefoundry.config import security_edit
+
+    toml = tmp_path / "mf.toml"
+    toml.write_bytes(b"[security]\r\nrequire_mfa = false\n[api]\r\nport = 9000\r\n")
+    before = toml.read_bytes()
+    result = security_edit.set_security(
+        toml, {"require_mfa": False, "max_session_hours": None}, validate=lambda _c: None
+    )
+    assert result["op"] == "unchanged" and result["keys"] == []
+    assert toml.read_bytes() == before
+
+
+def test_an_edit_that_changes_nothing_still_refuses_a_file_the_check_refuses(
+    tmp_path: Path,
+) -> None:
+    from messagefoundry.config import security_edit
+
+    def refuse(_candidate: Path) -> None:
+        raise ValueError("the whole-file load refused it")
+
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
+    with pytest.raises(security_edit.SecurityEditError, match="whole-file load refused it"):
+        security_edit.set_security(toml, {"require_mfa": False}, validate=refuse)
+
+
+def test_an_edit_that_changes_nothing_refuses_a_target_that_is_no_regular_file(
+    tmp_path: Path,
+) -> None:
+    """With no write, the replace no longer refuses a directory at the path, so the no-change
+    path refuses it itself rather than report it as an unchanged settings file."""
+    from messagefoundry.config import security_edit
+
+    toml = tmp_path / "mf.toml"
+    toml.mkdir()
+    with pytest.raises(security_edit.SecurityEditError, match="not a regular file"):
+        security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
+
+
+def test_an_edit_that_changes_nothing_refuses_a_link(tmp_path: Path) -> None:
+    """The replace refuses a link (vault BACKLOG #5619); an edit that changes nothing does too."""
+    import os
+
+    from messagefoundry.config import security_edit
+
+    target = tmp_path / "real.toml"
+    target.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
+    link = tmp_path / "mf.toml"
+    try:
+        os.symlink(target, link)
+    except OSError as exc:  # Windows without the symlink privilege or developer mode
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    with pytest.raises(security_edit.SecurityEditError, match="it is a link"):
+        security_edit.set_security(link, {"require_mfa": False}, validate=lambda _c: None)
+
+
+def test_a_security_table_holding_only_comments_is_kept(tmp_path: Path) -> None:
+    """The emptied-table drop is for a table the edit emptied, not one that held only comments
+    when the edit removed nothing."""
+    from messagefoundry.config import security_edit
+
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\n# require_mfa = false  (kept for later)\n", encoding="utf-8")
+    before = toml.read_bytes()
+    result = security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
+    assert result["op"] == "unchanged"
+    assert toml.read_bytes() == before
 
 
 def test_null_reset_of_a_removed_key_offers_no_spelling(
@@ -130,7 +207,9 @@ def test_null_reset_of_a_removed_key_offers_no_spelling(
         ]
     )
     err = capsys.readouterr().err
-    assert rc != 0 and "require_sign_in (removed: " in err and "did you mean" not in err
+    assert rc != 0 and "[security].require_sign_in was REMOVED" in err
+    # Neither a nearest spelling nor advice to check the spelling of a key that is not misspelled.
+    assert "did you mean" not in err and "Check the spelling" not in err
     assert not toml.exists()
 
 
@@ -149,7 +228,12 @@ def test_null_reset_refusal_names_every_unknown_key(
         ]
     )
     err = capsys.readouterr().err
-    assert rc != 0 and "require_mfx" in err and "block_unlisted_outbund" in err
+    assert rc != 0
+    # Joined as the loader joins unknown keys.
+    assert (
+        "[security].require_mfx (did you mean 'require_mfa'?), [security].block_unlisted_outbund"
+        in err
+    )
 
 
 def test_an_edit_that_changes_nothing_still_refuses_a_file_the_engine_refuses(

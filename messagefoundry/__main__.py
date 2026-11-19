@@ -13842,6 +13842,7 @@ def _security(args: argparse.Namespace) -> int:
         _auth_default,
         _auth_limit_loosenings,
         _env_overrides,
+        _removed_key_message,
         _unknown_key_report,
         _unknown_keys,
         security_loosenings,
@@ -14113,18 +14114,31 @@ def _security(args: argparse.Namespace) -> int:
             )
         )
         if unknown:
-            # A removed key is named with the decision that removed it, never a nearest spelling:
-            # for require_sign_in that would be require_mfa, another switch.
-            named = "; ".join(
-                f"[security].{key} (removed: {_REMOVED_KEYS[(table, key)]})"
+            # A removed key is named with the loader's own refusal for it, never a nearest
+            # spelling: for require_sign_in that would be require_mfa, another switch. It is
+            # built directly from the arguments, so the refusal names no environment variable.
+            removed = [
+                _removed_key_message(table, key, _REMOVED_KEYS[(table, key)], built_directly=True)
+                for table, key, _near in unknown
                 if (table, key) in _REMOVED_KEYS
-                else _unknown_key_report([(table, key, near)])
-                for table, key, near in unknown
+            ]
+            typos = [item for item in unknown if (item[0], item[1]) not in _REMOVED_KEYS]
+            detail = " ".join(
+                (
+                    [
+                        "Not a [security] key: "
+                        f"{_unknown_key_report(typos)}. Check the spelling against "
+                        "docs/CONFIGURATION.md."
+                    ]
+                    if typos
+                    else []
+                )
+                + removed
             )
             return _emit_error(
-                "refused, nothing written: a null value resets a [security] key, and each key "
-                f"named here is neither a [security] key nor set in the file, so resetting it "
-                f"would change nothing: {named}. Check the spelling against docs/CONFIGURATION.md.",
+                "refused, nothing written: a null value resets a [security] key, and resetting a "
+                "key that is neither a [security] key nor set in the file would change nothing. "
+                + detail,
                 as_json=args.json,
             )
         for key, value in updates.items():
