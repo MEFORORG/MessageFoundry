@@ -9,6 +9,7 @@ as written, so each such label is set to ``PlainText``.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -66,12 +67,22 @@ class _RefusingClient:
         raise ApiError(_HTML, status=403)
 
 
+def _settle_login(qapp: Any, dialog: Any) -> None:
+    deadline = time.time() + 10
+    while dialog._busy and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert not dialog._busy
+
+
 def test_the_sign_in_error_shows_the_engines_refusal_as_written(qapp: Any) -> None:
     from harness._login import LoginDialog
 
     dialog = LoginDialog(_RefusingClient())  # type: ignore[arg-type]
+    _settle_login(qapp, dialog)
     dialog._username.setText("op")
     dialog._password.setText("pw")
     dialog._attempt()
+    _settle_login(qapp, dialog)  # the sign-in runs off the GUI thread (BACKLOG #5946)
     assert dialog._error.textFormat() == Qt.TextFormat.PlainText
     assert dialog._error.text() == _HTML  # the refusal reached the label, as written

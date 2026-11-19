@@ -481,14 +481,25 @@ class _LoginClient:
         )
 
 
+def _settle_login(qapp: Any, dialog: Any) -> None:
+    """The dialog's engine calls run off the GUI thread (BACKLOG #5946); wait for them to land."""
+    deadline = time.time() + 10
+    while dialog._busy and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert not dialog._busy
+
+
 def test_the_login_dialog_carries_the_deadline_the_engine_returned(qapp: Any) -> None:
     # The monitor states only what the dialog hands back, so the hand-off is its own link.
     from harness._login import LoginDialog
 
     dialog = LoginDialog(_LoginClient(1.8e9))  # type: ignore[arg-type]
+    _settle_login(qapp, dialog)
     dialog._username.setText("op")
     dialog._password.setText("pw")
     dialog._attempt()
+    _settle_login(qapp, dialog)
     assert dialog.must_change_password is True
     assert dialog.credential_expires_at == 1.8e9
 

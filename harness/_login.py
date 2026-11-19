@@ -21,7 +21,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from harness._async import AsyncRunner
 from harness._console_widgets import ERROR_COLOR
+from messagefoundry.api.auth_models import LoginResponse, ProvidersInfo
 from messagefoundry.apiclient import ApiError, EngineClient
 
 
@@ -34,6 +36,11 @@ class LoginDialog(QDialog):
     When the engine reports ``must_change_password`` the dialog still ``accept()``s so the
     entrypoint regains control, but exposes :attr:`must_change_password` and
     :attr:`entered_password` so it can chain a password change and re-prompt sign-in.
+
+    Both engine calls run off the Qt main thread (BACKLOG #5946), so a stalled engine or a slow
+    directory leaves the dialog responsive rather than frozen. While one is in flight the Sign in
+    action is idle, and while the sign-in itself is in flight the dialog does not close: its result
+    may be a live session, which only the accept path hands back to the caller.
     """
 
     def __init__(self, client: EngineClient, parent: QWidget | None = None) -> None:
@@ -60,12 +67,10 @@ class LoginDialog(QDialog):
         self._code.setMaxLength(6)
         self._provider = QComboBox()
         self._provider.addItem("Local", "local")
-        try:
-            providers = client.providers()
-        except ApiError:
-            providers = None
-        if providers is not None and providers.ad:
-            self._provider.addItem("Active Directory", "ad")
+        self._runner = AsyncRunner(self)
+        # One engine call at a time on this client: the provider read first, then the sign-in.
+        self._busy = True
+        self._signing_in = False
 
         form = QFormLayout()
         form.addRow("Username", self._username)
@@ -82,6 +87,7 @@ class LoginDialog(QDialog):
         sign_in = QPushButton("Sign in")
         sign_in.setDefault(True)
         sign_in.clicked.connect(self._attempt)
+        self._sign_in = sign_in
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
@@ -91,24 +97,68 @@ class LoginDialog(QDialog):
         self._username.returnPressed.connect(self._password.setFocus)
         self._password.returnPressed.connect(self._attempt)
 
+        self._sign_in.setEnabled(False)
+        self._runner.submit(
+            self._read_providers, on_done=self._on_providers, on_error=self._on_providers_error
+        )
+
+    def _read_providers(self) -> ProvidersInfo | None:
+        """Runs on a worker thread. An engine that will not say leaves the Local option alone."""
+        try:
+            return self._client.providers()
+        except ApiError:
+            return None
+
+    def _on_providers(self, providers: ProvidersInfo | None) -> None:
+        if providers is not None and providers.ad:
+            self._provider.addItem("Active Directory", "ad")
+        self._idle()
+
+    def _on_providers_error(self, _exc: BaseException) -> None:
+        self._idle()
+
+    def _idle(self) -> None:
+        self._busy = False
+        self._signing_in = False
+        self._sign_in.setEnabled(True)
+
+    def done(self, result: int) -> None:
+        # A sign-in in flight may come back as a live session; closing now would drop it unseen.
+        if self._signing_in and result != QDialog.DialogCode.Accepted:
+            return
+        self._runner.stop()
+        super().done(result)
+
     def _attempt(self) -> None:
+        if self._busy:
+            return
         username = self._username.text().strip()
         password = self._password.text()
         provider = str(self._provider.currentData())
         if not username or not password:
             self._error.setText("Enter a username and password.")
             return
-        # On the GUI thread, so an engine that accepts the connection and then stalls freezes this
-        # dialog for up to the sign-in read, SIGN_IN_TIMEOUT_SECONDS (vault BACKLOG #2950 added item
-        # 15). Kept: this is a test tool aimed at an engine the tester runs, and an unreachable one
-        # still fails at the connect bound.
-        try:
-            result = self._client.login(
-                username, password, provider=provider, totp_code=self._code.text().strip() or None
-            )
-        except ApiError as exc:
+        totp_code = self._code.text().strip() or None
+        self._busy = True
+        self._signing_in = True
+        self._sign_in.setEnabled(False)
+        self._error.setText("Signing in...")
+        self._runner.submit(
+            lambda: self._client.login(username, password, provider=provider, totp_code=totp_code),
+            on_done=lambda result: self._on_login(result, password),
+            on_error=self._on_login_error,
+        )
+
+    def _on_login_error(self, exc: BaseException) -> None:
+        self._idle()
+        if isinstance(exc, ApiError):
             self._error.setText("Sign-in failed." if exc.status == 401 else str(exc))
-            return
+        else:
+            self._error.setText(f"Sign-in failed: {exc}")
+
+    def _on_login(self, result: LoginResponse, password: str) -> None:
+        self._idle()
+        self._error.setText("")
         if result.must_change_password and result.user.auth_provider == "ad":
             # The harness can't rotate AD passwords (the server rejects /me/password for AD
             # accounts) — advise and admit; the user changes it in Active Directory. (AD logins
