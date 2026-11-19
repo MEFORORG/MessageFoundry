@@ -99,7 +99,7 @@ shaped like the `connection_event` table (metadata-only, encrypted `reason` at r
 | Column | Notes |
 |---|---|
 | `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` (SQLite) / backend-native identity |
-| `event_type` | the `AlertSink` event name (bounded enum — must be in `_ALERT_EVENT_TYPES`, [`config/settings.py:1034`](../../messagefoundry/config/settings.py)) |
+| `event_type` | the `AlertSink` event name (bounded enum — `_ALERT_EVENT_TYPES`, [`config/settings.py:1034`](../../messagefoundry/config/settings.py)), except that a `connection_error` of kind `config_fault` is stored under the derived instance key `connection_error.config_fault`, which is not in that set (`_instance_type`, [`pipeline/alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py)) |
 | `connection` | inbound/outbound connection name (or the cert/db/`engine-integrity` label that already stands in for `connection` in `_emit`) — **config metadata, never payload** |
 | `severity` | the effective ADR 0014 severity (`info`/`warning`/`critical`) — last write wins |
 | `status` | `open` \| `acknowledged` \| `resolved` |

@@ -1363,11 +1363,24 @@ class SoapDestination(DestinationConnector):
                 )
                 body = ""
             except (OSError, ValueError, http.client.HTTPException) as failed:
-                # BACKLOG #5910: what a socket read can raise, named rather than caught bare, so a
-                # defect raising anything else is not hidden. By class only: no reply byte.
+                # BACKLOG #5910: what a socket read can raise, named so it logs as a failed read.
+                # By class only: no reply byte.
                 logger.warning(
                     "%s returned an HTTP %s fault body the read failed on (%s); classifying on "
                     "the status alone",
+                    self._hop,
+                    exc.code,
+                    type(failed).__name__,
+                )
+                body = ""
+            except Exception as failed:  # noqa: BLE001 - a body we can't read becomes status-only
+                # Anything else, a defect included, still falls through to the status, as before
+                # BACKLOG #5910: a 5xx stays retryable and a 401 still invalidates the token,
+                # rather than the raise reaching the delivery worker as an internal error. Logged
+                # by class only: the exception text could carry reply bytes.
+                logger.warning(
+                    "%s returned an HTTP %s fault body the read raised an unexpected %s on; "
+                    "classifying on the status alone",
                     self._hop,
                     exc.code,
                     type(failed).__name__,

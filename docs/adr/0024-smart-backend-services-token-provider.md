@@ -346,4 +346,4 @@ provider seam here is shaped to admit it (a challenge/response plug alongside th
 
 ## Amendment (2026-11-18, BACKLOG #5910)
 
-A token reply in a content coding the engine does not decode is refused permanently with code `token-reply-coded`, not retried as a malformed token response. What a delivery does with that refusal is stated once, in [ADR 0095 section B.2](0095-connection-lifecycle-scheduler-and-credential-fault-stop.md#b2-a-coded-token-reply-is-a-configuration-fault-2026-11-18-backlog-5910-pr-3069).
+A 2xx token reply with a body in a content coding the engine does not decode is refused permanently with code `token-reply-coded`, not retried as a malformed token response. What a delivery does with that refusal is stated in [ADR 0095 section B.2](0095-connection-lifecycle-scheduler-and-credential-fault-stop.md#b2-a-coded-token-reply-is-a-configuration-fault-2026-11-18-backlog-5910-pr-3069).

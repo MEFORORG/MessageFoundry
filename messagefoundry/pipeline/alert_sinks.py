@@ -323,7 +323,7 @@ _AUTO_RESOLVE: dict[str, str] = {
 }
 
 
-#: The alert instance of a ``connection_error`` of kind ``config_fault`` (ADR 0095 Amendment B.2):
+#: The alert instance of a ``connection_error`` of kind ``config_fault`` (ADR 0128 section 4):
 #: its own notification throttle, escalation count and instance, apart from a transport
 #: ``connection_error``, so neither's page suppresses the other's or replaces its reason. A rule's
 #: control action is not split this way: it is throttled per ``(event_type, connection)``

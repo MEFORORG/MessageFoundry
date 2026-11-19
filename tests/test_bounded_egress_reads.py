@@ -1155,20 +1155,29 @@ def test_a_socket_failure_on_the_error_body_still_classifies_on_the_status(
 
 
 @pytest.mark.parametrize("which", ["soap", "fhir"])
-def test_a_defect_in_the_error_body_read_is_not_swallowed(which: str) -> None:
-    """Step 2: the bare `except Exception` hid any defect as a status-only classification."""
+@pytest.mark.parametrize("failure", [RuntimeError("defect PID|123"), KeyError("defect PID|123")])
+def test_an_unexpected_raise_in_the_error_body_read_still_retries_a_5xx(
+    which: str, failure: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5910 repair: a raise outside the named read failures falls through to the status,
+    as on main, so a 500 stays the retryable DeliveryError rather than reaching the delivery
+    worker as an internal error that dead-letters. Logged by class only, never its text."""
     url = SOAP_URL if which == "soap" else FHIR_BASE
-    err = _FailingReadHTTPError(url, RuntimeError("defect"))
+    err = _FailingReadHTTPError(url, failure)
     if which == "soap":
         soap = _soap()
         soap._opener = _RaisingOpener(err)  # type: ignore[assignment]
-        with pytest.raises(RuntimeError, match="defect"):
-            _post_soap(soap)
+        post: Callable[[], None] = lambda: _post_soap(soap)  # noqa: E731
     else:
         fhir = _fhir()
         fhir._opener = _RaisingOpener(err)  # type: ignore[assignment]
-        with pytest.raises(RuntimeError, match="defect"):
-            _post_fhir(fhir)
+        post = lambda: _post_fhir(fhir)  # noqa: E731
+    with caplog.at_level(logging.WARNING), pytest.raises(DeliveryError) as raised:
+        post()
+    assert "500" in str(raised.value)
+    assert not getattr(raised.value, "permanent", False)
+    assert type(failure).__name__ in caplog.text
+    assert "PID|123" not in caplog.text
 
 
 def test_a_truncated_reply_never_carries_the_partial_body_on_the_exception_chain() -> None:
