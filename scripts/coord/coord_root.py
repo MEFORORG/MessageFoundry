@@ -266,9 +266,17 @@ def _windows_computer_name() -> str | None:
         size = ctypes.c_uint32(len(buf))
         kernel32 = ctypes.WinDLL("kernel32")  # type: ignore[attr-defined,unused-ignore]
         ok = kernel32.GetComputerNameW(buf, ctypes.byref(size))
-    except (ImportError, OSError, AttributeError):
+    except (ImportError, OSError, AttributeError) as exc:
+        # An MSYS2 or Cygwin Python has no WinDLL; say so once, since the cache keeps the answer.
+        print(
+            f"coord_root: GetComputerNameW unavailable ({exc!r}); using the DNS label",
+            file=sys.stderr,
+        )
         return None
-    return buf.value if ok and buf.value else None
+    if not (ok and buf.value):
+        print("coord_root: GetComputerNameW failed; using the DNS label", file=sys.stderr)
+        return None
+    return buf.value
 
 
 def host() -> str:

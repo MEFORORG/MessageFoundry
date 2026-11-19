@@ -155,7 +155,7 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
 - `-To <path>` -- the recipient **worktree** path. Matched case-insensitively and exactly. `all`
   broadcasts to the live roster from [`presence.ps1`](../scripts/coord/presence.ps1).
 - `-To <seat id>` -- a seat record's id, such as `autonomy-plan-62022e2c`, accepted when the seat
-  registry holds a readable record for it. **Use this for a seat on another PC**: its worktree path
+  registry holds a readable record for it that names a worktree. **Use this for a seat on another PC**: its worktree path
   does not exist here, so the path form cannot reach it. A seat id hashes the host as well as the
   path, so two PCs with a worktree at the same path have two seat ids and two mailboxes. A path
   target is keyed for this PC.
@@ -219,7 +219,7 @@ a path-only key gave them one mailbox ([`COORD-SHARED-ROOT.md`](COORD-SHARED-ROO
 names. The drain and the watcher move that box's inbox into the new box before they read, and
 `-Status` counts what is left there. This version of `mail.ps1` writes nothing under the old key. A
 send to a seat id published before the change goes to the box that seat's worktree and host key to
-now. A copy of `mail.ps1` on a branch older than the change still writes the old box, and the drain
+now, and is refused when that record names no readable host, since it cannot be keyed to one PC. A copy of `mail.ps1` on a branch older than the change still writes the old box, and the drain
 moves that mail too.
 
 **One definition, dot-sourced by both ends.** The sender and the drain must compute the same key from

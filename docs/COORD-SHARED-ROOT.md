@@ -170,8 +170,9 @@ exists to stop.
 The fix is part of the change, not a follow-up:
 
 1. Every shared record carries `host`. `Get-CoordHost` in `coord-root.ps1` reads it from
-   `[Environment]::MachineName`, and its Python twin `coord_root.host()` makes the same call, so the
-   two never read `$env:COMPUTERNAME` and cannot be split by it. At least mail's `from.host` and
+   `[Environment]::MachineName`, and its Python twin `coord_root.host()` makes the same call on a
+   native Windows Python (an MSYS2 or Cygwin one cuts the DNS label to the NetBIOS form instead).
+   Neither reads `$env:COMPUTERNAME`. At least mail's `from.host` and
    `lock.ps1` still read that variable. `seat.ps1` already writes it into its
    stage log, not into the record.
 2. A liveness check judges only records whose `host` is this machine. A record from another host

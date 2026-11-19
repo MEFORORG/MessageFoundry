@@ -14,6 +14,7 @@ a worktree at the same path, and a path-only key gave them one of each. These te
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -276,9 +277,16 @@ def test_a_legacy_seat_id_is_sent_to_the_new_box(repo: Path, shared: Path) -> No
     assert json.loads(proc.stdout)[0]["Key"] == _key(repo, OTHER)
 
 
+@functools.cache
 def _this_host() -> str:
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "[Environment]::MachineName"],
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{COORD / 'coord-root.ps1'}'; Get-CoordHost",
+        ],
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
@@ -289,7 +297,10 @@ def _this_host() -> str:
 
 def _refused(proc: subprocess.CompletedProcess[str], shared: Path, why: str) -> None:
     assert proc.returncode != 0, proc.stdout
-    assert "Refusing to send" in proc.stderr and why in proc.stderr, proc.stderr
+    # pwsh wraps an error to the console width and prefixes each line with '|', so compare the
+    # message with its whitespace and wrap marks flattened.
+    flat = " ".join(proc.stderr.replace("|", " ").split())
+    assert "Refusing to send" in flat and why in flat, proc.stderr
     box = shared / "mail" / "box"
     assert not box.exists() or not any(box.iterdir()), "no box may be minted for a refused send"
 
@@ -299,7 +310,7 @@ def test_a_hostless_legacy_seat_record_is_refused(repo: Path, shared: Path) -> N
     the mail to a box nobody drains, so the send is refused rather than defaulted to this PC."""
     legacy = _key(repo, legacy=True)
     _plant_seat(shared / "seats", legacy, str(repo), None)
-    _refused(_send(repo, shared, legacy, "to nobody"), shared, "names no host")
+    _refused(_send(repo, shared, legacy, "to nobody"), shared, "names no readable host")
 
 
 @pytest.mark.parametrize("host", [None, OTHER])

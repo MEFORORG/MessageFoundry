@@ -226,7 +226,7 @@ function Resolve-SeatRecipient {
     # with no worktree cannot be told from a legacy one, so it REFUSES the send. So does a worktree
     # that does not normalise to a path, and a legacy id whose record names no host or a host that is
     # not text: that record may be another PC's, and keying it with this PC's host would queue the
-    # mail to a box nobody drains. A hostless record is never defaulted to this PC here. These two
+    # mail to a box nobody drains. A hostless record is never defaulted to this PC here. These
     # throw rather than return $null: the seat IS in the registry, so the caller's "not a seat id"
     # would send the operator looking for a typo.
     if (-not $wt.Trim()) {
@@ -235,11 +235,15 @@ function Resolve-SeatRecipient {
     }
     $key = $Id
     $legacy = $null
-    try { $legacy = ConvertTo-LegacyBoxKey -Path $wt } catch { return $null }
+    try { $legacy = ConvertTo-LegacyBoxKey -Path $wt }
+    catch {
+        throw ("Refusing to send: seat '$Id' is in the shared seat registry, but its recorded " +
+            "worktree '$wt' does not normalise to a path, so its mailbox cannot be keyed.")
+    }
     if ($legacy -and $Id -ceq $legacy) {
         if (-not $seatHost -or $seatHost -eq $script:CoordUnreadableHost) {
             throw ("Refusing to send: seat '$Id' is a seat id from before the host joined the key, " +
-                "and its newest record names no host, so it cannot be keyed to one PC. Send to the " +
+                "and its newest record names no readable host, so it cannot be keyed to one PC. Send to the " +
                 "worktree path on its PC, or to the seat's current seat id.")
         }
         $key = ConvertTo-BoxKey -Path $wt -HostName $seatHost
