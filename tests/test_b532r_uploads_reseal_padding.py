@@ -183,10 +183,11 @@ def test_a_too_long_plaintext_sidecar_is_a_skip_over_any_body(
     assert result.unsealable == 0
 
 
-def test_the_reseal_reads_no_more_than_the_cap_of_an_oversized_sidecar(
+def test_the_reseal_reads_nothing_of_a_sidecar_its_fstat_puts_over_the_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """However large the file, the pass reads at most the cap of it, and answers a skip."""
+    """However large the file, the pass refuses it on its size alone and reads none of it. The
+    bounded read of one that grew after its fstat is pinned in test_b532r_uploads_refusals."""
     key_a, key_b = generate_key(), generate_key()
     fid = _save(tmp_path, key_a)
     sidecar = tmp_path / f"{fid}.meta"
@@ -215,7 +216,7 @@ def test_the_reseal_reads_no_more_than_the_cap_of_an_oversized_sidecar(
 
     monkeypatch.setattr(uploads, "_open_plain", spy)
     result = _reseal(tmp_path, _aes(key_b, key_a))
-    assert sum(taken) <= _OVER
+    assert taken == []
     assert _is_refused_skip(result)
 
 

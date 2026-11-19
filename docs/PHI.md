@@ -821,8 +821,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    before decrypting, as below, is skipped on every run too, but it is neither decrypted nor
    looked inside, so it may hold a value under the prior key: do not retire that key until the sidecar is fixed, as by restoring
    it, or deliberately removed. The log names each skipped file, and says whether the key its marker names is configured. A file
-   larger than an upload can be is skipped too, and only its first bytes are read. One that starts
-   with the active key's marker reads as already current instead, and is not reported. If a skipped
+   larger than an upload can be is skipped too, and only its first bytes are read. A body that
+   starts with the active key's marker reads as already current instead, and is not reported; a
+   sidecar does not, since it is decoded whole first. If a skipped
    one is a real upload from before `[store].max_upload_bytes` came down, raise that setting for the
    run. **A symlink at an upload's
    path is not followed, and it is a skip**, because its target may be a real upload under the
@@ -906,7 +907,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    plaintext sidecar is not the never-sealable kind `rotate-key` reports apart, though the prune
    and the delete class it as that kind. The command's error names how many of its skips are
    such a sidecar, says it may hold a value under the prior key, and does not advise deleting
-   it. The one sidecar `rotate-key` leaves as it is without a skip is one that provably holds
+   it. Its closing note after the audit roll still offers removing the two files of an upload that
+   cannot be fixed, whatever the skip, and the retention prune and the API delete class such a
+   plaintext sidecar over a lost body as the never-sealable kind and remove it; both are open
+   findings. The one sidecar `rotate-key` leaves as it is without a skip is one that provably holds
    nothing: read in full within 128 KiB, it is empty, or only a byte-order mark and whitespace.
    It counts that one apart from `skipped`, as `damaged`, so it does not hold the rotation open.
    The command's output does not report that count, and the log names each such upload. The

@@ -2922,8 +2922,10 @@ class UploadStore:
         reassembled here. Files are processed one at a time and each is rewritten through the same
         atomic temp-and-replace the write path uses. Peak memory is a SMALL MULTIPLE of ``max_bytes``,
         not ``max_bytes`` itself: base64 and the AES-GCM round trip each hold their own copy, so a
-        25 MiB upload transiently costs a few hundred MiB. A file already under the active key is
-        detected from its first bytes and never read whole.
+        25 MiB upload transiently costs a few hundred MiB. A body already under the active key is
+        detected from its first bytes and never read whole. A sidecar, at most
+        :data:`_SIDECAR_LIMIT`, is read and decoded whole before it is taken as current, so one
+        every reader refuses is never current (BACKLOG #5387).
 
         **This pass LAUNDERS an unmarked value, and that is the ruled trade, not an oversight.** It
         seals every plaintext file it can, legacy or planted, into a genuine AAD-bound ciphertext,
@@ -2936,7 +2938,8 @@ class UploadStore:
         **It does not seal a plaintext sidecar over a body it did not seal (BACKLOG #2322).** Sealing
         it would list an upload with no usable body, and would seal a planted lone sidecar too. Where
         the body is missing or is not text, no re-run can change that, so the upload is counted in
-        ``unsealable`` rather than ``skipped``, and the retention prune removes it at expiry. The same
+        ``unsealable`` rather than ``skipped``, unless every reader refuses the sidecar before
+        decrypting, as one past the plaintext seal bound, which is a skip (``refused_sidecars``), and the retention prune removes it at expiry. The same
         body under a SEALED sidecar is counted in ``body_lost``, also not a skip, and its sidecar is
         re-sealed. **That is a judgment about the body as it is now (BACKLOG #3737):** a missing body
         that comes back under a key retired since then is unreadable, so the command's note tells
@@ -3018,12 +3021,14 @@ class UploadStore:
         if resealed or skipped or unsealable or body_lost or not_regular or damaged:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
-                "upload(s) (%d upload(s) skipped, %d that cannot be sealed, %d whose body is lost, "
+                "upload(s) (%d upload(s) skipped, %d of them over a sidecar that could not be "
+                "read and must not be deleted, %d that cannot be sealed, %d whose body is lost, "
                 "%d holding a file that is not regular, %d whose sidecar is blank and every reader "
                 "refuses as damaged)",
                 resealed,
                 sealed_plaintext,
                 skipped,
+                refused_sidecars,
                 unsealable,
                 body_lost,
                 not_regular,
