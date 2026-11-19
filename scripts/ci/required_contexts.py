@@ -8,8 +8,8 @@ are not installed: ``scripts/release/tag_provenance.py`` on the release runner, 
 ``scripts/coord/pr_state.py`` loads it by path and passes ``allow_empty=True`` (see
 ``branch_protection_contexts``), and ``tests/_workflow_contexts.py`` uses the same file parser. Before vault BACKLOG #2631 each had its
 own copy, and two of them disagreed on what an absent server list means. Here an absent list
-RAISES: an unprotected branch, or a changed API shape, is not an empty required set. By default an
-empty one raises too (``branch_protection_contexts``).
+RAISES: a changed API shape is not an empty required set. By default an empty list, an unprotected
+branch and an unenforced one raise too; ``branch_protection_contexts`` names the one opt-out.
 """
 
 from __future__ import annotations
@@ -64,15 +64,20 @@ def branch_protection_contexts(payload: Any, *, allow_empty: bool = False) -> li
     set or gating a release on it must refuse rather than read "nothing is required" (BACKLOG
     #5465). ``allow_empty=True`` is for a caller that unions this with the ruleset contexts and
     refuses an empty COMBINED set itself; it gets ``[]`` for those three cases instead. A payload
-    with neither list raises either way, because the API shape changed and nothing was read.
+    with neither list raises either way, because the API shape changed and nothing was read, unless
+    it also says ``protected: false``, which GitHub may send with no status-check block at all.
     """
     if not isinstance(payload, dict):
         raise RuntimeError(f"the branch payload is a {type(payload).__name__}, not an object")
     unprotected = payload.get("protected") is False
-    if unprotected and allow_empty:
-        return []
     protection = payload.get("protection") or {}
-    checks = protection.get("required_status_checks") or {}
+    checks = (
+        protection.get("required_status_checks") or {} if isinstance(protection, dict) else None
+    )
+    if not isinstance(checks, dict):
+        raise RuntimeError(
+            "the branch payload's protection.required_status_checks is not an object"
+        )
     contexts = checks.get("contexts")
     check_list = checks.get("checks")
     if contexts is None and check_list is None and not unprotected:
@@ -82,13 +87,17 @@ def branch_protection_contexts(payload: Any, *, allow_empty: bool = False) -> li
         )
     if not isinstance(contexts, list | None) or not isinstance(check_list, list | None):
         raise RuntimeError("required_status_checks.contexts or .checks is not a list")
-    found = [
-        *(contexts or []),
-        *(c.get("context") if isinstance(c, dict) else None for c in check_list or []),
-    ]
-    if not all(isinstance(c, str) and c for c in found):
-        raise RuntimeError(f"a required_status_checks entry names no context: {found!r}")
-    unique = list(dict.fromkeys(found))
+    unique = list(
+        dict.fromkeys(
+            _named(
+                [
+                    *(contexts or []),
+                    *(c.get("context") if isinstance(c, dict) else None for c in check_list or []),
+                ],
+                "required_status_checks",
+            )
+        )
+    )
     if unprotected:
         why_empty = "the branch is not protected"
     elif checks.get("enforcement_level") == "off":
@@ -105,6 +114,17 @@ def branch_protection_contexts(payload: Any, *, allow_empty: bool = False) -> li
     )
 
 
+def _named(entries: list[Any], where: str) -> list[str]:
+    """``entries`` unchanged when every one is a non-blank string; otherwise a refusal.
+
+    A null, empty or whitespace-only entry would become a required context nothing can report, or
+    the string ``'None'``, so it is refused as a shape the reader does not understand.
+    """
+    if not all(isinstance(c, str) and c.strip() for c in entries):
+        raise RuntimeError(f"a {where} entry names no context: {entries!r}")
+    return entries
+
+
 def ruleset_contexts(rules: Any) -> list[str]:
     """The contexts every ruleset on a branch requires, from a ``rules/branches/{branch}`` payload.
 
@@ -112,9 +132,12 @@ def ruleset_contexts(rules: Any) -> list[str]:
     """
     if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
         raise RuntimeError("the branch rules payload is not a list of rule objects")
-    return [
-        str(check["context"])
-        for rule in rules
-        if rule.get("type") == "required_status_checks"
-        for check in (rule.get("parameters") or {}).get("required_status_checks") or []
-    ]
+    return _named(
+        [
+            check.get("context") if isinstance(check, dict) else None
+            for rule in rules
+            if rule.get("type") == "required_status_checks"
+            for check in (rule.get("parameters") or {}).get("required_status_checks") or []
+        ],
+        "ruleset required_status_checks",
+    )

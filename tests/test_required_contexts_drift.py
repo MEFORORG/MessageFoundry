@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from scripts.ci.required_contexts import branch_protection_contexts
+from scripts.ci.required_contexts import branch_protection_contexts, ruleset_contexts
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "scripts" / "ci" / "check_required_contexts_drift.py"
@@ -269,7 +269,7 @@ def test_the_reader_unions_contexts_and_checks() -> None:
 
 
 @pytest.mark.parametrize(
-    ("payload", "why"),
+    ("branch", "why"),
     [
         (_branch(contexts=[], checks=[]), "lists no context"),
         (_branch(contexts=[]), "lists no context"),
@@ -290,13 +290,13 @@ def test_the_reader_unions_contexts_and_checks() -> None:
         ),
     ],
 )
-def test_an_empty_or_unenforced_required_set_is_refused(payload: dict[str, Any], why: str) -> None:
+def test_an_empty_or_unenforced_required_set_is_refused(branch: dict[str, Any], why: str) -> None:
     """BACKLOG #5465: each of these read as "nothing required" before; now each refuses."""
     read = branch_protection_contexts
     with pytest.raises(RuntimeError, match=why):
-        read(payload)
+        read(branch)
     # A caller that unions with the rulesets and refuses an empty combined set opts in to [].
-    assert read(payload, allow_empty=True) == []
+    assert read(branch, allow_empty=True) == []
 
 
 def test_a_payload_with_neither_list_refuses_even_when_empty_is_allowed() -> None:
@@ -308,6 +308,8 @@ def test_a_payload_with_neither_list_refuses_even_when_empty_is_allowed() -> Non
         _branch(contexts=[""]),
         _branch(contexts=[None]),
         _branch(contexts=["CI gate"], checks=["CI gate"]),
+        _branch(contexts=["  "]),
+        {"protected": False, "protection": {"required_status_checks": {"checks": ["CI gate"]}}},
     ):
         with pytest.raises(RuntimeError, match="names no context"):
             read(bad, allow_empty=True)
@@ -326,3 +328,22 @@ def test_the_frozen_live_payload_still_reads(payload: dict[str, Any]) -> None:
     rsc = payload["protection"]["required_status_checks"]
     expected = {*rsc["contexts"], *(c["context"] for c in rsc["checks"])}
     assert set(branch_protection_contexts(payload)) == expected
+
+
+def test_a_non_object_status_check_block_is_a_refusal_not_a_crash() -> None:
+    """The drift checker catches RuntimeError as "unreadable"; an AttributeError would escape it."""
+    for bad in ({"protection": ["x"]}, {"protection": {"required_status_checks": "x"}}):
+        with pytest.raises(RuntimeError, match="not an object"):
+            branch_protection_contexts(bad)
+
+
+def test_a_blank_ruleset_context_is_refused() -> None:
+    for blank in (None, "", " "):
+        rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": blank}]},
+            }
+        ]
+        with pytest.raises(RuntimeError, match="names no context"):
+            ruleset_contexts(rules)
