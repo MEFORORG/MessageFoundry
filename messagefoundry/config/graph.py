@@ -8,7 +8,8 @@ advisory check — previously three divergent extractors. Edges are **AST-first*
 discipline: parse the defining module, never re-import it) with the compiled-``co_consts`` string
 scan retained as a fallback tier, and every edge carries its **provenance**:
 
-* ``declared`` — the structured ``inbound -> router`` binding on the Registry;
+* ``declared`` — the structured ``inbound -> router`` binding on the Registry, and an outbound's
+  ``reingress_to`` naming the Loopback inbound its captured reply re-enters (``outbound -> inbound``);
 * ``literal`` — AST-proven: a string literal, a module-level ``NAME = "..."`` constant (validated
   against the WHOLE module: a ``global NAME`` in any function or any second module-scope binding —
   ``NAME += ...``, ``for NAME in ...``, an import alias — disqualifies it), or a
@@ -1147,6 +1148,16 @@ def build_wiring_graph(registry: Registry) -> WiringGraph:
 
     for conn in registry.inbound.values():
         edges.append(WiringEdge("inbound", conn.name, "router", conn.router, "declared"))
+
+    # An outbound's `reingress_to` (ADR 0013) re-enters its captured reply on the named Loopback
+    # inbound; a .py factory and a connections.toml entry both land it in `spec.settings`. Without
+    # this edge a response cycle and the loopback's referrer are invisible (BACKLOG #5966). A name
+    # that registers no inbound gets no edge: build-check refuses it, and a shard-filtered view does
+    # not hold a sibling shard's loopback.
+    for oname, oconn in sorted(registry.outbound.items()):
+        target = oconn.spec.settings.get("reingress_to")
+        if isinstance(target, str) and target in registry.inbound:
+            edges.append(WiringEdge("outbound", oname, "inbound", target, "declared"))
 
     for rname, rfn in sorted(registry.routers.items()):
         ast_result = _router_returns(rfn, cache)
