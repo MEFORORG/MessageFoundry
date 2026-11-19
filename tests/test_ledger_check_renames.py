@@ -782,12 +782,15 @@ def test_CONTROL_a_pathspec_switch_in_the_environment_does_not_crash_the_gate(
 
 
 def _merge_base_fails(repo: Path) -> bool:
+    """True only for git's own "no common ancestor" answer: exit 1 and no output. A missing ref or a
+    bad object exits 128, and must not pass for the shape a test claims."""
     probe = subprocess.run(
         ["git", "-C", str(repo), "merge-base", "origin/main", "HEAD"],
         capture_output=True,
+        text=True,
         check=False,
     )
-    return probe.returncode != 0
+    return probe.returncode == 1 and not probe.stdout.strip()
 
 
 def test_the_rename_wording_holds_in_the_REAL_CI_checkout_shape(repo: Path, tmp_path: Path) -> None:
@@ -874,7 +877,7 @@ def test_a_branch_adr_rename_past_the_history_CAP_does_not_call_the_clone_shallo
     code, out = run_check(repo)
     assert code == 1, out
     assert "ADR 0002 cannot be checked against origin/main -- the history is TRUNCATED" in out
-    assert "A RENAME is refused once the walk reaches its cap" in out
+    assert "This file is a RENAME, and the base's history already touched this" in out
     assert "shallow" not in out
 
 
@@ -897,5 +900,7 @@ def test_a_branch_adr_rename_with_NO_FORK_POINT_is_not_sent_to_the_allocator(rep
     code, out = run_check(repo)
     assert code == 1, out
     assert "ADR 0002 is a rename, but git found no fork point with origin/main" in out
-    assert "alloc.ps1" not in out
     assert "was not allocated to this worktree" not in out
+    # The allocator stays reachable, for a number nobody allocated, but only as the last resort.
+    assert "Otherwise:" in out
+    assert out.index("Otherwise:") < out.index("alloc.ps1")

@@ -198,7 +198,10 @@ the same number, and that ADR was at `HEAD` or at the fork point, so this branch
 it, the change is a rename, and its row must link the new name in the same commit; the refusal says so
 rather than calling it a reuse. Where the staged file matches, path and bytes, one the base carries, as
 when a merge brings in an ADR the base renamed, the refusal says the row is wrong. Any other file under
-a number the base has spent, a stale branch's own ADR included, is refused as a reuse.
+a number the base has spent, a stale branch's own ADR included, is refused as a reuse. The `--ci` run
+checks neither the `HEAD` and fork-point condition nor the path-and-bytes match: it takes any such
+pairing as a rename, because there `HEAD` is the pull request merged into the base, and its shallow
+checkout has no merge base to read.
 
 Under rule 2, a same-number rename allocates nothing, so the gate grants it, but only on positive facts.
 Git pairs the file, diffed against `HEAD`, with an ADR of the same number. A walk of the base's history

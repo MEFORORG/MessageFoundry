@@ -365,11 +365,6 @@ def _coord_root() -> ModuleType | None:
     return None
 
 
-def _allocate_remedy(kind: str) -> str:
-    """The remedy for a number nobody holds: allocate a fresh one."""
-    return f'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind {kind} -Title "<title>"'
-
-
 class Ledger:
     def __init__(self, *, ci: bool, base: str = "origin/main") -> None:
         self.ci = ci
@@ -800,7 +795,7 @@ class Ledger:
         field and land in prose an agent then acts on -- the BACKLOG #1040 injection route, and a
         remedy block is precisely what that defect forged.
         """
-        allocate = _allocate_remedy(kind)
+        allocate = f'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind {kind} -Title "<title>"'
         # No record at all: nobody holds it, so allocating is the only move and the ONLY case where it
         # is the right one.
         if self.alloc is None:
@@ -869,7 +864,7 @@ class Ledger:
         (BACKLOG #5453). Only it gets the lines about a shallow clone and about renaming a restore,
         because only for it do those lines change what will pass. ``fork_unknown`` marks a renamed
         file whose grant failed only because git found no fork point with the base: the number may
-        well be allocated, so that refusal names the fork point rather than the allocator.
+        well be allocated, so that refusal names the fork point first and the allocator only last.
         """
         if self.alloc is None:
             # Unresolved is not unowned. Refusing costs a retry; guessing hands out a spent number.
@@ -896,10 +891,9 @@ class Ledger:
                         "      deepened or not: only an unshallowed one (git fetch --unshallow origin)\n"
                         "      can show the number is new. Committing from the allocating tree avoids it.\n"
                         if self._is_shallow()
-                        else "      A RENAME is refused once the walk reaches its cap of "
-                        f"{RESTORE_HISTORY_DEPTH} commits under\n"
-                        "      this number, however deep the clone. Committing from the allocating tree\n"
-                        "      avoids it.\n"
+                        else "      This file is a RENAME, and the base's history already touched this\n"
+                        "      number, so it is not a number new to this branch and deepening will not\n"
+                        "      grant it. Committing from the allocating tree avoids it.\n"
                     )
                     if renamed
                     else ""
@@ -927,16 +921,15 @@ class Ledger:
                 + f"      If a claim record still names a live tree, prefer that route:\n      {remedy}",
             )
         if fork_unknown:
-            # ownership_remedy returns the bare allocator when no record holds the number; only a
-            # record's recover-first advice is worth adding to this refusal.
-            recover = "" if remedy == _allocate_remedy("adr") else f"\n      {remedy}"
+            # Reached only in a clone that is not shallow (a shallow one reads as TRUNCATED above),
+            # so a failed merge-base means the histories share no commit; a fetch cannot fix that.
             return (
                 f"ADR {number} is a rename, but git found no fork point with {self.base}",
-                "Without the commit this branch was cut from, the gate cannot tell whether "
-                f"{self.base} held this number then, so it refuses. The number itself may well be "
-                "allocated; this is not a request for a new one.",
-                f"fetch {self.base} so the two histories meet (git fetch origin), then retry, or\n"
-                "      commit from the worktree that allocated the number" + recover,
+                f"This branch shares no commit with {self.base}, so the gate cannot tell whether "
+                f"{self.base} held this number when the branch began, and it refuses. The number "
+                "itself may well be allocated; this is not by itself a request for a new one.",
+                "commit from the worktree that allocated the number, or rebuild this branch on\n"
+                f"      {self.base} and retry. Otherwise:\n      {remedy}",
             )
         return (
             f"ADR {number} was not allocated to this worktree",
@@ -1050,7 +1043,13 @@ class Ledger:
                 seen = self._history_of_this_number(path, number)
                 if not seen.restores_lost_bytes:
                     renamed = self.same_number_source(path, number) is not None
-                    fork_unknown = renamed and self._fork_point() is None
+                    # Read the fork point only where the refusal would use it.
+                    fork_unknown = (
+                        renamed
+                        and not seen.truncated
+                        and not seen.number_is_historical
+                        and self._fork_point() is None
+                    )
                     self.fail(
                         *self._ownership_refusal(
                             number, seen, renamed=renamed, fork_unknown=fork_unknown
