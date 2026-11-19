@@ -32,6 +32,7 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore
+from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -192,3 +193,151 @@ async def test_an_error_with_no_errno_keeps_only_what_names_no_file(
     with pytest.raises(DeliveryError) as caught:
         await _file_destination(tmp_path / "out").send(BODY)
     assert kept in str(caught.value) and MRN not in _traceback(caught.value)
+
+
+async def test_send_reports_an_error_before_the_name_by_errno_and_directory(tmp_path: Path) -> None:
+    # BACKLOG #5302: a regular file sits at the configured directory, so making it fails before a
+    # name is rendered. send's own arm reports it by type, errno and the configured directory.
+    out = tmp_path / "out"
+    out.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(DeliveryError) as raised:
+        await _file_destination(out).send(BODY)
+    text = str(raised.value)
+    assert text.startswith(f"file write failed: FileExistsError: [Errno {errno.EEXIST}]")
+    assert text.endswith(f"(directory {out})")
+    # The raw OS error is not chained, so a traceback of the delivery error cannot print it.
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+async def test_send_reports_a_missing_validated_directory_in_words(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    dest = _file_destination(out)
+    dest.validate_directory = True
+    with pytest.raises(DeliveryError) as raised:
+        await dest.send(BODY)
+    assert str(raised.value) == (
+        f"file write failed: FileNotFoundError: [Errno {errno.ENOENT}] not found, and "
+        f"validate_directory never creates it (directory {out})"
+    )
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    # The directory survives safe_exc's length bound for a share path of this length (63 characters).
+    long_out = Path(r"\\hl7-share01.corp.example\interfaces\outbound\OB_ACME_ADT\drop")
+    assert str(long_out) in safe_exc(
+        DeliveryError(str(raised.value).replace(str(out), str(long_out)))
+    )
+
+
+async def test_a_validated_directory_that_is_a_file_is_not_called_missing(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    out.write_text("not a directory", encoding="utf-8")
+    dest = _file_destination(out)
+    dest.validate_directory = True
+    with pytest.raises(DeliveryError) as raised:
+        await dest.send(BODY)
+    assert str(raised.value) == (
+        f"file write failed: NotADirectoryError: [Errno {errno.ENOTDIR}] not a directory "
+        f"(directory {out})"
+    )
+
+
+async def test_a_refused_validated_directory_is_reported_by_its_own_errno(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # is_dir() is False for a refused directory too; the text names the refusal, not "missing".
+    out = tmp_path / "out"
+    out.mkdir()
+    dest = _file_destination(out)
+    dest.validate_directory = True
+    real_stat = Path.stat
+
+    def refuse(self: Path, *args: object, **kwargs: object) -> os.stat_result:
+        if self == out:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(self))
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", refuse)
+    with pytest.raises(DeliveryError) as raised:
+        await dest.send(BODY)
+    text = str(raised.value)
+    assert text == (
+        f"file write failed: PermissionError: [Errno {errno.EACCES}] "
+        f"{os.strerror(errno.EACCES)} (directory {out})"
+    )
+    assert "not found" not in text
+
+
+@pytest.mark.parametrize(
+    ("raised", "kept"),
+    [
+        (
+            PermissionError(errno.EACCES, os.strerror(errno.EACCES), f"out/{MRN}_SYNTHETIC.hl7"),
+            f"PermissionError: [Errno {errno.EACCES}] {os.strerror(errno.EACCES)} (directory",
+        ),
+        (
+            OSError(f"share refused out/{MRN}_SYNTHETIC-1.hl7"),
+            "file write failed: OSError (directory",
+        ),
+        (
+            wincred.CredentialLogonError(
+                "alternate Windows credential logon failed (win32 error 5)"
+            ),
+            "CredentialLogonError: alternate Windows credential logon failed (win32 error 5)",
+        ),
+    ],
+    ids=["errno", "message-only", "credential-logon"],
+)
+async def test_send_never_carries_a_raw_os_error_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: OSError, kept: str
+) -> None:
+    # BACKLOG #5302: whatever path an OS error reaching send's arm quotes, only its type, errno and
+    # OS text reach the delivery error, its traceback and the stored text. A message-only error
+    # keeps its type alone, except a credential logon error, whose words are fixed.
+    dest = _file_destination(tmp_path / "out")
+
+    def refuse(payload: str) -> None:
+        raise raised
+
+    monkeypatch.setattr(dest, "_write", refuse)
+    with pytest.raises(DeliveryError) as caught:
+        await dest.send(BODY)
+    text = str(caught.value)
+    assert kept in text and text.endswith(f"(directory {tmp_path / 'out'})")
+    assert MRN not in text and MRN not in _traceback(caught.value)
+    assert MRN not in safe_exc(caught.value)
+
+
+def _share_not_found() -> FileNotFoundError:
+    """What a stat of an unreachable UNC share raises on Windows (Win32 53), built on any platform."""
+    exc = FileNotFoundError(errno.ENOENT, "The network path was not found", "out")
+    exc.winerror = 53  # type: ignore[attr-defined,unused-ignore]
+    return exc
+
+
+@pytest.mark.parametrize(
+    ("raised", "kept"),
+    [
+        (_share_not_found(), f"[Errno {errno.ENOENT}] The network path was not found"),
+        (ValueError("embedded null character in path"), "[Errno {}] not a valid path"),
+    ],
+    ids=["share-not-found", "nul"],
+)
+async def test_a_validated_directory_stat_fault_is_not_called_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: Exception, kept: str
+) -> None:
+    # A Win32 share fault surfaces as a FileNotFoundError too, and keeps the OS's own words; a path
+    # the OS cannot take is a ValueError, which still leaves send as a DeliveryError.
+    out = tmp_path / "out"
+    dest = _file_destination(out)
+    dest.validate_directory = True
+    real_stat = Path.stat
+
+    def refuse(self: Path, *args: object, **kwargs: object) -> os.stat_result:
+        if self == out:
+            raise raised
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", refuse)
+    with pytest.raises(DeliveryError) as caught:
+        await dest.send(BODY)
+    text = str(caught.value)
+    assert kept.format(errno.EINVAL) in text and "not found, and" not in text

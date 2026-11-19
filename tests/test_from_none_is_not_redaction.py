@@ -150,16 +150,8 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "enum miss quoting the policy kind, which the new message also quotes",
     ),
     _Allowed(
-        "messagefoundry/config/code_sets.py::CodeSet.__getitem__::KeyError::KeyError",
-        _SAFE + "KeyError carries the lookup key, which the new KeyError also quotes",
-    ),
-    _Allowed(
         "messagefoundry/config/code_sets.py::parse_policy::CodeSetError::CodeSetError",
         _SAFE + "the new message interpolates the caught CodeSetError whole",
-    ),
-    _Allowed(
-        "messagefoundry/config/reference.py::ReferenceSet.__getitem__::KeyError::KeyError",
-        _SAFE + "KeyError carries the lookup key, which the new KeyError also quotes",
     ),
     _Allowed(
         "messagefoundry/config/reference.py::reference::KeyError::ReferenceError",
