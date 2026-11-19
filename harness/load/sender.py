@@ -48,6 +48,10 @@ _READ_BYTES = 65536
 _ACCEPT = frozenset({"AA", "CA"})  # MSA-1 accept codes; anything else is a NAK
 _BACKOFF_START = 0.1
 _BACKOFF_MAX = 5.0
+# How long past its ACK grace a graceful stop may run before the connection is aborted and its task
+# cancelled (BACKLOG #5951). A peer that stalls a connect, a drain or a close would otherwise hold
+# the run's shutdown for good. The margin leaves a healthy peer room to take what is still queued.
+_STOP_HARD_MARGIN_S = 10.0
 
 
 def _ack_code(payload: bytes) -> str:
@@ -103,6 +107,7 @@ class PersistentConnection:
             2.0  # seconds to wait for in-flight ACKs at graceful stop (set by stop())
         )
         self._task: asyncio.Task[None] | None = None
+        self._writer: asyncio.StreamWriter | None = None  # the open socket, for a hard stop
         # How many times this connection has been ESTABLISHED. It moves only on a successful open,
         # so a caller that snapshots it before an event that closes the socket (the connscale
         # reload probe, BACKLOG #1292) can wait until the connection is back rather than guess.
@@ -180,9 +185,24 @@ class PersistentConnection:
         # then waits for outstanding ACKs (set before the event so the writer sees it).
         self._stop_grace = grace
         self._stop.set()
-        if self._task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
+        task = self._task
+        if task is None:
+            return
+        # A hard deadline (BACKLOG #5951): past it the socket is aborted, which ends a stalled drain,
+        # read or close, and the task is cancelled, which ends a stalled connect.
+        done, _ = await asyncio.wait({task}, timeout=grace + _STOP_HARD_MARGIN_S)
+        if not done:
+            log.warning(
+                "load connection %s:%d did not stop within %.1fs; aborting it",
+                self._host,
+                self._port,
+                grace + _STOP_HARD_MARGIN_S,
+            )
+            if self._writer is not None:
+                self._writer.transport.abort()
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     # --- internals -----------------------------------------------------------
 
@@ -200,6 +220,7 @@ class PersistentConnection:
             backoff = _BACKOFF_START
             self._generation += 1
             self._up = True
+            self._writer = writer
             # Only the two ends a PEER causes count as a drop: `_serve` returning while this side is
             # not stopping (the read loop saw EOF), or a socket error. A harness exception or a
             # cancellation is not the engine closing anything, so it is not counted.
@@ -218,6 +239,7 @@ class PersistentConnection:
                 log.warning("MLLP reply frame over cap; closing connection: %s", exc)
             finally:
                 self._up = False
+                self._writer = None
                 if dropped:
                     self._drops += 1
                 self._fail_inflight()
@@ -239,11 +261,19 @@ class PersistentConnection:
         wtask = asyncio.create_task(self._write_loop(writer))
         rtask = asyncio.create_task(self._read_loop(reader)) if self._expect_ack else None
         tasks = {wtask} | ({rtask} if rtask else set())
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        # If the writer finished (queue drained on graceful stop), give in-flight ACKs the configured
-        # grace (set by stop()) before cancelling the reader.
-        if wtask in done and rtask is not None and not rtask.done():
-            await self._grace_for_acks(rtask, self._stop_grace)
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            # If the writer finished (queue drained on graceful stop), give in-flight ACKs the
+            # configured grace (set by stop()) before cancelling the reader.
+            if wtask in done and rtask is not None and not rtask.done():
+                await self._grace_for_acks(rtask, self._stop_grace)
+        except asyncio.CancelledError:
+            # A hard stop cancels this task; take the reader and writer down with it rather than
+            # leave them running against a closed socket with nobody to collect their errors.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         # Re-split AFTER the grace: a reader that finished inside it is done now, and cancelling it
         # is a no-op whose exception (an over-cap ACK refused, say) the gather below would swallow.
         done = {t for t in tasks if t.done()}
