@@ -700,7 +700,7 @@ async def test_a_hung_remote_process_is_killed_and_fails_the_band(tmp_path: Path
     its bound it is killed and the band fails with a reason, even though it wrote a report."""
     import asyncio
 
-    psutil = pytest.importorskip("psutil")
+    bound = 10.0  # wide enough for a loaded runner to start the interpreter and reach the sleep
     report = tmp_path / "hung.json"
     marker = tmp_path / "hung.pid"
     child = (
@@ -710,13 +710,18 @@ async def test_a_hung_remote_process_is_killed_and_fails_the_band(tmp_path: Path
         f"open({str(marker)!r}, 'w').write(str(os.getpid())); "
         "time.sleep(120)"
     )
-    # A bound wide enough for a loaded runner to start the interpreter and reach the sleep.
     with pytest.raises(
-        ConnScaleError, match="still running after 6s and was killed: stuck in the port preflight"
+        ConnScaleError, match="still running after 10s and was killed: stuck in the port preflight"
     ):
-        await bb._run_remote_proc([sys.executable, "-c", child], report, tmp_path, timeout=6.0)
-    # The child is gone, not orphaned. Polled, because a venv launcher's interpreter is a
+        await bb._run_remote_proc([sys.executable, "-c", child], report, tmp_path, timeout=bound)
+    # CONTROL: the same bound admits a child that finishes inside it.
+    quick = f"open({str(report)!r}, 'w').write('{{\"sent\": 4}}')"
+    assert await bb._run_remote_proc(
+        [sys.executable, "-c", quick], report, tmp_path, timeout=bound
+    ) == {"sent": 4}
+    # The hung child is gone, not orphaned. Polled, because a venv launcher's interpreter is a
     # grandchild that its job object ends just after the launcher is reaped.
+    psutil = pytest.importorskip("psutil")
     pid = int(marker.read_text(encoding="utf-8"))
 
     def gone() -> bool:
@@ -731,11 +736,6 @@ async def test_a_hung_remote_process_is_killed_and_fails_the_band(tmp_path: Path
         await asyncio.sleep(0.1)
     else:
         pytest.fail(f"the hung child {pid} outlived the kill")
-    # CONTROL: the same bound admits a child that finishes inside it.
-    quick = f"open({str(report)!r}, 'w').write('{{\"sent\": 4}}')"
-    assert await bb._run_remote_proc(
-        [sys.executable, "-c", quick], report, tmp_path, timeout=30.0
-    ) == {"sent": 4}
 
 
 async def test_a_remote_process_that_failed_after_writing_a_report_fails_the_band(

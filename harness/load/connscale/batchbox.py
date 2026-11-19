@@ -1045,11 +1045,15 @@ async def run_batch_engine(
 # --- the DRIVER half ---------------------------------------------------------
 
 
-# What a band may spend beyond its hold and its two drain windows: signing in, the inbound port
-# preflight (two waits of up to 60 s), binding its sinks, the engine reads that bracket the hold,
-# the sender stop graces, and writing its report. A child still running past the bound is hung, and
-# is killed so it cannot hang the driver (BACKLOG #5304).
+# What a band may spend beyond its hold and its two drain windows. It covers at least: interpreter
+# start-up, signing in, the inbound port preflight (two waits of up to 60 s), the batched connects,
+# binding its sinks, the engine reads that bracket the hold, the sender stop graces, closing its
+# sinks and poller, and writing its report. A child still running past the bound is hung, and is
+# killed so it cannot hang the driver (BACKLOG #5304).
 _REMOTE_PROC_SLACK = 300.0
+
+# How much of a band's stderr is kept: the tail is what names why it failed.
+_STDERR_TAIL_BYTES = 4096
 
 
 def _remote_proc_timeout(hold_seconds: float, drain_timeout: float) -> float:
@@ -1060,8 +1064,22 @@ def _remote_proc_timeout(hold_seconds: float, drain_timeout: float) -> float:
 
 
 def _stderr_reason(said: bytes) -> str:
-    """The tail of what a ``connscale-remote`` child wrote to stderr, as the reason its band failed."""
-    return said.decode("utf-8", "replace").strip()[-600:] or "it said nothing on stderr"
+    """The tail of what a ``connscale-remote`` child wrote to stderr, as the reason its band failed.
+    Escaped, since it reaches the operator's terminal in the cell's notes."""
+    tail = said.decode("utf-8", "replace").strip()[-600:]
+    return escape_for_terminal(tail) if tail else "it said nothing on stderr"
+
+
+async def _kill_and_reap(proc: asyncio.subprocess.Process) -> bool:
+    """Kill ``proc`` and wait, bounded, for it to exit. False when it is still there after
+    ``_STOP_GRACE``: a child stuck in uninterruptible I/O must not hang the driver either."""
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    try:
+        await asyncio.wait_for(proc.wait(), _STOP_GRACE)
+    except TimeoutError:
+        return False
+    return True
 
 
 # Module-level so a structural test can monkeypatch the subprocess spawn (no real connscale-remote runs).
@@ -1090,35 +1108,33 @@ async def _run_remote_proc(
 
     async def _hear() -> None:
         # Read as it arrives, so what a child said before it hung -- the only clue to the phase it
-        # hung in -- is still here once it has been killed.
+        # hung in -- is still here once it has been killed. Only the tail is kept.
         while chunk := await stderr.read(65536):
             heard.extend(chunk)
+            del heard[:-_STDERR_TAIL_BYTES]
 
     hearing = asyncio.ensure_future(_hear())
     try:
         try:
             await asyncio.wait_for(proc.wait(), timeout)
+            hung, reaped = False, True
         except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            await proc.wait()
-            hung = True
-        else:
-            hung = False
+            # A child that exited just as the bound fired is not hung: its report stands.
+            hung = proc.returncode is None
+            reaped = await _kill_and_reap(proc)
         # The pipe closes once the child exits. Bounded, since a grandchild that outlived the
-        # child could hold it open.
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(hearing, _STOP_GRACE)
+        # child could hold it open; asyncio.wait never raises what the reader hit.
+        done, _ = await asyncio.wait({hearing}, timeout=_STOP_GRACE)
+        cut = "" if hearing in done else " (stderr was still open, so this tail may be cut short)"
         if hung:
+            fate = "was killed" if reaped else f"did not exit within {_STOP_GRACE:g}s of the kill"
             raise ConnScaleError(
-                f"connscale-remote was still running after {timeout:g}s and was killed: "
-                f"{_stderr_reason(bytes(heard))}"
+                f"connscale-remote was still running after {timeout:g}s and {fate}: "
+                f"{_stderr_reason(bytes(heard))}{cut}"
             )
     finally:
         if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            await proc.wait()
+            await _kill_and_reap(proc)
         hearing.cancel()
         await asyncio.gather(hearing, return_exceptions=True)
     said = bytes(heard)
