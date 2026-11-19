@@ -123,7 +123,8 @@ TOOLKIT_PACKAGE = "messagefoundry_toolkit"
 #: ``<name>-<version>`` shape at all (:func:`filename_problem`): the split rule is keyed on the
 #: filename, so a name it cannot place would otherwise get no split rule, where reading up to the
 #: first hyphen used to give ``messagefoundry-dev.whl`` the engine's (BACKLOG #5470). Every archive
-#: this gate is pointed at is one of these four, so any other name is as unplaceable as no name.
+#: a release build writes is one of these four, so any other name is as unplaceable as no name. A
+#: CI control that renames an artifact (ci.yml's ``poisoned.whl``) is refused by its filename too.
 KNOWN_DISTRIBUTIONS: frozenset[str] = frozenset(
     {
         ENGINE_DISTRIBUTION,
@@ -332,8 +333,11 @@ def _parts(member: str) -> list[str]:
     THIS READING IS NOT THE DEFENCE AGAINST SUCH NAMES. :func:`inspect` refuses every name holding
     one of these components through :func:`non_canonical`, before the test-content and split rules
     run, because extractors disagree on them and no single reading can be right for all of them.
-    The reading stays so :func:`forbidden`, :func:`development_content` and
-    :func:`split_violation` still give a sound verdict when called on their own."""
+    The reading stays because :func:`forbidden`, :func:`development_content` and
+    :func:`split_violation` are also called on their own, and it catches some such names there.
+    It does NOT make them sound alone: ``split_violation('messagefoundry/../anon/__init__.py',
+    'messagefoundry')`` is ``None``, though ``zipfile`` extracts that member as the retired path.
+    Only :func:`inspect`, which runs :func:`non_canonical` first, refuses the whole class."""
     return [
         p for p in member.replace("\\", "/").split("/") if p.rstrip(" ") == ".." or _normalise(p)
     ]
