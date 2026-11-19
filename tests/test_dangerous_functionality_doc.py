@@ -1936,7 +1936,7 @@ _HARNESS_PARSE_HEADER = "| What it reads | Where it comes from | Harness modules
 _CONFIG_LOADERS = frozenset({"load_config"})
 
 #: Harness modules reviewed to import ``ctypes``. ``mllp.py`` calls ``ctypes.FormatError`` on
-#: Windows to turn a failed non-blocking dial's Winsock code into a blocking connect's error text.
+#: Windows to turn a failed non-blocking dial's Winsock code into Windows's text for that code.
 _REVIEWED_HARNESS_CTYPES = frozenset({"mllp.py"})
 
 #: Reviewed assignments to an attribute of something a harness module imported, by module, each as
