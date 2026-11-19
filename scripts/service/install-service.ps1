@@ -1745,7 +1745,19 @@ function Set-ServiceLogonRight {
             # dropped, so an empty row or a stray comma writes no empty holder (BACKLOG #5401).
             $value = $lines[$at] -replace '^\s*SeServiceLogonRight\s*=', ''
             $holders = @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            if ($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid }) {
+            # An exported row can hold an account NAME rather than the '*SID' form (BACKLOG #5401), so
+            # a name is resolved and its SID compared too; read by SID alone, a held name re-adds it. SID tokens are compared first, so an
+            # already-held SID needs no lookup. A name that does not resolve is not this account.
+            $held = @($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid })
+            if (-not $held) {
+                $held = @($holders | Where-Object { -not $_.StartsWith('*') } | Where-Object {
+                    try {
+                        ([Security.Principal.NTAccount]$_).Translate(
+                            [Security.Principal.SecurityIdentifier]).Value -eq $sid
+                    } catch { $false }
+                })
+            }
+            if ($held) {
                 Write-Host "  Right  : '$Account' already holds SeServiceLogonRight (Log on as a service)."
                 return
             }

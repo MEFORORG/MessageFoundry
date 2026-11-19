@@ -3281,6 +3281,27 @@ def test_the_grant_keeps_every_holder_and_a_dollar_in_a_held_name(tmp_path: Path
 
 
 @_windows_only
+@pytest.mark.parametrize("holder", ["BUILTIN\\Administrators", "Administrators"])
+def test_a_holder_written_as_a_name_is_already_granted(tmp_path: Path, holder: str) -> None:
+    """BACKLOG #5401 item 1: an exported row can name a holder rather than give its ``*SID``.
+    Compared by SID alone, the account written as a name read as missing, and the grant
+    re-imported the policy with the account added a second time. Nothing may be configured."""
+    configured = _grant_configured(tmp_path, f"SeServiceLogonRight = *S-1-5-80-4001,{holder}")
+    assert configured == "", f"the policy was re-imported for a held account: {configured}"
+
+
+@_windows_only
+def test_a_name_that_resolves_to_another_account_still_grants(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the name case: a name resolving to some other SID, and one that does
+    not resolve, are not this account, so the grant still writes it."""
+    configured = _grant_configured(
+        tmp_path, "SeServiceLogonRight = BUILTIN\\Users,NO-SUCH-DOMAIN-b532r\\nobody"
+    )
+    want = "SeServiceLogonRight = BUILTIN\\Users,NO-SUCH-DOMAIN-b532r\\nobody,*S-1-5-32-544 |"
+    assert want in configured, configured
+
+
+@_windows_only
 def test_the_grant_after_a_trailing_comma_writes_no_empty_holder(tmp_path: Path) -> None:
     configured = _grant_configured(tmp_path, "SeServiceLogonRight = *S-1-5-80-4001,")
     assert "SeServiceLogonRight = *S-1-5-80-4001,*S-1-5-32-544 |" in configured, configured
