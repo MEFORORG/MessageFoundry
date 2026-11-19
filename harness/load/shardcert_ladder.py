@@ -3456,6 +3456,12 @@ async def run_engine_ladder(
     # an EARLIER run left for rung k would abort it before rung k's own clear. Clear them all now.
     for planned in [*(r.run_suffix for r in climb), "soak"]:
         base_coord.for_run(f"{base_coord.run_id}.{planned}").clear_messages(ENGINE_SETUP_FAILED)
+    # The soak's handshake too (BACKLOG #5953). The drive reads the soak's SHARDS_READY as soon as it posts
+    # LADDER_SOAK, before this half has read it, so one an earlier run left would answer a soak this half
+    # then refuses. Nothing posts these for this run before the climb ends, so the clear races nothing.
+    base_coord.for_run(f"{base_coord.run_id}.soak").clear_messages(
+        SHARDS_READY, DRIVE_START, ENGINE_DRAINED, ENGINE_RUNG_REPORT, RUNG_ABORTED
+    )
 
     # Set when this half ends the climb for a reason that is not the drive's normal early-stop. The drive
     # then has no soak to post, so waiting out ``soak_timeout`` for LADDER_SOAK would only waste it.
@@ -3515,7 +3521,9 @@ async def run_engine_ladder(
         except CoordTimeout:
             # The drive did not drive this rung within the (short) DRIVE_START window. If it stopped (STOP
             # now present) this is the expected end of the climb; otherwise the drive is unresponsive.
-            if base_coord.read(LADDER_STOP) is not None:
+            # A bounded poll, as at the loop head: since this verdict now skips the soak, a STOP the drive
+            # posts just after the timeout must not read as an unresponsive drive.
+            if await _seen_stop(base_coord, stop_poll_grace):
                 result.notes.append(
                     f"early-stop: DRIVE_START timeout on {rung.run_suffix} + LADDER_STOP"
                 )
@@ -3542,9 +3550,9 @@ async def run_engine_ladder(
     soak_coord = base_coord.for_run(f"{base_coord.run_id}.soak")
 
     def refuse_soak(note: str, reason: str) -> EngineLadderResult:
-        # Tell the drive at once rather than leave it waiting out its SHARDS_READY window. An earlier run
-        # under this run_id may have left its soak's SHARDS_READY and drain results here, and the drive
-        # reads SHARDS_READY before ENGINE_SETUP_FAILED, so they go first. Best effort, as in
+        # Tell the drive at once rather than leave it waiting out its SHARDS_READY window. The startup clear
+        # above removed any soak drops an earlier run left; clearing again here is a second line, not what
+        # keeps the drive from reading a stale SHARDS_READY. Best effort, as in
         # _reset_store_or_signal: a coord write error must not replace this half's own outcome, and it
         # is recorded rather than dropped.
         result.notes.append(note)

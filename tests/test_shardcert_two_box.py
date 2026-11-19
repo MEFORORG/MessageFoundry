@@ -944,6 +944,69 @@ async def test_engine_ladder_still_arms_a_well_formed_soak(
     assert result.rungs_armed == ["r0", "soak"]
 
 
+async def test_engine_ladder_still_soaks_when_ladder_stop_lands_just_after_the_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A STOP the drive posts just after the engine's DRIVE_START timeout is a normal early-stop,
+    not an unresponsive drive, so the soak still runs.
+
+    Mutation: read LADDER_STOP once, without the bounded poll. Red: no soak armed."""
+    import harness.load.shardcert_ladder as ladder
+    from harness.load.coord import LADDER_SOAK, LADDER_STOP, CoordTimeout
+
+    soak_calls: list[dict[str, Any]] = []
+    pending: list[asyncio.Task[None]] = []
+
+    async def late_stop() -> None:
+        await asyncio.sleep(0.3)
+        base.post(LADDER_STOP, {"stopped_at": "r0", "verdict": "collapsed"})
+        base.post(LADDER_SOAK, {"soak_rate": 10.0, "hold_seconds": 1.0, "drain_timeout": 1.0})
+
+    async def fake_engine(**kwargs: Any) -> Any:
+        run_id = kwargs["coord"].run_id
+        if run_id.endswith(".soak"):
+            soak_calls.append(kwargs)
+        elif run_id.endswith(".r1"):
+            pending.append(asyncio.create_task(late_stop()))
+            raise CoordTimeout("no DRIVE_START")
+        return _fake_engine_report(aborted=False)
+
+    monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
+    _no_payload(monkeypatch)
+    base = FileDropCoord(tmp_path / "coord", run_id="late")
+    kwargs = _engine_ladder_kwargs(base, tmp_path)
+    kwargs["stop_poll_grace"] = 3.0
+    result = await asyncio.wait_for(ladder.run_engine_ladder(**kwargs), timeout=20.0)
+    await asyncio.gather(*pending)
+    assert len(soak_calls) == 1, result.notes
+    assert result.rungs_armed == ["r0", "soak"], result.notes
+
+
+async def test_engine_ladder_clears_a_stale_soak_handshake_at_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The drive reads the soak's SHARDS_READY as soon as it posts LADDER_SOAK, so one an earlier
+    run left must be gone before the climb starts, not only when this half refuses the soak.
+
+    Mutation: drop the startup clear of the soak coord. Red: the stale file is still there."""
+    import harness.load.shardcert_ladder as ladder
+
+    seen: list[object] = []
+
+    async def fake_engine(**kwargs: Any) -> Any:
+        seen.append(base.for_run("stale.soak").read(SHARDS_READY))
+        return _fake_engine_report(aborted=True)
+
+    monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
+    _no_payload(monkeypatch)
+    base = FileDropCoord(tmp_path / "coord", run_id="stale")
+    base.for_run("stale.soak").post(SHARDS_READY, {"stale": True})
+    await asyncio.wait_for(
+        ladder.run_engine_ladder(**_engine_ladder_kwargs(base, tmp_path)), timeout=10.0
+    )
+    assert seen == [None]
+
+
 async def test_drive_ladder_launches_no_soak_after_a_climb_abort(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
