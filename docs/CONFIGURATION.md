@@ -2369,7 +2369,17 @@ hop's context, with no restart (BACKLOG #299). OpenSSL then uses the newest CRL 
 issuer. The engine applies a replaced file only when all three of these hold:
 
 1. The file passes the rules a start applies. Every CRL parses, has a `nextUpdate`, is not a delta CRL
-   and has not expired. Its BEGIN line starts a line: OpenSSL skips an indented CRL block, so the
+   and has not expired. No issuing distribution point limits it to attribute certificates or
+   some revocation reasons, or makes it indirect: with no extended CRL support turned on,
+   OpenSSL never judges a certificate by such a CRL. No critical extension OpenSSL does not
+   handle is on the CRL itself. None is on an entry whose extensions the engine can read.
+   OpenSSL refuses every peer it judges by a CRL with one (vault BACKLOG #5896). The engine skips
+   an entry whose extensions do not read, so a critical extension there is left to the handshake.
+   A CRL refused for its issuing distribution point or for a critical extension refuses the
+   whole file, even beside a usable CRL
+   from the same issuer. Where such a usable CRL is in the file, remove the refused one.
+   Otherwise replace it. A CRL of CA certificates only, or of user certificates only, is not
+   refused, though a hop whose chain needs the other kind fails at the handshake. Its BEGIN line starts a line: OpenSSL skips an indented CRL block, so the
    engine refuses one. A `-----BEGIN X509 CRL-----` marker inside a comment line refuses the file
    too, on purpose: the engine cannot tell that text from a CRL the file is meant to hold. Take
    the marker text out of the comment. The file carries no certificate the hop does not already
@@ -2413,8 +2423,9 @@ different things, the ERROR names the strongest: fix the file, then restart, the
 a restart for a file that is not in effect yet, it also says not to restart before that time.
 
 **A start checks each CRL's signature too (vault BACKLOG #2905).** When a hop builds its TLS context,
-the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
-the file in one case only, where it has proof. Three things all hold then. A listed CA has the
+at start or later for a hop that builds one per connection or per bind, the engine checks each CRL
+in the file against the CA certificates that hop already lists. It refuses a file for a bad
+signature in one case only, where it has proof. Three things all hold then. A listed CA has the
 CRL's issuer name, compared as OpenSSL compares it for the case of ASCII letters and exactly
 otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its
 key identifier. The engine ran the signature check with that key, and the check failed. Where
@@ -2456,9 +2467,25 @@ Each CRL in the file is judged on its own, as for an expired CRL. So a badly sig
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
 such a file was measured to pass its handshakes. Remove the bad copy.
 
-Anything short of that proof passes this check, and the engine logs one WARNING for the file. The
-file then loads unless another rule refuses it; on the API listener one such rule refuses some of
-these cases after that WARNING (the paragraph after this list says which). At least these three cases warn:
+On a hop that checks the whole client chain, the build also refuses a CRL whose signature
+verifies, when each listed CA the engine judges it by, as above, whose key verifies it carries a
+key usage extension without `cRLSign` (vault BACKLOG #5896, RFC 5280 section 6.3.3).
+OpenSSL refuses to take a CRL from such a CA, so every handshake judged by that CRL would fail
+with `key usage does not include CRL signing`. A CA with no key usage extension is not refused.
+A hop that checks only the peer's own certificate does not refuse that CRL. There, a root that
+signs only intermediates is never judged by its own CRL, so the file can still pass. Where the
+build succeeds, it logs a WARNING that names the first such CRL in the file. Another CA's CRL
+fixes nothing, since OpenSSL judges a peer by a CRL from its own issuer. Reissue that CA with
+`cRLSign` and give the setting a CRL it signs. Otherwise, on a whole-chain hop, remove the CA from
+the hop's CA setting where no peer's chain runs through it, and on a leaf hop remove the CRL where
+no peer the hop meets was issued by that CA. The running-hop reload and the expiry scan do not make
+this check.
+
+A CRL whose signature the engine can neither confirm nor prove bad is not refused for its
+signature. Where the build succeeds, the engine logs one WARNING for the file, which names the
+first three such CRLs and counts the rest. On a hop that checks the whole chain, the own-CRL
+rule refuses some of these cases, and the build then logs no WARNING (the paragraph after this
+list says which). At least these three cases read that way:
 
 - The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly but for
   the case of ASCII letters, which it folds as OpenSSL does (vault BACKLOG #3543), and then the
@@ -2509,23 +2536,24 @@ such a CRL, since it never loads. A CRL of the first bullet's kind can refuse to
 its issuer differs from a loaded CA's name only in white space and that CA did not sign it. Every
 other hop, at least each outbound hop, loads all three cases with the WARNING.
 
-If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
-it judged before the failure is proved badly signed, which refuses the file. On a hop that checks
-the whole chain, at least `[api].tls_client_crl_file` and an inbound listener's `tls_crl_file`, the
-rule that each loaded CA has a CRL of its own is applied too. Where that rule refuses the file, the
-start refuses with its reason, unless a CRL already judged is proved badly signed, and the ERROR is
-not logged. Where it loads, the
-CRLs it judged and could not confirm are reported in the WARNING too, which names the first three
-and counts the rest; one it verified is not reported. The CRLs after
-the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
+If the check itself fails part way, the CRLs after the failure are not judged, so a badly signed
+one there is not refused when the context is built (vault BACKLOG #3506). The verdicts reached
+before the failure still count. These refusals apply in this order, and the first that applies
+wins: a CRL proved badly signed; on a hop that checks the whole chain, at least
+`[api].tls_client_crl_file` and an inbound listener's `tls_crl_file`, a CRL from a CA whose key
+usage lacks `cRLSign`, as above; and on such a hop, the rule that each loaded CA has a CRL of its
+own. A refusal reached after the failure also says the check failed. Where none applies and the build
+succeeds, the engine logs an ERROR that says the check failed and how many CRLs it judged, and the
+WARNING above reports the CRLs it judged and could not confirm.
 
-The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
-engine process logs the WARNING once while the file keeps the same bytes, and the ERROR above
-once for each type of exception that ended the check. It keeps that record for one version only, the last one it logged either line for. So
-an earlier version is logged again when it returns after another version that was logged. A
-version in between that logged neither line does not reset the record. That includes at least one
-that verified, and one refused with no failure in the check. A version refused after the check failed part way did log
-its ERROR, so it does reset the record. A hop whose CA list
+**Each of these lines is logged only once the hop's TLS context has loaded the file and checks
+revocation with it, and the line says so. A build refused on the file logs none of them.** The
+hop's own builder can still refuse after that, at least on its cipher settings, and that refusal
+is logged as its own. OpenSSL checks each CRL's signature at every handshake it judges. An engine
+process logs each line once while the file keeps the same bytes, the ERROR once for each type of
+exception that ended the check, so a hop that builds a context per connection or per bind does
+not repeat it. A new version of the file logs again, and an earlier version is logged again when
+it returns after another version that was logged. A hop whose CA list
 gives a different result for the same file logs its own line, and each engine shard logs its own. A system
 root the hop has loaded counts as a listed CA, including one whose serial number is not positive,
 as at least some roots carry. A CRL whose authority key identifier carries such a serial is judged
@@ -2715,10 +2743,11 @@ connection's own `tls_ca_file`, whole, CRL blocks included. So does the syslog f
 CRLs are checked too, and past `nextUpdate` one refuses every peer under its issuer, except on a hop
 that sets `tls_allow_expired`, as **CRL files** above says. The expiry scan watches
 each one in a row labelled `held-crl:` and the CA file's path. The reload does not apply a changed CA
-file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. A start does
-not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It applies a CRL setting's
-start rules, with no clock skew, and checks each CRL's signature against the CA the file lists for
-its issuer. In at least these cases `detail` says to fix the CRL in the CA file before restarting.
+file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. The scan
+judges the CA file's CRL (BACKLOG #3176). It checks each CRL's
+signature against the CA the file lists for its issuer. It judges the CA file's CRLs as it did
+before vault BACKLOG #5896 and does not apply that item's refusals, so a start can refuse a CA file
+the scan passed. In at least these cases `detail` says to fix the CRL in the CA file before restarting.
 The CRL is expired, not yet in effect, a delta CRL, unreadable, or proven badly signed. For a CRL
 not yet in effect, `detail` offers a wait too. The hop's copy of that issuer's CRL may lapse before
 the new one takes effect. Then waiting refuses that issuer's peers in between, so replace the CRL

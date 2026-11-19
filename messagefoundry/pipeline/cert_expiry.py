@@ -711,9 +711,8 @@ def _ca_file_crl_refusal(
     ``None`` when its CRLs pass the checks below, or it holds none (BACKLOG #3176). "Might" is a
     signature the engine could not confirm (BACKLOG #3512).
 
-    Nothing judges a CA file's CRL at start, so a restart loads it whatever it is. The checks are a
-    CRL setting's start rules (:func:`~messagefoundry.config.tls_policy.judge_crl_bytes`, then
-    :func:`~messagefoundry.config.tls_policy.crl_not_in_effect` with no clock skew), then OpenSSL
+    The checks are :func:`~messagefoundry.config.tls_policy.judge_crl_bytes`, then
+    :func:`~messagefoundry.config.tls_policy.crl_not_in_effect` with no clock skew, then OpenSSL
     loading exactly the CRLs judged, then the signature check a start and the reload make
     (:func:`~messagefoundry.pki.judge_crl_signatures`): each CRL signed by the CA OpenSSL loads
     from this file for its issuer. Only a signature proven bad says handshakes fail;
@@ -726,7 +725,11 @@ def _ca_file_crl_refusal(
     check raises on a later CRL, after one in :data:`_UNCONFIRMED`, whatever the error's type.
     The file is then unjudged. ``on_unchecked`` must not raise: an error from it leaves this
     function. :meth:`_HeldCopyLog.unchecked_later_crl` logs its own failure instead. Each remedy
-    leads, because the alert instance keeps only the start of it."""
+    leads, because the alert instance keeps only the start of it.
+
+    **It does not apply vault BACKLOG #5896's refusals**: an out-of-scope CRL, a CRL with a
+    critical extension OpenSSL does not handle, or a CRL from a CA without ``cRLSign``. So a start
+    can refuse a CA file this passes."""
     if not crl_pem_blocks(pem):
         return None  # the CRL was moved out, and a CA file with none starts
     unjudged = (
@@ -735,8 +738,15 @@ def _ca_file_crl_refusal(
         "restart loads the CA file whole",
     )
     try:
-        # As the reload does: the time a CRL takes effect is asked below, for its own remedy.
-        _, blocks = judge_crl_bytes(pem, label="the CA file", now=now, require_in_effect=False)
+        # The time a CRL takes effect is asked below, for its own remedy. Vault BACKLOG #5896's
+        # refusals are off, so this judges the CRLs as it did before them (pki.judge_every_crl).
+        _, blocks = judge_crl_bytes(
+            pem,
+            label="the CA file",
+            now=now,
+            require_in_effect=False,
+            refuse_fail_closed=False,
+        )
     except ValueError:
         if file_facts is not None and file_facts.expired:
             return (
@@ -969,9 +979,7 @@ def _judge_crl(
                 )
                 is not None
             ):
-                # BACKLOG #3176: nothing judges a CA file's CRL at start, so a restart would load
-                # this one, which refuses peers under its issuer or, unconfirmed, might (#3512).
-                # Fix or check it first.
+                # BACKLOG #3176: fix or check it first.
                 why, remedy = unsafe
                 if not bundle_only:
                     # BACKLOG #3512: a stale copy from a CRL setting is what the reload judges
