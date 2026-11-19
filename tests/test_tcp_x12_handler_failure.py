@@ -517,3 +517,46 @@ async def test_x12_an_over_cap_interchange_in_the_remainder_is_named(
     lines = _unhandled_lines(caplog)
     assert len(lines) == 1 and "closed with 1 complete interchange(s)" in lines[0]
     assert "over-cap interchange that discarded the rest of the read" in lines[0]
+
+
+@pytest.mark.parametrize("tail", [EDI[:200], b"ISA"], ids=["cut-interchange", "stray-isa"])
+async def test_x12_a_partial_only_remainder_on_an_ordinary_close_does_not_cry_wolf(
+    caplog: pytest.LogCaptureFixture, tail: bytes
+) -> None:
+    # Every complete interchange was handled and the sender then hung up mid-interchange, or line
+    # noise carried a stray "ISA". Nothing complete was lost, so the note stays at DEBUG: at
+    # WARNING or ERROR, noise and connection churn could flood the log, one line per close.
+    seen: list[bytes] = []
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.x12"):
+        events = await _drive(
+            _no_reply(_x12), _ThenEof(EDI + tail), _Peer(), handler=_failing_for(0, seen)
+        )
+    assert seen == [EDI]
+    assert _kinds(events)[0] == "established"
+    lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
+    assert lines, "the partial is still named, at DEBUG"
+    assert all(r.levelno == logging.DEBUG for r in lines), [r.levelname for r in lines]
+    assert all("closed with 0 complete interchange(s)" in r.getMessage() for r in lines)
+
+
+async def test_x12_a_refused_reply_on_a_no_reply_inbound_carries_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # No reply is owed here, so a reply the charset policy refuses is skipped and recorded as
+    # `handler_error`, and the interchanges behind it are still handed on rather than dropped with
+    # a close.
+    source = _no_reply(lambda: _x12(encoding="ascii"))
+    seen: list[bytes] = []
+
+    async def refused_reply(raw: bytes) -> str:
+        seen.append(raw)
+        return "MSH?^~\\&?SYNTH’\r"
+
+    writer = _Peer()
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(source, _ThenEof(EDI * 3), writer, handler=refused_reply)
+    assert seen == [EDI] * 3, "every interchange is handed to the pipeline"
+    assert _kinds(events) == ["established"] + ["handler_error"] * 3 + ["closed"]
+    assert not writer.written
+    assert _unhandled_lines(caplog) == []
+    assert not any("SYNTH" in r.getMessage() for r in caplog.records), "the reply is never logged"

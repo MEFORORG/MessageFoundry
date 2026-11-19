@@ -878,7 +878,9 @@ class X12Source(SourceConnector):
         decoder's generator only reassembles bytes already in memory; it does no I/O and hands
         nothing on. The count is the record: no frame content is logged. A sender waiting for a
         reply resends on the close; one that waits for none never does (``hold_and_retry``), so for
-        it the loss is final and is logged at ERROR.
+        it the loss of a complete interchange is final and is logged at ERROR. A remainder that is
+        only a partial interchange loses nothing complete and is logged at DEBUG, so line noise or
+        connection churn cannot flood the log.
         """
         left = 0
         over_cap = False
@@ -899,8 +901,18 @@ class X12Source(SourceConnector):
         if not left and not over_cap and not partial:
             return
         resends = owes_hl7_reply(self.ack_mode, self.content_type)
+        # ERROR only for complete interchanges a non-resending sender has lost. A partial-only
+        # remainder is an ordinary close (EOF, idle, frame deadline) or line noise such as a stray
+        # "ISA": nothing complete was lost, and a line per close at WARNING could be flooded by
+        # connection churn, so it stays at DEBUG.
+        if left and not resends:
+            level = logging.ERROR
+        elif left or over_cap:
+            level = logging.WARNING
+        else:
+            level = logging.DEBUG
         logger.log(
-            logging.WARNING if resends else logging.ERROR,
+            level,
             "X12 connection from %s closed with %d complete interchange(s) from its last read not "
             "handed to the pipeline%s; none of it is recorded, %s",
             peer,
@@ -908,7 +920,9 @@ class X12Source(SourceConnector):
             ", then an over-cap interchange that discarded the rest of the read"
             if over_cap
             else (", and a partial interchange still arriving" if partial else ""),
-            "and the sender resends what it sent unanswered"
+            "but nothing complete was lost"
+            if level == logging.DEBUG
+            else "and the sender resends what it sent unanswered"
             if resends
             else "and this inbound's sender does not resend, so they are lost",
         )
@@ -1019,17 +1033,27 @@ class X12Source(SourceConnector):
                                 except (LookupError, UnicodeError) as exc:
                                     reply_fault = safe_exc(exc)
                                 if reply_fault is not None:
+                                    # A sender owed a reply waits on it, so close and let it
+                                    # resend. One owed none waits on nothing: closing would only
+                                    # drop the interchanges behind this one, so skip the reply and
+                                    # carry on.
+                                    owed = owes_hl7_reply(self.ack_mode, self.content_type)
                                     logger.error(
                                         "X12 reply to %s could not be encoded: %s; the interchange "
-                                        "is recorded, closing the connection",
+                                        "is recorded, %s",
                                         peer,
                                         reply_fault,
+                                        "closing the connection"
+                                        if owed
+                                        else "no reply is owed, so none is sent",
                                     )
-                                    failed = True
+                                    failed = owed
                                     await self._emit_event(
                                         "handler_error", peer_host=peer_host, reason=reply_fault
                                     )
-                                    break
+                                    if owed:
+                                        break
+                                    continue
                                 writer.write(wire)  # unframed: the interchange is the frame
                                 await self._drain_reply(writer)
                         if failed:
