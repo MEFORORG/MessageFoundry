@@ -147,9 +147,10 @@ async def test_a_grace_longer_than_the_margin_is_not_cut_short(
     margin once the queue had moved, so a grace longer than the margin was cut short.
 
     Buffer premise: the peer's slow read must be drain progress the sender can see, so both socket
-    buffers are sized small here. The grace starts when the writer finishes, which is when the
-    kernel has taken the bytes, not when the peer has read them. Default buffers on Linux can hold
-    megabytes, so the peer is still reading when the grace starts and its late ACKs miss it.
+    buffers are sized small here. The grace starts when the writer's last drain returns, which is
+    once the bytes have left the sender's transport buffer, not when the peer has read them.
+    Default buffers on Linux can hold megabytes, so the peer is still reading when the grace starts
+    and its late ACKs miss it.
     """
     import socket
 
@@ -176,9 +177,11 @@ async def test_a_grace_longer_than_the_margin_is_not_cut_short(
         await writer.drain()
         await reader.read()
 
-    server = await asyncio.start_server(slow_then_late_acks, "127.0.0.1", 0)
-    # Set on the listener, before any connection, so the accepted socket inherits it.
-    server.sockets[0].setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, peer_rcvbuf)
+    # Set on the listener before bind and listen, so the accepted socket starts with it.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, peer_rcvbuf)
+    listener.bind(("127.0.0.1", 0))
+    server = await asyncio.start_server(slow_then_late_acks, sock=listener)
     port = server.sockets[0].getsockname()[1]
     metrics = LiveMetrics(Counters(), Histogram(), Histogram())
     conn = sender.PersistentConnection(

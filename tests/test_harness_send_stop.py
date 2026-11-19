@@ -191,7 +191,8 @@ def test_a_windows_dial_failure_names_its_code_without_ctypes(
 ) -> None:
     """RED when: the Windows path builds its text another way than ``socket.errorTab``, such as
     ``ctypes.FormatError``, which section 11 of DANGEROUS-FUNCTIONALITY.md says no harness module
-    imports, or drops the ``winerror`` that picks the subclass."""
+    imports. On a real Windows host only, it is also RED when the ``winerror`` that picks the
+    subclass is dropped; elsewhere ``OSError`` ignores that argument."""
     real_windows = sys.platform == "win32"
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(socket, "errorTab", {10061: "Connection refused."}, raising=False)
