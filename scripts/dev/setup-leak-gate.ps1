@@ -106,6 +106,8 @@ if (Test-Path -LiteralPath $local) {
 # below against the scanner's own detector counts in the SAME run rather than trusting either alone.
 $envTokens = [Environment]::GetEnvironmentVariable('MEFOR_FORBIDDEN_TOKENS')
 $envEmpty = $false
+# Set only when the variable names a file: that file's ABSOLUTE path, handed to the scanner below.
+$tokenPath = $null
 if ($null -ne $envTokens) {
     $trimmed = $envTokens.Trim()
     if (-not $trimmed) {
@@ -118,7 +120,12 @@ if ($null -ne $envTokens) {
     else {
         $isFile = $false
         try { $isFile = Test-Path -LiteralPath $trimmed -PathType Leaf } catch { $isFile = $false }
-        if ($isFile) { $source = "MEFOR_FORBIDDEN_TOKENS -> $trimmed" }
+        if ($isFile) {
+            # Resolved HERE, against the caller's directory, because the scanner runs from $repo below
+            # and would otherwise read a relative path as inline token content (BACKLOG #5467).
+            $tokenPath = (Resolve-Path -LiteralPath $trimmed).ProviderPath
+            $source = "MEFOR_FORBIDDEN_TOKENS -> $tokenPath"
+        }
         # NEVER echo the value. A non-path value IS the token list, carried inline; naming the variable
         # is the whole diagnostic, and printing its content would publish exactly what this protects
         # into whatever log the operator happened to be capturing.
@@ -136,13 +143,11 @@ else {
 }
 
 # --- verify: what can the gate actually SEE? -------------------------------------------------------
-# The checkout's own venv, in either layout: Windows puts the interpreter in Scripts\, POSIX in bin/
-# (BACKLOG #5467). Only with neither does it fall back to whatever `python` PATH offers.
-$py = 'python'
-foreach ($candidate in '.venv/Scripts/python.exe', '.venv/bin/python') {
-    $venvPy = Join-Path $repo $candidate
-    if (Test-Path -LiteralPath $venvPy -PathType Leaf) { $py = $venvPy; break }
-}
+# The checkout's own venv, in this platform's layout: Scripts\python.exe on Windows, bin/python on
+# POSIX (BACKLOG #5467). Only the platform's own layout is probed, since a POSIX venv's interpreter
+# cannot be launched on Windows. Without one it falls back to whatever `python` PATH offers.
+$venvPy = Join-Path $repo $(if ($IsWindows) { '.venv/Scripts/python.exe' } else { '.venv/bin/python' })
+$py = if (Test-Path -LiteralPath $venvPy -PathType Leaf) { $venvPy } else { 'python' }
 Write-Host ''
 Write-Host 'Verifying the gate can see:' -ForegroundColor Cyan
 # Run FROM the derived repo root (BACKLOG #5467). With no path argument the scanner lists the tracked
@@ -151,6 +156,8 @@ Write-Host 'Verifying the gate can see:' -ForegroundColor Cyan
 # checkout's tokens -- and outside any git directory it failed outright -- which is the same
 # wrong-checkout class the $repo derivation above closes for the install (BACKLOG #1063).
 Push-Location -LiteralPath $repo
+$savedTokens = $envTokens
+if ($tokenPath) { $env:MEFOR_FORBIDDEN_TOKENS = $tokenPath }
 try {
     $out = & $py $scanner --require-tokens 2>&1
     # Captured on the very next line, before any other native call can overwrite it. The scanner's
@@ -160,6 +167,7 @@ try {
 }
 finally {
     Pop-Location
+    if ($tokenPath) { $env:MEFOR_FORBIDDEN_TOKENS = $savedTokens }
 }
 $loaded = $out | Where-Object { $_ -match 'loaded names=' } | Select-Object -First 1
 if (-not $loaded) { Write-Host ($out | Select-Object -Last 5); throw 'Scanner produced no detector-count line.' }
@@ -188,8 +196,8 @@ if ($scanExit -ne 0) {
     Write-Host "  token source: $source"
     # Its output is NOT reprinted here: a hit line can quote matched content, and copying that into a
     # terminal scrollback, a ticket or a CI log is the disclosure this whole gate exists to prevent.
-    Write-Host '  Re-run the scanner yourself, from this checkout, to see why, and do not paste its output anywhere:' -ForegroundColor Red
-    Write-Host "      cd `"$repo`"; & `"$py`" scripts/security/scan_forbidden.py --require-tokens"
+    Write-Host "  Re-run the scanner yourself, from $repo, to see why, and do not paste its output anywhere:" -ForegroundColor Red
+    Write-Host "      $py scripts/security/scan_forbidden.py --require-tokens"
     exit $scanExit
 }
 if ($loaded -match 'SYNTHETIC') {

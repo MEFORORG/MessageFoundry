@@ -95,7 +95,8 @@ def _checkout(path: Path) -> Path:
 def _python_shim(path: Path) -> Path:
     """A directory holding a ``python`` that forwards to THIS interpreter.
 
-    The script resolves ``<repo>/.venv/Scripts/python.exe`` or falls back to bare ``python`` on PATH.
+    The script resolves the checkout's venv interpreter (``<repo>/.venv/Scripts/python.exe`` on
+    Windows, ``<repo>/.venv/bin/python`` on POSIX) or falls back to bare ``python`` on PATH.
     A temp checkout has no venv, so the verify step would otherwise depend on whichever ``python`` the
     runner happens to expose -- which is why the neighbouring anchoring test declines to assert the
     verify step at all. The shim makes the interpreter an INPUT of the test rather than an accident of
@@ -130,6 +131,10 @@ def _env(shim: Path, **over: str) -> dict[str, str]:
         "MEFOR_MIN_DETECTORS",
         "PYTHONIOENCODING",
         "PYTHONUTF8",
+        # A GIT_DIR or GIT_WORK_TREE exported by a hook running the suite would put a directory the
+        # tests treat as outside any checkout inside one.
+        "GIT_DIR",
+        "GIT_WORK_TREE",
     ):
         env.pop(var, None)
     env["PATH"] = str(shim) + os.pathsep + env.get("PATH", "")
@@ -351,7 +356,13 @@ def test_the_verify_step_runs_from_outside_any_git_directory(
     root, shim, _ = rig
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    proc = _run(root, "-Synthetic", env=_env(shim), cwd=elsewhere)
+    env = _env(shim)
+    # The premise: a basetemp inside a checkout would make this a git directory after all.
+    probe = subprocess.run(
+        ["git", "rev-parse", "--git-dir"], cwd=str(elsewhere), capture_output=True, env=env
+    )
+    assert probe.returncode != 0, "the test's 'outside any git directory' premise does not hold"
+    proc = _run(root, "-Synthetic", env=env, cwd=elsewhere)
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "CONFIGURED (synthetic)" in proc.stdout, proc.stdout
@@ -404,3 +415,21 @@ def test_a_posix_venv_interpreter_is_used(rig: tuple[Path, Path, Path], tmp_path
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert marker.exists(), "the checkout's .venv/bin/python was not used"
+
+
+def test_a_relative_env_token_path_is_resolved_against_the_callers_directory(
+    rig: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """The scanner runs from the derived checkout, so a relative ``MEFOR_FORBIDDEN_TOKENS`` path must
+    be resolved where the operator typed it; read from the checkout, it would be taken as inline
+    token content and load nothing while the script named the file as the source."""
+    root, shim, ext = rig
+    caller = tmp_path / "caller-rel"
+    caller.mkdir()
+    shutil.copy2(ext, caller / "tok.txt")
+    proc = _run(root, "-Synthetic", env=_env(shim, MEFOR_FORBIDDEN_TOKENS="tok.txt"), cwd=caller)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "STRUCTURAL-ONLY" not in _loaded(proc), _loaded(proc)
+    assert "SYNTHETIC" not in _loaded(proc), "the env file was not the source loaded"
+    assert str(caller / "tok.txt") in _source_line(proc), _source_line(proc)
