@@ -1157,7 +1157,7 @@ UNCONFIRMED_SIGNATURE: dict[CrlSignatureState, str] = {
     ),
 }
 
-#: What a whole-chain start's refusal, and a leaf start's WARNING, say of a CRL whose
+#: What a whole-chain build's refusal, and a leaf build's WARNING, say of a CRL whose
 #: :attr:`CrlSignature.without_crl_sign` is set, after the block (vault BACKLOG #5896).
 NO_CRL_SIGN = (
     "is signed by a CA certificate this hop trusts whose key usage does not include cRLSign. A "

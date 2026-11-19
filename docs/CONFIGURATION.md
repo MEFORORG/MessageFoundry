@@ -2399,8 +2399,9 @@ different things, the ERROR names the strongest: fix the file, then restart, the
 a restart for a file that is not in effect yet, it also says not to restart before that time.
 
 **A start checks each CRL's signature too (vault BACKLOG #2905).** When a hop builds its TLS context,
-the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
-the file for its signature in one case only, where it has proof. Three things all hold then. A listed CA has the
+at start or later for a hop that builds one per connection or per bind, the engine checks each CRL
+in the file against the CA certificates that hop already lists. It refuses a file for a bad
+signature in one case only, where it has proof. Three things all hold then. A listed CA has the
 CRL's issuer name, compared as OpenSSL compares it for the case of ASCII letters and exactly
 otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its
 key identifier. The engine ran the signature check with that key, and the check failed. Where
@@ -2442,21 +2443,22 @@ Each CRL in the file is judged on its own, as for an expired CRL. So a badly sig
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
 such a file was measured to pass its handshakes. Remove the bad copy.
 
-A start also refuses a CRL whose signature verifies, on a hop that checks the whole client
-chain, when every listed CA the engine judges it by, as above, and whose key verifies it carries
-a key usage extension without `cRLSign` (vault BACKLOG #5896, RFC 5280 section 6.3.3). OpenSSL
-refuses to take a CRL from such a CA, so every handshake judged by that CRL would fail with
-`key usage does not include CRL signing`. A CA with no key usage extension is not refused. A
-hop that checks only the peer's own certificate loads the file and logs a WARNING instead.
-There, a root that signs only intermediates is never judged by its own CRL, so the file can
-still pass. The WARNING is logged as the one for an unconfirmed signature is, not once per
-connection, and names only the first such CRL in the file.
-Sign the CRL with a CA whose key usage includes `cRLSign`, or reissue the CA with it. The
-running-hop reload and the expiry scan do not make this check.
+On a hop that checks the whole client chain, the build also refuses a CRL whose signature
+verifies when every listed CA the engine judges it by, as above, and whose key verifies it
+carries a key usage extension without `cRLSign` (vault BACKLOG #5896, RFC 5280 section 6.3.3).
+OpenSSL refuses to take a CRL from such a CA, so every handshake judged by that CRL would fail
+with `key usage does not include CRL signing`. A CA with no key usage extension is not refused.
+A hop that checks only the peer's own certificate does not refuse that CRL. There, a root that
+signs only intermediates is never judged by its own CRL, so the file can still pass. Where the
+build succeeds, it logs a WARNING that names the first such CRL in the file. Sign the CRL with a
+CA whose key usage includes `cRLSign`, or reissue the CA with it. The running-hop reload and the
+expiry scan do not make this check.
 
-Anything short of a proof of a bad signature passes this check, and the engine logs one WARNING for the file. The
-file then loads unless another rule refuses it. On a hop that checks the whole chain, one such rule
-refuses some of these cases first, and no WARNING is logged (the paragraph after this list says which). At least these three cases warn:
+A CRL whose signature the engine can neither confirm nor prove bad is not refused for its
+signature. Where the build succeeds, the engine logs one WARNING for the file, which names the
+first three such CRLs and counts the rest. On a hop that checks the whole chain, the own-CRL
+rule refuses some of these cases, and the build then logs no WARNING (the paragraph after this
+list says which). At least these three cases read that way:
 
 - The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly but for
   the case of ASCII letters, which it folds as OpenSSL does (vault BACKLOG #3543), and then the
@@ -2507,31 +2509,24 @@ such a CRL, since it never loads. A CRL of the first bullet's kind can refuse to
 its issuer differs from a loaded CA's name only in white space and that CA did not sign it. Every
 other hop, at least each outbound hop, loads all three cases with the WARNING.
 
-If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
-it judged before the failure is proved badly signed, which refuses the file. On a hop that checks
-the whole chain, at least `[api].tls_client_crl_file` and an inbound listener's `tls_crl_file`, the
-rule that each loaded CA has a CRL of its own is applied too. Where that rule refuses the file, the
-start refuses with its reason, unless a CRL already judged is proved badly signed, and the ERROR is
-not logged. On those hops a judged CRL from a CA whose key usage lacks `cRLSign`, as above, refuses
-the start too. That refusal comes before the own-CRL rule's, and the ERROR is not logged then
-either. Where it loads, the
-CRLs it judged and could not confirm are reported in the WARNING too, which names the first three
-and counts the rest; one it verified is not reported. The CRLs after
-the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
+If the check itself fails part way, the CRLs after the failure are not judged, so a badly signed
+one there is not refused when the context is built (vault BACKLOG #3506). The verdicts reached
+before the failure still count. These refusals apply in this order, and the first that applies
+wins: a CRL proved badly signed; on a hop that checks the whole chain, at least
+`[api].tls_client_crl_file` and an inbound listener's `tls_crl_file`, a CRL from a CA whose key
+usage lacks `cRLSign`, as above; and on such a hop, the rule that each loaded CA has a CRL of its
+own. Where none applies and the build
+succeeds, the engine logs an ERROR that says the check failed and how many CRLs it judged, and the
+WARNING above reports the CRLs it judged and could not confirm.
 
-The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
-engine process logs the WARNING once while the file keeps the same bytes, and the ERROR above
-once for each type of exception that ended the check. A leaf hop's WARNING for a CA without
-`cRLSign`, above, shares this record. It keeps that record for one version only, the last one it
-logged any of these lines for. So
-an earlier version is logged again when it returns after another version that was logged. A
-version in between that logged none of these lines does not reset the record. That includes at least one
-this signature check refused with no failure in it. It also includes one whose CRLs all verified,
-unless a leaf hop logged the `cRLSign` WARNING for it. A version refused after the check failed
-part way logged its ERROR and resets the record, except at least in two cases on a whole-chain hop.
-One is where the own-CRL rule would refuse the file. The other is where a judged CRL comes from a
-CA whose key usage lacks `cRLSign`. There the ERROR is not logged, so the record is not reset. A
-hop whose CA list
+**Each of these lines is logged only once the hop's TLS context has loaded the file and checks
+revocation with it, and the line says so. A build refused on the file logs none of them.** The
+hop's own builder can still refuse after that, at least on its cipher settings, and that refusal
+is logged as its own. OpenSSL checks each CRL's signature at every handshake it judges. An engine
+process logs each line once while the file keeps the same bytes, the ERROR once for each type of
+exception that ended the check, so a hop that builds a context per connection or per bind does
+not repeat it. A new version of the file logs again, and an earlier version is logged again when
+it returns after another version that was logged. A hop whose CA list
 gives a different result for the same file logs its own line, and each engine shard logs its own. A system
 root the hop has loaded counts as a listed CA, including one whose serial number is not positive,
 as at least some roots carry. A CRL whose authority key identifier carries such a serial is judged

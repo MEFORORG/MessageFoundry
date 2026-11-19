@@ -35,7 +35,13 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry import pki as pki_module
 from messagefoundry.config import loaded_crls
-from messagefoundry.config.tls_policy import harden_crl_check, judge_crl_bytes
+from messagefoundry.config.tls_policy import (
+    _CRL_JUDGMENT_FAILED,
+    _CRL_SIGN_MISSING_ON_LEAF,
+    _CRL_UNCONFIRMED,
+    harden_crl_check,
+    judge_crl_bytes,
+)
 from messagefoundry.pki import NO_CRL_SIGN, judge_crl_signatures
 from tests.test_crl_reload import _key_pem, _leaf
 from tests.test_crl_signature_at_start import _ders, _hop, _raw_hop
@@ -47,6 +53,9 @@ _PEM = serialization.Encoding.PEM
 _NAME = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-5896-ca")])
 _PRIVATE = x509.ObjectIdentifier("1.3.6.1.4.1.55555.5896.1")
 _SETTING = "[tls].crl_file"
+#: What every CRL-signature line says, once a build has loaded the file.
+_LOADED = "This TLS context loaded the file and checks revocation with it"
+_TLS_LOGGER = "messagefoundry.config.tls_policy"
 
 
 @pytest.fixture(autouse=True)
@@ -338,7 +347,7 @@ def test_the_leaf_hop_crl_sign_warning_is_not_repeated_per_build(
             pki.hop(crl)
         assert warned() == 1
         assert any(
-            NO_CRL_SIGN in r.getMessage() and "is used unless a later check" in r.getMessage()
+            NO_CRL_SIGN in r.getMessage() and _LOADED.lower() in r.getMessage().lower()
             for r in caplog.records
         )
         # Control: a new version of the file logs again.
@@ -374,3 +383,95 @@ def test_a_ca_without_key_usage_is_not_refused(tmp_path: Path) -> None:
     )
     [signature] = judge_crl_signatures(_crl(key), [ca.public_bytes(serialization.Encoding.DER)])
     assert signature.state == "verified" and not signature.without_crl_sign
+
+
+# --- the lines are logged only once the build's outcome is known --------------------------------
+
+_OTHER = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-5896-stranger")])
+
+
+def _opening(template: str) -> str:
+    """The fixed words a line template starts with after its label, to find the line by."""
+    return template.removeprefix("%s: ").split("%", 1)[0]
+
+
+def _stranger_crl() -> bytes:
+    """A current CRL from an issuer no CA in these tests carries, so its signature is unlisted."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    return (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(_OTHER)
+        .last_update(_NOW - _DAY)
+        .next_update(_NOW + 7 * _DAY)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key()), False)
+        .sign(key, hashes.SHA256())
+        .public_bytes(_PEM)
+    )
+
+
+def _lines(caplog: pytest.LogCaptureFixture, template: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if _opening(template) in r.getMessage()]
+
+
+def test_a_refused_whole_chain_build_logs_no_line_about_the_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A file holding a CRL from a CA without cRLSign and an unlisted CRL: a whole-chain build
+    refuses it on the first and logs neither the unconfirmed WARNING nor the cRLSign one."""
+    pki = _Pki(tmp_path, crl_sign=False)
+    crl = pki.crl_file(_crl(pki.key) + _stranger_crl())
+    whole_chain = ssl.create_default_context(cafile=str(pki.ca_file))
+    with (
+        caplog.at_level(logging.WARNING, logger=_TLS_LOGGER),
+        pytest.raises(ValueError, match="does not include cRLSign"),
+    ):
+        harden_crl_check(whole_chain, str(crl), setting=_SETTING, chain=True)
+    assert not [r for r in caplog.records if r.name == _TLS_LOGGER]
+
+    # Control: the leaf build of the same file loads it and logs both lines, each saying so.
+    with caplog.at_level(logging.WARNING, logger=_TLS_LOGGER):
+        pki.hop(crl)
+    for template in (_CRL_UNCONFIRMED, _CRL_SIGN_MISSING_ON_LEAF):
+        (line,) = _lines(caplog, template)
+        assert _LOADED.lower() in line.getMessage().lower()
+
+
+def test_a_whole_chain_crl_sign_refusal_after_a_failure_logs_no_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The judgment fails on block 2, after block 1 reads verified from a CA without cRLSign. The
+    whole-chain build refuses on block 1 and logs no ERROR, the failure riding as the refusal's
+    cause. The leaf build of the same file is the control: it loads, and logs the ERROR once and
+    the cRLSign WARNING once, however many contexts it builds."""
+    pki = _Pki(tmp_path, crl_sign=False)
+    crl = pki.crl_file(_crl(pki.key) + _crl(pki.key))
+    real = pki_module._signature_state
+    calls = 0
+
+    def second_fails(
+        crl: x509.CertificateRevocationList, cas: list[pki_module._ListedCa]
+    ) -> pki_module.CrlSignatureState:
+        nonlocal calls
+        calls += 1
+        if calls % 2 == 0:
+            raise RuntimeError("a defect in the check")
+        return real(crl, cas)
+
+    monkeypatch.setattr(pki_module, "_signature_state", second_fails)
+    whole_chain = ssl.create_default_context(cafile=str(pki.ca_file))
+    with (
+        caplog.at_level(logging.WARNING, logger=_TLS_LOGGER),
+        pytest.raises(ValueError, match="does not include cRLSign") as refused,
+    ):
+        harden_crl_check(whole_chain, str(crl), setting=_SETTING, chain=True)
+    assert isinstance(refused.value.__cause__, RuntimeError)
+    assert not [r for r in caplog.records if r.name == _TLS_LOGGER]
+
+    with caplog.at_level(logging.WARNING, logger=_TLS_LOGGER):
+        for _ in range(2):
+            pki.hop(crl)
+    (error,) = _lines(caplog, _CRL_JUDGMENT_FAILED)
+    assert error.levelno == logging.ERROR and error.exc_info is not None
+    assert "after judging 1 of them" in error.getMessage()
+    assert _LOADED in error.getMessage()
+    assert len(_lines(caplog, _CRL_SIGN_MISSING_ON_LEAF)) == 1
