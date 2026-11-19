@@ -63,6 +63,12 @@ class SecretProviderError(RuntimeError):
     store KeyProvider's :class:`~messagefoundry.store.keyprovider.KeyProviderError`."""
 
 
+class _UnnamedReferenceError(SecretProviderError):
+    """A refusal that leaves the reference out of its text (BACKLOG #5326), so it does not say which
+    credential failed. :func:`resolve_connector_secret` re-raises it with the credential's setting in
+    front. Other providers' refusals pass through unchanged, since callers compare their text."""
+
+
 @runtime_checkable
 class SecretProvider(Protocol):
     """How a named connector credential is sourced (ADR 0019 §5).
@@ -88,11 +94,11 @@ class EnvSecretProvider:
         if value is None or not value.strip():
             # The refusal does not repeat the reference (BACKLOG #5326): an operator may have pasted
             # the secret itself where its variable name belongs, and the text reaches the log.
-            raise SecretProviderError(
+            # resolve_connector_secret names the credential's setting instead.
+            raise _UnnamedReferenceError(
                 "[secrets].provider='env': the secret reference names an environment variable that "
-                "is unset, empty or whitespace-only. Set it, or correct the reference: a *_secret or "
-                "*_ref setting read through this provider. The reference is not repeated here, in "
-                "case a secret was placed in it by mistake."
+                "is unset, empty or whitespace-only. Set it, or correct the reference. The reference "
+                "is not repeated here, in case a secret was placed in it by mistake."
             )
         return value
 
@@ -186,6 +192,8 @@ def resolve_connector_secret(
       on a missing/erroring secret).
 
     ``label`` names the credential (e.g. ``"[auth].ad_bind_password"``) for the error only — never a value.
+    A refusal that leaves the reference out (``env``, BACKLOG #5326) is re-raised with ``label`` in
+    front, so it still says which credential to correct.
     """
     if not ref:
         return literal
@@ -195,4 +203,7 @@ def resolve_connector_secret(
             f"('none'). Set [secrets].provider (e.g. 'vault'), or remove the reference to use the "
             f"environment-sourced value."
         )
-    return provider.resolve(ref)
+    try:
+        return provider.resolve(ref)
+    except _UnnamedReferenceError as exc:
+        raise SecretProviderError(f"{label}: {exc}") from exc
