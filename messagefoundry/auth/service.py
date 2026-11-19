@@ -2124,6 +2124,15 @@ class FactorEnrolmentRequired(ValueError):
         super().__init__(ENROL_AUTHENTICATOR_FIRST)
 
 
+class PasswordChangeNotApplied(RuntimeError):
+    """The password write matched no row although the caller's account is still there: its record
+    changed between the read and the write, so nothing was set (BACKLOG #5902). Raised rather than
+    reporting a change that did not land; the route answers 409 and the caller tries again."""
+
+    def __init__(self) -> None:
+        super().__init__("the account changed while the password was being set; try again")
+
+
 #: ADR 0207 section 3: an enrolment code lives 24 hours from issue, fixed rather than a setting. That
 #: is the ADR's recommended answer to its open lifetime item, and Amendment A6 records the trade: a
 #: shorter life would expire codes handed over late in a day, and each re-issue is one more handover.
@@ -2263,8 +2272,10 @@ USER_SEAL_REFUSED: Final = "the user record fails its integrity check, so it was
 
 class UserSealRefused(RuntimeError):
     """:meth:`AuthService.checked_user` found the account's row, and its record fails its integrity
-    seal (BACKLOG #5520). The failure was handed to the seal-failure report, which writes the audit
-    row and raises the alert only for the first failure of the account in each report interval
+    seal (BACKLOG #5520). :meth:`AuthService.change_password` raises it too, from that read or
+    from the store write's own seal refusal, each reported the same way, and ``POST /me/password``
+    answers it 423 (BACKLOG #5902). The failure was handed to the seal-failure report, which
+    writes the audit row and raises the alert only for the first failure of the account in each report interval
     (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
     service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
     may still delete it. The admin routes answer it 423. A record Vault transit cannot verify is
@@ -13347,7 +13358,8 @@ class AuthService:
 
     async def checked_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its whole record checked against its seal, for a caller
-        outside this service that SHOWS it (BACKLOG #5520). ``None`` when no row is there. Raises
+        outside this service that SHOWS it (BACKLOG #5520), and for :meth:`change_password`, which
+        decides on it (BACKLOG #5902), so its raise-or-``None`` contract binds that control too. ``None`` when no row is there. Raises
         :class:`UserSealRefused` only when :meth:`_verified` established that the record fails,
         or :meth:`_checked_by_id` failed closed, and handed that to the seal-failure report, so
         the caller can say so rather than answer "no such user". A record Vault transit cannot
@@ -13419,8 +13431,8 @@ class AuthService:
     async def _user_seal_unverifiable(
         self, user_id: str, exc: TransitSealUnverifiableError | RowSealUnverifiableError
     ) -> None:
-        """Report an account whose record Vault transit could not verify on an admin read, or at
-        a directory rename's write (ADR 0217 (a); vault BACKLOG #3069 note T2): a page through the store's :class:`~messagefoundry.store.row_seal.SealPager` under the
+        """Report an account whose record Vault transit could not verify on an admin read, at a
+        password change (BACKLOG #5902), or at a directory rename's write (ADR 0217 (a); vault BACKLOG #3069 note T2): a page through the store's :class:`~messagefoundry.store.row_seal.SealPager` under the
         row's capped Unverifiable subject, then a WARNING and a soft
         :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` row carrying the triage versions. Throttled per
         account on a key of its own, so it never holds back the account's Forged report."""
@@ -16360,6 +16372,25 @@ class AuthService:
         Returns policy violations (empty list = changed). No-op-safe for AD identities at the API
         layer, which rejects password changes for AD users before calling this.
 
+        **A write that matched no row is never reported as a change** (BACKLOG #5902). The
+        caller's record is read through :meth:`checked_user` before the policy check, so a gone row
+        raises ``ValueError("no such user")`` whatever password was typed, and a row whose record
+        fails its seal, or that Vault transit cannot verify, raises :class:`UserSealRefused` with
+        nothing written: with no checked record the MFA requirement's coverage cannot be judged,
+        and writing anyway would drop the way-past condition below. A Vault transit Outage raises
+        :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError`. The store write's own
+        seal refusal is answered as the read's is. A write that matched no row re-reads the record:
+        gone is ``ValueError("no such user")``; a covered account with no way past left is
+        :class:`FactorEnrolmentRequired`; anything else is :class:`PasswordChangeNotApplied`. A
+        covered row deleted while either way-past check runs is ``ValueError("no such user")``
+        too, not an enrolment refusal. A deletion that lands after the write has committed is not
+        caught: that change is reported as made. So is one whose ``auth.password_changed`` row the
+        store refuses (:func:`~messagefoundry.store.base.audit_write_errors`), logged at ERROR. A
+        session revoke that fails past its retries still raises, as :meth:`_revoke_after_commit`
+        says. The notice goes to the address the checked read held.
+        :class:`BreachCorpusUnavailable` propagates from the policy check unchanged: the password
+        is refused, never accepted unscreened.
+
         **Raises :class:`FactorEnrolmentRequired` while ``[security].require_mfa`` covers the account
         and it holds no factor with a way past the sign-in lock** (ADR 0197 Amendment A, N-B2 part 4).
         The rotation ends every session, the holder's own included, so without this a holder who does
@@ -16378,35 +16409,97 @@ class AuthService:
         before the current password. Without the ``[webauthn]`` extra the write counts no passkey,
         as :meth:`_has_way_past` counts none.
         """
+        user = await self.checked_user(identity.user_id)
+        if user is None:
+            # BACKLOG #5902: the caller's row was deleted after its session was resolved. Asked
+            # before the policy, so the answer does not depend on the password typed, and before the
+            # hash, so no password_changed row is written for an absent account.
+            raise ValueError("no such user")
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
-        user = await self._load_user(identity.user_id)
-        covered = user is not None and self._covered_by_requirement(user, identity.roles)
-        if covered and user is not None:
-            await self._refuse_rotation_without_way_past(user)
-        written = await self._store.set_password(
-            identity.user_id,
-            password_hash=await self._argon2(hash_password, new_password),
-            must_change_password=must_change,
-            password_generated=False,
-            require_way_past=_opened_totp_state if covered else None,
-            # Without the [webauthn] extra no passkey can sign in, so the write counts none, as
-            # _has_way_past counts none (BACKLOG #3948).
-            passkey_counts=self._gate_counts if webauthn.available() else _passkey_counts_nothing,
-        )
-        if not written and covered:
-            raise FactorEnrolmentRequired()
+        covered = self._covered_by_requirement(user, identity.roles)
+        gone = False
+        if covered:
+            try:
+                await self._refuse_rotation_without_way_past(user)
+            except FactorEnrolmentRequired:
+                # A row deleted meanwhile takes its factors with it, so it reads as one with no way
+                # past; it is answered as gone, not as an account that must enrol (BACKLOG #5902).
+                if await self.checked_user(identity.user_id) is not None:
+                    raise
+                gone = True
+        if gone:
+            raise ValueError("no such user")
+        # Without the [webauthn] extra no passkey can sign in, so the write counts none, as
+        # _has_way_past counts none (BACKLOG #3948).
+        passkey_counts = self._gate_counts if webauthn.available() else _passkey_counts_nothing
+        try:
+            written = await self._store.set_password(
+                identity.user_id,
+                password_hash=await self._argon2(hash_password, new_password),
+                must_change_password=must_change,
+                password_generated=False,
+                require_way_past=_opened_totp_state if covered else None,
+                passkey_counts=passkey_counts,
+            )
+        except RowSealError as exc:
+            # The record passed its seal at the read above and failed it at the write, which wrote
+            # nothing: refused and reported as the read refuses and reports it (BACKLOG #5902).
+            if exc.kind != USER_KIND:
+                raise
+            await self._user_seal_failed(user.id)
+            raise UserSealRefused(USER_SEAL_REFUSED) from exc
+        except RowSealUnverifiableError as exc:
+            if exc.kind != USER_KIND:
+                raise
+            await self._user_seal_unverifiable(user.id, exc)
+            raise UserSealRefused(USER_SEAL_REFUSED) from exc
+        except TransitSealUnavailableError:
+            self._user_seal_outage("password change")
+            raise
+        if not written:
+            # A row deleted between the read above and the write is told apart from a lost way
+            # past, and a covered account that still has a way past lost only a compare to another
+            # write, so neither a success nor a false enrolment refusal is reported (BACKLOG #5902).
+            # The early refusal judges the re-read, with its guards for a passkey cell that does
+            # not decode, so such a cell is the enrolment refusal here too, not an error.
+            after = await self.checked_user(identity.user_id)
+            if after is None:
+                raise ValueError("no such user")
+            if covered:
+                try:
+                    await self._refuse_rotation_without_way_past(after)
+                except FactorEnrolmentRequired:
+                    # As at the early check: a row deleted during this re-judge is gone, not an
+                    # account that must enrol (BACKLOG #5902).
+                    if await self.checked_user(identity.user_id) is not None:
+                        raise
+                    gone = True
+            if gone:
+                raise ValueError("no such user")
+            raise PasswordChangeNotApplied()
         await self._revoke_after_commit(
             identity.user_id, change="password_changed", actor=identity.username, client=client
         )
-        await self._audit("auth.password_changed", actor=identity.username, client=client)
-        user = await self._load_user(identity.user_id)
+
+        async def row() -> None:
+            await self._audit("auth.password_changed", actor=identity.username, client=client)
+
+        # The change has committed, so a store refusal of its row must not report it as failed
+        # (BACKLOG #5902); the loss is logged, and a defect still raises.
+        await write_audit_soft(
+            row,
+            log=_log,
+            message="the auth.password_changed row of a committed password change could not be"
+            " written",
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
+        # The address the checked read above held: a re-read after the commit could only turn a
+        # committed change into a refusal (BACKLOG #5902).
         await self._notify_security(
-            PASSWORD_CHANGED,
-            username=identity.username,
-            email=user.notify_email if user is not None else None,
-            client=client,
+            PASSWORD_CHANGED, username=identity.username, email=user.notify_email, client=client
         )
         return []
 
@@ -16420,8 +16513,9 @@ class AuthService:
         read, and elsewhere it reads the set through :meth:`_verified_passkeys`, so a row that does
         not parse is no exception and a set that fails its seal is reported. Such a set counts for
         nothing, and so does one with a cell the driver cannot decode while fetching
-        (:func:`passkey_cell_undecodable`), as the census counts it. Any other read error raises,
-        before the hash. Where the TOTP counts, the store's write confirms it under its lock and
+        (:func:`passkey_cell_undecodable`), as the census counts it. A record that Vault transit
+        cannot verify when that read re-reads it raises :class:`UserSealRefused`, reported. Any
+        other read error raises, before the hash. Where the TOTP counts, the store's write confirms it under its lock and
         reads no passkey (:func:`~messagefoundry.store.store.way_past_passkeys`); where it no
         longer counts there, the write reads the set, and one that cannot be read counts for
         nothing, so the write declines after the hash and ``change_password`` raises the
@@ -16432,6 +16526,12 @@ class AuthService:
         try:
             if await self._holds_gate_passkey(user):
                 return
+        except TransitSealUnverifiableError as exc:
+            # _verified_passkeys re-reads the record on a digest mismatch, and Vault transit may
+            # not verify it then: refused and reported as checked_user refuses and reports it, so
+            # the change answers the 423 rather than an unhandled error (BACKLOG #5902).
+            await self._user_seal_unverifiable(user.id, exc)
+            raise UserSealRefused(USER_SEAL_REFUSED) from exc
         except UnicodeDecodeError:
             # The class name only: a decode error's message quotes the cell, so the arm binds no
             # name. Throttled per account, as _verified_passkeys throttles a row that does not parse.

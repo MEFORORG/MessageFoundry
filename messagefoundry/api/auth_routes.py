@@ -135,6 +135,7 @@ from messagefoundry.auth.audit_visibility import (
 )
 from messagefoundry.auth.ldap import LdapError, canonical_group_dn
 from messagefoundry.auth.permissions import CustomRoleError
+from messagefoundry.auth.policy import BreachCorpusUnavailable
 from messagefoundry.auth.service import (
     ENROL_AUTHENTICATOR_FIRST,
     STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_ISSUE,
@@ -165,6 +166,7 @@ from messagefoundry.auth.service import (
     InvalidUsername,
     LastAdministratorRefused,
     NotifyEmailAlreadySet,
+    PasswordChangeNotApplied,
     SelfTargetOp,
     TemporaryPasswordUnavailable,
     UsernameTaken,
@@ -857,6 +859,30 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         except FactorEnrolmentRequired as exc:
             raise HTTPException(status.HTTP_403_FORBIDDEN, ENROL_AUTHENTICATOR_FIRST) from exc
+        except BreachCorpusUnavailable as exc:
+            # BACKLOG #5902: the screen cannot run, so the change is refused (ASVS 6.2.4), as a
+            # named 503 rather than the generic 500. The detail names no path; the log carries it.
+            _log.error("password change refused: %s", exc)
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "password screening is unavailable; ask an administrator to repair it",
+            ) from exc
+        except PasswordChangeNotApplied as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except UserSealRefused as exc:
+            # BACKLOG #5902: the caller's record fails its seal, so nothing was set. The admin
+            # reads' 423, with the same fixed text, which names no field of the record.
+            raise HTTPException(status.HTTP_423_LOCKED, str(exc)) from exc
+        except TransitSealUnavailableError as exc:
+            # A Vault transit Outage on the record's seal: nothing was set; retry once Vault answers.
+            raise _seal_outage_503() from exc
+        except ValueError as exc:
+            if str(exc) != "no such user":
+                raise
+            # BACKLOG #5902: the caller's account was deleted while this request ran.
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "session ended; sign in again"
+            ) from exc
         if violations:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
