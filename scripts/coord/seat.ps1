@@ -298,8 +298,9 @@ function Read-HookPayload {
 function Read-RecordHookInput {
     <#
       The -Record hook input, and which worktree it answers for. Returns
-      @{ Payload; Dir = <worktree root or $null>; FromPin = <bool>; Reason = <fault or ''> }.
-      A Reason means NO WRITE. A $null Dir means the directory this script runs in.
+      @{ Payload; Dir = <worktree root or $null>; FromPin = <bool>; Reason = <fault or ''>; Fault = <bool> }.
+      A Reason means NO WRITE. Fault marks a Reason that is this writer's own failure (the helper is
+      missing or threw) rather than input it refused. A $null Dir means the directory this script runs in.
 
       Taken as it stood, the payload `cwd` after a `cd` put this session's record in a sibling's box
       or in another repository's registry (BACKLOG #5961). scripts/hooks/_hookinput.ps1's header
@@ -318,15 +319,15 @@ function Read-RecordHookInput {
     if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
         $p = Read-HookPayload
         $why = if ($p -and ($p.PSObject.Properties.Name -contains 'cwd')) { "scripts/hooks/_hookinput.ps1 is missing beside this script, so the hook input's cwd cannot be checked" } else { '' }
-        return @{ Payload = $p; Dir = $null; FromPin = $false; Reason = $why }
+        return @{ Payload = $p; Dir = $null; FromPin = $false; Reason = $why; Fault = [bool]$why }
     }
     try {
         . $helper
         $s = Resolve-CcxHookSession -Text (Read-CcxHookInput) -ReadOnly
     } catch {
-        return @{ Payload = $null; Dir = $null; FromPin = $false; Reason = "the hook-input helper failed ($($_.Exception.Message))" }
+        return @{ Payload = $null; Dir = $null; FromPin = $false; Reason = "the hook-input helper failed ($($_.Exception.Message))"; Fault = $true }
     }
-    return @{ Payload = $s.Payload; Dir = $s.Root; FromPin = ($s.Source -eq 'pin'); Reason = [string]$s.Reason }
+    return @{ Payload = $s.Payload; Dir = $s.Root; FromPin = ($s.Source -eq 'pin'); Reason = [string]$s.Reason; Fault = $false }
 }
 
 function Get-SessionKey {
@@ -938,12 +939,27 @@ try {
         if (-not $wtHint) {
             if ($hookIn.Reason) {
                 # Rule 1 again: input this cannot vouch for names no worktree, so NO RECORD, and exit
-                # 0 because this is the Stop path. A refusal is not a writer failure, so it goes to
-                # stderr only and NEVER to .writer-errors.txt, which fleet.ps1 counts as failures;
+                # 0 because this is the Stop path. Refused input is not a writer failure, so it goes
+                # to stderr only and NEVER to .writer-errors.txt, which fleet.ps1 counts as failures;
                 # an unpinned session would otherwise add one line there on every Stop (the same
                 # rule Invoke-ClearHandoff states). No .writer-alive heartbeat either: it is keyed
                 # by this session's box, and refused input names no box to key it by.
-                [System.Console]::Error.WriteLine("seat.ps1: the hook input was refused, so nothing was recorded: $($hookIn.Reason)")
+                $why = "the hook input was refused, so nothing was recorded: $($hookIn.Reason)"
+                [System.Console]::Error.WriteLine("seat.ps1: $why")
+                if ($hookIn.Fault) {
+                    # A missing or throwing helper IS a writer failure, and rule 2 wants a line for
+                    # it. seat-record.ps1 discards stderr, so it goes to the registry of the checkout
+                    # this hook started in, where that checkout and its registry resolve.
+                    $startWt = Resolve-Worktree -Hint $null
+                    if ($startWt) {
+                        $startRes = Resolve-CoordSharedRoot -From $startWt -LocalRoot (Get-CoordLocalRoot -From $startWt)
+                        if (-not $startRes.Error) {
+                            $script:SeatsDir = Join-Path $startRes.Path 'seats'
+                            $null = New-Item -ItemType Directory -Force -Path $script:SeatsDir -EA SilentlyContinue
+                            Write-WriterError -Stage 'hook-input' -Message $why
+                        }
+                    }
+                }
                 exit 0
             }
             $wtHint = $hookIn.Dir
