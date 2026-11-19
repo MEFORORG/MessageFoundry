@@ -7,7 +7,7 @@ scrub logs its own failure by type name only. All data here is synthetic."""
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
 
@@ -140,14 +140,36 @@ def test_harness_scrub_failure_logs_the_type_names_only(
         assert fragment not in logged
 
 
-def test_a_raising_log_filter_propagates_from_the_harness_scrub(
+_FILTER_ORIG = "Zqxfiltorig PWD=Kv9x7Qz3filt"
+_FILTER_SCRUB = "Zqxfiltscrub PWD=Kv9x7Qz3fscr"
+_FILTER_PLANTED = ("Zqxfiltorig", "Kv9x7Qz3filt", "Zqxfiltscrub", "Kv9x7Qz3fscr")
+
+
+def _direct(typed: bool) -> str:
+    return probes.scrubbed_exc(OSError(_FILTER_ORIG), before="Zqxfiltorig ", typed=typed)
+
+
+def _inside_except(typed: bool) -> str:
+    try:
+        raise OSError(_FILTER_ORIG)
+    except OSError as exc:
+        return probes.scrubbed_exc(exc, before="Zqxfiltorig ", typed=typed)
+
+
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("call", [_direct, _inside_except], ids=["direct", "inside_except"])
+def test_a_raising_log_filter_is_dropped_by_the_harness_scrub(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    typed: bool,
+    call: Callable[[bool], str],
 ) -> None:
-    """A raising filter is not silently swallowed (CLAUDE.md section 6). ``ran`` is the positive
-    control: the ValueError is the filter's, not one raised before the log call."""
+    """The log call is the scrub's last resort, so a filter that raises inside it must not escape:
+    an escape would leave ``run_probe``'s catch-all and abort ``run_matrix``, carrying frames that
+    hold the raw text. ``ran`` is the positive control that the filter was called and raised."""
 
     def broken(*_args: object, **_kwargs: object) -> str:
-        raise RuntimeError("Zqxscrubtext")
+        raise RuntimeError(_FILTER_SCRUB)
 
     ran: list[str] = []
 
@@ -156,6 +178,8 @@ def test_a_raising_log_filter_propagates_from_the_harness_scrub(
         raise ValueError("the filter refuses")
 
     monkeypatch.setattr(verify_leaf, "safe_exc_text", broken)
+    monkeypatch.setattr(verify_leaf, "safe_detail_text", broken)
+    monkeypatch.setattr(logging, "raiseExceptions", True)
     logger = logging.getLogger(probes.__name__)
     monkeypatch.setattr(logger, "disabled", False)
     monkeypatch.setattr(logger, "level", logging.DEBUG)
@@ -163,9 +187,14 @@ def test_a_raising_log_filter_propagates_from_the_harness_scrub(
     logging.disable(logging.NOTSET)
     logger.addFilter(refuse)
     try:
-        with pytest.raises(ValueError, match="the filter refuses"):
-            probes.scrubbed_exc(OSError("Zqxdetail"))
+        row = call(typed)
     finally:
         logger.removeFilter(refuse)
         logging.disable(previous)
-    assert len(ran) == 1 and "RuntimeError" in ran[0] and "Zqxdetail" not in ran[0]
+    assert len(ran) == 1 and "RuntimeError" in ran[0] and "OSError" in ran[0]
+    assert row == "OSError (detail withheld: the detail scrub failed with RuntimeError)"
+    captured = capsys.readouterr()
+    for fragment in _FILTER_PLANTED:
+        assert fragment not in row
+        assert fragment not in captured.err
+        assert fragment not in ran[0]

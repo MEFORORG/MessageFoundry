@@ -14,6 +14,7 @@ rules admitting external traffic, service-account ACLs, a real interactive deskt
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
@@ -53,10 +54,15 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
     and with :class:`_ChainCut` current, its ``__context__`` cleared. A handler whose ``emit``
     fails and calls ``logging``'s ``handleError`` prints the current chain to stderr; this way
     that chain reaches neither the scrub failure nor an exception the caller is handling, either
-    of which could quote the text. A log filter that raises is not swallowed here; its exception
-    propagates, and that exception's traceback frames still hold ``exc`` and ``before``. A1 exists to report an
+    of which could quote the text. An exception raised by the log call itself, such as one from a
+    log filter or a record factory, is dropped, so this still returns the withheld row: the log
+    call is the last resort and has nowhere left to report its own failure, and letting it
+    propagate would carry frames holding the raw ``exc`` and ``before`` out of here and break the
+    contract that a probe never raises. A1 exists to report an
     interpreter the engine cannot run on, and there the engine's modules may not even parse, so a
     scrub that fails to load must not take the runner down either."""
+    # Bound on every path, though only the except below reaches the code that reads it.
+    failure_name = "unknown"
     try:
         from messagefoundry.redaction import codec_safe_str
         from messagefoundry.verify_leaf import (
@@ -90,9 +96,15 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
         raise _ChainCut from None
     except _ChainCut as cut:
         cut.__context__ = None
-        _log.warning(
-            "the detail scrub failed with %s; a row's %s detail is withheld", failure_name, exc_name
-        )
+        # The last resort: a filter or record factory that raises here has nowhere left to report
+        # to, and propagating would leak frames holding the raw exc and before and break the probe
+        # contract that run_probe and run_matrix rely on. Exception only, never BaseException.
+        with contextlib.suppress(Exception):
+            _log.warning(
+                "the detail scrub failed with %s; a row's %s detail is withheld",
+                failure_name,
+                exc_name,
+            )
     return f"{exc_name} (detail withheld: the detail scrub failed with {failure_name})"
 
 
