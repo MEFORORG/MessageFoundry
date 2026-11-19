@@ -19,6 +19,7 @@ view widgets, so they now live beside it.
 from __future__ import annotations
 
 import html
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -46,7 +47,7 @@ from PySide6.QtWidgets import (
 
 from harness._async import AsyncRunner
 from messagefoundry.api.models import MessageDetail, MessageSummary
-from messagefoundry.apiclient import ApiError, EngineClient
+from messagefoundry.apiclient import ApiError, EngineClient, IdpStepUpRequired
 from messagefoundry.parsing import HL7PeekError, parse_tree
 
 #: Shared "error red" for inline error text — the message-detail error, the auth dialogs'
@@ -430,6 +431,9 @@ class _MessagesSnapshot:
     count_text: str
     truncated: bool
     error: str | None
+    # A content search refused with 403. The polling client has no step-up handler, so the
+    # refusal surfaces here instead of prompting; the panel answers it on the GUI thread.
+    search_refused: bool = False
 
 
 class MessagesPanel(QWidget):
@@ -458,10 +462,21 @@ class MessagesPanel(QWidget):
         "Metadata",
     ]
 
-    def __init__(self, client: EngineClient, *, poll_client: EngineClient | None = None) -> None:
+    def __init__(
+        self,
+        client: EngineClient,
+        *,
+        poll_client: EngineClient | None = None,
+        step_up: Callable[[], bool] | None = None,
+    ) -> None:
         super().__init__()
         self._client = client
         self._poll = poll_client or client  # message-list read — runs off the main thread
+        # The content search is step-up gated, and the worker's polling client cannot prompt. A
+        # search refused with 403 calls this on the GUI thread (it prompts and re-proves) and, if
+        # it returns True, resubmits the same refresh once. None: the refusal is reported as is.
+        self._step_up = step_up
+        self._stepped_up = False  # the in-flight read is the one retry after a step-up
         self._runner = AsyncRunner(self)
         self._loading = False  # in-flight refresh guard (don't pile up during a slow call)
         # A refresh requested WHILE one is in flight is latched here (not dropped) and re-fired when
@@ -595,12 +610,32 @@ class MessagesPanel(QWidget):
                 False,
                 None,
             )
-        except ApiError as exc:
+        except IdpStepUpRequired as exc:
+            # Only the web console can step up at the IdP, so a password prompt would not help.
             return _MessagesSnapshot(None, "", False, str(exc))
+        except ApiError as exc:
+            refused = bool(field_path or content) and exc.status == 403
+            return _MessagesSnapshot(None, "", False, str(exc), search_refused=refused)
 
     def _apply(self, snap: _MessagesSnapshot, *, autosize: bool = False) -> None:
         """Runs on the main thread (result slot) — safe to touch widgets."""
         self._loading = False
+        retried, self._stepped_up = self._stepped_up, False
+        if snap.search_refused and not retried and self._step_up is not None:
+            try:
+                proved = self._step_up()
+            except ApiError as exc:
+                # A refused re-proof: report its own cause, not the original 403.
+                snap = _MessagesSnapshot(None, "", False, str(exc))
+                proved = False
+            if proved:
+                # Re-proved on the GUI thread; the polling client reads the rotated token through
+                # the shared cell, so the resubmitted search carries the fresh grant. One retry
+                # only: a second 403 is reported below rather than prompting again. The retry
+                # re-reads the filters, so it also covers any refresh latched meanwhile.
+                self._stepped_up = True
+                self.refresh(autosize=autosize)
+                return
         if snap.error is not None:
             self.error.emit(snap.error)
             self._drain_pending()

@@ -527,8 +527,11 @@ class MonitorPanel(QWidget):
         # Messages: reuse the console's filter list + detail pane (user-initiated, GUI thread).
         # Their reads run on worker threads, so they get a polling client: it shares the token but
         # carries no step-up handler, so a refusal there can never open a Qt dialog off the GUI
-        # thread (vault BACKLOG #2625 gave the main client one).
-        self._messages = MessagesPanel(self._client, poll_client=self._poll_client)
+        # thread (vault BACKLOG #2625 gave the main client one). The step-up gated content search
+        # hands its 403 back to the GUI thread, which answers it with the same re-proof.
+        self._messages = MessagesPanel(
+            self._client, poll_client=self._poll_client, step_up=self._step_up
+        )
         self._detail = MessageDetailPanel(self._client, poll_client=self._poll_client)
         self._messages.message_selected.connect(self._detail.load)
         self._messages.error.connect(lambda m: self._set_status(m, error=True))
