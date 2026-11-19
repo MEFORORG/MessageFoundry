@@ -18,7 +18,7 @@ from pydantic import AfterValidator, BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
-    SIGN_IN_NAME_PATTERN,
+    PRINTABLE_TEXT_PATTERN,
     ChannelScopeEntry,
     PermissionId,
     RoleId,
@@ -275,6 +275,21 @@ class ChannelScope(RequestModel):
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
+def _not_blank(value: str) -> str:
+    """Refuse a value that is only whitespace (BACKLOG #5784)."""
+    if not value.strip():
+        raise ValueError("must not be blank")
+    return value
+
+
+#: A name an administrator types for an account (BACKLOG #5784): printable, so no C0 control, DEL or
+#: C1 control reaches the store (a NUL is a server error on PostgreSQL), and not blank or
+#: whitespace only.
+DisplayName = Annotated[
+    str, Field(max_length=_NAME_MAX, pattern=PRINTABLE_TEXT_PATTERN), AfterValidator(_not_blank)
+]
+
+
 def _valid_new_username(username: str) -> str:
     """BACKLOG #5521: the rule ``AuthService.create_local_user`` applies, checked here as well so a
     refused name never reaches the route."""
@@ -306,7 +321,7 @@ class UserCreateRequest(RequestModel):
 
     #: Refused, 422, by the new-username rule ``auth/usernames.py`` states (BACKLOG #5521).
     username: NewUsername
-    display_name: str | None = Field(default=None, max_length=_NAME_MAX)
+    display_name: DisplayName | None = None
     #: REQUIRED (BACKLOG #2018, ASVS 6.3.7). It seeds both the profile address and ``notify_email``,
     #: where every security notice goes. An account born without one is told nothing about a change
     #: made to it before its holder's first sign-in, an administrator's password reset included. The
@@ -329,14 +344,16 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    # vault BACKLOG #5342. Pinned by tests/test_auth_federated_identity_routes.py::
+    # vault BACKLOG #5342, #5784: no control character and not blank. Pinned by
+    # tests/test_auth_federated_identity_routes.py::
     # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory.
-    username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
+    username: DisplayName
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 
 class UserUpdateRequest(RequestModel):
-    display_name: str | None = Field(default=None, max_length=_NAME_MAX)
+    #: An explicit null clears it; a value takes the :data:`DisplayName` rule (BACKLOG #5784).
+    display_name: DisplayName | None = None
     #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).
     #: Its shape rule is in ``AuthService.update_user`` (BACKLOG #3278).
     email: str | None = Field(default=None, max_length=_NAME_MAX)
