@@ -3049,7 +3049,7 @@ same with its `connection_purge` row, which names the outbound, the scope and th
 attributed to the requester (vault BACKLOG #3217). A released purge re-reads the refusals the route
 makes about its target, through `_purge_target_refusal` (vault BACKLOG #3798). The release skips at
 least if no graph is loaded, or the outbound has left the graph, is running, or is owned by another
-engine shard. It cancels nothing, writes no
+engine shard, or if this node does not hold the cluster lease (BACKLOG #5792). It cancels nothing, writes no
 `connection_purge` row, and its `approval.approved` row records the route's refusal text as the
 skip. The operator clears the cause and requests the purge again. The on-box row is whole. Its
 off-box copy is cut at the bound stated for `approval.standing_shown` above, and this row's detail

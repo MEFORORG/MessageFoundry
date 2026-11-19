@@ -6878,8 +6878,10 @@ class ClusterSettings(_Section):
     )
     @classmethod
     def _positive(cls, value: float) -> float:
-        if value <= 0:
-            raise ValueError("must be > 0")
+        # BACKLOG #5771: written so NaN fails too, since every comparison with NaN is False, and an
+        # infinite or NaN lease, timeout or interval would break renewal, membership or reclaim.
+        if not 0 < value < float("inf"):
+            raise ValueError("must be a finite number > 0")
         return value
 
     @field_validator("lease_renew_timeout_seconds")
@@ -6888,8 +6890,10 @@ class ClusterSettings(_Section):
         # Split out of _positive above because None is this field's "derive it" sentinel, and the
         # shared validator would compare None to 0. There is deliberately no "0 disables" escape
         # hatch: an unbounded renew is the defect the knob removes.
-        if value is not None and value <= 0:
-            raise ValueError("must be > 0 (leave it unset to derive it from the detection margin)")
+        if value is not None and not 0 < value < float("inf"):
+            raise ValueError(
+                "must be a finite number > 0 (leave it unset to derive it from the detection margin)"
+            )
         return value
 
     @field_validator("acquire_delay_seconds")
