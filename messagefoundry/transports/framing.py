@@ -48,6 +48,7 @@ __all__ = [
     "check_frame_bytes",
     "codec_for",
     "declared_encoding",
+    "encode_reply",
     "frame_for_delivery",
     "frame_reply",
 ]
@@ -150,24 +151,37 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     as data). So the reply is neutralised rather than refused: the sender still gets exactly one
     frame, and an echoed control id that held a frame byte simply stops matching. A space is what
     the ACK builder already puts in place of an echoed CR or LF. The replacement is on bytes, for the
-    reason :func:`frame_for_delivery` checks bytes.
+    reason :func:`frame_for_delivery` checks bytes. The reply is encoded by :func:`encode_reply`,
+    which says what it does with a charset that cannot hold it."""
+    body = encode_reply(reply, encoding, connection=connection)
+    if codec.start in body or codec.end in body:
+        logger.warning(
+            "reply held a frame start or end byte; each was replaced by a space before framing"
+        )
+    # The replacement is the leaf's rule, shared with the test harness's ACK writers.
+    return codec.frame(codec.neutralise(body))
 
-    For the same reason a reply whose charset NAME is unusable is sent in ``utf-8`` instead: a name
+
+def encode_reply(reply: str, encoding: str, *, connection: str = "") -> bytes:
+    """Encode a listener's post-commit reply in its declared charset, for :func:`frame_reply` and
+    for the X12 listener, which writes its reply unframed (BACKLOG #5958).
+
+    A reply whose charset NAME is unusable is sent in ``utf-8`` instead: a name
     that names no text codec, or one that refuses every conversion, would otherwise leave the ``AE``
     the runner built for exactly that misconfiguration unsent (BACKLOG #2431). A usable charset that
     cannot hold one reply's characters is not that misconfiguration, so the reply is not moved to
     ``utf-8``: it stays in the declared charset, and each character the charset cannot hold becomes
-    the codec's replacement character, for the same reason a frame byte becomes a space (BACKLOG
-    #5799). Before, that reply raised to the listener's last-resort arm, which closed the connection
-    unanswered, so the sender resent a message already stored. A codec that cannot replace, such as
-    ``idna``, or an ``MSH``-led reply whose own delimiters include the replacement ``?``
-    (:func:`_encode_replacing`), still raises, with a fixed ``UnicodeError`` that chains nothing,
-    since the strict encode's error holds the whole reply. Usable is decided by probing the NAME, as ``decode_body``
-    decides it: a usable codec can also raise a bare ``UnicodeError`` for one reply, which still
-    raises here. ``connection`` names the listener in the warning each fallback logs, once per
-    connection for each, since a narrow charset meets the same characters message after message.
-    The charset setting and the reply are never logged: the setting is configuration that may hold
-    anything, and the reply echoes the message."""
+    the codec's replacement character, for the same reason :func:`frame_reply` turns a frame byte
+    into a space (BACKLOG #5799). Before, that reply raised to the listener's last-resort arm, which
+    closed the connection unanswered, so the sender resent a message already stored. A codec that
+    cannot replace, such as ``idna``, or an ``MSH``-led reply whose own delimiters include the
+    replacement ``?`` (:func:`_encode_replacing`), still raises, with a fixed ``UnicodeError`` that
+    chains nothing, since the strict encode's error holds the whole reply. Usable is decided by
+    probing the NAME, as ``decode_body`` decides it: a usable codec can also raise a bare
+    ``UnicodeError`` for one reply, which still raises here. ``connection`` names the listener in
+    the warning each fallback logs, once per connection for each, since a narrow charset meets the
+    same characters message after message. The charset setting and the reply are never logged: the
+    setting is configuration that may hold anything, and the reply echoes the message."""
     unencodable = False
     try:
         body = reply.encode(encoding)
@@ -187,17 +201,12 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
         body = reply.encode("utf-8")
     if unencodable:
         body = _encode_replacing(reply, encoding, connection)
-    if codec.start in body or codec.end in body:
-        logger.warning(
-            "reply held a frame start or end byte; each was replaced by a space before framing"
-        )
-    # The replacement is the leaf's rule, shared with the test harness's ACK writers.
-    return codec.frame(codec.neutralise(body))
+    return body
 
 
 def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
     """``reply`` in ``encoding`` with each character the charset cannot hold replaced, for
-    :func:`frame_reply`. A codec that refuses the ``replace`` handler raises a fixed
+    :func:`encode_reply`. A codec that refuses the ``replace`` handler raises a fixed
     ``UnicodeError``, outside the handler, so neither error's text or ``object`` rides the chain.
     The warning names the connection, never the reply or the setting.
 
@@ -233,7 +242,7 @@ def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
         _reply_replacement_logged.add(connection)
         logger.warning(
             "inbound %r: a reply held characters its charset cannot encode; each was replaced "
-            "before framing (logged once per connection)",
+            "before it was sent (logged once per connection)",
             connection,
         )
     return body

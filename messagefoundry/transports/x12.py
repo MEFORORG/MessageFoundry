@@ -67,7 +67,7 @@ from messagefoundry.transports.base import (
     register_source,
     wait_for_intake,
 )
-from messagefoundry.transports.framing import declared_encoding
+from messagefoundry.transports.framing import declared_encoding, encode_reply
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_CONNECTIONS_PER_HOST,
@@ -951,7 +951,11 @@ class X12Source(SourceConnector):
                                     break  # handler_error is recorded; close
                                 failed = False
                             if reply is not None:
-                                writer.write(reply.encode(self.encoding))  # verbatim reply
+                                # BACKLOG #5958: encoded as the MLLP and TCP listeners encode
+                                # theirs, since this write follows the commit.
+                                writer.write(
+                                    encode_reply(reply, self.encoding, connection=self._pacing_name)
+                                )
                                 await self._drain_reply(writer)
                         if failed:
                             break
