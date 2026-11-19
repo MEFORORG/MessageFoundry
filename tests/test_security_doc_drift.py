@@ -3973,12 +3973,13 @@ _OVERRIDE_NOTE_FACTS = (
     "A dry-run reload counts",
     "each engine shard writes its own",
     # BACKLOG #5967: each engine shard process's retention reads its own inbounds' overrides
-    # alone. The limit binds an inbound's override only, and only where more than one engine shard
-    # PROCESS runs: plain `serve` on a config naming several honours the override.
+    # alone. The limit binds an inbound's override only, and only where a `serve --shard` process
+    # runs: plain `serve` on a config naming several engine shards honours the override.
     "One limit applies to an inbound's override alone.",
-    "When the config runs as more than one engine shard process (`serve --shard`), it keeps "
-    "nothing past a bounded global window",
-    "a sibling engine shard purges that inbound's message bodies on the global window",
+    "Where a `serve --shard` process runs on a config that names more than one engine shard, it "
+    "keeps nothing past a bounded global window",
+    "an engine shard that does not hold that inbound purges its message bodies on the global window",
+    "One such process is enough.",
     "Plain `serve` on the same config honours it.",
     # The body windows' line is the older rule, left alone by the 2026-11-01 ruling. The other
     # global tiers are not in this claim: an acknowledged one writes its line on either dial.

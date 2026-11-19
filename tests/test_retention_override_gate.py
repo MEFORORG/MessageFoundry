@@ -250,26 +250,25 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
     # The caveat names the inbound overrides' bodies alone, so in the mixed case its "them" cannot
     # be read as covering the outbound's dead rows, and it leaves no comma before "(status)".
     caveat = (
-        "except the inbound overrides' message bodies where a sibling engine shard process purges "
-        "them as stated below"
+        "except an inbound override's message bodies where another engine shard purges them, "
+        "as stated after this"
     )
     assert (caveat in text) is (inbound_days is not None)
-    assert "below, (" not in text and ",," not in text
+    assert "this, (" not in text and ",," not in text
     if inbound_days is None:
         assert "PHI message bodies" not in text
-    # The limit is keyed on how many engine shard processes run, not on how many the config names:
-    # plain `serve` on a config that names several honours the override.
+    # The limit is keyed on a `serve --shard` process running, not on the config naming several
+    # engine shards: plain `serve` on such a config honours the override.
     shard_limit = (
-        "When the config runs as more than one engine shard process (serve --shard), an inbound "
-        "override keeps nothing past the global [security].delete_message_bodies_after_days window "
-        "where that window is bounded"
+        "Where a serve --shard process runs on a config that names more than one engine shard, an "
+        "inbound override keeps nothing past the global [security].delete_message_bodies_after_days "
+        "window where that window is bounded"
     )
     assert (shard_limit in text) is (inbound_days is not None)
     assert ("Otherwise, plain serve included, it keeps forever" in text) is (
         inbound_days is not None
     )
     if outbound_days is not None:
-        assert "override, which a sibling engine shard does not hold, override" not in text
         assert (
             "which is that inbound's own override or else the global "
             "[security].delete_message_bodies_after_days, where that window is bounded" in text

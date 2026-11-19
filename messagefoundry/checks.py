@@ -4132,11 +4132,9 @@ def _check_retention_overrides(
     """Report the refusal ``serve`` applies to a connection's own keep-forever retention override,
     at commit/CI time (vault BACKLOG #2368).
 
-    An inbound ``messages_days = 0`` keeps that inbound's PHI bodies forever, and an outbound
-    ``dead_letter_days = 0`` that outbound's dead-lettered rows, but not every row about their
-    messages; and when the config runs as more than one engine shard process, an inbound override
-    keeps nothing past a bounded global window, while every engine shard holds every outbound
-    override: :func:`~messagefoundry.config.retention_classification._override_scope` states which.
+    An inbound ``messages_days = 0`` or an outbound ``dead_letter_days = 0`` asks to keep that
+    connection's PHI forever. What each keeps, and the engine shard limit on an inbound override,
+    are stated once, on :func:`~messagefoundry.config.retention_classification._override_scope`.
     ``serve`` hands the engine a registry guard that refuses such a graph under ``enforce`` unless
     ``[security].allow_keeping_phi_indefinitely`` is set, and this gate passed it. The decision is
     :func:`~messagefoundry.config.retention_classification.judge_keep_forever_overrides`, the
