@@ -119,10 +119,11 @@ TOOLKIT_DISTRIBUTION = "messagefoundry-toolkit"
 TOOLKIT_PACKAGE = "messagefoundry_toolkit"
 
 #: Every distribution this repository publishes, as PEP 503 normalised names. An archive whose
-#: filename names a ``messagefoundry`` distribution outside this set is refused, and so is one whose
-#: filename has no ``<name>-<version>`` shape at all (:func:`filename_problem`): the split rule is
-#: keyed on the filename, so a name it cannot place would otherwise get no split rule, where reading
-#: up to the first hyphen used to give ``messagefoundry-dev.whl`` the engine's (BACKLOG #5470).
+#: filename names a distribution outside this set is refused, and so is one whose filename has no
+#: ``<name>-<version>`` shape at all (:func:`filename_problem`): the split rule is keyed on the
+#: filename, so a name it cannot place would otherwise get no split rule, where reading up to the
+#: first hyphen used to give ``messagefoundry-dev.whl`` the engine's (BACKLOG #5470). Every archive
+#: this gate is pointed at is one of these four, so any other name is as unplaceable as no name.
 KNOWN_DISTRIBUTIONS: frozenset[str] = frozenset(
     {
         ENGINE_DISTRIBUTION,
@@ -139,6 +140,9 @@ KNOWN_DISTRIBUTIONS: frozenset[str] = frozenset(
 _INERT_SUFFIXES: frozenset[str] = frozenset(
     {"md", "rst", "txt", "toml", "json", "yaml", "yml", "cfg", "ini"}
 )
+
+#: Modules ``site`` imports at every interpreter start when they sit on a site directory.
+_STARTUP_MODULES: frozenset[str] = frozenset({"sitecustomize", "usercustomize"})
 
 #: Engine paths ADR 0201 has moved into the toolkit, each as its run of path components. An engine
 #: archive carrying one as a CONSECUTIVE run is refused, wheel or sdist. A retired path stays
@@ -169,6 +173,10 @@ RETIRED_ENGINE_PATHS: tuple[tuple[str, ...], ...] = (
 _SPECIAL = "a link or special file; a published distribution carries regular files only"
 
 
+#: The Unix file types a zip entry may carry: none recorded, a regular file, or a directory.
+_ZIP_PLAIN_TYPES: frozenset[int] = frozenset({0, stat.S_IFREG, stat.S_IFDIR})
+
+
 class InspectionError(RuntimeError):
     """An archive could not be inspected, so nothing about it has been proved."""
 
@@ -177,7 +185,8 @@ def _members(archive: Path) -> list[tuple[str, bool]]:
     """Every member of ``archive`` as ``(name, special)``, or raise :class:`InspectionError`.
 
     ``special`` marks a member that is not a regular file or directory: a tar symbolic or hard
-    link, device or fifo, or a zip entry whose Unix mode says symbolic link. :func:`inspect`
+    link, device or fifo, or a zip entry whose Unix mode names any file type but a regular file or
+    a directory (a zip written with no Unix mode carries type 0 and reads as regular). :func:`inspect`
     refuses every one (BACKLOG #5470). Reading names alone never saw a link's target, so an
     innocently named link, or a chain of them, could make extraction write into the engine
     package or outside the archive. Modelling targets by text cannot follow a chain; a published
@@ -192,7 +201,10 @@ def _members(archive: Path) -> list[tuple[str, bool]]:
     try:
         if archive.suffix.lower() in {".whl", ".zip"}:
             with zipfile.ZipFile(archive) as zf:
-                return [(i.filename, stat.S_ISLNK(i.external_attr >> 16)) for i in zf.infolist()]
+                return [
+                    (i.filename, stat.S_IFMT(i.external_attr >> 16) not in _ZIP_PLAIN_TYPES)
+                    for i in zf.infolist()
+                ]
         if suffixes[-2:] == [".tar", ".gz"] or archive.suffix.lower() == ".tgz":
             # `r:gz` and not `r:*`: the mode must be the one the filename promised, so a `.tar.gz`
             # that is secretly an uncompressed tar fails here rather than being read anyway.
@@ -270,8 +282,13 @@ def _parts(member: str) -> list[str]:
     component names the directory it sits in, so ``./messagefoundry/x.py`` is ``messagefoundry/x.py``
     to an extractor, and keeping it hid that from a rule that reads the first component or a
     consecutive run (BACKLOG #5470). Dropping one never removes a component a rule could match.
-    ``. `` counts as ``.``, as :func:`_normalise` reads a trailing space."""
-    return [p for p in member.replace("\\", "/").split("/") if p and p.rstrip(" ") != "."]
+    ``. `` counts as ``.``, as :func:`_normalise` reads a trailing space. So does every other
+    component that :func:`_normalise` reduces to nothing (``...``, ``   ``, ``. .``): Windows strips
+    trailing dots and spaces and then drops the empty component, so ``   /messagefoundry/x.py``
+    writes ``messagefoundry/x.py`` there. ``..`` is the one such component kept, because it climbs."""
+    return [
+        p for p in member.replace("\\", "/").split("/") if p.rstrip(" ") == ".." or _normalise(p)
+    ]
 
 
 def forbidden(member: str) -> str | None:
@@ -389,6 +406,15 @@ def escapes_root(member: str) -> str | None:
         return "the path is absolute, outside the archive"
     if _resolve_dots(_parts(member))[1]:
         return "the path climbs above the archive's top level"
+    # Two Windows spellings of a path no rule here can read, each opening a file under another
+    # name: a colon names an alternate data stream (``messagefoundry::$INDEX_ALLOCATION`` is the
+    # directory ``messagefoundry``), and ``~<digit>`` an 8.3 short name (``MESSAG~1``). No build
+    # backend writes either into a published distribution.
+    for part in _parts(member):
+        if ":" in part:
+            return f"component {part!r} names a drive or an alternate data stream"
+        if re.search(r"~\d", part):
+            return f"component {part!r} has the shape of a Windows 8.3 short name"
     return None
 
 
@@ -447,9 +473,12 @@ def _split_rule(parts: list[str], dist: str) -> str | None:
         ):
             return "the toolkit may not write into the engine's package directory (ADR 0201)"
         # A top-level .pth of ANY name runs its import lines at every interpreter start, where it
-        # can rebind engine modules: the split-package override ADR 0201 rejects.
+        # can rebind engine modules: the split-package override ADR 0201 rejects. So does a
+        # top-level sitecustomize or usercustomize module or package, which `site` imports.
         if len(parts) == 1 and first.endswith(".pth"):
             return "the toolkit ships no top-level .pth, which runs code at interpreter start"
+        if _stem(first) in _STARTUP_MODULES:
+            return f"the toolkit ships no top-level {_stem(first)}, which runs at interpreter start"
         if first.endswith(".data"):
             return "the toolkit ships no wheel .data tree, which installs outside its package"
     return None
@@ -516,8 +545,9 @@ def filename_problem(archive: Path) -> str | None:
     The split rule is keyed on the distribution the filename names, so a filename that names none
     would get no split rule at all. Two shapes are refused, fail closed: a filename with no
     ``<name>-<version>`` shape, which no wheel or sdist build writes (``messagefoundry-dev.whl``,
-    ``messagefoundry-v0.4.0.tar.gz``), and a ``messagefoundry`` name outside
-    :data:`KNOWN_DISTRIBUTIONS`, which reading up to the first hyphen once gave the engine's rule.
+    ``messagefoundry-v0.4.0.tar.gz``), and any name outside :data:`KNOWN_DISTRIBUTIONS`, where a
+    ``messagefoundry`` one once got the engine's rule by reading up to the first hyphen and a
+    renamed toolkit (``mftoolkit-0.4.0``) would get none.
     :func:`inspect` still inspects such an archive, under both split rules."""
     # Falsy, not `is None`: an empty name (``-1.0-py3-none-any.whl``) places nothing either.
     if not _name_version(_filename_stem(archive)):
@@ -526,7 +556,7 @@ def filename_problem(archive: Path) -> str | None:
             "toolkit split rule that applies to it, cannot be read"
         )
     dist = distribution(archive)
-    if dist.startswith(ENGINE_DISTRIBUTION) and dist not in KNOWN_DISTRIBUTIONS:
+    if dist not in KNOWN_DISTRIBUTIONS:
         return f"its filename names {dist!r}, which is no distribution this repository publishes"
     return None
 
@@ -657,11 +687,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     # Print the COUNT, not just a word: a green log line has to show the gate inspected something.
     print(
-        f"member gate passed: inspected {total} members across {len(archives)} archive(s), "
-        f"none matching {len(FORBIDDEN_BASENAMES)} forbidden basenames or "
-        f"{len(FORBIDDEN_PATH_COMPONENTS)} forbidden path components, and none carrying test or "
-        f"development content outside {len(TEST_TOOLING_DISTRIBUTIONS)} test-tooling distribution, "
-        f"and none on the wrong side of the engine and toolkit split"
+        f"member gate passed: inspected {total} members across {len(archives)} archive(s) and "
+        f"refused none, under every rule in scripts/release/forbidden_members.py, at least "
+        f"{len(FORBIDDEN_BASENAMES)} forbidden basenames, {len(FORBIDDEN_PATH_COMPONENTS)} "
+        f"forbidden path components, test or development content outside "
+        f"{len(TEST_TOOLING_DISTRIBUTIONS)} test-tooling distribution, links and special members, "
+        f"paths leaving the archive, unplaceable filenames, rootless sdists, and the engine and "
+        f"toolkit split"
     )
     return 0
 

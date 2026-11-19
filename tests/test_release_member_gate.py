@@ -663,6 +663,8 @@ def test_a_prefixed_or_dotted_engine_member_in_a_toolkit_archive_is_refused(memb
 )
 def test_the_toolkit_s_own_prefixed_members_still_pass(member: str) -> None:
     assert split_violation(member, "messagefoundry-toolkit") is None
+    # And with the sdist root inspect() derives, so a stripped reading is exercised too.
+    assert split_violation(member, "messagefoundry-toolkit", "messagefoundry_toolkit-0.4.0") is None
 
 
 def test_a_dot_segment_does_not_hide_a_retired_engine_path() -> None:
@@ -981,6 +983,8 @@ def test_an_engine_archive_may_not_carry_a_toolkit_entry_in_any_spelling(member:
         "messagefoundry-v0.4.0.tar.gz",
         "messagefoundry-foo-1.0-py3-none-any.whl",  # read as the engine before BACKLOG #5470
         "messagefoundryx-1.0-py3-none-any.whl",
+        "mftoolkit-0.4.0-py3-none-any.whl",  # a renamed toolkit would get no split rule
+        "unrelated-1.0-py3-none-any.whl",
         "poisoned.whl",
     ],
 )
@@ -996,7 +1000,6 @@ def test_a_filename_naming_no_known_distribution_is_refused(filename: str) -> No
         "messagefoundry_toolkit-0.4.0-py3-none-any.whl",
         "messagefoundry_harness-0.4.0-py3-none-any.whl",
         "messagefoundry_webconsole-0.4.0-py3-none-any.whl",
-        "unrelated-1.0-py3-none-any.whl",  # no MessageFoundry name: no split rule, as before
     ],
 )
 def test_a_filename_naming_a_known_distribution_is_placed(filename: str) -> None:
@@ -1089,12 +1092,53 @@ def test_known_distributions_match_the_published_project_names() -> None:
     assert names == KNOWN_DISTRIBUTIONS
 
 
-def test_the_root_refusal_names_an_entry_that_normalises_to_nothing(
+@pytest.mark.parametrize(
+    ("member", "dist"),
+    [
+        ("   /messagefoundry/__init__.py", "messagefoundry-toolkit"),
+        (".../messagefoundry/x.py", "messagefoundry-toolkit"),
+        (". ./messagefoundry/x.py", "messagefoundry-toolkit"),
+        ("messagefoundry/.../anon/__init__.py", "messagefoundry"),
+    ],
+)
+def test_a_component_that_normalises_to_nothing_is_dropped(member: str, dist: str) -> None:
+    """Windows strips trailing dots and spaces and drops the empty component, so these write the
+    engine path the rule exists to stop."""
+    assert split_violation(member, dist) is not None
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["sitecustomize.py", "usercustomize.py", "sitecustomize/__init__.py", "SiteCustomize.pyc"],
+)
+def test_a_toolkit_archive_may_not_carry_a_startup_module(member: str) -> None:
+    assert split_violation(member, "messagefoundry-toolkit") is not None
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "MESSAG~1/__init__.py",
+        "messagefoundry::$INDEX_ALLOCATION/__init__.py",
+        "messagefoundry_toolkit/x.py:hidden",
+    ],
+)
+def test_a_windows_alias_spelling_is_refused(member: str) -> None:
+    assert escapes_root(member) is not None
+
+
+def test_a_zip_entry_of_any_special_unix_type_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    sdist = _write_tar(tmp_path / "dist" / _TK_SDIST, _files(f"{_TK_ROOT}/PKG-INFO", "..."))
-    assert main([str(sdist)]) == 1
-    assert "(''," in capsys.readouterr().err
+    for mode, verdict in ((0o010644, 1), (0o020644, 1), (0o060644, 1), (0, 0), (0o040755, 0)):
+        wheel = tmp_path / str(mode) / _TOOLKIT_WHEEL
+        wheel.parent.mkdir(parents=True)
+        with zipfile.ZipFile(wheel, "w") as zf:
+            entry = zipfile.ZipInfo("messagefoundry_toolkit/h.py")
+            entry.external_attr = mode << 16
+            zf.writestr(entry, "")
+        assert main([str(wheel)]) == verdict, oct(mode)
+        assert ("-- a link" in capsys.readouterr().err) is bool(verdict), oct(mode)
 
 
 def test_the_cli_passes_a_toolkit_sdist_with_an_engine_named_config_file(
