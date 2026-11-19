@@ -2257,12 +2257,18 @@ def _ws_origin_allowed(websocket: WebSocket) -> bool:
     No native client ships today. The shipped client is the browser web console. When the console
     is mounted, its same-origin handshake is tried first by the console's cookie hook
     (``authorize_ui_ws``), which checks the Origin itself and does not read ``ws_allowed_origins``.
-    A handshake the hook declines, or any handshake while the console is not mounted, comes here."""
-    origin = websocket.headers.get("origin")
-    if not origin:
+    A handshake the hook declines, or any handshake while the console is not mounted, comes here.
+
+    Only an ABSENT header counts as a native client. An empty or whitespace-only ``Origin``, or more
+    than one ``Origin`` header, is refused (BACKLOG #5789): reading only the first value, or taking
+    a blank one for absent, would let such a handshake skip the allow-list."""
+    origins = websocket.headers.getlist("origin")
+    if not origins:
         return True  # native client (no browser Origin)
+    if len(origins) > 1 or not origins[0].strip():
+        return False
     allowed = getattr(websocket.app.state, "ws_allowed_origins", ()) or ()
-    return origin in allowed
+    return origins[0] in allowed
 
 
 async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identity | None:
