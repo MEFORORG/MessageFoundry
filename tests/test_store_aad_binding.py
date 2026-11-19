@@ -200,6 +200,56 @@ async def test_totp_connection_event_alert_roundtrip(tmp_path: Path) -> None:
         await store.close()
 
 
+@pytest.mark.parametrize("keyed", [False, True], ids=["keyless", "keyed"])
+async def test_a_null_key_with_a_null_cell_does_not_fail_a_list_read(
+    tmp_path: Path, keyed: bool
+) -> None:
+    # BACKLOG #5962: queue.id is a nullable SQLite TEXT key, and these reads build each row's AAD
+    # before they know whether its cell is sealed. A NULL id with a NULL last_error binds nothing, so
+    # it reads as it did before the None refusal, keyed or keyless.
+    db = tmp_path / "null_key.db"
+    store = await (_open_bound(db, generate_key()) if keyed else MessageStore.open(db))
+    try:
+        mid = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", BODY)])
+        await store._db.execute(
+            "UPDATE queue SET id=NULL, status='dead', last_error=NULL WHERE message_id=?", (mid,)
+        )
+        await store._db.commit()
+        rows = await store.outbox_for(mid)
+        assert [(r["id"], r["last_error"]) for r in rows] == [(None, None)]
+        dead = await store.list_dead(allowed_channels=None)
+        assert [(r["outbox_id"], r["last_error"]) for r in dead] == [(None, None)]
+    finally:
+        await store.close()
+
+
+async def test_an_integer_timestamp_still_opens_its_connection_event(tmp_path: Path) -> None:
+    # BACKLOG #5962: the writer binds the int it was given, the REAL column hands back a float, and
+    # both must spell the same AAD, or the reason never opens on read or on rotate-key.
+    db, old = tmp_path / "int_ts.db", generate_key()
+    store = await _open_bound(db, old)
+    try:
+        await store.record_connection_event(
+            connection="IB",
+            transport="mllp",
+            direction="inbound",
+            kind="framing_error",
+            reason="bad MLLP frame",
+            now=1_763_400_000,
+        )
+        evs = await store.list_connection_events(connection="IB", allowed_channels=None)
+        assert evs and evs[0].reason == "bad MLLP frame"
+    finally:
+        await store.close()
+    store = await _open_bound(db, generate_key(), retired=[old])
+    try:
+        assert await store.reencrypt_to_active() >= 1
+        evs = await store.list_connection_events(connection="IB", allowed_channels=None)
+        assert evs and evs[0].reason == "bad MLLP frame"
+    finally:
+        await store.close()
+
+
 # --- fail-closed: a ciphertext moved to a DIFFERENT cell fails the tag ----------------------------
 
 

@@ -74,11 +74,13 @@ from messagefoundry.store.crypto import (
     CipherUnavailableError,
     TransitSealRefused,
     UnauthenticatedCipherError,
+    UnboundAAD,
     _UnmarkedPolicy,
     b64_chars,
     batch_chars,
     decrypt_or_error,
     gave_no_verdict,
+    require_bound_aad,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.keyprovider_vault import (
@@ -534,6 +536,8 @@ class TransitCipher(_UnmarkedPolicy):
 
     def _associated_data(self, aad: bytes | None) -> str | None:
         # Transit's associated_data is base64; None → omit it (symmetric with a None-aad encrypt).
+        # BACKLOG #5962: a cell_aad with a None or bool key component never reaches Vault.
+        require_bound_aad(aad)
         return base64.b64encode(aad).decode("ascii") if aad is not None else None
 
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
@@ -639,7 +643,8 @@ class TransitCipher(_UnmarkedPolicy):
         results: dict[int, str | CipherError] = {}
         sealed: list[int] = []
         for index, (stored, aad) in enumerate(items):
-            if stored.startswith(_V3_PREFIX):
+            # An UnboundAAD is answered alone: decrypt refuses it, and in a batch it fails the request.
+            if stored.startswith(_V3_PREFIX) and not isinstance(aad, UnboundAAD):
                 sealed.append(index)
             else:
                 results[index] = decrypt_or_error(self, stored, aad)
@@ -728,6 +733,10 @@ class TransitCipher(_UnmarkedPolicy):
         this cipher then sends every later value alone. Vault's 400 to a batch, or a failure the
         classifier could not read (:func:`_classify_batch_failure`), seals that batch alone and
         leaves batching on. A batch of one is a single request."""
+        for _, aad in items:
+            # Refused before any request: in a batch the refusal would read as Transit's, and the
+            # values ahead of it would each be sealed alone first (BACKLOG #5962).
+            require_bound_aad(aad)
         costs = [
             b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
             for plaintext, aad in items

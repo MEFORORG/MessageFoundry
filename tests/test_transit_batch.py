@@ -40,6 +40,7 @@ from messagefoundry.store.cipher_cells import (
     connect_readonly,
 )
 from messagefoundry.store.crypto import (
+    AADComponentError,
     AesGcmCipher,
     CipherError,
     CipherUnavailableError,
@@ -726,3 +727,25 @@ def test_detached_clears_every_member_of_an_exception_group() -> None:
     assert _frames_reach(error, secret)
     detached(error)
     assert not _frames_reach(error, secret)
+
+
+def test_a_none_key_is_refused_before_any_transit_request() -> None:
+    # BACKLOG #5962: a cell_aad with a None key component never reaches Vault. A seal batch refuses
+    # it before any request, and an open batch answers it alone, so the rest still batch and
+    # batching stays on.
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = [("v", cell_aad("t", "c", i)) for i in range(4)] + [("v", cell_aad("t", "c", None))]
+    with pytest.raises(AADComponentError, match=r"^t\.c: "):
+        cipher.encrypt_many(items)
+    assert transit.encrypt_requests == 0
+    sealed = cipher.encrypt_many([("v", cell_aad("t", "c", i)) for i in range(5)])
+    transit.decrypt_requests = 0
+    opened = cipher.decrypt_many(
+        [(sealed[i], cell_aad("t", "c", i)) for i in range(4)]
+        + [(sealed[4], cell_aad("t", "c", None))]
+    )
+    assert opened[:4] == ["v"] * 4
+    assert isinstance(opened[4], AADComponentError)
+    assert transit.decrypt_requests == 1  # one batch for the four; the refusal sent nothing
+    assert cipher._batch_alone is False
