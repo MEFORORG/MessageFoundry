@@ -137,7 +137,10 @@ def _env(shim: Path, **over: str) -> dict[str, str]:
     return env
 
 
-def _run(root: Path, *args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run(
+    root: Path, *args: str, env: dict[str, str], cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the checkout's script by absolute path, from ``cwd`` (the checkout itself by default)."""
     return subprocess.run(
         [
             "pwsh",
@@ -147,7 +150,7 @@ def _run(root: Path, *args: str, env: dict[str, str]) -> subprocess.CompletedPro
             str(root / "scripts" / "dev" / "setup-leak-gate.ps1"),
             *args,
         ],
-        cwd=str(root),
+        cwd=str(cwd or root),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -333,3 +336,71 @@ def test_a_healthy_run_still_exits_zero(rig: tuple[Path, Path, Path]) -> None:
     proc = _run(root, "-Synthetic", env=_env(shim))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "VERIFY FAILED" not in proc.stdout
+
+
+# --------------------------------------------------------------------------------------------------
+# the verify step scans the checkout the script derives, not the caller's directory (BACKLOG #5467)
+# --------------------------------------------------------------------------------------------------
+
+
+def test_the_verify_step_runs_from_outside_any_git_directory(
+    rig: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """With no path argument the scanner lists the tracked files of its CURRENT DIRECTORY. Invoked by
+    absolute path from a directory that is no git checkout, the verify step used to fail there."""
+    root, shim, _ = rig
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    proc = _run(root, "-Synthetic", env=_env(shim), cwd=elsewhere)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "CONFIGURED (synthetic)" in proc.stdout, proc.stdout
+    assert "VERIFY FAILED" not in proc.stdout
+
+
+def test_the_verify_step_scans_the_derived_checkout_not_the_callers(
+    rig: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """The caller's checkout tracks a file carrying a listed token; the derived checkout does not.
+
+    Scanning the caller's directory would report that hit against a checkout it does not belong to.
+    The paired control below proves the planted file IS a hit, so a pass here is not a blind scanner.
+    """
+    root, shim, ext = rig
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    (caller / "notes.txt").write_text(f"{_EXTERNAL_MARKER}\n", encoding="utf-8")
+    _git("init", "-b", "main", ".", cwd=caller)
+    _git("add", "notes.txt", cwd=caller)
+    env = _env(shim, MEFOR_FORBIDDEN_TOKENS=str(ext))
+
+    proc = _run(root, "-Synthetic", env=env, cwd=caller)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "VERIFY FAILED" not in proc.stdout
+
+    # The control: the same planted file, tracked in the DERIVED checkout, does fail the verify step.
+    (root / "notes.txt").write_text(f"{_EXTERNAL_MARKER}\n", encoding="utf-8")
+    _git("add", "notes.txt", cwd=root)
+    control = _run(root, "-Synthetic", env=env, cwd=caller)
+    assert control.returncode != 0, control.stdout
+    assert "VERIFY FAILED" in control.stdout, control.stdout
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="a POSIX venv interpreter has no .exe to launch on Windows"
+)
+def test_a_posix_venv_interpreter_is_used(rig: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    """``<repo>/.venv/bin/python`` is the checkout's interpreter on POSIX; it was ignored in favour of
+    whatever ``python`` PATH offered."""
+    root, shim, _ = rig
+    marker = tmp_path / "venv-python-ran"
+    venv_py = root / ".venv" / "bin" / "python"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_text(
+        f'#!/bin/sh\ntouch "{marker}"\nexec "{sys.executable}" "$@"\n', encoding="ascii"
+    )
+    venv_py.chmod(0o755)
+    proc = _run(root, "-Synthetic", env=_env(shim))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert marker.exists(), "the checkout's .venv/bin/python was not used"
