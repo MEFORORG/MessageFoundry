@@ -281,10 +281,18 @@ function Get-RootUnavailability {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $o }
 
     $doc = $null
-    try { $doc = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
-    catch {
+    # -NoEnumerate: unrolled, a one-element array would reach the object check below as its element.
+    # A read or parse that throws leaves $doc $null, which the object check refuses with the rest.
+    try { $doc = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
+    catch { $doc = $null }
+    # A MARKER THAT PARSES TO ANYTHING BUT AN OBJECT IS DAMAGED TOO. An empty or whitespace-only file
+    # and JSON null parse to $null without throwing, and an array or a scalar parses cleanly, so the
+    # catch alone let all of them fall through to UNAVAILABLE -- the verdict for a recorded
+    # cancellation, which stops the collector publishing a live account. An array holding
+    # `{"unavailable": false}` even read as AVAILABLE. Only an object can say anything here.
+    if ($doc -isnot [System.Management.Automation.PSCustomObject]) {
         $o.state = 'MALFORMED'
-        $o.reason = "the availability marker at $path is not readable JSON, so this account is treated as UNAVAILABLE rather than assumed spendable"
+        $o.reason = "the availability marker at $path is not a readable JSON object, so this account is treated as UNAVAILABLE rather than assumed spendable"
         return $o
     }
     # A MARKER SAYING `unavailable: false` IS AN ANSWER, not a broken file. It is what -Clear could

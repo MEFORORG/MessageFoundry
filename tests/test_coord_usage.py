@@ -3750,6 +3750,74 @@ def test_a_damaged_marker_does_not_stop_a_live_account_publishing(tmp_path: Path
     assert doc["marker_state"] == "MALFORMED"
 
 
+# Each parses WITHOUT throwing, so on origin/main the catch that names a damaged marker never ran.
+_NOT_AN_OBJECT = {
+    "empty": "",
+    "whitespace": "  \r\n ",
+    "null": "null",
+    "array": "[]",
+    "array-of-marker": '[{"unavailable": true, "reason": "cancelled"}]',
+    "array-of-clear": '[{"unavailable": false}]',
+    "number": "5",
+    "string": '"cancelled"',
+    "boolean": "true",
+}
+
+
+def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_path: Path) -> None:
+    """Vault BACKLOG #5305. Red pre-fix: every one of these fell through to UNAVAILABLE -- the verdict
+    for a recorded cancellation, which the collector honours by refusing to publish a live account --
+    and an array holding a cleared marker read as AVAILABLE outright. One pwsh run classifies them
+    all; the end-to-end test below drives the collector and the reader on two of them.
+    """
+    for name, body in _NOT_AN_OBJECT.items():
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "unavailable.json").write_text(body, encoding="utf-8")
+    script = "; ".join(
+        [
+            f". '{CONFIG_ROOTS}'",
+            "$out = [ordered]@{}",
+            *(
+                f"$out['{name}'] = (Get-RootUnavailability -StateDir '{tmp_path / name}').state"
+                for name in _NOT_AN_OBJECT
+            ),
+            "$out | ConvertTo-Json -Compress | Write-Output",
+        ]
+    )
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    states = json.loads(proc.stdout)
+    assert states == dict.fromkeys(_NOT_AN_OBJECT, "MALFORMED"), states
+
+
+@pytest.mark.parametrize("name", ["empty", "array-of-clear"])
+def test_a_marker_that_parses_to_no_object_does_not_stop_a_live_account_publishing(
+    tmp_path: Path, name: str
+) -> None:
+    """Vault BACKLOG #5305, end to end: the collector's damaged-marker guard publishes, and the
+    reader still refuses, so the fix cannot pass by dropping the marker check altogether.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    (state / "unavailable.json").write_text(_NOT_AN_OBJECT[name], encoding="utf-8")
+
+    line = collect(state, {"rate_limits": {"seven_day": window(42.0, 3600)}})
+    assert "unavailable" not in line, f"a damaged marker blanked a live account: {line}"
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(42.0)
+
+    code, doc = read(state)
+    assert code == UNAVAILABLE, doc
+    assert doc["marker_state"] == "MALFORMED", doc
+
+
 # ------------------------------------------ BACKLOG #1459: roots that never publish, and why
 #
 # Measured 2026-09-30 across six live config roots. The account roots that DID publish carry a
