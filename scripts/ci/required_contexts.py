@@ -7,7 +7,8 @@ installed: ``scripts/release/tag_provenance.py`` on the release runner, and
 ``scripts/ci/check_required_contexts_drift.py`` on the scanner-lock job.
 ``tests/_workflow_contexts.py`` uses the same file parser. Before vault BACKLOG #2631 each had its
 own copy, and two of them disagreed on what an absent server list means. Here an absent list
-RAISES: an unprotected branch, or a changed API shape, is not an empty required set.
+RAISES: an unprotected branch, or a changed API shape, is not an empty required set. By default an
+empty one raises too (``branch_protection_contexts``).
 """
 
 from __future__ import annotations
@@ -50,22 +51,53 @@ def gh_api(args: Sequence[str]) -> Any:
     return json.loads(out.stdout)
 
 
-def branch_protection_contexts(payload: Any) -> list[str]:
+def branch_protection_contexts(payload: Any, *, allow_empty: bool = False) -> list[str]:
     """The contexts classic branch protection requires, from a ``branches/{branch}`` payload.
 
-    That endpoint answers an anonymous reader, so no admin scope is needed.
+    That endpoint answers an anonymous reader, so no admin scope is needed. GitHub carries the
+    required set twice, as ``contexts`` and as ``checks[].context``; the answer is the union, so a
+    context recorded under only one of them is still read.
+
+    An empty answer RAISES by default: an unprotected branch, an ``enforcement_level`` of ``off`` and
+    an empty list all mean classic protection requires nothing, and a caller comparing against this
+    set or gating a release on it must refuse rather than read "nothing is required" (BACKLOG
+    #5465). ``allow_empty=True`` is for a caller that unions this with the ruleset contexts and
+    refuses an empty COMBINED set itself; it gets ``[]`` for those three cases instead. A payload
+    with neither list raises either way, because the API shape changed and nothing was read.
     """
     if not isinstance(payload, dict):
         raise RuntimeError(f"the branch payload is a {type(payload).__name__}, not an object")
     protection = payload.get("protection") or {}
     checks = protection.get("required_status_checks") or {}
     contexts = checks.get("contexts")
-    if contexts is None:
+    check_list = checks.get("checks")
+    if contexts is None and check_list is None:
         raise RuntimeError(
-            "the branch payload carried no required_status_checks.contexts -- the API shape changed, "
-            "or this branch is unprotected. Either way it is not an empty required set."
+            "the branch payload carried no required_status_checks.contexts or .checks -- the API "
+            "shape changed, or this branch is unprotected. Either way it is not an empty required set."
         )
-    return [str(c) for c in contexts]
+    if not isinstance(contexts, list | None) or not isinstance(check_list, list | None):
+        raise RuntimeError("required_status_checks.contexts or .checks is not a list")
+    found: list[str] = [str(c) for c in contexts or []]
+    for check in check_list or []:
+        if not isinstance(check, dict) or not check.get("context"):
+            raise RuntimeError(f"a required_status_checks.checks entry names no context: {check!r}")
+        found.append(str(check["context"]))
+    unique = list(dict.fromkeys(found))
+    if payload.get("protected") is False:
+        why_empty = "the branch is not protected"
+    elif checks.get("enforcement_level") == "off":
+        why_empty = "required_status_checks.enforcement_level is off"
+    elif not unique:
+        why_empty = "required_status_checks lists no context"
+    else:
+        return unique
+    if allow_empty:
+        return []
+    raise RuntimeError(
+        f"{why_empty}, so classic branch protection requires nothing. That is refused, not read as "
+        "an empty required set."
+    )
 
 
 def ruleset_contexts(rules: Any) -> list[str]:
