@@ -11,11 +11,15 @@ the old name in another role is reported unresolved rather than passed as clean.
 
 from __future__ import annotations
 
+import codecs
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
+from messagefoundry.config import codeset_edit
+from messagefoundry.config.code_sets import load_code_set
 from messagefoundry.config.impact import apply_rename, plan_rename
 from messagefoundry.config.reachability import Reference
 from messagefoundry.config.wiring import WiringError, load_config
@@ -932,7 +936,7 @@ def test_a_definition_on_line_one_of_a_bom_file_is_renamed(tmp_path: Path) -> No
     d = tmp_path / "config"
     d.mkdir()
     (d / "mod.py").write_text(
-        "﻿import messagefoundry as mf; "
+        "\ufeffimport messagefoundry as mf; "
         'mf.outbound("OB_OLD", mf.MLLP(host="127.0.0.1", port=7015))\n'
         + _HEAD
         + 'inbound("IB_B", MLLP(port=2854), router="r_b")\n'
@@ -1005,3 +1009,233 @@ def test_a_definition_named_through_a_module_constant_is_renamed(
     reg = load_config(config_dir)
     table = reg.outbound if kind == "outbound" else reg.handlers
     assert old + "_NEW" in table and old not in table
+
+
+@pytest.mark.parametrize(
+    ("kind", "old", "body"),
+    [
+        (
+            # The constant names the inbound and its router alike: rewriting it renames both.
+            "inbound",
+            "IB_SAME",
+            'NAME = "IB_SAME"\n'
+            "inbound(NAME, MLLP(port=2860), router=NAME)\n"
+            'outbound("OB_S", MLLP(host="127.0.0.1", port=7020))\n'
+            "\n"
+            '@router("IB_SAME")\n'
+            "def r_s(msg):\n"
+            '    return ["h_s"]\n'
+            "\n"
+            '@handler("h_s")\n'
+            "def h_s(msg):\n"
+            '    return Send("OB_S", msg)\n',
+        ),
+        (
+            # The constant names the outbound and a handler: rewriting it renames the handler too.
+            "outbound",
+            "OB_SAME",
+            'NAME = "OB_SAME"\n'
+            'inbound("IB_S", MLLP(port=2861), router="r_s")\n'
+            'outbound(NAME, MLLP(host="127.0.0.1", port=7021))\n'
+            "\n"
+            '@router("r_s")\n'
+            "def r_s(msg):\n"
+            '    return ["OB_SAME"]\n'
+            "\n"
+            "@handler(NAME)\n"
+            "def h_s(msg):\n"
+            '    return Send("OB_SAME", msg)\n',
+        ),
+        (
+            # The call reads its parameter, not the module constant of the same name.
+            "outbound",
+            "OB_OLD",
+            'OB = "OB_OLD"\n'
+            'inbound("IB_S", MLLP(port=2862), router="r_s")\n'
+            "\n"
+            "def _declare(OB):\n"
+            '    outbound(OB, MLLP(host="127.0.0.1", port=7022))\n'
+            "\n"
+            '_declare("OB_OLD")\n'
+            "\n"
+            '@router("r_s")\n'
+            "def r_s(msg):\n"
+            '    return ["h_s"]\n'
+            "\n"
+            '@handler("h_s")\n'
+            "def h_s(msg):\n"
+            '    return Send("OB_OLD", msg)\n',
+        ),
+    ],
+    ids=["inbound-and-router", "outbound-and-handler", "shadowing-parameter"],
+)
+def test_a_definition_constant_other_code_reads_is_refused(
+    tmp_path: Path, kind: str, old: str, body: str
+) -> None:
+    """A module constant the definition's name argument reads is rewritten only when no other code
+    reads it, and only when the call reads the module's binding at all; otherwise the rename would
+    change another object's name or leave the definition under its old one."""
+    config_dir = _write_config(tmp_path, body)
+    before = _mod(config_dir)
+    with pytest.raises(WiringError, match="could not be located, or other code reads it too"):
+        plan_rename(load_config(config_dir), config_dir, kind, old, old + "_NEW")
+    assert _mod(config_dir) == before
+
+
+def test_a_referrer_constant_another_object_is_named_by_is_reported(tmp_path: Path) -> None:
+    """``H`` is the handler's own name and its Send() target alike, so rewriting it for the
+    outbound would rename the handler too: it is left, and the handler is reported unresolved."""
+    config_dir = _write_config(
+        tmp_path,
+        'H = "OB_SAME"\n'
+        'inbound("IB_S", MLLP(port=2863), router="r_s")\n'
+        'outbound("OB_SAME", MLLP(host="127.0.0.1", port=7023))\n'
+        "\n"
+        '@router("r_s")\n'
+        "def r_s(msg):\n"
+        '    return ["OB_SAME"]\n'
+        "\n"
+        "@handler(H)\n"
+        "def h_s(msg):\n"
+        "    return Send(H, msg)\n",
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_SAME", "OB_NEW")
+    assert [(e.line, e.new_literal) for e in plan.edits] == [(5, '"OB_NEW"')]
+    assert plan.unresolved == (Reference("handler", "OB_SAME", "outbound", "OB_SAME"),)
+
+
+_LOOKUP_TAIL = (
+    "\n"
+    '@router("r_l")\n'
+    "def r_l(msg):\n"
+    '    return ["h_l"]\n'
+    "\n"
+    '@handler("h_l")\n'
+    "def h_l(msg):\n"
+    '    row = db_lookup("clarity", "SELECT 1", ())\n'
+    '    return Send("OB_L", msg)\n'
+)
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "from messagefoundry import DatabaseLookup\n"
+        'DatabaseLookup(name="clarity", server="db", database="C", username="u", password="p")\n',
+        "from messagefoundry import DatabaseLookup as DL\n"
+        'DL("clarity", server="db", database="C", username="u", password="p")\n',
+        "from messagefoundry import DatabaseLookup\n"
+        'CLARITY = "clarity"\n'
+        'DatabaseLookup(CLARITY, server="db", database="C", username="u", password="p")\n',
+    ],
+    ids=["keyword-name", "aliased-factory", "module-constant"],
+)
+def test_a_declaration_spelled_another_way_is_renamed(tmp_path: Path, declaration: str) -> None:
+    config_dir = _write_config(
+        tmp_path,
+        "from messagefoundry import db_lookup\n"
+        + declaration
+        + 'inbound("IB_L", MLLP(port=2864), router="r_l")\n'
+        'outbound("OB_L", MLLP(host="127.0.0.1", port=7024))\n' + _LOOKUP_TAIL,
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "lookup", "clarity", "clarity2")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"clarity"' not in _mod(config_dir)
+    assert "clarity2" in load_config(config_dir).lookups
+
+
+def test_a_declaration_the_scan_cannot_read_is_refused(tmp_path: Path) -> None:
+    """A name built at load time leaves no literal to rewrite, so the rename is refused rather than
+    renaming only the referents."""
+    config_dir = _write_config(
+        tmp_path,
+        "from messagefoundry import DatabaseLookup, db_lookup\n"
+        'for _n in ["clarity"]:\n'
+        '    DatabaseLookup(_n, server="db", database="C", username="u", password="p")\n'
+        'inbound("IB_L", MLLP(port=2865), router="r_l")\n'
+        'outbound("OB_L", MLLP(host="127.0.0.1", port=7025))\n' + _LOOKUP_TAIL,
+    )
+    with pytest.raises(WiringError, match="could not be located"):
+        plan_rename(load_config(config_dir), config_dir, "lookup", "clarity", "clarity2")
+
+
+def test_a_declaration_in_a_bom_file_is_renamed(tmp_path: Path) -> None:
+    d = tmp_path / "config"
+    d.mkdir()
+    (d / "mod.py").write_bytes(
+        codecs.BOM_UTF8
+        + (
+            _HEAD + "from messagefoundry import DatabaseLookup, db_lookup\n"
+            'DatabaseLookup("clarity", server="db", database="C", username="u", password="p")\n'
+            'inbound("IB_L", MLLP(port=2866), router="r_l")\n'
+            'outbound("OB_L", MLLP(host="127.0.0.1", port=7026))\n' + _LOOKUP_TAIL
+        ).encode("utf-8")
+    )
+    plan = plan_rename(load_config(d), d, "lookup", "clarity", "clarity2")
+    apply_rename(plan)
+    assert '"clarity"' not in (d / "mod.py").read_text(encoding="utf-8-sig")
+    assert "clarity2" in load_config(d).lookups
+
+
+def test_a_handler_defined_outside_the_config_dir_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handler's definition is in a module outside the config dir, which a rename never
+    writes, so renaming only the router's referent would leave the two apart."""
+    ext = tmp_path / "ext"
+    ext.mkdir()
+    (ext / "b617_ext_handlers.py").write_text(
+        "from messagefoundry import Send, handler\n"
+        "\n"
+        '@handler("h_ext")\n'
+        "def h_ext(msg):\n"
+        '    return Send("OB_E", msg)\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(ext))
+    monkeypatch.delitem(sys.modules, "b617_ext_handlers", raising=False)
+    config_dir = _write_config(
+        tmp_path,
+        'inbound("IB_E", MLLP(port=2867), router="r_e")\n'
+        'outbound("OB_E", MLLP(host="127.0.0.1", port=7027))\n'
+        "import b617_ext_handlers  # noqa: E402, F401\n"
+        "\n"
+        '@router("r_e")\n'
+        "def r_e(msg):\n"
+        '    return ["h_ext"]\n',
+    )
+    registry = load_config(config_dir)
+    assert "h_ext" in registry.handlers
+    with pytest.raises(WiringError, match="could not be located"):
+        plan_rename(registry, config_dir, "handler", "h_ext", "h_ext2")
+
+
+def test_codeset_rename_with_an_unresolved_referrer_moves_nothing(tmp_path: Path) -> None:
+    """``codeset rename`` moved the file and then applied a plan that left a referrer reading the
+    old name. It now refuses before anything moves."""
+    config_dir = _write_config(
+        tmp_path,
+        'inbound("IB_K", MLLP(port=2868), router="r_k")\n'
+        'outbound("OB_K", MLLP(host="127.0.0.1", port=7028))\n'
+        "\n"
+        '@router("r_k")\n'
+        "def r_k(msg):\n"
+        '    return ["h_k"]\n'
+        "\n"
+        '@handler("h_k")\n'
+        "def h_k(msg):\n"
+        '    label = code_set("diets").get("diets")\n'
+        '    return Send("OB_K", msg)\n',
+        codesets=("diets",),
+    )
+
+    def validate(path: Path) -> None:
+        load_code_set(path)
+
+    before = _mod(config_dir)
+    with pytest.raises(WiringError, match="cannot be rewritten"):
+        codeset_edit.rename_code_set(config_dir, "diets", "meals", validate=validate)
+    assert (config_dir / "codesets" / "diets.csv").is_file()
+    assert not (config_dir / "codesets" / "meals.csv").exists()
+    assert _mod(config_dir) == before

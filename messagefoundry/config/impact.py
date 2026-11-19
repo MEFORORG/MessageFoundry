@@ -243,28 +243,37 @@ def plan_rename(
     # file -> the line spans of the object's own definition, scanned for literals, and the positions in
     # them of its name argument, the only literals there that are rewritten (BACKLOG #5980).
     def_spans: dict[str, list[_Span]] = {}
-    def_positions: dict[str, set[tuple[int, int]]] = {}
+    def_positions: dict[str, set[_Pos]] = {}
+    # (file, literal position) -> the declaring arguments reading a module constant's literal.
+    def_readers: dict[tuple[str, _Pos], frozenset[_Pos]] = {}
+    # A definition that exists but that this plan cannot read: outside the config dir, with no
+    # source, or not found by the declaration scan. Its name would stay old, so the plan refuses.
+    unlocated: list[str] = []
     # (toml-path, key) pairs whose value == old must be rewritten (router binding / name definition).
     toml_targets: set[tuple[str, str]] = set()
 
     def add_def_span(
-        file: str | None, span: _Span | None, positions: frozenset[tuple[int, int]]
+        file: str | None, span: _Span | None, positions: Mapping[_Pos, frozenset[_Pos]]
     ) -> None:
-        if file is None or span is None:
+        resolved = _under_config_dir(config_dir, file) if file is not None else None
+        if resolved is None or span is None:
+            unlocated.append(file or "an unreadable source")
             return
-        resolved = _under_config_dir(config_dir, file)
-        if resolved is not None:
-            def_spans.setdefault(resolved, []).append(span)
-            def_positions.setdefault(resolved, set()).update(positions)
-            # A name given through a module constant sits on that constant's line, outside the span.
-            def_spans[resolved].extend(
-                _Span(line, line) for line, _col in positions if not span.start <= line <= span.end
-            )
+        def_spans.setdefault(resolved, []).append(span)
+        def_positions.setdefault(resolved, set()).update(positions)
+        for pos, args in positions.items():
+            if args:
+                def_readers[(resolved, pos)] = def_readers.get((resolved, pos), frozenset()) | args
+        # A name given through a module constant sits on that constant's line, outside the span.
+        def_spans[resolved].extend(
+            _Span(line, line) for line, _col in positions if not span.start <= line <= span.end
+        )
 
     # The object's own definition (so the name is actually changed, not only its referents).
     _add_definition_span(
         registry, config_dir, target_kind, old, sources, add_def_span, toml_targets
     )
+    toml_defs = {path for path, key in toml_targets if key == "name"}
 
     # Every referent edge: rewrite the literal at each site the referrer reads it from (or its toml
     # binding). Keep each py referrer's sites, so a referrer we could not rewrite is surfaced, not
@@ -300,12 +309,31 @@ def plan_rename(
         kinds = sources.occurrences(file, old)
         for edit in _py_literal_edits(file, old, new, spans):
             pos = _source_position(edit, bom_files)
-            if pos in def_positions.get(file, ()) or any(
+            is_def = pos in def_positions.get(file, ())
+            if not is_def and not any(
                 site.rewrites(pos, kinds, shared_kind) for site in file_sites
             ):
+                continue
+            # A literal a module binding holds changes every read of that name, so each read must
+            # be one this rename means to change. A definition's own literal argument is not
+            # bound; its constant is checked against the declaring argument that reads it.
+            if is_def and (file, pos) not in def_readers:
+                edits.append(edit)
+                continue
+            covering = [
+                site
+                for _ref, sites, _complete in referrers
+                if any(s.file == file and s.rewrites(pos, kinds, shared_kind) for s in sites)
+                for site in sites
+            ]
+            declaring = def_readers.get((file, pos), frozenset())
+            if _binding_read_only_by_referents(sources, config_dir, file, pos, declaring, covering):
                 edits.append(edit)
     for toml_path, key in toml_targets:
-        edits.extend(_toml_value_edits(toml_path, key, old, new))
+        toml_edits = _toml_value_edits(toml_path, key, old, new)
+        if key == "name" and not toml_edits:
+            unlocated.append(toml_path)
+        edits.extend(toml_edits)
 
     # Deterministic, de-duplicated (a literal reachable from two overlapping spans appears once).
     unique = {(e.file, e.start_line, e.start_col): e for e in edits}
@@ -313,13 +341,18 @@ def plan_rename(
     edited = {(e.file, *_source_position(e, bom_files)) for e in ordered}
     # The definition's name literal must be among the edits, or --apply would rename every referent
     # and leave the object under its old name: a name that reaches the call through a loop or a
-    # comprehension, say, or one the tokenizer refused. Refuse rather than plan half a rename.
+    # comprehension, say, one the tokenizer refused, a constant other code also reads, or a
+    # definition this plan cannot read at all. Refuse rather than plan half a rename. A code set's
+    # definition is its file, which `codeset rename` moves.
     wanted = {(file, *pos) for file, positions in def_positions.items() for pos in positions}
-    if def_spans and (not wanted or not wanted <= edited):
-        where = ", ".join(sorted(def_spans))
+    if target_kind != "code_set" and (
+        unlocated or (not toml_defs and not wanted) or not wanted <= edited
+    ):
+        where = ", ".join(sorted(set(def_spans) | set(unlocated))) or "the loaded config"
         raise WiringError(
             f"cannot rename {target_kind} {old!r}: the name literal of its definition in {where} "
-            "could not be located, so the rename would leave it under its old name; rename it by hand"
+            "could not be located, or other code reads it too, so the rename would leave the "
+            "definition under its old name or change what that code reads; rename it by hand"
         )
     unresolved = _unresolved_referrers(referrers, edited, old, sources, shared_kind)
     return RenamePlan(
@@ -368,7 +401,7 @@ def _add_definition_span(
     target_kind: str,
     old: str,
     sources: SourceCache,
-    add_py_span: Callable[[str | None, _Span | None, frozenset[tuple[int, int]]], None],
+    add_py_span: Callable[[str | None, _Span | None, Mapping[_Pos, frozenset[_Pos]]], None],
     toml_targets: set[tuple[str, str]],
 ) -> None:
     """Scope the object's own definition (``@router("old")`` / ``outbound("old", …)`` /
@@ -385,7 +418,7 @@ def _add_definition_span(
             positions = (
                 _decorator_positions(sources, file, span, fn, old, target_kind)
                 if file is not None and span is not None
-                else frozenset()
+                else {}
             )
             add_py_span(file, span, positions)
         return
@@ -401,22 +434,19 @@ def _add_definition_span(
             )
         elif conn.source_file and _is_connections_toml(conn.source_file):
             toml_targets.add((conn.source_file, "name"))
+        else:
+            # Declared somewhere this plan cannot read, so its name cannot be rewritten.
+            add_py_span(None, None, {})
         return
     if target_kind in _DECLARATION_FACTORIES:
         # lookup/fhir_lookup/reference are code-first declarations (``DatabaseLookup("old", …)`` etc.)
         # whose spec records no source line — locate the declaring statement by parsing the modules.
-        file, span, name_arg = _scan_declaration_span(
-            config_dir, _DECLARATION_FACTORIES[target_kind], old
-        )
         # The scan found the declaring call itself, so its name argument is taken from it, never
         # re-found by line: a declaration wrapped in another call (with_smart_backend(...)) is
         # still the one renamed.
-        positions = (
-            frozenset({sources.position(file, name_arg)})
-            if file is not None and name_arg is not None
-            else frozenset()
+        add_py_span(
+            *_scan_declaration_span(config_dir, _DECLARATION_FACTORIES[target_kind], old, sources)
         )
-        add_py_span(file, span, positions)
 
 
 @dataclass(frozen=True)
@@ -513,8 +543,10 @@ def _referrer_sites(
         # site, so an equal literal there is still counted.
         own_file, own_span = _fn_span(fn)
         ignored = (
-            _decorator_positions(
-                sources, own_file, own_span, fn, old, ref.referrer_kind, registering_only=True
+            frozenset(
+                _decorator_positions(
+                    sources, own_file, own_span, fn, old, ref.referrer_kind, registering_only=True
+                )
             )
             if own_file is not None and own_span is not None
             else frozenset()
@@ -653,6 +685,9 @@ _COLLECTOR_METHODS = frozenset({"append", "extend", "add", "insert"})
 _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
+
+#: A ``(line, char col)`` source position, as :meth:`SourceCache.position` gives it.
+_Pos = tuple[int, int]
 
 
 @dataclass
@@ -1080,53 +1115,100 @@ def _name_argument_position(
 
 def _definition_positions(
     sources: SourceCache, file: str, calls: list[ast.Call], kind: str, old: str
-) -> frozenset[tuple[int, int]]:
+) -> dict[_Pos, frozenset[_Pos]]:
     """The name argument of each call to ``kind`` among ``calls``, or of every one of ``calls``
-    when none is spelled ``kind`` (an aliased import)."""
+    when none is spelled ``kind`` (an aliased import), each mapped to the declaring arguments that
+    read it: none for a literal, the ``NAME`` argument for a module constant's literal."""
     named = [call for call in calls if _call_name(call.func) == kind] or calls
-    return frozenset(
-        pos
-        for call in named
-        if (
-            pos := _name_argument_position(sources, file, call, old)
-            or _module_constant_position(sources, file, call, old)
-        )
-    )
+    out: dict[_Pos, frozenset[_Pos]] = {}
+    for call in named:
+        pos = _name_argument_position(sources, file, call, old)
+        if pos is not None:
+            out.setdefault(pos, frozenset())
+            continue
+        constant = _module_constant_position(sources, file, call, old)
+        if constant is not None:
+            literal, arg = constant
+            out[literal] = out.get(literal, frozenset()) | {arg}
+    return out
 
 
 def _module_constant_position(
     sources: SourceCache, file: str, call: ast.Call, old: str
-) -> tuple[int, int] | None:
+) -> tuple[_Pos, _Pos] | None:
     """Where a name argument spelled as a module constant (``outbound(OB_ADT, ...)``) is given
-    ``old``: the literal of the module's one top-level ``OB_ADT = "old"``. A name bound any other
-    way, or more than once, gives ``None``, so the definition counts as not located."""
+    ``old``: the literal of the module's one top-level ``OB_ADT = "old"``, and the position of the
+    argument that reads it. ``None`` when the call is not evaluated in module scope (in a ``def``,
+    a class body or a comprehension a parameter or a local may shadow the module's name), or the
+    module binds the name any other way or more than once, so the definition counts as not
+    located. Who else reads the constant is checked once the referrers are known
+    (:func:`_binding_read_only_by_referents`)."""
     arg = _first_or_keyword(call, "name")
     parsed = sources.parse(file)
     if not isinstance(arg, ast.Name) or parsed is None:
         return None
-    values: list[ast.expr | None] = []
-    for stmt in parsed[0].body:
-        if isinstance(stmt, ast.Assign):
-            values.extend(
-                stmt.value for t in stmt.targets if isinstance(t, ast.Name) and t.id == arg.id
-            )
-            if any(not isinstance(t, ast.Name) for t in stmt.targets):
-                # A tuple or attribute target may bind it too; do not guess which element.
-                values.extend(
-                    None
-                    for t in stmt.targets
-                    for n in ast.walk(t)
-                    if isinstance(n, ast.Name) and n.id == arg.id and n is not t
-                )
-        elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
-            if isinstance(stmt.target, ast.Name) and stmt.target.id == arg.id:
-                values.append(None)
-        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            if any((a.asname or a.name) == arg.id for a in stmt.names):
-                values.append(None)
-    if len(values) == 1 and isinstance(values[0], ast.Constant) and values[0].value == old:
-        return sources.position(file, values[0])
-    return None
+    tree = parsed[0]
+    if id(arg) not in _module_scope_ids(tree):
+        return None
+    bindings = [node for node in ast.walk(tree) if _binds(node, arg.id)]
+    if len(bindings) != 1:
+        return None
+    stmt = next(
+        (
+            s
+            for s in tree.body
+            if isinstance(s, ast.Assign) and any(t is bindings[0] for t in s.targets)
+        ),
+        None,
+    )
+    if stmt is None or not isinstance(stmt.value, ast.Constant) or stmt.value.value != old:
+        return None
+    return sources.position(file, stmt.value), sources.position(file, arg)
+
+
+def _module_scope_ids(tree: ast.Module) -> set[int]:
+    """The ids of ``tree``'s nodes evaluated in module scope: a ``def``'s decorators and defaults
+    are, its body is not, and nor is a class body or any part of a comprehension."""
+    out: set[int] = set()
+    stack: list[ast.AST] = list(tree.body)
+    while stack:
+        node = stack.pop()
+        out.add(id(node))
+        if isinstance(node, _FUNCTION_NODES):
+            if not isinstance(node, ast.Lambda):
+                stack.extend(node.decorator_list)
+            stack.extend(node.args.defaults)
+            stack.extend(d for d in node.args.kw_defaults if d is not None)
+        elif isinstance(node, ast.ClassDef):
+            stack.extend(node.decorator_list + node.bases + [kw.value for kw in node.keywords])
+        elif not isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            stack.extend(ast.iter_child_nodes(node))
+    return out
+
+
+def _binds(node: ast.AST, name: str) -> bool:
+    """Whether ``node`` binds ``name`` in some scope, or may (a star import, a ``global``)."""
+    if isinstance(node, ast.Name):
+        return node.id == name and not isinstance(node.ctx, ast.Load)
+    if isinstance(node, ast.alias):
+        return node.name == "*" or (node.asname or node.name.split(".")[0]) == name
+    if isinstance(
+        node,
+        (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.ClassDef,
+            ast.ExceptHandler,
+            ast.MatchAs,
+            ast.MatchStar,
+        ),
+    ):
+        return node.name == name
+    if isinstance(node, ast.MatchMapping):
+        return node.rest == name
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return name in node.names
+    return False
 
 
 def _decorator_positions(
@@ -1138,7 +1220,7 @@ def _decorator_positions(
     kind: str,
     *,
     registering_only: bool = False,
-) -> frozenset[tuple[int, int]]:
+) -> dict[_Pos, frozenset[_Pos]]:
     """The name argument of the ``@router("old")`` / ``@handler("old")`` call registering ``fn``, or
     of ``router("old")(lambda ...)``. The function's body is not part of its definition, and nor is
     another decorator stacked on it -- unless the factory is imported under an alias, when every
@@ -1150,7 +1232,7 @@ def _decorator_positions(
 
     parsed = sources.parse(file)
     if parsed is None or not callable(fn):
-        return frozenset()
+        return {}
     fn_name = getattr(inspect.unwrap(fn), "__name__", None)
     calls: list[ast.Call] = []
     for node in ast.walk(parsed[0]):
@@ -1173,24 +1255,24 @@ def _decorator_positions(
             for a in node.names
             if a.name == kind and a.asname
         }
-        return frozenset(
-            pos
+        return {
+            pos: frozenset()
             for call in calls
             if _call_name(call.func) in spelled
             and (pos := _name_argument_position(sources, file, call, old))
-        )
+        }
     return _definition_positions(sources, file, calls, kind, old)
 
 
 def _call_line_positions(
     sources: SourceCache, file: str, line: int, old: str, kind: str
-) -> frozenset[tuple[int, int]]:
+) -> dict[_Pos, frozenset[_Pos]]:
     """The name argument of the ``inbound("old", …)`` / ``outbound("old", …)`` call on ``line``,
     which may sit inside another call (``_keep(outbound("old", …))``). Under an aliased factory, the
     calls on the line naming ``old`` that no other such call holds in its arguments."""
     parsed = sources.parse(file)
     if parsed is None:
-        return frozenset()
+        return {}
     calls = [n for n in ast.walk(parsed[0]) if isinstance(n, ast.Call) and n.lineno == line]
     if not any(_call_name(call.func) == kind for call in calls):
         calls = [c for c in calls if _name_argument_position(sources, file, c, old) is not None]
@@ -1273,12 +1355,124 @@ def _module_binding_sites(
     return sites, required <= bound
 
 
+def _binding_read_only_by_referents(
+    sources: SourceCache,
+    config_dir: Path,
+    file: str,
+    pos: _Pos,
+    declaring: frozenset[_Pos],
+    covering: list[_Site],
+) -> bool:
+    """Whether every read of the names bound by the module-scope statement holding the literal at
+    ``pos`` is one the rename means to change; ``True`` when no such statement holds it.
+
+    Rewriting ``NAME = "old"`` changes every read of ``NAME``, so a read is allowed only if it is
+    the definition's own declaring argument (``declaring``, at most one), or it sits in the body of
+    a function scanned at one of ``covering``, the sites of the referrers that rewrite this literal
+    as a referent. Any other read -- a second declaration (``inbound(NAME, router=NAME)``), another
+    object's decorator (``@handler(NAME)``), module-level code, a function no referrer covers, a
+    config module that imports it -- would change with it, so the literal is not rewritten: the
+    definition then counts as not located, and a referrer as unresolved (BACKLOG #5980)."""
+    names: set[str] = set()
+    for stmt, stmt_names in _module_bindings(sources, file, None):
+        if stmt.value is not None and any(
+            isinstance(node, ast.Constant) and sources.position(file, node) == pos
+            for node in ast.walk(stmt.value)
+        ):
+            names |= stmt_names
+    if not names:
+        return True
+    if len(declaring) > 1:
+        return False
+    try:
+        readers = _name_readers(sources, config_dir, file, names)
+    except OSError as exc:
+        _log.debug("rename could not list %s for readers: %s", config_dir, type(exc).__name__)
+        return False
+    for reader_file, node in readers:
+        if reader_file == file and sources.position(file, node) in declaring:
+            continue
+        if not _in_covered_body(sources, reader_file, node, covering):
+            return False
+    return True
+
+
+def _name_readers(
+    sources: SourceCache, config_dir: Path, file: str, names: set[str]
+) -> list[tuple[str, ast.expr]]:
+    """Every read of one of ``names``, bound at module scope in ``file``, across the config dir:
+    in ``file`` itself, and in any other config ``.py`` module that imports ``file``'s module (by
+    a bare name or as an attribute, whatever the import's spelling). A module that cannot be
+    parsed cannot have been run, so it is skipped. Raises the ``OSError`` of a failed listing."""
+    out: list[tuple[str, ast.expr]] = []
+    parsed = sources.parse(file)
+    if parsed is not None:
+        out.extend(
+            (file, node)
+            for node in ast.walk(parsed[0])
+            if isinstance(node, ast.Name) and node.id in names and isinstance(node.ctx, ast.Load)
+        )
+    stem = Path(file).stem
+    root = config_dir.resolve()
+    for path in sorted(root.rglob("*.py")):
+        other = str(path)
+        if other == file or any(part.startswith(".") for part in path.relative_to(root).parts):
+            continue
+        other_parsed = sources.parse(other)
+        if other_parsed is None:
+            continue
+        tree = other_parsed[0]
+        imports = any(
+            (isinstance(node, ast.ImportFrom) and stem in (node.module or "").split("."))
+            or any(stem in a.name.split(".") for a in node.names)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+        )
+        if not imports:
+            continue
+        out.extend(
+            (other, node)
+            for node in ast.walk(tree)
+            if (isinstance(node, ast.Name) and node.id in names)
+            or (isinstance(node, ast.Attribute) and node.attr in names)
+        )
+    return out
+
+
+def _in_covered_body(
+    sources: SourceCache, file: str, node: ast.expr, covering: list[_Site]
+) -> bool:
+    """Whether ``node`` sits in the body of a function in ``file`` that lies wholly in one of
+    ``covering``'s spans. A decorator, a default or a signature is not the body: it is evaluated
+    where the function is defined, so it is not one of the referrer's reads."""
+    parsed = sources.parse(file)
+    if parsed is None:
+        return False
+    at = (node.lineno, node.col_offset)
+    for scope in ast.walk(parsed[0]):
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            body: ast.stmt | ast.expr = scope.body[0]
+        elif isinstance(scope, ast.Lambda):
+            body = scope.body
+        else:
+            continue
+        end = (scope.end_lineno or scope.lineno, scope.end_col_offset or 0)
+        if not (body.lineno, body.col_offset) <= at <= end:
+            continue
+        if any(
+            site.file == file and site.span.start <= scope.lineno and end[0] <= site.span.end
+            for site in covering
+        ):
+            return True
+    return False
+
+
 def _module_bindings(
-    sources: SourceCache, file: str, names: set[str]
+    sources: SourceCache, file: str, names: set[str] | None
 ) -> list[tuple[ast.Assign | ast.AnnAssign | ast.AugAssign, set[str]]]:
-    """``file``'s module-scope assignments that bind one of ``names``, with the names each binds.
-    Module scope includes the bodies of top-level ``if``/``try``/``with``/``for``/``while``
-    statements, but never a ``def`` or ``class`` body."""
+    """``file``'s module-scope assignments that bind one of ``names`` (any name, for ``None``),
+    with the names each binds. Module scope includes the bodies of top-level
+    ``if``/``try``/``with``/``for``/``while`` statements, but never a ``def`` or ``class`` body."""
     parsed = sources.parse(file)
     if parsed is None:
         return []
@@ -1301,7 +1495,9 @@ def _module_bindings(
             targets = [stmt.target]
         else:
             continue
-        stmt_names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)} & names
+        stmt_names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+        if names is not None:
+            stmt_names &= names
         if stmt_names:
             out.append((stmt, stmt_names))
     return out
@@ -1350,17 +1546,19 @@ def _statement_span(file: str, start_line: int) -> _Span | None:
 
 
 def _scan_declaration_span(
-    config_dir: Path, factories: frozenset[str], old: str
-) -> tuple[str | None, _Span | None, ast.expr | None]:
+    config_dir: Path, factories: frozenset[str], old: str, sources: SourceCache
+) -> tuple[str | None, _Span | None, dict[_Pos, frozenset[_Pos]]]:
     """Locate the code-first declaration of ``old`` (``Reference("old", …)`` / ``DatabaseLookup("old",
-    …)`` / ``FhirLookup("old", …)``) and return its ``(source_file, statement span, name literal)``.
+    …)`` / ``FhirLookup("old", …)``) and return its ``(source_file, statement span, name positions)``,
+    as :func:`_definition_positions` maps them.
 
     lookup/fhir_lookup/reference specs carry no source line (unlike inbound/outbound), so the declaring
-    statement is found by parsing each config-dir ``.py`` module and matching a call to one of
-    ``factories`` whose first positional arg is the string literal ``old``; that literal's node is
-    returned too, as the one a rename rewrites. Best-effort: an unparseable
-    module is skipped; the first match wins (a loaded graph holds the name once). Returns ``(None, None, None)``
-    when nothing matches — the definition simply isn't rewritten, exactly as before this branch existed.
+    statement is found by parsing each config-dir ``.py`` module (``utf-8-sig``, as the loader reads
+    it) and matching a call to one of ``factories``, or an alias the module imports one under, whose
+    name argument (first positional or ``name=``) is the literal ``old`` or a module constant holding
+    it. Returns ``(None, None, {})`` unless exactly one call matches, so a definition this scan cannot
+    see, or sees twice (a second branch, a dead copy), counts as not located and the rename is
+    refused rather than leaving the declaration under its old name. An unparseable module is skipped.
     Raises :class:`WiringError` when ``config_dir`` cannot be listed, which is not "nothing matches"."""
     # The loader's own file rule: a dot-named backup of a module (vault BACKLOG #2781) or a file in a
     # subdirectory is never run, so a declaration in one must not take the definition edit.
@@ -1370,22 +1568,30 @@ def _scan_declaration_span(
         # Read as an empty directory, this left the definition out of the plan unremarked, and an
         # apply renamed only the referents (vault BACKLOG #5117).
         raise WiringError(f"could not list the config dir {config_dir}: {safe_exc(exc)}") from exc
+    found: list[tuple[str, ast.Call, dict[_Pos, frozenset[_Pos]]]] = []
     for path in modules:
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, ValueError, MemoryError, RecursionError):
-            # MemoryError and RecursionError are the parser's width and depth walls, not SyntaxError
-            # subclasses (BACKLOG #1858); a module past either is as unparseable as a broken one.
+        file = str(path)
+        # SourceCache reads utf-8-sig and skips a module past the parser's walls (BACKLOG #1858).
+        parsed = sources.parse(file)
+        if parsed is None:
             continue
+        tree = parsed[0]
+        spelled = set(factories) | {
+            a.asname
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for a in node.names
+            if a.name in factories and a.asname
+        }
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not node.args:
-                continue
-            if _call_name(node.func) not in factories:
-                continue
-            first = node.args[0]
-            if isinstance(first, ast.Constant) and first.value == old:
-                return str(path), _statement_span(str(path), node.lineno), first
-    return None, None, None
+            if isinstance(node, ast.Call) and _call_name(node.func) in spelled:
+                positions = _definition_positions(sources, file, [node], "", old)
+                if positions:
+                    found.append((file, node, positions))
+    if len(found) != 1:
+        return None, None, {}
+    file, call, positions = found[0]
+    return file, _statement_span(file, call.lineno), positions
 
 
 def _call_name(func: ast.expr) -> str | None:
