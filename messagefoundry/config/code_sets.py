@@ -371,8 +371,9 @@ class CodeSet(Mapping[str, Any]):
 
     Behaves like a read-only ``dict`` (``cs[key]``, ``cs.get(key, default)``, ``key in cs``,
     ``len(cs)``, iteration) but rejects mutation — one instance is shared across every transform, so
-    reference data can't be edited from a handler. ``cs[missing]`` raises a :class:`KeyError` naming
-    the code set; ``cs.get(missing, default)`` returns the default.
+    reference data can't be edited from a handler. ``cs[missing]`` raises a :class:`CodeSetKeyError`
+    (a :class:`KeyError`) naming the code set, never the key; ``cs.get(missing, default)`` returns
+    the default.
 
     A code set may also declare an **unmapped-value policy** (``#162``, see :class:`UnmappedPolicy`),
     applied by :meth:`translate` on a miss so a Handler no longer hand-codes ``cs.get(key, default)``
@@ -402,8 +403,9 @@ class CodeSet(Mapping[str, Any]):
         A hit returns the mapped value (identical to ``cs[key]``). A miss applies the policy — a
         **pure** function of ``(key, table, policy)``: ``DEFAULT`` returns the configured value,
         ``PASSTHROUGH`` returns ``key`` unchanged, ``FLAG`` returns a :class:`Flagged` sentinel. With
-        no policy declared (``NONE``) a miss raises :class:`CodeSetError` (fail loud — declare a policy,
-        or use ``.get()``/``[]`` for the old None/KeyError behavior).
+        no policy declared (``NONE``) a miss raises :class:`CodeSetMissError`, a :class:`CodeSetError`
+        naming the code set, never the key (fail loud — declare a policy, or use ``.get()``/``[]`` for
+        the old None/KeyError behavior).
 
         The **only** effect beyond the return value is a record into the active run-scoped capture
         buffer (if a :func:`capturing` scope is active) — deterministic, in-memory, deduplicated, and

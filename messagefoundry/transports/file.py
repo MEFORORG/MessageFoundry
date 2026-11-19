@@ -666,15 +666,22 @@ class FileDestination(DestinationConnector):
         already probed ``is_dir()`` on its ``FileExistsError`` branch, which is the common one."""
         if self.validate_directory:
             # stat, not is_dir(): is_dir() is False for a missing directory, a refused one and an
-            # unreachable share alike, so its answer cannot name the cause. A failed stat propagates
-            # with its own errno and OS text, which send keeps (dropping the path it quotes) before
-            # adding the directory itself. Only a stat that succeeds on a non-directory is named here,
-            # in short words, so the stored text's length bound leaves room for that directory.
-            if not stat.S_ISDIR(self.directory.stat().st_mode):
-                raise NotADirectoryError(
-                    errno.ENOTDIR, "not a directory, and validate_directory never creates it"
-                )
-            return
+            # unreachable share alike, so its answer cannot name the cause. The stat's errno does.
+            # Not found gets short words naming the setting, so the stored text's length bound leaves
+            # room for the directory send adds; any other failed stat propagates with its own errno
+            # and OS text, which send keeps, dropping the path it quotes.
+            try:
+                mode = self.directory.stat().st_mode
+            except FileNotFoundError:
+                pass
+            else:
+                if stat.S_ISDIR(mode):
+                    return
+                raise NotADirectoryError(errno.ENOTDIR, "not a directory")
+            # Raised outside the handler, so the stat's error, which quotes the path, is not chained.
+            raise FileNotFoundError(
+                errno.ENOENT, "not found, and validate_directory never creates it"
+            )
         try:
             self.directory.mkdir(parents=True)
         except FileExistsError:

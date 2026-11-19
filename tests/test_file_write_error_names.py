@@ -209,26 +209,18 @@ async def test_send_reports_an_error_before_the_name_by_errno_and_directory(tmp_
     assert raised.value.__cause__ is None and raised.value.__context__ is None
 
 
-def _stat_words(path: Path) -> tuple[int, str]:
-    """The errno and OS text a stat of ``path`` fails with on this platform."""
-    with pytest.raises(OSError) as caught:
-        path.stat()
-    assert caught.value.errno is not None and caught.value.strerror is not None
-    return caught.value.errno, caught.value.strerror
-
-
 async def test_send_reports_a_missing_validated_directory_in_words(tmp_path: Path) -> None:
     out = tmp_path / "out"
     dest = _file_destination(out)
     dest.validate_directory = True
     with pytest.raises(DeliveryError) as raised:
         await dest.send(BODY)
-    code, words = _stat_words(out)
     assert str(raised.value) == (
-        f"file write failed: FileNotFoundError: [Errno {code}] {words} (directory {out})"
+        f"file write failed: FileNotFoundError: [Errno {errno.ENOENT}] not found, and "
+        f"validate_directory never creates it (directory {out})"
     )
     assert raised.value.__cause__ is None and raised.value.__context__ is None
-    # The directory survives the stored text's length bound even when the path is long.
+    # The directory survives safe_exc's length bound even when the path is long.
     long_out = Path(r"\\hl7-share01.corp.example\interfaces\outbound\OB_ACME_ADT\drop")
     assert str(long_out) in safe_exc(
         DeliveryError(str(raised.value).replace(str(out), str(long_out)))
@@ -243,8 +235,8 @@ async def test_a_validated_directory_that_is_a_file_is_not_called_missing(tmp_pa
     with pytest.raises(DeliveryError) as raised:
         await dest.send(BODY)
     assert str(raised.value) == (
-        f"file write failed: NotADirectoryError: [Errno {errno.ENOTDIR}] not a directory, and "
-        f"validate_directory never creates it (directory {out})"
+        f"file write failed: NotADirectoryError: [Errno {errno.ENOTDIR}] not a directory "
+        f"(directory {out})"
     )
 
 
@@ -271,7 +263,7 @@ async def test_a_refused_validated_directory_is_reported_by_its_own_errno(
         f"file write failed: PermissionError: [Errno {errno.EACCES}] "
         f"{os.strerror(errno.EACCES)} (directory {out})"
     )
-    assert "missing" not in text
+    assert "not found" not in text
 
 
 @pytest.mark.parametrize(

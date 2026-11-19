@@ -89,6 +89,10 @@ class ReferenceSet(Mapping[str, Any]):
         # outside the handler, so the dict's own KeyError, whose text is the key, is not __context__.
         raise KeyError(_miss_text(self._name, key, kind="reference set"))
 
+    def get(self, key: str, default: Any = None) -> Any:
+        # Straight to the snapshot, so a miss on a sparse set builds no KeyError only to discard it.
+        return self._data.get(key, default)
+
     def __contains__(self, key: object) -> bool:
         return key in self._data
 
