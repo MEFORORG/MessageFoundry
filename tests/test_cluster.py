@@ -1853,7 +1853,22 @@ def test_cluster_timing_fields_refuse_a_non_finite_value(field: str, value: floa
         ClusterSettings.model_validate({field: value})
 
 
-def test_cluster_timing_fields_still_take_the_shipped_defaults() -> None:
-    """The negative control for the non-finite refusal."""
-    assert ClusterSettings(reclaim_interval_seconds=1e6).reclaim_interval_seconds == 1e6
-    assert ClusterSettings(lease_renew_timeout_seconds=2.0).lease_renew_timeout_seconds == 2.0
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("heartbeat_seconds", 10.0),
+        ("node_timeout_seconds", 30.0),
+        ("reclaim_interval_seconds", 1e6),
+        ("leader_lease_ttl_seconds", 30.0),
+        ("leader_fence_timeout_seconds", 20.0),
+        ("lease_renew_timeout_seconds", 2.0),
+    ],
+)
+def test_cluster_timing_fields_still_take_a_finite_value_set_explicitly(
+    field: str, value: float
+) -> None:
+    """The negative control for the non-finite refusal. Each value is SET, since pydantic does not
+    run a field validator on a default, so each reaches the changed validator."""
+    settings = ClusterSettings.model_validate({field: value})
+    assert getattr(settings, field) == value
+    assert field in settings.model_fields_set
