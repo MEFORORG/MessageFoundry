@@ -217,12 +217,19 @@ class ComposePanel(QWidget):
         )
 
     def _on_finished(self) -> None:
+        worker = self._worker
+        failure = worker.failure if worker is not None else ""
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
         self._worker = None
         self._thread = None
         self._send_btn.setEnabled(True)
+        if failure:
+            # A fault the worker's run() caught ended the send without a result row: say why,
+            # as the Send and File tabs do, rather than end it silently.
+            transport = "MLLP" if isinstance(worker, SendWorker) else "File"
+            self._append(transport, "—", "no", f"ended early: {failure}", expected="—")
 
     def shutdown(self) -> None:
         """Stop and join the worker thread so the window can close cleanly."""
