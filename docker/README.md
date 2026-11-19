@@ -176,6 +176,9 @@ against one case that matters, described under
   `./config/pki/store-ca.pem`; `compose.yaml` says what each file must hold and how to own it. The
   default `engine` has no profile, so it starts beside the pair; `compose.yaml` says how to run the
   pair alone, and which host port publishes the pair's MLLP, and when.
+  Build the `runtime-postgres` variant first, beside the slim default and from the same checkout
+  (see *Image variants*): the `ha` engines and `schema-provision` run `messagefoundry:postgres`,
+  and compose has no `build:` key to make it for you.
 
 ## Exposure topologies (see the evaluation §1)
 

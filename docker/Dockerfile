@@ -77,7 +77,7 @@
 # changes one line, not what the image trusts.
 FROM python:3.14-slim-bookworm@sha256:3fe1a0b6c2d6b2ebb572906cdabeca75aeb558c0c17db5ffefbcf8094871c32b AS python-base
 
-# ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------
+# ---- builder-base: build the engine wheel from source (shared by every profile) -----------------
 FROM python-base AS builder-base
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -115,7 +115,9 @@ RUN python -m venv /opt/venv \
 # ---- builder-postgres: venv = core+postgres deps (hash-locked) + the engine wheel ----------------
 FROM builder-base AS builder-postgres
 COPY docker/locks/requirements-postgres.lock /tmp/req.lock
-RUN python -m venv /opt/venv  && /opt/venv/bin/pip install --require-hashes -r /tmp/req.lock  && /opt/venv/bin/pip install --no-deps /wheels/messagefoundry-*.whl
+RUN python -m venv /opt/venv \
+ && /opt/venv/bin/pip install --require-hashes -r /tmp/req.lock \
+ && /opt/venv/bin/pip install --no-deps /wheels/messagefoundry-*.whl
 
 # ---- runtime-base: hardened common runtime (no venv yet — copied by the final stages) ------------
 FROM python-base AS runtime-base
