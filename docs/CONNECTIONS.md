@@ -995,12 +995,13 @@ the caller then receives a fixed-JSON `502`. An error the outbound retries, such
 keeps the caller waiting. Retries are finite here, so one of three things ends the wait. A later
 attempt that succeeds returns its reply. The last failed attempt dead-letters the delivery, and the
 caller gets the fixed-JSON `502`. If neither happens within `reply_timeout`, the caller gets the
-`reply_on_timeout` answer. The fixed-JSON `502`, `delivery_failed`, answers only once the message
-has reached a terminal status and every `reply_from` row is dead-lettered or cancelled, for example
-by an operator cancelling the queued delivery. While a sibling handler is still in flight, the
-caller keeps waiting, since that handler may yet send to the `reply_from` outbound and capture the
-reply. A delivery the outbound completed without capturing a reply, for example in shadow mode, is
-answered as an empty reply (`204`, or `200` per `reply_on_empty`), never `502`. A reply the outbound captured as a
+`reply_on_timeout` answer. The fixed-JSON `502`, `delivery_failed`, answers once every
+`reply_from` row is dead-lettered or cancelled (for example by an operator cancelling the queued
+delivery) **and** no other handler of the same message is still being routed or transformed. Until
+then the caller keeps waiting, because that handler may yet send to the `reply_from` outbound and
+capture the reply; an unrelated outbound still retrying does not hold the answer. A delivery the
+outbound completed without capturing a reply, for example in shadow mode, is answered as an empty
+reply (`204`, or `200` per `reply_on_empty`), never `502`. A reply the outbound captured as a
 rejection, at least a SOAP fault in a 2xx body, is the exception: it comes back as a `502` that
 carries the partner's body. The inbound **FHIR
 facade** (BACKLOG #20) and **DICOMweb STOW-RS receiver** (#24) are consumers of this listener, each its own

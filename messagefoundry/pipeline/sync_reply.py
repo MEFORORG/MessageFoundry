@@ -63,7 +63,9 @@ def poll_period(waiters: int) -> float:
 
 #: Outcomes that count as "a reply came back", so they get a ``reply_returned`` row. ``rejected`` and
 #: ``empty`` belong here: the partner answered, and the answer is what the caller was waiting for even
-#: when it is negative or deliberately blank.
+#: when it is negative or deliberately blank. An ``empty`` whose detail reads ``seq=None`` is the one
+#: exception: a delivery that captured nothing (a plain ``mark_done``, as shadow mode performs), so
+#: no partner answer exists, and the missing seq is what tells the two apart on the timeline.
 _RETURNED_OUTCOMES: Final = frozenset(
     {ReplyOutcome.REPLY, ReplyOutcome.REJECTED, ReplyOutcome.EMPTY}
 )
@@ -236,18 +238,18 @@ class SyncReplyResolverImpl:
                             message_id, state.latest_response_seq, elapsed_ms()
                         )
 
-                    # Decide only once the message itself is terminal (ADR 0154 D3, amended
-                    # 2026-11-18). While it is still RECEIVED or ROUTED, a sibling handler upstream
-                    # may yet emit another row to this outbound that captures the reply, and routed
-                    # rows carry a NULL destination_name, so no row set read here can rule that out.
-                    # mark_failed, cancel and complete_with_response each run the finalizer in the
-                    # same transaction as the row flip, so a lone failed row still answers at once.
-                    if state.message_is_terminal:
+                    # Decide only once no new row to this outbound can appear (ADR 0154 D3,
+                    # amended 2026-11-18): the message is terminal, or no ingress or routed row of
+                    # it is still unsettled. Until then a sibling handler upstream may yet emit a
+                    # row here that captures the reply, and routed rows carry a NULL
+                    # destination_name, so the row set alone cannot rule that out. An unrelated
+                    # outbound still retrying does not hold the turn: only upstream work can add a
+                    # row here.
+                    if state.message_is_terminal or not state.upstream_in_flight:
                         rows = state.row_states
                         if not rows:
-                            # Nothing was routed here at all. Only on the message's own terminal
-                            # status: the absence of rows alone is the 502-for-a-message-we-then-
-                            # delivered defect.
+                            # Nothing was routed here at all. Never on the absence of rows alone:
+                            # that is the 502-for-a-message-we-then-delivered defect.
                             return self._done(ReplyOutcome.NO_ROUTE, elapsed_ms())
                         if all(s in _SETTLED_ROW_STATES for s in rows):
                             if OutboxStatus.DONE.value in rows:
@@ -256,7 +258,7 @@ class SyncReplyResolverImpl:
                                 # reply", never delivery_failed, which would invite a resend.
                                 return self._done(ReplyOutcome.EMPTY, elapsed_ms())
                             return self._done(ReplyOutcome.FAILED, elapsed_ms())
-                        # A live row on a terminal message: keep waiting for it to settle.
+                        # A live row: keep waiting for it to settle.
 
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:

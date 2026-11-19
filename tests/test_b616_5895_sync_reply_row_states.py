@@ -5,9 +5,11 @@ message itself is terminal (ADR 0154 D3, amended 2026-11-18, BACKLOG #5895).
 
 Driven through the resolver suite's store double so each state is deterministic:
 
-* While the message is RECEIVED or ROUTED, no row set settles the turn: a sibling handler still
-  upstream may yet emit a row to the same outbound that captures the reply, and routed rows carry a
-  NULL ``destination_name``, so the row set cannot rule that out. ``mark_failed``, cancel and
+* While the message is RECEIVED or ROUTED and an ingress or routed row is unsettled, no row set
+  settles the turn: a sibling handler still upstream may yet emit a row to the same outbound that
+  captures the reply, and routed rows carry a NULL ``destination_name``, so the row set cannot rule
+  that out. With nothing upstream the set decides at once, so an unrelated outbound's retries never
+  hold the turn. ``mark_failed``, cancel and
   ``complete_with_response`` each finalize in the same transaction as the row flip, so a lone
   failed row still answers at once, beside a terminal status.
 * On a terminal message, every row dead or cancelled is ``failed``; any ``done`` row with no capture
@@ -24,7 +26,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from messagefoundry.pipeline.sync_reply import SyncReplyMetrics
-from messagefoundry.store.store import MessageStatus
+from messagefoundry.store.store import MessageStatus, ReplyWaitState
 from messagefoundry.transports.base import InboundReply, ReplyOutcome
 from messagefoundry.transports.http_listener import HttpSource
 from tests.test_sync_reply_resolver import DEST, _flowing, _RecordingStore, _resolver, _Row, _Store
@@ -85,6 +87,29 @@ async def test_a_dead_row_does_not_fail_the_turn_while_a_sibling_row_is_live() -
     reply = await _resolver(store)("m1")
     assert reply.outcome is ReplyOutcome.REPLY
     assert reply.response_seq == 1
+
+
+# --- nothing upstream: the settled set decides at once, even while ROUTED ---------------------------
+
+
+def _settled_upstream(**kw: Any) -> ReplyWaitState:
+    state = _flowing(**kw)
+    return ReplyWaitState(
+        state.message_status, state.row_states, state.latest_response_seq, upstream_in_flight=False
+    )
+
+
+async def test_nothing_upstream_settles_a_routed_message_at_once() -> None:
+    # An unrelated outbound still retrying holds the message ROUTED, but cannot add a row here.
+    cases = (
+        (("dead",), ReplyOutcome.FAILED),
+        (("dead", "cancelled"), ReplyOutcome.FAILED),
+        (("dead", "done"), ReplyOutcome.EMPTY),
+        ((), ReplyOutcome.NO_ROUTE),
+        (("dead", "pending"), ReplyOutcome.TIMEOUT),
+    )
+    for rows, expected in cases:
+        assert await _outcome(_settled_upstream(row_states=rows)) is expected, rows
 
 
 # --- terminal: the settled set decides --------------------------------------------------------------
