@@ -535,6 +535,38 @@ async def test_a_row_the_keys_cannot_open_stops_the_export_on_the_record(
     assert [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.ERROR] == []
 
 
+async def test_a_failed_denial_audit_mid_export_is_not_recorded_as_a_cipher_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5970: a CipherError raised while the export writes the ``auth.channel_denied``
+    row of an out-of-scope id (a Transit audit MAC failing, say) is not the row's cells. The stop
+    row names ``audit_write_failed``, never ``cipher_refused``, and a WARNING says the audit row is
+    lost. Before the fix the export read every CipherError as a cell refusal."""
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value], scope=["IB_A"])
+    mid_a, mid_b = await _seed(engine)
+    real = engine.store.record_audit
+
+    async def failing(action: str, **kw: Any) -> Any:
+        if action == "auth.channel_denied":
+            raise CipherError("Transit hmac failed (key='mefor-audit')")
+        return await real(action, **kw)
+
+    monkeypatch.setattr(engine.store, "record_audit", failing)
+    caplog.set_level(logging.WARNING)
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
+    assert await _stop_rows(engine) == [
+        {"selected": 2, "streamed": 1, "reason": "audit_write_failed"}
+    ]
+    warnings = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("that row is lost" in w and "CipherError" in w for w in warnings), warnings
+    assert all("mefor-audit" not in w for w in warnings)  # the class only, never the text
+
+
 async def test_a_store_fault_on_the_second_read_mid_export_still_records_the_stop(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

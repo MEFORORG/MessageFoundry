@@ -107,6 +107,8 @@ from messagefoundry.api.header_floor import (
 )
 from messagefoundry.api.message_scope import (
     CONNECTION_DENIED_DETAIL,
+    MessageCellsRefusedError,
+    MessageKeyServiceUnavailableError,
     get_scoped_message,
     read_scoped_message,
 )
@@ -8083,10 +8085,20 @@ def create_app(
                     # recorded stop, rather than leaving a gap nothing names (BACKLOG #5969).
                     try:
                         row = await read_scoped_message(engine, current, mid, request)
-                    except CipherUnavailableError:
+                    except MessageKeyServiceUnavailableError:
                         reason = "key_service_unavailable"
-                    except CipherError:
+                    except MessageCellsRefusedError:
                         reason = "cipher_refused"
+                    except CipherError as exc:
+                        # Not the row's cells: another step of the read raised it, at least the
+                        # auth.channel_denied audit write under a Transit audit MAC (BACKLOG
+                        # #5970). That audit row is lost, so it is named here; the class only.
+                        _log.warning(
+                            "message export could not write the audit row of a refused read (%s);"
+                            " that row is lost",
+                            type(exc).__name__,
+                        )
+                        reason = "audit_write_failed"
                 if reason is not None:
                     # Counts only, never an id or a body.
                     _log.warning(

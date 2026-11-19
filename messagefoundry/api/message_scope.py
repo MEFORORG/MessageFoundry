@@ -101,6 +101,17 @@ _KEYS_REFUSED = "this message's stored contents cannot be opened with the store'
 _KEY_SERVICE_UNAVAILABLE = "the store's key service could not open this message. Try again shortly"
 
 
+class MessageCellsRefusedError(CipherError):
+    """:func:`read_scoped_message`'s refusal, for a caller that skips, of an in-scope row whose
+    cells the cipher would not open for a reason other than their tag (BACKLOG #5969, #5970). Its
+    own class, so the export stream tells it from a :class:`CipherError` that any other step of the
+    read raised, such as the ``auth.channel_denied`` audit row's MAC, and names the real cause."""
+
+
+class MessageKeyServiceUnavailableError(MessageCellsRefusedError, CipherUnavailableError):
+    """:class:`MessageCellsRefusedError` where the key service gave no verdict on the cells."""
+
+
 async def read_scoped_message(
     engine: Engine,
     identity: Identity,
@@ -124,9 +135,11 @@ async def read_scoped_message(
     skips (the export stream), or, with ``refuse_integrity``, a 423. A cell the cipher refuses for
     another reason (a retired key not supplied, a Transit refusal other than the tag) is logged
     here by its error class, and is a 423 with ``refuse_integrity``, or a 503 with ``Retry-After``
-    when the key service gave no verdict. A caller that skips gets a fresh :class:`CipherError`
-    (:class:`CipherUnavailableError` for the outage) carrying no chain, as before this check the
-    store's own error stopped it."""
+    when the key service gave no verdict. A caller that skips gets a fresh
+    :class:`MessageCellsRefusedError` (:class:`MessageKeyServiceUnavailableError` for the outage)
+    carrying no chain, as before this check the store's own error stopped it. A
+    :class:`CipherError` of any other class is not about the row's cells: at least the
+    ``auth.channel_denied`` audit write can raise one, under a Transit audit MAC."""
     channel_id = await engine.store.message_channel_id(message_id)
     if channel_id is None:
         return None
@@ -175,7 +188,9 @@ async def read_scoped_message(
             # The export stream does not skip such a row: an export that leaves out rows nothing
             # records would read as complete, so it records a stop instead. A fresh error, so no
             # frame holding opened cells rides on it.
-            raise CipherUnavailableError(cause) if no_verdict else CipherError(cause)
+            if no_verdict:
+                raise MessageKeyServiceUnavailableError(cause)
+            raise MessageCellsRefusedError(cause)
         if no_verdict:
             raise HTTPException(
                 503,

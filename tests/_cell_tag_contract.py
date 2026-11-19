@@ -465,6 +465,18 @@ async def _assert_foreign_key_cells(store: Any, raw: RawSql) -> None:
     }
     assert alerts[planted].reason is None
     assert alerts[kept].reason == "SYNTH-ALERT"  # control
+    # A by-id alert read (the ack, resolve, suspend and resume echoes) is not a list: the owner's
+    # ruling covers list reads only, so it still raises on the cell, as before #5970.
+    try:
+        await store.get_alert_instance(alerts[planted].id, allowed_channels=None)
+    except CellTagError as exc:
+        raise AssertionError("a foreign-key alert reason read as a tag failure") from exc
+    except CipherError:
+        pass
+    else:
+        raise AssertionError("a by-id alert read withheld a reason the store's keys refused")
+    echoed = await store.get_alert_instance(alerts[kept].id, allowed_channels=None)
+    assert echoed is not None and echoed.reason == "SYNTH-ALERT"  # control
 
 
 async def _assert_list_fails(read: Awaitable[object]) -> None:

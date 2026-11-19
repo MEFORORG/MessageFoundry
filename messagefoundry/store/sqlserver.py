@@ -8753,7 +8753,7 @@ class SqlServerStore:
             " ORDER BY last_seen DESC, id DESC",
             tuple(params),
         )
-        return [self._alert_instance_row(r) for r in rows]
+        return [self._alert_instance_row(r, listed=True) for r in rows]
 
     async def summarize_active_alert_instances(
         self, *, allowed_channels: Sequence[str] | None
@@ -8786,9 +8786,10 @@ class SqlServerStore:
             f" escalation_tier FROM alert_instance{clause}",
             tuple(params),
         )
-        return self._alert_instance_row(row) if row is not None else None
+        return self._alert_instance_row(row, listed=False) if row is not None else None
 
-    def _alert_instance_row(self, r: dict[str, Any]) -> AlertInstance:
+    def _alert_instance_row(self, r: dict[str, Any], *, listed: bool) -> AlertInstance:
+        aad = cell_aad("alert_instance", "reason", r["event_type"], r["connection"])
         return AlertInstance(
             id=int(r["id"]),
             event_type=r["event_type"],
@@ -8798,12 +8799,12 @@ class SqlServerStore:
             first_seen=float(r["first_seen"]),
             last_seen=float(r["last_seen"]),
             count=int(r["count"]),
-            # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
-            reason=open_listed_cell(
-                self._cipher,
-                r["reason"],
-                cell_aad("alert_instance", "reason", r["event_type"], r["connection"]),
-                table="alert_instance",
+            # BACKLOG #5970: on a list read only, a reason under a key the store does not hold is
+            # withheld; a by-id read raises every refusal, as before (owner ruling 2026-11-19).
+            reason=(
+                open_listed_cell(self._cipher, r["reason"], aad, table="alert_instance")
+                if listed
+                else self._dec(r["reason"], aad=aad)
             ),
             acked_by=r["acked_by"],
             acked_at=r["acked_at"],

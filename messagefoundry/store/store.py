@@ -18213,7 +18213,7 @@ class MessageStore:
                 " ORDER BY last_seen DESC, id DESC LIMIT ?",
                 params,
             )
-            return [self._alert_instance_row(r) for r in await cur.fetchall()]
+            return [self._alert_instance_row(r, listed=True) for r in await cur.fetchall()]
 
     async def summarize_active_alert_instances(
         self, *, allowed_channels: Sequence[str] | None
@@ -18254,9 +18254,10 @@ class MessageStore:
                 params,
             )
             row = await cur.fetchone()
-            return self._alert_instance_row(row) if row is not None else None
+            return self._alert_instance_row(row, listed=False) if row is not None else None
 
-    def _alert_instance_row(self, r: aiosqlite.Row) -> AlertInstance:
+    def _alert_instance_row(self, r: aiosqlite.Row, *, listed: bool) -> AlertInstance:
+        aad = cell_aad("alert_instance", "reason", r["event_type"], r["connection"])
         return AlertInstance(
             id=r["id"],
             event_type=r["event_type"],
@@ -18266,12 +18267,12 @@ class MessageStore:
             first_seen=r["first_seen"],
             last_seen=r["last_seen"],
             count=r["count"],
-            # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
-            reason=open_listed_cell(
-                self._cipher,
-                r["reason"],
-                cell_aad("alert_instance", "reason", r["event_type"], r["connection"]),
-                table="alert_instance",
+            # BACKLOG #5970: on a list read only, a reason under a key the store does not hold is
+            # withheld; a by-id read raises every refusal, as before (owner ruling 2026-11-19).
+            reason=(
+                open_listed_cell(self._cipher, r["reason"], aad, table="alert_instance")
+                if listed
+                else self._dec(r["reason"], aad=aad)
             ),
             acked_by=r["acked_by"],
             acked_at=r["acked_at"],
