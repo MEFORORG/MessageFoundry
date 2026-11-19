@@ -2579,7 +2579,7 @@ def _clear_of_own_notes(text: str, kept: int) -> int:
 def _held_back(message: str, limit: int) -> str:
     """``message``, already redacted, cut to ``limit`` at a whole token with the ``(+N chars)`` count
     of what it held back: :func:`safe_text`'s length bound without its work bound, for a caller whose
-    text an earlier pass already bounded and scanned (``verify.model.safe_detail_text``)."""
+    text an earlier pass already bounded and scanned (``messagefoundry.verify_leaf.safe_detail_text``)."""
     if len(message) <= limit:
         return message
     kept = _clear_of_own_notes(message, _whole_token_prefix(message, limit))
