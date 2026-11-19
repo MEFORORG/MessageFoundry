@@ -13718,20 +13718,23 @@ class SqlServerStore:
             stored_raw = d.pop("raw", None)
 
             tag = {"message_id": d["id"], "channel_id": d["channel_id"]}
+            cell = d.get("summary")  # the cell being opened, which a refusal is judged on
             try:
-                d["summary"] = open_message_cell(self._cipher, "summary", d.get("summary"), **tag)
-                raw = open_message_cell(self._cipher, "raw", stored_raw, **tag)
+                d["summary"] = open_message_cell(self._cipher, "summary", cell, **tag)
+                cell = stored_raw
+                raw = open_message_cell(self._cipher, "raw", cell, **tag)
                 if not row_matches(spec, raw=raw, summary=d["summary"]):
                     continue
                 for column in ("error", "metadata"):
-                    d[column] = open_message_cell(self._cipher, column, d.get(column), **tag)
+                    cell = d.get(column)
+                    d[column] = open_message_cell(self._cipher, column, cell, **tag)
             except CellTagError as err:
                 failures.append(err)
                 continue
             except CipherError as exc:
                 # BACKLOG #5970: a candidate sealed under a key the store does not hold is left
                 # out, as a failed tag is; any other cipher error raises (owner ruling 2026-11-19).
-                withhold_refused_cell(self._cipher, "messages", exc)
+                withhold_refused_cell(self._cipher, "messages", exc, cell)
                 continue
             out.append(d)
             if len(out) >= limit:

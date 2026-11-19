@@ -1131,6 +1131,33 @@ def test_a_list_read_withholds_a_cell_the_cipher_refuses() -> None:
     assert row == {"error": None, "summary": None} and failures == []
 
 
+def test_a_substituted_cell_whose_key_id_was_rewritten_out_of_shape_still_fails_a_list() -> None:
+    """BACKLOG #5970, owner ruling 2026-11-19: a sibling's cell copied in with its marker's key id
+    rewritten to text no key id has (``zz``) names no key, so it is not a key the store does not
+    hold: the list read fails, on every table, and a messages list does not withhold it. A marker
+    rewritten to a well-shaped key id outside the keyring cannot be told from a retired key, so it
+    is withheld (the residual ``refused_for_key`` names)."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+    sibling = cipher.encrypt(
+        "SYNTH", aad=cell_aad("connection_event", "reason", "IB_B", 2.0, "closed")
+    )
+    parts = sibling.split(":")
+    assert len(parts[3]) == 16, sibling  # mfenc:v4:<alg>:<key id>:<salt>:<blob>
+    out_of_shape = ":".join([*parts[:3], "zz", *parts[4:]])
+    well_shaped = ":".join([*parts[:3], "0" * 16, *parts[4:]])
+    for table in ("queue", "connection_event", "alert_instance"):
+        with pytest.raises(CipherError) as loud:
+            open_listed_cell(cipher, out_of_shape, aad, table=table)
+        assert not isinstance(loud.value, CellTagError)
+        assert open_listed_cell(cipher, well_shaped, aad, table=table) is None
+    record: dict[str, Any] = {"error": None, "summary": out_of_shape}
+    with pytest.raises(CipherError):
+        withhold_message_cells(
+            cipher, record, ("error", "summary"), message_id="m", channel_id="IB_A", failures=[]
+        )
+
+
 def test_a_list_read_still_refuses_a_tag_failure_under_a_held_key() -> None:
     """BACKLOG #5970 withholds only a cell under a key the store does not hold (owner ruling
     2026-11-19). A cell sealed under the store's own key for another cell, a substitution, fails
@@ -1214,7 +1241,7 @@ def test_a_transit_list_read_fails_on_a_refusal_that_does_not_name_the_key(text:
         open_message_cell(cipher, "summary", stored, message_id="m", channel_id="IB_A")
     except CipherError as exc:
         with pytest.raises(CipherError):  # the content search's path
-            withhold_refused_cell(cipher, "messages", exc)
+            withhold_refused_cell(cipher, "messages", exc, stored)
     else:
         raise AssertionError("the refusing cipher opened the cell")
 
@@ -1254,9 +1281,14 @@ def test_a_transit_refusal_that_names_the_key_beside_another_reason_fails_loudly
     for errors in cases:
         exc = InvalidRequest()
         exc.errors = errors  # hvac's constructor joins the list, so a non-text entry is set here
-        assert not refused_for_key(cipher, _with_cause(_transit_failure("decrypt", "k", exc), exc))
+        assert not refused_for_key(
+            cipher, _with_cause(_transit_failure("decrypt", "k", exc), exc), _V3
+        )
     exc = InvalidRequest(errors=["no such key version"])
-    assert refused_for_key(cipher, _with_cause(_transit_failure("decrypt", "k", exc), exc))
+    assert refused_for_key(cipher, _with_cause(_transit_failure("decrypt", "k", exc), exc), _V3)
+
+
+_V3 = "mfenc:v3:vault:v1:AAAA"
 
 
 def _with_cause(error: CipherError, cause: BaseException) -> CipherError:
