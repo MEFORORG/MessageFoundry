@@ -34,6 +34,7 @@ from pydantic import ValidationError
 from starlette.requests import Request
 from uvicorn.main import run as _uvicorn_run
 
+import messagefoundry.api.tls as api_tls_module
 from messagefoundry.__main__ import main
 from messagefoundry.api import create_app
 from messagefoundry.api.security import (
@@ -4261,6 +4262,41 @@ def test_the_minted_certificate_names_the_bind_host(tmp_path: Path) -> None:
     loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
     common_names = [a.value for a in loaded.subject.get_attributes_for_oid(NameOID.COMMON_NAME)]
     assert api.host in common_names
+
+
+def _minted_names(tmp_path: Path, host: str) -> tuple[list[str], list[str]]:
+    """The common names and SAN entries, as strings, of the pair minted for ``host``."""
+    api = ApiSettings().model_copy(update={"host": host})
+    cert, _ = ensure_api_tls_material(api, state_dir=tmp_path)
+    loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
+    common_names = [
+        str(a.value) for a in loaded.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    ]
+    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    return common_names, [str(name.value) for name in san]
+
+
+def test_the_minted_certificate_names_every_loopback_spelling(tmp_path: Path) -> None:
+    """BACKLOG #5790: a loopback bind's certificate verifies for localhost and ::1 too."""
+    common_names, sans = _minted_names(tmp_path, "127.0.0.1")
+    assert common_names == ["127.0.0.1"]
+    assert sans == ["127.0.0.1", "localhost", "::1"]
+
+
+@pytest.mark.parametrize("wildcard", ["0.0.0.0", "::"])
+def test_a_wildcard_bind_mints_for_this_machine_and_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wildcard: str
+) -> None:
+    """BACKLOG #5790: a wildcard address names no host a client can dial, so it is not the name."""
+    monkeypatch.setattr(api_tls_module.socket, "gethostname", lambda: "engine-host")
+    common_names, sans = _minted_names(tmp_path, wildcard)
+    assert common_names == ["engine-host"]
+    assert sans == ["engine-host", "127.0.0.1", "localhost", "::1"]
+
+
+def test_a_named_bind_is_still_minted_for_that_name_alone(tmp_path: Path) -> None:
+    common_names, sans = _minted_names(tmp_path, "engine.example.org")
+    assert common_names == ["engine.example.org"] and sans == ["engine.example.org"]
 
 
 def test_a_second_start_reuses_a_fresh_pair_and_never_re_mints(tmp_path: Path) -> None:

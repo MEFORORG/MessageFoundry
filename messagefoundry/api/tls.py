@@ -10,9 +10,11 @@ isolation. The ``tls_min_version`` floor (NIST SP 800-52r2: 1.2+) is enforced vi
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
+import socket
 import ssl
 import sys
 import time
@@ -232,6 +234,35 @@ _MINT_LOCK_POLL_S = 0.05
 #: The generated pair's lifetime, inheriting the ``cert self-signed`` CLI default rather than
 #: inventing a second lifetime for the same primitive.
 _GENERATED_LIFETIME_DAYS = 365
+#: The loopback names a client on this machine may dial, in the order the generated certificate
+#: lists them.
+_LOOPBACK_NAMES = ("127.0.0.1", "localhost", "::1")
+#: The longest common name the certificate builder accepts (RFC 5280 ub-common-name).
+_CN_MAX = 64
+
+
+def _generated_cert_names(host: str) -> tuple[str, list[str]]:
+    """The common name and extra subject alternative names of the generated pair for ``host``
+    (BACKLOG #5790).
+
+    A loopback bind lists every loopback name, so a client dialling ``localhost`` or ``::1`` verifies
+    as one dialling ``127.0.0.1`` does. A wildcard bind (``0.0.0.0``, ``::``) names no host a client
+    can dial, so the certificate takes this machine's host name, when it is one the builder accepts,
+    and the loopback names, which that bind also serves. Any other host is named alone, as before."""
+    try:
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address | None = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if host in _LOOPBACK_NAMES or (address is not None and address.is_loopback):
+        return host, list(_LOOPBACK_NAMES)
+    if address is None or not address.is_unspecified:
+        return host, []
+    machine = socket.gethostname()
+    if machine and machine.isascii() and len(machine) <= _CN_MAX:
+        return machine, list(_LOOPBACK_NAMES)
+    return _LOOPBACK_NAMES[0], list(_LOOPBACK_NAMES)
+
+
 #: Renew the generated pair at startup once less than this share of its OWN validity period is
 #: left: about 122 of 365 days (ADR 0172, 2026-09-26 amendment). Early rather than at expiry, so a
 #: renewal lands at an ordinary restart months before any client could see an expired certificate.
@@ -878,7 +909,9 @@ def _renew_generated_pair(
     from messagefoundry.__main__ import _write_private_key
 
     staged_cert, staged_key = _staged_pair(cert_path, key_path)
-    cert_pem, key_pem = pki.make_self_signed(api.host, [], _GENERATED_LIFETIME_DAYS)
+    cert_pem, key_pem = pki.make_self_signed(
+        *_generated_cert_names(api.host), _GENERATED_LIFETIME_DAYS
+    )
     new = pki.read_self_signed_facts(cert_pem)
     try:
         _write_private_key(staged_key, key_pem)
@@ -932,7 +965,9 @@ def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> S
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
 
-    cert_pem, key_pem = pki.make_self_signed(api.host, [], _GENERATED_LIFETIME_DAYS)
+    cert_pem, key_pem = pki.make_self_signed(
+        *_generated_cert_names(api.host), _GENERATED_LIFETIME_DAYS
+    )
     _write_private_key(key_path, key_pem)
     paired = False
     try:
