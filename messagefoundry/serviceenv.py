@@ -522,9 +522,10 @@ def _continues_string(entry: str) -> bool:
         return True
     name = written.strip()
     could_be_key = _BASE64_TEXT.fullmatch(name) is not None or _holds_key_run(name)
-    # A padded secret outside the standard alphabet, such as base64url, reads as a name set to
-    # padding alone. An earlier rule continued on it, so a split padded secret still refuses.
-    # ``_line_start`` then holds its value to equals signs and whitespace, as a later line's.
+    # A secret outside the standard alphabet padded with ``==``, such as base64url, reads as a
+    # name set to ``=``. The rule of 3085e1d5c55 continued on that, so this case keeps it. One
+    # ``=`` of padding leaves the value empty, so this case does not take such a secret.
+    # ``_line_start`` holds the value to equals signs and whitespace, as on a later line.
     padded = bool(name) and "=" in rest
     return (could_be_key or padded) and _line_start(first) is None
 

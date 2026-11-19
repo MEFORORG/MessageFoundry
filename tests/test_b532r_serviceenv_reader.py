@@ -89,6 +89,8 @@ def test_an_empty_store_key_item_above_an_ordinary_item_does_not_refuse(key: str
         "=C:=C:\\x",
         "HTTP_PROXY=",  # an ordinary variable set to nothing still ends the value above
         "NO_PROXY=",
+        "HTTP_PROXY= ",  # a value of blanks alone, with no equals sign, ends it too
+        "NO_PROXY=\t",
         "MEFOR_SECRETS_DIRECTORY=",
         "A" * 42 + "_B=1",  # a base64 run one short of a key's, so this is a name
     )
@@ -411,16 +413,19 @@ def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_abo
     assert control is not None and "The service's lists set no" in control
 
 
+#: A base64url secret with two ``=`` of padding and both ``-`` and ``_`` in it.
+_URL_TWO_PAD = base64.urlsafe_b64encode(b"\xfb\xff\xfe-tok-0017x").decode()
+
 #: A padded secret outside the standard base64 alphabet, split from its name into the next item.
-#: Each reads as a name set to equals signs alone. The item rule of 3085e1d5c55 took that as the
-#: empty value's continuation; the one of 99cc2f7c260 did not.
+#: Each reads as a name whose value holds equals signs and whitespace alone. 99cc2f7c260 ended the
+#: empty value above on each. 3085e1d5c55 continued on the first three, but not on the two with
+#: whitespace other than a space or a tab.
 _PADDED_OUTSIDE_STANDARD = (
     "ab-c_dEf==",  # base64url letters before two ``=``, too short to decode
     "abc.def==",  # a dot, in no base64 alphabet
-    base64.urlsafe_b64encode(b"\xfb\xff\xfe-tok-0017x").decode(),  # base64url with ``-`` and ``_``
+    _URL_TWO_PAD,
     "ab-c_dEf==\xa0",  # a no-break space after the padding, as a paste from a web page brings
     "ab-c_dEf==\x0b",  # a vertical tab: whitespace, but not a space or a tab
-    "ProgramFiles(x86)= =",  # not a secret: a Windows name whose value is ``=`` beside a blank
 )
 
 
@@ -438,9 +443,18 @@ def test_a_padded_secret_outside_standard_base64_split_into_the_next_item_refuse
 
 
 def test_the_base64url_stand_in_is_outside_the_standard_alphabet() -> None:
-    url = _PADDED_OUTSIDE_STANDARD[2]
-    assert url.endswith("==") and "-" in url and "_" in url
-    assert not serviceenv._BASE64_TEXT.fullmatch(url.rstrip("="))
+    assert _URL_TWO_PAD.endswith("==") and "-" in _URL_TWO_PAD and "_" in _URL_TWO_PAD
+    assert not serviceenv._BASE64_TEXT.fullmatch(_URL_TWO_PAD.rstrip("="))
+
+
+def test_an_ordinary_name_set_to_padding_alone_continues_the_empty_key() -> None:
+    """Not a secret: a Windows name whose value is ``=`` beside a blank. Its shape is a padded
+    secret's, so it continues the empty key above and refuses, as at 3085e1d5c55. This errs
+    toward refusing. It is an open finding, not a behaviour to keep."""
+    key = KEY_CLASS_NAMES[0]
+    posture = _read([f"{key}=", "ProgramFiles(x86)= ="])
+    assert posture.listed_keys == (key,)
+    assert service_env_refusal(posture) is not None
 
 
 def test_a_key_shaped_item_with_an_ordinary_later_line_continues_the_empty_key() -> None:
