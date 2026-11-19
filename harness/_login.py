@@ -33,11 +33,14 @@ log = logging.getLogger(__name__)
 
 
 def _log_text(exc: BaseException, token: str | None = None) -> str:
-    """An error's text, made safe to log the way the client's revoke path makes it.
+    """The error's type name and text, for the caller to log with ``%r``.
 
-    The text can carry an engine-supplied detail, which falls back to a whole response body. A
-    bearer is scrubbed out, the text is cut to ``_REVOKE_LOG_CHARS``, and the caller logs it with
-    ``%r`` so a CR or LF in it cannot forge a log line."""
+    The text can carry an engine-supplied detail, which falls back to a whole response body. When
+    ``token`` is given, every copy of it in the text becomes ``[token]``; only the logout of a
+    cancelled sign-in passes one. The text is then cut to ``_REVOKE_LOG_CHARS`` characters. The cut
+    counts characters before ``%r`` escapes them, and one escaped character can take up to ten, so
+    the logged form can be about ten times that long. ``%r`` escapes a CR or LF, so neither can
+    start a new log line."""
     text = f"{type(exc).__name__}: {exc}"
     if token:
         text = text.replace(token, "[token]")
@@ -58,8 +61,10 @@ class LoginDialog(QDialog):
     directory leaves the dialog responsive rather than frozen. While one is in flight the Sign in
     action is idle, and a close is held until the call answers, then taken as a rejection. A
     sign-in that succeeded after a held close is logged out off the GUI thread before the dialog
-    rejects; a failed logout is logged, and :attr:`session_may_remain` tells the caller the
-    session may stay valid until it expires.
+    rejects. A logout refused with a 401 is taken as a session already ended. Any other failed
+    logout is logged, and :attr:`session_may_remain` tells the caller the session may stay valid
+    until it expires. A sign-in that got no reply after a held close sets it too, because the
+    engine may have made a session the client never received.
     """
 
     def __init__(self, client: EngineClient, parent: QWidget | None = None) -> None:
@@ -130,7 +135,9 @@ class LoginDialog(QDialog):
         try:
             return self._client.providers()
         except ApiError as exc:
-            log.info("sign-in providers unavailable; offering Local only: %r", _log_text(exc))
+            # WARNING, not INFO: the harness configures no logging, so the root logger stays at
+            # WARNING and drops anything lower.
+            log.warning("sign-in providers unavailable; offering Local only: %r", _log_text(exc))
             return None
 
     def _on_providers(self, providers: ProvidersInfo | None) -> None:
@@ -194,8 +201,19 @@ class LoginDialog(QDialog):
         self._idle()
         if self._close_requested:
             if isinstance(exc, ApiError):
-                # The error is not shown once the close is taken, so it is logged instead (R8).
-                log.info("sign-in failed after the dialog was closed: %r", _log_text(exc))
+                # The error is not shown once the close is taken, so it is logged instead (R8), at
+                # WARNING: the harness sets up no logging, and the root logger drops lower levels.
+                if exc.status is None:
+                    # No reply, so the outcome is unknown: the engine may have made a session that
+                    # this client never received and so cannot end.
+                    self.session_may_remain = True
+                    log.warning(
+                        "sign-in got no reply after the dialog was closed, so a session may stay "
+                        "valid until it expires: %r",
+                        _log_text(exc),
+                    )
+                else:
+                    log.warning("sign-in failed after the dialog was closed: %r", _log_text(exc))
             self._close_if_requested()
             return
         if isinstance(exc, ApiError):
@@ -204,6 +222,15 @@ class LoginDialog(QDialog):
             self._error.setText(f"Sign-in failed: {exc}")
 
     def _on_cancelled_logout_error(self, exc: BaseException, token: str | None) -> None:
+        if isinstance(exc, ApiError) and exc.status == 401:
+            # As the client's revoke path: a 401 most likely means the session has already ended.
+            # The engine refuses with 401 for other reasons too, so the line says it refused.
+            log.info(
+                "the engine refused to end a cancelled sign-in's session (401); it has most "
+                "likely already ended"
+            )
+            self._end_cancelled()
+            return
         log.error(
             "could not end the session of a cancelled sign-in, so it may stay valid until it "
             "expires: %r",

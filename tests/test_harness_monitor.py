@@ -543,14 +543,31 @@ def _settle_login(qapp: Any, dialog: Any) -> None:
     assert not dialog._busy
 
 
-@pytest.mark.parametrize("logout_fails", [False, True], ids=["logged-out", "logout-failed"])
+_MAY_REMAIN = (
+    "sign-in cancelled, but its session could not be ended and may stay valid until it expires"
+)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "status", "logouts"),
+    [
+        ("logged-out", "sign-in cancelled", 1),
+        ("logout-failed", _MAY_REMAIN, 1),
+        ("logout-401", "sign-in cancelled", 1),
+        ("sign-in-no-reply", _MAY_REMAIN, 0),
+        ("sign-in-refused", "sign-in cancelled", 0),
+    ],
+    ids=["logged-out", "logout-failed", "logout-401", "sign-in-no-reply", "sign-in-refused"],
+)
 def test_a_cancel_during_sign_in_wins_and_the_monitor_does_not_connect(
-    qapp: Any, monkeypatch: pytest.MonkeyPatch, logout_fails: bool
+    qapp: Any, monkeypatch: pytest.MonkeyPatch, outcome: str, status: str, logouts: int
 ) -> None:
     """A Cancel pressed while the sign-in is in flight is held until it answers. If the sign-in
     then succeeds, the dialog is still rejected: the monitor does not connect, and it ends the
     session the client was handed. When that logout fails, the status bar says the session may
-    stay valid until it expires."""
+    stay valid until it expires. A 401 on the logout means the session has already ended, so it
+    does not. A sign-in with no reply (status None) leaves the outcome unknown, so it does; a
+    sign-in the engine refused made no session, so it does not."""
     from harness import _login
 
     login_gate = threading.Event()
@@ -573,6 +590,10 @@ def test_a_cancel_during_sign_in_wins_and_the_monitor_does_not_connect(
         def login(self, *_a: object, **_k: object) -> LoginResponse:
             if not login_gate.wait(10):
                 raise TimeoutError("login gate never opened")
+            if outcome == "sign-in-no-reply":
+                raise ApiError("timed out waiting for the engine", status=None)
+            if outcome == "sign-in-refused":
+                raise ApiError("refused", status=403)
             self.token = "t"
             return LoginResponse(
                 token="t",
@@ -585,8 +606,10 @@ def test_a_cancel_during_sign_in_wins_and_the_monitor_does_not_connect(
         def logout(self) -> None:
             self.logouts += 1
             self.token = None
-            if logout_fails:
+            if outcome == "logout-failed":
                 raise ApiError("engine unreachable", status=None)
+            if outcome == "logout-401":
+                raise ApiError("not signed in", status=401)
 
         def for_polling(self) -> Any:
             self.polled += 1
@@ -620,15 +643,9 @@ def test_a_cancel_during_sign_in_wins_and_the_monitor_does_not_connect(
     try:
         panel._connect()
         assert panel._client is None
-        if logout_fails:
-            assert panel._status.text() == (
-                "sign-in cancelled, but its session could not be ended and may stay valid "
-                "until it expires"
-            )
-        else:
-            assert panel._status.text() == "sign-in cancelled"
+        assert panel._status.text() == status
         assert clients and clients[0].polled == 0
-        assert clients[0].logouts == 1 and clients[0].token is None
+        assert clients[0].logouts == logouts and clients[0].token is None
     finally:
         login_gate.set()
         panel.shutdown()

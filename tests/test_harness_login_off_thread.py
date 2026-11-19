@@ -254,7 +254,9 @@ def test_a_provider_read_refusal_is_logged_bounded_and_quoted(
 ) -> None:
     client = _GatedClient()
     client.providers_error = ApiError(_HOSTILE, status=503)
-    with caplog.at_level(logging.INFO, logger="harness._login"):
+    # The level the shipped harness runs at: it configures no logging, so the root logger stays at
+    # WARNING. An INFO record is dropped there, and this test would see none.
+    with caplog.at_level(logging.WARNING):
         dialog = LoginDialog(client)  # type: ignore[arg-type]
         try:
             client.providers_gate.set()
@@ -265,7 +267,7 @@ def test_a_provider_read_refusal_is_logged_bounded_and_quoted(
             # The raised error's traceback holds the dialog's frame; drop it so no Qt cycle is left.
             if client.providers_error is not None:
                 client.providers_error.__traceback__ = None
-    _one_bounded_quoted_record(caplog)
+    assert _one_bounded_quoted_record(caplog).levelno == logging.WARNING
     assert dialog._provider.count() == 1  # Local only
 
 
@@ -285,12 +287,12 @@ def test_a_sign_in_refusal_after_a_held_close_is_logged_bounded_and_quoted(
         dialog._password.setText("pw")
         dialog._attempt()
         dialog.reject()
-        with caplog.at_level(logging.INFO, logger="harness._login"):
+        with caplog.at_level(logging.WARNING):  # the shipped harness's root level, not lowered
             client.login_gate.set()
             assert _until(qapp, lambda: finished == [dialog.DialogCode.Rejected.value])
-        _one_bounded_quoted_record(caplog)
+        assert _one_bounded_quoted_record(caplog).levelno == logging.WARNING
         assert client.logout_threads == []  # no session was made, so none is ended
-        assert not dialog.session_may_remain
+        assert not dialog.session_may_remain  # the engine answered, so none was made
     finally:
         client.login_gate.set()
         dialog.done(dialog.DialogCode.Rejected)
@@ -298,3 +300,71 @@ def test_a_sign_in_refusal_after_a_held_close_is_logged_bounded_and_quoted(
         if client.login_error is not None:
             client.login_error.__traceback__ = None
         client.login_error = None
+
+
+def _cancel_in_flight(qapp: Any, client: _GatedClient) -> tuple[LoginDialog, list[int]]:
+    """A dialog whose sign-in is in flight and whose close is held. The caller opens the gates."""
+    dialog = LoginDialog(client)  # type: ignore[arg-type]
+    finished: list[int] = []
+    dialog.finished.connect(finished.append)
+    assert _until(qapp, lambda: not dialog._busy)
+    dialog._username.setText("op")
+    dialog._password.setText("pw")
+    dialog._attempt()
+    dialog.reject()
+    return dialog, finished
+
+
+def test_a_sign_in_with_no_reply_after_a_held_close_may_leave_a_session(
+    qapp: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RED when: an ApiError with no status (a timeout or dropped connection, so the outcome is
+    unknown) after a held close leaves ``session_may_remain`` unset, or is logged below WARNING,
+    where the shipped harness drops it. The engine may have made a session the client never got."""
+    client = _GatedClient()
+    client.providers_gate.set()
+    client.login_error = ApiError("timed out waiting for the engine", status=None)
+    dialog, finished = _cancel_in_flight(qapp, client)
+    try:
+        with caplog.at_level(logging.WARNING):
+            client.login_gate.set()
+            assert _until(qapp, lambda: finished == [dialog.DialogCode.Rejected.value])
+        record = _one_bounded_quoted_record(caplog, hostile=False)
+        assert record.levelno == logging.WARNING
+        assert "until it expires" in record.getMessage()
+        assert dialog.session_may_remain
+        assert client.logout_threads == []  # the client holds no token to end a session with
+    finally:
+        client.login_gate.set()
+        dialog.done(dialog.DialogCode.Rejected)
+        if client.login_error is not None:
+            client.login_error.__traceback__ = None
+        client.login_error = None
+
+
+def test_a_401_on_the_cancelled_sign_in_logout_is_a_session_already_ended(
+    qapp: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RED when: a 401 on the logout of a cancelled sign-in sets ``session_may_remain`` or logs the
+    "may stay valid" warning. A 401 there most likely means the session has already ended, as the
+    client's own revoke path reads it."""
+    client = _GatedClient()
+    client.providers_gate.set()
+    client.logout_error = ApiError("not signed in", status=401)
+    dialog, finished = _cancel_in_flight(qapp, client)
+    try:
+        with caplog.at_level(logging.INFO, logger="harness._login"):
+            client.login_gate.set()
+            assert _until(qapp, lambda: finished == [dialog.DialogCode.Rejected.value])
+        logged = [r for r in caplog.records if r.name == "harness._login"]
+        assert [r.levelno for r in logged] == [logging.INFO]
+        assert "already ended" in logged[0].getMessage()
+        assert "until it expires" not in logged[0].getMessage()
+        assert not dialog.session_may_remain
+        assert len(client.logout_threads) == 1
+        assert client.token is None
+    finally:
+        client.login_gate.set()
+        dialog.done(dialog.DialogCode.Rejected)
+        if client.logout_error is not None:
+            client.logout_error.__traceback__ = None
