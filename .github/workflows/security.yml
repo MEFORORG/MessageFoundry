@@ -648,18 +648,16 @@ jobs:
             --spec-version 1.6 --validate \
             --output-format JSON --output-file ../sbom-ide.cdx.json
           python ../scripts/security/sbom_finalize.py ../sbom-ide.cdx.json --phase build
-      - name: Score SBOM quality (sbomqs — advisory)
-        # continue-on-error: sbomqs is advisory HERE, so a download/checksum/parse hiccup must never skip
-        # the SBOM-artifact upload below (the actual deliverable). This no longer matches release.yml:
-        # there the install and pin check BLOCK and only the score is advisory (BACKLOG #1698).
+      - name: Install sbomqs (checksum-verified; a failed check fails the job)
+        # NO continue-on-error, on purpose (BACKLOG #5475), the split release.yml made under BACKLOG
+        # #1698: a checksum mismatch is a supply-chain event, not an SBOM-quality signal, so it must
+        # red the scheduled run rather than end green inside the advisory score step. Only the score
+        # step below stays advisory.
         # if: always(), like the IDE generator above: a failed Python SBOM must not leave the IDE one
-        # unscored (BACKLOG #2521).
+        # unscored (BACKLOG #2521), so the binary is installed whatever the generators did.
         if: always()
-        continue-on-error: true
         run: |
-          # sbomqs grades an SBOM 0-10 across structural/semantic/quality completeness and prints the NTIA
-          # minimum-elements breakdown, so an SBOM-completeness regression is visible. Pinned + checksum-
-          # verified against the release's own goreleaser checksums.txt. ADR 0149.
+          # Pinned + checksum-verified against the release's own goreleaser checksums.txt. ADR 0149.
           VER=2.0.11
           asset="sbomqs_${VER}_Linux_x86_64.tar.gz"
           base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
@@ -668,11 +666,24 @@ jobs:
           grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -
           tar -xzf "${asset}" sbomqs
           sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
+      - name: Score SBOM quality (sbomqs — advisory)
+        # continue-on-error: the SCORE is advisory (ADR 0149), and it is the only step here that is.
+        # The download and checksum are the blocking step above (BACKLOG #5475). The upload below runs
+        # on always(), so a failed score never costs the SBOM artifacts (the actual deliverable).
+        # if: always(), like the IDE generator above: a failed Python SBOM must not leave the IDE one
+        # unscored (BACKLOG #2521).
+        if: always()
+        continue-on-error: true
+        run: |
+          # sbomqs grades an SBOM 0-10 across structural/semantic/quality completeness and prints the NTIA
+          # minimum-elements breakdown, so an SBOM-completeness regression is visible. It calls the
+          # binary the step above verified, by the path it installed it at, so no other `sbomqs`
+          # earlier on PATH can stand in for it.
           # Each score runs whatever the other did; the step still fails if either did (BACKLOG #2521).
           rc=0
-          sbomqs score -b sbom-python.cdx.json || rc=1
-          sbomqs score -b sbom-ide.cdx.json || rc=1
-          sbomqs compliance --ntia sbom-python.cdx.json || true
+          /usr/local/bin/sbomqs score -b sbom-python.cdx.json || rc=1
+          /usr/local/bin/sbomqs score -b sbom-ide.cdx.json || rc=1
+          /usr/local/bin/sbomqs compliance --ntia sbom-python.cdx.json || true
           exit "$rc"
       - name: Upload the SBOM artifacts
         # if: always() + if-no-files-found: ignore so whichever SBOM(s) generated are retained even if a
@@ -723,10 +734,9 @@ jobs:
           python scripts/security/sbom_finalize.py sbom-python-windows.cdx.json \
             --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
             --vendored-from messagefoundry/_vendor
-      - name: Score the Windows SBOM's quality (sbomqs -- advisory)
-        # The pre-tag dry-run of release.yml's score of this file (BACKLOG #2521). It rehearses the FILE:
-        # the release uses sbomqs's Linux build, this runner its Windows build. Advisory, like `sbom`'s.
-        continue-on-error: true
+      - name: Install sbomqs for Windows (pinned in-repo; a failed check fails the job)
+        # NO continue-on-error, as for `sbom`'s install (BACKLOG #5475): a pin mismatch must red the
+        # scheduled run. Only the score step below stays advisory.
         shell: bash
         run: |
           # PINNED IN-REPO, as release.yml's sbomqs step is, rather than verified against a
@@ -741,6 +751,13 @@ jobs:
           echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -
           # A relative archive name: Git Bash's tar reads a `D:\...` path as a remote host.
           tar -xzf "${asset}" sbomqs.exe
+      - name: Score the Windows SBOM's quality (sbomqs -- advisory)
+        # The pre-tag dry-run of release.yml's score of this file (BACKLOG #2521). It rehearses the FILE:
+        # the release uses sbomqs's Linux build, this runner its Windows build. Advisory, like `sbom`'s,
+        # and the only advisory step in this job: the download and pin check are the step above.
+        continue-on-error: true
+        shell: bash
+        run: |
           ./sbomqs.exe score -b sbom-python-windows.cdx.json
           ./sbomqs.exe compliance --ntia sbom-python-windows.cdx.json || true
       - name: Upload the Windows SBOM artifact

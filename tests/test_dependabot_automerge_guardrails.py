@@ -41,6 +41,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import NamedTuple
 
@@ -419,7 +420,7 @@ def test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge() -
 # condition rewritten in another form has to extend it here rather than pass unread.
 
 _EXPR_TOKEN = re.compile(
-    r"\s*(?:(?P<op>==|!=|&&|\|\||[()!])|'(?P<str>(?:[^']|'')*)'|(?P<ref>[A-Za-z_][\w.\-]*))"
+    r"\s*(?:(?P<op>==|!=|&&|\|\||[()!,])|'(?P<str>(?:[^']|'')*)'|(?P<ref>[A-Za-z_][\w.\-]*))"
 )
 
 
@@ -443,10 +444,19 @@ def _tokenize_expression(text: str) -> tuple[tuple[str, str], ...]:
     return tuple(tokens)
 
 
-def _evaluate_expression(text: str, context: dict[str, str]) -> bool:
+def _evaluate_expression(
+    text: str,
+    context: dict[str, str],
+    functions: Mapping[str, Callable[..., str | bool]] | None = None,
+) -> bool:
     """Evaluate an Actions ``if:`` as GitHub does for this subset: ``==``/``!=`` compare strings
     case-insensitively, ``&&``/``||``/``!`` coerce to truthiness, and an output that is not set (its
-    step was skipped) reads as the empty string, which is falsy."""
+    step was skipped) reads as the empty string, which is falsy.
+
+    A function call (``always()``, ``startsWith(a, b)``) is refused unless ``functions`` names it,
+    so a caller that passes no table keeps the refusal of every construct outside the subset.
+    tests/test_security_posture.py passes one, to show a loosening such as ``|| always()`` reads as
+    a run rather than as an error."""
     tokens = _tokenize_expression(text)
     at = 0
 
@@ -472,6 +482,19 @@ def _evaluate_expression(text: str, context: dict[str, str]) -> bool:
             return not bool(primary())
         if tok[0] == "str":
             return tok[1]
+        if tok[0] == "ref" and peek() == ("op", "("):
+            take("(")
+            args: list[str | bool] = []
+            if peek() != ("op", ")"):
+                args.append(disjunction())
+                while peek() == ("op", ","):
+                    take()
+                    args.append(disjunction())
+            take(")")
+            assert functions is not None and tok[1] in functions, (
+                f"unsupported function {tok[1]!r} in {text!r}"
+            )
+            return functions[tok[1]](*args)
         if tok[0] == "ref":
             return context.get(tok[1], "")
         raise AssertionError(f"unexpected token {tok!r} in {text!r}")

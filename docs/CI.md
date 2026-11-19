@@ -64,7 +64,7 @@ from branch protection. Every other job in the workflow is now out of the set, i
 
 | Bucket | Jobs | Why it is out |
 | --- | --- | --- |
-| advisory by **design** | `sbom`, `sbom-windows`, `trivy` | schedule/dispatch-only, so none can report on a PR, and each declares `continue-on-error: true` on one step only, never on the job (the sbomqs score step on the two SBOM jobs, the scan step on `trivy`), so a finding, a low score or a score that never ran leaves them green; `trivy` goes red when its scan produces no verdict, and an SBOM job when its SBOM cannot be produced (BACKLOG #5475) |
+| advisory by **design** | `sbom`, `sbom-windows`, `trivy` | schedule/dispatch-only, so none can report on a PR, and each declares `continue-on-error: true` on one step only, never on the job (the sbomqs score step on the two SBOM jobs, the scan step on `trivy`), so a finding, a low score or a score that errors leaves them green; `trivy` goes red when its scan produces no verdict, and an SBOM job when its SBOM cannot be produced or its sbomqs download fails its checksum, a step of its own (BACKLOG #5475) |
 | advisory by **placement** | `released-line-audit`, `cla-action-audit` | schedule/dispatch-only, so it can never report on a PR — it deliberately does **not** carry `continue-on-error` and still goes red on a finding (the `dast.yml` posture) |
 | **superseded** | the seven original scan jobs | they hard-fail and they report on every PR; a required composite now runs the same scan, so the original no longer gates the merge. Deleted at step 3 below |
 
