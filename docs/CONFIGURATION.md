@@ -2455,8 +2455,8 @@ Sign the CRL with a CA whose key usage includes `cRLSign`, or reissue the CA wit
 running-hop reload and the expiry scan do not make this check.
 
 Anything short of a proof of a bad signature passes this check, and the engine logs one WARNING for the file. The
-file then loads unless another rule refuses it; on the API listener one such rule refuses some of
-these cases after that WARNING (the paragraph after this list says which). At least these three cases warn:
+file then loads unless another rule refuses it. On a hop that checks the whole chain, one such rule
+refuses some of these cases first, and no WARNING is logged (the paragraph after this list says which). At least these three cases warn:
 
 - The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly but for
   the case of ASCII letters, which it folds as OpenSSL does (vault BACKLOG #3543), and then the
@@ -2512,8 +2512,9 @@ it judged before the failure is proved badly signed, which refuses the file. On 
 the whole chain, at least `[api].tls_client_crl_file` and an inbound listener's `tls_crl_file`, the
 rule that each loaded CA has a CRL of its own is applied too. Where that rule refuses the file, the
 start refuses with its reason, unless a CRL already judged is proved badly signed, and the ERROR is
-not logged. On those hops a judged CRL from a CA without `cRLSign` also refuses the start, and the
-ERROR is not logged then either. Where it loads, the
+not logged. On those hops a judged CRL from a CA whose key usage lacks `cRLSign`, as above, refuses
+the start too. That refusal comes before the own-CRL rule's, and the ERROR is not logged then
+either. Where it loads, the
 CRLs it judged and could not confirm are reported in the WARNING too, which names the first three
 and counts the rest; one it verified is not reported. The CRLs after
 the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
@@ -2525,11 +2526,12 @@ once for each type of exception that ended the check. A leaf hop's WARNING for a
 logged any of these lines for. So
 an earlier version is logged again when it returns after another version that was logged. A
 version in between that logged none of these lines does not reset the record. That includes at least one
-refused with no failure in the check. It also includes one whose CRLs all verified, unless a leaf
-hop logged the `cRLSign` WARNING for it. A version refused after the check failed part way logged
-its ERROR and resets the record, with two exceptions on a whole-chain hop. There the ERROR is not
-logged where the own-CRL rule would refuse the file. Nor is it where a judged CRL comes from a CA
-without `cRLSign`. Those versions log nothing, so they do not reset the record. A hop whose CA list
+this signature check refused with no failure in it. It also includes one whose CRLs all verified,
+unless a leaf hop logged the `cRLSign` WARNING for it. A version refused after the check failed
+part way logged its ERROR and resets the record, except at least in two cases on a whole-chain hop.
+One is where the own-CRL rule would refuse the file. The other is where a judged CRL comes from a
+CA whose key usage lacks `cRLSign`. There the ERROR is not logged, so the record is not reset. A
+hop whose CA list
 gives a different result for the same file logs its own line, and each engine shard logs its own. A system
 root the hop has loaded counts as a listed CA, including one whose serial number is not positive,
 as at least some roots carry. A CRL whose authority key identifier carries such a serial is judged

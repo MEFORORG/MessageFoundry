@@ -390,15 +390,14 @@ def harden_crl_check(
     entry whose extensions ``cryptography`` reads. With ``chain`` only, the signature check also
     refuses a CRL whose signature verifies where each judged CA whose key verifies it carries a
     key usage without ``cRLSign``. That refusal comes after a proven bad signature and before the
-    refusal below. Without ``chain`` that
-    CRL is not refused: the file loads with a WARNING, logged as :func:`_check_crl_signatures`
-    says (:attr:`~messagefoundry.pki.CrlSignature.without_crl_sign`).
+    refusal below. Without ``chain`` that CRL is not refused: the file loads with a WARNING, logged
+    as :func:`_check_crl_signatures` says (:attr:`~messagefoundry.pki.CrlSignature.without_crl_sign`).
 
     A seventh, with ``chain`` only, since vault BACKLOG #5627 and #5511: a loaded CA with no CRL of
     its own in the file (:func:`messagefoundry.pki.own_crl_reason`). It is the last refusal. It
     is raised inside :func:`_check_crl_signatures`, after a proven bad signature refuses and before
     the warning for a signature short of proof, so a refused start never first logs that the file
-    is loaded. The running-hop reload checks in the same order, except where the signature
+    is used. The running-hop reload checks in the same order, except where the signature
     judgment itself raises: a start then refuses on this rule, and the reload retries.
 
     **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
@@ -500,7 +499,7 @@ def harden_crl_check(
     # Last of the refusals: only now is it known that OpenSSL holds exactly the CRLs judged. On a
     # whole-chain hop the own-CRL rule (vault BACKLOG #5627, #5511) refuses a file that would
     # refuse every client under a loaded CA. It goes in the reload's order: after a proven bad
-    # signature, before the warning that the file is loaded (messagefoundry.pki.own_crl_reason).
+    # signature, before the warning that the file is used (messagefoundry.pki.own_crl_reason).
     _check_crl_signatures(
         pem,
         anchors,
@@ -683,7 +682,7 @@ def _check_crl_signatures(
 
     ``refusal``, where given, is raised after a proven bad signature and before the warning, and
     the ERROR for a failed judgment is not logged beside it, so a start the caller refuses never
-    first logs that the file is loaded (vault BACKLOG #5511)."""
+    first logs that the file is used (vault BACKLOG #5511)."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
     from messagefoundry.pki import (
         NO_CRL_SIGN,
@@ -706,16 +705,16 @@ def _check_crl_signatures(
         # that with exception types of its own. The handshake still checks every signature. The
         # verdicts already reached are used below: a proof refuses, and the unconfirmed warn.
         # Not logged where the caller's ``refusal`` refuses the start anyway, since the line says
-        # the file is loaded (vault BACKLOG #5511).
+        # the file is used (vault BACKLOG #5511).
         refuses = refusal is not None or (chain and any(s.without_crl_sign for s in judged))
         if not refuses and first_unconfirmed_signature(
             crl_file, fingerprint, ("unjudged", type(exc).__name__)
         ):
             logger.error(
                 "%s: the engine could not check the signatures of the CRL(s) in this file at "
-                "start (%s), after judging %d of them. That is not a verdict on the rest. Unless "
-                "a CRL it judged is proven badly signed, the file is loaded and revocation "
-                "checking is on, and OpenSSL checks each signature at the handshake",
+                "start (%s), after judging %d of them. That is not a verdict on the rest. If no "
+                "CRL it judged is proven badly signed, the file is used unless a later check "
+                "refuses the build, and OpenSSL checks each signature at the handshake",
                 label,
                 type(exc).__name__,
                 len(judged),
@@ -745,10 +744,10 @@ def _check_crl_signatures(
         crl_file, fingerprint, ("no-crl-sign", unable.where)
     ):
         logger.warning(
-            "%s: the file passes this check and will be loaded unless a later check refuses the "
-            "build, but %s %s. This hop checks "
-            "only the peer's own certificate. So it fails only peers that CA issued directly, "
-            "and a CA that signs only intermediates fails none. %s",
+            "%s: the file passes the start's CRL signature check and is used unless a later "
+            "check refuses the build, but %s %s. This hop checks only the peer's own certificate. "
+            "So it fails only peers that CA issued directly, and a CA that signs only "
+            "intermediates fails none. %s",
             label,
             unable.where,
             NO_CRL_SIGN,
@@ -767,8 +766,9 @@ def _check_crl_signatures(
         shown = f"{shown}; and {more} more"
     logger.warning(
         "%s: the engine could not confirm at start that a CA this hop lists signed %d of the %d "
-        "CRL(s) it judged in this file. %s. The file is loaded and revocation checking is on. OpenSSL "
-        "checks each signature at the handshake. If peers are then refused with 'CRL signature "
+        "CRL(s) it judged in this file. %s. The file passes the start's CRL signature check and "
+        "is used unless a later check refuses the build. OpenSSL checks each signature at the "
+        "handshake. If peers are then refused with 'CRL signature "
         "failure' or 'unable to get certificate CRL', check this file first",
         label,
         len(unconfirmed),
