@@ -2753,14 +2753,16 @@ class UploadStore:
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
-            except (OSError, UnicodeDecodeError, _MalformedSidecarError) as exc:
-                # An OSError only when it is the file's own refusal, such as a permission the
-                # engine lacks, which answered a server error (BACKLOG #5388 added item 2).
-                if isinstance(exc, OSError):
-                    refused = _refused_read(exc)
-                    if refused is None:
-                        raise
-                    kind = refused
+            except OSError as exc:
+                # Only when it is the file's own refusal, such as a permission the engine lacks,
+                # which answered a server error (BACKLOG #5388 added item 2). Its own arm, so the
+                # Unicode error below is handed to nothing but codec_safe_str.
+                refused = _refused_read(exc)
+                if refused is None:
+                    raise
+                kind = refused
+                defect = codec_safe_str(exc)
+            except (UnicodeDecodeError, _MalformedSidecarError) as exc:
                 defect = codec_safe_str(exc)
             # Raised after the handler, so the error holding the file is on no chain.
             raise _refusal(file_id, "sidecar", defect, kind)
@@ -2787,14 +2789,16 @@ class UploadStore:
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
-            except (OSError, UnicodeError, binascii.Error) as exc:
-                # Refused on disk (BACKLOG #5388 added item 2), not UTF-8, not ASCII, or not the
-                # strict base64 the body is stored as.
-                if isinstance(exc, OSError):
-                    refused = _refused_read(exc)
-                    if refused is None:
-                        raise
-                    kind = refused
+            except OSError as exc:
+                # Refused on disk (BACKLOG #5388 added item 2). Its own arm, so the Unicode error
+                # below is handed to nothing but codec_safe_str.
+                refused = _refused_read(exc)
+                if refused is None:
+                    raise
+                kind = refused
+                defect = codec_safe_str(exc)
+            except (UnicodeError, binascii.Error) as exc:
+                # Not UTF-8, not ASCII, or not the strict base64 the body is stored as.
                 defect = codec_safe_str(exc)
             raise _refusal(file_id, "body", defect, kind)
 
@@ -2847,15 +2851,17 @@ class UploadStore:
                     raise UploadUnavailableError(str(exc)) from exc
                 except CipherError as exc:
                     refusal = str(exc)
-                except (OSError, UnicodeDecodeError, _MalformedSidecarError) as exc:
-                    # An OSError only when it is the file's own refusal, such as a permission the
-                    # engine lacks, which answered a server error (BACKLOG #5388 added item 2).
-                    # It is never classed, and a permission refusal is not answered as damage.
-                    if isinstance(exc, OSError):
-                        refused = _refused_read(exc)
-                        if refused is None:
-                            raise
-                        kind = refused
+                except OSError as exc:
+                    # Only when it is the file's own refusal, such as a permission the engine
+                    # lacks, which answered a server error (BACKLOG #5388 added item 2). It is
+                    # never classed, and a permission refusal is not answered as damage. Its own
+                    # arm, so the Unicode error below is handed to nothing but codec_safe_str.
+                    refused = _refused_read(exc)
+                    if refused is None:
+                        raise
+                    kind = refused
+                    defect = codec_safe_str(exc)
+                except (UnicodeDecodeError, _MalformedSidecarError) as exc:
                     defect = codec_safe_str(exc)
                     classed = isinstance(exc, UnicodeDecodeError | _OversizedFileError)
             # Refused, never trusted, and raised after the handler, so the error holding the file

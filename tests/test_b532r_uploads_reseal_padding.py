@@ -414,6 +414,9 @@ def test_rotate_key_output_over_only_a_refused_sidecar_advises_no_removal(
     assert _rotate_over_a_refused_sidecar(tmp_path, monkeypatch) == 1
     out = capsys.readouterr()
     lines = (out.out + out.err).splitlines()
+    # The positive control: the scan below walks real output, the skip error and the closing note.
+    assert len(lines) >= 2, lines
+    assert any(line.startswith("error: 1 of those") for line in lines), lines
     assert any(line.startswith("note: this run did not complete") for line in lines), lines
     advising = [line for line in lines if any(p in line.lower() for p in _REMOVAL_ADVICE)]
     assert advising == [], advising

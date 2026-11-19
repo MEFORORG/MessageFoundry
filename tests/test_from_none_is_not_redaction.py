@@ -115,6 +115,14 @@ _UPLOAD_MISS = (
     "UnicodeDecodeError that cannot hold stored content while both upload writers store ASCII "
     "(base64 body, json.dumps metadata)"
 )
+#: The by-id routes' 423 (_UploadRefused) is built from the caught error's class alone, through
+#: _upload_refusal_kind in api/app.py. BACKLOG #5388 added the damaged and access refusals.
+_UPLOAD_REFUSAL = (
+    "the 423 detail is the fixed text of the error's kind, read from its class, so from None "
+    "withholds nothing the response would carry; the caught error is either a damaged or access "
+    "refusal whose message names only the part, raised after the store's handler with no read "
+    "error on its chain, or the cipher's refusal: " + _UPLOAD_MISS
+)
 
 #: The four store refusal sites of engine PR 2818's eighth hold: each raises outside its own
 #: handler, so the error it caught is on neither chain link; ``from None`` there suppresses at most
@@ -334,7 +342,10 @@ _ALLOWED: tuple[_Allowed, ...] = (
         f"{_APP}.browse_uploaded_file::(UploadPathError, UploadNotFoundError)" + _HTTP,
         _SAFE + _UPLOAD_MISS,
     ),
-    _Allowed(f"{_APP}.browse_uploaded_file::UploadUnreadableError" + _HTTP, _SAFE + _UPLOAD_MISS),
+    _Allowed(
+        f"{_APP}.browse_uploaded_file::UploadUnreadableError::_UploadRefused",
+        _SAFE + _UPLOAD_REFUSAL,
+    ),
     _Allowed(
         f"{_APP}.resend_uploaded_message::KeyError" + _HTTP,
         _SAFE + "KeyError carries the inbound name, which the 404 detail also quotes",
@@ -344,13 +355,17 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + _UPLOAD_MISS,
     ),
     _Allowed(
-        f"{_APP}.resend_uploaded_message::UploadUnreadableError" + _HTTP, _SAFE + _UPLOAD_MISS
+        f"{_APP}.resend_uploaded_message::UploadUnreadableError::_UploadRefused",
+        _SAFE + _UPLOAD_REFUSAL,
     ),
     _Allowed(
         f"{_APP}.delete_uploaded_file::(UploadPathError, UploadNotFoundError)" + _HTTP,
         _SAFE + _UPLOAD_MISS,
     ),
-    _Allowed(f"{_APP}.delete_uploaded_file::UploadUnreadableError" + _HTTP, _SAFE + _UPLOAD_MISS),
+    _Allowed(
+        f"{_APP}.delete_uploaded_file::UploadUnreadableError::_UploadRefused",
+        _SAFE + _UPLOAD_REFUSAL,
+    ),
 )
 
 
