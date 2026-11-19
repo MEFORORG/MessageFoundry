@@ -159,7 +159,41 @@ def test_the_startup_count_matches_rotate_keys_sealed_count_over_a_damaged_sidec
     assert (result.damaged, result.skipped) == (1, 0)
 
 
-# --- review round 1: the marker is looked for anywhere, to the file's end -------------------------
+# --- review rounds 1 and 2: the marker is looked for anywhere in the bounded head -----------------
+
+
+@pytest.mark.parametrize("k", range(1, 7))
+def test_a_marker_straddling_the_read_bound_is_a_skip(tmp_path: Path, k: int) -> None:
+    """Only ``k`` bytes of ``mfenc:`` fall inside the head, so ``find`` alone misses it."""
+    key_a, key_b = generate_key(), generate_key()
+    fid = _save(tmp_path, key_a)
+    sidecar = tmp_path / f"{fid}.meta"
+    sidecar.write_bytes(b" " * (_OVER - k) + sidecar.read_bytes())
+    result = _reseal(tmp_path, _aes(key_b, key_a))
+    assert (result.skipped, result.damaged) == (1, 0)
+
+
+def test_mfenc_letters_in_a_plaintext_sidecar_are_not_a_marker(tmp_path: Path) -> None:
+    """A filename may carry the same letters; a plaintext sidecar under no key stays terminal."""
+    store = UploadStore(tmp_path, make_cipher(None), max_bytes=4096)
+    meta = asyncio.run(
+        store.save(data=_BODY, filename="mfenc:report.txt", uploader="op", uploader_id="u-op")
+    )
+    sidecar = tmp_path / f"{meta.file_id}.meta"
+    plain = sidecar.read_text(encoding="utf-8")
+    sidecar.write_text(plain + " " * (_OVER - len(plain)), encoding="utf-8")
+    result = _reseal(tmp_path, _aes(generate_key()))
+    assert (result.skipped, result.damaged) == (0, 1)
+
+
+def test_the_startup_count_skips_a_body_too_large_to_seal(tmp_path: Path) -> None:
+    """rotate-key skips a body larger than a body can be, so the count must not include it."""
+    cipher = _aes(generate_key())
+    fid = _save(tmp_path, cipher)
+    (tmp_path / f"{fid}.blob").write_bytes(b"p" * (2 * 4096 + 4096 + 10))
+    counted = asyncio.run(UploadStore(tmp_path, cipher, max_bytes=4096).warn_if_unsealed())
+    result = _reseal(tmp_path, cipher)
+    assert (counted, result.sealed_plaintext, result.skipped) == (0, 0, 1)
 
 
 @pytest.mark.parametrize("stray", [b"\xff", b"\xff\xfe", b"\xa0"], ids=["ff", "utf16-bom", "a0"])

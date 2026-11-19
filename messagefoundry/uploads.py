@@ -1169,8 +1169,8 @@ class ResealResult:
     #: at least one larger than that cap on disk, one that is not UTF-8, one PLAINTEXT and longer
     #: than :data:`_PLAIN_SIDECAR_LIMIT`, so that no seal of it fits that cap, and one that is
     #: blank once its padding is skipped. One of the first three kinds whose part holds such a
-    #: marker, or one cut short, or that is padding to the end of what was read of a longer file,
-    #: is a skip instead (:meth:`UploadStore._refused_meta`), since trimming it may recover a
+    #: marker, or one cut short, or, read from a longer file, is only padding or ends on the first
+    #: bytes of a marker or a byte-order mark, is a skip instead (:meth:`UploadStore._refused_meta`), since trimming it may recover a
     #: value under the prior key. So retiring the prior key loses nothing in the part the pass
     #: reads of any of these. Past that part, in a file grown past the cap, the pass does not
     #: look, so there a value under the prior key behind more than the cap of other content would
@@ -1214,6 +1214,10 @@ _WRITTEN = frozenset({_Half.RESEALED, _Half.SEALED_PLAINTEXT})
 _MARKER_READ_LIMIT = 256
 #: :data:`MARKER_PREFIX` as bytes, for a sidecar scanned before it is decoded (:func:`_names_another_key`).
 _MARKER_BYTES = MARKER_PREFIX.encode("ascii")
+#: What a marker's version field starts with (:func:`_names_another_key`).
+_VERSION_FIELD = b"v"
+#: A UTF-8 byte-order mark, which a cut head may end inside (:func:`_cut_may_hide_a_marker`).
+_UTF8_BOM = b"\xef\xbb\xbf"
 
 
 def _marker_key_id(raw: bytes) -> str | None:
@@ -1232,14 +1236,34 @@ def _marker_key_id(raw: bytes) -> str | None:
 
 def _names_another_key(cipher: AesGcmCipher, data: bytes) -> bool:
     """True when ``data`` holds an ``mfenc:`` marker, anywhere in it, that does not name the active
-    key, or names no key, as one cut short at its end does (BACKLOG #5387)."""
+    key, or names no key, as one cut short at its end does (BACKLOG #5387). ``mfenc:`` counts as a
+    marker only when a version (``v`` and a digit, then ``:``) follows it, or the data ends before
+    one could, so the same letters in plaintext, such as a filename, are not taken for one."""
     active = cipher.active_key_id
     at = data.find(_MARKER_BYTES)
     while at != -1:
-        if _marker_key_id(data[at : at + _MARKER_READ_LIMIT]) != active:
+        window = data[at : at + _MARKER_READ_LIMIT]
+        version = window[len(_MARKER_BYTES) : len(_MARKER_BYTES) + 3]
+        is_marker = _VERSION_FIELD.startswith(version[:1]) and (
+            len(version) < 3 or (version[1:2].isdigit() and version[2:] == b":")
+        )
+        if is_marker and _marker_key_id(window) != active:
             return True
         at = data.find(_MARKER_BYTES, at + 1)
     return False
+
+
+def _cut_may_hide_a_marker(head: bytes) -> bool:
+    """True when ``head``, read from a file that goes on past it, may hide a marker just after it
+    (BACKLOG #5387): it is padding to its end, or ends on padding and then the first bytes of a
+    byte-order mark or of ``mfenc:``."""
+    value = _lstrip_pad(head.decode("utf-8", errors="replace"))
+    if not value:
+        return True
+    tail = head.rstrip(_SIDECAR_PAD.encode("ascii"))
+    return any(tail.endswith(_MARKER_BYTES[:k]) for k in range(1, len(_MARKER_BYTES))) or any(
+        tail.endswith(_UTF8_BOM[:k]) for k in range(1, len(_UTF8_BOM))
+    )
 
 
 @dataclass(frozen=True)
@@ -3084,11 +3108,11 @@ class UploadStore:
         key, which trimming recovers with that key. So ``head`` is searched for the ``mfenc:``
         marker, anywhere in it, and one marker that names a key other than the active one, or
         names none, as a marker cut short at the end of ``head`` does, makes it a skip: retiring
-        the prior key would lose it. A cut ``head`` that is padding to its end is a skip too, since
-        a marker may follow. Any other is damaged: nothing in what the pass read of it names the
+        the prior key would lose it. A cut ``head`` that is only padding, or ends on the first bytes
+        of a marker or a byte-order mark, is a skip too, since a marker may follow
+        (:func:`_cut_may_hide_a_marker`). Any other is damaged: nothing in what the pass read of it names the
         prior key. ``cause`` names the refusal."""
-        blank = not _lstrip_pad(head.decode("utf-8", errors="replace"))
-        if (cut and blank) or _names_another_key(cipher, head):
+        if (cut and _cut_may_hide_a_marker(head)) or _names_another_key(cipher, head):
             _log.warning(
                 "uploaded file %s (meta): skipped, %s and it may hold a value under a prior key; "
                 "repair it and re-run before retiring that key",
@@ -3251,11 +3275,11 @@ class UploadStore:
             if body is _Half.SKIPPED:
                 _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
                 return _Half.SKIPPED
-        if kind == "meta" and plaintext and len(stored.encode("utf-8")) > _PLAIN_SIDECAR_LIMIT:
+        encoded = stored.encode("utf-8") if kind == "meta" and plaintext else b""
+        if len(encoded) > _PLAIN_SIDECAR_LIMIT:
             # Checked before encrypting, because no seal of it fits _SIDECAR_LIMIT (_read_sidecar).
-            return self._refused_meta(
-                cipher, fid, stored.encode("utf-8"), "it is plaintext too long to seal"
-            )
+            return self._refused_meta(cipher, fid, encoded, "it is plaintext too long to seal")
+        del encoded
         blocked = gate.check()
         if blocked == "gone":
             # Not a skip: the pass ends as root_missing once this pair is done, and _pair_lock
@@ -3411,6 +3435,17 @@ class UploadStore:
             )
         return count
 
+    def _seals_whole(self, body: Path) -> bool:
+        """Whether ``rotate-key`` would seal plaintext body ``body``: a regular file no larger than
+        :attr:`_stored_limit` that decodes to its end (:meth:`_lost_body_size`)."""
+        try:
+            info = body.lstat()
+        except OSError:
+            return False
+        if not S_ISREG(info.st_mode) or info.st_size > self._stored_limit:
+            return False
+        return self._lost_body_size(body) is None
+
     def _count_unsealed_sync(self) -> tuple[int, int]:
         """How many uploads have a non-blank half with no ``mfenc:`` marker, as two counts: those
         ``rotate-key`` can seal, and those it cannot (:meth:`_unsealable_sync`). Reads the first
@@ -3423,8 +3458,10 @@ class UploadStore:
         (``damaged``) or skips it. Its upload is still counted by its body, as under any other
         sidecar, because ``rotate-key`` seals a plaintext body under each of those kinds, so the
         count matches that pass's ``sealed_plaintext`` over every one of them (BACKLOG #5387). A
-        plaintext body under a sidecar that is not plaintext is counted only when it decodes to its
-        end (:meth:`_lost_body_size`), as ``rotate-key`` seals only such a body. An oversized
+        plaintext body under a sidecar that is not plaintext is counted only when it is a regular
+        file no larger than a body can be that decodes to its end (:meth:`_seals_whole`), as
+        ``rotate-key`` seals only such a body. One it cannot read for another cause, such as a
+        permission, is still counted, though that pass skips it. An oversized
         sidecar the class check holds, over a body no key reads, is counted as one ``rotate-key``
         cannot seal instead."""
         count = unsealable = 0
@@ -3462,9 +3499,10 @@ class UploadStore:
                         held = self._unsealable_sync(fid, sidecar) is not None
                     if held:
                         unsealable += 1
-                    elif path is meta or self._lost_body_size(body) is None:
-                        # A plaintext body is counted only when it is text to its end, since
-                        # rotate-key counts one that is not as lost and seals nothing of it.
+                    elif path is meta or self._seals_whole(path):
+                        # A plaintext body is counted only when rotate-key would seal it: text to
+                        # its end, and no larger than a body can be, since that pass counts one not
+                        # text as lost and skips one too large.
                         count += 1
                     break  # count the upload once, whichever half is plaintext
         return count, unsealable
