@@ -189,8 +189,9 @@ jobs:
 
           # PersistKeySet, not EphemeralKeySet: signtool is another process and reaches the key through the
           # certificate store, which an ephemeral key never enters. So the key is written to this user's key
-          # store, and the finally block below deletes it again (BACKLOG #5478). Everything from the import on
-          # sits inside that try, so a failure at any point, the import included, still removes what it made.
+          # store, and the finally block below deletes the imported certificate's key again (BACKLOG #5478).
+          # Everything from the import on sits inside that try. Not covered: a key the import persists and
+          # then fails before returning a certificate, or the key of a second certificate in the same PFX.
           $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]'PersistKeySet, UserKeySet'
           $pfx = [System.Convert]::FromBase64String($env:SIGNING_PFX_BASE64)
           $pfxPassword = $env:SIGNING_PFX_PASSWORD
@@ -224,11 +225,11 @@ jobs:
             if ($cert) {
               try {
                 # Removing the certificate from the store leaves the persisted private key behind, so the
-                # key is deleted through its own handle. A certificate with no RSA or ECDSA key, or a key
-                # type this cannot delete, fails the step rather than leave a key behind unreported.
+                # key is deleted through its own handle. A private key that is neither RSA nor ECDSA, or a
+                # key type this cannot delete, fails the step rather than leave a key behind unreported.
                 $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
                 $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($cert)
-                if ($null -eq $rsa -and $null -eq $ecdsa) {
+                if ($cert.HasPrivateKey -and $null -eq $rsa -and $null -eq $ecdsa) {
                   throw 'the imported certificate has no RSA or ECDSA private key this step can delete'
                 }
                 foreach ($key in @($rsa, $ecdsa)) {
@@ -262,10 +263,12 @@ jobs:
           }
 
           # Checked without chain trust: a certificate from an internal CA is not trusted by this runner, and
-          # whether to trust it is the deploying site's decision. Asserted (BACKLOG #5478): signed and
-          # timestamped, by the certificate imported above, with status Valid, or UnknownError (what an
-          # untrusted root reports) only when the signer's chain builds for code signing with the unknown-CA
-          # fault alone ignored. Any other status fails. Revocation is not checked, as Valid does not either.
+          # whether to trust it is the deploying site's decision. Asserted (BACKLOG #5478): a signer and a
+          # timestamper certificate are present, the signer is the certificate imported above, and the status
+          # is Valid, or UnknownError (what an untrusted root reports) when the signer's chain builds for code
+          # signing with the unknown-CA fault alone ignored. Any other status fails. NOT asserted on the
+          # UnknownError path: that the untrusted root is its only cause. PowerShell reports at least a bad
+          # timestamp countersignature and a revoked signer as UnknownError too, and neither is checked here.
           $signature = Get-AuthenticodeSignature -FilePath $exe
           if (-not $signature.SignerCertificate -or -not $signature.TimeStamperCertificate) {
             throw 'the binary is not both signed and timestamped'
