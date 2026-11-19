@@ -164,8 +164,10 @@ def request_token(
     The reply is checked in this order, and a reply refused at one step takes that step's refusal.
     Every token opener is built by
     :func:`~messagefoundry.transports.bounded_read.build_strict_opener`, so a bare CR in the status
-    line or header block is refused first, inside ``opener.open``, as
-    :class:`~messagefoundry.transports.bounded_read.MalformedReplyHeadError`. A non-2xx reply then
+    line or header block is refused first, inside ``opener.open``: as
+    :class:`~messagefoundry.transports.bounded_read.MalformedReplyHeadError`, or as
+    ``http.client``'s own ``HTTPException`` when its header-count limit trips before the line with
+    the CR is read. Either is a retryable ``DeliveryError`` here. A non-2xx reply then
     never reaches a body read: it is handled as the paragraph above says. On a 2xx reply,
     :func:`~messagefoundry.transports.bounded_read.reply_framing_fault` checks the header block,
     then the ``Transfer-Encoding`` and ``Content-Length`` framing, and only then the content

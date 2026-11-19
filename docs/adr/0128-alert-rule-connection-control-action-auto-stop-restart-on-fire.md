@@ -92,7 +92,7 @@ so the task cannot hang a lane.
 
 The action fires on the **same throttle gate** as the notification — at most once per `realert_seconds`
 (or the rule's `cooldown_seconds`) per `(event_type, connection)` — so a flapping lane cannot trigger a
-restart storm (superseded 2026-11-19, see below). It is **independent of transport suppression**: a rule may set `transports=[]` to
+restart storm (corrected 2026-11-19, see below). It is **independent of transport suppression**: a rule may set `transports=[]` to
 auto-remediate **quietly** (restart, no page) or fire alongside a page. The control action requires the
 **notifier** to be active (≥1 transport configured), since it is a notifier outcome; a deployment that
 wants transportless remediation configures at least one transport (documented; a transportless-notifier
@@ -115,8 +115,11 @@ flapping lane's restarts, with at least these limits. With `[alerts].realert_sec
 rule `cooldown_seconds`, the window is zero and there is no throttle; a rule's `cooldown_seconds`
 cannot be zero. The window is judged against the current emit's rule cooldown, not the one in force
 at the last restart, so a `schedule` switch from a rule with a long cooldown to one with a short
-cooldown can let a restart come before the long window ends. The zero window held before this amendment
-too, so §4's "cannot trigger a restart storm" was never true at `realert_seconds = 0`. The key is the connection that raised
+cooldown can let a restart come before the long window ends. At least these held before this
+amendment too, on the shared gate: the zero window, the window judged against the current emit's
+rule cooldown, and the key on the connection that raised the event, described next. So §4's "cannot
+trigger a restart storm" was never true at `realert_seconds = 0` with no rule `cooldown_seconds`.
+The key is the connection that raised
 the event, not the one restarted, so a `control_target` that several connections' events name can be
 restarted once per window for each of them. The time is recorded only when the sink schedules a
 control task: an emit whose action the sink skips (for example: no control callback wired, the
@@ -144,7 +147,7 @@ notification throttle is otherwise unchanged. The `connection_started` clear abo
 
 **Positive** — the common "just restart the wedged lane" case is auto-remediated at alert latency with a
 human still paged (or deliberately quiet); additive, off by default, no new dependency, no layering
-change. Reuses the existing throttle so it can't storm (superseded 2026-11-19, see the amendment under §4).
+change. Reuses the existing throttle so it can't storm (corrected 2026-11-19, see the amendment under §4).
 
 **Negative / residual** — auto-restarting a lane wedged on a *persistent* fault will restart-loop it (once
 per cooldown) until an operator intervenes — the same class of caveat as retry-forever; an operator scopes
