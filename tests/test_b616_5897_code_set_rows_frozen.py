@@ -16,10 +16,12 @@ import pickle
 import sys
 from collections import defaultdict
 from collections.abc import Callable
+from types import FrameType
 from typing import Any
 
 import pytest
 
+from messagefoundry.config import code_sets
 from messagefoundry.config.code_sets import (
     _MAX_FREEZE_DEPTH,
     CodeSet,
@@ -29,6 +31,7 @@ from messagefoundry.config.code_sets import (
     parse_code_set,
     parse_policy,
 )
+from messagefoundry.pipeline._sandbox_codec import _MAX_DEPTH as _CODEC_MAX_DEPTH
 from messagefoundry.pipeline._sandbox_codec import _Blobs, _Reader, dec_code_sets, enc_code_sets
 
 _CSV = b"code,display,system\nM,Male,HL7\nF,Female,HL7\n"
@@ -124,12 +127,24 @@ def test_tuples_are_frozen_and_other_values_are_stored_as_given() -> None:
     assert cs["D"]["missing"] == 0  # a deliberate dict subclass is stored as given
 
 
-def test_a_value_nested_past_the_recursion_limit_is_a_code_set_error() -> None:
-    deep = "x = 1"
-    for _ in range(300):  # over the freeze's bound of 256, under tomllib's own limit
-        deep = "a." + deep
+def _dotted(tables: int) -> bytes:
+    """A TOML file whose one value, under ``[K]``, is ``tables`` nested tables deep."""
+    return ("[K]\n" + "a." * (tables - 1) + "x = 1\n").encode()
+
+
+def test_a_toml_value_exactly_at_the_freeze_bound_loads() -> None:
+    # Positive control for the test below: the same shape one table shallower loads.
+    cs = parse_code_set("deep.toml", _dotted(_MAX_FREEZE_DEPTH))
+    inner: Any = cs["K"]
+    for _ in range(_MAX_FREEZE_DEPTH - 1):
+        assert type(inner) is _FrozenDict
+        inner = inner["a"]
+    assert inner == {"x": 1}
+
+
+def test_a_toml_value_one_past_the_freeze_bound_is_a_code_set_error() -> None:
     with pytest.raises(CodeSetError, match="nested too deeply"):
-        parse_code_set("deep.toml", ("[K]\n" + deep + "\n").encode())
+        parse_code_set("deep.toml", _dotted(_MAX_FREEZE_DEPTH + 1))
 
 
 def _nested(levels: int) -> Any:
@@ -141,28 +156,60 @@ def _nested(levels: int) -> Any:
 
 def test_a_value_exactly_at_the_freeze_bound_loads() -> None:
     # Positive control for the test below: 256 containers deep is the bound and still loads.
-    cs = CodeSet("edge", {"K": _nested(_MAX_FREEZE_DEPTH)})
+    cs = CodeSet("edge", {"K": _nested(_MAX_FREEZE_DEPTH), "T": ((1, [2]),)})
     inner: Any = cs["K"]
     for _ in range(_MAX_FREEZE_DEPTH):
         assert type(inner) in (_FrozenDict, _FrozenList)
         inner = inner["k"] if isinstance(inner, dict) else inner[0]
     assert inner == 1
     assert cs["K"] == _nested(_MAX_FREEZE_DEPTH)
-
-
-def test_a_value_at_the_bound_loads_from_a_deep_caller_stack() -> None:
-    # The walk is iterative, so a caller already deep in its stack can still load the table.
-    def descend(remaining: int) -> CodeSet:
-        if remaining:
-            return descend(remaining - 1)
-        return CodeSet("edge", {"K": _nested(_MAX_FREEZE_DEPTH)})
-
-    assert len(descend(sys.getrecursionlimit() - 100)) == 1
+    assert type(cs["T"][0][1]) is _FrozenList
 
 
 def test_a_value_one_past_the_freeze_bound_is_a_code_set_error() -> None:
     with pytest.raises(CodeSetError, match="nested too deeply"):
         CodeSet("edge", {"K": _nested(_MAX_FREEZE_DEPTH + 1)})
+
+
+def test_the_freeze_bound_matches_the_sandbox_codec() -> None:
+    # A table that loads must also cross into the sandbox child, or the two modes disagree.
+    assert _MAX_FREEZE_DEPTH == _CODEC_MAX_DEPTH
+    blobs = _Blobs()
+    node = enc_code_sets({"cs": CodeSet("edge", {"K": _nested(_MAX_FREEZE_DEPTH)})}, blobs)
+    rebuilt = dec_code_sets(node, _Reader(blobs.items))
+    assert rebuilt is not None
+    assert rebuilt["cs"]["K"] == _nested(_MAX_FREEZE_DEPTH)
+
+
+def _frames_below() -> int:
+    depth = 0
+    frame: FrameType | None = sys._getframe(1)
+    while frame is not None:
+        depth, frame = depth + 1, frame.f_back
+    return depth
+
+
+def test_a_value_at_the_bound_freezes_from_a_deep_caller_stack() -> None:
+    # The freeze walk is iterative, so a caller close to the limit can still freeze the table.
+    def descend(remaining: int) -> CodeSet:
+        if remaining:
+            return descend(remaining - 1)
+        return CodeSet("edge", {"K": _nested(_MAX_FREEZE_DEPTH)})
+
+    headroom = 40  # the frames CodeSet and the freeze use, with margin
+    assert len(descend(sys.getrecursionlimit() - _frames_below() - headroom)) == 1
+
+
+def test_a_recursion_error_while_freezing_is_a_code_set_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def out_of_stack(name: str, value: Any) -> Any:
+        raise RecursionError
+
+    monkeypatch.setattr(code_sets, "_freeze", out_of_stack)
+    with pytest.raises(CodeSetError, match="stack is too deep") as caught:
+        CodeSet("edge", {"K": [1]})
+    assert caught.value.__context__ is None
 
 
 def test_a_policy_sidecar_nested_past_tomllibs_limit_is_a_code_set_error() -> None:

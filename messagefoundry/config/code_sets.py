@@ -33,8 +33,9 @@ exactly like a missing ``env()`` key — surfaced by ``validate`` / ``check`` / 
   :mod:`tomllib`.
 
 **Rows are read-only.** A multi-column CSV row, a nested TOML table and a TOML array are frozen once
-loaded: a mutation raises :class:`TypeError`, and ``copy.deepcopy`` gives a copy to edit. One table
-serves every message until reload (BACKLOG #5897).
+loaded: an ordinary edit raises :class:`TypeError`, and ``copy.deepcopy`` gives a copy to edit. One
+table serves every message until reload (BACKLOG #5897). :class:`_FrozenDict` names the C-level
+writers the guard does not stop.
 
 **Resolution.** :func:`~messagefoundry.config.wiring.load_config` loads every code set into a registry
 and makes it the **active** set *before* importing config modules (so a module-top-level
@@ -335,8 +336,9 @@ def _drain_capture(buffer: UnmappedCapture, message_id: str | None) -> None:
 # --- code set ----------------------------------------------------------------
 
 
-#: How many containers deep :func:`_freeze` walks, the sandbox codec's ``_MAX_DEPTH``. The walk keeps
-#: its own stack, so whether a table loads does not depend on how deep the caller's stack already is.
+#: How many containers deep :func:`_freeze` walks. It equals the sandbox codec's ``_MAX_DEPTH`` (a
+#: test pins the two), so a table that loads also crosses into the sandbox child. The walk keeps its
+#: own stack, so the freeze adds no frame per level; ``tomllib`` still recurses while parsing a file.
 _MAX_FREEZE_DEPTH = 256
 
 
@@ -418,39 +420,66 @@ def _freeze(name: str, value: Any) -> Any:
     naming code set ``name``."""
     if type(value) not in _FREEZABLE:
         return value
-    # One frame per open container: its type, an iterator over its (key, child) pairs (key None for
-    # a list or tuple), the frozen pairs built so far, and the container's own key in its parent.
-    stack: list[tuple[type, Iterator[tuple[Any, Any]], list[tuple[Any, Any]], Any]] = [
-        (type(value), _pairs(value), [], None)
-    ]
+    flat = _freeze_flat(value)
+    if flat is not None:
+        return flat
+    stack = [_Frame(value, None)]
     while True:
-        kind, pairs, built, own_key = stack[-1]
-        for key, child in pairs:
+        frame = stack[-1]
+        for key, child in frame.children:
             if type(child) in _FREEZABLE:
                 if len(stack) >= _MAX_FREEZE_DEPTH:
                     raise CodeSetError(f"code set {name!r}: a value is nested too deeply to load")
-                stack.append((type(child), _pairs(child), [], key))
-                break
-            built.append((key, child))
+                flat = _freeze_flat(child)
+                if flat is None:
+                    stack.append(_Frame(child, key))
+                    break
+                child = flat
+            frame.add(key, child)
         else:
             stack.pop()
-            frozen: Any
-            if kind is dict:
-                frozen = _FrozenDict(built)
-            elif kind is list:
-                frozen = _FrozenList(v for _, v in built)
-            else:
-                frozen = tuple(v for _, v in built)
+            frozen = frame.build()
             if not stack:
                 return frozen
-            stack[-1][2].append((own_key, frozen))
+            stack[-1].add(frame.key, frozen)
 
 
-def _pairs(container: Any) -> Iterator[tuple[Any, Any]]:
-    """A container's children as ``(key, child)``: a dict's items, else ``(None, child)``."""
-    if type(container) is dict:
-        return iter(container.items())
-    return ((None, child) for child in container)
+def _freeze_flat(value: Any) -> Any:
+    """Freeze a container none of whose children is a container in one step, else return None.
+
+    The common row shapes are flat, and this skips the walk's per-child bookkeeping for them."""
+    children = value.values() if type(value) is dict else value
+    if any(type(child) in _FREEZABLE for child in children):
+        return None
+    if type(value) is dict:
+        return _FrozenDict(value)
+    if type(value) is list:
+        return _FrozenList(value)
+    return value  # a tuple of non-containers is already immutable
+
+
+class _Frame:
+    """One open container in :func:`_freeze`'s walk, with the frozen children built so far."""
+
+    __slots__ = ("kind", "children", "built", "key")
+
+    def __init__(self, value: Any, key: Any) -> None:
+        self.kind: type = type(value)
+        self.children: Iterator[tuple[Any, Any]] = (
+            iter(value.items()) if self.kind is dict else enumerate(value)
+        )
+        self.built: list[Any] = []
+        self.key = key  # this container's key (or index) in its parent
+
+    def add(self, key: Any, child: Any) -> None:
+        self.built.append((key, child) if self.kind is dict else child)
+
+    def build(self) -> Any:
+        if self.kind is dict:
+            return _FrozenDict(self.built)
+        if self.kind is list:
+            return _FrozenList(self.built)
+        return tuple(self.built)
 
 
 class CodeSet(Mapping[str, Any]):
@@ -476,9 +505,17 @@ class CodeSet(Mapping[str, Any]):
         # One pass over the values at load; only container values are rebuilt.
         # A value nested past the freeze's bound raises CodeSetError, which every loader catches.
         frozen: dict[str, Any] = dict(data)
-        for key, value in frozen.items():
-            if type(value) in _FREEZABLE:
-                frozen[key] = _freeze(name, value)
+        out_of_stack = False
+        try:
+            for key, value in frozen.items():
+                if type(value) in _FREEZABLE:
+                    frozen[key] = _freeze(name, value)
+        except RecursionError:
+            # A caller already at the interpreter's limit: the freeze's few frames tipped it over.
+            out_of_stack = True
+        if out_of_stack:
+            # Raised after the handler, so the CodeSetError every loader catches carries no context.
+            raise CodeSetError(f"code set {name!r}: the caller's stack is too deep to load it")
         self._data = frozen
         self._policy: UnmappedPolicy = policy if policy is not None else UnmappedPolicy()
 
