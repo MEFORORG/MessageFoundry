@@ -417,11 +417,11 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    least two steps stay outside that check: the cursor's creation between the windows and the
 >    COMMIT after them. No load-time check covers them, and that is the remaining residual. The
 >    warning above, which is unchanged, does not cover them either: it fires only when twice the
->    clamp reaches the margin, and at the stock `[store]` timeouts a whole-second clamp's two
->    windows are already twice the clamp, so a whole-second clamp that passes the refusal never
->    draws it. A whole-second clamp that passes with little headroom, or a derived one stepped down,
->    which is always a whole second, therefore logs nothing. A fractional clamp, such as the stock
->    derived 4.5, can still draw it.
+>    clamp reaches the margin, and at the stock `[store]` timeouts (30 s each) a whole-second clamp
+>    of at most 30 s has two windows of exactly twice the clamp, so such a clamp that passes the
+>    refusal never draws it. Such a clamp passing with little headroom, or a derived one stepped
+>    down, therefore logs nothing. At least a fractional clamp, such as the stock derived 4.5, or a
+>    clamp above a timeout that caps it, can still draw it.
 >    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, by the warning's arithmetic and
 >    by a timing test of the two windows, and its gated test shows the driver
 >    ending a slow statement at the clamp.
