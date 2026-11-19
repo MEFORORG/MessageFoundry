@@ -36,6 +36,9 @@ from tests._extras_probe import report_header_lines, write_incomplete_run_summar
 from tests._qt_cycles import collect_qobjects_in_cycles
 from tests._root_logging import root_logging_restored
 
+# Caps pytest -n auto; tests/_xdist_worker_cap.py says why it is registered here.
+from tests._xdist_worker_cap import pytest_xdist_auto_num_workers  # noqa: F401
+
 if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinConfigSourceProbes, _WinPathSecurity
     from messagefoundry.remotedebug import RemoteDebugPosture

@@ -16,7 +16,7 @@ import pytest
 from tests import _xdist_worker_cap as cap
 
 _ROOT = Path(__file__).resolve().parents[1]
-_ROOT_CONFTEST = _ROOT / "conftest.py"
+_TESTS_CONFTEST = _ROOT / "tests" / "conftest.py"
 _CONSOLE_CONFTEST = _ROOT / "packaging" / "messagefoundry-webconsole" / "tests" / "conftest.py"
 
 
@@ -38,19 +38,19 @@ def test_an_override_xdist_ignored_does_not_lift_the_cap() -> None:
     assert cap.capped_auto_workers(16, "many") == 8
 
 
-def test_the_root_conftest_registers_the_cap_in_this_run(pytestconfig: pytest.Config) -> None:
-    """The premise: the root conftest is a loaded plugin and binds the shared hook.
+def test_the_tests_conftest_registers_the_cap_in_this_run(pytestconfig: pytest.Config) -> None:
+    """The premise: ``tests/conftest.py`` is a loaded plugin and binds the shared hook.
 
     Reached through the plugin manager, never imported, because pytest registers it under the bare
     name ``conftest``. Unlike the hook-chain test below, this holds even where xdist is inactive.
     """
     for plugin in pytestconfig.pluginmanager.get_plugins():
         location = getattr(plugin, "__file__", None)
-        if location and Path(location).resolve() == _ROOT_CONFTEST:
+        if location and Path(location).resolve() == _TESTS_CONFTEST:
             hook = plugin.pytest_xdist_auto_num_workers
             assert hook is cap.pytest_xdist_auto_num_workers
             return
-    pytest.fail(f"{_ROOT_CONFTEST} is not registered in this run, so -n auto is uncapped")
+    pytest.fail(f"{_TESTS_CONFTEST} is not registered in this run, so -n auto is uncapped")
 
 
 def _binds_the_cap(source: str) -> bool:
@@ -85,7 +85,7 @@ def _binds_the_cap(source: str) -> bool:
 
 
 def test_the_console_conftest_registers_the_cap_too() -> None:
-    """A run naming only the console tree never loads the root conftest; its own must bind the hook.
+    """A run naming only the console tree never loads tests/conftest.py; its own must bind the hook.
 
     Read by AST, not run: importing that conftest here would load the console suite's fixtures. It
     proves the import is written, not that a console-rooted run resolves it; the smoke run recorded
