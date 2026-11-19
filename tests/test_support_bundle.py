@@ -81,10 +81,12 @@ def test_manifest_phi_contract_does_not_claim_the_bundle_secret_free(tmp_path: P
 
 
 def test_cli_help_and_build_docstring_state_the_phi_contract_residual() -> None:
-    """BACKLOG #5385 item 1: the support-bundle help and ``build_bundle``'s docstring are other records
-    of the manifest's ``phi_contract``. The help used to omit the DEBUG-body residual, and the docstring
-    said the function reads no "secret value" into the bundle, which the best-effort tail does not
-    meet. Both now name what survives the redaction and claim no secret-free bundle."""
+    """BACKLOG #5385 item 1: the support-bundle help and ``build_bundle``'s docstring must not
+    contradict the manifest's ``phi_contract``. The help named one residual, a username, as if it
+    were the whole of it, omitting the DEBUG-logged body; the docstring said the function reads no
+    "secret value" into the bundle, which the best-effort tail does not meet. Both now claim no
+    secret-free or PHI-free bundle and point at ``phi_contract``, the one place the residual is
+    stated, rather than restate it."""
     import argparse
 
     from messagefoundry.__main__ import _build_parser
@@ -94,14 +96,14 @@ def test_cli_help_and_build_docstring_state_the_phi_contract_residual() -> None:
     entry = next(c for c in sub._choices_actions if c.dest == "support-bundle")
     help_text = " ".join((entry.help or "").split()).lower()
     assert "best-effort" in help_text
-    assert "debug" in help_text
-    assert "message body" in help_text
-    assert "at least" in help_text
     assert "not as secret-free or phi-free" in help_text
+    assert "phi_contract" in help_text
+    # No residual of its own: the old text's "an operator username included" read as the whole.
+    assert "username" not in help_text
 
     doc = " ".join((build_bundle.__doc__ or "").split()).lower()
     assert "nor any secret value" not in doc
-    assert "not secret-free" in doc
+    assert "neither secret-free nor phi-free" in doc
     assert "phi_contract" in doc
 
 

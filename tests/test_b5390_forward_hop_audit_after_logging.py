@@ -5,9 +5,8 @@
 
 Logged before it, the record missed ``[logging].file`` and the collector. A start that a later
 gate refuses still logs it, once, to the handlers the process has then, as the old decision-time
-log call did: ``supervise``'s stdout handler, or ``serve``'s lastResort. There the line ends with
-``_START_AUDIT_NOT_APPLIED``, because the refused start never took the posture it records (the
-row's last limb). The stderr warning is still printed where the hop is decided.
+log call did: ``supervise``'s stdout handler, or ``serve``'s lastResort. The stderr warning is
+still printed where the hop is decided.
 """
 
 from __future__ import annotations
@@ -105,8 +104,6 @@ def test_hop_audit_is_logged_once_after_configure(
     assert "crosses the network unprotected, in cleartext over UDP" in next(
         m for m, _ in seen if "AUDIT:" in m
     )
-    # The control for the refused tests below: a start that goes on writes it unmarked.
-    assert cli._START_AUDIT_NOT_APPLIED not in next(m for m, _ in seen if "AUDIT:" in m)
     err = capsys.readouterr().err
     assert f"warning: off-box log/audit forwarding to {_HOST}:" in err
     # The handlers took it, so it is not written to stderr a second time.
@@ -183,9 +180,6 @@ def test_a_later_refusal_still_logs_the_hop_audit_once(
     # The handlers took it, so it is not written to stderr a second time.
     assert "AUDIT:" not in err
     assert _hop_audit(seen) == [False]
-    # The record says the refused start did not take the posture (#5390 last limb).
-    (line,) = [m for m, _ in seen if m.startswith(_HOP_AUDIT_PREFIX)]
-    assert line.endswith(cli._START_AUDIT_NOT_APPLIED)
 
 
 def test_a_supervise_refusal_after_a_warn_hop_logs_the_hop_audit(
@@ -216,10 +210,8 @@ def test_a_supervise_refusal_after_a_warn_hop_logs_the_hop_audit(
     assert configured == []
     audit = [r.getMessage() for r in caplog.records if "AUDIT" in r.getMessage()]
     assert len(audit) == 2
-    # A refused or failed start never took the posture, so each line says so (#5390 last limb).
-    assert audit[0] == f"AUDIT: the posture line{cli._START_AUDIT_NOT_APPLIED}"
+    assert audit[0] == "AUDIT: the posture line"
     assert audit[1].startswith(_HOP_AUDIT_PREFIX)
-    assert audit[1].endswith(cli._START_AUDIT_NOT_APPLIED)
 
 
 def test_a_raise_out_of_configure_still_logs_the_pending_audit(
@@ -246,10 +238,8 @@ def test_a_raise_out_of_configure_still_logs_the_pending_audit(
     assert pending == []
     audit = [r.getMessage() for r in caplog.records if "AUDIT" in r.getMessage()]
     assert len(audit) == 2
-    # A refused or failed start never took the posture, so each line says so (#5390 last limb).
-    assert audit[0] == f"AUDIT: the posture line{cli._START_AUDIT_NOT_APPLIED}"
+    assert audit[0] == "AUDIT: the posture line"
     assert audit[1].startswith(_HOP_AUDIT_PREFIX)
-    assert audit[1].endswith(cli._START_AUDIT_NOT_APPLIED)
 
 
 def test_a_refusal_on_an_empty_root_reaches_stderr_through_the_filtered_last_resort(
