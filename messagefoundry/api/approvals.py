@@ -507,6 +507,23 @@ class _Operation:
     requires_fingerprint: bool = False
 
 
+class OperationInterrupted(Exception):
+    """An outliving operation was cancelled while its caller was NOT (BACKLOG #5903).
+
+    :meth:`~messagefoundry.api.outlive.OutlivingOperations.run` raises it in place of the
+    operation's ``CancelledError``, which would reach a request as a cancellation nobody asked
+    for, past every exception handler. At least the shutdown drain cancels an operation that way
+    (:meth:`~messagefoundry.api.outlive.OutlivingOperations.drain`). The operation may have run
+    none, some or all of its effects, so the approval gate records a release that raised it as
+    ``interrupted``, never ``failed``. Deliberately not an ``HTTPException``: the ``/ui`` routes
+    render an ``HTTPException`` 503 as a refusal where nothing ran, which this is not. The app's
+    own handler answers it (``_operation_interrupted`` in ``api/app.py``)."""
+
+    def __init__(self, label: str) -> None:
+        super().__init__(f"{label} was interrupted before it answered, and its outcome is unknown")
+        self.label = label
+
+
 class ApprovalError(Exception):
     """A pending-approval decision could not be made. ``status`` is the HTTP code the API should map
     to — at least 404 unknown, 409 already-decided/expired/unapprovable, 403 self-approval, and 503
@@ -1745,13 +1762,15 @@ class ApprovalGate:
             # Encodable once, here, so the audit row and the caller's answer carry one form, and
             # an unencodable result cannot turn a release that ran into a 500 (vault BACKLOG #3193).
             result = _encodable_result(await op.execute(params))
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, OperationInterrupted):
             # BACKLOG #1562. The approve was cancelled while the executor ran -- at least a request
             # timeout (RequestTimeoutMiddleware) does this. The executor may have finished none, some
             # or all of its effects, so the outcome is UNKNOWN: record 'interrupted', never 'failed'
             # (which says the operation did not happen) and never 'approved'. Nothing retries it; a
             # blind re-run of an operation that may already have run is worse than the stuck row.
             # Shielded, so a cancellation re-delivered here cannot cancel the record of the first one.
+            # OperationInterrupted is the same unknown outcome: the executor's operation was
+            # cancelled under an approve that was not (#5903).
             handed_off = True
             await self._shielded(
                 self._record_interrupted_execution(
@@ -1774,7 +1793,8 @@ class ApprovalGate:
             #
             # `except Exception` is deliberate and is not a swallow: ANY executor failure has to
             # compensate, and the original is re-raised below. CancelledError is handled above,
-            # because a cancelled approve has an unknown outcome and must not be recorded as a failure.
+            # because a cancelled approve has an unknown outcome and must not be recorded as a failure,
+            # and so is OperationInterrupted.
             # Shielded for the same reason as the interrupted record above.
             handed_off = True
             await self._shielded(
@@ -2106,7 +2126,8 @@ class ApprovalGate:
         ``interrupted`` means the outcome is unknown: the executor may have finished none, some or all
         of its effects. The audit row is ``approval.interrupted``, so the trail tells an operation that
         ran (``approval.approved``) apart from one that was cut off. Its ``recorded`` field says
-        whether the row moved (:meth:`_settle`). The caller re-raises the cancellation either way."""
+        whether the row moved (:meth:`_settle`). The caller re-raises the cancellation, or the
+        :class:`OperationInterrupted` that stands for one, either way."""
         await self._settle(
             approval_id,
             status="interrupted",

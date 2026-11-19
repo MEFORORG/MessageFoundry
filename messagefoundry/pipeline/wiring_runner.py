@@ -219,6 +219,7 @@ from messagefoundry.pipeline.reference_sync import (
     reference_connection_name,
     reference_max_rows,
     reference_statement,
+    reference_statement_timeout,
 )
 from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, with_refusal_note
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
@@ -2014,6 +2015,8 @@ class RegistryRunner:
         #: process by construction (under HA the graph runs on the leader only), so process-local is
         #: the right scope. It carries no information — every signal is a latency hint and the waiter
         #: re-reads the store — so a shard that never sees a signal is merely slower, never wrong.
+        #: Each listener start arms through its own scope() of this root, so one listener's drain
+        #: never latches another's (BACKLOG #5893).
         self._reply_rendezvous = ReplyRendezvous()
         #: Per-inbound sync-reply counters, exposed via sync_reply_metrics() (ADR 0154 D8).
         self._sync_reply_metrics: dict[str, SyncReplyMetrics] = {}
@@ -2900,7 +2903,9 @@ class RegistryRunner:
 
         return _sink
 
-    def _make_sync_reply_resolver(self, ic: InboundConnection) -> SyncReplyResolver | None:
+    def _make_sync_reply_resolver(
+        self, ic: InboundConnection, rendezvous: ReplyRendezvous
+    ) -> SyncReplyResolver | None:
         """The per-inbound synchronous-reply resolver (ADR 0154 D2/D3), or ``None``.
 
         ``None`` unless this inbound declares ``reply_from``, which is what keeps every other
@@ -2930,7 +2935,7 @@ class RegistryRunner:
         metrics = self._sync_reply_metrics.setdefault(ic.name, SyncReplyMetrics(ic.name))
         return SyncReplyResolverImpl(
             self.store,
-            self._reply_rendezvous,
+            rendezvous,
             destination=str(settings["reply_from"]),
             timeout=reply_seconds(settings, "reply_timeout"),
             content_type=str(settings.get("reply_content_type") or "passthrough"),
@@ -6118,10 +6123,13 @@ class RegistryRunner:
         # ADR 0154 D2: the resolver that lets the listener return bytes out of the store while
         # transports/ imports neither store/ nor pipeline/ (AC-17). None unless this inbound declares
         # reply_from, so every other connection keeps the shipped 202 path byte for byte.
-        source.sync_reply = self._make_sync_reply_resolver(ic)
+        # BACKLOG #5893: a scope per start, so this listener's stop() drains only its own turns and
+        # its next start arms again, while delivery hints on the root still reach every scope.
+        reply_scope = self._reply_rendezvous.scope()
+        source.sync_reply = self._make_sync_reply_resolver(ic, reply_scope)
         if source.sync_reply is not None:
             # ADR 0154 D5/AC-10: stop() wakes blocked turns through this BEFORE closing writers.
-            source.reply_drain = self._reply_rendezvous.drain
+            source.reply_drain = reply_scope.drain
         # Inject the process-in-place dedup ledger (#142): a store-backed adapter keyed to THIS inbound, so
         # a leave-in-place (after_read='leave') File/RemoteFile source records/skips files it has ingested
         # by a HASHED key. Every other source ignores it (byte-identical); transports/ stays store-agnostic
@@ -15436,9 +15444,10 @@ def _build_check_connectors(
         database_source_dsn(rsettings, connection=reference_connection_name(rname))
         # BACKLOG #3432: the sync reads acquire_timeout by this rule, so an env() value it would
         # refuse fails check here rather than as a failed sync after start. max_rows the same way
-        # (BACKLOG #2617).
+        # (BACKLOG #2617), and statement_timeout (BACKLOG #5891).
         reference_acquire_timeout(rsettings)
         reference_max_rows(rsettings)
+        reference_statement_timeout(rsettings)
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         resolved_fhir_lookups[fname] = _fhir_lookup_settings(fspec, env_values, egress)

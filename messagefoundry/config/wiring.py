@@ -1200,6 +1200,7 @@ def DatabaseRef(
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
     max_rows: int | EnvRef = DEFAULT_REFERENCE_MAX_ROWS,  # refuse a larger result; 0 = off (#2617)
+    statement_timeout: int | EnvRef | None = None,  # whole s, 0 = no limit, unset = 30 (#5891)
     tls_hop_attested: bool = False,
     tls_hop_attested_reason: str | None = None,
 ) -> ReferenceSourceSpec:
@@ -1237,6 +1238,17 @@ def DatabaseRef(
     removes the ceiling. Checked when declared, like ``acquire_timeout``; an ``env()`` value is
     checked by the build check (``messagefoundry check``'s build leg, reload) and at each sync, once
     resolved.
+
+    ``statement_timeout`` (whole seconds, ``0`` for no limit) bounds each statement call of the sync
+    (the execute, each fetch), not the statement or the pass, by the DATABASE connector's rule:
+    unset is :data:`~messagefoundry.config.models.DEFAULT_DB_STATEMENT_TIMEOUT`. A call that runs
+    past it fails that sync, the last-good snapshot stays, and a set never synced stays unloaded.
+    Some cases leave a call unbounded, at least ``0``; docs/CONNECTIONS.md, *The statement
+    timeout*, lists them. Checked when declared, like ``max_rows``.
+
+    A result that does not fit ``key_column`` and ``value_column`` fails the sync too, rather than
+    replacing the last-good snapshot. At least these do: a named column the result lacks or holds
+    twice, a column name held twice with no ``value_column``, a NULL key, or two rows with one key.
 
     ``tls_hop_attested`` with its mandatory ``tls_hop_attested_reason`` attests that this source's
     database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR
@@ -1297,6 +1309,20 @@ def DatabaseRef(
             rows_refusal = str(exc)
         if rows_refusal is not None:
             raise WiringError(rows_refusal)
+    # statement_timeout by the same rule and for the same reason (BACKLOG #5891; the rule is #5756).
+    if statement_timeout is not None and not isinstance(statement_timeout, EnvRef):
+        from messagefoundry.transports.database import _statement_timeout
+
+        # Raised outside the handler, as the two above are, so it carries no exception chain.
+        timeout_refusal: str | None = None
+        try:
+            _statement_timeout(
+                {"statement_timeout": statement_timeout}, "DATABASE reference source"
+            )
+        except ValueError as exc:
+            timeout_refusal = str(exc)
+        if timeout_refusal is not None:
+            raise WiringError(timeout_refusal)
     return ReferenceSourceSpec(
         "database",
         {
@@ -1317,6 +1343,7 @@ def DatabaseRef(
             "pool_max": pool_max,
             "acquire_timeout": acquire_timeout,
             "max_rows": max_rows,
+            "statement_timeout": statement_timeout,
             **attestation,
         },
     )
@@ -6843,6 +6870,14 @@ class Registry:
     all_inbound_guard_settings: (
         Mapping[str, tuple[ConnectorType, Mapping[str, Any] | None]] | None
     ) = None
+    # EVERY inbound's explicit `messages_days` retention override in the deployment (NAME -> days,
+    # 0 = keep forever; an inbound that inherits the global window is omitted), pinned beside the
+    # engine shard identity by pipeline.sharding (None on an unfiltered graph / single-engine-shard
+    # config). Read through :meth:`inbound_messages_days`, at least by the retention runner's body
+    # purge, which runs over the UNIFIED store every engine shard shares (ADR 0063): keyed off
+    # `inbound` alone it would apply the global cutoff to a sibling engine shard's keep-forever or
+    # longer-window bodies (BACKLOG #5889).
+    all_inbound_messages_days: Mapping[str, int] | None = None
     # The directory :func:`load_config` read this graph from, or None for a graph built in code. A
     # `[sandbox].mode=subprocess` worker re-loads its Router/Handler functions from here, so after
     # an operator reload from another root the workers load the root the running graph came from,
@@ -6889,6 +6924,19 @@ class Registry:
             name: ic.deployed
             for name, ic in self.inbound.items()
             if ic.spec.type is ConnectorType.PT
+        }
+
+    def inbound_messages_days(self) -> Mapping[str, int]:
+        """Every inbound's explicit ``messages_days`` override in the deployment (#34, ADR 0027), NAME
+        -> days, 0 = keep forever, an inheriting inbound omitted: the pinned unfiltered map when this
+        is one engine shard's filtered view, else derived from this graph's own inbounds. Why it
+        spans the deployment: the ``all_inbound_messages_days`` field comment."""
+        if self.all_inbound_messages_days is not None:
+            return self.all_inbound_messages_days
+        return {
+            ic.name: ic.messages_days
+            for ic in self.inbound.values()
+            if ic.messages_days is not None
         }
 
     def add_inbound(self, conn: InboundConnection) -> None:

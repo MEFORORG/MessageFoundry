@@ -101,18 +101,46 @@ class ReplyRendezvous:
     """Wakes HTTP turns blocked on a captured downstream reply, keyed by ``(message_id, dest)``.
 
     Owned by the runner and injected into the resolver, so ``transports/`` never imports it.
+
+    **Draining is per listener; waking is not.** The runner holds one root instance and hands each
+    listener start its own :meth:`scope`. Every scope shares the root's waiter table, so a delivery
+    signal on the root reaches a waiter whichever listener armed it, and the cap stays runner-wide.
+    A scope's drain wakes only the waiters armed through it and refuses only its own later arms, so
+    stopping one listener neither aborts a sibling's turns nor latches it, and the next start of the
+    same listener gets a fresh, undrained scope (BACKLOG #5893). A drain on the root keeps its
+    runner-wide meaning: it wakes every waiter, and every scope of it refuses further arms for good.
+    No runner path drains the root; each listener drains only its own scope.
     """
 
-    __slots__ = ("_waiters", "_max_waiters", "_draining")
+    __slots__ = ("_waiters", "_max_waiters", "_draining", "_owned", "_parent")
 
     def __init__(self, *, max_waiters: int = DEFAULT_MAX_WAITERS) -> None:
         self._waiters: dict[tuple[str, str], set[ReplyWaiter]] = {}
         self._max_waiters = max_waiters
         self._draining: str | None = None
+        #: The waiters armed through this scope: what its :meth:`drain` wakes. Unused on the root.
+        self._owned: set[ReplyWaiter] = set()
+        #: The root this is a :meth:`scope` of, or ``None`` on the root itself.
+        self._parent: ReplyRendezvous | None = None
+
+    def scope(self) -> ReplyRendezvous:
+        """A rendezvous for one listener start: the root's waiter table and cap, its own drain.
+
+        Always a child of the root, so a scope's ``scope()`` is a sibling, not a nested scope.
+        """
+        root = self._parent if self._parent is not None else self
+        child = ReplyRendezvous(max_waiters=root._max_waiters)
+        child._waiters = root._waiters
+        child._parent = root
+        return child
 
     @property
     def waiters(self) -> int:
-        """Currently armed waiters. Tested to return to zero — see :meth:`arm`."""
+        """Currently armed waiters, runner-wide. Tested to return to zero — see :meth:`arm`.
+
+        On a :meth:`scope` this is still the total across every scope of the root, because the scopes
+        share one waiter table; it is what the cap in :meth:`arm` is checked against.
+        """
         return sum(len(group) for group in self._waiters.values())
 
     @contextmanager
@@ -128,17 +156,23 @@ class ReplyRendezvous:
 
         Raises :class:`RendezvousFull` when the cap is reached or the listener is draining.
         """
-        if self._draining is not None:
-            raise RendezvousFull(f"listener is draining ({self._draining})")
+        draining = self._draining
+        if draining is None and self._parent is not None:
+            draining = self._parent._draining
+        if draining is not None:
+            raise RendezvousFull(f"listener is draining ({draining})")
         if self.waiters >= self._max_waiters:
             raise RendezvousFull(f"reply rendezvous at capacity ({self._max_waiters} waiters)")
 
         key = (message_id, destination_name)
         waiter = ReplyWaiter()
         self._waiters.setdefault(key, set()).add(waiter)
+        if self._parent is not None:
+            self._owned.add(waiter)
         try:
             yield waiter
         finally:
+            self._owned.discard(waiter)
             group = self._waiters.get(key)
             if group is not None:
                 group.discard(waiter)
@@ -172,12 +206,16 @@ class ReplyRendezvous:
             waiter._wake()
 
     def drain(self, reason: str) -> None:
-        """Wake every waiter for listener shutdown and refuse further arms.
+        """Wake this instance's waiters for listener shutdown and refuse its further arms.
 
         Called from ``stop()`` **before** client writers are closed, so each woken turn can still
-        write its ``503`` through a live socket. Idempotent.
+        write its ``503`` through a live socket. Idempotent. On a :meth:`scope` it reaches only the
+        waiters armed through that scope; on the root it reaches every waiter of every scope.
         """
         self._draining = reason
-        for group in list(self._waiters.values()):
-            for waiter in list(group):
-                waiter._drain(reason)
+        if self._parent is None:
+            targets = [waiter for group in self._waiters.values() for waiter in group]
+        else:
+            targets = list(self._owned)
+        for waiter in targets:
+            waiter._drain(reason)

@@ -30,7 +30,7 @@ import math
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import tomlkit
 from tomlkit.items import Float, Trivia
@@ -129,6 +129,10 @@ assert set(_SCALAR_FIELDS) | set(_SUB_TABLES) == _INBOUND_KEYS | _OUTBOUND_KEYS
 assert "direction" not in _SCALAR_FIELDS + _SUB_TABLES
 
 Validate = Callable[[Path], None]
+
+#: The phrase :func:`remove_connection` refuses a name held by both an inbound and an outbound with,
+#: so the CLI can add its own flag to the advice without the library naming one.
+SHARED_NAME_REFUSAL = "is both an inbound and an outbound"
 
 
 @contextlib.contextmanager
@@ -291,9 +295,23 @@ def upsert_connection(
     return {"op": "upsert", "direction": direction, "name": obj["name"]}
 
 
-def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) -> dict[str, Any]:
+def remove_connection(
+    config_dir: str | Path,
+    name: str,
+    *,
+    validate: Validate,
+    direction: Literal["inbound", "outbound"] | None = None,
+) -> dict[str, Any]:
     """Remove the data-authored connection ``name``. Raises :class:`WiringError` if it isn't in
-    ``connections.toml`` (a code-first connection can't be removed here)."""
+    ``connections.toml`` (a code-first connection can't be removed here).
+
+    An inbound and an outbound may share a name, since the :class:`~messagefoundry.config.wiring.
+    Registry` keeps inbounds and outbounds in separate tables, so ``direction`` says which one to
+    remove. Without it, a name held in both directions is refused (:data:`SHARED_NAME_REFUSAL`)
+    rather than resolved to the first match, which removed the inbound when the outbound was meant
+    (BACKLOG #5898). Within one direction the first match is removed, as before."""
+    if direction not in (None, "inbound", "outbound"):
+        raise WiringError(f"direction must be 'inbound' or 'outbound', not {direction!r}")
     path = _path(config_dir)
     if not atomic_edit.is_file(path, refused_error=WiringError):
         raise WiringError(f"no {CONNECTIONS_FILE_NAME} in {config_dir}")
@@ -301,26 +319,38 @@ def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) 
         text, crlf = atomic_edit.read_text(path, refused_error=WiringError)
         doc = tomlkit.parse(text)
 
-        removed = False
-        for direction in ("inbound", "outbound"):
-            aot = doc.get(direction)
-            if aot is None:
+        # Each direction whose array holds the name, with the index of its first match.
+        held: dict[str, tuple[Any, int]] = {}
+        for where in ("inbound", "outbound"):
+            tables = doc.get(where)
+            if tables is None:
                 continue
-            for index in range(len(aot)):
-                if aot[index].get("name") == name:
-                    del aot[index]
-                    removed = True
+            for index in range(len(tables)):
+                if tables[index].get("name") == name:
+                    held[where] = (tables, index)
                     break
-            if removed:
-                break
-        if not removed:
+        if direction is not None and held and direction not in held:
+            (other,) = held
+            raise WiringError(
+                f"{direction} connection {name!r} is not in {CONNECTIONS_FILE_NAME}; "
+                f"it holds {name!r} only as an {other} (nothing was removed)"
+            )
+        if direction is None and len(held) > 1:
+            raise WiringError(
+                f"connection {name!r} {SHARED_NAME_REFUSAL} in {CONNECTIONS_FILE_NAME}; name the "
+                "direction to remove (nothing was removed)"
+            )
+        removed_direction = direction if direction is not None else next(iter(held), None)
+        if removed_direction is None or removed_direction not in held:
             raise WiringError(
                 f"connection {name!r} is not in {CONNECTIONS_FILE_NAME} "
                 "(a code-authored connection can't be removed here)"
             )
+        tables, index = held[removed_direction]
+        del tables[index]
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
-    return {"op": "remove", "name": name}
+    return {"op": "remove", "direction": removed_direction, "name": name}
 
 
 # --- internals ---------------------------------------------------------------

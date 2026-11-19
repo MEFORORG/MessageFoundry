@@ -2563,10 +2563,15 @@ def _icacls_fails() -> Any:
     raise OSError(2, "icacls could not be started")
 
 
+def _icacls_times_out() -> Any:
+    raise subprocess.TimeoutExpired(["icacls.exe", _CONTROL_PATH], ta._ICACLS_TIMEOUT_S)
+
+
 @pytest.mark.parametrize(
     "ran",
     [
         pytest.param(_icacls_fails, id="icacls could not run"),
+        pytest.param(_icacls_times_out, id="icacls timed out"),
         pytest.param(lambda: _ran(0, None), id="no readable output"),
         pytest.param(
             lambda: _ran(5, "", f"{_CONTROL_PATH}: Access is denied."), id="exit non-zero"

@@ -3175,7 +3175,7 @@ the row to one of three outcomes. Each move carries its own audit row, after the
 |---|---|---|
 | `approved` | The operation ran and returned | `approval.approved` |
 | `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
-| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. Or the engine process that claimed it restarted before it recorded an outcome. Or an operator interrupted a release stranded in `executing`. It may have done none, some or all of its work | `approval.interrupted` (against `system`, with `reason` `engine_restart`, when a restart finds it; against the operator, with `reason` `operator_interrupt`, when an operator interrupts it) |
+| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. Or the shutdown drain cancelled the released operation while the approve still waited; the approve then answers 503 (BACKLOG #5903). Or the engine process that claimed it restarted before it recorded an outcome. Or an operator interrupted a release stranded in `executing`. It may have done none, some or all of its work | `approval.interrupted` (against `system`, with `reason` `engine_restart`, when a restart finds it; against the operator, with `reason` `operator_interrupt`, when an operator interrupts it) |
 | `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolved` (against the resolver) |
 | `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolved` (against the resolver) |
 
