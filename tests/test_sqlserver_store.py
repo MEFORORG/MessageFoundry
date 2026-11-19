@@ -1036,8 +1036,8 @@ async def test_approval_repeats_racing_from_two_processes_file_one_request(store
         answers = await asyncio.to_thread(race_repeat_requests, "sqlserver", tmp_path, nonce)
         await assert_one_request_per_round(store, answers)
     finally:
-        # The fixture does not clear pending_approvals, so a run that fails anywhere, the race
-        # itself included, must not leave its open requests behind for a later test.
+        # A run that fails anywhere, the race itself included, must not leave its open requests
+        # behind for a later test; this does not rest on the fixture's table list.
         for approval_id in filed_for(nonce, await open_requests(store)):
             await store.decide_pending_approval(
                 approval_id, status="rejected", approver="race-cleanup", decided_at=1_100.0
@@ -6048,7 +6048,8 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
         )
         await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
         # Vault BACKLOG #5635: an open request another test left, sealed under its own key,
-        # would stop this run. The fixture does not clear this table, so this test does.
+        # would stop this run. The fixture clears this table too; this test clears it again so
+        # it does not rest on the fixture's table list.
         async with seed._pool.acquire() as conn:
             cur = await conn.cursor()
             await cur.execute("DELETE FROM pending_approvals")

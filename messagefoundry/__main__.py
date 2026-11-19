@@ -7085,6 +7085,15 @@ def _host_gated_store_settings(
     return settings
 
 
+#: The recovery an Unverifiable row seal gets (ADR 0217 (a)): the exact closing clause of
+#: ``auth.service._UNVERIFIABLE_ACCOUNT_REFUSAL``, whose opening names provision-admin's scan and
+#: so does not fit a host unlock (BACKLOG #5633).
+_UNVERIFIABLE_RECOVERY = (
+    "The seal may be planted: check that Vault is healthy and that every node holds the audit "
+    "key's latest version, then retry"
+)
+
+
 def _seal_refusal(username: str, act: str) -> str:
     """The fixed refusal of a host command whose write the store refused because the account's
     record fails its integrity seal (BACKLOG #3510). Logs it and returns the text, which the caller
@@ -7193,6 +7202,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         *reach_errors,
     )
 
+    # The name every refusal after the read uses: the stored username once the account is found,
+    # as the output and the audit row name it (BACKLOG #5633 item 7).
+    named = [wanted]
+
     async def run() -> tuple[str, Any]:
         """``(outcome, extra)``: ``extra`` is the report for ``unlocked``, the error for
         ``open-failed``, ``read-refused`` and ``refused``, else ``None``. Each catch is scoped to
@@ -7223,10 +7236,13 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 return ("read-refused", exc)
             if user is None:
                 return ("no-such-user", None)
+            named[0] = user.username
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
             # ADR 0197: both old expiries and both cycle counts, read before the clear so they are
-            # what the clear replaced. The engine is stopped for this command (ADR 0171).
+            # what the clear replaced. The engine is stopped for this command (ADR 0171). The
+            # stored username, which the output names too, not the argument as typed (#5633).
             report: dict[str, Any] = {
+                "username": user.username,
                 "was_locked_until": user.locked_until,
                 "was_second_step_locked_until": user.second_step_locked_until,
                 "lock_cycles": user.lock_cycles,
@@ -7238,7 +7254,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             audit = AuditAppend(
                 ADMIN_UNLOCKED_ACTION,
                 actor=actor,
-                detail=json.dumps({"username": user.username, **report}),
+                detail=json.dumps(report),
             )
             try:
                 cleared = await store.clear_lockout(
@@ -7276,8 +7292,18 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 f"{_sentence(codec_safe_str(extra))} Nothing was written.", as_json=args.json
             )
             return 2
-        # #1670: a path that is not a database, or a server the driver could not reach.
-        return _emit_store_open_error(extra, _store_label(settings.store), as_json=args.json)
+        # #1670: a path that is not a database, or a server the driver could not reach. A refusal
+        # class the engine defines, such as SchemaNotProvisionedError, is printed whole, so its
+        # remedy survives, as the transit-bound commands print one (BACKLOG #5633). A plain
+        # RuntimeError keeps the redacted rendering it had on main: one the engine raises can
+        # embed a driver's text, so printing it whole is left open rather than taken here.
+        whole = type(extra) is not RuntimeError and _is_engine_refusal(extra)
+        return _emit_store_open_error(
+            extra,
+            _store_label(settings.store),
+            as_json=args.json,
+            text=_engine_refusal_text(extra) if whole else None,
+        )
     if outcome in ("read-refused", "refused"):
         # Logged, so the cause can be found: WARNING names the class only, since a driver's
         # message can quote a stored value (ASVS 16.5.4); the traceback goes to DEBUG. A busy
@@ -7286,7 +7312,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         log.warning(
             "admin-unlock: the store refused the %s for %r (%s)",
             "account read" if outcome == "read-refused" else "unlock",
-            wanted,
+            named[0],
             type(extra).__name__,
         )
         log.debug("admin-unlock: the refusal's traceback", exc_info=extra)
@@ -7296,9 +7322,28 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             "nothing was written. Check the store key and the database, then re-run",
             as_json=args.json,
         )
+    # A Transit row seal is not a busy store, so neither gets the busy store's remedy (BACKLOG
+    # #5633 item 2). The Outage class covers a refused hmac or verify too, so its remedy names
+    # the token's grants.
+    if outcome == "refused" and isinstance(extra, TransitSealUnavailableError):
+        return _emit_error(
+            f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}): a row seal "
+            "could not be made or checked through Vault transit. The clear and its audit row are "
+            "one transaction, so neither was written. Check that Vault transit is reachable and "
+            "that the token holds transit/hmac and transit/verify on the audit key, then re-run",
+            as_json=args.json,
+        )
+    if outcome == "refused" and isinstance(extra, RowSealUnverifiableError):
+        return _emit_error(
+            f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}): Vault "
+            "transit would not check the account's row seal (stored key version "
+            f"{extra.stored_version}, probe version {extra.probe_version}). The clear and its "
+            "audit row are one transaction, so neither was written. " + _UNVERIFIABLE_RECOVERY,
+            as_json=args.json,
+        )
     if outcome == "refused":
         return _emit_error(
-            f"the store refused the unlock for {wanted!r} ({type(extra).__name__}). The clear and "
+            f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}). The clear and "
             "its audit row are one transaction, so neither was written, unless a server "
             "database reported the error after its commit. If the engine is running, stop it "
             "and re-run; a second unlock is harmless",
@@ -7306,7 +7351,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
     if outcome == "changed":
         return _emit_error(
-            f"the account {wanted!r} was removed or changed while this command ran; nothing was "
+            f"the account {named[0]!r} was removed or changed while this command ran; nothing was "
             "written. Stop the engine and re-run",
             as_json=args.json,
         )
@@ -7314,7 +7359,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         return _emit_error(f"no local account named {wanted!r}", as_json=args.json)
     report = cast("dict[str, Any]", extra)
     if args.json:
-        print(json.dumps({"ok": True, "username": wanted, **report}))
+        print(json.dumps({"ok": True, **report}))
     else:
 
         def _state(label: str, until: float | None) -> str:
@@ -7334,7 +7379,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
         kept = "reset to 0" if report["cycles_reset"] else "kept"
         print(
-            f"OK: cleared lockout for {wanted!r} ({states}; {cycles}, {kept}); "
+            f"OK: cleared lockout for {report['username']!r} ({states}; {cycles}, {kept}); "
             "the password is UNCHANGED"
         )
     return 0
@@ -12324,16 +12369,20 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if seals.refused:
-        # Vault BACKLOG #5635: a seal that fails under a key this run holds, or is malformed, is
-        # left as it is. No key re-seals it, so it must not fail the run, or every later run would
-        # fail on it too (the BACKLOG #3181 precedent). Said here, not only logged.
+        # Vault BACKLOG #5635: a seal that names a key this run holds other than the active one, or
+        # is malformed, is left as it is. One that fails no key re-seals, so it must not fail the
+        # run, or every later run would fail on it too (the BACKLOG #3181 precedent).
+        # `ResealOutcome` says what else the count holds. Said here, not only logged.
         print(
             f"note: {seals.refused} user, role, open approval or directory-map record(s) were left "
-            "as they are: their seal fails under a key this run holds, or is malformed. The "
-            "causes include at least a change made outside the store and, if an engine was still "
-            "running, a write it made during this run. A record changed outside the store is "
-            "refused on every read and no key re-seals it, so it does not hold this rotation open; "
-            "recreate or remove it. The log names each kind."
+            "as they are: their seal names a key this run holds other than the active one, or is "
+            "malformed. The causes include at least a change made outside the store and, if an "
+            "engine was still running, a write it made during this run. A record changed outside "
+            "the store is refused on every read and no key re-seals it, so it does not hold this "
+            "rotation open; recreate or remove it. A write an engine made during this run may be "
+            "sound and still under the prior key: stop every engine using this store and re-run "
+            "before dropping that key. A re-run may count such a record again; do not remove an "
+            "account on this count alone."
         )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under
@@ -12984,9 +13033,10 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     is host access, as for ``admin-unlock``, whose docstring says why that gate is a real one.
     It keeps no session: the shell that runs it holds none.
 
-    The audit row is written after the revoke, as ``admin-unlock`` writes its own, and the audit
-    append is checked for a refusal before the revoke, so a refused row cannot follow a change
-    that already landed."""
+    The audit row is written after the revoke, and the audit append is checked for a refusal
+    before the revoke, so a refused row cannot follow a change that already landed.
+    ``admin-unlock`` no longer works this way: its row commits in the clear's own transaction
+    (BACKLOG #5633)."""
     import getpass
 
     from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
@@ -14261,8 +14311,9 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
 
 
 async def _close_store_quietly(store: Store) -> None:
-    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``store attest-transit-bound`` or
-    ``store withdraw-transit-bound`` has its result. A close that fails prints a warning naming its
+    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``admin-unlock``,
+    ``cipher-audit``, ``store attest-transit-bound`` or ``store withdraw-transit-bound`` has its
+    result. A close that fails prints a warning naming its
     class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()
@@ -14417,7 +14468,8 @@ def _emit_store_open_error(
     OSError, and its client errors, whose text ``safe_exc`` redacts by pattern only.
 
     ``text``, when given, replaces that rendering, for a caller that has already rendered the error
-    its own way: the transit-bound commands print an engine refusal whole (BACKLOG #2337).
+    its own way: the transit-bound commands print an engine refusal whole (BACKLOG #2337), and
+    ``admin-unlock`` a refusal class the engine defines (BACKLOG #5633).
     """
     message = f"cannot open the store at {path}: {_store_error_text(exc) if text is None else text}"
     if as_json:

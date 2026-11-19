@@ -367,10 +367,10 @@ class RowSealer:
 
         ``rotate-key`` asks this of each row its re-seal passes left as they were: such a row may
         be genuine and sealed under a retired key the run was not given, so the run stops short
-        until a run that holds that key re-seals it. A row whose seal fails under a key this
-        sealer holds, or that is malformed, answers ``False``: no key re-seals it, so it must not
-        hold the rotation open. A key id that is not one :func:`row_seal_key_id` could return is
-        malformed."""
+        until a run that holds that key re-seals it. A row whose seal names a key this sealer
+        holds, or that is malformed, answers ``False`` and does not hold the rotation open;
+        :class:`ResealOutcome` says what such a row may be. A key id that is not one
+        :func:`row_seal_key_id` could return is malformed."""
         parsed = self._parse(stored)
         if parsed is None or parsed[0] == self.key_id or parsed[0] in self._retired:
             return False
@@ -911,8 +911,12 @@ class ResealOutcome:
     did not hold, which may be a retired key it was not given: dropping that key would strand
     them, so the store pass aborts. ``unheld_tables`` and ``unheld_key_ids`` say where they are and
     which seal key ids they name, both non-secret, so an operator can find them. ``refused`` counts
-    the rest it left: a seal that fails under a key the run holds, or is malformed. No key re-seals
-    those, so they never hold a rotation open; failing on them would fail every later run too."""
+    the rest it left: a seal that names a key the run holds other than the active one, or is
+    malformed. The read-back does not verify them, so ``refused`` holds at least a seal that fails
+    under a key the run holds, which no key re-seals, and a sound seal a writer running alongside
+    made under a retired key the run holds after its pass (vault BACKLOG #5635 items 14 and
+    15). They never hold a rotation open: failing on a seal no
+    key re-seals would fail every later run too."""
 
     unheld: int = 0
     refused: int = 0
