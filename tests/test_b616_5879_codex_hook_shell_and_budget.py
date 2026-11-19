@@ -103,7 +103,10 @@ def test_a_missing_bash_does_not_drop_session_start_context(bridge, tmp_path, mo
 
 
 def test_other_events_still_raise(bridge, tmp_path):
-    """The failure propagates; docs/CODEX.md states what Codex then receives."""
+    """The failure propagates; docs/CODEX.md states what the registered line returns.
+
+    How Codex handles that exit is assumed there, not measured.
+    """
     _settings(tmp_path, "PreToolUse", [_py("import sys; sys.exit(1)")])
     with pytest.raises(subprocess.CalledProcessError):
         bridge.dispatch(tmp_path, _PRE_TOOL)

@@ -400,9 +400,10 @@ def dispatch(root: Path, payload: dict) -> dict:
                 completed.check_returncode()
             except (OSError, ValueError, subprocess.SubprocessError, HookBlocked) as exc:
                 # A failed SessionStart hook, exit 2 included, is a non-blocking error in Claude
-                # Code: the session starts with every other hook's context. Elsewhere it propagates:
-                # exit 2 becomes the block exit, and any other fault ends the bridge with no deny,
-                # which does not fail closed. docs/CODEX.md states the known gap.
+                # Code: the session starts with every other hook's context. Elsewhere it propagates.
+                # Run as `python bridge.py hook` or `pwsh -File invoke.ps1 hook`, a hook's exit 2
+                # and a fault `__main__` catches both exit 2, with no deny or block output.
+                # docs/CODEX.md states what the registered line returns.
                 if event != "SessionStart":
                     raise
                 label = " ".join(str(part) for part in (hook["command"], *hook.get("args", [])))

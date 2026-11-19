@@ -21,9 +21,11 @@ Matching command hooks run from their current source paths, with their arguments
 and timeouts. Removing or changing a source handler affects the next call.
 The bridge combines context. Among the hooks of one event that complete, it keeps
 a `hookSpecificOutput.permissionDecision` of deny over ask or allow, and a
-top-level `decision: block` or `continue: false` over later hooks. Every other
-`hookSpecificOutput` key but `additionalContext`, PermissionRequest's `decision`
-included, takes the last hook's value. The known gap below covers a fault.
+top-level `decision: block` or `continue: false` over later hooks.
+PermissionRequest's `hookSpecificOutput.decision` is not ranked: the last hook
+that sets it wins, so a later allow replaces an earlier deny. For how the other
+`hookSpecificOutput` keys merge, see `merge_output` in `scripts/codex/bridge.py`.
+The known gap below covers a fault.
 
 Codex calls shell hooks `Bash`, including PowerShell commands. The bridge also
 matches Claude's `PowerShell` name. Patch calls match `apply_patch`, `Edit`, and
