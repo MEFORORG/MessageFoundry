@@ -623,7 +623,7 @@ def _seps(msg: Message) -> _Seps:
 
 
 def _refuse_delimiter_field(seg: str, fld: int, path: str) -> None:
-    if seg in ("MSH", "BHS", "FHS") and fld in (1, 2):
+    if _builtin_hl7.is_delimiter_field(seg, fld):
         raise ValueError(f"cannot transform {path}: fields 1 and 2 hold the delimiters themselves")
 
 

@@ -114,6 +114,76 @@ def test_custom_separators_round_trip() -> None:
     assert m["PID-5.2"] == "JANE"
 
 
+# --- header delimiter fields (BACKLOG #5972) -----------------------------------
+
+#: A batch-led message: the parser reads its separators from the BHS line, not from the MSH.
+_BATCH = "BHS|^~\\&|A|B\rMSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||X^Y\r"
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("MSH-1", "#"),
+        ("MSH-2", "#~\\&"),
+        ("MSH-2", "^~\\"),  # a short MSH-2
+        ("MSH-2.1", "#"),
+    ],
+)
+@pytest.mark.parametrize("as_data", [False, True])
+def test_a_write_that_changes_a_delimiter_field_is_refused(
+    path: str, value: str, as_data: bool
+) -> None:
+    """A changed MSH-1 or MSH-2 would advertise delimiters the rest of the message is not written
+    in, while the separators the parser read stay as they were: mixed-delimiter HL7. So the write
+    raises and the message is left exactly as it was."""
+    m = Message.parse(ADT)
+    before = m.encode()
+    write = m.set_data if as_data else m.set
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        write(path, value)
+    assert m.encode() == before
+    assert m["PID-5.1"] == "DOE"
+
+
+def test_a_repetition_scoped_delimiter_write_is_refused() -> None:
+    m = Message.parse(ADT)
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.set("MSH-2", m["MSH-2"] or "", repetition=1)
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.add_repetition("MSH-2", "x")
+
+
+def test_a_delimiter_write_of_the_text_already_there_changes_nothing() -> None:
+    """A passthrough copy of the header (``set("MSH-2", msg["MSH-2"])``) still works."""
+    m = Message.parse(ADT)
+    before = m.encode()
+    m.set("MSH-1", m["MSH-1"] or "")
+    m.set_data("MSH-2", m["MSH-2"] or "")
+    assert m.encode() == before
+
+
+@pytest.mark.parametrize("path", ["BHS-1", "BHS-2", "MSH-2"])
+def test_a_batch_header_delimiter_write_is_refused(path: str) -> None:
+    """BHS fields 1 and 2 hold the delimiters the whole batch is split on, and an inner MSH-2 that
+    differed from them would contradict the body it heads."""
+    m = Message.parse(_BATCH)
+    before = m.encode()
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.set(path, "#")
+    assert m.encode() == before
+
+
+@pytest.mark.parametrize("header", ["BHS", "FHS"])
+def test_add_segment_refuses_a_header_segment(header: str) -> None:
+    """A split line numbers a header's delimiter fields as MSH-3 onward, so it would encode as a
+    garbled line; it is refused as a second MSH is."""
+    m = Message.parse(ADT)
+    before = m.encode()
+    with pytest.raises(ValueError, match=f"refusing to add a {header} header segment"):
+        m.add_segment(f"{header}|^~\\&|Z")
+    assert m.encode() == before
+
+
 # --- field repetitions (H-9) -------------------------------------------------
 
 

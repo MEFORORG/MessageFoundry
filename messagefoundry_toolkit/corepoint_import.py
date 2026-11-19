@@ -1416,9 +1416,9 @@ _SINGLE_OCCURRENCE = frozenset(
     {"MSH", "EVN", "PID", "PD1", "PV1", "PV2", "MRG", "ACC", "UB1", "UB2"}
 )
 
-# ``MSH-1``/``MSH-2`` are the field separator and the encoding characters. ``Message.set`` accepts both
-# and rewrites the glyph in place while the rest of the line keeps the old one, producing a message
-# with mixed delimiters — corruption that parses. Never emit a write to either.
+# ``MSH-1``/``MSH-2`` are the field separator and the encoding characters. A write that changed either
+# would leave the rest of the message on the old delimiters, so ``Message.set`` now refuses one
+# (BACKLOG #5972); an emitted write would fail in the Handler at run time. Never emit a write to either.
 _FRAMING_PATHS = frozenset({"MSH-1", "MSH-2"})
 
 # The connectives each mappable verb is allowed to carry. Anything outside its set means the statement

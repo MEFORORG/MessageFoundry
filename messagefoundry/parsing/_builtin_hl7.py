@@ -70,6 +70,8 @@ __all__ = [
     "encode_with_separators",
     "segment_ids",
     "separators",
+    "HEADER_IDS",
+    "is_delimiter_field",
     "unescape",
     "unescape_separators",
     "escape_leaf",
@@ -588,6 +590,16 @@ def count_segments(msg: ParsedMessage, seg_id: str) -> int:
         for i, seg in enumerate(msg["segments"])
         if seg["id"] == seg_id and not _is_fieldless(msg, i)
     )
+
+
+#: The header segments whose fields 1 and 2 hold the delimiters themselves (MSH-1/MSH-2,
+#: BHS-1/BHS-2, FHS-1/FHS-2), numbered by the hidden offset :func:`_parse_msh` describes.
+HEADER_IDS = ("MSH", "BHS", "FHS")
+
+
+def is_delimiter_field(seg_id: str, fld: int) -> bool:
+    """Whether ``seg_id``-``fld`` is a header's field separator or encoding characters."""
+    return seg_id in HEADER_IDS and fld in (1, 2)
 
 
 def separators(msg: ParsedMessage) -> tuple[str, str, str, str, str]:

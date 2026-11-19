@@ -38,6 +38,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing.binary import (
     DOC_REF_MARKER,
     DOC_TOMBSTONE_MARKER,
@@ -1224,14 +1225,16 @@ async def test_a_bound_handle_under_ordinary_delimiters_is_spliced_verbatim(msh2
 async def test_a_handler_that_moves_msh2_into_the_base64_alphabet_never_sends_the_handle(
     store: MessageStore,
 ) -> None:
-    """The detach wrote the handle under ordinary delimiters; a Handler then set MSH-2 so the
+    """The detach wrote the handle under ordinary delimiters; MSH-2 was then changed so the
     subcomponent separator is ``/``. Setting the stored base64 back would escape every ``/`` in
-    it, so the row is refused before any read and dead-letters at once (BACKLOG #5099)."""
+    it, so the row is refused before any read and dead-letters at once (BACKLOG #5099).
+    ``Message.set`` refuses to change MSH-2 (BACKLOG #5972), so the header is written on the
+    parsed tree directly to build the payload."""
     from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
 
     ref = await store.put_attachment(chunk_b64(_EVERY_BASE64_CHARACTER), "application/pdf")
     msg = Message.parse(_hl7(make_doc_ref(ref, "Application")))
-    msg.set("MSH-2", "^~\\/")
+    _builtin_hl7.set_field(msg._m, "MSH", 2, "^~\\/")
     payload = msg.encode()
     assert Message.parse(payload)._encoding_chars()[4] == "/"
     reader = _Reader({ref: _EVERY_BASE64_CHARACTER})

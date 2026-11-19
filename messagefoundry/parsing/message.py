@@ -309,7 +309,14 @@ class Message:
         whole-field write with ``repetition`` replaces just that repetition's text (and the value may
         then not contain the repetition separator). Without ``repetition``, a whole-field write
         assigns the caller's text verbatim (their structure, repetitions and all). Raises
-        ``KeyError`` if the target segment (occurrence) isn't present."""
+        ``KeyError`` if the target segment (occurrence) isn't present.
+
+        ``MSH-1`` and ``MSH-2``, and fields 1 and 2 of a ``BHS`` or ``FHS`` header, are the message's
+        delimiters, which the parser read once and every other line is written in. A write that
+        would change one raises ``ValueError``, so no write can emit a message whose header
+        advertises delimiters its body is not written in (BACKLOG #5972); a whole-field write of the
+        text already there is accepted and changes nothing. To send under other delimiters,
+        re-encode the whole message, as a per-outbound ``encoding_characters`` does."""
         self._write(path, value, occurrence, repetition, as_data=False)
 
     def _write(
@@ -317,8 +324,9 @@ class Message:
     ) -> None:
         """The one write behind :meth:`set` and :meth:`set_data`, so both check the same things in
         the same order and fail the same way. ``as_data`` escapes a whole-field value as one leaf
-        once the target is known to exist, except at ``MSH-1`` and ``MSH-2``, which hold the
-        delimiters themselves and so have no escaped form."""
+        once the target is known to exist. ``MSH-1`` and ``MSH-2`` (and ``BHS``/``FHS`` fields 1 and
+        2) hold the delimiters themselves, so they take only a whole-field write of the text they
+        already hold, and that write changes nothing."""
         if "\r" in value or "\n" in value:
             raise ValueError("HL7 field value may not contain a segment separator (CR/LF)")
         if occurrence < 1:
@@ -329,11 +337,21 @@ class Message:
         if not self._segment_present(seg, occurrence):
             where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
             raise KeyError(f"cannot set absent segment {where}")
+        if _builtin_hl7.is_delimiter_field(seg, fld):
+            # Only a whole-field write of the text already there passes, so a passthrough copy of
+            # the header still works; any other write would leave the cached separators stale.
+            if (
+                comp is not None
+                or repetition is not None
+                or value != self._raw_field(seg, fld, occurrence)
+            ):
+                raise self._delimiter_write_refusal(seg, fld)
+            return
 
         field_sep, comp_sep, rep_sep, esc, sub_sep = self._encoding_chars()
 
         if comp is None:
-            if as_data and not (seg == "MSH" and fld in (1, 2)):
+            if as_data:
                 value = self._escape_leaf(value, field_sep, comp_sep, rep_sep, esc, sub_sep)
             # Whole-field write assigns the caller's structure verbatim — but the field separator
             # would split it into extra fields downstream, so reject it (review M-12). Components and
@@ -401,8 +419,8 @@ class Message:
 
         It raises exactly what :meth:`set` raises for the same arguments, ``ValueError`` on a CR or
         LF and ``KeyError`` on an absent segment among them, because both are one implementation.
-        ``MSH-1`` and ``MSH-2`` hold the delimiters themselves, have no escaped form, and are written
-        as :meth:`set` writes them. A dry-run trace records the value as passed here, as it records
+        ``MSH-1`` and ``MSH-2`` hold the delimiters themselves, have no escaped form, and are refused
+        as :meth:`set` refuses them. A dry-run trace records the value as passed here, as it records
         the value passed to :meth:`set`, never the escaped text."""
         self._write(path, value, occurrence, repetition, as_data=True)
 
@@ -416,8 +434,8 @@ class Message:
         ``value`` is the new repetition's structure (components with ``^`` are kept as the caller's
         intent), so it may not contain the field or repetition separator or a CR/LF. If the field is
         currently empty the value becomes its first repetition. ``occurrence`` selects the segment.
-        Raises ``KeyError`` if the segment (occurrence) is absent, ``ValueError`` on a component path
-        or an illegal separator in ``value``."""
+        Raises ``KeyError`` if the segment (occurrence) is absent, ``ValueError`` on a component path,
+        an illegal separator in ``value``, or a header's delimiter field (``MSH-1``/``MSH-2``)."""
         if "\r" in value or "\n" in value:
             raise ValueError("HL7 field value may not contain a segment separator (CR/LF)")
         if occurrence < 1:
@@ -428,6 +446,8 @@ class Message:
         if not self._segment_present(seg, occurrence):
             where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
             raise KeyError(f"cannot add a repetition to absent segment {where}")
+        if _builtin_hl7.is_delimiter_field(seg, fld):
+            raise self._delimiter_write_refusal(seg, fld)
         _refuse_frame_bytes(value)
         field_sep, _comp_sep, rep_sep, _esc, _sub_sep = self._encoding_chars()
         if field_sep in value:
@@ -449,7 +469,8 @@ class Message:
         byte-for-byte and re-parses into real components. It must be a **single** segment (no CR/LF)
         beginning with a 3-char segment id. By default the segment is appended at the end; pass
         ``index`` (1-based position among segments, ``1`` = just after MSH) to insert it earlier.
-        Adding an ``MSH`` is refused (there is exactly one). Raises ``ValueError`` on a malformed
+        Adding an ``MSH`` is refused (there is exactly one), and so is a ``BHS`` or ``FHS`` header,
+        whose delimiter fields a split line cannot number. Raises ``ValueError`` on a malformed
         line or out-of-range ``index``."""
         if "\r" in line or "\n" in line:
             raise ValueError(
@@ -463,6 +484,10 @@ class Message:
             raise ValueError(f"segment must begin with a 3-char segment id, got {segment_id!r}")
         if segment_id == "MSH":
             raise ValueError("refusing to add a second MSH segment")
+        if segment_id in _builtin_hl7.HEADER_IDS:
+            # A header line keeps its delimiters in fields 1 and 2, where a line split on the field
+            # separator puts MSH-3's numbering, so it would encode as a garbled line (BACKLOG #5972).
+            raise ValueError(f"refusing to add a {segment_id} header segment")
         # A bare segment id (no field separator -> a single token) would graft a fieldless segment,
         # which no read, count or write numbers as an occurrence (BACKLOG #5917), so a later set()
         # would raise "cannot set absent segment". Normalize a bare id to a settable empty segment
@@ -623,6 +648,18 @@ class Message:
         """The component/subcomponent value within a single repetition's text, unescaped, or None
         if that part is absent. Reads the message's own separators."""
         return _builtin_hl7.extract_part(rep_text, comp, sub, _builtin_hl7.separators(self._m))
+
+    @staticmethod
+    def _delimiter_write_refusal(seg: str, fld: int) -> ValueError:
+        """The refusal of a write that would change a header's delimiter field (BACKLOG #5972). The
+        parser reads the message's separators once, from the first line, and splits and re-encodes
+        every other line on them, so a changed delimiter field would advertise delimiters the rest
+        of the message is not written in."""
+        return ValueError(
+            f"{seg}-{fld} holds the message's delimiters, which every other line is written in; "
+            "it can only be written with the text it already holds. Re-encode the whole message "
+            "to send it under other delimiters"
+        )
 
     def _encoding_chars(self) -> tuple[str, str, str, str, str]:
         """The message's ``(field, component, repetition, escape, subcomponent)`` delimiters, read

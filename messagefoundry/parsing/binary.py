@@ -183,8 +183,9 @@ class NonVerbatimDocumentError(ValueError):
 
 class UnreadableDelimitersError(ValueError):
     """``Message._encoding_chars`` cannot read a message's delimiters: it has no MSH, its first
-    MSH's MSH-2 is shorter than four characters, or (only where a Handler set it) its MSH-1 is not
-    one character (BACKLOG #5099, #2873). :func:`iter_obx_documents` and
+    MSH's MSH-2 is shorter than four characters, or (only where the tree was written below the
+    ``Message`` API, whose writes refuse to change MSH-1, BACKLOG #5972) its MSH-1 is not one
+    character (BACKLOG #5099, #2873). :func:`iter_obx_documents` and
     :func:`strip_documents_in_hl7` raise it only on a message that has an OBX,
     :func:`embed_obx_document` only for an OBX that exists, and :func:`extract_obx_document` for
     any occurrence of a Message but only for an OBX a SegmentGroup holds. Where a received body has an MSH, the
