@@ -103,7 +103,7 @@ def set_security(
         if not changed and not os.path.lexists(path):
             # Only a reset can change nothing here, and there is no file to reset it in, so a
             # 0-byte file would be the edit's only effect. Anything else at the path, a directory
-            # or a link among them, goes on to the replace, which refuses it as for any set.
+            # or a link among them, goes on to the replace, which fails on it as for any set.
             return {
                 "op": "unchanged",
                 "keys": [],
@@ -112,10 +112,10 @@ def set_security(
                 "detail": f"no key changed; {path.name} does not exist, so no settings file was "
                 "created",
             }
-        # Drop a [security] table this edit emptied, or the bare one added above, so a full
-        # reset-to-defaults leaves no header behind. A table that already held only comments is
-        # kept when the edit removed nothing from it.
-        if not len(sec) and (changed or created):
+        # Drop a [security] table this edit emptied, the bare one added above, or a bare header,
+        # so a full reset-to-defaults leaves no header behind. A table that already held only
+        # comments is kept when the edit removed nothing from it.
+        if not len(sec) and (changed or created or not sec.as_string().strip()):
             del doc["security"]
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)

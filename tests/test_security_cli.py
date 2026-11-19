@@ -1097,26 +1097,36 @@ def test_a_reset_that_finds_nothing_on_an_absent_file_creates_none(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Through the CLI: no 0-byte file appears, and the result says nothing was written. With no
-    file there is no whole-file load, so the report marks its loosenings partial rather than
-    omit a session limit only this command's environment loosens without saying so."""
+    file there is no whole-file load, so the report is the one ``show`` gives for an absent file,
+    and its scope text says such a set names no session-limit variable."""
     toml = tmp_path / "mf.toml"
     monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "99")
     rc, res = _set(toml, {"require_mfa": None}, capsys)
     assert rc == 0 and res["op"] == "unchanged" and res["rewritten"] is False
     assert "does not exist" in res["detail"]
     assert not toml.exists()
-    assert res["loosenings_partial"] is True
-    assert "MEFOR_" in res["loosenings_partial_reason"]
+    shown = _show(toml, capsys)
+    assert (res["loosenings"], res["loosenings_partial"]) == (
+        shown["loosenings"],
+        shown["loosenings_partial"],
+    )
+    assert "a `set` that changed no key where no file exists" in res["loosenings_scope"]
 
 
-def test_a_reset_that_finds_nothing_on_a_directory_is_refused(tmp_path: Path) -> None:
-    """Only a path with nothing at it skips the replace; a directory there is refused as the
-    replace refuses it for any set, never reported as a file that does not exist."""
+def test_a_reset_that_finds_nothing_on_a_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a path with nothing at it skips the replace; a directory there fails the replace as it
+    does for any set (Windows answers access denied, POSIX a raw IsADirectoryError, both of which
+    the CLI reports as an error), never reported as a file that does not exist."""
+    import messagefoundry.restricted_file as restricted_mod
     from messagefoundry.config import security_edit
 
+    # Windows retries an access-denied replace for a held file; a directory is never released.
+    monkeypatch.setattr(restricted_mod, "_HELD_RETRY_S", 0.0)
     toml = tmp_path / "mf.toml"
     toml.mkdir()
-    with pytest.raises(security_edit.SecurityEditError):
+    with pytest.raises((security_edit.SecurityEditError, OSError)):
         security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
     assert toml.is_dir()
 
@@ -1201,3 +1211,15 @@ def test_an_edit_that_changes_no_key_still_narrows_a_loose_file_on_windows(
     assert before is not None and ";SY)" in before, before
     _unchanged_set(toml)
     assert_owner_only(toml, owner)
+
+
+def test_a_bare_security_header_is_dropped_by_a_full_reset(tmp_path: Path) -> None:
+    """A bare ``[security]`` header with no comment is still dropped by a set that changes no
+    key, so a full reset-to-defaults leaves no header behind."""
+    from messagefoundry.config import security_edit
+
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\n\n[api]\nport = 9000\n", encoding="utf-8")
+    result = security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
+    assert result["op"] == "unchanged"
+    assert "[security]" not in toml.read_text(encoding="utf-8")

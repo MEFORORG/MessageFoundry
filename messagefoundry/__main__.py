@@ -14035,7 +14035,9 @@ def _security(args: argparse.Namespace) -> int:
                 "equal to the file's value, or one whose value is no loosening, adds no entry, and "
                 "at least the require_mfa and block_unlisted_outbound variables are never named. "
                 "That needs a whole-file load that ran and succeeded: `show` on an absent file runs "
-                "none and names none, while `set` on a new file loads what it wrote and names it. "
+                "none and names none, and neither does a `set` that changed no key where no file "
+                "exists, since it writes none, while `set` on a new file loads what it wrote and "
+                "names it. "
                 "The other sections are read as the whole-file load "
                 "resolves them, so a MEFOR_<SECTION>_<KEY> variable in THIS command's environment "
                 "counts there, which may not be the service's. One entry is not read from the "
@@ -14150,14 +14152,6 @@ def _security(args: argparse.Namespace) -> int:
         # The candidate the write validated, so the preview reports the posture the edit left.
         view = saved_sec[-1] if saved_sec else sec
         degraded = reread_failed[-1] if reread_failed else None
-        if not result["rewritten"]:
-            # No file and no key changed, so no whole-file load ran: the environment layer, a
-            # MEFOR_* session limit among it, is not in this report, and it says so.
-            degraded = (
-                "no settings file exists and no key changed, so none was written or loaded; the "
-                "loosenings omit any MEFOR_* environment override, which the first set that "
-                "changes a key loads"
-            )
         result.update(_posture(view, saved[-1] if saved else None, degraded=degraded))
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)
