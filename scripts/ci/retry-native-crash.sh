@@ -66,6 +66,19 @@ set -uo pipefail
 
 attempts="${RETRY_NATIVE_CRASH_ATTEMPTS:-3}"
 
+# REFUSE A RUN THAT WOULD RUN NOTHING (BACKLOG #5466). The loop below is `seq 1 "$attempts"`, so an
+# attempt count of 0, a negative one or a word made it run zero times and fall through to an exit
+# of 0 -- a green step that never ran its command. No command at all did the same. Exit 2 is a
+# usage error, never a status the wrapped command could have produced by passing.
+if ! [[ "$attempts" =~ ^[1-9][0-9]*$ ]]; then
+  echo "::error::RETRY_NATIVE_CRASH_ATTEMPTS must be a positive integer, got '${attempts}'; nothing ran."
+  exit 2
+fi
+if [ "$#" -eq 0 ] || [ -z "$1" ]; then
+  echo "::error::retry-native-crash.sh was given no command to run; nothing ran."
+  exit 2
+fi
+
 # The default serves every database-leg call site, so only a caller where neither class is
 # established has to opt out. It names both known classes and does not pick one.
 default_cause=" -- a database-leg crash class: the pyodbc py3.14 parameter-binding segfault (mkleehammer/pyodbc#1459) or a handle freed under a running statement on the store cancel path (BACKLOG #2049); this wrapper cannot tell them apart, read the faulthandler dump"
@@ -79,6 +92,22 @@ fi
 
 # A process killed by signal N exits with 128+N. 139 = 128+SIGSEGV(11) (the observed
 # segfault); 134 = 128+SIGABRT(6) (the param/TVP path can abort() with a core dump instead).
+#
+# ON A WINDOWS RUNNER THIS SCRIPT SEES A FOLDED CODE, NEVER AN NTSTATUS. The ci.yml callers at the
+# time of writing run it as `bash scripts/ci/retry-native-crash.sh ...` under `shell: bash`, which is
+# Git Bash there, and Git Bash's runtime folds a native child's 32-bit exit code into $? itself.
+# Measured 2026-11-18 under Git Bash 5.3.15 on Windows 11, with a child exiting os._exit(<code>),
+# and with a child calling Python's os.abort(), which arrived as 127 like 0xC0000409:
+#   0xC0000005 (access violation)        -> 139, so a Windows segfault is already retried here
+#   0xC000001D (illegal instruction)     -> 132
+#   0xC0000409 (stack buffer overrun), 0xC00000FD (stack
+#   overflow), 0xC0000374 (heap corruption), 0xC0000094 (divide by zero) and 0xC0000135 (DLL not
+#   found)                               -> 127
+# So 134 never arrives from a Windows child: an abort there arrives as 127 and is not retried. $? is
+# never the raw 3221225477 or its low byte (5 or 9), so neither is listed. 127 is also "command not
+# found", so retrying it would retry a missing command and print a native-crash cause for it; it is
+# not listed, and tests/test_ci_retry_native_crash.py pins that. 132 is not listed either, because
+# adding it widens what a retry can turn green; that is a decision this note does not make.
 is_native_crash() {
   [ "$1" -eq 139 ] || [ "$1" -eq 134 ]
 }

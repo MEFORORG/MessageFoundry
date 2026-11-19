@@ -81,9 +81,19 @@ from pathlib import Path
 # A source reference carrying a line number. The extension list is closed on purpose: an open
 # `\w+\.\w+:\d+` matches version strings, host:port pairs and ordinary sentences, and a citation
 # lint whose first delivery is false positives does not get a second one.
+#
+# The optional prefix admits a relative `./` or `../` and a leading dot (`.github/workflows/ci.yml:12`,
+# `.pre-commit-config.yaml:40`); without it the lookbehind refused the token's second character and
+# such a citation passed unseen (BACKLOG #5468). The prefix is kept in the matched path, as every
+# other spelling is. The list was re-measured against the record's residual and absence prose with
+# an extension-anchored scan: at least `js`, `css`, `cs` and `mod` (as in `go.mod`) occur there and
+# were missing. An extensionless file (`Dockerfile`) cannot be seen by that scan or by this pattern.
+# The spaced-colon tolerance means prose such as `Node.js: 18` reads as a citation; that fails loud
+# (a NEW citation), not open, and the measured record holds no such case.
 CITATION = re.compile(
     r"(?<![\w/\\.-])"
-    r"([\w][\w./\\-]*\.(?:py|toml|md|yml|yaml|json|ts|tsx|ps1|sh|cfg|ini|txt|lock))"
+    r"((?:\.{1,2}[/\\])*\.?[\w][\w./\\-]*\."
+    r"(?:py|toml|md|yml|yaml|json|ts|tsx|js|css|cs|ps1|sh|cfg|ini|txt|lock|mod))"
     r"\s*:\s*(\d+)\b"
 )
 
@@ -104,8 +114,13 @@ class Citation:
 
     @property
     def bare(self) -> bool:
-        """A basename with no directory component -- it names no location by itself."""
-        return "/" not in self.file and "\\" not in self.file
+        """A basename with no directory component -- it names no location by itself.
+
+        A leading ``./`` or ``../`` is not a directory component: ``./service.py`` names no more
+        of a location than ``service.py`` does.
+        """
+        rest = re.sub(r"^(?:\.{1,2}[/\\])+", "", self.file)
+        return "/" not in rest and "\\" not in rest
 
     def key(self) -> str:
         """Baseline identity. Note the ABSENCE of the line number: see the module docstring."""

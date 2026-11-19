@@ -429,7 +429,8 @@ pwsh -NoProfile -File scripts\coord\recoverable.ps1                 # this workt
 pwsh -NoProfile -File scripts\coord\recoverable.ps1 -Worktree <p> -Json
 ```
 
-It exits non-zero if any file is at risk. Each row carries a **binary `Verdict`** — the only thing a
+It exits 1 if any file is at risk, and 2 when it refuses because it could not look, for example
+on a failed `git status`; a refusal prints no rows. Each row carries a **binary `Verdict`** — the only thing a
 caller has to act on — and a **`Reason`** from a closed set, because three of the four causes are
 `AT-RISK` and "absent" is not the same problem as "modified":
 

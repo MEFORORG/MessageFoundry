@@ -287,6 +287,43 @@ def test_an_unresolvable_ref_refuses_rather_than_reporting_everything_clean(
         timeout=TIMEOUT,
         check=False,
     )
-    assert proc.returncode != 0, "an unresolvable ref must not exit 0"
+    # 2, the refusal code: not 0 (clean) and not 1 (the AT-RISK verdict).
+    assert proc.returncode == 2, "an unresolvable ref must exit 2"
     combined = proc.stdout + proc.stderr
     assert "refusing" in combined.lower(), f"expected an explicit refusal, got:\n{combined}"
+
+
+def test_a_failed_git_status_refuses_rather_than_reporting_nothing_at_risk(
+    upstream_and_behind: tuple[Path, Path],
+) -> None:
+    """BACKLOG #5490: a status call that fails must not render as 'no untracked files'.
+
+    A corrupt index makes ``git status`` fail while the ref still resolves, so the run reaches the
+    listing step. An untracked file absent from the ref sits in the tree, so a run that silently
+    listed nothing would exit 0 over a file that is really at risk.
+    """
+    _, behind = upstream_and_behind
+    (behind / "only-here.txt").write_text("not on the ref\n", encoding="utf-8")
+    (behind / ".git" / "index").write_bytes(b"this is not an index")
+
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(SCRIPT),
+            "-Worktree",
+            str(behind),
+            "-NoFetch",
+            "-Json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    # 2, not 1: exit 1 is the AT-RISK verdict, and a refusal must not read as one.
+    assert proc.returncode == 2, f"a failed git status must exit 2:\n{proc.stdout}"
+    combined = proc.stdout + proc.stderr
+    assert "git status failed" in combined, f"expected an explicit refusal, got:\n{combined}"

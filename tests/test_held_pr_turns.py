@@ -1381,6 +1381,52 @@ def test_listed_commit_not_the_head_names_why_green_is_unknown(
     assert "release/1.0" in row["required"]["reason"]
 
 
+def test_the_query_asks_for_every_stamp_the_shared_speaker_ranks_a_check_run_by() -> None:
+    """pr_state._speaker ranks a CheckRun by startedAt, else completedAt. Without completedAt in this
+    query, a run cancelled while queued carried no stamp, tied as newest, and its CANCELLED read a
+    green PR as failing (BACKLOG #5489)."""
+    query = " ".join(hpt.QUERY.split())
+    fragment = query.split("... on CheckRun {", 1)[1].split("}", 1)[0].split()
+    assert "startedAt" in fragment and "completedAt" in fragment, fragment
+
+
+def _cancelled_while_queued(name: str, completed: str) -> dict[str, Any]:
+    """A run cancelled before it started: GitHub gives it a completedAt and no startedAt."""
+    return {
+        "__typename": "CheckRun",
+        "name": name,
+        "status": "COMPLETED",
+        "conclusion": "CANCELLED",
+        "startedAt": None,
+        "completedAt": completed,
+    }
+
+
+def test_a_run_cancelled_while_queued_does_not_outrank_a_later_pass(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The passing run started after the cancelled one completed, so the pass is the newest finished
+    stamp and the PR is green. The control is a real failure started later still, which reads red;
+    and the cancelled run with no completedAt, as the old query returned it, reads red too, which is
+    the regression the query fix closes."""
+    passed = _runs(ENGINE_REQUIRED)  # started 2026-10-28T10:00:00Z
+    cancelled = _cancelled_while_queued("cla", "2026-10-28T09:55:00Z")
+    later_failure = {**_runs(["cla"], conclusion="FAILURE")[0], "startedAt": "2026-10-28T10:30:00Z"}
+    unstamped = {k: v for k, v in cancelled.items() if k != "completedAt"}
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _pr(60, runs=[*passed, cancelled]),
+        _pr(61, runs=[*passed, cancelled, later_failure]),
+        _pr(62, runs=[*passed, unstamped]),
+    )
+    assert rows[60]["requiredGreen"] == "yes", rows[60]["required"]
+    assert rows[61]["requiredGreen"] == "no"
+    assert rows[61]["required"]["failing"] == ["cla"]
+    assert rows[62]["requiredGreen"] == "no"
+    assert rows[62]["required"]["failing"] == ["cla"]
+
+
 def test_turn_reads_head_ref_oid_not_the_listed_commit(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
