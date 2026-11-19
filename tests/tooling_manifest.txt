@@ -220,6 +220,7 @@ tests/test_stale_repo_slug_check.py
 tests/test_stalled_prs.py
 tests/test_steer_inject.py
 tests/test_testpaths_webconsole_coverage.py
+tests/test_fs_scan_escaped_quotes.py
 tests/test_unbounded_fs_scan_guard.py
 tests/test_shell_guard_dispatch.py
 tests/test_api_burn_guard.py

@@ -91,7 +91,8 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # BASH ONLY. The PowerShell tool is screened too, and there the backtick is the escape and a
 # backslash is literal, so `"done`n"` and `"D:\dir\"` would read as a substitution and an escaped
 # quote and blank the command after them. -Plain keeps the toggle this guard had before, which
-# reads neither PowerShell's `"$(...)"` subexpression nor a backtick-escaped quote. The same toggle
+# reads neither PowerShell's `"$(...)"` subexpression nor a backtick-escaped quote;
+# Hide-PowerShellSpans, below, reads the escape. The same toggle
 # also runs beside the bash reading, as a floor; the call site says why.
 #
 # A HEREDOC BODY IS DATA, and it is blanked here too, line for line. Hide-HeredocBodies runs on the
@@ -262,6 +263,247 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
     return $sb.ToString()
 }
 
+# THE POWERSHELL TOOL'S READING (BACKLOG #5451), with the same contract as Hide-QuotedSpans: equal
+# length, newlines kept. The plain toggle reads a backtick-escaped quote as a quote, so `"a`"b"` and
+# `` `" `` outside a string shifted every later span by one and blanked the walk after it. Here a
+# backtick outside single quotes escapes the next character, and a backtick ending a line, LF or
+# CRLF, is a line continuation that separates tokens without ending the statement.
+#
+# AMONG A COMMAND'S ARGUMENTS a `#` or `<#` STARTS A COMMENT ONLY AT A TOKEN START, as
+# PowerShell's tokenizer reads it: at least at the start, after whitespace or one of `;|&(){},`,
+# after a quoted string that itself began a token, after a here-string's close, and after a `>&1`
+# or `>&2` redirection. Elsewhere it continues a bareword and is literal: at least after `a`, `^`,
+# `/`, `_`, `a<`, an escaped character, a quote glued to a word (`a'b'#`), and `$b` (`$b#c` is one
+# argument). An argument with a member access or an index (`$x.Name#`, `$a[0]#`, `$a::b#`,
+# `(gci).Name#`, `'a'.Length#`) is an expression, and `#` after it starts a comment, until a glued
+# `-`, `=` or a word after `]` makes it a word again.
+#
+# AN EXPRESSION reads `#` as a comment after any of its tokens, glued or not: at least after a
+# variable (`$y#`), a number (`5#`, `1kb#`), a member (`$x.Count#`), a string, a closing
+# parenthesis or bracket, and an operator (`=+-*/%!` or `-eq`). A statement is read as an
+# expression from its first character when that is `$`, `[`, a quote, a here-string, `!`, `@{`,
+# `@(`, a number, a negative number, or `-not`, `-bnot`, `-split` or `-join`. A statement starts
+# at least at the start, after a line end, `;`, `|`, `&&` or `||`, inside `(`, `$(`, `@(` or `{`,
+# and after `return`, `throw` or `exit`. A bareword at a token start in an expression, such as the
+# command in `$x = Get-ChildItem *#`, ends expression mode, and so does a word starting with a
+# digit that is not a number (`7z`, `1_000`, `7.Foo`), and a call `&`. From there the reading
+# takes a command's arguments, where `=#` is one bareword. The close of `(`, `$(`, `@(` or `{`
+# restores the reading before it. `@{` at a token start opens a hashtable, whose keys, after `@{`,
+# `;` or a line end that does not follow an operator, are read as expressions. `${...}` is a
+# variable name, never a comment or a brace.
+#
+# THIS READING ONLY ADDS DENIES to the plain toggle's, which is judged first. At least two of its
+# misreadings add a false deny. A comment read where PowerShell has none blanks an opening quote and
+# exposes the prose the quote holds. A comment left unread keeps its backtick as an escape and its
+# `${` as a variable, so a quote after it pairs wrong, and its `;` can split a command out of it.
+# An unread comment's apostrophe can also hide a walk after it, which then goes undenied.
+#
+# A comment, a `<# ... #>` block and a here-string body (`@'` or `@"` ending its line, closed by
+# `'@` or `"@` starting one) are blanked whole, so an apostrophe in one opens no span. It still
+# does not read at least these: a `"$(...)"` subexpression, a backtick inside a program name or a
+# path, a `-Param:'x'#` argument, a statement starting with `-1`, a bare CR as a line end, and a
+# typographic quote.
+function Hide-PowerShellSpans([string]$Text) {
+    $sb = [System.Text.StringBuilder]::new($Text.Length)
+    $quote = $null
+    $here = $null
+    $inWord = $false        # the last character continues a bareword, so a `#` here is literal
+    $quoteGlued = $false    # the open quote was glued to a bareword
+    $stmtStart = $true
+    $exprStmt = $false      # this statement is read as an expression
+    $firstToken = $false    # still inside that expression statement's first token
+    $hashKey = $false       # the next token is a hashtable key, read as an expression
+    $atStart = -1           # where an `@` began a token, so a `{` after it opens a hashtable
+    # One frame per open `(` or `{`: its kind ('h' for a hashtable) and the reading to restore.
+    $frames = [System.Collections.Generic.List[object]]::new()
+    # Once one `${` finds no `}` before the end, none after it can, so a run of them stays linear.
+    $braceRunsOut = $false
+    # A number as PowerShell scans one, anchored where a token starts. Anything else that starts
+    # with a digit (`7z`, `1_000`, `7.Foo`, `1e`) is a generic word, and among those `#` is literal.
+    # The digits are one atomic group: backtracking into a long run before a letter was quadratic.
+    $numberAt = [regex]::new(
+        '\G(?>0x[0-9a-f]*|0b[01]+|(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(?:u?[ysl]?|n|d)?(?:kb|mb|gb|tb|pb)?(?!\w|\.[a-z_])',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $keywordAt = [regex]::new('\G(?:return|throw|exit)(?=[ \t])', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $unaryAt = [regex]::new('\G-(?:not|bnot|split|join)(?![\w-])', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $varTok = $false        # inside a `$name` argument, so a glued `.`, `[` or `::` makes it an expression
+    $exprArg = $false       # an argument read as an expression (`$x.Name`), where `#` starts a comment
+    $n = 0
+    while ($n -lt $Text.Length) {
+        $ch = $Text[$n]
+        $next = if ($n + 1 -lt $Text.Length) { $Text[$n + 1] } else { $null }
+        if ($null -ne $here) {
+            if (($n -eq 0 -or $Text[$n - 1] -ceq "`n") -and $null -ne $next -and "$ch$next" -ceq $here) {
+                [void]$sb.Append($here); $here = $null; $inWord = $false; $n += 2; continue
+            }
+            [void]$sb.Append($(if ($ch -ceq "`n") { $ch } else { ' ' })); $n++; continue
+        }
+        if ($ch -ceq '`' -and $quote -cne "'" -and $null -ne $next) {
+            # An escaped CRLF is one line end, so the LF is not read as a statement end.
+            $width = if ($next -ceq "`r" -and $n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq "`n") { 3 } else { 2 }
+            $continuation = $Text[$n + $width - 1] -ceq "`n"
+            if ($null -ne $quote) {
+                # Blanked inside a string, except a newline.
+                [void]$sb.Append(' ')
+                for ($k = $n + 1; $k -lt $n + $width; $k++) {
+                    [void]$sb.Append($(if ($Text[$k] -ceq "`n") { "`n" } else { ' ' }))
+                }
+            } else {
+                [void]$sb.Append($Text, $n, $width)
+                if ($continuation) { $inWord = $false; $firstToken = $false }
+                else {
+                    $inWord = $true
+                    if ($stmtStart) { $exprStmt = $false; $stmtStart = $false }
+                }
+            }
+            $n += $width; continue
+        }
+        if ($null -ne $quote) {
+            if ($ch -ceq $quote) { $quote = $null; $inWord = $quoteGlued; [void]$sb.Append($ch) }
+            elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
+            else { [void]$sb.Append(' ') }
+            $n++; continue
+        }
+        if ($ch -ceq '@' -and ($next -ceq "'" -or $next -ceq '"')) {
+            # Scanned in place: a Substring of the rest at every `@'` made a long command quadratic.
+            $k = $n + 2
+            while ($k -lt $Text.Length -and ($Text[$k] -ceq ' ' -or $Text[$k] -ceq "`t")) { $k++ }
+            if ($k -lt $Text.Length -and $Text[$k] -ceq "`r") { $k++ }
+            if ($k -lt $Text.Length -and $Text[$k] -ceq "`n") {
+                $here = "$next@"; [void]$sb.Append("@$next"); $n += 2
+                if ($stmtStart) { $exprStmt = $true; $firstToken = $false; $stmtStart = $false }
+                continue
+            }
+        }
+        if ($stmtStart -and 'rteRTE'.IndexOf($ch) -ge 0 -and $keywordAt.IsMatch($Text, $n)) {
+            # `return`, `throw` and `exit` take a pipeline, which starts a statement of its own.
+            $kw = $keywordAt.Match($Text, $n).Length
+            [void]$sb.Append($Text, $n, $kw); $n += $kw; continue
+        }
+        if ($ch -ceq '$' -and $next -ceq '{' -and -not $braceRunsOut) {
+            # `${#x}` is the variable `#x`: its name is blanked, and it is one word. A backtick
+            # escapes a `}` inside the name.
+            $close = $n + 2
+            while ($close -lt $Text.Length -and $Text[$close] -cne '}') {
+                $close += $(if ($Text[$close] -ceq '`') { 2 } else { 1 })
+            }
+            if ($close -lt $Text.Length) {
+                [void]$sb.Append('${')
+                [void]$sb.Append([regex]::Replace($Text.Substring($n + 2, $close - $n - 2), '[^\n]', ' '))
+                [void]$sb.Append('}')
+                if ($stmtStart) { $exprStmt = $true; $firstToken = $true; $stmtStart = $false }
+                $hashKey = $false; $inWord = $true; $n = $close + 1; continue
+            }
+            # A later `${` starts its scan at or past an aligned point of this one, so it runs out too.
+            $braceRunsOut = $true
+        }
+        $end = -1
+        if ($ch -ceq '#' -or ($ch -ceq '<' -and $next -ceq '#')) {
+            # A merge redirection such as `2>&1` ends in a digit and is still a whole token.
+            $tokenStart = -not $inWord -or $exprStmt -or $exprArg -or
+                ($n -ge 3 -and $Text.Substring($n - 3, 3) -cmatch '^>&[12]$')
+            if ($tokenStart -and $ch -ceq '<') {
+                $end = $Text.IndexOf('#>', $n + 2, [StringComparison]::Ordinal)
+                $end = if ($end -lt 0) { $Text.Length } else { $end + 2 }
+            } elseif ($tokenStart -and $ch -ceq '#') {
+                $end = $Text.IndexOf([char]10, $n)
+                if ($end -lt 0) { $end = $Text.Length }
+            }
+        }
+        if ($end -ge 0) {
+            [void]$sb.Append($ch)
+            [void]$sb.Append([regex]::Replace($Text.Substring($n + 1, $end - $n - 1), '[^\n]', ' '))
+            $n = $end; continue
+        }
+        if ([char]::IsWhiteSpace($ch) -or ';|&(){},'.IndexOf($ch) -ge 0) {
+            $inWord = $false; $firstToken = $false; $varTok = $false; $exprArg = $false
+            if ($ch -ceq "`n" -or $ch -ceq ';') {
+                if ($frames.Count -gt 0 -and $frames[$frames.Count - 1][0] -ceq 'h') {
+                    # A line end after a value's `=` continues it: `@{ a =` then `Get-Thing *#` on
+                    # the next line is a command's argument, not a key.
+                    $k = $n - 1
+                    while ($ch -ceq "`n" -and $k -ge 0 -and " `t`r".IndexOf($Text[$k]) -ge 0) { $k-- }
+                    if (-not ($ch -ceq "`n" -and $k -ge 0 -and '=+-*/%!,'.IndexOf($Text[$k]) -ge 0)) {
+                        $exprStmt = $true; $hashKey = $true; $stmtStart = $false
+                    }
+                } else { $stmtStart = $true }
+            } elseif (($ch -ceq '|' -or $ch -ceq '&') -and $next -ceq $ch) {
+                # `&&` and `||` start a pipeline, whose first element may be an expression.
+                [void]$sb.Append($ch); $n++; $exprStmt = $false; $stmtStart = $true
+            } elseif ($ch -ceq '(' -or $ch -ceq '{') {
+                # A statement start here is an expression, as `(gci).Count#` and `@{a=1}.b#` are.
+                $outer = $stmtStart -or $exprStmt
+                if ($ch -ceq '{' -and $atStart -eq $n - 1) {
+                    $frames.Add(@('h', $outer)); $exprStmt = $true; $hashKey = $true; $stmtStart = $false
+                } else {
+                    $frames.Add(@('s', $outer)); $hashKey = $false; $stmtStart = $true
+                }
+            } elseif ($ch -ceq ')' -or $ch -ceq '}') {
+                if ($frames.Count -gt 0) {
+                    $exprStmt = $frames[$frames.Count - 1][1]; $frames.RemoveAt($frames.Count - 1)
+                }
+                $hashKey = $false; $stmtStart = $false
+            } elseif ($ch -ceq '|') {
+                # A pipeline element may be an expression too: `gci | $x#` holds a comment.
+                $exprStmt = $false; $stmtStart = $true
+            } elseif ($ch -ceq '&') { $exprStmt = $false; $stmtStart = $false }
+        } else {
+            $digitLed = ($ch -ge '0' -and $ch -le '9') -or
+                ($ch -ceq '.' -and $null -ne $next -and $next -ge '0' -and $next -le '9')
+            if ($hashKey) {
+                $hashKey = $false
+            } elseif ($stmtStart) {
+                # A string, `!`, `-not` or a negative number leads an expression as `$` does.
+                $exprStmt = $ch -ceq '$' -or $ch -ceq '[' -or $ch -ceq "'" -or $ch -ceq '"' -or $ch -ceq '!' -or
+                    ($ch -ceq '@' -and ($next -ceq '{' -or $next -ceq '(')) -or
+                    ($digitLed -and $numberAt.IsMatch($Text, $n)) -or
+                    ($ch -ceq '-' -and ($unaryAt.IsMatch($Text, $n) -or
+                        ($null -ne $next -and (($next -ge '0' -and $next -le '9') -or $next -ceq '.') -and
+                         $numberAt.IsMatch($Text, $n + 1))))
+                $firstToken = $exprStmt; $stmtStart = $false
+            } elseif ($exprStmt -and -not $inWord -and -not $firstToken) {
+                if ($digitLed) {
+                    # `7z` in `$x = 7z -a` is a command, as a bareword is; `7kb` is a number.
+                    if (-not $numberAt.IsMatch($Text, $n)) { $exprStmt = $false }
+                } elseif (([char]::IsLetter($ch) -or '._\~^'.IndexOf($ch) -ge 0) -and $Text[$n - 1] -cne '-' -and
+                          -not ($ch -ceq '.' -and ')}"@'''.IndexOf($Text[$n - 1]) -ge 0)) {
+                    # A bareword here is a command, such as `Get-ChildItem` in `$x = Get-ChildItem`;
+                    # a letter after `-` is an operator name such as `-eq`, and a `.` glued to a
+                    # close or a string is a member access, as in `$y.Foo(1).Bar` and `'a'.Length`.
+                    $exprStmt = $false
+                }
+            }
+            if (-not $exprStmt) {
+                # AMONG ARGUMENTS, a member access or an index makes the argument an expression,
+                # where `#` starts a comment: `$x.Name#`, `$a[0]#`, `$a::b#`, `(gci).Name#` and
+                # `'a'.Length#`, though `$b#` alone is one word.
+                if ($exprArg) {
+                    # `$x.Name-foo` is a parameter and `$x[0]x` a word, so the expression ends there.
+                    if (-not ([char]::IsLetterOrDigit($ch) -or '_.[]:?$"'''.IndexOf($ch) -ge 0) -or
+                        ($Text[$n - 1] -ceq ']' -and [char]::IsLetterOrDigit($ch))) { $exprArg = $false }
+                } elseif ($varTok) {
+                    if ($ch -ceq '.' -or $ch -ceq '[' -or ($ch -ceq ':' -and $next -ceq ':')) {
+                        $exprArg = $true; $varTok = $false
+                    } elseif (-not ([char]::IsLetterOrDigit($ch) -or '_?:'.IndexOf($ch) -ge 0)) { $varTok = $false }
+                } elseif (-not $inWord) {
+                    if ($ch -ceq '$') { $varTok = $true }
+                    elseif ($ch -ceq '.' -and ')}"@'''.IndexOf($Text[$n - 1]) -ge 0) { $exprArg = $true }
+                }
+            }
+            if ($ch -ceq '@' -and -not $inWord) { $atStart = $n }
+            if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch; $quoteGlued = $inWord }
+            elseif ($exprStmt -and '=+-*/%!'.IndexOf($ch) -ge 0) {
+                $inWord = $false
+                if ($ch -ceq '=') { $firstToken = $false }
+            }
+            else { $inWord = $true }
+        }
+        [void]$sb.Append($ch)
+        $n++
+    }
+    return $sb.ToString()
+}
+
 # A token as bash hands it to the program. Quotes are removed throughout the word, not just at its
 # ends (`/''` and `/pro'c'` are /proc), and an unquoted backslash escapes the next character and is
 # itself removed (`/\proc` is /proc; unquoted `/proc\registry` is /procregistry, which is nothing).
@@ -377,18 +619,35 @@ try {
         $bashScan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd)
         if ($bashScan -cne $scans[0]) { $scans += $bashScan }
     }
+    # The PowerShell tool's reading, beside the toggle under the same rule (BACKLOG #5451). Without
+    # a backtick, `#`, `@` or `${` it masks exactly as the toggle does, so it is skipped. THE TOGGLE
+    # IS JUDGED FIRST, and this reading is built only once every toggle segment allows, so a slow
+    # path in it can delay an allow but never the toggle's own deny.
+    $psPending = @{ Value = ($tool -ceq 'PowerShell' -and
+        ($cmd.IndexOfAny([char[]]('`', '#', '@')) -ge 0 -or $cmd.IndexOf('${', [StringComparison]::Ordinal) -ge 0)) }
 
     # Split into simple commands. `(`, `)` and the backtick are separators too, or `$(find /proc)`,
     # a backtick substitution and a `( find /proc )` subshell were each allowed.
     $bounds = New-Object 'System.Collections.Generic.List[object[]]'
-    foreach ($scan in $scans) {
+    function Add-ScanBounds([string]$Scan) {
         $cursor = 0
-        foreach ($m in [regex]::Matches($scan, '(\|\||&&|[;|&\n()`])')) {
-            $bounds.Add(@($scan, $cursor, ($m.Index - $cursor)))
+        foreach ($m in [regex]::Matches($Scan, '(\|\||&&|[;|&\n()`])')) {
+            $bounds.Add(@($Scan, $cursor, ($m.Index - $cursor)))
             $cursor = $m.Index + $m.Length
         }
-        $bounds.Add(@($scan, $cursor, ($scan.Length - $cursor)))
+        $bounds.Add(@($Scan, $cursor, ($Scan.Length - $cursor)))
     }
+    # Called once the loop below has judged every bound it holds; true when it added more.
+    function Add-PowerShellBounds {
+        if (-not $psPending.Value) { return $false }
+        $psPending.Value = $false
+        $psScan = Hide-HeredocBodies $cmd (Hide-PowerShellSpans $cmd)
+        if ($psScan -ceq $scans[0]) { return $false }
+        $before = $bounds.Count
+        Add-ScanBounds $psScan
+        return $bounds.Count -gt $before
+    }
+    foreach ($scan in $scans) { Add-ScanBounds $scan }
 
     # Options whose value is a SEPARATE word, so the value is skipped rather than read as a program,
     # pattern or path. Only separate-word options belong here: listing an attached-value one such
@@ -413,7 +672,8 @@ try {
 
     # A segment both views mask alike is checked once.
     $checked = [System.Collections.Generic.HashSet[string]]::new()
-    foreach ($b in $bounds) {
+    for ($bi = 0; $bi -lt $bounds.Count -or (Add-PowerShellBounds); $bi++) {
+        $b = $bounds[$bi]
         if ($b[2] -le 0) { continue }
         $seg = $b[0].Substring($b[1], $b[2])
         if (-not $checked.Add("$($b[1]):$seg")) { continue }
