@@ -514,13 +514,18 @@ def test_an_accepts_lambda_is_scanned_not_a_lambda_in_the_body(tmp_path: Path) -
     assert [e.new_literal for e in plan.edits] == ['"meals"']
 
 
-def test_a_stacked_decorator_literal_on_a_referrer_is_never_silently_left(tmp_path: Path) -> None:
+@pytest.mark.parametrize("factory", ["handler", "hd"], ids=["plain", "aliased_factory"])
+def test_a_stacked_decorator_literal_on_a_referrer_is_never_silently_left(
+    tmp_path: Path, factory: str
+) -> None:
     """A referrer's stacked decorator is part of its definition: an equal literal there is either
     rewritten or reports the referrer unresolved, never left behind while the plan passes clean.
-    Only the registering ``@handler(...)`` name argument is the referrer's own and is skipped."""
+    Only the registering ``@handler(...)`` name argument is the referrer's own and is skipped, and
+    under an aliased factory a stacked decorator is still not taken for it."""
     config_dir = _write_config(
         tmp_path,
         "import functools\n"
+        "from messagefoundry import handler as hd\n"
         "\n"
         "def uses(table):\n"
         "    def deco(fn):\n"
@@ -538,7 +543,7 @@ def test_a_stacked_decorator_literal_on_a_referrer_is_never_silently_left(tmp_pa
         "def r_k(msg):\n"
         '    return ["h_k"]\n'
         "\n"
-        '@handler("h_k")\n'
+        f'@{factory}("h_k")\n'
         '@uses("diets")\n'
         "def h_k(msg):\n"
         '    code_set("diets")\n'
@@ -581,6 +586,56 @@ def test_an_aliased_or_keyword_code_set_call_in_the_body_is_rewritten(
     assert plan.unresolved == ()
     apply_rename(plan)
     assert '"diets"' not in _mod(config_dir)
+
+
+def test_an_accepts_lambda_does_not_count_the_handlers_own_name(tmp_path: Path) -> None:
+    """An accepts= lambda's site spans the registering decorator, whose name argument is the
+    handler's own name, not a referent to an outbound named the same."""
+    config_dir = _write_config(
+        tmp_path,
+        'inbound("IB_E", MLLP(port=2822), router="r_e")\n'
+        'outbound("EPIC", MLLP(host="127.0.0.1", port=6975))\n'
+        "\n"
+        '@router("r_e")\n'
+        "def r_e(msg):\n"
+        '    return ["EPIC"]\n'
+        "\n"
+        '@handler("EPIC", accepts=lambda m: m is not None)\n'
+        "def epic(msg):\n"
+        '    return Send("EPIC", msg)\n',
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "EPIC", "OB_EPIC")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    text = _mod(config_dir)
+    assert 'return Send("OB_EPIC", msg)' in text
+    assert '@handler("EPIC", accepts=' in text
+
+
+def test_a_nested_lambda_default_is_not_the_functions_own(tmp_path: Path) -> None:
+    """A nested lambda's parameter is another parameter, even when it shares a role parameter's
+    name, so its default is left and counted."""
+    config_dir = _write_config(
+        tmp_path,
+        'inbound("IB_L", MLLP(port=2823), router="r_l")\n'
+        'outbound("OB_OLD", MLLP(host="127.0.0.1", port=6976))\n'
+        "\n"
+        '@router("r_l")\n'
+        "def r_l(msg):\n"
+        '    return ["h_l"]\n'
+        "\n"
+        '@handler("h_l")\n'
+        "def h_l(msg, dest=None):\n"
+        '    if (lambda dest="OB_OLD": str(msg) == dest)():\n'
+        "        return None\n"
+        '    return Send(dest or "OB_OLD", msg)\n',
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    apply_rename(plan)
+    text = _mod(config_dir)
+    assert 'lambda dest="OB_OLD"' in text
+    assert 'Send(dest or "OB_NEW", msg)' in text
+    assert plan.unresolved == (Reference("handler", "h_l", "outbound", "OB_OLD"),)
 
 
 _DEFAULTS = {

@@ -486,9 +486,19 @@ def _referrer_sites(
         # A referrer whose own function cannot be read is unresolved. A predicate that is not a plain
         # function (a partial, a callable instance) is not: the index cannot read it either, so no
         # edge came from it.
-        own_reached = reached_functions(fn)
-        complete = bool(own_reached)
-        own = own_reached[0] if own_reached else None
+        complete = bool(reached_functions(fn))
+        # The registering decorator's name argument names the referrer, not a referent: counting it
+        # would report a handler named like its outbound unresolved, at its own site and at an
+        # accepts= lambda's, which spans the same decorator. Its other decorators stay in the
+        # site, so an equal literal there is still counted.
+        own_file, own_span = _fn_span(fn)
+        ignored = (
+            _decorator_positions(
+                sources, own_file, own_span, fn, old, ref.referrer_kind, registering_only=True
+            )
+            if own_file is not None and own_span is not None
+            else frozenset()
+        )
         funcs: list[tuple[int, FunctionType, str, _Span]] = []
         reached: list[FunctionType] = []
         for root in roots:
@@ -503,13 +513,7 @@ def _referrer_sites(
         role_globals = {name for scan in scans for name in scan.globals}
         role_attrs = {name for scan in scans for name in scan.attrs}
         for (depth, func, file, span), scan in zip(funcs, scans, strict=True):
-            rewritable = scan.positions
-            ignored: frozenset[tuple[int, int]] = frozenset()
-            if depth == 0 and func is own:
-                # The registering decorator's name argument names the referrer, not a referent:
-                # counting it would report a handler named like its outbound unresolved. Its other
-                # decorators stay in the site, so an equal literal there is still counted.
-                ignored = _decorator_positions(sources, file, span, fn, old, ref.referrer_kind)
+            rewritable = set(scan.positions)
             # A non-table rename rewrites a default only for a parameter that reaches a referent
             # role; a table rename rewrites every default equal to the old name.
             role_params = None if table_kind is not None else {name for _i, name in scan.slots}
@@ -580,6 +584,9 @@ def _default_positions(
         if not span.start <= node.lineno <= span.end:
             continue
         if not isinstance(node, ast.Lambda) and node.name != func.__name__:
+            continue
+        if params is not None and isinstance(node, ast.Lambda) != (func.__name__ == "<lambda>"):
+            # A lambda nested in the function is not the function: its parameter is another.
             continue
         args = node.args
         positional = [*args.posonlyargs, *args.args]
@@ -1026,12 +1033,22 @@ def _definition_positions(
 
 
 def _decorator_positions(
-    sources: SourceCache, file: str, span: _Span, fn: object, old: str, kind: str
+    sources: SourceCache,
+    file: str,
+    span: _Span,
+    fn: object,
+    old: str,
+    kind: str,
+    *,
+    registering_only: bool = False,
 ) -> frozenset[tuple[int, int]]:
     """The name argument of the ``@router("old")`` / ``@handler("old")`` call registering ``fn``, or
     of ``router("old")(lambda ...)``. The function's body is not part of its definition, and nor is
     another decorator stacked on it -- unless the factory is imported under an alias, when every
-    decorator call naming ``old`` is taken, since none can be told apart by name."""
+    decorator call naming ``old`` is taken, since none can be told apart by name. With
+    ``registering_only``, only a call spelled ``kind`` or an alias the module imports it under is
+    taken, and nothing when there is none, so a literal skipped as the referrer's own name is never
+    a stacked decorator's."""
     import inspect
 
     parsed = sources.parse(file)
@@ -1051,6 +1068,20 @@ def _decorator_positions(
             and any(isinstance(arg, ast.Lambda) for arg in node.args)
         ):
             calls.append(node.func)
+    if registering_only:
+        spelled = {kind} | {
+            a.asname
+            for node in ast.walk(parsed[0])
+            if isinstance(node, ast.ImportFrom)
+            for a in node.names
+            if a.name == kind and a.asname
+        }
+        return frozenset(
+            pos
+            for call in calls
+            if _call_name(call.func) in spelled
+            and (pos := _name_argument_position(sources, file, call, old))
+        )
     return _definition_positions(sources, file, calls, kind, old)
 
 
