@@ -15929,8 +15929,11 @@ class AuthService:
                                     type(revoke_exc).__name__,
                                 )
 
-                        await _write_through_cancellation([end_rotated])
-                        clear_denied_session_ended = bool(ended and ended[0])
+                        try:
+                            await _write_through_cancellation([end_rotated])
+                        finally:
+                            # Also when a second cancel lands: the revoke ran to completion.
+                            clear_denied_session_ended = bool(ended and ended[0])
                         raise
                     cleared = row_written = clear == "cleared"
                     if cleared and flag:

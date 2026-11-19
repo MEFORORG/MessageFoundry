@@ -15124,13 +15124,14 @@ class SqlServerStore:
         return UserAuthzRecord.of(UserRow.from_mapping(rows[0]), grants)
 
     async def _preseal_user(self, user_id: str, change: UserChange) -> _PresealedUserWrite | None:
-        """store.py's ``MessageStore._preseal_user`` (BACKLOG #5900): the read, unlocked, in a
-        transaction ended before the seal work, then the verify, ``change`` and the seal, holding
-        no lock, so neither the row lock nor ``_audit_lock`` waits on Vault transit."""
+        """store.py's ``MessageStore._preseal_user`` (BACKLOG #5900): the row and its role rows read
+        under ``UPDLOCK``, as ``_write_user`` reads them, so a role write cannot tear the pair, in a
+        transaction ended before the seal work; then the verify, ``change`` and the seal, which
+        hold neither the row lock nor ``_audit_lock``."""
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
-                    current = await self._read_user_record(cur, user_id, lock=False)
+                    current = await self._read_user_record(cur, user_id)
                 await conn.rollback()
             except Exception:
                 await self._rollback_or_discard(conn)
