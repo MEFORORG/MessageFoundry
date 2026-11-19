@@ -288,18 +288,38 @@ async function scaffoldHook(bin: string, ws: string, paths: CheckPaths): Promise
   return "written (.mefor-hooks/pre-commit, +x)";
 }
 
-/** Whether `a` and `b` name one directory, compared by real path (case-folded on Windows). */
-function sameDir(a: string, b: string): boolean {
-  const norm = (p: string): string => {
-    let real: string;
+/** Whether `p` is spelled as a UNC path (`\\host\share`, or `//host/share`). */
+function isUncSpelling(p: string): boolean {
+  return /^[\\/]{2}/.test(p);
+}
+
+/**
+ * Whether `a` and `b` name one directory, compared by real path (case-folded on Windows).
+ *
+ * Asynchronous, so a slow or unreachable share cannot block the extension host (BACKLOG #5404 item
+ * 1); the synchronous realpath did. `b` can come from the repository's own `core.hooksPath`, so a
+ * path spelled as a UNC share is compared by spelling alone, with no file-system call: a crafted
+ * value cannot make the extension open a remote share. A UNC folder spelled two ways, or a mapped
+ * drive against its UNC spelling, then reads as two folders, and the hook is left unwired.
+ */
+async function sameDir(a: string, b: string): Promise<boolean> {
+  const fold = (p: string): string => (process.platform === "win32" ? p.toLowerCase() : p);
+  const spelledA = path.resolve(a);
+  const spelledB = path.resolve(b);
+  if (fold(spelledA) === fold(spelledB)) {
+    return true;
+  }
+  if (isUncSpelling(spelledA) || isUncSpelling(spelledB)) {
+    return false;
+  }
+  const norm = async (p: string): Promise<string> => {
     try {
-      real = fs.realpathSync.native(p);
+      return fold(await fs.promises.realpath(p));
     } catch {
-      real = path.resolve(p); // a folder that cannot be read: compare its spelling instead
+      return fold(p); // a folder that cannot be read: compare its spelling instead
     }
-    return process.platform === "win32" ? real.toLowerCase() : real;
   };
-  return norm(a) === norm(b);
+  return (await norm(spelledA)) === (await norm(spelledB));
 }
 
 /**
@@ -311,14 +331,14 @@ function sameDir(a: string, b: string): boolean {
 async function wireHooksPath(bin: string, ws: string): Promise<{ note: string; wired: boolean }> {
   const top = await git(bin, ["rev-parse", "--show-toplevel"], ws);
   const topDir = top.code === 0 ? top.stdout.trim() : "";
-  if (!topDir || !sameDir(topDir, ws)) {
+  if (!topDir || !(await sameDir(topDir, ws))) {
     return {
       note: "not set (git resolves core.hooksPath from the repository's top level, which is not this workspace folder)",
       wired: false,
     };
   }
   const current = await getHooksPath(bin, ws);
-  if (current && sameDir(path.resolve(topDir, current), path.join(ws, HOOKS_DIR))) {
+  if (current && (await sameDir(path.join(ws, HOOKS_DIR), path.resolve(topDir, current)))) {
     return { note: "already set", wired: true };
   }
   if (current) {

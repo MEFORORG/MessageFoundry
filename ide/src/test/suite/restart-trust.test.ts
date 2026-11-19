@@ -164,10 +164,19 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     "realpathSync",
   ];
 
-  /** What one Restart did: each `fs` call as "<function> <path>", and whether it stopped or started
-   *  the engine. */
-  async function restart(url: string): Promise<{ statted: string[]; stopped: boolean; started: boolean }> {
+  /** Whether `p` is the workspace folder or spelled inside it. */
+  function isWithinWorkspace(p: string): boolean {
+    const rel = path.relative(ws, path.resolve(p));
+    return !(path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`));
+  }
+
+  /** What one Restart did: each `fs` call as "<function> <path>", each real path its link check
+   *  read inside the folder, and whether it stopped or started the engine. */
+  async function restart(
+    url: string,
+  ): Promise<{ statted: string[]; resolved: string[]; stopped: boolean; started: boolean }> {
     const statted: string[] = [];
+    const resolved: string[] = [];
     let stopped = false;
     let started = false;
     // A running engine this IDE owns, so a Restart that got past its checks would stop it.
@@ -191,7 +200,15 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     // Records and refuses every call, never reaching the real filesystem: a stat of the UNC value
     // would otherwise go to the network on Windows.
     for (const name of SPIED) {
-      FS_MODULE[name] = (p: fs.PathLike): boolean => {
+      FS_MODULE[name] = (p: fs.PathLike): boolean | string => {
+        // A writer's link check (cli.ts escapesByLink, BACKLOG #5404 item 1) reads the real path of
+        // the workspace folder and of a path spelled inside it. Those are answered as a folder with
+        // no links and kept apart, so `statted` still records every other call; the UNC value is not
+        // inside the folder, so a realpath of it is still recorded and refused.
+        if (name === "realpathSync" && isWithinWorkspace(String(p))) {
+          resolved.push(String(p));
+          return String(p);
+        }
         statted.push(`${name} ${String(p)}`);
         if (name === "existsSync") {
           return false;
@@ -210,7 +227,7 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
       }
     }
     await pending;
-    return { statted, stopped, started };
+    return { statted, resolved, stopped, started };
   }
 
   test("an untrusted workspace: Restart refuses, and the configured path is never statted", async () => {
@@ -321,6 +338,8 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
 
     assert.deepStrictEqual(run.statted, []);
     assert.deepStrictEqual(notices, []);
+    // Positive control for the stub above: the link check ran, on the folder itself.
+    assert.ok(run.resolved.includes(ws), JSON.stringify(run.resolved));
     assert.strictEqual(run.stopped, true);
     assert.strictEqual(run.started, true);
   });

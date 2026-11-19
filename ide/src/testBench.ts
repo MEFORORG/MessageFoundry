@@ -18,6 +18,7 @@ import {
   sweepStaleCaseDirs,
 } from "./collectionCaseFiles";
 import { CollectionStore, CollectionStoreError } from "./collectionStore";
+import { INTERPRETER_OPTIONS } from "./engineControlModel";
 import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
@@ -543,6 +544,12 @@ export class TestBench {
       name: `MEFOR dry-run: ${row.source}`,
       type: "debugpy",
       request: "launch",
+      // The interpreter options the CLI bridge launches with (BACKLOG #5409): `-P` keeps the working
+      // directory, the workspace, off the import path, so a `messagefoundry.py` or a stdlib-named
+      // module in the workspace root does not shadow the installed one through it. debugpy's module
+      // runner adds the working directory itself unless `sys.flags.safe_path` is set, which `-P`
+      // sets; that check is read from debugpy's main branch, and an older debugpy may lack it.
+      pythonArgs: [...INTERPRETER_OPTIONS],
       module: "messagefoundry",
       args: ["dryrun", "--config", configDir(), "--show-phi", "--messages", row.path],
       console: "integratedTerminal",

@@ -491,3 +491,35 @@ export function brokeredNoReplyNotice(sent: boolean): string {
     : "_Nothing was sent: sign in to the MessageFoundry engine to use engine-brokered AI assistance, " +
         "or, if an error said the engine address was refused, correct that address._";
 }
+
+/** The default of `messagefoundry.ai.contextCharLimit`, as the manifest declares it. */
+export const DEFAULT_CONTEXT_CHAR_LIMIT = 8000;
+
+/** The scopes of `messagefoundry.ai.contextCharLimit` that {@link contextCharLimitOf} reads: VS
+ *  Code's `inspect()` answer. A folder value is not read, as the setting is read with no resource. */
+export interface ContextCharLimitScopes {
+  readonly defaultValue?: unknown;
+  readonly globalValue?: unknown;
+  readonly workspaceValue?: unknown;
+}
+
+/** `v` as a character count: a finite number of zero or more, rounded down, else undefined. */
+function charCount(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : undefined;
+}
+
+/**
+ * The bound on editor code a chat request attaches (BACKLOG #5404 item 2). The user's own value,
+ * else the manifest default, else {@link DEFAULT_CONTEXT_CHAR_LIMIT}, sets the bound; a workspace
+ * value, which a repository's `.vscode/settings.json` can set, applies only when it is LOWER. A
+ * repository may so tighten what leaves for the model provider (say `0`, graph names only), but not
+ * widen it past what the operator chose. That is why the setting is not in the manifest's
+ * `restrictedConfigurations`: Restricted Mode would drop a tightening workspace value too. A value
+ * that is not a count of zero or more is ignored, at any scope, for the next one down. No answer at
+ * all (`seen` undefined) gives the default.
+ */
+export function contextCharLimitOf(seen: ContextCharLimitScopes | undefined): number {
+  const base = charCount(seen?.globalValue) ?? charCount(seen?.defaultValue) ?? DEFAULT_CONTEXT_CHAR_LIMIT;
+  const ws = charCount(seen?.workspaceValue);
+  return ws !== undefined && ws < base ? ws : base;
+}

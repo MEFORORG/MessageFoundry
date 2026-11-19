@@ -17,12 +17,15 @@ import {
   type CliResult,
 } from "./cliJson";
 import { connectionServiceConfig, settingIsSet } from "./connectionWizardModel";
+import { contextCharLimitOf } from "./aiPolicyModel";
 import { cliArgv } from "./engineControlModel";
 import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from "./stepsModel";
 import type { LensParseResult, OpSchema } from "./stepsModel";
 import {
+  committedRelativePath,
   containedPathSetting,
   droppedNotice,
+  resolveInsideWorkspace,
   writerRefusal,
   type ContainedPathSetting,
 } from "./workspaceContainment";
@@ -132,11 +135,43 @@ export function writerCheckSetting(key: PathSettingKey): ContainedPathSetting {
   return pathSetting(key, PATH_FALLBACK[key], false);
 }
 
+/**
+ * Whether a writer must refuse `value` because, though its spelling lies inside the workspace folder
+ * `ws`, its real path does not (BACKLOG #5404 item 1): a symlink or junction inside the folder that
+ * leads out of it, a dangling one, or a path whose real path cannot be read. {@link
+ * containedPathSetting} compares spellings only, so without this a writer would follow such a link
+ * out of the folder. The repository supplies the link whichever scope named the path, so the
+ * manifest default and a relative user value are checked too. A value spelled outside the folder can
+ * only be the operator's own user value, theirs to point anywhere, so it is not checked, and the
+ * spelling test runs first, with no I/O. The real-path reads are synchronous, as every writer's
+ * caller is, and they touch only the folder the operator opened and paths spelled inside it.
+ */
+function escapesByLink(ws: string | undefined, value: string): boolean {
+  if (ws === undefined || committedRelativePath(ws, value) === undefined) {
+    return false;
+  }
+  return resolveInsideWorkspace(ws, value) === undefined;
+}
+
+/** The refusal a writer shows when {@link escapesByLink} holds. It names the setting, never the
+ *  value or the link's target (docs/REVIEW-STANDARDS.md R12). */
+export function linkEscapeRefusal(key: PathSettingKey): string {
+  return (
+    `MessageFoundry: messagefoundry.${key} names a path inside the workspace folder that a symbolic link ` +
+    "or junction leads out of, or whose real path cannot be read, so nothing was written or started. " +
+    "Remove the link, or set the path in user settings."
+  );
+}
+
 /** {@link writerPathSetting}'s reading with its scope, or undefined after the refusal is shown. */
 function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
   const s = writerCheckSetting(key);
   if (s.dropped !== false) {
     void vscode.window.showErrorMessage(writerRefusal(key, s.dropped));
+    return undefined;
+  }
+  if (escapesByLink(workspaceDir(), s.value)) {
+    void vscode.window.showErrorMessage(linkEscapeRefusal(key));
     return undefined;
   }
   return s;
@@ -295,12 +330,12 @@ export function messageSetsDirSetting(): ContainedPathSetting {
 /**
  * Max characters of active-editor code attached to a `@messagefoundry` AI chat request
  * (`messagefoundry.ai.contextCharLimit`, default 8000). Bounds how much of the user's own code
- * egresses to their chosen model provider. A non-numeric/negative value (which the settings schema
- * already discourages) falls back to the default; `0` means "graph names only, no editor code".
+ * egresses to their chosen model provider; `0` means "graph names only, no editor code". A
+ * workspace value may only LOWER the bound that the user's own value or the default sets, never
+ * raise it (BACKLOG #5404 item 2); see {@link contextCharLimitOf}.
  */
 export function aiContextCharLimit(): number {
-  const v = config().get<number>("ai.contextCharLimit", 8000);
-  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 8000;
+  return contextCharLimitOf(config().inspect("ai.contextCharLimit"));
 }
 
 export function workspaceDir(): string | undefined {

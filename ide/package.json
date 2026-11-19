@@ -802,7 +802,7 @@
           "type": "integer",
           "default": 8000,
           "minimum": 0,
-          "markdownDescription": "Maximum characters of the active editor's code attached to a `@messagefoundry` AI chat request. The assistant only ever sends code + your config graph's names \u00e2\u20ac\u201d never message bodies/PHI \u00e2\u20ac\u201d so this bounds how much of your *own* code leaves to your chosen model provider. Files larger than the limit are truncated on a line boundary with a visible marker; `0` sends only the graph names (no editor code)."
+          "markdownDescription": "Maximum characters of the active editor's code attached to a `@messagefoundry` AI chat request. The assistant only ever sends code + your config graph's names \u00e2\u20ac\u201d never message bodies/PHI \u00e2\u20ac\u201d so this bounds how much of your *own* code leaves to your chosen model provider. Files larger than the limit are truncated on a line boundary with a visible marker; `0` sends only the graph names (no editor code). A workspace value can only lower the limit your user setting (or the default) sets, never raise it."
         },
         "messagefoundry.liveDebug.debounceMs": {
           "type": "integer",
