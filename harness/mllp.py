@@ -99,10 +99,22 @@ def _ack_code(ack_text: str) -> str:
 # How often a dial in progress looks at the stop flag, so stop() is seen within about this long
 # rather than after the whole connect timeout (BACKLOG #5947).
 _STOP_POLL_S = 0.1
-# What a non-blocking connect_ex returns while the dial is still in progress.
-_DIAL_IN_PROGRESS = frozenset(
-    {errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN, getattr(errno, "WSAEWOULDBLOCK", -1)}
+# What a non-blocking connect_ex returns while the dial is still in progress. Winsock says
+# WSAEWOULDBLOCK. On POSIX only EINPROGRESS means that: an EAGAIN or EWOULDBLOCK there is a dial
+# that failed (Linux, for one, when it has no local port to give), so it must surface as the error a
+# blocking dial would have raised, not be polled as if it were still connecting.
+_WSAEWOULDBLOCK = 10035
+_DIAL_IN_PROGRESS_POSIX = frozenset({errno.EINPROGRESS})
+_DIAL_IN_PROGRESS_WINDOWS = frozenset(
+    {errno.EINPROGRESS, getattr(errno, "WSAEWOULDBLOCK", _WSAEWOULDBLOCK)}
 )
+
+
+def _dial_in_progress(code: int) -> bool:
+    """Whether ``code`` from a non-blocking ``connect_ex`` means the dial is still in progress."""
+    if sys.platform == "win32":
+        return code in _DIAL_IN_PROGRESS_WINDOWS
+    return code in _DIAL_IN_PROGRESS_POSIX
 
 
 # The socket constructor the dial uses; a seam for a test that needs a dial which never settles.
@@ -244,7 +256,7 @@ class SendWorker(QObject):
     def _dial(self, sock: socket.socket, addr: Any, deadline: float) -> None:
         sock.setblocking(False)
         code = sock.connect_ex(addr)
-        if code and code not in _DIAL_IN_PROGRESS:
+        if code and not _dial_in_progress(code):
             raise _socket_error(code)
         while code:
             if self._stop.is_set():

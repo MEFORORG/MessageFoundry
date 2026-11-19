@@ -119,6 +119,45 @@ def test_a_socket_that_cannot_be_made_moves_on_to_the_next_address(
     assert tried == [socket_mod.AF_INET6, socket_mod.AF_INET]
 
 
+@pytest.mark.parametrize("code", sorted({errno.EAGAIN, errno.EWOULDBLOCK}))
+def test_a_posix_eagain_dial_raises_its_own_error(
+    monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    # On POSIX a non-blocking connect() returning EAGAIN or EWOULDBLOCK has failed; only
+    # EINPROGRESS is a dial in progress. Polled as if connecting, SO_ERROR reads 0 and the row
+    # reports a later broken pipe instead of the real error a blocking dial raised.
+    import sys
+
+    class _Refused(_NeverConnects):
+        def connect_ex(self, _addr: object) -> int:
+            return code
+
+        def getsockopt(self, *_a: object) -> int:
+            return 0
+
+        def settimeout(self, _t: float) -> None:
+            pass
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(mllp, "_dial_settled", lambda _sock, _wait_s: True)
+    worker = SendWorker("127.0.0.1", 9, [], timeout=1.0, rate=0.0)
+    # Not pytest.raises: the traceback it keeps would hold the worker in a reference cycle.
+    seen: int | None = None
+    try:
+        worker._dial(_Refused(), ("127.0.0.1", 9), time.monotonic() + 1.0)  # type: ignore[arg-type]
+    except OSError as exc:
+        seen = exc.errno
+    assert seen == code
+
+
+def test_a_windows_wouldblock_dial_is_still_in_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert mllp._dial_in_progress(mllp._WSAEWOULDBLOCK)
+    assert mllp._dial_in_progress(errno.EINPROGRESS)
+
+
 def test_the_pause_between_messages_keeps_a_fine_rate() -> None:
     # Event.wait rounds up to the Windows timer tick, about 15 ms, which capped 1000 msg/s at
     # about 65; the pause sleeps instead and still returns at once on stop.
