@@ -1084,6 +1084,8 @@ def test_fhir_lookup_maps_a_content_coded_reply_onto_fhir_lookup_error() -> None
 
 
 # --- the SOAP and FHIR error-body reads (BACKLOG #5910 steps 1 and 2) ------------------------------
+# Step 2 is met by a logged catch-all that keeps main's retry: a raise the named arms do not catch
+# is logged by class only, and the reply is classified on its status.
 
 _CODED_500 = b"HTTP/1.1 500 Internal Server Error\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
 

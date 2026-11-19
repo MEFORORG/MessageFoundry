@@ -160,7 +160,7 @@ def request_token(
     ``rest.auth_challenge_refused`` builds (BACKLOG #2989); no built provider's hop reaches that
     handler, since a Digest proxy in front of an https token endpoint is refused at build.
 
-    A reply in a content coding the engine does not decode is a permanent
+    A 2xx reply with a body in a content coding the engine does not decode is a permanent
     :class:`~messagefoundry.transports.base.NegativeAckError` coded
     :data:`TOKEN_REPLY_CODED_CODE`, and a configuration fault: every queued row mints through the
     same endpoint and would meet the same refusal, so it is not retried, and under the default

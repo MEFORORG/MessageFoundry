@@ -323,11 +323,13 @@ _AUTO_RESOLVE: dict[str, str] = {
 }
 
 
-#: The alert instance of a ``connection_error`` of kind ``config_fault`` (ADR 0128 section 4):
-#: its own notification throttle, escalation count and instance, apart from a transport
+#: The alert instance of a ``connection_error`` of kind ``config_fault``, new in PR 3069 (BACKLOG
+#: #5910): its own notification throttle, escalation count and instance, apart from a transport
 #: ``connection_error``, so neither's page suppresses the other's or replaces its reason. A rule's
 #: control action is not split this way: it is throttled per ``(event_type, connection)``
 #: (``NotifierAlertSink._last_control``). ``connection_restored`` of the same kind resolves it.
+#: ADR 0044's 2026-11-19 amendment states the instance key, and ADR 0128 section 4 states the
+#: notification and control throttles.
 _CONFIG_FAULT_INSTANCE = "connection_error.config_fault"
 
 

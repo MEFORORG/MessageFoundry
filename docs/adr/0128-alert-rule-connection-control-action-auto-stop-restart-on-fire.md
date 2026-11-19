@@ -122,8 +122,9 @@ once per window for each of them. The time is recorded only when the sink schedu
 task: an emit whose action the sink skips (for example: no control callback wired, the engine
 shutting down, or an event that is not about a connection) records nothing. A scheduled task records
 the time even when the callback then restarts nothing. A restart can therefore fire on a throttled
-alert when no restart task was scheduled for an earlier alert in the window. The notification throttle is unchanged, and a
-`connection_error` of kind `config_fault` keeps its own notification throttle while sharing the `connection_error` control throttle with the transport kind. The
+alert when no restart task was scheduled for an earlier alert in the window. The notification throttle is otherwise unchanged.
+PR 3069 also adds the `connection_error` of kind `config_fault`, with a notification throttle of its
+own, apart from the transport kind's; the two kinds share one `connection_error` control throttle. The
 `connection_started` clear above ends both windows, and a failed resolve restores both.
 
 ## Options considered
