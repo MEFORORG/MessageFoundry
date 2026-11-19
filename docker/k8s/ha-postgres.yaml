@@ -348,7 +348,10 @@ spec:
               - { key: api.key, path: api.key }
         - name: tmp
           emptyDir: { medium: Memory }
-        - name: log-spool               # on the node's disk, so it outlives a container restart
+        # On the node's disk, so it outlives a container restart. Keep sizeLimit above
+        # [logging].forward_spool_max_bytes (100 MB by default). The spool refuses a write once it is
+        # full; with the cap above sizeLimit, the kubelet evicts the pod before that.
+        - name: log-spool
           emptyDir: { sizeLimit: 1Gi }
 #
 # DO NOT add a HorizontalPodAutoscaler to this Deployment. HA replicas are for FAILOVER, not for spreading
