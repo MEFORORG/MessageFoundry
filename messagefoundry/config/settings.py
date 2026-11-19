@@ -3563,6 +3563,12 @@ def _normalise_claim_value_list(v: object) -> object:
     return v
 
 
+#: The longest session limits ``[security]`` accepts (BACKLOG #5772): a year each. Generous against
+#: any real policy; they only refuse a value large enough to break the session arithmetic.
+SESSION_IDLE_MINUTES_MAX = 365 * 24 * 60
+SESSION_ABSOLUTE_HOURS_MAX = 365 * 24
+
+
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file.
 
@@ -3571,8 +3577,10 @@ class AuthSettings(_Section):
     with no settings at all. ``enabled`` passed in code is refused by the base class, like every
     other removed key (``_Section._refuse_removed_keys``)."""
 
-    session_idle_timeout_minutes: int = 30
-    session_absolute_hours: int = 12
+    # At least one, so a session can outlive its own sign-in; the [security] spellings below take
+    # the same bounds (BACKLOG #5772).
+    session_idle_timeout_minutes: int = Field(default=30, ge=1, le=SESSION_IDLE_MINUTES_MAX)
+    session_absolute_hours: int = Field(default=12, ge=1, le=SESSION_ABSOLUTE_HOURS_MAX)
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
     # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). Sign-ins still
     # owing a second factor are capped apart, so they never evict a full session (BACKLOG #2076).
@@ -7830,8 +7838,9 @@ class SecuritySettings(_Section):
     allow_single_factor_admin_when_exposed: bool = (
         False  # ADR 0140: lift the require_mfa-off refusal at exposure under enforcement = enforce
     )
-    sign_out_after_idle_minutes: int = 30
-    max_session_hours: int = 12
+    # At least one: 0 or less would end every session at sign-in (BACKLOG #5772).
+    sign_out_after_idle_minutes: int = Field(default=30, ge=1, le=SESSION_IDLE_MINUTES_MAX)
+    max_session_hours: int = Field(default=12, ge=1, le=SESSION_ABSOLUTE_HOURS_MAX)
 
     # ── Data handling ────────────────────────────────────────────────
     block_unlisted_outbound: bool = (
@@ -7986,6 +7995,18 @@ class SecuritySettings(_Section):
                 )
             out.append(str(network))
         return out
+
+    @model_validator(mode="after")
+    def _local_access_binds_loopback(self) -> SecuritySettings:
+        # BACKLOG #5772: refused on the model, so a SecuritySettings built anywhere, not only through
+        # the load's desugar, cannot claim local-only access while naming an off-box address.
+        if self.local_access_only and self.listen_address not in _LOOPBACK_HOSTS:
+            raise ValueError(
+                f"[security].local_access_only=true but [security].listen_address={self.listen_address!r} "
+                "is not a loopback address (127.0.0.1/localhost/::1). Set local_access_only=false to "
+                "bind it off-box (TLS required), or use a loopback listen_address."
+            )
+        return self
 
     @property
     def client_networks(self) -> tuple[str, ...]:
@@ -9127,14 +9148,9 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
             _set(section, field, getattr(sec, skey))
 
     # Network host: local_access_only forces loopback; a contradictory non-loopback listen_address with
-    # local_access_only=true REFUSES (AC-3) rather than silently overriding.
+    # local_access_only=true REFUSES (AC-3) rather than silently overriding. The model refused it
+    # already, in SecuritySettings._local_access_binds_loopback.
     if "local_access_only" in provided or "listen_address" in provided:
-        if sec.local_access_only and sec.listen_address not in _LOOPBACK_HOSTS:
-            raise ValueError(
-                f"[security].local_access_only=true but [security].listen_address={sec.listen_address!r} "
-                "is not a loopback address (127.0.0.1/localhost/::1). Set local_access_only=false to "
-                "bind it off-box (TLS required), or use a loopback listen_address."
-            )
         _set("api", "host", "127.0.0.1" if sec.local_access_only else sec.listen_address)
 
     # Web-console external origin (empty string = unset → None, matching [api].public_origin).
@@ -9911,9 +9927,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         )
 
     # The [security] session limits. They desugar into these two [auth] fields, whose own spellings
-    # the load refuses, so each entry carries the [security] name an operator sets. A value of 0 or
-    # less ends every session at once, which is stricter. Read off the [auth] copy; the docstring
-    # names the caller that pays for it.
+    # the load refuses, so each entry carries the [security] name an operator sets. A value below 1
+    # is refused at load (BACKLOG #5772). Read off the [auth] copy; the docstring names the caller
+    # that pays for it.
     for switch, field, unit in (
         ("sign_out_after_idle_minutes", "session_idle_timeout_minutes", "minute(s)"),
         ("max_session_hours", "session_absolute_hours", "hour(s)"),
