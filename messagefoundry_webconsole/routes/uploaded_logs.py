@@ -151,6 +151,9 @@ RESEND_LOCKED_CODE = "resend_locked"
 DELETE_FAILED_CODE = "delete_failed"
 DELETE_LOCKED_CODE = "delete_locked"
 BROWSE_LOCKED_CODE = "browse_locked"
+RESEND_DAMAGED_CODE = "resend_damaged"
+DELETE_DAMAGED_CODE = "delete_damaged"
+BROWSE_DAMAGED_CODE = "browse_damaged"
 BROWSE_HOP_REFUSED_CODE = "browse_hop_refused"
 BROWSE_THROTTLED_CODE = "browse_throttled"
 UPLOADS_UNAVAILABLE_CODE = "uploads_unavailable"
@@ -192,17 +195,38 @@ DELETE_FAILED_NOTICE = (
 #: planted behind a sealed sidecar, which ``rotate-key`` would seal for good. So the notice names the
 #: common case and its fix without claiming either is the only one. The store's opt-out for unmarked
 #: values would also let the file through; it is a loosening, so no notice here may point at it.
-#: A damaged file's 423 (BACKLOG #5388) carries its own engine text, which this console does not
-#: read, so it gets this notice too, and the notice's rotate-key fix does not repair it. That is a
-#: known gap, recorded in docs/PHI.md section 3, not a claim that the cause here always holds.
+#: A damaged file's 423 (BACKLOG #5388) gets the notices below it instead, because no key and no
+#: rotate-key repairs it, and a keyless store has no key to name at all.
 _LOCKED_CAUSE = (
     "The engine cannot read the file under the store's encryption key, so it refuses it. A file "
     "stored as plaintext before the key was turned on stays refused until an administrator seals "
     "it. They seal it by running 'messagefoundry rotate-key' with the engine stopped."
 )
-BROWSE_LOCKED_NOTICE = f"That file could not be opened. {_LOCKED_CAUSE}"
-RESEND_LOCKED_NOTICE = f"That resend did not run — nothing was injected. {_LOCKED_CAUSE}"
-DELETE_LOCKED_NOTICE = f"That delete did not run — nothing was removed. {_LOCKED_CAUSE}"
+_BROWSE_LEAD = "That file could not be opened."
+_RESEND_LEAD = "That resend did not run — nothing was injected."
+_DELETE_LEAD = "That delete did not run — nothing was removed."
+BROWSE_LOCKED_NOTICE = f"{_BROWSE_LEAD} {_LOCKED_CAUSE}"
+RESEND_LOCKED_NOTICE = f"{_RESEND_LEAD} {_LOCKED_CAUSE}"
+DELETE_LOCKED_NOTICE = f"{_DELETE_LEAD} {_LOCKED_CAUSE}"
+
+#: The engine's own 423 text for a damaged file (BACKLOG #5388 added item 1). It is compared with
+#: the refusal's detail, never rendered, to tell a damaged file from one the store key refuses: the
+#: two share the status. This console reaches the engine only through its handlers, so it keeps a
+#: copy, and a test pins the copy to what the engine answers. If the two ever differ, a damaged
+#: file falls back to the locked notice above, as it did before this split.
+_ENGINE_DAMAGED_DETAIL = (
+    "this uploaded file is damaged, so it was not read and is not served. No key and no "
+    "command repairs it. An operator may try to delete it, and the delete may be refused too"
+)
+#: Why a damaged file is refused, with no key or command named, since none repairs it. It promises
+#: no removal, as the engine's text does not: some damaged files are refused by the delete too.
+_DAMAGED_CAUSE = (
+    "The engine found the file damaged, so it does not read or serve it. No encryption key and no "
+    "command repairs it. An administrator may try to delete it, and the engine may refuse that too."
+)
+BROWSE_DAMAGED_NOTICE = f"{_BROWSE_LEAD} {_DAMAGED_CAUSE}"
+RESEND_DAMAGED_NOTICE = f"{_RESEND_LEAD} {_DAMAGED_CAUSE}"
+DELETE_DAMAGED_NOTICE = f"{_DELETE_LEAD} {_DAMAGED_CAUSE}"
 
 #: Three more engine answers the routes used to let escape as JSON (BACKLOG #1169, PR 1506
 #: follow-up A). Each is this module's own text. The engine's detail for each names config keys and
@@ -252,6 +276,9 @@ _LIST_NOTICES: dict[str, str] = {
     DELETE_FAILED_CODE: DELETE_FAILED_NOTICE,
     DELETE_LOCKED_CODE: DELETE_LOCKED_NOTICE,
     BROWSE_LOCKED_CODE: BROWSE_LOCKED_NOTICE,
+    RESEND_DAMAGED_CODE: RESEND_DAMAGED_NOTICE,
+    DELETE_DAMAGED_CODE: DELETE_DAMAGED_NOTICE,
+    BROWSE_DAMAGED_CODE: BROWSE_DAMAGED_NOTICE,
     BROWSE_HOP_REFUSED_CODE: BROWSE_HOP_REFUSED_NOTICE,
     BROWSE_THROTTLED_CODE: BROWSE_THROTTLED_NOTICE,
     KEY_SERVICE_BUSY_CODE: KEY_SERVICE_BUSY_NOTICE,
@@ -308,8 +335,19 @@ _BROWSE_CODES: dict[int, str] = {
 _MINTED_FILE_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
 
+#: The code a locked refusal becomes when the engine's detail says the file is damaged.
+_DAMAGED_CODES: dict[str, str] = {
+    BROWSE_LOCKED_CODE: BROWSE_DAMAGED_CODE,
+    RESEND_LOCKED_CODE: RESEND_DAMAGED_CODE,
+    DELETE_LOCKED_CODE: DELETE_DAMAGED_CODE,
+}
+
+
 def _refusal_code(exc: HTTPException, codes: dict[int, str]) -> str | None:
     """The allow-listed code for an engine refusal, or ``None`` for one ``codes`` does not map.
+
+    A 423 whose detail is the engine's damaged-file text maps to that operation's damaged code
+    (BACKLOG #5388 added item 1), so its notice offers no key or rotate-key remedy.
 
     A 503 that carries ``Retry-After`` is a key-service outage (BACKLOG #3734), whatever ``codes``
     maps 503 to, because there an uploads store IS configured. It is told apart by its header, not
@@ -318,7 +356,11 @@ def _refusal_code(exc: HTTPException, codes: dict[int, str]) -> str | None:
     outage too. At least today, the handlers raise no other."""
     if exc.status_code == _UNAVAILABLE_STATUS and "Retry-After" in (exc.headers or {}):
         return KEY_SERVICE_BUSY_CODE
-    return codes.get(exc.status_code)
+    code = codes.get(exc.status_code)
+    damaged = _DAMAGED_CODES.get(code) if code is not None else None
+    if damaged is not None and exc.detail == _ENGINE_DAMAGED_DETAIL:
+        return damaged
+    return code
 
 
 def _log_file_id(file_id: str) -> str:
