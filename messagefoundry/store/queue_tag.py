@@ -35,7 +35,7 @@ import json
 import logging
 import time
 from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING, Any, Final, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Protocol
 
 from messagefoundry.store.crypto import (
     NO_STORE_ID,
@@ -208,7 +208,7 @@ class QueueTagError(CipherError):
 
     #: Whether the refusal is drift, which is audited and alerted. :class:`CorruptQueueCellError`
     #: is not.
-    drift: bool = True
+    drift: ClassVar[bool] = True
 
 
 class CorruptQueueCellError(QueueTagError):
@@ -503,24 +503,28 @@ async def report_queue_tag_failure(
     logged."""
     if error.drift:
         ref = str(row["id"])[:_ROW_REF_LEN]
+        stage = row["stage"]  # outside the try, so a missing column is not logged as the audit's
         try:
             await store.record_audit(
                 QUEUE_TAG_FAILED_ACTION,
                 actor="system",
                 channel_id=row["channel_id"],
-                detail=json.dumps({"queue_row": ref, "stage": row["stage"]}, sort_keys=True),
+                detail=json.dumps({"queue_row": ref, "stage": stage}, sort_keys=True),
             )
         except Exception:  # noqa: BLE001 -- the dead-letter stands whatever the audit write does
             _log.exception("the %s audit row could not be written", QUEUE_TAG_FAILED_ACTION)
     alert_queue_tag_failure(cipher, row, error=error, outcome=outcome)
 
 
-def _log_corrupt(row: Any, outcome: str) -> None:
+def _log_corrupt(row: Any, error: QueueTagError, outcome: str) -> None:
+    """The one signal a corrupt cell leaves. ``error`` carries the cipher's reason, which names
+    no row value."""
     _log.warning(
-        "a %s queue row's payload is corrupt and %s (row %s)",
+        "a queue row's payload (stage %s, row %s) is corrupt and %s: %s",
         row["stage"],
-        outcome,
         str(row["id"])[:_ROW_REF_LEN],
+        outcome,
+        error,
     )
 
 
@@ -535,7 +539,7 @@ def alert_queue_tag_failure(
     so. Names the row by its stage and a short id prefix, never a row value. A corrupt cell
     (``error`` is not drift, :class:`CorruptQueueCellError`) is only logged. Never raises."""
     if not error.drift:
-        _log_corrupt(row, outcome)
+        _log_corrupt(row, error, outcome)
         return
     reason = (
         f"a {row['stage']} queue row failed its integrity tag and {outcome}"

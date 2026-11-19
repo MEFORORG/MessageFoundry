@@ -377,12 +377,15 @@ async def test_a_corrupt_cell_under_a_held_key_is_dead_lettered_unaudited(
     its AEAD check reads a corrupt cell, not drift, so the claim dead-letters it with no tag-failed
     audit row."""
     store, cipher, db = await _open(tmp_path)
+    alerts: list[str] = []
+    cipher.set_tag_failure_hook(lambda _table, reason: alerts.append(reason))
     try:
         cipher.fault = lambda: CipherError("synthetic corrupt envelope")
         cipher.healthy_opens = 0
         assert all(i.payload != "B1" for i in await claim(store))
         assert _rows(db)[0][0] == "dead"
         assert _audited(db) == 0
+        assert alerts == []
     finally:
         await store.close()
 
