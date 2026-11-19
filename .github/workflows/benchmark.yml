@@ -646,7 +646,7 @@ jobs:
           MEFOR_STORE_DATABASE: MessageFoundryFailover
         run: |
           set +e
-          python -m harness --failover failover --db-backend sqlserver \
+          python -m harness --failover failover-sqlserver --db-backend sqlserver \
             --report-json out/load/failover-sqlserver.json
           echo "failover exit: $?"
           set -e

@@ -73,6 +73,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StorePrivilegeStatus,
     StoreSettings,
+    _clamped_statement_timeout,
 )
 from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
@@ -1120,20 +1121,6 @@ def _applock_timeout_ms(command_timeout: int) -> int:
 #: at a fixed bound that none does. It stays short enough that ``safe_exc``'s default limit keeps
 #: the whole rendered message, at any timeout (BACKLOG #5064).
 CLAMPED_BORROW_ADVICE = "its [cluster] clamp's setting, if any (docs/CONFIGURATION.md [cluster])"
-
-
-def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
-    """The whole-second pyodbc statement timeout for a statement clamped below ``command_timeout``
-    (ADR 0157 Inc 0: the cluster coordinator's maintenance loop and stepdown, BACKLOG #5064).
-
-    pyodbc's ``Connection.timeout`` is an integer, so the clamp rounds DOWN, never up: a bound that
-    rounded up could land past the detection margin the clamp was checked against. It never drops
-    below 1, because 0 means no limit at all. A clamp under one second cannot be expressed, and
-    ``ServiceSettings._sqlserver_renew_clamp_whole_seconds`` refuses one at config load. A
-    ``command_timeout`` shorter than the clamp still wins, and ``command_timeout == 0`` (no limit)
-    leaves the clamp as the only bound."""
-    whole = max(1, math.floor(clamp_seconds))
-    return min(whole, command_timeout) if command_timeout > 0 else whole
 
 
 def _restore_statement_timeout(raw: Any, previous: int) -> None:

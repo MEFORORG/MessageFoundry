@@ -394,7 +394,7 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    the same exit. As on Postgres, a shorter `command_timeout` still wins. Two differences from
 >    Postgres. First, the timeout counts whole seconds, so the clamp is rounded DOWN, never above the
 >    value `_renew_fits_the_margin` checked, and never below 1, and
->    `ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses a clamp under 1 s on this
+>    `ServiceSettings._sqlserver_renew_bounds` refuses a clamp under 1 s on this
 >    backend. Second, it binds each call on its own, never a shared deadline: the claim, and since
 >    BACKLOG #5064 the loop's other statements and the stepdown release. Each call's borrow waits at
 >    most the clamp too, but
@@ -410,6 +410,18 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    residual (Manager decision d20261030T213636115-0af931): the margin check is unchanged, and
 >    `serve` logs `ServiceSettings.sqlserver_renew_bound_warning` at start-up, without refusing, when
 >    twice the clamp reaches the margin. Deviation 4 says what that means for the derived default.
+>    **As built since BACKLOG #5979, the residual is narrower:** `ServiceSettings._sqlserver_renew_bounds`
+>    now checks the pool wait plus the whole-second statement timeout against the margin at load. A
+>    set clamp whose two windows reach it is refused, a derived one is stepped down to the largest
+>    whole second that fits, and a fence/TTL pair no clamp of at least 1 s fits is refused. At
+>    least two steps stay outside that check: the cursor's creation between the windows and the
+>    COMMIT after them. No load-time check covers them, and that is the remaining residual. The
+>    warning above, which is unchanged, does not cover them either: it fires only when twice the
+>    clamp reaches the margin, and at the stock `[store]` timeouts (30 s each) a whole-second clamp
+>    of at most 30 s has two windows of exactly twice the clamp, so such a clamp that passes the
+>    refusal never draws it. Such a clamp passing with little headroom, or a derived one stepped
+>    down, therefore logs nothing. At least a fractional clamp, such as the stock derived 4.5, or a
+>    clamp above a timeout that caps it, can still draw it.
 >    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, by the warning's arithmetic and
 >    by a timing test of the two windows, and its gated test shows the driver
 >    ending a slow statement at the clamp.

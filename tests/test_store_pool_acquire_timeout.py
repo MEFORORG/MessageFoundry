@@ -988,9 +988,10 @@ def test_store_acquire_timeout_default_matches_the_connector_tier() -> None:
     assert DEFAULT_STORE_ACQUIRE_TIMEOUT == _DEFAULT_DB_ACQUIRE_TIMEOUT
 
 
-@pytest.mark.parametrize("bad", [0.0, -1.0])
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
 def test_store_acquire_timeout_must_be_positive(bad: float) -> None:
     """No "0 disables" escape hatch, unlike ``command_timeout``: an unbounded pool wait is the defect
-    the setting exists to remove, so it must not be configurable back."""
+    the setting exists to remove, so it must not be configurable back. NaN passes a ``<= 0`` test
+    and inf passes ``> 0``, so those two pin the finite positive form (BACKLOG #5979)."""
     with pytest.raises(ValueError, match="acquire_timeout must be > 0"):
         StoreSettings(acquire_timeout=bad)

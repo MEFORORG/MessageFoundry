@@ -28,6 +28,8 @@ types = ["ADT"]
 
 # Tuned-short lease timings (heartbeat < fence < ttl) so a CI crash-failover completes in seconds; the
 # recovery SLO is relative to the TTL, so it stays valid if these are retuned for a slower network.
+# These are the Postgres timings. SQL Server refuses 4.0 / 6.0 at config load (BACKLOG #5979), so the
+# SQL Server leg runs failover-sqlserver.toml, which differs only in its TTL.
 [load.failover]
 kill_at_fraction = 0.5
 heartbeat_seconds = 2.0
