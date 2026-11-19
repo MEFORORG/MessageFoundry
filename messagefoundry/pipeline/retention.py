@@ -938,15 +938,12 @@ class RetentionRunner:
 
         Resolved each pass so a reload that changes an override takes effect on the next pass. Returns
         empty maps when no registry is wired (single global cutoff, byte-identical to the prior
-        behaviour)."""
+        behaviour). The inbound map spans every engine shard (:meth:`Registry.inbound_messages_days`,
+        BACKLOG #5889)."""
         registry = self._registry_source() if self._registry_source is not None else None
         if registry is None:
             return {}, {}
-        messages = {
-            ic.name: ic.messages_days
-            for ic in registry.inbound.values()
-            if ic.messages_days is not None
-        }
+        messages = dict(registry.inbound_messages_days())
         dead = {
             oc.name: oc.dead_letter_days
             for oc in registry.outbound.values()

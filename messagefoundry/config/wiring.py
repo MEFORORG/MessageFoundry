@@ -6842,6 +6842,14 @@ class Registry:
     all_inbound_guard_settings: (
         Mapping[str, tuple[ConnectorType, Mapping[str, Any] | None]] | None
     ) = None
+    # EVERY inbound's explicit `messages_days` retention override in the deployment (NAME -> days,
+    # 0 = keep forever; an inbound that inherits the global window is omitted), pinned beside the
+    # shard identity by pipeline.sharding (None on an unfiltered graph / single-shard config). Read
+    # through :meth:`inbound_messages_days`, at least by the retention runner's body purge, which
+    # runs over the UNIFIED store every shard shares (ADR 0063): keyed off `inbound` alone it would
+    # apply the global cutoff to a sibling shard's keep-forever or longer-window bodies (BACKLOG
+    # #5889).
+    all_inbound_messages_days: Mapping[str, int] | None = None
     # The directory :func:`load_config` read this graph from, or None for a graph built in code. A
     # `[sandbox].mode=subprocess` worker re-loads its Router/Handler functions from here, so after
     # an operator reload from another root the workers load the root the running graph came from,
@@ -6888,6 +6896,19 @@ class Registry:
             name: ic.deployed
             for name, ic in self.inbound.items()
             if ic.spec.type is ConnectorType.PT
+        }
+
+    def inbound_messages_days(self) -> Mapping[str, int]:
+        """Every inbound's explicit ``messages_days`` override in the deployment (#34, ADR 0027), NAME
+        -> days, 0 = keep forever, an inheriting inbound omitted: the pinned unfiltered map when this
+        is one engine shard's filtered view, else derived from this graph's own inbounds. Why it
+        spans the deployment: the ``all_inbound_messages_days`` field comment."""
+        if self.all_inbound_messages_days is not None:
+            return self.all_inbound_messages_days
+        return {
+            ic.name: ic.messages_days
+            for ic in self.inbound.values()
+            if ic.messages_days is not None
         }
 
     def add_inbound(self, conn: InboundConnection) -> None:
