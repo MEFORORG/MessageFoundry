@@ -216,8 +216,13 @@ async def test_send_reports_a_missing_validated_directory_in_words(tmp_path: Pat
     with pytest.raises(DeliveryError) as raised:
         await dest.send(BODY)
     assert str(raised.value) == (
-        f"file write failed: FileNotFoundError: [Errno {errno.ENOENT}] destination directory does "
-        f"not exist and validate_directory is on, so it is never created on write (directory {out})"
+        f"file write failed: FileNotFoundError: [Errno {errno.ENOENT}] missing, and "
+        f"validate_directory never creates it (directory {out})"
+    )
+    # The directory survives the stored text's length bound even when the path is long.
+    long_out = Path(r"\\hl7-share01.corp.example\interfaces\outbound\OB_ACME_ADT\drop")
+    assert str(long_out) in safe_exc(
+        DeliveryError(str(raised.value).replace(str(out), str(long_out)))
     )
 
 

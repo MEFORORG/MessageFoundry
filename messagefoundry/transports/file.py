@@ -604,15 +604,8 @@ class FileDestination(DestinationConnector):
         try:
             await self._run_fs(self._write, payload)
         except OSError as exc:
-            # The text goes at least to last_error and the alert reason, so it keeps the type, errno
-            # and OS text, never the raw OS message, as _write does (BACKLOG #5302). A credential
-            # logon error carries fixed words and a Win32 code, so its message is kept.
-            fixed_message = isinstance(exc, wincred.CredentialLogonError)
-            reason = (
-                _describe_os_error(exc)
-                if exc.errno is not None or fixed_message
-                else type(exc).__name__
-            )
+            # Raised before a name was rendered, but reduced the way _write's arm is (BACKLOG #5302).
+            reason = _write_failure_reason(exc)
         else:
             return
         # Raised outside the handler, so the OS error is neither __cause__ nor __context__. The
@@ -673,12 +666,10 @@ class FileDestination(DestinationConnector):
         already probed ``is_dir()`` on its ``FileExistsError`` branch, which is the common one."""
         if self.validate_directory:
             if not self.directory.is_dir():
-                # An errno, so send reports the words; it names the directory itself.
+                # An errno, so send keeps these words; send adds the directory itself. Short, so the
+                # stored text's length bound leaves room for that directory after them.
                 raise FileNotFoundError(
-                    errno.ENOENT,
-                    "destination directory does not exist and validate_directory is on, so it is "
-                    "never created on write",
-                    str(self.directory),
+                    errno.ENOENT, "missing, and validate_directory never creates it"
                 )
             return
         try:
@@ -709,16 +700,8 @@ class FileDestination(DestinationConnector):
             self._write_as(name, target, payload)
         except OSError as exc:
             # An OS error quotes the path it failed on, and its last part is this name, rendered
-            # from message fields, or a bumped name-1.ext of it. The error text goes at least to
-            # last_error and to the stored alert reason, so it keeps the type, errno and OS text
-            # only (BACKLOG #2814). An OSError with no errno keeps its type alone, unless it is one of
-            # this module's own, whose fixed message never names a file.
-            fixed_message = isinstance(exc, (_Unconfined, _Replaced))
-            reason = (
-                _describe_os_error(exc)
-                if exc.errno is not None or fixed_message
-                else type(exc).__name__
-            )
+            # from message fields, or a bumped name-1.ext of it (BACKLOG #2814).
+            reason = _write_failure_reason(exc)
         else:
             return
         # Raised outside the handler, so the OS error, which quotes the path, is on neither
@@ -3040,6 +3023,20 @@ def _describe_os_error(
         return f"{type(exc).__name__}: [Errno {exc.errno}] {exc.strerror or ''}".rstrip()
     # A message-only OSError keeps its message, redacted, with the known name swapped for a label.
     return safe_exc(exc, file_name=file_name)
+
+
+def _write_failure_reason(exc: OSError) -> str:
+    """The reason a file delivery failed, as its DeliveryError carries it (BACKLOG #2814, #5302).
+
+    The text goes at least to last_error and the stored alert reason, so it keeps the type, errno
+    and OS text only, never the path an OS error quotes, whose last part can be a name rendered from
+    message fields. An OSError with no errno keeps its type alone, unless its message is fixed words
+    that never name a file: this module's own refusals, and a credential logon error, which carries
+    a Win32 code."""
+    fixed_message = isinstance(exc, (_Unconfined, _Replaced, wincred.CredentialLogonError))
+    if exc.errno is not None or fixed_message:
+        return _describe_os_error(exc)
+    return type(exc).__name__
 
 
 class _Unconfined(OSError):
