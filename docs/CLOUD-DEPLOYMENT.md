@@ -340,17 +340,17 @@ durability (the WAN buffer) requires the store volume to **persist** like any at
 
 ---
 
-## 6. Off-box log forwarding — NOT in this manifest
+## 6. Off-box log forwarding — a required input, shipped commented out
 
-The built `[logging]` off-box forwarder (`[logging].forward_*` → syslog/SIEM) supports **native TLS**
-(`forward_protocol = "tls"`, RFC 5425 — ADR 0080; `SyslogProtocol.TLS` alongside the UDP/TCP variants in
-[`config/settings.py`](../messagefoundry/config/settings.py), with a CA anchor via `forward_tls_*`). The
-**default is UDP**, though, so enabling forwarding from an ephemeral cloud pod *without setting the protocol*
-would put PHI-adjacent log metadata on the wire in cleartext. It is therefore **deliberately omitted** from
-the HA manifest and is **not** turned on here. **Do not "flip it on" without also setting the transport.**
-For any prod-HA enablement, set `forward_protocol = "tls"` with a pinned CA — or, if your collector cannot
-terminate TLS, pair it with a **TLS-forwarding sidecar** (or rely on the container runtime's log driver to a
-TLS-terminating collector).
+An enforcing `serve --env prod` start, which is what the HA manifest runs, refuses until off-box log
+forwarding is configured: verified TLS (`forward_protocol = "tls"`, RFC 5425, ADR 0080, with a CA anchor
+in `forward_tls_ca_file`) to a collector that is not on this host, and on the `[egress].allowed_syslog`
+list. A loopback collector, such as a TLS-forwarding sidecar in the same pod, does not pass that gate.
+The HA manifest names these inputs in its block *what an enforcing start needs*, but ships them
+commented out, so an unedited manifest is refused rather than started with a placeholder collector.
+Uncomment them with your own collector. The `log-spool` emptyDir that holds records the collector has
+not yet taken keeps those redacted log records on the node's disk, so the node disk encryption your
+platform provides applies to it.
 
 ---
 

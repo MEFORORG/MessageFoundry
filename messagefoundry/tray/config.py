@@ -85,16 +85,22 @@ class TrayConfig:
     log_path: str | None = None
     #: A PEM the probe pins as its ONLY trust anchor, or ``None`` for the OS trust store.
     engine_cacert: str | None = None
+    #: True when the host in ``engine_url`` came from the local service's own settings file or the
+    #: engine default, not from ``serve --host`` or ``tray.toml``. That engine is the service on
+    #: this machine whatever address it binds (BACKLOG #5936).
+    host_from_local_service: bool = False
 
     @property
     def monitor_only(self) -> bool:
         """A **remote** engine → monitor-only (service control + Open-Repo disabled).
 
-        Keyed on locality alone: a loopback engine is controllable whether it serves http or
-        https (see the module docstring). Only a non-loopback host degrades the tray, because
-        only then are "start the local service" and "open the local repo" meaningless.
+        Keyed on locality: a loopback engine is controllable whether it serves http or https (see
+        the module docstring). A host the tray read from the local service's own settings file is
+        controllable too, whatever address it binds, since that service runs here. Otherwise only
+        a non-loopback host degrades the tray, because only then are "start the local service"
+        and "open the local repo" meaningless.
         """
-        return not is_local_engine(self.engine_url)
+        return not (self.host_from_local_service or is_local_engine(self.engine_url))
 
 
 @dataclass(frozen=True)
@@ -547,6 +553,7 @@ def compose_config(
     repo_path: str | None = None
     poll_seconds = DEFAULT_POLL_SECONDS
     log_path: str | None = None
+    host_from_local_service = False
 
     # Registry hints (untrusted; validated).
     if reg is not None:
@@ -561,6 +568,9 @@ def compose_config(
         )
         if url_hint is not None:
             engine_url = url_hint
+            # The settings file or the default named the host, not `serve --host`: this is the
+            # local service, whatever it binds, so service control stays on (BACKLOG #5936).
+            host_from_local_service = host_hint is None
         repo_path = (
             parse_project_root_arg(reg.app_parameters or "")
             or _clean_path_hint(reg.app_directory)
@@ -574,6 +584,7 @@ def compose_config(
         if isinstance(raw_url, str) and raw_url:
             engine_url = raw_url
             cacert = None
+            host_from_local_service = False
         raw_cacert = _clean_path_hint(toml_data.get("engine_cacert"))
         if raw_cacert is not None and Path(raw_cacert).is_absolute():
             cacert = raw_cacert
@@ -593,6 +604,7 @@ def compose_config(
         poll_seconds=poll_seconds,
         log_path=log_path,
         engine_cacert=cacert,
+        host_from_local_service=host_from_local_service,
     )
 
 

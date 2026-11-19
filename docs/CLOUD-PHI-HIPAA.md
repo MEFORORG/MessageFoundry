@@ -154,13 +154,12 @@ PHI at rest is protected in **two layers**, and the engine layer is **fail-close
 
 ## 7. Known residuals
 
-- **Off-box syslog is not enabled in the cloud manifest (enable it with TLS).** `[logging].forward_*` is
-  **omitted** from the HA manifest and is **not** flipped on by this guide — but the forwarder does support
-  **native TLS** (`SyslogProtocol.TLS`, RFC 5425 — ADR 0080;
-  [`config/settings.py`](../messagefoundry/config/settings.py)), so when you enable off-box shipping set
-  `[logging].forward_protocol = "tls"` with a `forward_tls_ca_file` trust anchor (verification is on by
-  default). Do **not** enable the plaintext UDP/TCP forwarder for PHI-adjacent log metadata; if you must,
-  front it with a TLS sidecar/collector first.
+- **Off-box syslog is a required input that the HA manifest names but ships commented out.** An enforcing
+  `--env prod` start refuses until `[logging].forward_*` is configured with verified TLS
+  (`forward_protocol = "tls"`, `SyslogProtocol.TLS`, RFC 5425, ADR 0080) to a collector that is not on
+  this host, so a loopback TLS sidecar does not pass; [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md)
+  section 6 says what to set. The HA manifest's `log-spool` emptyDir keeps redacted log records the
+  collector has not yet taken on the node's disk, so node disk encryption applies to it.
 - **In-engine TLS revocation is delegated** ([ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md)).
   For enforced OCSP/CRL revocation, terminate with an **OCSP-must-staple** proxy in front of a
   loopback-bound engine (the same-pod sidecar in [`../docker/README.md`](../docker/README.md)). An

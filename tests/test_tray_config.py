@@ -850,3 +850,31 @@ def test_load_config_reads_the_bind_from_the_service_toml(tmp_path: Path) -> Non
     cfg = load_config(tmp_path, reader)
     assert cfg.engine_url == "https://127.0.0.1:9443"
     assert cfg.monitor_only is False
+
+
+def test_load_config_a_lan_bind_from_the_service_toml_keeps_service_control(
+    tmp_path: Path,
+) -> None:
+    """The local service bound to a LAN address is still the service on this machine."""
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[security]\nlocal_access_only = false\nlisten_address = "10.0.0.5"\n'
+        '[api]\ntls_cert_file = "engine.pem"\n',
+        encoding="utf-8",
+    )
+    reader = _FakeReader(
+        ServiceRegistryInfo(app_directory=str(tmp_path), app_parameters="serve --config C:\\cfg")
+    )
+    cfg = load_config(tmp_path, reader)
+    assert cfg.engine_url == "https://10.0.0.5:8765"
+    assert cfg.monitor_only is False
+
+
+def test_a_host_from_the_command_line_or_tray_toml_keeps_the_locality_rule() -> None:
+    """``serve --host`` and an operator's engine_url are not read as the local service."""
+    reg = ServiceRegistryInfo(app_parameters="serve --host 10.0.0.5 --port 9100")
+    assert compose_config(None, reg).monitor_only is True
+    reg = ServiceRegistryInfo(app_parameters="serve")
+    cfg = compose_config(
+        {"engine_url": "https://10.0.0.5:7000"}, reg, service_bind=("10.0.0.5", None)
+    )
+    assert cfg.monitor_only is True
