@@ -14031,7 +14031,8 @@ def _security(args: argparse.Namespace) -> int:
                 "equal to the file's value, or one whose value is no loosening, adds no entry, and "
                 "at least the require_mfa and block_unlisted_outbound variables are never named. "
                 "That needs a whole-file load that ran and succeeded: `show` on an absent file runs "
-                "none and names none, while `set` on a new file loads what it wrote and names it. "
+                "none and names none, while `set` on a new file loads what it wrote and names it, "
+                "unless the edit changed nothing, which writes no file and so loads none. "
                 "The other sections are read as the whole-file load "
                 "resolves them, so a MEFOR_<SECTION>_<KEY> variable in THIS command's environment "
                 "counts there, which may not be the service's. One entry is not read from the "
@@ -14105,20 +14106,26 @@ def _security(args: argparse.Namespace) -> int:
         # operator meant to reset in place. A non-null unknown key is refused by the whole-file
         # load; a null one never reaches it. One the file does carry may be reset, since removing
         # it is the repair for a file the load refuses.
-        # No nearest spelling for a removed key: for require_sign_in it is require_mfa, another switch.
-        unknown = [
-            (table, key, None if (table, key) in _REMOVED_KEYS else near)
-            for table, key, near in _unknown_keys(
+        unknown = list(
+            _unknown_keys(
                 "security",
                 SecuritySettings,
                 {k: v for k, v in updates.items() if v is None and k not in merged},
             )
-        ]
+        )
         if unknown:
+            # A removed key is named with the decision that removed it, never a nearest spelling:
+            # for require_sign_in that would be require_mfa, another switch.
+            named = "; ".join(
+                f"[security].{key} (removed: {_REMOVED_KEYS[(table, key)]})"
+                if (table, key) in _REMOVED_KEYS
+                else _unknown_key_report([(table, key, near)])
+                for table, key, near in unknown
+            )
             return _emit_error(
-                f"refused, nothing written: {_unknown_key_report(unknown)} is not a [security] "
-                "key, so a null reset of it would change nothing. Check the spelling against "
-                "docs/CONFIGURATION.md.",
+                "refused, nothing written: a null value resets a [security] key, and each key "
+                f"named here is neither a [security] key nor set in the file, so resetting it "
+                f"would change nothing: {named}. Check the spelling against docs/CONFIGURATION.md.",
                 as_json=args.json,
             )
         for key, value in updates.items():

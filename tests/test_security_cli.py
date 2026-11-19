@@ -126,8 +126,68 @@ def test_null_reset_of_a_removed_key_offers_no_spelling(
         ]
     )
     err = capsys.readouterr().err
-    assert rc != 0 and "require_sign_in" in err and "did you mean" not in err
+    assert rc != 0 and "require_sign_in (removed: " in err and "did you mean" not in err
     assert not toml.exists()
+
+
+def test_null_reset_refusal_names_every_unknown_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    toml = tmp_path / "mf.toml"
+    rc = main(
+        [
+            "security",
+            "set",
+            "--service-config",
+            str(toml),
+            "--data",
+            json.dumps({"require_mfx": None, "block_unlisted_outbund": None}),
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc != 0 and "require_mfx" in err and "block_unlisted_outbund" in err
+
+
+def test_an_edit_that_changes_nothing_still_refuses_a_file_the_engine_refuses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An edit that writes nothing must not report a file the whole-file load refuses as fine:
+    before BACKLOG #5327 every set ran that load, so the no-op path keeps running it."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[auth]\nenabled = false\n", encoding="utf-8")
+    before = toml.read_bytes()
+    rc, _ = _set(toml, {"require_mfa": None}, capsys)
+    assert rc == 1 and toml.read_bytes() == before
+
+
+def test_a_value_the_file_already_holds_is_unchanged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    toml = tmp_path / "mf.toml"
+    _set(toml, {"require_mfa": False}, capsys)
+    before = toml.read_bytes()
+    rc, res = _set(toml, {"require_mfa": False}, capsys)
+    assert rc == 0 and res["op"] == "unchanged" and res["unchanged"] == ["require_mfa"]
+    assert toml.read_bytes() == before
+    # The loosening the file still carries is still reported.
+    assert "require_mfa" in [lo["switch"] for lo in res["loosenings"]]
+
+
+def test_every_ide_security_field_is_a_security_setting() -> None:
+    """The IDE editor sends null for each field at its default, and a null reset of a key
+    [security] does not define is refused (BACKLOG #5327), so a field the model dropped would
+    block every IDE save. TypeScript cannot import the Python, so this reads the source."""
+    import re
+
+    from messagefoundry.config.settings import SecuritySettings
+
+    source = (
+        Path(__file__).resolve().parent.parent / "ide" / "src" / "securityEditorWebview.ts"
+    ).read_text(encoding="utf-8")
+    block = source.split("export const FIELDS", 1)[1].split("\n];", 1)[0]
+    keys = re.findall(r'\{\s*key\s*:\s*"([^"]+)"', block)
+    assert len(keys) > 5  # the parse found the entries
+    assert set(keys) <= set(SecuritySettings.model_fields)
 
 
 def test_null_reset_of_an_unknown_key_the_file_carries_removes_it(
