@@ -29,6 +29,11 @@
   answers `AR` on MLLP, and so does every streaming-detach refusal the receipt path answers as final.
   The 2026-10-30 amendment keeps its text, with a dated note in place. See
   [Amendment 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary).
+- **Amended 2026-11-18 (BACKLOG #5895):** a sync-reply turn settles only once the message is
+  terminal, on the whole `reply_from` row set: every row `dead` or `cancelled` is `failed`, and any
+  `done` row with no captured reply is `empty` rather than `no_route`. D3's table, D5's table and
+  **AC-4** are revised in place, each with a dated note. See
+  [Amendment 2026-11-18, sync-reply row set](#amendment-2026-11-18-a-sync-reply-turn-settles-on-the-row-set-once-the-message-is-terminal).
 - **Amended 2026-11-04 (BACKLOG #5102, #5101; Manager decision d20261104T003342588-cbb49e):** an
   operator-only fault at intake, at least an inbound codec name that sets up no decode, is a
   **configuration** refusal: **`503` with no `Retry-After`** on `Http()` and `AE` on MLLP and TCP.
@@ -447,12 +452,17 @@ Each tick:
 
 | Observed | Action |
 |---|---|
-| a `reply_from` row is **`done`** *via capture* | **one** `correlate_response(message_id)` read; filter `kind == "response"` **and** `destination_name == reply_from`; take `max(response_seq)`; then map the captured row's **`outcome`** field: `accepted` → `reply`, `no_reply` → `empty`, `rejected`/`unparseable` → `rejected` |
-| a `reply_from` row is `done` but **no qualifying `response` row** (a plain `mark_done`, or retention nulled the body) | `purged` if the row exists with a null body; else, once **every** `reply_from` row is settled (`done`/`dead`/`cancelled`) **and** the message is terminal, `failed` — distinguished, not conflated |
-| **every** `reply_from` row is terminal-failed (**`dead`** or **`cancelled`**) and none is `done` | **fail immediately** (`failed`); one such row beside a `pending`/`inflight` sibling row keeps waiting |
-| `messages.status` is **terminal** — defined as **anything other than `RECEIVED` or `ROUTED`**, which therefore includes `PROCESSED` — **and** no `reply_from` row and no qualifying `response` row exists | **fail immediately** (`no_route`) |
-| a `reply_from` row is `pending`/`inflight`, **or** the message is still `RECEIVED`/`ROUTED` | keep waiting |
-| no `reply_from` row yet and the message is still `RECEIVED`/`ROUTED` | **keep waiting** — a sibling handler may simply not have transformed yet |
+| a qualifying `response` row is committed | **one** `correlate_response(message_id)` read; filter `kind == "response"` **and** `destination_name == reply_from`; take `max(response_seq)`; `purged` if no row survives the filter or its body is null (retention); else map the captured row's **`outcome`** field: `accepted` → `reply`, `no_reply` → `empty`, `rejected`/`unparseable` → `rejected` |
+| no qualifying `response` row, and the message is still `RECEIVED`/`ROUTED` | **keep waiting**, whatever the `reply_from` rows read: a sibling handler may not have transformed yet, and its row may still capture the reply |
+| no qualifying `response` row, the message is **terminal** (defined as **anything other than `RECEIVED` or `ROUTED`**, which therefore includes `PROCESSED`), and no `reply_from` row | **fail immediately** (`no_route`) |
+| as above, but every `reply_from` row is **`dead`** or **`cancelled`** | **fail immediately** (`failed`) |
+| as above, but every `reply_from` row is settled (`done`, `dead` or `cancelled`) and at least one is `done` | **answer immediately** (`empty`): delivered, with no reply captured (a plain `mark_done`, as shadow mode performs) |
+| as above, but a `reply_from` row is `pending`, `inflight` or any other state | keep waiting |
+
+*(Note 2026-11-18, BACKLOG #5895: this table was revised in place. It now has one row per state and
+settles a turn only on a terminal message. Before, one `dead` or `cancelled` row failed the turn
+beside a live sibling row, and a `done` row with no capture on a terminal message answered
+`no_route`. See [Amendment 2026-11-18, sync-reply row set](#amendment-2026-11-18-a-sync-reply-turn-settles-on-the-row-set-once-the-message-is-terminal).)*
 
 **The terminal set is defined by exclusion (`not in (RECEIVED, ROUTED)`), never by enumeration**, and that
 is a correctness requirement rather than a stylistic preference. An enumerated list
@@ -596,14 +606,17 @@ two rows with no outcome and one that needed a body it might not have.
 | Outcome | Condition | HTTP | Body |
 |---|---|---|---|
 | `reply` | captured `accepted` | `200` | partner reply verbatim |
-| `empty` | captured `no_reply` | `204` (or `200` per `reply_on_empty`) | none |
+| `empty` | captured `no_reply`; or the message is terminal, every `reply_from` row is settled, and at least one is `done` with no captured reply | `204` (or `200` per `reply_on_empty`) | none |
 | `rejected` | captured `rejected` / `unparseable` | `502` | partner reply verbatim |
-| `failed` | every `reply_from` row `dead`/`cancelled` (the common partner-4xx case); or the message is terminal and every `reply_from` row is settled, at least one `done` with no captured reply | `502` | fixed non-PHI JSON + `message_id` |
+| `failed` | the message is terminal and every `reply_from` row is `dead`/`cancelled` (the common partner-4xx case) | `502` | fixed non-PHI JSON + `message_id` |
 | `purged` | captured row exists, body nulled by retention | `502` | fixed non-PHI JSON |
 | `no_route` | `UNROUTED` / `FILTERED` / `NOT_DEPLOYED` | `reply_on_timeout` status, **immediately** | fixed JSON |
 | `timeout` | `reply_timeout` expired | `504` (default) / `202` | `{"status":"timeout","message_id":…}` |
 | `degraded` | store read raised / rendezvous full | configured fallback | fixed JSON |
 | `shutting_down` | listener stopped mid-block (D2/AC-9) | `503` + `Retry-After` | fixed JSON |
+
+*(Note 2026-11-18, BACKLOG #5895: the `empty` and `failed` rows were revised in place. See
+[Amendment 2026-11-18, sync-reply row set](#amendment-2026-11-18-a-sync-reply-turn-settles-on-the-row-set-once-the-message-is-terminal).)*
 
 `degraded` is its own outcome, not folded into `timeout`, because D8's SLO series
 `rate(timeout)/rate(total)` is *the proxy API's error budget* — counting engine store errors as partner
@@ -999,11 +1012,14 @@ to skip auth.
   `reply_on_timeout="202"`) AND SHALL leave the message committed and still flowing, with its disposition
   decided only by the finalizer — the HTTP status SHALL NOT act as a disposition.
   → `tests/test_inbound_http_sync_reply.py::test_timeout_returns_504_and_message_keeps_flowing`
-- **AC-4** — IF the `reply_from` outbound row reaches `dead` or `cancelled`, THEN THE SYSTEM SHALL fail the
-  HTTP turn immediately; AND IF the router produces `UNROUTED`, THE SYSTEM SHALL fail immediately from the
+- **AC-4** — IF every `reply_from` outbound row reaches `dead` or `cancelled` and the message is terminal,
+  THEN THE SYSTEM SHALL fail the HTTP turn immediately; AND IF the router produces `UNROUTED`, THE SYSTEM SHALL fail immediately from the
   **router** worker; AND IF the transform stage produces `FILTERED` or `NOT_DEPLOYED`, THE SYSTEM SHALL fail
   immediately from the **transform** worker — not after `reply_timeout`.
   → `tests/test_inbound_http_sync_reply.py::test_terminal_states_fail_fast_at_the_correct_stage`
+  *(Note 2026-11-18, BACKLOG #5895: AC-4 read "IF the `reply_from` outbound row reaches `dead` or
+  `cancelled`". It now waits for a terminal message, as revised D3 does; see
+  [Amendment 2026-11-18, sync-reply row set](#amendment-2026-11-18-a-sync-reply-turn-settles-on-the-row-set-once-the-message-is-terminal).)*
 - **AC-5** — WHERE the in-process rendezvous signal never fires (an engine shard owns the capturing outbound
   lane), THE SYSTEM SHALL still return the committed reply by polling the store, differing only in latency.
   → `tests/test_inbound_http_sync_reply.py::test_reply_returned_without_any_in_process_signal`
@@ -1758,6 +1774,38 @@ calls `FileSource._emit` and reads the one `ERROR` row; it drives neither `_scan
 `RemoteFileSource._hand_off`, so that the file is consumed is not tested, and the remote-file
 source is covered only by calling its batch split, `split_batch_bytes`, on a name that refuses
 every conversion.
+
+## Amendment 2026-11-18: a sync-reply turn settles on the row set, once the message is terminal
+
+D3's table read one `reply_from` row at a time. One `dead` or `cancelled` row failed the turn with
+`502` even while a sibling row to the same outbound was still `pending` or `inflight` and could yet
+capture the reply. A `done` row with no captured reply on a terminal message matched no failure
+row, and fell through to `no_route`, which tells the caller nothing was routed to an outbound that
+in fact took the message (BACKLOG #5895).
+
+The resolver now decides only on a **terminal message**, and on the **whole** `reply_from` row set:
+
+- While the message is `RECEIVED` or `ROUTED`, no row set settles the turn. A routed row carries a
+  null `destination_name`, so a sibling handler still upstream is invisible to the row read, and
+  its row to the same outbound may still capture the reply. The turn waits for the finalizer or for
+  `reply_timeout`.
+- On a terminal message, every row `dead` or `cancelled` is `failed`. That is still fast in the
+  common case: `mark_failed`, `cancel_queued` and `complete_with_response` each run the finalizer in
+  the same transaction as the row flip, so a lone failed row reads beside a terminal status on the
+  next tick. It waits only while a sibling handler's work is still in flight.
+- On a terminal message, a settled set with at least one `done` row and no capture is `empty`, the
+  outcome D5 already gives a delivery with no reply. It is answered `204` (or `200` per
+  `reply_on_empty`) and recorded as `reply_returned`. It is never `failed`, because a
+  `502 delivery_failed` for a delivered message invites the caller to send it again.
+- A terminal message with a live row keeps the turn waiting.
+
+One case moves from a fast `502` to waiting: a `dead` row beside a `done` one while the message is
+still `ROUTED`. That wait is the point of the change, since a sibling row may still capture the
+reply, and it ends when the finalizer marks the message terminal. Neither `dead` nor `cancelled` is
+treated as final for the turn on its own: `complete_with_response` refuses only a `done` row.
+
+D3's table, D5's `empty` and `failed` rows, and **AC-4** were revised in place, each with a dated
+note. `tests/test_b616_5895_sync_reply_row_states.py` pins this amendment.
 
 ## Note 2026-11-10: the refusal records the forwarded client beside the peer
 

@@ -39,11 +39,12 @@ _POLL_CEILING_SECONDS: Final = 0.25
 #: therefore scales with load rather than being a constant an operator has to reason about.
 _POLL_SCALE_AFTER_WAITERS: Final = 8
 
-#: Failed delivery states for an awaited destination's row: that row will never capture a reply.
+#: Failed delivery states for an awaited outbound's row. Neither proves the turn will get no reply:
+#: ``complete_with_response`` refuses only a ``done`` row, so a dead or cancelled row can still be
+#: completed with a capture, and a sibling handler upstream may yet emit another row to the outbound.
 _FAILED_ROW_STATES: Final = frozenset({OutboxStatus.DEAD.value, OutboxStatus.CANCELLED.value})
-#: Settled delivery states: the failed ones plus ``done``. Capture commits in the same transaction as
-#: the ``done`` flip (``complete_with_response``), so a ``done`` row with no captured reply will never
-#: gain one. Any other state, including one this module does not know, counts as live.
+#: Settled delivery states: the failed ones plus ``done``. Any other state, including one this module
+#: does not know, counts as live.
 _SETTLED_ROW_STATES: Final = _FAILED_ROW_STATES | {OutboxStatus.DONE.value}
 
 
@@ -184,9 +185,8 @@ class SyncReplyResolverImpl:
         else:
             # Every other outcome already has its own disposition trail — a dead/cancelled row, an
             # UNROUTED message, or (for degraded) the metric label. Minting a second record of the
-            # same fact would make the timeline read as two events where one thing happened. The
-            # exception is ``failed`` from a ``done`` row with no capture: its row reads delivered,
-            # so the ``failed`` answer is recorded only in the metric.
+            # same fact would make the timeline read as two events where one thing happened. A
+            # ``done`` row with no captured reply resolves ``empty`` and is recorded above.
             return
 
         try:
@@ -236,25 +236,27 @@ class SyncReplyResolverImpl:
                             message_id, state.latest_response_seq, elapsed_ms()
                         )
 
-                    rows = state.row_states
-                    if rows:
-                        # Decide only on the WHOLE row set: a dead or cancelled row says nothing
-                        # while a sibling row to the same destination is still pending or inflight.
-                        # Every row failed is ``failed`` at once (ADR 0154 D3). A settled set that
-                        # holds a ``done`` row with no capture is ``failed`` too, never ``no_route``
-                        # since something WAS routed here, but only once the message is terminal: a
-                        # sibling handler still upstream may yet emit a row that captures the reply.
-                        if all(s in _FAILED_ROW_STATES for s in rows) or (
-                            state.message_is_terminal
-                            and all(s in _SETTLED_ROW_STATES for s in rows)
-                        ):
+                    # Decide only once the message itself is terminal (ADR 0154 D3, amended
+                    # 2026-11-18). While it is still RECEIVED or ROUTED, a sibling handler upstream
+                    # may yet emit another row to this outbound that captures the reply, and routed
+                    # rows carry a NULL destination_name, so no row set read here can rule that out.
+                    # mark_failed, cancel and complete_with_response each run the finalizer in the
+                    # same transaction as the row flip, so a lone failed row still answers at once.
+                    if state.message_is_terminal:
+                        rows = state.row_states
+                        if not rows:
+                            # Nothing was routed here at all. Only on the message's own terminal
+                            # status: the absence of rows alone is the 502-for-a-message-we-then-
+                            # delivered defect.
+                            return self._done(ReplyOutcome.NO_ROUTE, elapsed_ms())
+                        if all(s in _SETTLED_ROW_STATES for s in rows):
+                            if OutboxStatus.DONE.value in rows:
+                                # Delivered, but no reply was captured (a plain mark_done, as
+                                # shadow or simulate mode performs). That is "delivered, no
+                                # reply", never delivery_failed, which would invite a resend.
+                                return self._done(ReplyOutcome.EMPTY, elapsed_ms())
                             return self._done(ReplyOutcome.FAILED, elapsed_ms())
-                    elif state.message_is_terminal:
-                        # Only on the ABSENCE of rows plus the message's own terminal status. A
-                        # sibling handler still upstream leaves the rows empty (routed rows carry a
-                        # NULL destination_name), and reading that alone as exclusion is the
-                        # 502-for-a-message-we-then-delivered defect.
-                        return self._done(ReplyOutcome.NO_ROUTE, elapsed_ms())
+                        # A live row on a terminal message: keep waiting for it to settle.
 
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:

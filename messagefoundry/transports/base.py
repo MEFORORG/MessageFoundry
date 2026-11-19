@@ -882,10 +882,11 @@ class ReplyOutcome(str, Enum):  # noqa: UP042 - matches MessageStatus/OutboxStat
     """
 
     REPLY = "reply"  # the partner replied and we return it verbatim
-    EMPTY = "empty"  # a successful round-trip with a deliberately empty payload
+    # A successful round-trip with a deliberately empty payload, or, on a terminal message, a
+    # delivered reply_from row that captured no reply (shadow or simulate mode).
+    EMPTY = "empty"
     REJECTED = "rejected"  # the partner replied negatively; the reply is still returned
-    # Every reply_from row went dead/cancelled, or the message is terminal and every reply_from row
-    # settled (dead/cancelled/done) with no reply captured.
+    # The message is terminal and every reply_from row went dead/cancelled, with no reply captured.
     FAILED = "failed"
     PURGED = "purged"  # the row exists but retention has already nulled the body
     NO_ROUTE = "no_route"  # nothing routed to the awaited destination

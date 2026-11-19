@@ -1374,10 +1374,13 @@ class ReplyWaitState:
     delivered normally. Consult :attr:`message_is_terminal` before ever interpreting an empty list.
 
     **Read order is load-bearing.** Every backend reads the message status, then the row states,
-    then the reply, and on a pooled backend each read may see its own snapshot. The resolver fails a
-    ``done`` row with no reply only when the message also reads terminal, and the finalizer marks it
-    terminal only after the capture commits, so a reply read taken later always sees that capture.
-    Reading the reply first would let a fresh ``done`` beside a missed capture read as ``failed``.
+    then the reply, and on a pooled backend each read may see its own snapshot. The resolver settles
+    a turn with no reply only when the message also reads terminal. ``complete_with_response`` flips
+    the row to ``done``, inserts the capture and runs the finalizer in ONE transaction, so a status
+    read that sees the terminal status was taken after the capture committed, and a reply read taken
+    after it sees that capture. Reading the reply first would let a capture that commits between the
+    two reads leave a terminal message with a ``done`` row and no reply, an ``empty`` answer for a
+    reply that exists.
     """
 
     #: ``messages.status`` for the awaited message, or ``None`` when the row no longer exists.

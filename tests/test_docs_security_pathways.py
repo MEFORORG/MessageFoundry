@@ -4719,8 +4719,8 @@ def test_the_thirteenth_sweep_second_round_probes_reply_logging_and_opt_in() -> 
 
     # 1b. What the blocked turn answers (ADR 0154 D5). A reply captured as anything but accepted or
     #     no-reply resolves `rejected`, and `rejected` is answered 502 WITH the partner's body.
-    #     `failed`, answered 502 with fixed JSON, needs every `reply_from` row dead or cancelled, or
-    #     a terminal message whose `reply_from` rows are all settled with no reply captured.
+    #     `failed`, answered 502 with fixed JSON, needs a terminal message whose `reply_from` rows
+    #     are all dead or cancelled.
     from messagefoundry.pipeline import sync_reply
     from messagefoundry.store.store import OutboxStatus
     from messagefoundry.transports import rest, soap
