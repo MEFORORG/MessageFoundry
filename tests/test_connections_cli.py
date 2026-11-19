@@ -367,6 +367,52 @@ def test_cli_end_to_end_maximal_with_commented_sibling(
     assert "HAND" in after_reg.inbound
 
 
+def _strict_json(text: str) -> object:
+    def _refuse(token: str) -> object:
+        raise ValueError(f"non-standard JSON token {token}")
+
+    return json.loads(text, parse_constant=_refuse)
+
+
+def test_list_emits_standard_json_for_an_infinite_alert_age(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5778: `inf` is the TOML spelling of an off alert age. `connection list` used to print
+    it as a bare Infinity token the IDE's JSON.parse refuses; it now passes a strict parse, loads as
+    off, and stays off through the GUI's list -> upsert re-save."""
+    (cfg / "connections.toml").write_text(
+        textwrap.dedent(
+            """\
+            [[outbound]]
+            name = "OB"
+            transport = "mllp"
+            cleartext_accepted = true
+            cleartext_reason = "legacy partner has no MLLP-over-TLS listener"
+              [outbound.settings]
+              host = "epic.example"
+              port = 2700
+              [outbound.buildup]
+              max_oldest_seconds = inf
+              [outbound.stall]
+              max_oldest_seconds = inf
+            """
+        ),
+        encoding="utf-8",
+    )
+    svc = _svc(cfg, _EPIC_EGRESS)
+    assert load_config(cfg).outbound["OB"].buildup.max_oldest_seconds is None  # type: ignore[union-attr]
+    rc = main(["connection", "list", "--config", str(cfg), "--json"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    entries = _strict_json(out)
+    assert isinstance(entries, list)
+    [entry] = [e for e in entries if e["name"] == "OB"]
+    assert _upsert(cfg, entry, capsys, svc=svc)[0] == 0
+    after = load_config(cfg).outbound["OB"]
+    assert after.buildup is not None and after.buildup.max_oldest_seconds is None
+    assert after.stall is not None and after.stall.max_oldest_seconds is None
+
+
 def test_upsert_rejects_unknown_key_and_writes_nothing(
     cfg: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

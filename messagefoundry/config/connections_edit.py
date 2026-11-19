@@ -26,6 +26,7 @@ silently deleted by the next GUI/CLI save (the #234 data-loss bug this closes).
 from __future__ import annotations
 
 import contextlib
+import math
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, time
 from pathlib import Path
@@ -176,15 +177,22 @@ def list_connections(config_dir: str | Path) -> list[dict[str, Any]]:
 
 def _jsonable(value: Any) -> Any:
     """Canonicalize a TOML-unwrapped value for the list boundary: ``datetime``/``date``/``time``
-    become ISO-8601 strings (``HH:MM:SS`` for a time), containers recurse, everything else passes
-    verbatim. Those are the only non-JSON types ``tomllib``/tomlkit can yield, so the result is
-    always ``json.dumps``-able."""
+    become ISO-8601 strings (``HH:MM:SS`` for a time), a non-finite float (TOML ``inf`` / ``nan``)
+    its string form, containers recurse, everything else passes verbatim, so the result is
+    ``json.dumps``-able as standard JSON, with no bare ``Infinity`` or ``NaN`` token."""
     if isinstance(value, dict):
         return {key: _jsonable(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_jsonable(item) for item in value]
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
+    if isinstance(value, float) and not math.isfinite(value):
+        # TOML's inf / -inf / nan have no JSON literal: json.dumps would print a bare Infinity or
+        # NaN token a strict parser (the IDE's JSON.parse) refuses. The string form survives the
+        # GUI's list -> upsert re-save, and the read schema parses it back to the same float; a
+        # null instead would drop the key on re-save, turning an `inf` (off) alert age back into
+        # its default (BACKLOG #5778).
+        return str(value)
     return value
 
 

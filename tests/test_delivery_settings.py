@@ -115,14 +115,25 @@ def test_buildup_and_stall_thresholds_refuse_non_positive_nan_or_bool(value: flo
         DeliverySettings(stall_max_oldest_seconds=value)
 
 
-def test_infinite_age_threshold_still_loads() -> None:
-    # Not refused: an infinite age is never crossed, and TOML has no null, so it is a spelling
-    # a settings file has for leaving a default-on age dimension quiet. Refusing it is a separate
-    # decision from BACKLOG #5778's zero, negative and NaN refusals.
-    assert BuildupThreshold(max_oldest_seconds=float("inf")).max_oldest_seconds == float("inf")
-    assert DeliverySettings(
-        stall_max_oldest_seconds=float("inf")
-    ).stall_max_oldest_seconds == float("inf")
+def test_infinite_age_threshold_loads_as_off(tmp_path: Path) -> None:
+    # BACKLOG #5778: TOML has no null, so `inf` is the settings-file spelling of an off age
+    # dimension. It loads as None, so the runner skips the store read an off dimension needs no read
+    # for, and a JSON view carries null. Negative infinity is still refused.
+    assert BuildupThreshold(max_oldest_seconds=float("inf")).max_oldest_seconds is None
+    assert StallThreshold(max_oldest_seconds=float("inf")).max_oldest_seconds is None
+    assert BuildupThreshold(max_oldest_seconds="inf").max_oldest_seconds is None  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        BuildupThreshold(max_oldest_seconds=float("-inf"))
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text(
+        "[delivery]\nbuildup_max_oldest_seconds = inf\nstall_max_oldest_seconds = inf\n",
+        encoding="utf-8",
+    )
+    delivery = load_settings(config_path=cfg).delivery
+    assert delivery.buildup_max_oldest_seconds is None
+    assert delivery.stall_max_oldest_seconds is None
+    assert delivery.buildup_threshold() == BuildupThreshold(max_oldest_seconds=None)
+    assert delivery.stall_threshold().max_oldest_seconds is None
 
 
 @pytest.mark.parametrize("depth", [0, -5, True])

@@ -769,7 +769,7 @@ def route_message(
         ingest_time=ingest_time,
         # #162: a dry-run/preview has no persisted message, so message_id stays None — the
         # unmapped-capture drain has no id to key by (and the default sink is None here anyway).
-        snapshot_on_send=snapshot_on_send,  # ADR 0104: preview copy-on-Send iff the caller opts in
+        snapshot_on_send=snapshot_on_send,  # ADR 0104: preview copy-on-Send unless the caller opts out
     )
     with run_contexts(rc, phase="transform"):
         ct = ic.content_type.value

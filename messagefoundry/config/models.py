@@ -540,6 +540,16 @@ def _refuse_bool_threshold(value: object) -> object:
     return value
 
 
+def infinite_age_is_off(value: float | None) -> float | None:
+    """An infinite alert age, which can never be crossed, is the TOML spelling of off, TOML having no
+    null: read it as ``None`` so the runner skips the store read an off dimension needs no read for,
+    and a JSON view of the threshold carries ``null``, not a non-standard ``Infinity`` (BACKLOG
+    #5778). Negative infinity never reaches here: ``gt=0`` refuses it first."""
+    if value is not None and value == float("inf"):
+        return None
+    return value
+
+
 class BuildupThreshold(BaseModel):
     """When to raise a ``queue_buildup`` alert for a lane whose backlog is not draining. An outbound
     lane is the classic case: a head retrying its way toward :attr:`RetryPolicy.max_attempts`. The cap
@@ -555,7 +565,8 @@ class BuildupThreshold(BaseModel):
 
     A set dimension must be greater than zero (BACKLOG #5778): a depth below one, or an age of zero
     or below, is crossed by every lane that holds a message, so it pages on each one; NaN is never
-    crossed, so it would turn the alert off unseen. A boolean is refused rather than read as 1."""
+    crossed, so it would turn the alert off unseen. A boolean is refused rather than read as 1. An
+    infinite age loads as ``None``, the dimension off (:func:`infinite_age_is_off`)."""
 
     max_depth: int | None = Field(default=None, ge=1)
     max_oldest_seconds: float | None = Field(default=300.0, gt=0)
@@ -564,6 +575,11 @@ class BuildupThreshold(BaseModel):
     @classmethod
     def _refuse_bool(cls, value: object) -> object:
         return _refuse_bool_threshold(value)
+
+    @field_validator("max_oldest_seconds", mode="after")
+    @classmethod
+    def _inf_is_off(cls, value: float | None) -> float | None:
+        return infinite_age_is_off(value)
 
 
 class StallThreshold(BaseModel):
@@ -579,7 +595,7 @@ class StallThreshold(BaseModel):
     ``stall=`` override > the ``[delivery]`` global default > built-in (off).
 
     A set threshold must be greater than zero, and not a boolean, for the reasons
-    :class:`BuildupThreshold` gives (BACKLOG #5778)."""
+    :class:`BuildupThreshold` gives (BACKLOG #5778). An infinite age loads as ``None``, off."""
 
     max_oldest_seconds: float | None = Field(default=None, gt=0)
 
@@ -587,6 +603,11 @@ class StallThreshold(BaseModel):
     @classmethod
     def _refuse_bool(cls, value: object) -> object:
         return _refuse_bool_threshold(value)
+
+    @field_validator("max_oldest_seconds", mode="after")
+    @classmethod
+    def _inf_is_off(cls, value: float | None) -> float | None:
+        return infinite_age_is_off(value)
 
 
 #: BACKLOG #5768: the rise, in messages, a lane's backlog must clear before saturation fires.
