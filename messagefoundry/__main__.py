@@ -13834,6 +13834,7 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
+        _REMOVED_KEYS,
         _SECURITY_PASSTHROUGH,
         AuthSettings,
         SecuritySettings,
@@ -13841,6 +13842,8 @@ def _security(args: argparse.Namespace) -> int:
         _auth_default,
         _auth_limit_loosenings,
         _env_overrides,
+        _unknown_key_report,
+        _unknown_keys,
         security_loosenings,
     )
 
@@ -14097,6 +14100,27 @@ def _security(args: argparse.Namespace) -> int:
             )
         # Precise per-field error before we touch the file: validate the merged [security] view.
         merged = dict(security_edit.read_security(path))
+        # BACKLOG #5327: a null reset of a key [security] does not define, and the file does not
+        # carry, would change nothing, so reporting it as set would leave the loosening the
+        # operator meant to reset in place. A non-null unknown key is refused by the whole-file
+        # load; a null one never reaches it. One the file does carry may be reset, since removing
+        # it is the repair for a file the load refuses.
+        # No nearest spelling for a removed key: for require_sign_in it is require_mfa, another switch.
+        unknown = [
+            (table, key, None if (table, key) in _REMOVED_KEYS else near)
+            for table, key, near in _unknown_keys(
+                "security",
+                SecuritySettings,
+                {k: v for k, v in updates.items() if v is None and k not in merged},
+            )
+        ]
+        if unknown:
+            return _emit_error(
+                f"refused, nothing written: {_unknown_key_report(unknown)} is not a [security] "
+                "key, so a null reset of it would change nothing. Check the spelling against "
+                "docs/CONFIGURATION.md.",
+                as_json=args.json,
+            )
         for key, value in updates.items():
             if value is None:
                 merged.pop(key, None)

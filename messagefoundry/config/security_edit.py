@@ -57,7 +57,13 @@ def set_security(
     """Merge ``updates`` into the ``[security]`` table (creating the file + table if needed), validate the
     whole file still loads, then write comment-preservingly. A value of ``None`` **removes** that key
     (resets it to its secure default). Raises :class:`SecurityEditError` if the result wouldn't load —
-    leaving the TOML untouched. Only the ``[security]`` table is edited; other sections are byte-stable."""
+    leaving the TOML untouched. Only the ``[security]`` table is edited; other sections are byte-stable.
+
+    The result says what changed (BACKLOG #5327): ``keys`` lists the keys written or removed, and
+    ``unchanged`` the ``None`` resets that found no such key in the file. When nothing changed,
+    ``op`` is ``"unchanged"`` and the file is not written. This module cannot tell a known
+    ``[security]`` key from a misspelled one, since it stays outside the settings import graph,
+    so refusing a reset of an unknown key is the caller's job; the ``security`` CLI does it."""
     if not isinstance(updates, Mapping):
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
@@ -69,18 +75,28 @@ def set_security(
         if sec is None:
             sec = tomlkit.table()
             doc["security"] = sec
+        changed: list[str] = []
+        unchanged: list[str] = []
         for key, value in updates.items():
             if value is None:
                 if key in sec:
                     del sec[key]
+                    changed.append(key)
+                else:
+                    # Reporting this as set would claim a reset that did not happen.
+                    unchanged.append(key)
             else:
                 sec[key] = value
+                changed.append(key)
+        if not changed:
+            # Nothing to write, and a file that did not exist is not created.
+            return {"op": "unchanged", "keys": [], "unchanged": unchanged}
         # Drop an emptied [security] table so a full reset-to-defaults leaves no bare header behind.
         if not len(sec):
             del doc["security"]
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
-    return {"op": "set", "keys": list(updates.keys())}
+    return {"op": "set", "keys": changed, "unchanged": unchanged}
 
 
 # --- internals ---------------------------------------------------------------

@@ -70,6 +70,96 @@ def test_null_value_resets_to_default_and_drops_emptied_table(
     assert "[security]" not in text and "require_mfa" not in text  # emptied table dropped
 
 
+def test_null_reset_of_an_unknown_key_is_refused_and_leaves_the_loosening(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5327: a null reset of a misspelled key changed nothing, yet the CLI exited 0 and
+    reported the key as set, so the loosening the operator meant to reset stayed on disk."""
+    toml = tmp_path / "mf.toml"
+    _set(toml, {"require_mfa": False}, capsys)
+    before = toml.read_bytes()
+    rc = main(
+        [
+            "security",
+            "set",
+            "--service-config",
+            str(toml),
+            "--data",
+            json.dumps({"require_mfx": None}),
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc != 0
+    assert "require_mfx" in err and "did you mean 'require_mfa'" in err
+    assert toml.read_bytes() == before  # nothing written; the loosening is still there
+
+
+def test_set_security_writes_nothing_when_no_reset_finds_its_key(tmp_path: Path) -> None:
+    """BACKLOG #5327, the editor itself: a reset that finds nothing is reported apart from a key
+    it wrote, and an edit that changes nothing creates no file."""
+    from messagefoundry.config import security_edit
+
+    def refuse(candidate: Path) -> None:
+        raise AssertionError("an edit that changes nothing must not validate or write")
+
+    toml = tmp_path / "mf.toml"
+    result = security_edit.set_security(toml, {"require_mfa": None}, validate=refuse)
+    assert result == {"op": "unchanged", "keys": [], "unchanged": ["require_mfa"]}
+    assert not toml.exists()
+
+
+def test_null_reset_of_a_removed_key_offers_no_spelling(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A removed [security] key is refused like any unknown one, with no nearest spelling: for
+    require_sign_in that would be require_mfa, a different switch (vault BACKLOG #2719)."""
+    assert ("security", "require_sign_in") in _REMOVED_KEYS
+    toml = tmp_path / "mf.toml"
+    rc = main(
+        [
+            "security",
+            "set",
+            "--service-config",
+            str(toml),
+            "--data",
+            json.dumps({"require_sign_in": None}),
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc != 0 and "require_sign_in" in err and "did you mean" not in err
+    assert not toml.exists()
+
+
+def test_null_reset_of_an_unknown_key_the_file_carries_removes_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Removing a key the file does carry is a real change, and the repair for a file the
+    whole-file load refuses, so it is not refused."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nrequire_mfx = false\n", encoding="utf-8")
+    rc, res = _set(toml, {"require_mfx": None}, capsys)
+    assert rc == 0 and res["op"] == "set" and res["keys"] == ["require_mfx"]
+    assert "require_mfx" not in toml.read_text(encoding="utf-8")
+
+
+def test_null_reset_of_an_absent_known_key_reports_nothing_changed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5327: resetting a known key the file does not set changes nothing, so the result
+    says so instead of reporting it as set, and the file is not written."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("# keep\n[api]\nport = 9000\n", encoding="utf-8")
+    before = toml.read_bytes()
+    rc, res = _set(toml, {"require_mfa": None}, capsys)
+    assert rc == 0
+    assert res["op"] == "unchanged" and res["keys"] == [] and res["unchanged"] == ["require_mfa"]
+    assert toml.read_bytes() == before
+    # Mixed: the reset that found nothing is named apart from the key that was written.
+    rc, res = _set(toml, {"require_mfa": None, "max_session_hours": 13}, capsys)
+    assert rc == 0 and res["op"] == "set"
+    assert res["keys"] == ["max_session_hours"] and res["unchanged"] == ["require_mfa"]
+
+
 def test_ac3_contradiction_is_rejected_and_rolled_back(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
