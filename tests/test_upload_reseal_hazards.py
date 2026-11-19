@@ -189,8 +189,8 @@ def test_a_file_too_large_for_an_upload_is_a_skip_and_is_never_read_whole(
     fid = _save(tmp_path, _aes(key_a))
     blob = tmp_path / f"{fid}.blob"
     with blob.open("ab") as handle:
-        handle.truncate(2 * _MAX + 4097)
-    limit = 2 * _MAX + 4096  # UploadStore._stored_limit
+        handle.truncate(4 * (2 * _MAX + 4096))  # well past UploadStore._stored_limit
+    bound = 4096  # the marker and no more: the fstat alone decides the size
     real_open = uploads._open_plain  # noqa: SLF001 - the spy wraps the seam the pass reads through
     taken: list[int] = []
 
@@ -199,7 +199,7 @@ def test_a_file_too_large_for_an_upload_is_a_skip_and_is_never_read_whole(
             self._inner = inner
 
         def read(self, size: int | None = -1) -> bytes:
-            if size is None or size < 0 or size > limit + 1 or sum(taken) + size > limit + 1:
+            if size is None or size < 0 or sum(taken) + size > bound:
                 raise MemoryError
             data = self._inner.read(size)
             taken.append(len(data))

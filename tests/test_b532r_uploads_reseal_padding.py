@@ -11,8 +11,10 @@ while ``rotate-key`` sealed it, so the operator's cross-check of the two disagre
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, BinaryIO
 
 import pytest
 
@@ -155,3 +157,110 @@ def test_the_startup_count_matches_rotate_keys_sealed_count_over_a_damaged_sidec
     result = _reseal(tmp_path, cipher)
     assert (counted, result.sealed_plaintext) == (1, 1)
     assert (result.damaged, result.skipped) == (1, 0)
+
+
+# --- review round 1: the marker is looked for anywhere, to the file's end -------------------------
+
+
+@pytest.mark.parametrize("stray", [b"\xff", b"\xff\xfe", b"\xa0"], ids=["ff", "utf16-bom", "a0"])
+@pytest.mark.parametrize("over", [False, True], ids=["under-cap", "over-cap"])
+def test_a_stray_leading_byte_before_a_prior_key_value_is_a_skip(
+    tmp_path: Path, stray: bytes, over: bool
+) -> None:
+    """The marker test read only the start of the unpadded head, so a byte before the value hid it
+    and the pair counted as damaged."""
+    key_a, key_b = generate_key(), generate_key()
+    fid = _save(tmp_path, key_a)
+    sidecar = tmp_path / f"{fid}.meta"
+    sealed = sidecar.read_bytes()
+    pad = b" " * (_OVER - len(sealed) - len(stray)) if over else b""
+    sidecar.write_bytes(stray + sealed + pad)
+    result = _reseal(tmp_path, _aes(key_b, key_a))
+    assert (result.skipped, result.damaged) == (1, 0)
+
+
+def test_a_sidecar_that_is_only_padding_past_the_cap_is_a_skip(tmp_path: Path) -> None:
+    """The pass reads no more than the cap, so a file that is padding that far may hide a marker
+    after it: a skip, as the brief's bounded read requires, never damaged."""
+    cipher = _aes(generate_key())
+    fid = _save(tmp_path, cipher)
+    (tmp_path / f"{fid}.meta").write_bytes(b" " * (_OVER + 4))
+    result = _reseal(tmp_path, cipher)
+    assert (result.skipped, result.damaged) == (1, 0)
+
+
+def test_a_marker_cut_at_the_read_bound_is_a_skip(tmp_path: Path) -> None:
+    """A marker cut short names no key, so even one that would name the active key is a skip."""
+    cipher = _aes(generate_key())
+    fid = _save(tmp_path, cipher)
+    sidecar = tmp_path / f"{fid}.meta"
+    sealed = sidecar.read_bytes()
+    sidecar.write_bytes(b" " * (_OVER - 10) + sealed)
+    result = _reseal(tmp_path, cipher)
+    assert (result.skipped, result.damaged) == (1, 0)
+
+
+def test_the_reseal_reads_no_more_than_the_cap_of_an_oversized_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The head is read boundedly, however large the file."""
+    key_a, key_b = generate_key(), generate_key()
+    fid = _save(tmp_path, key_a)
+    sidecar = tmp_path / f"{fid}.meta"
+    sidecar.write_bytes(b"x" * (4 * _OVER) + sidecar.read_bytes())
+    real = uploads._open_plain  # noqa: SLF001 - the spy wraps the seam the pass reads through
+    taken: list[int] = []
+
+    class _Counted:
+        def __init__(self, inner: BinaryIO) -> None:
+            self._inner = inner
+
+        def read(self, size: int = -1) -> bytes:
+            data = self._inner.read(size)
+            taken.append(len(data))
+            return data
+
+        def __enter__(self) -> _Counted:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._inner.close()
+
+    def spy(path: Path) -> tuple[Any, os.stat_result]:
+        handle, info = real(path)
+        return (_Counted(handle), info) if path == sidecar else (handle, info)
+
+    monkeypatch.setattr(uploads, "_open_plain", spy)
+    result = _reseal(tmp_path, _aes(key_b, key_a))
+    assert taken and sum(taken) <= _OVER
+    # What lies past the read is not seen: a plaintext head with no marker is damaged.
+    assert (result.skipped, result.damaged) == (0, 1)
+
+
+def test_a_too_long_plaintext_sidecar_holding_a_prior_key_value_is_a_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_a, key_b = generate_key(), generate_key()
+    fid = _save(tmp_path, key_a)
+    sidecar = tmp_path / f"{fid}.meta"
+    sealed = sidecar.read_text(encoding="utf-8")
+    sidecar.write_text("x" + sealed, encoding="utf-8")
+    monkeypatch.setattr(uploads, "_PLAIN_SIDECAR_LIMIT", len(sealed) - 1)
+    result = _reseal(tmp_path, _aes(key_b, key_a))
+    assert (result.skipped, result.damaged) == (1, 0)
+
+
+@pytest.mark.parametrize("damage", [_oversized, _blank], ids=["oversized", "blank"])
+def test_the_startup_count_skips_a_body_that_is_not_text_past_its_head(
+    tmp_path: Path, damage: Callable[[Path, str], None]
+) -> None:
+    """rotate-key counts such a body as lost and seals nothing of it, so the count must not send
+    the operator to run it."""
+    fid = _save(tmp_path, None)
+    sidecar = tmp_path / f"{fid}.meta"
+    damage(sidecar, sidecar.read_text(encoding="utf-8"))
+    (tmp_path / f"{fid}.blob").write_bytes(b"p" * 3000 + b"\xff")
+    cipher = _aes(generate_key())
+    counted = asyncio.run(UploadStore(tmp_path, cipher, max_bytes=4096).warn_if_unsealed())
+    result = _reseal(tmp_path, cipher)
+    assert (counted, result.sealed_plaintext, result.damaged) == (0, 0, 1)
