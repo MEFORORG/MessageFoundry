@@ -576,14 +576,24 @@ def _override_scope(kept: tuple[str, ...]) -> str:
     ``messages_days`` is the cutoff of ``purge_message_bodies``, keyed on the receiving inbound, and
     an outbound's ``dead_letter_days`` the cutoff of ``purge_dead_letters``, keyed on the dead
     row's outbound. Read their docstrings for what each blanks. The lists in the text say "at
-    least", because a closed list here would go false when a purge gains a tier."""
+    least", because a closed list here would go false when a purge gains a tier.
+
+    Each engine shard runs its own retention over the one shared store, with the override maps
+    :meth:`~messagefoundry.pipeline.retention.RetentionRunner._resolve_overrides` reads from its own
+    registry. :func:`~messagefoundry.pipeline.sharding.filter_registry_for_shard` keeps only that
+    engine shard's inbounds and every outbound, so an inbound's hold is honoured only by the engine
+    shard that holds it, and the text says so; an outbound's is in every engine shard's registry."""
     dead_global = _window_setting("dead_letter_days")
     body_global = _window_setting("messages_days")
     parts = []
     if any(entry.startswith("inbound ") for entry in kept):
         parts.append(
-            "An inbound override keeps forever, while that inbound stays in the live graph with "
-            "it, at least what the purge of message bodies holds for the messages that inbound "
+            "An inbound override is honoured only by an engine whose live graph holds that inbound "
+            "with it: on a config of more than one engine shard, each engine shard purges the "
+            "shared store with the overrides of its own inbounds alone, so a sibling engine shard "
+            "purges that inbound's bodies on the global "
+            f"{body_global} window where that window is bounded. Where it is honoured, it keeps "
+            "forever at least what the purge of message bodies holds for the messages that inbound "
             "received: each stored body, though the inbound's own prune_documents_after, where "
             "set, still strips embedded documents from it; its delivered and cancelled outbound "
             "payloads, its event detail and the replies captured for it. It does not keep their "
@@ -624,6 +634,16 @@ def _keep_forever_remedy() -> str:
     )
 
 
+def _kept_phi(kept: tuple[str, ...]) -> str:
+    """What the opening sentence of the refusal and the ``AUDIT:`` line says ``kept`` holds: an
+    outbound override keeps dead-lettered rows, not message bodies (:func:`_override_scope`)."""
+    inbound = any(entry.startswith("inbound ") for entry in kept)
+    outbound = any(entry.startswith("outbound ") for entry in kept)
+    if inbound and outbound:
+        return "PHI message bodies and dead-lettered PHI rows"
+    return "PHI message bodies" if inbound else "dead-lettered PHI rows"
+
+
 def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None) -> str:
     """The refusal text for ``kept``, the non-empty result of :func:`keep_forever_overrides`.
 
@@ -632,7 +652,7 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
     words a reload would use. ``env_name`` is ``None`` where no environment is active."""
     where = f" ({env_name!r})" if env_name is not None else ""
     return (
-        "a per-connection retention override keeps PHI message bodies indefinitely on a PHI "
+        f"a per-connection retention override keeps {_kept_phi(kept)} indefinitely on a PHI "
         f"instance{where}: {'; '.join(kept)} (unbounded PHI at rest, ASVS 14.2.4/14.2.7). "
         f"{_override_scope(kept)} {_keep_forever_remedy()}"
     )
@@ -652,7 +672,7 @@ def _override_audit_line(
     return (
         f"AUDIT: the retention gate on a PHI instance{where} passed a graph "
         f"with per-connection unbounded data retention ({basis}; {'; '.join(kept)}) -- once that "
-        "graph is live, these connections' PHI message bodies are retained INDEFINITELY "
+        f"graph is live, these connections' {_kept_phi(kept)} are retained INDEFINITELY "
         f"({status}). {_override_scope(kept)}"
     )
 

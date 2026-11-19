@@ -1324,8 +1324,12 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
 >
 > **Under `enforce`, an override of `0` needs the same acknowledgement as a global `0`** (BACKLOG
-> #2368). It keeps that connection's PHI bodies forever, whatever the global window says, but not
-> every row about its messages; the refusal and the `AUDIT:` line state which (BACKLOG #5967). The
+> #2368). It keeps that connection's PHI forever, whatever the global window says, but not every
+> row about its messages; the refusal and the `AUDIT:` line state which (BACKLOG #5967). On a
+> config of more than one engine shard, an inbound's override is honoured only by the engine shard
+> that holds that inbound: each engine shard purges the shared store with its own inbounds'
+> overrides, so a sibling engine shard purges those bodies on the global window where it is
+> bounded. The
 > overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
 > and on every config reload:
 >
@@ -1334,7 +1338,8 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 >   graph stays.
 > - Without it, under `warn`, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming
 >   each connection, with the remedy (owner ruling 2026-11-01). The graph loads with no
->   acknowledgement, and those bodies are kept forever.
+>   acknowledgement, and what the override holds is kept forever, subject to the engine-shard
+>   limit above.
 > - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection.
 >
 > The gate writes its `AUDIT:` line each time it passes such a graph. A dry-run reload counts, and

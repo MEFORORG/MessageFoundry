@@ -3958,7 +3958,7 @@ _OVERRIDE_ARMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "- Without it, under `warn`, the gate passes the graph",
-        (_OVERRIDE_AUDITED, "with the remedy", "those bodies are kept forever"),
+        (_OVERRIDE_AUDITED, "with the remedy", "what the override holds is kept forever"),
     ),
     ("- With it, the gate passes the graph", (_OVERRIDE_AUDITED,)),
 )
@@ -4202,7 +4202,7 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
             "Without it, under `warn`",
         ),
         # A warn arm that reads as if nothing is lost.
-        "bodies-not-kept": ("and those bodies are kept forever", "", "kept forever"),
+        "bodies-not-kept": ("and what the override holds is kept forever", "", "kept forever"),
         "acknowledged-arm-unaudited": (
             "the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each "
             "connection.\n",

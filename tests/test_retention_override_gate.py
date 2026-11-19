@@ -215,6 +215,49 @@ def test_the_override_text_states_what_the_purge_keeps(
     assert (outbound_scope in text) is outbound_named
 
 
+@pytest.mark.parametrize(
+    ("inbound_days", "outbound_days", "kept"),
+    [
+        (0, None, "PHI message bodies"),
+        (None, 0, "dead-lettered PHI rows"),
+        (0, 0, "PHI message bodies and dead-lettered PHI rows"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("acknowledged", "enforcing"), [(True, True), (False, True), (False, False)]
+)
+def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
+    tmp_path: Path,
+    acknowledged: bool,
+    enforcing: bool,
+    inbound_days: int | None,
+    outbound_days: int | None,
+    kept: str,
+) -> None:
+    """BACKLOG #5967: the opening sentence names what the overrides keep, so an outbound-only
+    override is not said to keep message bodies, and an inbound override's scope says a sibling
+    engine shard purges its bodies on the global window. Red on a text that says "PHI message
+    bodies" for every override, or promises an inbound's hold on every engine shard."""
+    registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=acknowledged, enforcing=enforcing, env_name="prod"
+    )
+    refused = enforcing and not acknowledged
+    text = verdict.refusal if refused else verdict.report
+    assert text is not None
+    opening = f"keeps {kept} indefinitely" if refused else f"connections' {kept} are retained"
+    assert opening in text
+    if inbound_days is None:
+        assert "PHI message bodies" not in text
+    shard_limit = (
+        "An inbound override is honoured only by an engine whose live graph holds that inbound "
+        "with it: on a config of more than one engine shard, each engine shard purges the shared "
+        "store with the overrides of its own inbounds alone, so a sibling engine shard purges that "
+        "inbound's bodies on the global [security].delete_message_bodies_after_days window"
+    )
+    assert (shard_limit in text) is (inbound_days is not None)
+
+
 def test_the_remedy_does_not_offer_an_unbounded_global_window_as_a_bound(tmp_path: Path) -> None:
     # Under warn a global 0 passes the start gate. Inheriting it keeps the bodies forever with the
     # line gone, so removing the override is the remedy only where the global window is bounded.

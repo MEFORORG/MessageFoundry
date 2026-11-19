@@ -404,6 +404,36 @@ async def test_an_inbound_keep_forever_override_leaves_a_dead_ingress_row_to_the
     assert purged.bodies == 1  # the dead ingress row took the global window
 
 
+async def test_a_sibling_engine_shard_purges_an_inbound_keep_forever_body(
+    store: MessageStore,
+) -> None:
+    """BACKLOG #5967: each engine shard's runner reads the overrides of its own filtered registry,
+    so an inbound's ``messages_days = 0`` is honoured only by the engine shard that holds it. A
+    sibling engine shard's runner, purging the same store, takes the global window for that
+    inbound's bodies. ``_override_scope`` states this; this pins the behaviour it describes."""
+    from messagefoundry.pipeline.sharding import filter_registry_for_shard
+
+    keep, _ = await _delivered(store, channel_id="IB_KEEP", dest="OB", now=0.0, control="S-KEEP")
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection("IB_KEEP", MLLP(port=2601), router="r", messages_days=0, shard="a")
+    )
+    reg.add_inbound(build_inbound_connection("IB_OTHER", MLLP(port=2603), router="r", shard="b"))
+    settings = RetentionSettings(messages_days=1)
+
+    owner = filter_registry_for_shard(reg, "a")
+    await RetentionRunner(
+        store, settings, clock=lambda: 100 * DAY, registry_source=lambda: owner
+    ).run_once()
+    assert await _raw(store, keep) == RAW  # the engine shard holding IB_KEEP keeps the body
+
+    sibling = filter_registry_for_shard(reg, "b")
+    await RetentionRunner(
+        store, settings, clock=lambda: 100 * DAY, registry_source=lambda: sibling
+    ).run_once()
+    assert await _raw(store, keep) == ""  # the sibling engine shard purged it on the global window
+
+
 async def test_runner_without_registry_is_global_only(store: MessageStore) -> None:
     """No registry_source wired → no overrides → a single global cutoff (byte-identical to the global
     runner), and the audit records empty override maps."""
