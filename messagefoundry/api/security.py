@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
+import weakref
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -1631,6 +1632,28 @@ def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Ide
 # step-up / MFA controls. Activated by the scope-populating shim in api/tls_client_cert (ADR 0083).
 
 
+#: The fallback's verified read, kept per TLS connection, keyed on its ``ssl_object`` (BACKLOG #5788).
+#: The read parses the leaf and checks its issuer, so making it on every request would repeat that
+#: work on the event loop; the shim makes it once, at ``connection_made``. Weak keys, so an entry
+#: goes when its connection does. A read that found no certificate is not kept.
+_FALLBACK_PEERCERTS: weakref.WeakKeyDictionary[Any, Mapping[str, Any]] = weakref.WeakKeyDictionary()
+
+
+def _fallback_peercert(ssl_object: Any) -> Mapping[str, Any] | None:
+    """:func:`peercert_from_ssl_object`, read once per connection (BACKLOG #5788). An object that
+    cannot take a weak reference is read each time, as before."""
+    try:
+        cached = _FALLBACK_PEERCERTS.get(ssl_object)
+    except TypeError:
+        return peercert_from_ssl_object(ssl_object)
+    if cached is not None:
+        return cached
+    cert = peercert_from_ssl_object(ssl_object)
+    if cert is not None:
+        _FALLBACK_PEERCERTS[ssl_object] = cert
+    return cert
+
+
 def peer_cert_from_request(request: Request) -> Mapping[str, Any] | None:
     """Best-effort read of the verified peer certificate (``getpeercert()`` shape) for this request.
 
@@ -1665,8 +1688,8 @@ def peer_cert_from_request(request: Request) -> Mapping[str, Any] | None:
             return None  # a list that cannot be read: deny rather than fail the request
         if peer_is_trusted_proxy(transport, parsed):
             return None
-    # The same read the shim makes, verified issuer included (BACKLOG #2237).
-    return peercert_from_ssl_object(ssl_object)
+    # The same read the shim makes, verified issuer included (BACKLOG #2237), once per connection.
+    return _fallback_peercert(ssl_object)
 
 
 def note_client_cert_expiry(request: Request, peercert: Mapping[str, Any], label: str) -> None:
