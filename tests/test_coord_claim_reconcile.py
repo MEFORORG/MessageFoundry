@@ -268,6 +268,19 @@ def test_a_date_shaped_key_is_released_under_its_own_spelling(repo: Path, tmp_pa
     assert row["outcome"] == "released", row
 
 
+def test_a_case_variant_file_name_is_a_key_mismatch(repo: Path, tmp_path: Path) -> None:
+    """claim.ps1 writes the folded, lower-case name; on a case-sensitive disk a variant is another file."""
+    landed_branch(repo, "landed")
+    p = write_claim(repo, "k-case", tmp_path / "vanished", "landed")
+    variant = p.with_name("K-Case.json")
+    p.rename(variant)
+    proc = reconcile(repo, "-Json", "-Apply")
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert row["verdict"] == "KEY-MISMATCH", row
+    assert variant.exists(), row
+
+
 def _ps_function(path: Path, name: str) -> str:
     text = path.read_text(encoding="utf-8")
     start = text.index(f"function {name}(")
@@ -538,7 +551,12 @@ def test_a_rename_whose_deletion_never_landed_holds(repo: Path, tmp_path: Path) 
     write_claim(repo, "k-rename", tmp_path / "vanished", "renamer")
     github_origin(repo)
     stub = _gh_stub(tmp_path, _merged_pr("0" * 40, landing=landing))
-    assert verdicts(repo, "-GhCommand", str(stub))["k-rename"] == "HOLD"
+    proc = reconcile(repo, "-Json", "-GhCommand", str(stub))
+    assert proc.returncode == 0, proc.stderr
+    row = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}["k-rename"]
+    assert row["verdict"] == "HOLD", row
+    # held by the blob comparison, not by a diff that could not run
+    assert "differ from the landing commit" in row["why"], row
 
 
 def test_a_merged_pr_with_no_readable_landing_commit_holds(repo: Path, tmp_path: Path) -> None:
@@ -957,6 +975,24 @@ def test_apply_releases_a_finished_present_holder_and_leaves_the_worktree(
     assert records[0]["prior_branch"] == "done-here"
     assert Path(records[0]["released_by"]).resolve() == done_wt.resolve()
     assert Path(records[0]["invoked_from"]).resolve() == repo.resolve()
+
+
+def test_apply_releases_a_present_holder_claim_with_no_key_field(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """The -Apply re-check keys a claim with no key field by its file name, as the scan does."""
+    wt, tip = present_holder(repo, "no-key-field")
+    p = write_claim(repo, "9125", wt, "no-key-field")
+    claim = json.loads(p.read_bytes())
+    del claim["key"]
+    p.write_bytes(json.dumps(claim).encode("utf-8"))
+    cfg = fence_root(tmp_path, sleeper, repo)
+    stub = gh_router(tmp_path, head=json.dumps(pr_at(tip, "9125")))
+    proc = reconcile(repo, "-Json", "-Apply", "-GhCommand", str(stub), "-ConfigRoot", str(cfg))
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert row.get("outcome") == "released", row
+    assert not p.exists(), row
 
 
 def test_apply_rechecks_a_holder_that_changed_after_the_scan(

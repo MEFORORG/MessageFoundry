@@ -226,6 +226,16 @@ function Get-KeyFileName([string]$Key) {
     try { return (ConvertTo-KeyFile $Key) } catch { return "" }
 }
 
+# A claim's key, and whether it names the file it was read from. ONE predicate for the scan and the
+# -Apply re-check. A claim with no key field is keyed by its file name, which names itself. The
+# comparison is case-sensitive: claim.ps1 writes the folded, lower-case name, and on a case-sensitive
+# disk a case variant is another file.
+function Get-ClaimKey([object]$Claim, [string]$BaseName) {
+    $key = if ($Claim.key) { [string]$Claim.key } else { $BaseName }
+    $keyFile = Get-KeyFileName $key
+    return [pscustomobject]@{ Key = $key; KeyFile = $keyFile; NamesFile = ($keyFile -ceq $BaseName) }
+}
+
 function ConvertTo-Norm([string]$Path) {
     if (-not $Path) { return "" }
     ($Path -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
@@ -284,10 +294,10 @@ $ghAvailable = $false
 if (-not $NoPullRequests) {
     $ghAvailable = [bool](Get-Command $GhCommand -ErrorAction SilentlyContinue)
 }
-# Both pull-request arms scope every GitHub call with --repo, and with --base (BACKLOG #5481). Without
-# --repo gh answers from the caller's cwd or its default-repo setting, and this script is run by
-# absolute path from other checkouts -- the
-# vault shares engine history and has pull requests of its own. prune-merged.ps1 scopes the same way
+# Both pull-request arms scope every GitHub call with --repo, and every `pr list` with --base too
+# (BACKLOG #5481). Without --repo gh answers from the caller's cwd or its default-repo setting, and
+# this script is run by absolute path from other checkouts -- the vault shares engine history and
+# has pull requests of its own. prune-merged.ps1 scopes the same way
 # for the same reason. No GitHub origin means the question cannot be asked, and the claim is held.
 $ghRepo = ""
 $originUrl = (& git -C $repo remote get-url origin 2>$null)
@@ -325,7 +335,8 @@ function Test-LandedByPullRequest {
 }
 
 # ConvertFrom-Json coerces an ISO-8601 string into a [datetime] (claim.ps1's ConvertTo-Stamp records
-# the same trap), so a claim's stamps and a PR's `mergedAt` can each arrive in either shape. Compare
+# the same trap). Claim files are parsed with -DateKind String, but a PR's `mergedAt` comes through
+# ConvertFrom-GhJson's default parse, so a stamp can arrive in either shape. Compare
 # them as offsets, never as local wall-clock text. $null means unreadable, and the caller holds on it.
 function ConvertTo-Instant($Value) {
     if ($Value -is [datetimeoffset]) { return $Value }
@@ -520,9 +531,8 @@ function Test-StillReleasable([object]$Row) {
     if (-not (Test-Path -LiteralPath $file)) { return "the claim file is gone" }
     try { $c = Read-CoordText $file | ConvertFrom-Json -DateKind String -EA Stop }
     catch { return "the claim file no longer parses" }
-    if ((Get-KeyFileName ([string]$c.key)) -ne [IO.Path]::GetFileNameWithoutExtension($file)) {
-        return "the claim file's key no longer names that file"
-    }
+    $k = Get-ClaimKey $c ([IO.Path]::GetFileNameWithoutExtension($file))
+    if (-not $k.NamesFile -or $k.Key -cne $Row.key) { return "the claim file's key no longer names that file" }
     if ((ConvertTo-Norm ([string]$c.worktree)) -ne $Row.holder) { return "the claim is now held by another worktree" }
     if (-not (Test-CoordRecordIsHere $c)) { return "the claim is now held on $(Get-CoordRecordHost $c)" }
     $fresh = Read-WorktreeRegistry
@@ -553,7 +563,8 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
         continue
     }
 
-    $key = if ($c.key) { [string]$c.key } else { $f.BaseName }
+    $claimKey = Get-ClaimKey $c $f.BaseName
+    $key = $claimKey.Key
     $holder = ConvertTo-Norm ([string]$c.worktree)
     $branch = [string]$c.branch
     $note = [string]$c.note
@@ -561,9 +572,8 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
     # The release goes through `claim.ps1 -Release <key>`, which deletes the file the KEY names, not
     # this one (BACKLOG #5482). A key that folds to another file name would release a different
     # claim, or nothing while reading as released. Judged here, it is reported and never released.
-    $keyFile = Get-KeyFileName $key
-    if ($keyFile -ne $f.BaseName) {
-        $names = if ($keyFile) { "'$keyFile.json'" } else { "no file at all" }
+    if (-not $claimKey.NamesFile) {
+        $names = if ($claimKey.KeyFile) { "'$($claimKey.KeyFile).json'" } else { "no file at all" }
         $rows += [pscustomobject]@{ key = $f.BaseName; holder = $holder; branch = $branch; note = $note; verdict = "KEY-MISMATCH"
             why = "the file is '$($f.Name)' but its key reads '$key', which names $names -- a release by that key would act on another file" }
         continue
@@ -662,9 +672,9 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
                 $listed = ($LASTEXITCODE -eq 0)
             }
             $identical = $listed -and $touched.Count -gt 0
-            foreach ($f in $touched) {
-                $a = (& git -C $repo rev-parse --quiet --verify "${ref}:$f" 2>$null)
-                $b = (& git -C $repo rev-parse --quiet --verify "${landing}:$f" 2>$null)
+            foreach ($path in $touched) {
+                $a = (& git -C $repo rev-parse --quiet --verify "${ref}:$path" 2>$null)
+                $b = (& git -C $repo rev-parse --quiet --verify "${landing}:$path" 2>$null)
                 if (-not $a -or -not $b -or $a -ne $b) { $identical = $false; break }
             }
             if ($identical) {
@@ -787,12 +797,15 @@ if ($Apply) {
         }
         # The ledger writer stays in one place. A gone holder's release needs -Force, because it is
         # held by a worktree that is not this one, which is the condition that defines that set.
-        & pwsh -NoProfile -File $claimTool @releaseArgs | Out-Null
-        # claim.ps1 exits 0 on "no claim -- nothing to release" too, so an exit code alone can report
-        # a release that did not happen. Released means the file this row judged is gone.
-        $outcome = if ($LASTEXITCODE -ne 0) { "release FAILED -- claim untouched" }
-        # The scan let through only keys that fold to their own file name, so the key names the file.
-        elseif (Test-Path -LiteralPath (Join-Path $claimsDir "$(Get-KeyFileName $r.key).json")) { "release FAILED -- the claim file is still there" }
+        $said = @(& pwsh -NoProfile -File $claimTool @releaseArgs 2>&1 | ForEach-Object { [string]$_ })
+        $code = $LASTEXITCODE
+        # claim.ps1 exits 0 on "No claim on <key> -- nothing to release" too, and that leaves no file
+        # either, so neither the exit code nor a missing file shows a release happened. Its own
+        # success line does. The scan let through only keys that fold to their own file name.
+        $released = $code -eq 0 -and @($said | Where-Object { $_ -like "Released claim on *" }).Count -gt 0
+        $outcome = if ($code -ne 0) { "release FAILED -- claim untouched" }
+        elseif (-not $released) { "NOT released -- claim.ps1 found no claim under that key" }
+        elseif (Test-Path -LiteralPath (Join-Path $claimsDir "$(Get-KeyFileName $r.key).json")) { "released -- and a claim file is under that key again" }
         else { "released" }
         $r | Add-Member -NotePropertyName outcome -NotePropertyValue $outcome -Force
     }
