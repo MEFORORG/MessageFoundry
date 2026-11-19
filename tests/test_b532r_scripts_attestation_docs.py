@@ -67,3 +67,41 @@ def test_the_compose_check_disables_the_image_healthcheck() -> None:
     compose = yaml.safe_load((_REPO / "docker" / "compose.yaml").read_text(encoding="utf-8"))
     check = compose["services"]["revocation-attestation-check"]
     assert check.get("healthcheck") == {"disable": True}
+
+
+_HEADLINE = "**A revocation attestation that does not read as true"
+
+
+def _changelog_entry() -> str:
+    """The #5400 compose entry, wherever it lives: its fragment until a release folds it, then
+    CHANGELOG.md. No fragment path is named, because the fold deletes the file."""
+    sources = [*sorted((_REPO / "changelog.d").glob("*.md")), _REPO / "CHANGELOG.md"]
+    for path in sources:
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        at = text.find(_HEADLINE)
+        if at >= 0:
+            end = text.find(" - **", at)
+            return text[at : end if end >= 0 else len(text)]
+    raise AssertionError("no changelog entry starts with " + _HEADLINE)
+
+
+def test_the_check_comment_names_both_no_deps_skips() -> None:
+    # `up --no-deps <engine>` skips the check as `run --no-deps` does, and would start a serving
+    # engine that restarts forever on a false value, so the check's own comment must name both.
+    compose = (_REPO / "docker" / "compose.yaml").read_text(encoding="utf-8")
+    start = compose.index("# One-shot check that the attestation reads as TRUE")
+    words = compose[start : compose.index("revocation-attestation-check:", start)].split()
+    comment = " ".join(w for w in words if w != "#")
+    assert "`docker compose run --no-deps`" in comment
+    assert "`docker compose up --no-deps <engine>`" in comment
+    assert "At least two commands skip it" in comment
+
+
+def test_the_changelog_claims_only_a_default_up_and_names_the_skips() -> None:
+    entry = _changelog_entry()
+    headline = entry[: entry.index("**", len(_HEADLINE))]
+    # The headline must not claim every `up`; `up --no-deps <engine>` skips the check.
+    assert "stops a default `docker compose up`" in headline, headline
+    assert "At least `docker compose up --no-deps <engine>` and `docker compose run --no-deps`" in (
+        entry
+    ), entry

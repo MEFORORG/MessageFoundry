@@ -1,8 +1,11 @@
-- **A revocation attestation that does not read as true now stops `docker compose up` before any
-  engine starts.** The compose file required `MEFOR_TLS_REVOCATION_ATTESTED` but refused only an
-  unset or empty value, so a value such as `0` would have started engines that exit 2 at the API
-  revocation gate and restart forever. A one-shot `revocation-attestation-check` service now reads
-  the value with the engine's own parser, from the same image, and every serving engine waits on it.
+- **A revocation attestation that does not read as true now stops a default `docker compose up`
+  before any engine starts.** The compose file required `MEFOR_TLS_REVOCATION_ATTESTED` but
+  refused only an unset or empty value, so a value such as `0` would have started engines that
+  exit 2 at the API revocation gate and restart forever. A one-shot `revocation-attestation-check`
+  service now reads the value with the engine's own parser, from the same image, and every serving
+  engine waits on it.
+  At least `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip that
+  check, so an engine started with `up --no-deps` and a false value would still restart forever.
   The Postgres password's missing-value message now says that `--env-file` reads its file instead of
   the `.env` beside `compose.yaml`. Both Kubernetes manifests, `docker/k8s/statefulset.yaml` and
   `docker/k8s/ha-postgres.yaml`, now take the value from a ConfigMap you create,
