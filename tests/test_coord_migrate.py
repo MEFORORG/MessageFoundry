@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import warnings
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -400,7 +401,10 @@ def test_a_start_time_in_the_past_is_refused(tmp_path: Path) -> None:
 # The only reason a real run may be retried: a side started past the limit, so the gates already
 # past when it started were not raced and -Compare gives no verdict. Any other invalid entry is a
 # real finding. The pattern copies coord-race.ps1's wording; the -Compare test below pins it.
-_LATE_START = re.compile(r"P[12] started \d+ ms late, past the \d+ ms limit")
+_TAGS = ("P1", "P2")
+_LATE_START = re.compile(
+    rf"(?:{'|'.join(map(re.escape, _TAGS))}) started \d+ ms late, past the \d+ ms limit"
+)
 
 
 def _race_verdict(code: int, summary: Any) -> str:
@@ -463,51 +467,60 @@ def test_compare_late_start_wording_is_what_the_retry_matches(tmp_path: Path) ->
     _result(d, "P1", [1], 2)
     _result(d, "P2", [2], 2, "2026-10-21T10:00:00.025Z")
     proc, summary = _compare(d)
-    assert summary["invalid"] == ["P2 started 25 ms late, past the 20 ms limit"], proc.stdout
+    assert summary is not None, (proc.returncode, proc.stdout, proc.stderr)
+    assert summary["invalid"] == [_LATE], proc.stdout
     assert _race_verdict(proc.returncode, summary) == "retry", (proc.stdout, proc.stderr)
 
 
 def _run_race(d: Path) -> None:
     start = _soon(8)
-    procs = [
-        subprocess.Popen(
-            [
-                "pwsh",
-                "-NoProfile",
-                "-NonInteractive",
-                "-File",
-                str(RACE),
-                "-Dir",
-                str(d),
-                "-Tag",
-                tag,
-                "-StartAtUtc",
-                start,
-                "-Slots",
-                "50",
-            ],
-            cwd=str(d),
-            env=_env(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        for tag in ("P1", "P2")
-    ]
+    procs: list[subprocess.Popen[str]] = []
+    reaped: set[int] = set()
     try:
+        for tag in _TAGS:
+            procs.append(_race_side(d, tag, start))
         for p in procs:
             out, err = p.communicate(timeout=TIMEOUT)
+            reaped.add(p.pid)
             assert p.returncode == 0, (out, err)
     finally:
-        # A failed side must not leave its sibling writing into tmp_path during teardown.
+        # A failed side must not leave its sibling writing into tmp_path, or its pipes open.
         for p in procs:
-            if p.poll() is None:
-                p.kill()
+            if p.pid not in reaped:
+                if p.poll() is None:
+                    p.kill()
                 p.communicate()
 
 
-def test_two_real_processes_race_clean(tmp_path: Path) -> None:
+def _race_side(d: Path, tag: str, start: str) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(RACE),
+            "-Dir",
+            str(d),
+            "-Tag",
+            tag,
+            "-StartAtUtc",
+            start,
+            "-Slots",
+            "50",
+        ],
+        cwd=str(d),
+        env=_env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def test_two_real_processes_race_clean(
+    tmp_path: Path, record_property: Callable[[str, object], None]
+) -> None:
     # A loaded runner can start one side past coord-race.ps1's limit, and -Compare then gives no
     # verdict; that attempt is retried in a fresh directory. Any other outcome ends the test at once.
     inconclusive: list[list[str]] = []
@@ -520,10 +533,14 @@ def test_two_real_processes_race_clean(tmp_path: Path) -> None:
         if verdict == "accept":
             break
         inconclusive.append(list(summary["invalid"]))
-        # Visible in the warnings summary, so a rising late-start rate shows before all three fail.
+        # Recorded in the junit XML and the warnings summary, so a rising late-start rate shows
+        # before all three attempts are late.
+        record_property(f"race_attempt_{attempt}_inconclusive", summary["invalid"])
         warnings.warn(f"race attempt {attempt} inconclusive: {summary['invalid']}", stacklevel=1)
     else:
-        pytest.fail(f"every attempt had a side start late, so none was a race: {inconclusive}")
+        pytest.fail(
+            f"every attempt had a side start past the limit, so -Compare gave no verdict: {inconclusive}"
+        )
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert summary["doubleWinners"] == [] and summary["emptySlots"] == []
     assert summary["invalid"] == []
