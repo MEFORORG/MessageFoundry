@@ -7,7 +7,13 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
-import { findTestFiles } from "./index";
+import { findTestFiles, newSuiteMocha } from "./index";
+
+suite("test entry point: newSuiteMocha", () => {
+  test("fails a run in which the loaded files register no test", () => {
+    assert.strictEqual(newSuiteMocha().options.failZero, true);
+  });
+});
 
 suite("test entry point: findTestFiles", () => {
   let root: string;

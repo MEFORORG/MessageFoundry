@@ -7,8 +7,9 @@ import Mocha from "mocha";
 
 /**
  * The absolute path of every compiled *.test.js under `testsRoot`. Rejects when there are none:
- * mocha run over zero files reports zero failures, so a broken build or a wrong output path would
- * otherwise resolve as a passing IDE test leg.
+ * mocha run over zero files reports zero failures, so a build that emitted no tests, or an output
+ * path that holds none, would otherwise resolve as a passing IDE test leg. It does not catch stale
+ * tests left in an uncleaned out/ by an earlier build.
  */
 export async function findTestFiles(testsRoot: string): Promise<string[]> {
   const files = await glob("**/*.test.js", { cwd: testsRoot });
@@ -18,11 +19,16 @@ export async function findTestFiles(testsRoot: string): Promise<string[]> {
   return files.map((file) => path.resolve(testsRoot, file));
 }
 
+/** The suite's mocha. failZero: files that load but register no test fail the run too. */
+export function newSuiteMocha(): Mocha {
+  return new Mocha({ ui: "tdd", color: true, timeout: 60_000, failZero: true });
+}
+
 // The entry point VS Code's test host loads (extensionTestsPath). It boots mocha in the TDD interface
 // (suite()/test()), discovers every compiled *.test.js next to this file, and runs them inside the
 // Extension Host process — so the tests can drive the real `vscode` API against the loaded extension.
 export async function run(): Promise<void> {
-  const mocha = new Mocha({ ui: "tdd", color: true, timeout: 60_000 });
+  const mocha = newSuiteMocha();
   for (const file of await findTestFiles(__dirname)) {
     mocha.addFile(file);
   }
