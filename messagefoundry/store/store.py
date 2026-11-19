@@ -14839,12 +14839,16 @@ class MessageStore:
 
         ``alert`` is for a read (a resend source, a body view): a tag failure there raises the
         alert and propagates, refusing the read. A claim leaves it off, because its dead-letter
-        path reports the failure with an audit row as well."""
+        path reports the failure with an audit row as well. A corrupt cell
+        (:class:`~messagefoundry.store.queue_tag.CorruptQueueCellError`) takes both paths the same
+        way, its alert and audit row saying corrupt rather than drift (BACKLOG #5884)."""
         try:
             opened = open_queue_cell(self._cipher, row)
-        except QueueTagError:
+        except QueueTagError as refused:
             if alert:
-                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+                alert_queue_tag_failure(
+                    self._cipher, row, error=refused, outcome="the read was refused"
+                )
             raise
         if row["body_ref"] is None:
             return opened
@@ -14861,7 +14865,8 @@ class MessageStore:
         """Dead-letter a claimed row whose payload could not be opened, standalone (Hazard A: this
         runs after the claim committed, so it must never join a group batch). A row that failed its
         queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
-        (BACKLOG #2593). Returns ``None`` then.
+        (BACKLOG #2593), a corrupt cell included, whose audit row names its cause as corrupt
+        (BACKLOG #5884). Returns ``None`` then.
 
         A failure that says nothing about the row is returned instead, with nothing written
         (BACKLOG #5735): a key service that gave no verdict (:func:`is_transient_open_failure`) or
@@ -14872,7 +14877,9 @@ class MessageStore:
         (:meth:`_set_aside_claimed`)."""
         if is_transient_open_failure(exc) or isinstance(exc, (sqlite3.OperationalError, OSError)):
             return queue_open_fault(exc)
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
+        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
         except PROGRAMMING_ERRORS:
@@ -14885,11 +14892,11 @@ class MessageStore:
             )
             if isinstance(exc, QueueTagError):
                 await report_queue_tag_failure(
-                    self, self._cipher, row, outcome="could not be dead-lettered"
+                    self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
-            await report_queue_tag_failure(self, self._cipher, row)
+            await report_queue_tag_failure(self, self._cipher, row, error=exc)
         return None
 
     async def _set_aside_claimed(self, tail: Sequence[aiosqlite.Row], now: float | None) -> None:
@@ -15030,7 +15037,8 @@ class MessageStore:
             # The dead-letter records the message ERROR (visible in the tracking view). An UNMARKED
             # payload is also pushed as an `integrity_drift` alert: the cipher's refusal hook reaches
             # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its row tag
-            # is audited and alerted too (BACKLOG #2593).
+            # is audited and alerted too (BACKLOG #2593), and so is one that is corrupt rather than
+            # drift, its audit row naming that cause (BACKLOG #5884).
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
             if await self._dead_letter_unopenable(claimed, exc) is not None:
                 await self._set_aside_claimed([claimed], now)
