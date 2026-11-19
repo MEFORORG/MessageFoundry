@@ -222,10 +222,13 @@ def _named_annotations(dto: type) -> list[tuple[str, object]]:
         # A deferred build (defer_build=True, or a forward ref pending at class creation) completes
         # only on first use, so its annotations would depend on whether something had validated the
         # model earlier in the process. Completing it here makes discovery order-independent; one
-        # that still cannot complete is refused by _refuse_unresolved below.
-        if not dto.__pydantic_complete__:
-            dto.model_rebuild(raise_errors=False)
+        # that still cannot complete is refused by _refuse_unresolved below. BaseModel itself is
+        # never complete and has no generic metadata, so rebuilding it raises AttributeError; it
+        # has no fields to complete, so it is skipped. The rebuild sits inside the try so any other
+        # failure is refused as a SeamDiscoveryError rather than escaping as a raw exception.
         try:
+            if dto is not BaseModel and not dto.__pydantic_complete__:
+                dto.model_rebuild(raise_errors=False)
             fields = dto.model_fields
             computed = dto.model_computed_fields
         except Exception as exc:  # unresolved forward ref / pending model_rebuild

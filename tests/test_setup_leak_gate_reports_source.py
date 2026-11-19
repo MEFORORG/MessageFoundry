@@ -440,3 +440,32 @@ def test_a_relative_env_token_path_is_resolved_against_the_checkout(
     assert "STRUCTURAL-ONLY" not in _loaded(proc), _loaded(proc)
     assert "SYNTHETIC" not in _loaded(proc), "the env file was not the source loaded"
     assert str(root / "tok.txt") in _source_line(proc), _source_line(proc)
+
+
+def test_an_inherited_git_dir_does_not_point_the_scan_at_another_repository(
+    rig: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """An exported ``GIT_DIR`` outranks the current directory, so the scanner's file listing would
+    come from ANOTHER repository's index while the files are read from this checkout.
+
+    The other repository tracks ``notes.txt``; this checkout holds a same-named file carrying a listed
+    token, UNTRACKED. Listing the other index makes that untracked file a hit; listing this checkout's
+    own index does not. The control tracks the file here, proving the planted file IS a hit.
+    """
+    root, shim, ext = rig
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "notes.txt").write_text("nothing listed here\n", encoding="utf-8")
+    _git("init", "-b", "main", ".", cwd=other)
+    _git("add", "notes.txt", cwd=other)
+    (root / "notes.txt").write_text(f"{_EXTERNAL_MARKER}\n", encoding="utf-8")
+    env = _env(shim, MEFOR_FORBIDDEN_TOKENS=str(ext), GIT_DIR=str(other / ".git"))
+
+    proc = _run(root, "-Synthetic", env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "VERIFY FAILED" not in proc.stdout, proc.stdout
+
+    _git("add", "notes.txt", cwd=root)
+    control = _run(root, "-Synthetic", env=env)
+    assert control.returncode != 0, control.stdout
+    assert "VERIFY FAILED" in control.stdout, control.stdout

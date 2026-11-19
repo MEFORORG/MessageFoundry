@@ -785,3 +785,36 @@ def test_a_string_annotation_left_unresolved_fails_loud() -> None:
     with pytest.raises(sd.SeamDiscoveryError, match="UNRESOLVED"):
         sd._refuse_unresolved(_Root, [list["Leaf"]])  # type: ignore[name-defined]  # noqa: F821
     sd._refuse_unresolved(_Root, [Literal["a", "b"], Annotated[int, "metadata"]])
+
+
+# --- A field typed as pydantic's own BaseModel ---------------------------------------------------
+
+
+class _AnyModelHolder(BaseModel):
+    inner: BaseModel | None = None
+
+
+def test_a_field_typed_basemodel_itself_does_not_crash_discovery() -> None:
+    """``BaseModel`` is never ``__pydantic_complete__`` and has no generic metadata, so rebuilding it
+    raises ``AttributeError``. It has no fields to complete, so discovery skips the rebuild and walks
+    it as an empty DTO, as origin/main did before the deferred-build completion was added."""
+    module = types.ModuleType("fake.anymodel")
+    module.__dict__["_AnyModelHolder"] = _AnyModelHolder
+    assert _names(sd._closure({"_AnyModelHolder"}, module, "synthetic")) == {
+        "_AnyModelHolder",
+        "BaseModel",
+    }
+
+
+def test_a_failing_rebuild_is_refused_as_a_seam_discovery_error(
+    postponed: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuild failure must come out loud and TYPED, never as a raw exception from pydantic."""
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise AttributeError("synthetic rebuild failure")
+
+    monkeypatch.setattr(postponed.Deferred, "model_rebuild", _boom)
+    monkeypatch.setattr(postponed.Deferred, "__pydantic_complete__", False)
+    with pytest.raises(sd.SeamDiscoveryError, match="synthetic rebuild failure"):
+        sd._closure({"Deferred"}, postponed, "synthetic")

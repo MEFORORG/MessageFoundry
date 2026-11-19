@@ -66,6 +66,29 @@ $local   = Join-Path $secDir 'scan-tokens.local.txt'
 $example = Join-Path $secDir 'scan-tokens.local.txt.example'
 $scanner = Join-Path $secDir 'scan_forbidden.py'
 
+# Every git call this script makes, its own and the scanner's, must answer about $repo. An inherited
+# GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE -- exported by a hook, or left behind in the operator's shell
+# -- outranks both -C and the current directory, so the scan would list another repository's tracked
+# files (or another index) and report its verdict as this checkout's. Each call runs with the three
+# dropped, and they are restored afterwards so a caller that dot-sources or invokes this in-process
+# keeps its own environment.
+$gitRedirects = 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'
+function Invoke-WithoutGitRedirect([scriptblock]$Body) {
+    $saved = @{}
+    foreach ($name in $gitRedirects) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name)
+        # Remove-Item, not SetEnvironmentVariable($name, $null): PowerShell binds that $null to the
+        # [string] parameter as '', and git then reads GIT_DIR='' as a (missing) repository.
+        Remove-Item -LiteralPath "Env:$name" -ErrorAction Ignore
+    }
+    try { & $Body }
+    finally {
+        foreach ($name in $gitRedirects) {
+            if ($null -ne $saved[$name]) { Set-Item -LiteralPath "Env:$name" -Value $saved[$name] }
+        }
+    }
+}
+
 if ($PSCmdlet.ParameterSetName -eq 'Real') {
     if (-not (Test-Path -LiteralPath $From)) { throw "No such token file: $From" }
     Copy-Item -LiteralPath $From -Destination $local -Force
@@ -87,7 +110,7 @@ if ($PSCmdlet.ParameterSetName -ne 'Status') {
 # The token file must never become committable. Verify rather than assume -- this is the one mistake
 # that would publish the very list the gate protects.
 if (Test-Path -LiteralPath $local) {
-    $ignored = & git -C $repo check-ignore -- 'scripts/security/scan-tokens.local.txt' 2>$null
+    $ignored = Invoke-WithoutGitRedirect { & git -C $repo check-ignore -- 'scripts/security/scan-tokens.local.txt' 2>$null }
     if (-not $ignored) {
         Remove-Item -LiteralPath $local -Force
         throw 'scan-tokens.local.txt is NOT git-ignored in this checkout. Removed it rather than risk committing the token list.'
@@ -156,11 +179,16 @@ Write-Host 'Verifying the gate can see:' -ForegroundColor Cyan
 # wrong-checkout class the $repo derivation above closes for the install (BACKLOG #1063).
 Push-Location -LiteralPath $repo
 try {
-    $out = & $py $scanner --require-tokens 2>&1
-    # Captured on the very next line, before any other native call can overwrite it. The scanner's
-    # verdict used to be discarded entirely, so a refusal came back out of here as CONFIGURED and exit
-    # 0 -- which contradicts this file's own header promise to "exit non-zero if the sections are empty".
-    $scanExit = $LASTEXITCODE
+    $scan = Invoke-WithoutGitRedirect {
+        $scanOut = & $py $scanner --require-tokens 2>&1
+        # Captured on the very next line, before any other native call can overwrite it. The scanner's
+        # verdict used to be discarded entirely, so a refusal came back out of here as CONFIGURED and
+        # exit 0 -- which contradicts this file's own header promise to "exit non-zero if the sections
+        # are empty".
+        [pscustomobject]@{ Out = $scanOut; Exit = $LASTEXITCODE }
+    }
+    $out = $scan.Out
+    $scanExit = $scan.Exit
 }
 finally {
     Pop-Location
