@@ -201,20 +201,21 @@ async def assert_cell_tag_contract(store: Any, raw: RawSql, fetch: RawFetch) -> 
     await _assert_foreign_key_cells(store, raw)
     # --- a substituted cell under a held key still fails a list read loudly --------------------
     await _assert_substituted_listed_cells(store, raw, fetch)
-    # --- under Transit, only a refusal that names the key withholds a listed cell --------------
+    # --- under Transit, only a refusal naming a key version withholds a listed cell ----------
     await _assert_transit_listed_refusals(store, raw, fetch)
 
 
 #: Vault's 400 texts for a Transit data-key decrypt, read 2026-11-19 from Vault ``main``
 #: (``sdk/helper/keysutil/policy.go``, ``builtin/logical/transit/path_decrypt.go``). The first
-#: three name the key, so a list withholds the cell; the rest are a malformed, truncated or
-#: rewritten cell, which must fail the list read (BACKLOG #5970, owner ruling 2026-11-19).
+#: two name a retired or unknown key version, so a list withholds the cell; the rest are a
+#: missing configured key or a malformed, truncated or rewritten cell, which must fail the list
+#: read (BACKLOG #5970, owner ruling 2026-11-19).
 _TRANSIT_KEY_REFUSALS = (
     "ciphertext or signature version is disallowed by policy (too old)",
     "invalid ciphertext: version is too new",
-    "encryption key not found",
 )
 _TRANSIT_LOUD_REFUSALS = (
+    "encryption key not found",
     "invalid ciphertext: could not decode base64",
     "invalid ciphertext length",
     "invalid ciphertext: version number could not be decoded",
@@ -249,8 +250,8 @@ class _TransitShaped:
 
 async def _assert_transit_listed_refusals(store: Any, raw: RawSql, fetch: RawFetch) -> None:
     """BACKLOG #5970, owner ruling 2026-11-19: under Transit a list read withholds a cell only
-    where Vault's refusal names the key (a retired or unknown version, a key it does not hold).
-    Any other refusal, such as an invalid or truncated ciphertext or a ``vault:vN`` version that
+    where Vault's refusal names a retired or unknown key version. Any other refusal, such as the
+    configured key not found, an invalid or truncated ciphertext or a ``vault:vN`` version that
     does not decode, fails the read on every list path: messages list, content search,
     ``queue.last_error``, ``connection_event.reason`` and ``alert_instance.reason``. Each planted
     cell is put back after, and each list has an untouched row beside it."""
@@ -350,9 +351,9 @@ async def _assert_transit_listed_refusals(store: Any, raw: RawSql, fetch: RawFet
     ]
     store._cipher = shaped
     try:
-        for index, (sql, where, put_back, read) in enumerate(cases):
-            loud = _TRANSIT_LOUD_REFUSALS[index % len(_TRANSIT_LOUD_REFUSALS)]
-            for text in (*_TRANSIT_KEY_REFUSALS, loud):
+        for sql, where, put_back, read in cases:
+            for text in (*_TRANSIT_KEY_REFUSALS, *_TRANSIT_LOUD_REFUSALS):
+                loud = text in _TRANSIT_LOUD_REFUSALS
                 await raw(sql, (plant(text), *where))
                 try:
                     rows = await read()
@@ -361,11 +362,11 @@ async def _assert_transit_listed_refusals(store: Any, raw: RawSql, fetch: RawFet
                         f"{read.__name__}: {text!r} read as a tag failure"
                     ) from exc
                 except CipherError:
-                    assert text == loud, f"{read.__name__}: a key refusal failed the read: {text!r}"
+                    assert loud, f"{read.__name__}: a key refusal failed the read: {text!r}"
                     continue
                 finally:
                     await raw(sql, put_back)
-                assert text != loud, f"{read.__name__}: {text!r} was withheld, not refused"
+                assert not loud, f"{read.__name__}: {text!r} was withheld, not refused"
                 _assert_withheld(read.__name__, rows, m=m, mctl=mctl, qa=qa, qb=qb)
     finally:
         store._cipher = real

@@ -467,7 +467,7 @@ def withhold_message_cells(
     too, but is only logged, never appended (:func:`withhold_refused_cell`, BACKLOG #5970). Any
     other cipher error raises, failing the read as before #5970 (owner ruling 2026-11-19): at
     least an outage, a malformed or truncated cell under a key the store does not hold, and a
-    Transit refusal other than its tag that does not name the key."""
+    Transit refusal other than its tag that names no key version."""
     stored: str | None = None
     try:
         for col in columns:
@@ -539,28 +539,29 @@ def _first_in_interval(memo: _Memo, err: CellTagError, key: _Key | None = None) 
 
 
 #: The texts, lower-cased and matched whole, that a Transit data-key ``decrypt`` 400 names a
-#: retired key version or a key Transit does not hold with (BACKLOG #5970), beside the audit
-#: walk's :data:`~messagefoundry.store.crypto_transit._VERSION_REFUSAL_TEXTS`, which also cover
+#: retired key version with (BACKLOG #5970), beside the audit walk's
+#: :data:`~messagefoundry.store.crypto_transit._VERSION_REFUSAL_TEXTS`, which also cover
 #: ``decrypt``'s ``invalid ciphertext: version is too new`` and ``no such key version``. Read on
-#: 2026-11-19 from Vault ``main``: ``sdk/helper/keysutil/policy.go`` (``ErrTooOld``) and
-#: ``builtin/logical/transit/path_decrypt.go``; OpenBao was not read. Wording a release changes
-#: stops matching, so that refusal fails the read loudly, the side the owner's ruling keeps.
+#: 2026-11-19 from Vault ``main``'s ``sdk/helper/keysutil/policy.go`` (``ErrTooOld``); OpenBao was
+#: not read. Wording a release changes stops matching, so that refusal fails the read loudly, the
+#: side the owner's ruling keeps. ``encryption key not found`` is deliberately absent: Transit
+#: answers it when the store's configured key is missing, a fault of the whole store rather than
+#: of a cell's key version, so a list read raises on it (owner ruling 2026-11-19).
 _TRANSIT_KEY_REFUSAL_TEXTS: Final = frozenset(
-    {
-        "ciphertext or signature version is disallowed by policy (too old)",
-        "encryption key not found",
-    }
+    {"ciphertext or signature version is disallowed by policy (too old)"}
 )
 
 
 def _transit_refused_for_key(cause: BaseException | None) -> bool:
     """Whether a Transit ``decrypt`` failure's ``cause`` is Vault's HTTP 400 whose every reason
-    names the key: a version below ``min_decryption_version``, a version past the key's latest or
-    one it has no entry for, or a key Transit does not hold. Every other 400 is ``False``, at
-    least invalid or truncated ciphertext, bad base64, a version number that does not decode, a
-    missing prefix and a body too long to read. The reply is read by the Transit cipher's own
-    bounded reader, and this never raises."""
+    names the cell's key version: one below ``min_decryption_version``, one past the key's latest,
+    or one it has no entry for. Every other 400 is ``False``, at least invalid or truncated
+    ciphertext, bad base64, a version number that does not decode, a missing prefix, the
+    configured key not found, and a body too long to read. The reply is read by the Transit
+    cipher's own bounded reader. A memory or stack fault reading it is logged and read as
+    ``False``; anything else it raises propagates, which fails the read too."""
     from messagefoundry.store.crypto_transit import (  # noqa: PLC0415 -- Transit only
+        _READ_FAULTS,
         _VERSION_REFUSAL_TEXTS,
         _reply_errors,
     )
@@ -570,7 +571,7 @@ def _transit_refused_for_key(cause: BaseException | None) -> bool:
         return False
     try:
         errors, oversize = _reply_errors(cause, bound_parsed=True)
-    except Exception as fault:  # noqa: BLE001 -- any fault reading the reply fails the read loudly
+    except _READ_FAULTS as fault:
         _log.warning(
             "reading a Transit decrypt 400 raised %s; not read as a key refusal",
             type(fault).__name__,
@@ -594,6 +595,9 @@ def refused_for_key(cipher: Cipher, exc: CipherError, stored: str | None) -> boo
     does not hold the key the cell names: a key not supplied, a retired key version, or an unknown
     one (BACKLOG #5970). Only such a cell may a list-shaped read withhold (owner ruling
     2026-11-19); every other refusal fails the read.
+
+    Under Transit only a retired or unknown key VERSION counts; a configured key Transit does not
+    find is a fault of the whole store, so it fails the read.
 
     The in-process cipher, which names its keys (``holds_key_for``), says so with
     :class:`~messagefoundry.store.crypto.UnauthenticatedCipherError` for a marked value whose
@@ -635,7 +639,7 @@ def withhold_refused_cell(cipher: Cipher, table: str, exc: CipherError, stored: 
     (:func:`refused_for_key`), log
     that the cell was withheld, once per table and error class per interval, and return; else
     re-raise ``exc``, failing the read as before #5970 (owner ruling 2026-11-19). That raises at
-    least an outage, a malformed or truncated cell, and a Transit 400 that does not name the key.
+    least an outage, a malformed or truncated cell, and a Transit 400 that names no key version.
     The class name only: the cipher's text can echo fields cut from the stored value."""
     if not refused_for_key(cipher, exc, stored):
         raise exc
@@ -660,7 +664,7 @@ def open_listed_cell(cipher: Cipher, stored: str | None, aad: bytes, *, table: s
     Every other refusal raises the cipher's own error, failing the read as it did before #5970
     (owner ruling 2026-11-19): at least an outage, a tag that failed under a key the store holds
     (a substituted or tampered cell), a corrupt, malformed or truncated cell, an unmarked value,
-    and any Transit refusal whose text does not name the key. These tables have no tag-failed
+    and any Transit refusal whose text names no key version. These tables have no tag-failed
     audit row or ``integrity_drift`` alert, so the failed read is the only signal, and withholding
     it would hide the tamper. A substituted cell whose marker was also rewritten to name a key the
     store does not hold cannot be told from a key genuinely not held, so it is withheld

@@ -1195,18 +1195,19 @@ def _transit_refusing(text: str) -> Any:
     return TransitCipher(client, "mefor-store")
 
 
-#: Vault's 400 texts for a Transit data-key decrypt that name the key, read 2026-11-19 from Vault
-#: ``main`` (``sdk/helper/keysutil/policy.go``, ``builtin/logical/transit/path_decrypt.go``).
+#: Vault's 400 texts for a Transit data-key decrypt that name a retired or unknown key version,
+#: read 2026-11-19 from Vault ``main`` (``sdk/helper/keysutil/policy.go``).
 _TRANSIT_KEY_REFUSALS = (
     "ciphertext or signature version is disallowed by policy (too old)",
     "invalid ciphertext: version is too new",
     "no such key version",
-    "encryption key not found",
     " Invalid Ciphertext: Version Is Too New ",
 )
-#: Its 400 texts for a malformed, truncated or rewritten cell, from the same source, and wording
-#: that names no key.
+#: Its 400 texts for a malformed, truncated or rewritten cell and for a missing configured key,
+#: from the same source and ``builtin/logical/transit/path_decrypt.go``, and wording that names no
+#: key version.
 _TRANSIT_LOUD_REFUSALS = (
+    "encryption key not found",
     "invalid ciphertext: no prefix",
     "invalid ciphertext: wrong number of fields",
     "invalid ciphertext: version number could not be decoded",
@@ -1249,7 +1250,7 @@ def test_a_transit_list_read_fails_on_a_refusal_that_does_not_name_the_key(text:
 @pytest.mark.parametrize("text", _TRANSIT_KEY_REFUSALS)
 def test_a_transit_list_read_withholds_a_cell_vault_refuses_for_its_key(text: str) -> None:
     """BACKLOG #5970, owner ruling 2026-11-19 (the control): under Transit a cell Vault refuses
-    for a retired or unknown key version, or a key it does not hold, is withheld from a list."""
+    for a retired or unknown key version is withheld from a list."""
     pytest.importorskip("hvac")
     cipher = _transit_refusing(text)
     stored = "mfenc:v3:vault:v9:AAAA"
@@ -1265,7 +1266,7 @@ def test_a_transit_list_read_withholds_a_cell_vault_refuses_for_its_key(text: st
 
 
 def test_a_transit_refusal_that_names_the_key_beside_another_reason_fails_loudly() -> None:
-    """Every reason must name the key; one that does not fails the read."""
+    """Every reason must name a key version; one that does not fails the read."""
     pytest.importorskip("hvac")
     from hvac.exceptions import InvalidRequest
 

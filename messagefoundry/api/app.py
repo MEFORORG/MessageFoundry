@@ -12334,7 +12334,7 @@ async def _open_reconcile_instances(store: Store) -> dict[int, tuple[str, str]] 
     family: each backend's driver errors, the engine's own ``RuntimeError``, aiosqlite's
     ``ValueError`` on a closed connection, and, opening a stored ``reason``, every cipher refusal
     but one: at least a key-service outage, a substituted, corrupt or malformed cell under a key
-    the store holds, and a Transit refusal that does not name the key. A reason whose marker names
+    the store holds, and a Transit refusal that names no key version. A reason whose marker names
     a key the store does not hold, retired or unknown, is withheld instead (BACKLOG #5970, owner
     ruling 2026-11-19; ``cell_tag.refused_for_key`` names the rewrites it cannot tell apart). One
     that escaped would cost the pass's pages, or the whole pass, through the loop's own catch. Any

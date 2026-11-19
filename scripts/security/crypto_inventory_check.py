@@ -581,7 +581,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2593: builds the AES-GCM associated data a message cell (bound to its channel) and a
     # preset's criteria (bound to its owner) are sealed under, and opens those cells through the store
     # cipher seam. No key of its own. BACKLOG #5970: to tell a Transit decrypt 400 that names the
-    # key (a retired or unknown version, a key not held) from any other, it reads the reply with
+    # key version (retired or unknown) from any other, it reads the reply with
     # crypto_transit's bounded reader and version texts and keyprovider_vault's 400 test; it makes
     # no Transit call of its own.
     "messagefoundry/store/cell_tag.py": frozenset(
