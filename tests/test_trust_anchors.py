@@ -2892,7 +2892,7 @@ def test_a_forward_ca_its_hop_does_not_read_refuses_at_load_and_is_not_collected
     control, the same build on verified TLS, is collected, so the skip is not the model's doing."""
     from pydantic import ValidationError
 
-    base = {
+    base: dict[str, Any] = {
         "forward_host": "collector.example.org",
         "forward_protocol": SyslogProtocol.TLS,
         "forward_tls_ca_file": str(tmp_path / "gone.pem"),
