@@ -214,8 +214,8 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
     // sign-in names the cached one as `supersedes` and the engine ends that session itself, once it
     // has accepted the new credential and before its session cap counts. A failed sign-in therefore
     // signs nobody out, and only that one token ends, never the user's other sessions. No
-    // `/auth/logout` follows. signInSession.ts says why, and what the order costs. `withAuth`
-    // clears the cache before it re-signs in after a 401, so the case this covers is the status
+    // `/auth/logout` follows. signInSession.ts says why, and what the order costs. `withAuth` (through
+    // `withAuthAdopting`) clears the cache before it re-signs in after a 401, so the case this covers is the status
     // bar's explicit "Sign in" over a token that is still cached and still live.
     let res: LoginResponse;
     try {
@@ -287,7 +287,8 @@ export async function withAuth<T>(
 /**
  * {@link withAuth}, for a `call` that may replace its own token mid-call, as a step-up re-proof
  * does. The call reports the token it now holds through `adopt` (BACKLOG #5960). A 401 on that
- * token then reads as this call's own session ending, and signs in again. Without it, the cache
+ * token then signs in again unless the cache holds a token newer still, as after a sign-in
+ * elsewhere, which is retried as for any call. Without it, the cache
  * holding the adopted token would read as a sign-in elsewhere, and the retry would spend one of its
  * three runs of `call` on a token the engine had just refused. Each run is the whole `call`, so a
  * step-up call may itself reach the engine more than once per run.
@@ -379,8 +380,9 @@ export async function withStepUpAuth<T>(
   return await withAuthAdopting(ctx, url, (token, adopt) =>
     withStepUp(token, call, {
       ...host,
-      // The re-proof ended the token withAuth handed in, so withAuth is told which one this call
-      // now holds: a 401 on it is this session ending, not a sign-in elsewhere (BACKLOG #5960).
+      // The re-proof ended the token withAuthAdopting handed in, so it is told which one this call
+      // now holds: a 401 on it is then not mistaken for a sign-in elsewhere merely because the
+      // cache holds the rotated token (BACKLOG #5960).
       storeToken: async (rotated) => {
         adopt(rotated);
         await ctx.secrets.store(secretKey(url), rotated);

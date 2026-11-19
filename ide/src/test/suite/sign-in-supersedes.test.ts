@@ -251,7 +251,9 @@ suite("auth.ts routes sign-in through the superseding path (BACKLOG #2281)", () 
     assert.ok(start >= 0, `${name} was not found in auth.ts`);
     // Ends at the next declaration or doc comment, exported or not, so a module-private function
     // placed after `name` is never read as part of it.
-    const rest = text.slice(start + 1).search(/\n(?:export |async function |\/\*\*)/);
+    const rest = text
+      .slice(start + 1)
+      .search(/\n(?:export |async function |function |const |let |class |interface |type |\/\*\*|\/\/)/);
     return text.slice(start, rest < 0 ? undefined : start + 1 + rest);
   }
 

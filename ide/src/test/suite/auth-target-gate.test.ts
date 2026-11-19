@@ -175,7 +175,7 @@ gateSuite("a cached bearer goes only to a target assertTargetAllowed passes (BAC
     assert.ok(errors[0].includes("non-loopback host engine_prod.invalid"), errors[0]);
   });
 
-  test("A3: withStepUpAuth inherits the gate through withAuth", async () => {
+  test("A3: withStepUpAuth inherits the gate through withAuthAdopting", async () => {
     const seen: string[] = [];
     const result = await auth.withStepUpAuth(context, REFUSED, (token) => {
       seen.push(token);

@@ -90,7 +90,7 @@ const NODE_SIDE = !insideExtensionHost();
 type AuthModule = typeof import("../../auth");
 type ClientModule = typeof import("../../engineClient");
 let auth!: AuthModule;
-/** The HttpError class the freshly loaded auth.ts checks against; the top-level import is another. */
+/** The HttpError class the freshly loaded auth.ts checks against, not a copy from another load. */
 let HttpErrorCls!: ClientModule["HttpError"];
 
 if (NODE_SIDE) {
