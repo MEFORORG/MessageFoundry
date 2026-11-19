@@ -479,9 +479,7 @@ def test_a_broad_account_that_can_read_is_a_problem(ace: tuple[int, int, str], n
         "S-1-5-9",  # Enterprise Domain Controllers
         "S-1-5-83-0",  # Virtual Machines
         "S-1-5-84-0-0-0-0-0",  # USER MODE DRIVERS
-        # Legacy Enterprise Read-only Domain Controllers Beta; the real enterprise RODC group
-        # (RID 498) is not screened by this entry.
-        "S-1-5-22",
+        "S-1-5-22",  # Legacy Enterprise Read-only Domain Controllers Beta
         "S-1-5-32-554",  # Pre-Windows 2000 Compatible Access
         "S-1-5-64-36",  # Cloud Account Authentication
         "S-1-5-21-9-9-9-516",  # Domain Controllers
