@@ -446,15 +446,27 @@ SLOW_PRUNE_STUB = (
 
 
 @requires_windows
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ({}, "after prompt=[] gcm=[] exists=False,False"),
+        (
+            {"GIT_TERMINAL_PROMPT": "1", "GCM_INTERACTIVE": "always"},
+            "after prompt=[1] gcm=[always] exists=True,True",
+        ),
+    ],
+    ids=["unset-before", "set-before"],
+)
 def test_a_hand_run_stopped_part_way_leaves_the_shells_prompt_variables_alone(
-    tmp_path: Path,
+    tmp_path: Path, before: dict[str, str], after: str
 ) -> None:
-    """A Ctrl+C part way must not leave the prompt variables set in the operator's shell.
+    """A stop part way must not leave the prompt variables changed in the operator's shell.
 
     A hand run with ``&`` shares the caller's process. Here one pwsh stands in for that shell: the
-    runner runs in a second runspace of it and is stopped, as Ctrl+C stops it, while the stub
+    runner runs in a second runspace of it and is stopped with a runspace Stop while the stub
     prune-merged.ps1 is still running. Restored only in Exit-Run, both variables stayed set; the
-    runner's `finally` now removes them, as they were unset before, and the child still saw both.
+    runner's `finally` now removes each that was unset before and puts back each value that was set,
+    and the child still saw both as the runner set them.
     """
     runner, log_dir, env = copy_runner(tmp_path, SLOW_PRUNE_STUB)
     started = tmp_path / "stub-started.txt"
@@ -464,6 +476,7 @@ def test_a_hand_run_stopped_part_way_leaves_the_shells_prompt_variables_alone(
             "T_LOGDIR": str(log_dir),
             "T_REPO": str(tmp_path),
             "T_STARTED": str(started),
+            **before,
         }
     )
     script = (
@@ -474,7 +487,8 @@ def test_a_hand_run_stopped_part_way_leaves_the_shells_prompt_variables_alone(
         "{ Start-Sleep -Milliseconds 100 }; "
         "$ps.Stop(); "
         '"state=$($ps.InvocationStateInfo.State) '
-        'after prompt=[$env:GIT_TERMINAL_PROMPT] gcm=[$env:GCM_INTERACTIVE]"'
+        "after prompt=[$env:GIT_TERMINAL_PROMPT] gcm=[$env:GCM_INTERACTIVE] "
+        'exists=$(Test-Path Env:\\GIT_TERMINAL_PROMPT),$(Test-Path Env:\\GCM_INTERACTIVE)"'
     )
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -488,7 +502,7 @@ def test_a_hand_run_stopped_part_way_leaves_the_shells_prompt_variables_alone(
     assert started.is_file(), proc.stdout + proc.stderr
     assert started.read_text(encoding="utf-8").strip() == "stub prompt=0 gcm=never"
     assert "state=Stopped " in proc.stdout, f"the run must be stopped part way: {proc.stdout}"
-    assert "after prompt=[] gcm=[]" in proc.stdout, proc.stdout + proc.stderr
+    assert after in proc.stdout, proc.stdout + proc.stderr
 
 
 # A prune-merged.ps1 stand-in that REFUSES the prune (exit 2, nothing attempted) and lists one finished
@@ -525,7 +539,11 @@ REMOVING_HELPER_STUB = (
         (True, "REMOVED", False, 1),
         (True, "REMOVED", True, 1),
         (True, "FAILED", False, 1),
+        (True, "FAILED", True, 1),
+        (True, "DECLINED", False, 1),
         (True, "DECLINED", True, 1),
+        (True, "ORPHANED", False, 3),
+        (True, "ORPHANED", True, 3),
         # Controls: nothing was attempted, so the prune's 2 stands.
         (True, "REFUSED", False, 2),
         (True, "REFUSED", True, 2),

@@ -82,7 +82,6 @@ $ErrorActionPreference = 'Stop'
 # Set here so the trap below never reads a caller's variable of the same name.
 $log = $null
 $code = $null
-$removalAttempted = $false
 $pruneStarted = $false
 # In UTC: Task Scheduler's limit counts elapsed time, and a local clock repeats an hour at the DST
 # fall-back, which would put this deadline an hour past the kill.
@@ -152,12 +151,8 @@ trap {
     Write-Error -Message $fault -ErrorAction Continue
     # 2 promises nothing was removed: true before the prune started and on a dry run. Once an -Apply
     # prune has started, even if it has not exited, 1, the rule the step's own refusal follows. Never
-    # below a code already set: an orphan's 3 must survive a later error. The one exception is a 2 the
-    # prune itself returned, under the same rule as the normal end: once the step has a REMOVED, FAILED
-    # or DECLINED row, that promise is false, so 1.
-    $trapCode = [math]::Max([int]$code, $(if (-not $pruneStarted -or -not $Apply) { 2 } else { 1 }))
-    if ($trapCode -eq 2 -and $removalAttempted) { $trapCode = 1 }
-    Exit-Run $trapCode
+    # below a code already set, which already carries every row the step handled (raised per row, below).
+    Exit-Run ([math]::Max([int]$code, $(if (-not $pruneStarted -or -not $Apply) { 2 } else { 1 })))
 }
 
 # BEFORE ANYTHING ASKS GIT, the primary's resolution below included: the helper refuses these too, but
@@ -200,15 +195,16 @@ if ($PSBoundParameters.ContainsKey('IdleHours')) { $pruneArgs += @('-IdleHours',
 # two. An SSH origin's passphrase or host-key prompt is not covered. The 2026-11-17 log stops right
 # after "Fetching origin (--prune)...", which a fetch waiting on a prompt would explain; that is not
 # established. A hand run with `&` shares the caller's process, so the `finally` below puts both back
-# as they were, as alloc.ps1 does: it runs on Exit-Run's `exit`, after the trap, and on a stop (Ctrl+C).
+# as they were, as alloc.ps1 does. Measured: it runs on Exit-Run's `exit`, on a runspace Stop, and on a
+# throw, where it runs BEFORE the trap, so the trap and its Exit-Run see the caller's values again.
 $hadPromptEnv = @{}
 foreach ($k in 'GIT_TERMINAL_PROMPT', 'GCM_INTERACTIVE') {
     $hadPromptEnv[$k] = if (Test-Path -LiteralPath "Env:\$k") { [Environment]::GetEnvironmentVariable($k) } else { $null }
     $hadPromptEnv["$k.exists"] = Test-Path -LiteralPath "Env:\$k"
 }
-$env:GIT_TERMINAL_PROMPT = '0'
-$env:GCM_INTERACTIVE = 'never'
 try {
+    $env:GIT_TERMINAL_PROMPT = '0'
+    $env:GCM_INTERACTIVE = 'never'
     $deadlineText = if ($deadline) { " stopAfter=$($deadline.ToLocalTime().ToString('HH:mm:ss'))" } else { '' }
     "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot$deadlineText ===" | Add-Content -LiteralPath $log
     # A marker on each side of the prune-merged.ps1 run, which prints nothing between its fetch line and its
@@ -269,11 +265,19 @@ try {
                     -IdleHours ([double]$listing.fence.idleHours) -Protect $protect -Apply:$Apply -StopAt $deadline | ForEach-Object {
                     $f = $why[$_.Path]
                     $detail = if ($_.Outcome -in 'REMOVED', 'WOULD-REMOVE') { "$($_.Reason) [$($f.branch)]; listed because: $($f.whyFinished)" } else { $_.Reason }
+                    # The code is raised here, per row and BEFORE the row's log line, so an error later in the
+                    # run, a failed log write included, reaches the trap with it. A deregistered tree still on
+                    # disk is an orphan, 3. A 2 from the prune says nothing was attempted, which a REMOVED,
+                    # FAILED or DECLINED row makes false, so 1. A failure is at least 1. Otherwise the code
+                    # never goes lower, and refusals and trees the deadline left change nothing.
+                    if ($_.Outcome -eq 'ORPHANED') { $script:code = [math]::Max([int]$script:code, 3) }
+                    elseif ($_.Outcome -in 'REMOVED', 'FAILED', 'DECLINED') {
+                        if ([int]$script:code -eq 2) { $script:code = 1 }
+                        elseif ($_.Outcome -eq 'FAILED') { $script:code = [math]::Max([int]$script:code, 1) }
+                    }
                     $lines = @("  {0,-12} {1} -- {2}" -f $_.Outcome, $_.Path, $detail)
                     if ($_.Outcome -eq 'WOULD-REMOVE') { $lines += "               would run: $($_.Command)" }
                     $lines | Add-Content -LiteralPath $log
-                    # Read by the trap too, so an error part way through still counts what was attempted.
-                    if ($_.Outcome -in 'REMOVED', 'FAILED', 'DECLINED') { $script:removalAttempted = $true }
                     $_
                 })
 
@@ -290,16 +294,6 @@ try {
             }
             "=== finished .claude/worktrees: mode=$mode listed=$($finished.Count) removed=$(& $n 'REMOVED') wouldRemove=$(& $n 'WOULD-REMOVE') refused=$(& $n 'REFUSED') declined=$(& $n 'DECLINED') failed=$(& $n 'FAILED') orphaned=$(& $n 'ORPHANED') notReached=$(& $n 'NOT-REACHED'); $free ===" |
                 Add-Content -LiteralPath $log
-
-            # Refusals leave the code alone, as do trees the deadline left and git declining a tree every re-check passed: nothing
-            # changed, and the DECLINED line is there to be read. (A decline still turns the prune's 2 into 1, below.) A removal that failed is a failure, and a
-            # deregistered tree still on disk is an orphan -- the same severity order prune-merged.ps1 uses.
-            if ((& $n 'FAILED') -gt 0) { $code = [math]::Max($code, 1) }
-            if ((& $n 'ORPHANED') -gt 0) { $code = [math]::Max($code, 3) }
-            # A 2 from the prune says nothing was attempted. Once this step has run a removal, whether it
-            # removed, failed or git declined it, that is false; 1 says something was attempted and not all of
-            # it succeeded. (An orphan is already 3.)
-            if ($code -eq 2 -and $removalAttempted) { $code = 1 }
         }
     }
 
