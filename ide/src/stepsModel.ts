@@ -1190,8 +1190,9 @@ export interface EditMessage {
   // render a re-typed string literal (`_render_literal` emits `6` for an int but `"6"` for a str).
   // A {@link TemplateValue} writes the argument in templated mode (ADR 0076 Amendment E, #237): the
   // engine renders the parts to an f-string and checks it reads back. Offer it only for an argument
-  // whose {@link paramWritableModes} include `templated`.
-  value: string | number | TemplateValue;
+  // whose {@link paramWritableModes} include `templated`. `null` is a cleared number field of an
+  // `X | None` param, which the engine writes as None (BACKLOG #5942).
+  value: string | number | null | TemplateValue;
   // The row's PROJECTION-TIME source text (the row as the user saw it when the lens projected the inputs),
   // echoed back from the webview's `data-expect-src` and carried to `lens rewrite` as `expect_src` (F7).
   // Optional so a hand-built message (tests / an older payload) may omit it — then no stale check is sent.
@@ -1206,8 +1207,9 @@ export interface EditRequest {
   op: "set_params";
   // A number-kind field carries a JS number so `JSON.stringify` emits a bare `6` (an int/float literal),
   // not `"6"` (a re-typed string literal) — BACKLOG #1760. A template is `{"parts": [...]}` (#237).
-  // Every other param stays a string.
-  params: Record<string, string | number | TemplateValue>;
+  // A cleared nullable number field is `null`, rendered None (BACKLOG #5942). Every other param stays
+  // a string.
+  params: Record<string, string | number | null | TemplateValue>;
   // The projected row's source text from the LIVE buffer (no EOL). `lens rewrite` verifies it still
   // matches the row before splicing, so a stale coordinate (a coincidental same-shape row) is refused
   // instead of edited in the wrong place (F7). Omitted → no stale check (older/no-buffer callers).
@@ -1335,6 +1337,9 @@ function readEditCoords(m: Record<string, unknown>): EditCoords | undefined {
     typeof handler !== "string" ||
     typeof lineStart !== "number" ||
     typeof lineEnd !== "number" ||
+    // A line number is a whole number; NaN, a fraction or an infinity addresses no row (BACKLOG #5942).
+    !Number.isSafeInteger(lineStart) ||
+    !Number.isSafeInteger(lineEnd) ||
     typeof name !== "string" ||
     typeof expectSrc !== "string"
   ) {
@@ -1351,7 +1356,8 @@ export type EditMessageRead = { edit: EditMessage } | { refused: string };
  *
  * `undefined` when it is not an `edit` message, or when its coordinates are not all present: that is
  * dropped silently, as it always was. An edit whose coordinates are present but whose value is not a
- * string, a number or a well-formed template ({@link isTemplateValue}) is REFUSED with a reason, never
+ * string, a finite number, `null` with `nullable: true` (a cleared nullable number field, BACKLOG
+ * #5942) or a well-formed template ({@link isTemplateValue}) is REFUSED with a reason, never
  * repaired and never dropped silently: a template the webview built wrong must not become a partial
  * write. A template is copied part by part, so nothing later can change what the engine is sent.
  */
@@ -1366,9 +1372,19 @@ export function readEditMessage(m: unknown): EditMessageRead | undefined {
   const raw = m.value;
   // A template's parts, copied, or null when the value is not exactly a well-formed template.
   const parts = isTemplateValue(raw) ? readTemplateParts(raw.parts) : null;
-  let value: string | number | TemplateValue;
-  if (typeof raw === "string" || typeof raw === "number") {
+  let value: string | number | null | TemplateValue;
+  if (typeof raw === "number" && !Number.isFinite(raw)) {
+    // JSON has no infinity or NaN: JSON.stringify sends each as null, which the engine would write
+    // as None, a different argument from the one typed (BACKLOG #5942).
+    return {
+      refused: `the Steps view sent "${coords.name}" as ${String(raw)}, which is not a finite number, so nothing was written`,
+    };
+  } else if (typeof raw === "string" || typeof raw === "number") {
     value = raw;
+  } else if (raw === null && m.nullable === true) {
+    // Only a cleared number field the page marked nullable (`data-nullable`) posts null; any other
+    // null stays refused below, as it was before null could be sent at all.
+    value = null;
   } else if (parts !== null) {
     value = templateValue(parts);
   } else {
@@ -2997,6 +3013,8 @@ export type OpSchema = Record<string, OpParamSchema[]>;
 export interface WidgetSpec {
   kind: "text" | "number" | "enum";
   choices?: string[]; // enum only
+  // number only: the param is an `X | None` slot, so clearing the field writes None (BACKLOG #5942).
+  nullable?: boolean;
 }
 
 /**
@@ -3022,7 +3040,7 @@ export function resolveWidget(
     return { kind: "enum", choices: param.choices };
   }
   if (param.kind === "int" || param.kind === "float") {
-    return { kind: "number" };
+    return param.nullable === true ? { kind: "number", nullable: true } : { kind: "number" };
   }
   return { kind: "text" };
 }
@@ -3092,8 +3110,11 @@ function renderLiteralInputHtml(
     // A number field posts a JS number (see stepsWebview.js) so the engine renders an int/float
     // literal, never a re-typed string literal (`_render_literal` renders `6` for an int but `"6"`
     // for a str — posting the string would silently retype the arg).
+    // `data-nullable` tells the page a cleared field means None. Without it the page refuses a
+    // cleared field rather than posting `Number("")`, which is 0 (BACKLOG #5942).
+    const nullable = widget.nullable === true ? ` data-nullable="true"` : "";
     input =
-      `<input type="number" class="edit" ${attrs} ` +
+      `<input type="number" class="edit" ${attrs}${nullable} ` +
       `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
   } else {
     input =
