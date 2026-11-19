@@ -2637,9 +2637,9 @@ def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is
     reaped: list[int] = []
     reaped_results: list[bool | None] = []
 
-    def _spy_unread(pid: int, **kwargs: Any) -> bool:
+    def _spy_unread(pid: int, **kwargs: Any) -> proctree.GroupKill:
         unread.append(pid)
-        return False
+        return _NOT_SENT
 
     def _spy_reaped(pid: int) -> bool | None:
         reaped.append(pid)
@@ -2688,22 +2688,44 @@ def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is
 # --- vault BACKLOG #5314: a failed group read does not drop to a single-process kill -----------
 
 
+_SENT, _EMPTY, _NOT_SENT = (
+    proctree.GroupKill.SENT,
+    proctree.GroupKill.EMPTY,
+    proctree.GroupKill.NOT_SENT,
+)
+
+
+def _single_kill_warnings(caplog: pytest.LogCaptureFixture) -> list[object]:
+    """The args of each single-process-kill WARNING the reap wrote, matched on a fragment of that
+    line and of no other line it writes."""
+    return [
+        r.args
+        for r in caplog.records
+        if r.name == sandbox_mod.log.name and "only the worker itself is killed" in r.getMessage()
+    ]
+
+
 @pytest.mark.parametrize(
     ("state", "group", "reaped", "calls", "single"),
     [
         # The guarded group kill sent its signal: nothing else runs.
-        ("running", True, None, ["group"], False),
+        ("running", _SENT, None, ["group"], False),
+        ("zombie", _SENT, None, ["group"], False),
+        # It found the group empty: nothing is left to kill, and the reuse-safe signal, with its
+        # pid-reuse gap, is not sent.
+        ("running", _EMPTY, None, ["group"], False),
+        ("zombie", _EMPTY, None, ["group"], False),
         # It sent nothing (the worker was reaped after the state check, or its zombie's group
         # could not be read): the reuse-safe signal reaches the group, and no single kill.
-        ("running", False, True, ["group", "reaped"], False),
-        ("zombie", False, True, ["group", "reaped"], False),
-        # The group is empty: nothing is left to kill.
-        ("zombie", False, False, ["group", "reaped"], False),
-        ("running", False, False, ["group", "reaped"], False),
+        ("running", _NOT_SENT, True, ["group", "reaped"], False),
+        ("zombie", _NOT_SENT, True, ["group", "reaped"], False),
+        # The reuse-safe signal found the group empty: nothing is left to kill.
+        ("zombie", _NOT_SENT, False, ["group", "reaped"], False),
+        ("running", _NOT_SENT, False, ["group", "reaped"], False),
         # Neither sent anything and members may remain, as for a live pid that left its group:
         # the single kill is the fallback, under a WARNING.
-        ("running", False, None, ["group", "reaped"], True),
-        ("zombie", False, None, ["group", "reaped"], True),
+        ("running", _NOT_SENT, None, ["group", "reaped"], True),
+        ("zombie", _NOT_SENT, None, ["group", "reaped"], True),
         # Already reaped: only the reuse-safe signal, as before (vault BACKLOG #3135), whose own
         # WARNING, pinned elsewhere, is not the single kill's.
         ("reaped", None, True, ["reaped"], False),
@@ -2714,7 +2736,7 @@ def test_the_posix_reap_reaches_the_group_before_any_single_kill(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     state: str,
-    group: bool | None,
+    group: proctree.GroupKill | None,
     reaped: bool | None,
     calls: list[str],
     single: bool,
@@ -2723,12 +2745,14 @@ def test_the_posix_reap_reaches_the_group_before_any_single_kill(
 
     FALSIFICATION: restore ``if not proctree.kill_process_group(proc.pid): _kill_single(proc)``
     as the last step of :func:`_reap_process_tree`, and the arms where the group kill sent nothing
-    red: the single kill runs and the reuse-safe signal is never sent."""
+    red: the single kill runs and the reuse-safe signal is never sent. Test the guarded kill's
+    result as a bool instead of against ``NOT_SENT``, and the ``EMPTY`` arms red: the reuse-safe
+    signal is sent to a group already found empty."""
     seen: list[str] = []
     singles: list[object] = []
     proc: Any = SimpleNamespace(pid=4242)
 
-    def _group(pid: int, **kwargs: Any) -> bool:
+    def _group(pid: int, **kwargs: Any) -> proctree.GroupKill:
         seen.append("group")
         assert (pid, kwargs) == (proc.pid, {})
         assert group is not None, "the guarded group kill ran for an already-reaped worker"
@@ -2749,12 +2773,58 @@ def test_the_posix_reap_reaches_the_group_before_any_single_kill(
     assert seen == calls
     assert singles == ([proc] if single else [])
     assert_capture_sees(caplog, sandbox_mod.log)  # so an empty scan below means nothing logged
-    warned = [
-        r.args
-        for r in caplog.records
-        if r.name == sandbox_mod.log.name and "single-process kill" in r.getMessage()
-    ]
-    assert warned == ([("IB_T", proc.pid)] if single else [])
+    assert _single_kill_warnings(caplog) == ([("IB_T", proc.pid)] if single else [])
+
+
+@pytest.mark.parametrize(
+    ("killpg_error", "expected", "logged"),
+    [
+        (None, _SENT, False),
+        (ProcessLookupError(3, "No such process"), _EMPTY, False),
+        (PermissionError(1, "Operation not permitted"), _NOT_SENT, True),
+    ],
+)
+def test_kill_process_group_tells_an_empty_group_from_a_failed_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    killpg_error: OSError | None,
+    expected: proctree.GroupKill,
+    logged: bool,
+) -> None:
+    """``killpg`` failing with ``ESRCH`` reads as an empty group, with nothing logged; any other
+    failure reads as nothing sent, under the module's WARNING; only a sent signal is truthy, so
+    the DR hook's bool test of the result is unchanged. The process calls are replaced, so this
+    runs on every host. FALSIFICATION: drop the ``ProcessLookupError`` arm in
+    :func:`proctree.kill_process_group`, and the ``ESRCH`` case returns ``NOT_SENT`` and logs."""
+    sent: list[int] = []
+
+    def _killpg(pgid: int, sig: int) -> None:
+        sent.append(pgid)
+        if killpg_error is not None:
+            raise killpg_error
+
+    fake_os = SimpleNamespace(getpgid=lambda pid: pid, getpgrp=lambda: 1, killpg=_killpg)
+    monkeypatch.setattr(proctree, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(proctree, "os", fake_os)
+    monkeypatch.setattr(proctree, "signal", SimpleNamespace(SIGKILL=9))
+    caplog.set_level(logging.WARNING, logger=proctree.log.name)
+    for started_as_leader in (False, True):
+        caplog.clear()
+        sent.clear()
+        result = proctree.kill_process_group(4242, started_as_leader=started_as_leader)
+        assert result is expected
+        assert bool(result) is (expected is _SENT)
+        assert sent == [4242]
+        assert_capture_sees(caplog, proctree.log)  # so an empty scan below means nothing logged
+        lines = [r.getMessage() for r in caplog.records if r.name == proctree.log.name]
+        assert lines == (
+            [
+                "could not signal process group 4242 (Operation not permitted), so a process in it "
+                "may survive"
+            ]
+            if logged
+            else []
+        )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
@@ -2762,7 +2832,7 @@ def test_the_posix_reap_reaches_the_group_before_any_single_kill(
     not os.path.isdir("/proc"), reason="_pid_running needs /proc to tell a zombie from a runner"
 )
 def test_a_worker_reaped_after_the_state_check_still_has_its_group_killed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A group leader that starts a grandchild, then exits and is reaped by something other than
     ``Popen`` AFTER the reap read it as a zombie, still has its group killed: the grandchild dies.
@@ -2787,9 +2857,14 @@ def test_a_worker_reaped_after_the_state_check_still_has_its_group_killed(
         assert proc.returncode is None
         assert _pid_running(grandchild_pid) is True  # the control: it outlived the leader
         monkeypatch.setattr(sandbox_mod, "_posix_child_state", lambda p: "zombie")
+        caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
         sandbox_mod._reap_process_tree(proc, None, "IB_T")
         assert _wait_until_not_running(grandchild_pid, timeout=5.0) is False, (
             "the grandchild of a worker reaped after the state check survived the reap"
+        )
+        assert_capture_sees(caplog, sandbox_mod.log)  # so an empty scan below means nothing logged
+        assert _single_kill_warnings(caplog) == [], (
+            "the reap fell back to a single-process kill though the group was signalled"
         )
     finally:
         if grandchild_pid is not None:

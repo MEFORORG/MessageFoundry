@@ -1450,14 +1450,16 @@ member left. At least these cases differ: after a kill that writes a line, it fo
 after a reap that is not a kill, such as closing a session whose worker had already died, no kill
 line comes before it; and when the signal itself failed, for example for want of permission, a line
 naming the process group and the system's error text, but not the inbound, comes before it. A
-worker not yet reaped whose group gets no signal takes the same reuse-safe group signal next, so a
-group that cannot be read because the worker is gone is still reached. When that also sends
-nothing, as for a worker that does not lead its group or a signal that failed, a second `WARNING`
-naming the inbound and the pid says the worker gets a single-process kill and a process it started
-may survive. A failed signal writes a similar unattributed line before it, which adds that the kill
-degrades to a single-process kill; that line can also be written when the group emptied in the
-meantime and no single-process kill follows. That single-process kill signals a running worker, and
-only reaps one that has already exited.
+worker not yet reaped whose group is found empty gets nothing more and no line. One whose group
+gets no signal for another reason takes the same reuse-safe group signal next, so a group that
+cannot be read because the worker is gone is still reached. When that also sends nothing and the
+group may still have members, as for a worker that does not lead its group or a signal that
+failed, a second `WARNING` naming the inbound and the pid says only the worker itself is killed,
+if it is still running, and a process it started may survive; when that signal finds the group
+empty, no such line is written. Each failed signal, to the group or by the reuse-safe path, writes
+an unattributed line naming the process group and the system's error text, which says a process in
+it may survive and does not say what the reap does next. That single-process kill signals a running
+worker, only reaps one that has exited and not been reaped, and does nothing to one already reaped.
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
 **`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the
