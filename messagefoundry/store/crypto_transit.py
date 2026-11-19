@@ -610,11 +610,11 @@ class TransitCipher(_UnmarkedPolicy):
         if self._client_factory is None:
             return self._shared_client
         held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
-        if held is not None and held.generation == self._generation:
-            return held.client
-        # Stale or absent: close a stale one before the build, so a build that raises cannot
-        # leave it open.
-        self._drop_held()
+        if held is not None:
+            if held.generation == self._generation:
+                return held.client
+            # Stale: close it before the build, so a build that raises cannot leave it open.
+            self._drop_held(held)
         generation = self._generation
         return self._hold(self._client_factory(), generation)
 
@@ -631,24 +631,27 @@ class TransitCipher(_UnmarkedPolicy):
         self._thread_clients.held = _ThreadClient(client, generation)
         return client
 
-    def _drop_held(self) -> None:
-        """Detach the calling thread's client, if any, then close it, in that order."""
-        held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
-        if held is not None:
-            del self._thread_clients.held
-            held.release()
+    def _drop_held(self, held: _ThreadClient) -> None:
+        """Detach the calling thread's ``held`` client, then close it here. The close is called
+        directly rather than through the finalizer, which does nothing once weakref's exit hook
+        has run."""
+        del self._thread_clients.held
+        if held.release.detach() is not None:
+            _close_client(held.client, threading.get_ident())
 
     def close_connections(self) -> None:
         """Close the calling thread's client and mark every other thread's stale (BACKLOG #5963).
 
         This cipher never closes a thread's client from another thread. Each other thread releases
-        its own at least on its next call, which builds a fresh one, or when it ends; until then a
-        stale client stays open. The cipher stays usable, since stores can share it. Without a
-        factory, the one shared client is left open."""
+        its own at least on its next Transit request, which builds a fresh client, or when it ends
+        before interpreter shutdown; until then a stale client stays open. The cipher stays usable,
+        since stores can share it. Without a factory, the one shared client is left open."""
         if self._client_factory is None:
             return
         self._generation += 1
-        self._drop_held()
+        held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
+        if held is not None:
+            self._drop_held(held)
 
     @property
     def transit_key_name(self) -> str:

@@ -304,7 +304,7 @@ def test_a_thread_that_exits_closes_its_own_client() -> None:
     so threads that come and go do not each leave a Vault socket open."""
     cipher, built = _cipher()
     _in_thread(lambda: cipher.encrypt("synthetic"))
-    # The ending thread tears its locals down itself, which can land just after join() returns.
+    # The ending thread tears its locals down itself; the wait is a margin, not a measured race.
     # A teardown on this thread would close nothing, so only waiting can help here.
     deadline = time.monotonic() + 10
     while built[1].adapter.closed == 0 and time.monotonic() < deadline:
@@ -371,6 +371,17 @@ def test_weakrefs_exit_hook_does_not_release_a_thread_client() -> None:
     cipher, _ = _cipher()
     held = cipher._thread_clients.held
     assert held.release.alive and held.release.atexit is False
+
+
+def test_a_close_after_weakrefs_exit_hook_still_closes_the_callers_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5963. Mutation: close through the finalizer, which is a no-op once weakref's exit
+    hook has run. Red: a store closed on a thread still running at shutdown closes nothing."""
+    cipher, built = _cipher()
+    monkeypatch.setattr(weakref.finalize, "_shutdown", True)
+    cipher.close_connections()
+    assert built[0].adapter.closed == 1
 
 
 def test_a_stale_client_is_closed_even_when_its_rebuild_raises() -> None:
@@ -565,7 +576,8 @@ async def test_every_store_close_releases_the_clients_even_when_a_close_step_rai
     store_class: type[Any],
 ) -> None:
     """All three backends: the release runs in a finally, so a close step that raises still
-    closes the Vault sockets, and the step's error still propagates. No database is opened."""
+    closes the closing thread's client, and the step's error still propagates. No database is
+    opened."""
     cipher, built = _cipher()
     store = object.__new__(store_class)
     store._cipher = cipher
