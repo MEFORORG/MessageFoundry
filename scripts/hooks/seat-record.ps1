@@ -36,8 +36,16 @@ try {
     # Read stdin ONCE and pass it on. The payload carries session_id, and without it seat.ps1 keys the
     # record on the literal string 'nosid' -- correct, but it collapses every unidentified session in
     # a worktree into one record, so the payload is worth forwarding carefully.
+    #
+    # Read as UTF-8 through the shared reader where it is present: [Console]::In decodes with the
+    # console code page, which mangles a non-ASCII `cwd`, and seat.ps1 then refuses it. The pipe
+    # below re-encodes with $OutputEncoding, UTF-8 under pwsh 7. seat.ps1 resolves the `cwd`.
     $payload = ''
-    if ([Console]::IsInputRedirected) { $payload = [Console]::In.ReadToEnd() }
+    $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+    if (Test-Path -LiteralPath $hookInput -PathType Leaf) {
+        . $hookInput
+        $payload = Read-CcxHookInput
+    } elseif ([Console]::IsInputRedirected) { $payload = [Console]::In.ReadToEnd() }
 
     $seat = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\seat.ps1'
     if (-not (Test-Path -LiteralPath $seat)) {

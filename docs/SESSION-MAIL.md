@@ -235,13 +235,14 @@ lives in [`scripts/hooks/_hookinput.ps1`](../scripts/hooks/_hookinput.ps1): a Se
 launch worktree, and every later event answers for the pin, so a `cd` into a sibling never shows or
 consumes the sibling's mail. `EnterWorktree` looks like that `cd` to the drain.
 
-The seat record does not follow the pin. `scripts/coord/seat.ps1` records the toplevel of the hook
-`cwd`, so after a move a peer that addresses you by your seat record writes to the box of the
-worktree you moved into, and nothing drains it. Measured 2026-10-28: a Lander launched in the
-primary, entered a sibling worktree, and fifteen messages waited there for fourteen hours with
-nothing saying so.
+The Stop-hook seat record now follows the pin too (BACKLOG #5961), so a peer that addresses you by
+your seat record writes to the box the drain reads. Mail can still reach the worktree you moved
+into, from a peer that addresses that path, or from a record written before the change. Before it,
+`scripts/coord/seat.ps1` recorded the toplevel of the hook `cwd`. Measured 2026-10-28 under that
+behaviour: a Lander launched in the primary, entered a sibling worktree, and fifteen messages waited
+there for fourteen hours with nothing saying so.
 
-The drain now names that box. When a pinned session's hook `cwd` is in another worktree of the same
+The drain names that box. When a pinned session's hook `cwd` is in another worktree of the same
 repository, and that worktree's box holds live mail this session may read, the injection carries one
 line with the count and the path. It never shows or consumes that box, because after a stray `cd` it
 is a sibling's. The line is said again only when newer mail arrives there, because Stop output

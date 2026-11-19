@@ -286,45 +286,43 @@ function Resolve-Worktree {
 function Read-HookPayload {
     # Hooks receive JSON on stdin. Absent or unparsable stdin is NORMAL for a manual run and is not
     # an error -- it just means every payload-derived field reports its source as 'absent'.
-    # The raw text is kept for Resolve-RecordHookDir, which hands it to the shared hook-input helper.
-    $script:HookPayloadText = ''
+    # Only Read-RecordHookInput's fallback, where the hook-input helper is absent, reads this way.
     if ([Console]::IsInputRedirected -ne $true) { return $null }
     try {
         $raw = [Console]::In.ReadToEnd()
         if (-not $raw -or -not $raw.Trim()) { return $null }
-        $script:HookPayloadText = $raw
         return ($raw | ConvertFrom-Json -EA Stop)
     } catch { return $null }
 }
 
-function Resolve-RecordHookDir {
+function Read-RecordHookInput {
     <#
-      Which directory -Record answers for when the hook payload names a `cwd`. Returns
-      @{ Dir = <path or $null>; Reason = <fault or ''> }. A Reason means NO WRITE.
+      The -Record hook input, and which worktree it answers for. Returns
+      @{ Payload; Dir = <worktree root or $null>; FromPin = <bool>; Reason = <fault or ''> }.
+      A Reason means NO WRITE. A $null Dir means the directory this script runs in.
 
-      THE PAYLOAD CWD IS WHERE THE SESSION IS NOW, NOT WHERE IT STARTED. A session that ran `cd`
-      into a sibling worktree, or into an unrelated repository, carries that directory in `cwd` at
-      every later Stop. Taken as it stands, it put this session's record in the sibling's box, or
-      in the other repository's registry (BACKLOG #5961). scripts/hooks/_hookinput.ps1 is the one
-      place the answer lives: same repository only, a pinned session answers for its pin, an
-      unpinned one only for the checkout the hook started in. It is read -ReadOnly, because a Stop
-      must never write a pin.
+      THE PAYLOAD CWD IS WHERE THE SESSION IS NOW, NOT WHERE IT STARTED. Taken as it stood, a `cd`
+      put this session's record in a sibling's box or in another repository's registry (BACKLOG
+      #5961). scripts/hooks/_hookinput.ps1 holds the rule; it is read -ReadOnly, because a Stop
+      must never write a pin. Its reader also decodes stdin as UTF-8 and bounds the read in time.
 
-      A missing helper is a Reason, not a fallback to the raw `cwd`: the raw `cwd` is the defect.
+      Without the helper (a sandbox that copies this script alone), input that names a `cwd` is a
+      Reason rather than a fallback to the raw `cwd`, which is the defect. Other input is read as
+      before.
     #>
     $helper = Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/_hookinput.ps1'
     if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
-        return @{ Dir = $null; Reason = "scripts/hooks/_hookinput.ps1 is missing beside this script, so the payload cwd cannot be checked" }
+        $p = Read-HookPayload
+        $why = if ($p -and ($p.PSObject.Properties.Name -contains 'cwd')) { "scripts/hooks/_hookinput.ps1 is missing beside this script, so the hook input's cwd cannot be checked" } else { '' }
+        return @{ Payload = $p; Dir = $null; FromPin = $false; Reason = $why }
     }
     try {
         . $helper
-        $s = Resolve-CcxHookSession -Text $script:HookPayloadText -ReadOnly
+        $s = Resolve-CcxHookSession -Text (Read-CcxHookInput) -ReadOnly
     } catch {
-        return @{ Dir = $null; Reason = "the hook-input helper failed ($($_.Exception.Message))" }
+        return @{ Payload = $null; Dir = $null; FromPin = $false; Reason = "the hook-input helper failed ($($_.Exception.Message))" }
     }
-    if ($s.Reason) { return @{ Dir = $null; Reason = [string]$s.Reason } }
-    $dir = if ($s.Root) { [string]$s.Root } elseif ($s.Dir) { [string]$s.Dir } else { $null }
-    return @{ Dir = $dir; Reason = '' }
+    return @{ Payload = $s.Payload; Dir = $s.Root; FromPin = ($s.Source -eq 'pin'); Reason = [string]$s.Reason }
 }
 
 function Get-SessionKey {
@@ -927,18 +925,23 @@ function Invoke-SeatWorktreeLock {
 
 $exit = 0
 try {
-    $payload = if ($Record) { Read-HookPayload } else { $null }
-
+    $payload = $null
     $wtHint = $Worktree
-    if (-not $wtHint -and $payload -and ($payload.PSObject.Properties.Name -contains 'cwd')) {
-        $hookDir = Resolve-RecordHookDir
-        if ($hookDir.Reason) {
-            # Rule 1 again: a `cwd` this cannot vouch for is no worktree, so NO WRITE, and exit 0
-            # because this is the Stop path.
-            [System.Console]::Error.WriteLine("seat.ps1: the hook payload's cwd was refused, so nothing was recorded: $($hookDir.Reason)")
-            exit 0
+    $script:WorktreeSource = 'git rev-parse --show-toplevel'
+    if ($Record) {
+        $hookIn = Read-RecordHookInput
+        $payload = $hookIn.Payload
+        if (-not $wtHint) {
+            if ($hookIn.Reason) {
+                # Rule 1 again: input this cannot vouch for names no worktree, so NO WRITE, and exit
+                # 0 because this is the Stop path. Like the no-worktree path below, it has no seats
+                # directory to log to, since that is found from the worktree.
+                [System.Console]::Error.WriteLine("seat.ps1: the hook input was refused, so nothing was recorded: $($hookIn.Reason)")
+                exit 0
+            }
+            $wtHint = $hookIn.Dir
+            if ($hookIn.FromPin) { $script:WorktreeSource = 'session pin (scripts/hooks/_hookinput.ps1)' }
         }
-        $wtHint = $hookDir.Dir
     }
     $wt = Resolve-Worktree -Hint $wtHint
 
@@ -1144,7 +1147,7 @@ try {
         # on its own disk; see Test-CoordRecordIsHere and docs/COORD-SHARED-ROOT.md.
         host             = Get-CoordHost
         worktree         = $wt
-        worktreeSource   = 'git rev-parse --show-toplevel'
+        worktreeSource   = $script:WorktreeSource
         sessionId        = $sk.Id
         sessionKey       = $sk.Key
         sessionIdSource  = $sk.Source

@@ -731,7 +731,46 @@ def test_after_a_cd_to_another_repository_the_seat_recorder_writes_nothing_there
 def test_an_unpinned_seat_recorder_writes_no_record_for_a_sibling_cwd(
     seat_clones: tuple[Path, Path, Path, Path],
 ) -> None:
-    """No pin says the session started in the sibling, and the only other record is the primary's."""
+    """No pin says the session started in the sibling, so neither its box nor the primary's is right."""
     repo, _, sibling, _ = seat_clones
     _record_stop(repo, _stop("s1", sibling))
+    assert _seat_records(repo) == []
+
+
+def test_an_unpinned_seat_recorder_still_records_the_checkout_it_started_in(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The control for the arm above: an unpinned cwd in the start checkout itself is recorded."""
+    repo, _, _, _ = seat_clones
+    _record_stop(repo, _stop("s1", repo))
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], repo), recs
+
+
+def test_a_pinned_seat_recorder_with_no_cwd_records_its_pin(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    repo, wt, _, _ = seat_clones
+    seed_pin(repo, wt, "s1")
+    _record_stop(repo, {"session_id": "s1", "hook_event_name": "Stop"})
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"].startswith("session pin"), recs
+
+
+def test_seat_ps1_says_why_it_refused_a_cwd(seat_clones: tuple[Path, Path, Path, Path]) -> None:
+    """seat-record.ps1 discards seat.ps1's stderr, so the refusal is read from seat.ps1 itself: an
+    absent record must be this refusal, not a writer that failed for some other reason."""
+    repo, _, sibling, _ = seat_clones
+    seat = ROOT / "scripts" / "coord" / "seat.ps1"
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(seat), "-Record"],
+        cwd=str(repo),
+        input=_raw(_stop("s1", sibling)),
+        capture_output=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert b"the hook input was refused, so nothing was recorded" in proc.stderr, proc.stderr
     assert _seat_records(repo) == []
