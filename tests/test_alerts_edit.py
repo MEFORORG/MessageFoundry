@@ -178,7 +178,7 @@ def test_add_into_an_inline_rules_array_in_other_spellings(
     """The inline array under an inline ``alerts`` table, and under dotted keys, take the add too,
     and a dotted sibling key stays on ``[alerts]`` rather than landing in a rule. An inline
     ``alerts`` table with no rules yet gets an inline array, since no array of tables fits in it.
-    The new rule is written in the usual ``{a = 1, b = 2}`` spacing."""
+    The new rule's top-level keys are written in the usual ``{a = 1, b = 2}`` spacing."""
     svc = _svc(tmp_path)
     svc.write_text(original, encoding="utf-8")
     rc, out = _add(svc, {"event_type": "connection_stopped", "min_depth": 3}, capsys)
