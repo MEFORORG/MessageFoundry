@@ -832,23 +832,19 @@ def _no_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ladder, "_attach_rung_timings", lambda payload, logs: None)
 
 
-@pytest.mark.parametrize("cause", ["unresponsive", "rung_aborted"])
-async def test_engine_ladder_does_not_wait_for_a_soak_after_its_climb_aborts(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cause: str
+async def test_engine_ladder_does_not_wait_for_a_soak_after_the_drive_aborts_a_rung(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Once the engine half aborts its climb, it ends at once rather than wait out ``soak_timeout``
-    for a LADDER_SOAK the drive has no reason to post.
+    """Once the drive aborts a rung, the engine half ends at once rather than wait out
+    ``soak_timeout`` for a LADDER_SOAK the drive has no reason to post.
 
     Mutation: drop the climb-abort return. Red: the bounded wait times out."""
     import harness.load.shardcert_ladder as ladder
-    from harness.load.coord import CoordTimeout
 
     calls: list[float] = []
 
     async def fake_engine(**kwargs: Any) -> Any:
         calls.append(kwargs["hold_seconds"])
-        if cause == "unresponsive":
-            raise CoordTimeout("no DRIVE_START")
         return _fake_engine_report(aborted=True)
 
     monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
@@ -860,8 +856,42 @@ async def test_engine_ladder_does_not_wait_for_a_soak_after_its_climb_aborts(
     assert len(calls) == 1
     assert "soak" not in result.rungs_armed
     assert "no soak: the climb aborted" in result.notes
-    # A drive that was slow rather than gone is told at once, rather than wait out SHARDS_READY.
+    # A drive that reaches the soak anyway is told at once, rather than wait out SHARDS_READY.
     assert coord.for_run("eab.soak").read(sc.ENGINE_SETUP_FAILED) is not None
+
+
+async def test_engine_ladder_still_soaks_after_a_missed_ladder_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """LADDER_STOP is an optimisation (coord.py): with it lost, a DRIVE_START timeout still ends the
+    climb, and the engine half still arms the soak the drive posts.
+
+    Mutation: refuse the soak on the unresponsive branch. Red: no soak armed."""
+    import harness.load.shardcert_ladder as ladder
+    from harness.load.coord import LADDER_SOAK, CoordTimeout
+
+    soak_calls: list[dict[str, Any]] = []
+
+    async def fake_engine(**kwargs: Any) -> Any:
+        run_id = kwargs["coord"].run_id
+        if run_id.endswith(".soak"):
+            soak_calls.append(kwargs)
+            return _fake_engine_report(aborted=False)
+        if run_id.endswith(".r1"):
+            # The drive's STOP was lost; its soak message is not.
+            base.post(LADDER_SOAK, {"soak_rate": 10.0, "hold_seconds": 1.0, "drain_timeout": 1.0})
+            raise CoordTimeout("no DRIVE_START")
+        return _fake_engine_report(aborted=False)
+
+    monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
+    _no_payload(monkeypatch)
+    base = FileDropCoord(tmp_path / "coord", run_id="lost")
+    result = await asyncio.wait_for(
+        ladder.run_engine_ladder(**_engine_ladder_kwargs(base, tmp_path)), timeout=10.0
+    )
+    assert len(soak_calls) == 1, result.notes
+    assert result.rungs_armed == ["r0", "soak"], result.notes
+    assert any("drive unresponsive" in n for n in result.notes), result.notes
 
 
 @pytest.mark.parametrize(
@@ -880,6 +910,9 @@ async def test_engine_ladder_does_not_wait_for_a_soak_after_its_climb_aborts(
         {"soak_rate": 10.0, "drain_timeout": [1]},
         {"soak_rate": 10**400},
         {"skip": "false", "soak_rate": 10.0},
+        {"skip": 0, "soak_rate": 10.0},
+        {"skip": 0.0, "soak_rate": 10.0},
+        {"skip": 1, "soak_rate": 10.0},
     ],
 )
 async def test_engine_ladder_refuses_a_malformed_ladder_soak(

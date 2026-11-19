@@ -3463,8 +3463,8 @@ async def run_engine_ladder(
         SHARDS_READY, DRIVE_START, ENGINE_DRAINED, ENGINE_RUNG_REPORT, RUNG_ABORTED
     )
 
-    # Set when this half ends the climb for a reason that is not the drive's normal early-stop. The drive
-    # then has no soak to post, so waiting out ``soak_timeout`` for LADDER_SOAK would only waste it.
+    # Set only when the climb ended because the drive aborted a rung (store-truth INVALID). The drive
+    # then skips the soak itself, so waiting out ``soak_timeout`` for LADDER_SOAK would only waste it.
     climb_aborted = False
     for rung in climb:
         # Early-stop: before arming any rung after the first, give the drive's just-posted LADDER_STOP a
@@ -3521,8 +3521,9 @@ async def run_engine_ladder(
         except CoordTimeout:
             # The drive did not drive this rung within the (short) DRIVE_START window. If it stopped (STOP
             # now present) this is the expected end of the climb; otherwise the drive is unresponsive.
-            # A bounded poll, as at the loop head: since this verdict now skips the soak, a STOP the drive
-            # posts just after the timeout must not read as an unresponsive drive.
+            # A bounded poll, as at the loop head, so a STOP posted just after the timeout is named as
+            # the early-stop it is. Either way the soak is still awaited below: LADDER_STOP is an
+            # optimisation (coord.py), and a lost one must not cost a soak the drive goes on to post.
             if await _seen_stop(base_coord, stop_poll_grace):
                 result.notes.append(
                     f"early-stop: DRIVE_START timeout on {rung.run_suffix} + LADDER_STOP"
@@ -3532,7 +3533,6 @@ async def run_engine_ladder(
                     f"aborting climb: no DRIVE_START for {rung.run_suffix} and no LADDER_STOP "
                     "(drive unresponsive)"
                 )
-                climb_aborted = True
             break
         payload = _engine_rung_payload(report)
         _attach_rung_timings(payload, _rung_log_paths(keep_dir, report.shards))
@@ -3586,8 +3586,10 @@ async def run_engine_ladder(
     soak_rate = _soak_field(soak_msg, "soak_rate", math.nan)
     soak_hold = _soak_field(soak_msg, "hold_seconds", soak_hold_seconds)
     soak_drain = _soak_field(soak_msg, "drain_timeout", soak_drain_timeout)
-    # The drive posts skip as true or not at all; any other value is as malformed as a bad number.
-    if skip not in (None, False) or soak_rate is None or soak_hold is None or soak_drain is None:
+    # The drive posts skip as true or not at all; any other value but false is as malformed as a bad
+    # number. Compared by identity, because 0 == False and 1 == True.
+    skip_malformed = skip is not None and skip is not False
+    if skip_malformed or soak_rate is None or soak_hold is None or soak_drain is None:
         return refuse_soak("LADDER_SOAK malformed: ending without a soak", "LADDER_SOAK malformed")
     soak_rung = LadderRung(
         index=-1,

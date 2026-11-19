@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -154,6 +155,35 @@ class TestTheRecordLandsOnTheSessionsWorktree:
         assert recs, proc.stdout + proc.stderr
         assert all(_same_dir(r["worktree"], repo) for r in recs)
         assert "[seat]" not in proc.stdout, "the success path prints nothing"
+
+
+class TestTheInputReadIsUnbounded:
+    def test_a_payload_written_after_three_seconds_is_still_recorded(self, repo: Path) -> None:
+        """The hook always read stdin to its end. The helper's 2 s default bound would refuse a slow
+        writer and record nothing.
+
+        Mutation: call Read-CcxHookInput with its default bound. Red: no record, and a notice."""
+        proc = subprocess.Popen(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(repo / "scripts" / "hooks" / "seat-record.ps1"),
+            ],
+            cwd=str(repo),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(3.0)
+        out, err = proc.communicate(
+            json.dumps({"session_id": "s1", "hook_event_name": "Stop"}), timeout=TIMEOUT
+        )
+        assert proc.returncode == 0, err
+        assert "[seat]" not in out, out
+        assert _records(repo), out + err
 
 
 class TestARecorderThatDidNotRunIsReported:

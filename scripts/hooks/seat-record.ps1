@@ -56,7 +56,10 @@ try {
     # Read stdin ONCE and pass it on. The payload carries session_id, and without it seat.ps1 keys the
     # record on the literal string 'nosid' -- correct, but it collapses every unidentified session in
     # a worktree into one record, so the payload is worth forwarding carefully.
-    $payload = Read-CcxHookInput
+    # UNBOUNDED, as this hook always read it (-1 is Task.Wait's infinite timeout): the helper's 2 s
+    # default would turn a slow harness write into a refused, unrecorded turn. The hook's own Timeout in
+    # install-coordination.ps1 still bounds the whole run.
+    $payload = Read-CcxHookInput -TimeoutMs -1
     $session = Enter-CcxHookSession -Text $payload -ReadOnly
     $worktree = $null
     if ($session.Reason) {
