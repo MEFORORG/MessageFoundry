@@ -1885,7 +1885,9 @@ QUEUE_CORRUPT_SUBJECT = "queue-corrupt"
 
 
 def alert_cell_tag_failure(sink: AlertSink, table: str, reason: str) -> None:
-    """Raise ``integrity_drift`` for a store cell that failed its row tag. The reason names a stage
+    """Raise ``integrity_drift`` for a store cell its tag-checked open refused, whatever the cause
+    the reason states: a failed row tag, or for a queue row any cause
+    ``store.queue_tag.QUEUE_TAG_CAUSES`` names. The reason names a stage
     and a short row-id prefix, never a row value, so it carries no PHI. Never raises."""
     if table == "queue":
         subject = QUEUE_TAG_SUBJECT

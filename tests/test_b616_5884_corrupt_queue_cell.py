@@ -28,6 +28,7 @@ from messagefoundry.pipeline.alerts import (
 )
 from messagefoundry.store.crypto import (
     AesGcmCipher,
+    CipherError,
     UnauthenticatedCipherError,
     generate_key,
     make_cipher,
@@ -202,6 +203,39 @@ def test_a_real_transit_cipher_verdict_stays_drift() -> None:
         with pytest.raises(QueueTagError) as refused:
             open_queue_cell(cipher, row)
         assert refused.value.cause == cause, text
+
+
+def test_a_v4_cell_with_a_corrupt_salt_is_reported_as_corrupt() -> None:
+    """A v4 cell whose salt segment does not parse names no key id, so ``holds_key_for`` is False.
+    It must still reach the audited, alerted corrupt path, not a silent dead-letter (BACKLOG
+    #5884)."""
+    cipher, _key_b64, seen = _cipher_and_hook()
+    row = _row()
+    sealed = cipher.encrypt("SYNTH-BODY", aad=queue_row_aad(row))
+    head, salt, blob = sealed.rsplit(":", 2)
+    assert sealed.startswith("mfenc:v4:") and len(salt) > 2  # the cell is v4, with a salt
+    damaged = f"{head}:zz{salt[2:]}:{blob}"
+    assert cipher.named_key_id(damaged) is None  # the marker no longer parses
+    with pytest.raises(CorruptQueueCellError) as corrupt:
+        open_queue_cell(cipher, {**row, "payload": damaged})
+    assert corrupt.value.cause == "corrupt"
+    sink = _Sink()
+    asyncio.run(report_queue_tag_failure(sink, cipher, row, error=corrupt.value))
+    assert json.loads(sink.details[0])["cause"] == "corrupt" and len(seen) == 1
+    # Control: a well-formed marker naming a key this cipher does not hold stays the cipher's own
+    # key-configuration error, unreported here.
+    other = make_cipher(generate_key(), write_v2=True)
+    foreign = other.encrypt("SYNTH-BODY", aad=queue_row_aad(row))
+    with pytest.raises(CipherError) as unheld:
+        open_queue_cell(cipher, {**row, "payload": foreign})
+    assert not isinstance(unheld.value, QueueTagError)
+
+
+def test_a_contradictory_cause_is_refused() -> None:
+    with pytest.raises(ValueError, match="cause"):
+        CorruptQueueCellError("c", cause="tag")
+    with pytest.raises(ValueError, match="cause"):
+        QueueTagError("t", cause="corrupt")
 
 
 def test_each_refusal_names_only_the_cause_the_code_knows() -> None:

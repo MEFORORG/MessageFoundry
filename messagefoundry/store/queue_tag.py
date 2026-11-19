@@ -195,7 +195,9 @@ async def release_unreturned(store: _Releaser, lanes: Iterable[Iterable[Any]]) -
         )
 
 
-#: The audit action written when a queue row's payload does not open under its own tag.
+#: The audit action written when a claimed queue row is refused by :func:`open_queue_cell` or a
+#: claim's own check, whatever the cause: its detail's ``cause`` (:data:`QUEUE_TAG_CAUSES`) says
+#: which, and only ``tag`` means the row's tag failed.
 QUEUE_TAG_FAILED_ACTION: Final = "integrity.queue_tag_failed"
 
 #: How much of a queue row id an audit row or alert names. Row ids are random, never PHI.
@@ -213,27 +215,26 @@ type QueueTagCause = Literal[
 #:
 #: - ``tag``: the cell's AEAD check failed under the row's own tag. The cell was sealed for another
 #:   row, or its ciphertext was altered; an AEAD check cannot tell those apart.
-#: - ``unknown``: the cipher refused the cell under the row's tag and cannot say why, so it may be
-#:   corrupt or sealed for another row. A Vault Transit verdict that is not an AEAD failure reads
-#:   this, as does a :class:`QueueTagError` raised with no cause.
-#: - ``corrupt``: a cipher that names its keys refused a cell under a key it holds for a reason
-#:   other than a failed AEAD check (:class:`CorruptQueueCellError`).
+#: - ``unknown``: the row was refused and its cause was not determined. Nothing more is claimed.
+#:   A Vault Transit verdict that is not an AEAD failure reads this, as does a
+#:   :class:`QueueTagError` raised with no cause.
+#: - ``corrupt``: a cipher that names its keys could not parse the cell's marker, or refused a cell
+#:   under a key it holds for a reason other than a failed AEAD check
+#:   (:class:`CorruptQueueCellError`).
 #: - ``blank``: the row holds a blank ``payload`` where a sealed cell must be.
-#: - ``ref``: a store-once row's cell opened under its tag, and the sealed ``shared_body`` key in it
-#:   differs from the row's ``body_ref`` column.
-#: - ``ref-unsealed``: as ``ref``, on a keyless store, where nothing was sealed, so the stored key is
-#:   plaintext and no tag bound it.
+#: - ``ref``: on a keyed store, a store-once row's cell opened and the ``shared_body`` key it holds
+#:   differs from the row's ``body_ref`` column. Whether this one payload was sealed is not checked.
+#: - ``ref-unsealed``: as ``ref``, on a keyless store, where nothing is sealed.
 #: - ``ref-not-delivered``: a store-once row on a backend that does not deliver one; its cell opened
 #:   and nothing says it was altered.
 QUEUE_TAG_CAUSES: Final[Mapping[QueueTagCause, str]] = MappingProxyType(
     {
         "tag": "failed its integrity tag",
-        "unknown": "was refused under its own tag, and the cipher cannot say whether it is"
-        " corrupt or sealed for another row,",
+        "unknown": "was refused, and its cause was not determined,",
         "corrupt": "holds a payload that is corrupt",
         "blank": "holds no sealed payload",
-        "ref": "holds a sealed reference that differs from its body_ref",
-        "ref-unsealed": "holds an unsealed reference that differs from its body_ref",
+        "ref": "holds a reference that differs from its body_ref (the store is keyed)",
+        "ref-unsealed": "holds a reference that differs from its body_ref (the store is keyless)",
         "ref-not-delivered": "is a store-once row, which this backend does not deliver,",
     }
 )
@@ -247,11 +248,13 @@ QUEUE_CORRUPT_ALERT_TABLE: Final = "queue-corrupt"
 
 
 class QueueTagError(CipherError):
-    """A queue row's ``payload`` did not open under the tag its own routing fields build, or opened
-    and was refused.
+    """A queue row's ``payload`` was refused: it did not open under the tag its own routing fields
+    build, or it opened and a check refused it.
 
-    Raised for a cell whose AEAD tag fails, a blank ``payload`` where a sealed cell must be, and a
-    sealed ``shared_body`` key that differs from the row's ``body_ref``. A subclass of
+    Raised for at least a cell whose AEAD tag fails, a cell a cipher refused for a cause it did not
+    name, a corrupt cell (:class:`CorruptQueueCellError`), a blank ``payload`` where a sealed cell
+    must be, a ``shared_body`` key that differs from the row's ``body_ref``, and a store-once row on
+    a backend that does not deliver one. A subclass of
     :class:`CipherError`, so every claim path that already dead-letters an undecryptable row
     dead-letters this one the same way. Carries no row value. Its :attr:`cause` names which case it
     was, from :data:`QUEUE_TAG_CAUSES`."""
@@ -265,13 +268,17 @@ class QueueTagError(CipherError):
     def __init__(self, message: str, *, cause: QueueTagCause | None = None) -> None:
         super().__init__(message)
         if cause is not None:
+            # ``corrupt`` and ``drift`` must agree, or the alert's subject and words disagree.
+            if (cause == "corrupt") == self.drift:
+                raise ValueError(f"cause {cause!r} contradicts {type(self).__name__}")
             self.cause = cause
 
 
 class CorruptQueueCellError(QueueTagError):
     """A queue row's ``payload`` under a key this process holds that no tag check can judge,
     because the cell is corrupt (BACKLOG #5884). That covers at least bad base64, a ciphertext too
-    short to hold a tag, and a plaintext whose tag VERIFIED but is not UTF-8.
+    short to hold a tag, a plaintext whose tag VERIFIED but is not UTF-8, and a marker the cipher
+    cannot parse, such as a v4 cell whose salt segment is damaged.
 
     It is not drift, so its alert says corrupt rather than a failed tag, under its own alert
     subject (:data:`QUEUE_CORRUPT_ALERT_TABLE`), and a claim's audit row names cause ``corrupt``.
@@ -489,6 +496,19 @@ def _names_tag_failure(cipher: Cipher, stored: str, exc: CipherError) -> bool:
     return not is_transient_open_failure(exc) and is_tag_failure(cipher, stored)
 
 
+def _marker_unparsed(cipher: Cipher, stored: str, exc: CipherError) -> bool:
+    """Whether ``stored`` is marked, yet a cipher that names its keys cannot parse a key id out of
+    its marker, and the failed open was a verdict. A well-formed marker naming a key that is not
+    configured parses, so it stays the cipher's own key-configuration error."""
+    named = getattr(cipher, "named_key_id", None)
+    return (
+        callable(named)
+        and not is_transient_open_failure(exc)
+        and cipher.is_encrypted(stored)
+        and named(stored) is None
+    )
+
+
 def open_queue_cell(cipher: Cipher, row: Any) -> str:
     """Open ``row``'s ``payload`` under its own tag: the body for an inline row, the sealed
     ``shared_body`` key for a ``ref`` row.
@@ -513,6 +533,12 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     try:
         opened = cipher.decrypt(payload, aad=queue_row_aad(row))
     except CipherError as exc:
+        if _marker_unparsed(cipher, payload, exc):
+            # A marked value whose marker this cipher cannot parse names no key, so holds_key_for
+            # is False and it would leave unreported. It is the cell that is damaged (BACKLOG #5884).
+            raise CorruptQueueCellError(
+                f"the queue row's payload is corrupt: its marker cannot be parsed ({exc})"
+            ) from exc
         if not _names_tag_failure(cipher, payload, exc):
             raise  # a key, format or key-service problem, which the cipher's own error names
         if not isinstance(exc, UnauthenticatedCipherError) and _names_its_keys(cipher):
@@ -558,8 +584,8 @@ async def report_queue_tag_failure(
     error: QueueTagError,
     outcome: str = "was dead-lettered",
 ) -> None:
-    """Record that ``row`` failed its queue tag: a WARNING, a :data:`QUEUE_TAG_FAILED_ACTION` audit
-    row and an ``integrity_drift`` alert through the cipher's tag-failure hook (BACKLOG #2593).
+    """Record that ``row`` was refused with ``error``: a WARNING, a :data:`QUEUE_TAG_FAILED_ACTION`
+    audit row and an ``integrity_drift`` alert through the cipher's tag-failure hook (BACKLOG #2593).
 
     The caller has usually dead-lettered the row, so the lane has moved on and the message is
     ``ERROR``. A caller whose dead-letter write failed reports the tag failure all the same, with
