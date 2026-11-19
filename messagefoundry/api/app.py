@@ -757,20 +757,9 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     re-authenticate toward the partner lockout a credential STOP protects against. It does not say
     the lane stays down until an operator acts, which is false (``RegistryRunner.outbound_stop_held``
     says what else re-arms it)."""
-    if not rr.running:
-        # BACKLOG #5702: the start this would point at is refused on a downed graph.
-        return (
-            f"outbound {name!r} is not running because this engine's graph is not running "
-            "(stopped, or a demoted node); resend through the engine that runs the graph"
-        )
-    if not rr.coordinator.is_leader():
-        # BACKLOG #5906: a cluster node that lost its lease still reads running until
-        # _stop_graph runs, and its start door refuses with RunnerLeaseLostError, so "start it
-        # before resending" would point at a refused control.
-        return (
-            f"outbound {name!r} is not running and this node no longer holds the cluster lease, so "
-            "it starts no connection; resend through the leader"
-        )
+    refused = _graph_down_detail(rr, "outbound", name)
+    if refused is not None:
+        return refused
     if rr.outbound_status(name) == "log_halted":
         return (
             f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
@@ -784,22 +773,30 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     return f"outbound {name!r} is not running — start it before resending"
 
 
-def _inbound_down_detail(rr: RegistryRunner, name: str) -> str:
-    """The 409 reason for an upload resend into an inbound that is not running. As
-    :func:`_outbound_down_detail` does for an outbound, it names a downed graph (BACKLOG #5702) or
-    a node that lost its cluster lease (BACKLOG #5906) rather than pointing at a start the inbound
-    start door refuses there."""
+def _graph_down_detail(rr: RegistryRunner, kind: str, name: str) -> str | None:
+    """The 409 reason both resend helpers share when every start door is refused on this node, or
+    ``None``: a downed graph (BACKLOG #5702), or a cluster node that lost its lease while its graph
+    still runs, whose start door refuses with ``RunnerLeaseLostError`` (BACKLOG #5906). Either way
+    "start it before resending" would point at a refused control. One place, so the inbound and
+    outbound texts cannot drift."""
     if not rr.running:
         return (
-            f"inbound {name!r} is not running because this engine's graph is not running "
+            f"{kind} {name!r} is not running because this engine's graph is not running "
             "(stopped, or a demoted node); resend through the engine that runs the graph"
         )
     if not rr.coordinator.is_leader():
         return (
-            f"inbound {name!r} is not running and this node no longer holds the cluster lease, so "
+            f"{kind} {name!r} is not running and this node no longer holds the cluster lease, so "
             "it starts no connection; resend through the leader"
         )
-    return f"inbound {name!r} is not running — start it before resending"
+    return None
+
+
+def _inbound_down_detail(rr: RegistryRunner, name: str) -> str:
+    """The 409 reason for an upload resend into an inbound that is not running: the shared
+    :func:`_graph_down_detail`, else the instruction to start it."""
+    refused = _graph_down_detail(rr, "inbound", name)
+    return refused or f"inbound {name!r} is not running — start it before resending"
 
 
 def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
