@@ -260,10 +260,15 @@ try {
     # line as the only signal. The try/catch guards against a THROW, not against a MALFORMED verdict,
     # so it did not cover this. A damaged marker publishes normally here and usage.ps1 refuses it on
     # the read, which is what "fail closed in the reader, fail open in the writer" actually means.
+    #
+    # THE BIT, NOT THE STATE (BACKLOG #5305). The reader now reports MALFORMED for markers it used to
+    # read as UNAVAILABLE -- an array-wrapped marker, an agreeing repeated key, a flag of "yes".
+    # records_cancellation is true for exactly the markers the reader called UNAVAILABLE before that
+    # change, so this suppresses on the same set it always did, while the reader refuses them as damaged.
     if ($HaveConfigRoots) {
         $av = $null
         try { $av = Get-RootUnavailability -StateDir $StateDir } catch { }
-        if ($av -and $av.state -eq 'UNAVAILABLE') {
+        if ($av -and $av.records_cancellation) {
             Write-Output "mefor-usage: account unavailable -- $([string]$av.reason)"
             exit 0
         }

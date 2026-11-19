@@ -3853,12 +3853,15 @@ def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_p
     assert states == expected, states
 
 
-@pytest.mark.parametrize("name", ["empty", "array-of-clear"])
+@pytest.mark.parametrize("name", ["array-of-clear", "flag-null", "flag-repeated"])
 def test_a_marker_that_parses_to_no_object_does_not_stop_a_live_account_publishing(
     tmp_path: Path, name: str
 ) -> None:
     """Vault BACKLOG #5305, end to end: the collector's damaged-marker guard publishes, and the
     reader still refuses, so the fix cannot pass by dropping the marker check altogether.
+
+    Only markers the pre-#5305 reader did NOT read as UNAVAILABLE: those it did still suppress, as
+    the next test pins. This is that test's negative control.
     """
     root = tmp_path / ".claude-account-9"
     root.mkdir()
@@ -3873,6 +3876,127 @@ def test_a_marker_that_parses_to_no_object_does_not_stop_a_live_account_publishi
     code, doc = read(state)
     assert code == UNAVAILABLE, doc
     assert doc["marker_state"] == "MALFORMED", doc
+
+
+# The collector's suppression set is the pre-#5305 reader's UNAVAILABLE set, unchanged. Each entry is
+# (body, the reader's state now, whether the collector suppresses), and each suppression value was
+# measured against origin/main's Get-RootUnavailability before this change: True exactly where main
+# read UNAVAILABLE.
+_SUPPRESSION = {
+    # Main read these as UNAVAILABLE, so the collector suppressed; the reader now says MALFORMED.
+    "array-of-marker": ('[{"unavailable": true, "reason": "cancelled"}]', "MALFORMED", True),
+    "flag-repeated-same": ('{"unavailable": true, "unavailable": true}', "MALFORMED", True),
+    "flag-yes": ('{"unavailable": "yes"}', "MALFORMED", True),
+    "flag-one-string": ('{"unavailable": "1"}', "MALFORMED", True),
+    "flag-string-false": ('{"unavailable": "false"}', "MALFORMED", True),
+    "flag-object": ('{"unavailable": {}}', "MALFORMED", True),
+    "flag-array-of-one": ('{"unavailable": [1]}', "MALFORMED", True),
+    "flag-repeated-then-true": ('{"unavailable": false, "unavailable": true}', "MALFORMED", True),
+    "empty": ("", "MALFORMED", True),
+    "whitespace": ("  \r\n ", "MALFORMED", True),
+    "null": ("null", "MALFORMED", True),
+    "array": ("[]", "MALFORMED", True),
+    "array-of-two-clears": ('[{"unavailable": false}, {"unavailable": false}]', "MALFORMED", True),
+    "number": ("5", "MALFORMED", True),
+    "string": ('"cancelled"', "MALFORMED", True),
+    "boolean-false": ("false", "MALFORMED", True),
+    "effective-from-repeated-past-last": (
+        '{"unavailable": true, "effective_from": "2099-01-01T00:00:00Z",'
+        ' "effective_from": "2000-01-01T00:00:00Z"}',
+        "MALFORMED",
+        True,
+    ),
+    # NaN and Infinity read UNAVAILABLE in both readers, and the collector suppressed on them in both.
+    "flag-nan": ('{"unavailable": NaN}', "UNAVAILABLE", True),
+    "flag-infinity": ('{"unavailable": Infinity}', "UNAVAILABLE", True),
+    "flag-negative-infinity": ('{"unavailable": -Infinity}', "UNAVAILABLE", True),
+    "marked": ('{"unavailable": true}', "UNAVAILABLE", True),
+    # Negative controls: main did not read these as UNAVAILABLE, so the collector publishes.
+    "array-of-clear": ('[{"unavailable": false}]', "MALFORMED", False),
+    "flag-null": ('{"unavailable": null}', "MALFORMED", False),
+    "flag-zero": ('{"unavailable": 0}', "MALFORMED", False),
+    "flag-repeated": ('{"unavailable": true, "unavailable": false}', "MALFORMED", False),
+    "effective-from-repeated-future-last": (
+        '{"unavailable": true, "effective_from": "2000-01-01T00:00:00Z",'
+        ' "effective_from": "2099-01-01T00:00:00Z"}',
+        "MALFORMED",
+        False,
+    ),
+    "torn": ("{ torn write", "MALFORMED", False),
+    "pending": (
+        '{"unavailable": true, "effective_from": "2099-01-01T00:00:00Z"}',
+        "PENDING",
+        False,
+    ),
+    "cleared": ('{"unavailable": false}', "AVAILABLE", False),
+}
+
+
+def test_the_collector_suppresses_on_exactly_the_markers_it_suppressed_on_before(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #5305 changed what the reader calls MALFORMED, not what the collector suppresses
+    on. records_cancellation carries the old set beside the new state, so both are pinned per marker
+    in one pwsh run. A directory at the marker path read as an absent marker before, so it does not
+    suppress either.
+    """
+    for name, (body, _, _) in _SUPPRESSION.items():
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "unavailable.json").write_text(body, encoding="utf-8")
+    (tmp_path / "directory" / "unavailable.json").mkdir(parents=True)
+    (tmp_path / "absent").mkdir()
+    names = [*_SUPPRESSION, "directory", "absent"]
+    script = "; ".join(
+        [
+            f". '{CONFIG_ROOTS}'",
+            "$out = [ordered]@{}",
+            *(
+                f"$a = Get-RootUnavailability -StateDir '{tmp_path / name}'; "
+                f"$out['{name}'] = @($a.state, [bool]$a.records_cancellation)"
+                for name in names
+            ),
+            "$out | ConvertTo-Json -Compress | Write-Output",
+        ]
+    )
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    got = json.loads(proc.stdout)
+    expected = {name: [state, bit] for name, (_, state, bit) in _SUPPRESSION.items()}
+    expected.update({"directory": ["MALFORMED", False], "absent": ["AVAILABLE", False]})
+    assert got == expected, got
+
+
+@pytest.mark.parametrize(
+    "name", ["array-of-marker", "flag-repeated-same", "flag-yes", "flag-one-string", "flag-nan"]
+)
+def test_a_marker_main_read_as_a_cancellation_still_stops_the_collector(
+    tmp_path: Path, name: str
+) -> None:
+    """Vault BACKLOG #5305, end to end. These markers read UNAVAILABLE before the change, so the
+    collector refused to publish for them; it still refuses, while the reader names the damage.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    body, marker_state, _ = _SUPPRESSION[name]
+    (state / "unavailable.json").write_text(body, encoding="utf-8")
+
+    line = collect(state, {"rate_limits": {"seven_day": window(42.0, 3600)}})
+    assert "account unavailable" in line, line
+    assert not (state / "latest.json").exists(), (
+        "the collector published for a recorded cancellation"
+    )
+
+    code, doc = read(state)
+    assert code == UNAVAILABLE, doc
+    assert doc["marker_state"] == marker_state, doc
 
 
 # ------------------------------------------ BACKLOG #1459: roots that never publish, and why
