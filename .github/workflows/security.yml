@@ -560,9 +560,10 @@ jobs:
     # job below (which builds the image). Full rationale: docs/SUPPLY-CHAIN.md + ADR 0149. Each step fails
     # if its SBOM can't be produced (a lock that won't render is caught), and so does the job.
     #
-    # NO JOB-LEVEL continue-on-error (BACKLOG #5475). It rewrote a broken SBOM dry-run into a green job,
-    # so the scheduled run concluded success, nightly-notice.yml's Security watch never fired, and the break
-    # surfaced only at a tagged release. What keeps this job off the merge path is placement: the `if:`
+    # NO JOB-LEVEL continue-on-error (BACKLOG #5475). It would rewrite a broken SBOM dry-run into a green
+    # job, so the scheduled run would conclude success, nightly-notice.yml's Security watch would not fire,
+    # and the break would surface only at a tagged release. What keeps this job off the merge path is
+    # placement: the `if:`
     # below admits no pull_request or merge_group run, and it is NOT a required check. Only the sbomqs
     # score step stays advisory, at the step (tests/test_security_posture.py, _STEP_ADVISORY_JOBS).
     # Daily cron + on-demand only (CI cost): the SBOMs derive from COMMITTED lockfiles, so a per-PR build adds

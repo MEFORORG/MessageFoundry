@@ -267,9 +267,11 @@ jobs:
           # whether to trust it is the deploying site's decision. Asserted (BACKLOG #5478): a signer and a
           # timestamper certificate are present, the signer is the certificate imported above, and the status
           # is Valid, or UnknownError (what an untrusted root reports) when the signer's chain builds for code
-          # signing with the unknown-CA fault alone ignored. Any other status fails. NOT asserted on the
+          # signing with AllowUnknownCertificateAuthority set. Any other status fails. NOT asserted on the
           # UnknownError path: that the untrusted root is its only cause. PowerShell reports at least a bad
           # timestamp countersignature and a revoked signer as UnknownError too, and neither is checked here.
+          # That flag also accepts a partial chain, one whose issuer is found nowhere, so on this path an
+          # intermediate CA the chain never reached is not checked either.
           $signature = Get-AuthenticodeSignature -FilePath $exe
           if (-not $signature.SignerCertificate -or -not $signature.TimeStamperCertificate) {
             throw 'the binary is not both signed and timestamped'

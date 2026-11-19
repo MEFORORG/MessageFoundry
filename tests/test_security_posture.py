@@ -83,9 +83,9 @@ _BLOCKING_SECURITY_JOBS = frozenset(
 # WHERE the flag sits: on one named step of each, never on the job. All three are listed in
 # _STEP_ADVISORY_JOBS below and graded there instead of by the job-level rule. `sbom` and
 # `sbom-windows` (its Windows twin, the engine SBOM resolved on win32, ADR 0149's 2026-09-30
-# amendment) carried the flag on the JOB until BACKLOG #5475: that turned a broken SBOM dry-run into
-# a green scheduled run, so the nightly notice never fired and the break surfaced only at a tagged
-# release. Each now softens only its sbomqs score step.
+# amendment) carried the flag on the JOB until BACKLOG #5475: that would turn a broken SBOM dry-run
+# into a green scheduled run, so the nightly notice would not fire and the break would surface only at
+# a tagged release. Each now softens only its sbomqs score step.
 _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "sbom-windows", "trivy"})
 
 # ADVISORY BY PLACEMENT: hard-failing, but NOT in branch protection. This is a third posture the file
@@ -475,6 +475,24 @@ def test_advisory_by_placement_jobs_cannot_run_on_a_pull_request() -> None:
             f"reports on a PR, but its `if:` is {expr!r}. Either restore the schedule/dispatch gate or "
             "reclassify it and add its context to .github/required-contexts.txt and branch protection."
         )
+
+
+def test_step_advisory_security_jobs_cannot_run_on_a_pull_request() -> None:
+    """RED when: a step-advisory job's ``if:`` admits a pull request or merge group (BACKLOG #5475).
+
+    With no job-level continue-on-error, that ``if:`` is all that keeps these jobs, which now go red
+    on a failed step, off every pull request and merge group run.
+    """
+    jobs = jobs_of(_SECURITY)
+    for key in sorted({key for wf, key, _, _ in _STEP_ADVISORY_JOBS if wf == _SECURITY}):
+        expr = str(jobs[key].get("if") or "")
+        assert (
+            "schedule" in expr
+            and "workflow_dispatch" in expr
+            and "pull_request" not in expr
+            and "merge_group" not in expr
+            and "!=" not in expr
+        ), f"security.yml job {key!r} is step-advisory, so must be schedule/dispatch-only: {expr!r}"
 
 
 def test_advisory_security_jobs_keep_continue_on_error() -> None:

@@ -324,11 +324,17 @@ def _steps_naming(needles: tuple[str, ...]) -> list[str]:
 
 
 def test_the_resync_job_env_hands_out_no_credential() -> None:
-    """RED when: the job's own ``env:`` names the token or the key, which hands it to every step."""
-    job_env = _normalised(load_workflow(_RESYNC.name)["jobs"]["resync"].get("env") or {})
-    assert not any(n in job_env for n in _TOKEN_NEEDLES + _KEY_NEEDLES), (
-        "the resync job's env names the App token or key"
-    )
+    """RED when: the workflow's or the job's ``env:`` names the token or the key, which hands it to
+    every step."""
+    workflow = load_workflow(_RESYNC.name)
+    for where, env in (
+        ("workflow", workflow.get("env")),
+        ("job", workflow["jobs"]["resync"].get("env")),
+    ):
+        text = _normalised(env or {})
+        assert not any(n in text for n in _TOKEN_NEEDLES + _KEY_NEEDLES), (
+            f"the resync {where}-level env names the App token or key"
+        )
 
 
 def test_the_resync_checkout_persists_no_credential() -> None:
