@@ -1,15 +1,15 @@
 name: Dependabot lock resync
 
-# Re-exports the EIGHT committed "uv export" artifacts (requirements.lock +
+# Re-exports the committed "uv export" artifacts (requirements.lock +
 # docker/locks/requirements-core.lock + docker/locks/requirements-sqlserver.lock +
-# security/locks/requirements-harness.lock + the HASHLESS
+# docker/locks/requirements-postgres.lock + security/locks/requirements-harness.lock + the HASHLESS
 # constraints.lock + the two PEP 735 CI-toolchain locks ci/locks/ci-scanners.lock and
 # ci/locks/ci-quality.lock, and the release-signing lock ci/locks/release-tools.lock) on a Dependabot PR that touched uv.lock / pyproject.toml, and commits them
 # back to the PR branch so the DEP-1 drift gate (security.yml -> pip-audit job, step "Check the
 # lockfile is in sync with pyproject (DEP-1)") goes green WITHOUT a human re-export.
 #
 # WHY: the native "uv" Dependabot ecosystem regenerates uv.lock + pyproject.toml in its PR, but NOT
-# the exported lock artifacts. The DEP-1 gate re-runs "uv lock --check" + all eight "uv export"s and
+# the exported lock artifacts. The DEP-1 gate re-runs "uv lock --check" + every "uv export" and
 # "git diff --exit-code"s the result, so a Dependabot uv PR would otherwise leave the exports stale
 # and red the gate. This workflow runs the IDENTICAL commands and pushes the refreshed exports onto
 # the Dependabot branch.
@@ -154,7 +154,7 @@ jobs:
           # ci.yml). Same lock, --no-hashes; omitted here it would stay stale and red DEP-1 forever.
           uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
           # The CI TOOLCHAIN locks (PEP 735 dependency groups, ADR 0034 §3). Same lockstep rule as the
-          # five above: the gate diffs them, so the bot must re-export them or the PR has no path green.
+          # exports above: the gate diffs them, so the bot must re-export them or the PR has no path green.
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
           uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock

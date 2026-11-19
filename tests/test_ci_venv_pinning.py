@@ -1134,6 +1134,7 @@ def test_dependency_groups_do_not_leak_into_the_runtime_exports() -> None:
         "constraints.lock",
         "docker/locks/requirements-core.lock",
         "docker/locks/requirements-sqlserver.lock",
+        "docker/locks/requirements-postgres.lock",
         "security/locks/requirements-harness.lock",
     )
     groups = _dependency_groups()

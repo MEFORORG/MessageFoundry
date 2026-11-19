@@ -308,8 +308,9 @@ derived image. Full build/run/ops guide:
 
 Container-specific essentials, for that unsupported image (all detailed in [`../docker/README.md`](../docker/README.md)):
 
-- **Two variants:** slim default (core + SQLite) and `-sqlserver` (adds the OS-level MS ODBC Driver 18
-  for the SQL Server store / `db_lookup`). Non-root uid 10001; read-only root fs; per-profile hash-locked deps.
+- **Three variants:** slim default (core + SQLite), `-sqlserver` (adds the OS-level MS ODBC Driver 18
+  for the SQL Server store / `db_lookup`), and `-postgres` (adds `asyncpg` for the Postgres store, which
+  the HA manifest and the compose `ha` profile run). Non-root uid 10001; read-only root fs; per-profile hash-locked deps.
 - **Config is executed code:** mount it owned by **root** (safest) or **uid 10001** and not
   group/world-writable, or -- the robust path, and the recommended one on Kubernetes -- **bake it into
   a derived image** (`FROM messagefoundry; COPY config /config`, which writes root-owned files).
