@@ -655,6 +655,8 @@ jobs:
         # step below stays advisory.
         # if: always(), like the IDE generator above: a failed Python SBOM must not leave the IDE one
         # unscored (BACKLOG #2521), so the binary is installed whatever the generators did.
+        # The id is what the score step below gates on, so a failed install never reaches it.
+        id: sbomqs-install
         if: always()
         run: |
           # Pinned + checksum-verified against the release's own goreleaser checksums.txt. ADR 0149.
@@ -675,15 +677,19 @@ jobs:
         # continue-on-error: the SCORE is advisory (ADR 0149), and it is the only step here that is.
         # The download and checksum are the blocking step above (BACKLOG #5475). The upload below runs
         # on always(), so a failed score never costs the SBOM artifacts (the actual deliverable).
-        # if: always(), like the IDE generator above: a failed Python SBOM must not leave the IDE one
-        # unscored (BACKLOG #2521).
-        if: always()
+        # It runs only when the install step above SUCCEEDED (BACKLOG #5475): a failed download or
+        # checksum must never be followed by a run of whatever sits at /usr/local/bin/sbomqs. The
+        # always() is still needed beside that test: a condition with no status function gets an
+        # implicit success(), which would skip the score after an unrelated earlier failure, and a
+        # failed Python SBOM must not leave the IDE one unscored (BACKLOG #2521).
+        if: always() && steps.sbomqs-install.outcome == 'success'
         continue-on-error: true
         run: |
           # sbomqs grades an SBOM 0-10 across structural/semantic/quality completeness and prints the NTIA
-          # minimum-elements breakdown, so an SBOM-completeness regression is visible. It calls the
-          # binary the step above verified, by the path it installed it at, so no other `sbomqs`
-          # earlier on PATH can stand in for it.
+          # minimum-elements breakdown, so an SBOM-completeness regression is visible. This step runs
+          # only after the install step succeeded (the if: above), so it calls the binary that step
+          # verified, by the path it installed it at, and no other `sbomqs` earlier on PATH can stand
+          # in for it.
           # Each score runs whatever the other did; the step still fails if either did (BACKLOG #2521).
           rc=0
           /usr/local/bin/sbomqs score -b sbom-python.cdx.json || rc=1

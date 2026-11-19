@@ -1395,6 +1395,116 @@ def test_the_sbomqs_split_check_reds_on_the_merged_shape(key: str) -> None:
     assert any("carries continue-on-error" in o for o in offences), offences
 
 
+_STATUS_FUNCTIONS = ("always", "success", "failure", "cancelled")
+
+
+def _step_if_runs(step: dict, *, earlier_failed: bool, outcomes: dict[str, str]) -> bool:
+    """Evaluate a STEP's ``if:`` as GitHub does for one run state. A condition naming no status
+    function gets an implicit ``success() &&`` in front, so it is added here rather than assumed
+    away. ``outcomes`` maps a step id to its ``steps.<id>.outcome``; an id not seeded reads empty.
+    The run is never cancelled."""
+    from tests.test_dependabot_automerge_guardrails import _evaluate_expression
+
+    body = str(step.get("if") or "").strip()
+    if body.startswith("${{") and body.endswith("}}"):
+        body = body[3:-2].strip()
+    if not re.search(rf"\b(?:{'|'.join(_STATUS_FUNCTIONS)})\s*\(", body, re.IGNORECASE):
+        body = f"success() && ({body})" if body else "success()"
+    functions: dict[str, Callable[..., str | bool]] = {
+        "always": lambda: True,
+        "success": lambda: not earlier_failed,
+        "failure": lambda: earlier_failed,
+        "cancelled": lambda: False,
+    }
+    context = {f"steps.{sid}.outcome": outcome for sid, outcome in outcomes.items()}
+    return _evaluate_expression(body, context, functions)
+
+
+def _sbomqs_score_gate_offences(job: dict, soft_step: str, *, must_survive: bool) -> list[str]:
+    """Why ``job``'s sbomqs score could run after its install step failed; empty when it cannot.
+
+    The install step's id, when it has one, is seeded with each outcome. ``must_survive`` adds the
+    BACKLOG #2521 case: an unrelated earlier failure with a good install must still score."""
+    steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+    install = next(s for s in steps if "sha256sum -c" in _shell_lines(s))
+    score = next(s for s in steps if s.get("name") == soft_step)
+    sid = str(install.get("id") or "")
+    offences: list[str] = []
+    failed = {sid: "failure"} if sid else {}
+    if _step_if_runs(score, earlier_failed=True, outcomes=failed):
+        offences.append(
+            f"the score step runs after a failed install: if: {score.get('if')!r}, install id "
+            f"{sid or None!r}"
+        )
+    passed = {sid: "success"} if sid else {}
+    if not _step_if_runs(score, earlier_failed=False, outcomes=passed):
+        offences.append(f"the score step never runs after a good install: if: {score.get('if')!r}")
+    if must_survive and not _step_if_runs(score, earlier_failed=True, outcomes=passed):
+        offences.append(
+            "the score step skips after an unrelated earlier failure with a good install "
+            f"(BACKLOG #2521): if: {score.get('if')!r}"
+        )
+    return offences
+
+
+#: Whether each SBOM job's score must still run after an unrelated earlier failure (BACKLOG
+#: #2521). Only `sbom` scores two files; `sbom-windows` scores one, so its implicit success() holds.
+_SBOMQS_SCORE_SURVIVES = {"sbom": True, "sbom-windows": False}
+
+
+def test_the_sbomqs_score_never_runs_after_a_failed_install() -> None:
+    """RED when: an SBOM job's sbomqs score step can run after its install-and-verify step failed
+    (BACKLOG #5475), so it would call whatever sits at the install path with no verified binary
+    behind it. Evaluated, not searched: the step's ``if:`` is run through the expression evaluator
+    for a failed install, a good install, and (Linux) a good install after an unrelated failure."""
+    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}
+    jobs = jobs_of(_SECURITY)
+    for key in _SBOMQS_SPLIT_JOBS:
+        offences = _sbomqs_score_gate_offences(
+            jobs[key], soft[key], must_survive=_SBOMQS_SCORE_SURVIVES[key]
+        )
+        assert not offences, f"security.yml:{key}: {offences}"
+
+
+@pytest.mark.parametrize(
+    ("score_if", "needle"),
+    [
+        ("always()", "runs after a failed install"),
+        ("always() || steps.sbomqs-install.outcome == 'success'", "runs after a failed install"),
+        ("steps.sbomqs-install.outcome == 'success'", "unrelated earlier failure"),
+        ("always() && steps.other.outcome == 'success'", "never runs after a good install"),
+        ("false_flag", "never runs after a good install"),
+    ],
+    ids=["always-only", "or-always", "implicit-success", "wrong-id", "never"],
+)
+def test_the_sbomqs_score_gate_check_reds_on_each_loosening(score_if: str, needle: str) -> None:
+    """The controls: the gate before this fix (``always()`` alone), an ``||`` that admits a failed
+    install, a gate that loses the BACKLOG #2521 survival, and gates that never run."""
+    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}["sbom"]
+    job = jobs_of(_SECURITY)["sbom"]
+    steps = [
+        {**s, "if": score_if} if s.get("name") == soft else s
+        for s in job["steps"]
+        if isinstance(s, dict)
+    ]
+    offences = _sbomqs_score_gate_offences({**job, "steps": steps}, soft, must_survive=True)
+    assert any(needle in o for o in offences), offences
+
+
+def test_the_sbomqs_score_gate_check_reds_when_the_install_loses_its_id() -> None:
+    """The control for the id: an install step with no id leaves ``steps.<id>.outcome`` empty, so
+    the shipped gate never runs; that must be reported, not pass as a skip."""
+    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}["sbom"]
+    job = jobs_of(_SECURITY)["sbom"]
+    steps = [
+        {k: v for k, v in s.items() if k != "id"} if "sha256sum -c" in _shell_lines(s) else s
+        for s in job["steps"]
+        if isinstance(s, dict)
+    ]
+    offences = _sbomqs_score_gate_offences({**job, "steps": steps}, soft, must_survive=True)
+    assert any("never runs after a good install" in o for o in offences), offences
+
+
 # --- trivy: run the scan step and its reporter against each other, verbatim ----------------------
 #
 # The registry entry above pins WHERE `trivy`'s flag sits. These pin what the two steps DO: a
