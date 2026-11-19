@@ -779,3 +779,145 @@ async def test_stop_before_start_does_not_disarm_a_later_stop(tmp_path: Path) ->
     async with asyncio.timeout(5.0):
         await relay.stop()
     assert worker.done()  # the second stop() really tore down what start() opened
+
+
+async def test_start_after_an_early_stop_serves_messages(tmp_path: Path) -> None:
+    # A stop() before start() used to leave the shutdown flag set, so every connection the later
+    # start() accepted was dropped with no ACK.
+    corepoint = await FakeMllpServer().start()
+    mefor = await FakeMllpServer().start()
+    relay = TeeRelay(
+        RelayConfig(
+            listen_epic=("127.0.0.1", 0),
+            corepoint=corepoint.address,
+            mefor=mefor.address,
+            db_path=str(tmp_path / "tee.db"),
+        )
+    )
+    await relay.stop()  # nothing started yet
+    await relay.start()
+    try:
+        ack = await _send_from_epic(relay.epic_address, SAMPLE)
+        assert mllp.parse_ack(ack)[0] == "AA"
+        await corepoint.wait_for(1)
+    finally:
+        await relay.stop()
+        await corepoint.stop()
+        await mefor.stop()
+
+
+async def test_stop_during_start_closes_listeners_bound_after_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A stop() racing a start() still binding its listeners used to tear down only what was bound
+    # so far, and memoize that teardown, so a listener bound afterwards was never closed.
+    corepoint = await FakeMllpServer().start()
+    mefor = await FakeMllpServer().start()
+    relay = TeeRelay(
+        RelayConfig(
+            listen_epic=("127.0.0.1", 0),
+            corepoint=corepoint.address,
+            mefor=mefor.address,
+            db_path=str(tmp_path / "tee.db"),
+            listen_corepoint_copy=("127.0.0.1", 0),
+        )
+    )
+    gate = asyncio.Event()
+    real_start_server = asyncio.start_server
+
+    async def gated_start_server(handler, *args, **kwargs):
+        if getattr(handler, "__name__", "") == "_handle_corepoint_copy":
+            await gate.wait()
+        return await real_start_server(handler, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "start_server", gated_start_server)
+    starting = asyncio.create_task(relay.start())
+    try:
+        await _wait_until(lambda: relay._epic_server is not None)  # noqa: SLF001
+        stopping = asyncio.create_task(relay.stop())
+        await asyncio.sleep(0.05)
+        gate.set()
+        async with asyncio.timeout(5.0):
+            await starting
+            await stopping
+        copy_server = relay._copy_server  # noqa: SLF001
+        assert copy_server is not None
+        assert not copy_server.is_serving()  # the listener bound after stop() began was closed
+        worker = relay._mefor_worker  # noqa: SLF001
+        assert worker is not None and worker.done()
+    finally:
+        gate.set()
+        with contextlib.suppress(Exception):
+            await starting
+        await relay.stop()
+        await corepoint.stop()
+        await mefor.stop()
+
+
+async def _cut_off_legs(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    block: str,
+) -> set[tuple[str, str, str]]:
+    """Wedge one post-ACK store write, let stop() run out of grace, check the cut-off log, and
+    return the legs left in the store."""
+    corepoint = await FakeMllpServer().start()
+    mefor = await FakeMllpServer().start()
+    db_path = tmp_path / "tee.db"
+    relay = TeeRelay(
+        RelayConfig(
+            listen_epic=("127.0.0.1", 0),
+            corepoint=corepoint.address,
+            mefor=mefor.address,
+            db_path=str(db_path),
+            capture_bodies=True,
+            stop_grace=0.2,
+        )
+    )
+    await relay.start()
+    store = relay.store
+    assert store is not None
+    wedged = asyncio.Event()
+    real = getattr(store, block)
+
+    async def wedge_once(*args, **kwargs):
+        if not wedged.is_set():
+            wedged.set()
+            await asyncio.Event().wait()  # never set: only stop()'s cancel ends this
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(store, block, wedge_once)
+    try:
+        await _send_from_epic(relay.epic_address, SAMPLE)
+        async with asyncio.timeout(2.0):
+            await wedged.wait()
+        with caplog.at_level(logging.WARNING):
+            async with asyncio.timeout(5.0):
+                await relay.stop()
+        assert any(
+            "cut off" in r.getMessage() and "control_id=CTRL123" in r.getMessage()
+            for r in caplog.records
+        )
+        assert not any("JOHN" in r.getMessage() for r in caplog.records)  # no message content
+        return _legs(db_path)
+    finally:
+        await relay.stop()
+        await corepoint.stop()
+        await mefor.stop()
+
+
+async def test_stop_cut_off_in_record_capture_is_recorded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legs = await _cut_off_legs(tmp_path, caplog, monkeypatch, block="record_capture")
+    assert legs == {("epic_to_corepoint", "corepoint", "transport_error")}
+
+
+async def test_stop_cut_off_in_the_success_record_leg_is_recorded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legs = await _cut_off_legs(tmp_path, caplog, monkeypatch, block="record_leg")
+    # The forward finished before the cut-off, so the row carries its real outcome.
+    assert legs == {("epic_to_corepoint", "corepoint", "accepted")}

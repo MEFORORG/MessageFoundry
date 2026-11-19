@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -181,6 +181,9 @@ class TeeRelay:
         self._mefor_queue: asyncio.Queue[_MeforItem | _WorkerStop] = asyncio.Queue()
         self._mefor_worker: asyncio.Task[None] | None = None
         self._stop_task: asyncio.Future[None] | None = None
+        # Set while start() runs, so a stop() racing it waits for every listener to be bound
+        # rather than tearing down a partial set and memoizing that.
+        self._start_done: asyncio.Event | None = None
 
     # -- properties ----------------------------------------------------------
     @property
@@ -223,20 +226,29 @@ class TeeRelay:
 
     # -- lifecycle -----------------------------------------------------------
     async def start(self) -> None:
-        if self._epic_server is not None:
+        if self._epic_server is not None or (
+            self._start_done is not None and not self._start_done.is_set()
+        ):
             raise RuntimeError("relay already started")
         cfg = self.config
+        # A stop() before start() had nothing to tear down; its flag must not make this start()'s
+        # handlers drop every connection they accept.
+        self._shutdown.clear()
+        self._start_done = asyncio.Event()
         logger.warning(
             "tee relay is a TEST-DATA-ONLY validation tool — do not carry production PHI through it"
         )
-        self.store = await RelayStore.open(cfg.db_path)
-        self._mefor_queue = asyncio.Queue(maxsize=cfg.mefor_queue_max)
-        self._mefor_worker = asyncio.create_task(self._run_mefor_worker())
-        self._epic_server = await asyncio.start_server(self._handle_epic, *cfg.listen_epic)
-        if cfg.listen_corepoint_copy is not None:
-            self._copy_server = await asyncio.start_server(
-                self._handle_corepoint_copy, *cfg.listen_corepoint_copy
-            )
+        try:
+            self.store = await RelayStore.open(cfg.db_path)
+            self._mefor_queue = asyncio.Queue(maxsize=cfg.mefor_queue_max)
+            self._mefor_worker = asyncio.create_task(self._run_mefor_worker())
+            self._epic_server = await asyncio.start_server(self._handle_epic, *cfg.listen_epic)
+            if cfg.listen_corepoint_copy is not None:
+                self._copy_server = await asyncio.start_server(
+                    self._handle_corepoint_copy, *cfg.listen_corepoint_copy
+                )
+        finally:
+            self._start_done.set()
         logger.info(
             "tee relay started: epic=%s -> corepoint=%s + mefor=%s%s (db=%s, capture_bodies=%s,"
             " capture_corepoint_copy=%s)",
@@ -260,10 +272,13 @@ class TeeRelay:
     async def stop(self) -> None:
         """Tear the relay down. Runs once: a concurrent or repeated call (``serve_forever``'s own
         ``finally`` among them) waits for the same teardown rather than starting a second one.
-        Before start() there is nothing to tear down, so nothing is memoized and a later stop()
-        still cleans up whatever start() opened."""
+        A stop() racing a start() waits for start() to finish binding, so the teardown covers every
+        listener it opens. Before start() there is nothing to tear down, so this returns without
+        memoizing anything (or setting the shutdown flag) and a later stop() still cleans up
+        whatever start() opened."""
+        if self._start_done is not None:
+            await self._start_done.wait()
         if self.store is None:
-            self._shutdown.set()
             return
         if self._stop_task is None:
             self._stop_task = asyncio.ensure_future(self._stop())
@@ -402,73 +417,94 @@ class TeeRelay:
         if not await self._send_ack(writer, message):
             return
 
-        if cfg.capture_bodies:
-            await store.record_capture(
-                direction="epic_to_corepoint", control_id=control_id, raw=message
-            )
-
-        # 2. Production leg: Corepoint (a transport failure trips fail-closed; a NAK is only logged).
-        try:
-            outcome, code, detail = await self._forward_corepoint(message)
-        except asyncio.CancelledError:
-            # stop() ran out of grace with this message ACKed but its forward unfinished: record it
-            # (as a transport error, so `naks` lists it) rather than leave an ACK with no row.
-            logger.warning(
-                "relay stop cut off an ACKed message mid-forward; Corepoint delivery unknown"
-                " control_id=%s",
-                control_id,
-            )
-            try:
-                await store.record_leg(
-                    direction="epic_to_corepoint",
-                    leg="corepoint",
-                    control_id=control_id,
-                    message_type=message_type,
-                    size_bytes=size,
-                    outcome="transport_error",
-                    ack_code=None,
-                    detail="cancelled by relay stop after the ACK; delivery unknown",
-                )
-            except Exception as exc:  # noqa: BLE001 -- the cancel must still propagate
-                logger.error(
-                    "could not record the cut-off message (%r) control_id=%s", exc, control_id
-                )
-            raise
-        except ForwardError as exc:
+        async def record_corepoint(outcome: str, code: str | None, detail: str | None) -> None:
             await store.record_leg(
                 direction="epic_to_corepoint",
                 leg="corepoint",
                 control_id=control_id,
                 message_type=message_type,
                 size_bytes=size,
-                outcome="transport_error",
-                ack_code=None,
-                detail=str(exc),
+                outcome=outcome,
+                ack_code=code,
+                detail=detail,
             )
-            await self._trip(f"Corepoint unreachable: {exc}")
-            return
 
-        await store.record_leg(
-            direction="epic_to_corepoint",
-            leg="corepoint",
-            control_id=control_id,
-            message_type=message_type,
-            size_bytes=size,
-            outcome=outcome,
-            ack_code=code,
-            detail=detail,
-        )
-        if outcome == "nak":
+        # Everything after the ACK sits under one cut-off handler: a stop() that runs out of grace
+        # cancels this task wherever it is (the capture, the forward, or the leg's own write), and
+        # an ACKed message must still leave a Corepoint row and a log line.
+        result: tuple[str, str | None, str | None] | None = None  # the Corepoint leg, once known
+        recorded = False
+        try:
+            if cfg.capture_bodies:
+                await store.record_capture(
+                    direction="epic_to_corepoint", control_id=control_id, raw=message
+                )
+
+            # 2. Production leg: Corepoint (a transport failure trips fail-closed; a NAK is only
+            #    logged).
+            try:
+                result = await self._forward_corepoint(message)
+            except ForwardError as exc:
+                result = ("transport_error", None, str(exc))
+                await record_corepoint(*result)
+                recorded = True
+                await self._trip(f"Corepoint unreachable: {exc}")
+                return
+
+            outcome, code, detail = result
+            await record_corepoint(outcome, code, detail)
+            recorded = True
+            if outcome == "nak":
+                logger.warning(
+                    "Corepoint NAK (%s) control_id=%s type=%s: %s",
+                    code,
+                    control_id,
+                    message_type,
+                    detail,
+                )
+
+            # 3. Shadow leg: MEFOR (decoupled, best-effort — never blocks/trips the production
+            #    path).
+            self._enqueue_mefor(_MeforItem(message, control_id, message_type, "epic_to_corepoint"))
+        except asyncio.CancelledError:
+            if not recorded:
+                await self._record_cut_off(control_id, result, record_corepoint)
+            raise
+
+    async def _record_cut_off(
+        self,
+        control_id: str | None,
+        result: tuple[str, str | None, str | None] | None,
+        record: Callable[[str, str | None, str | None], Awaitable[None]],
+    ) -> None:
+        """Log and record an ACKed Epic message that stop() cancelled before its Corepoint row.
+
+        With the forward unfinished, delivery is unknown, so the row is a transport error (which
+        ``naks`` lists). With the forward done, the row carries its real outcome; if the cancel hit
+        the leg's own write after it reached the database, that outcome can then appear twice,
+        which is safer than no row. The log names only the control id, never message content."""
+        if result is None:
             logger.warning(
-                "Corepoint NAK (%s) control_id=%s type=%s: %s",
-                code,
+                "relay stop cut off an ACKed message before its Corepoint forward finished;"
+                " delivery unknown control_id=%s",
                 control_id,
-                message_type,
-                detail,
             )
-
-        # 3. Shadow leg: MEFOR (decoupled, best-effort — never blocks/trips the production path).
-        self._enqueue_mefor(_MeforItem(message, control_id, message_type, "epic_to_corepoint"))
+            result = (
+                "transport_error",
+                None,
+                "cancelled by relay stop after the ACK; delivery unknown",
+            )
+        else:
+            logger.warning(
+                "relay stop cut off an ACKed message while recording its Corepoint leg"
+                " (outcome=%s) control_id=%s",
+                result[0],
+                control_id,
+            )
+        try:
+            await record(*result)
+        except Exception as exc:  # noqa: BLE001 -- the cancel must still propagate
+            logger.error("could not record the cut-off message (%r) control_id=%s", exc, control_id)
 
     async def _forward_corepoint(self, payload: bytes) -> tuple[str, str | None, str | None]:
         """Forward to Corepoint with a few quick retries; raise :class:`ForwardError` if all fail."""
