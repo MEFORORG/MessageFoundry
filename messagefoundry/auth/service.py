@@ -13358,7 +13358,8 @@ class AuthService:
 
     async def checked_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its whole record checked against its seal, for a caller
-        outside this service that SHOWS it (BACKLOG #5520). ``None`` when no row is there. Raises
+        outside this service that SHOWS it (BACKLOG #5520), and for :meth:`change_password`, which
+        decides on it (BACKLOG #5902), so its raise-or-``None`` contract binds that control too. ``None`` when no row is there. Raises
         :class:`UserSealRefused` only when :meth:`_verified` established that the record fails,
         or :meth:`_checked_by_id` failed closed, and handed that to the seal-failure report, so
         the caller can say so rather than answer "no such user". A record Vault transit cannot
@@ -13430,8 +13431,8 @@ class AuthService:
     async def _user_seal_unverifiable(
         self, user_id: str, exc: TransitSealUnverifiableError | RowSealUnverifiableError
     ) -> None:
-        """Report an account whose record Vault transit could not verify on an admin read, or at
-        a directory rename's write (ADR 0217 (a); vault BACKLOG #3069 note T2): a page through the store's :class:`~messagefoundry.store.row_seal.SealPager` under the
+        """Report an account whose record Vault transit could not verify on an admin read, at a
+        password change (BACKLOG #5902), or at a directory rename's write (ADR 0217 (a); vault BACKLOG #3069 note T2): a page through the store's :class:`~messagefoundry.store.row_seal.SealPager` under the
         row's capped Unverifiable subject, then a WARNING and a soft
         :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` row carrying the triage versions. Throttled per
         account on a key of its own, so it never holds back the account's Forged report."""
@@ -16415,15 +16416,21 @@ class AuthService:
         if violations:
             return violations
         covered = self._covered_by_requirement(user, identity.roles)
+        gone = False
         if covered:
             try:
                 await self._refuse_rotation_without_way_past(user)
             except FactorEnrolmentRequired:
                 # A row deleted meanwhile takes its factors with it, so it reads as one with no way
                 # past; it is answered as gone, not as an account that must enrol (BACKLOG #5902).
-                if await self.checked_user(identity.user_id) is None:
-                    raise ValueError("no such user") from None
-                raise
+                if await self.checked_user(identity.user_id) is not None:
+                    raise
+                gone = True
+        if gone:
+            raise ValueError("no such user")
+        # Without the [webauthn] extra no passkey can sign in, so the write counts none, as
+        # _has_way_past counts none (BACKLOG #3948).
+        passkey_counts = self._gate_counts if webauthn.available() else _passkey_counts_nothing
         try:
             written = await self._store.set_password(
                 identity.user_id,
@@ -16431,11 +16438,7 @@ class AuthService:
                 must_change_password=must_change,
                 password_generated=False,
                 require_way_past=_opened_totp_state if covered else None,
-                # Without the [webauthn] extra no passkey can sign in, so the write counts none, as
-                # _has_way_past counts none (BACKLOG #3948).
-                passkey_counts=self._gate_counts
-                if webauthn.available()
-                else _passkey_counts_nothing,
+                passkey_counts=passkey_counts,
             )
         except RowSealError as exc:
             # The record passed its seal at the read above and failed it at the write, which wrote
@@ -16445,6 +16448,8 @@ class AuthService:
             await self._user_seal_failed(user.id)
             raise UserSealRefused(USER_SEAL_REFUSED) from exc
         except RowSealUnverifiableError as exc:
+            if exc.kind != USER_KIND:
+                raise
             await self._user_seal_unverifiable(user.id, exc)
             raise UserSealRefused(USER_SEAL_REFUSED) from exc
         except TransitSealUnavailableError:
@@ -16454,22 +16459,28 @@ class AuthService:
             # A row deleted between the read above and the write is told apart from a lost way
             # past, and a covered account that still has a way past lost only a compare to another
             # write, so neither a success nor a false enrolment refusal is reported (BACKLOG #5902).
+            # The early refusal judges the re-read, with its guards for a passkey cell that does
+            # not decode, so such a cell is the enrolment refusal here too, not an error.
             after = await self.checked_user(identity.user_id)
             if after is None:
                 raise ValueError("no such user")
-            if covered and not await self._has_way_past(after):
-                raise FactorEnrolmentRequired()
+            if covered:
+                await self._refuse_rotation_without_way_past(after)
             raise PasswordChangeNotApplied()
         await self._revoke_after_commit(
             identity.user_id, change="password_changed", actor=identity.username, client=client
         )
         await self._audit("auth.password_changed", actor=identity.username, client=client)
-        user = await self._load_user(identity.user_id)
+        try:
+            current = await self._load_user(identity.user_id)
+            email = current.notify_email if current is not None else None
+        except TransitSealUnavailableError:
+            # The change has committed, so an Outage here must not turn it into a retryable
+            # refusal (BACKLOG #5902): the notice goes to the address the checked read above held.
+            self._user_seal_outage("password-change notice read")
+            email = user.notify_email
         await self._notify_security(
-            PASSWORD_CHANGED,
-            username=identity.username,
-            email=user.notify_email if user is not None else None,
-            client=client,
+            PASSWORD_CHANGED, username=identity.username, email=email, client=client
         )
         return []
 

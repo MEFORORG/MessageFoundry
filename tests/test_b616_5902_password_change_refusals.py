@@ -36,7 +36,12 @@ from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import Store
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.row_seal import USER_KIND, RowSealError
+from messagefoundry.store.row_seal import (
+    USER_KIND,
+    RowSealError,
+    RowSealUnverifiableError,
+    TransitSealUnavailableError,
+)
 from messagefoundry.store.store import MessageStore
 from tests.test_api_auth import _auth, _login
 from tests.test_password_corpus_guard import bundled_corpus as bundled_corpus  # noqa: F401
@@ -258,8 +263,9 @@ async def test_a_raced_first_read_still_writes_with_the_way_past_condition(
     monkeypatch.setattr(service, "_verified", verified)
     monkeypatch.setattr(service, "_refuse_rotation_without_way_past", way_past)
     monkeypatch.setattr(store, "set_password", recording)
-    # The account holds no factor, so the conditioned write declines and the change is refused.
-    with pytest.raises(FactorEnrolmentRequired):
+    # The account holds no factor, so the conditioned write declines and the change is refused; the
+    # stubbed early refusal passes the re-judgement too, so the answer is the lost-write 409.
+    with pytest.raises(PasswordChangeNotApplied):
         await service.change_password(identity, _NEW_PASSWORD)
     assert raced == [] and len(seen) == 1 and seen[0] is not None
     assert await _changed_rows(store) == []
@@ -269,24 +275,26 @@ async def test_a_covered_lost_write_is_an_enrolment_refusal_only_with_no_way_pas
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service, identity = await _account(store, require_mfa=True)
+    # One verdict per call of the early refusal: the first passes (a factor counted before the
+    # write), the second is the re-judgement after the lost write.
+    verdicts: list[bool] = []
 
-    async def way_past(_user: Any) -> None:
-        return None
+    async def judged(_user: Any) -> None:
+        if not verdicts.pop(0):
+            raise FactorEnrolmentRequired()
 
     async def lost(_uid: str, **_kwargs: Any) -> bool:
         return False
 
-    monkeypatch.setattr(service, "_refuse_rotation_without_way_past", way_past)
+    monkeypatch.setattr(service, "_refuse_rotation_without_way_past", judged)
     monkeypatch.setattr(store, "set_password", lost)
+    verdicts[:] = [True, False]  # the factor went between the early check and the write
     with pytest.raises(FactorEnrolmentRequired):
         await service.change_password(identity, _NEW_PASSWORD)
-
-    async def still_has_one(_user: Any) -> bool:
-        return True  # the factor is still there: the write lost only a compare to another write
-
-    monkeypatch.setattr(service, "_has_way_past", still_has_one)
+    verdicts[:] = [True, True]  # the factor is still there: the write lost only a compare
     with pytest.raises(PasswordChangeNotApplied):
         await service.change_password(identity, _NEW_PASSWORD)
+    assert verdicts == []
     assert await _changed_rows(store) == []
 
 
@@ -318,6 +326,59 @@ async def test_a_seal_refusal_at_the_write_is_refused_and_reported(
         await service.change_password(identity, _NEW_PASSWORD)
     assert await _changed_rows(store) == []
     assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+
+
+async def test_an_unverifiable_seal_at_the_write_is_refused_and_reported(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, identity = await _account(store)
+    reported: list[str] = []
+
+    async def unverifiable(_uid: str, **_kwargs: Any) -> bool:
+        raise RowSealUnverifiableError(USER_KIND, "u1")
+
+    async def report(user_id: str, _exc: Any) -> None:
+        reported.append(user_id)
+
+    monkeypatch.setattr(store, "set_password", unverifiable)
+    monkeypatch.setattr(service, "_user_seal_unverifiable", report)
+    with pytest.raises(UserSealRefused):
+        await service.change_password(identity, _NEW_PASSWORD)
+    assert reported == ["u1"]
+    assert await _changed_rows(store) == []
+
+
+async def test_an_outage_at_the_write_propagates_and_changes_nothing(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, identity = await _account(store)
+    paged: list[str] = []
+
+    async def outage(_uid: str, **_kwargs: Any) -> bool:
+        raise TransitSealUnavailableError()
+
+    monkeypatch.setattr(store, "set_password", outage)
+    monkeypatch.setattr(service, "_user_seal_outage", paged.append)
+    with pytest.raises(TransitSealUnavailableError):
+        await service.change_password(identity, _NEW_PASSWORD)
+    assert paged == ["password change"]
+    assert await _changed_rows(store) == []
+
+
+async def test_an_outage_on_the_notice_read_still_reports_the_change(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the write has committed, an Outage on the read for the notice address does not turn a
+    made change into a refusal."""
+    service, identity = await _account(store)
+
+    async def outage(_uid: str) -> Any:
+        raise TransitSealUnavailableError()
+
+    monkeypatch.setattr(service, "_load_user", outage)
+    monkeypatch.setattr(service, "_user_seal_outage", lambda _refused="read": None)
+    assert await service.change_password(identity, _NEW_PASSWORD) == []
+    assert len(await _changed_rows(store)) == 1
 
 
 async def test_a_lost_write_is_a_409_on_the_route(
@@ -355,4 +416,22 @@ async def test_a_seal_refused_row_is_a_423_on_the_route(
         await c.aclose()
     assert r.status_code == 423, r.text
     assert r.json()["detail"] == USER_SEAL_REFUSED
+    assert await _changed_rows(engine.store) == []
+
+
+async def test_an_outage_is_a_503_on_the_route(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, service, headers = await _signed_in(engine)
+
+    async def outage(_uid: str) -> Any:
+        raise TransitSealUnavailableError()
+
+    monkeypatch.setattr(service, "checked_user", outage)
+    try:
+        r = await _post_change(c, headers)
+    finally:
+        await c.aclose()
+    assert r.status_code == 503, r.text
+    assert "Retry-After" in r.headers
     assert await _changed_rows(engine.store) == []
