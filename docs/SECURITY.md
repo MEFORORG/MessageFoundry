@@ -3728,10 +3728,12 @@ transaction, so a re-read answers it as a lost session. An MFA reset removes the
 revokes the sessions in separate writes, so a re-read that falls between them reads as the factor
 gone. The factor is then not marked and no counter is cleared, and because the proof is already
 spent the refusal is audited, with at least the reasons named here. A factor that cannot be read
-at the re-read is refused `reason=factor_unverified`. That covers a TOTP secret that does not open
-once the code has been checked, which is also logged, and a passkey set that fails its seal. A
-TOTP secret that does not open for the check itself is refused the same way, before any code is
-read, so no recovery code is spent and nothing is charged. **A correct code whose TOTP factor is
+at the re-read is refused `reason=factor_unverified`. That covers a TOTP secret whose stored
+enrolment, its stamp or its cell, moved during the check and that then does not open, which is
+also logged, and a passkey set that fails its seal. A re-read that finds the stored TOTP enrolment
+unmoved opens nothing (BACKLOG #5781): the request opens the secret once, before the check, and
+checks the code against that open. A TOTP secret that does not open there is refused the same way,
+before any code is read, so no recovery code is spent and nothing is charged. **A correct code whose TOTP factor is
 turned off or enrolled again during the check charges no lockout** (BACKLOG #3780 item 1). Either
 change can leave the check nothing to spend, so the code fails its spend. Only a code that
 MATCHED the factor is asked further: the session, the account and its lock are read again, as

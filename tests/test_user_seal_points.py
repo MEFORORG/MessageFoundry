@@ -137,6 +137,20 @@ async def test_the_combined_sign_in_checks_the_secret_the_seal_covered(
     assert signed_in.ok and not signed_in.mfa_required  # control
 
 
+async def test_the_two_step_verify_checks_the_secret_the_seal_covered(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5781: ``verify_mfa`` hands ``_verify_second_factor`` the secret it opened itself, so
+    this pins that the secret it opens is the checked record's cell, never a second store read."""
+    store, _ = keyed
+    service, _, password, secret, clock = await _enrolled(store, monkeypatch)
+    _swap_the_stored_secret(monkeypatch, store)
+    pending = await service.login(ADMIN_USERNAME, password)
+    assert pending.ok and pending.mfa_required and pending.token is not None
+    assert not (await service.verify_mfa(pending.token, clock.code(_ATTACKER))).ok
+    assert (await service.verify_mfa(pending.token, clock.code(secret))).ok  # control
+
+
 async def test_the_enrolment_confirm_checks_the_secret_the_seal_covered(
     keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

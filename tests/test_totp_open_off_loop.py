@@ -213,9 +213,9 @@ async def test_the_service_paths_that_open_the_totp_cell_open_it_off_the_loop(
     monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
     """At least these service paths open the TOTP cell in a worker thread: the enrolment's confirm,
-    the combined sign-in, the two-step verify (its code check and its before-and-after enrolment
-    reads), a replayed code's failed spend (its after-read), a way-past gate (``_totp_state``), and
-    the status read where a re-enrolment is possible. The lockable-account census reads through the
+    the combined sign-in, the two-step verify (its one open before the code check, BACKLOG #5781), a
+    replayed code's failed spend (the same one open), a way-past gate (``_totp_state``), and the
+    status read where a re-enrolment is possible. The lockable-account census reads through the
     store's ``get_totp_secret``, which has its own test above."""
     real_open = store.open_totp_secret
     seen: dict[str, list[threading.Thread]] = {}
@@ -336,8 +336,9 @@ async def test_a_verify_checks_its_code_against_the_one_open_of_the_cell(
 async def test_a_disable_during_the_after_check_comparison_stops_the_factor_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The after-check comparison opens the cell in a worker thread, so a self-service disable,
-    which takes no account queue, can land during it. The holder is read again after it, so the
+    """The after-check comparison awaits, and opens the cell in a worker thread when the row's TOTP
+    columns moved (BACKLOG #5781), so a self-service disable, which takes no account queue, can land
+    during it; the wrapper below lands one there. The holder is read again after it, so the
     disable is seen: the verify is refused ``factor_removed`` and the session's factor is not
     marked. RED when the factor is written after the comparison with no read of the holder."""
     store = await MessageStore.open(":memory:")

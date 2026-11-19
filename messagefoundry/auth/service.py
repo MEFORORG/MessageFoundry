@@ -13590,10 +13590,11 @@ class AuthService:
     async def _opened_totp_enrolment(
         self, user: VerifiedUser
     ) -> tuple[_TotpEnrolment, str | None] | None:
-        """``user``'s TOTP enrolment, as :meth:`_totp_enrolment` gives it, and the secret it opened,
-        from ONE open of the cell, or ``None`` when the cell does not open, logged by
-        :func:`_log_totp_undecryptable`. :meth:`verify_mfa` checks its code against that secret, so
-        the check opens no cell of its own (BACKLOG #5781)."""
+        """From ONE open of ``user``'s TOTP cell, the one its seal covered: the enrolment reading
+        (the enrolment stamp and a digest of the opened secret) and the opened secret itself. ``None``
+        when the cell does not open, logged by :func:`_log_totp_undecryptable`. :meth:`verify_mfa`
+        compares the reading after its code check, and checks the code against the secret, so the
+        check opens no cell of its own (BACKLOG #5781)."""
         try:
             secret = await self._totp_secret(user)
         except CipherError:
@@ -13602,10 +13603,10 @@ class AuthService:
         return (user.totp_enrolled_at, None if secret is None else hash_token(secret)), secret
 
     async def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
-        """``user``'s TOTP enrolment as :meth:`verify_mfa` compares it across a code check (BACKLOG
-        #3068): the enrolment stamp and a digest of the opened secret, so the plaintext is not held
-        across the check. ``None`` when the cell does not open, logged by
-        :func:`_log_totp_undecryptable`."""
+        """The enrolment reading of :meth:`_opened_totp_enrolment` alone (BACKLOG #3068): the
+        enrolment stamp and a digest of the opened secret, so no plaintext is kept. ``None`` when
+        the cell does not open, logged by :func:`_log_totp_undecryptable`. :meth:`verify_mfa`'s
+        after-check comparison reads a moved row's enrolment through it."""
         opened = await self._opened_totp_enrolment(user)
         return None if opened is None else opened[0]
 
@@ -17447,7 +17448,7 @@ class AuthService:
                     client=client,
                 )
                 return Elevation()
-            del secret  # the plaintext is not held past the check it was opened for
+            del secret, opened  # the plaintext is not held past the check it was opened for
             if proved:
                 # BACKLOG #3068: the verify awaited (a recovery-code walk is argon2 work off the
                 # loop), and a revocation or a disable needs no queue to land. So the session, the
@@ -17473,10 +17474,10 @@ class AuthService:
                 refusal = await self._totp_enrolment_moved(
                     verified_enrolment, fresh, checked=checked
                 )
-                # BACKLOG #3929: a comparison that opens the cell opens it in a worker thread, and
-                # every comparison awaits, so a revocation, a disable or a lock can land during it
-                # (BACKLOG #5781: one whose row still stores ``checked``'s TOTP columns opens
-                # nothing). The holder is read again after each one
+                # BACKLOG #3929: a comparison that opens the cell opens it in a worker thread, so a
+                # revocation, a disable or a lock can land during it (BACKLOG #5781: one whose row
+                # still stores ``checked``'s TOTP columns opens nothing). The holder is read again
+                # after each one
                 # until a read finds the stored enrolment the comparison judged, so the last read
                 # before the write is a store read, and the write is for the enrolment compared.
                 while refusal is None:
