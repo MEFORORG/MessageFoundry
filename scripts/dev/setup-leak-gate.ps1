@@ -66,6 +66,30 @@ $local   = Join-Path $secDir 'scan-tokens.local.txt'
 $example = Join-Path $secDir 'scan-tokens.local.txt.example'
 $scanner = Join-Path $secDir 'scan_forbidden.py'
 
+# Every git call this script makes, its own and the scanner's, must answer about $repo. An inherited
+# location variable -- exported by a hook, or left behind in the operator's shell -- outranks both -C
+# and the current directory, so the scan would list another repository's tracked files (or another
+# index), and check-ignore would read another repository's exclude rules, each reported as this
+# checkout's. The list is the location set scripts/worktree/worktree-gates.ps1 refuses
+# ($GIT_REDIRECT_NAMES); keep the two in step. Each call runs with them dropped, and they are
+# restored afterwards so a caller that dot-sources or invokes this in-process keeps its environment.
+$gitRedirects = 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE'
+function Invoke-WithoutGitRedirect([scriptblock]$Body) {
+    $saved = @{}
+    foreach ($name in $gitRedirects) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name)
+        # Remove-Item, not SetEnvironmentVariable($name, $null): PowerShell binds that $null to the
+        # [string] parameter as '', and git then reads GIT_DIR='' as a (missing) repository.
+        Remove-Item -LiteralPath "Env:$name" -ErrorAction Ignore
+    }
+    try { & $Body }
+    finally {
+        foreach ($name in $gitRedirects) {
+            if ($null -ne $saved[$name]) { Set-Item -LiteralPath "Env:$name" -Value $saved[$name] }
+        }
+    }
+}
+
 if ($PSCmdlet.ParameterSetName -eq 'Real') {
     if (-not (Test-Path -LiteralPath $From)) { throw "No such token file: $From" }
     Copy-Item -LiteralPath $From -Destination $local -Force
@@ -87,7 +111,7 @@ if ($PSCmdlet.ParameterSetName -ne 'Status') {
 # The token file must never become committable. Verify rather than assume -- this is the one mistake
 # that would publish the very list the gate protects.
 if (Test-Path -LiteralPath $local) {
-    $ignored = & git -C $repo check-ignore -- 'scripts/security/scan-tokens.local.txt' 2>$null
+    $ignored = Invoke-WithoutGitRedirect { & git -C $repo check-ignore -- 'scripts/security/scan-tokens.local.txt' 2>$null }
     if (-not $ignored) {
         Remove-Item -LiteralPath $local -Force
         throw 'scan-tokens.local.txt is NOT git-ignored in this checkout. Removed it rather than risk committing the token list.'
@@ -116,9 +140,15 @@ if ($null -ne $envTokens) {
         $source = 'NONE -- MEFOR_FORBIDDEN_TOKENS is set but EMPTY, which the scanner reads as "no source" (it does NOT fall back to the file)'
     }
     else {
-        $isFile = $false
-        try { $isFile = Test-Path -LiteralPath $trimmed -PathType Leaf } catch { $isFile = $false }
-        if ($isFile) { $source = "MEFOR_FORBIDDEN_TOKENS -> $trimmed" }
+        # Probed APPROXIMATELY as the scanner probes it, with Python's Path(value).is_file() from $repo,
+        # where both the verify step below and the pre-commit hook run it (BACKLOG #5467): a relative
+        # path is relative to the checkout, and no `~` or PSDrive is expanded, as Test-Path would. NOT
+        # identical: a trailing separator, a drive- or root-relative Windows form, and a POSIX `..`
+        # through a symlink can resolve differently here, so in those cases the label below can
+        # disagree with what the scanner loaded. The counts line is the scanner's own answer.
+        $tokenPath = $null
+        try { $tokenPath = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, $trimmed)) } catch { $tokenPath = $null }
+        if ($tokenPath -and [IO.File]::Exists($tokenPath)) { $source = "MEFOR_FORBIDDEN_TOKENS -> $tokenPath" }
         # NEVER echo the value. A non-path value IS the token list, carried inline; naming the variable
         # is the whole diagnostic, and printing its content would publish exactly what this protects
         # into whatever log the operator happened to be capturing.
@@ -136,14 +166,37 @@ else {
 }
 
 # --- verify: what can the gate actually SEE? -------------------------------------------------------
-$py = if (Test-Path (Join-Path $repo '.venv/Scripts/python.exe')) { Join-Path $repo '.venv/Scripts/python.exe' } else { 'python' }
+# The checkout's own venv, in this platform's layout: Scripts\python.exe on Windows, bin/python on
+# POSIX (BACKLOG #5467). Only the platform's own layout is probed, since a POSIX venv's interpreter
+# cannot be launched on Windows. Without one it falls back to whatever `python` PATH offers.
+# [Environment]::OSVersion rather than $IsWindows, which Windows PowerShell 5.1 does not define
+# (scripts/worktree/ensure-venv.ps1 takes the same form).
+$onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+$venvPy = Join-Path $repo $(if ($onWindows) { '.venv/Scripts/python.exe' } else { '.venv/bin/python' })
+$py = if (Test-Path -LiteralPath $venvPy -PathType Leaf) { $venvPy } else { 'python' }
 Write-Host ''
 Write-Host 'Verifying the gate can see:' -ForegroundColor Cyan
-$out = & $py $scanner --require-tokens 2>&1
-# Captured on the very next line, before any other native call can overwrite it. The scanner's verdict
-# used to be discarded entirely, so a refusal came back out of here as CONFIGURED and exit 0 -- which
-# contradicts this file's own header promise to "exit non-zero if the sections are empty".
-$scanExit = $LASTEXITCODE
+# Run FROM the derived repo root (BACKLOG #5467). With no path argument the scanner lists the tracked
+# files of its CURRENT DIRECTORY (scan_forbidden._git_tracked), while its token list is anchored on its
+# own location. Run from the caller's directory, the verify step scanned the CALLER's checkout with this
+# checkout's tokens -- and outside any git directory it failed outright -- which is the same
+# wrong-checkout class the $repo derivation above closes for the install (BACKLOG #1063).
+Push-Location -LiteralPath $repo
+try {
+    $scan = Invoke-WithoutGitRedirect {
+        $scanOut = & $py $scanner --require-tokens 2>&1
+        # Captured on the very next line, before any other native call can overwrite it. The scanner's
+        # verdict used to be discarded entirely, so a refusal came back out of here as CONFIGURED and
+        # exit 0 -- which contradicts this file's own header promise to "exit non-zero if the sections
+        # are empty".
+        [pscustomobject]@{ Out = $scanOut; Exit = $LASTEXITCODE }
+    }
+    $out = $scan.Out
+    $scanExit = $scan.Exit
+}
+finally {
+    Pop-Location
+}
 $loaded = $out | Where-Object { $_ -match 'loaded names=' } | Select-Object -First 1
 if (-not $loaded) { Write-Host ($out | Select-Object -Last 5); throw 'Scanner produced no detector-count line.' }
 Write-Host "  $loaded"
@@ -171,7 +224,7 @@ if ($scanExit -ne 0) {
     Write-Host "  token source: $source"
     # Its output is NOT reprinted here: a hit line can quote matched content, and copying that into a
     # terminal scrollback, a ticket or a CI log is the disclosure this whole gate exists to prevent.
-    Write-Host '  Re-run the scanner yourself to see why, and do not paste its output anywhere:' -ForegroundColor Red
+    Write-Host "  Re-run the scanner yourself, from $repo, to see why, and do not paste its output anywhere:" -ForegroundColor Red
     Write-Host "      $py scripts/security/scan_forbidden.py --require-tokens"
     exit $scanExit
 }
