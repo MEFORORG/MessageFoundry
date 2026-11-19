@@ -76,6 +76,7 @@ from messagefoundry.redaction import _REDACTED as PHI_PLACEHOLDER
 from messagefoundry.redaction import (
     ExcInfo,
     prepare_log_record,
+    redact_binary_carriage,
     redact_untrusted,
     safe_traceback,
 )
@@ -111,6 +112,7 @@ __all__ = [
     "JsonFormatter",
     "CredentialQueryScrubFilter",
     "CredentialScrubFilter",
+    "BinaryCarriageScrubFilter",
     "redact_log_value",
     "redacted_log_field",
     "UNREADABLE_LOG_VALUE",
@@ -268,7 +270,7 @@ class RedactionFilter(logging.Filter):
     exception message, so what a bound drops is the peer-sized payload and what it keeps is the part
     an operator reads.
 
-    **The bound reaches the three filters installed after this one too, and by order rather than by
+    **The bound reaches the filters installed after this one too, and by order rather than by
     their own code.** :class:`CredentialScrubFilter` and :class:`CredentialQueryScrubFilter` walk the
     same fields, and ``secretscrub``'s DSN-password pattern is itself superlinear over dotted text.
     They are bounded today only because this filter runs first and writes the clamped text back onto
@@ -660,6 +662,21 @@ class CredentialScrubFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         _rewrite_record(record, scrub_credentials)
+        return True
+
+
+class BinaryCarriageScrubFilter(logging.Filter):
+    """Replace an ``mfb64:v1:`` binary-carriage body in every emitted record -- message, exception
+    traceback and ``stack_info`` -- via :func:`~messagefoundry.redaction.redact_binary_carriage`
+    (BACKLOG #5378).
+
+    ORDER. Installed **after** :class:`CredentialScrubFilter`, the last label pass, and **before**
+    :class:`ControlCharScrubFilter`, which must stay last. After, because ``/``, ``+`` and ``=`` are
+    base64 characters: a carriage pass run earlier took a label joined to the run and left its value
+    for no pass to find. :data:`~messagefoundry.redaction._BINARY_CARRIAGE` states the rest."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        _rewrite_record(record, redact_binary_carriage)
         return True
 
 
@@ -1198,7 +1215,8 @@ def _install_phi_filters(handler: logging.Handler) -> None:
 
     Order matters: redact PHI from the raw content first (which also renders ``exc_info`` into
     ``exc_text``, so the credential passes have a traceback to read), scrub credentials from the
-    result, then scrub control chars last. Applied to **every** handler a logger carries (stdout,
+    result, then replace a binary-carriage body, after every label pass so a label joined to the
+    run keeps its value hidden (BACKLOG #5378), then scrub control chars last. Applied to **every** handler a logger carries (stdout,
     stderr, and the off-box forwarder's queue handler) so the forwarded stream is held to the same
     PHI-safety, secret-safety and log-injection guarantees as stdout. Every handler re-runs the
     chain over the ONE shared record, so a later handler filters the earlier one's escaped output.
@@ -1212,17 +1230,21 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     handler.addFilter(RedactionFilter())  # PHI redaction — message + exception traceback (Gate #1)
     handler.addFilter(CredentialQueryScrubFilter())  # OIDC code/state in a URL (ADR 0142 AC-10)
     handler.addFilter(CredentialScrubFilter())  # credential labels + values (BACKLOG #1478)
+    handler.addFilter(BinaryCarriageScrubFilter())  # mfb64 bodies, after every label (#5378)
     handler.addFilter(ControlCharScrubFilter())  # log-injection defense (16.4.1)
 
 
 def scrub_log_text(text: str) -> str:
-    """``text`` through the three text passes :func:`_install_phi_filters` installs, in its order:
-    PHI redaction (bounded), the credential query scrub, then the credential scrub. The control
-    scrub, which runs last on a handler, is left out, so a control character stays as it is.
+    """``text`` through the text passes :func:`_install_phi_filters` installs, in its order: PHI
+    redaction (bounded), the credential query scrub, the credential scrub, then the binary-carriage
+    pass. The control scrub, which runs last on a handler, is left out, so a control character stays
+    as it is.
 
     For a caller that must filter a value before it is encoded, as the audit tee does (BACKLOG
     #3045). A handler still runs its chain over the encoded line afterwards."""
-    return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
+    return redact_binary_carriage(
+        scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
+    )
 
 
 def _build_syslog_handler(
@@ -1668,8 +1690,9 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         """Report new spool read faults at most once per :data:`_FORWARD_DROP_REPORT_INTERVAL`
         (BACKLOG #2278).
 
-        :meth:`LogSpool.peek` keeps every file when a read fails for a reason other than a missing
-        file, and returns ``None``, which is also what a drained spool returns. Without this report
+        :meth:`LogSpool.peek` retires nothing when a read fails for a reason other than a missing
+        segment file, a missing spool directory included, and returns ``None``, which is also what
+        a drained spool returns. Without this report
         the only sign was the "spool is full" drop warning, long after and naming the wrong cause.
         The line carries a count and a directory, never a record. It is rate limited for the same
         reason as :meth:`_report_spool_drop`: it comes back through this listener, and every pass
@@ -1686,9 +1709,10 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         batch, self._spool_read_errors_reported = total - self._spool_read_errors_reported, total
         _log.warning(
             "off-box log forwarding could not read its on-disk spool at %s: %d read(s) failed (%d "
-            "since this process started), for a reason other than a missing file. The segments are "
-            "kept, and what they hold is not sent until a read succeeds. Newer records are sent "
-            "ahead of them meanwhile.",
+            "since this process started), for a reason other than a missing segment file; a "
+            "missing spool directory counts. No segment is retired for it, and what the spool "
+            "holds is not sent until a read succeeds. Newer records can be sent ahead of it "
+            "meanwhile.",
             self.spool.directory,
             batch,
             total,
@@ -2121,7 +2145,8 @@ class ForwarderStatus:
     spool_dropped: int = 0
     #: Spooled records skipped as torn or malformed, and segments found gone before they were sent.
     spool_skipped: int = 0
-    #: Spool reads that failed for a reason other than a missing file. Held, not lost.
+    #: Spool reads that failed for a reason other than a missing segment file, a missing spool
+    #: directory included. Nothing is retired for them.
     spool_read_errors: int = 0
     #: Whether the last spool read failed that way.
     spool_read_faulted: bool = False

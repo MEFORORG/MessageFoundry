@@ -754,7 +754,7 @@ def _open_windows_held(path: Path, *, delete: bool = False) -> int:
     from ctypes import wintypes
 
     from messagefoundry.restricted_file import (
-        _DELETE,
+        DELETE_ACCESS,
         WINERROR_SHARING_VIOLATION,
         ride_out_a_held_file,
     )
@@ -776,7 +776,7 @@ def _open_windows_held(path: Path, *, delete: bool = False) -> int:
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
     generic_read, file_share_read, open_existing, file_type_disk = 0x80000000, 0x1, 3, 0x1
-    access = generic_read | (_DELETE if delete else 0)
+    access = generic_read | (DELETE_ACCESS if delete else 0)
     # FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT: a link is opened as itself, and the
     # access check that follows refuses it.
     flags = 0x00000080 | 0x00200000
@@ -1058,29 +1058,29 @@ def check_handoff_writable(service_account: str, *, enforcing: bool = True) -> s
         raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
     from messagefoundry.restricted_file import (
         RestrictedFileError,
-        _lookup_account_name,
-        _lookup_sid_kind,
-        _resolve_sid,
         administrators_enabled,
         custody_non_local_account_problem,
         handoff_grantee_problem,
         local_account_domain_sid,
+        lookup_account_name,
+        lookup_sid_kind,
+        resolve_sid,
     )
 
     refused: str | None = None
     service_sid = ""
     try:
         if service_account.removeprefix("*").upper().startswith("S-1-"):
-            service_sid = _resolve_sid(service_account)
+            service_sid = resolve_sid(service_account)
         else:
             # A name is resolved without the key-file grant's kind gate, so a name and its SID
-            # literal are judged alike, by handoff_grantee_problem, and every refusal names the
-            # account through describe_sid rather than the typed name (see below).
-            found = _lookup_account_name(service_account)
+            # literal are judged alike, by handoff_grantee_problem, and a refusal of a resolved
+            # account names its SID rather than the typed name (see below).
+            found = lookup_account_name(service_account)
             if found is None:
                 raise RestrictedFileError(f"the account {service_account!r} could not be resolved")
             service_sid = found[0]
-        refused = handoff_grantee_problem(service_sid, _lookup_sid_kind)
+        refused = handoff_grantee_problem(service_sid, lookup_sid_kind)
         if refused is None and enforcing:
             refused = custody_non_local_account_problem(service_sid, local_account_domain_sid())
     except RestrictedFileError as exc:

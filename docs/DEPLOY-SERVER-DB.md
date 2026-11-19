@@ -150,7 +150,7 @@ server = "sql01.corp.example.com"
 database = "MessageFoundry"
 auth = "integrated"                # Trusted_Connection=yes — the gMSA's identity authenticates
 encrypt = true                     # default; TLS to the DB
-trust_server_certificate = false   # default; verify the DB cert (import its CA into LocalMachine\Root, §5.2)
+trust_server_certificate = false   # default; verify the DB cert (import its CA into the machine stores, §5.2)
 require_managed_identity = true    # refuse a static SQL login on production PHI (ASVS 13.2.1)
 # schema_management = "external"   # the server-DB default; step 4 owns the DDL (BACKLOG #305)
 ```
@@ -552,23 +552,33 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 .\scripts\service\import-db-ca.ps1 -CaPath C:\certs\internal-root-ca.crt
 ```
 
+This script needs PowerShell 7.1 or later (pwsh); it refuses to run under Windows PowerShell 5.1.
+
 The helper shows every certificate in the file, and refuses the whole file in at least these cases:
-any one is not a CA or carries a private key, the file holds no self-signed root, or a DER value in
-it does not end where its bytes end. The helper's own help lists the rest.
+any one is not a CA or carries a private key, any one does not chain to a self-signed root in the
+same file, a root in it is outside its validity period, or a DER value in it does not end where its
+bytes end. The helper's own help lists the rest.
 
 **Where each CA goes.** This paragraph and the helper's own help are the statement of it; other
 documents point here. A self-signed root, whose signature verifies under its own key, goes into
-`LocalMachine\Root`. Any other CA in the file, such as an issuing CA in a `.p7b` chain, or a
+`LocalMachine\Root`; the helper asks .NET's chain engine (`X509Chain`) whether that signature
+verifies. Any other CA in the file, such as an issuing CA in a `.p7b` chain, or a
 self-issued certificate another key signed, goes into the intermediate store `LocalMachine\CA`.
-That store is **not** a trust anchor for SChannel or ODBC Driver 18 chain building, so the SQL
-Server hop still checks the chain up to the root. It **is** usable as a trust anchor by the
+The Windows chain engine needs an authority key identifier to link a self-issued certificate to its
+signer; without one it reads the certificate as self-signed with a signature that fails, so the
+file is refused. `LocalMachine\CA` is **not** a trust anchor for SChannel or ODBC Driver 18 chain
+building, so the SQL Server hop still checks the chain up to the root. It **is** usable as a trust anchor by the
 engine's Python TLS on Windows: CPython's `ssl.create_default_context()`, which the PostgreSQL
 system-trust path calls, loads the `CA` and `ROOT` system stores, and Python 3.13 and later set
 partial-chain verification, so a chain that reaches a certificate in `LocalMachine\CA` validates
-there without its root. The helper refuses a file unless at least one certificate in it is a
-self-signed root. It does not check that each other CA in the file chains to that root, and with
-`-Confirm` you may still decline the root and accept another CA, so give it the root of the CA you
-mean to trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
+there without its root. So the helper refuses a file unless the chain engine, given every
+certificate in the file, builds a chain from each one to a self-signed root in the same file with
+every signature verifying and no fault reported but an untrusted root or a time status, and every
+self-signed root in it is within its validity period. Only the file's own roots anchor that chain,
+and the helper turns off fetching a missing issuer from a URL a certificate names. It warns of,
+but does not refuse, an expired issuing CA, and it does not check revocation. With `-Confirm`
+you may still decline the root and accept another CA, so give it the root of the CA you mean to
+trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
 
 The built-ins below check none of that, so use them only for a file holding one self-signed root
 CA you have checked yourself:

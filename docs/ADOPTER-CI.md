@@ -347,10 +347,10 @@ failed** — advisory checks and skips never block.
 | Check | Required? | What it proves | Fails when |
 | --- | --- | --- | --- |
 | **`validate`** | ✅ blocking | every config module imports; **every `inbound → router` reference resolves**; the directory **declares at least one connection** | a router/handler named but not defined, an unresolvable reference, an import error, or a directory that declares no inbound and no outbound at all — pass `--allow-empty-config` when that is deliberate |
-| **`dryrun`** | ✅ blocking *(when fixtures exist)* | each synthetic `*.hl7` fixture **routes through its inbound's Router/Handler(s) without erroring** | a transform throws, or the message lands in `ERROR` disposition |
+| **`dryrun`** | ✅ blocking *(when fixtures exist)* | each synthetic `*.hl7` fixture **routes through its inbound's Router/Handler(s) without erroring** | a transform throws, the message lands in `ERROR` disposition, or the `--config` directory does not exist |
 | **`posture`** | ✅ blocking *(best-effort)* | the active environment's security posture is resolvable | a **custom** env name with no explicit `[ai].data_class`/`[ai].production` — which would make `serve` fail-closed at runtime |
-| **`ruff`** | advisory | config style/lint | only when installed; never blocks |
-| **`mypy`** | advisory | config types | only when installed; never blocks |
+| **`ruff`** | advisory | config style/lint | only when installed for the Python that runs `check` (ruff also from the user scheme's scripts folder); never blocks |
+| **`mypy`** | advisory | config types; `check` starts it with `--config-file=`, so it reads no mypy configuration file and runs without `strict`, which makes this pass weaker than `mypy --strict` ([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md#4-the-engine-starts-processes) section 4 says why) | only when installed for the Python that runs `check`; never blocks |
 
 ### Why `dryrun` is the interface gate that matters
 
@@ -451,7 +451,11 @@ What CI **does** guarantee on every PR:
 - **Treat the gate as a merge requirement** (branch protection on `main`): no config merges unless
   `validate` **and** `dryrun` are green.
 - **Add `ruff`/`mypy` to your repo** and drop `--no-lint` if your analysts want config linting/types
-  in the gate.
+  in the gate. The gate's `mypy` pass reads no mypy configuration file, so your own mypy settings
+  (`strict`, plugins, per-module options) do not apply there; run `mypy` directly in its own CI
+  step for them. A CI that installs `ruff` only as a binary on `PATH` (not in the scripts folder of
+  the Python that runs `check`, its base installation or the user scheme) loses the gate's advisory
+  `ruff` and `ruff-security` (`S` rules) passes: `check` skips both.
 - **Don't rely on CI alone for output parity** — pair it with the test harness and a reconciliation
   window before and after cutover.
 - **Leave `verify-engine` on.** Only set `MEFOR_VERIFY_ENGINE=off` if your index genuinely strips

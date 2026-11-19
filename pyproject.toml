@@ -288,8 +288,10 @@ x12 = ["pyx12>=4.1.0"]
 # (parser locked down directly — defusedxml does NOT cover lxml and defusedxml.lxml is deprecated);
 # xmlschema validates against XSD with remote schemaLocation fetch disabled; signxml does XML-DSig
 # (it drags cryptography — registered in scripts/security/crypto_inventory_check.py). Floors are the
-# current major lines (lxml 6.x dropped py<3.8 + bundled modern libxml2; xmlschema 4.x; signxml 4.x).
-xml = ["lxml>=6.0.0", "xmlschema>=4.0.0", "signxml>=4.0.0"]
+# current major lines (lxml 6.x dropped py<3.8 + bundled modern libxml2; xmlschema 4.x), except
+# signxml, floored at 5.3.0: from there a same-document reference never signs a comment, and
+# parsing/xml/signature.py's coverage rule and its tests state the refusal that follows.
+xml = ["lxml>=6.0.0", "xmlschema>=4.0.0", "signxml>=5.3.0"]
 # WebAuthn/FIDO2 browser second factor for the ops console (ADR 0068, WP-14b; BACKLOG #11). PyPI name
 # is EXACTLY "webauthn" (duo-labs/py_webauthn, BSD-3-Clause) — "py_webauthn"/"py-webauthn" pip-normalize
 # to AS207960's UNRELATED package; never "fix" this name to match the GitHub repo. Lazy-imported

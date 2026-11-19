@@ -30,7 +30,7 @@ import logging
 import tomllib
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -112,6 +112,9 @@ class EnvironmentValuesReader(SnapshotEnvValuesProvider):
     def __init__(
         self, read: ValuesRead, *, base_dir: Path, dir_name: str, environment: str
     ) -> None:
+        # Refused here, once, so value_file, which the engine reads on every reload, cannot raise
+        # later (BACKLOG #5322).
+        values_file_path(base_dir, dir_name, environment)
         self._read = read
         self.base_dir = base_dir
         self.dir_name = dir_name
@@ -187,12 +190,72 @@ def resolve_values_base_dir(base_dir: str, *, cwd: Path) -> Path:
     return cwd / base_dir
 
 
+def _leaves_base(value: str) -> bool:
+    """Whether joining ``value`` under a base directory could name a path outside it: a drive, a root
+    (``/x``, ``\\x``, ``C:x``, ``C:/x``, a UNC share), or a part of only dots and spaces other than
+    ``.``, such as ``..``. Read under the Windows rules on every host, which split on both
+    separators, so a value Windows would read as leaving the base is refused on POSIX too. The join
+    itself uses the host's rules, so on POSIX a backslash stays part of a folder name. Windows strips
+    the trailing dots and spaces of a part, so ``...`` and ``.. `` are refused with ``..``."""
+    path = PureWindowsPath(value)
+    # pathlib drops a "." part itself, so every part left of only dots and spaces is refused.
+    return bool(path.drive or path.root) or any(not part.strip(". ") for part in path.parts)
+
+
 def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> Path:
     """The value file :func:`load_environment_values` reads, ``<base_dir>/<dir_name>/<env>.toml``.
 
     One rule, so the ``serve`` and ``supervise`` start checks vet the file the load reads (vault
-    BACKLOG #2626)."""
-    return Path(base_dir) / dir_name / f"{environment}.toml"
+    BACKLOG #2626).
+
+    Raises ``ValueError``, withholding the value, when ``dir_name`` would leave ``base_dir``
+    (:func:`_leaves_base`), or when ``environment`` is not a name ``[ai].environment`` admits, so the
+    path's text names a file under ``base_dir`` (BACKLOG #5322). The name check covers a caller that
+    never ran the settings validator, such as the ``--project-root`` check of a raw ``--env``.
+
+    It checks the text and nothing else. A link inside ``base_dir`` that leads out is not refused
+    anywhere: the ``serve`` and ``supervise`` start checks
+    (:func:`~messagefoundry.config.wiring.assert_trusted_start_paths`) vet the owner of each folder
+    holding a link on the way, of the object the chain ends at and of that object's folder, but
+    nothing checks that the end lies under ``base_dir``.
+
+    It also raises when a part of ``dir_name``, or the file name ``<env>.toml``, is one
+    :func:`ntpath.isreserved` calls reserved, read under the Windows rules on every host: at least a
+    device name such as ``NUL`` or ``COM1.toml``, a part ending in a dot or a space, and a part
+    holding a character Windows refuses in a name, such as ``:`` or ``?``. On Windows 11 (measured
+    on build 26300) ``NUL.toml`` is an ordinary file name, but a bare ``NUL`` folder part named the
+    device rather than a folder, and older Windows releases, Windows Server among them, were not
+    measured; refusing every such name leaves no release where the path could open a device."""
+    import ntpath
+
+    # Imported here, so importing this module does not load the settings model.
+    from messagefoundry.config.settings import _ENV_NAME_ALLOWED
+
+    if _leaves_base(dir_name):
+        raise ValueError(
+            "[environments].dir must be a folder under the environments base directory: no drive, "
+            "no leading slash or backslash, and no part of only dots or spaces such as '..' "
+            "(value withheld)"
+        )
+    if any(ntpath.isreserved(part) for part in PureWindowsPath(dir_name).parts):
+        raise ValueError(
+            "[environments].dir must not hold a name Windows reserves: a device name such as NUL "
+            "or COM1, a part ending in a dot or a space, or a character such as ':' or '?' "
+            "(value withheld)"
+        )
+    # The validator's own alphabet has no separator and no ':', so the file name is one plain part.
+    if not environment or not set(environment) <= _ENV_NAME_ALLOWED:
+        raise ValueError(
+            "the environment name must be a non-empty name of letters, digits, '.', '_' or '-' "
+            "(value withheld)"
+        )
+    file_name = f"{environment}.toml"
+    if ntpath.isreserved(file_name):
+        raise ValueError(
+            "the environment name must not be a device name Windows reserves, such as NUL or COM1 "
+            "(value withheld)"
+        )
+    return Path(base_dir) / dir_name / file_name
 
 
 def load_environment_values(
@@ -215,7 +278,8 @@ def load_environment_values(
     validation, read it as missing. A file
     that cannot be stated or read raises its ``OSError``
     (:func:`~messagefoundry.config.snapshot.is_regular_file` says which is which).
-    :func:`environment_values_from_bytes` says what it refuses.
+    :func:`environment_values_from_bytes` says what it refuses. A ``dir_name`` or ``environment``
+    that :func:`values_file_path` refuses raises its ``ValueError`` before anything is read.
     """
     from messagefoundry.config.snapshot import is_regular_file
 

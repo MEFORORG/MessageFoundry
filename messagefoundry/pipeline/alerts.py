@@ -1878,11 +1878,24 @@ def store_cipher_refusal_forwarder(
 #: build (BACKLOG #2593). Its own subject, so it throttles and routes apart from the cipher refusal.
 QUEUE_TAG_SUBJECT = "queue-tag"
 
+#: The ``integrity_drift`` subject for a queue row whose payload is corrupt rather than drift
+#: (BACKLOG #5884), and the table name ``store.queue_tag.QUEUE_CORRUPT_ALERT_TABLE`` hands the
+#: tag-failure hook for one. Apart from :data:`QUEUE_TAG_SUBJECT` because the notifier's cooldown is
+#: per subject: on one subject, a corrupt cell inside the cooldown would hold back a drift page.
+QUEUE_CORRUPT_SUBJECT = "queue-corrupt"
+
 
 def alert_cell_tag_failure(sink: AlertSink, table: str, reason: str) -> None:
-    """Raise ``integrity_drift`` for a store cell that failed its row tag. The reason names a stage
+    """Raise ``integrity_drift`` for a store cell its tag-checked open refused, whatever the cause
+    the reason states: a failed row tag, or for a queue row any cause
+    ``store.queue_tag.QUEUE_TAG_CAUSES`` names. The reason names a stage
     and a short row-id prefix, never a row value, so it carries no PHI. Never raises."""
-    subject = QUEUE_TAG_SUBJECT if table == "queue" else f"{table}-tag"
+    if table == "queue":
+        subject = QUEUE_TAG_SUBJECT
+    elif table == QUEUE_CORRUPT_SUBJECT:
+        subject = QUEUE_CORRUPT_SUBJECT
+    else:
+        subject = f"{table}-tag"
     try:
         sink.integrity_drift(subject, reason=reason, drift_count=1)
     except Exception:  # noqa: BLE001 — an alert-sink failure must never undo the dead-letter

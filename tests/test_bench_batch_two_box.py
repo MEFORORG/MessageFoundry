@@ -463,8 +463,14 @@ def _install_engine_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
 def _install_driver_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     rec = types.SimpleNamespace(spawned=[])
 
-    async def fake_run_remote_proc(argv: list[str], report_path: Path, cwd: Path) -> dict[str, Any]:
+    async def fake_run_remote_proc(
+        argv: list[str], report_path: Path, cwd: Path, *, timeout: float
+    ) -> dict[str, Any]:
         rec.spawned.append(list(argv))
+        # The drive bounds every band by its hold and both drain windows plus the slack (BACKLOG #5304).
+        hold = float(argv[argv.index("--hold-seconds") + 1])
+        drain = float(argv[argv.index("--drain-timeout") + 1])
+        assert timeout == hold + 2 * drain + bb._REMOTE_PROC_SLACK, timeout
         # The arm is recoverable from the per-proc report filename (it carries the cell id).
         b1 = "-bt1-" in report_path.name
         share = int(argv[argv.index("--count") + 1])
@@ -661,13 +667,120 @@ async def test_a_remote_process_that_wrote_no_report_says_why(tmp_path: Path) ->
     seam, with a real child process."""
     child = "import sys; sys.stderr.write('connscale-remote setup failed: the reason'); sys.exit(2)"
     with pytest.raises(ConnScaleError, match="exited 2 and wrote no report.*the reason"):
-        await bb._run_remote_proc([sys.executable, "-c", child], tmp_path / "none.json", tmp_path)
+        await bb._run_remote_proc(
+            [sys.executable, "-c", child], tmp_path / "none.json", tmp_path, timeout=60.0
+        )
     # CONTROL: a child that does write its report is read, whatever it said on stderr.
     report = tmp_path / "there.json"
     writer = f"import sys; open({str(report)!r}, 'w').write('{{\"sent\": 3}}'); sys.stderr.write('noise')"
-    assert await bb._run_remote_proc([sys.executable, "-c", writer], report, tmp_path) == {
-        "sent": 3
-    }
+    assert await bb._run_remote_proc(
+        [sys.executable, "-c", writer], report, tmp_path, timeout=60.0
+    ) == {"sent": 3}
+
+
+async def test_a_failed_remote_process_never_reads_an_earlier_runs_report(tmp_path: Path) -> None:
+    """BACKLOG #5304: a band report an EARLIER run left at the same path must not be read as this
+    child's. A child that fails before writing has to fail the band, not hand back stale counts."""
+    report = tmp_path / "cell.p0.json"
+    report.write_text('{"sent": 99, "stale": true}', encoding="utf-8")
+    child = "import sys; sys.stderr.write('connscale-remote setup failed: refused'); sys.exit(2)"
+    with pytest.raises(ConnScaleError, match="exited 2 and wrote no report.*refused"):
+        await bb._run_remote_proc([sys.executable, "-c", child], report, tmp_path, timeout=60.0)
+    assert not report.exists()
+    # CONTROL: with a stale report planted again, a child that writes its own is read, not refused.
+    report.write_text('{"sent": 99, "stale": true}', encoding="utf-8")
+    writer = f"open({str(report)!r}, 'w').write('{{\"sent\": 3}}')"
+    assert await bb._run_remote_proc(
+        [sys.executable, "-c", writer], report, tmp_path, timeout=60.0
+    ) == {"sent": 3}
+
+
+async def test_a_hung_remote_process_is_killed_and_fails_the_band(tmp_path: Path) -> None:
+    """BACKLOG #5304: a ``connscale-remote`` child that never exits must not hang the driver. Past
+    its bound it is killed and the band fails with a reason, even though it wrote a report."""
+    import asyncio
+
+    bound = 10.0  # wide enough for a loaded runner to start the interpreter and reach the sleep
+    report = tmp_path / "hung.json"
+    marker = tmp_path / "hung.pid"
+    child = (
+        "import os, sys, time; "
+        "sys.stderr.write('stuck in the port preflight'); sys.stderr.flush(); "
+        f"open({str(report)!r}, 'w').write('{{\"sent\": 3}}'); "
+        f"open({str(marker)!r}, 'w').write(str(os.getpid())); "
+        "time.sleep(120)"
+    )
+    with pytest.raises(
+        ConnScaleError, match="still running after 10s and was killed: stuck in the port preflight"
+    ):
+        await bb._run_remote_proc([sys.executable, "-c", child], report, tmp_path, timeout=bound)
+    # CONTROL: the same bound admits a child that finishes inside it.
+    quick = f"open({str(report)!r}, 'w').write('{{\"sent\": 4}}')"
+    assert await bb._run_remote_proc(
+        [sys.executable, "-c", quick], report, tmp_path, timeout=bound
+    ) == {"sent": 4}
+    # The hung child is gone, not orphaned. Polled, because a venv launcher's interpreter is a
+    # grandchild that its job object ends just after the launcher is reaped.
+    psutil = pytest.importorskip("psutil")
+    pid = int(marker.read_text(encoding="utf-8"))
+
+    def gone() -> bool:
+        try:
+            return bool(psutil.Process(pid).status() == psutil.STATUS_ZOMBIE)
+        except psutil.NoSuchProcess:
+            return True
+
+    for _ in range(100):
+        if gone():
+            break
+        await asyncio.sleep(0.1)
+    else:
+        pytest.fail(f"the hung child {pid} outlived the kill")
+
+
+async def test_a_remote_process_that_failed_after_writing_a_report_fails_the_band(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5304: a report on disk used to mean success whatever the child's exit code. A child
+    that wrote a report and then exited with a code that report does not record fails the band, with
+    its stderr reason."""
+    report = tmp_path / "written.json"
+
+    def child(payload: dict[str, Any], stderr: str = "") -> list[str]:
+        script = (
+            f"import json, sys; json.dump({payload!r}, open({str(report)!r}, 'w')); "
+            f"sys.stderr.write({stderr!r}); sys.exit(1)"
+        )
+        return [sys.executable, "-c", script]
+
+    for payload in ({"sent": 3}, {"sent": 3, "exit_code": 0}, {"sent": 3, "exit_code": True}):
+        with pytest.raises(ConnScaleError, match="exited 1, but its report records.*the reason"):
+            await bb._run_remote_proc(
+                child(payload, "Traceback: the reason"), report, tmp_path, timeout=60.0
+            )
+    # CONTROL: a child whose own FAIL verdict is in its report (exit 1, "exit_code": 1) is read, so
+    # the aggregation still judges a measured failing band from its counts.
+    verdict = {"sent": 3, "exit_code": 1}
+    assert await bb._run_remote_proc(child(verdict), report, tmp_path, timeout=60.0) == verdict
+
+
+def test_the_band_bound_covers_the_hold_and_both_drain_windows() -> None:
+    # The child awaits the drain and then samples until reconciled, each up to drain_timeout.
+    assert bb._remote_proc_timeout(60.0, 300.0) == 660.0 + bb._REMOTE_PROC_SLACK
+
+
+async def test_a_partial_report_fails_the_band_with_its_exit_and_reason(tmp_path: Path) -> None:
+    """A child that dies mid-write leaves a report that is not JSON. The band fails naming the exit
+    code and the stderr reason, not a bare JSONDecodeError."""
+    report = tmp_path / "partial.json"
+    child = (
+        f"import sys; open({str(report)!r}, 'w').write('{{\"sent\": '); "
+        "sys.stderr.write('OSError: no space left on device'); sys.exit(1)"
+    )
+    with pytest.raises(
+        ConnScaleError, match="exited 1 and its report .* is not JSON .*no space left"
+    ):
+        await bb._run_remote_proc([sys.executable, "-c", child], report, tmp_path, timeout=60.0)
 
 
 def test_batch_engine_cli_threads_flags(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -814,7 +927,9 @@ async def test_batch_driver_crashed_band_fails_cell_not_absent(
     # A profile that gates on zero-loss so the failed cell surfaces as an SLO failure in the verdict.
     profile = load_connscale_profile_text(_MINIMAL_BATCH + "\n[connscale.slo]\nzero_loss = true\n")
 
-    async def boom(argv: list[str], report_path: Path, cwd: Path) -> dict[str, Any]:
+    async def boom(
+        argv: list[str], report_path: Path, cwd: Path, *, timeout: float
+    ) -> dict[str, Any]:
         raise OSError("connscale-remote crashed")
 
     monkeypatch.setattr(bb, "_run_remote_proc", boom)
@@ -868,6 +983,74 @@ async def test_batch_driver_crashed_band_fails_cell_not_absent(
     zero_loss = next((s for s in report.slos if s.name == "zero_loss"), None)
     assert zero_loss is not None and zero_loss.ok is False
     assert report.exit_code != 0
+
+
+async def test_batch_driver_keeps_a_loss_a_sibling_of_a_crashed_band_proved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5574 item 7, through the driver: one band crashes in every cell and the others are
+    # over their stranding budget, so every failed cell record is LOSS, not INCONCLUSIVE.
+    import asyncio
+
+    profile = load_connscale_profile_text(_MINIMAL_BATCH)
+
+    async def one_crashes(
+        argv: list[str], report_path: Path, cwd: Path, *, timeout: float
+    ) -> dict[str, Any]:
+        if report_path.name.endswith(".p0.json"):  # band 0 of every cell
+            raise OSError("connscale-remote crashed")
+        return {
+            "engine_index_base": 0,
+            "traffic": {"sent": 10, "acked": 2, "nak": 0, "deferred": 0, "timeouts": 8},
+            "no_loss": {
+                "ok": False,
+                "inconclusive": False,
+                "stranding": {"unconfirmed": 8, "budget": 7, "over_budget": True},
+            },
+        }
+
+    monkeypatch.setattr(bb, "_run_remote_proc", one_crashes)
+    with tempfile.TemporaryDirectory() as tmp:
+        coord = FileDropCoord(tmp, run_id="batch_ab")
+        cells = bb.iter_batch_cells(profile, claim_mode="pooled")
+
+        async def stub_engine() -> None:
+            for cell in cells:
+                cc = coord.for_run(f"batch_ab.{cell.cell_id}")
+                cc.post(
+                    BATCH_CELL_READY,
+                    {
+                        "cell_id": cell.cell_id,
+                        "inbound_base": 20000,
+                        "api_port": 9000,
+                        "sink_base": 40000,
+                        "sink_procs": 6,
+                        "count": cell.count,
+                        "hold_seconds": profile.hold_seconds,
+                        "drain_timeout_s": profile.drain_timeout_s,
+                        "aggregate_rate": 24.0,
+                    },
+                )
+                await cc.await_message(BATCH_CELL_DONE, timeout=10.0, interval=0.02)
+
+        driver_task = asyncio.create_task(
+            bb.run_batch_driver(
+                profile=profile,
+                claim_mode="pooled",
+                engine_host="10.0.0.5",
+                coord=coord,
+                sink_host="0.0.0.0",
+                report_dir=Path(tmp) / "reports",
+                cell_timeout=10.0,
+            )
+        )
+        _, report = await asyncio.gather(stub_engine(), driver_task)
+
+    assert len(report.records) == len(cells)
+    for rec in report.records:
+        assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+        assert "cell drive failed" in rec.no_loss.detail
+        assert "exceed its stranding budget" in rec.no_loss.detail
 
 
 async def _drive_against_stub_engine(

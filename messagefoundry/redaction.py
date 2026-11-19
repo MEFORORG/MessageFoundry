@@ -71,6 +71,7 @@ import encodings.aliases
 import hashlib
 import json
 import logging
+import os
 import pkgutil
 import re
 import traceback
@@ -104,6 +105,7 @@ __all__ = [
     "prepare_log_record",
     "prints_a_codec_error",
     "redact",
+    "redact_binary_carriage",
     "redact_untrusted",
     "refuse_repeated_keys",
     "safe_error",
@@ -578,7 +580,7 @@ _NAME_DIGEST_CHARS = 12
 #: derived from engine code rather than from a list of plausible extensions:
 #:
 #: * ``parsing/sniff.py`` ``_EXTENSION_CONTENT_TYPE`` — the engine's own extension-to-``ContentType``
-#:   map for archive-member admission (ASVS 5.2.2): ``.hl7 .json .fhir .xml .dcm .edi .x12``.
+#:   map for archive-member admission (ASVS 5.2.2): ``.hl7 .hl7v2 .json .fhir .xml .dcm .edi .x12``.
 #: * ``parsing/sniff.py`` ``_EXTENSION_MAGIC`` — the container/attachment formats it admits by leading
 #:   magic bytes: ``.pdf .png .jpg .jpeg .gif .tif .tiff .zip .gz``.
 #: * ``uploads.py`` ``_ALLOWED_UPLOAD_EXTENSIONS`` / ``content_type_for`` — ``.hl7v2`` and ``.txt``.
@@ -1080,6 +1082,75 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
     return f"{head}\n{_clamp_marker(dropped)}"  # newline, not space: see _clamp_marker
 
 
+#: An ``mfb64:v1:`` binary-carriage value (ADR 0028; ``parsing/binary.py`` ``MARKER``) and the base64
+#: run after it (BACKLOG #5378). The run is a whole message body, PHI by design, and every pass in
+#: :func:`redact` reads it as one opaque token: no HL7 delimiter, no date, no second capitalized word.
+#: So a log record or traceback quoting a carriage reached every sink whole. The marker is written as
+#: a literal because this module is pure stdlib and must not import ``parsing``; a test pins it to
+#: ``MARKER``.
+#:
+#: **It runs LAST, after every label pass** -- the PHI passes here and the credential passes of the
+#: log chain -- through :func:`redact_binary_carriage`, never inside :func:`redact`. ``/``, ``+``
+#: and ``=`` are base64 characters, so a run read first took a label joined to it (``QUJD/MRN: 123``, ``QUJD+token=x``) and left its value with nothing to find it by.
+#: Read last, every labelled value is already hidden as it was before this pass existed, and the
+#: run then takes what is left. A placeholder an earlier pass wrote inside the run (a date-shaped
+#: piece between two ``/``) is read as part of the run, so the run is not cut there and its tail is
+#: taken too. So is a marker whose ``mfb64`` an earlier pass replaced: the MRN pass reads it as the
+#: value of ``MRN: mfb64:v1:...`` and writes ``[redacted]:v1:...``, and the run after that head is
+#: still a body.
+#:
+#: Beyond the literal form, the pattern reads a marker whose colons are percent-encoded (``%3A``) or
+#: JSON unicode-escaped (``\u003A``, also with the backslash doubled, as a ``repr`` writes it), and a
+#: run whose ``+``, ``/`` or ``=`` is percent-encoded or unicode-escaped, or whose ``/`` is
+#: JSON-escaped (``\/``), the escapes also with the backslash doubled. The marker and the escapes are
+#: case-insensitive; the run is ASCII only (``re.ASCII``), so the case fold takes no non-ASCII letter.
+#: The run ends at its padding, and before a unit that starts another marker, so a carriage glued
+#: straight after another is still read as its own. One run unit is required, so prose that merely
+#: names the marker, such as ``missing mfb64:v1: marker``, is kept. Because the placeholder is a
+#: run unit, a second pass can extend a run over text glued after the padding, so
+#: :func:`redact_binary_carriage` repeats until nothing changes, for at most
+#: :data:`_CARRIAGE_ROUNDS` rounds.
+#:
+#: Residuals, at least these: a carriage broken by whitespace keeps every piece after the first
+#: break (``encode`` never writes one); a URL-safe (``-``/``_``) carriage keeps the part after its
+#: first such character; a marker escaped any other way (``\x3a``) is not read at all; and a run
+#: character encoded a way the pattern does not read (a doubly escaped ``\\\\/``, ``%252F``,
+#: ``&#x2F;``) ends the run, and the rest of the body prints in the log chain, which has no
+#: long-base64 backstop. Text that never reaches a log handler, such as :func:`safe_text`,
+#: :func:`safe_exc` and :func:`safe_error` output, gets no carriage pass at all, and neither does
+#: the support bundle (``support/redact.py``), which keeps its own ``_MFB64`` pass, run first.
+_BINARY_CARRIAGE = re.compile(
+    r"(?i)((?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1(?::|%3A|\\u003A|\\\\u003A))"
+    r"(?:(?!(?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1)"
+    r"(?:[A-Z0-9+/]|%2[BF]|\\/|\\\\/|\\u002[BF]|\\\\u002[BF]|\[redacted\]|<redacted>))++"
+    r"(?:=|%3D|\\u003D|\\\\u003D){0,2}",
+    re.ASCII,
+)
+
+
+def redact_binary_carriage(text: str) -> str:
+    """``text`` with every ``mfb64:v1:`` carriage run replaced by the placeholder, the marker kept so a
+    reader can still see a binary body was withheld (BACKLOG #5378).
+
+    **Call it last**, after every label and credential pass over the same text, as
+    :data:`_BINARY_CARRIAGE` says. Every marker it reads, a replaced ``mfb64`` head included,
+    holds ``v1`` or ``V1``, so most text skips the case-insensitive search."""
+    if "v1" not in text and "V1" not in text:
+        return text
+    for _ in range(_CARRIAGE_ROUNDS):
+        scrubbed = _BINARY_CARRIAGE.sub(rf"\g<1>{_REDACTED}", text)
+        if scrubbed == text:
+            break
+        text = scrubbed
+    return text
+
+
+#: The most rounds :func:`redact_binary_carriage` runs. The first round replaces the run, and each
+#: later round extends it over at most one more piece glued after the padding, so at most
+#: ``_CARRIAGE_ROUNDS - 1`` glued pieces are taken; a piece past those is left as it was.
+_CARRIAGE_ROUNDS = 8
+
+
 def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
     """:func:`redact` over :func:`clamp_untrusted` — bound the input, then scrub it.
 
@@ -1309,20 +1380,27 @@ def _json_scalar(match: re.Match[str], policy: int, widened: bool) -> str:
     return f"{prefix}{quote}{_REDACTED}{closer}"
 
 
+class _MismatchedJsonCloser(Exception):
+    """Raised by :func:`_scrub_json_value` on a closer of another kind than the open container's, and
+    caught only by :func:`redact` (BACKLOG #5814)."""
+
+
 def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[str, int]:
     """``(replacement, end)`` for the JSON value starting at ``pos``, scrubbed under ``policy``.
 
     An explicit stack rather than recursion, because the nesting depth is the peer's choice. The walk
     visits each character once. A structure that never closes runs to the end of the text, so a cut
-    inside it strands nothing (the fail-closed rule on the section comment above).
+    inside it strands nothing (the fail-closed rule on the section comment above). A container ends
+    only on its own closer; a closer of another kind raises :class:`_MismatchedJsonCloser`.
 
     **Object KEYS are always kept**, which is what keeps the output legible, so a structure that uses
     PHI as its keys (``{"name": {"DOE": 1}}``) is a residual. A bare token straight before ``(`` is a
     callable's name (``date(``, ``frozenset(``) and is kept too; its arguments are the value."""
     out: list[str] = []
-    #: One frame per open container: ``(is_object, policy)``. An object's policy is LEAF or INHERIT
-    #: (searched); an array's or a call's is the policy its elements take.
-    frames: list[tuple[bool, int]] = []
+    #: One frame per open container: ``(is_object, policy, closer)``. An object's policy is LEAF or
+    #: INHERIT (searched); an array's or a call's is the policy its elements take. ``closer`` is the
+    #: one delimiter that ends the frame.
+    frames: list[tuple[bool, int, str]] = []
     pending = policy
     n = len(text)
     while pos < n:
@@ -1344,12 +1422,15 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
             out.append(token)
             if punct == "{":
                 leaf = pending in (_LEAF, _STRUCTURE_ONLY)
-                frames.append((True, _LEAF if leaf else _INHERIT))
+                frames.append((True, _LEAF if leaf else _INHERIT, "}"))
                 pending = frames[-1][1]
             elif punct in "[(":
-                frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending))
+                closer = "]" if punct == "[" else ")"
+                frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending, closer))
                 pending = frames[-1][1]
             elif punct in "}])":
+                if punct != frames[-1][2]:
+                    raise _MismatchedJsonCloser
                 frames.pop()
                 if not frames:
                     return "".join(out), pos
@@ -1952,7 +2033,20 @@ def redact(text: str) -> str:
     call can scrub what the first kept, but only while the key is still there. A run that took a
     key glued to its token left that value in view on the second call, where the stages alone scrub
     it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
-    and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels."""
+    and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
+
+    **A JSON value with a mismatched closer makes the whole text redacted (BACKLOG #5814)**: the
+    result is the placeholder alone. The JSON pass reads what the passes before it left, so this
+    holds for a closer that pass still sees as mismatched."""
+    try:
+        return _redact_unguarded(text)
+    except _MismatchedJsonCloser:
+        return _REDACTED
+
+
+def _redact_unguarded(text: str) -> str:
+    """:func:`redact` without its mismatched-closer rule, which raises :class:`_MismatchedJsonCloser`
+    out of here."""
     out = _redact_stages(text)
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
@@ -2624,8 +2718,11 @@ def safe_exc(
     (BACKLOG #1748), so swapping :func:`safe_name` in has to happen where the name is known. Without
     it, routing a file source's error arm through this function would keep the OS diagnostic and leak
     the name anyway: a control that reports success while the hole stays open. The basename is
-    replaced wherever it appears, so a full path is covered; the directory part is operator
-    configuration, not partner-chosen, and stays.
+    replaced as written and in at least the forms one level of ``repr()``, ``ascii()``, a bytes
+    ``repr()`` or a JSON string renders it as (:func:`_name_forms`), so a full path is
+    covered; the directory part is operator configuration, not partner-chosen, and stays. A name
+    escaped twice, as ``repr(str(oserror))`` renders it, or encoded any other way, is NOT replaced,
+    and only :func:`safe_text`'s patterns stand between it and the output.
 
     A ``UnicodeError`` never reaches :func:`redact` as text (vault BACKLOG #3033). Its ``str()`` quotes
     the character or byte it failed on, which is a character of the message, and no pattern can tell
@@ -2646,9 +2743,49 @@ def safe_exc(
         return f"{name}: {_HOLDER_TEXT}"
     raw = str(exc)
     if file_name and (base := _basename(file_name)):
-        raw = raw.replace(base, safe_name(file_name))
+        label = safe_name(file_name)
+        # An OSError quotes its path with repr(), so a name holding a control, a non-printable or a
+        # quote character appears escaped and the raw name alone matches nothing (BACKLOG #5815).
+        for form in _name_forms(base):
+            raw = raw.replace(form, label)
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
+
+
+def _name_forms(text: str) -> list[str]:
+    """``text`` and the bodies one level of ``repr()``, ``ascii()``, a bytes ``repr()`` or a JSON
+    string can render it as inside a longer quoted string, longest first, so a form never shadows a
+    longer one it is a prefix of. Every form but ``text`` holds a backslash, so none is a substring
+    of a :func:`safe_name` label.
+
+    repr picks its quote from the WHOLE string, a path whose directory the name does not decide: it
+    quotes with ``'`` and escapes it, unless the string holds ``'`` and no ``"``, when it quotes with
+    ``"`` and escapes neither. Appending ``"`` forces the first choice, so both forms are read off the
+    interpreter itself rather than reimplemented. The bytes come from each encoding a path can take:
+    the filesystem encoding, and UTF-8 with either surrogate handler, since Windows passes a lone
+    surrogate through and POSIX escapes it. One a name cannot be encoded in is skipped, never raised:
+    this runs on an error arm, and a lone surrogate is a name a partner can choose."""
+    forms = {
+        text,
+        repr(text)[1:-1],
+        repr(text + '"')[1:-2],
+        ascii(text)[1:-1],
+        ascii(text + '"')[1:-2],
+        json.dumps(text)[1:-1],
+        json.dumps(text, ensure_ascii=False)[1:-1],
+    }
+    encoders: list[Callable[[str], bytes]] = [
+        os.fsencode,
+        lambda s: s.encode("utf-8", "surrogatepass"),
+        lambda s: s.encode("utf-8", "surrogateescape"),
+    ]
+    for encode in encoders:
+        try:
+            encoded = encode(text)
+        except UnicodeEncodeError:
+            continue
+        forms.update((repr(encoded)[2:-1], repr(encoded + b'"')[2:-2]))
+    return sorted(forms, key=lambda form: (-len(form), form))
 
 
 #: ``encodings`` modules that are no text codec: the alias table, the bytes-to-bytes and str-to-str

@@ -134,7 +134,11 @@ changes no decision above.
 **Built.**
 
 - **A read fault is reported as a read fault (#2278).** A spool read that fails for a reason other
-  than a missing file keeps every segment, as before. The listener now logs a WARNING naming the
+  than a missing segment file retires no segment, as before. **Corrected 2026-11-17 (BACKLOG
+  #5811):** a missing spool directory now counts as such a read fault rather than as a gone
+  segment. It, and a read error that names the directory as out of reach
+  (`_directory_unreachable` in `log_spool.py` says which errors do), now also close the spool's
+  writer. The listener now logs a WARNING naming the
   directory and the count, at most once a minute. The "spool is full" warning says when a
   standing read fault may be what filled the spool. No unreadable segment is retired: that would
   delete undelivered records. While the fault stands, newer records are sent ahead of the

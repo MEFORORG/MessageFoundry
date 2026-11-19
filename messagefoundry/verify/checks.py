@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from messagefoundry import __version__
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
@@ -658,6 +659,13 @@ def check_lockable_accounts(
             "and computes" + passkey_note,
         )
     parts: list[str] = []
+    if census.integrity_failed:
+        # BACKLOG #5505: named by stored id, never judged on fields the store could not read.
+        parts.append(
+            "record fails its integrity check (a stored timestamp or counter does not parse), so "
+            "whether it is lockable cannot be told; restore the row or delete the account: "
+            + ", ".join(scrub_log_argument(i) for i in census.integrity_failed)
+        )
     if census.no_way_past:
         parts.append(
             "chosen password and no authenticator app or discoverable passkey (anyone who knows "
@@ -674,16 +682,20 @@ def check_lockable_accounts(
             "the cipher service before resetting any of them, since a reset destroys a healthy "
             "enrolment): " + ", ".join(census.unknown_totp)
         )
+    # BACKLOG #5505: the factor remedy is offered only when an account other than an unreadable
+    # one is named; an unreadable account can neither enrol nor have its factors reset.
+    lockable = census.no_way_past or census.undecryptable_totp or census.unknown_totp
+    remedy = (
+        ". Ask each holder to enrol an authenticator app or a passkey, or reset the account's "
+        "factors (POST /users/{id}/reset-mfa), which issues a generated credential"
+        if lockable
+        else ""
+    )
     return CheckResult(
         rid,
         title,
         Status.FAIL,
-        "; ".join(parts)
-        + ". Ask each holder to enrol an authenticator app or a passkey, or reset the account's "
-        "factors (POST /users/{id}/reset-mfa), which issues a generated credential"
-        + passkey_note
-        + reset_note
-        + ".",
+        "; ".join(parts) + remedy + passkey_note + reset_note + ".",
     )
 
 

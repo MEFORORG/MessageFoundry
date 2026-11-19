@@ -347,17 +347,18 @@ def test_cumulative_plaintext_cap_stops_before_the_write() -> None:
     assert len(out.getvalue()) == 2048
 
 
-def test_cumulative_cap_admits_an_archive_exactly_at_the_ceiling() -> None:
+@pytest.mark.parametrize("at_cap", [True, False], ids=["exactly-at-cap", "uncapped"])
+def test_cumulative_cap_admits_an_archive_exactly_at_the_ceiling(at_cap: bool) -> None:
     # Off-by-one control for the cap, and the proof that it is opt-in: the same archive round-trips
     # both at exactly its own size and with no cap supplied at all.
     key = os.urandom(32)
     payload = b"z" * 5000
     enc = io.BytesIO()
     bc.encrypt_stream(io.BytesIO(payload), enc, key, chunk_size=1024)
-    for cap in (len(payload), None):
-        out = io.BytesIO()
-        bc.decrypt_stream(io.BytesIO(enc.getvalue()), out, key, max_plaintext_bytes=cap)
-        assert out.getvalue() == payload
+    out = io.BytesIO()
+    cap = len(payload) if at_cap else None
+    bc.decrypt_stream(io.BytesIO(enc.getvalue()), out, key, max_plaintext_bytes=cap)
+    assert out.getvalue() == payload
 
 
 def test_writer_refuses_a_chunk_size_its_own_reader_would_reject() -> None:
@@ -514,17 +515,17 @@ def test_encrypt_fills_each_frame_from_a_short_reading_source() -> None:
     assert out.getvalue() == payload
 
 
-def test_a_writer_source_with_no_data_ready_is_refused_not_read_as_eof() -> None:
+@pytest.mark.parametrize("block_after", [0, 1024, 2048, 2500])
+def test_a_writer_source_with_no_data_ready_is_refused_not_read_as_eof(block_after: int) -> None:
     # A non-blocking raw stream returns None for "nothing yet". Reading that as EOF after two full
     # chunks would let the writer seal a silently truncated backup as a complete, authentic archive.
-    for block_after in (0, 1024, 2048, 2500):
-        with pytest.raises(bc.BackupCodecError, match="no data"):
-            bc.encrypt_stream(
-                _Trickle(b"x" * 5000, step=300, block_after=block_after),
-                io.BytesIO(),
-                os.urandom(32),
-                chunk_size=1024,
-            )
+    with pytest.raises(bc.BackupCodecError, match="no data ready reading the source chunk"):
+        bc.encrypt_stream(
+            _Trickle(b"x" * 5000, step=300, block_after=block_after),
+            io.BytesIO(),
+            os.urandom(32),
+            chunk_size=1024,
+        )
 
 
 @pytest.mark.parametrize("where", ["prefix", "between frames", "inside a frame", "after final"])
@@ -542,17 +543,17 @@ def test_a_reader_source_with_no_data_ready_is_refused_not_read_as_eof(where: st
         bc.decrypt_stream(_Trickle(blob, step=7, block_after=block_after), io.BytesIO(), key)
 
 
-def test_a_source_that_returns_more_than_asked_is_refused() -> None:
+@pytest.mark.parametrize("honest", [0, 1], ids=["first-read", "inside-fill-loop"])
+def test_a_source_that_returns_more_than_asked_is_refused(honest: int) -> None:
     # An over-long read would let the writer seal a frame past its declared chunk_size, which this
     # build's own reader then rejects at restore time.
     # Both on the first read and inside the fill loop, after a short read.
     key = os.urandom(32)
     blob, _, _ = _archive(b"x" * 3000, key)
-    for honest in (0, 1):
-        with pytest.raises(bc.BackupCodecError, match="returned"):
-            bc.encrypt_stream(_Gush(b"x" * 3000, honest=honest), io.BytesIO(), key, chunk_size=1024)
-        with pytest.raises(bc.BackupCodecError, match="returned"):
-            bc.decrypt_stream(_Gush(blob, honest=honest), io.BytesIO(), key)
+    with pytest.raises(bc.BackupCodecError, match="returned"):
+        bc.encrypt_stream(_Gush(b"x" * 3000, honest=honest), io.BytesIO(), key, chunk_size=1024)
+    with pytest.raises(bc.BackupCodecError, match="returned"):
+        bc.decrypt_stream(_Gush(blob, honest=honest), io.BytesIO(), key)
 
 
 class _OneEof(io.BytesIO):
@@ -571,6 +572,15 @@ class _OneEof(io.BytesIO):
         return data
 
 
+def test_the_one_eof_source_actually_refuses_a_second_eof_read() -> None:
+    # Positive control: without it, the test below could pass on a source that never refuses.
+    src = _OneEof(b"ab")
+    assert src.read(5) == b"ab"
+    assert src.read(5) == b""
+    with pytest.raises(AssertionError, match="past an end of stream"):
+        src.read(5)
+
+
 @pytest.mark.parametrize("length", [0, 1000, 1024, 5000])
 def test_encrypt_reads_the_source_past_eof_at_most_once(length: int) -> None:
     # A TTY or similar source may block, or raise, when read again after it reported EOF.
@@ -581,3 +591,137 @@ def test_encrypt_reads_the_source_past_eof_at_most_once(length: int) -> None:
     out = io.BytesIO()
     bc.decrypt_stream(io.BytesIO(enc.getvalue()), out, key)
     assert out.getvalue() == payload
+
+
+# --- BACKLOG #6686 item 1: the header's integer fields are taken as written, not int()-coerced -----
+
+
+def _with_header_field(name: str, value: object) -> bytes:
+    """A real archive whose header field ``name`` is rewritten to ``value``, ``hdrlen`` refitted."""
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(b"x" * 100), enc, os.urandom(32), chunk_size=1024)
+    blob = enc.getvalue()
+    off = len(bc.MAGIC) + 1
+    (old_len,) = _U32.unpack(blob[off : off + _U32.size])
+    obj = json.loads(blob[off + _U32.size : off + _U32.size + old_len])
+    obj[name] = value
+    header = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+    return blob[:off] + _U32.pack(len(header)) + header + blob[off + _U32.size + old_len :]
+
+
+@pytest.mark.parametrize("name", ["chunk_size", "format_version"])
+@pytest.mark.parametrize("kind", ["float", "string", "bool"])
+def test_a_header_integer_field_that_is_not_an_int_is_refused(name: str, kind: str) -> None:
+    # int() turned 1024.0, "1024" and true into numbers the writer never wrote. Each is now refused
+    # as a wrong type, ahead of the canonical-form check below.
+    good = 1024 if name == "chunk_size" else bc.FORMAT_VERSION
+    value: object = {"float": float(good), "string": str(good), "bool": True}[kind]
+    with pytest.raises(bc.BackupCodecError, match="missing/invalid field"):
+        bc.read_header(io.BytesIO(_with_header_field(name, value)))
+
+
+def test_a_header_with_its_integer_fields_as_written_still_reads() -> None:
+    # Negative control for the test above: the helper's rewrite alone does not trip the refusal. A
+    # CHANGED valid int reads back as written, so the helper is shown to rewrite the field.
+    assert bc.read_header(io.BytesIO(_with_header_field("chunk_size", 2048))).chunk_size == 2048
+
+
+@pytest.mark.parametrize("salted", [False, True], ids=["unsalted", "salted"])
+@pytest.mark.parametrize("chunk_size", [1, 1024, bc.MAX_CHUNK_SIZE])
+def test_every_header_the_writer_emits_is_in_canonical_form(chunk_size: int, salted: bool) -> None:
+    # The canonical-form check must never refuse this build's own archive.
+    key = os.urandom(32)
+    enc = io.BytesIO()
+    bc.encrypt_stream(
+        io.BytesIO(b"x" * 3),
+        enc,
+        key,
+        chunk_size=chunk_size,
+        salt=os.urandom(STORE_SALT_BYTES) if salted else None,
+    )
+    blob = enc.getvalue()
+    off = len(bc.MAGIC) + 1
+    (hdrlen,) = _U32.unpack(blob[off : off + _U32.size])
+    raw = blob[off + _U32.size : off + _U32.size + hdrlen]
+    assert bc.read_header(io.BytesIO(blob)).to_json_bytes() == raw
+    out = io.BytesIO()
+    bc.decrypt_stream(io.BytesIO(blob), out, key)
+    assert out.getvalue() == b"x" * 3
+
+
+def _respelled(blob: bytes, spell: str) -> bytes:
+    """``blob`` with its header JSON re-spelled, the parsed fields unchanged unless ``spell`` adds
+    one, and ``hdrlen`` refitted."""
+    off = len(bc.MAGIC) + 1
+    (old_len,) = _U32.unpack(blob[off : off + _U32.size])
+    obj = json.loads(blob[off + _U32.size : off + _U32.size + old_len])
+    if spell == "pretty":
+        header = json.dumps(obj, sort_keys=True, indent=2).encode()
+    elif spell == "reordered":
+        header = json.dumps(dict(reversed(list(obj.items()))), separators=(",", ":")).encode()
+    elif spell == "extra-key":
+        header = json.dumps({**obj, "zz": "x"}, sort_keys=True, separators=(",", ":")).encode()
+    else:  # "canonical", the control
+        header = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+    return blob[:off] + _U32.pack(len(header)) + header + blob[off + _U32.size + old_len :]
+
+
+@pytest.mark.parametrize("spell", ["pretty", "reordered", "extra-key"])
+def test_a_header_respelled_with_the_same_fields_is_refused_before_decrypt(spell: str) -> None:
+    # The AAD hashes the re-serialized header, so these used to authenticate and decrypt.
+    key = os.urandom(32)
+    blob, _, _ = _archive(b"y" * 100, key)
+    out = io.BytesIO()
+    with pytest.raises(bc.BackupCodecError, match="not in the form this format writes"):
+        bc.decrypt_stream(io.BytesIO(_respelled(blob, spell)), out, key)
+    assert out.getvalue() == b""  # refused before a byte was decrypted
+
+
+def test_a_header_respelled_canonically_still_decrypts() -> None:
+    # Control for the test above: the helper's rebuild alone does not trip the refusal.
+    key = os.urandom(32)
+    blob, _, _ = _archive(b"y" * 100, key)
+    out = io.BytesIO()
+    bc.decrypt_stream(io.BytesIO(_respelled(blob, "canonical")), out, key)
+    assert out.getvalue() == b"y" * 100
+
+
+# --- BACKLOG #6687 items 3 and 7: memoryview reads, non-bytes reads, the field named ---------------
+
+
+class _Views(io.BytesIO):
+    """A source whose reads return ``memoryview``s, as some buffer-backed readers do."""
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        return memoryview(super().read(size))  # type: ignore[return-value]
+
+
+def test_a_memoryview_source_reads_as_bytes() -> None:
+    # The fast path used to hand a memoryview straight to the header's JSON decoder.
+    key = os.urandom(32)
+    payload = os.urandom(3000)
+    enc = io.BytesIO()
+    bc.encrypt_stream(_Views(payload), enc, key, chunk_size=1024)
+    assert bc.read_header(_Views(enc.getvalue())).chunk_size == 1024
+    out = io.BytesIO()
+    bc.decrypt_stream(_Views(enc.getvalue()), out, key)
+    assert out.getvalue() == payload
+
+
+class _Text(io.BytesIO):
+    """A source that breaks the binary contract by returning ``str``."""
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        return super().read(size).decode("latin-1")  # type: ignore[return-value]
+
+
+def test_a_source_that_returns_text_is_refused() -> None:
+    with pytest.raises(bc.BackupCodecError, match="returned str, not bytes, reading the magic"):
+        bc.read_header(_Text(b"MFBAK\x00"))
+
+
+def test_a_refusal_names_the_field_being_read() -> None:
+    key = os.urandom(32)
+    blob, first, _ = _archive(os.urandom(3000), key)
+    with pytest.raises(bc.BackupCodecError, match="no data ready reading the frame nonce"):
+        bc.decrypt_stream(_Trickle(blob, step=7, block_after=first), io.BytesIO(), key)

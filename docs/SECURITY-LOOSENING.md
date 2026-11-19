@@ -525,7 +525,8 @@ false premise.
   two session limits get this: a `MEFOR_SECURITY_*` variable for another switch, at least
   `require_mfa` and `block_unlisted_outbound`, is not named. It needs a whole-file load that ran
   and succeeded, so a report the failed load left partial names none, and so does `security show` on a file that does
-  not exist yet; `security set` on a new file loads what it wrote, and names it. The variable also
+  not exist yet; `security set` on a new file loads what it wrote, and names it, except a `set`
+  that changed no key where no file exists, which writes none and names none. The variable also
   feeds that load, so one the load refuses makes the report partial, or refuses the edit. The IDE
   security editor marks a value above the default it is shown.
 
@@ -1867,7 +1868,10 @@ count is above `0` (vault BACKLOG #2613).
   the shapes its own controls pin. It reads call shapes by name, not what the code evaluates to, so
   some such call sites pass it; ADR 0173 §4.3's note of 2026-11-04 and the docstrings of that
   file's relaxed-hop census say what it reads. REST, SOAP
-  and FHIR hand the guard no context there.)* The engine will tell you *which* connections have it set,
+  and FHIR hand the guard no context there.)* *(Note 2026-11-17, vault BACKLOG #4912: on a
+  context whose `verify_mode` is `CERT_NONE`, `capture` names a remedy that makes the context
+  verify the peer, not the `tls_allow_expired` one, for a hop that passes no remedy of its own;
+  `_DEFAULT_WAYS_ACROSS` in `config/tls_policy.py` maps each reason to its default remedy.)* The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
@@ -2033,13 +2037,15 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `url_query_credential` — a credential in a connection `url`'s query string
 > **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an
-> outbound `url` (`Rest`, `Soap`, `FHIR`, `DICOMweb`) or a `FhirLookup` `url` whose query string has a
+> outbound `url` (`Rest`, `Soap`, `FHIR`) or a `FhirLookup` `url` whose query string has a
 > parameter named like a credential: `key`, `sig`, `signature`, most names ending in `token`,
 > `secret`, `password` or `credential` (as `access_token` or `accessToken`), and the rest of the
 > engine's credential vocabulary. A few such names are not named, at least `page_token` and
 > `next_token`, because they usually carry a paging cursor; the detector never reads what a
 > parameter carries, so a credential under one of them is missed. `secretscrub.py`
 > `_QUERY_NOT_CREDENTIAL_TAILS` is the list. ASVS 14.2.1.
+> A `DICOMweb` url is not listed: its build refuses any query or fragment (vault BACKLOG #5358),
+> so no such hop exists to report.
 - **What you lose:** the credential rides the request line. The partner's access log holds it, and so
   does the log of any proxy on the path. On an `https` hop TLS still encrypts it on the wire. The
   engine's own log lines drop the query, and `GET /metadata` and `graph --json` withhold the whole

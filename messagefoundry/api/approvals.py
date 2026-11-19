@@ -95,6 +95,7 @@ from messagefoundry.store.store import (
     ApprovalRow,
     AuditAppend,
     ClaimOwnerGuard,
+    UserRecord,
     approval_seal_ok_async,
 )
 
@@ -2171,8 +2172,22 @@ class ApprovalGate:
         answers it (BACKLOG #3157 item 1). Without it the fault is raised as it is: the queue
         degrades it to no prediction for that requester and logs it itself (BACKLOG #3189), so it
         must not spend :meth:`_read`'s throttle slot, which would silence approve()'s own ERROR."""
-        read = self._store.get_user(requester_user_id)
-        user = await (self._read(read, what="the requester's account") if outage_is_503 else read)
+
+        async def read() -> tuple[UserRecord | None, bool]:
+            # BACKLOG #5505: a requester row that does not parse (store.listed_users says which)
+            # fails its integrity check, so the requester cannot be verified. Answered here,
+            # before _read, which would call it an outage; never read as missing or disabled,
+            # which nothing established.
+            try:
+                return await self._store.get_user(requester_user_id), False
+            except RowSealError:
+                return None, True
+
+        user, unreadable = await (
+            self._read(read(), what="the requester's account") if outage_is_503 else read()
+        )
+        if unreadable:
+            return "requester_unverifiable"
         if user is None:
             return "requester_missing"
         if user.disabled:

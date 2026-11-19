@@ -337,6 +337,7 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
         "tls-check-hostname",
         "url-query-credential",
         "ech-sidecar-cleartext",
+        "listener-trusted-proxies",
     ):
         r = _result(report, name)
         assert r.skipped and r.ok and "config did not load" in r.detail

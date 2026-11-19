@@ -136,9 +136,9 @@ def anonymize_checked(
     token *categories* and field *shapes/addresses* only, never a value, and carries a coverage clause (the count + addresses
     of the unmapped fields, whether the denylist tables were live) so a refusal is legible.
 
-    A clean return is NOT proof the output is PHI-free. The structural detectors find only a dashed
-    SSN, a punctuated NANP phone and an ``MR``/``MRN``-typed CX; a name, an undashed number or a date
-    in an unmapped field passes (BACKLOG #1710). The coverage report is the record of those fields,
+    A clean return is NOT proof the output is PHI-free. The structural detectors look for a few
+    shapes only, which docs/PHI.md section 9 lists; a name, an undashed number or a date in an
+    unmapped field passes (BACKLOG #1710). The coverage report is the record of those fields,
     so pass ``on_report`` and surface it on the clean path too. A line no rule can reach never gets
     this far: :func:`anonymize` refuses it with :class:`AnonError`, before any report is built.
 

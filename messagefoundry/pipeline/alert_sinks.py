@@ -2621,8 +2621,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._control_stopped = True
 
     async def aclose(self) -> None:
-        """Drain and stop the delivery task, then cancel every control task still running and wait
-        for it to end (BACKLOG #5909), so none outlives the sink. The lifespan closes this sink
+        """Drain and stop the delivery task, then cancel the control tasks still running when the
+        drain wait ends and wait for each to end (BACKLOG #5909). The lifespan closes this sink
         after engine.stop(), so such a task can only meet a stopped runner. Runs even when the sink
         was never started. A close cancelled while its sentinel waits on a full queue cancels the
         delivery task too and waits for it (BACKLOG #5907), so the startup unwind's cut does not
@@ -2633,19 +2633,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         try:
             await super().aclose()
         finally:
-            if drain is not None and not drain.done():
-                drain.cancel()
-                self._task = None
-                await asyncio.gather(drain, return_exceptions=True)
-            pending = [task for task in self._control_tasks if not task.done()]
-            for task in pending:
-                task.cancel()
-            if pending:
-                log.warning(
-                    "%d alert control_action task(s) still running at shutdown were cancelled",
-                    len(pending),
-                )
-                await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                if drain is not None and not drain.done():
+                    drain.cancel()
+                    self._task = None
+                    await asyncio.gather(drain, return_exceptions=True)
+            finally:
+                # In a finally of its own (BACKLOG #5907 step 3), so a second cancel landing on
+                # the drain's wait still cancels the control tasks dispatched before the drain wait
+                # ends. Read after that wait, so a task dispatched during it is cancelled too.
+                pending = [task for task in self._control_tasks if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    log.warning(
+                        "%d alert control_action task(s) still running at shutdown were cancelled",
+                        len(pending),
+                    )
+                    await asyncio.gather(*pending, return_exceptions=True)
 
     def _dispatch_control(
         self, action: str, target: str, *, default_target: bool, log_skip: bool = True

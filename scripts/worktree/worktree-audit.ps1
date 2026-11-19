@@ -87,6 +87,9 @@ function Get-SeatLockReading {
         -ClearHandoff refuses on the same ground. -Unreadable takes that count from a caller that
         already read the registry, so a report over many locks reads it once.
     #>
+    # The lookup names no worktree, so a fresh registry record that names no session vetoes every lock
+    # on the box (fail closed): a cwd spelled by a junction, an 8.3 name or a subst drive cannot be told
+    # apart from the locked tree by its spelling.
     param([string]$SessionKey, [string[]]$ConfigRoot, [Nullable[int]]$Unreadable)
     # session-registry.ps1's fence reads its record fields without throwing under StrictMode since
     # BACKLOG #5491. This stays off for any read below it that is still bare, under a caller's
@@ -95,7 +98,10 @@ function Get-SeatLockReading {
     if ($SessionKey.StartsWith('codex-')) {
         return [pscustomobject]@{ State = 'CODEX'; Detail = "Claude's session registry cannot fence a Codex seat"; Gone = $false }
     }
-    try { $l = Get-SessionLiveness -SessionId $SessionKey -ConfigRoot $ConfigRoot }
+    # The removal paths' unbounded start skew (remove.ps1, prune-merged.ps1 and the nightly removal pass
+    # [int]::MaxValue to Get-WorktreeOccupancy), so a session the removal fence reads LIVE never reads
+    # STALE, and so gone, here.
+    try { $l = Get-SessionLiveness -SessionId $SessionKey -ConfigRoot $ConfigRoot -StartSkewMinutes ([int]::MaxValue) }
     catch { return [pscustomobject]@{ State = 'UNREADABLE'; Detail = "the liveness lookup failed: $($_.Exception.Message)"; Gone = $false } }
     if ((-not $l.Found) -and $l.State -eq 'UNKNOWN') {
         if ($null -eq $Unreadable) {

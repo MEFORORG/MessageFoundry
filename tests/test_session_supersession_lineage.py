@@ -247,7 +247,8 @@ def test_only_the_rotation_the_supersession_and_the_purge_touch_the_lineage(back
 def test_the_service_follows_the_lineage_from_the_supersession_and_sign_out_alone() -> None:
     # `_load_session` and the validator never pass a lineage window; only the sign-in's
     # supersession and the sign-out (BACKLOG #3715) do, and both only to end a session.
-    # `_end_lapsed_session` shares the store call and passes none.
+    # `_end_lapsed_session` shares the store call and passes none. `_supersede_session` is the
+    # wrapper each of them calls (BACKLOG #5505); it only forwards the window it is given.
     source = (Path(__file__).resolve().parents[1] / "messagefoundry/auth/service.py").read_text(
         encoding="utf-8"
     )
@@ -260,7 +261,7 @@ def test_the_service_follows_the_lineage_from_the_supersession_and_sign_out_alon
                     k.arg == "lineage_since" for k in call.keywords
                 ):
                     passing.add(node.name)
-    assert passing == {"_supersede_session_hash", "logout"}
+    assert passing == {"_supersede_session_hash", "logout", "_supersede_session"}
     assert not _LINEAGE.search(source)
 
 

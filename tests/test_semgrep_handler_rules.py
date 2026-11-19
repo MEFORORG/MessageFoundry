@@ -43,6 +43,13 @@ network-dependent.
 
 from __future__ import annotations
 
+import collections
+import functools
+import importlib.util
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
 import pytest
 
 from messagefoundry.security import handler_semgrep_rules
@@ -80,10 +87,205 @@ def test_rules_are_wellformed_yaml() -> None:
     yaml = pytest.importorskip("yaml")  # in requirements.lock; NO new dep
     doc = yaml.safe_load(handler_semgrep_rules().read_text(encoding="utf-8"))
     rules = {r["id"]: r for r in doc["rules"]}
-    assert set(rules) >= _EXPECTED
+    # Equal, not a superset (BACKLOG #5463): a rule added to the file must join _EXPECTED, which
+    # test_fixture_annotations_match_the_pinned_counts then requires a fixture case for.
+    assert set(rules) == _EXPECTED
     for r in doc["rules"]:
         assert r["languages"] == ["python"] and r["message"].strip()
         assert r["severity"] in {"WARNING", "ERROR", "INFO"}
     for tid in _TAINT:
         assert rules[tid]["mode"] == "taint"
         assert rules[tid]["pattern-sources"] and rules[tid]["pattern-sinks"]
+
+
+@functools.cache
+def _load_gate() -> ModuleType:
+    path = (
+        Path(__file__).resolve().parents[1] / "scripts" / "ci" / "assert_semgrep_handler_taint.py"
+    )
+    spec = importlib.util.spec_from_file_location("_assert_semgrep_handler_taint", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_fixture_annotations_match_the_pinned_counts() -> None:
+    # The CI gate needs semgrep; this half does not. It keeps the fixture's `# ruleid:` annotations and
+    # the gate's pinned per-rule counts in step, so a case added or deleted on one side reds here
+    # before it reds in the security.yml semgrep job (BACKLOG #5380, #5381, #5382).
+    gate = _load_gate()
+    want, ok = gate.annotated_findings(gate.read_fixture())
+    assert collections.Counter(rule for rule, _ in want) == gate._EXPECTED
+    assert not want & ok
+    # BACKLOG #5463: every rule the file defines has a case, so none can regress unseen.
+    assert set(gate._EXPECTED) == _EXPECTED
+
+
+# Every `# ruleid:` case in the fixture, by the start of its code line. Pinning each case by name, not
+# by count, means changing one case's annotation to `# ok:`, or deleting it, reds here even when the
+# per-rule totals are edited to match.
+_POSITIVE_CASES: tuple[tuple[str, str], ...] = (
+    ("mf-handler-phi-to-log", "log.info(body)"),
+    ("mf-handler-phi-to-log", "log.log(logging.INFO, msg.raw)"),
+    # BACKLOG #5380: a module-qualified decorator, an aliased decorator on an async def, an
+    # undecorated `_` helper, a public helper, the parameter after self or _self on a method, and an
+    # attribute-form logger.
+    ("mf-handler-phi-to-log", "log.error(body)"),
+    ("mf-handler-phi-to-log", "print(msg.raw)"),
+    ("mf-handler-phi-to-log", "log.critical(msg.raw)"),
+    ("mf-handler-phi-to-log", "log.warning(m.raw)"),
+    ("mf-handler-phi-to-log", "sys.stderr.write(msg.raw)"),
+    ("mf-handler-phi-to-log", "log.exception(msg.raw)"),
+    ("mf-handler-phi-to-log", "_self.logger.info(msg.raw)"),
+    ("mf-handler-ambient-subprocess", 'r(["/bin/echo", msg.raw])'),
+    ("mf-handler-ambient-deserialization", "pk(msg.raw)"),
+    ("mf-handler-ambient-eval-exec", "eval(msg.text)"),
+    # BACKLOG #5463: the os.system/os.popen rule had no case, so a regressed rule passed the gate.
+    ("mf-handler-ambient-os-exec", "os.system(msg.raw)"),
+    ("mf-handler-ambient-os-exec", "osp(msg.text)"),  # os.popen through an import alias
+    ("mf-handler-sqli-db-lookup", 'db_lookup("MPI", "select * from p where mrn = \'" + mrn'),
+    ("mf-handler-sqli-db-lookup", 'db_lookup("MPI", f"select * from p'),
+    # BACKLOG #5381: connection= keyword, module alias, import alias, FhirRaw, FhirToken system.
+    ("mf-handler-sqli-db-lookup", 'db_lookup(connection="MPI", statement="select * from'),
+    ("mf-handler-sqli-db-lookup", 'mf.db_lookup("MPI", "select * from'),
+    ("mf-handler-sqli-db-lookup", 'mf.fhir_lookup(connection="epic", query="Patient/" + mrn)'),
+    ("mf-handler-sqli-db-lookup", 'dl("MPI", "select * from'),
+    ("mf-handler-sqli-db-lookup", 'fhir_lookup("epic", "Patient", {"code": FhirRaw(mrn)})'),
+    (
+        "mf-handler-sqli-db-lookup",
+        'fhir_lookup("epic", "Patient", {"code": mf.FhirRaw(value=mrn)})',
+    ),
+    (
+        "mf-handler-sqli-db-lookup",
+        'fhir_lookup("epic", "Patient", {"identifier": FhirToken(mrn, "x")})',
+    ),
+    (
+        "mf-handler-sqli-db-lookup",
+        'fhir_lookup("epic", "Patient", {"identifier": FhirToken(code="x", system=mrn)})',
+    ),
+    ("mf-handler-phi-to-file", 'Path("/tmp/x.hl7").write_text('),
+    ("mf-handler-phi-to-file", 'Path("/tmp/h.hl7").write_bytes(body)'),
+    # BACKLOG #5382: a non-literal mode, codecs.open, an import-aliased and a name-aliased open,
+    # os.write, tempfile and shutil.
+    ("mf-handler-phi-to-file", "fh.write(body)"),
+    ("mf-handler-phi-to-file", "out.write(body)"),
+    ("mf-handler-phi-to-file", 'bopen("/tmp/c.hl7", "w").write(body)'),
+    ("mf-handler-phi-to-file", 'opener("/tmp/d.hl7", "w").writelines([body])'),
+    ("mf-handler-phi-to-file", "os.write(3, body)"),
+    ("mf-handler-phi-to-file", "tmpf.writelines([body])"),
+    ("mf-handler-phi-to-file", "shutil.copyfileobj(io.BytesIO(body), sink)"),
+)
+
+
+# Every `# ok:` case, the same way: an over-match is usually "fixed" by deleting the ok case it
+# fires on, which the counts and the gate's line match cannot see.
+_NEGATIVE_CASES: tuple[tuple[str, str], ...] = (
+    ("mf-handler-phi-to-log", "log.debug(msg.raw)"),
+    ("mf-handler-phi-to-log", 'log.info("processed %s", msg.control_id)'),
+    ("mf-handler-ambient-os-exec", "os.fspath(msg.raw)"),  # BACKLOG #5463: the rule's ok case
+    ("mf-handler-sqli-db-lookup", 'db_lookup("MPI", "select npi from p where mrn = :mrn"'),
+    ("mf-handler-phi-to-log", "log.info(note)"),
+    ("mf-handler-phi-to-log", "log.info(self.banner)"),
+    ("mf-handler-sqli-db-lookup", 'db_lookup(connection="MPI", statement="select npi from p'),
+    ("mf-handler-sqli-db-lookup", 'mf.db_lookup("MPI", "select npi from p'),
+    (
+        "mf-handler-sqli-db-lookup",
+        'fhir_lookup("epic", "Patient", {"identifier": FhirToken("MRN", mrn)})',
+    ),
+    (
+        "mf-handler-sqli-db-lookup",
+        'fhir_lookup("epic", "Patient", {"_sort": FhirRaw("status,-date")})',
+    ),
+    ("mf-handler-phi-to-file", "buf.write(body)"),
+    ("mf-handler-phi-to-file", 'fh2.write("processed")'),
+    ("mf-handler-phi-to-file", 'os.write(len(body), b"ok")'),
+    ("mf-handler-phi-to-file", "shutil.which(body)"),
+    ("mf-handler-phi-to-file", 'shutil.move("/tmp/staged.hl7", body)'),
+)
+
+
+def _pin(cases: tuple[tuple[str, str], ...], lines: list[str]) -> set[tuple[str, int]]:
+    pinned: set[tuple[str, int]] = set()
+    for rule, start in cases:
+        found = [n for n, line in enumerate(lines, start=1) if line.strip().startswith(start)]
+        assert len(found) == 1, (start, found)
+        pinned.add((rule, found[0]))
+    return pinned
+
+
+def test_every_annotated_case_is_pinned_by_name() -> None:
+    gate = _load_gate()
+    text = gate.read_fixture()
+    want, ok = gate.annotated_findings(text)
+    lines = text.split("\n")
+    assert _pin(_POSITIVE_CASES, lines) == want
+    assert _pin(_NEGATIVE_CASES, lines) == ok
+    # A misspelt rule id in an annotation would pin a case no rule can ever fire on.
+    assert {rule for rule, _ in want | ok} <= _EXPECTED
+
+
+def test_annotations_count_lines_as_semgrep_does() -> None:
+    # A U+2028 inside a string literal is not a line break to semgrep, and stacked annotations both
+    # name the next code line.
+    gate = _load_gate()
+    text = 'x = "a\u2028b"\n# ruleid: r1\n# ok: r2\ncall()\n'
+    assert gate.annotated_findings(text) == ({("r1", 4)}, {("r2", 4)})
+
+
+def _canned(gate: ModuleType) -> tuple[str, dict[str, Any]]:
+    """The fixture, and the semgrep --json payload a correct rule set would produce over it."""
+    text = gate.read_fixture()
+    want, _ok = gate.annotated_findings(text)
+    results = [{"check_id": f"tmp.{rule}", "start": {"line": line}} for rule, line in sorted(want)]
+    return text, {"results": results, "errors": []}
+
+
+def test_gate_passes_the_payload_the_annotations_describe() -> None:
+    gate = _load_gate()
+    text, payload = _canned(gate)
+    assert gate.check(payload, text) is None
+
+
+def test_gate_fails_when_semgrep_reports_errors_beside_parsed_results() -> None:
+    # BACKLOG #5463: a rule semgrep could not load, or a file it could not parse, lands in `errors`
+    # while the JSON still parses, and the gate read `results` alone.
+    gate = _load_gate()
+    text, payload = _canned(gate)
+    payload["errors"] = [{"level": "error", "type": "Rule parse error", "message": "bad rule"}]
+    failure = gate.check(payload, text)
+    assert failure is not None and "reported errors" in failure
+
+
+def test_gate_fails_when_the_os_exec_rule_stops_firing() -> None:
+    gate = _load_gate()
+    text, payload = _canned(gate)
+    payload["results"] = [
+        r for r in payload["results"] if not r["check_id"].endswith("mf-handler-ambient-os-exec")
+    ]
+    failure = gate.check(payload, text)
+    assert failure is not None and "mf-handler-ambient-os-exec" in failure
+
+
+def test_gate_fails_on_a_finding_moved_to_another_line() -> None:
+    gate = _load_gate()
+    text, payload = _canned(gate)
+    payload["results"][0]["start"]["line"] += 1
+    assert gate.check(payload, text) is not None
+
+
+def test_gate_fails_on_a_payload_without_results() -> None:
+    gate = _load_gate()
+    assert gate.check(None, gate.read_fixture()) is not None
+    assert gate.check({"errors": []}, gate.read_fixture()) is not None
+    # Errors with no results name the errors, not only the missing key.
+    failure = gate.check({"errors": [{"message": "bad rule"}]}, gate.read_fixture())
+    assert failure is not None and "bad rule" in failure
+
+
+def test_gate_reports_a_malformed_result_instead_of_raising() -> None:
+    gate = _load_gate()
+    text, payload = _canned(gate)
+    del payload["results"][0]["start"]
+    failure = gate.check(payload, text)
+    assert failure is not None and "cannot read" in failure

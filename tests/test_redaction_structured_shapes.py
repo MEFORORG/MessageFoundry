@@ -816,6 +816,15 @@ def test_the_widened_stage_runs_where_a_widened_rule_can_match(text: str) -> Non
     assert redaction._needs_widened_stage(text)
 
 
+def _structured_or_mismatch(text: str, *, widened: bool) -> str | None:
+    """The structured passes' output, or ``None`` where a mismatched JSON closer makes
+    :func:`redact` return the placeholder alone (BACKLOG #5814)."""
+    try:
+        return redaction._redact_structured(text, widened=widened)
+    except redaction._MismatchedJsonCloser:
+        return None
+
+
 def test_skipping_the_widened_stage_never_skips_a_widened_rule() -> None:
     """THE SCREEN'S SAFETY PROPERTY, over a seeded corpus of near-misses and real triggers: wherever
     the screen says skip, every pass gives the same output in both stages, so no widened rule could
@@ -869,8 +878,8 @@ def test_skipping_the_widened_stage_never_skips_a_widened_rule() -> None:
                 redaction._redact_flat(text, widened=False, credentials=True),
             ),
             (
-                redaction._redact_structured(text, widened=True),
-                redaction._redact_structured(text, widened=False),
+                _structured_or_mismatch(text, widened=True),
+                _structured_or_mismatch(text, widened=False),
             ),
         )
         if not redaction._needs_widened_stage(text):

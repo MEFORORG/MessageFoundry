@@ -8,7 +8,8 @@ import io
 import json
 import logging
 import re
-import shutil
+import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -132,6 +133,31 @@ def test_check_dryrun_fails_on_missing_messages_path(
     assert rc == 1
     dr = _check(_out_json(capsys), "dryrun")
     assert dr["ok"] is False and dr["required"] is True and dr["skipped"] is False
+
+
+def test_check_dryrun_fails_a_missing_config_dir_without_aborting_the_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing config dir raises ConfigDirMissing, a FileNotFoundError and not a WiringError. Its
+    traceback must not abort the remaining legs and the --json report (BACKLOG #5810)."""
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), None)
+    missing = tmp_path / "no-such-config"
+    rc = main(["check", "--config", str(missing), "--messages", str(msgs), "--no-lint", "--json"])
+    assert rc == 1
+    report = _out_json(capsys)
+    assert _check(report, "validate")["ok"] is False
+    dr = _check(report, "dryrun")
+    assert dr["ok"] is False and dr["required"] is True and dr["skipped"] is False
+    assert dr["detail"].startswith("config did not load")
+
+
+def test_check_dryrun_alone_fails_closed_on_a_missing_config_dir(tmp_path: Path) -> None:
+    """With no validate leg to report the missing directory, the required dry-run leg still fails
+    rather than skips, so it cannot pass a gate whose fixtures never ran."""
+    result = checks._check_dryrun(
+        tmp_path / "no-such-config", _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), None)
+    )
+    assert result.ok is False and result.required is True and result.skipped is False
 
 
 def test_check_dryrun_accepts_single_file(
@@ -387,9 +413,7 @@ def test_read_message_sets_single_file_is_unmapped(tmp_path: Path) -> None:
 
 
 def test_run_checks_skips_lint_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        shutil, "which", lambda _: None
-    )  # the module object the checks module calls
+    monkeypatch.setattr(checks, "_tool_command", lambda _module: None)
     report = run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
     by_name = {r.name: r for r in report.results}
     for tool in ("ruff", "mypy", "ruff-security"):
@@ -404,7 +428,7 @@ def test_run_checks_no_lint_excludes_tools() -> None:
     assert "validate" in names and "dryrun" in names
 
 
-@pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff advisory pass is run-if-installed")
+@pytest.mark.skipif(checks._ruff_binary() is None, reason="ruff advisory pass is run-if-installed")
 def test_ruff_security_ignores_placeholder_token_fp() -> None:
     # ADR 0144 Increment 3: full `S` over the shipped samples trips S105 on the ADR-0015 body_secrets
     # placeholder token (_TOK_PASSWORD); the curated --ignore S105,S106,S107 suppresses that structural
@@ -414,6 +438,110 @@ def test_ruff_security_ignores_placeholder_token_fp() -> None:
     assert rs.required is False  # still advisory, never blocks
     assert rs.skipped is False and rs.ok is True
     assert "S105" not in rs.detail
+
+
+def _capture_tool_start(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen["cmd"] = cmd
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "Key-Pq4Zt8Wm")
+    monkeypatch.setenv("VAULT_TOKEN", "hvs.Tok-Rx2Lc7")
+    monkeypatch.setenv("PGPASSWORD", "Pw-Hn5Dv1")
+    monkeypatch.setenv("CI_DEPLOY_TOKEN_B614", "Ci-Gs9Kb3")
+    monkeypatch.setenv("MYPYPATH", "stubs")
+    monkeypatch.setenv("PYTHONIOENCODING", "ascii")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return seen
+
+
+def _assert_no_engine_secret(env: dict[str, str]) -> None:
+    upper = {name.upper() for name in env}
+    assert not any(name.startswith("MEFOR_") for name in upper)
+    assert {"VAULT_TOKEN", "PGPASSWORD", "CI_DEPLOY_TOKEN_B614"}.isdisjoint(upper)
+    assert env.get("MYPYPATH") == "stubs"  # the tools' own variables still cross
+    assert env.get("PYTHONIOENCODING") == "utf-8"  # pinned over an inherited value
+    assert "PATH" in upper
+
+
+def test_mypy_runs_by_interpreter_path_with_no_engine_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5375: the tool was started by its bare name, which a PATH search resolves (the
+    working directory first, on Windows), and with the engine's whole environment."""
+    seen = _capture_tool_start(monkeypatch)
+    monkeypatch.setattr(checks, "_tool_installed", lambda _module: True)
+
+    result = checks._run_tool("mypy", "mypy", ["cfg"])
+
+    assert result.ok is True and result.skipped is False
+    cmd = seen["cmd"]
+    assert cmd[0] == sys.executable and Path(cmd[0]).is_absolute()
+    assert cmd[-3:] == ["-m", "mypy", "cfg"]
+    assert "-P" in cmd and cmd[cmd.index("utf8") - 1] == "-X"
+    _assert_no_engine_secret(seen["env"])
+
+
+def test_ruff_runs_its_program_by_absolute_path_with_no_engine_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ruff is its own program, not ``python -m ruff``: on Windows that module starts the program as
+    a grandchild, which the 120 s timeout cannot kill."""
+    seen = _capture_tool_start(monkeypatch)
+    program = str(tmp_path / "ruff.exe")
+    monkeypatch.setattr(checks, "_ruff_binary", lambda: program)
+
+    result = checks._run_tool("ruff", "ruff", ["check", "cfg"])
+
+    assert result.ok is True and result.skipped is False
+    assert seen["cmd"] == [program, "check", "cfg"]
+    _assert_no_engine_secret(seen["env"])
+
+
+def test_ruff_binary_is_absolute_when_found() -> None:
+    found = checks._ruff_binary()
+    assert found is None or Path(found).is_absolute()
+
+
+def test_tool_probe_ignores_a_module_in_the_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The child starts with ``-P``, so a module only the working directory holds is not one it
+    can run; the probe must not count it as installed."""
+    (tmp_path / "b614_cwd_only_tool.py").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    assert checks._tool_installed("b614_cwd_only_tool") is False
+
+
+def test_lint_tool_absent_is_skipped_without_starting_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_run(*_a: object, **_k: object) -> None:
+        raise AssertionError("a tool that is not installed must not be started")
+
+    monkeypatch.setattr(subprocess, "run", no_run)
+    result = checks._run_tool("mypy", "mypy_b614_not_a_module", ["cfg"])
+    assert result.skipped is True and result.detail == (
+        "not importable by this interpreter outside the working directory; a copy on PATH is not "
+        "used"
+    )
+
+
+def test_ruff_not_found_skip_names_where_it_looked(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_run(*_a: object, **_k: object) -> None:
+        raise AssertionError("a ruff that was not found must not be started")
+
+    monkeypatch.setattr(checks, "_ruff_binary", lambda: None)
+    monkeypatch.setattr(subprocess, "run", no_run)
+    result = checks._run_tool("ruff", "ruff", ["check", "cfg"])
+    assert result.skipped is True and result.detail == (
+        "not found in the scripts folder of this interpreter, its base installation or the user "
+        "scheme; a copy on PATH is not used"
+    )
 
 
 def test_accepts_candidate_flags_leading_guard_filter_and_is_advisory(tmp_path: Path) -> None:
@@ -1336,3 +1464,78 @@ def test_cli_check_allow_empty_config_flag(
     capsys.readouterr()
     assert refused == 1
     assert allowed == 0
+
+
+def test_tool_probe_finds_an_installed_module() -> None:
+    """Positive control for the probe: a module installed for this interpreter is found."""
+    assert checks._tool_installed("pytest") is True
+
+
+def test_lint_tool_the_child_cannot_import_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe reads the parent's import path; when the ``-P`` child cannot run the module the
+    advisory reads as not installed, not as a lint failure."""
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, "", "/usr/bin/python3: No module named mypy\n")
+
+    monkeypatch.setattr(checks, "_tool_installed", lambda _module: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = checks._run_tool("mypy", "mypy", ["cfg"])
+    assert result.skipped is True and result.ok is True and result.detail == "not installed"
+
+
+def test_lint_tool_fault_is_still_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            cmd, 1, "cfg/x.py:1: error: No module named mypy\nFound 1", ""
+        )
+
+    monkeypatch.setattr(checks, "_tool_installed", lambda _module: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = checks._run_tool("mypy", "mypy", ["cfg"])
+    assert result.skipped is False and result.ok is False
+
+
+def test_gate_runs_mypy_with_no_configuration_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str, list[str]]] = []
+
+    def capture(name: str, module: str, args: list[str]) -> checks.CheckResult:
+        calls.append((name, module, args))
+        return checks.CheckResult(name, ok=True, required=False, skipped=True, detail="x")
+
+    monkeypatch.setattr(checks, "_run_tool", capture)
+    run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
+    mypy_args = [args for name, _module, args in calls if name == "mypy"]
+    assert mypy_args and mypy_args[0][0] == "--config-file="
+
+
+@pytest.mark.skipif(not checks._tool_installed("mypy"), reason="needs mypy for this interpreter")
+@pytest.mark.timeout(300)
+def test_mypy_config_in_the_working_directory_cannot_run_a_plugin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5375: a mypy.ini in the caller's working directory named a plugin that mypy
+    imported and ran. The positive control runs without the flag and sees the plugin run."""
+    work = tmp_path / "work"
+    work.mkdir()
+    marker = tmp_path / "plugin-ran.txt"
+    (work / "planted_plugin.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+        "from mypy.plugin import Plugin\n\n"
+        "def plugin(version):\n"
+        "    return Plugin\n",
+        encoding="utf-8",
+    )
+    (work / "mypy.ini").write_text("[mypy]\nplugins = planted_plugin.py\n", encoding="utf-8")
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("x: int = 1\n", encoding="utf-8")
+    monkeypatch.chdir(work)
+
+    checks._run_tool("mypy", "mypy", [str(cfg)])
+    assert marker.exists(), "positive control: the planted plugin did not run without the flag"
+    marker.unlink()
+
+    checks._run_tool("mypy", "mypy", ["--config-file=", str(cfg)])
+    assert not marker.exists()

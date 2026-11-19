@@ -107,6 +107,7 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
+    CLEARTEXT_REVOCATION_KEYS,
     INTAKE_AUTH_RATE_LIMIT_DEFAULT,
     INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
     EnvRef,
@@ -123,7 +124,9 @@ from messagefoundry.config.wiring import (
     inbound_binding_conflicts,
     read_intake_budget,
     read_lax_flag,
+    refuse_bool_literals,
     refuse_capture_conflicts,
+    refuse_raw_declarations,
     refuse_resolved_verify_off,
     refuse_unresolved_hop_flags,
     resolve_env_settings,
@@ -412,9 +415,9 @@ class _IntakeRateLimiter:
     def check_peer(self, peer: str) -> bool:
         return self._per_peer.would_allow(peer)
 
-    def charge_failure(self, peer: str) -> None:
+    def charge_failure(self, peer: str, *, charge_global: bool = True) -> None:
         self._per_peer.allow(peer)
-        if self._global is not None:
+        if charge_global and self._global is not None:
             self._global.allow(peer)
 
     def note_success(self, peer: str) -> None:
@@ -1699,9 +1702,10 @@ def _to_lane_result(outcome: tuple[_ItemOutcome, float | None]) -> LaneItemResul
     """Map a ``_process_*_item`` result (the per_lane control-flow carrier) onto the pooled
     dispatcher's :class:`LaneItemResult` (ADR 0066 §4.5): ``(PROCESSED, None)`` → ``RESOLVED``,
     ``(PROCESSED, next_attempt_at)`` → ``RETRY`` (park the lane until that deadline), ``(STOPPED, _)``
-    → ``STOP``. The delivery body surfaces a non-``None`` ``retry_until``, and so does the #122
-    claim gate's hand-back on ingress / routed / response (:meth:`RegistryRunner._refuse_log_halted`,
-    BACKLOG #5704); their bodies otherwise resolve or stop. The per_lane worker loops
+    → ``STOP``. The delivery body surfaces a non-``None`` ``retry_until``; the bodies otherwise
+    resolve or stop. Not the #122 claim gate's hand-back on ingress / routed / response
+    (:meth:`RegistryRunner._refuse_log_halted`, BACKLOG #5704), which builds its own result to set
+    ``hand_back``, which this mapping cannot carry. The per_lane worker loops
     ignore this mapping — they read ``outcome[0]`` directly; it exists only for the pooled adapters."""
     item_outcome, retry_until = outcome
     if item_outcome is _ItemOutcome.STOPPED:
@@ -3265,6 +3269,7 @@ class RegistryRunner:
         resolved: dict[str, dict[str, Any]] = {}
         for name, spec in self.registry.lookups.items():
             refuse_unresolved_hop_flags(spec.settings, f"database lookup {name!r}")
+            refuse_bool_literals(spec.settings, f"database lookup {name!r}")
             resolved[name] = resolve_env_settings(spec.settings, self._env_values)
         # #200 (ADR 0092): stamp the derived posture around the live executor build. engine.start()/
         # reload build the executor here WITHOUT going through build_check_registry's
@@ -4831,8 +4836,10 @@ class RegistryRunner:
         entry there could drift from the runner's records and leave the lane ``stopping`` for good.
 
         With no dispatcher yet (boot, as ``_start_outbound`` runs first), the owner's pause waits
-        for :meth:`_replay_pooled_pauses`."""
-        if not self._owns_destination(name):
+        for :meth:`_replay_pooled_pauses`. The exception: a lane whose ownership check raises is
+        paused here as if owned (:meth:`_owns_for_pause`), so this dispatcher may hold a lane
+        another engine shard owns, and the matching resume raises while the check keeps raising."""
+        if not self._owns_for_pause(name):
             self._mark_outbound_quiesced(name)
             return
         d = self._dispatchers.get(Stage.OUTBOUND)
@@ -5380,7 +5387,11 @@ class RegistryRunner:
             # Before anything below can fail the build, as _start_outbound does (BACKLOG #4997).
             # A raise here fails the lane, isolated as the build's own would be.
             warn_url_query_credentials_before_build(
-                f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                f"outbound {name!r}",
+                oc.spec.settings,
+                self._env_values,
+                connection=oc.name,
+                connector_type=oc.spec.type,
             )
         except Exception as exc:
             return self._install_lane_destination(name, _LaneBuild(exc, _AnchorVerdict()))
@@ -6313,18 +6324,22 @@ class RegistryRunner:
 
     # --- #122 / ADR 0162: fail-closed application-log write guard ------------
 
-    def _on_log_sink_event(self, event: LogSinkEvent) -> None:
+    def _on_log_sink_event(self, event: LogSinkEvent) -> bool:
         """The guard's escalation, called SYNCHRONOUSLY from whatever thread emitted the record that
         could not be written — the event loop, a handler worker thread, a connector thread. It does one
         thing: hand the event to this runner's loop. Never blocks (we are inside a failing
-        ``logging.Handler.emit``) and never raises (the guard is already handling a failure)."""
+        ``logging.Handler.emit``) and never raises (the guard is already handling a failure).
+
+        Returns False when it dropped the event because there is no open loop to hand it to, so the
+        guard keeps a dropped stage-2 event owed and fires it again (BACKLOG #5812)."""
         loop = self._loop
         if loop is None or loop.is_closed():
-            return  # not started, or already torn down — nothing to stop
+            return False  # not started, or already torn down
         try:
             loop.call_soon_threadsafe(self._spawn_log_sink_response, event)
         except RuntimeError:
-            return  # the loop closed between the check and the call
+            return False  # the loop closed between the check and the call
+        return True
 
     def _spawn_log_sink_response(self, event: LogSinkEvent) -> None:
         task = asyncio.ensure_future(self._respond_to_log_sink_event(event))
@@ -6374,8 +6389,8 @@ class RegistryRunner:
         Setting the latch is what gates every inbound (:meth:`_inbound_log_halted`), so no router,
         transform or response row is processed from a claim begun after that line: a pooled lane
         parks before its claim (:meth:`_may_claim_internal`) and hands back a prefix it had already
-        claimed, and a per_lane worker finishes a batch it had already claimed, or was claiming,
-        when the latch was set. The halt pauses no internal lane, and
+        claimed, and a per_lane worker finishes a batch it had begun to run when the latch was set
+        and hands back one it was claiming (:meth:`_log_gate_after_claim`). The halt pauses no internal lane, and
         STOPs one only through that pooled hand-back of a prefix claimed before the gate shut (on
         leadership loss, or at T17); :meth:`_inbound_log_halted` states what else can STOP one.
         The marks go on in the same await-free step, before this waits for the reload lock, which is
@@ -6392,7 +6407,7 @@ class RegistryRunner:
         # own re-arm.
         self._log_halted.update(self.registry.inbound)
         detail = f"application log sink {sink!r} is unwritable ({reason})"
-        inbounds, outbounds = self._log_halt_lanes(sink)
+        inbounds, outbounds = self._log_halt_lanes()
         # Alert BEFORE stopping, and through the NOTIFIER rather than a log line: the sink this is
         # about is the one that just broke, so a log line may never land. If the stop itself wedges,
         # the operator has already been told why the engine is going quiet. Guarded, so a raise
@@ -6437,33 +6452,38 @@ class RegistryRunner:
             except Exception:
                 log.exception("alert sink raised on connection_stopped for %r", name)
 
-    def _log_halt_lanes(self, sink: str) -> tuple[list[str], list[str]]:
+    def _log_halt_lanes(self) -> tuple[list[str], list[str]]:
         """The bound inbounds and the running owned outbounds a #122 halt stops, as ``(inbounds,
         outbounds)``. Read once, before the halt waits for the reload lock, so the halt stops and
         alerts what was bound when it fired; a lane a racing reload rebinds meets the rebind gate.
 
-        An ownership check that raises skips that outbound and logs it, rather than aborting the
-        halt with the latch set and every listener still bound (BACKLOG #5704). The skipped lane is
-        not paused, so another engine shard's lane is never paused here, and it delivers nothing:
-        the ADR 0189 claim gate reads the latch."""
+        Ownership is read through :meth:`_owns_for_pause`, so an ownership check that raises pauses
+        that outbound rather than aborting the halt or skipping the lane (BACKLOG #5704)."""
         inbounds = [name for name in self.registry.inbound if name in self._sources]
-        outbounds: list[str] = []
-        for name in self.registry.outbound:
-            if name in self._outbound_paused:
-                continue
-            try:
-                owned = self._owns_destination(name)
-            except Exception:
-                log.exception(
-                    "log-failure halt: the ownership check for outbound %r raised for sink %r; "
-                    "left to the delivery claim gate",
-                    name,
-                    sink,
-                )
-                continue
-            if owned:
-                outbounds.append(name)
+        outbounds = [
+            name
+            for name in self.registry.outbound
+            if name not in self._outbound_paused and self._owns_for_pause(name)
+        ]
         return inbounds, outbounds
+
+    def _owns_for_pause(self, name: str) -> bool:
+        """Whether a pause takes outbound ``name`` down here: :meth:`_owns_destination`, read as True
+        when it raises, which is logged (BACKLOG #5704). Pausing is the fail-closed direction, so a
+        lane whose owner cannot be read is paused rather than left delivering. A #122 halt that
+        skipped such a lane left it unpaused, and it delivered again with no operator start once a
+        later probe cleared the latch, while its siblings waited for one. Read where a pause picks
+        its lanes: both halts (:meth:`_log_halt_lanes`, :meth:`_park_delivery_for_log_failure`) and
+        :meth:`_pause_pooled_outbound`. A lane another engine shard owns may be paused and alerted
+        here as a result; that is the cost of not leaving an unplaced lane delivering."""
+        try:
+            return self._owns_destination(name)
+        except Exception:
+            log.exception(
+                "the ownership check for outbound %r raised; pausing it as if this process owns it",
+                name,
+            )
+            return True
 
     def _pause_delivery_lanes(self, names: Iterable[str]) -> None:
         """Pause these outbound lanes for a #122 log-failure halt. Sync and await-free.
@@ -6486,31 +6506,62 @@ class RegistryRunner:
                 log.exception("log-failure halt: outbound %r did not pause cleanly", name)
 
     def _lift_log_halt(self, name: str) -> None:
-        """Lift the #122 halt's mark on inbound ``name`` and wake its per_lane workers waiting at the
-        claim gate. Sync and await-free. Only the mark is lifted, and no paused or STOPPED internal
-        lane is resumed. The halt pauses no internal lane, and STOPs one only through its hand-back
-        of a prefix claimed before the gate shut (on leadership loss, or at T17). A lane that
-        STOPped meanwhile, under its own fault policy or otherwise, stays STOPPED here, as any STOP does
-        (:meth:`_inbound_log_halted`; BACKLOG #5704). A pooled lane the pre-claim gate parked is
-        released with :meth:`StageDispatcher.release_gated`, which unparks nothing else."""
+        """Lift the #122 halt's mark on inbound ``name`` and re-arm its internal lanes, as the
+        restart that rebinds its listener did before the halt became a claim gate, when the halt
+        paused them and this resumed them (BACKLOG #5704), except a pooled lane kept STOPPED
+        because it holds claimed rows whose return to the queue never landed. Sync and await-free. A restart of an
+        inbound the halt never gated does not come here, and under pooled re-arms no STOP.
+
+        Under pooled each lane the pre-claim gate parked is released
+        (:meth:`StageDispatcher.release_gated`), and then each internal lane is resumed with
+        :meth:`_resume_pooled_lane`, which re-arms a PAUSED or STOPPED one and lifts the inbound's
+        hold when it does. That covers at least a lane the halt's hand-back STOPPED at T17 or on
+        leadership loss. A lane STOPPED with claimed rows still in flight
+        (:meth:`StageDispatcher.stopped_holding_rows`) is not re-armed here, because a re-arm would
+        claim past them; the WARNING says the pooled lane is kept STOPPED. Any later
+        ``notify_work`` broadcast (:meth:`_broadcast_to`), at least a reload, replay, resend or
+        inject, re-arms it, since the mark is lifted, and it claims past them. Under per_lane the waiting workers are woken here, and the start that
+        called this respawns any that a STOP ended (:meth:`_ensure_inbound_workers`)."""
         self._log_halted.discard(name)
-        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
-            if self._claim_mode == "pooled":
-                dispatcher = self._dispatchers.get(stage)
-                if dispatcher is not None:
-                    dispatcher.release_gated([name])
-            else:
+        if self._claim_mode != "pooled":
+            for stage in _INTERNAL_STAGES:
                 self._wake_lane(stage, name)
+            return
+        lanes = [
+            (stage, d)
+            for stage in _INTERNAL_STAGES
+            if (d := self._dispatchers.get(stage)) is not None
+        ]
+        kept = [stage for stage, d in lanes if d.stopped_holding_rows(name)]
+        for stage in kept:
+            log.warning(
+                "%s pooled lane %r kept STOPPED: it holds claimed rows whose return to the queue "
+                "never landed; any later notify_work broadcast (at least a reload, replay, resend "
+                "or inject) re-arms it and claims past them",
+                stage.value,
+                name,
+            )
+        for stage, d in lanes:
+            d.release_gated([name])
+            if stage in kept:
+                continue
+            if kept:
+                # The ("inbound", name) hold is shared by the internal stages, and a kept sibling
+                # still needs it, so this re-arm leaves it in place.
+                d.resume_lane(name)
+            else:
+                self._resume_pooled_lane(d, stage, name)
 
     def _wake_log_gated(self) -> None:
         """Wake every router, transform and response lane waiting at the #122 claim gate, so a
         lifted gate is read now rather than at the idle backstop. per_lane wakes the workers; pooled
         releases only the lanes the pre-claim gate parked. Not the pooled broadcast, which re-arms
-        STOPPED lanes and releases holds, which a gate lifting must not do."""
+        STOPPED lanes and releases holds, which a latch clearing must not do; an inbound's own
+        restart does that (:meth:`_lift_log_halt`)."""
         if self._claim_mode != "pooled":
-            self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE)
+            self._wake_all(*_INTERNAL_STAGES)
             return
-        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
+        for stage in _INTERNAL_STAGES:
             dispatcher = self._dispatchers.get(stage)
             if dispatcher is not None:
                 dispatcher.release_gated()
@@ -6540,7 +6591,10 @@ class RegistryRunner:
                 item.channel_id,
             )
             return _to_lane_result((_ItemOutcome.STOPPED, None))
-        return _to_lane_result((_ItemOutcome.PROCESSED, await self._park_claimed([item.id])))
+        # A hand-back, so the lane's infra-fault streak and lane_stuck latch stand as they were.
+        return LaneItemResult(
+            LaneResultKind.RETRY, await self._park_claimed([item.id]), hand_back=True
+        )
 
     async def _park_claimed(self, ids: list[str]) -> float:
         """Reschedule claimed rows one backoff ahead and return that deadline: the hand-back both
@@ -6674,9 +6728,10 @@ class RegistryRunner:
 
         Scoped to the lanes this process owns (ADR 0073), because pausing another shard's lane would
         report a stop that did not happen — the same narrowest-honest-scope rule
-        :meth:`_stop_all_for_log_failure` states at length."""
+        :meth:`_stop_all_for_log_failure` states at length. A lane whose ownership check raises is
+        paused too (:meth:`_owns_for_pause`), so it may be another engine shard's."""
         self._pause_delivery_lanes(
-            [name for name in self.registry.outbound if self._owns_destination(name)]
+            [name for name in self.registry.outbound if self._owns_for_pause(name)]
         )
 
     async def _unbind_for_log_failure(self) -> None:
@@ -6726,9 +6781,7 @@ class RegistryRunner:
         """Lift the #122 claim gate (ADR 0162) for one inbound whose listener is being bound, the
         rebind gate every start, restart and reload passes. Returns whether the inbound may run.
 
-        The recovery path the ADR promises — fix the disk, restart the connection, the backlog drains
-        — except that under pooled an internal lane that is STOPPED when the restart runs (for
-        example one T17 stopped while the log was down) stays STOPPED after it, held or not.
+        The recovery path the ADR promises — fix the disk, restart the connection, the backlog drains.
         Per-inbound, so restarting A leaves B halted until B is restarted too. A no-op when the
         inbound is not gated (:meth:`_inbound_log_halted`).
 
@@ -6743,9 +6796,12 @@ class RegistryRunner:
         halt had not marked, such as one the reload added, and leave it bound. A refused inbound is
         marked, so it stays halted after another inbound's restart clears the latch.
 
-        Lifting the gate unparks only lanes the gate parked: a STOP, whatever caused it
-        (:meth:`_inbound_log_halted`), an operator pause and their holds stand as they were, here.
-        Under per_lane the start that called this then respawns the finished workers (:meth:`_ensure_inbound_workers`), which re-arms such a STOP."""
+        Lifting the gate re-arms the inbound's internal lanes (:meth:`_lift_log_halt`): under pooled
+        a STOPPED or PAUSED one is resumed and its hold lifted here, except a pooled lane kept
+        STOPPED because it holds claimed rows whose return to the queue never landed, and under
+        per_lane the start that
+        called this then respawns the finished workers (:meth:`_ensure_inbound_workers`), which
+        re-arms such a STOP."""
         if not self._inbound_log_halted(name):
             return True
         if not self._log_recovery_ok():
@@ -6838,7 +6894,11 @@ class RegistryRunner:
                 # unresolved setting, a refused CA or any other build failure keeps its ASVS 14.2.1
                 # record. Inside this try, so a step that raises fails this lane only.
                 warn_url_query_credentials_before_build(
-                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                    f"outbound {name!r}",
+                    oc.spec.settings,
+                    self._env_values,
+                    connection=oc.name,
+                    connector_type=oc.spec.type,
                 )
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: a refused CA fails this lane only.
@@ -10950,9 +11010,53 @@ class RegistryRunner:
             return False
         return True
 
+    async def _log_gate_after_claim(
+        self,
+        worker: str,
+        name: str,
+        claimed: list[str],
+        faults: _WorkerFaultLog,
+        fence: RependFence,
+    ) -> bool | None:
+        """The per_lane half of the #122 claim gate's hand-back (BACKLOG #5704): read the gate
+        again once a router, transform or response worker's claim returns, before any row of the
+        batch runs. The loop-top check alone let a batch whose claim was in flight when the halt
+        latched be processed whole. Returns None when the gate is open, so the batch runs; True
+        when the batch went back unrun and the worker loops to wait at its loop-top gate; False
+        when the worker must return.
+
+        The batch goes back through :meth:`_release_tail_on_stop`, which spends no attempt. If
+        that release fails, the rows are re-pended through :meth:`_repend_claimed_on_fault`,
+        retried while this worker holds the lane, as the transform worker's voided STOP does. Only
+        a landed hand-back goes on; a worker that returns otherwise leaves the rows in flight, and
+        a respawn of it, the recovery restart's included, can claim past them, because the
+        restart's in-flight exception is pooled-only (:meth:`_lift_log_halt`). A worker on a node that does not
+        report ``is_leader`` returns at once, leaving the rows to the successor's recovery. The
+        first write checks only ``is_leader``, not the claim's lease, so a node leading again under
+        another lease still sends the release; only the fallback re-pend is fenced.
+
+        A batch that passes this check runs whole, so a halt that latches while it runs meets the
+        gate at the next claim, where the pooled adapters re-read it per row
+        (:meth:`_refuse_log_halted`)."""
+        if not self._inbound_log_halted(name):
+            return None
+        if await self._release_tail_on_stop(worker, name, claimed):
+            claimed.clear()
+            return True
+        if not fence.may_write():
+            return False
+        held = await self._repend_claimed_on_fault(
+            worker, name, claimed, faults=faults, fence=fence
+        )
+        if held is HoldResult.LANDED:
+            claimed.clear()
+            return True
+        return False
+
     def _inbound_log_halted(self, name: str) -> bool:
         """Whether the #122 halt (ADR 0162) holds inbound ``name``'s internal stages: THE CLAIM GATE
-        the per_lane router, transform and response workers read at their loop top. Under pooled the
+        the per_lane router, transform and response workers read at their loop top, and again once
+        a claim returns (:meth:`_log_gate_after_claim`). Under pooled the
         INGRESS, ROUTED and RESPONSE dispatchers read it before each claim
         (:meth:`_may_claim_internal`), and their adapters read it again on each claimed row
         (:meth:`_refuse_log_halted`) for a prefix claimed before the gate shut. Other readers include
@@ -10964,7 +11068,7 @@ class RegistryRunner:
         instant it fires, before it waits for the reload lock, and what covers an inbound a reload
         adds later, bound or not.
 
-        **What the halt does to a lane, in full.** The halt pauses no internal lane, and
+        **What the halt does to a lane: at least the following.** The halt pauses no internal lane, and
         STOPs one only through its hand-back of a prefix claimed before the gate shut (on leadership
         loss, or at T17). It gates the claim, and under pooled hands back that prefix
         (:meth:`_refuse_log_halted`); a pooled lane the gate refuses parks with no timer
@@ -10978,9 +11082,12 @@ class RegistryRunner:
         the head for; the lane STOPs when that count reaches the bound, for example when the
         re-pend keeps failing on a full store. A lane can also still
         STOP while the halt is in force for other causes, at least under its own fault policy, such
-        as a held re-pend begun before the latch that exhausts. Lifting the gate does not
-        itself re-arm such a STOP; :meth:`_resume_inbound_processing` says what its caller does
-        next."""
+        as a held re-pend begun before the latch that exhausts. A per_lane worker whose post-claim
+        hand-back cannot land returns with no STOP and no hold, leaving its rows in flight
+        (:meth:`_log_gate_after_claim`). Clearing the latch does not
+        itself re-arm such a STOP; the rebind of the inbound's listener that lifts its mark does
+        (:meth:`_lift_log_halt`), except a pooled lane kept STOPPED because it holds claimed rows
+        whose return to the queue never landed."""
         # A mark gates only an inbound still in the graph: a removed inbound's worker must reach
         # its claim, see the inbound gone and return, rather than wait on a mark nothing lifts. A
         # re-add finds the mark again.
@@ -11186,7 +11293,7 @@ class RegistryRunner:
         raw_meta = await _read_from_store(
             "metadata read", lambda: self.store.message_metadata_json(message_id)
         )
-        user_json = user_metadata(raw_meta)
+        user_json = user_metadata(raw_meta, row_id=message_id)
         if not user_json:
             return None
         try:
@@ -12262,6 +12369,11 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
+                gate = await self._log_gate_after_claim("router", name, claimed, faults, fence)
+                if gate is not None:
+                    if gate:
+                        continue
+                    return
                 for i, item in enumerate(items):
                     outcome = await self._process_ingress_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
@@ -12630,6 +12742,11 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
                     woken = await self._wait_for_work(wait_ev)
                     continue
+                gate = await self._log_gate_after_claim("response", name, claimed, faults, fence)
+                if gate is not None:
+                    if gate:
+                        continue
+                    return
                 outcome = await self._process_response_item(name, item)
                 if outcome[0] is _ItemOutcome.STOPPED:
                     return
@@ -12807,6 +12924,11 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
+                gate = await self._log_gate_after_claim("transform", name, claimed, faults, fence)
+                if gate is not None:
+                    if gate:
+                        continue
+                    return
                 # Process the claimed FIFO batch. BACKLOG #214: when intra-message transform concurrency
                 # is enabled this overlaps a message's sibling rows' transforms while keeping the handoff
                 # serial + in claim order; default (concurrency 1 / single row / fused) it is the exact
@@ -14672,13 +14794,23 @@ def check_intake_budgets(source: Source, name: str, written: Mapping[str, Any]) 
         _intake_budget(source.settings, knob, name, written)
 
 
+def _refuse_declared_settings(settings: Mapping[str, Any], where: str) -> None:
+    """What a connection's declaration refuses in its transport settings, run again at its build on
+    the settings as declared (vault BACKLOG #8253 item 2; :func:`refuse_bool_literals` says why).
+    The raw declaration keys first, as at declaration, so such a key is named as misplaced rather
+    than as a bad value."""
+    refuse_raw_declarations(settings, where)
+    refuse_bool_literals(settings, where)
+
+
 def _source_config(
     ic: InboundConnection,
     bind_host: str,
     env_values: Mapping[str, Any],
     trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> Source:
-    # Resolve any env() references first (a missing value raises WiringError here, before bind).
+    _refuse_declared_settings(ic.spec.settings, f"inbound connection {ic.name!r}")
+    # Then resolve any env() references (a missing value raises WiringError here, before bind).
     settings = resolve_env_settings(
         ic.spec.settings, env_values, connection=inbound_record_name(ic.name)
     )
@@ -14741,12 +14873,9 @@ def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings
 
 #: The settings keys mirrored from a connection's typed declarations (ADR 0153, ADR 0173) and its
 #: name, by `_dest_config` for an outbound and `_fhir_lookup_settings` for a lookup. Named once so the
-#: strip and the writes cannot drift apart.
+#: strip and the writes cannot drift apart, and from the keys a connection's build refuses raw.
 _DECLARATION_MIRROR_KEYS: tuple[str, ...] = (
-    "cleartext_accepted",
-    "cleartext_reason",
-    "tls_revocation_attested",
-    "tls_revocation_attested_reason",
+    *CLEARTEXT_REVOCATION_KEYS,
     MIRRORED_CONNECTION_SETTING,
 )
 
@@ -14804,6 +14933,7 @@ def _fhir_lookup_settings(
     # Before env() resolves, so a post-factory env() flag cannot resolve "false" to True (#2232). It
     # checks the attestation pair as FhirLookupSpec does, so a raw flag with no reason is refused too.
     attested = refuse_unresolved_hop_flags(spec.settings, where)
+    refuse_bool_literals(spec.settings, where)
     settings = resolve_env_settings(
         spec.settings, env_values, connection=fhir_lookup_record_name(spec.name)
     )
@@ -14835,7 +14965,19 @@ def _dest_config(
     # off (every existing outbound unchanged). The connector loads the key + mints the signature; this
     # is the single choke point feeding start, check and a reload's dry run, so a bad key fails loud at
     # all three. `messagefoundry dryrun` builds no connector, so it never reaches here.
+    # A raw declaration key is refused, not stripped by the mirror below, which would drop the
+    # author's declaration with no word (vault BACKLOG #8253 item 2).
+    _refuse_declared_settings(oc.spec.settings, f"outbound connection {oc.name!r}")
     settings = resolve_env_settings(oc.spec.settings, env_values, connection=oc.name)
+    # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
+    # setting. Refuse a raw attestation pair, then mirror a declared one for the settings-driven
+    # seams.
+    apply_hop_attestation(
+        settings,
+        f"outbound connection {oc.name!r}",
+        oc.tls_hop_attested,
+        oc.tls_hop_attested_reason,
+    )
     # Vault BACKLOG #3138: a verify_tls env() can resolve falsy, which the factory's literal-only
     # unread-CA check never sees.
     refuse_resolved_verify_off(oc.spec.type, settings, f"outbound connection {oc.name!r}")
@@ -14857,20 +14999,12 @@ def _dest_config(
         tls_revocation_attested=oc.tls_revocation_attested,
         tls_revocation_attested_reason=oc.tls_revocation_attested_reason,
     )
-    # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
-    # setting. Refuse the raw keys, then mirror a declared pair for the same settings-driven seams.
-    apply_hop_attestation(
-        settings,
-        f"outbound connection {oc.name!r}",
-        oc.tls_hop_attested,
-        oc.tls_hop_attested_reason,
-    )
     return Destination(
         name=oc.name,
         type=oc.spec.type,
         settings=settings,
         retry=oc.retry or RetryPolicy(),
-        sign=OutboundSigning.from_settings(settings),
+        sign=OutboundSigning.from_settings(settings, connection=oc.name),
         # BACKLOG #107: surface the per-outbound raw-separator escape-hatch as a typed field. Default
         # False → byte-identical; only an explicit `hl7_raw_separators=True` (MLLP() factory or a
         # connections.toml setting) flips it. The MLLP connector reads config.hl7_raw_separators.
@@ -15342,6 +15476,7 @@ def _build_check_connectors(
     resolved_lookups: dict[str, dict[str, Any]] = {}
     for lname, lspec in registry.lookups.items():
         refuse_unresolved_hop_flags(lspec.settings, f"database lookup {lname!r}")
+        refuse_bool_literals(lspec.settings, f"database lookup {lname!r}")
         resolved_lookups[lname] = resolve_env_settings(lspec.settings, env_values)
     if resolved_lookups:
         # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
@@ -15467,9 +15602,11 @@ def refuse_reference_hop_flags(registry: Registry) -> None:
     ``DatabaseRef`` or ``FileRef`` source after its factory was refused only at the set's first
     sync, after start, where it surfaced as a failed sync (vault BACKLOG #3139). It is the same
     :func:`refuse_unresolved_hop_flags` call :func:`build_check_registry` and the sync make, so the
-    three cannot disagree. Every source kind, and it needs no resolved value."""
+    three cannot disagree. Every source kind, and it needs no resolved value. It runs
+    :func:`~messagefoundry.config.wiring.refuse_bool_literals` too (vault BACKLOG #3234)."""
     for rname, rspec in registry.references.items():
         refuse_unresolved_hop_flags(rspec.source.settings, f"reference set {rname!r}")
+        refuse_bool_literals(rspec.source.settings, f"reference set {rname!r}")
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})

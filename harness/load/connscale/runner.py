@@ -2042,7 +2042,33 @@ def _reconcile(
     counter_reset: str | None,
     reload: _ReloadAccount | None = None,
 ) -> NoLoss:
-    """The step's no-loss verdict: PASS, LOSS, or INCONCLUSIVE (``ok`` False, ``inconclusive``).
+    """The step's no-loss verdict; :func:`_reconcile_judged` without the excusal it judged."""
+    return _reconcile_judged(
+        c,
+        base,
+        final,
+        unconfirmed_budget=unconfirmed_budget,
+        drain_seconds=drain_seconds,
+        counter_reset=counter_reset,
+        reload=reload,
+    )[0]
+
+
+def _reconcile_judged(
+    c: Counters,
+    base: EngineSample | None,
+    final: EngineSample | None,
+    *,
+    unconfirmed_budget: int,
+    drain_seconds: float | None,
+    counter_reset: str | None,
+    reload: _ReloadAccount | None = None,
+) -> tuple[NoLoss, _Excusal]:
+    """The step's no-loss verdict, with the :class:`_Excusal` its stranding arm judged, so a caller
+    that publishes the arm (connscale-remote) publishes the one this verdict rests on rather than a
+    second ``_excusal`` call that matches it only by convention (BACKLOG #5574).
+
+    The verdict: PASS, LOSS, or INCONCLUSIVE (``ok`` False, ``inconclusive``).
 
     INCONCLUSIVE is the step that cannot clear itself although no arm proved a loss (BACKLOG
     #5574), in the shapes ``harness.load.report._reconcile`` names: the engine metrics are
@@ -2284,8 +2310,18 @@ def _reconcile(
         if parts
         else "read>=sent, written>=read, sink_received>=written, backlog drained"
     )
-    return NoLoss(
-        ok, sent, read, written, sink_received, backlog, detail, inconclusive=not ok and not lost
+    return (
+        NoLoss(
+            ok,
+            sent,
+            read,
+            written,
+            sink_received,
+            backlog,
+            detail,
+            inconclusive=not ok and not lost,
+        ),
+        ex,
     )
 
 

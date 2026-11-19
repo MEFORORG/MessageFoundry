@@ -6,7 +6,7 @@ ADR 0215 moves the console off its in-process seam: each ``/ui`` route will send
 JSON route, so one gate family authorizes both planes. Its first slice is this inventory. It
 classifies every ``/ui`` route by the JSON route that carries its authority, and every handle the
 console holds on the engine: the handler fields of ``CoreHandlers`` and ``AdminHandlers`` (86 when
-slice 1 measured them, 89 since BACKLOG #5559, as the field-count test pins), the
+slice 1 measured them, 89 now; the field-count test pins the count and says what added each), the
 other ``UiDeps`` fields with ``get_engine`` and ``get_gate`` among them, and the ``AuthService``
 members and auth-store reads the console makes. Slices 2 to 6 work from these tables.
 
@@ -426,7 +426,7 @@ def _core(*ops: str) -> Field:
 
 
 #: Every ``CoreHandlers`` and ``AdminHandlers`` field. 66 endpoints by identity, as ADR 0215
-#: slice 1 measured (ADR 0207 moved one to a core and added one), 18 cores a JSON route runs
+#: slice 1 measured (ADR 0207 moved one to a core and added one of each), 18 cores a JSON route runs
 #: past its gate (BACKLOG #5559 added ``admin.checked_user``), 2 sharing a helper with a JSON
 #: route, and 3 with no JSON route that carries the console's use.
 _SEAM_FIELDS: dict[str, Field] = {
@@ -503,10 +503,12 @@ _SEAM_FIELDS: dict[str, Field] = {
     "core.resolve_action": _endpoint("POST /approvals/{approval_id}/resolve"),
     "admin.list_roles": _endpoint("GET /roles"),
     "admin.list_users": _endpoint("GET /users"),
-    # BACKLOG #5559: the seal-checked account read, which the JSON route's endpoint runs too.
+    # BACKLOG #5559: the seal-checked account read, which the JSON route's endpoint runs too. The
+    # notification-address form reads the caller's own profile email through it, which its slice 2
+    # route returns.
     "admin.checked_user": Field(
         "core",
-        ("GET /users/{user_id}/federated-identity",),
+        ("GET /users/{user_id}/federated-identity", "ADD GET /me/notify-email"),
         also=(
             "GET /users/{user_id}/channel-scope",
             "GET /users/{user_id}/permissions",
@@ -659,10 +661,6 @@ _AUTH_SERVICE: dict[str, AuthUse] = {
 #: At least the ``service.store.<name>`` reads the console makes, by what carries it: the census
 #: reads only a store reached off a name ``service`` or ``auth`` (see the module docstring).
 _STORE_READS: dict[str, tuple[str, ...]] = {
-    # The notification-address form reads the caller's own profile email, which its slice 2
-    # route returns. The admin user pages read the target account through admin.checked_user
-    # instead (BACKLOG #5559).
-    "get_user": ("ADD GET /me/notify-email",),
     "list_webauthn_credentials": ("ADD GET /me/webauthn",),
     # The heartbeat is in the confinement set and makes no sub-request (ADR 0215 section 3).
     "get_session": (
@@ -826,7 +824,7 @@ _UI_ROUTES: dict[str, Ui] = {
     "POST /ui/account/password": _J("POST /me/password", f"{_AS} admin.change_password"),
     "GET /ui/account/notify-address": _J(
         "ADD GET /me/notify-email",
-        f"{_AS} service.store.get_user service.suggested_notify_email",
+        f"{_AS} admin.checked_user service.suggested_notify_email",
     ),
     "POST /ui/account/notify-address": _J(
         "POST /me/notify-email", f"{_AS} service.fill_own_notify_email"
@@ -1510,8 +1508,9 @@ def test_every_seam_field_is_classified_as_the_app_holds(live: _Live) -> None:
 
 
 def test_the_seam_field_counts_are_the_measured_ones() -> None:
-    """ADR 0215 slice 1 measured 86 fields, 66 of them a JSON route's endpoint by identity;
-    BACKLOG #5559 added one core."""
+    """ADR 0215 slice 1 measured 86 fields, 66 of them a JSON route's endpoint by identity. ADR
+    0207 moved one endpoint to a core and added one endpoint and one core, and BACKLOG #5559 added
+    one core: 89 in all."""
     counts = Counter(f.kind for f in _SEAM_FIELDS.values())
     assert counts == {"endpoint": 66, "core": 18, "shared": 2, "helper": 3}, counts
 

@@ -110,3 +110,75 @@ def test_validation_error_never_leaks_the_body() -> None:
     while node is not None:
         assert PHI_CANARY not in f"{node!r}", "PHI reachable by walking the exception chain"
         node = node.__cause__ or node.__context__
+
+
+_NESTED_UNKNOWN_TYPE = [
+    # An unknown nested type reached fhir.resources' model lookup as a raw KeyError quoting it.
+    {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{"resource": {"resourceType": PHI_CANARY}}],
+    },
+    {"resourceType": "Patient", "contained": [{"resourceType": PHI_CANARY}]},
+    # A non-string nested type escaped as a TypeError. Its text did not quote the canary on
+    # fhir.resources 8.3.0; the canary is there in case a later version's does.
+    {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{"resource": {"resourceType": [PHI_CANARY]}}],
+    },
+]
+
+
+def _deep_bundle(depth: int) -> dict[str, object]:
+    body: dict[str, object] = {"resourceType": "Patient", "id": PHI_CANARY}
+    for _ in range(depth):
+        body = {"resourceType": "Bundle", "type": "collection", "entry": [{"resource": body}]}
+    return body
+
+
+@pytest.mark.parametrize(
+    ("body", "raised"),
+    [
+        (_NESTED_UNKNOWN_TYPE[0], "KeyError"),
+        (_NESTED_UNKNOWN_TYPE[1], "KeyError"),
+        (_NESTED_UNKNOWN_TYPE[2], "TypeError"),
+        # Nesting deep enough to overflow the stack escaped as a RecursionError.
+        (_deep_bundle(400), "RecursionError"),
+    ],
+    ids=["bundle-entry", "contained", "non-string", "too-deep"],
+)
+def test_nested_resource_failure_is_a_phi_safe_validation_error(
+    body: dict[str, object], raised: str
+) -> None:
+    """BACKLOG #5367: a nested resource that fails outside pydantic's checks raises a PHI-safe
+    FhirValidationError, with the untrusted value on neither the message nor either chain."""
+    with pytest.raises(FhirValidationError, match="nested resource could not be validated") as ei:
+        FhirResource.parse(as_json(body))
+    exc = ei.value
+    assert f"({raised})" in str(exc)
+    assert PHI_CANARY not in str(exc) and PHI_CANARY not in repr(exc)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+
+
+def test_an_unmeasured_exception_type_is_also_converted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The catch is broad, so a type nobody measured cannot escape quoting the body either."""
+    import messagefoundry.parsing.fhir.resource as resource_module
+
+    class _Faulty:
+        @staticmethod
+        def model_validate(data: object) -> object:
+            raise AttributeError(PHI_CANARY)
+
+    monkeypatch.setattr(
+        resource_module, "load_get_fhir_model_class", lambda version: lambda rt: _Faulty
+    )
+    with pytest.raises(
+        FhirValidationError, match=r"could not be validated \(AttributeError\)"
+    ) as ei:
+        FhirResource.parse(as_json({"resourceType": "Patient"}))
+    exc = ei.value
+    assert PHI_CANARY not in str(exc) and PHI_CANARY not in repr(exc)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None

@@ -87,7 +87,7 @@ def test_the_raw_settings_hatch_no_longer_crosses_the_mllp_gate(tmp_path: Path) 
         "    return []\n",
         encoding="utf-8",
     )
-    with pytest.raises(WiringError, match="is not a transport setting"):
+    with pytest.raises(WiringError, match="are not transport settings"):
         load_config(tmp_path)
 
 
@@ -393,6 +393,7 @@ def _loosening_names(attested_hops: tuple[str, ...]) -> list[str]:
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
             ech_cleartext_sidecar_hops=(),
+            listener_trusted_proxy_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),

@@ -52,8 +52,7 @@ from messagefoundry.parsing import (
     validate,
 )
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.parsing.sniff import _lstrip_bom_ws
-from messagefoundry.parsing.split import one_message_bytes
+from messagefoundry.parsing.split import _BOM, _BOM_BYTES, one_message_bytes
 from messagefoundry.parsing.validate import warm_validation
 from messagefoundry.pipeline._sandbox_codec import build_payload
 from messagefoundry.pipeline.ingress_guards import (
@@ -1218,13 +1217,16 @@ def dry_run(
     )
 
 
+#: The UTF-8 byte order mark as the latin-1 view spells it: three characters.
+_LATIN1_BOM = _BOM_BYTES.decode("latin-1")
+
+
 def split_messages(raw: bytes) -> list[bytes]:
     """Split a possibly-batched HL7 payload into individual messages on ``MSH`` boundaries — as BYTES.
 
     A real file connection delivers each ``MSH``-delimited message separately; mirror that so a
     dry-run / commit-check sees every message in a batch file, not just the first. Delegates to the
-    shared :func:`messagefoundry.parsing.split.split_batch` so the live File-source ingress split
-    (transports/file.py) and this dry-run / ``messagefoundry check`` path stay byte-identical.
+    shared :func:`messagefoundry.parsing.split.split_batch`.
 
     **Bytes in, bytes out** (BACKLOG #1689). Returning ``str`` meant this function had already decoded
     the fixture — tolerantly, as UTF-8 — before any inbound was in scope, so the connection's declared
@@ -1235,28 +1237,47 @@ def split_messages(raw: bytes) -> list[bytes]:
     U+0000..U+00FF: ``\\rMSH`` in that view is exactly ``b"\\x0dMSH"`` in the bytes. So the split is
     charset-agnostic — correct for every ASCII-compatible encoding without being told which one — and
     each member re-encodes to the file's own bytes. A payload holding a **single** message returns the
-    original bytes verbatim, exactly as the File source hands a non-batch file off, unless a byte
-    order mark or an ``FHS``/``BHS`` header the parser refuses leads it; only a true batch pays the
-    normalize (line endings collapsed to ``\\r``, the ``FHS``/``BHS`` envelope
-    dropped), which is the same transformation that source applies to a batch.
+    original bytes, as the File source hands a non-batch file off under a charset that writes ASCII
+    as itself: less the bytes of any trailer lines that end it (BACKLOG #5806), and as the split
+    read it when a byte order mark or an ``FHS``/``BHS`` header the parser refuses leads it. Only a
+    batch, or such a message, pays the normalize (line endings collapsed to ``\\r``, the leading
+    ``FHS``/``BHS`` lines and the trailer lines dropped), which is the same transformation that
+    source applies to a batch.
 
     A UTF-16/32 payload has no ``b"\\x0dMSH"`` to find, so it comes back as one message and
     :func:`dry_run` decodes and parses it whole. That is narrower than the live File source, which
     decodes before splitting — and still strictly better than the UTF-8/``replace`` decode this
     replaced, which turned such a payload into mojibake before anything looked at it.
 
-    A leading UTF-8 byte order mark is read past whatever the connection's charset. The live sources
-    do that only under a UTF-8 charset; under a single-byte one they keep the three bytes and the
-    parser refuses the file, so there the dry run is more lenient than the engine (ADR 0206).
+    UTF-8 byte order marks are spelled as the mark itself in the view, whatever the connection's
+    charset, so the split reads past leading ones and splits where marks lead a later ``MSH``, as
+    the live split of a UTF-8 decode does. That is a deliberate change by BACKLOG #5918: before
+    it, only the whitespace and one byte order mark leading the file were stripped, so the dry run
+    did not split where marks lead a later ``MSH``. The live remote-file source hands a file its
+    byte scan passes over as its bytes, so where that scan and the split disagree the two differ.
+    Under a single-byte charset the live sources keep the three bytes, so there the dry run is more
+    lenient than the engine (ADR 0206).
+
+    Under a charset such as cp932 or ``utf-8-sig``, which does not write ASCII as itself
+    (:func:`~messagefoundry.parsing.split.one_message_bytes`), the live sources hand a one-message
+    file whose text starts with ``MSH`` over whole, trailer lines included, while this view drops
+    them.
     """
-    # A UTF-8 byte order mark reads as three characters in the latin-1 view, so split_batch could
-    # not see past it as the live split, which decodes first, does (ADR 0206). Strip it, with the
-    # whitespace around it, before the view.
-    messages = split_batch(_lstrip_bom_ws(raw).decode("latin-1"))
-    # A non-batch payload goes back byte-identical, as the File source hands one off, unless the
-    # parser would refuse what leads it; that source then hands the message as the split read it.
+    # The view spells each UTF-8 mark as U+FEFF, so split_batch reads the marks exactly as the
+    # live split reads the UTF-8 decode. A mark the split keeps is spelled back before the latin-1
+    # encode.
+    view = raw.decode("latin-1")
+    marked = _LATIN1_BOM in view
+    if marked:
+        view = view.replace(_LATIN1_BOM, _BOM)
+    messages = split_batch(view)
+    if marked:
+        messages = [m.replace(_BOM, _LATIN1_BOM) for m in messages]
+    # A non-batch payload goes back as its bytes, less any trailer lines, as the File source hands
+    # one off, unless the parser would refuse what leads it; that source then hands the message as
+    # the split read it.
     if len(messages) == 1:
-        return [one_message_bytes(raw, raw.decode("latin-1"), messages[0], "latin-1")]
+        return [one_message_bytes(raw, view, messages[0], "latin-1")]
     return [m.encode("latin-1") for m in messages]
 
 

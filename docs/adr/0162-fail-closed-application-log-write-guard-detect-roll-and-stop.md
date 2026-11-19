@@ -164,7 +164,8 @@ re-binds (reload quiesces every source and re-binds from the new graph). The inb
 declines to bind — `deployed=False`, `auto_start=False` and not previously listening, DR-filtered —
 stay halted, as do the connections a per-connection restart does not name. *(Note, BACKLOG #5704:
 under the pooled claim mode a router, transform or response lane that is STOPPED at a
-per-connection restart of its inbound stays STOPPED after it.)*
+per-connection restart of its inbound is re-armed by it and its hold released, except a lane that
+STOPPED holding claimed rows whose re-pend never landed, which stays STOPPED with a WARNING.)*
 The outbound **pause is
 operator-owned in both cases** (#115/#233: a reload never resumes a lane an operator has not looked
 at), so delivery needs an explicit `start_outbound` or a service restart either way. Stated the other
@@ -237,7 +238,14 @@ records, and the two are easy to conflate — hence this clause. An application-
 store failure, and the guard performs **no store I/O at all**. A message already committed to the
 ingress stage was ACKed on receipt; stopping its inbound unbinds the listener and touches no row, and
 pausing an outbound retains its rows PENDING un-errored. Nothing is un-ACKed, lost, or double-
-delivered — fix the disk, reload, and the backlog drains. **Fix the disk first**: the reload re-arms
+delivered — fix the disk, reload, and the backlog drains, with at least these qualifications
+(BACKLOG #5704). Under the pooled claim mode, a router, transform or response lane that STOPPED
+while holding claimed rows whose re-pend never landed is not re-armed by the lift of the halt,
+which logs a WARNING. Any later `notify_work` broadcast re-arms such a lane, at least a reload, a
+replay, a resend, an inject or a dead-letter replay, and it then claims past the unlanded rows;
+until one arrives it stays STOPPED. At least a service restart returns its rows to the queue first. Under per_lane, a worker that a content STOP ended during the halt
+is respawned by the reload or restart that lifts its inbound's gate, and it retries that STOP's row.
+**Fix the disk first**: the reload re-arms
 only once the log accepts a record again (section 4), so on a still-broken disk the rows simply stay
 where the halt left them. A test asserts store stats are byte-identical across a stage-2 halt and that
 the committed ingress row is still claimable afterwards.
@@ -386,7 +394,7 @@ restarts a minute after its first roll, so a sink still rolling every few second
 again, and `can_log()` read True with no probe, until the bound tripped again.
 
 **The latch, as built in [`logging_guard.py`](../../messagefoundry/logging_guard.py).** It is an
-overlay in its own field, `_flap_latch`, holding a `_FlapLatch` per held sink, and never in the
+overlay in its own field, `_flap_latch`, holding a `time.monotonic()` reading per held sink, and never in the
 bound's `_roll_flap`. `LogWriteGuard.record_rollover`'s docstring states the rule; in short:
 
 - The roll that trips the bound latches the sink, in the same hold of the guard's lock that writes the
@@ -394,37 +402,14 @@ bound's `_roll_flap`. `LogWriteGuard.record_rollover`'s docstring states the rul
 - A later roll keeps the latch while it comes within 60 seconds of the sink's last roll or stage-2
   failure, and the first roll after a longer gap releases it. A stage-2 failure refreshes that clock
   but never starts a latch: a sink stage 2 alone declared dead is not latched.
-- `revalidate()` releases the latch on every sink whose own state is not `unwritable`, **without
-  writing to it**, so for those sinks its answer is section 4's answer before this amendment. A sink
-  whose own state is `unwritable` gets section 4's probe exactly as before, and its latch goes only
-  with that state, through `record_healthy`. Any write to a sink the latch alone holds would make the
-  guard weaker than the bound alone: `record_healthy` resets the bound's window and streak, the
-  probe's roll heals a broken handle that the next record would otherwise have rolled through
-  `handleError`, where the bound counts it, and even one plain write can take a one-shot fault that
-  the next record would have met. A draft of this amendment did each of the last two, and review
-  found both.
 - `status()` and `can_log()` read a sink unwritable when its own state or the latch says so. On
   `GET /status` the latch changes only the `state` field. The cause, the rolled-aside path and the
   roll count are what the guard records with or without it. At least the runner's halt pages also
   read `status()`, so a page that lists the unwritable sinks can name a latched one too.
 
-**What the latch does not change.** The code that computes the bound, its window and streak, the
-state the three `record_*` methods write, the events the guard fires and every stop request is the
-code on `main` before this amendment, line for line, and it does not read the latch. The latch never
-writes to, rolls or probes a sink. The row's *one page per break* clause is not closed by this
-amendment.
-
-**Stricter than section 1 between recovery actions, and stated rather than hidden.** A sink the
-latch holds reads unwritable while it may be accepting records, so `can_log()` and `/status` can read
-it unwritable where section 1 alone would read `rolled`. `revalidate()`, and so every re-arm and
-runner start gated on it, answers as section 1 does.
-
-**The latch requests no stop of its own, and the stop decision does not read it.** With two sinks,
-one held by the latch alone and the other failing stage 2, `can_log()` and `/status` read every sink
-unwritable, while the stage-2 failure asks for no stop and its stderr line says another sink is
-still writable, as both did before this amendment. The process keeps running until a stop event or
-a re-arm asks. This is kept deliberately so that the stop requests stay exactly section 1's; whether
-the latch should also take part in the stop decision is left open.
+**What `revalidate()`, the stage-2 events and the stage-2 stderr line do with the latch is in
+Amendment C**, which replaces what this amendment said about them. The latch never writes to, rolls
+or probes a sink, and the stop decision does not read it.
 
 **How far "never weaker than section 1" was checked, and no further.** A side-by-side fuzz ran this
 guard beside `main`'s `logging_guard.py` (checked byte-identical to `origin/main` at the run) under a
@@ -444,3 +429,52 @@ stream, not a proof, and it does not model threads.
 [`tests/test_log_write_guard.py`](../../tests/test_log_write_guard.py) pins the cases by name, among
 them a revalidate between two flaps that must still stop at the moment `main` stops, and two
 revalidates on real handlers that must neither heal a broken handle nor take a one-shot fault.
+
+## Amendment C (2026-11-17) -- rolls past the bound, owed stage-2 events, and unformattable records (BACKLOG #5812, #5813)
+
+**Amendment A is unedited. Amendment B points here for what `revalidate()`, the stage-2 events and
+the stage-2 stderr line do with its latch. Where this amendment disagrees with either, it is the
+newer text.**
+
+**Rolls past the bound, and stage-2 events that were not delivered.** Before this amendment
+every roll past section 1's bound wrote the sink's state as `rolled` before escalating, so for
+that interval another thread could read the sink as writable. Now a roll past the bound on a sink
+already unwritable keeps it unwritable, and still fires a stage-2 event and the stderr line, as
+`main` does. The row's *one page per break* clause is therefore not closed for these rolls. A
+stage-2 event that was not delivered is now owed and fired again later;
+`LogWriteGuard.record_unwritable`'s docstring says when. A responder that raises on a stage-2 event
+gets a stderr line saying so once per break of the sink and responder, not once per event
+fired again.
+
+**The stage-2 stderr line.** Where every other sink reads unwritable but at least one only through
+the flap latch, the line now says so, instead of saying another sink is still writable.
+The stop decision is unchanged.
+
+**`revalidate()` and the flap latch.** `revalidate()` releases the latch, without writing to the
+sink, on each sink whose own state was not `unwritable` at its snapshot. On a sink whose own state
+is `unwritable`, the latch goes only through `record_healthy`, after a probe that landed: any write
+to a sink the latch alone holds would make the guard weaker than the bound alone. `revalidate()`
+probes a sink only if nothing was recorded on it since its snapshot, and marks it healthy only if
+nothing was recorded on it by the time its probe ends. The guard's lock is not held across the probe's write.
+Its answer is now `can_log()`'s, read under the lock after the probes, so it reads the flap latch.
+
+**A record that cannot be formatted is not a sink failure** (BACKLOG #5813). On `main`,
+`handleError` rolls the sink on any failure, so a record its formatter refuses rolls the sink, and
+the re-write, which formats the same record, fails too, so the record always reaches stage 2. Now the guard writes in the record's
+place a fixed notice naming the record's logger, its level and the exception's type, where the
+formatter can format that notice. When the sink takes the notice, neither stage runs and the
+engine keeps processing. **The fault is reported on the stderr last-resort line only, at a bounded
+rate: no alert is raised and nothing shows on `GET /status`.** This is weaker than `main`, where
+such a record went to stage 2. Keeping it was decided by the Manager under the owner's
+delegation of 2026-11-17 (decision d20261118T002722950-fa0f70). An alert and a
+`/status` signal for it are not built. When the sink refuses the notice, the two stages decide, as
+for any write failure. When the formatter cannot format the notice either, the sink is recorded
+unwritable with a reason that names a formatter fault, and the file is not rolled or renamed;
+stage 2 then decides the stop as for any other stage-2 failure. `_GuardedSinkMixin.handleError` and `_report_format_faults` in
+`logging_guard.py` say what is counted and when the stderr line is written.
+
+**Part of the side-by-side check is now committed.**
+`test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone` runs seeded random steps on
+two guards, one with the latch switched off, and compares their events, recorded states, bound and
+`revalidate()` answers. It drives the guard directly, not real handlers, and it does not model
+threads.

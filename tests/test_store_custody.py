@@ -1170,7 +1170,7 @@ def test_windows_a_grantee_that_cannot_be_looked_up_is_a_custody_refusal(
     def _fails(sid: str) -> int | None:
         raise RestrictedFileError(f"the account {sid} could not be looked up (Win32 error 1789)")
 
-    monkeypatch.setattr(restricted_file, "_lookup_sid_kind", _fails)
+    monkeypatch.setattr(restricted_file, "lookup_sid_kind", _fails)
     path = tmp_path / "handoff.key"
     with pytest.raises(CustodyError, match="could not be looked up"):
         custody.write_handoff_file(path, _blob(), service_account="*S-1-5-21-1-2-3-1001")

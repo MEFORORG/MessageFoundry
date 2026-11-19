@@ -20,6 +20,17 @@ BACKLOG #5918 widened three readings on purpose, and edited their copies here to
 split, the ingress guard and the byte scan now take a later ``MSH`` line that byte order marks
 lead as a boundary, as the delivery reading already did, and the split cuts past those marks.
 Each edited line says what it read at a0a5e4f5a4.
+
+BACKLOG #5806 changed the split on purpose, and only by dropping lines: an ``MSH``-led message no
+longer ends with the run of envelope trailer lines (``BTS``, ``FTS``, ``BHS`` or ``FHS``, then that
+message's own MSH-1) that followed it. The split's copy is left as it stood, so it is the oracle
+for every other cut: the live split must give the copy's messages less those trailer lines, and
+nothing else (:func:`_less_the_trailer`). The byte scan and its copy are unchanged. The whole-file
+split is held to a copy of origin/main's, on that scan: each message it re-encodes must come back
+less the same lines. A file it hands over as its bytes must come back, under a codec that writes
+ASCII as itself, as its decoded text less the same trailer lines, line ends and leading whitespace
+kept, re-encoded (:func:`_old_bytes_less_the_trailer`), and under any other codec as its bytes,
+unchanged. The corpus gained trailer tokens and the shapes a review of that change named.
 """
 
 from __future__ import annotations
@@ -72,13 +83,19 @@ def _old_sends_more_than_one_message(payload: str) -> bool:
     return BOM in payload and _OLD_LATER_MSH_PAST_BOM.search(payload, start) is not None
 
 
-def _old_needs_a_decode(raw: bytes, encoding: str) -> bool:
+def _old_writes_ascii_as_itself(encoding: str) -> bool:
+    """The codec test ``_old_needs_a_decode`` opens with, named for BACKLOG #5806's use of it."""
     try:
         name = codecs.lookup(encoding).name
     except LookupError:
+        return False
+    return name in {"utf-8", "ascii"} or name.startswith(("iso8859-", "cp125"))
+
+
+def _old_needs_a_decode(raw: bytes, encoding: str) -> bool:
+    if not _old_writes_ascii_as_itself(encoding):
         return True
-    if name not in {"utf-8", "ascii"} and not name.startswith(("iso8859-", "cp125")):
-        return True
+    name = codecs.lookup(encoding).name
     if name == "utf-8" and _OLD_LEADING_BOM.match(raw):
         return True
     if b"\rMSH" in raw or b"\nMSH" in raw:
@@ -99,17 +116,140 @@ def _old_split_batch(raw: str | bytes) -> list[str]:
     return messages or [text]
 
 
+_OLD_LEADS_WITH_MSH = re.compile(r"\s*MSH")
+
+
+def _old_split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
+    """``split_batch_bytes`` and ``one_message_bytes`` as they stood, on the copies above."""
+    if not _old_needs_a_decode(raw, encoding):
+        return [raw]
+    try:
+        text = raw.decode(encoding)
+    except (UnicodeError, LookupError):
+        return [raw]
+    messages = _old_split_batch(text)
+    if len(messages) == 1:
+        if _OLD_LEADS_WITH_MSH.match(text) or not messages[0].startswith("MSH"):
+            return [raw]
+        return [messages[0].encode(encoding)]
+    return [message.encode(encoding) for message in messages]
+
+
+#: BACKLOG #5806: the ids a trailer line opens with.
+_TRAILER_IDS = ("BTS", "FTS", "BHS", "FHS")
+
+
+def _less_the_trailer(message: str) -> str:
+    """BACKLOG #5806, written over lines rather than as the live scan from the end: an ``MSH``-led
+    message less the run of lines that ends it, past one final CR, each of which opens with a
+    trailer id and then the message's own MSH-1, when that is ASCII. The CR before the run
+    stays."""
+    if not message.startswith("MSH") or len(message) < 4 or message[3] == "\r":
+        return message
+    if not message[3].isascii():
+        return message
+    separator = message[3]
+    lines = message.split("\r")
+    last = len(lines) - 1 if lines[-1] == "" else len(lines)
+    first = last
+    while first > 1 and lines[first - 1][:3] in _TRAILER_IDS and lines[first - 1][3:4] == separator:
+        first -= 1
+    if first == last:
+        return message
+    return "\r".join(lines[:first]) + "\r"
+
+
+def _only_trailer_lines_gone(new: list[str], old: list[str]) -> bool:
+    """Whether each of ``new`` is its ``old`` message, or that message less a suffix of whole
+    lines each opening with a trailer id and the message's own MSH-1: a check of the shape of any
+    difference, independent of :func:`_less_the_trailer`."""
+    if len(new) != len(old):
+        return False
+    for kept, was in zip(new, old, strict=True):
+        if kept == was:
+            continue
+        if not (was.startswith(kept) and kept.startswith("MSH") and kept.endswith("\r")):
+            return False
+        separator = kept[3]
+        dropped = was[len(kept) :].removesuffix("\r").split("\r")
+        if not all(line[:3] in _TRAILER_IDS and line[3:4] == separator for line in dropped):
+            return False
+    return True
+
+
+#: After each line break, a CR LF counting as one: the file's own lines, ends kept.
+_AFTER_A_LINE_BREAK = re.compile(r"(?<=\n)|(?<=\r)(?!\n)")
+
+
+def _old_bytes_less_the_trailer(raw: bytes, encoding: str) -> bytes:
+    """BACKLOG #5806, over a file the copy hands over as its bytes: its decoded text less its own
+    last lines, as many as :func:`_less_the_trailer` drops from the copy's one message, re-encoded
+    with ``encoding``. Line ends and leading whitespace stay in the text."""
+    try:
+        text = raw.decode(encoding)
+    except (UnicodeError, LookupError):
+        return raw
+    (message,) = _old_split_batch(text)
+    kept = _less_the_trailer(message)
+    if kept == message:
+        return raw
+    dropped = message[len(kept) :].removesuffix("\r").count("\r") + 1
+    lines = [line for line in _AFTER_A_LINE_BREAK.split(text) if line]
+    return "".join(lines[:-dropped]).encode(encoding)
+
+
 # --- the corpus ---------------------------------------------------------------------------------
 
 #: Tokens for each shape the readings tell apart: both line ends, a whole and a broken ``MSH``,
 #: the byte order mark, other leading whitespace and a vertical tab, a field separator, the batch
 #: envelope headers, another segment, and a non-Latin-1 character (a wider string kind).
-TOKENS = ("\r", "\n", "MSH", "MS", "H", BOM, " ", "\x0b", "|", "FHS|", "BHS|", "PID|", "王")
+#: BACKLOG #5806 added a file separator, trailers under ``|`` and under ``^``, and a bare id.
+TOKENS = (
+    "\r",
+    "\n",
+    "MSH",
+    "MS",
+    "H",
+    BOM,
+    " ",
+    "\x0b",
+    "\x1c",
+    "|",
+    "FHS|",
+    "BHS|",
+    "BTS|",
+    "FTS^",
+    "BTS",
+    "PID|",
+    "王",
+)
 #: Every string of up to this many tokens, then a seeded sample of longer ones, which is where a
 #: marked second boundary or two boundaries behind an envelope header first fit.
 EXHAUSTIVE_TOKENS = 4
 SAMPLED = 40_000
 SAMPLED_TOKENS = (5, 9)
+
+
+#: BACKLOG #5806: the shapes a review of that change found the split treating unlike origin/main,
+#: and data lines that only begin like a trailer, each also with a trailer after it.
+_SHAPES = (
+    "MSH|a\r MSH|b\r",
+    "MSH|a\r\x0bMSH|b\r",
+    "MSH|a\r\x1cMSH|b\r",
+    "\x1c\rFHS|x\rMSH|a\rPID|1\r",
+    "FHS^x\rMSH|a\rPID|1\r",
+    "FHSX\rMSH|a\rPID|1\r",
+    "FHS|x\rBHS|x\rBTS|0\rBHS|x\rMSH|a\rPID|1\r",
+    "MSH|a\rOBX|1|TX|||note\rFHS: 140 bpm\rFHS\rBTS^1\r",
+    "MSH^a\rPID^1\rBTS|1\rBTS^1\rFTS^1\r",
+    "MSH|a\rBTS|1\r\rFTS|1\r",
+    "MSH|a\rBTS|1\r" + BOM + "FTS|1\r",
+    # Round four: header lines after a line break sent this file to the decode, which read it
+    # past them where origin/main handed it over as its bytes.
+    "FHS|x\rBHS|y\r MSH|a\rPID|1\r",
+    " \r\nMSH|a\r\nPID|1\r\n",
+)
+REVIEW_SHAPES = [*_SHAPES, *(shape + "BTS|2\rFTS|1\r" for shape in _SHAPES)]
 
 
 def _corpus() -> list[str]:
@@ -120,7 +260,7 @@ def _corpus() -> list[str]:
         for parts in itertools.product(TOKENS, repeat=n)
     ]
     sampled = ["".join(rng.choices(TOKENS, k=rng.randint(*SAMPLED_TOKENS))) for _ in range(SAMPLED)]
-    return exhaustive + sampled
+    return exhaustive + sampled + REVIEW_SHAPES
 
 
 CORPUS = _corpus()
@@ -171,9 +311,99 @@ def test_the_whole_file_byte_scan_matches_its_copy(encoding: str) -> None:
     ] == []
 
 
-def test_the_batch_split_matches_its_copy() -> None:
-    assert [text for text in CORPUS if split.split_batch(text) != _old_split_batch(text)] == []
-    assert [body for body in BODIES if split.split_batch(body) != _old_split_batch(body)] == []
+def test_the_batch_split_is_its_copy_less_the_trailer_lines() -> None:
+    # BACKLOG #5806: every input splits as it did, and each message differs only by trailer lines.
+    for inputs in (CORPUS, BODIES):
+        wrong = []
+        for text in inputs:
+            new, old = split.split_batch(text), _old_split_batch(text)
+            if new != [_less_the_trailer(m) for m in old] or not _only_trailer_lines_gone(new, old):
+                wrong.append(text)
+        assert wrong == []
+
+
+def test_the_corpus_drops_a_trailer_and_keeps_one() -> None:
+    # A corpus on which the split never drops a line, or always does, proves nothing about it.
+    dropped = {text for text in CORPUS if split.split_batch(text) != _old_split_batch(text)}
+    assert dropped
+    assert any("BTS" in text and text not in dropped for text in CORPUS)
+    for kept in ("FHS: 140 bpm", "\rFHS\r", "BTS^1"):
+        assert any(kept in text and text not in dropped for text in REVIEW_SHAPES)
+
+
+def _old_whole_file_less_the_trailer(raw: bytes, encoding: str) -> list[bytes]:
+    """What origin/main's whole-file split hands over for ``raw``, less the trailer lines. A file
+    it hands over as its bytes keeps them under a codec that does not write ASCII as itself."""
+    old = _old_split_batch_bytes(raw, encoding)
+    if old == [raw]:
+        if not _old_writes_ascii_as_itself(encoding):
+            return [raw]
+        return [_old_bytes_less_the_trailer(raw, encoding)]
+    return [_less_the_trailer(part.decode(encoding)).encode(encoding) for part in old]
+
+
+#: Each line ending, and the leading whitespace before an ``MSH`` the parser reads past.
+_SPELLINGS = (("\r", "\r"), ("\r", "\n"), ("\r", "\r\n"), ("", " \t"), ("", "\r\n"))
+
+
+@pytest.mark.parametrize(
+    "encoding", ["utf-8", "latin-1", "cp1252", "utf-16", "utf-16-le", "utf-8-sig", "nope"]
+)
+def test_the_whole_file_split_is_origin_mains_less_the_trailer_lines(encoding: str) -> None:
+    # BACKLOG #5806: what a whole-file source hands over is what origin/main's whole-file split
+    # hands over, part by part, less the trailer lines and nothing else: a re-encoded message less
+    # its trailer lines, and a file handed over as its bytes less their bytes where the codec
+    # writes ASCII as itself, and unchanged where it does not.
+    codec = encoding if encoding.startswith(("utf-16", "utf-8-sig")) else "utf-8"
+    respelled = [shape.replace(cr, brk) for shape in REVIEW_SHAPES for cr, brk in _SPELLINGS if cr]
+    led = [lead + shape for shape in REVIEW_SHAPES for cr, lead in _SPELLINGS if not cr]
+    wrong = []
+    for text in [*CORPUS, *respelled, *led]:
+        raw = text.encode(codec)
+        if split.split_batch_bytes(raw, encoding) != _old_whole_file_less_the_trailer(
+            raw, encoding
+        ):
+            wrong.append(text)
+    assert wrong == []
+
+
+#: One message ending in trailer lines, which origin/main handed over as the file's bytes.
+_ONE_WITH_A_TRAILER = "MSH|^~\\&|A|B\r\nPID|1||123\r\nBTS|1\r\nFTS|1\r\n"
+
+
+@pytest.mark.parametrize(
+    ("encoding", "raw"),
+    [
+        ("utf-16", codecs.BOM_UTF16_BE + _ONE_WITH_A_TRAILER.encode("utf-16-be")),
+        ("utf-16-le", _ONE_WITH_A_TRAILER.encode("utf-16-le")),
+        ("utf-8-sig", _ONE_WITH_A_TRAILER.encode("utf-8-sig")),
+        ("cp932", "MSH|^~\\&|A|B\rPID|1||王\rBTS|1\rFTS|1\r".encode("cp932")),
+    ],
+    ids=["utf-16be-bom", "utf-16le-no-bom", "utf-8-sig", "cp932"],
+)
+def test_a_codec_that_does_not_write_ascii_as_itself_keeps_the_file_whole(
+    encoding: str, raw: bytes
+) -> None:
+    # BACKLOG #5806, round 6: no byte cut is exact under these codecs, so a one-message file goes
+    # over as origin/main handed it over, its own bytes with the trailer lines, on both whole-file
+    # paths: the remote source's split_batch_bytes and the File source's one_message_bytes.
+    assert _old_split_batch_bytes(raw, encoding) == [raw]
+    assert split.split_batch_bytes(raw, encoding) == [raw]
+    text = raw.decode(encoding)
+    (message,) = split.split_batch(text)
+    assert not message.rstrip("\r").endswith("FTS|1")  # the split itself still drops them
+    assert split.one_message_bytes(raw, text, message, encoding) == raw
+
+
+def test_the_whole_file_corpus_cuts_bytes_the_byte_scan_hands_over() -> None:
+    # A corpus in which no file the byte scan hands over as its bytes loses a trailer line, or
+    # every such file does, proves nothing about that path.
+    scanned = [body for body in BODIES if not _old_needs_a_decode(body, "utf-8")]
+    cut = [body for body in scanned if split.split_batch_bytes(body, "utf-8") != [body]]
+    assert cut
+    assert len(cut) < len(scanned)
+    assert b"FHS|x\rBHS|y\r MSH|a\rPID|1\r" in scanned
+    assert b"FHS|x\rBHS|y\r MSH|a\rPID|1\r" not in cut
 
 
 #: The earliest boundary each ``_Boundary`` names, written out again here as a plain regex.

@@ -197,6 +197,8 @@ class _CountingLimiter:
         self.allow = allow
         self.checks: list[str] = []
         self.charges: list[str] = []
+        #: The keys whose charge also spent the global window (BACKLOG #5525).
+        self.global_charges: list[str] = []
         self.successes: list[str] = []
 
     def check(self, peer: str) -> bool:
@@ -206,8 +208,10 @@ class _CountingLimiter:
     def check_peer(self, peer: str) -> bool:  # MLLP's; the HTTP listener reads check
         raise AssertionError("the HTTP listener consults check, never check_peer")
 
-    def charge_failure(self, peer: str) -> None:
+    def charge_failure(self, peer: str, *, charge_global: bool = True) -> None:
         self.charges.append(peer)
+        if charge_global:
+            self.global_charges.append(peer)
 
     def note_success(self, peer: str) -> None:
         self.successes.append(peer)

@@ -37,6 +37,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
+    _SealCheck,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -297,6 +298,91 @@ async def test_c_an_affected_save_with_the_grant_saves_and_ends_the_session(
         assert r.status_code == 200, r.text
         assert await case.saved(engine, service, role_id)
         assert (await c.get("/auth/me", headers=_auth(tok))).status_code == 401
+
+
+@pytest.mark.parametrize("case", CASES[:2], ids=IDS[:2])
+async def test_a_directory_caller_whose_check_fails_only_at_the_gate_read_is_named(
+    engine: Engine, case: _Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the gate's read of the AD map set leaves out a directory caller whose integrity
+    check fails at that read only (a raced honest write, a Vault transit lag). The caller would
+    then save on the window alone, and the revoke, reading again after the save, would end the
+    caller's own sessions with no bound proof (BACKLOG #3401, #5505)."""
+    service = await _service(engine)
+    method, path, body = case.request(None)
+    async with _client(engine, service) as c:
+        tok, password = await _affected(c, case, service, None, monkeypatch)
+        tok = await _reauth(c, tok, password)  # the window is live; no bound grant
+        real_set = service.sessions_ended_by_ad_map_save
+        real_check = service._checked_by_id
+        reads = 0
+        racing = False
+
+        async def check(user_id: str, listed: Any = None) -> _SealCheck:
+            if racing:
+                return _SealCheck(failed=True)
+            return await real_check(user_id, listed)
+
+        async def ended() -> frozenset[str]:
+            nonlocal reads, racing
+            reads += 1
+            racing = reads == 1  # the gate's read only
+            try:
+                return await real_set()
+            finally:
+                racing = False
+
+        monkeypatch.setattr(service, "_checked_by_id", check)
+        monkeypatch.setattr(service, "sessions_ended_by_ad_map_save", ended)
+        r = await c.request(method, path, json=body, headers=_auth(tok))
+        assert reads == 1, "the gate did not read the set"
+        assert r.status_code == 403, r.text
+        assert r.headers.get("X-Step-Up-Action") == ACTION
+        assert not await case.saved(engine, service, None)
+        assert (await c.get("/auth/me", headers=_auth(tok))).status_code == 200
+
+
+@pytest.mark.parametrize("case", CASES[2:], ids=IDS[2:])
+async def test_a_role_holder_whose_check_fails_only_at_the_gate_read_is_named(
+    engine: Engine, case: _Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the gate's read of a custom role's holders leaves out a holder whose integrity
+    check fails at that read only. The caller would then save on the window alone, and the revoke
+    would end the caller's own sessions with no bound proof (finding 4 of round 8b6500f2 on PR
+    3007, BACKLOG #3401, #5505)."""
+    service = await _service(engine)
+    role_id = await case.setup(service)
+    method, path, body = case.request(role_id)
+    async with _client(engine, service) as c:
+        tok, password = await _affected(c, case, service, role_id, monkeypatch)
+        tok = await _reauth(c, tok, password)  # the window is live; no bound grant
+        real_set = service.sessions_ended_by_custom_role_save
+        real_check = service._checked_by_id
+        reads = 0
+        racing = False
+
+        async def check(user_id: str, listed: Any = None) -> _SealCheck:
+            if racing:
+                return _SealCheck(failed=True)
+            return await real_check(user_id, listed)
+
+        async def ended(role: str) -> frozenset[str]:
+            nonlocal reads, racing
+            reads += 1
+            racing = reads == 1  # the gate's read only
+            try:
+                return await real_set(role)
+            finally:
+                racing = False
+
+        monkeypatch.setattr(service, "_checked_by_id", check)
+        monkeypatch.setattr(service, "sessions_ended_by_custom_role_save", ended)
+        r = await c.request(method, path, json=body, headers=_auth(tok))
+        assert reads == 1, "the gate did not read the set"
+        assert r.status_code == 403, r.text
+        assert r.headers.get("X-Step-Up-Action") == ACTION
+        assert not await case.saved(engine, service, role_id)
+        assert (await c.get("/auth/me", headers=_auth(tok))).status_code == 200
 
 
 async def test_a_pending_sessions_password_re_proof_mints_no_grant(engine: Engine) -> None:

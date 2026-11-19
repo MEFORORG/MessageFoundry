@@ -27,7 +27,10 @@ from .monitoring import _opt, _post_button, _ts, _yn
 __all__ = [
     "high_availability",
     "high_availability_fragment",
+    "high_availability_unreadable",
+    "high_availability_unreadable_fragment",
     "stepdown_confirm",
+    "stepdown_confirm_unreadable",
     "stepdown_refused",
 ]
 
@@ -400,6 +403,101 @@ def high_availability(
         live,
         active="cluster",
     )
+
+
+# BACKLOG #5932: the membership and lease rows are store reads, so a store timeout or outage leaves
+# only the node's in-memory status to show. No node list, lease and control are rendered from it.
+_UNREADABLE = (
+    "This node could not read cluster membership or the leadership lease from the store, so this "
+    "page shows only this node's own status, and no stepdown can be started from it. Retry, and if "
+    "it repeats, check the store connection."
+)
+_UNREADABLE_CONFIRM = (
+    "This node could not read cluster membership or the leadership lease from the store, so this "
+    "page cannot say what a stepdown would do, and offers none. Retry, and if it repeats, check the "
+    "store connection."
+)
+
+
+def _unreadable_body(cluster: ClusterStatus) -> Markup:
+    """The live body when the membership read raised: the in-memory status and the reason, with no
+    nodes table and no control. Keeps ``id="ha-live"``, so the page's poller recovers on its own
+    once the store answers again."""
+    summary = rows_table(
+        ["Field", "Value"],
+        [
+            [
+                "Clustering",
+                "enabled (active-passive)" if cluster.clustered else "disabled (single-node)",
+            ],
+            ["This console runs on", cluster.node_id],
+            # Without the lease row nothing confirms the in-memory role: a node cut off from the
+            # store can still read itself as primary after its lease has moved.
+            ["Role in this node's memory, unconfirmed", cluster.role],
+            ["Config version", cluster.config_version],
+        ],
+        adjustable=False,
+    )
+    return el(
+        "div",
+        el("h2", "Cluster"),
+        el("p", _UNREADABLE, class_="banner"),
+        summary,
+        id="ha-live",
+    )
+
+
+def high_availability_unreadable_fragment(cluster: ClusterStatus) -> Markup:
+    """The live fragment when the membership read raised (BACKLOG #5932)."""
+    return _unreadable_body(cluster)
+
+
+# The post-stepdown notices for the degraded page. "released" points at a lease owner the
+# degraded page cannot show, so it says where to confirm instead; "drained" names nothing shown.
+_UNREADABLE_NOTICES: dict[str, str] = {
+    **_NOTICES,
+    "released": (
+        "Leadership lease released. A standby takes the lease on its next heartbeat, or after its "
+        "acquire delay if it has one. This page cannot read the lease owner right now, so before "
+        "you start maintenance, confirm here once the store answers that the lease owner has moved "
+        "and this node's connections are quiet."
+    ),
+}
+
+
+def high_availability_unreadable(cluster: ClusterStatus, *, notice: str = "") -> Markup:
+    """The High Availability page when the membership read raised (BACKLOG #5932). It keeps the
+    post-stepdown notice, since the stepdown it reports already ran whatever this read did, and
+    leaves out the intro, which describes the whole-cluster view this page cannot show."""
+    message = _UNREADABLE_NOTICES.get(notice)
+    live = el(
+        "div",
+        _unreadable_body(cluster),
+        data_mf_fragment=True,
+        data_fragment_url="/ui/cluster/live",
+        data_fragment_ms="5000",
+    )
+    return page(
+        "High Availability",
+        el("h1", "High Availability"),
+        el("p", message, class_="banner") if message else Markup(""),
+        live,
+        active="cluster",
+    )
+
+
+def stepdown_confirm_unreadable(*, force: bool) -> Markup:
+    """Either confirm page when the membership read raised (BACKLOG #5932). It offers no form: the
+    page cannot tell the operator what a stepdown would do without the rows it failed to read."""
+    title = "Force a drain" if force else "Planned stepdown"
+    body = el(
+        "div",
+        el("h1", title),
+        el("p", _UNREADABLE_CONFIRM),
+        el("p", el("a", "Back to High Availability", href=_PAGE)),
+        class_="card detail-card",
+    )
+    return page(title, body, active="cluster")
 
 
 def _releases(node: str, *, holds: bool) -> str:

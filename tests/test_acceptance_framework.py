@@ -9,6 +9,8 @@ small suite, because only a real run shows what pytest's JUnit actually carries.
 
 from __future__ import annotations
 
+import ast
+import re
 import subprocess
 from collections.abc import Sequence
 from dataclasses import replace
@@ -17,7 +19,15 @@ from typing import Any
 
 import pytest
 
-from harness.acceptance.matrix import MATRIX, ONCE, PER_DB, Coverage, MatrixRow, Status
+from harness.acceptance.matrix import (
+    MATRIX,
+    ONCE,
+    PER_DB,
+    SERVER_SUITE_GATES,
+    Coverage,
+    MatrixRow,
+    Status,
+)
 from harness.acceptance.report import (
     exit_code,
     render_console,
@@ -25,6 +35,7 @@ from harness.acceptance.report import (
     render_markdown,
 )
 from harness.acceptance.runner import (
+    FileCounts,
     PytestRun,
     RowResult,
     _aggregate,
@@ -51,15 +62,17 @@ _JUNIT = """<?xml version="1.0" encoding="utf-8"?>
 def test_parse_junit_aggregates_per_file(tmp_path: Path) -> None:
     junit = tmp_path / "junit.xml"
     junit.write_text(_JUNIT, encoding="utf-8")
-    status, unattributed = _parse_junit_by_file(junit)
+    status, unattributed, counts = _parse_junit_by_file(junit)
     assert unattributed == []
+    assert counts["tests/test_a.py"] == FileCounts(passed=1, skipped=1)
+    assert counts["tests/test_b.py"] == FileCounts(failed=1)
     assert status["tests/test_a.py"] is Status.PASS  # one pass + one skip -> PASS
     assert status["tests/test_b.py"] is Status.FAIL
     assert status["tests/test_c.py"] is Status.SKIP  # all skipped
 
 
 def test_parse_junit_missing_file_is_empty(tmp_path: Path) -> None:
-    assert _parse_junit_by_file(tmp_path / "nope.xml") == ({}, [])
+    assert _parse_junit_by_file(tmp_path / "nope.xml") == ({}, [], {})
 
 
 def test_aggregate_precedence() -> None:
@@ -174,7 +187,10 @@ def test_collection_error_in_a_row_file_reads_error_not_fail(
     broken += '<error message="collection failure">ImportError</error></testcase>'
     _fake_pytest(monkeypatch, _passing_plus(broken), pytest.ExitCode.TESTS_FAILED)
     run = default_pytest_runner(["tests/test_a.py", "tests/test_b.py"])
-    assert run == PytestRun({"tests/test_a.py": Status.PASS, "tests/test_b.py": Status.ERROR})
+    assert run == PytestRun(
+        {"tests/test_a.py": Status.PASS, "tests/test_b.py": Status.ERROR},
+        counts={"tests/test_a.py": FileCounts(passed=1), "tests/test_b.py": FileCounts(errored=1)},
+    )
 
 
 def test_broken_run_exit_leads_the_run_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,7 +215,9 @@ def test_default_runner_accepts_exit_1_a_row_file_explains(monkeypatch: pytest.M
 
 def test_default_runner_clean_exit_has_no_run_error(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_pytest(monkeypatch, _PASSING, pytest.ExitCode.OK)
-    assert default_pytest_runner(["tests/test_a.py"]) == PytestRun({"tests/test_a.py": Status.PASS})
+    assert default_pytest_runner(["tests/test_a.py"]) == PytestRun(
+        {"tests/test_a.py": Status.PASS}, counts={"tests/test_a.py": FileCounts(passed=1)}
+    )
 
 
 def test_default_runner_drops_pytest_addopts_from_the_child_env(
@@ -251,6 +269,291 @@ def test_once_row_still_passes_with_a_skipped_suite() -> None:
     assert _pytest_row_result(once, mixed).status is Status.PASS
     per_db = replace(once, per_db=PER_DB)
     assert _pytest_row_result(per_db, mixed).status is Status.SKIP
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+#: Any ``MEFOR_TEST_*`` name, in any case (Windows reads environment names case-insensitively), and
+#: the bare prefix a name built at run time starts from (``f"MEFOR_TEST_{db}"``). Not derived from
+#: the registry, so a gate the registry has never heard of is still found.
+_TEST_GATE_NAME = re.compile(r"MEFOR_TEST\w*", re.IGNORECASE)
+
+
+def _strip_docstrings(tree: ast.AST) -> None:
+    """Drop every docstring, so a gate named only in prose (tests/test_cluster_lease.py) reads none."""
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if (
+            isinstance(body, list)
+            and body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body[0] = ast.Pass()
+
+
+def server_gates(source: str) -> list[tuple[int, str]]:
+    """Each ``MEFOR_TEST`` name in a string of ``source`` outside a docstring, as (line, name).
+
+    Any mention counts, not only a skip condition, so at least these gate shapes are found: a
+    ``skipif`` or ``xfail`` mark, ``pytest.skip`` or a raised ``SkipTest`` under an ``if``, and a
+    local, class attribute or module name bound to the read, in any letter case, and a name built at
+    run time from the whole ``MEFOR_TEST`` prefix. Not found: a gate in an imported helper or a
+    conftest fixture, a prefix split across strings (``"MEFOR_" + "TEST_"``), and a gate on some
+    other variable.
+    """
+    tree = ast.parse(source)
+    _strip_docstrings(tree)
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            hits.extend((node.lineno, name) for name in _TEST_GATE_NAME.findall(node.value))
+    return hits
+
+
+def _callee(call: ast.Call) -> str:
+    func = call.func
+    return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+
+
+def _is_unset_test(cond: ast.expr, var: str) -> bool:
+    """Whether ``cond`` is true exactly when ``var`` is unset, in one of the shapes the suites use.
+
+    ``not os.getenv(VAR)``, ``not os.environ.get(VAR)`` and ``VAR not in os.environ``. Anything else
+    reads as not proven, so an inverted or diluted condition fails the check.
+    """
+    if isinstance(cond, ast.UnaryOp) and isinstance(cond.op, ast.Not):
+        call = cond.operand
+        return (
+            isinstance(call, ast.Call)
+            and ast.unparse(call.func) in ("os.getenv", "os.environ.get")
+            and len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value == var
+        )
+    return (
+        isinstance(cond, ast.Compare)
+        and isinstance(cond.left, ast.Constant)
+        and cond.left.value == var
+        and len(cond.ops) == 1
+        and isinstance(cond.ops[0], ast.NotIn)
+        and ast.unparse(cond.comparators[0]) == "os.environ"
+    )
+
+
+def skips_whole_unless(source: str, var: str) -> bool:
+    """Whether the module's one ``pytestmark`` binding carries a skipif on ``var`` being unset.
+
+    The name must appear exactly once in the module, at that top-level binding, so a rebinding in
+    an ``if``, a ``for``, an import, or a mutation such as ``pytestmark.clear()`` reads as not proven.
+    """
+    tree = ast.parse(source)
+    uses = sum(isinstance(n, ast.Name) and n.id == "pytestmark" for n in ast.walk(tree))
+    uses += sum(
+        "pytestmark" in (alias.name, alias.asname)
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+        for alias in n.names
+    )
+    if uses != 1:
+        return False
+    value: ast.expr | None = None
+    for stmt in tree.body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in stmt.targets)
+            or (
+                isinstance(stmt, ast.AnnAssign)
+                and isinstance(stmt.target, ast.Name)
+                and stmt.target.id == "pytestmark"
+                and stmt.value is not None
+            )
+        ):
+            value = stmt.value
+    if value is None:
+        return False
+    marks = value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
+    return any(
+        isinstance(mark, ast.Call)
+        and ast.unparse(mark.func) == "pytest.mark.skipif"
+        and len(mark.args) >= 1
+        and _is_unset_test(mark.args[0], var)
+        for mark in marks
+    )
+
+
+def _per_db_pytest_refs() -> set[str]:
+    return {
+        ref
+        for row in MATRIX
+        if row.is_per_db and row.coverage is Coverage.PYTEST
+        for ref in row.refs
+    }
+
+
+@pytest.mark.parametrize("ref", sorted(SERVER_SUITE_GATES))
+def test_every_server_suite_skips_whole_on_its_own_gate(ref: str) -> None:
+    assert ref in _per_db_pytest_refs(), f"{ref} is registered but no Per-DB row names it"
+    source = (_REPO_ROOT / ref).read_text(encoding="utf-8")
+    own = SERVER_SUITE_GATES[ref]
+    assert skips_whole_unless(source, own)
+    # Gated whole on one backend, the file must not gate some tests on another backend too. Its own
+    # variants (MEFOR_TEST_SQLSERVER_STRICT) only narrow a file that already skips whole.
+    assert [hit for hit in server_gates(source) if not hit[1].upper().startswith(own)] == []
+
+
+def test_no_other_per_db_file_gates_a_test_on_a_server_backend() -> None:
+    # The no-mixed-file invariant: a file outside the registry that gated some tests on a server
+    # backend would read PASS on its SQLite tests alone, with the server tests skipped.
+    unregistered = sorted(_per_db_pytest_refs() - SERVER_SUITE_GATES.keys())
+    # A floor, so an empty scan cannot read as no offenders: 15 unregistered Per-DB pytest refs
+    # when this was written. Lower it only when a ref moves into SERVER_SUITE_GATES.
+    assert len(unregistered) >= 15, unregistered
+    offenders = {
+        ref: hits
+        for ref in unregistered
+        if (hits := server_gates((_REPO_ROOT / ref).read_text(encoding="utf-8")))
+    }
+    assert offenders == {}
+
+
+_MIXED_SOURCES = {
+    "decorator": """
+import os, pytest
+def test_sqlite(): pass
+@pytest.mark.skipif(not os.getenv("MEFOR_TEST_SQLSERVER"), reason="server")
+def test_server(): pass
+""",
+    "skip under if": """
+import os, pytest
+@pytest.fixture
+def server():
+    if "MEFOR_TEST_POSTGRES" not in os.environ:
+        pytest.skip("no server")
+""",
+    "through a local": """
+import os, unittest
+def test_server():
+    on = os.getenv("MEFOR_TEST_SQLSERVER")
+    if not on:
+        raise unittest.SkipTest("no server")
+""",
+    "xfail mark": """
+import os, pytest
+@pytest.mark.xfail(not os.getenv("MEFOR_TEST_POSTGRES"), run=False, reason="server")
+def test_server(): pass
+""",
+    "built at run time": """
+import os, pytest
+@pytest.fixture(params=["sqlite", "postgres"])
+def backend(request):
+    if request.param != "sqlite" and not os.getenv(f"MEFOR_TEST_{request.param.upper()}"):
+        pytest.skip("no server")
+""",
+    "lower case": """
+import os, pytest
+@pytest.mark.skipif(not os.getenv("mefor_test_sqlserver"), reason="server")
+def test_server(): pass
+""",
+    "a variant of a registered gate": """
+import os, pytest
+@pytest.mark.skipif(os.getenv("MEFOR_TEST_SQLSERVER_STRICT") != "1", reason="strict")
+def test_strict(): pass
+""",
+    "a backend the registry does not name": """
+import os, pytest
+@pytest.mark.skipif(not os.getenv("MEFOR_TEST_ORACLE"), reason="server")
+def test_server(): pass
+""",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_MIXED_SOURCES))
+def test_the_mixed_file_check_catches_a_per_test_server_gate(shape: str) -> None:
+    # Negative control: each shape is a SQLite-plus-server file the invariant must refuse.
+    source = _MIXED_SOURCES[shape]
+    assert server_gates(source) != []
+    assert not skips_whole_unless(source, "MEFOR_TEST_SQLSERVER")
+    assert not skips_whole_unless(source, "MEFOR_TEST_POSTGRES")
+
+
+_GATED = 'pytest.mark.skipif(not os.getenv("MEFOR_TEST_SQLSERVER"), reason="server")'
+
+
+@pytest.mark.parametrize(
+    ("pytestmark", "whole"),
+    [
+        (f"pytestmark = {_GATED}", True),
+        (f"pytestmark = [pytest.mark.asyncio, {_GATED}]", True),
+        (f"pytestmark: object = {_GATED}", True),
+        (
+            'pytestmark = pytest.mark.skipif(bool(os.getenv("MEFOR_TEST_SQLSERVER")), reason="x")',
+            False,
+        ),
+        (
+            'pytestmark = pytest.mark.skipif(not os.getenv("MEFOR_TEST_SQLSERVER") and False, reason="x")',
+            False,
+        ),
+        (f"pytestmark = {_GATED}\npytestmark = pytest.mark.asyncio", False),
+        (f"pytestmark = pytest.mark.asyncio({_GATED})", False),
+        ("pytestmark: object", False),
+        (f"pytestmark = {_GATED}\nif True:\n    pytestmark = pytest.mark.asyncio", False),
+        (f"pytestmark = {_GATED}\npytestmark.args = ()", False),
+        (f"pytestmark = {_GATED}\nfrom other import pytestmark", False),
+    ],
+)
+def test_the_whole_file_check_reads_the_condition_not_a_mention(
+    pytestmark: str, whole: bool
+) -> None:
+    source = f"import os, pytest\n{pytestmark}\n"
+    assert skips_whole_unless(source, "MEFOR_TEST_SQLSERVER") is whole
+
+
+def test_the_mixed_file_check_ignores_prose_and_other_settings() -> None:
+    source = '''
+"""Gated elsewhere on ``MEFOR_TEST_SQLSERVER``; this module is not."""
+import os, pytest
+def test_doc():
+    """Mentions MEFOR_TEST_POSTGRES in prose only."""
+    assert os.getenv("MEFOR_STORE_BACKEND", "sqlite")
+'''
+    assert server_gates(source) == []
+
+
+_MIXED_JUNIT = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" tests="3">
+  <testcase classname="tests.test_mixed" name="test_sqlite" file="tests/test_mixed.py" time="0.1"/>
+  <testcase classname="tests.test_mixed" name="test_sqlserver" file="tests/test_mixed.py" time="0.1">
+    <skipped message="set MEFOR_TEST_SQLSERVER"/></testcase>
+  <testcase classname="tests.test_mixed" name="test_postgres" file="tests/test_mixed.py" time="0.1">
+    <skipped message="set MEFOR_TEST_POSTGRES"/></testcase>
+</testsuite></testsuites>
+"""
+
+
+def test_a_mixed_file_reads_pass_with_its_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Why the no-mixed-file invariant exists: within a file PASS outranks SKIP, so a Per-DB row whose
+    # file mixed SQLite tests with skipped server tests would read PASS. The counts show the skips.
+    _fake_pytest(monkeypatch, _MIXED_JUNIT, pytest.ExitCode.OK)
+    run = default_pytest_runner(["tests/test_mixed.py"])
+    assert run.counts["tests/test_mixed.py"] == FileCounts(passed=1, skipped=2)
+    row = MatrixRow("Z2", "Z", "t", PER_DB, Coverage.PYTEST, ("tests/test_mixed.py",))
+    result = _pytest_row_result(row, run)
+    assert result.status is Status.PASS
+    assert result.detail == "test_mixed.py=PASS (1 passed, 2 skipped)"
+
+
+def test_an_xfail_is_not_counted_as_a_skip(tmp_path: Path) -> None:
+    xfail = '<testcase name="t" file="tests/test_a.py"><skipped type="pytest.xfail"/></testcase>'
+    junit = tmp_path / "junit.xml"
+    junit.write_text(_passing_plus(xfail), encoding="utf-8")
+    status, _, counts = _parse_junit_by_file(junit)
+    assert status["tests/test_a.py"] is Status.PASS
+    assert counts["tests/test_a.py"] == FileCounts(passed=1, xfailed=1)
+    row = MatrixRow("Z3", "Z", "t", PER_DB, Coverage.PYTEST, ("tests/test_a.py",))
+    run = PytestRun(status, counts=counts)
+    assert _pytest_row_result(row, run).detail == "test_a.py=PASS"  # no skip to show
 
 
 def test_default_runner_flags_a_report_that_attributes_nothing(

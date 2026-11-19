@@ -5,34 +5,53 @@
 # dependency. Ships in the wheel (hatchling packages every file under messagefoundry/); reference the
 # installed copy via importlib.resources. See docs/security/SECURING-HANDLER-CONFIG-IN-CI.md.
 # Static taint is a filter, not a boundary (~16-70% recall). Run with --error to block; drop it to advise.
-# Minor gaps mirroring the AST lint: attribute-form loggers (self.logger.info) / decorators (@mf.handler).
+# Known gaps include at least: a file handle opened in one function and written in another; a write
+# through a handle by anything but its own .write/.writelines (json.dump(x, fh), csv.writer(fh));
+# an opener or lookup imported under an alias from a module none of the patterns below names; a
+# receiver named other than the names below; and a function whose first parameter is not the message.
 rules:
   # --- (1) inter-statement taint: message body/fields -> dangerous sink ------------------------------
-  # SOURCE = the message parameter (first positional) of every @handler/@router. Taint propagates
-  # through accessors (msg.raw, msg.field(...), msg["PID-3"], msg.encode(), ...) and assignments
-  # (body = msg.raw), so a body reaching a sink one or more statements later is caught.
+  # SOURCE = the first positional parameter of EVERY function, def or async def, decorated or not;
+  # on a method, the parameter after a receiver named self, cls, mcs, klass, metacls or _self. So
+  # undecorated helpers and module-qualified or aliased @handler/@router decorators are covered
+  # (BACKLOG #5380). This is close to, NOT the same as, the AST lint's phi-to-log scope: that lint
+  # also keys on the first positional parameter of every function, but takes `self` on a method and
+  # skips async def. Every function's first parameter is a source, so a helper whose first parameter
+  # is a path, statement or event name is flagged too, and under --error that blocks; the AST lint
+  # carries the same false positive but is advisory by default. Taint propagates through accessors
+  # (msg.raw, msg.field(...), msg["PID-3"], msg.encode(), ...) and assignments (body = msg.raw), so a
+  # body reaching a sink one or more statements later is caught.
   - id: mf-handler-phi-to-log
     mode: taint
     languages: [python]
     severity: WARNING
     metadata: {asvs: "15.2.5", note: "CLAUDE.md §9 never log full bodies at INFO+"}
     message: >
-      Message body/fields reach print() or an INFO+ logger call. Full payloads are PHI and go only to
-      the secured store, never the general log (CLAUDE.md §9). Log a non-PHI id (control id) instead.
+      Message body/fields reach print(), sys.stdout/sys.stderr or an INFO+ logger call. Full payloads
+      are PHI and go only to the secured store, never the general log (CLAUDE.md §9). Log a non-PHI id
+      (control id) instead.
     pattern-sources:
       - patterns:
           - pattern-either:
-              - pattern: |
-                  @handler(...)
-                  def $F($MSG, ...):
-                      ...
-              - pattern: |
-                  @router(...)
-                  def $F($MSG, ...):
-                      ...
+              - patterns:
+                  - pattern: |
+                      def $F($MSG, ...):
+                          ...
+                  - metavariable-regex:
+                      metavariable: $MSG
+                      regex: ^(?!(_?self|cls|mcs|klass|metacls)\b)
+              - patterns:
+                  - pattern: |
+                      def $F($RECV, $MSG, ...):
+                          ...
+                  - metavariable-regex:
+                      metavariable: $RECV
+                      regex: ^(_?self|cls|mcs|klass|metacls)\b
           - focus-metavariable: $MSG
     pattern-sinks:
       - pattern: print(...)
+      - pattern: sys.stdout.write(...)
+      - pattern: sys.stderr.write(...)
       - patterns:
           - pattern-either:
               - pattern: $LOG.info(...)
@@ -45,10 +64,12 @@ rules:
               - pattern: $LOG.log(...)
           - metavariable-regex:
               metavariable: $LOG
-              regex: (?i)^(.*_)?(log|logger|logging)$
+              regex: (?i)^(.*[._])?(log|logger|logging)$
     pattern-sanitizers:
       # HL7 MSH envelope metadata is non-PHI (control id / message type); logging it is the recommended
       # safe pattern, so it clears the taint on this rule (so the remediation above does not itself flag).
+      # A helper that RECEIVES a control id as its first parameter cannot see this sanitizer, and so is
+      # flagged (see the SOURCE note above).
       - pattern: $M.control_id
       - pattern: $M.message_type
       - pattern: $M.message_code
@@ -59,31 +80,82 @@ rules:
     severity: WARNING
     metadata: {asvs: "15.2.5", note: "CLAUDE.md §8 validate before it reaches SQL"}
     message: >
-      Message-derived data flows into the db_lookup/fhir_lookup STATEMENT/QUERY argument. Keep the
-      statement constant and pass values through the parameterized `params` dict / structured FHIR
-      query — never string interpolation (SQL / FHIR injection).
+      Message-derived data flows into the db_lookup/fhir_lookup STATEMENT/QUERY argument, or into a
+      FhirRaw value or the system half of a FhirToken. Keep the statement and query constant, pass
+      message values as values in the parameterized `params` dict, never inside a FhirRaw or a
+      FhirToken system, and never interpolate them (SQL / FHIR injection).
     pattern-sources:
       - patterns:
           - pattern-either:
-              - pattern: |
-                  @handler(...)
-                  def $F($MSG, ...):
-                      ...
-              - pattern: |
-                  @router(...)
-                  def $F($MSG, ...):
-                      ...
+              - patterns:
+                  - pattern: |
+                      def $F($MSG, ...):
+                          ...
+                  - metavariable-regex:
+                      metavariable: $MSG
+                      regex: ^(?!(_?self|cls|mcs|klass|metacls)\b)
+              - patterns:
+                  - pattern: |
+                      def $F($RECV, $MSG, ...):
+                          ...
+                  - metavariable-regex:
+                      metavariable: $RECV
+                      regex: ^(_?self|cls|mcs|klass|metacls)\b
           - focus-metavariable: $MSG
     pattern-sinks:
+      # The statement/query is the 2nd positional or the statement=/query= keyword, whatever form the
+      # connection takes (positional or connection=), called bare, through a module (`mf.db_lookup`),
+      # or through an import alias Semgrep resolves (`from messagefoundry import db_lookup as dl`).
       - patterns:
           - pattern-either:
-              - pattern: db_lookup($CONN, $STMT, ...)
-              - pattern: db_lookup($CONN, statement=$STMT, ...)
-              - pattern: fhir_lookup($CONN, $STMT, ...)
-              - pattern: fhir_lookup($CONN, query=$STMT, ...)
+              - pattern: $LOOKUP($CONN, $STMT, ...)
+              - pattern: $LOOKUP(..., statement=$STMT, ...)
+              - pattern: $LOOKUP(..., query=$STMT, ...)
+          - metavariable-pattern:
+              metavariable: $LOOKUP
+              pattern-either:
+                - pattern: db_lookup
+                - pattern: fhir_lookup
+                - pattern: $MOD.db_lookup
+                - pattern: $MOD.fhir_lookup
+                - pattern: messagefoundry.db_lookup
+                - pattern: messagefoundry.fhir_lookup
+                - pattern: messagefoundry.config.db_lookup.db_lookup
+                - pattern: messagefoundry.config.fhir_lookup.fhir_lookup
           - focus-metavariable: $STMT
+      # FHIR search syntax that is the AUTHOR's includes the whole of a FhirRaw, the system half of a
+      # FhirToken, and a `params` dict key (the search parameter's name). Message data there is
+      # injection. This sink flags the first two only: a `params` key is not flagged, and neither is
+      # the FhirToken code half.
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern: $KIND($V, ...)
+                      - pattern: $KIND(..., value=$V, ...)
+                  - metavariable-pattern:
+                      metavariable: $KIND
+                      pattern-either:
+                        - pattern: FhirRaw
+                        - pattern: $MOD.FhirRaw
+                        - pattern: messagefoundry.FhirRaw
+                        - pattern: messagefoundry.fhirsearch.FhirRaw
+              - patterns:
+                  - pattern-either:
+                      - pattern: $KIND($V, ...)
+                      - pattern: $KIND(..., system=$V, ...)
+                  - metavariable-pattern:
+                      metavariable: $KIND
+                      pattern-either:
+                        - pattern: FhirToken
+                        - pattern: $MOD.FhirToken
+                        - pattern: messagefoundry.FhirToken
+                        - pattern: messagefoundry.fhirsearch.FhirToken
+          - focus-metavariable: $V
   - id: mf-handler-phi-to-file
     mode: taint
+    options:
+      symbolic_propagation: true
     languages: [python]
     severity: WARNING
     metadata: {asvs: "15.2.5", note: "CLAUDE.md §9 payloads go only to the secured store"}
@@ -93,21 +165,72 @@ rules:
     pattern-sources:
       - patterns:
           - pattern-either:
-              - pattern: |
-                  @handler(...)
-                  def $F($MSG, ...):
-                      ...
-              - pattern: |
-                  @router(...)
-                  def $F($MSG, ...):
-                      ...
+              - patterns:
+                  - pattern: |
+                      def $F($MSG, ...):
+                          ...
+                  - metavariable-regex:
+                      metavariable: $MSG
+                      regex: ^(?!(_?self|cls|mcs|klass|metacls)\b)
+              - patterns:
+                  - pattern: |
+                      def $F($RECV, $MSG, ...):
+                          ...
+                  - metavariable-regex:
+                      metavariable: $RECV
+                      regex: ^(_?self|cls|mcs|klass|metacls)\b
           - focus-metavariable: $MSG
     pattern-sinks:
-      # Path-specific writes only. Bare `.write()` (open(...,"w").write) is caught by Control A's
-      # ambient-authority (write-mode open), so it is intentionally NOT a sink here — a bare-`.write`
-      # taint sink over-matches benign io.StringIO/io.BytesIO payload assembly.
+      # This rule does NOT lean on Control A. The ambient-authority lint flags a builtin `open` whose
+      # 2nd argument is a LITERAL write mode, and an `X.open` whose 1st argument is one -- right for
+      # Path(p).open("w"), wrong for codecs.open/io.open(path, mode), where it reads the path as the
+      # mode. It misses at least a non-literal mode, an aliased open, os.write and tempfile, and
+      # flags shutil only when called by that name.
       - pattern: $P.write_text(...)
       - pattern: $P.write_bytes(...)
+      - patterns:
+          - pattern: os.write($FD, $DATA)
+          - focus-metavariable: $DATA
+      # The SOURCE argument of a shutil copy or move: the content or file being written out.
+      - patterns:
+          - pattern-either:
+              - pattern: shutil.copyfileobj($SRC, ...)
+              - pattern: shutil.copyfile($SRC, ...)
+              - pattern: shutil.copy($SRC, ...)
+              - pattern: shutil.copy2($SRC, ...)
+              - pattern: shutil.copytree($SRC, ...)
+              - pattern: shutil.move($SRC, ...)
+          - focus-metavariable: $SRC
+      # A bare `.write()` on ANY receiver is not a sink: it over-matches benign io.StringIO/io.BytesIO
+      # payload assembly. `.write()`/`.writelines()` count on a handle this rule saw opened as a file,
+      # whatever the mode expression says: chained, assigned or bound by `with`. `builtins.open` and
+      # `$P.open` resolve an import alias (`from builtins import open as o`, codecs.open, io.open), and
+      # symbolic propagation (this rule's options, above) resolves an opener bound to a name (`o = open`).
+      - patterns:
+          - pattern-either:
+              - pattern: $OPEN(...).write(...)
+              - pattern: $OPEN(...).writelines(...)
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          $FH = $OPEN(...)
+                          ...
+                      - pattern-inside: |
+                          with $OPEN(...) as $FH:
+                              ...
+                  - pattern-either:
+                      - pattern: $FH.write(...)
+                      - pattern: $FH.writelines(...)
+          - metavariable-pattern:
+              metavariable: $OPEN
+              pattern-either:
+                - pattern: open
+                - pattern: builtins.open
+                - pattern: $P.open
+                - pattern: tempfile.NamedTemporaryFile
+                - pattern: tempfile.TemporaryFile
+                - pattern: tempfile.SpooledTemporaryFile
+                - pattern: os.fdopen
   # --- (2) aliased-import evasion: plain search rules; Semgrep resolves `from X import y as z` --------
   # These match the qualified name through an import alias (r(...) == subprocess.run(...)), the exact
   # case the name-literal AST scan misses. They fire regardless of taint: reaching past the sanctioned

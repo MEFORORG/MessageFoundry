@@ -68,6 +68,7 @@ def _loosenings(
         revocation_attested_hops=(),
         path_form_fhir_hops=(),
         ech_cleartext_sidecar_hops=(),
+        listener_trusted_proxy_hops=(),
         api=ApiSettings(),
         approvals=ApprovalsSettings(),
         cert_monitor=CertMonitorSettings(),
@@ -906,6 +907,31 @@ def test_open_egress_gate_still_refuses_smtp_only_when_deny_by_default_is_opted_
     assert "egress is UNRESTRICTED on a production PHI instance" in err
     assert "block_unlisted_outbound" in err
     assert "allowed_smtp" in err
+
+
+@pytest.mark.parametrize(
+    "intermediary",
+    ['egress.allowed_proxy = ["proxy.example"]', 'egress.allowed_ech_sidecar = ["127.0.0.1:8123"]'],
+    ids=["allowed_proxy", "allowed_ech_sidecar"],
+)
+def test_an_intermediary_list_never_satisfies_the_open_egress_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    intermediary: str,
+) -> None:
+    """``allowed_proxy`` and ``allowed_ech_sidecar`` gate a transport intermediary, not a
+    destination, so listing one says nothing about where PHI may be sent: under the opt-out the
+    gate still names an instance that lists only one of them, on both arms: under the opt-out it
+    refuses, and with the switch unset it still says no destination is declared, where an SMTP or
+    Direct list would satisfy it (BACKLOG #1659, #5528)."""
+    toml = f"security.block_unlisted_outbound = false\n{intermediary}\n"
+    rc = _serve(tmp_path, monkeypatch, toml, env="prod")
+    assert rc == 2
+    assert "egress is UNRESTRICTED on a production PHI instance" in capsys.readouterr().err
+
+    _serve(tmp_path, monkeypatch, f"{intermediary}\n", env="prod")
+    assert "no outbound destination is declared" in capsys.readouterr().err
 
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only

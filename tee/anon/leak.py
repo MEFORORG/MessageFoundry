@@ -9,16 +9,15 @@ literal or fragmented customer/vendor token appears in this tracked, published f
 drift (``test_anon_parity`` still pins the two equal). Loading by path keeps the tee ``messagefoundry``-free.
 The name and estate tables are read from the guard at each scan, not copied at import, so a
 ``reload_tokens()`` on this module's own guard instance, ``_GUARD``, reaches those tables and the
-liveness flag together (BACKLOG
-#5541). It does not reach the site-code check: ``surrogates.message_has_site_code`` keeps the
-prefixes ``surrogates.py`` loaded at import until ``surrogates.reload_site_prefixes()`` runs, so
-after a guard reload alone a report can call the denylist live while that check uses the old
-prefixes.
+liveness flag together (BACKLOG #5541). The site-code check reads its own table, loaded in
+``surrogates.py``; a report calls the denylist live only when that table holds the guard's
+two-digit ``[site_prefix]`` entries (``surrogates.site_prefix_split``).
 
 The real tokens themselves are EXTERNALIZED out of the guard (a git-ignored token file /
-``MEFOR_FORBIDDEN_TOKENS``), so a token-less checkout (a fork, or an installed wheel with no
-``scripts/``) loads the name + estate + site-code tables **empty** and the leak-check degrades to a
-no-op for those (a public checkout has no customer estate to leak). The generic IP detector keeps a
+``MEFOR_FORBIDDEN_TOKENS``), so a checkout with no token source (a fork, or an installed wheel
+with no ``scripts/`` and no ``MEFOR_FORBIDDEN_TOKENS``) loads the name, estate and site-code tables
+**empty** and the leak-check degrades to a no-op for those (a public checkout has no customer
+estate to leak). The generic IP detector keeps a
 literal default so the anonymizer's structural IP check still functions without a token source.
 
 Returns **reasons only** (never the matched text), and the token denylist is the fail-closed
@@ -32,7 +31,8 @@ separator cut across fields, when at least one of them is unmapped (BACKLOG #346
 a retarget of a default field left past its first component (:func:`retarget_residue_hits`,
 BACKLOG #3493), and the components an ``id``, ``mrn``, ``ssn`` or ``dln`` rule keeps as captured
 past its first (:func:`kept_component_hits`, BACKLOG #5533, #5534). The shape detectors that read one field, and the token scan, read a value
-decoded from its HL7 escape sequences as well as as written (BACKLOG #5532); docs/PHI.md section
+decoded from its HL7 escape sequences as well as as written, when the message has a parseable
+MSH that declares an escape character (BACKLOG #5532); docs/PHI.md section
 9, *An escaped value is read decoded too*, lists at least the escaped forms each check still
 passes.
 """
@@ -51,13 +51,17 @@ from pathlib import Path
 from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind, retargeted_defaults
 from .surrogates import (
     COMPONENT_KEEPING_KINDS,
+    SITE_PREFIX_SPLIT_LEAD,
+    SITE_PREFIX_WIDTH_MARK,
     Seps,
     decoded_readings,
     dropped,
+    folded,
     message_has_site_code,
     read_message_seps,
+    repeats_encoding_characters,
+    site_prefix_split,
     trim,
-    unescape,
     unescaped_fields,
     unescaped_message,
 )
@@ -228,14 +232,30 @@ def _ipv6_candidates(run: str) -> Iterator[str]:
 def _label_dropped_runs(run: str) -> tuple[str, ...]:
     """``run`` without a leading label that ends in hex letters or digits and a colon or dot, as
     in ``Device:`` or ``data.``, without a trailing ``:port``, and without both, as in
-    ``IPv6:<address>:443``. Tried only when no text :func:`_ipv6_candidates` gives parses, so a
+    ``IPv6:<address>:443``, and with a dotted tail cut as the code below says. Tried only when no text :func:`_ipv6_candidates` gives parses, so a
     well-formed address, such as a unique-local ``fd00:1::5``, is never read as the shorter
     address its tail would make."""
     labels = (
         run.split(":", 1)[1] if ":" in run else run,
         run.split(".", 1)[1] if "." in run else run,
     )
-    return (*labels, run.rsplit(":", 1)[0], *(label.rsplit(":", 1)[0] for label in labels))
+    # Every dotted group after the last colon cut off, as in ``4000:a1::5.1.2``, which no dotted
+    # IPv4 tail parses in, and the tail cut to its first four groups and to its last four, as in
+    # ``::ffff:8.8.8.8.1.2``, whose IPv4 part the first cut would drop (BACKLOG #5654).
+    last_colon = run.rfind(":")
+    dot = run.find(".", last_colon + 1)
+    cut: tuple[str, ...] = ()
+    if last_colon != -1 and dot != -1:
+        head, groups = run[: last_colon + 1], run[last_colon + 1 :].split(".")
+        cut = (run[:dot],)
+        if len(groups) > 4:
+            cut += (head + ".".join(groups[:4]), head + ".".join(groups[-4:]))
+    return (
+        *labels,
+        run.rsplit(":", 1)[0],
+        *(label.rsplit(":", 1)[0] for label in labels),
+        *cut,
+    )
 
 
 def _is_allowed_ipv6(address: ipaddress.IPv6Address) -> bool:
@@ -264,8 +284,8 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
             continue
         verdict = _judge_ipv6_texts(_ipv6_candidates(run), ipv4_is_routable)
         if verdict is None:
-            dropped = (c for r in _label_dropped_runs(run) for c in _ipv6_candidates(r))
-            verdict = _judge_ipv6_texts(dropped, ipv4_is_routable)
+            labelled = (c for r in _label_dropped_runs(run) for c in _ipv6_candidates(r))
+            verdict = _judge_ipv6_texts(labelled, ipv4_is_routable)
         if verdict:
             return True
     return False
@@ -710,19 +730,52 @@ def _walk(
     return out, split_hits
 
 
+def _without_highlighting(text: str, seps: Seps) -> str:
+    """``text`` with every ``\\H\\`` and ``\\N\\`` taken out, as a display that shows
+    highlighting rather than a character reads it (:func:`.surrogates.decoded_readings`)."""
+    escape = seps.escape
+    return text.replace(f"{escape}H{escape}", "").replace(f"{escape}N{escape}", "")
+
+
 def _line_readings(fields: list[str], seps: Seps, field_sep: str) -> list[list[str]]:
     """The fields of one line as written, then with each field decoded a subcomponent at a time
-    and a component at a time, the readings :func:`unescaped_message` gives the token scan. The
-    segment id and encoding characters of a header line are left as written. A reading the same
-    as one before it is left out."""
-    readings = [fields]
-    if not seps.escape or not any(seps.escape in field for field in fields):
-        return readings
-    for by_component in (False, True):
-        decoded = unescaped_fields(fields, seps, field_sep, by_component=by_component)
-        if decoded not in readings:
-            readings.append(decoded)
+    and a component at a time, the readings :func:`unescaped_message` gives the token scan, each
+    decoded both with ``\\H\\`` and ``\\N\\`` kept and with them taken out. Every one of those is
+    also read with its invisible characters dropped (:func:`.surrogates.dropped`), the readings
+    :func:`_shape_forms` takes of one field (BACKLOG #5654). The segment id and encoding
+    characters of a header line are left as written when decoded. A reading the same as one
+    before it is left out."""
+    sources = [fields]
+    if seps.escape and any(seps.escape in field for field in fields):
+        shown = [_without_highlighting(field, seps) for field in fields]
+        sources += [
+            unescaped_fields(source, seps, field_sep, by_component=by_component)
+            for source in (fields, shown)
+            for by_component in (False, True)
+        ]
+    keep = _separators(seps, field_sep) + _SHOWN_WHITESPACE
+    readings: list[list[str]] = []
+    for source in sources:
+        for reading in (source, [dropped(field, keep) for field in source]):
+            if reading not in readings:
+                readings.append(reading)
     return readings
+
+
+#: The control characters a consumer shows as white space rather than drop: TAB, line feed,
+#: vertical tab, form feed, carriage return and NEL. Every reading this module takes with
+#: invisible characters dropped, but the MRN-typed check's, keeps them, so ``1<TAB>23-45-6789``
+#: is not read as a dashed SSN.
+_SHOWN_WHITESPACE = "\t\n\x0b\x0c\r\x85"
+
+
+def _separators(seps: Seps, field_sep: str) -> str:
+    """The field, component, repetition and subcomponent separators the message declares: the
+    characters the token scan, the cut-shape check and :func:`_shape_forms`'s as-written reading
+    keep when they drop invisible characters, so a TAB field separator does not join two fields
+    there (BACKLOG #5654). A decoded part's readings (:func:`.surrogates.decoded_readings`) do not
+    keep them."""
+    return field_sep + seps.component + seps.repetition + seps.subcomponent
 
 
 def _split_shape_hits(
@@ -734,7 +787,8 @@ def _split_shape_hits(
 
     The line is read as written and with its fields decoded (:func:`_line_readings`), so a shape
     whose own characters are escaped, such as ``123-45\\X2D\\6789`` under a field separator of
-    ``-``, is found too (#5533 item 8). A separator is only where the fields meet, so a field
+    ``-``, is found too (#5533 item 8), and so is one an invisible character or a ``\\H\\`` or
+    ``\\N\\`` escape interrupts, such as ``123-45-67\\XAD\\89`` (BACKLOG #5654). A separator is only where the fields meet, so a field
     separator a ``\\F\\`` decodes to inside a field never counts as a cut; the shape detectors
     that read one field judge that one.
 
@@ -772,10 +826,10 @@ def _split_shape_hits(
     return hits
 
 
-def _decoded_parts(value: str, seps: Seps, field_sep: str) -> Iterator[str]:
-    """Each component of ``value`` that holds the escape character, decoded whole, and each of its
-    subcomponents that holds one, decoded on its own. Those are the two readings the engine gives
-    a part: ``Message`` decodes a whole component on a component read and one subcomponent on a
+def _escaped_parts(value: str, seps: Seps) -> Iterator[str]:
+    """Each component of ``value`` that holds the escape character, whole, and each of its
+    subcomponents that holds one, on its own. Those are the two parts the engine decodes:
+    ``Message`` decodes a whole component on a component read and one subcomponent on a
     subcomponent read, and ``Peek`` decodes a subcomponent. A part is decoded after the split, so
     an escaped separator inside it never makes a new one. A part with no escape character is left
     out: the raw scan of the whole value already read it."""
@@ -785,62 +839,97 @@ def _decoded_parts(value: str, seps: Seps, field_sep: str) -> Iterator[str]:
         for comp in rep.split(seps.component):
             if seps.escape not in comp:
                 continue
-            yield unescape(comp, seps, field_sep)
+            yield comp
             if seps.subcomponent in comp:
-                for leaf in comp.split(seps.subcomponent):
-                    if seps.escape in leaf:
-                        yield unescape(leaf, seps, field_sep)
+                yield from (leaf for leaf in comp.split(seps.subcomponent) if seps.escape in leaf)
+
+
+def _shape_forms(value: str, seps: Seps, field_sep: str) -> list[str]:
+    """The readings the one-field shape detectors take of ``value``: as written, with its
+    invisible characters dropped (:func:`.surrogates.dropped`), and each part
+    :func:`_escaped_parts` names read every way :func:`.surrogates.decoded_readings` reads it
+    without splitting it again, ``\\H\\`` and ``\\N\\`` dropped and invisible characters
+    dropped among them. So ``123-45-67\\XAD\\89`` reads as a dashed SSN (BACKLOG #5654)."""
+    forms = [value, dropped(value, _separators(seps, field_sep) + _SHOWN_WHITESPACE)]
+    for part in _escaped_parts(value, seps):
+        forms += decoded_readings(part, seps, field_sep, resplit=False, keep=_SHOWN_WHITESPACE)
+    return list(dict.fromkeys(forms))
+
+
+def _dropped_lines(text: str, keep: str) -> str:
+    """``text`` with the invisible characters of each line dropped (:func:`.surrogates.dropped`)
+    and its line breaks and the characters in ``keep``, the message's declared separators
+    (:func:`_separators`), kept, so two lines or two fields never join into one token."""
+    lines = text.replace("\r\n", "\r").replace("\n", "\r").split("\r")
+    return "\r".join(dropped(line, keep) for line in lines)
 
 
 def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]:
     """``scan`` run over ``text`` as written, then over :func:`unescaped_message` decoded a
     subcomponent at a time and a component at a time, so a token written with an HL7 escape
-    sequence is found in either reading (BACKLOG #5532). A decoding that matches one already
-    scanned is not scanned again, and a reason a later pass finds again is not repeated."""
+    sequence is found in either reading (BACKLOG #5532). Each decoding is also taken with
+    ``\\H\\`` and ``\\N\\`` taken out first, and every reading is also scanned with the invisible
+    characters of each line dropped, the readings the cut-shape check takes of a line, so a token
+    an invisible character or a ``\\H\\`` interrupts is found too (BACKLOG #5654). A reading that
+    matches one already scanned is not scanned again, and a reason a later pass finds again is
+    not repeated."""
+    sources = [text]
+    parsed = read_message_seps(text)
+    keep = _SHOWN_WHITESPACE + (_separators(*parsed) if parsed is not None else "")
+    if parsed is not None and parsed[0].escape and parsed[0].escape in text:
+        shown = _without_highlighting(text, parsed[0])
+        sources += [
+            unescaped_message(source, by_component=by_component)
+            for source in dict.fromkeys((text, shown))
+            for by_component in (False, True)
+        ]
     hits = scan(text)
-    scanned = {text}
-    for by_component in (False, True):
-        decoded = unescaped_message(text, by_component=by_component)
-        if decoded not in scanned:
-            scanned.add(decoded)
-            hits.extend(hit for hit in scan(decoded) if hit not in hits)
+    readings = dict.fromkeys(
+        r for source in sources for r in (source, _dropped_lines(source, keep))
+    )
+    for reading in list(readings)[1:]:
+        hits.extend(hit for hit in scan(reading) if hit not in hits)
     return hits
 
 
 def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     """True if any repetition of ``value`` has a non-empty component 1 and an ``MR``/``MRN`` id
     type — an unmapped medical-record number by HL7 structure, far more precise than a bare
-    digit-run heuristic. Two readings count (BACKLOG #5654):
-
-    * any component, component 1 included, that is ``MR`` or ``MRN`` whole or as its first
-      subcomponent, as written or decoded and trimmed, so ``12345^MR``, ``MRN^12345``,
-      ``12345^MR&L`` and an XCN ``1234^DOE^JOHN^^^MR`` count, as they did before; and
-    * CX.5, the identifier type code, in any of its subcomponents too, as written or decoded and
-      trimmed, so ``ID^^^AUTH^MR&local`` counts.
-
-    ``M\\X52\\`` (BACKLOG #5532) and ``MR\\X20\\`` count in either. A decoded part is never split
-    again, so ``PET&MR`` outside CX.5, and a word ``MR`` that an escaped delimiter or whitespace
-    sets apart, as in ``PET\\T\\MR`` or ``X\\S\\MR``, do not count. :func:`.surrogates.trim`
-    says what is trimmed. The id counts when it is non-empty as written, so one that decodes to
-    nothing, such as ``\\Z98765\\``, counts."""
+    digit-run heuristic. A component counts, component 1 included, when it is ``MR`` or ``MRN``
+    whole or as its first subcomponent; and components 5, 7 and 13, where CX.5, XON.7 and
+    XCN.13 carry an identifier type code, count in any one of their subcomponents too. So
+    ``12345^MR``, ``MRN^12345``, ``12345^MR&L``, an XCN ``1234^DOE^JOHN^^^MR``,
+    ``ID^^^AUTH^MR&local``, ``ACME^L^^^^AUTH^X&MR`` and ``1234^DOE^JOHN^^^^^^AUTH^^^^X&MR``
+    count, each on any reading :func:`_is_mrn_type` takes. The check does not know a field's
+    type, so those three components are read that way in every field, a coded element's
+    alternate text in component 5 included; an ``MR`` subcomponent past the first in any other
+    component, such as ``70553^PET&MR``, does not count (BACKLOG #5654). A decoded part is never
+    split again, so a word ``MR`` that an escaped delimiter or whitespace sets apart, as in
+    ``PET\\T\\MR`` or ``X\\S\\MR``, does not count. The id counts when it is non-empty as
+    written, so one that decodes to nothing, such as ``\\Z98765\\``, counts."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
         if not comps[0]:
             continue
-        if any(_is_mrn_type(comp, seps, field_sep, subcomponents=False) for comp in comps):
-            return True
-        if len(comps) >= 5 and _is_mrn_type(comps[4], seps, field_sep, subcomponents=True):
+        if any(
+            _is_mrn_type(comp, seps, field_sep, subcomponents=at in _ID_TYPE_COMPONENTS)
+            for at, comp in enumerate(comps, start=1)
+        ):
             return True
     return False
 
 
+#: The 1-based components that hold an identifier type code in a common HL7 type: CX.5, XON.7
+#: and XCN.13. Each is read in any one of its subcomponents (BACKLOG #5654).
+_ID_TYPE_COMPONENTS = frozenset({5, 7, 13})
+
+
 def _is_mrn_type(comp: str, seps: Seps, field_sep: str, *, subcomponents: bool) -> bool:
-    """True if ``comp`` is ``MR`` or ``MRN`` as written or decoded whole, as a ``Message`` component
-    read decodes it, or as its first subcomponent, as ``Peek`` reads a component that has them,
-    each reading also with its invisible characters dropped (:func:`.surrogates.dropped`), each
-    trimmed (:func:`.surrogates.trim`), and never split again. With ``subcomponents``, any one of
-    its subcomponents counts the same way, since a ``Message`` subcomponent read can read any of
-    them (BACKLOG #5654)."""
+    """True if ``comp`` is ``MR`` or ``MRN``, whole or as its first subcomponent, or with
+    ``subcomponents`` as any one of them: as written, decoded as a ``Message`` component or
+    subcomponent read decodes it, each reading also with its invisible characters dropped
+    (:func:`.surrogates.dropped`), each trimmed (:func:`.surrogates.trim`), each also folded to
+    compatibility form (:func:`.surrogates.folded`), and never split again (BACKLOG #5654)."""
     leaves = comp.split(seps.subcomponent)
     if len(leaves) == 1:
         parts: tuple[str, ...] = (comp,)
@@ -855,20 +944,27 @@ def _is_mrn_type(comp: str, seps: Seps, field_sep: str, *, subcomponents: bool) 
             *decoded_readings(part, seps, field_sep, resplit=False),
         )
     ]
-    return any(trim(form).upper() in _MRN_TYPES for form in forms)
+    for form in forms:
+        typed = trim(form)
+        if typed.upper() in _MRN_TYPES:
+            return True
+        # Folded first: a compatibility letter with no case mapping folds to lower case.
+        if not typed.isascii() and folded(typed).upper() in _MRN_TYPES:
+            return True
+    return False
 
 
 def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
     """PHI-safe shape labels for one unmapped field value — the SHAPE only, never the value.
 
     Each shape is looked for in the value as written and in each of its parts decoded
-    (:func:`_decoded_parts`), so a shape written with HL7 escape sequences, such as
+    (:func:`_shape_forms`), so a shape written with HL7 escape sequences, such as
     ``123\\X2D\\45\\X2D\\6789``, is found too (BACKLOG #5532). A routable IPv6 address is looked
     for the same way (:func:`_has_routable_ipv6`). It is read here, in a field no rule rewrote, and
     not over the whole message, so a surrogate the anonymizer wrote, such as an id whose letters
     came out as hex beside a ``::``, is never refused as one (BACKLOG #5654)."""
     reasons: list[str] = []
-    forms = [value, *_decoded_parts(value, seps, field_sep)]
+    forms = _shape_forms(value, seps, field_sep)
     for pattern, reason in _SPLITTABLE_SHAPES:
         if reason not in reasons and any(pattern.search(form) for form in forms):
             reasons.append(reason)
@@ -910,10 +1006,18 @@ def _header_ipv6_hits(text: str, mapped_paths: set[str]) -> list[str]:
     for address, value in values:
         if not value or address in mapped_paths:
             continue
-        forms = [value, *_decoded_parts(value, seps, field_sep)]
+        forms = _shape_forms(value, seps, field_sep)
         if any(_has_routable_ipv6(form, _ipv4_is_routable) for form in forms):
             hits.append(f"unmapped {IPV6_REASON} in {address}")
     return hits
+
+
+#: The hit for a header that repeats an MSH-2 encoding character (BACKLOG #5374). No field of such
+#: a message can be read, so it is reported whether or not ``rules`` were given, and it carries
+#: advice of its own: no rule can fix it.
+REPEATED_ENCODING_HIT = "MSH-2 repeats an encoding character, so no field could be read"
+#: The step for :data:`REPEATED_ENCODING_HIT`.
+_REPEATED_ENCODING_ADVICE = "Repair the header: MSH-2 must hold four different encoding characters."
 
 
 def structural_phi_hits(
@@ -921,7 +1025,8 @@ def structural_phi_hits(
 ) -> list[str]:
     """Structural PHI-shape hits over the fields no rule matched — reasons name the shape + field
     ADDRESS only (e.g. ``"unmapped SSN-shaped value in ZPD-4"``), never the offending value, so the
-    result is safe to raise/log. Empty when the message has no parseable MSH. ``version`` is
+    result is safe to raise/log. Empty when the message has no parseable MSH, except for
+    :data:`REPEATED_ENCODING_HIT` (see below). ``version`` is
     handed to the walk behind :func:`unmapped_field_values`.
 
     A line no rule can reach (kinds include at least a malformed segment id, a short header line,
@@ -933,9 +1038,14 @@ def structural_phi_hits(
     is a hit too, named by the fields it spans (:func:`_split_shape_hits`, BACKLOG #3465).
 
     The header, which the walk skips, is read for a routable IPv6 address alone
-    (:func:`_header_ipv6_hits`, BACKLOG #5654)."""
+    (:func:`_header_ipv6_hits`, BACKLOG #5654).
+
+    A header that repeats an MSH-2 encoding character is a hit by itself (BACKLOG #5374): no field
+    of such a message can be read, so an empty result would read as clean."""
     parsed = read_message_seps(text)
     if parsed is None:
+        if repeats_encoding_characters(text):
+            return [REPEATED_ENCODING_HIT]
         return []
     seps, field_sep = parsed
     hits: list[str] = []
@@ -1080,7 +1190,8 @@ class LeakReport:
 
     * ``hits`` — every leak reason (token/IP/site + structural); non-empty means refuse.
     * ``unmapped_fields`` — the addresses present but matched by no rule (the coverage report).
-    * ``structural_hits`` — the subset of ``hits`` from the structural PHI-shape detectors.
+    * ``structural_hits`` — the subset of ``hits`` from the structural PHI-shape detectors,
+      and :data:`REPEATED_ENCODING_HIT`, which is reported with or without ``rules``.
     * ``token_tables_live`` — whether the denylist tables loaded from a real token source.
     * ``token_floor_reason`` — why the denylist is not trustworthy, or ``None`` if it is.
     * ``undecided_fields`` — the addresses present that no rule scrubs, no ``keep`` names and
@@ -1104,15 +1215,17 @@ class LeakReport:
 def leak_report(
     text: str, *, rules: tuple[FieldRule, ...] | None = None, version: str | None = None
 ) -> LeakReport:
-    """The full :class:`LeakReport` for ``text`` using the tee's vendored token authority.
+    """The full :class:`LeakReport` for ``text`` using the publish guard this module loads, ``_GUARD``.
 
     Behaviourally parallel to the toolkit's :func:`messagefoundry_toolkit.anon.leak.leak_report`: the
     token hits come from the tee's local :func:`scan_text` (and the field-anchored site-code check)
     rather than the toolkit's ``_scanner()`` delegate, but the structural walk, coverage report, and
     token-floor signal are the byte-identical shared logic above. Structural detection engages **only
-    when ``rules`` is supplied**; a bare-string call is token-only, as the legacy one was, except
-    that the token scan also reads the text decoded from its HL7 escape sequences when it has a
-    parseable MSH (BACKLOG #5532).
+    when ``rules`` is supplied**, over the same fields and components as the toolkit's; a
+    bare-string call is token-only, except that a header that repeats an MSH-2 encoding character
+    is still reported as :data:`REPEATED_ENCODING_HIT` (BACKLOG #5374). The token scan also reads
+    the text decoded from its HL7 escape sequences when it has a parseable MSH (BACKLOG #5532), and
+    it reads the guard's tables at each scan (BACKLOG #5541).
 
     ``version`` is the HL7 version a bare line is judged by. A caller that checks the OUTPUT of
     ``anonymize`` passes the version of the INPUT (:func:`message_version`), because a rule may
@@ -1126,7 +1239,9 @@ def leak_report(
     undecided: tuple[str, ...] = ()
     if rules is None:
         unmapped: tuple[str, ...] = ()
-        structural: list[str] = []
+        # Without rules no field is walked, but a header no field can be read under is still
+        # reported, or a token-only call would read it as clean (BACKLOG #5374).
+        structural: list[str] = [REPEATED_ENCODING_HIT] if repeats_encoding_characters(text) else []
     else:
         # A KEEP rule rewrote nothing, so its field stays in the detectors' scope; it only
         # counts as DECIDED for the coverage switch (BACKLOG #1710).
@@ -1158,7 +1273,11 @@ def leak_report(
     token_floor_reason: str | None
     if _GUARD is not None:
         token_tables_live = bool(_GUARD.TOKENS_PRESENT)  # type: ignore[attr-defined]
-        token_floor_reason = _GUARD.token_floor_failure()  # type: ignore[attr-defined]
+        # The site-code check reads its own table, so the denylist is live only when that table
+        # is the guard's (BACKLOG #5541).
+        token_floor_reason = _GUARD.token_floor_failure() or site_prefix_split(  # type: ignore[attr-defined]
+            tuple(_GUARD._SITE_PREFIXES)  # type: ignore[attr-defined]
+        )
     else:
         token_tables_live = False
         # nosec B105: a human-readable diagnostic string, not a credential; bandit's
@@ -1184,10 +1303,10 @@ def leak_check(
 ) -> list[str]:
     """Forbidden-token + structural PHI hits in ``text`` (empty list = clean) — a thin wrapper over
     :func:`leak_report`. ``rules`` scopes the structural PHI-shape detectors to the fields no rule
-    matched, to what a retarget left and to the components an identifier rule keeps; omitting it
-    (a bare-string call) runs the token-only check :func:`leak_report` describes. A caller that ran
-    ``anonymize`` itself
-    passes ``version=message_version(raw)``, as :func:`leak_report` says.
+    matched, a ``keep`` rule's field counting as unmatched, to what a retarget left and to the
+    components an identifier rule keeps; omitting it (a bare-string call) runs the token-only
+    check :func:`leak_report` describes. A caller that ran ``anonymize`` itself passes
+    ``version=message_version(raw)``, as :func:`leak_report` says.
     """
     return leak_report(text, rules=rules, version=version).hits
 
@@ -1204,9 +1323,11 @@ def coverage_clause(report: LeakReport) -> str:
 
 
 def denylist_is_live(report: LeakReport) -> bool:
-    """True only if the token tables loaded AND passed the floor check. ``token_tables_live`` alone
-    is true for a source that lost a whole section, which ``token_floor_reason`` then names, so
-    printing "live" from the first field alone overstated the check (BACKLOG #2247)."""
+    """True only if the token tables loaded, passed the floor check, and hold the same
+    two-digit ``[site_prefix]`` entries as the table the site-code check reads
+    (``site_prefix_split``, BACKLOG #5541). ``token_tables_live`` alone is true for a source that
+    lost a whole section, which ``token_floor_reason`` then names, so printing "live" from the
+    first field alone overstated the check (BACKLOG #2247)."""
     return report.token_tables_live and report.token_floor_reason is None
 
 
@@ -1261,7 +1382,8 @@ def refusal_advice(
     steps: list[str] = []
     token_hit = len(report.hits) > len(report.structural_hits)
     shape_hit = any(
-        hit != MALFORMED_LINE_HIT and not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE)
+        hit not in (MALFORMED_LINE_HIT, REPEATED_ENCODING_HIT)
+        and not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE)
         for hit in report.structural_hits
     )
     if token_hit or shape_hit:
@@ -1270,6 +1392,8 @@ def refusal_advice(
         # No rule may rewrite MSH-2, so the step above cannot reach the text after its
         # encoding characters (BACKLOG #5654).
         steps.append(_MSH2_ADVICE)
+    if REPEATED_ENCODING_HIT in report.structural_hits:
+        steps.append(_REPEATED_ENCODING_ADVICE)
     steps.extend(mapped_field_advice(report))
     if coverage_refused:
         steps.append("Add a rule for each field named, or a keep for one you reviewed.")
@@ -1280,7 +1404,22 @@ def refusal_advice(
     if MALFORMED_LINE_HIT in report.structural_hits:
         steps.append(MALFORMED_LINE_ADVICE)
     if denylist_refused:
-        steps.append("Load the denylist token source.")
+        reason = report.token_floor_reason or ""
+        if reason.startswith(SITE_PREFIX_SPLIT_LEAD):
+            # The source loaded; the site-code table and the guard's differ (BACKLOG #5541).
+            steps.append(
+                "The site-code check's prefixes differ from the publish guard's [site_prefix] "
+                "table. A new run loads both from one token source, which clears a split that a "
+                "reload of one table left; docs/PHI.md section 9 describes the check."
+            )
+        elif SITE_PREFIX_WIDTH_MARK in reason:
+            # The source loaded; the site-code table cannot load one of its entries.
+            steps.append(
+                "The token source holds a [site_prefix] entry that is not two digits, and the "
+                "anonymizer loads two-digit prefixes only."
+            )
+        else:
+            steps.append("Load the denylist token source.")
     return " ".join(steps)
 
 

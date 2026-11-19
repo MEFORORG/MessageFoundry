@@ -437,12 +437,12 @@ def _refuse(
 ) -> None:
     """One call of the guard. The CRL flag is read off a context ``ssl_context_factory``
     builds, each time the guard asks; the adapter's kept read has its own test."""
-    from messagefoundry.config.tls_policy import context_checks_revocation
+    from messagefoundry.config.tls_policy import crl_credited
     from messagefoundry.transports.strict_requests import _refuse_an_unrevoked_vault_hop
 
     arguments: dict[str, Any] = {
         "connector": "Vault test hop",
-        "checks_revocation": lambda: context_checks_revocation(ssl_context_factory()),
+        "checks_revocation": lambda: crl_credited(ssl_context_factory()),
         "revocation_attested": False,
         "attestation_section": "store",
     }
@@ -660,21 +660,20 @@ def test_the_crl_flag_is_read_once_for_a_client_however_many_times_it_sends(
 ) -> None:
     """The guard runs at the mount and before every send, and the Transit cipher sends once per
     stored cell. Reading the flag builds a TLS context, so it is read off one context and kept.
-    Mutation: ``return context_checks_revocation(self._ssl_context_factory())`` with no kept
-    answer."""
+    Mutation: ``return crl_credited(self._ssl_context_factory())`` with no kept answer."""
     import requests
 
     from messagefoundry.config import secretprovider_vault
-    from messagefoundry.config.tls_policy import context_checks_revocation
+    from messagefoundry.config.tls_policy import crl_credited
     from messagefoundry.transports import strict_requests
 
     seen: list[object] = []
 
     def counting(ctx: ssl.SSLContext | None) -> bool:
         seen.append(ctx)
-        return context_checks_revocation(ctx)
+        return crl_credited(ctx)
 
-    monkeypatch.setattr(strict_requests, "context_checks_revocation", counting)
+    monkeypatch.setattr(strict_requests, "crl_credited", counting)
     client = secretprovider_vault._build_client(
         _OFF_BOX,
         _TOKEN,

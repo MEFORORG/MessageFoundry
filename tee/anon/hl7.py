@@ -20,9 +20,9 @@ custom MSH-1. At least: the date fill writes ``+``, the free-text redaction writ
 every street in the address pool holds a space, and the surrogate kinds write letters and digits.
 Joined back, such a value would add fields and renumber every later field for any reader of the
 output. So :func:`_whole_field` refuses the values a RULE writes that the engine adapter's
-whole-field ``Message.set`` refuses (BACKLOG #5540). Neither adapter checks what the shared
-site-code pass writes after the rules, or a surrogate holding a component, repetition, subcomponent
-or escape character.
+whole-field ``Message.set`` refuses (BACKLOG #5540). The shared site-code pass that runs after
+the rules writes no digit the message declares as a separator. Neither adapter checks a rule's
+surrogate holding a component, repetition, subcomponent or escape character.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ from .surrogates import (
     obx5_kind,
     preserve_obx5_value,
     read_message_seps,
+    repeats_encoding_characters,
     scrub_message_site_codes,
     surrogate_field_recorded,
 )
@@ -74,6 +75,8 @@ def anonymize_message(
     )
     parsed = read_message_seps(text)
     if parsed is None:
+        if repeats_encoding_characters(text):
+            raise AnonError("message MSH-2 repeats an encoding character — refusing to emit")
         raise AnonError("message has no parseable MSH / encoding characters — refusing to emit")
     seps, field_sep = parsed
     segments = [seg.split(field_sep) for seg in text.split("\r")]
@@ -109,15 +112,26 @@ def anonymize_message(
 _REFUSED_IN_FIELD = ("\r", "\n", "\x0b", "\x1c", "\x00")
 
 
+class SurrogateSeparatorRefused(AnonError):
+    """A rule's surrogate would hold the field separator or a character in ``_REFUSED_IN_FIELD``,
+    so writing it would add a field or a line (BACKLOG #5540). A ``keep`` on that field does not
+    help: it would emit the captured value. ``path`` is the rule's field address, never a value."""
+
+    def __init__(self, path: str, cause: str) -> None:
+        super().__init__(f"the surrogate for {path} would hold {cause} — refusing to emit")
+        self.path = path
+
+
 def _whole_field(path: str, value: str, field_sep: str) -> str:
     """``value``, unless it holds the field separator or a character in ``_REFUSED_IN_FIELD``; then a
-    body-free :class:`AnonError` naming the rule, never the value."""
-    if field_sep in value or any(char in value for char in _REFUSED_IN_FIELD):
-        raise AnonError(
-            f"the surrogate for {path} would hold the field separator, a segment separator, an MLLP "
-            "frame byte or NUL — refusing to emit"
-        )
-    return value
+    body-free :class:`SurrogateSeparatorRefused` naming the rule and the cause, never the value."""
+    if field_sep in value:
+        cause = "the message's field separator (MSH-1)"
+    elif any(char in value for char in _REFUSED_IN_FIELD):
+        cause = "a segment separator, an MLLP frame byte or NUL"
+    else:
+        return value
+    raise SurrogateSeparatorRefused(path, cause)
 
 
 def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:

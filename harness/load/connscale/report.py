@@ -1487,9 +1487,12 @@ class ConnScaleReport:
         # it, not only in the JSON artifact.
         # BACKLOG #5574: a step that could not clear itself says why, beside the table, so a failed
         # zero_loss SLO is not read as a message loss nobody can find.
+        # A LOSS step says why too: the table shows only its counts (BACKLOG #5574).
         for r in self.records:
-            if r.no_loss.inconclusive:
-                lines.append(f"no-loss INCONCLUSIVE: {r.step_label} -- {r.no_loss.detail}")
+            if r.no_loss.ok:
+                continue
+            label = "INCONCLUSIVE" if r.no_loss.inconclusive else "LOSS"
+            lines.append(f"no-loss {label}: {r.step_label} -- {r.no_loss.detail}")
         for r in self.records:
             for audit in (r.intake_audit_live, r.intake_audit):
                 if audit.verdict in (VERDICT_INTAKE_COMPLETE, VERDICT_NOT_RUN):

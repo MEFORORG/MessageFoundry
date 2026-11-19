@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -467,19 +468,51 @@ def test_with_no_usable_startedat_the_file_age_decides(
         ("here-sub", "UNREADABLE"),
         ("elsewhere", "DEAD"),
         (None, "UNREADABLE"),
+        ("parent", "UNREADABLE"),
+        ("plain-parent", "DEAD"),
+        ("long-path-prefix", "UNREADABLE"),
+        ("dot-dot-out-of-tree", "UNREADABLE"),
+        ("relative", "UNREADABLE"),
+        ("sibling-prefix", "DEAD"),
+        ("drive-root", "DEAD"),
     ],
-    ids=["same-worktree", "inside-worktree", "other-worktree", "no-cwd-fails-closed"],
+    ids=[
+        "same-worktree",
+        "inside-worktree",
+        "other-worktree",
+        "no-cwd-fails-closed",
+        "checkout-holding-the-worktree",
+        "plain-parent-does-not-reach",
+        "long-path-prefix",
+        "dot-dot-out-of-the-tree-still-vetoes",
+        "relative-cwd-fails-closed",
+        "sibling-sharing-a-prefix",
+        "drive-root-does-not-reach",
+    ],
 )
 def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
     config_root: Path, tmp_path: Path, anon_cwd: str | None, state: str
 ) -> None:
-    """A record naming no session vetoes a lookup for its own tree, case and slashes aside, and not
-    one for another tree. One with no readable cwd cannot be placed, so it vetoes everywhere."""
-    here = tmp_path / "wt-here"
+    """A record naming no session vetoes a lookup for its own tree, case, slashes and a \\\\?\\
+    prefix aside, and one for a tree under a git checkout it sits in, as a primary checkout holds
+    its worktrees. A cwd spelled ``<tree>\\..\\<other>`` is not collapsed, so it still vetoes
+    ``<tree>`` as it did on main. A plain parent directory does not reach, nor does another tree,
+    even one whose name starts with this one's. One with no readable cwd, or a relative one, cannot
+    be placed, so it vetoes everywhere."""
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    here = checkout / "wt-here"
     cwds = {
         "here": str(here).upper().replace("\\", "/") + "/",
         "here-sub": str(here / "sub"),
         "elsewhere": str(tmp_path / "wt-elsewhere"),
+        "parent": str(checkout),
+        "plain-parent": str(tmp_path),
+        "long-path-prefix": "\\\\?\\" + str(here),
+        "dot-dot-out-of-tree": str(here / ".." / "wt-elsewhere"),
+        "relative": "wt-elsewhere",
+        "sibling-prefix": str(checkout / "wt-here-too"),
+        "drive-root": tmp_path.anchor,
     }
     write_session(config_root, pid=never_live_pid(), session_id="5491abab-0000")
     record: dict[str, Any] = {"pid": os.getpid(), "startedAt": NOW_MS}
@@ -491,6 +524,44 @@ def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
         f"-Worktree '{here}').State"
     )
     assert got == state
+
+
+@pytest.mark.parametrize(
+    ("hours_ahead", "state"), [(0, "UNREADABLE"), (48, "UNKNOWN"), (-1, "UNREADABLE")]
+)
+def test_a_callers_now_ages_the_anonymous_records(
+    config_root: Path, tmp_path: Path, hours_ahead: int, state: str
+) -> None:
+    """box-activity.ps1 passes its own -Now. A fresh record naming no session vetoes at the real
+    time and has aged out 48 hours later, by the caller's clock rather than the wall clock. A
+    nullable -Now read through .Value threw here under StrictMode. A record written after a clock
+    taken an hour ago is the freshest kind: it used to read as future-dated and drop out."""
+    wt = tmp_path / "wt-now"
+    _anonymous(config_root, "99017.json", {"startedAt": NOW_MS, "cwd": str(wt)})
+    got = _strict(
+        f"(Get-SessionLiveness -SessionId '5491e5e5' -ConfigRoot '{config_root}' "
+        f"-Worktree '{wt}' -Now ([DateTime]::UtcNow.AddHours({hours_ahead}))).State"
+    )
+    assert got == state
+
+
+def test_a_local_kind_now_ages_a_record_as_the_same_instant_in_utc(config_root: Path) -> None:
+    """A Local-kind -Now was subtracted from UTC times as if it were UTC, so every age moved by the
+    local offset, and on a box ahead of UTC a fresh record aged out. The same instant now ages a
+    record alike in either kind. On 352502253e the two ages differed by the offset (on a box whose
+    offset is not zero)."""
+    started = NOW_MS - 20 * 3600 * 1000
+    _anonymous(config_root, "99018.json", {"startedAt": started, "cwd": "C:\\x"}, age_h=20)
+    got = _strict(
+        f"$rows = @(Get-SessionRecords -ConfigRoot '{config_root}'); $u = [DateTime]::UtcNow; "
+        "$a = @(Get-AnonymousSessionRecords -Records $rows -Now $u); "
+        "$b = @(Get-AnonymousSessionRecords -Records $rows -Now $u.ToLocalTime()); "
+        "'{0:F2}|{1:F2}|{2}' -f $a[0].AgeHours, $b[0].AgeHours, $b[0].Fresh"
+    )
+    utc_age, local_age, fresh = got.split("|")
+    assert abs(float(utc_age) - 20) < 0.1, got
+    assert local_age == utc_age, got
+    assert fresh == "True", got
 
 
 def test_a_vanished_record_file_ages_zero_whatever_its_startedat() -> None:
@@ -510,14 +581,24 @@ def _fleet(
     anonymous: dict[str, Any] | None,
     coord: Path | None = None,
     anon_in_seat_worktree: bool = True,
+    raw_records: dict[str, str] | None = None,
+    extra_seats: dict[str, str] | None = None,
+    fleet_args: list[str] | None = None,
+    prepare: Callable[[Path], None] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run fleet.ps1 -Json over one seat whose own registry record is DEAD, beside an optional
     registry record that names no session. The record's cwd is the seat's worktree, or another
-    worktree, unless ``anonymous`` sets its own. Returns the run and the anonymous record's path."""
+    directory, unless ``anonymous`` sets its own. Both sit inside the primary checkout, which is a
+    worktree of this repo, so a live record in either counts in the denominator. ``raw_records`` maps more registry file names to
+    their exact text, and ``extra_seats`` more seat boxes to the exact text of one seat record in
+    each. ``fleet_args`` replaces ``-Json``. ``prepare`` gets the repo after its first commit.
+    Returns the run and the anonymous record's path."""
     home = tmp_path / "home"
     root = home / ".claude"
     (root / "sessions").mkdir(parents=True)
     write_session(root, pid=never_live_pid(), session_id="5491dead-0000-0000-0000-000000000000")
+    for name, text in (raw_records or {}).items():
+        (root / "sessions" / name).write_text(text, encoding="utf-8")
     repo = tmp_path / "repo"
     seat_wt = repo / "seat-worktree"
     anon = root / "sessions" / "99010.json"
@@ -532,6 +613,8 @@ def _fleet(
         + ["-m", "base"],
     ):
         subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    if prepare is not None:
+        prepare(repo)
     shared = tmp_path / "shared"
     seat_dir = shared / "seats" / "box-5491"
     seat_dir.mkdir(parents=True)
@@ -551,6 +634,9 @@ def _fleet(
         "handoff": None,
     }
     (seat_dir / "5491dead.json").write_text(json.dumps(seat), encoding="utf-8")
+    for box, text in (extra_seats or {}).items():
+        (shared / "seats" / box).mkdir()
+        (shared / "seats" / box / "seat.json").write_text(text, encoding="utf-8")
 
     env = {
         k: v
@@ -560,7 +646,7 @@ def _fleet(
     env.update(USERPROFILE=str(home), MEFOR_COORD_ROOT=str(shared))
     fleet = (coord or REGISTRY.parent) / "fleet.ps1"
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(fleet), "-Json"],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(fleet), *(fleet_args or ["-Json"])],
         cwd=str(repo),
         capture_output=True,
         text=True,
@@ -581,8 +667,9 @@ def test_fleet_reads_a_seat_with_an_anonymous_record_in_its_worktree_as_possibly
     tmp_path: Path,
 ) -> None:
     """The record may be this seat relaunched, so the seat must not read INTERRUPTED, which -Chip and
-    respawn.ps1 treat as respawnable. It counts as a live session without reading as a writer that
-    failed, and the receipt names it."""
+    respawn.ps1 treat as respawnable, and the receipt names it. The seat's worktree is not a
+    registered git worktree here, but it sits inside the primary checkout, so the record counts in
+    the denominator too; the denominator tests below assert that count."""
     proc, anon = _fleet(tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS})
     j = _fleet_json(proc)
     row = {r["Box"]: r for r in j["rows"]}["box-5491"]
@@ -590,13 +677,14 @@ def test_fleet_reads_a_seat_with_an_anonymous_record_in_its_worktree_as_possibly
     receipt = j["receipt"]
     assert receipt["anonymousLiveRecords"] == 1, receipt
     assert str(anon) in receipt["anonymousLiveRecordFiles"]
-    assert receipt["liveSessionsWithoutRecord"] == 0, receipt
 
 
 def test_fleet_leaves_a_seat_alone_when_the_anonymous_record_is_in_another_worktree(
     tmp_path: Path,
 ) -> None:
-    """The twin: a record in another worktree is not this seat, so the seat keeps its own verdict."""
+    """The twin: a record in another directory is not this seat, so the seat keeps its own
+    verdict. That directory is inside the primary checkout, so the record still counts in the
+    denominator; that is not what this asserts."""
     proc, _ = _fleet(
         tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS}, anon_in_seat_worktree=False
     )
@@ -623,18 +711,148 @@ def test_fleet_renders_with_no_anonymous_record(tmp_path: Path) -> None:
 def test_fleet_suppresses_the_roster_when_the_anonymous_scan_fails(tmp_path: Path) -> None:
     """An instrument that failed must not read as no record. The scan is made to throw in a copy of
     the scripts, so the real ones are untouched."""
-    coord = tmp_path / "coord"
-    coord.mkdir()
-    for name in ("fleet.ps1", "mail-key.ps1", "coord-root.ps1"):
-        shutil.copy2(REGISTRY.parent / name, coord / name)
-    broken = REGISTRY.read_text(encoding="utf-8") + (
-        "\nfunction Get-AnonymousSessionRecords { throw 'scan-broke-5491' }\n"
+    coord = _broken_coord(
+        tmp_path, "function Get-AnonymousSessionRecords { throw 'scan-broke-5491' }"
     )
-    (coord / "session-registry.ps1").write_text(broken, encoding="utf-8")
     proc, _ = _fleet(tmp_path, None, coord=coord)
     assert proc.returncode == 4, proc.stdout + proc.stderr
     assert not proc.stdout.strip(), proc.stdout
     assert "scan-broke-5491" in proc.stderr, proc.stderr
+
+
+def _broken_coord(tmp_path: Path, override: str) -> Path:
+    """A copy of fleet.ps1 and the scripts it loads, with ``override`` appended to the copy of
+    session-registry.ps1, so the real scripts are untouched."""
+    coord = tmp_path / "coord"
+    coord.mkdir()
+    for name in ("fleet.ps1", "mail-key.ps1", "coord-root.ps1"):
+        shutil.copy2(REGISTRY.parent / name, coord / name)
+    (coord / "session-registry.ps1").write_text(
+        REGISTRY.read_text(encoding="utf-8") + "\n" + override + "\n", encoding="utf-8"
+    )
+    return coord
+
+
+def test_fleet_suppresses_the_roster_when_the_anonymous_scan_fails_with_no_message(
+    tmp_path: Path,
+) -> None:
+    """The failure is the throw, not its message: an empty message read as a scan that passed."""
+    coord = _broken_coord(
+        tmp_path, "function Get-AnonymousSessionRecords { throw [System.Exception]::new('') }"
+    )
+    proc, _ = _fleet(tmp_path, None, coord=coord)
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert not proc.stdout.strip(), proc.stdout
+    assert "with no message" in proc.stderr, proc.stderr
+
+
+def test_fleet_reads_a_seat_whose_lookup_throws_as_possibly_running(tmp_path: Path) -> None:
+    """An unevaluated fence is not a gone session. A throw used to read UNKNOWN, rendered
+    INTERRUPTED, which -Chip and respawn.ps1 treat as respawnable."""
+    coord = _broken_coord(tmp_path, "function Get-SessionLiveness { throw 'lookup-broke-5491' }")
+    proc, _ = _fleet(tmp_path, None, coord=coord)
+    j = _fleet_json(proc)
+    row = {r["Box"]: r for r in j["rows"]}["box-5491"]
+    assert row["Fence"] == "UNREADABLE", row
+    assert row["State"] == "POSSIBLY RUNNING", row
+    # The receipt says the instrument failed, so a broken fence cannot pass for a busy fleet.
+    assert "lookup-broke-5491" in json.dumps(j), j
+
+
+def test_fleet_reaches_its_refusal_on_an_empty_object_registry_file(tmp_path: Path) -> None:
+    """A registry file holding ``{}`` parses to an object with no properties. Reading its cwd threw
+    under StrictMode and ended fleet with exit 1. It names no session, no pid and no cwd, so it
+    cannot be placed: the roster is suppressed with exit 4 and the file named."""
+    proc, _ = _fleet(tmp_path, None, raw_records={"99015.json": "{}"})
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert "99015.json" in proc.stderr, proc.stderr
+    assert "cannot be found" not in proc.stderr, proc.stderr
+
+
+def test_fleet_counts_a_live_anonymous_record_in_a_real_worktree_in_its_denominator(
+    tmp_path: Path,
+) -> None:
+    """A LIVE record naming no session, whose cwd is one of this repo's worktrees (the primary
+    checkout here), matches no seat record, so the roster is incomplete by it. It was left out of
+    liveSessionsWithoutRecord with no stop. The seat's worktree sits under that checkout, so the
+    seat reads POSSIBLY RUNNING too."""
+    proc, _ = _fleet(
+        tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS, "cwd": str(tmp_path / "repo")}
+    )
+    j = _fleet_json(proc)
+    assert j["receipt"]["liveSessionsWithoutRecord"] == 1, j["receipt"]
+    row = {r["Box"]: r for r in j["rows"]}["box-5491"]
+    assert row["State"] == "POSSIBLY RUNNING", row
+
+
+def _live_named_record(cwd: Path) -> str:
+    """A LIVE registry record naming a session no seat record holds, sitting in ``cwd``."""
+    return json.dumps(
+        {
+            "pid": os.getpid(),
+            "startedAt": NOW_MS,
+            "sessionId": "5485live-0000-0000-0000-000000000000",
+            "cwd": str(cwd),
+        }
+    )
+
+
+def _linked_worktree(repo: Path) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(repo.parent / "repo-wt")],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _nested_repo(repo: Path) -> None:
+    (repo / "nested" / ".git").mkdir(parents=True)
+
+
+@pytest.mark.parametrize(
+    ("where", "counted", "prepare"),
+    [
+        ("repo/sub/dir", 1, None),
+        ("repo-wt/sub", 1, _linked_worktree),
+        ("repo-other", 0, None),
+        ("repo/nested/sub", 0, _nested_repo),
+    ],
+    ids=["subdirectory", "linked-worktree-subdirectory", "sibling-prefix", "nested-repository"],
+)
+def test_fleet_counts_a_live_session_in_a_worktree_subdirectory_in_its_denominator(
+    tmp_path: Path, where: str, counted: int, prepare: Callable[[Path], None] | None
+) -> None:
+    """BACKLOG #5485. A live session whose cwd is a subdirectory of one of this repo's worktrees is
+    a session in that worktree. Exact equality left it out of liveSessionsWithoutRecord, so the
+    roster read complete without it. A sibling directory sharing the name as a prefix is not inside
+    the worktree, and nor is a directory under another repository nested in it."""
+    # The cwd is not created: the denominator compares paths. A nested .git is what it reads.
+    proc, _ = _fleet(
+        tmp_path,
+        None,
+        raw_records={"99485.json": _live_named_record(tmp_path / where)},
+        prepare=prepare,
+    )
+    j = _fleet_json(proc)
+    assert j["receipt"]["liveSessionsWithoutRecord"] == counted, j["receipt"]
+    fired = [s for s in j["receipt"]["stopConditions"] if s.startswith("liveSessionsWithoutRecord")]
+    assert len(fired) == counted, j["receipt"]["stopConditions"]
+
+
+def test_fleet_raises_a_stop_when_a_seat_record_is_unreadable(tmp_path: Path) -> None:
+    """BACKLOG #5485. An unreadable seat record was counted in the receipt and fired no stop, so the
+    roster could read complete with a seat missing from it. The stop names that file and not the
+    parseable seat record _fleet always writes beside it, which is the twin. A record is written by
+    one atomic rename, so the stop says it is damaged and to move it out by hand, never to run again:
+    a rerun reads the same damaged file and stops the same way."""
+    proc, _ = _fleet(tmp_path, None, extra_seats={"box-5485": "{not json"})
+    j = _fleet_json(proc)
+    assert j["receipt"]["recordsUnreadable"] == 1, j["receipt"]
+    fired = [s for s in j["receipt"]["stopConditions"] if s.startswith("recordsUnreadable")]
+    assert len(fired) == 1, j["receipt"]["stopConditions"]
+    assert "box-5485" in fired[0] and "box-5491" not in fired[0], fired
+    assert "damaged" in fired[0] and "by hand" in fired[0], fired
+    assert "run again" not in fired[0], fired
 
 
 @pytest.mark.parametrize(
@@ -648,7 +866,11 @@ def test_fleet_suppresses_the_roster_when_the_anonymous_scan_fails(tmp_path: Pat
     ids=["unreadable", "dead", "anonymous-in-its-tree", "anonymous-elsewhere"],
 )
 def test_sessions_rehome_refuses_an_unreadable_fence(
-    tmp_path: Path, pid: str | None, anonymous: str | None, refusal: str | None
+    tmp_path: Path,
+    pid: str | None,
+    anonymous: str | None,
+    refusal: str | None,
+    home_name: str = "home",
 ) -> None:
     """sessions.ps1 moves a transcript, so an UNREADABLE fence must stop it. A non-numeric pid used
     to throw in the fence, which stopped the move; reading UNREADABLE must stop it the same way. A
@@ -672,7 +894,7 @@ def test_sessions_rehome_refuses_an_unreadable_fence(
         .removeprefix("worktree ")
         .replace("/", "\\")
     )
-    home = tmp_path / "home"
+    home = tmp_path / home_name
     root = home / ".claude"
     sid = "5491eeee-1111-2222-3333-444444444444"
     slug = "".join(c if c.isalnum() else "-" for c in primary)
@@ -711,6 +933,15 @@ def test_sessions_rehome_refuses_an_unreadable_fence(
     else:
         assert proc.returncode == 0 and "already filed" in proc.stdout, proc.stdout + proc.stderr
     assert transcript.exists()
+
+
+def test_sessions_reads_a_profile_whose_name_holds_a_bracket(tmp_path: Path) -> None:
+    """Vault BACKLOG #2985, added item 2. sessions.ps1 listed USERPROFILE as a pattern, so a profile
+    named home[1] matched only a folder named home1, found no config root and no transcript. Red
+    before the fix: the DEAD case below did not find the transcript already filed."""
+    test_sessions_rehome_refuses_an_unreadable_fence(
+        tmp_path, None, None, None, home_name="home[1]"
+    )
 
 
 def test_a_gone_match_beside_a_live_record_naming_no_session_is_unreadable(
@@ -785,3 +1016,166 @@ def test_a_record_with_no_session_id_does_not_break_a_lookup_under_strict_mode(
         "'{0}|{1}' -f $r.State, $l.Matched"
     )
     assert got == "LIVE|1"
+
+
+AUDIT = REGISTRY.parents[1] / "worktree" / "worktree-audit.ps1"
+
+
+def _stale_seat_locks(config_root: Path, locked: Path, sid: str, prelude: str = "") -> str:
+    """How many seat locks Get-StaleSeatLocks lists for one lock on ``locked`` held by ``sid``."""
+    return _strict(
+        f". '{AUDIT}'; {prelude}"
+        f"$w = [pscustomobject]@{{ Path = '{locked}'; Locked = $true; "
+        f"LockReason = 'builder {sid}' }}; "
+        f"@(Get-StaleSeatLocks -Worktrees @($w) -ConfigRoot '{config_root}').Count"
+    )
+
+
+@pytest.mark.parametrize(
+    ("anon_cwd", "listed"),
+    [(None, 1), ("locked", 0), ("elsewhere", 0)],
+    ids=["no-anonymous-record-lists-the-lock", "anonymous-in-the-tree-vetoes", "anywhere-vetoes"],
+)
+def test_stale_seat_locks_keep_the_box_wide_anonymous_veto(
+    config_root: Path, tmp_path: Path, anon_cwd: str | None, listed: int
+) -> None:
+    """A fresh record naming no session vetoes every seat lock on the box, wherever its cwd is: a
+    junction, 8.3 or subst spelling of the locked tree cannot be told apart from another tree by
+    its spelling, so the lookup names no worktree (fail closed). With no such record, the gone
+    session's lock is listed."""
+    sid = "5491a0a0-0000-4000-8000-000000000000"
+    write_session(config_root, pid=never_live_pid(), session_id=sid)
+    locked = tmp_path / "wt-locked"
+    if anon_cwd is not None:
+        cwd = str(locked) if anon_cwd == "locked" else str(tmp_path / "wt-other")
+        _anonymous(config_root, "99016.json", {"pid": os.getpid(), "startedAt": NOW_MS, "cwd": cwd})
+    assert _stale_seat_locks(config_root, locked, sid) == str(listed)
+
+
+# A fence stub for the start-skew plumbing: LIVE only under the removal paths' unbounded skew, STALE
+# (gone) under any bounded one, so the seat's reading names which skew its lookup passed.
+_SKEW_STUB = (
+    "function Test-RecordLiveness { param([AllowNull()][object]$Record, [int]$StartSkewMinutes = 15) "
+    "if ($StartSkewMinutes -eq [int]::MaxValue) { return @{ State = 'LIVE'; Detail = '' } } "
+    "return @{ State = 'STALE'; Detail = 'bounded skew' } }"
+)
+
+
+def test_stale_seat_locks_use_the_removal_paths_unbounded_start_skew(
+    config_root: Path, tmp_path: Path
+) -> None:
+    """A session whose process started long before it registered reads LIVE to the removal fence,
+    which passes [int]::MaxValue, and read STALE, so gone, here under the default 15 minutes. The
+    stub reads LIVE only under the unbounded skew; on 3c19a009b6 the lock was listed."""
+    sid = "5491a1a1-0000-4000-8000-000000000000"
+    write_session(config_root, pid=never_live_pid(), session_id=sid)
+    locked = tmp_path / "wt-skew"
+    assert _stale_seat_locks(config_root, locked, sid, prelude=_SKEW_STUB + "; ") == "0"
+    # A lookup that throws lists no lock either, so the count alone cannot tell the two apart. The
+    # reading names which one it was: LIVE here, UNREADABLE for a throw.
+    assert _seat_lock_state(config_root, sid, _SKEW_STUB + "; ") == "LIVE"
+
+
+def _seat_lock_state(config_root: Path, sid: str, prelude: str) -> str:
+    """The State Get-SeatLockReading gives a seat lock held by ``sid``, after ``prelude``."""
+    return _strict(
+        f". '{AUDIT}'; {prelude}"
+        f"(Get-SeatLockReading -SessionKey '{sid}' -ConfigRoot '{config_root}').State"
+    )
+
+
+def test_a_seat_lock_lookup_that_throws_reads_unreadable_not_live(config_root: Path) -> None:
+    """The negative control for the skew test above: a throwing lookup also lists no lock, and its
+    reading is UNREADABLE, so the LIVE assertion there fails if the stub's lookup threw."""
+    sid = "5491a2a2-0000-4000-8000-000000000000"
+    write_session(config_root, pid=never_live_pid(), session_id=sid)
+    throw = "function Get-SessionLiveness { throw 'lookup-broke-5491' }; "
+    assert _stale_seat_locks(config_root, config_root / "wt-throw", sid, prelude=throw) == "0"
+    assert _seat_lock_state(config_root, sid, throw) == "UNREADABLE"
+
+
+def test_fleet_uses_the_removal_paths_unbounded_start_skew(tmp_path: Path) -> None:
+    """The twin in fleet.ps1: a seat the removal fence reads LIVE read STALE under the default skew,
+    rendered INTERRUPTED, which -Chip and respawn.ps1 treat as respawnable. On 3c19a009b6 it read
+    INTERRUPTED."""
+    proc, _ = _fleet(tmp_path, None, coord=_broken_coord(tmp_path, _SKEW_STUB))
+    row = {r["Box"]: r for r in _fleet_json(proc)["rows"]}["box-5491"]
+    assert row["Fence"] == "LIVE", row
+    assert row["State"] == "RUNNING", row
+
+
+def test_fleet_reads_an_empty_object_seat_record_under_strict_mode(tmp_path: Path) -> None:
+    """A seat record holding ``{}`` has no properties, and ``.PSObject.Properties.Name`` on it threw
+    under fleet.ps1's StrictMode Latest, ending the run with exit 1. On 3c19a009b6 it did."""
+    proc, _ = _fleet(tmp_path, None, extra_seats={"box-empty": "{}"})
+    assert "cannot be found" not in proc.stderr, proc.stderr
+    j = _fleet_json(proc)
+    boxes = {r["Box"] for r in j["rows"]}
+    assert {"box-5491", "box-empty"} <= boxes, boxes
+
+
+def test_fleet_chip_renders_a_seat_record_missing_its_fields_under_strict_mode(
+    tmp_path: Path,
+) -> None:
+    """The -Chip briefing read its seat record's fields bare, so a record lacking asOf, claims or
+    handoff threw under fleet.ps1's StrictMode Latest and wrote no briefing. A missing field now
+    renders as not declared."""
+    rec = {"sessionKey": "5491c0de", "sessionId": "5491c0de-0000", "worktree": str(tmp_path / "w")}
+    proc, _ = _fleet(
+        tmp_path,
+        None,
+        extra_seats={"box-chip": json.dumps(rec)},
+        fleet_args=["-Chip", "-BoxKey", "box-chip", "-SessionKey", "5491c0de"],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "You are a REPLACEMENT SEAT" in proc.stdout, proc.stdout
+    assert "SEAT: NOT DECLARED" in proc.stdout, proc.stdout
+    assert "CLAIMS HELD BY THE PREDECESSOR EPISODE: none" in proc.stdout, proc.stdout
+
+
+# respawn.ps1 (in the vault) respawns only rows whose State is one of these.
+_RESPAWNABLE = {"INTERRUPTED", "HANDED", "ORPHANED-STALE"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{}",
+        "null",
+        json.dumps({"sessionKey": "5491c1de", "worktree": "C:\\nowhere"}),
+        json.dumps({"sessionKey": "5491c1de", "sessionId": "5491c1de-0000"}),
+        json.dumps({"sessionKey": "5491c1de", "lifecycle": "handed"}),
+    ],
+    ids=["empty-object", "null", "no-session-id", "no-worktree", "handed-no-fields"],
+)
+def test_fleet_reads_an_incomplete_seat_record_as_possibly_running(
+    tmp_path: Path, text: str
+) -> None:
+    """A seat record that names no session or no worktree cannot be fenced. It read INTERRUPTED
+    (HANDED when it said so), the population respawn.ps1 respawns and -Chip briefs with
+    ``git -C ""``. It now reads POSSIBLY RUNNING and the receipt names it. On 352502253e each case
+    read INTERRUPTED, or HANDED."""
+    proc, _ = _fleet(tmp_path, None, extra_seats={"box-part": text})
+    j = _fleet_json(proc)
+    row = {r["Box"]: r for r in j["rows"]}["box-part"]
+    assert row["State"] == "POSSIBLY RUNNING", row
+    assert row["State"] not in _RESPAWNABLE
+    assert row["Fence"] == "UNREADABLE", row
+    assert j["receipt"]["seatRecordsIncomplete"] == 1, j["receipt"]
+    assert "box-part" in json.dumps(j["receipt"]["stopConditions"]), j["receipt"]
+    # The twin: the complete seat record beside it keeps its own verdict.
+    assert {r["Box"]: r for r in j["rows"]}["box-5491"]["State"] in _RESPAWNABLE
+
+
+def test_fleet_chip_writes_no_briefing_for_an_incomplete_seat_record(tmp_path: Path) -> None:
+    """-Chip briefed a record with no worktree with ``git -C ""``, which runs in whatever directory
+    the replacement seat starts in. It now refuses and names the record."""
+    proc, _ = _fleet(
+        tmp_path,
+        None,
+        extra_seats={"box-chip": json.dumps({"sessionKey": "5491c2de"})},
+        fleet_args=["-Chip", "-BoxKey", "box-chip", "-SessionKey", "5491c2de"],
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "git -C" not in proc.stdout, proc.stdout
+    assert "box-chip" in proc.stderr and "names no session or no worktree" in proc.stderr

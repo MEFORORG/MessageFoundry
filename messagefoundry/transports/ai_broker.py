@@ -24,8 +24,8 @@ the vetted network call.
   endpoint that is not loopback. :func:`_endpoint_opener` says which opener that gives.
 * **Off the event loop.** :meth:`AiBroker.chat` blocks (a provider POST), and so can construction,
   which builds rest.py's shared opener on first use (BACKLOG #2484), or reads the CA and CRL files
-  for an opener of its own. The API route runs the build and :meth:`AiBroker.chat` each through
-  :func:`asyncio.to_thread`.
+  when it builds the anchored opener :func:`_endpoint_opener` holds. The API route runs the build
+  and :meth:`AiBroker.chat` each through :func:`asyncio.to_thread`.
 * **Revocation (BACKLOG #2193 slice (e), BACKLOG #5527).** The endpoint's certificate is verified,
   and stdlib ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]``
   policy is handed in, and the endpoint is not loopback. So an
@@ -59,6 +59,8 @@ import urllib.request
 from typing import TYPE_CHECKING
 
 from messagefoundry.config.tls_policy import (
+    PEER_NOT_VERIFIED_WAYS_ACROSS,
+    CrlNoCredit,
     HopDisposition,
     HopPosture,
     RevocationHopGuard,
@@ -106,13 +108,20 @@ _DEFAULT_MAX_OUTPUT_TOKENS = 4096
 _DEFAULT_TIMEOUT = 60.0
 
 
-#: The cell the AI hop's revocation refusal and its log lines name. PHI-free and fixed.
+#: The cell the AI hop's revocation refusal and its log lines name where the guard's reason is
+#: that the context consults no CRL. PHI-free.
 _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
+
+#: The cell for any other reason, written through the guard's ``stated_cell``, which drops
+#: "verified" on a context that does not verify the peer. It does not say "no revocation check",
+#: as REST's and remotefile's cells do not on a relaxed hop (vault BACKLOG #4912).
+_AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 
 #: The ways across that refusal under an enforcing posture, besides an endpoint on this machine.
 #: ``[tls].crl_file`` reaches this hop since BACKLOG #5527, the later CRL lever ADR 0173 section 12
 #: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. It is offered only
-#: to a broker that was handed a ``[tls]`` policy: on a build with none, such as a direct
+#: to a broker that was handed a ``[tls]`` policy, on a context whose only reason for no CRL
+#: credit is that it consults none: on a build with none, such as a direct
 #: ``create_app`` whose embedder set no ``app.state.tls_settings``, setting it would change
 #: nothing. No connection's attestation is offered either:
 #: the endpoint is not a connection. Naming either would be a remedy the operator cannot perform.
@@ -128,9 +137,14 @@ _AI_ATTESTATION_LEVER = (
 )
 
 
-def _revocation_lever(*, crl_reachable: bool) -> str:
-    """The refusal's remedy text: :data:`_AI_CRL_LEVER` only where a CRL can reach the hop."""
-    if crl_reachable:
+def _revocation_lever(*, crl_reachable: bool, no_credit: CrlNoCredit | None) -> str:
+    """The refusal's remedy text: :data:`_AI_CRL_LEVER` only where a CRL can reach the hop and
+    could be credited there. On a context that does not verify the peer it is the guard's default
+    for such a context, :data:`~messagefoundry.config.tls_policy.PEER_NOT_VERIFIED_WAYS_ACROSS`
+    (vault BACKLOG #4912)."""
+    if no_credit is CrlNoCredit.PEER_NOT_VERIFIED:
+        return PEER_NOT_VERIFIED_WAYS_ACROSS
+    if crl_reachable and no_credit is CrlNoCredit.NO_CRL:
         return _AI_CRL_LEVER + _AI_ATTESTATION_LEVER
     return _AI_ATTESTATION_LEVER[0].upper() + _AI_ATTESTATION_LEVER[1:]
 
@@ -173,22 +187,26 @@ def _endpoint_opener(
 ) -> urllib.request.OpenerDirector:
     """The opener the broker dials ``endpoint`` through, under the instance ``[tls]`` ``policy``
     (BACKLOG #5527). ``None``, no policy reached the broker, resolves as the empty policy does:
-    the OS trust store and no CRL. The two differ only in the refusal's text, which offers
-    ``[tls].crl_file`` only where a policy reached the broker (``crl_reachable``).
+    the OS trust store and no CRL. The two differ only in the remedy the refusal and the warn
+    line name: each offers ``[tls].crl_file`` only where a policy reached the broker
+    (``crl_reachable``).
 
     The anchor is resolved by ``rest.http_family_trust_anchor``, as for every HTTP-family hop, here
     with no ``tls_ca_file`` of its own: ``[tls].internal_ca_file`` under ``augment`` or ``pinned``,
     and ``[tls].crl_file`` in any mode, each only for a host that is not loopback. So this is where
-    a CRL reaches this hop. An anchor that narrows gets an anchored opener of its own. One that
-    narrows nothing gets rest.py's shared opener, which is never mutated: callers compare an
-    opener to it by identity to learn that.
+    a CRL reaches this hop. An anchor that narrows gets the held anchored opener, built on first
+    use. One that narrows nothing gets rest.py's shared opener, which is never mutated: callers
+    compare an opener to it by identity to learn that.
 
     **The anchored opener is held across requests**, though the broker is built for each one: one
-    slot, keyed on the resolved anchor, so a changed ``[tls]`` policy builds a new one and drops the
-    old. Held, its context is a live hop as every connection's is, so ``loaded_crls`` records the
-    CRL it holds, the expiry monitor judges that copy, and ``crl_reload`` brings it current when
-    the file is replaced. Built per request, it would read and judge the CA and CRL files on every
-    assist call, and record a held copy for each throwaway context.
+    slot, keyed on the resolved anchor, so a narrowing anchor that differs builds a new one in its
+    place. An anchor that narrows nothing leaves the slot as it is, so an opener held before stays
+    held. A replaced opener is no longer held here, but ``loaded_crls`` keeps its context's record
+    until the opener is garbage-collected. Held, its context is a live hop as every connection's
+    is, so ``loaded_crls`` records the CRL it holds, the expiry monitor judges that copy, and
+    ``crl_reload`` brings it current when the file is replaced. Built per request, it would read
+    and judge the CA and CRL files on every assist call, and record a held copy for each throwaway
+    context.
 
     Raises ``ValueError`` or ``OSError`` for a file that cannot be loaded or a CRL that
     ``harden_crl_check`` refuses; a build that raises caches nothing."""
@@ -229,11 +247,14 @@ def _refuse_an_unrevoked_ai_hop(
     """Refuse a verifying AI endpoint hop that checks no revocation and carries no attestation
     (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the ADR 0173 section 12 pattern).
 
-    Every call sends ``[ai].api_key`` and the code sent for assistance over https that verifies
-    the endpoint's certificate. Stdlib ssl checks no OCSP, and no CRL unless one is loaded on the
+    Every call sends ``[ai].api_key`` and the code sent for assistance over https. The openers
+    the broker builds verify the endpoint's certificate; on a context handed in that does not
+    verify the peer, the record says so instead of calling the hop verified, and its remedy is
+    the guard's (vault BACKLOG #4912). Stdlib ssl checks no OCSP, and no CRL unless one is loaded on the
     context, so without one a revoked but unexpired certificate would be accepted with no refusal
     and no record. ``crl_reachable`` says whether a ``[tls]`` policy reached the broker, and so
-    whether the refusal and the warning may offer ``[tls].crl_file``.
+    whether the refusal and the warning may offer ``[tls].crl_file``; they offer it only where
+    the guard's reason is that the context consults no CRL.
 
     The decision is ``tls_policy.revocation_hop_disposition``, the authority every revocation
     guard uses, asked through ``RevocationHopGuard.capture(...).disposition()``, with these inputs:
@@ -248,12 +269,13 @@ def _refuse_an_unrevoked_ai_hop(
       only. The authority ranks it below the enforcing refusal (BACKLOG #299), so it does not
       cross this hop under an enforcing or unknown posture.
     * ``crl_checked`` is read off ``opener``'s https context, the opener the broker will dial
-      through, never off a setting. It is ``True`` only when that context checks a CRL
-      (``context_checks_revocation``) and does not skip time validity
-      (``skips_validity_period``), which would accept a CRL past its ``nextUpdate`` (vault
-      BACKLOG #5086). It is ``True`` when ``[tls].crl_file`` reached the hop through
-      :func:`_endpoint_opener` (BACKLOG #5527). Otherwise the opener is rest.py's shared one,
-      which loads no CRL, or one carrying only ``[tls].internal_ca_file``, so it is ``False``.
+      through, never off a setting. It is ``True`` only when
+      :func:`~messagefoundry.config.tls_policy.crl_no_credit` gives no reason against that
+      context (vault BACKLOG #5086, #4912). That function's docstring is the source of record
+      for the conditions. It can be ``True`` when
+      ``[tls].crl_file`` reached the hop through :func:`_endpoint_opener` (BACKLOG #5527).
+      Otherwise the opener is rest.py's shared one, which loads no CRL, or one carrying only
+      ``[tls].internal_ca_file``, so it is ``False``.
     * An attestation with no reason or a blank one, and a reason holding a control character or a
       lone surrogate, are refused here as at settings load, so a broker built directly cannot
       cross with no recorded reason or forge a log line through it.
@@ -309,14 +331,14 @@ def _refuse_an_unrevoked_ai_hop(
         refusal = str(exc)
     if refusal is not None:
         raise AiBrokerError(refusal)
-    # capture() reads the process-wide variable into its own field and the CRL and time-validity
-    # flags off the context, the same reads every RevocationHopGuard hop makes; disposition() asks
-    # revocation_hop_disposition, logging and raising nothing. Its cell, description and
-    # connection are never rendered here: the texts below are this hop's own. disposition() is
-    # never None, since a posture is held.
+    # capture() reads the process-wide variable into its own field and the context through
+    # crl_no_credit, the same reads every RevocationHopGuard hop makes; disposition() asks
+    # revocation_hop_disposition, logging and raising nothing. The texts below are this hop's own,
+    # worded from the guard's reason (guard.no_credit) and its stated_cell (vault BACKLOG #4912).
+    # disposition() is never None, since a posture is held.
     guard = RevocationHopGuard.capture(
         host=host,
-        cell=_AI_HOP_CELL,
+        cell=_AI_HOP_CELL_OTHER,
         description="sends [ai].api_key over verified https",
         attested=attested,
         context=context,
@@ -326,10 +348,28 @@ def _refuse_an_unrevoked_ai_hop(
     )
     disposition = guard.disposition()
     enforcing = held.enforcing
-    detail = (
-        f"the AI endpoint {host!r} is sent [ai].api_key over https that verifies its "
-        "certificate, but NO certificate revocation checking (OCSP/CRL) is performed"
-    )
+    no_credit = guard.no_credit
+    # On NO_CRL the verify_mode is not CERT_NONE, or there is no context, so stated_cell would keep
+    # "verified" as well.
+    cell = _AI_HOP_CELL if no_credit is CrlNoCredit.NO_CRL else guard.stated_cell
+    sent = f"the AI endpoint {host!r} is sent [ai].api_key over https"
+    if no_credit is CrlNoCredit.PEER_NOT_VERIFIED:
+        detail = (
+            f"{sent} whose TLS context does not verify the peer (verify_mode is CERT_NONE), and "
+            "the guard credits no revocation check on such a context"
+        )
+    elif no_credit is CrlNoCredit.EXPIRY_RELAXED:
+        # A CRL on such a context still refuses a leaf it lists, so "NO revocation checking"
+        # would say less was checked than was; what the hop lacks is a check the guard credits.
+        detail = (
+            f"{sent} whose TLS context skips validity-period checks, and the guard credits no "
+            "revocation check on such a context"
+        )
+    else:
+        detail = (
+            f"{sent} that verifies its certificate, but NO certificate revocation checking "
+            "(OCSP/CRL) is performed"
+        )
     if disposition is HopDisposition.ALLOW:
         # Not when the context's CRL is a real check: that hop crossed on it, not on the
         # attestation, and the line would be a false record. `crl_checked` is the same one field
@@ -339,9 +379,9 @@ def _refuse_an_unrevoked_ai_hop(
         if crossed_on_attestation and _first_crossing("attested", host):
             log_attested_crossing(
                 logger,
-                crossing="verified TLS hop crossed without certificate revocation checking",
+                crossing=guard.crossing_lead,
                 connection=None,
-                detail=f"{_AI_HOP_CELL}: {detail}",
+                detail=f"{cell}: {detail}",
                 reason=revocation_reason,
                 declaration=guard.declaration,
             )
@@ -352,13 +392,15 @@ def _refuse_an_unrevoked_ai_hop(
                 "insecure transport hop permitted -- %s: %s; under [security].enforcement = "
                 "enforce this hop is refused unless %s[ai].endpoint_revocation_attested is true "
                 "with its reason",
-                _AI_HOP_CELL,
+                cell,
                 detail,
-                "a [tls].crl_file covering its issuer is set or " if crl_reachable else "",
+                "a [tls].crl_file covering its issuer is set or "
+                if crl_reachable and no_credit is CrlNoCredit.NO_CRL
+                else "",
             )
         return
     raise AiBrokerError(
-        f"{_AI_HOP_CELL}: {detail}. {_revocation_lever(crl_reachable=crl_reachable)}"
+        f"{cell}: {detail}. {_revocation_lever(crl_reachable=crl_reachable, no_credit=no_credit)}"
     )
 
 

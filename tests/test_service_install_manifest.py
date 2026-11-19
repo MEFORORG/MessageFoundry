@@ -3067,7 +3067,8 @@ def _workdir_seam(parent: Path) -> str:
         return rf"""
   $script:RealWorkDir = ${{function:{_WORKDIR_FN}}}
   $script:WorkOwner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  function {_WORKDIR_FN} {{ & $script:RealWorkDir -Parent {_psq(str(parent))} -OwnerSid $script:WorkOwner }}
+  function {_WORKDIR_FN} {{ & $script:RealWorkDir -Parent {_psq(str(parent))} -OwnerSid $script:WorkOwner `
+    -CheckedUpTo {_psq(str(parent.parent))} }}
 """
     return rf"""
   function {_WORKDIR_FN} {{
@@ -3345,24 +3346,46 @@ def test_the_secedit_files_sit_in_a_fresh_folder_only_administrators_can_change(
 
 
 @_windows_only
-def test_the_work_folder_is_refused_under_a_parent_others_can_delete_in(tmp_path: Path) -> None:
-    """A parent folder that lets another account delete its children lets that account rename the
-    private folder away and substitute its own, so the helper refuses it."""
+@pytest.mark.parametrize(
+    ("where", "grant"),
+    [
+        # A parent that lets another account delete its children lets that account rename the
+        # private folder away and substitute its own. Delete-child alone, so this case still fails
+        # if the check stops judging FILE_DELETE_CHILD.
+        ("parent-children", "*S-1-5-32-545:(DC)"),
+        # Modify holds DELETE on the parent itself but no FILE_DELETE_CHILD, so the parent, with
+        # the private folder inside, can be renamed away and a planted one put at its name.
+        ("parent", "*S-1-5-32-545:M"),
+        # Delete-child alone on the folder ABOVE the parent, on that folder only: it renames the
+        # parent away, though the parent's own DACL grants nothing.
+        ("above", "*S-1-5-32-545:(DC)"),
+        # An entry that applies to the parent and is also inherited still applies to the parent.
+        ("parent-inheritable", "*S-1-5-32-545:(OI)(CI)F"),
+    ],
+)
+def test_the_work_folder_is_refused_when_the_parent_or_a_folder_above_can_be_renamed(
+    tmp_path: Path, where: str, grant: str
+) -> None:
+    """The helper refuses a parent whose children, or which itself, or any folder above which,
+    another account can rename. BACKLOG #8239 item 13 added the last two."""
     assert _UNINSTALL is not None
-    parent = tmp_path / "open-parent"
-    parent.mkdir()
+    above = tmp_path / "above"
+    parent = above / "parent"
+    parent.mkdir(parents=True)
+    target = above if where == "above" else parent
     body = rf"""
   $parent = {_psq(str(parent))}
+  $top = {_psq(str(tmp_path))}
+  $target = {_psq(str(target))}
   $me = [Security.Principal.WindowsIdentity]::GetCurrent()
-  # F, not M: Modify holds no FILE_DELETE_CHILD, and that is the right that renames a child.
-  & icacls $parent /grant '*S-1-5-32-545:(OI)(CI)F' | Out-Null
+  & icacls $target /grant {_psq(grant)} | Out-Null
   $made = $null
   $refusal = ''
-  try {{ $made = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value }}
+  try {{ $made = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value -CheckedUpTo $top }}
   catch {{ $refusal = $_.Exception.Message }}
   $clean = $null
-  & icacls $parent /remove:g '*S-1-5-32-545' | Out-Null
-  try {{ $clean = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value }} catch {{ $clean = "ERR $_" }}
+  & icacls $target /remove:g '*S-1-5-32-545' | Out-Null
+  try {{ $clean = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value -CheckedUpTo $top }} catch {{ $clean = "ERR $_" }}
   [pscustomobject]@{{ made = $made; refusal = $refusal; clean = $clean
     left = @(Get-ChildItem -LiteralPath $parent -Force | ForEach-Object {{ $_.Name }}) }} |
     ConvertTo-Json -Compress
@@ -3370,9 +3393,12 @@ def test_the_work_folder_is_refused_under_a_parent_others_can_delete_in(tmp_path
     got = json.loads(
         _ok(_extract(_UNINSTALL, [_WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
     )
-    assert got["made"] is None, f"a folder was made under an open parent: {got['made']}"
+    assert got["made"] is None, f"a folder was made though {where} can be renamed: {got['made']}"
     assert "S-1-5-32-545" in got["refusal"] or "Users" in got["refusal"], got["refusal"]
-    # POSITIVE CONTROL: the same parent without the grant is accepted.
+    assert f"'{target}' S-1-5-32-545" in got["refusal"], (
+        f"the refusal does not name {target} as the open folder: {got['refusal']}"
+    )
+    # POSITIVE CONTROL: the same chain without the grant is accepted.
     assert got["clean"] and not str(got["clean"]).startswith("ERR"), got["clean"]
     assert got["left"] == [Path(got["clean"]).name], (
         f"the refused attempt left a folder behind: {got['left']}"
@@ -3435,6 +3461,49 @@ def test_the_secedit_folder_defaults_to_the_windows_temp_not_the_users(tmp_path:
         "the user can set SystemRoot and windir for their own processes, so neither may name the "
         "trusted parent"
     )
+
+
+def test_no_caller_cuts_the_secedit_folder_walk_short() -> None:
+    """STATIC. The walk to the root is the production check; -CheckedUpTo, which ends it early, is
+    a test seam, so neither script names it outside the helper's own definition."""
+    assert _SCRIPT is not None and _UNINSTALL is not None
+    for script in (_SCRIPT, _UNINSTALL):
+        text = script.read_text(encoding="utf-8-sig")
+        start = text.index(f"function {_WORKDIR_FN} {{")
+        end = text.index("\nfunction ", start)
+        rest = text[:start] + text[end:]
+        assert "CheckedUpTo" not in rest, f"{script.name} cuts the ancestor walk short"
+
+
+@_windows_only
+def test_the_work_folder_is_refused_under_a_reparse_point_above_the_parent(tmp_path: Path) -> None:
+    """A junction above the parent makes the walk read the junction's own ACL, not the folders that
+    hold the parent, so the helper refuses it."""
+    assert _UNINSTALL is not None
+    real = tmp_path / "real"
+    (real / "parent").mkdir(parents=True)
+    link = tmp_path / "link"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(real)], capture_output=True, text=True
+    )
+    assert made.returncode == 0, made.stdout + made.stderr
+    body = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $out = [ordered]@{{}}
+  foreach ($p in @({_psq(str(link / "parent"))}, {_psq(str(real / "parent"))})) {{
+    try {{ $out[$p] = {_WORKDIR_FN} -Parent $p -OwnerSid $me.User.Value -CheckedUpTo {_psq(str(tmp_path))} }}
+    catch {{ $out[$p] = "ERR $($_.Exception.Message)" }}
+  }}
+  [pscustomobject]$out | ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_UNINSTALL, [_WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
+    )
+    through_link = got[str(link / "parent")]
+    assert str(through_link).startswith("ERR") and "reparse point" in through_link, through_link
+    # POSITIVE CONTROL: the same parent reached by its real path is accepted.
+    direct = got[str(real / "parent")]
+    assert direct and not str(direct).startswith("ERR"), direct
 
 
 def test_both_scripts_carry_the_same_secedit_folder_helper(tmp_path: Path) -> None:

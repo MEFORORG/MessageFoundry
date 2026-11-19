@@ -124,9 +124,11 @@ def load_pkcs12(
     passphrase can never leak into stderr/logs.
 
     Before anything decrypts it, the bundle's MAC and bag encryption are checked (BACKLOG #1352,
-    #1171): a weak or unreadable wrap, a MAC that is not PBMAC1 at the floor even over unencrypted
-    bags, or a bundle that is encrypted or carries a MAC with no passphrase, raises
-    :class:`~messagefoundry.keywrap.KeyWrapRefused`, whose text is safe to show.
+    #1171). At least these raise :class:`~messagefoundry.keywrap.KeyWrapRefused`, whose text is
+    safe to show: a weak or unreadable wrap; a MAC, even over unencrypted bags, that is not PBMAC1
+    or is a PBMAC1 MAC off the terms :func:`~messagefoundry.keywrap.pkcs12_wrap_refusal` lists,
+    such as one under the PBKDF2 floor or with a keyLength that is absent or not its HMAC's output
+    size; and a bundle that is encrypted or carries a MAC with no passphrase.
 
     Then each encrypted part is opened here and the key bags inside it get the same check, before
     ``cryptography`` decrypts any key (BACKLOG #1352; why the part is opened rather than refused is
@@ -1367,7 +1369,27 @@ def _load_one_certificate(data: bytes) -> x509.Certificate:
 
 class PinRefused(ValueError):
     """Why a SQL Server pin file can never match the server's certificate. Its text is the engine's
-    own and names no part of the file, unlike a ``ValueError`` from ``cryptography``'s parser."""
+    own and names no part of the file, unlike a ``ValueError`` from ``cryptography``'s parser.
+    ``scope`` is a fixed word naming the check that refused, for an audit row that carries no
+    path or text (vault BACKLOG #3714). It has a default so a copy or an unpickle, which calls
+    the class with the text alone and then restores ``scope``, works as before."""
+
+    def __init__(self, text: str, *, scope: str = "pin_refused") -> None:
+        super().__init__(text)
+        self.scope = scope
+
+
+class PinReason(str):
+    """A reason :func:`pinned_server_certificate` returns, with ``scope``, the fixed word naming
+    the check that refused (vault BACKLOG #3714). ``scope`` has a default for the same reason as
+    :class:`PinRefused`'s."""
+
+    scope: str
+
+    def __new__(cls, text: str, scope: str = "pin_refused") -> PinReason:
+        reason = super().__new__(cls, text)
+        reason.scope = scope
+        return reason
 
 
 def _signs_certificates(cert: x509.Certificate) -> bool:
@@ -1414,19 +1436,22 @@ def load_pinned_server_certificate(data: bytes) -> x509.Certificate:
         raise PinRefused(
             f"it {ENCRYPTION_HEADER_SCOPE}. The ODBC driver loads this file with its own TLS "
             "library, which can wait for a password on an encrypted block; name the server's "
-            "certificate without encryption headers"
+            "certificate without encryption headers",
+            scope="encryption_header",
         )
     if has_private_key_label_bytes(data):
         raise PinRefused(
             f"it {PRIVATE_KEY_SCOPE}. The pin is the server's public certificate, so a private "
-            "key does not belong in it; name a file holding only that certificate"
+            "key does not belong in it; name a file holding only that certificate",
+            scope="private_key",
         )
     if b"-----BEGIN" in data:
         certs = x509.load_pem_x509_certificates(data)  # ValueError when the file holds none
         if len(certs) != 1:
             raise PinRefused(
                 f"it holds {len(certs)} certificates; the SQL Server pin must be exactly one, the "
-                "server's own certificate"
+                "server's own certificate",
+                scope="certificate_count",
             )
         cert = certs[0]
     else:
@@ -1439,7 +1464,8 @@ def load_pinned_server_certificate(data: bytes) -> x509.Certificate:
         raise PinRefused(
             "it is a CA certificate (basicConstraints CA:TRUE, used to sign certificates); the SQL "
             "Server pin is an exact match, so name the server's own certificate, or trust the CA "
-            "through the machine store instead"
+            "through the machine store instead",
+            scope="ca_certificate",
         )
     return cert
 
@@ -1464,10 +1490,11 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
 
 
 #: The largest SQL Server pin file the engine accepts (BACKLOG #3714). A pin is one certificate,
-#: a few KiB. :func:`read_pinned_server_certificate` reads at most this plus one byte. At store
-#: open the cap is judged on the size on disk, then on the bytes after the anchor checks have read
-#: the file whole. At least a reload, the serve start preflight, the expiry monitor and ``cert
-#: inventory`` read the file with no cap.
+#: a few KiB. :func:`read_pinned_server_certificate` reads at most this plus one byte. The pin's
+#: trust-anchor checks read the whole file. The store open refuses a longer file, judged on the
+#: size on disk, then on the bytes those checks read. A settings check warns about
+#: one instead (``messagefoundry.auth.trust_anchors`` module item 11). At least the expiry monitor
+#: and ``cert inventory`` read the file with no cap.
 PIN_FILE_MAX_BYTES = 1 << 20
 
 _TOO_LARGE = f"is not a usable SQL Server pin: it is larger than {PIN_FILE_MAX_BYTES} bytes"
@@ -1475,10 +1502,12 @@ _TOO_LARGE = f"is not a usable SQL Server pin: it is larger than {PIN_FILE_MAX_B
 
 def oversized_pin_reason(path: str) -> str | None:
     """The reason a pin file is too large to read, from its size on disk, or ``None``. For a
-    caller whose read is not bounded, such as the trust-anchor checks, to call first. A file
+    caller that judges the size before it reads, as the store open does. A file
     that cannot be stat'ed gives ``None``: the read that follows reports it. A file whose size
-    the OS does not report, such as a FIFO or a device, passes here, and the store open does not
-    guard its read: it can block or never end."""
+    the OS does not report, such as a FIFO or a device, passes here. The store open's read that
+    follows goes through :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which
+    refuses anything but a regular file; on Windows its own stat opens the path first, as its
+    docstring says."""
     try:
         size = os.stat(path).st_size
     except (OSError, ValueError, TypeError):
@@ -1496,19 +1525,32 @@ def unreadable_pin_reason(exc: OSError | ValueError | TypeError) -> str:
     return f"could not be read: the path is not usable ({type(exc).__name__})"
 
 
-def pinned_server_certificate(data: bytes) -> x509.Certificate | str:
+def pinned_server_certificate(
+    data: bytes, *, raise_memory_error: bool = False
+) -> x509.Certificate | PinReason:
     """:func:`read_pinned_server_certificate` over bytes already read, for a caller that has read
     the file once for another check (vault BACKLOG #3714). Bytes past
-    :data:`PIN_FILE_MAX_BYTES` are refused as too large, so the cap judges the bytes in hand."""
+    :data:`PIN_FILE_MAX_BYTES` are refused as too large, so the cap judges the bytes in hand.
+
+    ``raise_memory_error`` re-raises a ``MemoryError`` from the parse rather than returning it as
+    a reason, for a caller that must not record it as a verdict on the file."""
     if len(data) > PIN_FILE_MAX_BYTES:
-        return _TOO_LARGE
-    reason: str
+        return PinReason(_TOO_LARGE, "oversize")
+    reason: PinReason
     try:
         return load_pinned_server_certificate(data)
     except PinRefused as exc:
-        reason = f"is not a usable SQL Server pin: {exc}"
+        reason = PinReason(f"is not a usable SQL Server pin: {exc}", exc.scope)
+    except MemoryError:
+        # Not a verdict on the file: the parse ran out of memory (vault BACKLOG #4203).
+        if raise_memory_error:
+            raise
+        reason = PinReason("could not be loaded (out of memory)", "out_of_memory")
     except Exception as exc:  # cryptography's ValueError, DuplicateExtension and the like
-        reason = f"is not a usable SQL Server pin: it is not a certificate ({type(exc).__name__})"
+        reason = PinReason(
+            f"is not a usable SQL Server pin: it is not a certificate ({type(exc).__name__})",
+            "not_a_certificate",
+        )
     return reason
 
 

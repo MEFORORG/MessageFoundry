@@ -185,8 +185,8 @@ if ($avail.state -in @('UNAVAILABLE', 'MALFORMED')) {
         Write-Host "  marker: $($avail.marker_path)" -ForegroundColor DarkGray
         if ($avail.state -eq 'MALFORMED') {
             Write-Host ""
-            Write-Host "  The marker itself is damaged, so this is a FAIL-CLOSED refusal rather than a" -ForegroundColor Yellow
-            Write-Host "  recorded cancellation. Fix or remove it:" -ForegroundColor Yellow
+            Write-Host "  The marker itself is damaged, so this is a FAIL-CLOSED refusal." -ForegroundColor Yellow
+            Write-Host "  Fix or remove it:" -ForegroundColor Yellow
             Write-Host "    pwsh -NoProfile -File scripts\coord\account-availability.ps1 -Status -ConfigDir `"$availRoot`"" -ForegroundColor DarkGray
         }
         Write-Host ""

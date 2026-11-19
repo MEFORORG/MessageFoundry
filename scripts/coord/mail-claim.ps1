@@ -74,7 +74,19 @@ function Get-ClaimHostToken {
     # stranded/, which is visible in -Status and is never a double delivery, because the sweep only
     # ever moves claiming/ -> stranded/ and NEVER back to inbox/. Do not "improve" the sweep into a
     # re-queue; that is what would turn this collision into a delivered-twice bug.
-    $n = ([string]$env:COMPUTERNAME).ToLowerInvariant()
+    #
+    # [Environment]::MachineName, NEVER $env:COMPUTERNAME. The variable is inherited and overwritable,
+    # so two machines with it unset (every machine hashes "") or set alike would share a token, and a
+    # LIVE remote claim would be read against this machine's process table, judged dead, and swept to
+    # stranded/. On an ordinary Windows host the two read the same name, so existing tokens keep their
+    # value. It is coord-root.ps1's Get-CoordHost rule, read inline rather than through Get-BoxKeyHost:
+    # that loader throws when coord-root.ps1 is missing, which this file's no-throw contract forbids,
+    # and it caches the first answer, which would hide a later change from the tests that pin this.
+    # MachineName is documented to throw InvalidOperationException when the name cannot be read. That
+    # falls back to the empty name rather than throwing: the worst a shared token does is the visible
+    # stranded/ sweep above, and a throw here would break the no-throw contract.
+    $n = ''
+    try { $n = [Environment]::MachineName.ToLowerInvariant() } catch [System.InvalidOperationException] { <# $n stays the empty name #> }
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { $b = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($n)) }
     finally { $sha.Dispose() }

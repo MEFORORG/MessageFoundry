@@ -58,6 +58,7 @@ from .. import pages
 from .._auth import (
     assert_same_origin,
     clear_session_cookie,
+    gate_ended_sessions,
     register_ui_action,
     require_ui,
     require_ui_step_up,
@@ -1013,9 +1014,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 )
             except HTTPException as page_exc:
                 # BACKLOG #5559: the users list offers the delete for a record that fails its
-                # seal, whose detail page answers 423. The delete's own refusal is the answer.
-                if page_exc.status_code != status.HTTP_423_LOCKED:
+                # seal, whose detail page answers 423. The delete's own refusal is the answer, and
+                # it stays the answer when the page's read is refused on an HTTP refusal from the
+                # re-render (a 503 Vault Outage, say), which would replace it. An account gone
+                # since answers 404.
+                if page_exc.status_code == status.HTTP_404_NOT_FOUND:
                     raise
+                _log.warning(
+                    "the page for a refused delete of account %s was not shown: it answered %s; "
+                    "the delete's own refusal is answered",
+                    scrub_log_argument(user_id),
+                    page_exc.status_code,
+                )
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc.detail)) from exc
         return RedirectResponse("/ui/users", status_code=303)
 
@@ -1104,7 +1114,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 description=form.get("description", "").strip() or None,
                 permissions=perms,
             )
-            await admin.update_custom_role(role_id, body=body, service=service, identity=identity)
+            await admin.update_custom_role(
+                role_id,
+                body=body,
+                service=service,
+                identity=identity,
+                ended=gate_ended_sessions(request),
+            )
         except (ValidationError, HTTPException) as exc:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
@@ -1133,7 +1149,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
-        await admin.delete_custom_role(role_id, service=service, identity=identity)
+        await admin.delete_custom_role(
+            role_id, service=service, identity=identity, ended=gate_ended_sessions(request)
+        )
         return await _after_group_save(request, service, "/ui/roles")
 
     # --- AD group mappings --------------------------------------------------
@@ -1188,7 +1206,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     if g and r
                 ]
             )
-            await admin.set_ad_group_map(body=body, service=service, identity=identity)
+            await admin.set_ad_group_map(
+                body=body, service=service, identity=identity, ended=gate_ended_sessions(request)
+            )
         except (ValidationError, ValueError, HTTPException) as exc:
             detail = str(exc.detail) if isinstance(exc, HTTPException) else "invalid input"
             return await _ad_groups_response(service, identity, error=detail, status_code=400)
@@ -1219,7 +1239,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     if g and c
                 ]
             )
-            await admin.set_ad_group_scope_map(body=body, service=service, identity=identity)
+            await admin.set_ad_group_scope_map(
+                body=body, service=service, identity=identity, ended=gate_ended_sessions(request)
+            )
         except (ValidationError, ValueError, HTTPException) as exc:
             detail = str(exc.detail) if isinstance(exc, HTTPException) else "invalid input"
             return await _ad_groups_response(service, identity, error=detail, status_code=400)

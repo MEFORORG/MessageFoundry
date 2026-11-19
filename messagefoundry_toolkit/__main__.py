@@ -176,7 +176,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     impact.add_argument(
         "--apply",
         action="store_true",
-        help="with --rename-to: actually write the edits to disk (otherwise a dry-run that writes nothing)",
+        help="with --rename-to: actually write the edits to disk (otherwise a dry-run that writes nothing); "
+        "not for code_set, whose file move is `messagefoundry codeset rename`",
     )
     impact.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -187,7 +188,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     generate.add_argument(
         "--triggers", default="", help="comma-separated subset (default: all for the type)"
     )
-    generate.add_argument("--count", type=int, default=50, help="messages per trigger (default 50)")
+    generate.add_argument(
+        "--count",
+        type=int,
+        default=50,
+        help="messages per trigger, 1 to 9999 (default 50)",
+    )
     generate.add_argument(
         "--out", default=None, help="output root (default: samples/messages/<type>)"
     )
@@ -653,7 +659,13 @@ def _generate(args: argparse.Namespace) -> int:
     code = args.type.upper()
     triggers = [t.strip().upper() for t in args.triggers.split(",") if t.strip()] or None
     out = args.out or f"samples/messages/{code.lower()}"
-    seed = args.seed or _core.DEFAULT_SEED
+    # Checked here as well as in write_corpus, so a bad count is a usage error (exit 2) without
+    # catching every ValueError generation might raise (BACKLOG #5819).
+    if not 1 <= args.count <= _core.MAX_CORPUS_COUNT:
+        _emit_error(f"--count must be between 1 and {_core.MAX_CORPUS_COUNT}", as_json=args.json)
+        return 2
+    # `is None`, not `or`: an explicit empty --seed is a seed the user chose (BACKLOG #5819).
+    seed = _core.DEFAULT_SEED if args.seed is None else args.seed
     try:
         result = _core.write_corpus(code, triggers=triggers, count=args.count, out=out, seed=seed)
     except KeyError as exc:
@@ -662,6 +674,13 @@ def _generate(args: argparse.Namespace) -> int:
     except _core.GenerationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except OSError as exc:
+        # The failure can land after a trigger's old files were cleared, so do not imply nothing
+        # changed.
+        return _emit_error(
+            f"could not write the corpus under {out}, which may now be partly rewritten: {exc}",
+            as_json=args.json,
+        )
 
     if args.json:
         _print_json(
@@ -706,6 +725,17 @@ def _impact(args: argparse.Namespace) -> int:
         return _emit_error("--rename-to and --delete are mutually exclusive", as_json=args.json)
     if args.apply and args.rename_to is None:
         return _emit_error("--apply is only valid with --rename-to", as_json=args.json)
+    if args.apply and args.kind == "code_set":
+        # apply_rename rewrites only the code_set("...") literals; the table's data file under
+        # codesets/ keeps the old name, so the config would stop loading while this reported
+        # success (BACKLOG #5820). `codeset rename` moves the file and rewrites the referents
+        # together, under the code-set directory lock. The dry-run plan stays available here.
+        return _emit_error(
+            "--apply is not supported for a code_set rename: it would rewrite the code_set(...) "
+            "references without moving the code set's file. Use `messagefoundry codeset rename "
+            "--config <dir> --name <old> --to <new>` instead",
+            as_json=args.json,
+        )
 
     try:
         # allow_empty: `impact` is the CLI front door to the SAME rename/delete pre-flight

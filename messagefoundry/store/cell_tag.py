@@ -37,10 +37,13 @@ import functools
 import inspect
 import json
 import logging
+import re
+import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable, Coroutine, Mapping
-from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Final, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Final, Protocol, cast
 
 import annotationlib
 
@@ -64,9 +67,11 @@ __all__ = [
     "MESSAGE_TAG_FAILED_ACTION",
     "PRESET_TAG_COLUMNS",
     "PRESET_TAG_FAILED_ACTION",
+    "BlankCellError",
     "CellTagError",
     "CellTagSink",
     "CorruptCellError",
+    "NonTextCellError",
     "UnmarkedCellError",
     "audits_cell_tag",
     "dead_letter_on_cell_tag",
@@ -185,6 +190,13 @@ def row_tag_aad(table: str, column: str, row: Any) -> bytes:
     return entry[1](column, row)
 
 
+def _require_tagged_table(table: str) -> None:
+    """Refuse a table this module does not tag, so no failure is reported under another table's
+    audit action and no open meets a :class:`CellTagError` it cannot build."""
+    if table not in _TAG_FAILED_ACTION:
+        raise ValueError(f"{table} is not a table this module tags")
+
+
 class CellTagError(CipherError):
     """A message cell or a preset's criteria did not open under the tag its own row builds.
 
@@ -201,13 +213,13 @@ class CellTagError(CipherError):
     cipher_alerted: ClassVar[bool] = False
 
     def __init__(self, table: str, column: str, row_id: str, channel_id: str | None) -> None:
-        if table not in _TAG_FAILED_ACTION:
-            raise ValueError(f"{table} is not a table this module tags")
+        _require_tagged_table(table)
         self.table = table
         self.column = column
         self.row_ref = str(row_id)[:_ROW_REF_LEN]
         self.channel_id = channel_id
-        #: Set once the audit row is written, so nested boundaries write it once.
+        #: Set once this error needs no further audit write: its row was written, or the cell's row
+        #: was written within the interval. So nested boundaries report it once.
         self.audited = False
         super().__init__(self._describe())
 
@@ -216,6 +228,10 @@ class CellTagError(CipherError):
             f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} does not open"
             " under its own row's tag"
         )
+
+    def alert_reason(self) -> str:
+        """The ``integrity_drift`` alert's reason: the cell and a row-id prefix, never a value."""
+        return f"a {self.table}.{self.column} cell failed its integrity tag (row {self.row_ref})"
 
 
 class CorruptCellError(CellTagError):
@@ -254,6 +270,46 @@ class UnmarkedCellError(CellTagError):
         return (
             f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} holds an"
             " unmarked value, which a keyed writer does not write"
+        )
+
+
+class BlankCellError(CellTagError):
+    """A preset's ``criteria`` cell holds NULL or an empty string (BACKLOG #5523). The store never
+    writes either, keyed or keyless, and a keyed cipher passes a blank value through unopened, so a
+    blank cell was written outside the store. Read as an empty filter it would drop a narrowing
+    preset out of a layered search and widen it, so it is refused.
+
+    It counts as drift: it writes the tag-failed audit row and, on a keyed store, raises the
+    ``integrity_drift`` alert, as a moved cell does. A keyless store's cipher has no alert hook."""
+
+    def _describe(self) -> str:
+        return (
+            f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} is blank, which"
+            " the store never writes"
+        )
+
+    def alert_reason(self) -> str:
+        return (
+            f"a {self.table}.{self.column} cell is blank, which the store never writes"
+            f" (row {self.row_ref})"
+        )
+
+
+class NonTextCellError(CellTagError):
+    """A preset's ``criteria`` cell holds a value that is not text, a planted BLOB say (BACKLOG
+    #5523). The store writes criteria as text only, so this was written outside the store. A keyed
+    cipher handed it would fail with a ``TypeError``. Drift, as :class:`BlankCellError` is."""
+
+    def _describe(self) -> str:
+        return (
+            f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} is not text,"
+            " which the store never writes"
+        )
+
+    def alert_reason(self) -> str:
+        return (
+            f"a {self.table}.{self.column} cell is not text, which the store never writes"
+            f" (row {self.row_ref})"
         )
 
 
@@ -310,8 +366,7 @@ def open_tagged_cell(
     problem, raise the cipher's own error."""
     # Checked on every open, not only on a failure: a CellTagError for an unknown table would raise
     # ValueError instead, losing the alert and escaping every containment.
-    if table not in _TAG_FAILED_ACTION:
-        raise ValueError(f"{table} is not a table this module tags")
+    _require_tagged_table(table)
     if stored is None:
         return None
     try:
@@ -341,17 +396,34 @@ def open_message_cell(
 
 
 def open_preset_criteria(
-    cipher: Cipher, stored: str | None, *, preset_id: str, owner_user_id: str
-) -> str | None:
-    """Open a preset's ``criteria`` under the tag its row's id and owner build."""
-    return open_tagged_cell(
-        cipher,
-        stored,
-        preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
-        table="search_presets",
-        column="criteria",
-        row_id=preset_id,
-    )
+    cipher: Cipher, stored: object, *, preset_id: str, owner_user_id: str
+) -> str:
+    """Open a preset's ``criteria`` under the tag its row's id and owner build.
+
+    The store writes every preset's criteria as non-blank text, so a NULL or empty cell raises
+    :class:`BlankCellError` and a value that is not text, a planted BLOB say, raises
+    :class:`NonTextCellError`, on a keyed and a keyless store alike (BACKLOG #5523). Both are drift:
+    logged here, alerted here on a keyed store only, and audited by the store's read, before the
+    caller reads the cell or stamps the preset as used. The store's whole-surface cell walks do not run this check."""
+    if stored is None or stored == "":
+        refused: CellTagError = BlankCellError("search_presets", "criteria", preset_id, None)
+    elif not isinstance(stored, str):
+        refused = NonTextCellError("search_presets", "criteria", preset_id, None)
+    else:
+        # open_tagged_cell returns None only for a None cell, refused above.
+        return cast(
+            str,
+            open_tagged_cell(
+                cipher,
+                stored,
+                preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
+                table="search_presets",
+                column="criteria",
+                row_id=preset_id,
+            ),
+        )
+    _alert(cipher, refused)
+    raise refused
 
 
 def withhold_message_cells(
@@ -440,11 +512,47 @@ def _alert(cipher: object, err: CellTagError) -> None:
         # The text, not the error: a record keeps its args, and the error's chain reaches PHI.
         _log.warning("%s; the read was refused", str(err))
         return
-    reason = f"a {err.table}.{err.column} cell failed its integrity tag (row {err.row_ref})"
+    reason = err.alert_reason()
     _log.warning("%s; the read was refused", reason)
     report = getattr(cipher, "report_tag_failure", None)
     if callable(report):
         report(err.table, reason)
+
+
+#: Exception classes that usually mean a defect in this code rather than a failed write, so the
+#: audit write's refusal logs where they were raised (BACKLOG #6697).
+_OWN_BUGS: Final = (TypeError, AttributeError, NameError, KeyError, IndexError)
+
+
+def _frames(exc: BaseException) -> str:
+    """``exc``'s traceback frames as file, line and function, without its message or its chain,
+    which may carry a driver's text. No source line is read, so no file is opened on the event
+    loop."""
+    return "\nTraceback (frames only):" + "".join(
+        f"\n  {frame.f_code.co_filename}:{lineno} in {frame.f_code.co_name}"
+        for frame, lineno in traceback.walk_tb(exc.__traceback__)
+    )
+
+
+#: The shape of SQLite's own error names (``SQLITE_BUSY``). Any other ``sqlite_errorname`` value is
+#: not logged, as ``transports/database.py`` withholds one.
+_SQLITE_ERRORNAME: Final = re.compile(r"SQLITE_[A-Z_]{1,40}")
+
+
+def _error_code(exc: BaseException) -> str | None:
+    """The driver's SQLSTATE or SQLite error name for ``exc``, or ``None``. Never raises: the audit
+    write's refusal is logged and swallowed, and a lookup that failed would escape that."""
+    try:
+        from messagefoundry.store.base import driver_sqlstate  # lazy: base imports this module
+
+        code = driver_sqlstate(exc)
+        if code:
+            return code
+        name = getattr(exc, "sqlite_errorname", None)
+    except Exception as lookup:  # noqa: BLE001 -- a code is a nicety; the refusal still logs
+        _log.debug("could not read the error code (%s)", type(lookup).__name__)
+        return None
+    return name if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name) else None
 
 
 class _AuditSink(Protocol):
@@ -461,9 +569,11 @@ class _AuditSink(Protocol):
 
 
 async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
-    """Write the audit row for ``err``, once. The alert was raised when the read was refused. An
-    audit failure is logged and swallowed: reporting must never change what the read did. A corrupt
-    cell is not drift, so it writes no tag-failed row; its WARNING was logged at the read.
+    """Write the audit row for ``err``, unless the cell's row was already written within the interval
+    (then nothing is written and ``err`` is marked reported). The alert was raised when the read was
+    refused. An audit failure is logged and swallowed: reporting must never change what the read
+    did. A corrupt cell is not drift, so it writes no tag-failed row; its WARNING was logged at the
+    read.
 
     The cell is muted for the interval only once its row is WRITTEN, so a write that fails or is
     cancelled leaves the cell's next refusal to write it (BACKLOG #6697). Nothing marks a write in
@@ -490,14 +600,18 @@ async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
     except Exception as exc:  # noqa: BLE001 -- the refusal stands whatever the audit write does
         # Class and an error code only (SQLSTATE, or SQLite's error name), as the store's other
         # driver-failure lines: a driver's text and traceback are not this function's to vouch for.
-        from messagefoundry.store.base import driver_sqlstate  # lazy: base imports this module
-
+        # A programming error gets its frames, so its site can be found, but still not its message
+        # or its chain, either of which may hold a driver's text.
         _log.error(
-            "the %s audit row could not be written (%s, code %s); it is written only if the cell"
-            " is refused again",
+            "the %s audit row for the %s.%s cell of row %s could not be written (%s, code %s); it"
+            " is written only if the cell is refused again%s",
             action,
+            err.table,
+            err.column,
+            err.row_ref,
             type(exc).__name__,
-            driver_sqlstate(exc) or getattr(exc, "sqlite_errorname", None),
+            _error_code(exc),
+            _frames(exc) if isinstance(exc, _OWN_BUGS) else "",
         )
         return
     err.audited = True
@@ -540,19 +654,60 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
 
     ``routed_id`` must be keyword-only with no default, so every call that reaches the handoff
     carries it in ``kwargs``; a handoff that takes it any other way is refused here, at decoration
-    (BACKLOG #6698)."""
-    # STRING: only the kind is read, so no annotation is evaluated (a TYPE_CHECKING-only one would
-    # raise NameError at decoration).
-    sig = inspect.signature(fn, annotation_format=annotationlib.Format.STRING)
-    param = sig.parameters.get("routed_id")
-    if (
-        param is None
-        or param.kind is not inspect.Parameter.KEYWORD_ONLY
-        or param.default is not inspect.Parameter.empty
-    ):
-        raise TypeError(
-            f"{fn.__qualname__} must take routed_id as a keyword-only parameter with no default"
-        )
+    (BACKLOG #6698). Every layer of a ``functools.wraps`` chain that has a code object is read, the
+    one this wrapper calls included, and none may take ``routed_id`` positionally or give it a
+    default. A layer without a code object, such as an ``lru_cache`` wrapper or a callable object,
+    is skipped by that read. Where the chain's innermost layer has a code object and no layer carries a
+    ``__signature__``, that layer must take ``routed_id`` keyword-only. Otherwise
+    ``inspect.signature`` decides it, as before this walk: ``routed_id`` must be keyword-only with
+    no default in the signature it reports. What a layer does with ``*args`` or ``**kwargs`` is not
+    read."""
+    name = getattr(fn, "__qualname__", repr(fn))
+    layers: list[object] = [fn]
+    while hasattr(layers[-1], "__wrapped__"):
+        if len(layers) >= sys.getrecursionlimit():  # the bound inspect.unwrap applies
+            raise TypeError(f"{name} has a __wrapped__ chain too long to read")
+        layer = layers[-1].__wrapped__
+        if any(layer is seen for seen in layers):
+            raise TypeError(f"{name} has a cycle in its __wrapped__ chain")
+        layers.append(layer)
+    # A layer with no code object (an lru_cache wrapper, a callable object) is skipped, and the
+    # layers that have one are judged.
+    coded = [(layer, code) for layer in layers if (code := getattr(layer, "__code__", None))]
+    # The code objects give the signature the call reaches only when the chain's innermost layer has
+    # one and no layer declares a __signature__ (mock.create_autospec does). Otherwise the signature
+    # read below decides whether routed_id is keyword-only with no default.
+    walk_decides = (
+        bool(coded)
+        and coded[-1][0] is layers[-1]
+        and not any(hasattr(layer, "__signature__") for layer in layers)
+    )
+    for depth, (layer, code) in enumerate(coded):
+        # Each refusal names the layer that failed: functools.wraps copies the innermost's
+        # __qualname__ onto every layer, so the code object's own name is read.
+        label = code.co_qualname
+        if "routed_id" in code.co_varnames[: code.co_argcount]:
+            raise TypeError(f"{label} must take routed_id as a keyword-only parameter")
+        keyword_only = code.co_varnames[
+            code.co_argcount : code.co_argcount + code.co_kwonlyargcount
+        ]
+        if walk_decides and depth == len(coded) - 1 and "routed_id" not in keyword_only:
+            raise TypeError(f"{label} must take routed_id as a keyword-only parameter")
+        if "routed_id" in (getattr(layer, "__kwdefaults__", None) or {}):
+            raise TypeError(f"{label} must give its keyword-only routed_id no default")
+    if not walk_decides:
+        # STRING: only the kind is read, so no annotation is evaluated (a TYPE_CHECKING-only one
+        # would raise NameError at decoration).
+        sig = inspect.signature(fn, annotation_format=annotationlib.Format.STRING)
+        param = sig.parameters.get("routed_id")
+        if (
+            param is None
+            or param.kind is not inspect.Parameter.KEYWORD_ONLY
+            or param.default is not inspect.Parameter.empty
+        ):
+            raise TypeError(
+                f"{name} must take routed_id as a keyword-only parameter with no default"
+            )
 
     async def wrapper(self: S, /, *args: P.args, **kwargs: P.kwargs) -> bool:
         try:
@@ -570,12 +725,18 @@ async def dead_letter_on_cell_tag(store: CellTagSink, row_id: str, err: CellTagE
     moves on and the message is ``ERROR`` (count-and-log), then audit the failure. The one policy for
     a stage that met a tag failure, on the async handoffs and the runner's fused path alike.
 
-    The audit is written even when the dead-letter fails, whose error then propagates: the row
-    stays in flight, meets the tag failure again on its re-run and is dead-lettered then, and the
-    audit row is not lost meanwhile (BACKLOG #6698). A cancellation is not held up by a write."""
+    The audit is written even when the dead-letter fails with an ``Exception``, whose error then
+    propagates: the row stays in flight, meets the tag failure again on its re-run and is
+    dead-lettered then, and the audit row is not lost meanwhile (BACKLOG #6698). A
+    ``BaseException`` that is not an ``Exception``, such as a cancellation, ``KeyboardInterrupt`` or
+    ``SystemExit``, propagates with NO audit write, so a store write never holds up a shutdown;
+    that audit row is written only if the cell is refused again."""
     try:
         await store.dead_letter_now(row_id, str(err))
     except Exception:
+        # Exception, not BaseException: a cancellation, KeyboardInterrupt or SystemExit propagates
+        # at once and skips the audit write, which is then made only if the cell is refused again.
+        # An Exception is re-raised after the audit.
         await report_cell_tag_failure(store, err)
         raise
     await report_cell_tag_failure(store, err)

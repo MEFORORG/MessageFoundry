@@ -429,6 +429,122 @@ def test_name_refuses_when_the_copy_being_run_lives_inside_the_target(fx: Fixtur
     assert not wt.exists()
 
 
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        ("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=false'"),
+        ("GIT_CONFIG_COUNT", "0"),
+        ("GIT_CONFIG_GLOBAL", ""),
+    ],
+)
+@pytest.mark.parametrize("route", ["-Name", "-List"])
+def test_a_git_config_carrier_refuses_every_route(
+    fx: Fixture, var: str, value: str, route: str
+) -> None:
+    """Vault BACKLOG #8225 item 2, #5648's remainder. Red before the fix: remove.ps1 refused the four
+    redirects but not config carried in the environment, which steers every `git -C <path>` read, for
+    example through a core.fsmonitor hook. GIT_CONFIG_GLOBAL is given an empty file of its own."""
+    if var == "GIT_CONFIG_GLOBAL":
+        value = str(fx.root / "empty.gitconfig")
+        Path(value).write_text("", encoding="utf-8")
+    wt = fx.add("carried")
+    args = ("-Name", "carried") if route == "-Name" else ("-List",)
+
+    proc = run(fx, *args, extra={var: value})
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert f"{var} is set" in proc.stderr, proc.stdout + proc.stderr
+    assert wt.exists() and fx.is_registered(wt)
+
+    control = run(fx, *args)
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert wt.exists() != (route == "-Name")
+
+
+def _junction(link: Path, target: Path) -> None:
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True
+    )
+
+
+@pytest.mark.parametrize("via", ["cwd", "script"])
+def test_name_refuses_a_junction_alias_of_the_target(fx: Fixture, via: str) -> None:
+    """Vault BACKLOG #8225 item 8. Red before the fix: the inside-target check compared spellings
+    only, so a caller standing in, or running a copy from, a junction alias of the target passed it
+    and the forced removal ran from inside the tree."""
+    wt = fx.add("aliased")
+    (wt / "deep").mkdir()
+    copy_real_scripts(wt)
+    alias = fx.root / "alias"
+    _junction(alias, wt)
+    try:
+        if via == "cwd":
+            proc = run(fx, "-Name", "aliased", "-Force", cwd=alias / "deep")
+            needle = "standing inside"
+        else:
+            proc = run(
+                fx,
+                "-Name",
+                "aliased",
+                "-Force",
+                script=alias / "scripts" / "worktree" / "remove.ps1",
+            )
+            needle = "lives inside"
+        assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert needle in proc.stderr, proc.stdout + proc.stderr
+        assert (wt / "seed.txt").is_file() and fx.is_registered(wt)
+    finally:
+        os.rmdir(alias)
+
+    control = run(fx, "-Name", "aliased", "-Force")
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert not wt.exists()
+
+
+def test_name_refuses_a_commit_only_the_head_reflog_holds_even_with_force(fx: Fixture) -> None:
+    """Vault BACKLOG #8225 item 9. Red before the fix: -Path refused it and -Name did not. A commit
+    made on a detached HEAD, then left by switching back, is held by the tree's HEAD reflog alone,
+    which the removal deletes."""
+    wt = fx.add("reflogged")
+    _git(wt, "checkout", "-q", "--detach")
+    loose = _commit(wt, "loose.txt", "held by the HEAD reflog alone")
+    _git(wt, "checkout", "-q", "reflogged")
+
+    proc = run(fx, "-Name", "reflogged", "-Force")
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "no shared ref holds" in proc.stdout, proc.stdout + proc.stderr
+    assert wt.exists() and fx.is_registered(wt)
+
+    # Control: once a branch holds the commit, the same call removes the tree.
+    _git(fx.primary, "branch", "keep-loose", loose)
+    control = run(fx, "-Name", "reflogged", "-Force")
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert not wt.exists()
+
+
+def test_name_removes_a_tree_whose_amended_commit_only_the_kept_branch_reflog_holds(
+    fx: Fixture,
+) -> None:
+    """The twin of the reflog refusal. Without -DeleteBranch the branch stays, and its own reflog
+    with it, so an amended commit survives the removal and must not refuse it. With -DeleteBranch
+    the script may delete the branch and its reflog, so the check keeps counting the commit and the
+    same tree refuses."""
+    wt = fx.add("amended")
+    _commit(wt, "a.txt", "v1")
+    _git(wt, "commit", "-q", "--amend", "-m", "v1 amended")
+
+    refused = run(fx, "-Name", "amended", "-DeleteBranch")
+    assert refused.returncode != 0, refused.stdout + refused.stderr
+    assert "no shared ref holds" in refused.stdout, refused.stdout + refused.stderr
+    assert wt.exists() and fx.is_registered(wt)
+
+    proc = run(fx, "-Name", "amended")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not wt.exists()
+    assert fx.branch_exists("amended")
+
+
 @pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
 def test_name_refuses_a_flagged_file_and_force_overrides_it_by_name(fx: Fixture, flag: str) -> None:
     """Red before the fix: git status does not read a flagged file, so an edit to one read as a clean
@@ -525,6 +641,33 @@ def _write_claim(fx: Fixture, key: str, worktree: Path | str) -> Path:
         encoding="utf-8",
     )
     return f
+
+
+def test_a_claims_registry_under_a_dead_link_refuses(fx: Fixture) -> None:
+    """Vault BACKLOG #2985, added item 1. Red before the fix: remove.ps1 read a registry it could not
+    reach as absent, so a coordination folder that is a link to a folder now gone read as "no
+    claims" and the tree went. It reads registries the nightly removal's way now: absent only when
+    the folder above lists without it."""
+    wt = fx.add("unreached")
+    common = Path(
+        _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    )
+    target = fx.root / "share-gone"
+    target.mkdir()
+    _junction(common / "mefor-coord", target)
+    target.rmdir()
+    try:
+        proc = run(fx, "-Name", "unreached", "-Force")
+        assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert "the claims directory" in proc.stdout + proc.stderr, proc.stdout + proc.stderr
+        assert wt.exists() and fx.is_registered(wt)
+    finally:
+        os.rmdir(common / "mefor-coord")
+
+    # Control: with no coordination folder at all, the same call removes the tree.
+    control = run(fx, "-Name", "unreached", "-Force")
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert not wt.exists()
 
 
 def test_a_claim_held_by_the_target_refuses_and_is_not_released(fx: Fixture) -> None:

@@ -48,6 +48,7 @@ import enum
 import ipaddress
 import logging
 import os
+import re
 import ssl
 import sys
 import time
@@ -114,6 +115,9 @@ __all__ = [
     "CaFileUnreadable",
     "cleartext_acceptance_audit_sink",
     "context_checks_revocation",
+    "crl_credited",
+    "crl_no_credit",
+    "CrlNoCredit",
     "current_hop_posture",
     "enforce_insecure_hop",
     "CRL_CLOCK_SKEW_SECONDS",
@@ -141,6 +145,7 @@ __all__ = [
     "relax_verify_expiry",
     "skips_validity_period",
     "EXPIRY_RELAXED_WAYS_ACROSS",
+    "PEER_NOT_VERIFIED_WAYS_ACROSS",
     "verifies_peer_fully",
     "warn_hostname_check_off",
     "requests_verify_from_anchor",
@@ -1026,9 +1031,63 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
     return bool(ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME)
 
 
+class CrlNoCredit(enum.Enum):
+    """Why a CRL earns a revocation guard no credit (vault BACKLOG #4912).
+
+    :func:`crl_no_credit` returns one of these, or ``None`` where the CRL is credited.
+    :class:`RevocationHopGuard` words its record from the same value: the lead of the refusal and
+    the WARNING, the attested crossing's lead, and the remedy :meth:`RevocationHopGuard.capture`
+    fills in."""
+
+    #: The context does not verify the peer: its ``verify_mode`` is ``ssl.CERT_NONE``.
+    PEER_NOT_VERIFIED = "peer_not_verified"
+    #: The context skips validity-period checks (:func:`skips_validity_period`), so a CRL past
+    #: ``nextUpdate`` is accepted, or the caller says the hop sets ``tls_allow_expired``.
+    EXPIRY_RELAXED = "expiry_relaxed"
+    #: No context, or a context that consults no CRL (:func:`context_checks_revocation`).
+    NO_CRL = "no_crl"
+
+
+def crl_no_credit(ctx: ssl.SSLContext | None) -> CrlNoCredit | None:
+    """Why a CRL on ``ctx`` may not relax a revocation guard, or ``None`` when it may (vault
+    BACKLOG #4912).
+
+    ``None`` only when the context's ``verify_mode`` is not ``ssl.CERT_NONE`` (on a client
+    context ``CERT_OPTIONAL`` enforces the chain and a loaded CRL as ``CERT_REQUIRED`` does; the
+    rule does not read whether a context is a client or a server one), does not skip validity-period
+    checks (:func:`skips_validity_period`), which would let a CRL past ``nextUpdate`` through,
+    and consults a CRL (:func:`context_checks_revocation`). A context that fails more than one of
+    these gets the first in that order. ``None`` as ``ctx`` is :attr:`CrlNoCredit.NO_CRL`.
+    :func:`crl_credited` is the yes-or-no form. Find the readers of both by symbol; at least
+    :meth:`RevocationHopGuard.capture` and the Vault and proxy legs in
+    ``transports/strict_requests.py`` read one. The verify condition can decide only where a
+    reader can be handed a ``CERT_NONE`` context, as ``capture`` can be. The two legs read a
+    context from the hop's own factory, and the shipped factory's context verifies the peer.
+    ``NarrowedHTTPSConnection.connect`` on those legs is a separate check: it reads the
+    connection's ``cert_reqs``, not this context. ``tests/test_revocation_guard_crl_credit.py``
+    fails a read of :func:`context_checks_revocation` by that name elsewhere in the engine package.
+    A guard that reads the CRL flag another way passes that test, so review still owns it."""
+    if ctx is None:
+        return CrlNoCredit.NO_CRL
+    if ctx.verify_mode == ssl.CERT_NONE:
+        return CrlNoCredit.PEER_NOT_VERIFIED
+    if skips_validity_period(ctx):
+        return CrlNoCredit.EXPIRY_RELAXED
+    if not context_checks_revocation(ctx):
+        return CrlNoCredit.NO_CRL
+    return None
+
+
+def crl_credited(ctx: ssl.SSLContext | None) -> bool:
+    """Whether a CRL on ``ctx`` may relax a revocation guard: :func:`crl_no_credit` gives no
+    reason against it. That function's docstring states the conditions."""
+    return crl_no_credit(ctx) is None
+
+
 #: The remedy a revocation refusal names on a hop whose context skips validity-period checks
 #: (``tls_allow_expired``, :func:`skips_validity_period`), where the caller tells the guard so
-#: (``RevocationHopGuard.capture(expiry_relaxed=True)``, which names it by default). No CRL can
+#: (``RevocationHopGuard.capture(expiry_relaxed=True)``, which names it by default unless the
+#: context does not verify the peer, where :data:`PEER_NOT_VERIFIED_WAYS_ACROSS` wins). No CRL can
 #: relax that refusal, so the connection-shaped default, which offers ``[tls].crl_file``, would
 #: name a lever that cannot work there (SDS-3.7). Since vault BACKLOG #5086 a guard handed such a
 #: context without that flag credits no CRL either, and names this text the same way.
@@ -1041,6 +1100,14 @@ EXPIRY_RELAXED_WAYS_ACROSS = (
     "tls_revocation_attested_reason on this connection, or remove tls_allow_expired so a "
     "[tls].crl_file on this hop can admit it."
 )
+
+#: The remedy :meth:`RevocationHopGuard.capture` names by default on a hop whose context does not
+#: verify the peer (:attr:`CrlNoCredit.PEER_NOT_VERIFIED`). No CRL is credited there, so the
+#: connection-shaped default and :data:`EXPIRY_RELAXED_WAYS_ACROSS`, which each offer a
+#: ``[tls].crl_file``, would name a lever that cannot work. It does not offer the attestation
+#: either. The disposition still ALLOWs an attested hop (:func:`revocation_hop_disposition`)
+#: (vault BACKLOG #4912).
+PEER_NOT_VERIFIED_WAYS_ACROSS = "Make this hop's TLS context verify the peer."
 
 
 def warn_hostname_check_off(*, connector: str, name: str, host: str) -> None:
@@ -2631,9 +2698,9 @@ def revocation_hop_disposition(
        configured CRL that a given hop's handshake never consults must not silence that hop's guard.
        A CRL on a context that skips time validity (:func:`skips_validity_period`) is accepted past
        ``nextUpdate``, so ``capture`` passes False for one (vault BACKLOG #5086). This function does
-       not read the context: a caller that derives the flag itself, as the Vault and proxy legs in
-       ``transports/strict_requests.py`` do from :func:`context_checks_revocation` alone, carries
-       that check only while it builds no such context, which neither does today.
+       not read the context: a caller that derives the flag itself carries the rule only if it
+       reads :func:`crl_credited`, as the Vault and proxy legs in ``transports/strict_requests.py``
+       do (vault BACKLOG #4912). Nothing here can make a new caller do so.
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
@@ -2725,8 +2792,52 @@ _EXPIRY_RELAXED_NO_CHECK = (
 
 #: The attested crossing's lead on such a hop, for the same reason.
 _EXPIRY_RELAXED_CROSSING = (
-    "verified TLS hop with tls_allow_expired crossed without a revocation check the guard credits"
+    "verified TLS hop that skips validity-period checks crossed without a revocation check the "
+    "guard credits"
 )
+
+#: What a revocation record says on a hop whose context does not verify the peer
+#: (:attr:`CrlNoCredit.PEER_NOT_VERIFIED`). It does not call the peer certificate verified.
+_PEER_NOT_VERIFIED_NO_CHECK = (
+    "this hop's TLS context does not verify the peer (verify_mode is CERT_NONE), and the guard "
+    "credits no revocation check on such a context (ASVS 12.1.4, ADR 0173)."
+)
+
+#: The attested crossing's lead on such a hop.
+_PEER_NOT_VERIFIED_CROSSING = (
+    "TLS hop whose context does not verify the peer crossed without a revocation check the guard "
+    "credits"
+)
+
+#: The attested crossing's lead on any other hop.
+_NO_CHECK_CROSSING = "verified TLS hop crossed without certificate revocation checking"
+
+#: Each record's wording by :attr:`RevocationHopGuard.no_credit`; a reason absent here takes the
+#: plain wording. One table per output, all keyed on that one value (vault BACKLOG #4912).
+_NO_CHECK_LEAD: dict[CrlNoCredit | None, str] = {
+    CrlNoCredit.PEER_NOT_VERIFIED: _PEER_NOT_VERIFIED_NO_CHECK,
+    CrlNoCredit.EXPIRY_RELAXED: _EXPIRY_RELAXED_NO_CHECK,
+}
+_CROSSING_LEAD: dict[CrlNoCredit | None, str] = {
+    CrlNoCredit.PEER_NOT_VERIFIED: _PEER_NOT_VERIFIED_CROSSING,
+    CrlNoCredit.EXPIRY_RELAXED: _EXPIRY_RELAXED_CROSSING,
+}
+_DEFAULT_WAYS_ACROSS: dict[CrlNoCredit | None, str] = {
+    CrlNoCredit.PEER_NOT_VERIFIED: PEER_NOT_VERIFIED_WAYS_ACROSS,
+    CrlNoCredit.EXPIRY_RELAXED: EXPIRY_RELAXED_WAYS_ACROSS,
+}
+
+#: The word a caller's ``cell`` or ``description`` uses to call its hop verified, as in "(verified
+#: TLS, ...)" or "over verified https". On a hop whose context does not verify the peer the guard
+#: drops it from both before either is written into the refusal, the WARNING or the crossing line
+#: that :meth:`RevocationHopGuard.enforce_construction` writes (vault BACKLOG #4912). Every
+#: whole word "verified" goes: with the whitespace after it, or, where punctuation follows it, as
+#: in "verified," or "verified)", with the whitespace before it. A caller that writes its own
+#: record, as the AI broker does, reads :attr:`RevocationHopGuard.stated_cell` for its cell and
+#: words the rest itself. The word boundary keeps "unverified" whole, but a negation written as
+#: two words, such as "not verified", loses its second word. No shipped caller writes one, and
+#: nothing checks that a new caller does not.
+_VERIFIED_CLAIM = re.compile(r"\s*\bverified\b(?=[^\w\s])|\bverified\b\s*", re.IGNORECASE)
 
 
 #: The attestation setting a revocation record names for a hop that is a connection.
@@ -2758,9 +2869,8 @@ class RevocationHopGuard:
     #: Held SEPARATELY from the per-connection ``attested`` (BACKLOG #299) — folding the two into one
     #: field is exactly what let one env var cross every enforcing hop in the instance.
     blanket_attested: bool = False
-    #: Whether this hop's OWN context checks a CRL that is a real revocation check: it sets
-    #: ``VERIFY_CRL_CHECK_LEAF`` (:func:`context_checks_revocation`), the context does not skip time
-    #: validity (:func:`skips_validity_period`), which would let a CRL past ``nextUpdate`` through,
+    #: Whether this hop's OWN context checks a CRL that is a real revocation check: the context
+    #: gets no reason against it from :func:`crl_no_credit`, whose docstring states the conditions,
     #: and the caller did not pass ``expiry_relaxed=True``. Derived in :meth:`capture`, never from a
     #: global setting. It is the one field that decides both the disposition's CRL arm and whether
     #: the attested crossing is logged (vault BACKLOG #5086, owner ruling 2026-11-03). Find its
@@ -2769,15 +2879,24 @@ class RevocationHopGuard:
     crl_checked: bool = False
     #: Whether this hop skips the validity-period check: the caller passed ``expiry_relaxed=True``
     #: (``tls_allow_expired``), or the context handed to :meth:`capture` skips it. Descriptive only.
-    #: At least the record's wording reads it: :meth:`_detail` (the refusal and the WARNING) and
-    #: :meth:`enforce_construction`'s choice of the attested crossing's lead. No disposition reads
-    #: it, since :attr:`crl_checked` is already False wherever it is True.
+    #: The record's wording reads it through :attr:`no_credit`. No disposition reads it, since
+    #: :attr:`crl_checked` is already False wherever it is True.
     expiry_relaxed: bool = False
+    #: Whether the context handed to :meth:`capture` does not verify the peer
+    #: (:attr:`CrlNoCredit.PEER_NOT_VERIFIED`, :func:`crl_no_credit`). Descriptive only, like
+    #: :attr:`expiry_relaxed`, and it outranks that field in :attr:`no_credit`. Where it is True the
+    #: guard's own words do not call the peer certificate verified, and :attr:`stated_cell` and
+    #: :attr:`stated_description` drop the word "verified" from the caller's, by the rule
+    #: :data:`_VERIFIED_CLAIM` states (vault BACKLOG #4912).
+    peer_not_verified: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
-    #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
-    #: ``tls_revocation_attested`` — **the connection flag is inapplicable to every non-connection
-    #: hop that passes this field, and ``[tls].crl_file`` to most of them**. At least the IdP, the
-    #: syslog forwarder and the store each load their own CRL setting and resolve no ``[tls]`` anchor, so ``[tls].crl_file``
+    #: (BACKLOG #1498). That is not only a hop outside a connection: a connection hop whose CRL
+    #: cannot cross passes one too, as the REST destination and the token hop do behind an ECH
+    #: sidecar with ``ECH_HOP_WAYS_ACROSS`` (vault BACKLOG #4912). The default names
+    #: ``[tls].crl_file`` and a connection's ``tls_revocation_attested`` — **the connection flag is
+    #: inapplicable to every non-connection hop that passes this field, and ``[tls].crl_file`` to
+    #: most of them**. At least the IdP, the syslog forwarder and the store each load their own
+    #: CRL setting and resolve no ``[tls]`` anchor, so ``[tls].crl_file``
     #: never reaches their contexts, and there is no connection to carry the flag; check any new one
     #: before relying on this. Telling such an operator to set one of them is a refusal whose remedy
     #: cannot be performed, which is the SDS-3.7 false-premise defect wearing a helpful voice. A
@@ -2788,9 +2907,9 @@ class RevocationHopGuard:
     #: ``alert_sinks._refuse_alert_smtp_revocation``, which passes its own sentence naming both
     #: ``[tls].crl_file`` and the ``[alerts]`` pair; the alert webhook's guard,
     #: ``alert_sinks._refuse_webhook_revocation``, passes one naming its ``[alerts]`` pair only.
-    #: The field is not always what the caller passed: :meth:`capture` fills a ``None`` with
-    #: :data:`EXPIRY_RELAXED_WAYS_ACROSS` on a hop that :attr:`expiry_relaxed` marks (vault BACKLOG
-    #: #5089 and #5086).
+    #: The field is not always what the caller passed: :meth:`capture` fills a ``None`` from
+    #: :attr:`no_credit`, with :data:`PEER_NOT_VERIFIED_WAYS_ACROSS` or :data:`EXPIRY_RELAXED_WAYS_ACROSS`
+    #: (vault BACKLOG #5089, #5086 and #4912).
     ways_across: str | None = None
     #: The connection's ``tls_revocation_attested_reason`` (ADR 0173), recorded in the audit line
     #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
@@ -2829,7 +2948,7 @@ class RevocationHopGuard:
         hop (scheme/host only — never a credential or a body).
 
         ``context`` is the :class:`ssl.SSLContext` this hop's handshake will actually use. When supplied,
-        :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off it, so a hop whose CRL was
+        :func:`crl_no_credit` reads it, so a hop whose CRL was
         really loaded stops being refused while a sibling hop that never got one keeps its guard. Passing
         the context rather than a ``[tls].crl_file`` boolean is what makes the CRL relaxation per-hop:
         one instance-wide setting must never silence a hop whose handshake does not consult it.
@@ -2855,7 +2974,12 @@ class RevocationHopGuard:
         does not offer the CRL it has just refused to credit. A ``ways_across`` the caller passes is
         used as given, so it can still name a CRL whose credit was dropped; nothing here refuses
         that. That text names a connection's flags, so a hop that is not a connection and hands over
-        such a context must pass its own sentence (BACKLOG #1498).
+        such a context must pass its own sentence (BACKLOG #1498). A context that does not verify
+        the peer outranks the relaxation: the hop earns no CRL credit, and an omitted
+        ``ways_across`` becomes :data:`PEER_NOT_VERIFIED_WAYS_ACROSS` instead (vault BACKLOG #4912).
+        :attr:`no_credit` holds the reason the record is worded from, and on such a hop the
+        record drops the word "verified" from the caller's ``cell`` and ``description``
+        (:attr:`stated_cell`).
 
         The flag can only take credit away, never grant it: on a context that skips the check, the
         CRL earns nothing with or without the flag (vault BACKLOG #5086, which closes the no-flag
@@ -2867,6 +2991,9 @@ class RevocationHopGuard:
         reads call shapes by name, not what the code evaluates to, so some such call sites pass
         it; ADR 0173 §4.3's note of 2026-11-04 says what it reads."""
         expiry_relaxed = expiry_relaxed or (context is not None and skips_validity_period(context))
+        no_credit = crl_no_credit(context)
+        if expiry_relaxed and no_credit is not CrlNoCredit.PEER_NOT_VERIFIED:
+            no_credit = CrlNoCredit.EXPIRY_RELAXED
         return cls(
             host=host,
             cell=cell,
@@ -2874,12 +3001,11 @@ class RevocationHopGuard:
             attested=attested,
             posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
-            crl_checked=not expiry_relaxed and context_checks_revocation(context),
+            crl_checked=no_credit is None,
             expiry_relaxed=expiry_relaxed,
+            peer_not_verified=no_credit is CrlNoCredit.PEER_NOT_VERIFIED,
             ways_across=(
-                EXPIRY_RELAXED_WAYS_ACROSS
-                if expiry_relaxed and ways_across is None
-                else ways_across
+                _DEFAULT_WAYS_ACROSS.get(no_credit) if ways_across is None else ways_across
             ),
             attested_reason=attested_reason,
             connection=connection,
@@ -2888,11 +3014,48 @@ class RevocationHopGuard:
 
     def __post_init__(self) -> None:
         # A guard built or replaced directly, not through capture(), has no context to read, so
-        # skips_validity_period is not asked here. This refuses only the contradiction the fields
-        # themselves show, crl_checked and expiry_relaxed both True (vault BACKLOG #5086). A direct
-        # build with crl_checked=True and expiry_relaxed False is accepted whatever its caller dials.
+        # crl_no_credit is not asked here. This refuses only the two contradictions the fields
+        # themselves show: crl_checked with expiry_relaxed (vault BACKLOG #5086), and crl_checked
+        # with peer_not_verified (vault BACKLOG #4912). A direct build with crl_checked=True and
+        # both of those False is accepted whatever its caller dials.
         if self.crl_checked and self.expiry_relaxed:
             raise ValueError("a guard on a hop that skips time validity cannot credit a CRL")
+        if self.crl_checked and self.peer_not_verified:
+            raise ValueError("a guard marked peer_not_verified cannot credit a CRL")
+
+    @property
+    def no_credit(self) -> CrlNoCredit | None:
+        """Why this hop's CRL earns no credit, or ``None`` when :attr:`crl_checked` credits one.
+
+        The one value the guard's own words are chosen from: :meth:`_detail` (the refusal and the
+        WARNING), :attr:`crossing_lead`, and the remedy :meth:`capture` fills in (vault BACKLOG
+        #4912)."""
+        if self.peer_not_verified:
+            return CrlNoCredit.PEER_NOT_VERIFIED
+        if self.expiry_relaxed:
+            return CrlNoCredit.EXPIRY_RELAXED
+        return None if self.crl_checked else CrlNoCredit.NO_CRL
+
+    def _as_stated(self, text: str) -> str:
+        return _VERIFIED_CLAIM.sub("", text) if self.peer_not_verified else text
+
+    @property
+    def stated_cell(self) -> str:
+        """:attr:`cell` as the record writes it: with the word "verified" removed where
+        :attr:`peer_not_verified` is True, by the rule :data:`_VERIFIED_CLAIM` states, else
+        unchanged."""
+        return self._as_stated(self.cell)
+
+    @property
+    def stated_description(self) -> str:
+        """:attr:`description` as the record writes it, by the rule :attr:`stated_cell` states."""
+        return self._as_stated(self.description)
+
+    @property
+    def crossing_lead(self) -> str:
+        """The attested crossing line's lead, chosen by :attr:`no_credit`. A caller that logs its
+        own crossing, as the AI broker does, reads it here (vault BACKLOG #4912)."""
+        return _CROSSING_LEAD.get(self.no_credit, _NO_CHECK_CROSSING)
 
     def disposition(self) -> HopDisposition | None:
         """What :meth:`enforce_construction` would do, without logging, auditing or raising.
@@ -2913,8 +3076,8 @@ class RevocationHopGuard:
 
     def _detail(self) -> str:
         return (
-            f"{self.description} to {self.host}: "
-            f"{_EXPIRY_RELAXED_NO_CHECK if self.expiry_relaxed else _NO_REVOCATION_CHECK} "
+            f"{self.stated_description} to {self.host}: "
+            f"{_NO_CHECK_LEAD.get(self.no_credit, _NO_REVOCATION_CHECK)} "
             # `is not None`, never `or`: a hop with no lever at all passes "" to offer nothing, and a
             # falsy test would hand it back the connection-shaped advice this field exists to suppress.
             f"{_CONNECTION_WAYS_ACROSS if self.ways_across is None else self.ways_across} "
@@ -2955,18 +3118,14 @@ class RevocationHopGuard:
         ):
             log_attested_crossing(
                 logger,
-                crossing=(
-                    _EXPIRY_RELAXED_CROSSING
-                    if self.expiry_relaxed
-                    else "verified TLS hop crossed without certificate revocation checking"
-                ),
+                crossing=self.crossing_lead,
                 connection=self.connection,
-                detail=f"{self.cell}: {self._detail()}",
+                detail=f"{self.stated_cell}: {self._detail()}",
                 reason=self.attested_reason,
                 declaration=self.declaration,
             )
         enforce_insecure_hop(
-            disposition, message=self._detail(), cell=self.cell, connection=self.connection
+            disposition, message=self._detail(), cell=self.stated_cell, connection=self.connection
         )
 
 

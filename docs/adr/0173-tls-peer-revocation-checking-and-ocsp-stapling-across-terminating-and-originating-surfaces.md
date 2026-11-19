@@ -790,13 +790,20 @@ that context's CRL, with no attestation, so the rule rests on each caller passin
 gone, and the guard decides on one field, `crl_checked`, which the disposition, the line and the
 AI broker all read (vault BACKLOG #5086, owner ruling 2026-11-03). `capture()` sets it True only
 when the context checks a CRL, the context does not skip time validity, and the caller did not pass
-`expiry_relaxed=True`, so the flag can only take the credit away. A CRL on a context that skips time
+`expiry_relaxed=True`, so the flag can only take the credit away. [Note 2026-11-17, vault BACKLOG
+#4912: `capture()` also gives no credit to a context whose `verify_mode` is `CERT_NONE`. It reads
+`crl_no_credit` in `config/tls_policy.py`, whose docstring states the conditions. On such a
+context, relaxed or not, the record is worded from `CrlNoCredit.PEER_NOT_VERIFIED` and an omitted
+`ways_across` becomes `PEER_NOT_VERIFIED_WAYS_ACROSS`. The relaxed words this paragraph names below,
+from `CrlNoCredit.EXPIRY_RELAXED` with `EXPIRY_RELAXED_WAYS_ACROSS`, apply to a relaxed hop with
+any other context or none.] A CRL on a context that skips time
 validity earns no credit with or without the flag, so such a hop is decided as one with no CRL:
 at least, off-box and unattested, it is refused under an enforcing posture, and warned on an
 instance that does not enforce unless `MEFOR_TLS_REVOCATION_ATTESTED` is set. Before it, a guard handed such a context without the flag
 admitted the hop on that CRL, the case §4.3's note of 2026-11-03 left open. A hop is relaxed for
 the record's words and for the remedy when the flag is set or the context skips time validity, so a
-caller that passes no `ways_across` there gets `EXPIRY_RELAXED_WAYS_ACROSS`. No shipped call site's
+caller that passes no `ways_across` there gets `EXPIRY_RELAXED_WAYS_ACROSS` (not on a `CERT_NONE`
+context: see the 2026-11-17 bracket above). No shipped call site's
 disposition moved: MLLP, the DICOM SCU and FTPS pass their relaxed context with the flag (vault
 BACKLOG #5089), and at least REST, SOAP and FHIR hand the guard no context there. Tests in
 `tests/test_revocation_guard_census.py` pin the call sites as written:
@@ -842,13 +849,20 @@ each other. Whether such a context's CRL should admit the hop is not decided her
 guard's, and its line keeps the unrelaxed words: no context that skips time validity reaches it,
 because neither opener it can dial relaxes: rest.py's shared opener, or, since BACKLOG #5527, the
 anchored opener it holds, built by rest.py's `_no_redirect_opener`, which never calls
-`relax_verify_expiry`. *(Note 2026-11-04: the open limit above is closed by
+`relax_verify_expiry`. *(Note 2026-11-17, vault BACKLOG #4912: the AI broker now takes its
+crossing line's lead from the guard and words its records from the guard's reason, so a context
+that skips time validity, if one reached it, would get the relaxed words, or the
+`CrlNoCredit.PEER_NOT_VERIFIED` words if that context's `verify_mode` is `CERT_NONE`.)* *(Note 2026-11-04: the open limit above is closed by
 vault BACKLOG #5086. `capture()` reads the time-validity flag off any context it is handed, so a
 context that skips time validity earns no CRL credit without the flag either, takes the relaxed
 words and, where the caller passes no remedy, `EXPIRY_RELAXED_WAYS_ACROSS`; "Only the flag sets
-them" no longer holds. Its attested line is kept on `crl_checked`, which is now False there, so the
+them" no longer holds. Where that context's `verify_mode` is `CERT_NONE` it takes the
+`CrlNoCredit.PEER_NOT_VERIFIED` words instead and, where the caller passes no remedy,
+`PEER_NOT_VERIFIED_WAYS_ACROSS`. Its attested line is kept on `crl_checked`, which is now False there, so the
 record and the disposition no longer contradict each other. `crl_is_a_check` is gone; §4.3's note
-of 2026-11-04 above says what replaced it.)*
+of 2026-11-04 above says what replaced it. CORRECTED 2026-11-18, vault BACKLOG #4912: the
+relaxed-words sentence had no `CERT_NONE` exception; it read "takes the relaxed words and, where
+the caller passes no remedy, `EXPIRY_RELAXED_WAYS_ACROSS`".)*
 
 The Status paragraph and the two §7.1 rows that called #2188 and #2169 open defects carry a
 correction dated 2026-10-04.
@@ -1246,25 +1260,31 @@ ruling:
 - **The ruling rests on Microsoft's driver.** The question cited Microsoft's driver documentation,
   and the test names ODBC Driver 18 only. Another driver can serve these hops, as the second
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
-- **Driver 18 was tested on one build on Windows Server 2022, and other drivers were not
-  tested.** The ruling's "then test it" half has two recorded results. The test needs a SQL
-  Server whose certificate can be revoked. A control connection to a certificate that is not
-  revoked shows that a refusal comes from the revocation. The amendment of 2026-11-11 below
-  states what the runs measured and which run is still owed.
+- **Only two runs have results, and the run on the SQL Server test box is still owed.** The
+  test needs a SQL Server whose certificate can be revoked. A control connection to a
+  certificate that is not revoked shows that a refusal comes from the revocation. The amendment of 2026-11-11 below states what
+  the runs measured, their limits, and which run is still owed. *(Corrected 2026-11-17, vault
+  BACKLOG #3009: this bullet's heading read "Driver 18 was tested on one build on Windows Server
+  2022, and other drivers were not tested", which restated the amendment's limits.)*
   *(Until 2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still
   unmeasured.** The ruling's "then test it" half is owed. It needs a SQL Server whose certificate
   can be revoked. A control connection to a certificate that is not revoked shows that a refusal
   comes from the revocation. Until #3009 runs, nothing here says whether Driver 18 checks
   revocation.")*
-- **What a result would mean for the grade is not ruled.** If Driver 18 checks, the text can say
+- **What a result would mean for the grade: R6 does not rule it, and a delegated decision holds
+  the grade for now (the note at the end of this bullet).** *(Corrected 2026-11-17, vault BACKLOG
+  #3009: the heading read "What a result would mean for the grade is not ruled", which the note
+  below it had overtaken.)* If Driver 18 checks, the text can say
   under what conditions. If it does not, R6 does not say whether the gap stands or the owner's
   other two options come back. BACKLOG #3009's third closing step says the gap stands. That is
-  the ledger row's wording, not the owner's, so it is the owner's to decide when a result exists.
+  the ledger row's wording, not the owner's, so it was the owner's to decide once a result
+  existed; the note below records how that was decided.
   *(Note 2026-11-11: two recorded results exist, in the amendment of that date below. That
   amendment does not change the grade. A Manager decided under the owner's delegation of
   2026-11-11 that the five rows keep the grade R6 gives them, that R6's named gap stands as
   named, and that #2194's guard and driver-control options are not reopened now: decision
-  d20261112T022118464-c27c39, logged 2026-11-12 UTC.)*
+  d20261112T022118464-c27c39, logged at 02:21 UTC on 2026-11-12, the evening of 2026-11-11 in
+  Central time.)*
 
 *(Until 2026-10-11 this paragraph read: "**What is open on the five ODBC hops.** BACKLOG #2194 names
 three outcomes for a hop: a guard, a documented driver control, or an accepted gap. This note
@@ -1300,8 +1320,8 @@ chosen option gives for building no guard:
 **Amendment 2026-11-11 -- what the ODBC Driver 18 test measured (vault BACKLOG #3009).** This is a
 public summary of two private test records in the vault, each recording one run of the vault's
 ODBC revocation runbook that reached a result. Their contents beyond this summary are not repeated
-here. It changes no code. For the grade, see the limit *What a result would mean for the grade is
-not ruled*, under the ruling above, and its note of 2026-11-11.
+here. It changes no code. For the grade, see the limit headed *What a result would mean for the
+grade*, under the ruling above, and its note of 2026-11-11.
 
 - **Where it ran.** Two runs with results, dated 2026-10-16 and 2026-10-17 in Central time. In
   UTC, the first run's legs ran from 02:22 to 02:25 and the second's from 05:18 to 05:19, both on
@@ -1309,11 +1329,15 @@ not ruled*, under the ruling above, and its note of 2026-11-11.
   test, not on the SQL Server test box, and that the runbook puts the next run there. The second
   run's record says it ran inside a virtual machine, after a revert to checkpoint
   `post-3009-clean-2026-10-16`, a tightening of folder permissions and a new checkpoint,
-  `post-3009-acl-2026-10-17`, and does not say which machine that is. An earlier scripted run
-  stopped at Step 2, as designed, and changed nothing. Neither record says a run took place on the
-  SQL Server test box. The run there is still owed, and BACKLOG #3009's step 2 stays open for it:
+  `post-3009-acl-2026-10-17`. It writes the machine's name as a placeholder, so it cannot show
+  which machine that is. An earlier scripted run stopped at Step 2, as designed, and changed
+  nothing. So no record shows a run on the SQL Server test box. *(Corrected 2026-11-17, vault
+  BACKLOG #3009: this read "does not say which machine that is" and "Neither record says a run
+  took place on the SQL Server test box", which leaned on a name the second record had replaced
+  with a placeholder.)* The run there is still owed, and BACKLOG #3009's step 2 stays open for it:
   a Manager decided so under the owner's delegation of 2026-11-11, decision
-  d20261112T022119877-2ccc8b, logged 2026-11-12 UTC.
+  d20261112T022119877-2ccc8b, logged at 02:21 UTC on 2026-11-12, the evening of 2026-11-11 in
+  Central time.
 - **Versions.** ODBC Driver 18 for SQL Server, 64-bit: `msodbcsql18.dll` ProductVersion 18.7,
   build 1, revision 1, reporting driver version `18.07.0001`. Windows Server 2022 Datacenter,
   build 20348, update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. Both records list
@@ -1560,8 +1584,10 @@ cells, whose old grade is quoted once, in the grades bullet:
 ruling's limits and what the test must show. Other places name the ruling and point there. When
 BACKLOG #3009 has a result, it goes in that paragraph. *(Note 2026-11-11: the result is in §7.1's
 amendment of that date, after the 2026-10-04 reading that follows that paragraph. What the test
-must show is still stated in that paragraph's limit *Driver 18 was tested on one build on
-Windows Server 2022, and other drivers were not tested*.)*
+must show is still stated in that paragraph's third limit, headed *Only two runs have results,
+and the run on the SQL Server test box is still owed*. Corrected 2026-11-17, vault BACKLOG #3009:
+this named the limit by its old heading, "Driver 18 was tested on one build on Windows Server
+2022, and other drivers were not tested".)*
 
 **What this amendment does not do.** It builds no guard, changes no code and measures nothing.
 
@@ -1640,7 +1666,10 @@ note (decision log `d20261026T140954228-ff8cff`).
   tunnelled connection runs it in `connect`, before its socket opens, so before `CONNECT` and
   before any proxy credentials cross.
 - It reads the CRL flag off that leg's own context and decides with `revocation_hop_disposition`
-  on the hop's posture and attestation, as the Vault leg's guard does. For this leg a proxy on
+  on the hop's posture and attestation, as the Vault leg's guard does. *(Note 2026-11-17, vault
+  BACKLOG #4912: both legs now read the flag through `crl_credited` in `config/tls_policy.py`, the
+  yes-or-no form of `crl_no_credit`, the rule `RevocationHopGuard.capture` reads. The docstring of
+  `crl_no_credit` states the conditions.)* For this leg a proxy on
   a loopback address is on the box, decided without DNS, but the Vault leg's guard still counts
   any proxied hop as off the box. A proxy that takes no credentials is judged the same way,
   because the host name still crosses.
@@ -1709,10 +1738,13 @@ on first deployment, with no attestation.
   2026-10-30, and it has changed. The two sites, and both FTPS directions, now pass the guard the
   context they dial with and `expiry_relaxed=True`; FTPS still reads the setting, the two sites the
   flag. `RevocationHopGuard.capture` gained that keyword, which drops the CRL credit and makes an
-  omitted remedy `EXPIRY_RELAXED_WAYS_ACROSS`, and the guard gained a `context_skips_validity`
+  omitted remedy `EXPIRY_RELAXED_WAYS_ACROSS`, except on a context whose `verify_mode` is `CERT_NONE`,
+  where an omitted remedy is `PEER_NOT_VERIFIED_WAYS_ACROSS` with or without the keyword, and the guard gained a `context_skips_validity`
   field that feeds `crl_is_a_check`. `context_checks_revocation` itself is unchanged. The
   disposition on these hops is the same: refused under an enforcing posture unless attested. §4.3's
-  note of 2026-11-03 says what the record now reads.)*
+  note of 2026-11-03 says what the record now reads. CORRECTED 2026-11-18, vault BACKLOG #4912: this
+  said the keyword "makes an omitted remedy `EXPIRY_RELAXED_WAYS_ACROSS`", with no `CERT_NONE`
+  exception; that exception exists since #4912.)*
   *(Note 2026-11-04, BACKLOG #5086: the `context_skips_validity` field and `crl_is_a_check` are
   gone. `capture` reads `skips_validity_period` off any context it is handed and, on True, drops
   the CRL credit and treats the hop as relaxed whether or not the caller passed the flag, so these

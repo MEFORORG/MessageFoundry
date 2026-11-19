@@ -484,8 +484,8 @@ _POSTURES_BUILT = sorted(
         ("harness/load/connscale/runner.py", "_reset_server_store"),
         ("harness/load/connscale/runner.py", "_reset_server_store"),
         ("harness/load/connscale/runner.py", "_store_reader._read"),
-        ("harness/load/shardcert.py", "_queue_breakdown"),
-        ("harness/load/shardcert.py", "_reset_store"),
+        # The one opener _reset_store and _queue_breakdown share.
+        ("harness/load/shardcert.py", "_open_rig_store"),
     ]
 )
 

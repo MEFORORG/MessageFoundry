@@ -102,6 +102,7 @@ __all__ = [
     "envelope_address_problem",
     "envelope_recipients",
     "envelope_refusal_under",
+    "refuse_unsafe_subject",
 ]
 
 logger = logging.getLogger(__name__)
@@ -230,17 +231,16 @@ def _checked_header(cell: str, field: str, checked: list[str], what: str) -> lis
     return addresses
 
 
-def _refuse_unsafe_subject(subject: str) -> None:
-    """Refuse a subject that the header parser reads as text holding a control character.
+def refuse_unsafe_subject(subject: str, *, transport: str) -> None:
+    """Refuse at least a subject holding a C0 control character, DEL or a Unicode line break, raw
+    or inside an encoded word, and a subject holding a lone surrogate.
 
-    ``policy.default`` parses the ``Subject:`` it is given and decodes RFC 2047 encoded words. So
-    ``=?utf-8?b?AA==?=`` holds no control character as configured, reads back as a NUL, and the
-    generator writes that NUL raw into the header (vault BACKLOG #3206). This sets the subject on a
-    scratch message, as :func:`_checked_header` does for an address, and checks what reads back.
-
-    Setting it here also moves any fault the header class raises from every send to load. Only the
-    exception's type is kept, and the refusal is raised outside the handler, so neither the text nor
-    the chain quotes the subject. Raises :class:`ValueError` naming the setting, never its value."""
+    Raises :class:`ValueError` whose text starts with ``transport``, the outbound's label such as
+    ``"Email destination"``, and holds no subject text."""
+    if _holds_control_char(subject):
+        raise ValueError(f"{transport} 'subject' holds a control character")
+    if has_lone_surrogate(subject):
+        raise ValueError(f"{transport} 'subject' holds a lone surrogate")
     probe = EmailMessage()
     failure = ""
     try:
@@ -248,10 +248,13 @@ def _refuse_unsafe_subject(subject: str) -> None:
     except (UnicodeError, ValueError) as exc:
         failure = type(exc).__name__
     if failure:
-        raise ValueError(f"Email destination 'subject' cannot be set as a header ({failure})")
+        # Raised outside the handler and type-only: UnicodeEncodeError.object holds the subject or
+        # its decoded text.
+        raise ValueError(f"{transport} 'subject' cannot be set as a header ({failure})")
+    # Read-back of encoded words (vault BACKLOG #3206).
     if _holds_control_char(str(probe["Subject"])):
         raise ValueError(
-            "Email destination 'subject' holds an encoded word that decodes to a control character"
+            f"{transport} 'subject' holds an encoded word that decodes to a control character"
         )
 
 
@@ -515,18 +518,12 @@ class EmailDestination(DestinationConnector):
         self.sender = sender
         self.recipients = _as_recipients(s.get("recipients"))
         self.subject = str(s.get("subject", ""))
-        for name, value in (("subject", self.subject), ("sender", self.sender)):
-            # A control character in a header value would raise inside _build_message at every
-            # send, where it dead-letters as an internal error. Refuse it here, at load.
-            if _holds_control_char(value):
-                raise ValueError(f"Email destination '{name}' holds a control character")
-        # Why: has_lone_surrogate (vault BACKLOG #2842). The sender needs no such check: the address
-        # rule below already refuses any non-ASCII sender.
-        if has_lone_surrogate(self.subject):
-            raise ValueError("Email destination 'subject' holds a lone surrogate")
-        # The two checks above read the setting as text. This one reads it as the header parser
-        # does, which decodes encoded words (vault BACKLOG #3206).
-        _refuse_unsafe_subject(self.subject)
+        refuse_unsafe_subject(self.subject, transport="Email destination")
+        # A control character in the sender would raise inside _build_message at every send, where
+        # it dead-letters as an internal error. Refuse it here, at load. The sender needs no
+        # surrogate check: the address rule below already refuses any non-ASCII sender.
+        if _holds_control_char(self.sender):
+            raise ValueError("Email destination 'sender' holds a control character")
         # Each recipient gets the rule the [egress] check applies, held here too so no build path
         # that skips that check can put an unchecked mailbox on the RCPT line. The sender is MAIL
         # FROM, where bounces go, so it gets the same rule (vault BACKLOG #2841). The headers are

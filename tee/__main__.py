@@ -49,6 +49,7 @@ from pathlib import Path
 
 from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
+from tee.anon.hl7 import SurrogateSeparatorRefused
 from tee.anon.keying import Keyer
 from tee.anon.leak import (
     MALFORMED_LINE_ADVICE,
@@ -66,7 +67,7 @@ from tee.anon.rules import (
     load_rules,
     retargeted_defaults,
 )
-from tee.anon.surrogates import site_prefixes_loaded
+from tee.anon.surrogates import SiteCodeSeparatorRefused, site_prefixes_loaded
 from tee.controlchars import scrub_control_chars
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
@@ -833,6 +834,13 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     residue_advice: dict[str, None] = {}
     # Whether such a report also had another cause, which needs the general advice as well.
     residue_mixed = False
+    # Messages refused because a rule's surrogate would hold the field separator or a control
+    # byte (BACKLOG #5540). A keep is the wrong advice for one: it would emit the captured value.
+    separator_refused = 0
+    separator_paths: dict[str, None] = {}
+    # Messages refused because no site-code surrogate could avoid a declared separator digit. A
+    # keep does not help: the site-code pass reads a kept field too.
+    site_code_refused = 0
 
     def _tally(report: LeakReport) -> None:
         nonlocal residue_reports, residue_mixed
@@ -854,21 +862,29 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 require_full_coverage=args.require_full_coverage,
                 on_report=_tally,
             )
-        except AnonError:
+        except AnonError as exc:
             # Counted apart from the rest: anonymize refused the message before the leak-check
             # built a report, so the coverage line would not show it at all (BACKLOG #3004).
             # The error's text is not printed; the summary names the count and fixed causes.
             coverage.refuse()
             failed += 1
+            if isinstance(exc, SurrogateSeparatorRefused):
+                separator_refused += 1
+                separator_paths[exc.path] = None
+            elif isinstance(exc, SiteCodeSeparatorRefused):
+                site_code_refused += 1
             continue
         except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
             failed += 1  # it is a count, not a leak (LeakError, or anything else)
             continue
         # The id is read from the anonymized body, with the reader the relay used for row.control_id,
-        # so it follows the rules; it is None when that body has no MSH-10. received_at is the
-        # relay's real receive time, which no MSH-7 rule touches (BACKLOG #2994). The surrogates
-        # are ASCII today, but this runs outside the catch above, so a character latin-1 cannot
-        # hold must give None rather than end the run.
+        # so it follows the rules (the store then cuts an over-long row.control_id to
+        # `_MAX_IDENTIFIER`, tee/store.py, and this id is not cut); it is None when that body has
+        # no MSH-10. received_at is the relay's real receive time, which no MSH-7 rule touches
+        # (BACKLOG #2994). The text was decoded from latin-1, so this encode fails only on a
+        # character an anonymizer pass wrote that latin-1 cannot hold, and no pass is known to
+        # write one. It runs outside the catch above, so if one ever did, the id would be None
+        # rather than the run ending.
         try:
             control_id, _ = mllp.peek_fields(anon.encode("latin-1"))
         except UnicodeEncodeError:
@@ -900,15 +916,39 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         ]
         if residue_reports:
             # A keep is the wrong advice here: it would leave the whole field.
+            if residue_reports < failed - separator_refused - site_code_refused:
+                rest = ["For the others:", *steps]
+            elif residue_mixed:
+                rest = ["At least one of them also had another cause:", *steps]
+            else:
+                rest = ["Then retry."]
             steps = [
                 f"{residue_reports} of them carried a PHI shape in a field a rule maps, past its "
                 "first component, where a retarget or an identifier rule left it as captured. "
                 f"{' '.join(residue_advice)} A keep would leave the whole field.",
+                *rest,
+            ]
+        if separator_refused:
+            # A keep is the wrong advice here too: it would emit the captured value whole.
+            steps = [
+                f"{separator_refused} of them were refused because the surrogate a rule wrote "
+                "would hold the message's field separator or a control byte, in "
+                f"{', '.join(separator_paths)}. A keep on such a field would emit the captured "
+                "value: point the field at drop in an overlay.",
                 *(
                     ["For the others:", *steps]
-                    if residue_reports < failed or residue_mixed
+                    if separator_refused < failed - site_code_refused
                     else ["Then retry."]
                 ),
+            ]
+        if site_code_refused:
+            # A keep is the wrong advice here too: the site-code pass reads a kept field.
+            steps = [
+                f"{site_code_refused} of them held a site code that no surrogate could replace "
+                "without a digit the message declares as a separator or escape character. A keep "
+                "does not help: the site-code pass reads a kept field too. Point each field that "
+                "holds a site code at drop in an overlay.",
+                *(["For the others:", *steps] if site_code_refused < failed else ["Then retry."]),
             ]
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "

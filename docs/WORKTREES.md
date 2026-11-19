@@ -182,7 +182,7 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Without `-Force`: uncommitted tracked changes (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. Unless `-AllowOrphanedAllocations`: an unlanded ledger number. Whatever `-Force` says: a detached HEAD no ref holds, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, a caller standing in the tree or running a copy of the script that lives in it, a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Without `-Force`: uncommitted tracked changes (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. Unless `-AllowOrphanedAllocations`: an unlanded ledger number. Whatever `-Force` says: a detached HEAD no ref holds, a commit only the tree's HEAD reflog or its own per-worktree refs hold (on `-Name` without `-DeleteBranch`, one the kept branch's reflog holds does not count), `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, `GIT_CONFIG` or a `GIT_CONFIG_<anything>` variable set, a caller standing in the tree or running a copy of the script that lives in it (a junction or 8.3 alias included), a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
 | `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` (one above the primary does not count; see below) | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
@@ -234,12 +234,15 @@ cannot. (Vault BACKLOG #1017.)
 [`scripts/worktree/remove.ps1`](../scripts/worktree/remove.ps1) is the source of record; this list
 is a copy for readers and can lag it.
 
-- `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set in the environment.
+- `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set in the environment, or
+  `GIT_CONFIG` or any `GIT_CONFIG_<anything>` variable. Both routes and `-List` refuse these.
 - A path component that ends in a dot or a space. Windows drops both, so it names another directory.
 - Anything that is not a registered linked worktree of this clone, matched on its full path as git
   records it. That covers the primary, another repository's worktree, a plain directory, and a
   junction, `subst` or 8.3 spelling of a real worktree.
-- The tree you are standing in, and a tree that holds the copy of the script being run.
+- The tree you are standing in, and a tree that holds the copy of the script being run, matched
+  by spelling and by the real path git resolves, so a junction or 8.3 alias is caught.
+  `-Name` refuses this too.
 - A tree under `.claude/worktrees`, other than a segment above the primary. The next section says why.
 - A tree that holds another registered worktree.
 - A tree git has locked.
@@ -247,7 +250,9 @@ is a copy for readers and can lag it.
 - A commit that only the tree's HEAD reflog holds, or only one of its own per-worktree refs
   (`refs/worktree`, `refs/bisect`, `refs/rewritten`). The removal deletes that reflog and those
   refs, so nothing would reach the commit afterwards. This one can refuse a harmless tree: a commit
-  replaced by an amend counts, although the branch's own reflog still holds it.
+  replaced by an amend counts, although the branch's own reflog still holds it. `-Name` refuses
+  this too, except that without `-DeleteBranch` it does not count a commit the kept branch's own
+  reflog holds.
 - A tree the session registry records a session in.
 - Any tree at all, when the session registry cannot be read.
 - A tree that still holds a work claim, or any tree when a claim file cannot be read. Neither route
@@ -424,7 +429,8 @@ pwsh -NoProfile -File scripts\coord\recoverable.ps1                 # this workt
 pwsh -NoProfile -File scripts\coord\recoverable.ps1 -Worktree <p> -Json
 ```
 
-It exits non-zero if any file is at risk. Each row carries a **binary `Verdict`** — the only thing a
+It exits 1 if any file is at risk, and 2 when it refuses because it could not look, for example
+on a failed `git status`; a refusal prints no rows. Each row carries a **binary `Verdict`** — the only thing a
 caller has to act on — and a **`Reason`** from a closed set, because three of the four causes are
 `AT-RISK` and "absent" is not the same problem as "modified":
 
@@ -729,13 +735,27 @@ says what else the step does not see.
 The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
 refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as it
 is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check
-passed and git still refused), `FAILED` or `ORPHANED`, with its reason, then a summary line with the
-counts and the drive's free space. A refusal or a decline is data and leaves the exit code alone; a
-failure raises it to `1`, and an orphan raises it to `3` and goes into `prune-merged.ps1`'s orphan
-ledger, so later runs keep reporting it. A list that could not be read skips the step, raising the
-code to `2` on a dry run and to `1` under `-Apply`, since the prune before it may have removed
-siblings. With `-Apply` the runner refuses to run inside Claude Code. Tests:
-[`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py).
+passed and git still refused), `FAILED`, `ORPHANED` or `NOT-REACHED` (the runner's
+`-StopAfterMinutes` deadline passed before that tree was started), with its reason, then a summary
+line with the counts and the drive's free space. Past that deadline before the listing run, the step
+logs one `SKIPPED` line instead and leaves the exit code alone. The installer sets the deadline inside
+the task's time limit (`-TimeLimitHours`, default 4); a task registered before either existed keeps
+its old one-hour limit and no deadline until `install-daily-prune.ps1` is run again.
+
+The exit code starts as the prune's, and each row changes it as the row arrives, before the row's
+log line is written. A refusal or a tree the deadline left leaves it alone. An orphan raises it to `3`
+and goes into `prune-merged.ps1`'s orphan ledger, so later runs keep reporting it. A `2` from the
+prune says nothing was attempted, so a `REMOVED`, `FAILED` or `DECLINED` row turns it into `1`; apart
+from that, a failure raises the code to at least `1`, and nothing lowers it. An unhandled error after
+the log path is set exits with at least `2` before the prune started or on a dry run, and at least `1`
+once an `-Apply` prune has started, never below the code the prune and the rows have set. A list that
+could not be read skips the step, raising the code to at least `2` on a dry run and at least `1` under
+`-Apply`, since the prune before it may have removed siblings. With `-Apply` the runner refuses to run
+inside Claude Code. Tests:
+[`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py)
+for the step, and
+[`tests/test_worktree_install_daily_prune.py`](../tests/test_worktree_install_daily_prune.py) for the
+exit codes and the prompt variables.
 
 ## A scheduled hygiene report that deletes nothing — `hygiene-report.ps1`
 
@@ -777,13 +797,17 @@ A merged worktree is proposed for removal only when all of these hold:
   it. A registry or record that cannot be read holds it too. The readers are the ones the nightly
   `.claude/worktrees` removal uses, in `worktree-gates.ps1`. For a tree under
   `.claude/worktrees`, routing the removal through `remove.ps1` instead would not help: `-Path`
-  refuses every such tree. The report shares those readers, not the nightly step's whole gate set,
-  so a tree that step refuses for an ignored file or a nested checkout can still be proposed here.
+  refuses every such tree.
+- No operation in progress in its git dir, no ignored entry other than a regenerable cache or a file
+  the nightly step tolerates, and no nested checkout, link or data file inside a cache. These are
+  the nightly step's own readers too. The report does not share that step's whole gate set: at
+  least its could-not-open and working-tree activity checks are not read here.
 
 Any merged worktree that fails one of those goes to NEEDS A HUMAN LOOK with its reasons. The session
 check is the liveness fence `prune-merged.ps1` uses, with the same limit. It cannot see a session
-writing into a worktree by absolute path. `git worktree remove` also deletes gitignored files, such
-as a `.venv`, caches, or a local `.env`.
+writing into a worktree by absolute path. `git worktree remove` also deletes gitignored files. A tree
+holding one other than a `.venv`, a cache or a file the nightly step tolerates is held, so what goes
+is those.
 
 It writes `hygiene-<yyyy-MM-dd>.md` and a `.json` twin, plus `latest.md` and `latest.json`, to
 `<git common dir>/mefor-coord/hygiene/`. A later run the same day replaces that day's pair. Nothing

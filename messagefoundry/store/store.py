@@ -99,9 +99,10 @@ from messagefoundry.config.settings import (
     StoreBackend,
 )
 from messagefoundry.connection_events import check_connection_event_kind
+from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
-from messagefoundry.redaction import safe_text
+from messagefoundry.redaction import json_loads_or_refusal, safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -206,6 +207,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     ResealOutcome,
+    RevokedRowSealError,
     RowSealer,
     RowSealError,
     RowSealKeyRetiredError,
@@ -2190,8 +2192,12 @@ async def require_role_seal_for_write(sealer: AnyRowSealer | None, row: RoleRow)
 
 def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
     """Whether ``record`` carries a valid seal. Always True with no sealer: a store that holds no
-    key writes and checks no seals. With one, a missing or empty seal fails like a wrong one."""
-    return sealer is None or sealer.verify(SESSION_KIND, record.seal_fields(), record.seal)
+    key writes and checks no seals. With one, a missing or empty seal fails like a wrong one, and
+    so does a value the encoder cannot read, as :func:`user_seal_ok` answers it (BACKLOG #5505)."""
+    if sealer is None:
+        return True
+    parts = record.seal_fields()
+    return _encodes(SESSION_KIND, parts) and sealer.verify(SESSION_KIND, parts, record.seal)
 
 
 # The awaitable read checks below serve either sealer (ADR 0217 slice 1b). Under the local sealer
@@ -2204,10 +2210,26 @@ def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
 
 
 async def session_seal_ok_async(sealer: AnyRowSealer | None, record: SessionRecord) -> bool:
-    """:func:`session_seal_ok`, awaitable, for either sealer."""
-    return sealer is None or await sealer.verify_async(
-        SESSION_KIND, record.seal_fields(), record.seal
+    """:func:`session_seal_ok`, awaitable, for either sealer. A value the encoder cannot read fails
+    as :func:`_held_seal_ok` fails it (:func:`_encodes`, BACKLOG #5505)."""
+    if sealer is None:
+        return True
+    parts = record.seal_fields()
+    return _encodes(SESSION_KIND, parts) and await sealer.verify_async(
+        SESSION_KIND, parts, record.seal
     )
+
+
+def _encodes(kind: str, parts: tuple[tuple[str, object], ...]) -> bool:
+    """Whether the seal encoder can read ``parts``. Tried on its own, so only the encoder's
+    ``TypeError`` reads as a failed seal; one raised past it, in the pool hand-off or the backend,
+    is a defect and propagates, as :func:`~messagefoundry.store.row_seal.require_seal_for_write`
+    lets it."""
+    try:
+        seal_bytes(kind, parts)
+    except TypeError:
+        return False
+    return True
 
 
 async def session_sealed_by_retired_key_async(
@@ -2215,9 +2237,13 @@ async def session_sealed_by_retired_key_async(
 ) -> bool:
     """Whether ``record`` carries a genuine seal made under a RETIRED store key: a session minted
     before the key changed and not yet ended by ``rotate-key``. It is refused like any other row
-    that fails; this only says the refusal is a key change, not an integrity failure."""
-    return sealer is not None and await sealer.sealed_by_retired_key_async(
-        SESSION_KIND, record.seal_fields(), record.seal
+    that fails; this only says the refusal is a key change, not an integrity failure. A value the
+    encoder cannot read is no genuine seal, so it reads False (:func:`_encodes`, BACKLOG #5505)."""
+    if sealer is None:
+        return False
+    parts = record.seal_fields()
+    return _encodes(SESSION_KIND, parts) and await sealer.sealed_by_retired_key_async(
+        SESSION_KIND, parts, record.seal
     )
 
 
@@ -2225,19 +2251,12 @@ async def _held_seal_ok(
     sealer: AnyRowSealer | None, kind: str, fields: Iterable[tuple[str, object]], stored: str
 ) -> bool:
     """The record read check every ``*_seal_ok_async`` shares: True with no sealer, else whether
-    ``stored`` holds under a held key, a value the encoder cannot read failing like a wrong seal.
-
-    The encoding is tried on its own first, so only the encoder's ``TypeError`` reads as a
-    failed seal; one raised past it, in the pool hand-off or the backend, is a defect and
-    propagates, as :func:`~messagefoundry.store.row_seal.require_seal_for_write` lets it."""
+    ``stored`` holds under a held key, a value the encoder cannot read failing like a wrong seal
+    (:func:`_encodes`)."""
     if sealer is None:
         return True
     parts = tuple(fields)
-    try:
-        seal_bytes(kind, parts)
-    except TypeError:
-        return False
-    return await sealer.verify_held_async(kind, parts, stored)
+    return _encodes(kind, parts) and await sealer.verify_held_async(kind, parts, stored)
 
 
 def new_session_record(
@@ -2767,7 +2786,12 @@ async def admin_guard_counts(
         if is_target:
             target += 1
             continue
-        record = await read_record(holder_id)
+        try:
+            record = await read_record(holder_id)
+        except RowSealError:
+            # A holder whose users row has a timestamp or counter cell that does not parse, or
+            # whose role rows have an assigned_at that does not parse, fails (BACKLOG #5505).
+            continue
         if record is None or not await user_seal_ok_async(sealer, record):
             continue
         if record.row.disabled or role_id not in record.role_ids:
@@ -2802,6 +2826,81 @@ _END_DECLINED_KEPT_SESSION_SQL: Final = (
     "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL"
     " AND token_hash=?"
 )
+
+
+#: What a record decoder raises for a cell that is there but does not parse: ``int()``/``float()``
+#: of text (``ValueError``), of a type with no such form (``TypeError``), of an infinite REAL
+#: (``OverflowError``), and JSON nested past the parser's depth (``RecursionError``). A MISSING
+#: column (``KeyError``) is not among them: it is a schema defect on every row, so it stays loud.
+_CELL_PARSE_ERRORS: Final = (ValueError, TypeError, OverflowError, RecursionError)
+
+
+def decode_or_refuse[T](kind: str, ident: str, decode: Callable[[], T]) -> T:
+    """``decode()``, or :class:`RowSealError` when a cell it reads does not parse (BACKLOG #5505).
+    A row someone wrote outside the store raises the error a failed seal raises, so the handlers
+    that already catch that one, at least the re-seal pass and the write helpers' callers, refuse
+    that row alone. A multi-row read of users or sessions decides per row (:func:`listed_users`,
+    :func:`decoded_rows`); an account's role read raises for the whole account.
+    ``ident`` is the row's stored id or token hash, ``""`` when none is readable; the refusal's
+    subject is its :func:`seal_row_ref`.
+
+    The refusal is raised once the handler has ended, so the parse error, which can quote the cell,
+    is on neither chain (``WebAuthnCredential.from_mapping`` says why ``from None`` is not
+    enough). The WARNING names the kind, the bounded subject and the error's class, never the
+    cell."""
+    try:
+        return decode()
+    except _CELL_PARSE_ERRORS as exc:
+        failure = type(exc).__name__
+    subject = seal_row_ref(kind, ident) if ident else ""
+    log.warning(
+        "a row of a %s record (%s) holds a cell that does not parse (%s)",
+        kind,
+        subject or "no readable id",
+        failure,
+    )
+    raise RowSealError(kind, subject)
+
+
+def _cell_text(d: Mapping[str, Any], column: str) -> str:
+    """``d[column]`` when it reads as text, else ``""``: the ``ident`` a decoder hands
+    :func:`decode_or_refuse`, read before the decode so a corrupt id cell cannot raise here."""
+    value = d.get(column)
+    return value if isinstance(value, str) else ""
+
+
+def parse_recovery_code_hashes(cell: str | None, user_id: str) -> list[str]:
+    """The recovery-code hashes a ``totp_recovery_codes`` cell holds, ``[]`` for ``None``. A cell
+    that is not a JSON list raises :class:`RowSealError` for the account (:func:`decode_or_refuse`,
+    BACKLOG #5505). :meth:`UserRow.recovery_code_hashes` and each backend's
+    ``get_recovery_code_hashes`` parse it here."""
+    if cell is None:
+        return []
+
+    def parse() -> list[str]:
+        # The shared hostile-JSON reader: a depth bomb is a refusal, not a RecursionError.
+        hashes, refused = json_loads_or_refusal(cell)
+        if refused is not None:
+            raise ValueError("totp_recovery_codes is not JSON")
+        if not isinstance(hashes, list):  # ``null`` included
+            raise TypeError("totp_recovery_codes is not a list")
+        return [str(h) for h in hashes]
+
+    return decode_or_refuse(USER_KIND, user_id, parse)
+
+
+def decoded_rows[T](rows: Iterable[Any], decode: Callable[[Any], T]) -> list[T]:
+    """``decode`` over a multi-row read, leaving out each row it refuses with
+    :class:`RowSealError` (BACKLOG #5505). :func:`decode_or_refuse` has already logged that row,
+    and the single-row readers still raise for it, so it is refused everywhere it is named while
+    every other row of the read stays readable."""
+    out: list[T] = []
+    for row in rows:
+        try:
+            out.append(decode(row))
+        except RowSealError:
+            continue
+    return out
 
 
 @dataclass(frozen=True)
@@ -2942,6 +3041,13 @@ class UserRecord:
     #: to pin a compare-and-set (``VerifiedUser.totp_secret_cell``, and ``admin-reset-totp``,
     #: BACKLOG #3778). ``None`` on a record built by hand.
     row: UserRow | None = field(default=None, compare=False, repr=False)
+    #: Set only on the stand-in :meth:`unreadable_row` builds for a row that does not parse
+    #: (:func:`listed_users` says which; BACKLOG #5505), from a list read or
+    #: ``read_user_or_unreadable``. ``AuthService._verified`` answers it as a
+    #: record that fails its seal, on a keyless store too, so a list keeps showing the account as
+    #: failing and reports it. Its other fields are invented closed values: a caller that is not
+    #: the seal check must not read them as the account's state.
+    unreadable: bool = field(default=False, compare=False)
 
     def sign_in_locked(self, now: float) -> bool:
         """Whether the SIGN-IN lock is live at ``now``."""
@@ -2952,7 +3058,41 @@ class UserRecord:
         return self.second_step_locked_until is not None and now < self.second_step_locked_until
 
     @classmethod
+    def unreadable_row(cls, user_id: str) -> UserRecord:
+        """The stand-in a list read returns for the account ``user_id`` names when its row does
+        not decode (:func:`listed_users`). Every field but the id is the closed value: disabled, no
+        password, no factor, no row to seal."""
+        return cls(
+            id=user_id,
+            username=user_id,
+            auth_provider="local",
+            display_name=None,
+            email=None,
+            disabled=True,
+            created_at=0.0,
+            updated_at=0.0,
+            last_login_at=None,
+            password_hash=None,
+            password_changed_at=None,
+            must_change_password=True,
+            failed_attempts=0,
+            locked_until=None,
+            unreadable=True,
+        )
+
+    @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
+        """The account ``d`` holds; a cell of the row that does not parse raises
+        :class:`RowSealError`, as :func:`decode_or_refuse` says, and a missing column still raises
+        ``KeyError``. The store-wide global epoch is read outside that refusal: a fault in it is
+        one value every account reads, so it stays loud rather than refuse each account."""
+        global_epoch = global_epoch_or_refuse(d["global_session_epoch"])
+        return decode_or_refuse(
+            USER_KIND, _cell_text(d, "id"), lambda: cls._decode(d, global_epoch)
+        )
+
+    @classmethod
+    def _decode(cls, d: Mapping[str, Any], global_epoch: int) -> UserRecord:
         return cls(
             id=d["id"],
             username=d["username"],
@@ -3010,11 +3150,40 @@ class UserRecord:
             enrolment_code_digest=d.get("enrolment_code_digest"),
             enrolment_code_expires_at=_opt_float(d.get("enrolment_code_expires_at")),
             enrolment_code_issuer=d.get("enrolment_code_issuer"),
-            # Hard subscript for the same reason: every user reader is ``USER_READ_SQL``, and a
-            # mapping without the global epoch fails here rather than decode one nobody read.
-            global_session_epoch=global_epoch_or_refuse(d["global_session_epoch"]),
-            row=UserRow.from_mapping(d),
+            # Read by from_mapping with a hard subscript for the same reason: every user reader is
+            # ``USER_READ_SQL``, and a mapping without the global epoch fails rather than decode one
+            # nobody read.
+            global_session_epoch=global_epoch,
+            row=UserRow._decode(d),  # inside this decode's own refusal
         )
+
+
+def _listed_user(d: Mapping[str, Any]) -> UserRecord:
+    """One row of a list read: :meth:`UserRecord.from_mapping`, or, for a row that does not
+    parse (:func:`listed_users` says which), :meth:`UserRecord.unreadable_row`. Such a row whose id
+    cell is empty or not text still raises the :class:`RowSealError`, which :func:`decoded_rows` leaves
+    out."""
+    try:
+        return UserRecord.from_mapping(d)
+    except RowSealError:
+        ident = _cell_text(d, "id")
+        if not ident:
+            raise
+    return UserRecord.unreadable_row(ident)
+
+
+def listed_users(rows: Iterable[Mapping[str, Any]]) -> list[UserRecord]:
+    """The accounts a list read returned, in order (BACKLOG #5505). An account whose row has a
+    timestamp or counter cell that does not parse stays in the list as
+    :meth:`UserRecord.unreadable_row`, so the admin list shows it as failing, unless its id cell is
+    empty or not text, when it is left out. The read coerces the
+    flag cells with ``bool()`` and copies the text cells, at least ``totp_recovery_codes`` and
+    ``channel_scope``, without parsing them, so a bad value in one leaves the account listed as it
+    reads. The single-row user readers raise :class:`RowSealError` for a row with such a
+    timestamp or counter cell instead; the service's loaders answer it as a failed seal, and the
+    write helpers refuse it. A caller iterating a list read checks ``unreadable`` before it acts on
+    a field."""
+    return decoded_rows(rows, _listed_user)
 
 
 @dataclass(frozen=True)
@@ -3102,6 +3271,12 @@ class SessionRecord:
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
+        """The session ``d`` holds; a cell that does not parse raises :class:`RowSealError`, as
+        :func:`decode_or_refuse` says, and a missing column still raises ``KeyError``."""
+        return decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
+
+    @classmethod
+    def _decode(cls, d: Mapping[str, Any]) -> SessionRecord:
         return cls(
             token_hash=d["token_hash"],
             user_id=d["user_id"],
@@ -3332,7 +3507,12 @@ class UserRow:
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRow:
         """Hard subscripts throughout: every reader is a ``SELECT *``, and a row missing a column
-        must fail loudly rather than decode a default the seal was never made over."""
+        must fail loudly rather than decode a default the seal was never made over. A cell that is
+        there but does not parse raises :class:`RowSealError` (:func:`decode_or_refuse`)."""
+        return decode_or_refuse(USER_KIND, _cell_text(d, "id"), lambda: cls._decode(d))
+
+    @classmethod
+    def _decode(cls, d: Mapping[str, Any]) -> UserRow:
         last_step = d["last_totp_step"]
         return cls(
             id=str(d["id"]),
@@ -3375,10 +3555,9 @@ class UserRow:
         )
 
     def recovery_code_hashes(self) -> list[str]:
-        """The remaining single-use recovery-code hashes this row holds, or ``[]``."""
-        if self.totp_recovery_codes is None:
-            return []
-        return [str(h) for h in json.loads(self.totp_recovery_codes)]
+        """The remaining single-use recovery-code hashes this row holds, or ``[]``, as
+        :func:`parse_recovery_code_hashes` reads them."""
+        return parse_recovery_code_hashes(self.totp_recovery_codes, self.id)
 
     def write_params(self) -> tuple[object, ...]:
         """Every column but ``id``, in :class:`UserRow` field order, as the write statements bind
@@ -3396,10 +3575,17 @@ class RoleGrant:
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> RoleGrant:
-        return cls(
-            role_id=str(d["role_id"]),
-            assigned_at=float(d["assigned_at"]),
-            assigned_by=_opt_str(d["assigned_by"]),
+        """The grant ``d`` holds; a cell that does not parse raises :class:`RowSealError` under
+        the account's kind (:func:`decode_or_refuse`). The read selects no account id, so the
+        refusal names none; the reader that asked for the account knows it."""
+        return decode_or_refuse(
+            USER_KIND,
+            "",
+            lambda: cls(
+                role_id=str(d["role_id"]),
+                assigned_at=float(d["assigned_at"]),
+                assigned_by=_opt_str(d["assigned_by"]),
+            ),
         )
 
 
@@ -7139,9 +7325,28 @@ def _audit_row_mac(
     except AuditVerifyTimedOutError as exc:
         if in_walk:
             raise
-        log.warning("%s; read as a MAC that does not verify", exc)
+        _log_timeout_read_as_unverified(exc)
         return None
     return stored if verified is True and checked else None
+
+
+#: What :func:`_log_timeout_read_as_unverified` writes on stderr when its log call raises.
+_TIMEOUT_WARNING_UNLOGGED: Final = "an audit row check that timed out could not be logged"
+
+
+def _log_timeout_read_as_unverified(exc: AuditVerifyTimedOutError) -> None:
+    """Log that a row check outside the walk timed out and is read as a MAC that does not verify.
+    A failure of the log call is reported on stderr by its class alone (BACKLOG #6707), except out
+    of memory or stack, where that report can itself raise out of this function.
+    :func:`settle_audit_ranges`' own log calls are not guarded, so the store open
+    can still fail when a failing filter meets them."""
+    try:
+        log.warning("%s; read as a MAC that does not verify", exc)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+        text = _TIMEOUT_WARNING_UNLOGGED
+        with suppress(Exception):
+            text = f"{_TIMEOUT_WARNING_UNLOGGED} ({ascii(type(fault).__name__)})"
+        _last_resort(text)
 
 
 def _audit_digest_line(r: Mapping[str, Any]) -> bytes:
@@ -14388,7 +14593,7 @@ class MessageStore:
             # metadata and a re-run re-derives the identical merged bag (purity). Reuses the single read
             # above; correlation lineage (other keys) is preserved by merge_user_metadata.
             if meta_ops:
-                merged = merge_user_metadata(pmeta_json, meta_ops)
+                merged = merge_user_metadata(pmeta_json, meta_ops, row_id=message_id)
                 await self._db.execute(
                     "UPDATE messages SET metadata=? WHERE id=?",
                     (
@@ -14634,12 +14839,16 @@ class MessageStore:
 
         ``alert`` is for a read (a resend source, a body view): a tag failure there raises the
         alert and propagates, refusing the read. A claim leaves it off, because its dead-letter
-        path reports the failure with an audit row as well."""
+        path reports the failure with an audit row as well. A corrupt cell
+        (:class:`~messagefoundry.store.queue_tag.CorruptQueueCellError`) takes both paths the same
+        way, its alert and audit row saying corrupt rather than drift (BACKLOG #5884)."""
         try:
             opened = open_queue_cell(self._cipher, row)
-        except QueueTagError:
+        except QueueTagError as refused:
             if alert:
-                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+                alert_queue_tag_failure(
+                    self._cipher, row, error=refused, outcome="the read was refused"
+                )
             raise
         if row["body_ref"] is None:
             return opened
@@ -14656,7 +14865,8 @@ class MessageStore:
         """Dead-letter a claimed row whose payload could not be opened, standalone (Hazard A: this
         runs after the claim committed, so it must never join a group batch). A row that failed its
         queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
-        (BACKLOG #2593). Returns ``None`` then.
+        (BACKLOG #2593), a corrupt cell included, whose audit row names its cause as corrupt
+        (BACKLOG #5884). Returns ``None`` then.
 
         A failure that says nothing about the row is returned instead, with nothing written
         (BACKLOG #5735): a key service that gave no verdict (:func:`is_transient_open_failure`) or
@@ -14667,7 +14877,9 @@ class MessageStore:
         (:meth:`_set_aside_claimed`)."""
         if is_transient_open_failure(exc) or isinstance(exc, (sqlite3.OperationalError, OSError)):
             return queue_open_fault(exc)
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
+        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
         except PROGRAMMING_ERRORS:
@@ -14680,11 +14892,11 @@ class MessageStore:
             )
             if isinstance(exc, QueueTagError):
                 await report_queue_tag_failure(
-                    self, self._cipher, row, outcome="could not be dead-lettered"
+                    self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
-            await report_queue_tag_failure(self, self._cipher, row)
+            await report_queue_tag_failure(self, self._cipher, row, error=exc)
         return None
 
     async def _set_aside_claimed(self, tail: Sequence[aiosqlite.Row], now: float | None) -> None:
@@ -14825,7 +15037,8 @@ class MessageStore:
             # The dead-letter records the message ERROR (visible in the tracking view). An UNMARKED
             # payload is also pushed as an `integrity_drift` alert: the cipher's refusal hook reaches
             # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its row tag
-            # is audited and alerted too (BACKLOG #2593).
+            # is audited and alerted too (BACKLOG #2593), and so is one that is corrupt rather than
+            # drift, its audit row naming that cause (BACKLOG #5884).
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
             if await self._dead_letter_unopenable(claimed, exc) is not None:
                 await self._set_aside_claimed([claimed], now)
@@ -16152,7 +16365,8 @@ class MessageStore:
                             r["destination_name"],
                             r["response_seq"],
                         ),
-                    )
+                    ),
+                    row_id=r["message_id"],
                 ),
             )
             for r in rows
@@ -19632,7 +19846,7 @@ class MessageStore:
     async def list_users(self) -> list[UserRecord]:
         async with self._read() as db:
             cur = await db.execute(f"{USER_READ_SQL} ORDER BY username")
-            return [UserRecord.from_mapping(dict(r)) for r in await cur.fetchall()]
+            return listed_users(dict(r) for r in await cur.fetchall())
 
     async def count_users(self) -> int:
         async with self._read() as db:
@@ -19951,9 +20165,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute("SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
-        if not row or row["totp_recovery_codes"] is None:
-            return []
-        return [str(h) for h in json.loads(row["totp_recovery_codes"])]
+        return parse_recovery_code_hashes(row["totp_recovery_codes"] if row else None, user_id)
 
     async def consume_recovery_code_hash(
         self, user_id: str, code_hash: str, *, now: float | None = None
@@ -21050,11 +21262,16 @@ class MessageStore:
         return SessionRecord.from_mapping(dict(row)) if row else None
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        strict: bool = False,
     ) -> list[SessionRecord]:
         """A user's currently-**active** sessions (not revoked, not expired), most-recently-used
         first — the self-service session inventory (WP-10, ASVS 7.5.2). See
-        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
+        :meth:`AuthStore.list_sessions` for ``idle_seconds`` and ``strict``."""
         now = time.time() if now is None else now
         async with self._read() as db:
             if idle_seconds is None:
@@ -21069,7 +21286,10 @@ class MessageStore:
                     " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                     (user_id, now, now, float(idle_seconds)),
                 )
-            return [SessionRecord.from_mapping(dict(r)) for r in await cur.fetchall()]
+            rows = await cur.fetchall()
+        if strict:
+            return [SessionRecord.from_mapping(dict(r)) for r in rows]
+        return decoded_rows(rows, lambda r: SessionRecord.from_mapping(dict(r)))
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -21172,11 +21392,18 @@ class MessageStore:
             row = await cur.fetchone()
             return str(row[0]) if row else None
 
+        refused: RowSealError | None = None
         async with _writer_guard(self._db, self._lock):
-            ended = await revoke_through_lineage(
-                token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
-            )
+            try:
+                ended = await revoke_through_lineage(
+                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+                )
+            except RowSealError as exc:
+                # BACKLOG #5505: only the read-back refused the row; its revoke still commits.
+                refused, ended = exc, None
             await self._commit()
+        if refused is not None:
+            raise RevokedRowSealError(refused.kind, refused.subject)
         return ended
 
     async def revoke_user_sessions(

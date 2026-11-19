@@ -18,9 +18,9 @@ content. A returned ``reason`` is the class name of the bad-signature exception 
 module's fixed names such as :data:`WEAK_SIGNING_KEY`. An
 :class:`XmlError` for a signature the libraries cannot process names only the class of the exception
 raised, which can come from signxml, lxml, ``cryptography`` or the standard library. The rule does
-NOT cover a document that fails before signature processing: at least a document that is not
-well-formed XML, and a ``str`` document UTF-8 cannot encode, raise errors that can carry document
-content. :func:`verify` says what each carries.
+NOT cover a document that fails before signature processing: at least a ``str`` document UTF-8
+cannot encode raises an error that carries document content. :func:`verify` says what each such
+failure carries.
 
 Pure: no engine imports.
 """
@@ -243,9 +243,10 @@ def _drop_signature(signature: Any) -> None:
     """Remove ``signature`` from its parent and keep its tail text, as the enveloped transform does.
 
     A copy of ``signxml.util._remove_sig``, the removal the verifier runs, so the document side of
-    the comparison drops exactly what the digest side dropped. Copied rather than imported because
-    that name is private; keep the two in step. Dropping the tail too would refuse a pretty-printed
-    document.
+    the comparison drops the signature exactly as the digest side dropped it. Copied rather than
+    imported because that name is private; keep the two in step. Dropping the tail too would refuse
+    a pretty-printed document. It does not mirror signxml's comment stripping; see
+    :func:`_coverage_refusal`.
     """
     parent = signature.getparent()
     if signature.tail:
@@ -308,7 +309,10 @@ def _coverage_refusal(root: Any, result: Any, location: str) -> str | None:
     and a comment the signature excluded is refused: a comment can split a text node and change what
     an element's ``.text`` reads. For the same reason a comment or processing instruction before or
     after the document element is refused: no enveloped signature covers one. The ``ds:Signature``
-    element is checked on its own, because the comparison removes it.
+    element is checked on its own, because the comparison removes it. From signxml 5.3.0, the
+    floor the ``[xml]`` extra sets, a same-document reference, ``URI=""`` or ``URI="#id"``,
+    excludes every comment whatever its c14n method, so every comment under the signed element is
+    refused.
 
     It MUTATES ``root``: ``verify`` parsed that tree itself and reads nothing from it afterwards, and
     signxml worked on copies of it, so no copy is made here.
@@ -547,15 +551,16 @@ def verify(
     because several quote the document.
 
     A document :func:`~messagefoundry.parsing.xml.harden.parse_bytes` cannot parse fails there
-    instead, before any signature processing, and that path does NOT hold to the paragraph above.
-    It raises at least these:
+    instead, before any signature processing. Of the errors listed below, the
+    :class:`UnicodeEncodeError` carries the document's text; the other two carry no document text
+    and are not chained from lxml's error. It raises at least these:
 
-    - a document that declares a DOCTYPE: :class:`~messagefoundry.parsing.xml.errors.XmlSecurityError`
+    - a document that declares a DOCTYPE, and one that fails to parse after a prolog DOCTYPE
+      that function's scan reads: :class:`~messagefoundry.parsing.xml.errors.XmlSecurityError`
       with a fixed message;
     - a document that is not well-formed XML: :class:`~messagefoundry.parsing.xml.errors.XmlParseError`,
-      whose message carries lxml's syntax-error text and which is chained from lxml's
-      ``XMLSyntaxError``. That text can quote the document, such as an element or entity name or
-      the bytes at the fault;
+      whose message names only the fault's line, column and libxml2 error code, and which is not
+      chained from lxml's ``XMLSyntaxError`` (BACKLOG #5371);
     - a ``str`` document that UTF-8 cannot encode, such as one holding a lone surrogate:
       :class:`UnicodeEncodeError`, which is NOT an :class:`XmlError`, and whose ``object``
       attribute holds the whole document.

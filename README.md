@@ -229,7 +229,7 @@ there is no switch to set):
   + Open VSX publishing is **planned** (the plan itself is not public — see
   [docs/BACKLOG.md](docs/BACKLOG.md)). Until then, get it from
   this repo: open the `ide/` folder in VS Code and press **F5** (Extension Development Host), or build the
-  VSIX (`cd ide && npm install && npx @vscode/vsce package`) and install the `.vsix`. See
+  VSIX (`cd ide && npm install && npx @vscode/vsce@4.1.0 package`) and install the `.vsix`. See
   [ide/README.md](https://github.com/MEFORORG/MessageFoundry/blob/main/ide/README.md).
 - **Test harness** — synthetic-only send/receive (MLLP), load, and failover tooling for exercising a
   running engine. It ships as a **separate distribution, `messagefoundry-harness`**, released in lockstep

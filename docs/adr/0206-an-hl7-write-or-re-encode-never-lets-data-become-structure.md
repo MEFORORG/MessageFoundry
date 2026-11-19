@@ -248,11 +248,9 @@ open points settled below.
   `FHS`/`BHS`-led body. Splitting has no ACK to reinterpret, which is the draft's objection to
   splitting on a listener: a file source answers nobody, and each message gets its own disposition.
   The split goes through a new `split_batch_bytes` in `messagefoundry/parsing/split.py`, which decodes
-  with the declared charset, splits with `split_batch`, and re-encodes each message; a single-message
-  or undecodable file is handed over as its original bytes, as the File source does. In a charset
-  whose ASCII bytes always mean ASCII (UTF-8, ASCII, ISO 8859, Windows-125x), a file with no `MSH`
-  after a line break is one message, so it is handed over after one byte scan, with no decode or
-  split. The stop is checked before every hand-off, the first included: a stop part-way leaves the
+  with the declared charset, splits with `split_batch`, and re-encodes each message; an
+  undecodable file is handed over as its original bytes, and a single-message file as
+  `split_batch_bytes` says. The stop is checked before every hand-off, the first included: a stop part-way leaves the
   whole file for the next start, and a store failure on hand-off K leaves it for the next poll; both
   re-emit the first K messages, the at-least-once behaviour the File source already has. The split
   runs in a worker thread, as the poll's other blocking steps do, so a large batch file does not
@@ -265,12 +263,12 @@ open points settled below.
   chunk is read past whitespace, a byte order mark (U+FEFF) and its `FHS`/`BHS` envelope header
   lines. What remains is a message when it starts with `MSH`, and is otherwise kept so the parser
   records its `ERROR`. The File source calls `split_batch` too, so it is fixed by the same change.
-  The dry-run's `split_messages` splits a latin-1 view of the bytes, where a UTF-8 byte order mark is
-  three characters, so it strips that mark first and splits as the live sources do under a UTF-8
-  charset. It is not told the connection's charset, so under a single-byte charset, where the live
-  sources keep those three bytes and the parser refuses the file, the dry run still reads past them;
-  that gap stays open. *Changed in the
-  final repair round:* a file holding one message led by a UTF-8 byte order mark, or by an
+  The dry-run's `split_messages` splits a latin-1 view of the bytes, in which it spells each UTF-8
+  byte order mark's three bytes as the mark itself, so it reads the marks as the live sources do
+  under a UTF-8 charset. It is not told the connection's charset, so under a single-byte charset,
+  where the live sources keep those three bytes and the parser refuses the file, the dry run still
+  reads past them; that gap stays open. *Changed in the final repair round:* a file holding one
+  message led by a UTF-8 byte order mark, or by an
   `FHS`/`BHS` envelope header, used to be handed over whole, and the parser refused it, while each
   message of a two-message file led the same way was recorded. Now `one_message_bytes` in
   `messagefoundry/parsing/split.py` hands such a file over as the split read it: past the mark or
@@ -279,9 +277,22 @@ open points settled below.
   disposition each member of a batch gets. The mark is read in the decoded text, so under a
   single-byte charset its bytes are three characters, which the batch split keeps too, and a
   `utf-8-sig` or UTF-16 decode drops the mark itself. A one-message file whose decoded text starts
-  with `MSH` after whitespace is still handed over as its own bytes. The split drops an envelope's
-  header lines but not its `BTS`/`FTS` trailer lines, so the last message of an enveloped file, and
-  now its only message, carries them to the Handler; dropping them is not built here.
+  with `MSH` after whitespace is still handed over as its own bytes, less any trailer lines where
+  the paragraph below says. *Changed by BACKLOG #5806:* the split also drops the run of trailer
+  lines that ends an `MSH`-led message. A trailer line starts with `BTS`, `FTS`, `BHS` or `FHS`
+  and then, right after the id, that message's own field separator (MSH-1, read from the message's
+  own `MSH` line, and only when it is ASCII). So a data line such as `FHS: 140 bpm`, a bare `FHS`,
+  `BTS^1` under `|`, and a line a space or a byte order mark leads all stay. The first chunk is
+  read as before, so a `BTS` line before the first `MSH` is still kept as a message for the
+  parser.
+
+  A whole-file source that handed a file over as its bytes still does. Under a charset that
+  writes ASCII as itself, as the `one_message_bytes` docstring in
+  `messagefoundry/parsing/split.py` defines one, the trailer lines the split drops are cut from
+  those bytes at the line break before them, so its line ends and leading whitespace stay. Under
+  any other charset the file is handed over whole, trailer lines included, as before this change.
+  `tests/test_msh_boundary_parity.py` holds `split_batch` to a copy of it as it stood before, and
+  `split_batch_bytes` to a copy of its own, each less the trailer lines where they are dropped.
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
   embedded start byte, so the parser reads a segment whose id begins with that byte, not `MSH`. The
   embedded-byte refusal of ADR 0205 rule 4 runs first in the same guard and is what closes it.
@@ -478,7 +489,7 @@ into one MLLP frame or one HTTP request is told so, with an `AR` where it can be
 is processed as the File source processes one, and an enveloped remote batch is no longer one
 `ERROR`. A batch file led by whitespace or a byte order mark keeps its first message on both file
 sources, and a one-message file led by a byte order mark or an `FHS`/`BHS` envelope header is no
-longer an `ERROR`.
+longer an `ERROR`. The split drops the trailer lines that end an `MSH`-led message.
 
 **Negative / risks** -- Rule 3 is advisory: a Handler author can still write the unsafe form, and
 the lint sees only literal paths and has the blind spots listed above. A partner that reads a
@@ -578,10 +589,12 @@ segment, is still not a boundary. Each `_Boundary` is now one pattern that opens
 break, which no mark holds, so `_next_boundary` stays linear in the text however its boundaries
 are spelled, after one scan for `MSH` settles a text holding none.
 
-**Not changed.** The dry run's `split_messages` splits a latin-1 view of the bytes, where a UTF-8
-mark is three characters, so it does not cut at a marked later `MSH`. It hands the file over whole,
-and the ingress guard it then runs refuses it as two messages, where the live sources under UTF-8
-record two messages. That is a further case of the gap vault #2853 names, and it stays open.
+**The dry run, changed on purpose.** The dry run's `split_messages` splits a latin-1 view of the
+bytes in which each UTF-8 mark's three bytes are spelled as the mark itself, so it cuts at a marked
+later `MSH` as the live sources do under UTF-8. Before this change it stripped only the
+whitespace and one mark that lead the file, so it did not cut there. Under a single-byte charset the live sources keep the three bytes and do not cut there,
+while the dry run still does. That is a further case of the gap vault #2853 names, and it stays
+open.
 
 The tests: `tests/test_one_frame_one_message.py::test_the_ingress_guard_refuses_a_second_msh_that_marks_lead`,
 `::test_the_file_split_cuts_past_the_marks_before_a_later_msh` and

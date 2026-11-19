@@ -642,7 +642,8 @@ from typing import Any
 #: console's new ``require_ui_step_up_when_own_sessions_end`` gate asks, and the four console
 #: routes moved to that gate. ``AdminHandlers.update_custom_role``, ``delete_custom_role``,
 #: ``set_ad_group_map`` and ``set_ad_group_scope_map`` are now the cores past the JSON routes'
-#: step-up, with the signatures the console already called, so no console call changed. The JSON
+#: step-up, with the signatures the console then called, so no console call changed (BACKLOG #5505,
+#: below, has since added a keyword the console passes). The JSON
 #: routes themselves now take ``request``, which the seam does not carry. The digest moved from
 #: ``7f01058f7699dfe8`` because the discovered surface and the route gates did. An older console
 #: on this engine is refused at mount, as is a newer console on an older engine, which lacks the
@@ -890,9 +891,10 @@ from typing import Any
 #:
 #: BACKLOG #5930: the console's edit-resend form parser ``_resubmit_form`` now restores the
 #: original's line endings through ``restore_eol`` and reads the body through ``_form_pairs``. Both
-#: are globals of ``routes/core.py``, so the snapshot hashes their bodies with the closure's. It
-#: does not hash the ``EDIT_EOL_TERMINATORS`` mapping, which is module data, or the route's refusal
-#: of an unknown ``eol``, which sits in the endpoint body. No engine surface changed.
+#: are globals of ``routes/core.py``, so the snapshot hashes their bodies with the closure's. What
+#: it leaves unhashed includes at least the ``EDIT_EOL_TERMINATORS`` mapping, which is module
+#: data, and the route's refusal of an unknown ``eol``, which sits in the endpoint body. No engine
+#: surface changed.
 #: Re-derived with ``--write``, on the branch from ``4b5769ef2c675677`` to ``8386df80553a4313``,
 #: and over the merge with #5931 from ``6737556a16ce6d15`` to ``c537067c6952d93c``.
 #:
@@ -921,12 +923,38 @@ from typing import Any
 #: ``messagefoundry_webconsole/routes/core.py``. The digest records the models' field names, not
 #: their bounds. Re-derived with ``--write``, from ``bc56eed44a1590fd`` to ``f16ae6b198ad952b``.
 #:
+#: BACKLOG #5505: the four ``AdminHandlers`` cores of the group-wide saves,
+#: ``update_custom_role``, ``delete_custom_role``, ``set_ad_group_map`` and
+#: ``set_ad_group_scope_map``, take the keyword ``ended``, the set the step-up gate read, and the
+#: console passes ``ended=gate_ended_sessions(request)`` on each call. The digest records
+#: ``AdminHandlers`` field names only, the blind spot BACKLOG #1149 names above, so it does not see
+#: that keyword: a newer console on an older engine would raise TypeError on each of those four
+#: saves, and an older console on this engine omits ``ended``, which the save then reads itself.
+#: The digest moved for another reason: the console's
+#: ``require_ui_step_up_when_own_sessions_end`` gate now keeps its set for the route, and the
+#: snapshot hashes that gate's body. Re-derived with ``--write`` on the branch, from
+#: ``bc56eed44a1590fd`` to ``3485aab8a5abd1bc``, and over the merge with BACKLOG #5397 above, from
+#: ``f16ae6b198ad952b`` to ``10638208017f77d0``.
+#:
+#: BACKLOG #5930: ``_resubmit_form`` now restores the line endings of a form with no ``eol``
+#: field too, to the style ``missing_eol_style`` names (CR for a body that starts with MSH). That
+#: helper is defined in ``pages/messages.py`` and imported as a ``routes/core.py`` global, so the
+#: hashed closure changed. No engine surface changed. Re-derived with ``--write`` on the branch,
+#: from ``f16ae6b198ad952b`` to ``3ae6bcfdebbf1401``, and over the merge with BACKLOG #5505 above,
+#: from ``10638208017f77d0`` to ``92b8db415d6730cc``.
+#:
+#: BACKLOG #5931: the console's ``require_ui_reauth_only_action`` gate takes a ``before_spend``
+#: hook, and the TOTP verify route passes it the empty-code check that used to run as its own
+#: dependency ahead of the gate. The snapshot hashes that gate's body and closure, so the digest
+#: moved. No engine surface changed. Re-derived with ``--write``, from ``92b8db415d6730cc`` to
+#: ``fb220e2a1ada115e``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "f16ae6b198ad952b"
+ENGINE_UI_SEAM: str = "fb220e2a1ada115e"
 
 
 @dataclass(frozen=True, slots=True)

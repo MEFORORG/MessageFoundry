@@ -109,3 +109,87 @@ def test_shardcert_kill_leg_scoped_recovery() -> None:
     assert report.killed_shard is not None, "kill leg did not kill a shard\n\n" + report.render()
     _assert_certified(report)
     assert report.ok, "kill-leg certification failed\n\n" + report.render()
+
+
+@pytest.mark.timeout(120)
+def test_reset_store_empties_a_seeded_store_on_a_real_server() -> None:
+    """BACKLOG #5576: ``_reset_store``'s T-SQL had run only against a fake cursor. Seed one parent
+    ``messages`` row and one child ``queue`` row (the foreign key the DELETE order exists for), then
+    reset, and read back that no reset table holds a row."""
+    import asyncio
+    import time
+
+    from harness.load import shardcert
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    env = {
+        **os.environ,
+        **_store_env(),
+        "MEFOR_ALLOW_INSECURE_TLS": "1",
+        "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE": "1",
+    }
+
+    async def open_store() -> SqlServerStore:
+        # The same open the reset itself uses, so the seed and the read-back see its store.
+        return await shardcert._open_rig_store(env)
+
+    async def seed() -> None:
+        store = await open_store()
+        try:
+            now = time.time()
+            async with store._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(
+                    "INSERT INTO messages (id, channel_id, received_at, raw, status) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("reset-seed-1", "IB_RESET_SEED", now, "synthetic", "RECEIVED"),
+                )
+                await cur.execute(
+                    "INSERT INTO queue (id, message_id, stage, channel_id, payload, status, "
+                    "next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "reset-seed-q1",
+                        "reset-seed-1",
+                        "ingress",
+                        "IB_RESET_SEED",
+                        "synthetic",
+                        "pending",
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                await conn.commit()
+        finally:
+            await store.close()
+
+    async def leftovers() -> list[str]:
+        store = await open_store()
+        try:
+            async with store._pool.acquire() as conn:
+                return await shardcert._reset_leftovers(await conn.cursor())
+        finally:
+            await store.close()
+
+    async def unseed() -> None:
+        # Children first, for the foreign key; a no-op once the reset has emptied both tables.
+        store = await open_store()
+        try:
+            async with store._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute("DELETE FROM queue WHERE id = ?", ("reset-seed-q1",))
+                await cur.execute("DELETE FROM messages WHERE id = ?", ("reset-seed-1",))
+                await conn.commit()
+        finally:
+            await store.close()
+
+    # A seed left by an earlier failed run would refuse this one's on its primary key.
+    asyncio.run(unseed())
+    asyncio.run(seed())
+    try:
+        # The control: the read-back finds the seeded rows before the reset.
+        assert {"messages", "queue"} <= set(asyncio.run(leftovers()))
+        asyncio.run(shardcert._reset_store(env))
+        assert asyncio.run(leftovers()) == []
+    finally:
+        asyncio.run(unseed())

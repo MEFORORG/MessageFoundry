@@ -74,6 +74,7 @@ counters so the split cannot be mistaken for drift.
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -1747,3 +1748,151 @@ def test_rig_reconciles_a_reset_does_not_claim_the_drain_arm_went_unjudged() -> 
         assert result.inconclusive, result.detail
         assert "not drained" in result.detail
         assert "drain arms were not judged" not in result.detail
+
+
+# --- BACKLOG #5574 added items, from engine PR 2981's open findings ---------------------------------
+
+
+def test_batchbox_stranding_arm_must_agree_with_the_rest_of_the_band_report() -> None:
+    # Item 3: a published arm that agrees with itself but not with the band's traffic or its own
+    # sign does not clear the arm. Each case used to clear the cell.
+    for stranding, timeouts in (
+        ({"unconfirmed": -1, "budget": 8, "over_budget": False}, 0),
+        ({"unconfirmed": 0, "budget": -1, "over_budget": True}, 0),
+        ({"unconfirmed": 3, "budget": 8, "over_budget": False}, 2),
+    ):
+        band = _pair()
+        no_loss = band["no_loss"]
+        traffic = band["traffic"]
+        assert isinstance(no_loss, dict) and isinstance(traffic, dict)
+        no_loss["stranding"] = stranding
+        no_loss["inconclusive"] = False
+        traffic["timeouts"] = timeouts
+        assert bb._band_stranding(band) == (None, ""), stranding
+        rec = bb.aggregate_cell_record(_cell(), [band, _pair()])
+        assert not rec.no_loss.ok and rec.no_loss.inconclusive, (stranding, rec.no_loss.detail)
+    # A report whose no_loss or traffic is not an object is malformed too, and does not raise.
+    for key in ("no_loss", "traffic"):
+        broken = _pair()
+        broken[key] = None
+        assert bb._band_stranding(broken) == (None, ""), key
+    # The controls: the producer's own report is read as published, within and over budget.
+    assert bb._band_stranding(_remote_band(7)) == (False, "")
+    over, why = bb._band_stranding(_remote_band(8))
+    assert over is True and "8 unconfirmed sends exceed its stranding budget (7)" in why
+
+
+def test_a_failed_cell_keeps_a_stranding_loss_a_surviving_band_proved() -> None:
+    # Item 7: a cell whose fleet failed used to be INCONCLUSIVE whatever the bands that did report
+    # proved. A band over its own stranding budget is a loss no other band can correct.
+    rec = bb._failed_cell_record(_cell(), "band 2 raised OSError: boom", [_remote_band(8), _pair()])
+    assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "cell drive failed: band 2 raised OSError: boom" in rec.no_loss.detail
+    assert "8 unconfirmed sends exceed its stranding budget (7)" in rec.no_loss.detail
+    # A survivor whose own reconcile proved a loss on client counters alone, across a reset, is a
+    # loss too, as aggregate_cell_record keeps it.
+    flood = _pair(counter_reset=_RESET, ok=False, inconclusive=False)
+    flood_no_loss = flood["no_loss"]
+    assert isinstance(flood_no_loss, dict)
+    del flood_no_loss["stranding"]
+    rec = bb._failed_cell_record(_cell(), "boom", [flood])
+    assert not rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "proved a loss on client counters alone" in rec.no_loss.detail
+    # The controls: survivors within budget, or none, prove nothing, so the cell stays INCONCLUSIVE;
+    # a malformed survivor does not raise.
+    broken = _pair()
+    broken["no_loss"] = None
+    unsure = _pair(counter_reset=_RESET, ok=False, inconclusive=True)
+    for survivors in ([_remote_band(7), _pair()], [broken], [unsure], [], None):
+        control = bb._failed_cell_record(_cell(), "boom", survivors)
+        assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
+
+
+async def test_a_crashed_band_carries_its_siblings_reports(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Item 7, the driver half: the error a crashed band raises keeps what the other bands wrote.
+    calls = 0
+
+    async def one_crashes(
+        argv: list[str], report_path: Path, cwd: Path, *, timeout: float
+    ) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("connscale-remote crashed")
+        return _remote_band(8)
+
+    monkeypatch.setattr(bb, "_run_remote_proc", one_crashes)
+    ready = {
+        "inbound_base": 20000,
+        "api_port": 9000,
+        "sink_base": 40000,
+        "sink_procs": 2,
+        "count": 4,
+        "hold_seconds": 1.0,
+        "drain_timeout_s": 1.0,
+        "aggregate_rate": 4.0,
+    }
+    with pytest.raises(bb.CellFleetFailed) as info:
+        await bb._drive_cell_fleet(
+            _cell(),
+            ready,
+            engine_host="10.0.0.5",
+            sink_host="0.0.0.0",
+            cwd=tmp_path,
+            report_dir=tmp_path,
+        )
+    assert calls >= 2 and len(info.value.reports) == calls - 1
+    rec = bb._failed_cell_record(_cell(), str(info.value), info.value.reports)
+    assert not rec.no_loss.inconclusive, rec.no_loss.detail
+
+
+def test_batchbox_nothing_delivered_does_not_quote_a_blind_bands_stand_in() -> None:
+    # Item 10: with every band blind, engine_written 0 is the stand-in, not a reading.
+    blind = _band(engine_read=0, engine_written=0, sink_received=0, backlog=-1)
+    rec = bb.aggregate_cell_record(_cell(), [blind])
+    assert rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "engine_written not read cleanly by any band" in rec.no_loss.detail
+    assert "engine_written 0" not in rec.no_loss.detail
+    # The control: a band that read the engine cleanly is quoted.
+    read = bb.aggregate_cell_record(_cell(), [_band(engine_written=0, sink_received=0)])
+    assert "union sink_received 0, engine_written 0)" in read.no_loss.detail
+
+
+def test_connscale_reconcile_judged_returns_the_excusal_it_judged() -> None:
+    # Item 6: connscale-remote publishes the stranding arm this returns, not a second `_excusal`.
+    from harness.load.connscale.runner import _excusal, _reconcile_judged
+
+    c = Counters(sent=10, acked=2, timeouts=8, sink_received=10)
+    final = _sample(read=10, written=10)
+    no_loss, excusal = _reconcile_judged(
+        c, _BASE, final, unconfirmed_budget=4, drain_seconds=0.5, counter_reset=None
+    )
+    assert excusal == _excusal(c, unconfirmed_budget=4)
+    assert excusal.over_budget and not no_loss.ok and not no_loss.inconclusive
+    assert no_loss == _connscale_reconcile(
+        c, _BASE, final, unconfirmed_budget=4, drain_seconds=0.5, counter_reset=None
+    )
+
+
+def test_the_connscale_console_says_why_a_loss_step_failed() -> None:
+    # Item 11: the console printed the detail for an INCONCLUSIVE step but not for a LOSS step.
+    loss = bb.aggregate_cell_record(_cell(), [_band(sink_received=7)])
+    unsure = bb.aggregate_cell_record(_cell(), [_band(backlog=4)])
+    clean = bb.aggregate_cell_record(_cell(), [_band()])
+    report = connscale_report.ConnScaleReport(
+        profile="t",
+        engine_url="https://127.0.0.1:8800",
+        db_backend=None,
+        shim_installed=True,
+        records=[loss, unsure, clean],
+        slos=[connscale_report.SloCheck("zero_loss", True, False, False)],
+        notes=[],
+        result_ok=False,
+        exit_code=1,
+    )
+    text = report.render_console()
+    assert f"no-loss LOSS: {loss.step_label} -- {loss.no_loss.detail}" in text
+    assert f"no-loss INCONCLUSIVE: {unsure.step_label} -- {unsure.no_loss.detail}" in text
+    assert text.count("no-loss ") == 2

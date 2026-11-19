@@ -643,6 +643,28 @@ def test_cli_apply_requires_rename_to(tmp_path: Path, capsys: pytest.CaptureFixt
     assert rc != 0
 
 
+def test_cli_code_set_apply_is_refused_and_points_at_codeset_rename(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5820: apply_rename rewrites only the code_set("...") literals, so an applied
+    code_set rename left codesets/diets.csv behind and a config that no longer loads, with exit 0."""
+    config_dir = _write_codeset_config(tmp_path)
+    before = (config_dir / "mod.py").read_bytes()
+    argv = ["impact", "--config", str(config_dir), "code_set", "diets", "--rename-to", "meals"]
+
+    rc, data = _run([*argv, "--apply", "--json"], capsys)
+
+    assert rc != 0
+    assert "codeset rename" in data["error"]
+    assert (config_dir / "mod.py").read_bytes() == before
+    assert (config_dir / "codesets" / "diets.csv").exists()
+    load_config(config_dir)
+
+    # The dry-run plan is still offered.
+    rc, data = _run([*argv, "--json"], capsys)
+    assert rc == 0 and data["dry_run"] is True and data["edits"]
+
+
 # --- codeset_edit composition (#152 item 3) ----------------------------------
 
 

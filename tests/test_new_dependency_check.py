@@ -1120,6 +1120,9 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
         ),
         ("[tool.hatch.build.hooks.custom]\n", "in-tree build hook"),
         ("[tool.hatch.build.targets.wheel.hooks.custom]\npath = 'hook.py'\n", "in-tree build hook"),
+        ("[tool.hatch.build.targets.custom]\npath = 'hatch_build.py'\n", "in-tree build target"),
+        ("[tool.uv.pip]\nallow-insecure-host = ['example.invalid:8080']\n", "insecure host"),
+        ("[tool.uv]\nallow-insecure-host = ['example.invalid']\n", "insecure host"),
         ("[project]\ndynamic = 'dependencies'\n", "not a list"),
         ("[tool.uv.dependency-metadata]\nname = 'x'\n", "not a list"),
     ],
@@ -1137,6 +1140,9 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
         "backend-path",
         "hatch-custom-hook",
         "hatch-target-custom-hook",
+        "hatch-custom-target",
+        "uv-allow-insecure-host",
+        "uv-pip-allow-insecure-host",
         "dynamic-not-a-list",
         "dependency-metadata-not-an-array",
     ],
@@ -1197,6 +1203,41 @@ def test_hatch_toml_is_merged_over_tool_hatch_as_hatchling_does() -> None:
     declared, findings = _gate.scan(pyproject, hatch_toml_text=hatch_toml)
     assert set(declared) == {"invented-helper"}, "the shallow merge replaces [tool.hatch].build"
     assert [f.problem for f in findings] == ["in-tree build hook"], findings
+
+
+def test_a_custom_target_in_hatch_toml_is_refused() -> None:
+    """A ``build.targets.custom`` in hatch.toml loads an in-tree builder, as in [tool.hatch]."""
+    declared, findings = _gate.scan(
+        "", hatch_toml_text="[build.targets.custom]\ndependencies = ['helper>=1']\n"
+    )
+    assert [f.problem for f in findings] == ["in-tree build target"], findings
+    assert set(declared) == {"helper"}, "the target's own dependencies are still vetted"
+
+
+def test_an_empty_allow_insecure_host_is_not_refused() -> None:
+    """An empty list turns off nothing, so it is not a finding."""
+    assert _gate.scan("[tool.uv]\nallow-insecure-host = []\n") == ({}, [])
+
+
+def test_a_failed_check_beside_an_unreachable_pypi_exits_2_not_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exit-code contract the docstring states: "could not see" outranks a failed check."""
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["aaa-invented>=1", "zzz>=1"]\n', encoding="utf-8"
+    )
+    asked: list[str] = []
+
+    def fetch(name: str, **_kw: object) -> dict | None:
+        asked.append(name)
+        if name == "aaa-invented":
+            return None
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr(_gate, "_http_fetch", fetch)
+    assert main(["--pyproject", str(project)]) == 2
+    assert asked == ["aaa-invented", "zzz"], "the failed check must come first for this to bite"
 
 
 def test_main_reads_a_hatch_toml_beside_a_pyproject(

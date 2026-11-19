@@ -841,11 +841,16 @@ def test_a_real_directory_granting_this_user_as_run_as(tmp_path: Path) -> None:
 
 
 def _elevated() -> bool:
+    # The production elevation check, as the custody tests use, not a second API's answer to a
+    # nearby question (vault BACKLOG #6674 item 12).
     if sys.platform != "win32":
         return False
-    import ctypes
+    from messagefoundry.restricted_file import RestrictedFileError, administrators_enabled
 
-    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    try:
+        return administrators_enabled()
+    except RestrictedFileError:
+        return False  # a token that cannot be read is not elevated; never fail collection
 
 
 @pytest.mark.skipif(

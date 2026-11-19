@@ -1290,6 +1290,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "compare:via messagefoundry.credential",  # BACKLOG #1167: evaluate_anchor's pin compare
             "hash:hashlib.sha256",
+            # Vault BACKLOG #3714: a reload parses the SQL Server pin with pki's certificate check,
+            # the one the store runs at open, and reads its validity period. Parse only, no key.
+            "key_cert:via messagefoundry.pki",
             # BACKLOG #2025: the throwaway cadata= trial load in anchor_cadata.
             "tls_context:.load_verify_locations()",
             "tls_context:ssl.SSLContext",
@@ -2928,13 +2931,12 @@ POWERSHELL_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
 POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # --- The operator deployment path (docs/SERVICE.md). These two are the reason this arm exists. ---
     # Parses the operator's CA certificate file into a collection (so a malformed file fails before
-    # anything is touched and the operator sees every certificate they are about to trust), checks
-    # whether each one's signature verifies under its own key (to tell a self-signed root from an
-    # issuing CA), then INSTALLS each one through X509Store into a machine store (docs/DEPLOY-SERVER-DB.md
-    # section 5.2 says which). A trust-anchor decision for the whole host, not only the engine.
-    "scripts/service/import-db-ca.ps1": frozenset(
-        {"key_cert:X509", "key_cert:X509Store", "sign_verify:SignData"}
-    ),
+    # anything is touched and the operator sees every certificate they are about to trust), has
+    # .NET's X509Chain verify each one's chain to a self-signed root in the same file (which also
+    # tells a root from an issuing CA; no pattern here names X509Chain), then INSTALLS each one
+    # through X509Store into a machine store (docs/DEPLOY-SERVER-DB.md section 5.2 says which).
+    # A trust-anchor decision for the whole host, not only the engine.
+    "scripts/service/import-db-ca.ps1": frozenset({"key_cert:X509", "key_cert:X509Store"}),
     # Downloads the NSSM service wrapper and checks it against a pinned SHA-256 before extracting it:
     # supply-chain verification of a binary that then runs as a service. The download hop ADDS TLS
     # 1.2 to the enabled protocol set with `-bor`; that is not a floor, so anything the machine

@@ -90,6 +90,24 @@ _CASES = [
     (["CLAUDE.md"], True, "root CLAUDE.md -- `\\.claude/` matches the DIRECTORY, not this file"),
     (["docs/security/THREAT-MODEL.md"], True, "all of docs/, not just BACKLOG and adr"),
     (["pyproject.toml"], True, "test_new_dependency_check reads it"),
+    # The new-dependency gate's default sweep also reads every packaging/*/pyproject.toml and a
+    # hatch.toml beside any swept pyproject (BACKLOG #5641), so an edit to one must run the tier.
+    (
+        ["packaging/messagefoundry-toolkit/pyproject.toml"],
+        True,
+        "test_new_dependency_check sweeps every packaging pyproject",
+    ),
+    (["hatch.toml"], True, "merged over the root's [tool.hatch] by the gate"),
+    (
+        ["packaging/messagefoundry-harness/hatch.toml"],
+        True,
+        "merged over a packaging pyproject's [tool.hatch] by the gate",
+    ),
+    (
+        ["packaging/messagefoundry-webconsole/README.md"],
+        False,
+        "only the files the gate reads, not the whole packaging tree",
+    ),
     (["ide/package.json"], True, "test_ide_licence_packaging reads ide/"),
     (["LICENSE"], True, "same test reads LICENSE"),
     (["tests/tooling_manifest.txt"], True, "edit the partition, re-run the tier it defines"),

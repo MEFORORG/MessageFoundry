@@ -264,7 +264,8 @@ updates:
   # The VS Code extension's npm tree (build-time toolchain — the shipped artifact is the esbuild
   # bundle). Surfaces a vulnerable/outdated npm dep as a PR, the same DEP-1 surveillance the uv
   # ecosystem gets; the blocking npm-audit job in security.yml is the fail-closed companion. Neither
-  # reaches @vscode/vsce, which `npm run package` fetches with npx outside the lock.
+  # reaches @vscode/vsce or its dependencies: `npm run package` fetches vsce with npx, pinned only at
+  # the top level, outside the lock. Dependabot does not bump that pin.
   - package-ecosystem: "npm"
     directory: "/ide"
     schedule:

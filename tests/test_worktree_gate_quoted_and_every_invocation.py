@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -414,3 +415,226 @@ def test_a_later_disarm_owned_by_a_path_git_or_after_a_closer_is_rule_3cs(
 ) -> None:
     reason = _reason(rig, _fmt(rig, template), rig.outside)
     assert "SHARED git" in reason, reason
+
+
+# ------------------------------------------------------------------ BACKLOG #5655 closing steps 1, 3, 6
+#
+# Each row of test_closing_step_shapes_are_denied was measured ALLOW on origin/main f0e49f45c5c, run
+# from an ungoverned repository. Other DENY rows below are not all origin/main's: several are refusals
+# this branch adds.
+
+
+@pytest.mark.parametrize(
+    ("template", "text"),
+    [
+        # Step 1: the broad git word answered the git inside the closed `$( )`, so no `-C` was read.
+        ("git -C '{p}' -c user.name=$(git log -1 --format=%an) config {k}", "SHARED git configur"),
+        # Step 3: an earlier line's subshell chdir switched the added reading off.
+        ("(cd {tmp} && ls)\ngit -C '{p}' reset --hard", "SHARED PRIMARY"),
+    ],
+)
+def test_closing_step_shapes_are_denied(rig: SimpleNamespace, template: str, text: str) -> None:
+    reason = _reason(rig, _fmt(rig, template), rig.outside)
+    assert text in reason, reason
+
+
+@pytest.mark.parametrize(
+    ("template", "tool"),
+    [
+        ("git -C '{o}' -c user.name=$(git log -1 --format=%an) config {k}", "Bash"),
+        ("git -C '{o}' -c user.name=$(git config user.name) config {k}", "Bash"),
+        ("(cd {tmp} && ls)\ngit -C '{o}' reset --hard", "Bash"),
+        ("git commit -m '' ; git -C {o} status", "Bash"),
+    ],
+)
+def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str, tool: str) -> None:
+    assert _allowed(rig, _fmt(rig, template), rig.outside, tool)
+
+
+# Step 6: the known false denies of the added readings, pinned as KNOWN. Each row is a command whose
+# verdict should be ALLOW and is DENY; a change that fixes one fails its row here, and the row then
+# moves to the ALLOW controls above. Plain asserts rather than a strict xfail, so a pwsh launch timeout
+# (BACKLOG #1304) surfaces as itself instead of reading as the expected failure.
+@pytest.mark.parametrize(
+    ("template", "where", "tool"),
+    [
+        # An earlier bracket-joined command's `-C` decides the later reset.
+        ("if (git -C '{p}' diff --quiet) {{ git reset --hard }}", "outside", "PowerShell"),
+        # The later-disarm filter counts `.git` as a git word, so the grep's `-c alias.lg` is judged.
+        ("git config core.hooksPath ; grep --exclude-dir=.git -c alias.lg f", "primary", "Bash"),
+        # Rule 3c's first window starts at a git inside a closed `$( )`, or at the git of a `.git`
+        # path, so it names no `-C` and falls back to the session cwd. DENY on origin/main too.
+        ("git -C {o} -c user.name=$(git log -1 --format=%an) config {k}", "primary", "Bash"),
+        ("git -C {o} --git-dir=$(echo .git) config {k}", "primary", "Bash"),
+        # KNOWN FALSE DENIES below, each ALLOW on origin/main f0e49f45c5c (measured with the PR 3030
+        # reviewer probes) and listed in the hook's ADDED READINGS note.
+        # A `config` pathspec after a closed `$( )` reads as a config disarm of the `-C` repository.
+        ("git -C '{p}' log $(git rev-parse HEAD) -- config core.hooksPath x", "outside", "Bash"),
+        # $absC folds the `-C` inside the closed `$( )` as the outer invocation's.
+        ("(cd {tmp} && ls)\ngit -c a=$(git -C '{p}' log -1) config {k}", "outside", "Bash"),
+        # Rule 3c's owning-word reading compares bracket counts, not nesting, so the owner git in an
+        # earlier closed `$( )` decides the disarm in a later one.
+        ("echo $(git -C '{p}' log -1) $(/usr/bin/git config {k})", "outside", "Bash"),
+        # Each is refused on a line of its own (origin/main's too); the $absC fallback carries that
+        # refusal past an earlier line's chdir in parentheses. A fix belongs in the one-line reading.
+        ("(cd {tmp} && ls)\ngit -C '{p}' stash list", "outside", "Bash"),
+        ("(cd {tmp} && ls)\ngit -C '{p}' ''--git-dir={o}/.git config {k}", "outside", "Bash"),
+        (
+            "(cd {tmp} && ls)\ngit -C '{o}' log $(git -C '{p}' rev-parse HEAD) -- config core.hooksPath x",
+            "outside",
+            "Bash",
+        ),
+    ],
+)
+def test_known_false_denies_of_the_added_readings_still_deny(
+    rig: SimpleNamespace, template: str, where: str, tool: str
+) -> None:
+    assert not _allowed(rig, _fmt(rig, template), _cwd(rig, where), tool)
+
+
+# Quoted forms the gate's unquoting does not read as the shell does (closing step 7), left ALLOW as on
+# origin/main f0e49f45c5c. Each names the primary, so each should be DENY; a fix flips its row.
+@pytest.mark.parametrize(
+    "template",
+    [
+        "git -C $'{p}' reset --hard",
+        "git -C ''{p} reset --hard",
+        "git -C {p}'' reset --hard",
+        "bash -c 'git -C '\"'\"'{p}'\"'\"' reset --hard'",
+        r"bash -c 'git -C '\''{p}'\'' reset --hard'",
+    ],
+)
+def test_known_gap_joined_quote_forms_stay_allowed(rig: SimpleNamespace, template: str) -> None:
+    assert _allowed(rig, _fmt(rig, template), rig.outside)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        # Review round c49803c0c3, finding 4: the git runs in the ungoverned repository. Allowed on
+        # origin/main; refused by this branch's former joined `bash -c` reading.
+        r"bash -c 'git -C '\''{o}'\'' stash list'",
+        r"bash -c 'git -C '\''{o}'\'' reset --hard'",
+    ],
+)
+def test_a_joined_bash_payload_naming_an_ungoverned_repo_is_allowed_from_the_primary(
+    rig: SimpleNamespace, template: str
+) -> None:
+    assert _allowed(rig, _fmt(rig, template), rig.primary)
+
+
+# Review round 34781a2201: shapes the first build of this change got wrong.
+@pytest.mark.parametrize(
+    ("template", "where", "tool"),
+    [
+        # Rule 3c's owning word must not cross `;` to an earlier command's `-C`.
+        ("git -C '{p}' log ; /usr/bin/git config {k}", "outside", "Bash"),
+        (r"git -C '{p}' log ; \git config {k}", "outside", "Bash"),
+        # PowerShell passes a leading `''` as an argument of its own, so it joins nothing -- only while
+        # $PSNativeCommandArgumentPassing is not Legacy. Under Legacy the empty argument is dropped and
+        # this command runs against the primary, so this row pins the gate's ALLOW, not a safe command.
+        ("git -C ''{p} reset --hard", "outside", "PowerShell"),
+    ],
+)
+def test_review_round_controls_stay_allowed(
+    rig: SimpleNamespace, template: str, where: str, tool: str
+) -> None:
+    assert _allowed(rig, _fmt(rig, template), _cwd(rig, where), tool)
+
+
+@pytest.mark.parametrize(
+    ("template", "where", "text"),
+    [
+        # A later absolute `-C` after a relative one, behind an earlier subshell chdir.
+        ("(cd {tmp} && ls)\ngit -C Primary -C '{p}' reset --hard", "outside", "SHARED PRIMARY"),
+        # Origin/main's reading of an empty pair glued to a chdir verb is kept: the scan is unchanged.
+        ("git commit -C HEAD && cd'' . && git config {k}", "primary", "SHARED git configur"),
+    ],
+)
+def test_review_round_shapes_are_denied(
+    rig: SimpleNamespace, template: str, where: str, text: str
+) -> None:
+    reason = _reason(rig, _fmt(rig, template), _cwd(rig, where))
+    assert text in reason, reason
+
+
+def test_a_disarm_inside_a_substitution_is_not_the_outer_commands(rig: SimpleNamespace) -> None:
+    # The substitution's git runs in the cwd; the outer `-C` must not decide it.
+    assert _allowed(rig, _fmt(rig, "git -C '{p}' log $(/usr/bin/git config {k})"), rig.outside)
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_a_spacey_quoted_suffix_names_its_own_repository(rig: SimpleNamespace, tool: str) -> None:
+    # `<p>' copy'` names `<p> copy`, an ungoverned repository; origin/main allows this.
+    copy = rig.tmp / "Primary copy"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(copy)], check=True, capture_output=True)
+    assert _allowed(rig, _fmt(rig, "git -C {p}' copy' reset --hard"), rig.outside, tool)
+    assert _allowed(rig, _fmt(rig, "echo a'' ; git -C {p}' copy' reset --hard"), rig.outside, tool)
+
+
+def test_origin_mains_bare_read_with_a_glued_pair_still_denies(rig: SimpleNamespace) -> None:
+    # A false deny origin/main already makes, not one of the added readings': bash runs this as the
+    # bare read `git config core.hooksPath`. Pinned as known, with its refusal text.
+    reason = _reason(rig, "git config core.hooksPath''", rig.primary)
+    assert "SHARED git configur" in reason, reason
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["git -C '{p}''' reset --hard", "git -C '{p}''' config {k}", "git -C ''\"{p}\" reset --hard"],
+)
+def test_powershell_escaped_or_leading_pairs_stay_allowed(
+    rig: SimpleNamespace, template: str
+) -> None:
+    # PowerShell passes `'<p>'''` as `<p>'` and `''"<p>"` as two arguments, so none names the primary.
+    # The two-argument reading of `''"<p>"` holds only while $PSNativeCommandArgumentPassing is not
+    # Legacy; under Legacy the empty argument is dropped and that row runs against the primary, so it
+    # pins the gate's ALLOW, not a safe command.
+    assert _allowed(rig, _fmt(rig, template), rig.outside, "PowerShell")
+
+
+def test_a_bash_payload_on_an_earlier_line_does_not_hide_a_later_lines_payload(
+    rig: SimpleNamespace,
+) -> None:
+    # Review round 462e4285: an intermediate head emitted line 1's payload ahead of line 2's, so rule
+    # 3b judged line 1's checkout (in an ungoverned repository) and never reached line 2's. Measured
+    # ALLOW on that head (2026-11-17) and DENY on origin/main f0e49f45c5c.
+    who = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    for args in (["commit", "-q", "--allow-empty", "-m", "x"], ["branch", rig.other]):
+        subprocess.run(
+            ["git", *who, "-C", str(rig.outside), *args], check=True, capture_output=True
+        )
+    first = r"bash -c 'git -C '\''{o}'\'' checkout {b}'"
+    second = "bash -c 'git -C {wt} -C \"\" checkout {b}'"
+    reason = _reason(rig, _fmt(rig, first + "\n" + second), rig.outside)
+    assert "LINKED WORKTREE" in reason, reason
+
+
+def test_known_gap_an_inner_config_word_ahead_of_the_disarm(rig: SimpleNamespace) -> None:
+    # Known gap, ALLOW on origin/main f0e49f45c5c too: the disarm match starts at the `config` inside
+    # the closed `$( )`, so rule 3c's added reading reads only the inner invocation. A fix flips this.
+    command = _fmt(rig, "git -C '{p}' -c user.name=$(git config user.name) config {k}")
+    assert _allowed(rig, command, rig.outside)
+
+
+def test_known_gap_a_separator_inside_a_closed_substitution(rig: SimpleNamespace) -> None:
+    # Known gap, ALLOW on origin/main f0e49f45c5c too: the `|` inside the closed `$( )` stops rule 3c's
+    # owning-word reading, so the outer quoted `-C` is not read. A fix flips this row.
+    command = _fmt(rig, "git -C '{p}' -c user.name=$(git log -1 | head -1) config {k}")
+    assert _allowed(rig, command, rig.outside)
+
+
+def test_a_long_run_of_glued_pairs_costs_about_what_a_short_line_does(rig: SimpleNamespace) -> None:
+    # Review round c49803c0c3, finding 3: an intermediate head's joined reading grew with the square
+    # of the line, and a 12 KB run of glued `''` after one `-C` outran the gate's 45 s test budget
+    # (27.7 s in that review; origin/main about 2 s). The ceiling is generous on purpose, so a slow
+    # pwsh launch does not flake it: the regression it guards costs tens of seconds.
+    short = _fmt(rig, "git -C {o}'' reset --hard")
+    long = _fmt(rig, "git -C {o}" + "''" * 5900 + " reset --hard")
+    started = time.monotonic()
+    assert _allowed(rig, short, rig.outside)
+    short_s = time.monotonic() - started
+    started = time.monotonic()
+    assert _allowed(rig, long, rig.outside)
+    long_s = time.monotonic() - started
+    assert long_s < 3 * short_s + 20, (short_s, long_s)

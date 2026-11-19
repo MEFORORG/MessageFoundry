@@ -6,6 +6,8 @@ import * as path from "path";
 
 import {
   type LensRow,
+  type OpSchema,
+  buildEditRequest,
   buildRowViewModel,
   readEditMessage,
   readPickPartMessage,
@@ -115,9 +117,9 @@ interface Page {
 const OPEN_WINDOWS: JsdomWindow[] = [];
 
 /** Load the shipped webview script over the rendered rows, recording every postMessage. */
-function loadPage(rows: LensRow[]): Page {
+function loadPage(rows: LensRow[], schema?: OpSchema): Page {
   const vms = rows.map((r, i) => buildRowViewModel(r, i, LINES));
-  const body = renderHandlerHtml({ handler: "h", defLine: 5, role: "handler", rows: vms });
+  const body = renderHandlerHtml({ handler: "h", defLine: 5, role: "handler", rows: vms }, schema);
   const shell =
     `<!doctype html><html><head><meta charset="utf-8"></head><body>` +
     `<div class="bar"><input id="stepsFilter" type="search" />` +
@@ -464,5 +466,156 @@ suite("Steps modes webview: the selector and the parts editor post only what the
         expectSrc: LINES[8],
       },
     ]);
+  });
+});
+
+// BACKLOG #5942: a number field posted Number(inp.value), so a cleared field wrote 0 and nothing kept a
+// non-finite value out. A cleared field now writes None only where the schema says the param is
+// nullable, and is otherwise put back unposted.
+suite("Steps webview: a number field posts only a finite number, or null where nullable", () => {
+  const SCHEMA: OpSchema = {
+    pad_field: [
+      { name: "width", kind: "int", required: true, keyword_only: false },
+      { name: "limit", kind: "int", required: false, keyword_only: true, nullable: true },
+    ],
+  };
+  const ROW: LensRow = {
+    kind: "action",
+    action: "pad_field",
+    params: { width: "6", limit: "3" },
+    literal_params: ["width", "limit"],
+    line_start: 6,
+    line_end: 6,
+    nesting: 0,
+    suite: "5",
+  };
+
+  teardown(() => {
+    for (const w of OPEN_WINDOWS.splice(0)) {
+      (w as unknown as { close(): void }).close();
+    }
+  });
+
+  const numberInput = (p: Page, name: string): DomNode => {
+    const input = p.field(6, name).querySelector('input[type="number"]');
+    assert.ok(input, `no number input for ${name}`);
+    return input;
+  };
+
+  test("a typed number posts as a JSON number the provider accepts", () => {
+    const p = loadPage([ROW], SCHEMA);
+    const before = p.posted.length;
+    change(p, numberInput(p, "width"), "8");
+    const msgs = sent(p, before);
+    assert.strictEqual(msgs.length, 1);
+    assert.strictEqual(msgs[0].value, 8);
+    const read = readEditMessage(msgs[0]);
+    assert.ok(read && "edit" in read);
+  });
+
+  test("clearing a nullable field posts null, which the provider reads as None", () => {
+    const p = loadPage([ROW], SCHEMA);
+    const before = p.posted.length;
+    change(p, numberInput(p, "limit"), "");
+    const msgs = sent(p, before);
+    assert.strictEqual(msgs.length, 1, "one write");
+    assert.strictEqual(msgs[0].value, null, "not Number(''), which is 0");
+    const read = readEditMessage(msgs[0]);
+    assert.ok(read && "edit" in read, "the provider's guard accepts the null");
+    assert.strictEqual(read.edit.value, null);
+  });
+
+  test("clearing a field that is not nullable posts nothing and puts the value back", () => {
+    const p = loadPage([ROW], SCHEMA);
+    const input = numberInput(p, "width");
+    const before = p.posted.length;
+    change(p, input, "");
+    assert.deepStrictEqual(sent(p, before), [], "no write of 0");
+    assert.strictEqual(input.value, "6", "the projected value is shown again");
+  });
+});
+
+// BACKLOG #5941: a Router's route row showed no target Handlers and had no handlers field, and the
+// edit reader refused the list the engine's set_route takes.
+suite("Steps webview: a route row shows and edits its Handler names as a list", () => {
+  const STATIC_ROUTE: LensRow = {
+    kind: "route",
+    handlers: ["adt_handler", "oru_handler"],
+    line_start: 6,
+    line_end: 6,
+    nesting: 0,
+    suite: "5",
+  };
+  const DYNAMIC_ROUTE: LensRow = { ...STATIC_ROUTE, handlers: [], line_start: 7, line_end: 7 };
+
+  teardown(() => {
+    for (const w of OPEN_WINDOWS.splice(0)) {
+      (w as unknown as { close(): void }).close();
+    }
+  });
+
+  test("a static route names its Handlers and posts an edit as a list", () => {
+    const vm = buildRowViewModel(STATIC_ROUTE, 0, LINES);
+    assert.strictEqual(vm.subtitle, "→ adt_handler, oru_handler");
+    const p = loadPage([STATIC_ROUTE]);
+    const input = p.field(6, "handlers").querySelector("input.edit");
+    assert.ok(input, "the handlers field is editable");
+    assert.strictEqual(input.value, "adt_handler, oru_handler");
+    const before = p.posted.length;
+    change(p, input, " adt_handler , rad_handler,, ");
+    const msgs = sent(p, before);
+    assert.strictEqual(msgs.length, 1);
+    assert.deepStrictEqual(msgs[0].value, ["adt_handler", "rad_handler"]);
+    const read = readEditMessage(msgs[0]);
+    assert.ok(read && "edit" in read, "the provider's guard accepts the list");
+    assert.deepStrictEqual(buildEditRequest(read.edit).params, { handlers: ["adt_handler", "rad_handler"] });
+  });
+
+  test("a dynamic route shows no editable field, so its placeholder is never sent as a name", () => {
+    const vm = buildRowViewModel(DYNAMIC_ROUTE, 0, LINES);
+    assert.strictEqual(vm.subtitle, "(dynamic selection)");
+    const p = loadPage([DYNAMIC_ROUTE]);
+    assert.strictEqual(p.field(7, "handlers").querySelector("input.edit"), null);
+  });
+
+  test("a cleared handlers field posts nothing and puts the names back", () => {
+    const p = loadPage([STATIC_ROUTE]);
+    const input = p.field(6, "handlers").querySelector("input.edit");
+    const before = p.posted.length;
+    change(p, input, " , ");
+    assert.deepStrictEqual(sent(p, before), [], "no write of return []");
+    assert.strictEqual(input.value, "adt_handler, oru_handler");
+  });
+
+  test("a Handler name the comma list cannot carry keeps the field read-only", () => {
+    for (const name of ["Lab, Results", " padded"]) {
+      const p = loadPage([{ ...STATIC_ROUTE, handlers: ["adt_handler", name] }]);
+      assert.strictEqual(p.field(6, "handlers").querySelector("input.edit"), null, name);
+    }
+  });
+
+  test("a routed-nowhere route offers no handlers field (a bare return takes no list)", () => {
+    const vm = buildRowViewModel({ ...STATIC_ROUTE, handlers: [], unrouted: true }, 0, LINES);
+    assert.deepStrictEqual(vm.params, []);
+    assert.strictEqual(vm.subtitle, undefined);
+  });
+
+  test("the reader takes a string list for handlers only", () => {
+    const base = {
+      command: "edit",
+      handler: "h",
+      lineStart: 6,
+      lineEnd: 6,
+      expectSrc: LINES[5],
+    };
+    const ok = readEditMessage({ ...base, name: "handlers", value: ["a", "b"] });
+    assert.ok(ok && "edit" in ok);
+    for (const bad of [
+      { ...base, name: "value", value: ["a"] },
+      { ...base, name: "handlers", value: ["a", 1] },
+    ]) {
+      const read = readEditMessage(bad);
+      assert.ok(read && "refused" in read, JSON.stringify(bad.value));
+    }
   });
 });

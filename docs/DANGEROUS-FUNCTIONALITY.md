@@ -332,7 +332,7 @@ debugging on, because a launcher passes no interpreter option.
 | `service_status.py` | `sc.exe query` | Reading the service's state | argument list |
 | `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
 | `store/store.py` | `icacls.exe` | Setting owner-only permissions on store files, which hold no key | argument list |
-| `checks.py` | `ruff` and `mypy`, found on `PATH` | `messagefoundry check`, when they are installed | argument list |
+| `checks.py` | `ruff` from the running interpreter's, its base installation's or the user scheme's scripts folder, and `mypy` as a module of that interpreter | `messagefoundry check`, unless `--no-lint` is passed: `ruff` when it is in one of those folders, and `mypy`, on its own, when the search `_tool_installed` runs finds it. Either can be a copy inside the working directory, for example from a virtual environment there; the `checks.py` paragraph below says what bounds each | argument list |
 | `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` from the system TLS module on Windows; `openssl ciphers` and `openssl version -d`, found on `PATH`, on Linux | `messagefoundry verify`, in its host section, which runs by default, when that row reads the policy ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 says when) | argument list |
 | `security/audit_all_platforms.py` | `pip` and `pip-audit`, as modules of the running interpreter | A dependency audit in CI or by hand, never in the service | argument list |
 | `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
@@ -356,10 +356,20 @@ system tool, the code pins its absolute path under the system directory, so a sa
 planted in the working directory cannot run instead. The security lint marks the reviewed sites with
 a `nosec` note naming the rule it answers.
 
-Three argument-list starts are not pinned that way:
+`checks.py` runs `ruff` by its absolute path, from the first of three scripts folders that holds
+it: the running interpreter's environment, its base installation, then the user scheme's
+(`~/.local/bin` on Linux, where a pipx or `uv tool` ruff may live). It runs `mypy` as a `-m`
+module of that interpreter, by its absolute path and with `-P`. So no `PATH` search picks
+either copy. Only those three folders are read for `ruff`, so one elsewhere in the working
+directory does not run, but a folder of the three can lie inside the working directory, at least
+when the running interpreter's environment lives there, and its `ruff` then runs. `mypy`'s module
+search keeps the working directory out only as far as the `_tool_installed` docstring in
+`checks.py` says (BACKLOG #5375). `mypy` is also started with `--config-file=`,
+an empty name, so it reads no configuration file at all. Without it, mypy reads a `mypy.ini`,
+`.mypy.ini`, `pyproject.toml` or `setup.cfg` from the working directory or a parent folder, or the
+user's own file, and such a file can name a plugin that mypy imports and runs. At least two
+argument-list starts are not pinned that way:
 
-- `checks.py` is a developer tool. It runs `ruff` and `mypy` by bare name, so Windows may find a
-  copy in the working directory before the one on `PATH`.
 - `verify/cipher_policy.py` runs `openssl` by bare name on Linux, as the manual check in
   [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 does, so the `PATH` the operator runs
   `verify` with picks the copy. That copy names the folder of the file the floor is read from. So
@@ -432,9 +442,13 @@ and the builders, and a test checks that each module named calls each builder na
   certificate, `NETRC` and XDG folder variables that pip and pip-audit read to reach an index;
   and each name the auditor's `--pass-environment` lists, which refuses an engine variable. No
   other variable is in their environment, a CI token or an engine secret among them.
+- The advisory `ruff` and `mypy` starts in `checks.py` get an allowlist (`worker_environment`):
+  what a Python child needs to start, as the sandbox worker gets it, plus the tools' own cache,
+  stub-path, `XDG_CONFIG_HOME` and `VIRTUAL_ENV` variables, with `PYTHONIOENCODING` set to `utf-8`. No
+  other variable is in their environment, a `MEFOR_*` value, `VAULT_TOKEN` or a CI token among
+  them (BACKLOG #5375).
 
-At least these pass on the environment they run with, on purpose: `checks.py`, which adds one
-variable, and the tray's opens, where starting VS Code drops the two variables VS Code's own
+At least these pass on the environment they run with, on purpose: the tray's opens, where starting VS Code drops the two variables VS Code's own
 launcher manages. The elevated service-control and install commands go through `ShellExecute`,
 which takes no environment argument, so the code chooses none; which environment Windows gives a
 child raised through the UAC prompt is not measured here. `tests/test_child_process_environment.py`
@@ -551,7 +565,10 @@ pure-Python equivalent:
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
   `transports/database.py`, which calls `GetDriveTypeW` and `QueryDosDeviceW` as inputs to the
-  best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705)
+  best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705). And
+  `restricted_file.py`, which on Windows asks `kernel32`'s `GetDriveTypeW` whether a volume the
+  walk of a key file's path reaches is a mapped network drive, and may load `mpr` to ask
+  `WNetGetConnectionW` which share such a drive is mapped to (vault BACKLOG #5657)
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
   only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and
@@ -596,7 +613,8 @@ loads no new library. One load takes a computed path: `tray/branding.py` opens t
 launcher with `LoadLibraryExW`, but as a data file, to read its version resource, so none of that
 file's code runs. Most sites declare argument and return types before the call, so a wrong-width
 argument fails at the boundary rather than corrupting the stack. Not all do: at least `service.py`,
-`service_status.py` and `store/crypto.py` make some calls without declared types.
+`service_status.py` and `store/crypto.py` make some calls without declared types, and so does
+`restricted_file.py` for `GetDriveTypeW`.
 
 ---
 
@@ -866,7 +884,11 @@ or compression library:
   before or after the archive, or an entry compressed with any method but STORED or DEFLATED. The
   ceiling holds as it goes only for those two methods, because stdlib `zipfile` does not bound one
   read's output for the others (BACKLOG #5535). Each member's name must be a safe relative path, and its bytes must match the
-  type its extension names. Members come back as bytes in memory; this module writes no file.
+  type its extension names. A zip member's name must also pass the Windows name check,
+  `windows_member_name_reason` in `parsing/sniff.py`, which refuses at least a colon, a component
+  ending in a dot or space, a reserved device name such as `con.hl7`, and a character Windows
+  refuses in a name (BACKLOG #5369). Members come back as bytes in memory; this module writes no
+  file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.
 - `parsing/dicom/_deps.py` imports `zlib` only to name `zlib.error` in the tuple of parse errors
@@ -877,7 +899,9 @@ or compression library:
   as a path: it streams the store member into one fixed file name. The reader accepts only an
   uncompressed tar, and both a member's declared size and the bytes actually read are capped. With
   `--config-to`, the restore writes the archive's config files under their own relative names. Each
-  name must pass the same safe-path check as a zip member, and must resolve inside the destination.
+  name must pass the archive-member safe-path check, `archive_member_name_reason`, and must resolve inside the destination.
+  The restore uses only that check: it does not run the Windows name check,
+  `windows_member_name_reason`.
   A member-count cap and a total-size cap apply too. An encrypted backup must decrypt with a store
   key, and every block of it must authenticate, so a tampered one fails before anything is
   extracted. With a store key configured, a plaintext backup is refused; one restores only on a
@@ -1042,7 +1066,7 @@ So a settings file checked into a repository cannot set it.
 `git.ts` runs `git` for the source-control commands, and those do not check workspace trust. It
 uses the path VS Code's own Git extension resolved. When that gives none, it runs `git` by bare
 name with the workspace folder as its working folder. On Windows, that search may find a `git.exe`
-in the workspace folder before the one on `PATH`, as section 4 says of `checks.py`.
+in the workspace folder before the one on `PATH`, as section 4 says of the tray's `code` command.
 
 **Terminals.** Two terminals run one program as the terminal's own process, with no shell reading
 a command line: the engine's `serve`, and `provision-admin`. The other two type text into a shell:

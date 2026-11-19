@@ -89,10 +89,9 @@ def _pwsh(
     )
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    """A throwaway git repo with one commit, so ``git rev-parse`` answers."""
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+def _init_repo(path: Path) -> Path:
+    """A throwaway git repo at ``path`` with one commit, so ``git rev-parse`` answers."""
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
     # Maintenance off for the reason test_coord_cloud_refusal.py's _template gives: the -Show test
     # otherwise sees the commit's background maintenance.lock vanish between its two snapshots
     # (CI run 44211257229, repo harness tests ubuntu-latest). It removes the writer, not a path.
@@ -102,11 +101,17 @@ def repo(tmp_path: Path) -> Path:
         ("maintenance.auto", "false"),
         ("gc.auto", "0"),
     ):
-        subprocess.run(["git", "-C", str(tmp_path), "config", k, v], check=True)
-    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(tmp_path), "add", "seed.txt"], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "seed"], check=True)
-    return tmp_path
+        subprocess.run(["git", "-C", str(path), "config", k, v], check=True)
+    (path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "seed.txt"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", "seed"], check=True)
+    return path
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    """A throwaway git repo with one commit, so ``git rev-parse`` answers."""
+    return _init_repo(tmp_path)
 
 
 def _lane_record(repo: Path) -> Path:
@@ -329,3 +334,337 @@ def test_show_never_reuses_the_earlier_read_when_its_own_read_fails(repo: Path, 
     assert "not a JSON object" in str(rec["absent"]), rec
     assert set(rec) == _BLANK_KEYS | {"absent"}, rec
     assert rec["statedFree"] is None and rec["statedInFlight"] is None, rec
+
+
+# BACKLOG #5486: THE LANE IS KEYED ON THE WORK TREE ROOT, NOT THE CURRENT DIRECTORY. From a
+# subdirectory the current directory wrote a lane level under a box key no reader computes, and a
+# claim hash of `none` while the tree held claims.
+
+
+def _toplevel(repo: Path) -> str:
+    """git's own name for the work tree root, so a claim record matches the path the script reads."""
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--show-toplevel"],
+        check=True,
+        capture_output=True,
+        # git writes UTF-8 whatever the locale, and a non-ASCII root must compare as git names it.
+        encoding="utf-8",
+    ).stdout.strip()
+
+
+def test_a_statement_from_a_subdirectory_keys_on_the_work_tree_root(repo: Path) -> None:
+    """The control is the statement from the root: the one from a subdirectory must land in the same
+    record, name the same worktree, and carry the same claim hash, which is not `none`."""
+    claims = repo / ".git" / "mefor-coord" / "claims"
+    claims.mkdir(parents=True)
+    (claims / "BACKLOG-5486.json").write_text(
+        json.dumps({"worktree": _toplevel(repo)}), encoding="utf-8"
+    )
+    assert _pwsh(repo, "-Free", "1", "-InFlight", "1").returncode == 0
+    at_root = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+    assert at_root["claimHashAtStated"] not in ("", "none"), at_root
+
+    sub = repo / "sub" / "dir"
+    sub.mkdir(parents=True)
+    proc = _pwsh(sub, "-Free", "2", "-InFlight", "0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # _lane_record asserts there is still exactly one record: a subdirectory key would add a second.
+    from_sub = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+    assert from_sub["statedFree"] == 2, from_sub
+    assert from_sub["boxKey"] == at_root["boxKey"], (at_root, from_sub)
+    assert from_sub["worktree"] == at_root["worktree"], (at_root, from_sub)
+    assert from_sub["claimHashAtStated"] == at_root["claimHashAtStated"], (at_root, from_sub)
+
+
+def test_a_directory_with_no_work_tree_refuses_and_writes_nothing(repo: Path) -> None:
+    """Inside .git, git names a common dir but no work tree. The script used to key a lane on that
+    directory; it now refuses and writes no lane."""
+    proc = _pwsh(repo / ".git", "-Free", "1", "-InFlight", "0")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "REFUSED" in proc.stderr and "work tree root" in proc.stderr, proc.stderr
+    assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
+
+
+def _removed_worktree(repo: Path) -> Path:
+    """A folder under the primary's ignored .claude/worktrees/ container with no .git left."""
+    (repo / ".gitignore").write_text("/.claude/worktrees/\n", encoding="utf-8")
+    stale = repo / ".claude" / "worktrees" / "gone"
+    stale.mkdir(parents=True)
+    return stale
+
+
+def test_a_removed_worktree_under_the_container_refuses_and_writes_nothing(repo: Path) -> None:
+    """A removed worktree under the primary (.claude/worktrees/<name>, its .git gone) has git walk up
+    to the primary, so keying on that root would overwrite the primary's level. It refuses. The
+    controls are the tracked subdirectory test above and the ignored .venv test below."""
+    stale = _removed_worktree(repo)
+    proc = _pwsh(stale, "-Free", "1", "-InFlight", "0")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "REFUSED" in proc.stderr and "removed worktree" in proc.stderr, proc.stderr
+    assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
+
+
+def test_an_ignored_directory_of_a_live_tree_keys_on_its_root(repo: Path) -> None:
+    """A session in .venv/Scripts is in the tree, ignored or not. It used to refuse as if it were a
+    removed worktree; it now lands in the same record as a statement from the root."""
+    (repo / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    assert _pwsh(repo, "-Free", "1", "-InFlight", "0").returncode == 0
+    at_root = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+    scripts = repo / ".venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    proc = _pwsh(scripts, "-Free", "3", "-InFlight", "0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rec = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+    assert rec["statedFree"] == 3 and rec["boxKey"] == at_root["boxKey"], (at_root, rec)
+
+
+def test_a_removed_worktree_refuses_where_the_container_is_not_ignored(repo: Path) -> None:
+    """A directory under .claude/worktrees that git places in the primary is no live tree's, whether
+    or not the primary ignores the container. Gating the refusal on check-ignore let it through, and
+    the statement overwrote the primary's level, where the container was not ignored."""
+    stale = repo / ".claude" / "worktrees" / "gone"
+    stale.mkdir(parents=True)
+    proc = _pwsh(stale, "-Free", "1", "-InFlight", "0")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "REFUSED" in proc.stderr and "removed worktree" in proc.stderr, proc.stderr
+    assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
+
+
+def test_a_junction_and_its_target_key_the_same_lane_and_claim_hash(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The lane is keyed on git's resolved root, which claim.ps1 records and seat records carry. A
+    statement from a junction's subdirectory must land in the target's record with the target's
+    claim hash, which is not `none`. The control is the statement from the target itself."""
+    if os.name != "nt":
+        pytest.skip("a directory junction is a Windows mount point")
+    claims = repo / ".git" / "mefor-coord" / "claims"
+    claims.mkdir(parents=True)
+    (claims / "BACKLOG-5486.json").write_text(
+        json.dumps({"worktree": _toplevel(repo)}), encoding="utf-8"
+    )
+    assert _pwsh(repo, "-Free", "1", "-InFlight", "1").returncode == 0
+    at_target = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+    assert at_target["claimHashAtStated"] not in ("", "none"), at_target
+    link = tmp_path.parent / f"{tmp_path.name}-junction"
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(repo)], check=True, capture_output=True
+    )
+    try:
+        sub = link / "sub"
+        sub.mkdir()
+        proc = _pwsh(sub, "-Free", "2", "-InFlight", "0")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        # _lane_record asserts one record: a junction key would add a second.
+        rec = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+        assert rec["statedFree"] == 2, rec
+        assert rec["boxKey"] == at_target["boxKey"], (at_target, rec)
+        assert rec["worktree"] == at_target["worktree"], (at_target, rec)
+        assert rec["claimHashAtStated"] == at_target["claimHashAtStated"], (at_target, rec)
+    finally:
+        # rmdir removes the junction itself and leaves its target alone.
+        os.rmdir(link)
+
+
+_HOOK = Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "lane-level.ps1"
+_UNSTATED = "Your lane level is unstated or stale"
+
+
+def _hook(cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run the lane-level Stop hook in ``cwd`` with no ``cwd`` field, so it reads where it runs."""
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(_HOOK)],
+        input=json.dumps({"hook_event_name": "Stop"}),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+        env=_env(),
+        timeout=45,
+    )
+
+
+def test_the_hook_reads_a_lane_stated_through_a_junction_through_either_path(
+    tmp_path: Path,
+) -> None:
+    """lane.ps1 keys on git's resolved root and the hook keyed on the current directory, so a lane
+    stated through a junction read as unstated every turn there (BACKLOG #5486). The hook now keys
+    on the same root. The control is the hook's nag before anything is stated, through both paths:
+    it shows the hook would say so, and that both names are builder lanes it answers for."""
+    if os.name != "nt":
+        pytest.skip("a directory junction is a Windows mount point")
+    target = _init_repo(tmp_path / "builder-target")
+    link = tmp_path / "builder-link"
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True
+    )
+    try:
+        for where in (link, target):
+            before = _hook(where)
+            assert before.returncode == 0, before.stdout + before.stderr
+            assert _UNSTATED in before.stdout, (where, before.stdout)
+        stated = _pwsh(link, "-Free", "1", "-InFlight", "1", "-Note", "through the junction")
+        assert stated.returncode == 0, stated.stdout + stated.stderr
+        _lane_record(target)  # exactly one record, under the resolved root
+        for where in (link, target):
+            after = _hook(where)
+            assert after.returncode == 0, after.stdout + after.stderr
+            # Silent: no nag, and no SKIPPED or COULD NOT READ line in its place.
+            assert after.stdout == "", (where, after.stdout)
+    finally:
+        # rmdir removes the junction itself and leaves its target alone.
+        os.rmdir(link)
+
+
+def test_the_hook_reads_a_lane_stated_at_a_non_ascii_path(tmp_path: Path) -> None:
+    """lane.ps1 reads git's paths as UTF-8; the hook read the coordination root in the console's
+    OEM code page, so at a non-ASCII path it looked in a directory lane.ps1 never wrote and nagged.
+    The control is the nag before the statement."""
+    target = _init_repo(tmp_path / "builder-ü")
+    before = _hook(target)
+    assert before.returncode == 0 and _UNSTATED in before.stdout, before.stdout + before.stderr
+    stated = _pwsh(target, "-Free", "1", "-InFlight", "1")
+    assert stated.returncode == 0, stated.stdout + stated.stderr
+    after = _hook(target)
+    assert after.returncode == 0, after.stdout + after.stderr
+    assert after.stdout == "", after.stdout
+
+
+def test_a_non_ascii_path_keys_on_the_root_git_names(tmp_path: Path) -> None:
+    """git writes UTF-8 and PowerShell decoded it with the console's OEM code page, so a non-ASCII
+    segment came back mangled and keyed a worktree that does not exist. From a non-ASCII
+    subdirectory of a non-ASCII root, the record must name the root as git names it."""
+    root = tmp_path / "repo-ü"
+    root.mkdir()
+    _init_repo(root)
+    sub = root / "sub-é"
+    sub.mkdir()
+    proc = _pwsh(sub, "-Free", "1", "-InFlight", "0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rec = json.loads(_lane_record(root).read_text(encoding="utf-8-sig"))
+    assert Path(rec["worktree"]) == Path(_toplevel(root)), rec
+
+
+# BACKLOG #5486: A HOST WITH NO CONSOLE MAY REFUSE THE [Console]::OutputEncoding SETTER. Invoke-GitUtf8
+# set it unguarded, so the refusal reached the lane-level hook's catch and it printed "[lane] SKIPPED"
+# on every Stop. A stub stands in for System.Console: the `Console` type accelerator is pointed at a
+# class whose OutputEncoding setter throws and counts its calls, and whose other members forward to
+# the real console. The count is the control: a run where the setter was never reached proves nothing.
+
+_LANE_ROOT = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "lane-root.ps1"
+
+_THROWING_CONSOLE = r"""
+Add-Type -TypeDefinition @'
+public static class MeforThrowingConsole {
+    public static int SetAttempts;
+    public static System.Text.Encoding OutputEncoding {
+        get { return System.Console.OutputEncoding; }
+        set { SetAttempts++; throw new System.IO.IOException("The handle is invalid."); }
+    }
+    public static System.IO.TextWriter Out { get { return System.Console.Out; } }
+    public static System.IO.TextWriter Error { get { return System.Console.Error; } }
+    public static bool IsInputRedirected { get { return System.Console.IsInputRedirected; } }
+    public static System.IO.Stream OpenStandardInput() { return System.Console.OpenStandardInput(); }
+}
+'@
+[psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')::Add('Console', [MeforThrowingConsole])
+"""
+
+
+def _under_throwing_setter(
+    cwd: Path, body: str, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run ``body`` in a pwsh whose ``[Console]`` is the throwing stub, then print the setter count."""
+    script = (
+        _THROWING_CONSOLE
+        + body
+        + '\n[System.Console]::Error.WriteLine("SETATTEMPTS=$([MeforThrowingConsole]::SetAttempts)")\n'
+    )
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+        env=_env(),
+        timeout=45,
+    )
+
+
+def _set_attempts(proc: subprocess.CompletedProcess[str]) -> int:
+    lines = [ln for ln in proc.stderr.splitlines() if ln.startswith("SETATTEMPTS=")]
+    assert lines, proc.stdout + proc.stderr
+    return int(lines[-1].split("=", 1)[1])
+
+
+def _ps_literal(path: Path) -> str:
+    """``path`` as a single-quoted PowerShell literal, its apostrophes doubled."""
+    return "'" + str(path).replace("'", "''") + "'"
+
+
+_CODE_PAGE = '[System.Console]::Out.WriteLine("CP=$([System.Console]::OutputEncoding.CodePage)")\n'
+
+
+def _code_page(proc: subprocess.CompletedProcess[str]) -> int:
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("CP=")]
+    assert lines, proc.stdout + proc.stderr
+    return int(lines[-1].split("=", 1)[1])
+
+
+def test_invoke_git_utf8_runs_the_action_when_the_encoding_setter_throws(repo: Path) -> None:
+    """The action's output comes back and nothing is thrown, though the setter refused. Exactly one
+    setter call: an encoding that was never switched is not put back. The refusal is reported unless
+    the encoding the action ran in was UTF-8 already."""
+    body = (
+        f". {_ps_literal(_LANE_ROOT)}\n"
+        + _CODE_PAGE
+        + "try { $r = Invoke-GitUtf8 { 'ACTION-RAN' }; [System.Console]::Out.WriteLine(\"RESULT=$r\") }\n"
+        'catch { [System.Console]::Out.WriteLine("THREW=$($_.Exception.Message)") }\n'
+    )
+    proc = _under_throwing_setter(repo, body)
+    assert _set_attempts(proc) == 1, proc.stdout + proc.stderr
+    assert "RESULT=ACTION-RAN" in proc.stdout, proc.stdout + proc.stderr
+    assert "THREW=" not in proc.stdout, proc.stdout
+    warned = "could not be set to decode as UTF-8" in proc.stderr
+    assert warned == (_code_page(proc) != 65001), proc.stdout + proc.stderr
+
+
+def test_the_hook_does_not_skip_when_the_encoding_setter_throws(tmp_path: Path) -> None:
+    """The hook still resolves the root and nags for the unstated lane, with no SKIPPED or COULD NOT
+    READ line. The tree is named as a builder lane, the population the hook answers for."""
+    repo = _init_repo(tmp_path / "builder-no-console")
+    proc = _under_throwing_setter(
+        repo,
+        f'& {_ps_literal(_HOOK)}\n[System.Console]::Error.WriteLine("HOOKEXIT=$LASTEXITCODE")\n',
+        stdin=json.dumps({"hook_event_name": "Stop"}),
+    )
+    assert _set_attempts(proc) >= 1, proc.stdout + proc.stderr
+    assert "HOOKEXIT=0" in proc.stderr, proc.stdout + proc.stderr
+    assert "SKIPPED" not in proc.stdout, proc.stdout
+    assert "COULD NOT READ" not in proc.stdout, proc.stdout
+    assert _UNSTATED in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_a_mangled_root_under_a_refused_setter_refuses(tmp_path: Path) -> None:
+    """With the setter refused, git's UTF-8 is decoded in the host's own page, so a non-ASCII root
+    comes back as a path that does not exist. That must refuse, not key a level no reader computes.
+    Only measurable where that page is not UTF-8, which the run reports and the test checks."""
+    root = tmp_path / "builder-\u00fc"
+    root.mkdir()
+    _init_repo(root)
+    body = (
+        f". {_ps_literal(_LANE_ROOT)}\n"
+        + _CODE_PAGE
+        + "$r = Resolve-LaneWorktreeRoot -From (Get-Location).ProviderPath\n"
+        '[System.Console]::Out.WriteLine("PATH=[$($r.Path)]")\n'
+        '[System.Console]::Out.WriteLine("ERROR=$($r.Error)")\n'
+    )
+    proc = _under_throwing_setter(root, body)
+    assert _set_attempts(proc) == 1, proc.stdout + proc.stderr
+    if _code_page(proc) == 65001:
+        pytest.skip("the host page is UTF-8 already, so nothing is mangled to refuse")
+    assert "PATH=[]" in proc.stdout, proc.stdout
+    assert "no such directory exists" in proc.stdout, proc.stdout + proc.stderr

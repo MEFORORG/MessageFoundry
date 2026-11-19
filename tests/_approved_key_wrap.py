@@ -267,23 +267,36 @@ def clear_pfx_with_mac(
     return with_pkcs12_kdf_mac(clear, passphrase, mac_hash=mac, iterations=2048)
 
 
-def with_pbmac1(pfx: bytes, passphrase: bytes, *, iterations: int, prf: str = "sha256") -> bytes:
-    """``pfx`` with its MacData replaced by a PBMAC1 one keyed by PBKDF2 over ``prf``."""
+def with_pbmac1(
+    pfx: bytes,
+    passphrase: bytes,
+    *,
+    iterations: int,
+    prf: str = "sha256",
+    key_length: int | None = None,
+    omit_key_length: bool = False,
+    mac: str | None = None,
+) -> bytes:
+    """``pfx`` with its MacData replaced by a PBMAC1 one keyed by PBKDF2 over ``prf``, with an HMAC
+    over ``mac`` (the same hash as ``prf`` when ``None``).
+
+    The PBKDF2 keyLength defaults to the HMAC's output size, as RFC 9579 section 5 asks.
+    ``key_length`` overrides it, and ``omit_key_length`` leaves the field out (BACKLOG #5377)."""
     head, content = _pfx_parts(pfx)
-    prf_oid, digest = PRF[prf]
+    prf_oid, prf_digest = PRF[prf]
+    mac_oid, mac_digest = PRF[mac or prf]
+    length = mac_digest.digest_size if key_length is None else key_length
     salt = os.urandom(16)
-    mac_key = PBKDF2HMAC(algorithm=digest, length=32, salt=salt, iterations=iterations).derive(
-        passphrase
-    )
-    signer = hmac.HMAC(mac_key, digest)
+    mac_key = PBKDF2HMAC(
+        algorithm=prf_digest, length=length, salt=salt, iterations=iterations
+    ).derive(passphrase)
+    signer = hmac.HMAC(mac_key, mac_digest)
     signer.update(content)
-    params = seq(
-        seq(
-            oid(PBKDF2),
-            seq(octets(salt), integer(iterations), integer(32), seq(oid(prf_oid), NULL)),
-        ),
-        seq(oid(prf_oid), NULL),
-    )
+    kdf_fields = [octets(salt), integer(iterations)]
+    if not omit_key_length:
+        kdf_fields.append(integer(length))
+    kdf_fields.append(seq(oid(prf_oid), NULL))
+    params = seq(seq(oid(PBKDF2), seq(*kdf_fields)), seq(oid(mac_oid), NULL))
     mac_data = seq(seq(seq(oid(PBMAC1), params), octets(signer.finalize())), octets(b"\x00" * 8))
     return seq(head, mac_data)
 

@@ -1593,16 +1593,20 @@ function New-SeceditWorkDirectory {
       the Windows folder's Temp. The Windows folder is asked of the system, not read from
       $env:SystemRoot: the user can set that variable for their own processes.
 
-      WHAT IS CHECKED ON THE PARENT, before anything is made, and nothing more. It must be a folder
-      that is not a reparse point. Its owner must be SYSTEM, Administrators, TrustedInstaller or
-      $OwnerSid. No allow entry that applies to the parent itself may give anyone else
-      delete-child, a DACL change, ownership or GENERIC_ALL; OWNER RIGHTS counts as the owner and
-      CREATOR OWNER is not judged. A parent that fails is refused. DELETE on the parent itself is
-      not checked, and neither is any folder above it.
+      WHAT IS CHECKED, before anything is made, and nothing more. The parent must be a folder, and
+      neither it nor any folder above it, up to the root, may be a reparse point. On each of those
+      folders the owner must be SYSTEM, Administrators, TrustedInstaller or $OwnerSid, and no allow
+      entry that applies to that folder itself may give anyone else delete, delete-child, a DACL
+      change, ownership or GENERIC_ALL; OWNER RIGHTS counts as that folder's owner and CREATOR
+      OWNER is not judged. Conditional (callback) access entries are not read. A parent that fails, or that has a folder above it that fails, is
+      refused. The folders above the parent are walked by name.
 
-      $Parent and $OwnerSid are parameters so the unelevated tests can make a folder they own.
+      $Parent, $OwnerSid and $CheckedUpTo are parameters so the unelevated tests can make a folder
+      they own. $CheckedUpTo ends the walk at that folder, which must be the parent or a folder
+      above it; a user's own profile folders can grant full control to an app's capability SID, so
+      the tests stop at their own temporary folder. No caller in either script passes it.
     #>
-    param([string]$Parent, [string]$OwnerSid = "S-1-5-32-544")
+    param([string]$Parent, [string]$OwnerSid = "S-1-5-32-544", [string]$CheckedUpTo)
     if (-not $Parent) { $Parent = Join-Path ([Environment]::GetFolderPath("Windows")) "Temp" }
     # CREATOR OWNER (S-1-3-0) matches no one outside an inherited entry, so it is listed here.
     $trusted = @(
@@ -1613,27 +1617,41 @@ function New-SeceditWorkDirectory {
     if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         throw "'$Parent' is not a plain folder"
     }
-    # Who could rename a folder made here: its owner (WRITE_DAC grants the rest), and anyone the
-    # folder itself gives delete-child, a DACL change, ownership or GENERIC_ALL. Inherit-only entries
-    # apply to what is made inside, which this folder's own DACL replaces. OWNER RIGHTS (S-1-3-4)
-    # names the parent's owner, so the owner arm judges it.
-    $acl = Get-Acl -LiteralPath $Parent -ErrorAction Stop
+    # Who could move a folder made here away: whoever can rename it out of the parent, and whoever
+    # can rename the parent, or any folder above it, with it inside (BACKLOG #8239 item 13). So each
+    # folder from the parent up to the root is judged: its owner (WRITE_DAC grants the rest), and
+    # anyone that folder itself gives delete, delete-child, a DACL change, ownership or GENERIC_ALL.
+    # Inherit-only entries apply to what is made inside, not to the folder. OWNER RIGHTS (S-1-3-4)
+    # names the folder's owner, so the owner arm judges it.
     $rights = [System.Security.AccessControl.FileSystemRights]
-    $renameMask = [int]($rights::DeleteSubdirectoriesAndFiles -bor $rights::ChangePermissions -bor
-        $rights::TakeOwnership) -bor 0x10000000
+    $renameMask = [int]($rights::Delete -bor $rights::DeleteSubdirectoriesAndFiles -bor
+        $rights::ChangePermissions -bor $rights::TakeOwnership) -bor 0x10000000
     $open = @()
-    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    if ($trusted -notcontains $owner) { $open += "$owner (owner)" } else { $trusted += @("S-1-3-4") }
-    foreach ($rule in $acl.Access) {
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-        if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
-        if (([int]$rule.FileSystemRights -band $renameMask) -eq 0) { continue }
-        $sid = "$($rule.IdentityReference)"
-        try { $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { }
-        if ($trusted -notcontains $sid) { $open += "$sid ($($rule.FileSystemRights))" }
+    $stop = if ($CheckedUpTo) { (Get-Item -LiteralPath $CheckedUpTo -Force -ErrorAction Stop).FullName.TrimEnd('\') }
+    for ($dir = $item; $dir; $dir = $dir.Parent) {
+        # A junction or link above the parent would make this walk judge the wrong folders.
+        if ($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "'$Parent' sits under '$($dir.FullName)', a reparse point"
+        }
+        $acl = Get-Acl -LiteralPath $dir.FullName -ErrorAction Stop
+        $judged = $trusted
+        $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($trusted -notcontains $owner) { $open += "'$($dir.FullName)' $owner (owner)" }
+        else { $judged = @($trusted) + @("S-1-3-4") }
+        # Read as SIDs, so no rule needs a name lookup.
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+            if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+            if (([int]$rule.FileSystemRights -band $renameMask) -eq 0) { continue }
+            $sid = $rule.IdentityReference.Value
+            if ($judged -notcontains $sid) { $open += "'$($dir.FullName)' $sid ($($rule.FileSystemRights))" }
+        }
+        if ($stop -and $dir.FullName.TrimEnd('\') -eq $stop) { break }
     }
+    # Past the root without meeting $CheckedUpTo: it named no folder on this path.
+    if ($stop -and -not $dir) { throw "'$CheckedUpTo' is not '$Parent' or a folder above it" }
     if ($open) {
-        throw ("'$Parent' lets another account rename a folder made in it: " +
+        throw ("'$Parent' lets another account rename a folder made in it, or a folder above it: " +
             (($open | Select-Object -Unique) -join ', '))
     }
     $path = Join-Path $Parent ("mefor-secedit-" + [guid]::NewGuid().ToString("N"))

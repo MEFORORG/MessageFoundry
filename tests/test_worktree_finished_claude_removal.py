@@ -256,12 +256,14 @@ def remove(
     protect: list[Path] | None = None,
     prelude: str = "",
     env_extra: dict[str, str | None] | None = None,
+    stop_at: str = "",
 ) -> dict[str, dict[str, Any]]:
     """Call Invoke-FinishedWorktreeRemoval directly, keyed by tree name.
 
     Inputs travel as environment JSON, never spliced into the command text, so no path needs quoting.
     ``prelude`` runs after the helper is dot-sourced, so a test can stand a function in for git.
-    ``env_extra`` sets a variable, or removes it where the value is None.
+    ``env_extra`` sets a variable, or removes it where the value is None. ``stop_at`` is a PowerShell
+    expression passed as -StopAt (a fixed literal from the test, not data).
     """
     env = fx.env()
     for key, value in (env_extra or {}).items():
@@ -276,7 +278,8 @@ def remove(
         f". '{HELPER}'; {prelude}; "
         "$r = Invoke-FinishedWorktreeRemoval -Primary $env:T_PRIMARY "
         "-Paths @($env:T_PATHS | ConvertFrom-Json) -Protect @($env:T_PROTECT | ConvertFrom-Json) "
-        f"-IdleHours {idle_hours} -Apply:${'true' if apply else 'false'}; "
+        f"-IdleHours {idle_hours} -Apply:${'true' if apply else 'false'}"
+        f"{f' -StopAt {stop_at}' if stop_at else ''}; "
         "ConvertTo-Json -InputObject @($r) -Depth 4"
     )
     proc = subprocess.run(
@@ -351,6 +354,34 @@ def test_apply_refuses_every_unsafe_tree_and_leaves_it(fx: Fx, sleeper: int) -> 
         if p != gone:
             assert p.is_dir(), f"a refused tree was touched: {p}"
             assert fx.is_registered(p)
+
+
+def test_a_live_process_that_started_long_before_its_session_registered_occupies(
+    fx: Fx, sleeper: int
+) -> None:
+    """Vault BACKLOG #2985, added item 4 (item 9 carried to the nightly). The registry's default skew
+    reads a record as STALE, which vetoes nothing, when its live process started more than 15 minutes
+    before the session registered: a long-running process that starts a new session does that. Red
+    before the fix: the tree went. The prelude stands a Get-Process in that dates the sleeper two hours
+    back, so the record's startedAt is now and still a real registration, never a future one."""
+    tree = fx.tree("clean")
+    _session(fx, sleeper, tree, "late2222-0000")
+    prelude = (
+        "function Get-Process { [CmdletBinding()] param([int]$Id) "
+        "$p = Microsoft.PowerShell.Management\\Get-Process -Id $Id -ErrorAction SilentlyContinue; "
+        f"if ($p -and $Id -eq {sleeper}) {{ [pscustomobject]@{{ Id = $Id; StartTime = (Get-Date).AddHours(-2) }} }} "
+        "else { $p } }"
+    )
+    rows = remove(fx, [tree], apply=True, prelude=prelude)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "occupied: late2222 LIVE" in rows["clean"]["Reason"], rows["clean"]
+    assert tree.is_dir() and fx.is_registered(tree)
+
+    # Control: without that record, the same pass removes the tree.
+    (fx.sessions / f"{sleeper}.json").unlink()
+    rows = remove(fx, [tree], apply=True, prelude=prelude)
+    assert rows["clean"]["Outcome"] == "REMOVED", rows["clean"]
+    assert not tree.exists()
 
 
 @pytest.mark.parametrize("idle", ["6", "0", "([double]::NaN)", "([double]::PositiveInfinity)"])
@@ -464,6 +495,46 @@ def test_runner_apply_removes_the_finished_trees_and_logs_each(
     for name in UNSAFE:
         assert fx.tree(name).is_dir(), f"{name} was removed: {log}"
     assert re.search(r"mode=APPLY listed=\d+ removed=2 wouldRemove=0 ", log), log
+    assert "notReached=0;" in log, log
+
+
+def test_runner_past_its_deadline_skips_the_step_and_still_writes_its_exit_line(
+    fx: Fx, tmp_path: Path
+) -> None:
+    """The task's time limit kills the run with nothing written (2026-11-18), so the runner stops first.
+
+    A deadline already gone when the step starts: the listing run is not started, no tree is touched,
+    and the exit line is still written.
+    """
+    _, log = run_logged(
+        fx,
+        tmp_path / "logs-deadline",
+        "-Apply",
+        "-RemoveFinishedClaudeWorktrees",
+        "-StopAfterMinutes",
+        "0.0001",
+    )
+    for name in FINISHED:
+        assert fx.tree(name).is_dir(), f"{name} was removed past the deadline: {log}"
+    assert "SKIPPED, the run's deadline (stopAfter=" in log, log
+    assert "listed finished:" not in log, "the listing run must not start past the deadline"
+    assert "--- prune-merged.ps1 exit " in log
+    assert re.search(r"^=== exit \d \(.*\) at \d\d:\d\d:\d\d ===$", log.splitlines()[-1]), log
+
+
+def test_the_helper_past_its_stop_time_attempts_no_path_and_says_so(fx: Fx) -> None:
+    """Each path left at -StopAt gets a NOT-REACHED row, so the runner's summary counts it."""
+    rows = remove(
+        fx,
+        [fx.tree(name) for name in FINISHED],
+        apply=True,
+        stop_at="([DateTime]::UtcNow.AddMinutes(-1))",
+    )
+    for name in FINISHED:
+        assert rows[name]["Outcome"] == "NOT-REACHED", rows[name]
+        assert "nothing was attempted" in rows[name]["Reason"]
+        assert fx.tree(name).is_dir()
+        assert fx.is_registered(fx.tree(name))
 
 
 def test_runner_refuses_apply_with_the_step_inside_claude_code(fx: Fx, tmp_path: Path) -> None:

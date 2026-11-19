@@ -10,9 +10,8 @@
   its owner and mode. The folders above it are not, except those that hold a link on the path or
   lie above one, which `_posix_link_problem` in `messagefoundry/restricted_file.py` judges, and,
   since the secrets directory is checked as a path of its own, the folder that holds that
-  directory. A part of the path whose owner and mode cannot be read is refused, except when the
-  first read, of the root folder `/`, fails: the path is then not walked, so a link on it is not
-  judged either.
+  directory. A part of the path whose owner and mode cannot be read is refused, the root folder
+  `/` included.
   When the engine mints its own TLS pair and the store directory does not exist yet, it creates
   that directory on POSIX with no group or other write bit (`0755` at most), and only then; with
   an operator certificate or an upstream terminator it creates none. The `cert self-signed` and

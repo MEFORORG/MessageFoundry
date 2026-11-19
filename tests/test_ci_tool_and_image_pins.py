@@ -25,6 +25,7 @@ import functools
 import json
 import posixpath
 import re
+import shlex
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -175,7 +176,14 @@ def test_the_npm_tools_lock_pins_every_package_by_integrity() -> None:
     manifest = json.loads((_NPM_TOOLS / "package.json").read_text(encoding="utf-8"))
     declared = manifest["dependencies"]
     print(f"declared npm tools: {declared}")
-    assert set(declared) == {"jscpd", "@cyclonedx/cyclonedx-npm"}
+    # The three ajv packages are the validator cyclonedx-npm's --validate loads (why: the description).
+    assert set(declared) == {
+        "jscpd",
+        "@cyclonedx/cyclonedx-npm",
+        "ajv",
+        "ajv-formats",
+        "ajv-formats-draft2019",
+    }
     for name, version in declared.items():
         assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"{name} is not pinned exactly: {version!r}"
 
@@ -196,6 +204,100 @@ def test_the_npm_tools_lock_pins_every_package_by_integrity() -> None:
         assert str(entry.get("resolved", "")).startswith("https://registry.npmjs.org/"), (
             f"{path} resolves outside the npm registry: {entry.get('resolved')!r}"
         )
+
+
+#: Shell operators that end one command on a line; a redirection operator takes the next word.
+_COMMAND_ENDS = frozenset({";", "&&", "||", "|", "&", "|&"})
+#: cyclonedx-npm 7.x's options that take a value; its parser hands them the next word whatever it
+#: looks like, so a `--validate` there is a value, not the flag. --omit and --workspace are variadic.
+_CYCLONEDX_NPM_VALUE_OPTIONS = frozenset(
+    {"--spec-version", "--sv", "--output-format", "--of", "-o", "--output-file", "--mc-type"}
+)
+_CYCLONEDX_NPM_VARIADIC_OPTIONS = frozenset({"--omit", "-w", "--workspace"})
+
+
+def _cyclonedx_npm_args(body: str) -> list[list[str]]:
+    """Each cyclonedx-npm command in a run body, as its argument words: continuations are joined
+    first, as bash does, then each line is split the way the shell would, a `#` comment ending it
+    and an operator such as `;` or `&&` ending the command."""
+    found: list[list[str]] = []
+    for line in body.replace("\\\n", " ").splitlines():
+        # Only these lines are lexed: a quote in another line can open a string bash closes later.
+        if "node_modules/.bin/cyclonedx-npm" not in line:
+            continue
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        words = list(lexer)
+        for start, word in enumerate(words):
+            if not word.endswith("node_modules/.bin/cyclonedx-npm"):
+                continue
+            args: list[str] = []
+            for nxt in words[start + 1 :]:
+                if nxt in _COMMAND_ENDS:
+                    break
+                args.append(nxt)
+            found.append(args)
+    return found
+
+
+def _pins_spec_and_validates(args: list[str]) -> bool:
+    """Every spec option says 1.6 and the last validate option is `--validate`. The tool's option
+    parser lets the last occurrence win, so an earlier right value does not count."""
+    specs: list[str] = []
+    validate: list[str] = []
+    i = 0
+    while i < len(args):
+        name, eq, value = args[i].partition("=")
+        i += 1
+        if name and set(name) <= {"<", ">", "&"}:
+            i += 1  # a redirection operator; the next word is its target
+        elif name in _CYCLONEDX_NPM_VALUE_OPTIONS:
+            if not eq:
+                value = args[i] if i < len(args) else ""
+                i += 1
+            if name in ("--spec-version", "--sv"):
+                specs.append(value)
+        elif name in _CYCLONEDX_NPM_VARIADIC_OPTIONS:
+            while not eq and i < len(args) and not args[i].startswith("-"):
+                i += 1
+        elif args[i - 1] in ("--validate", "--no-validate"):
+            validate.append(args[i - 1])
+    return bool(specs) and all(s == "1.6" for s in specs) and validate[-1:] == ["--validate"]
+
+
+def test_every_cyclonedx_npm_run_validates_and_pins_the_spec() -> None:
+    """Why both flags: security.yml's comment on the extension SBOM step."""
+    # Controls, through the same two functions the scan uses.
+    for good_body in (
+        "x/node_modules/.bin/cyclonedx-npm --package-lock-only \\\n  --spec-version 1.6 --validate",
+        "x/node_modules/.bin/cyclonedx-npm --sv '1.6' --validate --output-file sbom#1.json 2>&1",
+        "x/node_modules/.bin/cyclonedx-npm --omit dev optional --spec-version=1.6 --validate",
+    ):
+        assert [_pins_spec_and_validates(a) for a in _cyclonedx_npm_args(good_body)] == [True], (
+            good_body
+        )
+    for bad_body in (
+        "x/node_modules/.bin/cyclonedx-npm --package-lock-only",
+        "x/node_modules/.bin/cyclonedx-npm --package-lock-only \\\n  # n\n  --sv 1.6 --validate",
+        "x/node_modules/.bin/cyclonedx-npm --output-file --validate --spec-version 1.6",
+        "x/node_modules/.bin/cyclonedx-npm --output-file y  # --spec-version 1.6 --validate",
+        "x/node_modules/.bin/cyclonedx-npm --output-file y; z --spec-version 1.6 --validate",
+        "x/node_modules/.bin/cyclonedx-npm --spec-version 1.6 --validate --sv 1.7",
+        "x/node_modules/.bin/cyclonedx-npm --spec-version 1.6 --validate --no-validate",
+        "x/node_modules/.bin/cyclonedx-npm --spec-version 1.61 --validate",
+        "x/node_modules/.bin/cyclonedx-npm --spec-version=1.6 --validate-only",
+    ):
+        assert [_pins_spec_and_validates(a) for a in _cyclonedx_npm_args(bad_body)] == [False], (
+            bad_body
+        )
+
+    calls = [
+        (wf, job, args) for wf, job, body in _run_bodies() for args in _cyclonedx_npm_args(body)
+    ]
+    print(f"cyclonedx-npm runs: {calls}")
+    assert calls, "found no cyclonedx-npm run, so this scan checks nothing"
+    bad = [entry for entry in calls if not _pins_spec_and_validates(entry[2])]
+    assert not bad, f"cyclonedx-npm runs without --spec-version 1.6 and --validate: {bad}"
 
 
 _PY_PIN = "ci/python-version"

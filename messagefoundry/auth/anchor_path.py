@@ -1233,7 +1233,7 @@ def windows_host_readers() -> WinHost:
         if not kernel32.GetVolumeInformationW(root, None, 0, None, None, None, fs_name, 64):
             return f"its file system could not be read: {win_error(ctypes.get_last_error())}"
         if fs_name.value.upper() not in ("NTFS", "REFS"):
-            return f"it is a {fs_name.value} volume, which keeps no permissions this check can read"
+            return f"it is a {fs_name.value} volume, whose permissions this check does not read"
         return None
 
     def engine_sid() -> str | None:

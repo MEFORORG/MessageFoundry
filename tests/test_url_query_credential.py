@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import secretscrub
 from messagefoundry.config.models import (
     ActiveWindow,
     ConnectorType,
@@ -129,6 +130,73 @@ def test_detector_leaves_benign_parameters_alone(url: str) -> None:
 )
 def test_detector_reads_camel_case_tails(url: str, expected: list[str]) -> None:
     assert credential_query_params(url) == expected
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # BACKLOG #5379: a bracket key is read as a segment, and every trailing index is dropped.
+        (
+            "https://p.example.invalid/x?user[password]=a&token[0][0]=b&auth[apiKey]=c"
+            "&creds[client_secret][1]=d&[token]=e&key[]=f",
+            [
+                "'[token]'",
+                "'auth[apiKey]'",
+                "'creds[client_secret][1]'",
+                "'key[]'",
+                "'token[0][0]'",
+                "'user[password]'",
+            ],
+        ),
+        # A credential key with a non-index key after it.
+        (
+            "https://p.example.invalid/x?user[password][x]=a&data[secret][0][name]=b"
+            "&oauth[access_token][value]=c",
+            [
+                "'data[secret][0][name]'",
+                "'oauth[access_token][value]'",
+                "'user[password][x]'",
+            ],
+        ),
+        # A space around a bracket key, as ``+`` decodes, is not part of the key.
+        ("https://p.example.invalid/x?user[+password+]=a", ["'user[ password ]'"]),
+        # The old reading still holds: a credential word before a non-index bracket key.
+        ("https://p.example.invalid/x?token[value]=a", ["'token[value]'"]),
+        # Control: a bracket key whose dotted reading is a known non-secret, or no credential word.
+        (
+            "https://p.example.invalid/x?sort[key]=a&filter[name]=b&page[token][0]=c",
+            [],
+        ),
+    ],
+)
+def test_detector_reads_bracket_keyed_names(url: str, expected: list[str]) -> None:
+    assert credential_query_params(url) == expected
+
+
+def test_bracket_readings_stay_linear_in_the_name() -> None:
+    # BACKLOG #5379 review: a name of many ``[]`` groups is read in one split, not one copy per
+    # group. The best of three runs at each of two sizes, compared as a ratio with wide margin:
+    # linear is about 4x, quadratic about 16x.
+    import time
+
+    def cost(n: int) -> float:
+        name = "a" * n + "[]" * n
+        runs = []
+        for _ in range(3):
+            start = time.perf_counter()
+            secretscrub._base_names(name)
+            runs.append(time.perf_counter() - start)
+        return min(runs)
+
+    cost(1000)
+    assert cost(80_000) < 10 * cost(20_000) + 0.05
+
+
+def test_the_refusal_names_drop_every_trailing_index() -> None:
+    # BACKLOG #5379: ``code`` is a refusal-only name, judged whole, so every index is dropped first.
+    url = "https://p.example.invalid/x?code[0][0]=b"
+    assert credential_query_params(url) == []
+    assert credential_query_params(url, refusal=True) == ["'code[0][0]'"]
 
 
 def test_detector_escapes_a_control_character_in_a_decoded_name() -> None:

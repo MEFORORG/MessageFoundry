@@ -8,7 +8,9 @@ Unit tests over synthetic counters and a fake store: no load run, no database.
 from __future__ import annotations
 
 import dataclasses
+import textwrap
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -187,6 +189,56 @@ async def test_reset_store_clears_every_table(monkeypatch: pytest.MonkeyPatch) -
     deletes = [s for s in cur.executed if "DELETE" in s]
     assert len(deletes) == len(shardcert._RESET_TABLES)
     assert store.closed
+
+
+def test_reset_store_covers_every_table_the_scanned_sql_names() -> None:
+    """BACKLOG #5576: a table a verdict reads that the reset does not empty would carry an earlier
+    run's rows into this one. This scans the SQL of this module and of the two store methods the
+    engine's ``/stats`` answer is built from (``SqlServerStore.stats`` and ``in_pipeline_depth``),
+    and every table a ``FROM`` or ``JOIN`` there names must be reset. SQL elsewhere, such as what
+    the poller's other routes read, is not scanned."""
+    import ast
+    import inspect
+    import re
+
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    sql_start = ("SELECT", "DELETE", "INSERT", "UPDATE", "WITH", "SET ", "IF ")
+
+    def tables(source: str) -> set[str]:
+        found: set[str] = set()
+        tree = ast.parse(source)
+        # Docstrings are prose, even one that opens with "DELETE".
+        docstrings = {
+            id(body[0].value)
+            for owner in ast.walk(tree)
+            if isinstance(owner, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+            and (body := owner.body)
+            and isinstance(body[0], ast.Expr)
+        }
+        for node in ast.walk(tree):
+            # Only string pieces that open as SQL, so other prose is not read either.
+            if (
+                id(node) not in docstrings
+                and isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value.lstrip().upper().startswith(sql_start)
+            ):
+                found.update(re.findall(r"(?i)\b(?:FROM|JOIN)\s+([A-Za-z_][\w.]*)", node.value))
+        # The reset's own f-strings splice `{table}`/`{t}`, which leave no literal name here, and
+        # SQL Server's catalog views are no store table.
+        return {t for t in found if not t.lower().startswith("sys.")}
+
+    # Negative controls: the instrument sees a name in either keyword and either case.
+    assert tables('x = "SELECT a FROM not_reset JOIN other ON 1=1"') == {"not_reset", "other"}
+    assert tables('x = "select a from lower_case"') == {"lower_case"}
+    assert tables('"""DELETE the rows: a docstring that reads from a table."""') == set()
+
+    read = tables(Path(inspect.getfile(shardcert)).read_text(encoding="utf-8"))
+    for method in (SqlServerStore.stats, SqlServerStore.in_pipeline_depth):
+        read |= tables(textwrap.dedent(inspect.getsource(method)))
+    assert "queue" in read, read  # the instrument finds the store-truth scan it is meant to see
+    assert read <= set(shardcert._RESET_TABLES), read - set(shardcert._RESET_TABLES)
 
 
 async def test_reset_store_raises_on_a_delete_failure(monkeypatch: pytest.MonkeyPatch) -> None:

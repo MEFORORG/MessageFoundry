@@ -34,8 +34,6 @@ from typing import Any
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
@@ -70,6 +68,7 @@ from messagefoundry.transports.rest import (
     http_family_trust_anchor,
     opener_tls_context,
 )
+from tests._crl_pki import empty_crl, throwaway_ca
 from tests.test_direct_transport import _mint_ca, _mint_leaf, _write_key, _write_pem
 from tests.test_hop_refusal_revocation import (
     _crl_coverage_ca,
@@ -99,17 +98,7 @@ def _no_blanket_env(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(scope="module")
 def bare_crl(tmp_path_factory: pytest.TempPathFactory) -> str:
     """A CRL with no CA beside it: the shape a hop on the system trust store loads. Synthetic."""
-    now = datetime.datetime.now(datetime.UTC)
-    day = datetime.timedelta(days=1)
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2193-ca")])
-    crl = (
-        x509.CertificateRevocationListBuilder()
-        .issuer_name(name)
-        .last_update(now - 2 * day)
-        .next_update(now + 30 * day)
-        .sign(key, hashes.SHA256())
-    )
+    crl = empty_crl(*throwaway_ca("mefor-2193-ca"))
     path = tmp_path_factory.mktemp("crl2193") / "crl_only.pem"
     path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
     return str(path)
@@ -515,9 +504,12 @@ _RELAXED_DETAIL = (
     "are not"
 )
 
-#: The attested crossing's lead on a hop that sets ``tls_allow_expired`` (BACKLOG #5089).
+#: The attested crossing's lead on a hop that sets ``tls_allow_expired`` (BACKLOG #5089). It names
+#: no setting, since a hop whose context skips the check without one takes it too (vault BACKLOG
+#: #4912).
 _RELAXED_CROSSING = (
-    "verified TLS hop with tls_allow_expired crossed without a revocation check the guard credits"
+    "verified TLS hop that skips validity-period checks crossed without a revocation check the "
+    "guard credits"
 )
 
 #: The suffix the MLLP, DICOM SCU and FTPS call sites put on their description only on a hop that

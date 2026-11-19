@@ -506,6 +506,7 @@ from messagefoundry.pipeline.wiring_runner import (
     DrParkedError,
     NotDeployedError,
     RegistryRunner,
+    RunnerLeaseLostError,
     RunnerNotRunningError,
     ShardLaneOwnershipError,
 )
@@ -533,7 +534,7 @@ from messagefoundry.store.base import (
     audit_write_errors,
     build_store_cipher,
 )
-from messagefoundry.store.cell_tag import CellTagError
+from messagefoundry.store.cell_tag import BlankCellError, CellTagError, NonTextCellError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -756,12 +757,9 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     re-authenticate toward the partner lockout a credential STOP protects against. It does not say
     the lane stays down until an operator acts, which is false (``RegistryRunner.outbound_stop_held``
     says what else re-arms it)."""
-    if not rr.running:
-        # BACKLOG #5702: the start this would point at is refused on a downed graph.
-        return (
-            f"outbound {name!r} is not running because this engine's graph is not running "
-            "(stopped, or a demoted node); resend through the engine that runs the graph"
-        )
+    refused = _graph_down_detail(rr, "outbound", name)
+    if refused is not None:
+        return refused
     if rr.outbound_status(name) == "log_halted":
         return (
             f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
@@ -773,6 +771,43 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
             "configuration fault — fix the cause, then start the connection, then resend"
         )
     return f"outbound {name!r} is not running — start it before resending"
+
+
+def _graph_down_detail(rr: RegistryRunner, kind: str, name: str) -> str | None:
+    """The outbound resend's 409 reason when every start door is refused on this node, or
+    ``None``: a downed graph (BACKLOG #5702), or a cluster node that lost its lease while its graph
+    still runs, whose start door refuses with ``RunnerLeaseLostError`` (BACKLOG #5906). Either way
+    "start it before resending" would point at a refused control. The upload resend into an
+    inbound has its own text (:func:`_inbound_down_detail`), which names no other engine."""
+    if not rr.running:
+        return (
+            f"{kind} {name!r} is not running because this engine's graph is not running "
+            "(stopped, or a demoted node); resend through the engine that runs the graph"
+        )
+    if not rr.coordinator.is_leader():
+        return (
+            f"{kind} {name!r} is not running and this node no longer holds the cluster lease, so "
+            "it starts no connection; resend through the leader"
+        )
+    return None
+
+
+def _inbound_down_detail(rr: RegistryRunner, name: str) -> str:
+    """The 409 reason for an upload resend into an inbound that is not running. On a downed graph
+    (BACKLOG #5702) or a node that lost its cluster lease (BACKLOG #5906) it says only that this
+    node refuses the resend: the start the inbound needs is refused here too, so "start it before
+    resending" would point at a refused control. Otherwise it says to start the inbound."""
+    if not rr.running:
+        return (
+            f"inbound {name!r} is not running because this engine's graph is not running "
+            "(stopped, or a demoted node), so the resend is refused here"
+        )
+    if not rr.coordinator.is_leader():
+        return (
+            f"inbound {name!r} is not running and this node no longer holds the cluster lease, so "
+            "the resend is refused here"
+        )
+    return f"inbound {name!r} is not running — start it before resending"
 
 
 def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
@@ -1080,9 +1115,16 @@ async def _alert_restart(
     restart: Callable[[str], Awaitable[None]], action: str, target: str
 ) -> None:
     """``restart(target)``, logged at INFO and not raised when the runner's graph is down, as on a
-    demoted follower (BACKLOG #5702), where the leader, if there is one, acts on its own alert."""
+    demoted follower (BACKLOG #5702), or when this cluster node lost its lease while its graph
+    still runs (BACKLOG #5906). Either way the leader, if there is one, acts on its own alert."""
     try:
         await restart(target)
+    except RunnerLeaseLostError:
+        _log.info(
+            "alert control_action %s for %r not run: this node no longer holds the cluster lease",
+            action,
+            target,
+        )
     except RunnerNotRunningError:
         _log.info(
             "alert control_action %s for %r not run: this engine's graph is not running",
@@ -1313,6 +1355,17 @@ def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException
             409,
             f"owned by engine shard {owner!r}, so stop and purge outbound {name!r} on that engine "
             "shard's API",
+        )
+    # BACKLOG #5792: a cluster node that does not hold the leader lease delivers nothing, so its
+    # quiesced signal is vacuous the same way, and a stop there needs no lease. A purge on it would
+    # cancel rows of the shared store the leader is still delivering. The single-node
+    # NullCoordinator always leads. A point-in-time read, not a store fence: leadership can still
+    # change before the cancel completes.
+    if not rr.coordinator.is_leader():
+        return HTTPException(
+            409,
+            "this node does not hold the cluster lease, so stop and purge outbound "
+            f"{name!r} on the leader's API",
         )
     # require-stopped-before-purge (after the 404, before any approval is held for a doomed purge):
     # a running/still-"stopping" outbound may have a claimed INFLIGHT row cancel_queued cannot cancel,
@@ -1767,8 +1820,9 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered.
     A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
     alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). The count
-    includes an alert one transport delivered while another had not finished. The cut ends only
-    the asyncio side: a send in a worker thread runs on to its socket timeout."""
+    includes an alert one transport delivered while another had not finished. The cut does not
+    end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring say
+    which run on."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:
@@ -3722,7 +3776,7 @@ def _summary(row: Row) -> MessageSummary:
         summary=d.get("summary"),
         # Surface ONLY the operator/handler user bag (ADR 0081, #150) — user_metadata strips the
         # engine-internal ADR-0013 correlation-lineage keys so they never leak to the API.
-        metadata=user_metadata(d.get("metadata")),
+        metadata=user_metadata(d.get("metadata"), row_id=d["id"]),
     )
 
 
@@ -6008,8 +6062,10 @@ def create_app(
                 raise HTTPException(409, str(exc)) from None
             except RunnerNotRunningError as exc:
                 # BACKLOG #5702: the graph is down, as on a demoted follower whose API still serves,
-                # so a start would bind a listener outside the engine lifecycle. 503, as no runner
-                # is, and audited below as every refused inbound start or restart is.
+                # so a start would bind a listener outside the engine lifecycle. Its subclass
+                # RunnerLeaseLostError (BACKLOG #5906) is a node that lost its lease while its graph
+                # still runs, and carries its own text. 503, as no runner is, and audited below as
+                # every refused inbound start or restart is.
                 refused = HTTPException(503, str(exc))
             except TrustAnchorError as exc:
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
@@ -6087,7 +6143,9 @@ def create_app(
                 raise HTTPException(409, str(exc)) from None
             except RunnerNotRunningError as exc:
                 # BACKLOG #5702: the graph is down, so a start would spawn a delivery worker outside
-                # the engine lifecycle and a stop would record a pause a later start inherits.
+                # the engine lifecycle and a stop would record a pause a later start inherits. Its
+                # subclass RunnerLeaseLostError (BACKLOG #5906) refuses a start or restart on a node
+                # that lost its lease while its graph still runs, with its own text.
                 out_refused = HTTPException(503, str(exc))
             if out_refused is not None:
                 await _record_refused_control_audit(
@@ -7084,7 +7142,11 @@ def create_app(
         building = False  # true only across the EmailTransport build, for the cut below
         start = time.perf_counter()
         try:
-            smtp_password = resolve_connector_secret(
+            # Resolved off the event loop (BACKLOG #5793): a provider reference is a blocking call,
+            # for the vault provider an HTTP round trip, and on the loop it would stall every
+            # request the engine serves while it waits.
+            smtp_password = await asyncio.to_thread(
+                resolve_connector_secret,
                 secret_provider,
                 ref=alerts.email_password_secret,
                 literal=alerts.email_password,
@@ -9187,9 +9249,8 @@ def create_app(
         under the store DEK when a key is set); step-up-gated + audited (metadata only).
 
         **Text-only (ASVS 14.2.8).** This feature accepts only plain-text diagnostic logs (``.hl7`` /
-        ``.txt`` / ``.xml``). A body that begins with a metadata-bearing binary container's signature
-        (JPEG/PNG/PDF/ZIP incl. DOCX/GIF/TIFF), or holds a NUL byte or a control-dense 8 KiB window,
-        is refused with **HTTP 415** before anything is written. What this lets through is
+        ``.hl7v2`` / ``.txt`` / ``.xml``). A body the text-only check refuses is answered **HTTP 415**
+        before anything is written. Which bodies that check refuses, and what it lets through, are
         stated in docs/CONNECTIONS.md, under the uploaded-logs upload policy, "Permitted types".
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
@@ -9575,9 +9636,7 @@ def create_app(
             raise HTTPException(404, f"no such inbound connection: {body.to}")
         try:
             if not rr.inbound_running(body.to):
-                raise HTTPException(
-                    409, f"inbound {body.to!r} is not running — start it before resending"
-                )
+                raise HTTPException(409, _inbound_down_detail(rr, body.to))
         except KeyError:
             raise HTTPException(404, f"no such inbound connection: {body.to}") from None
         # Object-level authorization on the SOURCE file, in ADDITION to the target-channel check above.
@@ -9836,6 +9895,24 @@ def create_app(
         )
         return SearchPresetDeleteResult(id=preset_id, deleted=True)
 
+    # BACKLOG #5523: when the layered search last logged each (preset, cause) refusal. One record per
+    # pair per interval, as the store's tag-failure WARNING is; the route's audit row is written for
+    # each refusal, best effort. Touched on the event loop only.
+    _layered_refusals_logged: dict[tuple[str, str], float] = {}
+    _LAYERED_REFUSAL_LOG_INTERVAL_S = 3600.0
+    _LAYERED_REFUSAL_LOG_MAX = 4096
+
+    def _first_layered_refusal(preset_id: str, cause: str) -> bool:
+        key, now = (preset_id, cause), time.monotonic()
+        last = _layered_refusals_logged.pop(key, None)
+        if last is not None and now - last < _LAYERED_REFUSAL_LOG_INTERVAL_S:
+            _layered_refusals_logged[key] = last
+            return False
+        _layered_refusals_logged[key] = now
+        while len(_layered_refusals_logged) > _LAYERED_REFUSAL_LOG_MAX:
+            _layered_refusals_logged.pop(next(iter(_layered_refusals_logged)))
+        return True
+
     @app.get("/search/layered", response_model=MessageSearchResults)
     async def layered_search(
         request: Request,
@@ -9857,18 +9934,82 @@ def create_app(
             raise HTTPException(400, "provide at least one preset id")
         if len(ids) > _MAX_PRESET_LAYERS:
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
+
+        async def refuse(preset_id: str, refusal: HTTPException, cause: str) -> HTTPException:
+            # BACKLOG #5523: a refused recall of a stored preset writes the route's own audit row,
+            # naming the caller, the preset, the status and the error class, never a cipher text or
+            # a criterion. A drift refusal also has the store's tag-failed row; this one records
+            # who asked. The caller raises the refusal, after any except clause has ended. Best
+            # effort, as the store's tag-failed row is: on a Vault Transit store the audit MAC is
+            # Transit's, so during the outage the 503 arm answers, this write fails too, and the
+            # refusal must still be the answer, not a 500.
+            try:
+                await engine.store.record_audit(
+                    "preset.layered_search",
+                    actor=identity.username,
+                    detail=json.dumps(
+                        {
+                            "presets": len(ids),
+                            "refused": preset_id,
+                            "status": refusal.status_code,
+                            "cause": cause,
+                        }
+                    ),
+                    client=client_ip(request),
+                )
+            except audit_write_errors() as exc:
+                # The store-refusal set the other fail-soft audit writes catch. Defects
+                # (AUDIT_WRITE_DEFECTS) are not re-raised: a raise would replace the refusal owed
+                # with a 500, the case write_audit_soft's docstring says to pass defects=() for.
+                # write_audit_soft itself is not used: it logs the traceback, whose frames reach
+                # the route frame's decrypted `criterias`. Names the refusal's own status and
+                # cause, which the row would have held, at most once per preset, cause and failure
+                # class per interval: an outage fails every write. Later failures in that window
+                # leave no row and no log line.
+                failed = type(exc).__name__
+            except Exception as exc:  # noqa: BLE001 -- a defect must not replace the refusal owed
+                # A backstop for a fault outside that set, a defect in the chain seal say: logged
+                # the same way, by type name only, with no exc_info and no message text, so no
+                # audit-write failure changes the 423, 503 or 400 answer.
+                failed = f"defect {type(exc).__name__}"
+            else:
+                return refusal
+            if _first_layered_refusal(preset_id, f"audit:{cause}:{failed}"):
+                _log.error(
+                    "layered search could not audit its refusal of preset %s (%s %s; %s)",
+                    preset_id,
+                    str(refusal.status_code),
+                    cause,
+                    failed,
+                )
+            return refusal
+
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
             refusal: HTTPException | None = None
+            cause = ""
             try:
                 row = await engine.store.get_search_preset(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
-            except CellTagError:
+            except (BlankCellError, NonTextCellError) as exc:
+                # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, which
+                # it never writes (audited and logged there, and alerted on a keyed store), so it
+                # never reads as an empty filter that would widen the search. Its own text: a
+                # keyless store has no integrity tag for such a cell to fail.
+                cause = type(exc).__name__
+                shape = "blank" if isinstance(exc, BlankCellError) else "non-text"
+                refusal = HTTPException(
+                    423,
+                    f"preset {preset_id} has {shape} criteria, written outside the store, and"
+                    " cannot be used",
+                )
+            except CellTagError as exc:
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
                 # unmarked value (audited; the cipher alerted, BACKLOG #5650) or are corrupt
                 # (logged); the store refused. The caller's own preset exists, so a refusal, never
                 # a 500. Caught before CipherError, which it subclasses.
+                cause = type(exc).__name__
                 refusal = HTTPException(
                     423, f"preset {preset_id} failed its integrity check and cannot be used"
                 )
@@ -9877,6 +10018,7 @@ def create_app(
                 # so a later try may succeed. Its text goes to the log only, as in uploads, and as
                 # a str: the exception's traceback would reach this frame's decrypted `criterias`.
                 _log.warning("layered search answered 503 on preset %s: %s", preset_id, str(exc))
+                cause = type(exc).__name__
                 refusal = HTTPException(
                     503,
                     f"the store's key service could not open preset {preset_id}. Try again shortly",
@@ -9886,11 +10028,16 @@ def create_app(
                 # BACKLOG #5523: a key or format problem the cipher raises as is, for example a
                 # retired key that is not supplied, or a Vault Transit refusal other than the
                 # value's AEAD tag (a key-version refusal, a 403). It answered 500. The type name
-                # only: the text is the cipher's, not this route's. ERROR: it is neither audited
-                # nor alerted, so this is the engine's only record of it. Transit's AEAD refusal of
+                # only: the cipher's text can echo fields cut from the stored value, and this cell
+                # may have been written outside the store. ERROR, once per preset and error class
+                # per interval. refuse() tries to write the route's audit row for each refusal; a
+                # write that fails leaves no row, and its own ERROR is logged at most once per
+                # preset, cause and failure class per interval. Transit's AEAD refusal of
                 # a cell planted across owners is a CellTagError above (BACKLOG #5650). The outage
                 # above is a WARNING: it says nothing about the cell.
-                _log.error("layered search refused preset %s: %s", preset_id, type(exc).__name__)
+                cause = type(exc).__name__
+                if _first_layered_refusal(preset_id, cause):
+                    _log.error("layered search refused preset %s: %s", preset_id, cause)
                 refusal = HTTPException(
                     423,
                     f"preset {preset_id} cannot be opened with the store's keys and cannot be used;"
@@ -9900,30 +10047,26 @@ def create_app(
             if refusal is not None:
                 # Raised after the handler, so the refusal chains nothing (BACKLOG #1796): `from
                 # None` would still leave the store's and the cipher's errors on __context__.
-                raise refusal
+                raise await refuse(preset_id, refusal, cause)
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
-            if not row["criteria"]:
-                # BACKLOG #5523: the store never writes blank criteria, and a keyed store passes a
-                # blank cell through unopened, so NULL or "" was written outside the store. Read as
-                # `{}` it would drop out of the compose and widen the search, so refuse it. Logged,
-                # since only the caller would learn of it otherwise.
-                _log.warning(
-                    "layered search refused preset %s: its criteria cell is blank", preset_id
-                )
-                # Its own text: a keyless store has no integrity tag for it to fail.
-                raise HTTPException(
-                    423,
-                    f"preset {preset_id} has blank criteria, written outside the store, and cannot"
-                    " be used",
-                )
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
-            # arm is gone: get_search_preset returns the criteria through the cipher as a str, or
-            # None for a NULL cell, and the blank-cell refusal above has already refused None.
+            # arm is gone: get_search_preset returns the criteria through the cipher as a
+            # non-blank str, and refuses a NULL, blank or non-text cell itself (BACKLOG #5523).
             criteria, refused = json_loads_or_refusal(row["criteria"])
             if refused is not None or not isinstance(criteria, dict):
-                raise HTTPException(400, f"preset {preset_id} has malformed criteria")
+                # BACKLOG #5523: the store writes criteria as a JSON object, so this was written
+                # outside it. Logged, once per preset per interval, and audited each time.
+                if _first_layered_refusal(preset_id, "malformed"):
+                    _log.warning(
+                        "layered search refused preset %s: its criteria are malformed", preset_id
+                    )
+                raise await refuse(
+                    preset_id,
+                    HTTPException(400, f"preset {preset_id} has malformed criteria"),
+                    "malformed",
+                )
             criterias.append(criteria)
         spec, meta = _compose_preset_layers(criterias)
         # Re-clamp the scan against the request bound (the composed spec used make_spec's default).
@@ -9960,17 +10103,15 @@ def create_app(
         )
         # BACKLOG #5523: coalesced into summary_access after the route's own row, as
         # /messages/search does, so a layered recall is no way round the harvest signal (review
-        # M-5). Counted post-redaction.
-        exposed, masked = count_exposed(messages), count_masked(messages)
-        if exposed or masked:
-            await request.app.state.summary_auditor.note(
-                engine.store,
-                identity.username,
-                meta["channel_id"],
-                exposed,
-                time.time(),
-                masked=masked,
-            )
+        # M-5). Counted post-redaction; note() writes nothing when both counts are zero.
+        await request.app.state.summary_auditor.note(
+            engine.store,
+            identity.username,
+            meta["channel_id"],
+            count_exposed(messages),
+            time.time(),
+            masked=count_masked(messages),
+        )
         return MessageSearchResults(
             messages=messages,
             scanned=result.scanned,
@@ -12305,6 +12446,15 @@ async def _remind_expiring_initial_credentials(
     now = time.time() if now is None else now
     live: set[str] = set()
     for user in await auth.store.list_users():
+        if user.unreadable:
+            # BACKLOG #5505: the list's stand-in, whose fields are invented, so no deadline can be
+            # read from it. Skipped, and said so; the seal-failure report names it elsewhere.
+            _log.warning(
+                "initial credential reminder: the record of %s fails its integrity check, so "
+                "whether it holds an expiring credential cannot be told; skipped",
+                scrub_log_argument(user.id),
+            )
+            continue
         if user.disabled:
             continue
         deadline = pending_credential_deadline(auth, user)
@@ -12631,9 +12781,8 @@ def create_managed_app(
                 "or the log when there are none."
             )
         # BACKLOG #5908: built in a worker thread, since the factory blocks on at least the SMTP
-        # password read through the secret provider (a Vault read, under [secrets]). Nothing of
-        # this lifespan's is running yet, but a blocked loop cannot take uvicorn's stop signal.
-        # start() stays on the loop below.
+        # password read through the secret provider (a Vault read, under [secrets]). start() stays
+        # on the loop below.
         try:
             notifier = (
                 await asyncio.to_thread(
@@ -12752,11 +12901,11 @@ def create_managed_app(
                 )
             # #285 (ASVS 6.7.1): preflight every operator-supplied auth-path trust anchor (OIDC / AD /
             # api-mTLS client CA), the settings CAs a hop dials with (vault BACKLOG #3188;
-            # trust_anchors module item 10) and the SQL Server store pin (that module's
-            # store_sqlserver_pin item), BEFORE any listener binds — a group/world-writable anchor refuses (at enforce) or
+            # trust_anchors module item 10) and, at least, the SQL Server store pin and the
+            # PostgreSQL store CA (that module's item 11), BEFORE any listener binds — a group/world-writable anchor refuses (at enforce) or
             # warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
             # change since the last audited observation is audited (auth.trust_anchor; for the store
-            # pin, that item says where this falls short).
+            # anchors, that item says where this falls short).
             # Dormant (no store call, no audit) when no anchor is configured. On a fatal violation it
             # raises, and the startup guard tears down.
             # BACKLOG #3470: a CA refused before the store opened, here or by serve's forwarder gate.

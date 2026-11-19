@@ -137,7 +137,10 @@ def fx(tmp_path: Path) -> Fixture:
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=180, check=False)
+    # Without git config carried in the environment, which remove.ps1 refuses on every route (vault
+    # BACKLOG #8225 item 2): a run under `git -c` exports GIT_CONFIG_PARAMETERS.
+    env = {k: v for k, v in os.environ.items() if not re.match(r"GIT_CONFIG(_|$)", k, re.I)}
+    return subprocess.run(argv, capture_output=True, text=True, timeout=180, check=False, env=env)
 
 
 def test_the_advice_is_a_non_empty_set_of_commands_naming_the_checkout(fx: Fixture) -> None:

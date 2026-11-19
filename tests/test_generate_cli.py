@@ -76,3 +76,125 @@ def test_generate_is_deterministic(tmp_path: Path) -> None:
     main(["generate", "--type", "ADT", "--triggers", "A01", "--count", "1", "--out", str(a)])
     main(["generate", "--type", "ADT", "--triggers", "A01", "--count", "1", "--out", str(b)])
     assert (a / "A01" / "0001.hl7").read_bytes() == (b / "A01" / "0001.hl7").read_bytes()
+
+
+# --- BACKLOG #5819: count range, explicit seed, write failure -------------------
+
+
+@pytest.mark.parametrize("count", ["0", "-1", "10000"])
+def test_generate_refuses_a_count_out_of_range_and_keeps_the_old_corpus(
+    tmp_path: Path, count: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A zero count used to clear the existing NNNN.hl7 files, write nothing and exit 0.
+    assert (
+        main(
+            [
+                "generate",
+                "--type",
+                "ADT",
+                "--triggers",
+                "A01",
+                "--count",
+                "1",
+                "--out",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    before = (tmp_path / "A01" / "0001.hl7").read_bytes()
+    capsys.readouterr()
+
+    rc = main(
+        ["generate", "--type", "ADT", "--triggers", "A01", "--count", count, "--out", str(tmp_path)]
+    )
+
+    assert rc == 2
+    assert "count must be between 1 and 9999" in capsys.readouterr().err
+    assert (tmp_path / "A01" / "0001.hl7").read_bytes() == before
+
+
+def test_generate_honours_an_explicit_empty_seed(tmp_path: Path) -> None:
+    default, empty = tmp_path / "default", tmp_path / "empty"
+    main(["generate", "--type", "ADT", "--triggers", "A01", "--count", "1", "--out", str(default)])
+    main(
+        [
+            "generate",
+            "--type",
+            "ADT",
+            "--triggers",
+            "A01",
+            "--count",
+            "1",
+            "--seed",
+            "",
+            "--out",
+            str(empty),
+        ]
+    )
+    # An empty seed is the user's choice, not a request for the default seed.
+    assert (default / "A01" / "0001.hl7").read_bytes() != (empty / "A01" / "0001.hl7").read_bytes()
+
+
+def test_generate_reports_a_write_failure_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # --out names an existing FILE, so creating the trigger directory under it raises an OSError.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+
+    rc = main(
+        ["generate", "--type", "ADT", "--triggers", "A01", "--count", "1", "--out", str(blocker)]
+    )
+
+    assert rc == 1
+    assert "error: could not write the corpus" in capsys.readouterr().err
+
+
+def test_generate_json_reports_a_write_failure_as_a_json_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+
+    rc = main(
+        [
+            "generate",
+            "--type",
+            "ADT",
+            "--triggers",
+            "A01",
+            "--count",
+            "1",
+            "--out",
+            str(blocker),
+            "--json",
+        ]
+    )
+
+    assert rc == 1
+    assert "could not write the corpus" in _out_json(capsys)["error"]  # type: ignore[index]
+
+
+def test_adt_generator_reports_a_write_failure_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from messagefoundry_toolkit.generators import adt
+
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+
+    rc = adt.main(["--triggers", "A01", "--count", "1", "--out", str(blocker), "--quiet"])
+
+    assert rc == 1
+    assert "could not write the corpus" in capsys.readouterr().err
+
+
+def test_adt_generator_refuses_a_zero_count_and_keeps_the_old_corpus(tmp_path: Path) -> None:
+    from messagefoundry_toolkit.generators import adt
+
+    assert adt.main(["--triggers", "A01", "--count", "1", "--out", str(tmp_path), "--quiet"]) == 0
+    with pytest.raises(SystemExit) as excinfo:
+        adt.main(["--triggers", "A01", "--count", "0", "--out", str(tmp_path), "--quiet"])
+    assert excinfo.value.code == 2
+    assert (tmp_path / "A01" / "0001.hl7").exists()

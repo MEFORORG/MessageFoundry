@@ -323,6 +323,77 @@ async def test_a_send_that_swallows_the_cancel_does_not_hold_a_cut_close(
             await asyncio.gather(sink._task, return_exceptions=True)
 
 
+async def test_a_second_cancel_during_the_drain_wait_still_cancels_control_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5907 step 3 (#5909's harm): a second cancel of the notifier's close, landing
+    while it waited for the drain it had cut, skipped the control-task cleanup and left a
+    restart task running past the shutdown."""
+    from messagefoundry.pipeline import alert_sinks
+
+    # A long grace holds the drain wait open, so the second cancel lands in it, not after it.
+    monkeypatch.setattr(alert_sinks, "_DRAIN_CANCEL_GRACE_SECONDS", 10.0)
+    release, cut = asyncio.Event(), asyncio.Event()
+
+    class _Swallows(_HungTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            self.entered.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cut.set()
+
+    stubborn = _Swallows("webhook")
+    sink = NotifierAlertSink([stubborn])
+    sink._queue = asyncio.Queue(maxsize=1)  # full after one queued alert
+    restarting = asyncio.Event()
+
+    async def _hung_restart(action: str, target: str, *, default_target: bool) -> None:
+        restarting.set()
+        await asyncio.Event().wait()
+
+    sink.set_control_callback(_hung_restart)
+    sink.start()
+    drain = sink._task
+    assert drain is not None
+    sink._dispatch_control("restart", "IB_TEST_ADT", default_target=False)
+    [control] = list(sink._control_tasks)
+    tasks: list[asyncio.Task[None]] = [drain, control]
+    try:
+        await asyncio.wait_for(restarting.wait(), 5.0)
+        sink.connection_stopped("IB_TEST_ADT", detail="probe")
+        await asyncio.wait_for(stubborn.entered.wait(), 5.0)
+        sink.connection_stopped("IB_TEST_ORU", detail="probe")  # fills the queue
+        # The premise: the close's sentinel waits on the put, not on the drain. With room for it,
+        # the first cancel reaches the drain through the close's own wait, and main passes too.
+        assert sink._queue.full()
+
+        # The first cancel lands on the sentinel's put, so the close cuts the drain and waits.
+        close = asyncio.create_task(sink.aclose())
+        tasks.append(close)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        close.cancel()
+        await asyncio.wait_for(cut.wait(), 5.0)  # the drain's cut reached the send
+        # The control: the close is still waiting, and the drain it waits on has not ended.
+        assert not close.done()
+        assert not drain.done()
+        close.cancel()  # the second cancel, during that wait
+        release.set()  # the drain then ends, and the close with it
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close, 5.0)
+        assert control.done(), "a second cancel left the control task running"
+        assert control.cancelled()
+        assert not sink._control_tasks
+    finally:
+        # Release, whatever failed, or the swallowing send holds the test loop's close.
+        release.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def test_a_repeat_drain_cancel_reaches_a_send_in_its_cancel_cleanup(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

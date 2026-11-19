@@ -44,7 +44,7 @@ class SearchSpec:
     """A parsed, validated content-search request — the metadata pre-filter lives separately (it is the
     SQL ``WHERE``); this is only the in-memory content predicate + caps.
 
-    Exactly one of ``substring`` / ``field_path`` is set (validated by :func:`make_spec`):
+    Exactly one of ``substring`` / ``field_path`` is set (validated in ``__post_init__``):
 
     * ``substring`` — a literal case-insensitive substring tested against the decrypted target column(s).
     * ``field_path`` + ``field_value`` — an HL7 field path (``PID-3``) resolved via ``Peek.field`` against
@@ -64,7 +64,35 @@ class SearchSpec:
         # A bool passes the range check (True == 1), so it is refused by type first (#6700).
         _require_int(self.scan_limit)
         if not 1 <= self.scan_limit <= MAX_SCAN_LIMIT:
-            raise ValueError(f"scan_limit must be in [1, {MAX_SCAN_LIMIT}], got {self.scan_limit}")
+            raise ContentSearchError(
+                f"scan_limit must be in [1, {MAX_SCAN_LIMIT}], got {self.scan_limit}"
+            )
+        # The needle rules make_spec enforces, held here too, so a spec built any other way cannot
+        # carry two needles, none, a blank one, or a field_value with no field path (#6700).
+        for name in ("substring", "field_path", "field_value"):
+            _text(name, getattr(self, name))
+        if not isinstance(self.target, SearchTarget):
+            raise ContentSearchError("target must be a SearchTarget")
+        if (self.substring is None) == (self.field_path is None):
+            raise ContentSearchError("a spec holds exactly one of a substring or a field path")
+        if self.substring is not None and _sent(self.substring) is None:
+            raise ContentSearchError("a spec's substring must not be empty or only whitespace")
+        if self.field_path is not None and (
+            not self.field_path or self.field_path != self.field_path.strip()
+        ):
+            raise ContentSearchError("a spec's field path must be non-empty and unpadded")
+        if self.field_value is not None and (
+            self.field_path is None or _sent(self.field_value) is None
+        ):
+            raise ContentSearchError(
+                "a spec's field_value needs a field path and must not be empty or only whitespace"
+            )
+        if self.field_path is not None:
+            # Eagerly, so a bad path is a 4xx rather than a per-row no-match.
+            try:
+                parse_path(self.field_path)
+            except HL7PeekError as exc:
+                raise ContentSearchError(str(exc)) from exc
 
     @property
     def fetch_limit(self) -> int:
@@ -135,13 +163,13 @@ def make_spec(
 ) -> SearchSpec:
     """Validate a content-search request into a :class:`SearchSpec`.
 
-    Raises :class:`ContentSearchError` on an empty needle, supplying both a substring and a field path,
-    a ``field_value`` beside a substring or with no field path (it would otherwise be dropped unread),
-    a needle value that is not text, a malformed HL7 field path, a ``target`` outside :class:`SearchTarget`, or a ``scan_limit`` that
-    is not an ``int`` (a ``bool`` is refused too). A value of only whitespace counts as not sent; any
-    other needle is kept exactly as given, because leading or trailing spaces narrow a contains-match.
-    ``target`` may be the enum or its string value. ``scan_limit`` is clamped into
-    ``[1, MAX_SCAN_LIMIT]``."""
+    Raises :class:`ContentSearchError` on an empty needle, supplying both a substring and a field
+    path, a ``field_value`` beside a substring or with no field path (it would otherwise be dropped
+    unread), a needle value that is not text, a malformed HL7 field path, a ``target`` outside
+    :class:`SearchTarget`, or a ``scan_limit`` that is not an ``int`` (a ``bool`` is refused too). A
+    value of only whitespace counts as not sent; any other needle is kept exactly as given, because
+    leading or trailing spaces narrow a contains-match. ``target`` may be the enum or its string
+    value. ``scan_limit`` is clamped into ``[1, MAX_SCAN_LIMIT]``."""
     limit = max(1, min(_require_int(scan_limit), MAX_SCAN_LIMIT))
     try:
         target = SearchTarget(target)
@@ -150,15 +178,16 @@ def make_spec(
     needle = _sent(_text("content", content))
     path = (_text("field_path", field_path) or "").strip()  # a locator: its padding is noise
     fv = _sent(_text("field_value", field_value))
-    if needle is None and not path and fv is not None:
-        raise ContentSearchError("field_value needs an HL7 field path")
+    # One field_value check. With both a substring and a path, the both-needles refusal below wins.
+    if fv is not None and not path:
+        raise ContentSearchError(
+            "field_value applies only to an HL7 field path, not to content"
+            if needle is not None
+            else "field_value needs an HL7 field path"
+        )
     if (needle is None) == (not path):
         raise ContentSearchError("provide exactly one of a content substring or an HL7 field path")
     if needle is not None:
-        if fv is not None:
-            raise ContentSearchError(
-                "field_value applies only to an HL7 field path, not to content"
-            )
         return SearchSpec(
             substring=needle,
             field_path=None,
@@ -166,11 +195,7 @@ def make_spec(
             target=target,
             scan_limit=limit,
         )
-    # Field-path needle — validate the path eagerly so a bad path is a 4xx, not a per-row failure.
-    try:
-        parse_path(path)
-    except HL7PeekError as exc:
-        raise ContentSearchError(str(exc)) from exc
+    # Field-path needle: SearchSpec parses the path, so a bad one is a 4xx, not a per-row failure.
     return SearchSpec(
         substring=None,
         field_path=path,

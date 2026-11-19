@@ -83,7 +83,6 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
-from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.keywrap import key_wrap_refusal
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -98,6 +97,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.email import (
     checked_envelope,
     envelope_refusal_under,
+    refuse_unsafe_subject,
     refuse_unverified_smtp_credential,
 )
 
@@ -466,23 +466,32 @@ def _split_address(address: str) -> tuple[str, str]:
 
 def _address_binding_problem(cert: x509.Certificate, recipients: Sequence[str]) -> str | None:
     """Why ``cert`` does not name every address in ``recipients``, or None. An address is named by
-    an rfc822Name subjectAltName equal to it, or a dNSName equal to its domain (an organisation
-    certificate). The refusal names the address's position among the checked addresses, never an
+    an rfc822Name subjectAltName equal to it, or, on a cert that carries no rfc822Name at all, a
+    dNSName equal to its domain. A cert carrying any rfc822Name is bound to those mailboxes, so a
+    dNSName beside them binds no other mailbox at that domain: a CA that gave one subscriber a cert
+    naming its mailbox and its domain gave it no other subscriber's mailbox. The refusal names the address's position among the checked addresses, never an
     address or a SAN value. One ``recipients`` entry can hold several comma-joined addresses, so
     that position counts addresses, not entries."""
     names = _extension(cert, x509.SubjectAlternativeName, "recipient_cert") or (
         x509.SubjectAlternativeName([])
     )
     mailboxes = {_split_address(v) for v in names.get_values_for_type(x509.RFC822Name)}
-    domains = {v.lower() for v in names.get_values_for_type(x509.DNSName)}
+    dns_names = {v.lower() for v in names.get_values_for_type(x509.DNSName)}
+    domains = set() if mailboxes else dns_names
     for position, address in enumerate(recipients, start=1):
         local, domain = _split_address(address)
         if (local, domain) in mailboxes or domain in domains:
             continue
+        ignored = (
+            "; it does carry a dNSName equal to that domain, but a cert naming any rfc822Name is "
+            "bound to those mailboxes alone"
+            if domain in dns_names
+            else ""
+        )
         return (
             f"Direct destination 'recipient_cert' does not name recipient address {position} of "
-            f"{len(recipients)} in 'recipients': it carries no subjectAltName rfc822Name equal to that address and "
-            "no dNSName equal to its domain"
+            f"{len(recipients)} in 'recipients': it carries no subjectAltName rfc822Name equal to that address, and "
+            f"no dNSName equal to its domain on a cert that names no rfc822Name{ignored}"
         )
     return None
 
@@ -524,10 +533,10 @@ class DirectDestination(DestinationConnector):
         self._envelope = checked_envelope("Direct destination", sender, s.get("recipients"))
         self.recipients = list(self._envelope.recipients)
         self.subject = str(s.get("subject", ""))
-        # The Email destination's rule. _probe_build below does not catch every surrogate; the
-        # has_lone_surrogate docstring says which (vault BACKLOG #2842).
-        if has_lone_surrogate(self.subject):
-            raise ValueError("Direct destination 'subject' holds a lone surrogate")
+        # The Email destination's subject rule, imported so the two cannot drift (vault BACKLOG
+        # #5360). _probe_build below does not catch every lone surrogate (vault BACKLOG #2842), nor
+        # a control character the header writes raw, from the text or from a decoded encoded word.
+        refuse_unsafe_subject(self.subject, transport="Direct destination")
         username = s.get("username")
         password = s.get("password")
         self.username: str | None = str(username) if username else None
@@ -934,8 +943,8 @@ class DirectDestination(DestinationConnector):
         Every build input except the body is fixed by now: keys, certs, cipher, subject, addresses
         and codec. A fault in any of them would repeat on every send, and the send-time arm maps a
         build failure to a permanent per-message dead-letter, so without this a connection-wide fault
-        (a FIPS OpenSSL refusing the envelope builder, a library that stopped accepting a key, a
-        line break inside the subject) would quietly drain the whole queue into the dead-letter
+        (a FIPS OpenSSL refusing the envelope builder, a library that stopped accepting a key) would
+        quietly drain the whole queue into the dead-letter
         store. The body is synthetic, so the library's own text is safe to show.
 
         An unknown ``encoding`` never gets this far on a config path: config load refuses a literal

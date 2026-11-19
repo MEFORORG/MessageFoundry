@@ -329,6 +329,57 @@ class TestAnAbsentRegistryIsNotAnEvaluatedFence:
         assert a["Signals"] == 3, a
 
 
+class TestTheFailOpenOutcomesThePreFixCodeGave:
+    """BACKLOG #5596, asserted on the outcome alone.
+
+    Several tests in the two classes above assert `HostHere` or a fence state name the fix added
+    before they reach the outcome, so against the pre-fix function they stop on a missing key or a
+    renamed state rather than on the defect. These pass only the parameters and read only the fields
+    `Get-BoxActivity` had before the fix (`Signals`, `Evaluable`, `Veto`, `FenceVeto`), so against
+    the pre-fix function each fails on the fail-open answer itself: a seat on another PC counted as
+    evaluable, an absent registry counted as an evaluated fence, and a fresh half-written registry
+    record that did not veto.
+    """
+
+    def test_a_seat_on_another_pc_with_a_stale_heartbeat_is_not_evaluable(
+        self, sandbox: Path
+    ) -> None:
+        """Pre-fix: the shared heartbeat plus this PC's worktree list made Signals 2, Evaluable,
+        no veto -- a seat on another PC judged safe to disturb from probes that cannot see it."""
+        write_seat_record(sandbox, host="ANOTHER-PC-0001")
+        write_heartbeat(sandbox, age_hours=48)
+        a = activity(sandbox)
+        assert a["Veto"] is False, a
+        assert a["Signals"] == 1, a  # the shared heartbeat only
+        assert a["Evaluable"] is False, a
+
+    def test_no_registry_is_not_counted_as_the_fence_looking(self, sandbox: Path) -> None:
+        """Pre-fix: a config root with no sessions/ directory answered UNKNOWN, counted as an
+        evaluated fence, so it and the heartbeat made Signals 2 and an evaluable no-veto result."""
+        (sandbox / "root").mkdir(exist_ok=True)
+        write_heartbeat(sandbox, age_hours=48)
+        nope = str(sandbox / "nope")
+        a = activity(sandbox, SessionId="abcd1234", WorktreePath=nope, RepoHint=nope)
+        assert a["FenceVeto"] is False, a
+        assert a["Veto"] is False, a
+        assert a["Signals"] == 1, a  # the heartbeat only; no registry, so no fence
+        assert a["Evaluable"] is False, a
+
+    def test_a_fresh_unreadable_registry_record_vetoes(self, sandbox: Path) -> None:
+        """Pre-fix: a registry record caught mid-write was dropped, so a session launching right now
+        read as no record, counted, and did not veto. The aged twin is
+        `test_an_old_unreadable_record_does_not_veto_but_is_not_counted` above."""
+        sessions = sandbox / "root" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "2.json").write_text('{"pid": 2, "sessionId": "abcd', encoding="utf-8")
+        write_heartbeat(sandbox, age_hours=48)
+        write_transcript(sandbox, age_hours=48)
+        a = activity(sandbox, SessionId="abcd1234")
+        assert a["FenceVeto"] is True, a
+        assert a["Veto"] is True, a
+        assert a["Signals"] == 3, a  # heartbeat + transcript + worktree; the fence is not counted
+
+
 class TestTheTranscriptSlug:
     @pytest.mark.parametrize(
         ("path", "expected"),

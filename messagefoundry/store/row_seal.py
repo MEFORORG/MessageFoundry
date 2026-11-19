@@ -118,7 +118,8 @@ _FLOAT_INF: Final = float("inf")
 
 
 class RowSealError(Exception):
-    """A store write helper read a row whose seal does not verify, and refused the write.
+    """Raised at least when a store write helper read a row whose seal does not verify, and
+    refused the write.
 
     The helper never re-seals such a row, because the next honest write would otherwise turn a
     change made outside the helper into a sealed row. ``args`` are exactly ``(kind, subject)``
@@ -132,7 +133,16 @@ class RowSealError(Exception):
         self.subject = subject
 
     def __str__(self) -> str:
-        return f"the {self.kind} row's integrity seal does not verify; the write was refused"
+        return f"a stored {self.kind} row failed its integrity check and was refused"
+
+
+class RevokedRowSealError(RowSealError):
+    """A session revoke committed, and the row it ended then did not parse when read back
+    (BACKLOG #5505). The revoke is not rolled back for it: the row is ended either way, and only
+    the read-back is refused. ``args`` are as for :class:`RowSealError`."""
+
+    def __str__(self) -> str:
+        return f"a stored {self.kind} row failed its integrity check after it was revoked"
 
 
 class RowSealUnverifiableError(Exception):
@@ -357,10 +367,10 @@ class RowSealer:
 
         ``rotate-key`` asks this of each row its re-seal passes left as they were: such a row may
         be genuine and sealed under a retired key the run was not given, so the run stops short
-        until a run that holds that key re-seals it. A row whose seal fails under a key this
-        sealer holds, or that is malformed, answers ``False``: no key re-seals it, so it must not
-        hold the rotation open. A key id that is not one :func:`row_seal_key_id` could return is
-        malformed."""
+        until a run that holds that key re-seals it. A row whose seal names a key this sealer
+        holds, or that is malformed, answers ``False`` and does not hold the rotation open;
+        :class:`ResealOutcome` says what such a row may be. A key id that is not one
+        :func:`row_seal_key_id` could return is malformed."""
         parsed = self._parse(stored)
         if parsed is None or parsed[0] == self.key_id or parsed[0] in self._retired:
             return False
@@ -901,8 +911,12 @@ class ResealOutcome:
     did not hold, which may be a retired key it was not given: dropping that key would strand
     them, so the store pass aborts. ``unheld_tables`` and ``unheld_key_ids`` say where they are and
     which seal key ids they name, both non-secret, so an operator can find them. ``refused`` counts
-    the rest it left: a seal that fails under a key the run holds, or is malformed. No key re-seals
-    those, so they never hold a rotation open; failing on them would fail every later run too."""
+    the rest it left: a seal that names a key the run holds other than the active one, or is
+    malformed. The read-back does not verify them, so ``refused`` holds at least a seal that fails
+    under a key the run holds, which no key re-seals, and a sound seal a writer running alongside
+    made under a retired key the run holds after its pass (vault BACKLOG #5635 items 14 and
+    15). They never hold a rotation open: failing on a seal no
+    key re-seals would fail every later run too."""
 
     unheld: int = 0
     refused: int = 0

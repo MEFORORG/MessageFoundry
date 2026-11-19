@@ -310,22 +310,16 @@ def test_the_cleartext_record_quotes_its_name_the_same_way(
 def test_raw_spec_keys_cannot_attest_or_name_the_smart_hop(tmp_path: Path, smart_key: str) -> None:
     # Only a top-level declaration writes the mirror. A spec carrying the keys as raw transport settings
     # would cross the SMART refusal with no reason check and name a connection of its own choosing.
+    # The declaration keys are refused outright (vault BACKLOG #8253 item 2), at the declaration and,
+    # written after it, at the build; a raw connection name is overwritten by the mirror.
     (tmp_path / "graph.py").write_text(
         """
 from messagefoundry import Rest, outbound
 
-raw = {
-    "tls_revocation_attested": True,
-    "tls_revocation_attested_reason": "spoofed",
-    "cleartext_accepted": True,
-    "cleartext_reason": "spoofed",
-    "connection_name": "OB_OTHER",
-}
 spoofed = Rest(url="https://collector.example.org/ingest")
-spoofed.settings.update(raw)
+spoofed.settings["connection_name"] = "OB_OTHER"
 outbound("OB_RAW", spoofed)
 declared = Rest(url="https://collector.example.org/ingest")
-declared.settings.update(raw)
 outbound(
     "OB_DECLARED",
     declared,
@@ -339,16 +333,7 @@ outbound(
     raw = _dest_config(
         reg.outbound["OB_RAW"], {}, None, EgressSettings(deny_by_default=False)
     ).settings
-    assert not any(
-        k in raw
-        for k in (
-            "tls_revocation_attested",
-            "tls_revocation_attested_reason",
-            "cleartext_accepted",
-            "cleartext_reason",
-        )
-    )
-    assert raw["connection_name"] == "OB_RAW"  # its own name, never the one the raw keys chose
+    assert raw["connection_name"] == "OB_RAW"  # its own name, never the one the raw key chose
     # The spoofed outbound's SMART token hop is refused, as an undeclared one is.
     with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
         token_provider_from_settings({**raw, **_smart(smart_key)})
@@ -357,7 +342,12 @@ outbound(
     ).settings
     assert declared["connection_name"] == "OB_DECLARED"
     assert declared["tls_revocation_attested_reason"] == "declared"
-    assert "cleartext_accepted" not in declared  # its raw key went; nothing declared it
+    assert "cleartext_accepted" not in declared  # nothing declared it
+    for name in ("OB_RAW", "OB_DECLARED"):
+        spec_settings = reg.outbound[name].spec.settings
+        spec_settings.update({"tls_revocation_attested": True, "cleartext_accepted": True})
+        with pytest.raises(WiringError, match="are not transport settings"):
+            _dest_config(reg.outbound[name], {}, None, EgressSettings(deny_by_default=False))
 
 
 _SPOOF: dict[str, object] = {

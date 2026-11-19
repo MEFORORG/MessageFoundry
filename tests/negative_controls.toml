@@ -498,9 +498,9 @@ never acquire by accident.
 # block below is the original measurement, unchanged and not re-run. See this file's header.
 context = "repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)"
 plants = """
-Annotated handler fixtures carrying inter-statement PHI taint, an aliased import, an ambient subprocess
-call, ambient deserialization, ambient eval/exec, an unparameterized db_lookup and a PHI-to-file write.
-Each rule must fire EXACTLY as annotated.
+Annotated handler fixtures carrying at least inter-statement PHI taint, an aliased import, an
+ambient subprocess call, ambient deserialization, ambient eval/exec, an unparameterized db_lookup
+and a PHI-to-file write. Each rule must fire EXACTLY as annotated.
 """
 ci = "python scripts/ci/assert_semgrep_handler_taint.py"
 workflow = "security.yml"
@@ -509,12 +509,16 @@ red = [
   "tests/test_lint_scope_parity.py::test_ci_semgrep_scans_the_repo_not_an_allow_list",
 ]
 holds = """
-The `# ok` cases in the same fixture -- log.debug, msg.control_id, a parameterized db_lookup -- must
-contribute ZERO findings, and the count equality is what asserts it. A rule set that fired on those
-would be indistinguishable from one that fires on everything. On the workflow side, the excludes must
-keep matching bandit's rather than growing independently.
+The `# ok` cases in the same fixture -- at least log.debug, msg.control_id, a parameterized
+db_lookup -- must contribute ZERO findings, and the line-by-line match against the `# ruleid:`
+annotations is what asserts it; tests/test_semgrep_handler_rules.py pins each ok case by name.
+A rule set that fired on those would be indistinguishable from one that fires on everything. On
+the workflow side, the excludes must keep matching bandit's rather than growing independently.
 """
-green = ["tests/test_lint_scope_parity.py::test_semgrep_and_bandit_exclude_the_same_paths"]
+green = [
+  "tests/test_lint_scope_parity.py::test_semgrep_and_bandit_exclude_the_same_paths",
+  "tests/test_semgrep_handler_rules.py::test_every_annotated_case_is_pinned_by_name",
+]
 observed = """
 The fixture asserter is the gate's own step and fails the job on any count mismatch in either
 direction. `--error` is separately asserted here because without it semgrep prints every match across

@@ -27,12 +27,14 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import random
 import shutil
 import sqlite3
 import sys
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -207,11 +209,15 @@ def test_a_sink_that_keeps_needing_a_roll_is_declared_unwritable(tmp_path: Path)
 # alone would not, and never pages, asks for a stop or trips the bound less than the bound alone.
 
 
-def test_every_roll_past_the_bound_fires_a_stage2_event_as_before(tmp_path: Path) -> None:
-    # The latch never changes the guard's events: every roll past the bound fires a stage-2 event
-    # carrying the stop request, as on main. Driven by real rolls: a sink that heals on every roll
-    # and breaks on every record, well past the bound. This pins main's events, which the overlay
-    # must leave alone.
+def test_rolls_past_the_bound_ask_for_the_stop_again_as_main_does(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Each roll past the bound fires stage 2 with the stop request and writes the stderr line, as
+    # main does (BACKLOG #5812). The sink stays unwritable throughout. Driven by real rolls: a sink that
+    # heals on every roll and breaks on every record, well past the bound.
+    # NEGATIVE CONTROL: on ce55b5324d a roll past the bound on a sink already unwritable fired
+    # nothing, so a stop the responder had taken as delivered and then lost was never asked again:
+    # one stage-2 event, one stop request and one stderr line.
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
@@ -223,6 +229,7 @@ def test_every_roll_past_the_bound_fires_a_stage2_event_as_before(tmp_path: Path
 
     assert [e.stage for e in events] == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"] * 4
     assert sum(e.stop_requested for e in events) == 4
+    assert capsys.readouterr().err.count("IS UNWRITABLE") == 4
     status = guard.status()[0]
     assert status.state == "unwritable"
     assert status.rollovers == _MAX_ROLLS_PER_WINDOW + 4
@@ -282,9 +289,10 @@ def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable(
     # A sink rolling every 10 seconds for five minutes is one break. The bound's window restarts a
     # minute after its first roll, and without the latch the sink then read ``rolled`` (can_log()
     # True with no probe) until the bound tripped again. The latch keeps it ``unwritable``
-    # throughout, while the pages are exactly the bound's: one event per roll, stage 2 on every roll
-    # past the bound (two per 70 s window here, eight in all), stage 1 on the rest.
-    # NEGATIVE CONTROL: on main the state reads ``rolled`` at the first roll of each new window.
+    # throughout, while the pages are exactly main's: stage 1 for each roll the bound calls a heal,
+    # and stage 2 for each roll past the bound, two in each of the four windows it trips in.
+    # NEGATIVE CONTROL: before the latch the state read ``rolled`` at the first roll of each new
+    # window.
     clock = _FakeClock()
     monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
     events: list[LogSinkEvent] = []
@@ -320,9 +328,9 @@ def test_the_roll_that_trips_the_bound_reads_unwritable_before_record_unwritable
     seen: list[tuple[str, bool]] = []
     original = guard.record_unwritable
 
-    def spy(sink: str, *, reason: str) -> None:
+    def spy(sink: str, *, reason: str, repeat: bool = False) -> None:
         seen.append((guard.status()[0].state, guard.can_log()))
-        original(sink, reason=reason)
+        original(sink, reason=reason, repeat=repeat)
 
     monkeypatch.setattr(guard, "record_unwritable", spy)
     _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
@@ -330,39 +338,72 @@ def test_the_roll_that_trips_the_bound_reads_unwritable_before_record_unwritable
     assert seen == [("unwritable", False)]
 
 
+def _own_state(guard: LogWriteGuard, sink: str) -> str:
+    """The sink's own recorded state, without the flap latch that :meth:`LogWriteGuard.status`
+    applies."""
+    return guard._sinks[sink].state
+
+
+def _latch_before(
+    guard: LogWriteGuard, clock: _FakeClock, *, trip_at: float, held_at: float
+) -> None:
+    """Trip the bound from ``trip_at`` so the latch holds the sink, then refresh the latch's clock
+    with a stage-2 failure at ``held_at``. The bound's window from ``trip_at`` has ended by the next
+    roll the caller makes at 0 s, so the latch is held while the bound starts afresh."""
+    _roll(guard, clock, *(trip_at + n for n in range(_MAX_ROLLS_PER_WINDOW + 1)))
+    _at(clock, held_at)
+    guard.record_unwritable("file", reason="the replacement failed too")
+
+
+@pytest.mark.parametrize("latched_first", [False, True])
 def test_a_stage2_failure_between_rolls_does_not_reset_the_flap_bound(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, latched_first: bool
 ) -> None:
     # Rolls at 0, 10, 20 and 30 s, a stage-2 failure at 35 s, then six rolls 65 to 115 s: six rolls
     # in 50 s is a flap, and the bound's window catches it at 115 s. Pins the bound, which the latch
-    # must never move.
+    # must never move. With ``latched_first`` the latch holds the sink the whole time, so it has the
+    # chance to move the bound that the plain case never gives it.
     clock = _FakeClock()
     guard, events = _guard_on(clock, monkeypatch)
+    if latched_first:
+        _latch_before(guard, clock, trip_at=-70, held_at=-10)
     _roll(guard, clock, 0, 10, 20, 30)
     _at(clock, 35)
     guard.record_unwritable("file", reason="the replacement failed too")
-    _roll(guard, clock, 65, 75, 85, 95, 105, 115)
+    _roll(guard, clock, 65, 75, 85, 95, 105)
+    assert ("file" in guard._flap_latch) is latched_first
+    assert _own_state(guard, "file") == "rolled"  # the bound's own state, a roll before the trip
+    paged = len(events)
+    _roll(guard, clock, 115)
 
-    assert guard.status()[0].state == "unwritable"
+    assert _own_state(guard, "file") == "unwritable"  # tripped by the bound, not read off the latch
     assert guard.can_log() is False
-    assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
+    assert [(e.stage, e.stop_requested) for e in events[paged:]] == [("unwritable", True)]
 
 
+@pytest.mark.parametrize("latched_first", [False, True])
 def test_the_latch_never_trips_later_than_the_bound_alone(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, latched_first: bool
 ) -> None:
     # A roll at 0 s, stage 2 at 1 s, a healing roll at 2 s, then eight rolls in seven seconds from
-    # 59 s: the five-in-60 bound alone trips at 66 s, and so must this guard.
+    # 59 s: the five-in-60 bound alone trips at 66 s, and so must this guard. With
+    # ``latched_first`` the latch holds the sink throughout.
     clock = _FakeClock()
     guard, events = _guard_on(clock, monkeypatch)
+    if latched_first:
+        _latch_before(guard, clock, trip_at=-80, held_at=-5)
     _roll(guard, clock, 0)
     _at(clock, 1)
     guard.record_unwritable("file", reason="the replacement failed too")
-    _roll(guard, clock, 2, 59, 60, 61, 62.5, 63, 64, 65, 66)
+    _roll(guard, clock, 2, 59, 60, 61, 62.5, 63, 64, 65)
+    assert ("file" in guard._flap_latch) is latched_first
+    assert _own_state(guard, "file") == "rolled"
+    paged = len(events)
+    _roll(guard, clock, 66)
 
-    assert guard.status()[0].state == "unwritable"
+    assert _own_state(guard, "file") == "unwritable"
     assert guard.can_log() is False
-    assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
+    assert [(e.stage, e.stop_requested) for e in events[paged:]] == [("unwritable", True)]
 
 
 def test_a_roll_the_latch_alone_holds_still_pages_stage1_with_its_cause(
@@ -633,6 +674,618 @@ def test_the_flap_bound_does_not_fire_on_an_ordinary_transient(tmp_path: Path) -
     handler.emit(_record("break"))
 
     assert [e.stage for e in events] == ["rolled"]
+
+
+def test_a_roll_or_failure_during_a_sinks_probe_is_not_undone_by_revalidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812 item 9. The sink tripped the bound and is unwritable. While revalidate's probe
+    # runs, outside the lock, another thread records one more roll past the bound, which keeps the
+    # sink unwritable and refreshes its latch. The probe then lands. Marking the sink healthy now
+    # would wipe that roll: the bound's streak, the latch and the unwritable state.
+    # NEGATIVE CONTROL: before the fix revalidate marked it healthy and answered True.
+    clock = _FakeClock()
+    holder: list[LogWriteGuard] = []
+
+    def probe_while_it_flaps() -> None:
+        _at(clock, 7)
+        holder[0].record_rollover("file", reason="lock", rolled_aside=None)
+
+    guard, _events = _guard_on(clock, monkeypatch, probe=probe_while_it_flaps)
+    holder.append(guard)
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
+    assert _own_state(guard, "file") == "unwritable"
+
+    assert guard.revalidate() is False
+    assert _own_state(guard, "file") == "unwritable"
+    assert "file" in guard._flap_latch
+    assert guard._roll_flap["file"][1] == _MAX_ROLLS_PER_WINDOW + 2
+
+
+def test_revalidate_does_not_probe_a_sink_that_became_latch_only_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812 item 7. Two dead sinks. While the first one's probe runs, the second rolls once
+    # in a fresh window of the bound, so its own state is ``rolled`` and only the latch holds it.
+    # Probing it would write to a sink the latch alone holds, which the latch's design forbids.
+    # NEGATIVE CONTROL: before the fix the second sink's probe ran from the stale snapshot, and its
+    # record_healthy reset the bound.
+    clock = _FakeClock()
+    probed: list[str] = []
+    holder: list[LogWriteGuard] = []
+
+    def probe_a() -> None:
+        probed.append("a")
+        _at(clock, 62)
+        holder[0].record_rollover("b", reason="lock", rolled_aside=None)
+
+    def probe_b() -> None:
+        probed.append("b")
+
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    guard = LogWriteGuard()
+    holder.append(guard)
+    guard.register("a", probe=probe_a)
+    guard.register("b", probe=probe_b)
+    for t in range(_MAX_ROLLS_PER_WINDOW + 1):
+        _at(clock, t)
+        guard.record_rollover("b", reason="lock", rolled_aside=None)
+    _at(clock, 6)
+    guard.record_unwritable("a", reason="the replacement failed too")
+    assert [s.state for s in guard.status()] == ["unwritable", "unwritable"]
+
+    assert guard.revalidate() is True  # ``a`` landed, and ``b``'s own state is ``rolled``
+    assert probed == ["a"]
+    assert _own_state(guard, "b") == "rolled"
+    assert guard._roll_flap["b"] == (1062.0, 1)  # the bound's fresh window, not reset
+
+
+def test_the_stage2_line_says_when_only_the_latch_holds_the_other_sink(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #5812 item 8. ``file`` is held by the latch alone and ``stdout`` then fails stage 2.
+    # No stop is asked for, and the stderr line no longer calls the other sink writable while
+    # /status reads it unwritable. NEGATIVE CONTROL: before the fix it said "another sink is still
+    # writable".
+    clock = _FakeClock()
+    guard, events = _guard_on(clock, monkeypatch, sinks=("file", "stdout"))
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1), 62)
+    capsys.readouterr()
+
+    _at(clock, 63)
+    guard.record_unwritable("stdout", reason="the replacement failed too")
+
+    err = capsys.readouterr().err
+    assert "another sink is still writable" not in err
+    assert "only by the flap latch" in err and "nothing is being stopped" in err
+    assert events[-1].stop_requested is False
+
+
+def test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812 item 15: a committed form of the side-by-side check. Two guards take the same
+    # seeded random steps under a fake clock: rolls, stage-2 failures and revalidates whose probe
+    # outcome is drawn once per step and shared. One has the latch switched off. At every step the
+    # events, the stop requests, each sink's own recorded state, the bound and the revalidate answer
+    # must be identical, and the latched guard must read a sink unwritable wherever the other does.
+    def build(latched: bool, outcome: list[bool]) -> tuple[LogWriteGuard, list[LogSinkEvent]]:
+        def probe() -> None:
+            if not outcome[0]:
+                raise OSError("still broken")
+
+        guard = LogWriteGuard()
+        events: list[LogSinkEvent] = []
+        guard.set_escalation(events.append)
+        guard.register("file", probe=probe)
+        guard.register("stdout", probe=probe)
+        if not latched:
+            guard._latch_after_roll = lambda sink, *, now, tripped: None  # type: ignore[method-assign]
+            guard._latch_after_failure = lambda sink: None  # type: ignore[method-assign]
+        return guard, events
+
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    latched_seen = 0
+    for seed in range(40):
+        rng = random.Random(seed)
+        clock.now = 1000.0
+        outcome = [True]
+        with_latch, ev_with = build(True, outcome)
+        without, ev_without = build(False, outcome)
+        for _ in range(120):
+            clock.now += rng.choice((0.5, 3.0, 9.0, 30.0, 65.0))
+            sink = rng.choice(("file", "stdout"))
+            step = rng.random()
+            outcome[0] = rng.random() < 0.5
+            answers: list[bool] = []
+            for guard in (with_latch, without):
+                if step < 0.75:
+                    guard.record_rollover(sink, reason="lock", rolled_aside=None)
+                elif step < 0.9:
+                    guard.record_unwritable(sink, reason="the replacement failed too")
+                else:
+                    answers.append(guard.revalidate())
+            assert len(set(answers)) <= 1
+            assert ev_with == ev_without
+            # The wall-clock stamp is left out: the two guards write it a moment apart.
+            assert _without_stamps(with_latch) == _without_stamps(without)
+            assert with_latch._roll_flap == without._roll_flap
+            for latched_s, plain_s in zip(with_latch.status(), without.status(), strict=True):
+                assert plain_s.state != "unwritable" or latched_s.state == "unwritable"
+            assert with_latch.can_log() <= without.can_log()
+            latched_seen += bool(with_latch._flap_latch)
+    assert latched_seen > 50  # the latch was really in play, not idle through the run
+
+
+def _without_stamps(guard: LogWriteGuard) -> dict[str, Any]:
+    return {name: replace(s, last_event_at=None) for name, s in guard._sinks.items()}
+
+
+# --- BACKLOG #5813: a record that cannot be formatted is not a sink failure ----
+
+
+def test_a_record_that_cannot_be_formatted_does_not_roll_or_stop_a_healthy_sink(
+    tmp_path: Path,
+) -> None:
+    # A record whose arguments do not fit its format string, on a sink with no filter in front of
+    # the formatter (on the configured handlers RedactionFilter replaces such a record before the
+    # formatter runs, so this reaches the guard only through a formatter). The sink is fine: a fixed notice naming the logger takes the record's place,
+    # nothing is rolled, nothing pages, and the next record lands.
+    # NEGATIVE CONTROL: before the fix the guard rolled the sink, failed to re-write the same record
+    # and called the sink unwritable, asking for a stop.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = _file_handler(log_path, guard)
+
+    handler.emit(_record("count %d", "not a number"))
+    handler.emit(_record("the next line"))
+    handler.close()
+
+    assert events == []
+    assert [s.state for s in guard.status()] == ["healthy"]
+    assert list(tmp_path.iterdir()) == [log_path]  # nothing rolled aside
+    text = log_path.read_text(encoding="utf-8")
+    assert "a log record from logger 't' at level INFO could not be formatted" in text
+    assert "not a number" not in text  # the record's content is not in the stand-in
+    assert "the next line" in text
+
+
+def test_an_unformattable_record_on_a_broken_sink_rolls_and_writes_the_notice(
+    tmp_path: Path,
+) -> None:
+    # The record cannot be formatted AND the handle is broken. The notice in its place is refused,
+    # so the sink is the fault: it is rolled, and after the roll the notice, not the record, is
+    # written. A stage-1 heal, with no stop.
+    # NEGATIVE CONTROL: re-writing the record after the roll re-raises the format error and turns
+    # the heal into stage 2.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = _file_handler(log_path, guard)
+    _break_the_open_handle(handler)
+
+    handler.emit(_record("count %d", "not a number"))
+    handler.close()
+
+    assert [(e.stage, e.stop_requested) for e in events] == [("rolled", False)]
+    assert "could not be formatted" in log_path.read_text(encoding="utf-8")
+
+
+def test_a_record_whose_logger_name_cannot_be_rendered_does_not_raise(tmp_path: Path) -> None:
+    # The notice names the record's logger, and a name whose ``str`` raises is the likely reason the
+    # record did not format. Building the notice must not raise into the caller's log call.
+    class BadName:
+        def __str__(self) -> str:
+            raise RuntimeError("no name")
+
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = GuardedFileHandler(str(log_path), guard=guard, sink="file")
+    handler.setFormatter(logging.Formatter("%(name)s %(message)s"))
+    record = logging.makeLogRecord({"name": BadName(), "msg": "hello", "levelname": "INFO"})
+
+    handler.handle(record)
+    handler.close()
+
+    assert events == []
+    assert "from logger '<unnameable>'" in log_path.read_text(encoding="utf-8")
+
+
+def test_a_stage2_event_fired_before_a_responder_is_wired_is_fired_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The roll that trips the bound fires stage 2 while no responder is wired, as in the gap between
+    # a runner's revalidate and its set_escalation. Wiring the responder fires it at once, so the
+    # stop is asked for before the next roll; each later roll past the bound asks again. The retry
+    # on a later failure is pinned by test_a_stage2_event_the_responder_dropped_is_fired_again.
+    # NEGATIVE CONTROL: on 0a71e8b23f set_escalation fired nothing.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    guard = LogWriteGuard()
+    guard.register("file")
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
+    events: list[LogSinkEvent] = []
+    guard.set_escalation(events.append)
+    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
+
+    _roll(guard, clock, 6, 7)
+
+    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)] * 3
+
+
+def test_a_formatter_that_fails_on_every_record_halts_without_renaming_the_log(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # When the sink cannot format even the guard's own notice, this process cannot log through it,
+    # so the sink is recorded unwritable and, as the only sink, asks for the stop, as on main. The
+    # file itself is healthy, so it is not renamed, not by the failure and not by revalidate().
+    # NEGATIVE CONTROL: on c6ee866c0c the fault was only said on stderr: no event, the sink read
+    # healthy and can_log() answered True, so the halt never fired.
+    class Broken(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            raise RuntimeError("formatter is broken")
+
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = GuardedFileHandler(str(log_path), guard=guard, sink="file")
+    handler.setFormatter(Broken())
+    capsys.readouterr()
+
+    handler.emit(_record("anything"))
+
+    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
+    assert "nothing was written to it" in events[0].reason
+    assert [s.state for s in guard.status()] == ["unwritable"]
+    assert guard.can_log() is False
+    assert guard.revalidate() is False
+    handler.close()
+    assert list(tmp_path.iterdir()) == [log_path]  # nothing rolled aside
+    err = capsys.readouterr().err
+    assert "nor the notice standing in for it ('RuntimeError')" in err
+    assert "IS UNWRITABLE because its formatter fails" in err
+    assert "after a rollover attempt" not in err
+    assert "formatter is broken" not in err  # the exception's type only, never its message
+
+
+def test_an_absorbed_format_fault_is_said_on_stderr_once_per_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A record the stand-in absorbs leaves the guard's state alone, so without this line the fault
+    # would show only inside the log file. The line is rate limited: the first fault is said at
+    # once, the next within the interval is counted, and the line after the interval covers both.
+    # NEGATIVE CONTROL: on fd09ca1394 no stderr line was written for an absorbed format fault.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    guard = LogWriteGuard()
+    handler = _file_handler(tmp_path / "app.log", guard)
+    capsys.readouterr()
+
+    handler.emit(_record("count %d", "first"))
+    first = capsys.readouterr().err
+    clock.now += 1
+    handler.emit(_record("count %d", "second"))
+    quiet = capsys.readouterr().err
+    clock.now += logging_guard._FORMAT_FAULT_REPORT_SECONDS
+    handler.emit(_record("count %d", "third"))
+    later = capsys.readouterr().err
+    handler.close()
+
+    assert first.count("could not format a record ('TypeError')") == 1
+    assert "(x1)" in first
+    assert quiet == ""
+    assert "could not format a record ('TypeError')" in later and "(x2)" in later
+    for line in (first, later):
+        assert "first" not in line and "third" not in line  # nothing from the record
+    assert [s.state for s in guard.status()] == ["healthy"]
+
+
+def test_the_last_faults_of_a_burst_are_said_at_the_next_flush_and_at_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A burst's faults after its first line are counted. They are said once the interval has
+    # passed, by the next record's flush even when that record formats, and at close in any case.
+    # Each kind of fault is named with its own count.
+    # NEGATIVE CONTROL: on c6ee866c0c a burst's last faults were said only if a later FAULT came
+    # after the interval; a quiet sink never said them, and the line gave one total for all kinds.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    guard = LogWriteGuard()
+    handler = _file_handler(tmp_path / "app.log", guard)
+    capsys.readouterr()
+
+    handler.emit(_record("count %d", "a"))  # said at once
+    capsys.readouterr()
+    clock.now += 1
+    handler.emit(_record("count %d", "b"))  # TypeError, counted
+    handler.emit(_record("%z", "c"))  # a ValueError, another kind, counted
+    handler.emit(_record("count %d", "d"))
+    handler.emit(_record("formats fine"))
+    assert capsys.readouterr().err == ""  # still inside the interval
+    clock.now += logging_guard._FORMAT_FAULT_REPORT_SECONDS
+    handler.emit(_record("formats fine too"))
+    flushed = capsys.readouterr().err
+    clock.now += 1
+    handler.emit(_record("count %d", "e"))  # inside the new interval: counted
+    assert capsys.readouterr().err == ""
+    handler.close()
+    closed = capsys.readouterr().err
+
+    assert "could not format a record ('TypeError'); " in flushed
+    assert "(x2)" in flushed and "(x1)" in flushed
+    assert flushed.count("could not format a record (") == 2  # two kinds, each with its count
+    assert "could not format a record ('TypeError')" in closed and "(x1)" in closed
+
+
+def test_the_stand_in_escapes_the_logger_name_once(tmp_path: Path) -> None:
+    # The logger name is escaped for the notice and then quoted. ``repr`` on the escaped value
+    # doubled every backslash the escape wrote.
+    # NEGATIVE CONTROL: on c6ee866c0c the notice read ``'a\\\\nb'`` for a name holding a newline.
+    guard = LogWriteGuard()
+    log_path = tmp_path / "app.log"
+    handler = _file_handler(log_path, guard)
+    record = _record("count %d", "x")
+    record.name = "a\nb"
+
+    handler.handle(record)
+    handler.close()
+
+    text = log_path.read_text(encoding="utf-8")
+    assert "from logger 'a\\nb' at level INFO" in text
+    assert "a\\\\nb" not in text
+
+
+def test_a_record_with_no_name_or_level_name_does_not_raise(tmp_path: Path) -> None:
+    # A caller can delete both attributes; building the stand-in reads them inside its guard.
+    # NEGATIVE CONTROL: on fd09ca1394 reading ``record.name`` raised AttributeError out of
+    # handleError, into the caller's log call.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = GuardedFileHandler(str(log_path), guard=guard, sink="file")
+    handler.setFormatter(logging.Formatter("%(name)s %(message)s"))
+    record = _record("hello")
+    del record.name
+    del record.levelname
+
+    handler.handle(record)
+    handler.close()
+
+    assert events == []
+    assert "from logger '<unnameable>' at level <unnameable>" in log_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_an_owed_stage2_event_is_fired_once_per_failure_not_once_per_thread() -> None:
+    # Two failures racing on a break that owes its event: the first takes the debt under the lock,
+    # so the second, arriving while the first is still firing, fires nothing. The responder here
+    # records that second failure itself, which is that interleaving made deterministic.
+    # NEGATIVE CONTROL: on fd09ca1394 the debt was cleared only after the fire returned, so the
+    # nested failure fired the event a second time.
+    guard = LogWriteGuard()
+    guard.register("file")
+    guard.record_unwritable("file", reason="disk gone")  # no responder: owed
+    events: list[LogSinkEvent] = []
+    nested: list[bool] = []
+    ready: list[bool] = []
+
+    def responder(event: LogSinkEvent) -> bool:
+        # Dropped until ready, as a runner with no open loop drops it, so the event set_escalation
+        # fires stays owed and the next failure is what fires it.
+        if not ready:
+            return False
+        events.append(event)
+        if not nested:
+            nested.append(True)
+            guard.record_unwritable("file", reason="disk still gone")
+        return True
+
+    guard.set_escalation(responder)
+    ready.append(True)
+    guard.record_unwritable("file", reason="disk still gone")
+
+    assert len(events) == 1
+    guard.record_unwritable("file", reason="answered now, so nothing more")
+    assert len(events) == 1
+
+
+def test_a_stage2_event_the_responder_dropped_is_fired_again() -> None:
+    # The responder drops the stage-2 event, as the runner's does with no open loop. The break's
+    # next failure fires it again, and once one is delivered the failures after it fire nothing.
+    # NEGATIVE CONTROL: on 0a71e8b23f a wired responder counted as delivered, so the second
+    # failure fired nothing and the only stop request was the dropped one.
+    guard = LogWriteGuard()
+    guard.register("file")
+    delivering: list[bool] = []
+    stage2: list[LogSinkEvent] = []
+
+    def responder(event: LogSinkEvent) -> bool:
+        stage2.append(event)
+        return bool(delivering)
+
+    guard.set_escalation(responder)
+    guard.record_unwritable("file", reason="disk gone")
+    delivering.append(True)
+    guard.record_unwritable("file", reason="disk still gone")
+    guard.record_unwritable("file", reason="answered now, so nothing more")
+
+    assert [(e.reason, e.stop_requested) for e in stage2] == [
+        ("disk gone", True),
+        ("disk still gone", True),
+    ]
+
+
+def test_a_stage2_event_whose_responder_raised_is_fired_again(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A responder that raised did not take the event, so the break owes it, as for a drop.
+    # NEGATIVE CONTROL: on ce55b5324d a raise counted as delivered, so the second failure fired
+    # nothing and the only stop request was the one the responder raised on.
+    guard = LogWriteGuard()
+    guard.register("file")
+    raising: list[bool] = [True]
+    stage2: list[LogSinkEvent] = []
+
+    def responder(event: LogSinkEvent) -> bool:
+        stage2.append(event)
+        if raising:
+            raise RuntimeError("responder broke")
+        return True
+
+    guard.set_escalation(responder)
+    guard.record_unwritable("file", reason="disk gone")
+    raising.clear()
+    guard.record_unwritable("file", reason="disk still gone")
+    guard.record_unwritable("file", reason="answered now, so nothing more")
+
+    assert [(e.reason, e.stop_requested) for e in stage2] == [
+        ("disk gone", True),
+        ("disk still gone", True),
+    ]
+    assert "log-sink escalation for file failed" in capsys.readouterr().err
+
+
+def test_a_responder_that_keeps_raising_writes_one_stderr_line_per_break(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The owed event is fired again on every later failure, but the line saying the responder
+    # raised is written once per break, as main wrote it. A new break says it again.
+    # NEGATIVE CONTROL: on c4167a6e38 every failed record wrote the line.
+    guard = LogWriteGuard()
+    guard.register("file")
+    calls: list[LogSinkEvent] = []
+
+    def responder(event: LogSinkEvent) -> bool:
+        calls.append(event)
+        raise RuntimeError("responder broke")
+
+    guard.set_escalation(responder)
+    for n in range(5):
+        guard.record_unwritable("file", reason=f"disk gone {n}")
+    assert len(calls) == 5  # the owed event is still fired on every failure
+    assert capsys.readouterr().err.count("log-sink escalation for file failed") == 1
+
+    guard.record_healthy("file")
+    guard.record_unwritable("file", reason="a second break")
+    guard.record_unwritable("file", reason="still the second break")
+    assert capsys.readouterr().err.count("log-sink escalation for file failed") == 1
+
+    def other_responder(event: LogSinkEvent) -> bool:
+        raise ValueError("the new responder broke too")
+
+    # A new responder's failure in the same break is said too.
+    guard.set_escalation(other_responder)
+    assert capsys.readouterr().err.count("log-sink escalation for file failed") == 1
+
+
+async def test_the_runners_responder_reports_an_event_it_dropped(store: MessageStore) -> None:
+    # The guard learns of a drop only from the responder's return. NEGATIVE CONTROL: on
+    # 0a71e8b23f it returned None in every case, which the guard read as delivered.
+    runner, _source = _graph(store, _RecordingSink())
+    event = LogSinkEvent(sink="file", stage="rolled", reason="lock")
+    assert runner._on_log_sink_event(event) is False  # not started: no loop
+    closed = asyncio.new_event_loop()
+    closed.close()
+    runner._loop = closed
+    assert runner._on_log_sink_event(event) is False
+    runner._loop = asyncio.get_running_loop()
+    assert runner._on_log_sink_event(event) is True
+    for _ in range(3):
+        await asyncio.sleep(0)  # let the scheduled stage-1 response run
+
+
+def test_wiring_a_responder_fires_an_owed_stage2_event() -> None:
+    # A break that failed stage 2 before any responder was wired owes its event. Wiring one fires
+    # it at once, with the stop request, rather than waiting for the sink's next failure, which may
+    # never come. A sink that healed meanwhile owes nothing.
+    # NEGATIVE CONTROL: on 0a71e8b23f set_escalation fired nothing.
+    guard = LogWriteGuard()
+    guard.register("file")
+    guard.register("stdout")
+    guard.record_unwritable("stdout", reason="pipe closed")
+    guard.record_healthy("stdout")
+    guard.record_unwritable("file", reason="disk gone")
+    guard.record_unwritable("stdout", reason="pipe closed again")
+    guard.record_healthy("stdout")
+    events: list[LogSinkEvent] = []
+
+    guard.set_escalation(events.append)
+
+    assert [(e.sink, e.stage, e.stop_requested) for e in events] == [("file", "unwritable", False)]
+    assert "disk gone" in events[0].reason
+    guard.record_unwritable("file", reason="still gone")
+    assert len(events) == 1
+
+
+def test_wiring_a_responder_fires_the_owed_stop_when_every_sink_is_down() -> None:
+    # NEGATIVE CONTROL: on 0a71e8b23f set_escalation fired nothing.
+    guard = LogWriteGuard()
+    guard.register("file")
+    guard.record_unwritable("file", reason="disk gone")
+    events: list[LogSinkEvent] = []
+
+    guard.set_escalation(events.append)
+
+    assert [(e.sink, e.stage, e.reason, e.stop_requested) for e in events] == [
+        ("file", "unwritable", "disk gone", True)
+    ]
+
+
+def test_revalidate_never_answers_true_while_a_latch_set_during_its_probe_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The sink tripped the bound, so it is unwritable and latched. While revalidate's probe runs,
+    # another thread records a roll in a fresh window of the bound: its own state reads ``rolled``,
+    # and the latch still holds it, so /status and can_log() read it unwritable. revalidate must
+    # answer as they do.
+    # NEGATIVE CONTROL: on 0a71e8b23f revalidate read the own state alone and answered True while
+    # can_log() answered False.
+    clock = _FakeClock()
+    holder: list[LogWriteGuard] = []
+
+    def probe_while_it_heals() -> None:
+        _at(clock, 61)
+        holder[0].record_rollover("file", reason="lock", rolled_aside=None)
+
+    guard, _events = _guard_on(clock, monkeypatch, probe=probe_while_it_heals)
+    holder.append(guard)
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
+    assert _own_state(guard, "file") == "unwritable"
+
+    answer = guard.revalidate()
+
+    assert _own_state(guard, "file") == "rolled"
+    assert [s.state for s in guard.status()] == ["unwritable"]
+    assert answer is False
+    assert answer is guard.can_log()
+
+
+def test_a_type_name_that_cannot_be_rendered_is_said_on_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # NEGATIVE CONTROL: on 0a71e8b23f the fault was swallowed and stderr stayed empty.
+    from messagefoundry import logging_guard
+
+    def broken_ascii(value: object) -> str:
+        raise RuntimeError("cannot render")
+
+    monkeypatch.setattr(logging_guard, "ascii", broken_ascii, raising=False)
+    capsys.readouterr()
+
+    assert logging_guard._type_name(ValueError("x")) == "<unnameable>"
+
+    err = capsys.readouterr().err
+    assert "type name could not be rendered" in err
+    assert "cannot render" not in err
 
 
 # --- stage 2: STOP -----------------------------------------------------------
@@ -2467,9 +3120,9 @@ def _fail_the_next_write(handler: GuardedFileHandler, message: str) -> None:
 
 
 def test_a_stream_error_cannot_forge_a_line_in_the_notice_it_causes(tmp_path: Path) -> None:
-    # CONSUMER 1 of 4, and the one the row is named for. The notice is written by ``_emit_direct``,
-    # deliberately below ``Handler.handle``, so no filter will ever scrub it -- the escape has to
-    # happen where the reason is built or not at all.
+    # CONSUMER 1 of 4, and the one the row is named for. The notice is written by ``_write_notice``
+    # straight to the stream through ``_write_line``, deliberately below ``Handler.handle``, so no
+    # filter will ever scrub it -- the escape has to happen where the reason is built or not at all.
     guard = LogWriteGuard()
     log_path = tmp_path / "app.log"
     handler = _file_handler(log_path, guard)
@@ -2736,6 +3389,7 @@ def test_the_guards_scrub_composition_still_covers_the_installed_filter_chain() 
     accounted = {
         "RedactionFilter",  # safe_exc, applied with the scrub by _safe_reason
         "CredentialScrubFilter",  # scrub_credentials, composed by _scrub_diagnostic
+        "BinaryCarriageScrubFilter",  # redact_binary_carriage, composed by _scrub_diagnostic
         "ControlCharScrubFilter",  # scrub_control_chars, composed by _scrub_diagnostic
         "CredentialQueryScrubFilter",  # carve-out: no guard diagnostic carries a request URL
     }
@@ -2862,13 +3516,21 @@ async def test_a_raise_from_the_first_page_still_unbinds_and_pauses(
     assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
 
 
-async def test_an_ownership_check_that_raises_still_unbinds_and_holds_delivery(
+async def test_an_ownership_check_that_raises_still_unbinds_and_pauses_that_outbound(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A raise from the ownership check must not abort the halt with the latch set over bound
-    # listeners: the listener still goes down, and the outbound whose check raised is skipped.
+    # listeners: the listener still goes down. BACKLOG #5704: nor may it skip the outbound, which
+    # then delivered with no operator start once a later probe cleared the latch, while every
+    # sibling the halt paused waited for one. The halt is fail-closed, so the lane is paused,
+    # counted and alerted with the rest. MEASURED on main: it was left out of all three.
+    # The pooled dispatcher's lane is paused too, and reads quiesced: the pause path's own
+    # ownership read raised again and left it claiming, with the lane "stopping" for good.
     sink = _RecordingSink()
     runner, source = _graph(store, sink)
+    dispatcher = runner._make_dispatcher(Stage.OUTBOUND)
+    runner._dispatchers[Stage.OUTBOUND] = dispatcher
+    dispatcher.mark_ready(OUTBOUND)
 
     def raises(name: str) -> bool:
         raise RuntimeError("boom")
@@ -2877,10 +3539,33 @@ async def test_an_ownership_check_that_raises_still_unbinds_and_holds_delivery(
     await runner._stop_all_for_log_failure(sink="file", reason="disk full")
 
     assert source.stopped is True
-    # Not paused, so another engine shard's lane is never paused here, and still held: the
-    # ADR 0189 claim gate reads the latch.
-    assert OUTBOUND not in runner._outbound_paused and runner._delivery_halted
-    assert sink.log_failures == [("file", "unwritable", "disk full", 1)]
+    assert OUTBOUND in runner._outbound_paused and runner._delivery_halted
+    assert dispatcher.phase(OUTBOUND) is stage_dispatcher._LanePhase.PAUSED
+    assert runner._outbound_quiesced[OUTBOUND].is_set()
+    assert sink.log_failures == [("file", "unwritable", "disk full", 2)]
+    assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
+    # A probe that clears the latch does not resume it: it waits for an operator start, like
+    # every sibling the halt paused.
+    monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: None)
+    assert runner._log_recovery_ok() and not runner._log_write_stopped
+    assert OUTBOUND in runner._outbound_paused
+    assert dispatcher.phase(OUTBOUND) is stage_dispatcher._LanePhase.PAUSED
+
+
+def test_a_start_into_a_dead_log_pauses_an_outbound_whose_ownership_check_raises(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704: the start-time sibling of the halt read ownership unguarded, so one raising
+    # check aborted the whole delivery-tier park. MEASURED on main: RuntimeError out of the park.
+    runner, _source = _graph(store, _RecordingSink())
+
+    def raises(name: str) -> bool:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner, "_owns_destination", raises)
+    runner._park_delivery_for_log_failure()
+
+    assert OUTBOUND in runner._outbound_paused
 
 
 def test_the_rebind_gate_refuses_and_marks_an_unmarked_inbound_while_the_log_is_dead(
@@ -3136,8 +3821,9 @@ async def test_a_reload_during_the_halt_re_arms_a_stopped_lane_whose_sibling_sta
     # A lane STOPPED with no hold of its own is re-armed by the reload during the halt and gate-
     # parked, so the recovery restart releases it: the end state main reaches, where the halt
     # paused it and the restart resumed it. The sibling whose STOP is held stays STOPPED and keeps
-    # the hold, the gap against main the test below pins. MEASURED 2026-11-14: keyed by the inbound
-    # alone, the reload left the unheld lane STOPPED.
+    # the hold through the reload, and the recovery restart then re-arms it and releases the hold,
+    # as the test below pins. MEASURED 2026-11-14: keyed by the inbound alone, the reload left the
+    # unheld lane STOPPED.
     outdir, logdir = tmp_path / "out", tmp_path / "logs"
     outdir.mkdir()
     logdir.mkdir()
@@ -3168,7 +3854,8 @@ async def test_a_reload_during_the_halt_re_arms_a_stopped_lane_whose_sibling_sta
         assert not runner._log_write_stopped and INBOUND not in runner._log_halted
         assert not unheld.stopped(INBOUND), "the recovery restart left the unheld lane STOPPED"
         assert not unheld._states[INBOUND].gated, "the recovery restart left the lane gate-parked"
-        assert held.stopped(INBOUND), "the recovery restart re-armed the held STOP"
+        assert not held.stopped(INBOUND), "the recovery restart left the held STOP in place"
+        assert ("inbound", INBOUND) not in runner._stop_held, "the restart kept the hold"
     finally:
         await runner.stop()
 
@@ -3216,16 +3903,14 @@ async def test_an_unheld_stopped_pooled_lane_runs_after_a_halt_reload_and_the_re
 
 
 @pytest.mark.parametrize("held", [True, False])
-async def test_a_stopped_pooled_lane_stays_stopped_after_the_recovery_restart_until_a_reload(
+async def test_a_pooled_lane_stopped_under_the_halt_is_re_armed_by_the_recovery_restart(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: bool
 ) -> None:
-    # BACKLOG #5704: what the recovery records say about a pooled internal lane that STOPped while
-    # the log was down. The restart lifts the gate and re-arms no STOP, held (a T17 bound) or not
-    # (a leadership-loss hand-back). It also measures that a reload after that restart re-arms the
-    # lane and releases any hold: a measurement, not a remedy, so no record names it. This pins a
-    # known gap against main, where the halt paused the lane and the restart resumed it; a fix that
-    # makes the restart re-arm the lane should flip the first assertion after the restart, and the
-    # records with it.
+    # BACKLOG #5704 (ledger items 2 and 8): a pooled internal lane that STOPped while the log was
+    # down, held (a T17 bound) or not (a leadership-loss hand-back), is re-armed by the recovery
+    # restart, and its hold released, as before the halt became a claim gate, when the halt paused
+    # the lane and the restart resumed it. MEASURED on main: the restart only released gate-parked
+    # lanes, so the lane stayed STOPPED until a reload.
     outdir, logdir = tmp_path / "out", tmp_path / "logs"
     outdir.mkdir()
     logdir.mkdir()
@@ -3248,12 +3933,11 @@ async def test_a_stopped_pooled_lane_stays_stopped_after_the_recovery_restart_un
         await runner.restart_inbound(INBOUND)
         await runner.start_outbound(OUTBOUND)
         assert not runner._log_write_stopped and INBOUND not in runner._log_halted
-        assert routed.stopped(INBOUND), "the recovery restart re-armed the STOPPED lane"
-        assert (("inbound", INBOUND) in runner._stop_held) is held
-
-        await runner.reload(_e2e_registry(outdir))
-        assert not routed.stopped(INBOUND), "a reload after the recovery left the lane STOPPED"
+        assert not routed.stopped(INBOUND), "the recovery restart left the lane STOPPED"
         assert ("inbound", INBOUND) not in runner._stop_held
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until(lambda: any(outdir.iterdir())), "the re-armed lane never drained"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
     finally:
         await runner.stop()
 
@@ -3422,9 +4106,10 @@ async def test_a_claim_gate_that_raises_once_with_no_halt_lets_the_lane_drain(
 
 
 def test_lifting_the_gate_releases_only_gate_parked_lanes(store: MessageStore) -> None:
-    # BACKLOG #5704: lifting the gate unparks a lane the gate parked, and nothing else. A lane a
-    # backing-off head parked keeps its park, and a STOPPED lane keeps its STOP: release_gated is
-    # not the recovery broadcast, which re-arms STOPPED lanes and releases holds.
+    # BACKLOG #5704: release_gated, which a latch clearing runs, unparks a lane the gate parked,
+    # and nothing else. A lane a backing-off head parked keeps its park, and a STOPPED lane keeps
+    # its STOP: release_gated is not the recovery broadcast, which re-arms STOPPED lanes and
+    # releases holds. An inbound's own lift at its restart is tested below.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
     dispatcher = runner._make_dispatcher(Stage.ROUTED)
@@ -3481,8 +4166,209 @@ async def test_a_row_claimed_before_the_gate_shut_is_released_when_leadership_is
     result = await runner._refuse_log_halted(item)
 
     if leader:
-        assert result.kind is LaneResultKind.RETRY
+        assert result.kind is LaneResultKind.RETRY and result.hand_back
         assert (released, rescheduled) == ([], [[item.id]])
     else:
         assert result.kind is LaneResultKind.STOP
         assert (released, rescheduled) == ([[item.id]], [])
+
+
+@pytest.mark.parametrize("hand_back", [True, False])
+async def test_a_hand_back_leaves_the_lanes_infra_fault_count_as_it_was(
+    store: MessageStore, hand_back: bool
+) -> None:
+    # BACKLOG #5704 (ledger item 3): the pooled hand-back of a row claimed before the gate shut is a
+    # RETRY the lane never ran, so it must not reset the lane's T17 streak or its lane_stuck latch,
+    # as a content RETRY does. MEASURED on main: the hand-back read as a content RETRY and reset
+    # both. Control: a content RETRY (hand_back False) still resets them.
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    dispatcher = runner._make_dispatcher(Stage.INGRESS)
+    await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+    claimed = await store.claim_fifo_heads(Stage.INGRESS.value, [INBOUND], now=time.time() + 1)
+    (item,) = claimed.by_lane[INBOUND]
+    park_until = time.time() + 60
+
+    async def body(lane: str, it: object) -> stage_dispatcher.LaneItemResult:
+        return stage_dispatcher.LaneItemResult(
+            LaneResultKind.RETRY, park_until, hand_back=hand_back
+        )
+
+    dispatcher._process_item = body
+    dispatcher._call_later = asyncio.get_running_loop().call_later
+    outcome, _tail, _resched = await dispatcher._drain_lane(INBOUND, [item])
+    dispatcher.mark_ready(INBOUND)
+    st = dispatcher._states[INBOUND]
+    st.infra_error_streak = 2
+    st.lane_stuck_alerted = True
+    try:
+        dispatcher._apply_retry(INBOUND, st, outcome)
+        if hand_back:
+            assert (st.infra_error_streak, st.lane_stuck_alerted) == (2, True)
+        else:
+            assert (st.infra_error_streak, st.lane_stuck_alerted) == (0, False)
+        assert dispatcher.phase(INBOUND) is stage_dispatcher._LanePhase.PARKED
+    finally:
+        dispatcher._cancel_timer(INBOUND)
+
+
+async def _until_stage_pending(
+    store: MessageStore, message_id: str, stage: Stage, timeout: float = 5.0
+) -> bool:
+    """Whether ``message_id``'s ``stage`` row reads PENDING with no attempt spent in the window."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        async with store._read() as db:
+            cur = await db.execute(
+                "SELECT status, attempts FROM queue WHERE message_id=? AND stage=?",
+                (message_id, stage.value),
+            )
+            rows = list(await cur.fetchall())
+        if len(rows) == 1 and rows[0]["status"] == "pending":
+            assert rows[0]["attempts"] == 0, "the hand-back spent an attempt"
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+@pytest.mark.parametrize("stage", [Stage.INGRESS, Stage.ROUTED])
+async def test_a_per_lane_batch_claimed_as_the_halt_latches_is_handed_back_unrun(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: Stage
+) -> None:
+    # BACKLOG #5704 (ledger closing step 3): a per_lane router or transform worker read the claim
+    # gate only at its loop top, so a batch whose claim was in flight when the halt latched ran
+    # whole. Its worker now reads the gate again once the claim returns and hands the batch back
+    # unrun, with no attempt spent. MEASURED on main: the row was routed (INGRESS) or transformed
+    # (ROUTED) under the latch.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "per_lane")
+    real_claim = store.claim_next_fifo
+    tripped: list[str] = []
+
+    async def claim_then_latch(*args: Any, **kwargs: Any) -> Any:
+        item = await real_claim(*args, **kwargs)
+        if item is not None and kwargs.get("stage") == stage.value and not tripped:
+            tripped.append(item.id)
+            runner._log_write_stopped = True  # the halt latched while this claim was in flight
+        return item
+
+    monkeypatch.setattr(store, "claim_next_fifo", claim_then_latch)
+    await runner.start()
+    try:
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        runner._wake_lane(Stage.INGRESS, INBOUND)
+        assert await _until(lambda: bool(tripped)), "the claim never ran"
+        assert await _until_stage_pending(store, message_id, stage), "the batch was not handed back"
+        await asyncio.sleep(0.3)
+        assert await store.outbox_for(message_id) == [], "the batch ran under the latch"
+        assert list(outdir.iterdir()) == []
+        if stage is Stage.INGRESS:
+            fetched = await store.get_message(message_id)
+            assert fetched is not None and fetched["status"] == MessageStatus.RECEIVED.value
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("in_flight", [False, True])
+def test_an_inbounds_lift_re_arms_its_stopped_pooled_lane_unless_rows_are_in_flight(
+    store: MessageStore, in_flight: bool
+) -> None:
+    # BACKLOG #5704 (ledger items 2 and 8): the lift at an inbound's restart re-arms its STOPPED
+    # pooled internal lane and lifts the hold, except a lane whose STOP left claimed rows in
+    # flight, which a re-arm would claim past (the T16 STOP branch's own rule in _run_lane).
+    # MEASURED on main: the lift left every STOPPED lane STOPPED.
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    dispatcher = runner._make_dispatcher(Stage.ROUTED)
+    runner._dispatchers[Stage.ROUTED] = dispatcher
+    dispatcher.mark_ready(INBOUND)
+    st = dispatcher._states[INBOUND]
+    st.phase = stage_dispatcher._LanePhase.STOPPED
+    st.unlanded = in_flight
+    runner._hold_for_operator(INBOUND, "inbound", Stage.ROUTED)
+    runner._log_halted.add(INBOUND)
+
+    runner._lift_log_halt(INBOUND)
+
+    assert INBOUND not in runner._log_halted
+    assert dispatcher.stopped(INBOUND) is in_flight
+    assert (("inbound", INBOUND) in runner._stop_held) is in_flight
+
+
+def test_an_inbounds_lift_keeps_the_shared_hold_while_a_sibling_lane_holds_rows(
+    store: MessageStore,
+) -> None:
+    # BACKLOG #5704 review: one ("inbound", name) hold covers every internal stage. When the lift
+    # keeps one stage STOPPED for its rows in flight, re-arming a sibling must not release that
+    # hold, or a later window open brings the listener up over the kept lane (BACKLOG #2072).
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    phase = stage_dispatcher._LanePhase
+    for stage in (Stage.INGRESS, Stage.ROUTED):
+        d = runner._make_dispatcher(stage)
+        runner._dispatchers[stage] = d
+        d.mark_ready(INBOUND)
+        d._states[INBOUND].phase = phase.STOPPED
+    runner._dispatchers[Stage.ROUTED]._states[INBOUND].unlanded = True
+    runner._hold_for_operator(INBOUND, "inbound", Stage.ROUTED)
+    runner._log_halted.add(INBOUND)
+
+    runner._lift_log_halt(INBOUND)
+
+    assert not runner._dispatchers[Stage.INGRESS].stopped(INBOUND)
+    assert runner._dispatchers[Stage.ROUTED].stopped(INBOUND)
+    assert ("inbound", INBOUND) in runner._stop_held
+
+
+async def test_a_per_lane_hand_back_whose_release_fails_re_pends_the_batch_and_goes_on(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704 review: when the post-claim hand-back's release fails, the worker must not
+    # return with the batch in flight, where the recovery restart's respawn would claim past it.
+    # It re-pends the rows while it holds the lane, and once they land goes on to wait at its gate.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "per_lane")
+    real_claim = store.claim_next_fifo
+    tripped: list[str] = []
+
+    async def claim_then_latch(*args: Any, **kwargs: Any) -> Any:
+        item = await real_claim(*args, **kwargs)
+        if item is not None and not tripped:
+            tripped.append(item.id)
+            runner._log_write_stopped = True
+        return item
+
+    async def release_fails(ids: list[str]) -> None:
+        raise RuntimeError("store full")
+
+    monkeypatch.setattr(store, "claim_next_fifo", claim_then_latch)
+    monkeypatch.setattr(store, "release_claimed", release_fails)
+    await runner.start()
+    try:
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        runner._wake_lane(Stage.INGRESS, INBOUND)
+        assert await _until(lambda: bool(tripped)), "the claim never ran"
+
+        async def re_pended() -> bool:
+            async with store._read() as db:
+                cur = await db.execute(
+                    "SELECT status FROM queue WHERE message_id=? AND stage=?",
+                    (message_id, Stage.INGRESS.value),
+                )
+                rows = list(await cur.fetchall())
+            return len(rows) == 1 and rows[0]["status"] == "pending"
+
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not await re_pended():
+            assert asyncio.get_running_loop().time() < deadline, "the batch stayed in flight"
+            await asyncio.sleep(0.02)
+        worker = runner._router_workers[INBOUND]
+        await asyncio.sleep(0.2)
+        assert not worker.done(), "the worker returned instead of waiting at its gate"
+        assert await store.outbox_for(message_id) == []
+    finally:
+        await runner.stop()

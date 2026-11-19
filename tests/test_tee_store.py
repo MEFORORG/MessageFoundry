@@ -94,6 +94,49 @@ async def test_detail_is_bounded_and_scrubbed(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_identifiers_are_bounded_before_they_are_stored(tmp_path: Path) -> None:
+    # BACKLOG #5637: MSH-10, MSH-9 and MSA-1 come from partner bytes, so a huge value must not be stored
+    # whole for every `naks` read to load and escape. A conformant ASCII identifier is kept as sent.
+    huge_id = "9" * 1_000_000
+    huge_type = "ADT^" * 250_000
+    bound = tee_store._MAX_IDENTIFIER  # noqa: SLF001 - the bound under test
+    assert bound >= 199  # MSH-10's longest conformant length (ASCII, no escapes)
+    store = await _open(tmp_path)
+    try:
+        await store.record_leg(
+            direction="epic_to_corepoint",
+            leg="corepoint",
+            control_id=huge_id,
+            message_type=huge_type,
+            size_bytes=1,
+            outcome="transport_error",  # `naks` lists it whatever its code
+            ack_code="AR" * 500_000,
+            detail=None,
+        )
+        await store.record_leg(
+            direction="epic_to_corepoint",
+            leg="mefor",
+            control_id="C" * bound,
+            message_type="ADT^A01^ADT_A01",
+            size_bytes=1,
+            outcome="transport_error",
+            ack_code=None,
+            detail=None,
+        )
+        await store.record_capture(direction="epic_to_corepoint", control_id=huge_id, raw=b"MSH|")
+        naks = await store.recent_naks()
+        by_leg = {n.leg: n for n in naks}
+        assert by_leg["corepoint"].control_id == huge_id[:bound]
+        assert by_leg["corepoint"].message_type == huge_type[:bound]
+        assert by_leg["corepoint"].ack_code == ("AR" * 500_000)[:bound]
+        assert by_leg["mefor"].control_id == "C" * bound
+        assert by_leg["mefor"].message_type == "ADT^A01^ADT_A01"
+        (capture,) = await store.captures()
+        assert capture.control_id == huge_id[:bound]
+    finally:
+        await store.close()
+
+
 async def test_capture_bodies(tmp_path: Path) -> None:
     store = await _open(tmp_path)
     try:

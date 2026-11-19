@@ -30,6 +30,7 @@ from messagefoundry import __main__, logging_setup, secretscrub
 from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.logging_setup import (
     _CREDENTIAL_QUERY_KEYS,
+    BinaryCarriageScrubFilter,
     ControlCharScrubFilter,
     CredentialQueryScrubFilter,
     CredentialScrubFilter,
@@ -1320,9 +1321,20 @@ def test_configure_logging_tolerates_unreachable_tls_collector(
     assert "unavailable" in capsys.readouterr().out
 
 
-def test_configure_logging_tls_forwarder_roundtrip(tmp_path: Any) -> None:
+# A loaded CI runner can starve _TlsSyslogServer's server thread past the shipped
+# _FORWARD_TCP_TIMEOUT, and the client TLS handshake then times out. That constant is the forwarder
+# socket's one bound, so while patched it also covers at least the connect and the sends, not the
+# handshake alone. The two live-TLS tests below raise it for themselves; the shipped value stays as
+# it is on purpose, for the reasons its own comment in logging_setup.py gives.
+_LOADED_RUNNER_FORWARD_TIMEOUT = 30.0
+
+
+def test_configure_logging_tls_forwarder_roundtrip(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # End-to-end over real TLS: a verified handshake against the private CA must succeed (installed) and
     # an emitted record must arrive at the collector encrypted-in-transit / decrypted server-side.
+    monkeypatch.setattr(logging_setup, "_FORWARD_TCP_TIMEOUT", _LOADED_RUNNER_FORWARD_TIMEOUT)
     certs = _make_tls_certs(tmp_path)
     server = _TlsSyslogServer(certs.ca, certs.key)
     server.start()
@@ -1410,9 +1422,12 @@ def test_the_tcp_forwarder_sends_octet_counted_frames_not_nul_terminated_ones() 
     ]
 
 
-def test_the_tls_forwarder_sends_octet_counted_frames(tmp_path: Any) -> None:
+def test_the_tls_forwarder_sends_octet_counted_frames(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from messagefoundry.logging_setup import _build_syslog_handler
 
+    monkeypatch.setattr(logging_setup, "_FORWARD_TCP_TIMEOUT", _LOADED_RUNNER_FORWARD_TIMEOUT)
     certs = _make_tls_certs(tmp_path)
     server = _TlsSyslogServer(certs.ca, certs.key)
     server.start()
@@ -2239,6 +2254,7 @@ def test_configure_stderr_logging_installs_the_filter_chain() -> None:
         RedactionFilter,
         CredentialQueryScrubFilter,
         CredentialScrubFilter,  # BACKLOG #1478 -- the credential-label vocabulary
+        BinaryCarriageScrubFilter,  # BACKLOG #5378 -- after every label pass
         ControlCharScrubFilter,
     ]
 

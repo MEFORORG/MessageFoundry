@@ -1576,9 +1576,10 @@ ENVELOPED_ONE = "FHS|" + ENC + CR + "BHS|" + ENC + CR + THREE[0] + "BTS|1" + CR 
 
 
 async def test_one_enveloped_message_goes_over_as_the_split_reads_it(tmp_path: Path) -> None:
-    # The parser refuses a body led by FHS, so one message in an envelope goes as a batch member.
+    # The parser refuses a body led by FHS, so one message in an envelope goes as a batch member,
+    # without the trailer that followed it in the file (BACKLOG #5806).
     raw = ENVELOPED_ONE.encode("utf-8")
-    want = (THREE[0] + "BTS|1" + CR + "FTS|1" + CR).encode("utf-8")
+    want = THREE[0].encode("utf-8")
     assert split_batch_bytes(raw, "utf-8") == [want]
     assert split_messages(raw) == [want]
     source = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path)}))

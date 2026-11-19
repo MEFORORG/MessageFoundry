@@ -195,6 +195,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     ResealOutcome,
+    RevokedRowSealError,
     RowSealError,
     SealPager,
     classify_unrotated,
@@ -348,6 +349,7 @@ from messagefoundry.store.store import (
     cleanup_failed_open,
     conditional_way_past,
     create_batch_failure,
+    decoded_rows,
     delivery_key,
     enrolment_code_issue,
     enrolment_code_revoke,
@@ -369,6 +371,7 @@ from messagefoundry.store.store import (
     inheritance_plan,
     inheriting_children,
     judge_totp,
+    listed_users,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -379,6 +382,7 @@ from messagefoundry.store.store import (
     not_deployed_detail,
     operator_audits,
     owned_lane_scope,
+    parse_recovery_code_hashes,
     passkey_digest,
     password_change,
     raise_account_epoch,
@@ -7802,7 +7806,7 @@ class SqlServerStore:
                 # SetMeta (ADR 0081, #150): merge the user bag under messages.metadata."user" in THIS
                 # same transaction — crash before commit leaves no metadata; a re-run re-derives it.
                 if meta_ops:
-                    merged = merge_user_metadata(pmeta_dec, meta_ops)
+                    merged = merge_user_metadata(pmeta_dec, meta_ops, row_id=message_id)
                     await cur.execute(
                         _SQL_UPDATE_METADATA,
                         (
@@ -8012,7 +8016,7 @@ class SqlServerStore:
                 self._inherit_attachments_sync(cur, message_id, inherits)
             # SetMeta (ADR 0081, #150): merge the user bag under messages.metadata."user" in THIS txn.
             if meta_ops:
-                merged = merge_user_metadata(pmeta_dec, meta_ops)
+                merged = merge_user_metadata(pmeta_dec, meta_ops, row_id=message_id)
                 cur.execute(
                     _SQL_UPDATE_METADATA,
                     (
@@ -8296,7 +8300,8 @@ class SqlServerStore:
                         ),
                     )
                     if r["resp_headers"] is not None
-                    else None
+                    else None,
+                    row_id=r["message_id"],
                 ),
             )
             for r in rows
@@ -10829,7 +10834,8 @@ class SqlServerStore:
         self, d: dict[str, Any], stage: str, exc: CipherError
     ) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
-        tag is also audited and alerted (BACKLOG #2593). Returns ``None`` then.
+        tag is also audited and alerted (BACKLOG #2593), a corrupt cell included, whose audit row
+        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then.
 
         A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
         the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
@@ -10838,7 +10844,9 @@ class SqlServerStore:
         the caller does with it."""
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
-        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
+        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], str(exc))
         row = {**d, "stage": stage}
         try:
             await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
@@ -10852,11 +10860,11 @@ class SqlServerStore:
             )
             if isinstance(exc, QueueTagError):
                 await report_queue_tag_failure(
-                    self, self._cipher, row, outcome="could not be dead-lettered"
+                    self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
-            await report_queue_tag_failure(self, self._cipher, row)
+            await report_queue_tag_failure(self, self._cipher, row, error=exc)
         return None
 
     async def _set_aside_claimed(self, tail: Sequence[dict[str, Any]], now: float | None) -> None:
@@ -10882,9 +10890,11 @@ class SqlServerStore:
         propagates, refusing the read. ``cur`` is the caller's cursor."""
         try:
             opened = open_queue_cell(self._cipher, row)
-        except QueueTagError:
+        except QueueTagError as refused:
             if alert:
-                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+                alert_queue_tag_failure(
+                    self._cipher, row, error=refused, outcome="the read was refused"
+                )
             raise
         if row["body_ref"] is None:
             return opened
@@ -15331,7 +15341,7 @@ class SqlServerStore:
 
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
-        return [UserRecord.from_mapping(d) for d in rows]
+        return listed_users(rows)
 
     async def count_users(self) -> int:
         return await self._count("users")
@@ -15574,9 +15584,7 @@ class SqlServerStore:
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
         d = await self._fetchone("SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,))
-        if not d or d["totp_recovery_codes"] is None:
-            return []
-        return [str(h) for h in json.loads(d["totp_recovery_codes"])]
+        return parse_recovery_code_hashes(d["totp_recovery_codes"] if d else None, user_id)
 
     async def consume_recovery_code_hash(
         self, user_id: str, code_hash: str, *, now: float | None = None
@@ -16867,10 +16875,15 @@ class SqlServerStore:
         return SessionRecord.from_mapping(d) if d else None
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        strict: bool = False,
     ) -> list[SessionRecord]:
         """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
-        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
+        :meth:`AuthStore.list_sessions` for ``idle_seconds`` and ``strict``."""
         now = time.time() if now is None else now
         if idle_seconds is None:
             rows = await self._fetchall(
@@ -16884,7 +16897,9 @@ class SqlServerStore:
                 " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                 (user_id, now, now, float(idle_seconds)),
             )
-        return [SessionRecord.from_mapping(r) for r in rows]
+        if strict:
+            return [SessionRecord.from_mapping(r) for r in rows]
+        return decoded_rows(rows, SessionRecord.from_mapping)
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -16993,14 +17008,24 @@ class SqlServerStore:
                 rows = await cur.fetchall()
                 return str(rows[0][0]) if rows else None
 
+            refused: RowSealError | None = None
             try:
-                ended = await revoke_through_lineage(
-                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
-                )
+                try:
+                    ended = await revoke_through_lineage(
+                        token_hash,
+                        lineage_since=lineage_since,
+                        revoke=_revoke,
+                        successor=_successor,
+                    )
+                except RowSealError as exc:
+                    # BACKLOG #5505: only the read-back refused the row; its revoke still commits.
+                    refused, ended = exc, None
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+        if refused is not None:
+            raise RevokedRowSealError(refused.kind, refused.subject)
         return ended
 
     async def revoke_user_sessions(

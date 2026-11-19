@@ -65,8 +65,9 @@ _BASELINE_FILE = _ROOT / "scripts" / "ci" / "step_margin_baseline.toml"
 _GATED: dict[str, tuple[str, str, str]] = {
     # job name: (gated step name, its step-cap matrix key, that job's job-cap matrix key)
     "test": ("Tests (pytest)", "step_timeout", "job_timeout"),
-    # BACKLOG #5247: the engine suite's second shard, its own job with the same step, caps and check.
-    "test-shard2": ("Tests (pytest)", "step_timeout", "job_timeout"),
+    # BACKLOG #5247: the engine suite's second and third shards, one matrix job with the same step,
+    # caps and check.
+    "test-shards": ("Tests (pytest)", "step_timeout", "job_timeout"),
     "webconsole": (
         "Web console tests (pytest)",
         "webconsole_step_timeout",
@@ -952,7 +953,7 @@ def test_the_engine_margin_check_reds_a_low_margin_on_every_event(
     passes no second floor, and raises no warning of its own. The event is set as the step's old
     `EVENT_NAME`, as the runner's own `GITHUB_EVENT_NAME`, and as the `GITHUB_REF` that event
     carries (a merge queue ref for merge_group), so a branch on any of them differs by event; the
-    static test below refuses all three by name. `test-shard2` is not run separately:
+    static test below refuses all three by name. `test-shards` is not run separately:
     tests/test_ci_engine_suite_shards.py holds its body identical to this one.
 
     Red first, against the softened body: merge_group with the script at 1 exited 0, pull_request
@@ -1047,8 +1048,8 @@ def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_sui
 
     Falsified by restoring `timeout-minutes: matrix.step_timeout` on that step: RED. Restored.
     """
-    # Keyed by SUITE (the gated step's name), because the engine suite's two shards (BACKLOG #5247)
-    # are one suite in two jobs: they share a cap by design, and only the suites must not.
+    # Keyed by SUITE (the gated step's name), because the engine suite's three shards (BACKLOG
+    # #5247) are one suite in two jobs: they share a cap by design, and only the suites must not.
     caps: dict[str, str] = {}
     for job_name, (gated, step_key, _) in _GATED.items():
         steps = _job(job_name)["steps"]
@@ -1155,7 +1156,7 @@ _EXPECTED_LEGS: frozenset[str] = frozenset({"ubuntu-latest", "windows-2022", "wi
 _MARGIN_CAP_SOURCE: dict[str, tuple[str, bool]] = {
     # job: (matrix knob feeding --cap-minutes, is that knob also the kill?)
     "test": ("step_timeout", True),
-    "test-shard2": ("step_timeout", True),
+    "test-shards": ("step_timeout", True),
     "webconsole": ("webconsole_margin_cap", False),
 }
 

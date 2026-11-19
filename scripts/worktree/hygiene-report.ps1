@@ -79,17 +79,19 @@
         in it or in a worktree nested inside it. A DEAD record there holds it too: once the tree is
         gone that record is unplaceable, and occupancy.ps1 then keeps the fence unavailable;
       * it holds nothing the removal would take beyond the files git status lists, and nobody holds it
-        (BACKLOG #5647): no file flagged skip-worktree or assume-unchanged, no commit only its HEAD
+        (BACKLOG #5647): no file flagged skip-worktree or assume-unchanged, no operation in progress in
+        its git dir, no ignored entry other than a regenerable cache or a file the nightly removal
+        tolerates, no nested checkout, link or data file inside a cache, no commit only its HEAD
         reflog or its own refs/worktree, refs/bisect or refs/rewritten hold, no allocation naming it
         whose item is not provably on origin/main (the retired-allocator tombstone aside), and no
         claim naming it. An unreadable registry or record holds it too, and so does every merged
         tree while a GIT_* redirect or GIT_CONFIG carrier is set, since either can falsify these
         reads. These checks have to be here, because for a tree under .claude/worktrees the owner
         cannot be routed through remove.ps1 instead: its -Path refuses every such tree.
-    The report shares the nightly .claude/worktrees removal's ownership and flagged-file readers, NOT
-    its whole gate set. At least the ignored-file, nested-checkout, could-not-open and working-tree
-    activity checks are not read here (prune-merged.ps1 reads the working-tree activity too), so a
-    tree the nightly or prune-merged.ps1 refuses can still be proposed here.
+    The report shares the nightly .claude/worktrees removal's ownership, flagged-file, in-progress,
+    ignored-file and nested-checkout readers, NOT its whole gate set. At least the could-not-open and
+    working-tree activity checks are not read here (prune-merged.ps1 reads the working-tree activity
+    too), so a tree the nightly or prune-merged.ps1 refuses can still be proposed here.
 
     THE FENCE SEES A SESSION BY THE CWD IT LAUNCHED IN. A session writing into a worktree by absolute
     path from somewhere else, or relocated into it after launch, is invisible to it. The activity
@@ -107,7 +109,8 @@
     COST IS BOUNDED. One `git status` per existing worktree, run with -Throttle in parallel, plus a
     fixed handful of calls per clone. Each MERGED tree that exists also costs about eight git calls
     and a read of the claim and allocation registries, one tree at a time; on a UNC shared root
-    those registry reads cross the network, once per tree. No API call is made per worktree.
+    those registry reads cross the network, once per tree. Each also costs a second `git status` for
+    its ignored files and a walk of its whole working tree, a .venv included. No API call is made per worktree.
 
     OUTPUT. `hygiene-<yyyy-MM-dd>.md` and `.json` in -OutDir, one pair per day (a later run the same day
     replaces it), plus `latest.md` and `latest.json`. Nothing here deletes old reports.
@@ -342,6 +345,14 @@ function Get-ReportHolds {
         $flagged = Get-FlaggedFileCount $Path
         if ($flagged -lt 0) { $out.Add('its files flagged skip-worktree or assume-unchanged could not be read') }
         elseif ($flagged -gt 0) { $out.Add("$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see") }
+        # The nightly removal's other content gates (vault BACKLOG #5647, #8225 item 1), through the same
+        # readers: an operation in progress in the tree's git dir, an ignored entry that is not a
+        # regenerable cache, and a nested checkout, link or cached data file. Without them a tree the
+        # nightly holds could be proposed here.
+        $ops = Get-InProgressOperation $Path
+        if ($null -eq $ops) { $out.Add('its git dir could not be read for an operation in progress') }
+        elseif ($ops.Count -gt 0) { $out.Add("an operation is in progress in its git dir ($($ops -join ', ')), whose state the removal deletes") }
+        $out.AddRange([string[]]@(Get-HiddenWorkReasons -Path $Path -Primary $Primary -Checks 'ignored', 'nested'))
         if ($Coord.Error) {
             # Held already, so the remaining reads would add reasons to a tree no list proposes.
             $out.Add("the coordination root could not be resolved, so its claims and allocations are unknown: $($Coord.Error)")
@@ -364,7 +375,9 @@ $script:envHold = if ($envSet.Count -gt 0) {
 function Get-CloneReport($R) {
     # The liveness fence first: it also parses `worktree list` (with HEAD) and names the primary, so
     # this report reads the same worktree set and the same primary as prune-merged.ps1.
-    $occ = Get-WorktreeOccupancy -Repo $R.Hint -ConfigRoot $ConfigRoot
+    # The skew is unbounded, as in remove.ps1, prune-merged.ps1 and the nightly removal (vault BACKLOG
+    # #2985, added item 4), so a session all four read as LIVE is not read as STALE here.
+    $occ = Get-WorktreeOccupancy -Repo $R.Hint -ConfigRoot $ConfigRoot -StartSkewMinutes ([int]::MaxValue)
     $root = $occ.PrimaryPath
     $rep = [ordered]@{ root = $root; role = $R.Role; commonDir = $R.Common }
     $rep.fence = [ordered]@{
@@ -756,9 +769,9 @@ foreach ($c in $report.clones) {
     $md.Add("")
     if ($c.cleanup.remove.Count -eq 0) { $md.Add("No worktree passes every check, so nothing is proposed.") }
     else {
-        $md.Add("Each of these sits at the exact head of a merged PR, older than $HoldHours h. None has files ``git status`` lists, a lock, a nested worktree, or a session record the fence can see. None has a file flagged skip-worktree or assume-unchanged, a commit only its HEAD reflog or its own refs hold, an allocation not on origin/main, or a claim.")
+        $md.Add("Each of these sits at the exact head of a merged PR, older than $HoldHours h. None has files ``git status`` lists, a lock, a nested worktree, or a session record the fence can see. None has a file flagged skip-worktree or assume-unchanged, an operation in progress in its git dir, an ignored entry the nightly removal would refuse, a nested checkout or link, a commit only its HEAD reflog or its own refs hold, an allocation not on origin/main, or a claim.")
         $md.Add($(if ($IdleHours -gt 0) { "None shows git activity in the last $IdleHours h." } else { "**The activity window is OFF (-IdleHours 0), so recent git activity was not checked; a failed read of it still holds the tree.**" }))
-        $md.Add("``git worktree remove`` also deletes gitignored files: a ``.venv`` and caches, but also any local ``.env`` or store file. Run them from a plain terminal:")
+        $md.Add("``git worktree remove`` also deletes gitignored files. Any ignored entry other than a ``.venv`` at the root, a cache, or a file the nightly removal tolerates holds the tree, so those are what goes. Run them from a plain terminal:")
         $md.Add("")
         $md.Add('```powershell')
         foreach ($w in $c.cleanup.remove) { $md.Add($w.command) }

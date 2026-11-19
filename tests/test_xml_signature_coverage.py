@@ -96,11 +96,13 @@ def _refused(result: sigmod.XmlSignatureResult) -> None:
 # --- positive controls: the accepted shapes ---------------------------------------------------------
 
 
+@pytest.mark.parametrize("c14n", [None, _WITH_COMMENTS], ids=["default-c14n", "with-comments"])
 @pytest.mark.parametrize("body", [_BODY, _BODY_WITH_ID], ids=["uri-empty", "uri-root-id"])
-def test_a_signature_over_the_whole_document_verifies(body: bytes) -> None:
+def test_a_signature_over_the_whole_document_verifies(body: bytes, c14n: str | None) -> None:
     """The two shapes signxml's own enveloped signer produces: ``URI=""``, and ``URI="#id"`` naming
-    the document element. Both cover the whole document and must verify."""
-    result = _verify(_sign(body))
+    the document element. Both cover the whole document and must verify, under either c14n, which
+    is the positive control for the comment refusals below."""
+    result = _verify(_sign(body, c14n=c14n))
     assert result.verified, f"a whole-document signature was refused: {result.reason}"
     assert result.reason is None
 
@@ -133,11 +135,22 @@ def test_whitespace_after_the_signature_does_not_cause_a_false_refusal() -> None
     assert result.verified, f"a tail after the signature caused a refusal: {result.reason}"
 
 
-def test_a_comment_the_signature_covers_is_accepted() -> None:
-    """Comments are refused only when the signature excludes them; a with-comments c14n covers them."""
-    body = b"<Order><!-- synthetic note --><Item>SYNTHETIC-WIDGET</Item></Order>"
-    result = _verify(_sign(body, c14n=_WITH_COMMENTS))
-    assert result.verified, f"a signed comment was refused: {result.reason}"
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"<Order><!-- synthetic note --><Item>SYNTHETIC-WIDGET</Item></Order>",
+        b'<Order Id="order-1"><!-- synthetic note --><Item>SYNTHETIC-WIDGET</Item></Order>',
+    ],
+    ids=["uri-empty", "uri-root-id"],
+)
+def test_a_comment_under_a_same_document_reference_is_not_trusted(body: bytes) -> None:
+    """Even a with-comments c14n does not sign a comment under ``URI=""`` or ``URI="#id"``.
+
+    The XMLDSig rule for same-document references omits comments before the transforms run, and
+    signxml 5.3.0 applies it in both its signer and its verifier. So the comment is unsigned, and the
+    comparison against the received document must refuse it.
+    """
+    _refused(_verify(_sign(body, c14n=_WITH_COMMENTS)))
 
 
 # --- the refusals ------------------------------------------------------------------------------------
@@ -361,8 +374,8 @@ def test_a_document_element_that_is_the_signature_is_not_trusted() -> None:
 
 
 def test_a_comment_the_signature_excludes_is_not_trusted() -> None:
-    """The default c14n drops comments before digesting, so a comment added later is unsigned. It can
-    split a text node, which changes what an element's ``.text`` reads."""
+    """A same-document reference drops comments before digesting, so a comment added later is
+    unsigned. It can split a text node, which changes what an element's ``.text`` reads."""
     signed = _sign(_BODY)
     injected = signed.replace(b"<Qty>1</Qty>", b"<Qty><!---->1</Qty>")
     assert injected != signed

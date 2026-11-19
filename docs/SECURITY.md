@@ -997,9 +997,12 @@ such writes, the AD group-map and scope-map saves and the custom-role edit and d
 of the maps. Instead, a save that would end the caller's own sessions takes a single-use proof bound
 to `save_ends_own_sessions`, which only a re-proof made after sign-in mints, and an MFA-pending one
 never (the owner's #1149 Reading B). Any other save keeps the session window. The set it tests is
-the one the revoke ends, read from the stored accounts, and the revoke still ends the caller's own
-sessions, so the edit applies to them at once (BACKLOG #1154). On the console, such a save lands on
-the sign-in page. Those four write no `auth.self_target_refused` row, because they refuse nothing.
+read from the stored accounts and handed to the save, whose revoke ends that set, so the caller's
+integrity check is read once for both (BACKLOG #5505). The revoke also reads the accounts again,
+with no integrity check, and ends the caller's own sessions too, so the edit applies
+to them at once (BACKLOG #1154).
+On the console, such a save lands on the sign-in page. Those four write no
+`auth.self_target_refused` row, because they refuse nothing.
 The row names the actor, the route as `op`, the caller's
 stored id and the caller's address. The guard refuses when the path's spelling or the stored id
 matches the caller (vault BACKLOG #3259); `_refuse_if_self` in `api/auth_routes.py` says why the
@@ -1047,7 +1050,9 @@ after the attempt that met it; the reconciler's attempt without the row runs as 
 error is not always one: SQLite's, and SQL Server's generic 42000, are run again and recorded like a
 fault, while PostgreSQL's, in SQLSTATE class 42, is raised at once. A revoke the service gives up on is logged at ERROR
 and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
-the error class. A role edit or map save stops at that account, and its row counts the accounts it
+the error class. A custom-role edit or an AD map save whose second read of the accounts, after
+its gate's set is revoked, is refused writes one such row with no account, `"reread":
+"refused"` and the error class instead; the request fails and the change stands. A role edit or map save stops at that account, and its row counts the accounts it
 did not reach as `accounts_not_attempted`; on a request, the request still fails, the change
 stands, and the sessions the revoke would have ended may stay live. The row's write is soft, as above: on a store that refuses it too, the ERROR line is the only trace. A
 cancellation, such as the request deadline, skips both the retry and the row (vault BACKLOG #3802).
@@ -1638,7 +1643,7 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|
 | `POST` | `/auth/logout` | `require` | exempt from the `must_change_password` confinement |
 | `GET` | `/auth/me` | `require` | exempt from the `must_change_password` confinement |
-| `POST` | `/me/password` | `require` | per-**actor** credential-ceremony limiter; refused (400) for an AD identity; exempt from the confinement; MFA-exempt only for an account with **no** factor: a pending session on an account that has one gets 403 + `X-MFA-Required` (BACKLOG #1954). A local account `[security].require_mfa` covers that has no TOTP gets 403 `enrol an authenticator app first`, before its current password is read (ADR 0197 Amendment A) |
+| `POST` | `/me/password` | `require` | Per-**actor** credential-ceremony limiter. Refused (400) for an AD identity. Exempt from the `must_change_password` confinement. MFA-exempt only for an account with **no** factor: a pending session on an account that has one gets 403 + `X-MFA-Required` (BACKLOG #1954). A local account `[security].require_mfa` covers gets 403 `enrol an authenticator app first` when it holds no factor with a way past (ADR 0197 Amendment A). That is asked before its current password is read. An account deleted, or whose record fails its integrity seal, while the current password is checked gets at least the wrong-password 403 `current password is incorrect`, audited `auth.password_change_failed` with `reason=bad_password`, or 401 `session ended; sign in again`, audited `reason=session_gone`, where a deletion has already removed the session when the check reads it. Once the current password is checked, the change answers at least these refusals (BACKLOG #5902). An unusable bundled breach corpus gets 503 `password screening is unavailable; ask an administrator to repair it`. An account the change finds gone, when it reads the record before the write or re-reads it after a write that matched no row, gets 401 `session ended; sign in again`, with no `auth.password_changed` row. One deleted after that re-read can get the 409 below instead. A record that fails its integrity seal, or that Vault transit cannot verify, gets 423 and sets nothing. A Vault transit Outage on that record gets 503 and sets nothing. A write that lost to a concurrent change of the account sets nothing. It gets the enrolment 403 where a covered account no longer holds a factor with a way past, and 409 otherwise. Once the write commits, a deletion, or a store refusal of its `auth.password_changed` row, still reports the change. A session revoke that fails past its retries still fails the request, although the change has already committed, so the new password is in effect |
 | `POST` | `/me/notify-email` | `require_paced` | fills a **missing** notification address only (409 when one is set, 400 when blank); the way out of the address confinement, and **not** MFA-exempt, so a session owing its factor gets 403 + `X-MFA-Required` (BACKLOG #1139). Paced, and refused from a host the session has not verified from, like its console twin `POST /ui/account/notify-address` (vault BACKLOG #3052) |
 | `POST` | `/me/reauth` | `require` | per-**actor** credential-ceremony limiter; mints the action-bound grant when `purpose=` is given; refuses an `oidc` session with 403 naming `/ui/reauth`, before any verify and charging nothing to the lockout (that session steps up at the IdP) |
 | `POST` | `/auth/mfa-verify` | `require` | draws the **sign-in** window (per-IP + global); feeds the per-account lockout; exempt from the confinement, so a must-change account that has a factor can prove it before it rotates (BACKLOG #1954) |
@@ -1703,7 +1708,12 @@ interval holds only while the process still remembers the account: it remembers 
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
 so an account it forgot is reported again on its next refusal. A
 record is refused only after two failing reads that name the same account, or when it fails
-closed as this paragraph says below. A check whose row is
+closed as this paragraph says below. One exception: a `users` row with a timestamp or counter cell
+that does not parse is refused on the first read, with no re-read, on a store with or without an
+integrity key, and a list read lists it as failing even when the row is restored before its check,
+or leaves it out when its id cell is empty or not text (BACKLOG #5505). A `totp_recovery_codes` cell that does not parse as a JSON list reads as
+holding no codes; on a store with an integrity key, one changed outside the store fails the
+record's seal first. A check whose row is
 deleted, renamed, rebound or re-keyed while it is read is unreported and read again by id, up to
 three checks: one that then passes is served, or listed as it now reads, and one absent on a
 re-read reads as gone, a 404 or left out of the list. **A row still there after every check raced
@@ -3039,7 +3049,7 @@ same with its `connection_purge` row, which names the outbound, the scope and th
 attributed to the requester (vault BACKLOG #3217). A released purge re-reads the refusals the route
 makes about its target, through `_purge_target_refusal` (vault BACKLOG #3798). The release skips at
 least if no graph is loaded, or the outbound has left the graph, is running, or is owned by another
-engine shard. It cancels nothing, writes no
+engine shard, or if this node does not hold the cluster lease (BACKLOG #5792). It cancels nothing, writes no
 `connection_purge` row, and its `approval.approved` row records the route's refusal text as the
 skip. The operator clears the cause and requests the purge again. The on-box row is whole. Its
 off-box copy is cut at the bound stated for `approval.standing_shown` above, and this row's detail
@@ -3718,10 +3728,12 @@ transaction, so a re-read answers it as a lost session. An MFA reset removes the
 revokes the sessions in separate writes, so a re-read that falls between them reads as the factor
 gone. The factor is then not marked and no counter is cleared, and because the proof is already
 spent the refusal is audited, with at least the reasons named here. A factor that cannot be read
-at the re-read is refused `reason=factor_unverified`. That covers a TOTP secret that does not open
-once the code has been checked, which is also logged, and a passkey set that fails its seal. A
-TOTP secret that does not open for the check itself is refused the same way, before any code is
-read, so no recovery code is spent and nothing is charged. **A correct code whose TOTP factor is
+at the re-read is refused `reason=factor_unverified`. That covers a TOTP secret whose stored
+enrolment, its stamp or its cell, moved during the check and that then does not open, which is
+also logged, and a passkey set that fails its seal. A re-read that finds the stored TOTP enrolment
+unmoved opens nothing (BACKLOG #5781): the request opens the secret once, before the check, and
+checks the code against that open. A TOTP secret that does not open there is refused the same way,
+before any code is read, so no recovery code is spent and nothing is charged. **A correct code whose TOTP factor is
 turned off or enrolled again during the check charges no lockout** (BACKLOG #3780 item 1). Either
 change can leave the check nothing to spend, so the code fails its spend. Only a code that
 MATCHED the factor is asked further: the session, the account and its lock are read again, as
@@ -4704,13 +4716,13 @@ alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `Ale
 **Audit.** At least five of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
 census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`, and
 `/search/layered` since BACKLOG #5523), so a scripted bulk read cannot harvest the patient census
-unaudited. The rest do **not** call the coalescer — they write their own dedicated audit rows
+unaudited. At least these do **not** call the coalescer — they write their own dedicated audit rows
 instead (`response.read` for `GET /messages/{id}/responses`, a `connection_event_reveal` or `alert_reveal`
 row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
 each per-connection reveal on `GET /connections` and `GET /connections/{name}/metadata`; those
 five write nothing on a masked load). The census surfaces are audited **only when a
 gated property is actually returned** — `count_exposed()` and `count_masked()` are computed
-*post*-redaction and the coalescer is called under `if exposed or masked:`, so a display-masked row
+*post*-redaction and the coalescer counts nothing when both are zero, so a display-masked row
 counts (vault BACKLOG #1187) — so a fully-redacted list read by a caller without
 `messages:view_summary` (a Viewer paging `GET /messages` or `GET /dead-letters`) writes **no audit row
 at all**. That is accepted: those reads carry no PHI, and auditing them would let an unprivileged
@@ -4718,6 +4730,18 @@ caller amplify into unbounded `audit_log` growth. `GET /messages/{id}` and `GET 
 unconditional dedicated rows (`message_view`, `message_search`) regardless, and so does the body fetch
 `GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do
 `GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
+`GET /search/layered` also tries to write its `preset.layered_search` row when it refuses a
+stored preset while loading it, naming the preset id, the status and the refusal cause, an error
+class name or `malformed` (BACKLOG #5523). The write is best effort: a failed write does not change
+the answer, and it is logged at ERROR. A refusal of the composed layers writes no such row. A
+refusal row has `refused` in its detail, which tells it from a search that ran. A NULL, empty or
+non-text criteria cell is refused by the store itself, which logs a WARNING and writes the
+`integrity.preset_tag_failed` row on every store, and on a keyed store raises the
+`integrity_drift` alert, as for a moved preset. The store rate-limits its WARNING, alert and
+`integrity.preset_tag_failed` row for a repeated refusal, and the route rate-limits some of its
+refusal logs, including the failed-write ERROR. These limits are best effort and held in memory per
+engine process, and the AlertSink's per-subject re-alert cooldown applies on top, so the operator
+may see fewer notifications than refusals.
 
 **Roles and visibility.** `messages:view_raw` is **not** a superset of `messages:view_summary` —
 `Identity.has()` is a flat membership check. The built-in roles happen to grant them nested
@@ -5797,7 +5821,8 @@ is in the scope map, a scope an administrator set stays as stored (BACKLOG #2316
 
 At least these changes reach the next request, and each one also revokes the affected sessions:
 
-- a user's roles set, or a custom role edited or deleted;
+- a user's roles set, or a custom role edited or deleted (which accounts that edit or delete
+  revokes is in the [session-events table](#the-engine-session-is-independent-of-the-idp-session-asvs-761));
 - a user's channel scope set by an administrator;
 - a user disabled, deleted, or given a new password.
 
@@ -5899,7 +5924,7 @@ On a first deployment, each would let a caller keep acting on a withdrawn grant 
 | Path | What it re-checks, and when | How long a withdrawn grant could last |
 |---|---|---|
 | The IDE extension's AI policy, in `byo` mode | The IDE asks the engine when it holds a live session. Withdrawing `ai:assist` revokes that session. The engine then answers with the grant unknown, and `byo` mode treats unknown as allowed. When the engine is unreachable, the extension reuses its last cached answer. An answer that disables assistance stands at any age. One that enables it stands for 12 hours from the engine's answer, then the extension disables assistance (BACKLOG #1154). | Until the IDE signs in again. While the engine is unreachable, up to 12 hours. In `managed_endpoint` mode the engine checks `ai:assist` on each chat request. |
-| An engine-side edit that narrows an AD account's grant | An edit to the AD group-to-role or group-to-scope map revokes every unrevoked session of each enabled directory account. That includes sessions the clock already calls expired, and the audit row's `sessions_revoked` counts them all. At the next login the engine re-derives roles from the groups. It re-derives scope by the rule under *Per-channel scoping* above. | A per-user scope an admin narrowed on a user in a scope-mapped group: the next login restores the group scope. A scope-map row removed so that no mapped group matches: the map edit revokes the session, and the next login applies that rule. A service-certificate identity mapped to an AD account has no session to revoke. A narrowed role or scope map reaches its next request, because the engine keeps only the stored roles and channels the current groups still map to. A scope an administrator set stays as stored when none of the groups is in the scope map (BACKLOG #2316). |
+| An engine-side edit that narrows an AD account's grant | An edit to the AD group-to-role or group-to-scope map revokes every unrevoked session of each account the [session-events table](#the-engine-session-is-independent-of-the-idp-session-asvs-761) names for that edit. That includes sessions the clock already calls expired, and the audit row's `sessions_revoked` counts them all. At the next login the engine re-derives roles from the groups. It re-derives scope by the rule under *Per-channel scoping* above. | A per-user scope an admin narrowed on a user in a scope-mapped group: the next login restores the group scope. A scope-map row removed so that no mapped group matches: the map edit revokes the session, and the next login applies that rule. A service-certificate identity mapped to an AD account has no session to revoke. A narrowed role or scope map reaches its next request, because the engine keeps only the stored roles and channels the current groups still map to. A scope an administrator set stays as stored when none of the groups is in the scope map (BACKLOG #2316). |
 | A change made in Active Directory rather than in the engine | The [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2) runs every `[auth].ad_session_recheck_seconds` (300 s by default), for principals that hold a session. It revokes a changed role set after one pass. It revokes a disabled or deleted account after `ad_session_recheck_strikes` passes that each find it absent or disabled. It revokes after one pass when the directory groups would withdraw or narrow the channel scope, and leaves the scope for the next login to write. It fails open when the domain controller is unreachable. A pass that trips the mass-revoke breaker revokes nothing. | A role change, or a withdrawn or narrowed scope: about one interval. A disable or delete: about the interval times the strikes, and an engine restart starts the count again. Both run longer on an estate larger than one pass's probe budget. While the domain controller is down or the breaker keeps tripping, all of these last until the absolute session cap, 12 hours by default. A widened scope waits for the next login, within that cap. The live session then holds less than the directory grants, not more. |
 
 No alert fires when a caller acts inside one of these windows, and the engine reverts nothing done
@@ -6225,7 +6250,8 @@ At least these events bear on a live engine session:
 | The wall clock steps backward | Every session last used after the new time fails the engine's session check until the clock passes that use again. A failed check revokes the session. The engine fails closed rather than age it wrongly. |
 | The directory disables or deletes the account | The directory reconciler can end every session of the account. The row for a change made in Active Directory, in the [revocation table](#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832), gives the rule. Each engine process keeps its count in memory, so a restart sets it back to 0. |
 | A directory group change alters the account's roles, or withdraws or narrows its channel scope | The reconciler ends every session of the account on the first pass that sees the change. A pass can revoke nothing, as *Directory session reconciliation* explains. The account's next sign-in also ends its other sessions. |
-| An administrator edits the engine's AD group-to-role or group-to-scope map | Ends every session of every enabled directory account. |
+| An administrator edits the engine's AD group-to-role or group-to-scope map | Ends every session of at least these accounts: each whose stored row reads as an enabled directory account, whether or not its record passes its integrity check; each whose stored row has a timestamp or counter cell that does not parse, as *What an admin user read reports* says; and each whose integrity check fails, whatever its row reads. A row with such a timestamp or counter cell and an id cell that is empty or not text is not named. On a store with no integrity key no seal is checked, so a row edited to read as local or disabled is taken as it reads, and its sessions are not ended. A named account's sessions are revoked, not only refused, so a repair of its row does not bring them back. |
+| An administrator edits or deletes a custom role | Ends every session of at least these accounts: each whose stored role rows hold the role, whether or not its record passes its integrity check; each whose stored role rows do not parse, or whose stored row has a timestamp or counter cell that does not parse, as *What an admin user read reports* says; and each whose integrity check fails at the save's step-up gate, whatever its rows read, so an account that does not hold the role is ended too. A row with such a timestamp or counter cell and an id cell that is empty or not text is not named. The save reads the accounts again with no integrity check, after an edit commits and before a delete does. Once the change and its revoke complete, each account the gate named that, at that second read, neither holds the role in its stored role rows, nor has role rows that do not parse, nor a users row with a timestamp or counter cell that does not parse gets a `role.sessions_revoked` row naming it. On a store with no integrity key no seal is checked, so a role row deleted outside the store reads as no holder. |
 | An administrator binds, rebinds or unbinds the account's federated identity | Ends every session of the account, a first bind included. |
 | An administrator signs the user out with `DELETE /users/{user_id}/sessions` | Ends every session of the account. |
 | An administrator disables the user in the engine | Ends every session of the account. Each request also refuses a disabled account. |
@@ -6478,7 +6504,10 @@ was presented. The `outcome` is `lapsed` instead when the session's own clock ch
 revoke, or when the session passes them but the owner's admin-issued temporary credential is past
 its deadline, the test `identity_for_token` applies under every gate (a disabled account excepted,
 as that check excepts it). At least a session over its idle or absolute limit fails the clock
-checks. The temporary-credential case also writes the gate's `auth.temp_password_expired` row, with
+checks. A row the revoke ended that then does not parse is reported as failing its integrity
+check, and its sign-out is recorded `revoked` whatever its clock, with the session reference and the
+caller as actor where one is named, because neither its clock fields nor its owner can be read
+(BACKLOG #5505). The temporary-credential case also writes the gate's `auth.temp_password_expired` row, with
 `"at": "logout"` and the sign-out's client address. A `lapsed` row still names the owner. If the
 owner cannot be read, the temporary credential is not checked, and a session that passed its clock
 checks is recorded `revoked`. So is a session minted under an older session epoch than its
@@ -8179,9 +8208,11 @@ engine cannot read, refuses the start or the reload. These settings take no pin.
 refuse rather than warn). Every anchor the engine checks at start and reload takes it, the dialling
 CAs above and a connection's own `tls_ca_file` included, and so do at least the SQL Server
 `[store].ssl_root_cert` pin, a generic DATABASE connection's `odbc_params` `sslca` file and a Vault
-hop's CA text. Not covered: at least the Vault CA file (`MEFOR_STORE_VAULT_CA_FILE`,
-`MEFOR_SECRETS_VAULT_CA_FILE`) and the PostgreSQL `[store].ssl_root_cert`, which their hops load
-by path with no such check. The check refuses a PEM label ending in `PRIVATE KEY` anywhere after the file's first
+hop's CA text. The PostgreSQL `[store].ssl_root_cert` takes it in `serve`'s settings check, at
+least at start, reload and DR activation, after the store has opened with the file, as a paragraph
+below says. Not covered: at least
+the Vault CA files (`MEFOR_STORE_VAULT_CA_FILE`, `MEFOR_SECRETS_VAULT_CA_FILE`), which their hops
+load by path with no such check. The check refuses a PEM label ending in `PRIVATE KEY` anywhere after the file's first
 `-----BEGIN `, of any kind: plain, PKCS#8 encrypted, `RSA` or `EC`. A TLS load skips a key block and
 trusts the certificate beside it, so before this a key passed every check and sat in a file the
 engine treats as public trust material. The refusal names the setting, never the content. For an
@@ -8198,9 +8229,18 @@ Those keep the old bytes until they are built again, and a reload writes a `chan
 
 **The SQL Server `[store].ssl_root_cert` pin is checked at the next start or reload too, but its
 change check reads its baseline from, and writes its rows to, the store that pin secures, so it
-cannot vouch for its own hop.** The `store_sqlserver_pin` item of the
+cannot vouch for its own hop.** Item 11 of the
 [trust anchors module](../messagefoundry/auth/trust_anchors.py) docstring says what a swapped pin
-can hide and which checks still refuse.
+can hide, and which checks refuse there and which warn with an audited row instead.
+
+**The PostgreSQL `[store].ssl_root_cert` CA is checked in `serve` too, at least at start, reload and
+DR activation, but only after the store has opened with it** (vault BACKLOG #4203). It takes at
+least the permission, path and change checks, the private-key refusal and a refusal of a file
+larger than 16 MiB. Under `enforce`, a file or folder a broad principal can write, or one whose permissions the engine cannot read,
+refuses the start, the reload or the DR activation. The store runs none of these
+checks when it opens, so a start may already have trusted the file and sent the store login, and a
+command that opens the store without this check does not check the file at all. Item 11 of
+the same docstring says what else the check does not cover.
 
 **What a reload's `restart_required` list covers (BACKLOG #3015).** An empty list in the reload
 response says that no settings anchor with a recorded load changed in the engine process that

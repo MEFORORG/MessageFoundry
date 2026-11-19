@@ -99,6 +99,11 @@ def verify_written(
             # the sink refused to join, is a problem whatever it names.
             problems.append(f"a link or other non-file entry appeared in the outbox ({where})")
             continue
+        if refused:
+            # Any other refusal (over the cap, or a scan that could not finish) left it unread too,
+            # so its bytes were never compared: a problem whatever it was.
+            problems.append(f"an entry in the outbox was not read ({where}): {refused}")
+            continue
         cid = control_id_of(record.payload)
         if cid is None or cid not in sent:
             continue

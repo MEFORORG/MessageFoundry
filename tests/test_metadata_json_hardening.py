@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import types
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -69,18 +70,41 @@ def test_a_non_finite_float_is_refused_as_unencodable(value: Any) -> None:
     assert info.value.__context__ is None
 
 
-def test_a_nested_value_too_deep_to_encode_is_refused_as_unencodable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The dry-run catches only TypeError, so json's RecursionError must arrive as one too."""
-
-    def overflow(value: Any, **kwargs: Any) -> str:
-        raise RecursionError("maximum recursion depth exceeded while encoding a JSON object")
-
-    monkeypatch.setattr(json, "dumps", overflow)
+def test_a_nested_value_too_deep_to_encode_is_refused_as_unencodable() -> None:
+    """The dry-run catches only TypeError, so json's RecursionError must arrive as one too. A real
+    value too deep for the encoder, so no process-wide ``json.dumps`` is patched (BACKLOG #6711)."""
+    deep: Any = "leaf"
+    for _ in range(200_000):
+        deep = [deep]
     with pytest.raises(TypeError, match="nested too deep") as info:
-        encode_reference_value({"a": 1})
+        encode_reference_value(deep)
+    assert info.value.__cause__ is None
     assert info.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("value", "cause"),
+    [
+        ({"rate": float("nan")}, "a non-finite float"),
+        (10**5000, "an oversized int"),
+        ({"k": object()}, "cannot serialize a object value"),
+    ],
+    ids=["non-finite", "oversized-int", "unencodable-type"],
+)
+def test_the_refusal_names_the_kind_of_value_and_carries_no_notes(value: Any, cause: str) -> None:
+    """BACKLOG #6711 items 4 and 6: the error's own text names the kind of value, and json's notes
+    naming the dict keys on the path ride on nothing."""
+    with pytest.raises(TypeError, match=cause) as info:
+        encode_reference_value(value)
+    assert not getattr(info.value, "__notes__", None)
+    assert info.value.__cause__ is None and info.value.__context__ is None
+
+
+def test_a_circular_value_names_its_cause() -> None:
+    loop: list[Any] = []
+    loop.append(loop)
+    with pytest.raises(TypeError, match="a circular value"):
+        encode_reference_value(loop)
 
 
 @pytest.mark.parametrize("value", [1.5, 0.0, -2.25, 1e308, {"x": [1.5, None, True]}])
@@ -254,18 +278,21 @@ def test_merge_user_metadata_refuses_when_existing_will_not_re_encode(
     assert info.value.__context__ is None
 
 
-def test_a_non_str_cell_reads_as_empty() -> None:
-    """The TypeError arm the old decoders carried: a non-str cell still reads as no metadata."""
-    cell: Any = memoryview(b'{"user": {"k": "v"}}')
-    assert decode_response_headers(cell) == {}
-    assert user_metadata(cell) is None
-    assert json.loads(merge_user_metadata(cell, [("k", "v")])) == {"user": {"k": "v"}}
+def test_a_non_text_cell_reads_as_empty_and_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """The TypeError arm the old decoders carried: a cell that is not text or bytes still reads as
+    no metadata, and is now logged by its type name."""
+    cell: Any = 12345
+    with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
+        assert decode_response_headers(cell) == {}
+        assert user_metadata(cell) is None
+        assert json.loads(merge_user_metadata(cell, [("k", "v")])) == {"user": {"k": "v"}}
+    assert any("not text: int" in r.getMessage() for r in caplog.records)
 
 
-@pytest.mark.parametrize("wrap", [bytes, bytearray], ids=["bytes", "bytearray"])
+@pytest.mark.parametrize("wrap", [bytes, bytearray, memoryview], ids=["bytes", "bytearray", "view"])
 def test_a_bytes_cell_keeps_its_lineage_through_merge(wrap: Any) -> None:
     """``json.loads`` parsed a bytes cell before this branch; it still must, or the merge below would
-    write the ops alone over the lineage."""
+    write the ops alone over the lineage. A memoryview cell reads the same way (BACKLOG #6712)."""
     cell: Any = wrap(json.dumps({"correlation_id": "c", "user": {"old": "x"}}).encode("utf-8"))
     assert json.loads(merge_user_metadata(cell, [("k", "v")])) == {
         "correlation_id": "c",
@@ -276,9 +303,10 @@ def test_a_bytes_cell_keeps_its_lineage_through_merge(wrap: Any) -> None:
 
 
 def test_a_malformed_bytes_cell_reads_as_empty() -> None:
-    """The hardening still holds for bytes: deep nesting and a bad UTF-8 byte read as malformed."""
-    assert decode_response_headers(_DEEP.encode("ascii")) == {}  # type: ignore[arg-type]
-    assert user_metadata(b'{"user": {"k": "\xff"}}') is None  # type: ignore[arg-type]
+    """The hardening still holds for bytes: the header decoder reads deep nesting as malformed, and
+    every decoder reads a bad UTF-8 byte as malformed."""
+    assert decode_response_headers(_DEEP.encode("ascii")) == {}
+    assert user_metadata(b'{"user": {"k": "\xff"}}') is None
 
 
 def test_an_unreadable_cell_is_logged_without_its_content(caplog: pytest.LogCaptureFixture) -> None:
@@ -287,7 +315,102 @@ def test_an_unreadable_cell_is_logged_without_its_content(caplog: pytest.LogCapt
         assert user_metadata('{"user": {"k": "' + marker + '"') is None
         assert decode_response_headers("[" * 200_000 + '"' + marker) == {}
     assert len(caplog.records) == 2
-    assert all(marker not in r.getMessage() for r in caplog.records)
+    for record in caplog.records:
+        # The message, its arguments and any attached exception: none may carry the content.
+        assert marker not in record.getMessage()
+        assert all(marker not in str(arg) for arg in (record.args or ()))
+        assert record.exc_info is None and record.exc_text is None
+
+
+def test_every_malformed_cell_read_as_empty_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """Each malformed cell read as ``{}`` leaves its own WARNING, as on main: none is held back."""
+    with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
+        for _ in range(5):
+            assert user_metadata('{"user": ') is None
+        assert decode_response_headers("{") == {}
+    assert len(caplog.records) == 6
+
+
+def test_a_released_memoryview_cell_reads_as_empty(caplog: pytest.LogCaptureFixture) -> None:
+    """A released memoryview reads as no metadata in every decoder, as on main."""
+    view = memoryview(json.dumps({"user": {"k": "v"}}).encode("utf-8"))
+    view.release()
+    with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
+        assert decode_response_headers(view) == {}
+        assert user_metadata(view) is None
+        assert json.loads(merge_user_metadata(view, [("k", "v")])) == {"user": {"k": "v"}}
+    assert any("released memoryview" in r.getMessage() for r in caplog.records)
+
+
+def test_a_foreign_type_error_names_only_its_class() -> None:
+    """A TypeError that is not the default's own refusal may carry a value in its text, so the
+    refusal names its class only (BACKLOG #6711)."""
+
+    class _Leaky(Decimal):
+        def __str__(self) -> str:
+            raise TypeError("SYNTHETIC-MRN-5550199")
+
+    with pytest.raises(TypeError, match=r"an unencodable value \(TypeError\)") as info:
+        encode_reference_value({"k": _Leaky("1")})
+    assert "SYNTHETIC" not in str(info.value)
+
+
+def _chain(exc: BaseException | None) -> list[BaseException]:
+    """``exc`` and every exception on its cause and context chain."""
+    seen: list[BaseException] = []
+    while exc is not None and all(exc is not s for s in seen):
+        seen.append(exc)
+        exc = exc.__cause__ or exc.__context__
+    return seen
+
+
+def test_naming_the_cause_chains_nothing_to_json_s_error() -> None:
+    """A refusal names its kind after json's handler has exited and encodes nothing a second time,
+    so a value that would raise on a second pass cannot chain json's error, whose notes name the
+    key, to whatever that pass raised (BACKLOG #6711)."""
+
+    class _Overflowing(date):
+        def isoformat(self) -> str:
+            raise OverflowError("synthetic")
+
+    marker = "SYNTHETIC-KEY-123"
+    with pytest.raises(TypeError, match="a non-finite float") as info:
+        encode_reference_value({marker: float("nan"), "z": _Overflowing(2026, 1, 1)})
+    for exc in _chain(info.value):
+        assert marker not in str(exc)
+        assert all(marker not in note for note in getattr(exc, "__notes__", ()))
+    assert info.value.__cause__ is None and info.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{"a": float("nan"), "b": object()}, {"a": float("nan"), "b": 10**5000}],
+    ids=["beside-an-unencodable-type", "beside-an-oversized-int"],
+)
+def test_a_mixed_value_names_the_kind_json_stopped_on(value: Any) -> None:
+    with pytest.raises(TypeError, match="a non-finite float"):
+        encode_reference_value(value)
+
+
+def test_a_coercion_error_is_not_read_as_one_of_json_s_own() -> None:
+    """A ValueError a coercion raises through json is named generically, whatever its text."""
+
+    class _Digits(date):
+        def isoformat(self) -> str:
+            raise ValueError("synthetic: too many digits")
+
+    with pytest.raises(TypeError, match="it holds an unencodable value$"):
+        encode_reference_value({"k": _Digits(2026, 1, 1)})
+
+
+def test_the_unreadable_cell_warning_names_its_row(caplog: pytest.LogCaptureFixture) -> None:
+    """The WARNING names the row's reference, cut and scrubbed."""
+    with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
+        assert user_metadata('{"user": ', row_id="0123456789abcdef0123") is None
+        assert user_metadata('{"user": ', row_id="bad\nid") is None
+    first, second = (r.getMessage() for r in caplog.records)
+    assert "message 0123456789ab " in first
+    assert "message bad?id " in second
 
 
 @pytest.mark.parametrize("bag", ['"xyz"', "5", '[["a", "b"]]', "null"])

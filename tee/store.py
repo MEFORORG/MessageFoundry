@@ -39,6 +39,14 @@ __all__ = ["RelayStore", "NakRow", "CaptureRow", "PurgeIncompleteError"]
 # back. What is escaped is stated once, in docs/PHI.md, section 7, the tee relay paragraph.
 _MAX_DETAIL = 500
 
+# Bound the stored identifiers and ACK code too. MSH-10, MSH-9 and MSA-1 come from partner bytes, and
+# a frame may be as large as --max-frame-bytes allows (16 MiB by default), so an unbounded field
+# would be stored whole and every `naks` or `export` read would load it. 199 is the longest MSH-10
+# recent HL7 v2 versions allow, the longest of the three fields, so no conformant ASCII value
+# without escapes is cut. The count is of latin-1 characters, that is bytes (peek_fields decodes
+# latin-1), so a non-ASCII or escaped id can be. Cut, not escaped: `naks` escapes what it prints.
+_MAX_IDENTIFIER = 199
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS relay_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +57,7 @@ CREATE TABLE IF NOT EXISTS relay_log (
     message_type TEXT,                       -- MSH-9  (identifier, not PHI)
     size_bytes   INTEGER NOT NULL,
     outcome      TEXT    NOT NULL,           -- 'accepted' | 'nak' | 'transport_error'
-    ack_code     TEXT,                       -- AA/AE/AR/CA/CE/CR or NULL
+    ack_code     TEXT,                       -- for example AA/AE/AR/CA/CE/CR, or NULL
     detail       TEXT                        -- sanitized MSA-3 / error string (bounded); never a body
 );
 CREATE INDEX IF NOT EXISTS ix_relay_at  ON relay_log(at);
@@ -174,6 +182,11 @@ def _clean_detail(detail: str | None) -> str | None:
         pieces.append(piece)
         used += len(piece)
     return "".join(pieces)
+
+
+def _bound_identifier(value: str | None) -> str | None:
+    """An MSH-10, MSH-9 or MSA-1 value kept to at most ``_MAX_IDENTIFIER`` characters, or ``None``."""
+    return None if value is None else value[:_MAX_IDENTIFIER]
 
 
 def _iso(at: float) -> str:
@@ -322,11 +335,11 @@ class RelayStore:
                     time.time(),
                     direction,
                     leg,
-                    control_id,
-                    message_type,
+                    _bound_identifier(control_id),
+                    _bound_identifier(message_type),
                     size_bytes,
                     outcome,
-                    ack_code,
+                    _bound_identifier(ack_code),
                     _clean_detail(detail),
                 ),
             )
@@ -337,7 +350,7 @@ class RelayStore:
         async with self._lock:
             await self._db.execute(
                 "INSERT INTO relay_capture (at, direction, control_id, raw) VALUES (?,?,?,?)",
-                (time.time(), direction, control_id, raw),
+                (time.time(), direction, _bound_identifier(control_id), raw),
             )
             await self._db.commit()
 
