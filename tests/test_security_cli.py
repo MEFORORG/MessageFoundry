@@ -102,106 +102,33 @@ def test_set_security_reports_a_reset_that_finds_nothing_as_unchanged(tmp_path: 
     seen: list[Path] = []
     toml = tmp_path / "mf.toml"
     result = security_edit.set_security(toml, {"require_mfa": None}, validate=seen.append)
-    assert result == {"op": "unchanged", "keys": [], "unchanged": ["require_mfa"]}
-    # Nothing changed and no file was there, so none is created; an empty file is checked in its
-    # place, and its private directory is gone afterwards.
-    assert not toml.exists() and len(seen) == 1
-    assert seen[0] != toml and seen[0].name == toml.name and not seen[0].parent.exists()
-    seen.clear()
-    # A file that is there is checked as it stands, and not rewritten.
+    # No file and no key changed: none is created, nothing is checked, and the result says the
+    # file was not written rather than claim a rewrite.
+    assert result == {
+        "op": "unchanged",
+        "keys": [],
+        "unchanged": ["require_mfa"],
+        "rewritten": False,
+        "detail": "no key changed; mf.toml does not exist, so none was created",
+    }
+    assert not toml.exists() and seen == []
+    # A file that is there goes through the validated replace like any set, and says so.
     toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
     result = security_edit.set_security(toml, {"require_mfa": False}, validate=seen.append)
-    assert result["op"] == "unchanged" and seen == [toml]
+    assert result == {
+        "op": "unchanged",
+        "keys": [],
+        "unchanged": ["require_mfa"],
+        "rewritten": True,
+        "detail": "no key changed; file rewritten and restricted to its owner",
+    }
+    assert len(seen) == 1 and seen[0] != toml and seen[0].name == toml.name
     # A value equal in Python but of another type is a change, not the value the file holds.
     toml.write_text("[security]\nsign_out_after_idle_minutes = 1\n", encoding="utf-8")
     result = security_edit.set_security(
         toml, {"sign_out_after_idle_minutes": True}, validate=lambda _c: None
     )
     assert result["op"] == "set"
-
-
-def test_an_edit_that_changes_nothing_leaves_the_file_byte_for_byte(tmp_path: Path) -> None:
-    """BACKLOG #5327: an edit that changes nothing writes nothing. It once went through the
-    replace anyway, which turned mixed line endings into LF while reporting ``unchanged``."""
-    from messagefoundry.config import security_edit
-
-    toml = tmp_path / "mf.toml"
-    toml.write_bytes(b"[security]\r\nrequire_mfa = false\n[api]\r\nport = 9000\r\n")
-    before = toml.read_bytes()
-    result = security_edit.set_security(
-        toml, {"require_mfa": False, "max_session_hours": None}, validate=lambda _c: None
-    )
-    assert result["op"] == "unchanged" and result["keys"] == []
-    assert toml.read_bytes() == before
-
-
-def test_an_edit_that_changes_nothing_still_refuses_a_file_the_check_refuses(
-    tmp_path: Path,
-) -> None:
-    from messagefoundry.config import security_edit
-
-    def refuse(_candidate: Path) -> None:
-        raise ValueError("the whole-file load refused it")
-
-    toml = tmp_path / "mf.toml"
-    toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
-    with pytest.raises(security_edit.SecurityEditError, match="whole-file load refused it"):
-        security_edit.set_security(toml, {"require_mfa": False}, validate=refuse)
-
-
-def test_an_edit_that_changes_nothing_refuses_a_target_that_is_no_regular_file(
-    tmp_path: Path,
-) -> None:
-    """With no write, the replace no longer refuses a directory at the path, so the no-change
-    path refuses it itself rather than report it as an unchanged settings file."""
-    from messagefoundry.config import security_edit
-
-    toml = tmp_path / "mf.toml"
-    toml.mkdir()
-    with pytest.raises(security_edit.SecurityEditError, match="not a regular file"):
-        security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
-
-
-def test_an_edit_that_changes_nothing_refuses_a_link(tmp_path: Path) -> None:
-    """The replace refuses a link (vault BACKLOG #5619); an edit that changes nothing does too."""
-    import os
-
-    from messagefoundry.config import security_edit
-
-    target = tmp_path / "real.toml"
-    target.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
-    link = tmp_path / "mf.toml"
-    try:
-        os.symlink(target, link)
-    except OSError as exc:  # Windows without the symlink privilege or developer mode
-        pytest.skip(f"cannot create a symlink here: {exc}")
-    with pytest.raises(security_edit.SecurityEditError, match="it is a link"):
-        security_edit.set_security(link, {"require_mfa": False}, validate=lambda _c: None)
-
-
-def test_a_reset_that_finds_nothing_on_an_absent_file_still_names_the_environment(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With no file and nothing changed, the whole-file load still runs, on an empty file, so a
-    session limit only this command's environment loosens is still named, and none is created."""
-    toml = tmp_path / "mf.toml"
-    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "99")
-    rc, res = _set(toml, {"require_mfa": None}, capsys)
-    assert rc == 0 and res["op"] == "unchanged" and not toml.exists()
-    assert "max_session_hours" in [lo["switch"] for lo in res["loosenings"]]
-
-
-def test_a_security_table_holding_only_comments_is_kept(tmp_path: Path) -> None:
-    """The emptied-table drop is for a table the edit emptied, not one that held only comments
-    when the edit removed nothing."""
-    from messagefoundry.config import security_edit
-
-    toml = tmp_path / "mf.toml"
-    toml.write_text("[security]\n# require_mfa = false  (kept for later)\n", encoding="utf-8")
-    before = toml.read_bytes()
-    result = security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
-    assert result["op"] == "unchanged"
-    assert toml.read_bytes() == before
 
 
 def test_null_reset_of_a_removed_key_offers_no_spelling(
@@ -1162,38 +1089,62 @@ def test_cli_set_reports_a_malformed_edit_as_json_on_stdout_in_a_real_subprocess
     assert "Traceback" not in proc.stderr, "a raw traceback reached the operator"
 
 
-# --- BACKLOG #5327: an edit that changes nothing still restricts the file to its owner ----------
+# --- BACKLOG #5327: an edit that changes no key still restricts the file to its owner -----------
+
+
+def test_a_reset_that_finds_nothing_on_an_absent_file_creates_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Through the CLI: no 0-byte file appears, and the result says nothing was written. With no
+    file there is no whole-file load, so the posture reported is the one ``show`` reports for an
+    absent file."""
+    toml = tmp_path / "mf.toml"
+    rc, res = _set(toml, {"require_mfa": None}, capsys)
+    assert rc == 0 and res["op"] == "unchanged" and res["rewritten"] is False
+    assert "does not exist" in res["detail"]
+    assert not toml.exists()
+    assert res["loosenings"] == _show(toml, capsys)["loosenings"]
+
+
+def test_a_security_table_holding_only_comments_is_kept(tmp_path: Path) -> None:
+    """The emptied-table drop is for a table the edit emptied, not one that held only comments
+    when the edit removed nothing."""
+    from messagefoundry.config import security_edit
+
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\n# require_mfa = false  (kept for later)\n", encoding="utf-8")
+    before = toml.read_bytes()
+    result = security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
+    assert result["op"] == "unchanged" and result["rewritten"] is True
+    assert toml.read_bytes() == before
 
 
 def _unchanged_set(toml: Path) -> None:
     from messagefoundry.config import security_edit
 
     result = security_edit.set_security(toml, {"require_mfa": False}, validate=lambda _c: None)
-    assert result["op"] == "unchanged"
+    assert result["op"] == "unchanged" and result["rewritten"] is True
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
-def test_an_edit_that_changes_nothing_still_narrows_a_loose_file_on_posix(tmp_path: Path) -> None:
-    """The replace re-restricts the settings file to its owner on every set, so skipping the write
-    must not skip that: a file left at 0644 is narrowed to 0600, and its bytes are not touched."""
+def test_an_edit_that_changes_no_key_still_narrows_a_loose_file_on_posix(tmp_path: Path) -> None:
+    """Every set goes through the validated replace, which restricts the settings file to its
+    owner, so a file left at 0644 is narrowed to 0600 by a set that changes no key."""
     import os
     import stat
 
     toml = tmp_path / "mf.toml"
-    toml.write_bytes(b"[security]\r\nrequire_mfa = false\n")
+    toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
     os.chmod(toml, 0o644)
-    before = toml.read_bytes()
     _unchanged_set(toml)
     assert stat.S_IMODE(toml.stat().st_mode) == 0o600
-    assert toml.read_bytes() == before
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
-def test_an_edit_that_changes_nothing_but_is_refused_keeps_the_mode_on_posix(
+def test_an_edit_that_changes_no_key_but_is_refused_keeps_the_mode_on_posix(
     tmp_path: Path,
 ) -> None:
-    """The control: a refused replace never touches the live file, so neither does a refused
-    edit that changes nothing."""
+    """The control: a refused replace never touches the live file."""
     import os
     import stat
 
@@ -1210,129 +1161,28 @@ def test_an_edit_that_changes_nothing_but_is_refused_keeps_the_mode_on_posix(
     assert stat.S_IMODE(toml.stat().st_mode) == 0o644
 
 
-def _own_file_in_a_loose_folder(
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows access list")
+def test_an_edit_that_changes_no_key_still_narrows_a_loose_file_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, str]:
-    """A settings file that inherits a list granting this account and SYSTEM, and its real owner,
-    which the token seam then reports as the editing account."""
+) -> None:
+    """The Windows half: a file whose inherited list also grants SYSTEM is left with its owner's
+    entry alone by a set that changes no key, as by any set."""
     import messagefoundry.store.store as store_mod
     from messagefoundry.auth.anchor_path import SYSTEM_SID
     from messagefoundry.config import atomic_edit
-    from tests._win_acl import folder_granting
+    from messagefoundry.store.store import _read_dacl_sddl
+    from tests._win_acl import assert_owner_only, folder_granting
 
     token = store_mod._current_user_sid()
     assert token is not None
     toml = folder_granting(tmp_path / "config", token, SYSTEM_SID) / "mf.toml"
-    toml.write_bytes(b"[security]\r\nrequire_mfa = false\n")
+    toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
     owner = atomic_edit._owner_of(toml)
     assert owner is not None
+    # The token seam reports the file's real owner, so the test means the same on every runner.
     monkeypatch.setattr(store_mod, "_current_user_sid", lambda: owner)
-    return toml, owner
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="a Windows access list")
-def test_an_edit_that_changes_nothing_still_narrows_a_loose_file_on_windows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The Windows half: a file whose inherited list also grants SYSTEM is left with its owner's
-    entry alone, as the replace leaves the file it writes, and its bytes are not touched."""
-    from tests._win_acl import assert_owner_only
-
-    toml, owner = _own_file_in_a_loose_folder(tmp_path, monkeypatch)
-    before = toml.read_bytes()
+    # The positive control: the file starts with SYSTEM's inherited entry beside its owner's.
+    before = _read_dacl_sddl(toml, owner=False)
+    assert before is not None and ";SY)" in before, before
     _unchanged_set(toml)
     assert_owner_only(toml, owner)
-    assert toml.read_bytes() == before
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="a Windows access list")
-def test_an_edit_that_changes_nothing_keeps_a_foreign_owners_grant_on_windows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A file another account owns is narrowed to that account and the editor at read only, as
-    the replace narrows it, and the owner is not handed back again since it never left."""
-    import messagefoundry.restricted_file as restricted_mod
-    import messagefoundry.store.store as store_mod
-    from messagefoundry.config import atomic_edit
-    from tests._win_acl import protected_entries
-
-    editor = "S-1-5-21-1000000001-1000000002-1000000003-4242"
-    toml, owner = _own_file_in_a_loose_folder(tmp_path, monkeypatch)
-    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: editor)
-    monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: False)
-    written: list[str] = []
-    real_write = store_mod._set_security_from_sddl
-
-    def _record(path: Path, sddl: str, *, protected: bool) -> object:
-        written.append(sddl)
-        return real_write(path, sddl, protected=protected)
-
-    monkeypatch.setattr(store_mod, "_set_security_from_sddl", _record)
-    before = toml.read_bytes()
-    _unchanged_set(toml)
-    _, file_owner, entries = protected_entries(toml)
-    assert (file_owner, [sid for *_, sid in entries]) == (owner, [owner, editor])
-    assert written and not any(sddl.startswith("O:") for sddl in written), written
-    assert toml.read_bytes() == before
-    assert atomic_edit._owner_of(toml) == owner
-
-
-def test_an_edit_that_changes_nothing_refuses_a_hard_link_and_leaves_its_other_name(
-    tmp_path: Path,
-) -> None:
-    """The replace renames a new file over the name, so it never changes the file behind another
-    name. Restricting in place would, so a settings path with a second name is refused, and the
-    other name's file keeps its bytes and its permissions."""
-    import os
-
-    from messagefoundry.config import security_edit
-
-    other = tmp_path / "elsewhere.toml"
-    other.write_bytes(b"[security]\nrequire_mfa = false\n")
-    toml = tmp_path / "mf.toml"
-    try:
-        os.link(other, toml)
-    except OSError as exc:
-        pytest.skip(f"cannot create a hard link here: {exc}")
-    if sys.platform != "win32":
-        os.chmod(other, 0o644)
-    before = (other.read_bytes(), _permissions(other))
-    with pytest.raises(security_edit.SecurityEditError, match="not a regular file with one name"):
-        security_edit.set_security(toml, {"require_mfa": False}, validate=lambda _c: None)
-    assert (other.read_bytes(), _permissions(other)) == before
-
-
-def _permissions(path: Path) -> object:
-    """The mode on POSIX; on Windows the owner and access list too, which the mode does not show."""
-    import os
-
-    if sys.platform != "win32":
-        return os.stat(path).st_mode
-    from messagefoundry.store.store import _read_dacl_sddl
-
-    return _read_dacl_sddl(path, owner=True)
-
-
-def test_an_edit_that_changes_nothing_is_refused_when_the_restriction_does_not_take(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The replace always leaves a restricted file, so a no-change edit whose restriction did not
-    take, as for an account that neither owns the file nor is root, reports it rather than exit
-    as if it had. The file's bytes are left as they were."""
-    import os
-
-    from messagefoundry.config import atomic_edit, security_edit
-
-    monkeypatch.setattr(atomic_edit, "_restrict_to_owner_and_editor", lambda _path, _owner: False)
-    monkeypatch.setattr(atomic_edit, "_restrict_to_editor", lambda _path, **_kw: False)
-    monkeypatch.setattr(atomic_edit, "_secure_file", lambda _path: None)
-    toml = tmp_path / "mf.toml"
-    toml.write_bytes(b"[security]\nrequire_mfa = false\n")
-    if sys.platform != "win32":
-        os.chmod(toml, 0o644)
-    before = toml.read_bytes()
-    with pytest.raises(
-        security_edit.SecurityEditError, match="could not be restricted to its owner"
-    ):
-        security_edit.set_security(toml, {"require_mfa": False}, validate=lambda _c: None)
-    assert toml.read_bytes() == before
