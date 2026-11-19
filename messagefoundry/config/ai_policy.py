@@ -123,7 +123,8 @@ def resolve_effective_policy(
     """Clamp a requested (mode, data_scope) to the enforceable effective policy for this instance.
 
     The algorithm (in order): apply the production-posture data-scope ceiling; defensively block
-    ``phi`` unless the mode is BAA-managed; block ``deidentified`` (no AI-path de-id wired yet);
+    ``phi`` unless the mode is BAA-managed; pin ``managed_endpoint`` to ``code_only`` (the scope its
+    chat route enforces); block ``deidentified`` (no AI-path de-id wired yet);
     and normalize scope to ``code_only`` when the mode is ``off``. ``mode`` is never clamped — a
     central ``off``/managed choice is honored regardless of posture. ``production`` is the instance's
     posture flag (decoupled from the environment *name*, ADR 0017), not whether it is literally named
@@ -150,7 +151,13 @@ def resolve_effective_policy(
         eff = AiDataScope.CODE_ONLY
         reasons.append("phi scope requires managed_claude_baa mode; fell back to code_only")
 
-    # 3. deidentified hard rule: no runtime AI-path de-id wired yet, so this scope is never live.
+    # 3. managed_endpoint hard rule: POST /ai/chat, the route this mode serves, refuses any scope but
+    #    code_only, so advertising a wider one would point a client at a 403 (BACKLOG #5773).
+    if mode is AiMode.MANAGED_ENDPOINT and eff is not AiDataScope.CODE_ONLY:
+        eff = AiDataScope.CODE_ONLY
+        reasons.append("managed_endpoint mode is code_only in this release; fell back to code_only")
+
+    # 4. deidentified hard rule: no runtime AI-path de-id wired yet, so this scope is never live.
     if eff is AiDataScope.DEIDENTIFIED:
         eff = AiDataScope.CODE_ONLY
         reasons.append(
@@ -158,7 +165,7 @@ def resolve_effective_policy(
             "AI-assist path; fell back to code_only"
         )
 
-    # 4. off normalization: when AI is off the scope is irrelevant — pin it to the safe floor.
+    # 5. off normalization: when AI is off the scope is irrelevant — pin it to the safe floor.
     if mode is AiMode.OFF:
         eff = AiDataScope.CODE_ONLY
 
