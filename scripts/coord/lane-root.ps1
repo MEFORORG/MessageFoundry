@@ -18,7 +18,10 @@
 # A host with no console attached may refuse the setter (as alloc.ps1 and worktree/remove.ps1 note).
 # The action then runs in the encoding it already has, rather than the refusal reaching the caller:
 # the lane-level hook would otherwise read it as an unresolved root and print SKIPPED on every Stop
-# (BACKLOG #5486). Only an encoding that was actually switched is put back.
+# (BACKLOG #5486). The refusal is reported on stderr, as alloc.ps1 reports its own, unless that
+# encoding is UTF-8 already; a non-ASCII path may then come back mangled, and
+# Resolve-LaneWorktreeRoot refuses a root that names no directory. Only an encoding that was
+# actually switched is put back.
 function Invoke-GitUtf8([scriptblock]$Action) {
     $saved = $null
     $switched = $false
@@ -26,7 +29,12 @@ function Invoke-GitUtf8([scriptblock]$Action) {
         $saved = [Console]::OutputEncoding
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
         $switched = $true
-    } catch { }
+    } catch {
+        $why = $_.Exception.Message
+        if (-not $saved -or $saved.CodePage -ne 65001) {
+            try { [Console]::Error.WriteLine("lane-root.ps1: WARNING -- git's output could not be set to decode as UTF-8 ($why), so a path holding a non-ASCII character may come back mangled.") } catch { }
+        }
+    }
     try {
         & $Action
     } finally {
@@ -43,7 +51,7 @@ function Resolve-LaneWorktreeRoot([string]$From) {
         $revParse = @(Invoke-GitUtf8 { & git -C $From -c core.quotePath=false rev-parse --path-format=absolute --show-toplevel --show-prefix 2>$null })
         $revParseExit = $LASTEXITCODE
     } catch {
-        return [pscustomobject]@{ Path = $null; Error = "git could not be run, or its output could not be decoded as UTF-8, in $From ($($_.Exception.Message))" }
+        return [pscustomobject]@{ Path = $null; Error = "git could not be run in $From ($($_.Exception.Message))" }
     }
     $top = if ($revParse.Count -ge 1) { ([string]$revParse[0]).Trim() } else { '' }
     if ($revParseExit -ne 0 -or -not $top) {
@@ -59,6 +67,11 @@ function Resolve-LaneWorktreeRoot([string]$From) {
     # ignored or not (such as .venv\Scripts), is still that tree's work and keys on its root.
     if ("$prefix/" -like '.claude/worktrees/*') {
         return [pscustomobject]@{ Path = $null; Error = "$From is under the worktree container of $top but is no worktree of its own (a removed worktree reads this way)" }
+    }
+    # A root that names no directory was decoded in some page other than UTF-8 (Invoke-GitUtf8 above),
+    # and keying on it would write a level no reader computes, so it refuses instead.
+    if (-not (Test-Path -LiteralPath $top -PathType Container)) {
+        return [pscustomobject]@{ Path = $null; Error = "git named $top as the work tree root for $From, but no such directory exists (its output may have been decoded in a code page other than UTF-8)" }
     }
     # git's resolved root, the path claim.ps1 records and seat records carry, so a tree reached
     # through a junction keys the same lane and claim hash as its target.

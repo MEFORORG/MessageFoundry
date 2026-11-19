@@ -600,26 +600,71 @@ def _set_attempts(proc: subprocess.CompletedProcess[str]) -> int:
     return int(lines[-1].split("=", 1)[1])
 
 
+def _ps_literal(path: Path) -> str:
+    """``path`` as a single-quoted PowerShell literal, its apostrophes doubled."""
+    return "'" + str(path).replace("'", "''") + "'"
+
+
+_CODE_PAGE = '[System.Console]::Out.WriteLine("CP=$([System.Console]::OutputEncoding.CodePage)")\n'
+
+
+def _code_page(proc: subprocess.CompletedProcess[str]) -> int:
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("CP=")]
+    assert lines, proc.stdout + proc.stderr
+    return int(lines[-1].split("=", 1)[1])
+
+
 def test_invoke_git_utf8_runs_the_action_when_the_encoding_setter_throws(repo: Path) -> None:
-    """The action's output comes back and nothing is thrown, though the setter refused."""
+    """The action's output comes back and nothing is thrown, though the setter refused. Exactly one
+    setter call: an encoding that was never switched is not put back. The refusal is reported unless
+    the encoding the action ran in was UTF-8 already."""
     body = (
-        f". '{_LANE_ROOT}'\n"
-        "try { $r = Invoke-GitUtf8 { 'ACTION-RAN' }; [System.Console]::Out.WriteLine(\"RESULT=$r\") }\n"
+        f". {_ps_literal(_LANE_ROOT)}\n"
+        + _CODE_PAGE
+        + "try { $r = Invoke-GitUtf8 { 'ACTION-RAN' }; [System.Console]::Out.WriteLine(\"RESULT=$r\") }\n"
         'catch { [System.Console]::Out.WriteLine("THREW=$($_.Exception.Message)") }\n'
     )
     proc = _under_throwing_setter(repo, body)
-    assert _set_attempts(proc) >= 1, proc.stdout + proc.stderr
+    assert _set_attempts(proc) == 1, proc.stdout + proc.stderr
     assert "RESULT=ACTION-RAN" in proc.stdout, proc.stdout + proc.stderr
     assert "THREW=" not in proc.stdout, proc.stdout
+    warned = "could not be set to decode as UTF-8" in proc.stderr
+    assert warned == (_code_page(proc) != 65001), proc.stdout + proc.stderr
 
 
 def test_the_hook_does_not_skip_when_the_encoding_setter_throws(tmp_path: Path) -> None:
-    """The hook still resolves the root and nags for the unstated lane, with no SKIPPED line. The
-    tree is named as a builder lane, the population the hook answers for."""
+    """The hook still resolves the root and nags for the unstated lane, with no SKIPPED or COULD NOT
+    READ line. The tree is named as a builder lane, the population the hook answers for."""
     repo = _init_repo(tmp_path / "builder-no-console")
     proc = _under_throwing_setter(
-        repo, f"& '{_HOOK}'\n", stdin=json.dumps({"hook_event_name": "Stop"})
+        repo,
+        f'& {_ps_literal(_HOOK)}\n[System.Console]::Error.WriteLine("HOOKEXIT=$LASTEXITCODE")\n',
+        stdin=json.dumps({"hook_event_name": "Stop"}),
     )
     assert _set_attempts(proc) >= 1, proc.stdout + proc.stderr
+    assert "HOOKEXIT=0" in proc.stderr, proc.stdout + proc.stderr
     assert "SKIPPED" not in proc.stdout, proc.stdout
+    assert "COULD NOT READ" not in proc.stdout, proc.stdout
     assert _UNSTATED in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_a_mangled_root_under_a_refused_setter_refuses(tmp_path: Path) -> None:
+    """With the setter refused, git's UTF-8 is decoded in the host's own page, so a non-ASCII root
+    comes back as a path that does not exist. That must refuse, not key a level no reader computes.
+    Only measurable where that page is not UTF-8, which the run reports and the test checks."""
+    root = tmp_path / "builder-\u00fc"
+    root.mkdir()
+    _init_repo(root)
+    body = (
+        f". {_ps_literal(_LANE_ROOT)}\n"
+        + _CODE_PAGE
+        + "$r = Resolve-LaneWorktreeRoot -From (Get-Location).ProviderPath\n"
+        '[System.Console]::Out.WriteLine("PATH=[$($r.Path)]")\n'
+        '[System.Console]::Out.WriteLine("ERROR=$($r.Error)")\n'
+    )
+    proc = _under_throwing_setter(root, body)
+    assert _set_attempts(proc) == 1, proc.stdout + proc.stderr
+    if _code_page(proc) == 65001:
+        pytest.skip("the host page is UTF-8 already, so nothing is mangled to refuse")
+    assert "PATH=[]" in proc.stdout, proc.stdout
+    assert "no such directory exists" in proc.stdout, proc.stdout + proc.stderr
