@@ -108,12 +108,10 @@ rules:
       # so the persisted credential is inert noise here.
       #
       # NOT suppressed (fixed at the source instead): release.yml's checkouts set persist-credentials:
-      # false, because it DOES upload build artifacts. dependabot-lock-resync.yml persists a
-      # narrowly-scoped App token ON PURPOSE to push the resynced locks (documented inline) and is listed
-      # here for that reason.
+      # false, because it DOES upload build artifacts. dependabot-lock-resync.yml is NOT listed either:
+      # its checkout persists nothing and hands the App token to the push step alone (BACKLOG #5477).
       - benchmark.yml
       - ci.yml
-      - dependabot-lock-resync.yml
       - security.yml
       - vuln-metrics.yml
 

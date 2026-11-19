@@ -184,9 +184,8 @@ def test_the_resync_regenerates_the_closure_file() -> None:
 def test_the_resync_checks_out_the_triggering_sha() -> None:
     """RED when: the resync checks out the moving branch tip instead of the triggering SHA.
 
-    The closure step runs a repository script while the App token sits in the checkout's
-    credential config. Pinned to the SHA, a commit pushed after the trigger never runs, and the
-    push is refused if the branch has moved.
+    The closure step runs a repository script from this checkout. Pinned to the SHA, a commit
+    pushed after the trigger never runs, and the push is refused if the branch has moved.
     """
     steps = load_workflow(_RESYNC.name)["jobs"]["resync"]["steps"]
     checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
@@ -283,4 +282,67 @@ def test_the_resync_gate_keeps_its_immutable_author_conjunct() -> None:
     assert "&&" in condition, "the author gate must CONJOIN the actor check, not replace it"
     assert "||" not in condition, (
         "a disjunction lets the spoofable actor check alone open the job — the dominating shape"
+    )
+
+
+def _resync_steps() -> list[dict[str, object]]:
+    steps = load_workflow(_RESYNC.name)["jobs"]["resync"]["steps"]
+    assert isinstance(steps, list) and steps, "the resync job parsed to no steps"
+    return steps
+
+
+def test_the_resync_checkout_persists_no_credential() -> None:
+    """RED when: the checkout writes a credential into .git/config (BACKLOG #5477).
+
+    uv and a repository script run on the Dependabot-changed tree after the checkout. A persisted
+    contents-write App token would sit on disk for both; the push step takes it from its own
+    environment instead.
+    """
+    checkouts = [
+        s for s in _resync_steps() if str(s.get("uses", "")).startswith("actions/checkout@")
+    ]
+    assert len(checkouts) == 1, f"expected one checkout step, found {len(checkouts)}"
+    with_ = checkouts[0].get("with") or {}
+    assert isinstance(with_, dict)
+    assert with_.get("persist-credentials") is False, (
+        "the resync checkout must set persist-credentials: false"
+    )
+    assert "token" not in with_, (
+        "the checkout needs no App token: the run's read-only token fetches the PR head"
+    )
+
+
+def test_only_the_push_step_receives_the_app_token() -> None:
+    """RED when: any step but the push can read the minted contents-write token (BACKLOG #5477)."""
+    readers = [
+        str(s.get("name") or s.get("uses"))
+        for s in _resync_steps()
+        if "steps.app-token.outputs.token" in repr(s)
+    ]
+    assert readers == ["Commit and push the resynced locks"], (
+        f"steps reading the App token: {readers}"
+    )
+
+
+# The uv the DEP-1 gate installs, e.g. `pip install --upgrade pip "uv==0.12.0"`.
+_GATE_UV_PIN_RE = re.compile(r"""["']?\buv==(?P<version>[0-9][0-9A-Za-z.+-]*)["']?""")
+
+
+def test_the_resync_installs_the_uv_the_gate_pins() -> None:
+    """RED when: setup-uv is unpinned or pinned to a uv other than DEP-1's (BACKLOG #5477).
+
+    The resync must write the bytes DEP-1 diffs. With no ``version:`` setup-uv installs the latest
+    uv, whose export format can move ahead of the gate's, so the bot would push locks the gate then
+    finds stale -- or, worse, an unreviewed uv would serialize the locks the project audits.
+    """
+    gate_pins = set(_GATE_UV_PIN_RE.findall(_GATE.read_text(encoding="utf-8")))
+    assert len(gate_pins) == 1, f"security.yml pins uv at {sorted(gate_pins)}; expected one version"
+    setups = [
+        s for s in _resync_steps() if str(s.get("uses", "")).startswith("astral-sh/setup-uv@")
+    ]
+    assert len(setups) == 1, f"expected one setup-uv step, found {len(setups)}"
+    with_ = setups[0].get("with") or {}
+    assert isinstance(with_, dict)
+    assert str(with_.get("version", "")) == gate_pins.pop(), (
+        f"setup-uv installs uv {with_.get('version')!r}, not the uv security.yml's DEP-1 step pins"
     )
