@@ -2522,6 +2522,15 @@ def test_a_blank_crl_path_is_refused_at_load_naming_its_own_setting(
         load_settings(config_path=cfg, environ={})
 
 
+#: The settings a CRL knob needs beside it to load at all: the client CRL acts only under in-process
+#: mTLS (BACKLOG #5315), and the forwarder's only on verified TLS-syslog (BACKLOG #5316).
+_CRL_COMPANIONS = {
+    "api": 'tls_cert_file = "server.pem"\ntls_client_ca_file = "client-ca.pem"\n',
+    "logging": 'forward_host = "siem.local"\nforward_protocol = "tls"\n'
+    'forward_tls_ca_file = "siem-ca.pem"\n',
+}
+
+
 @pytest.mark.parametrize(("section", "key", "name"), [p for p in _CRL_KNOBS if p.id != "store"])
 def test_an_existing_crl_path_loads_on_each_setting(
     tmp_path: Path, section: str, key: str, name: str
@@ -2534,15 +2543,6 @@ def test_an_existing_crl_path_loads_on_each_setting(
     cfg = _write(tmp_path / "messagefoundry.toml", body)
     loaded = load_settings(config_path=cfg, environ={})
     assert getattr(getattr(loaded, section), key) == str(crl), name
-
-
-#: The settings a CRL knob needs beside it to load at all: the client CRL acts only under in-process
-#: mTLS (BACKLOG #5315), and the forwarder's only on verified TLS-syslog (BACKLOG #5316).
-_CRL_COMPANIONS = {
-    "api": 'tls_cert_file = "server.pem"\ntls_client_ca_file = "client-ca.pem"\n',
-    "logging": 'forward_host = "siem.local"\nforward_protocol = "tls"\n'
-    'forward_tls_ca_file = "siem-ca.pem"\n',
-}
 
 
 # --- BACKLOG #5315: the client-CA pin and the client CRL need the client CA they act on --------------
