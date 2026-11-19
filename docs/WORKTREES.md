@@ -737,20 +737,35 @@ refusal on a locked or dirty tree stays a last fence. The branch survives it. Ea
 is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check
 passed and git still refused), `FAILED`, `ORPHANED` or `NOT-REACHED` (the runner's
 `-StopAfterMinutes` deadline passed before that tree was started), with its reason, then a summary
-line with the counts and the drive's free space. Past that deadline before the listing run, the step
-logs one `SKIPPED` line instead and leaves the exit code alone. The installer sets the deadline inside
-the task's time limit (`-TimeLimitHours`, default 4); a task registered before either existed keeps
-its old one-hour limit and no deadline until `install-daily-prune.ps1` is run again.
+line with the counts and the drive's free space. The installer sets the deadline inside the task's
+time limit (`-TimeLimitHours`, default 4); a task registered before either existed keeps its old
+one-hour limit and no deadline until `install-daily-prune.ps1` is run again.
+
+**The deadline bounds both `prune-merged.ps1` runs too**, the prune and the step's listing run. With
+it, each is started as a child process and waited on for the time left. One still running at the
+deadline is killed with its whole process tree, `git` included, and logged as `--- prune-merged.ps1
+TIMED OUT after N min, killed at HH:mm:ss ---` after what it printed. A killed `-Apply` prune can
+leave a removal half done, which the next run's orphan check reports. Past the deadline before the
+prune run, nothing is started and the log says `NOT STARTED`. The step is skipped with one `SKIPPED`
+line when the prune run was not started or was killed, when the deadline passed before the listing
+run, or when the listing run was killed. Without a deadline both runs are started with `&`, unbounded,
+as before.
+
+**Every deadline stop exits `4`, STOPPED**: a killed or unstarted run, a skipped step, or a
+`NOT-REACHED` tree. `4` is the runner's own code, not one `prune-merged.ps1` returns, and it sits above
+that script's `0` to `3`, so it also stands over a `1`, `2` or `3` the run earned before it stopped; the
+log's rows still carry those. Before, a deadline stop left the code alone, so a run that skipped work
+exited as if it had finished it.
 
 The exit code starts as the prune's, and each row changes it as the row arrives, before the row's
-log line is written. A refusal or a tree the deadline left leaves it alone. An orphan raises it to `3`
+log line is written. A refusal leaves it alone; a tree the deadline left raises it to `4`. An orphan raises it to `3`
 and goes into `prune-merged.ps1`'s orphan ledger, so later runs keep reporting it. A `2` from the
 prune says nothing was attempted, so a `REMOVED`, `FAILED` or `DECLINED` row turns it into `1`; apart
 from that, a failure raises the code to at least `1`, and nothing lowers it. An unhandled error after
 the log path is set exits with at least `2` before the prune started or on a dry run, and at least `1`
 once an `-Apply` prune has started, never below the code the prune and the rows have set. A list that
 could not be read skips the step, raising the code to at least `2` on a dry run and at least `1` under
-`-Apply`, since the prune before it may have removed siblings. With `-Apply` the runner refuses to run
+`-Apply`, since the prune before it may have removed siblings. A deadline stop raises it to `4`. With `-Apply` the runner refuses to run
 inside Claude Code. Tests:
 [`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py)
 for the step, and

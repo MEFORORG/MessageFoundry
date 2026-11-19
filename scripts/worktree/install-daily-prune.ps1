@@ -49,10 +49,10 @@
 
     THE RUNNER STOPS ITSELF BEFORE THE LIMIT. A task killed at its limit writes nothing, so the task
     passes run-daily-prune.ps1 -StopAfterMinutes, the limit less the margin $STOP_MARGIN_MINUTES sets.
-    Past that point the runner starts no further removal.
-    That margin covers one removal in flight, or the step's listing run, and the closing lines. It does
-    not cover a hung prune-merged.ps1 run: the runner does not bound those, and a run killed inside the
-    first one leaves its log ending after the "prune-merged.ps1 running" marker.
+    Past that point the runner starts no further removal, kills a prune-merged.ps1 run still going (a
+    hung one included) with its process tree, logs it as TIMED OUT, writes its exit line and exits 4,
+    STOPPED; run-daily-prune.ps1's header says how. That margin covers one removal in flight, or the
+    kill of a prune-merged.ps1 run, and the closing lines.
 
 .PARAMETER Apply
     Register the task to actually remove worktrees. Omit this -- the default -- and the task dry-runs and
@@ -110,8 +110,10 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # How long before the task's limit the runner stops starting removals. It has to cover one removal in
-# flight (about 23 s on average on 2026-11-18, 157 an hour) or a listing run started just before the
-# deadline, then the closing lines. The only timing on record for a listing run is a bound: the whole
+# flight (about 23 s on average on 2026-11-18, 157 an hour) or the kill of a prune-merged.ps1 run still
+# going at the deadline (the runner waits at most 15 s for the killed tree's output), then the closing
+# lines. Before the runner bounded those runs, the margin also had to cover a listing run started just
+# before the deadline; 20 was set then and is kept. The only timing on record for a listing run is a bound: the whole
 # 2026-11-16 run, both prune-merged.ps1 runs and 633 listed rows, took 17 minutes. Larger populations
 # have not been timed, so 20 is a judgement on that one figure, not a measurement at today's count.
 $STOP_MARGIN_MINUTES = 20
