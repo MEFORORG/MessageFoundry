@@ -398,7 +398,7 @@ function Test-WindowHasNumber($w) {
 function Get-RootSummary([string]$Root) {
     $sd = Get-UsageStateDir $Root
     $lp = Join-Path $sd "latest.json"
-    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; seven = $null; age_min = $null; stale = $false; available = $true; pending_from = $null }
+    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; seven = $null; age_min = $null; stale = $false; dated_ahead = $false; available = $true; pending_from = $null }
     # THE SURVEY IS WHERE A CANCELLED ACCOUNT DOES ITS DAMAGE, because the survey is the only place
     # accounts are COMPARED -- and a dead one presents as the emptiest pool in the list. Checked per
     # row against that row's own root, before its document is opened, for the same ordering reason the
@@ -447,6 +447,7 @@ function Get-RootSummary([string]$Root) {
     # which passes `age -gt max` unconditionally and rendered as fresh.
     $aheadOf = if ($null -ne $sa) { $d.seven_day.captured_at } else { $d.captured_at }
     $datedAhead = Test-DatedAfterNow $aheadOf
+    $s.dated_ahead = $datedAhead
     $s.stale = ($null -eq $s.age_min) -or ($s.age_min -gt $MaxAgeMinutes) -or $datedAhead
     if (-not $sevenOurs) {
         $s.note = "REFUSED -- this window was observed under a DIFFERENT config root"
@@ -483,7 +484,10 @@ function Write-Survey {
                 $v = if ($null -ne $s.seven) { "7d {0,3:0}%" -f $s.seven } else { "7d   -" }
                 # Two branches rather than a computed -ForegroundColor: passing $null to that parameter
                 # throws ("Cannot convert null to type System.ConsoleColor"), measured.
-                if ($s.stale) {
+                if ($s.dated_ahead) {
+                    Write-Host ("    {0,-46} {1}   [STALE -- dated {2} min ahead of now]{3}" -f $s.root, $v, [math]::Abs([double]$s.age_min), $mark) -ForegroundColor DarkGray
+                }
+                elseif ($s.stale) {
                     Write-Host ("    {0,-46} {1}   [STALE -- confirmed {2} min ago, max {3}]{4}" -f $s.root, $v, $s.age_min, $MaxAgeMinutes, $mark) -ForegroundColor DarkGray
                 }
                 else {

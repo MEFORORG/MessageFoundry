@@ -4274,7 +4274,8 @@ def test_the_survey_does_not_render_a_future_dated_reading_as_fresh(fake_home: P
     assert "FUTURE" in row["note"], row
     _, _, human = reader("-AllRoots", pin=pin, home=fake_home)
     line = next(x for x in human.splitlines() if str(pin) in x and "7d" in x)
-    assert "STALE" in line, human
+    assert "STALE" in line and "min ahead of now" in line, human
+    assert "confirmed -" not in line, human
 
 
 def test_the_survey_still_reads_a_fresh_row_as_fresh(fake_home: Path) -> None:
@@ -4284,5 +4285,5 @@ def test_the_survey_still_reads_a_fresh_row_as_fresh(fake_home: Path) -> None:
     _stamp(pin / "mefor-usage", pin)
     _, doc, _ = reader("-AllRoots", "-Json", pin=pin, home=fake_home)
     row = _row(doc, pin)
-    assert row["stale"] is False, row
+    assert row["stale"] is False and row["dated_ahead"] is False, row
     assert "FUTURE" not in row["note"], row
