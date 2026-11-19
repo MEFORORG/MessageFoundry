@@ -155,10 +155,8 @@ relaunched in a tight loop, each pass a full interpreter start and config load.
 Per-shard structured-log aggregation and graceful in-flight drain on restart remain deferred. This
 implements vault BACKLOG #2773.
 
-**Note (2026-11-18, BACKLOG #5894):** `supervise` now also returns 3, which outranks 0 and 1, when
-the shutdown drain may have left an engine shard's child running: a child the force could not end,
-or a launch still running `terminate_grace` seconds after the drain cancelled it. It joins the
-existing non-zero codes, 1 when every engine shard tripped the breaker and 2 on a config or
-discovery error. Known limit: a launch that ignores every cancellation, which only an injected
-spawn can make, is reported as exit 3, and `asyncio.run`'s teardown may then still wait on it. The
+**Note (2026-11-18, BACKLOG #5894):** `supervise` now also returns 3, which outranks 0 and 1,
+when it returns with `Supervisor.drain_failure` set. It joins the existing non-zero codes, 1 when
+every engine shard tripped the breaker and 2 on a config or discovery error. Known limit: a launch
+that ignores every cancellation, which only an injected spawn can make, is reported as exit 3, and `asyncio.run`'s teardown may then still wait on it. The
 `supervise` docstring in `messagefoundry/pipeline/supervisor.py` lists every code.

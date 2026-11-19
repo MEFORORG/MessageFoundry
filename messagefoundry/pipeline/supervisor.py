@@ -341,8 +341,7 @@ class Supervisor:
     crash_looped: set[str] = field(default_factory=set, init=False)
     #: Set once the current :meth:`run`'s drain may have left an engine shard's child running, and
     #: ``None`` otherwise. :meth:`_terminate_all` sets it before its first await and settles it at
-    #: the end, so a drain cut short still reads as failed. :func:`supervise` maps it to exit 3,
-    #: however ``run`` itself ended.
+    #: the end, so a drain cut short still reads as failed. :func:`supervise` maps it to exit 3.
     drain_failure: ShardDrainError | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -795,11 +794,10 @@ async def supervise(
     Installs SIGINT/SIGTERM handlers (when ``install_signal_handlers``) that trigger a clean drain.
     Runs while any engine shard is alive. Returns 0 on a clean shutdown, 1 when every engine shard
     tripped the crash-loop breaker, 2 on a config/discovery error, which includes a graph
-    ``registry_guard`` refuses (:func:`discover_shard_specs`), and 3 when the shutdown drain may
-    have left an engine shard's child running (:attr:`Supervisor.drain_failure`), which outranks 0
-    and 1, however the supervisor itself ended. Known limit: a launch, which only an injected
-    ``spawn`` can make, that ignores every cancellation is reported as exit 3, and
-    ``asyncio.run``'s teardown may then still wait on it.
+    ``registry_guard`` refuses (:func:`discover_shard_specs`), and 3 when
+    :attr:`Supervisor.drain_failure` is set, which outranks 0 and 1. Known limit: a launch, which
+    only an injected ``spawn`` can make, that ignores every cancellation is reported as exit 3,
+    and ``asyncio.run``'s teardown may then still wait on it.
 
     While the engine shards run, a :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`
     applies a replaced CRL file to this process's own TLS contexts, as an engine process's runner
@@ -952,8 +950,7 @@ async def _run_supervisor(
                 # backstops Ctrl-C there. Non-fatal.
                 pass
 
-    # The drain's outcome is read from the supervisor, not from how run() ended, so a drain that
-    # failed or was cut short is exit 3 on every path below.
+    # The drain's outcome is read from the supervisor, not from how run() ended.
     try:
         await runner
     except asyncio.CancelledError as exc:
