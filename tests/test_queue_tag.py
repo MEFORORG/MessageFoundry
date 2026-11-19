@@ -21,6 +21,7 @@ import messagefoundry
 from messagefoundry.pipeline.alerts import QUEUE_TAG_SUBJECT, alert_cell_tag_failure
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import (
+    AADComponentError,
     AesGcmCipher,
     CipherError,
     aad_cell_name,
@@ -84,7 +85,7 @@ def test_a_null_destination_is_not_the_text_none_or_blank() -> None:
     }
     assert len(tags) == 3
     # cell_aad now refuses a None component rather than spell it "None" (BACKLOG #5962).
-    with pytest.raises(TypeError):
+    with pytest.raises(AADComponentError):
         cell_aad("queue", "payload", None)
 
 

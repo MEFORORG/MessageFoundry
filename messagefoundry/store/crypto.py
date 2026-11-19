@@ -327,7 +327,9 @@ _GCM_RESERVE_REFILL_AT = _GCM_RESERVE_BLOCK // 2
 # --- cell-bound AAD (ASVS 11.3.3, ADR 0019) -----------------------------------------------------------
 # The scheme tag prefixed into every cell_aad. Its own version so the AAD-construction scheme can evolve
 # additively (a future mfenc-aad/v2 would be a different bound value — a deliberate, migrated change,
-# never a silent one). NOT related to the mfenc marker version.
+# never a silent one). NOT related to the mfenc marker version. BACKLOG #5962 changed v1's spelling of
+# an integral float key component ("1000.0" became "1000") without a bump: nothing is deployed, and a
+# cell sealed with one never opened from its float column anyway.
 _AAD_SCHEME = b"mfenc-aad/v1"
 
 
@@ -347,7 +349,9 @@ def cell_aad(table: str, column: str, *pk: object) -> bytes:
     irrelevant to GCM (it is hashed into the tag), so a verbose, collision-free form is free.
 
     A component must be a ``str``, an ``int`` or a ``float`` (:func:`_aad_component` says why each
-    other type is refused and how a number is spelled). A ``TypeError`` here is a caller bug."""
+    other type is refused and how a number is spelled). Any other value raises
+    :class:`AADComponentError`, a :class:`CipherError`, because on a read path it comes from a damaged
+    or planted row, which the caller must contain like any cell that does not open."""
     fields = (
         _AAD_SCHEME,
         table.encode("utf-8"),
@@ -364,23 +368,30 @@ def _aad_component(value: object) -> bytes:
     is spelled by its value, not its Python type: a timestamp column (SQLite ``REAL``, Postgres
     ``DOUBLE PRECISION``, SQL Server ``FLOAT``) returns ``1000.0`` for an ``int`` 1000 written into
     it, and both must bind ``1000``. An integral float is therefore spelled as its integer, and any
-    other float by ``repr``, which round-trips exactly. ``None`` and ``bool`` are refused: ``str()``
-    would bind ``None`` and ``True`` to the same bytes as the strings ``"None"`` and ``"True"``, and
-    no key column holds either. Any other type is refused rather than ``str()``-spelled, since its
-    text form need not match what the column returns. A string is UTF-8 with ``surrogatepass``, so a
-    lone surrogate binds bytes no valid string produces instead of raising here; the backend's own
-    write still refuses to store one."""
+    other float by ``float.__repr__``, which round-trips exactly. The base types' own methods are
+    called, so a subclass (an ``int``-valued Enum member, say) is spelled as the value a driver binds,
+    never by its own ``__str__``. ``None`` and ``bool`` are refused: ``str()`` would bind them to the
+    same bytes as the strings ``"None"`` and ``"True"``, and no key column holds either. Any other
+    type is refused rather than ``str()``-spelled, since its text form need not match what the
+    column returns. A string is UTF-8 with ``surrogatepass``, so a lone surrogate binds bytes no
+    valid string produces instead of raising here; the backend's own write still refuses one.
+
+    Not covered: a float bound into a TEXT-affinity key column comes back as the text ``"1000.0"``,
+    and an int past 2**53 written to a float column comes back rounded. No key column today takes
+    either."""
     if isinstance(value, str):
-        return value.encode("utf-8", "surrogatepass")
+        return str.encode(value, "utf-8", "surrogatepass")
     if isinstance(value, bool) or value is None:
-        raise TypeError(f"cell_aad key component must not be {value!r}")
+        raise AADComponentError(f"cell_aad key component must not be {value!r}")
     if isinstance(value, int):
-        return str(value).encode("ascii")
+        return int.__repr__(value).encode("ascii")
     if isinstance(value, float):
-        if value.is_integer():
-            return str(int(value)).encode("ascii")
-        return repr(value).encode("ascii")
-    raise TypeError(f"cell_aad key component must be str, int or float, not {type(value).__name__}")
+        if float.is_integer(value):
+            return int.__repr__(int(value)).encode("ascii")
+        return float.__repr__(value).encode("ascii")
+    raise AADComponentError(
+        f"cell_aad key component must be str, int or float, not {type(value).__name__}"
+    )
 
 
 def aad_cell_name(aad: bytes | None) -> tuple[str, str]:
@@ -701,6 +712,14 @@ class CipherError(Exception):
     It also covers a **corrupt row** that no key fixes (BACKLOG #2308): a value whose tag verified
     but whose plaintext is not UTF-8, or, at an eager read seam (:func:`decrypt_json_cell`), is not
     JSON. The message says which, so an operator is not sent looking for a missing key."""
+
+
+class AADComponentError(CipherError, TypeError):
+    """A :func:`cell_aad` key component is not a ``str``, ``int`` or ``float`` (BACKLOG #5962).
+
+    A :class:`CipherError`, so a read or rotation path that contains an unopenable cell contains a
+    row whose key column holds a NULL or a BLOB the same way. Also a ``TypeError``, because on a write
+    path it is a caller passing the wrong type. The message names the type, never the row."""
 
 
 class TransitSealRefused(Exception):

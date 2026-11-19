@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import base64
+import enum
 import inspect
 import json
 import logging
@@ -18,6 +19,7 @@ from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.crypto import (
     MARKER_PREFIX,
     PREFIX,
+    AADComponentError,
     AesGcmCipher,
     CipherError,
     IdentityCipher,
@@ -639,7 +641,8 @@ def test_cell_aad_unambiguous_and_backend_agnostic() -> None:
     assert cell_aad("messages", "raw", "1") != cell_aad("messages", "error", "1")
     assert cell_aad("messages", "raw", "1") != cell_aad("messages", "raw", "2")
     # Same logical cell → identical AAD regardless of PK column type (SQLite int id vs a str id on a
-    # server-DB): str()-encoding makes 5 and "5" the same bound value, so re-encrypt/cross-backend agree.
+    # server-DB): an int is spelled as its decimal text, so 5 and "5" are the same bound value and
+    # re-encrypt/cross-backend agree.
     assert cell_aad("attachment_chunk", "ciphertext", 5, 0) == cell_aad(
         "attachment_chunk", "ciphertext", "5", "0"
     )
@@ -1214,23 +1217,34 @@ def test_cell_aad_spells_a_number_by_its_value_not_its_type() -> None:
     assert cell_aad("connection_event", "reason", "IB", 1000, "k") == cell_aad(
         "connection_event", "reason", "IB", 1000.0, "k"
     )
-    # A non-integral float is spelled exactly (repr round-trips), and stays distinct from its neighbours.
+    # A non-integral float is spelled by its shortest exact repr, distinct from its integer neighbour.
     ts = 1763400000.123456
-    assert cell_aad("message_events", "detail", "m", ts, "e") == cell_aad(
-        "message_events", "detail", "m", float(repr(ts)), "e"
-    )
-    assert cell_aad("message_events", "detail", "m", ts, "e") != cell_aad(
-        "message_events", "detail", "m", 1763400000, "e"
-    )
-    # The spelling of every value a store already bound is unchanged.
-    assert cell_aad("t", "c", 5, "x", ts) == cell_aad("t", "c", "5", "x", repr(ts))
+    assert cell_aad("t", "c", ts) == cell_aad("t", "c", "1763400000.123456")
+    assert cell_aad("t", "c", ts) != cell_aad("t", "c", 1763400000)
+    # A str, an int and a non-integral float bind the bytes they bound before; an integral float
+    # ("1000.0" before) is the one spelling that changed.
+    assert cell_aad("t", "c", 5, "x") == cell_aad("t", "c", "5", "x")
+
+
+def test_cell_aad_spells_a_subclass_by_its_value() -> None:
+    # A driver binds an int-valued Enum member as its value, so the reader gets 1, not "K.A".
+    class K(enum.IntEnum):
+        A = 1
+
+    class S(enum.StrEnum):
+        X = "x"
+
+    assert cell_aad("t", "c", K.A) == cell_aad("t", "c", 1)
+    assert cell_aad("t", "c", S.X) == cell_aad("t", "c", "x")
 
 
 @pytest.mark.parametrize("bad", [None, True, False, b"x", object()])
 def test_cell_aad_refuses_a_component_str_would_collide_or_misspell(bad: object) -> None:
-    # str(None) == "None" and str(True) == "True" would bind the same AAD as those strings.
-    with pytest.raises(TypeError):
+    # str(None) == "None" and str(True) == "True" would bind the same AAD as those strings. The
+    # refusal is a CipherError too, so a read path contains a NULL or BLOB key like any unopenable cell.
+    with pytest.raises(AADComponentError) as ei:
         cell_aad("t", "c", bad)
+    assert isinstance(ei.value, CipherError) and isinstance(ei.value, TypeError)
 
 
 def test_cell_aad_binds_a_lone_surrogate_instead_of_raising() -> None:
