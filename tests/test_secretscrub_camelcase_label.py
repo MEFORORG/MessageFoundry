@@ -490,10 +490,17 @@ def _dense_lines(count: int, seed: int) -> list[str]:
 
 #: DSN lines for the differential, each beside a label of the corpus, built in order so the seeded
 #: lines above stay as they were. The widened DSN pass (BACKLOG #5386) reads each password; the
-#: label after it is what that pass must not take.
+#: label after it is what that pass must not take. In the last two heads the DSN is itself a
+#: camelCase label's value, whose end a later reading finds at a ";" (code review of #5386).
 _DSN_LINES = tuple(
     f"connect {head}{sep}{label}{assign}vq2"
-    for head in ("redis://:vq0@h", "postgres://svc:vq0@vq1;w@h:5432", "redis://:vq0%40vq1@h")
+    for head in (
+        "redis://:vq0@h",
+        "postgres://svc:vq0@vq1;w@h:5432",
+        "redis://:vq0%40vq1@h",
+        "accessToken=redis://:vq0;w@h",
+        "clientSecret=redis://:vq0@vq1;w@h",
+    )
     for sep in (" failed ", ";", "?", "&")
     for label in _DENSE_LABELS
     for assign in ("=", "='vq3;PWD='")

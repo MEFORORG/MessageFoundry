@@ -46,13 +46,12 @@ def test_the_reading_before_kept_whole_still_runs_the_widened_pass(
 
     monkeypatch.setattr(scrub_mod, "_run", spy)
     out = scrub_credentials(line)
-    # Control: three readings ran: the narrow probe the shortcut is decided on, which changed the
-    # line so the shortcut was not taken; the reading before, which is what came back; and the
-    # shipped one, which hid the ``;PWD=`` member key the reading before printed. That is what
-    # sends the line down this branch rather than the merged one.
-    assert len(results) == 3 and out == results[1], (results, out)
-    assert results[0] != line, results
-    assert ";PWD=" in results[1] and ";PWD=" not in results[2], results
+    # Control: two readings ran to the end, the first, the reading before, is what came back, and
+    # the second hid the ``;PWD=`` member key the first printed, which is what sends the line down
+    # this branch rather than the merged one. The shortcut's probe stops at its first match, by
+    # raising, so it returns nothing to the spy.
+    assert len(results) == 2 and out == results[0], (results, out)
+    assert ";PWD=" in results[0] and ";PWD=" not in results[1], results
     assert secret not in out, out
     assert CREDENTIAL_PLACEHOLDER in out
 
@@ -68,8 +67,8 @@ def test_an_untraceable_line_still_runs_the_widened_pass(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(scrub_mod._Trace, "sub", untraceable)
     for line, secret in (
-        ("connect redis://:Zq-Pw_2@h failed userPwd=x", "Zq-Pw_2"),
-        ("connect postgres://svc:Kv9y@Zq8_Tail@h failed userPwd=x", "Zq8_Tail"),
+        ("connect redis://:Zq-Pw_2@h failed password=x userPwd=x", "Zq-Pw_2"),
+        ("connect postgres://svc:Kv9y@Zq8_Tail@h failed password=x userPwd=x", "Zq8_Tail"),
     ):
         calls.clear()
         out = scrub_credentials(line)
@@ -101,7 +100,7 @@ _MAX_GROWTH = 24.0
 #: Adversarial shapes, each a function of the run length. The first three reach no "@" the match
 #: could end at, so the scan walks the whole run and fails, which is the worst case. The fourth
 #: matches, over a run holding many "@"; the fifth packs scheme heads, each a match attempt. The
-#: last three are the alternatives added items 3 and 4 put in the segments, each a lookahead.
+#: sixth is the "%" alternative added item 3 put in an empty user's first segment.
 _WIDE_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     # An empty user's first segment over a run both of its classes take: the split the possessive
     # quantifier exists to refuse.
@@ -114,12 +113,8 @@ _WIDE_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     ("user, at-sign run", lambda n: "postgres://svc:<redacted>" + ("@a" * n)[:n] + " "),
     # Many scheme heads glued together, so the scan starts a match at every one of them.
     ("glued scheme heads", lambda n: ("a.b-://:" * n)[:n]),
-    # An empty user's first segment over "%" and "[", each "%" a lookahead (added item 3).
-    ("empty user, percent run", lambda n: "redis://:" + ("%a[" * n)[:n]),
-    # The run after over ";", each a lookahead to the next ";" (added item 4).
-    ("user, semicolon run", lambda n: "postgres://svc:<redacted>" + (";a@" * n)[:n] + " "),
-    # One ";" whose lookahead walks the whole run, which reaches no "=" and no "@".
-    ("empty user, one long lookahead", lambda n: "redis://:" + ("a;" + "b" * n)[:n]),
+    # An empty user's first segment over "%", each a fixed-width lookahead (added item 3).
+    ("empty user, percent run", lambda n: "redis://:" + ("%a" * n)[:n]),
 )
 
 
@@ -167,8 +162,8 @@ def test_the_widened_dsn_pattern_grows_linearly_in_line_length() -> None:
 def test_the_growth_shapes_reach_the_widened_pattern() -> None:
     """The shapes above are only evidence if the pattern reads them: each opens a scheme head the
     pattern starts on. The first three match once the run ends in "@"; the fourth matches as it
-    stands; the fifth starts a match at each of its heads. Of the last three, the sixth and eighth
-    match once the run ends in "@", and the seventh as it stands."""
+    stands; the fifth starts a match at each of its heads; the sixth matches once the run ends in
+    "@"."""
     wide = scrub_mod._WIDE_DSN_PASSWORD
     shapes = dict(_WIDE_SHAPES)
     for label, shape in _WIDE_SHAPES[:3]:
@@ -176,9 +171,7 @@ def test_the_growth_shapes_reach_the_widened_pattern() -> None:
     assert wide.search(shapes["user, at-sign run"](64)) is not None
     glued = shapes["glued scheme heads"](64)
     assert len(wide.findall(glued.replace("://:", "://:x@"))) >= 4
-    for label in ("empty user, percent run", "empty user, one long lookahead"):
-        assert wide.search(shapes[label](64) + "@h") is not None, label
-    assert wide.search(shapes["user, semicolon run"](64)) is not None
+    assert wide.search(shapes["empty user, percent run"](64) + "@h") is not None
 
 
 def test_both_readings_apply_the_same_widened_pattern() -> None:

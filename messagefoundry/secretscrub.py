@@ -407,9 +407,9 @@ _CAMEL_INITIALS = "".join(sorted({word[0].upper() for word in _CAMEL_WORDS}))
 # A line where this start or a compound key word could read anything is scrubbed twice, with these
 # patterns and with :func:`_pre_camel` of them, and :func:`_union` keeps a character only where the
 # second reading, the one ``origin/main`` shipped, printed it too (:func:`_run` says where the
-# widened DSN pass runs). THAT HOLDS FOR THIS FUNCTION'S OWN OUTPUT, by construction. A pass that reads that output AFTERWARDS can still differ: :func:`_union`
-# keeps the reading before whole where the bundle's member mask would lose a ";" key, and a record
-# filtered twice is a pinned residual. ``tests/test_secretscrub_camelcase_label.py`` measures the
+# widened DSN pass runs). THAT HOLDS FOR THIS FUNCTION'S OWN OUTPUT, by construction. A pass that
+# reads that output AFTERWARDS can still differ: :func:`_union` keeps the reading before whole
+# where the bundle's member mask would lose a ";" key, and a record filtered twice is a pinned residual. ``tests/test_secretscrub_camelcase_label.py`` measures the
 # chain and the bundle and holds the residual.
 #: One lower-case letter or digit as the ENCLOSING pattern's case rule reads it: an ASCII one, case-
 #: sensitively, or a non-ASCII character the pattern's own ``[a-z]`` takes. Under ``(?i)`` that is
@@ -1340,22 +1340,25 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # an "@": ``postgres://svc:pw@db:5432;sslpassword=Tail@Secret9`` came out as
 # ``svc:<placeholder>@Secret9``, because the label the member pass needed was inside the match, so
 # the tail printed where the old pattern let that pass mask it. So the run after the first segment
-# holds none of ``? # & , ( )`` or a quote, the characters a query or a quoted value starts after,
-# nor a ";" that opens a member, one followed by ``key=`` before the next ``; @ /`` or whitespace.
-# Any other ";" it may hold (BACKLOG #5386, added item 4): refusing every one cut
-# ``postgres://svc:Kv9x@Zq7;w@db`` at its first "@" and printed ``Zq7;w``. Nor does the run hold any
-# of ``| ^ ~ { } < > [ ] %``: a review measured ``|dbPassword=Tail@Sec`` print
+# holds none of ``; ? # & , ( )`` or a quote, the characters a member, a query or a quoted value
+# starts after, nor any of ``| ^ ~ { } < > [ ] %``: a review measured ``|dbPassword=Tail@Sec`` print
 # its tail, an HL7 run after the host, literal or percent-encoded, lose the separators the PHI pass
 # reads it by, and ``:587|cc=admin@corp`` name the wrong host, each where the run reached a later
-# "@". With a user, the old pattern runs first on both callers, :func:`_run` and
+# "@". A ";" that opens no ``key=`` member was tried too (BACKLOG #5386, added item 4) and declined:
+# a ";" this pass hides is one a LATER reading no longer ends a camelCase value at, so in
+# ``accessToken=redis://:Kv9;w@cache,userPwd='Sec;PWD='`` the support bundle, reading the log line,
+# printed ``Sec``, and ``smtp://ops:pw@mail:587;alerts@corp`` named the wrong host. With a user,
+# the old pattern runs first on both callers, :func:`_run` and
 # ``support.redact.redact_log_line``, and rewrites its match to ``user:<placeholder>@``, which this
 # one reads again, the placeholder as its whole first segment, so the tail after that "@" is read.
 #
-# AN EMPTY USER'S FIRST SEGMENT ALSO STOPS AT "=", AT ";", AND AT EVERY CHARACTER THE RUN AFTER IT
-# STOPS AT BUT "[", "]" AND A "%" THAT OPENS NO ENCODED HL7 SEPARATOR (``%7C``, ``%7E``, ``%5E``,
-# ``%26``, either case). Those three it takes (BACKLOG #5386, added item 3), so a percent-encoded
-# password, and one holding a ``[redacted]`` the PHI pass wrote first, are read; an encoded
-# separator still stops it, for the reason a literal "|" does, below.
+# AN EMPTY USER'S FIRST SEGMENT ALSO STOPS AT "=" AND AT EVERY CHARACTER THE RUN AFTER IT STOPS AT
+# BUT A "%" THAT OPENS NO ENCODED HL7 SEPARATOR (``%7C``, ``%7E``, ``%5E``, ``%26``, either case).
+# That "%" it takes (BACKLOG #5386, added item 3), so a percent-encoded password is read; an encoded
+# separator still stops it, for the reason a literal "|" does, below. It still stops at "[" and
+# "]", so it never crosses a placeholder: taking them was tried and declined, since the only
+# placeholder this reading crosses is a user's whole first segment, as ``support.redact`` and
+# ``docs/PHI.md`` state it.
 # Without the user the pattern reads ``ws://:8765?accessToken=Tail@Tok`` as a password-only DSN, and
 # a review measured the token's tail print where the old pattern, matching nothing, left the query
 # label to the member pass. And a "|" it took, as in ``redis://:Tk|mrn@h``, was a separator the PHI
@@ -1363,14 +1366,15 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # pass had hidden, printed (code review, round 4). The lookbehind ``(?<=//:)`` is what tells the two
 # cases apart. Residuals, at least these: a password whose own "@" is followed, before the host's
 # "@", by a character the run after the first segment stops at (the class above: at least
-# ``? # & , ( ) | ^ ~ { } < > [ ] %``, a quote, and a ";" that opens ``key=``, not "=") is cut at
-# that "@" and its tail prints, as the whole tail did before; and an empty user's password holding
-# one of those, or an encoded HL7 separator, is not read at all, as before #5386, so
-# ``redis://:p;k=ss@host`` and ``redis://:p%7Css@host`` print whole. An "=" and a ";" that opens
-# no key are not among them, so ``redis://:p=ss@host`` and ``redis://:p;ss@host`` are read and
-# hidden. Both count a character an earlier filter wrote: on the log chain the PHI pass runs first,
-# so a password holding a date- or name-shaped run reaches this pass holding ``[redacted]``, which
-# the first segment takes, and the run after it does not.
+# ``; ? # & , ( ) | ^ ~ { } < > [ ] %`` and a quote, not "=") is cut at that "@" and its tail
+# prints, as the whole tail did before, so ``postgres://svc:Kv9x@Zq7;w@db`` prints ``Zq7;w``; and
+# an empty user's password holding one of those but a "%", or holding an encoded HL7 separator, is
+# not read at all, as before #5386, so ``redis://:p;ss@host`` and ``redis://:p%7Css@host`` print
+# whole. An "=" is not one of those: the run after the first segment may hold it, so
+# ``redis://:p=ss@host`` is read and hidden. Both count a character an earlier filter wrote: on the
+# log chain the PHI pass runs first, so a password holding a date- or name-shaped run reaches this
+# pass holding ``[redacted]``, and ``redis://:Zq7-19800505-Kv9x@host`` prints ``Zq7-`` and
+# ``-Kv9x`` (code review, round 4).
 #
 # AN EMPTY USER'S FIRST SEGMENT MAY BE EMPTY (``*+``), so ``redis://:=Pw@db`` and ``redis://:@Pw@db``
 # are read (code review of BACKLOG #5386). WITH A USER IT MAY NOT (``++``), so
@@ -1385,9 +1389,7 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # CLASSES OVERLAP. Backtracking into it
 # would try every split of a run that reaches no "@", which is quadratic; possessive, it gives
 # nothing back, so the run after it is the only walk and backs off to its last "@". Written flat,
-# not as a repeated "@"-led group, so no quantifier nests under another outside a lookahead; the
-# one inside the ";" alternative's lookahead stops at the next ";", so those walks do not overlap.
-# The static ReDoS gate in
+# not as a repeated "@"-led group, so no quantifier nests under another. The static ReDoS gate in
 # ``tests/test_security_static.py`` DOES NOT SCAN this pattern: it splices ``_DSN_RUN_STOP`` below,
 # so that gate lists it among the patterns it cannot resolve, and the shape is held by inspection,
 # stated there. The growth is held by a stopwatch, against a backtracking control, in
@@ -1432,11 +1434,11 @@ _WIDE_DSN_PASSWORD = re.compile(
     r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
     r"(?:(?<=//:)(?:"
     + _DSN_RUN_STOP
-    + r"(?:[^\s/@?#&=;,()|^~{}<>%\x27\x22]|%(?!7c|7e|5e|26)))*+|(?<!//:)"
+    + r"(?:[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22]|%(?!7c|7e|5e|26)))*+|(?<!//:)"
     + _DSN_USER_FIRST_SEGMENT
     + r")(?:"
     + _DSN_RUN_STOP
-    + r"(?:[^\s/;?#&,()|^~{}<>\[\]%\x27\x22]|;(?![^\s/;@=]*=)))*@"
+    + r"[^\s/;?#&,()|^~{}<>\[\]%\x27\x22])*@"
 )
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
@@ -2275,7 +2277,10 @@ def _run(
 # comment on :data:`_CAMEL_START` gives the measurement). So on a line where they can read anything,
 # :func:`scrub_credentials` runs :func:`_run` twice, once with the shipped patterns and once with
 # :func:`_pre_camel` of each, which is exactly the pattern without them, and keeps a character of the
-# first output only where the second kept it too.
+# first output only where the second kept it too. Before those two runs :func:`_union` probes the
+# second reading with a search per pattern, stopping at the first match (BACKLOG #5386); a line
+# where none matches takes the shipped run alone. So a union line costs that probe and two runs, or
+# the probe and one.
 #
 # A LINE WHERE THEY CANNOT READ ANYTHING TAKES ONE RUN, and that is what keeps this affordable. Each
 # needs one of two things in the line. A camelCase label and a split unit's stop both need
@@ -2367,6 +2372,16 @@ def _pre_camel_sub(
     pattern: re.Pattern[str], repl: _Repl, text: str, _tail: str | int | None
 ) -> str:
     return _pre_camel(pattern).sub(repl, text)
+
+
+class _Changed(Exception):
+    """A pattern of :func:`_union`'s shortcut probe matched, so the reading before changes the line."""
+
+
+def _probe_sub(pattern: re.Pattern[str], _repl: _Repl, text: str, _tail: str | int | None) -> str:
+    if _pre_camel(pattern).search(text) is not None:
+        raise _Changed
+    return text
 
 
 class _Untraceable(Exception):
@@ -2468,10 +2483,14 @@ def _union(text: str, placeholder: str, folded: str | None) -> str:
         # member-key branch below and kept the reading before whole, which reads no camelCase label,
         # so ``Sec`` printed where the shipped reading hid it. Unchanged, the shipped reading,
         # which runs the widened pass itself, is the whole answer, as it was on origin/main.
-        # A trace, not a plain sub, because only a trace returns the very text where no pattern
-        # matched, so a replacement that writes back what it read still counts as a change.
-        probe = _Trace(len(text), _pre_camel)
-        if _run(text, placeholder, folded, probe.sub, wide=False) is text:
+        # origin/main's test was its trace returning the very line, which it does where no pattern
+        # matched. Until one matches the text is unchanged, so a search per pattern, stopping at
+        # the first that finds anything, answers the same question without rewriting anything.
+        try:
+            _run(text, placeholder, folded, _probe_sub, wide=False)
+        except _Changed:
+            pass
+        else:
             return _run(text, placeholder, folded)
         old = _run(text, placeholder, folded, before.sub)
         new = _run(text, placeholder, folded, shipped.sub)

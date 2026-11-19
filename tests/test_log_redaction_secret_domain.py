@@ -1494,23 +1494,22 @@ def test_a_label_glued_after_a_dsn_is_masked_and_main_did_no_better(
 
 def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> None:
     """The residuals secretscrub's ``_WIDE_DSN_PASSWORD`` comment states, pinned both ways. A
-    password-only DSN whose value holds "=" is read; one holding "|", an encoded HL7 separator, or a
-    ";" that opens a ``key=`` member is not, and prints whole; and with a user, a password that starts with "@" prints, as it did before #5386. A red on a
-    residual line means the comment is stale, not that a leak opened."""
+    password-only DSN whose value holds "=" or a "%" is read; one holding ";", "|" or an encoded HL7
+    separator is not, and prints whole; and with a user, a password that starts with "@" prints, as
+    it did before #5386. A red on a residual line means the comment is stale, not that a leak
+    opened."""
     for line in ("redis://:pw=Eq_Sec-81@host", "ws://:8765=accessToken=Tail@Tok_Sec-82"):
         for out in (redact_log_line(line), scrub_credentials(line)):
             assert "Eq_Sec-81" not in out and "Tok_Sec-82" not in out, out
-    # A ";" that opens no member key, and a "%", "[" or "]" in the first segment, are read since
-    # BACKLOG #5386's added items 3 and 4; tests/test_b532r_redaction_segments.py holds them.
-    assert "Semi_Sec-83" not in scrub_credentials("redis://:pw;Semi_Sec-83@host")
-    assert "pw;k=Semi_Sec-85" in scrub_credentials("redis://:pw;k=Semi_Sec-85@host")
+    assert "pw;Semi_Sec-83" in scrub_credentials("redis://:pw;Semi_Sec-83@host")
     assert "pw|Pipe_Sec-84" in scrub_credentials("redis://:pw|Pipe_Sec-84@host")
     assert "p%7CKv9x" in scrub_credentials("redis://:p%7CKv9x@host")
     assert "Lead_At-74" in scrub_credentials("store dsn postgres://svc:@Lead_At-74@db.invalid/m")
-    # Round 4 review: a placeholder the PHI pass wrote first, and a percent-encoded password. Both
-    # are read now, the placeholder's brackets and the "%" being in the first segment's class.
+    # Round 4 review: a placeholder the PHI pass wrote first is a residual. A percent-encoded
+    # password is read since BACKLOG #5386's added item 3; tests/test_b532r_redaction_segments.py
+    # holds it.
     chained = scrub_credentials(redact_untrusted("connect redis://:Zq7-19800505-Kv9x@host failed"))
-    assert "Zq7-" not in chained and "-Kv9x" not in chained, chained
+    assert "Zq7-" in chained and "-Kv9x" in chained, chained
     assert "Kv9x" not in scrub_credentials("redis://:p%40Kv9x@host")
     # A line where the union keeps the reading before whole is no longer a residual (BACKLOG #5386,
     # added item 2); tests/test_b532r_redaction_dsn.py holds it. The control takes no union.
