@@ -3778,11 +3778,12 @@ every backend it writes only while the account row, read inside the write's own 
 holds the six lockout columns, `disabled`, `auth_provider`, `directory_object_id` and
 `session_epoch` of the row the proof decided on. So a failure, a lock, a disable, a re-bind or an
 end-every-session raise that any writer commits after that read, on this engine shard or another,
-leaves the counters as they are; on SQLite the conditional write takes the write lock before its
-read, so another process cannot commit in between. The compare reads the account row only: a revoke
-of the rotated session itself, after the rotation and before the clear, is not seen. At least these
-outcomes follow, and **only on a re-auth whose clear is due**; a re-auth with nothing to clear makes
-no such check:
+leaves the counters as they are. On SQLite the conditional write does its Vault transit work
+before it takes the write lock, then re-reads the row under that lock and writes only if the row is
+the one that work read, so another process cannot commit in between. The compare reads the account
+row only: a revoke of the rotated session itself, after the rotation and before the clear, is not
+seen. At least these outcomes follow, and **only on a re-auth whose clear is due**; a re-auth with
+nothing to clear makes no such check:
 
 - A changed lockout column clears nothing, and the re-auth keeps its rotated session.
 - An account gone, disabled, re-bound or with its sessions ended, or whose record fails its seal

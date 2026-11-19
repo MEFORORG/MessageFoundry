@@ -15487,10 +15487,10 @@ class AuthService:
         unknown, since at least an ``OSError`` for a connection lost at the socket can follow a
         commit that landed. So ``audits`` are read back (:meth:`_reauth_clear_readback`). Found,
         the reset is in: the rows found are teed off-box, and the answer is ``"cleared"``. Not
-        found, or the read-back failing, the answer is ``"refused"``: the session has already
-        rotated, and the caller writes its own row, hard, so the step-up is granted only once that
-        row is in. So is a Vault transit Outage, which is paged (ADR 0217's Outage row ends
-        nothing). A seal refusal of another kind than the account's record raises, as on the login
+        found, or the read-back failing, the store error is re-raised: the reset's answer on the
+        account is not known, so nothing is granted. A Vault transit Outage, which is paged (ADR
+        0217's Outage row ends nothing), answers ``"refused"``: the caller writes its own row,
+        hard. A seal refusal of another kind than the account's record raises, as on the login
         leg, and so does a defect."""
         now = time.time()
         try:
@@ -15532,23 +15532,19 @@ class AuthService:
                     type(exc).__name__,
                 )
                 return "cleared"
-            if readback == "absent":
-                _log.warning(
-                    "a re-auth of account id %r rotated its session, but its lockout reset raised "
-                    "(%s) and the rows it would have committed were not found when read back, so "
-                    "it is answered as refused",
-                    decided.id,
-                    type(exc).__name__,
-                )
-            else:
-                _log.warning(
-                    "a re-auth of account id %r had its lockout reset raise (%s) and could not "
-                    "read back whether it committed, so the reset's outcome is unknown; it is "
-                    "answered as refused, and the re-auth writes its own row",
-                    decided.id,
-                    type(exc).__name__,
-                )
-            return "refused"
+            # Not found, or not readable: the compare-and-set's answer on the account is not
+            # known, so nothing is granted. The error propagates, as it did from the re-proof
+            # before the clear was deferred, and the rotated token is never handed back.
+            _log.warning(
+                "a re-auth of account id %r had its lockout reset raise (%s), and %s, so it grants "
+                "nothing",
+                decided.id,
+                type(exc).__name__,
+                "the rows it would have committed were not found when read back"
+                if readback == "absent"
+                else "whether it committed could not be read back",
+            )
+            raise
         if answer == "written":
             return "cleared"
         if answer == "lockout_changed":
@@ -15933,8 +15929,9 @@ class AuthService:
             if not row_written or not finished:
                 # Soft on a raise, so a store fault on the row does not replace the exception
                 # propagating (a defect the soft write re-raises still does). Hard after a refused
-                # clear: the step-up is granted only once its row is in, and a fault that refuses
-                # the row too fails the re-auth closed, its rotated token never handed back.
+                # clear, which runs after the address was marked known and the purpose grant was
+                # minted: a fault that refuses the row raises, so the rotated token, and with it
+                # the grant, is never handed back, but the address stays marked known.
                 await self._write_reauth_row(
                     lost=lost or not finished,
                     actor=identity.username,

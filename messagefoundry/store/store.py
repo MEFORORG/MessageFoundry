@@ -10386,6 +10386,16 @@ def full_authentication_snapshot(user: UserRecord | UserRow) -> tuple[object, ..
     return tuple(values[col] for col in FULL_AUTHENTICATION_GUARD)
 
 
+@dataclass(frozen=True)
+class _PresealedUserWrite:
+    """A user write whose seal work is already done (BACKLOG #5900): ``read``, the record as read
+    and verified, and ``updated``, the change applied to it and sealed. Built only by
+    ``MessageStore._preseal_user``."""
+
+    read: UserAuthzRecord
+    updated: UserAuthzRecord
+
+
 class FullAuthenticationWrite:
     """The change :meth:`MessageStore.record_login_success` hands its backend's ``_write_user``
     (BACKLOG #5900): :func:`full_authentication_clear`, declined when ``expected`` is given and the
@@ -19615,27 +19625,60 @@ class MessageStore:
             )
             return [RoleGrant.from_mapping(dict(r)) for r in await cur.fetchall()]
 
-    async def _read_user_record(self, user_id: str) -> UserAuthzRecord | None:
+    async def _read_user_record(
+        self, user_id: str, db: aiosqlite.Connection | None = None
+    ) -> UserAuthzRecord | None:
         """The account's whole authorization record, read on the writer connection inside the
-        caller's transaction (BACKLOG #2592)."""
-        cur = await self._db.execute("SELECT * FROM users WHERE id=?", (user_id,))
+        caller's transaction (BACKLOG #2592), or on ``db`` when given."""
+        db = self._db if db is None else db
+        cur = await db.execute("SELECT * FROM users WHERE id=?", (user_id,))
         row = await cur.fetchone()
         if row is None:
             return None
-        cur = await self._db.execute(
+        cur = await db.execute(
             "SELECT role_id, assigned_at, assigned_by FROM user_roles WHERE user_id=?", (user_id,)
         )
         grants = [RoleGrant.from_mapping(dict(r)) for r in await cur.fetchall()]
         return UserAuthzRecord.of(UserRow.from_mapping(dict(row)), grants)
 
-    async def _write_user(self, user_id: str, change: UserChange) -> UserAuthzRecord | None:
+    async def _preseal_user(self, user_id: str, change: UserChange) -> _PresealedUserWrite | None:
+        """:meth:`_write_user`'s seal work, done holding no lock and no writer transaction, since
+        under a Transit sealer the verify and the seal are each a Vault round trip that every
+        other writer would otherwise wait behind (BACKLOG #5900). Reads the record on a read
+        connection, verifies its seal, applies ``change`` and seals the result. ``None`` when there
+        is no row or ``change`` declined; raises as ``_write_user`` does on a record that fails its
+        seal. A change that touches the role rows is refused: it needs the role check under the
+        lock, which this cannot give it."""
+        async with self._read() as db:
+            current = await self._read_user_record(user_id, db)
+        if current is None:
+            return None
+        await require_user_seal_for_write(self._row_sealer, current)
+        changed = change(current)
+        if changed is None:
+            return None
+        if changed.roles != current.roles:
+            raise ValueError("a presealed user write may not change the account's role rows")
+        return _PresealedUserWrite(current, await seal_user_async(self._row_sealer, changed))
+
+    async def _write_user(
+        self,
+        user_id: str,
+        change: UserChange,
+        *,
+        presealed: _PresealedUserWrite | None = None,
+    ) -> UserAuthzRecord | None:
         """The one writer of a user's sealed record (BACKLOG #2592). Call it inside a writer
         transaction on ``self._db``.
 
         Reads the row and its role rows, verifies the seal, applies ``change``, seals the result and
         writes every column with a compare on the seal it read, then rewrites the role rows when they
         changed. Returns the new record, or ``None`` when there is no row, ``change`` declined, or
-        the compare lost to a concurrent write; nothing is written then. Raises
+        the compare lost to a concurrent write; nothing is written then.
+
+        With ``presealed`` (:meth:`_preseal_user`) it makes no Transit call: ``change`` still
+        decides on the row read here, and the write is the presealed one, made only when that row
+        is exactly the record it was sealed from, else nothing is written. Without it, it raises
         :class:`RowSealError` (Forged) or, under a Transit sealer, its sibling
         :class:`RowSealUnverifiableError` or :class:`TransitSealUnavailableError` (Outage), and
         writes nothing, when the record it read does not verify or cannot be checked:
@@ -19645,16 +19688,24 @@ class MessageStore:
         current = await self._read_user_record(user_id)
         if current is None:
             return None
-        await require_user_seal_for_write(self._row_sealer, current)
+        if presealed is None:
+            await require_user_seal_for_write(self._row_sealer, current)
         changed = change(current)
         if changed is None:
             return None
-        if changed.roles != current.roles:
-            cur = await self._db.execute("SELECT id FROM roles")
-            changed = existing_roles_only(
-                current, changed, [str(r["id"]) for r in await cur.fetchall()]
-            )
-        updated = await seal_user_async(self._row_sealer, changed)
+        if presealed is not None:
+            # The row the seal work verified and sealed from, or nothing: a row changed since was
+            # verified by nobody, and the presealed record would undo the change.
+            if current != presealed.read:
+                return None
+            updated = presealed.updated
+        else:
+            if changed.roles != current.roles:
+                cur = await self._db.execute("SELECT id FROM roles")
+                changed = existing_roles_only(
+                    current, changed, [str(r["id"]) for r in await cur.fetchall()]
+                )
+            updated = await seal_user_async(self._row_sealer, changed)
         cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
         if cur.rowcount != 1:
             return None
@@ -20585,11 +20636,15 @@ class MessageStore:
         when the reset is written, so a refused append rolls the reset back; a reset that writes
         nothing appends nothing.
 
-        The conditional form runs under ``BEGIN IMMEDIATE``, so no writer in another process can
-        commit between the read the compare uses and the write, and the compare decides that race
-        rather than a refusal. The cost: the file's write lock is held across the seal's Vault
-        transit round trips. The plain form stays a short writer, as every login leg has always
-        called it."""
+        The conditional form does its seal work, the verify of the row it read and the seal of the
+        reset, before it takes any lock, because under a Transit sealer each is a Vault round trip
+        that every other writer, ingress included, would otherwise wait behind. It then re-reads
+        the row under ``BEGIN IMMEDIATE``, so no writer in another process can commit between that
+        re-read and the write, and writes only when the row is exactly the one it sealed from.
+        A row changed in between writes nothing and answers from the row the re-read found, a
+        change that leaves the guarded columns as ``expected`` answering ``"account_changed"``, as
+        a lost compare on the seal does. The plain form stays a short writer, as every login leg
+        has always called it."""
         now = time.time() if now is None else now
         write = FullAuthenticationWrite(now, expected)
         if expected is None and not audits:
@@ -20597,15 +20652,23 @@ class MessageStore:
                 written = await self._write_user(user_id, write)
                 await self._commit()
             return write.answer(written)
+        presealed = await self._preseal_user(user_id, write)
+        if presealed is None:
+            return write.answer(None)
+        # A fresh decision for the row read under the lock, so its answer is that row's alone.
+        write = FullAuthenticationWrite(now, expected)
         appended: list[AppendedAuditRow] = []
         async with _writer_txn(self._db, self._lock, immediate=True):
-            written = await self._write_user(user_id, write)
-            if written is not None and audits:
+            written = await self._write_user(user_id, write, presealed=presealed)
+            if written is None:
+                await self._db.rollback()
+                return write.answer(None)
+            if audits:
                 appended = await self._append_audits(audits, now=now)
             await self._commit()
         if appended:
             tee_audits(audits, appended, ts=now)
-        return write.answer(written)
+        return "written"
 
     async def clear_lockout(
         self,
