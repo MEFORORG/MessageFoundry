@@ -132,7 +132,8 @@ Fix by cause, not in sequence.
   never rename it past the pattern.
 
 Only for a genuine false positive you cannot rewrite, add a vetted regex with a written reason to
-[`scripts/security/scan-allowlist.txt`](scripts/security/scan-allowlist.txt). Keep it narrow: an
+[`scripts/security/scan-allowlist.txt`](scripts/security/scan-allowlist.txt); its header says how
+an entry is matched. Keep it narrow: an
 entry vetoes the line **before any detector runs**, so an over-broad one switches this whole gate off
 for every line it covers, and the loader refuses a pattern that matches ordinary text. Never allowlist
 a real customer string — that has to be removed.

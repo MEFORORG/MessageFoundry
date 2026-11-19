@@ -360,6 +360,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # change, and on no queue run for any change. It spawns no subprocess, so staying on the
         # engine legs costs them almost nothing.
         "test_windows_lock_install.py",
+        # Reads messagefoundry/auth/oidc/claims.py off disk: the one comment line the leak gate's
+        # OIDC core allowlist entry excuses, as the control that the line stays clean (BACKLOG
+        # #5445). A reworded comment arrives as an ENGINE diff the tooling path gate does not see.
+        "test_scan_allowlist_whole_line_5445.py",
     }
 )
 
