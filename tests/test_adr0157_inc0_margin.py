@@ -63,6 +63,7 @@ from tests._pool_lend import LendsItself
 
 # A clustered node needs a server-DB store, so every [cluster] config below carries one.
 _PG = '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+_MSSQL = '[store]\nbackend = "sqlserver"\nserver = "s"\ndatabase = "d"\nauth = "integrated"\n'
 
 
 def _write(path: Path, body: str) -> Path:
@@ -333,9 +334,10 @@ def test_the_census_of_shipped_failover_configurations_is_not_empty() -> None:
     assert len(timings) >= 2
 
 
+@pytest.mark.parametrize("store", [_PG, _MSSQL], ids=["postgres", "sqlserver"])
 @pytest.mark.parametrize("source", sorted(_failover_timings()))
 def test_a_shipped_failover_configuration_loads_through_the_real_node_env(
-    source: str, tmp_path: Path
+    source: str, store: str, tmp_path: Path
 ) -> None:
     """Drive the REAL settings path with the REAL exported environment, not a hand-built object.
 
@@ -359,7 +361,9 @@ def test_a_shipped_failover_configuration_loads_through_the_real_node_env(
         api_b=2801,
     )
     env = _node_env({}, node_id="fo-a", ports=ports, fo=fo, sink_host="127.0.0.1")
-    cfg = _write(tmp_path / "messagefoundry.toml", _PG)
+    # Both server backends, because the harness runs these profiles on both, and SQL Server refuses
+    # a pair whose claim windows reach the margin (BACKLOG #5979).
+    cfg = _write(tmp_path / "messagefoundry.toml", store)
 
     s = load_settings(config_path=cfg, environ=env)
 
