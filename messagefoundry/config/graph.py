@@ -73,7 +73,9 @@ class WiringEdge:
 
 @dataclass(frozen=True)
 class DanglingRef:
-    """A **literal** target that resolves to nothing registered (a typo the runtime would dead-letter)."""
+    """A **literal** Router/Handler target that resolves to nothing registered (a typo the runtime
+    would dead-letter), or an outbound's declared ``reingress_to`` naming no Loopback inbound (which
+    build-check refuses on a deployed outbound)."""
 
     source_kind: str
     source: str
@@ -1150,22 +1152,6 @@ def build_wiring_graph(registry: Registry) -> WiringGraph:
     for conn in registry.inbound.values():
         edges.append(WiringEdge("inbound", conn.name, "router", conn.router, "declared"))
 
-    # An outbound's `reingress_to` (ADR 0013) re-enters its captured reply on the named Loopback
-    # inbound; a .py factory and a connections.toml entry both land it in `spec.settings`. Without
-    # this edge a response cycle and the loopback's referrer are invisible (BACKLOG #5966). A name
-    # that is no Loopback inbound anywhere in the config is dangling, as a Send typo is: build-check
-    # skips a not-deployed outbound, so nothing else would report it. A sibling engine shard's
-    # loopback is valid but not in this filtered view's `inbound`, so it gets neither.
-    loopback_names = registry.loopback_inbound_names()
-    for oname, oconn in sorted(registry.outbound.items()):
-        target = oconn.spec.settings.get("reingress_to")
-        if not isinstance(target, str):
-            continue
-        if target not in loopback_names:
-            dangling.append(DanglingRef("outbound", oname, target, "loopback inbound"))
-        elif target in registry.inbound:
-            edges.append(WiringEdge("outbound", oname, "inbound", target, "declared"))
-
     for rname, rfn in sorted(registry.routers.items()):
         ast_result = _router_returns(rfn, cache)
         literal: set[str] = set()
@@ -1209,5 +1195,22 @@ def build_wiring_graph(registry: Registry) -> WiringGraph:
             edges.append(WiringEdge("handler", hname, "outbound", name, "heuristic"))
         for name in sorted(((consts | extra) & pt_names) - literal):
             edges.append(WiringEdge("handler", hname, "inbound", name, "heuristic"))
+
+    # An outbound's `reingress_to` (ADR 0013) re-enters its captured reply on the named Loopback
+    # inbound; a .py factory and a connections.toml entry both land it in `spec.settings`. Without
+    # this edge a response cycle and the loopback's referrer are invisible (BACKLOG #5966). A name
+    # that is no Loopback inbound anywhere in the config is dangling: build-check skips a
+    # not-deployed outbound, so nothing else would report it. It is appended after the Send/Router
+    # passes so the send-target advisory's first five still show those typos. A sibling engine
+    # shard's loopback is valid but not in this filtered view's `inbound`, so it gets neither.
+    loopback_names = registry.loopback_inbound_names()
+    for oname, oconn in sorted(registry.outbound.items()):
+        target = oconn.spec.settings.get("reingress_to")
+        if not isinstance(target, str):
+            continue
+        if target not in loopback_names:
+            dangling.append(DanglingRef("outbound", oname, target, "loopback inbound"))
+        elif target in registry.inbound:
+            edges.append(WiringEdge("outbound", oname, "inbound", target, "declared"))
 
     return WiringGraph(edges=tuple(edges), dynamic=frozenset(dynamic), dangling=tuple(dangling))

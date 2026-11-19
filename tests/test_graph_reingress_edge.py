@@ -138,6 +138,17 @@ def test_reingress_to_naming_no_loopback_is_dangling_not_an_edge(
     assert graph.dangling == (DanglingRef("outbound", "OB_PARTNER", target, "loopback inbound"),)
 
 
+def test_sibling_shard_loopback_is_neither_edge_nor_dangling(tmp_path: Path) -> None:
+    # An engine shard's filtered view: the loopback lives on a sibling shard, so it is missing from
+    # this registry's `inbound` but present in the pinned whole-config loopback set.
+    registry = load_config(_config(tmp_path, "connections.py", PY_CONNECTIONS))
+    del registry.inbound["IB_LOOP"]
+    registry.all_loopback_inbound = frozenset({"IB_LOOP"})
+    graph = build_wiring_graph(registry)
+    assert graph.targets("outbound", "OB_PARTNER") == []
+    assert not any(d.source_kind == "outbound" for d in graph.dangling)
+
+
 def test_graph_cli_carries_the_reingress_edge(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
