@@ -104,3 +104,27 @@ def test_file_drop_rows_are_capped_and_the_summary_counts_all(
         assert "first 3" in text
     finally:
         panel.shutdown()
+
+
+def test_a_generation_fault_is_reported_not_shown_as_done(
+    qapp: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Generation now runs on the worker, so a fault there ends the batch after its finished
+    # signal; the summary must say it stopped early rather than read as a complete run.
+    def generate(code: str, trigger: str, index: int, **_kw: object) -> str:
+        if index == 2:
+            raise ValueError("generator fault")
+        return _MSG
+
+    monkeypatch.setattr(_core, "generate_message", generate)
+    panel = file_panel.FilePanel()
+    panel._count.setValue(5)
+    panel._drop_dir.setText(str(tmp_path))
+    try:
+        panel._start_drop()
+        assert _until(qapp, lambda: panel._worker is None)
+        text = panel._drop_summary.text()
+        assert "stopped early: ValueError: generator fault" in text
+        assert "dropped 1" in text
+    finally:
+        panel.shutdown()

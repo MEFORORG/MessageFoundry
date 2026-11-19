@@ -201,21 +201,49 @@ class PersistentConnection:
         task = self._task
         if task is None:
             return
-        # A hard deadline (BACKLOG #5951): past it the socket is aborted, which ends a stalled drain,
-        # read or close, and the task is cancelled, which ends a stalled connect.
-        done, _ = await asyncio.wait({task}, timeout=grace + _STOP_HARD_MARGIN_S)
-        if not done:
+        # A hard deadline (BACKLOG #5951): once the connection has made no progress for a window,
+        # the socket is aborted, which ends a stalled drain, read or close, and the task is
+        # cancelled, which ends a stalled connect. Progress is the queue shrinking, so a healthy
+        # peer that is still taking a long queue is never cut off.
+        window = grace + _STOP_HARD_MARGIN_S
+        queued = self._queue.qsize()
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=window)
+            if done:
+                break
+            if self._queue.qsize() < queued:
+                queued = self._queue.qsize()
+                window = _STOP_HARD_MARGIN_S
+                continue
             log.warning(
-                "load connection %s:%d did not stop within %.1fs; aborting it",
+                "load connection %s:%d made no progress for %.1fs while stopping; aborting it",
                 self._host,
                 self._port,
-                grace + _STOP_HARD_MARGIN_S,
+                window,
             )
             if self._writer is not None:
                 self._writer.transport.abort()
             task.cancel()
+            break
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        self._release_unsent()
+
+    def _release_unsent(self) -> None:
+        """Release the closed-loop slot of each job a hard stop left unwritten, and say how many."""
+        unsent = 0
+        while not self._queue.empty():
+            _out, on_done = self._queue.get_nowait()
+            unsent += 1
+            if on_done is not None:
+                on_done()
+        if unsent:
+            log.warning(
+                "load connection %s:%d stopped with %d queued sends unwritten",
+                self._host,
+                self._port,
+                unsent,
+            )
 
     # --- internals -----------------------------------------------------------
 

@@ -180,6 +180,8 @@ class SendWorker(QObject):
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
+        # Set before finished when the batch ended on a fault, so the tab can say so.
+        self.failure = ""
 
     def stop(self) -> None:
         """Stop between messages, and interrupt an in-flight blocking recv on the current socket
@@ -202,8 +204,9 @@ class SendWorker(QObject):
                 self.result.emit(self._send_one(item))
                 if delay and pause_unless_stopped(self._stop, delay):
                     break
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 -- any fault ends the batch; the tab must hear why
             log.exception("harness send batch ended early")
+            self.failure = f"{type(exc).__name__}: {exc}"
         finally:
             self.finished.emit()
 

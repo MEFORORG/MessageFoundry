@@ -71,6 +71,23 @@ async def test_no_timeout_is_passed_when_no_ack_is_expected() -> None:
     assert pool._conns[0]._ack_timeout is None
 
 
+def test_an_unset_ack_timeout_keeps_waiting_as_before() -> None:
+    # Unset, a connection waits on its ACKs for as long as the socket stays open, as every load
+    # run did before the setting reached it; a profile that sets it gets it.
+    from harness.load.profile import load_profile_text
+
+    base = '[load]\nname = "p"\n[[load.target]]\nname = "t"\n{extra}\n[load.mix]\n"ADT" = 1.0\n'
+    phase = '[[load.phase]]\nname = "r"\nkind = "sustained"\nloop = "open"\nrate_start = 1.0\n'
+    phase += "duration_s = 1.0\n"
+    unset = load_profile_text(base.format(extra="") + phase)
+    assert unset.targets[0].ack_timeout_s is None
+    set_ = load_profile_text(base.format(extra="ack_timeout_s = 2.5") + phase)
+    assert set_.targets[0].ack_timeout_s == 2.5
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+    pool = sender.ConnectionPool(unset.targets[0], 1, Correlator(10, metrics), metrics)
+    assert pool._conns[0]._ack_timeout is None
+
+
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan")])
 def test_a_non_positive_ack_timeout_is_refused(bad: float) -> None:
     metrics = LiveMetrics(Counters(), Histogram(), Histogram())

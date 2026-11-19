@@ -56,3 +56,40 @@ async def test_stop_returns_against_a_peer_that_never_reads(
             writer.transport.abort()
         server.close()
         await server.wait_closed()
+
+
+async def test_a_slow_peer_still_taking_the_queue_is_not_cut_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The deadline counts from the last progress, not from stop(): a healthy peer that takes a long
+    queue slowly gets every queued send, however long past grace plus the margin that runs."""
+    monkeypatch.setattr(sender, "_STOP_HARD_MARGIN_S", 0.5)
+    count = 200  # about 13 MB, read at about 6 MB/s: a couple of seconds, past 0.1 + 0.5
+
+    async def slow(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        while await reader.read(131072):
+            await asyncio.sleep(0.02)
+        writer.close()
+
+    server = await asyncio.start_server(slow, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+    conn = sender.PersistentConnection(
+        "127.0.0.1", port, Correlator(1000, metrics), metrics, expect_ack=False, queue_max=1000
+    )
+    try:
+        conn.start()
+        for seq in range(1, count + 1):
+            assert conn.submit_nowait(Outgoing(seq, "ADT", f"X{seq}", _MSG))
+        for _ in range(100):  # a stop before the first connect sends nothing, as on main
+            if conn.up:
+                break
+            await asyncio.sleep(0.02)
+        with caplog.at_level("WARNING", logger=sender.__name__):
+            await asyncio.wait_for(conn.stop(0.1), timeout=60.0)
+        assert metrics.counters.sent == count
+        assert "aborting" not in caplog.text
+        assert "unwritten" not in caplog.text
+    finally:
+        server.close()
+        await server.wait_closed()

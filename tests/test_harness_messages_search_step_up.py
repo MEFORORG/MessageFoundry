@@ -138,6 +138,30 @@ def test_a_declined_step_up_reports_the_refusal(qapp: Any) -> None:
         panel.stop()
 
 
+def test_a_refresh_during_the_prompt_neither_searches_nor_prompts_again(qapp: Any) -> None:
+    # The prompt runs a nested event loop, so a refresh can arrive while it is up. It must latch,
+    # not start a second search, and a declined prompt must not be followed by another.
+    client = _SearchClient(refusals=5)
+    panel_box: list[MessagesPanel] = []
+    calls: list[int] = []
+
+    def decline_after_a_refresh() -> bool:
+        calls.append(client.searches)
+        panel_box[0].refresh(autosize=True)
+        return False
+
+    panel, errors = _search(qapp, client, None)
+    panel_box.append(panel)
+    panel._step_up = decline_after_a_refresh
+    try:
+        _settle(qapp, panel, client, 1)
+        assert calls == [1]
+        assert client.searches == 1
+        assert errors == ["step-up required"]
+    finally:
+        panel.stop()
+
+
 def test_an_idp_step_up_is_not_answered_with_a_password_prompt(qapp: Any) -> None:
     client = _SearchClient(refusals=1, error=IdpStepUpRequired("use the web console", status=403))
     step_up = _StepUp(True)

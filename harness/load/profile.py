@@ -165,7 +165,9 @@ class Failover:
 @dataclass(frozen=True)
 class Target:
     """An inbound MLLP endpoint to drive. ``types`` restricts which message-type codes route here
-    (empty = any); ``weight`` splits offered load across targets."""
+    (empty = any); ``weight`` splits offered load across targets. ``ack_timeout_s``, when set,
+    closes and reopens a connection whose oldest send has waited that long for its ACK; unset, a
+    connection waits on its ACKs for as long as the socket stays open."""
 
     name: str
     host: str = "127.0.0.1"
@@ -173,7 +175,7 @@ class Target:
     types: tuple[str, ...] = ()
     weight: float = 1.0
     expect_ack: bool = True
-    ack_timeout_s: float = 10.0
+    ack_timeout_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -390,7 +392,7 @@ def _targets_from(raw: Any, where: str) -> tuple[Target, ...]:
                 types=_opt_str_tuple(table, "types", ctx),
                 weight=_opt_float(table, "weight", ctx, default=1.0, minimum=0.0),
                 expect_ack=_opt_bool(table, "expect_ack", ctx, default=True),
-                ack_timeout_s=_opt_float(table, "ack_timeout_s", ctx, default=10.0, minimum=0.1),
+                ack_timeout_s=_opt_float_or_none(table, "ack_timeout_s", ctx, minimum=0.1),
             )
         )
     return tuple(targets)

@@ -105,3 +105,21 @@ def test_the_provider_read_and_the_sign_in_run_off_the_gui_thread(qapp: Any) -> 
         client.providers_gate.set()
         client.login_gate.set()
         dialog.done(dialog.DialogCode.Rejected)
+
+
+def test_a_close_during_the_provider_read_is_taken_when_it_answers(qapp: Any) -> None:
+    client = _GatedClient()
+    dialog = LoginDialog(client)  # type: ignore[arg-type]
+    finished: list[int] = []
+    dialog.finished.connect(finished.append)
+    try:
+        started = time.monotonic()
+        dialog.reject()  # held, not a blocking wait on the worker
+        assert time.monotonic() - started < 1.0
+        assert finished == []
+        assert "Waiting for the engine" in dialog._error.text()
+        client.providers_gate.set()
+        assert _until(qapp, lambda: finished == [dialog.DialogCode.Rejected.value])
+    finally:
+        client.providers_gate.set()
+        client.login_gate.set()

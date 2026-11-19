@@ -638,10 +638,14 @@ class MessagesPanel(QWidget):
                 # Re-proved on the GUI thread; the polling client reads the rotated token through
                 # the shared cell, so the resubmitted search carries the fresh grant. One retry
                 # only: a second 403 is reported below rather than prompting again. The retry
-                # re-reads the filters, so it also covers any refresh latched meanwhile.
+                # re-reads the filters, so it also covers any refresh latched meanwhile, and keeps
+                # that refresh's column refit.
                 self._stepped_up = True
-                self.refresh(autosize=autosize)
+                self.refresh(autosize=autosize or bool(self._pending))
                 return
+            # Declined or refused: a refresh latched while the prompt was up would run the same
+            # refused search and prompt again at once, so it is dropped.
+            self._pending = None
         self._loading = False
         if snap.error is not None:
             self.error.emit(snap.error)

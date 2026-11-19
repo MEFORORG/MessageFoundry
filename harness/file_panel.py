@@ -164,6 +164,7 @@ class FilePanel(QWidget):
         self._drop_summary.setText(summary)
 
     def _on_drop_finished(self) -> None:
+        failure = self._worker.failure if self._worker is not None else ""
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
@@ -172,7 +173,8 @@ class FilePanel(QWidget):
         self._drop_results.setSortingEnabled(True)
         self._drop_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
-        self._drop_summary.setText(self._drop_summary.text() + " — done")
+        ending = f" — stopped early: {failure}" if failure else " — done"
+        self._drop_summary.setText(self._drop_summary.text() + ending)
 
     def shutdown(self) -> None:
         """Stop the folder-watch timer and join the drop thread so the window closes cleanly."""

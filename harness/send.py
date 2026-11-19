@@ -161,6 +161,7 @@ class SendPanel(QWidget):
         self._summary.setText(summary)
 
     def _on_finished(self) -> None:
+        failure = self._worker.failure if self._worker is not None else ""
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
@@ -169,7 +170,8 @@ class SendPanel(QWidget):
         self._results.setSortingEnabled(True)
         self._send_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
-        self._summary.setText(self._summary.text() + " — done")
+        ending = f" — stopped early: {failure}" if failure else " — done"
+        self._summary.setText(self._summary.text() + ending)
 
     def shutdown(self) -> None:
         """Stop and join the send thread so the window can close without destroying a running

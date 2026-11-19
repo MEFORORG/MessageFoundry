@@ -59,6 +59,8 @@ class FileDropWorker(QObject):
         self._items = items
         self._rate = rate
         self._stop = threading.Event()
+        # Set before finished when the batch ended on a fault, so the tab can say so.
+        self.failure = ""
 
     def stop(self) -> None:
         """Thread-safe; also ends a pause between files at once (BACKLOG #5948)."""
@@ -69,8 +71,9 @@ class FileDropWorker(QObject):
         # here; finished is emitted whatever happens, or the tab would wait on it for good.
         try:
             self._drop_all()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 -- any fault ends the batch; the tab must hear why
             log.exception("harness file drop batch ended early")
+            self.failure = f"{type(exc).__name__}: {exc}"
         finally:
             self.finished.emit()
 

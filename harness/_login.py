@@ -43,8 +43,9 @@ class LoginDialog(QDialog):
 
     Both engine calls run off the Qt main thread (BACKLOG #5946), so a stalled engine or a slow
     directory leaves the dialog responsive rather than frozen. While one is in flight the Sign in
-    action is idle, and while the sign-in itself is in flight the dialog does not close: its result
-    may be a live session, which only the accept path hands back to the caller.
+    action is idle, and a close is held until the call answers: a sign-in may come back as a live
+    session, which only the accept path hands back to the caller, so a successful one is still
+    accepted, and a failed one or the provider read then closes the dialog.
     """
 
     def __init__(self, client: EngineClient, parent: QWidget | None = None) -> None:
@@ -75,6 +76,7 @@ class LoginDialog(QDialog):
         # One engine call at a time on this client: the provider read first, then the sign-in.
         self._busy = True
         self._signing_in = False
+        self._close_requested = False  # a close asked for while a call was in flight
 
         form = QFormLayout()
         form.addRow("Username", self._username)
@@ -118,10 +120,12 @@ class LoginDialog(QDialog):
         if providers is not None and providers.ad:
             self._provider.addItem("Active Directory", "ad")
         self._idle()
+        self._close_if_requested()
 
     def _on_providers_error(self, exc: BaseException) -> None:
         log.warning("sign-in provider read failed; offering Local only: %r", exc)
         self._idle()
+        self._close_if_requested()
 
     def _idle(self) -> None:
         self._busy = False
@@ -129,11 +133,21 @@ class LoginDialog(QDialog):
         self._sign_in.setEnabled(True)
 
     def done(self, result: int) -> None:
-        # A sign-in in flight may come back as a live session; closing now would drop it unseen.
-        if self._signing_in and result != QDialog.DialogCode.Accepted:
+        # While a call is in flight the dialog does not close: a sign-in may come back as a live
+        # session, which closing now would drop unseen, and the client must not be closed under a
+        # worker still using it. The close is remembered and taken when the call answers.
+        if self._busy and result != QDialog.DialogCode.Accepted:
+            self._close_requested = True
+            self._error.setText("Waiting for the engine to answer; the dialog then closes.")
             return
         self._runner.stop()
         super().done(result)
+
+    def _close_if_requested(self) -> bool:
+        if self._close_requested:
+            self.done(QDialog.DialogCode.Rejected)
+            return True
+        return False
 
     def _attempt(self) -> None:
         if self._busy:
@@ -157,6 +171,9 @@ class LoginDialog(QDialog):
 
     def _on_login_error(self, exc: BaseException) -> None:
         self._idle()
+        if self._close_requested:
+            self._close_if_requested()
+            return
         if isinstance(exc, ApiError):
             self._error.setText("Sign-in failed." if exc.status == 401 else str(exc))
         else:
