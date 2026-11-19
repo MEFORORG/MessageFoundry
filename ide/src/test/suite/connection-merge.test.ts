@@ -398,7 +398,7 @@ suite("connectionMerge — a non-finite float tag is a leaf (BACKLOG #5778)", ()
     });
   });
 
-  test("a tag is never merged into as a table", () => {
+  test("a tag is never merged into as a table: a file's retry = inf is kept for the upsert to refuse", () => {
     const initial = maximalOutbound();
     initial.retry = { $toml: "inf" } as unknown as ConnObj["retry"];
     const posted: ConnObj = {
@@ -408,6 +408,6 @@ suite("connectionMerge — a non-finite float tag is a leaf (BACKLOG #5778)", ()
       settings: { host: "acme.example", port: 2575 },
       retry: { max_attempts: 3 },
     };
-    assert.deepStrictEqual(mergeFormIntoInitial(initial, posted).retry, { max_attempts: 3 });
+    assert.deepStrictEqual(mergeFormIntoInitial(initial, posted).retry, { $toml: "inf" });
   });
 });

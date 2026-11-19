@@ -117,7 +117,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // saved without its line breaks.
       if (original !== undefined) ROW_ORIGINAL.set(wrap, { key: k.value, shown: v.value, isEnv: !!isEnv, cast: cast || '', original: original });
       // Marked, so the save parses the JSON back into the table.
-      if (value !== null && typeof value === 'object') v.dataset.table = '1';
+      // A non-finite tag is a number, not a table: it shows its spelling and is marked so an edited
+      // inf / -inf posts the tag again.
+      if (isNonFiniteTag(value)) v.dataset.nonfinite = '1';
+      else if (value !== null && typeof value === 'object') v.dataset.table = '1';
       const castSel = document.createElement('select');
       // A recorded cast outside the list gets its own option, so it shows and an untouched save keeps
       // it for the engine to refuse, rather than the select going blank and the save dropping it.
@@ -535,7 +538,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           if (was && isEnvRefValue(was.original) && was.original.default !== undefined) ref.default = was.original.default;
           settings[key] = ref;
         } else {
-          settings[key] = inputs[1].dataset.table === '1' ? parseTable(raw) : coerce(raw);
+          const nonFinite = inputs[1].dataset.nonfinite === '1' && (raw === 'inf' || raw === '-inf');
+          settings[key] = nonFinite ? { [NON_FINITE_TAG]: raw }
+            : inputs[1].dataset.table === '1' ? parseTable(raw) : coerce(raw);
         }
       }
       return forHost ? settings : resolveHeld(settings);

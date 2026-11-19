@@ -866,6 +866,20 @@ suite("connection editor — a non-finite float tag round-trips (BACKLOG #5778)"
     });
   }
 
+  test("legacy rows: an untouched tag saves back exactly, and an edited -inf posts the tag", () => {
+    const p = load({ groups: null, initial: record });
+    assert.deepStrictEqual(saved(p, false).receive_timeout, { $toml: "inf" });
+    const q = load({ groups: null, initial: record });
+    const row = [...q.window.document.querySelectorAll("#settings .setting")].find(
+      (r: DomNode) => r.querySelector("input").value === "receive_timeout",
+    );
+    assert.ok(row);
+    const value = row.querySelectorAll("input[type=text]")[1];
+    assert.strictEqual(value.value, "inf");
+    value.value = "-inf";
+    assert.deepStrictEqual(saved(q, false).receive_timeout, { $toml: "-inf" });
+  });
+
   test("edit: inf / -inf typed into a float field post the tag; nan and Infinity post as typed", () => {
     const cases: Array<[string, unknown]> = [
       ["inf", { $toml: "inf" }],

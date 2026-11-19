@@ -163,7 +163,11 @@ export function mergeFormIntoInitial(initial: ConnObj | undefined, posted: ConnO
     }
     merged[key] = value;
   }
-  if (direction === "outbound") {
+  if (direction === "outbound" && isNonFiniteTag(initial.retry)) {
+    // A file's `retry = inf` is not a table. It is kept as authored, never silently dropped, so the
+    // upsert refuses it and the author sees why (#234).
+    merged.retry = initial.retry;
+  } else if (direction === "outbound") {
     // The form renders exactly retry.max_attempts: posted max_attempts sets-or-deletes over the
     // initial retry table's OTHER RetryPolicy fields (backoff_seconds/…), which the form never shows
     // and must never destroy. An emptied table drops the key (absent = read-schema default).
