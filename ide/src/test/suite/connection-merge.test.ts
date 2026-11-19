@@ -358,8 +358,9 @@ suite("connectionMerge — planSave (the one merge-source policy for both writer
   });
 });
 
-// BACKLOG #5937: an inbound and an outbound may share a name (separate loader tables; `connection
-// upsert` replaces within the posted direction only), so planSave scopes both lookups by direction.
+// BACKLOG #5937: an inbound and an outbound may share a name in a hand-edited file (separate loader
+// tables; `connection upsert` replaces within the posted direction only), so planSave finds the merge
+// source by name and direction.
 suite("connectionMerge — planSave with an inbound and an outbound sharing one name", () => {
   const sharedName = "ACME_ADT";
   const inbound = (): ConnObj => ({ ...maximalInbound(), name: sharedName });
@@ -392,15 +393,10 @@ suite("connectionMerge — planSave with an inbound and an outbound sharing one 
     assert.strictEqual(plan.conn.router, undefined);
   });
 
-  test("creating an outbound under an inbound's name is not a collision", () => {
-    const plan = planSave([inbound()], postedOutbound(), {});
-    assert.strictEqual(plan.collision, undefined);
-    assert.deepStrictEqual(plan.conn, postedOutbound());
-  });
-
-  test("creating an outbound under an existing outbound's name still collides", () => {
-    const plan = planSave([inbound(), outbound()], postedOutbound(), {});
-    assert.strictEqual(plan.collision, sharedName);
+  test("creating under a name either direction holds still collides", () => {
+    // Deliberately both directions: the openers and the picker still address a connection by name.
+    assert.strictEqual(planSave([inbound()], postedOutbound(), {}).collision, sharedName);
+    assert.strictEqual(planSave([inbound(), outbound()], postedOutbound(), {}).collision, sharedName);
   });
 
   test("a clone takes its merge source by the source direction the writer names", () => {

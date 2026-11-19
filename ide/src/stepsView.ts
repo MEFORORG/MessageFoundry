@@ -74,7 +74,7 @@ import {
   pickPartSeed,
   readEditMessage,
   readPickPartMessage,
-  rebaseQueuedEdit,
+  QueuedEditRebaser,
   releaseEdit,
   renderHandlersHtml,
   renderStepsContextMenuHtml,
@@ -594,14 +594,17 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         return;
       }
       try {
+        // A raced edit to a row this drain wrote is sent as the write left the row (#5943).
+        const rebaser = new QueuedEditRebaser();
         let current: EditMessage | undefined = msg;
         while (current) {
           const applied = await applyOne(current); // applyOne handles its own error + revert-render
           if (applied) {
-            const done = current; // a raced edit to the same row is sent as this one left it (#5943)
-            guard.rebasePending((queued) => rebaseQueuedEdit(done, applied, queued));
+            rebaser.noteApplied(current, applied);
           }
-          current = guard.takePending(); // drain a raced typed edit (F5) — NEVER clearPending (that drops it)
+          // Drain a raced typed edit (F5) — NEVER clearPending (that drops it).
+          const next = guard.takePending();
+          current = next === undefined ? undefined : rebaser.rebase(next);
         }
       } finally {
         // releaseEdit, never a bare endEdit — a save suppressed during the pick is deferred (#1759).

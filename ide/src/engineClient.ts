@@ -18,6 +18,7 @@ import {
   trustRemedy,
 } from "./engineTrustModel";
 import type { HostPin } from "./engineTrustModel";
+import { SIGN_IN_TIMEOUT_MS } from "./signInSession";
 
 /**
  * What a step-up refusal asked for (403 + `X-Step-Up-Required`). `action` is the
@@ -553,13 +554,11 @@ export function postApprovable<T>(
 }
 
 /**
- * Default POST deadline (ms), wall-clock from the request's start (BACKLOG #5938). The engine's
- * default request deadline (`DEFAULT_REQUEST_TIMEOUT_SECONDS` in
- * `messagefoundry/api/request_timeout.py`) is 120 s; this outlasts it by 30 s, so the engine's own
- * 503 at that deadline still has time to arrive, as the Python client's
- * `_PAST_ENGINE_DEADLINE_SECONDS` does.
+ * Default POST deadline (ms), wall-clock from the request's start (BACKLOG #5938). It is
+ * {@link SIGN_IN_TIMEOUT_MS}, which outlasts the engine's default request deadline by the margin
+ * that constant states, so the engine's own 503 at that deadline still has time to arrive.
  */
-export const POST_TIMEOUT_MS = 150_000;
+export const POST_TIMEOUT_MS = SIGN_IN_TIMEOUT_MS;
 
 /** A decoded 2xx POST reply. The status is kept so {@link postApprovable} can tell a hold apart. */
 interface PostReply {

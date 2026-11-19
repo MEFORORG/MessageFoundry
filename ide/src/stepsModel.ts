@@ -480,11 +480,14 @@ function rowParams(row: LensRow): ParamField[] {
     return [{ name: "to", value: outs.length > 0 ? outs.join(", ") : "(dynamic destination)" }];
   }
   if (row.kind === "route") {
-    // BACKLOG #5941. editableParamNames offers it for editing only when the selection is static, so
-    // the dynamic placeholder is never sent back as a name.
+    // BACKLOG #5941. A routed-nowhere return gets no field: the projection cannot tell a bare
+    // `return`, which the engine refuses to write a list into, from `return []`. A dynamic selection
+    // gets a read-only placeholder, never sent back as a name: editableParamNames omits it.
     const names = row.handlers ?? [];
-    const dynamic = names.length === 0 && row.unrouted !== true;
-    return [{ name: "handlers", value: dynamic ? "(dynamic selection)" : names.join(", ") }];
+    if (row.unrouted === true) {
+      return [];
+    }
+    return [{ name: "handlers", value: names.length > 0 ? names.join(", ") : "(dynamic selection)" }];
   }
   return paramsToFields(row.params);
 }
@@ -1946,8 +1949,8 @@ export interface ContextMenuEnablement {
  * The enable/disable state of each row context-menu item for a given row (pure; unit-testable). Rules:
  * Insert BEFORE is always available; Insert AFTER is suppressed on a `send` row (a step after the return
  * would be dead code — the same reason {@link buildToolbarInsertRequest} derives `before` for a send);
- * Delete is offered only on an editable `action`/`lookup`/`send` row (a `code`/`control` row is read-only
- * — the §4 degradation ladder); Move up/down follow the ↑/↓ walk (`canMoveUp`/`canMoveDown` come from
+ * Delete is offered only on a {@link isRowDeletable} row (a `code` row never; a `control` row only as a
+ * whole if/for block); Move up/down follow the ↑/↓ walk (`canMoveUp`/`canMoveDown` come from
  * {@link walkMove} returning a destination, so a suite edge / non-movable / sole-child row greys them).
  */
 export function contextMenuEnablement(
@@ -2816,13 +2819,6 @@ export class EditLoopGuard {
     return msg;
   }
 
-  /** Replace every queued edit with `fn` of it, keeping the queue order (BACKLOG #5943). */
-  rebasePending(fn: (msg: EditMessage) => EditMessage): void {
-    for (const [key, msg] of this.pending) {
-      this.pending.set(key, fn(msg));
-    }
-  }
-
   /**
    * Discard every queued param edit WITHOUT applying it (the orphaned-queue hazard, ADR 0076 §5 v2). A
    * STRUCTURAL op (insert/delete/move) shifts every row coordinate and forces a full re-projection, so a
@@ -2958,35 +2954,51 @@ export interface AppliedRewrite {
 }
 
 /**
- * A queued edit, rebased on a param edit applied ahead of it (BACKLOG #5943). Each queued edit carries
- * the row's PROJECTION-TIME source as `expectSrc`, and the engine refuses one that no longer matches
- * the buffer. A second edit to the row the first edit just rewrote would always be refused that way,
- * so it takes the row's text from the rewritten buffer instead.
+ * Rebases queued edits on the param edits a drain has written (BACKLOG #5943). Each edit carries the
+ * row's PROJECTION-TIME source as `expectSrc`, and the engine refuses one that no longer matches the
+ * buffer. The page is not re-projected during a drain, so every edit it posts to a row the drain has
+ * rewritten would be refused that way; {@link rebase} gives it the row's text as last written.
  *
- * Only an edit to the SAME row, projected from the SAME text, is rebased, and only when the rewrite
- * kept the file's line count, so every coordinate still names the row it named. Anything else is
- * returned unchanged and the engine's stale check judges it, as before.
+ * Only an edit to a row the drain wrote, projected from the SAME text that row was projected from,
+ * is rebased, and only while every write kept the file's line count, so each coordinate still names
+ * the row it named. Anything else is sent unchanged and the engine's stale check judges it, as before.
+ * One instance serves one drain.
  */
-export function rebaseQueuedEdit(
-  applied: EditMessage,
-  rewrite: AppliedRewrite,
-  queued: EditMessage,
-): EditMessage {
-  if (
-    queued.handler !== applied.handler ||
-    queued.lineStart !== applied.lineStart ||
-    queued.lineEnd !== applied.lineEnd ||
-    queued.expectSrc === undefined ||
-    queued.expectSrc !== applied.expectSrc
-  ) {
-    return queued;
+export class QueuedEditRebaser {
+  /** Per row written: the text it was projected with, and its text after the last write. */
+  private readonly rows = new Map<string, { projected: string; now: string }>();
+  /** The projected text of an edit {@link rebase} gave a new `expectSrc`. */
+  private readonly projectedOf = new WeakMap<EditMessage, string>();
+
+  private static rowKey(msg: EditMessage): string {
+    return `${msg.handler} ${msg.lineStart} ${msg.lineEnd}`;
   }
-  const before = physicalLines(rewrite.before);
-  const after = physicalLines(rewrite.after);
-  if (before.length !== after.length) {
-    return queued;
+
+  /** Record a param edit `lens rewrite` wrote. */
+  noteApplied(msg: EditMessage, rewrite: AppliedRewrite): void {
+    const projected = this.projectedOf.get(msg) ?? msg.expectSrc;
+    const after = physicalLines(rewrite.after);
+    if (physicalLines(rewrite.before).length !== after.length) {
+      this.rows.clear(); // every recorded coordinate may now name another row
+      return;
+    }
+    if (projected === undefined) {
+      return;
+    }
+    const now = after.slice(msg.lineStart - 1, msg.lineEnd).join("\n");
+    this.rows.set(QueuedEditRebaser.rowKey(msg), { projected, now });
   }
-  return { ...queued, expectSrc: after.slice(queued.lineStart - 1, queued.lineEnd).join("\n") };
+
+  /** The edit to send for `msg`, taken from the queue. */
+  rebase(msg: EditMessage): EditMessage {
+    const row = this.rows.get(QueuedEditRebaser.rowKey(msg));
+    if (row === undefined || msg.expectSrc !== row.projected) {
+      return msg;
+    }
+    const rebased = { ...msg, expectSrc: row.now };
+    this.projectedOf.set(rebased, row.projected);
+    return rebased;
+  }
 }
 
 /**
@@ -3003,9 +3015,9 @@ export function rebaseQueuedEdit(
  * document change suppressed during the drain still gets its re-projection (BACKLOG #1759), including on
  * the rejected-apply path above. Never throws.
  *
- * When `apply` reports the buffer it rewrote ({@link AppliedRewrite}), the queued edits are rebased
- * on it ({@link rebaseQueuedEdit}) before the next is taken, so a second edit to the same row is sent
- * with the row as the first edit left it, not as it was projected (BACKLOG #5943).
+ * When `apply` reports the buffer it rewrote ({@link AppliedRewrite}), each edit taken from the queue
+ * afterwards is rebased on it ({@link QueuedEditRebaser}), so a later edit to the same row is sent with
+ * the row as the earlier edits left it, not as it was projected (BACKLOG #5943).
  */
 export async function drainEdits(
   guard: EditLoopGuard,
@@ -3019,18 +3031,19 @@ export async function drainEdits(
     return;
   }
   try {
+    const rebaser = new QueuedEditRebaser();
     let current: EditMessage | undefined = first;
     while (current) {
       try {
         const applied = await apply(current);
         if (applied) {
-          const done = current;
-          guard.rebasePending((queued) => rebaseQueuedEdit(done, applied, queued));
+          rebaser.noteApplied(current, applied);
         }
       } catch (err) {
         onError?.(err, current);
       }
-      current = guard.takePending();
+      const next = guard.takePending();
+      current = next === undefined ? undefined : rebaser.rebase(next);
     }
   } finally {
     releaseEdit(guard, onRefreshOwed);
@@ -3442,7 +3455,9 @@ function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
     );
   }
   if (row.deletable) {
-    buttons.push(btn("deleteRow", "&#128465;", "Delete this row"));
+    // An if/for header deletes its whole block, every clause and step in it, so it says so.
+    const what = row.kind === "control" ? "Delete this whole block" : "Delete this row";
+    buttons.push(btn("deleteRow", "&#128465;", what));
   }
   // ADR 0104 fan-out: a per-row "＋ dest" on a real send (not the `return []` filter) adds another
   // destination — appending into the accumulator, or converting a returned send up to it.

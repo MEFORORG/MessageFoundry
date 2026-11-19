@@ -118,12 +118,13 @@ export interface AlignOp {
 }
 
 /**
- * The most LCS table cells {@link lcsAlign} allocates (BACKLOG #5940). The table is one Uint32Array
- * of (n+1)*(m+1) cells, so this caps it at 16 MiB. The diff runs on the Extension Host thread, and
- * a sample may be up to 16 MiB, so an uncapped table over two long, mostly different segment lists
- * could freeze VS Code or exhaust its memory. Past the cap the middle is aligned in one linear pass.
+ * The most LCS table cells {@link lcsAlign} allocates (BACKLOG #5940). The table is one Uint16Array
+ * of (n+1)*(m+1) cells, so this caps it at 32 MiB. Under the cap the shorter side has at most 4,000
+ * keys, so no LCS length passes 65,535. The diff runs on the Extension Host thread, and a sample may
+ * be up to 16 MiB, so an uncapped table over two long, mostly different segment lists could freeze
+ * VS Code or exhaust its memory. Past the cap the middle is aligned in one linear pass.
  */
-export const MAX_LCS_CELLS = 4_000_000;
+export const MAX_LCS_CELLS = 16_000_000;
 
 /**
  * Longest-common-subsequence alignment of two key lists → matched / removed / added ops.
@@ -172,7 +173,7 @@ function alignByLcs(
 ): void {
   const width = m + 1;
   // dp[i*width + j] = LCS length of the middle's aKeys[i:] and bKeys[j:].
-  const dp = new Uint32Array((n + 1) * width);
+  const dp = new Uint16Array((n + 1) * width); // MAX_LCS_CELLS keeps every length under 65,536
   for (let i = n - 1; i >= 0; i--) {
     for (let j = m - 1; j >= 0; j--) {
       dp[i * width + j] =

@@ -578,6 +578,12 @@ suite("Steps webview: a route row shows and edits its Handler names as a list", 
     assert.strictEqual(p.field(7, "handlers").querySelector("input.edit"), null);
   });
 
+  test("a routed-nowhere route offers no handlers field (a bare return takes no list)", () => {
+    const vm = buildRowViewModel({ ...STATIC_ROUTE, handlers: [], unrouted: true }, 0, LINES);
+    assert.deepStrictEqual(vm.params, []);
+    assert.strictEqual(vm.subtitle, undefined);
+  });
+
   test("the reader takes a string list for handlers only", () => {
     const base = {
       command: "edit",

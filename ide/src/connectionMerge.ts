@@ -213,14 +213,15 @@ export interface SavePlan {
  * apply over a save-time FRESH `connection list` (#234 merge-source policy — no cached copy, so an
  * external edit between open and save is never resurrected):
  *
- * 1. collision gate — a create/clone whose name matches an existing connection OF THE POSTED
- *    DIRECTION is refused. An inbound and an outbound may share a name (the loader keeps them in
- *    separate tables, and `connection upsert` replaces within the posted direction's table only),
- *    so a same-named connection of the other direction is not one the save would replace;
+ * 1. collision gate — a create/clone whose name matches an existing connection is refused. It
+ *    reads both directions on purpose: the loader would accept an inbound and an outbound sharing a
+ *    name, but at least the editor's openers and its picker still address a connection by name
+ *    alone, so a pair the IDE created could not be told apart there (BACKLOG #5937 left this half);
  * 2. merge — the post is merged over the `mergeFrom` entry (the connection the form was opened
- *    from: the edited name, or the clone source), preserving every non-rendered key. The entry is
- *    looked up by name AND direction: `mergeFromDirection` when the writer knows it (a clone may
- *    change direction), else the posted direction (an edit locks it). No `mergeFrom`, or the entry
+ *    from: the edited name, or the clone source), preserving every non-rendered key. An inbound and
+ *    an outbound may share a name in a hand-edited file, so the entry is looked up by name AND
+ *    direction (BACKLOG #5937): `mergeFromDirection` when the writer knows it (a clone may change
+ *    direction), else the posted direction (an edit locks it). No `mergeFrom`, or the entry
  *    vanished externally: the post stands alone (there is nothing left to preserve).
  */
 export function planSave(
@@ -229,7 +230,7 @@ export function planSave(
   opts: { mergeFrom?: string; mergeFromDirection?: Direction; editingName?: string },
 ): SavePlan {
   const collision = findNameCollision(
-    entries.filter((entry) => entry.direction === posted.direction).map((entry) => entry.name),
+    entries.map((entry) => entry.name),
     posted.name,
     opts.editingName,
   );

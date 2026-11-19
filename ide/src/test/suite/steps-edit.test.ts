@@ -32,7 +32,7 @@ import {
   isRowMovable,
   opForcesReprojection,
   parseRewriteResult,
-  rebaseQueuedEdit,
+  QueuedEditRebaser,
   physicalLines,
   releaseEdit,
   renderRowHtml,
@@ -572,25 +572,29 @@ suite("Steps update-loop guard — a suppressed document change is DEFERRED, not
 
   // BACKLOG #5943: a second edit to a row, queued while the first rewrote it, was sent with the row's
   // pre-first source as expect_src, so the engine's stale check refused it and the edit was lost.
-  test("a second edit to the same row, queued mid-rewrite, is sent as the first left the row", async () => {
-    let buffer = 'def h(msg):\n    msg.set_field("PID-5", "A")\n    return msg\n';
+  test("later edits to the same row, queued mid-rewrite, are sent as the earlier ones left it", async () => {
+    let buffer = 'def h(msg):\n    msg.set_field("PID-5", "A", "x")\n    return msg\n';
     const projected = physicalLines(buffer)[1];
     const guard = new EditLoopGuard();
     const outcomes: string[] = [];
-    const first: EditMessage = {
+    // Every edit the page posts before a re-projection carries the same projected text.
+    const edit = (name: string, value: string): EditMessage => ({
       command: "edit",
       handler: "h",
       lineStart: 2,
       lineEnd: 2,
-      name: "path",
-      value: "PID-7",
+      name,
+      value,
       expectSrc: projected,
-    };
-    const second: EditMessage = { ...first, name: "value", value: "B" };
+    });
+    const literalOf: Record<string, string> = { path: '"PID-5"', value: '"A"', note: '"x"' };
+    // The user edits the next field while each rewrite is in flight, the third after the first rebase.
+    const raced: Record<string, EditMessage> = { path: edit("value", "B"), value: edit("note", "y") };
     // A stand-in for lens rewrite: refuse a stale expect_src, else rewrite the one literal it names.
     const apply = async (msg: EditMessage): Promise<{ before: string; after: string } | void> => {
-      if (msg.name === "path") {
-        guard.queue(second); // the user edits the next field while this rewrite is in flight
+      const next = raced[msg.name];
+      if (next !== undefined) {
+        guard.queue(next);
       }
       const lines = physicalLines(buffer);
       if (lines[msg.lineStart - 1] !== msg.expectSrc) {
@@ -598,20 +602,22 @@ suite("Steps update-loop guard — a suppressed document change is DEFERRED, not
         return;
       }
       const before = buffer;
-      const old = msg.name === "path" ? '"PID-5"' : '"A"';
-      lines[msg.lineStart - 1] = lines[msg.lineStart - 1].replace(old, JSON.stringify(msg.value));
+      lines[msg.lineStart - 1] = lines[msg.lineStart - 1].replace(
+        literalOf[msg.name],
+        JSON.stringify(msg.value),
+      );
       buffer = lines.join("\n");
       outcomes.push(`applied ${msg.name}`);
       return { before, after: buffer };
     };
 
-    await drainEdits(guard, first, apply);
+    await drainEdits(guard, edit("path", "PID-7"), apply);
 
-    assert.deepStrictEqual(outcomes, ["applied path", "applied value"]);
-    assert.strictEqual(physicalLines(buffer)[1], '    msg.set_field("PID-7", "B")');
+    assert.deepStrictEqual(outcomes, ["applied path", "applied value", "applied note"]);
+    assert.strictEqual(physicalLines(buffer)[1], '    msg.set_field("PID-7", "B", "y")');
   });
 
-  test("rebaseQueuedEdit leaves an edit to another row, or after a line-count change, unchanged", () => {
+  test("QueuedEditRebaser leaves an edit to another row, or after a line-count change, unchanged", () => {
     const applied: EditMessage = {
       command: "edit",
       handler: "h",
@@ -625,9 +631,12 @@ suite("Steps update-loop guard — a suppressed document change is DEFERRED, not
     const otherRow: EditMessage = { ...sameRow, lineStart: 3, lineEnd: 3, expectSrc: "    b()" };
     const kept = { before: "def h():\n    a()\n    b()", after: "def h():\n    a(1)\n    b()" };
     const grown = { before: "def h():\n    a()\n    b()", after: "def h():\n    a(\n        1)\n    b()" };
-    assert.strictEqual(rebaseQueuedEdit(applied, kept, sameRow).expectSrc, "    a(1)");
-    assert.strictEqual(rebaseQueuedEdit(applied, kept, otherRow), otherRow);
-    assert.strictEqual(rebaseQueuedEdit(applied, grown, sameRow), sameRow);
+    const rebaser = new QueuedEditRebaser();
+    rebaser.noteApplied(applied, kept);
+    assert.strictEqual(rebaser.rebase(sameRow).expectSrc, "    a(1)");
+    assert.strictEqual(rebaser.rebase(otherRow), otherRow);
+    rebaser.noteApplied(applied, grown);
+    assert.strictEqual(rebaser.rebase(sameRow), sameRow, "a line-count change drops every rebase");
   });
 
   test("drainEdits with NO suppressed change never schedules a refresh", async () => {
