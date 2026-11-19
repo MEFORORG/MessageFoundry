@@ -13,11 +13,13 @@ carry a copy, and ``install-git-hooks.ps1`` puts it beside them.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
 import socket
 import subprocess  # nosec B404 - fixed argv, no shell
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -244,9 +246,51 @@ def resolve(
     return CoordDir(root / kind, True, source, None)
 
 
+# Windows' MAX_COMPUTERNAME_LENGTH: the NetBIOS name is at most this many characters.
+_NETBIOS_MAX = 15
+# The host is a Windows machine, so PowerShell on it writes the NetBIOS name. An MSYS2 or Cygwin
+# Python, which the git hooks can resolve from Git Bash, reports os.name 'posix' on that machine.
+_WINDOWS_HOST = os.name == "nt" or sys.platform.startswith(("cygwin", "msys"))
+
+
+@functools.cache
+def _windows_computer_name() -> str | None:
+    """The NetBIOS name from ``GetComputerNameW``, the call .NET's MachineName makes; None on failure.
+
+    Cached: the active NetBIOS name does not change until a reboot, and host() runs once per record.
+    """
+    try:
+        import ctypes  # Windows-only use; imported here so the module loads anywhere
+
+        buf = ctypes.create_unicode_buffer(_NETBIOS_MAX + 1)
+        size = ctypes.c_uint32(len(buf))
+        kernel32 = ctypes.WinDLL("kernel32")  # type: ignore[attr-defined,unused-ignore]
+        ok = kernel32.GetComputerNameW(buf, ctypes.byref(size))
+    except (ImportError, OSError, AttributeError) as exc:
+        # An MSYS2 or Cygwin Python has no WinDLL; say so once, since the cache keeps the answer.
+        print(
+            f"coord_root: GetComputerNameW unavailable ({exc!r}); using the DNS label",
+            file=sys.stderr,
+        )
+        return None
+    if not (ok and buf.value):
+        print("coord_root: GetComputerNameW failed; using the DNS label", file=sys.stderr)
+        return None
+    return buf.value
+
+
 def host() -> str:
-    """The name every shared record carries. Matches PowerShell's ``[Environment]::MachineName``."""
-    return os.environ.get("COMPUTERNAME") or socket.gethostname().split(".")[0].upper()
+    """The name every shared record carries. Matches PowerShell's ``[Environment]::MachineName``.
+
+    It never reads ``COMPUTERNAME``, which PowerShell's MachineName does not read either, so the two
+    twins cannot be split by that variable. On a Windows host the name is the NetBIOS name, upper case
+    and at most 15 characters, as .NET reads it; where that call is unavailable or fails, the DNS
+    host's first label is cut the same way. Elsewhere it is the host name's first label, case kept,
+    which is what .NET returns there.
+    """
+    if _WINDOWS_HOST:
+        return _windows_computer_name() or socket.gethostname().split(".")[0].upper()[:_NETBIOS_MAX]
+    return socket.gethostname().split(".")[0]
 
 
 # What a host field that is present but not a string reads as. It never equals a machine name, so the

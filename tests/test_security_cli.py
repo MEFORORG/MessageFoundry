@@ -70,6 +70,251 @@ def test_null_value_resets_to_default_and_drops_emptied_table(
     assert "[security]" not in text and "require_mfa" not in text  # emptied table dropped
 
 
+def test_null_reset_of_an_unknown_key_is_refused_and_leaves_the_loosening(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5327: a null reset of a misspelled key changed nothing, yet the CLI exited 0 and
+    reported the key as set, so the loosening the operator meant to reset stayed on disk."""
+    toml = tmp_path / "mf.toml"
+    _set(toml, {"require_mfa": False}, capsys)
+    before = toml.read_bytes()
+    rc = main(
+        [
+            "security",
+            "set",
+            "--service-config",
+            str(toml),
+            "--data",
+            json.dumps({"require_mfx": None}),
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc != 0
+    assert "require_mfx" in err and "did you mean 'require_mfa'" in err
+    assert toml.read_bytes() == before  # nothing written; the loosening is still there
+
+
+def test_set_security_reports_a_reset_that_finds_nothing_as_unchanged(tmp_path: Path) -> None:
+    """BACKLOG #5327, the editor itself: a reset that finds nothing is reported apart from a key
+    it wrote, and the edit is still validated like any other."""
+    from messagefoundry.config import security_edit
+
+    seen: list[Path] = []
+    toml = tmp_path / "mf.toml"
+    result = security_edit.set_security(toml, {"require_mfa": None}, validate=seen.append)
+    # No file and no key changed: none is created, nothing is checked, and the result says the
+    # file was not written rather than claim a rewrite.
+    assert result == {
+        "op": "unchanged",
+        "keys": [],
+        "unchanged": ["require_mfa"],
+        "rewritten": False,
+        "detail": "no key changed; mf.toml does not exist, so no settings file was created",
+    }
+    assert not toml.exists() and seen == []
+    # No edit lock either: its file would be the edit's only trace.
+    assert list(tmp_path.iterdir()) == []
+    # A file that is there goes through the validated replace like any set, and says so.
+    toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
+    result = security_edit.set_security(toml, {"require_mfa": False}, validate=seen.append)
+    assert result == {
+        "op": "unchanged",
+        "keys": [],
+        "unchanged": ["require_mfa"],
+        "rewritten": True,
+        "detail": "no key changed; file rewritten by the validated replace every set uses, which "
+        "restricts it, on POSIX to its owner afterwards (the editing account unless root keeps the "
+        "previous owner), on Windows to the editing account or, where another account owned it, to "
+        "that account and the editing account, and logs a warning where it cannot",
+    }
+    assert len(seen) == 1 and seen[0] != toml and seen[0].name == toml.name
+    # A value equal in Python but of another type is a change, not the value the file holds.
+    toml.write_text("[security]\nsign_out_after_idle_minutes = 1\n", encoding="utf-8")
+    result = security_edit.set_security(
+        toml, {"sign_out_after_idle_minutes": True}, validate=lambda _c: None
+    )
+    assert result["op"] == "set"
+
+
+def test_null_reset_of_a_removed_key_offers_no_spelling(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A removed [security] key is refused like any unknown one, with no nearest spelling: for
+    require_sign_in that would be require_mfa, a different switch (vault BACKLOG #2719)."""
+    assert ("security", "require_sign_in") in _REMOVED_KEYS
+    toml = tmp_path / "mf.toml"
+    rc = main(
+        [
+            "security",
+            "set",
+            "--service-config",
+            str(toml),
+            "--data",
+            json.dumps({"require_sign_in": None}),
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc != 0 and "[security].require_sign_in was REMOVED" in err
+    # Neither a nearest spelling nor advice to check the spelling of a key that is not misspelled.
+    assert "did you mean" not in err and "Check the spelling" not in err
+    assert not toml.exists()
+
+
+def test_null_reset_refusal_names_every_unknown_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    toml = tmp_path / "mf.toml"
+    rc = main(
+        [
+            "security",
+            "set",
+            "--service-config",
+            str(toml),
+            "--data",
+            json.dumps({"require_mfx": None, "block_unlisted_outbund": None}),
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc != 0
+    # Joined as the loader joins unknown keys.
+    assert (
+        "[security].require_mfx (did you mean 'require_mfa'?), [security].block_unlisted_outbund"
+        in err
+    )
+
+
+def test_an_edit_that_changes_nothing_still_refuses_a_file_the_engine_refuses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An edit that changes nothing must not report a file the whole-file load refuses as fine:
+    before BACKLOG #5327 every set ran that load, and it still does."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[auth]\nenabled = false\n", encoding="utf-8")
+    before = toml.read_bytes()
+    rc, _ = _set(toml, {"require_mfa": None}, capsys)
+    assert rc == 1 and toml.read_bytes() == before
+
+
+def test_a_value_the_file_already_holds_is_unchanged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    toml = tmp_path / "mf.toml"
+    _set(toml, {"require_mfa": False}, capsys)
+    before = toml.read_bytes()
+    rc, res = _set(toml, {"require_mfa": False}, capsys)
+    assert rc == 0 and res["op"] == "unchanged" and res["unchanged"] == ["require_mfa"]
+    assert toml.read_bytes() == before
+    # The loosening the file still carries is still reported.
+    assert "require_mfa" in [lo["switch"] for lo in res["loosenings"]]
+
+
+def test_every_ide_security_field_is_a_security_setting() -> None:
+    """The IDE editor sends null for each field at its default, and a null reset of a key
+    [security] does not define is refused (BACKLOG #5327), so a field the model dropped would
+    block every IDE save. TypeScript cannot import the Python, so this reads the source."""
+    import re
+
+    from messagefoundry.config.settings import SecuritySettings
+
+    source = (
+        Path(__file__).resolve().parent.parent / "ide" / "src" / "securityEditorWebview.ts"
+    ).read_text(encoding="utf-8")
+    block = source.split("export const FIELDS", 1)[1].split("\n];", 1)[0]
+    keys = re.findall(r'\{\s*key\s*:\s*"([^"]+)"', block)
+    assert len(keys) > 5  # the parse found the entries
+    assert set(keys) <= set(SecuritySettings.model_fields)
+
+
+def test_null_reset_of_an_unknown_key_the_file_carries_removes_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Removing a key the file does carry is a real change, and the repair for a file the
+    whole-file load refuses, so it is not refused."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nrequire_mfx = false\n", encoding="utf-8")
+    rc, res = _set(toml, {"require_mfx": None}, capsys)
+    assert rc == 0 and res["op"] == "set" and res["keys"] == ["require_mfx"]
+    assert "require_mfx" not in toml.read_text(encoding="utf-8")
+
+
+def test_null_reset_in_a_missing_folder_is_refused_and_creates_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5327: a reset whose folder does not exist is a mistyped path, so it exits non-zero
+    and creates nothing rather than read as a successful reset. An absent file in a folder that
+    exists still exits 0 and creates nothing, the edit lock's file included."""
+    toml = tmp_path / "missing" / "mf.toml"
+    rc, err = _set(toml, {"require_mfa": None}, capsys)
+    assert rc != 0
+    assert f"{tmp_path / 'missing'} is not a folder that exists" in err["error"]
+    assert list(tmp_path.iterdir()) == []
+    # A parent that is a regular file is the same mistake, refused the same way.
+    (tmp_path / "notes.txt").write_text("", encoding="utf-8")
+    rc, err = _set(tmp_path / "notes.txt" / "mf.toml", {"require_mfa": None}, capsys)
+    assert rc != 0 and "is not a folder that exists" in err["error"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.txt"]
+    (tmp_path / "notes.txt").unlink()
+    # In a folder that exists, no lock file is left beside the absent settings file.
+    toml = tmp_path / "mf.toml"
+    rc, res = _set(toml, {"require_mfa": None}, capsys)
+    assert rc == 0 and res["rewritten"] is False
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_null_reset_where_the_stat_is_refused_is_not_reported_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5327: a failed stat is not "nothing there". Where the editors' shared stat gate
+    refuses the path, as for a file behind an unreachable share, the reset is refused rather than
+    reported as finding no file."""
+    from messagefoundry.config import atomic_edit, security_edit
+
+    def refuse(path: Path, *, refused_error: object) -> bool:
+        raise security_edit.SecurityEditError(f"could not stat {path.name}")
+
+    monkeypatch.setattr(atomic_edit, "is_file", refuse)
+    with pytest.raises(security_edit.SecurityEditError, match="could not stat"):
+        security_edit.set_security(
+            tmp_path / "mf.toml", {"require_mfa": None}, validate=lambda _c: None
+        )
+    # A folder whose stat is refused is refused in the gate's words, not called missing.
+    monkeypatch.setattr(atomic_edit, "is_dir", refuse)
+    with pytest.raises(security_edit.SecurityEditError, match="could not stat"):
+        security_edit.set_security(
+            tmp_path / "mf.toml", {"require_mfa": None}, validate=lambda _c: None
+        )
+
+
+def test_null_reset_under_a_regular_file_is_not_reported_absent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5327: a path under a regular file is a mistyped path, not a missing settings
+    file, so a reset there fails rather than exit 0 as finding no file."""
+    notes = tmp_path / "notes.txt"
+    notes.write_text("x", encoding="utf-8")
+    rc, _res = _set(notes / "mf.toml", {"require_mfa": None}, capsys)
+    assert rc != 0
+    assert sorted(tmp_path.iterdir()) == [notes]
+
+
+def test_null_reset_of_an_absent_known_key_reports_nothing_changed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5327: resetting a known key the file does not set changes nothing, so the result
+    says so instead of reporting it as set, and the file's text is as it was."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("# keep\n[api]\nport = 9000\n", encoding="utf-8")
+    before = toml.read_bytes()
+    rc, res = _set(toml, {"require_mfa": None}, capsys)
+    assert rc == 0
+    assert res["op"] == "unchanged" and res["keys"] == [] and res["unchanged"] == ["require_mfa"]
+    assert toml.read_bytes() == before
+    # Mixed: the reset that found nothing is named apart from the key that was written.
+    rc, res = _set(toml, {"require_mfa": None, "max_session_hours": 13}, capsys)
+    assert rc == 0 and res["op"] == "set"
+    assert res["keys"] == ["max_session_hours"] and res["unchanged"] == ["require_mfa"]
+
+
 def test_ac3_contradiction_is_rejected_and_rolled_back(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -907,3 +1152,138 @@ def test_cli_set_reports_a_malformed_edit_as_json_on_stdout_in_a_real_subprocess
     assert proc.stdout.strip(), f"stdout was empty; stderr={proc.stderr}"
     assert json.loads(proc.stdout)["error"].startswith("invalid security update JSON:")
     assert "Traceback" not in proc.stderr, "a raw traceback reached the operator"
+
+
+# --- BACKLOG #5327: an edit that changes no key still restricts the file to its owner -----------
+
+
+def test_a_reset_that_finds_nothing_on_an_absent_file_creates_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through the CLI: no 0-byte file appears, and the result says nothing was written. With no
+    file there is no whole-file load, so the report is the one ``show`` gives for an absent file,
+    and its scope text says such a set names no session-limit variable."""
+    toml = tmp_path / "mf.toml"
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "99")
+    rc, res = _set(toml, {"require_mfa": None}, capsys)
+    assert rc == 0 and res["op"] == "unchanged" and res["rewritten"] is False
+    assert "does not exist" in res["detail"]
+    assert not toml.exists()
+    shown = _show(toml, capsys)
+    assert (res["loosenings"], res["loosenings_partial"]) == (
+        shown["loosenings"],
+        shown["loosenings_partial"],
+    )
+    assert "a `set` that changed no key where no file exists" in res["loosenings_scope"]
+
+
+def test_a_reset_that_finds_nothing_on_a_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a path with nothing at it skips the replace; a directory there fails the replace as it
+    does for any set (Windows answers access denied, POSIX a raw IsADirectoryError, both of which
+    the CLI reports as an error), never reported as a file that does not exist."""
+    import messagefoundry.restricted_file as restricted_mod
+    from messagefoundry.config import security_edit
+
+    # Windows retries an access-denied replace for a held file; a directory is never released.
+    monkeypatch.setattr(restricted_mod, "_HELD_RETRY_S", 0.0)
+    toml = tmp_path / "mf.toml"
+    toml.mkdir()
+    with pytest.raises((security_edit.SecurityEditError, OSError)):
+        security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
+    assert toml.is_dir()
+
+
+def test_a_security_table_holding_only_comments_is_kept(tmp_path: Path) -> None:
+    """The emptied-table drop is for a table the edit emptied, not one that held only comments
+    when the edit removed nothing."""
+    from messagefoundry.config import security_edit
+
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\n# require_mfa = false  (kept for later)\n", encoding="utf-8")
+    before = toml.read_bytes()
+    result = security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
+    assert result["op"] == "unchanged" and result["rewritten"] is True
+    assert toml.read_bytes() == before
+
+
+def _unchanged_set(toml: Path) -> None:
+    from messagefoundry.config import security_edit
+
+    result = security_edit.set_security(toml, {"require_mfa": False}, validate=lambda _c: None)
+    assert result["op"] == "unchanged" and result["rewritten"] is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_an_edit_that_changes_no_key_still_narrows_a_loose_file_on_posix(tmp_path: Path) -> None:
+    """Every set goes through the validated replace, which restricts the settings file to its
+    owner, so a file left at 0644 is narrowed to 0600 by a set that changes no key."""
+    import os
+    import stat
+
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
+    os.chmod(toml, 0o644)
+    _unchanged_set(toml)
+    assert stat.S_IMODE(toml.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_an_edit_that_changes_no_key_but_is_refused_keeps_the_mode_on_posix(
+    tmp_path: Path,
+) -> None:
+    """The control: a refused replace never touches the live file."""
+    import os
+    import stat
+
+    from messagefoundry.config import security_edit
+
+    def refuse(_candidate: Path) -> None:
+        raise ValueError("refused")
+
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
+    os.chmod(toml, 0o644)
+    with pytest.raises(security_edit.SecurityEditError):
+        security_edit.set_security(toml, {"require_mfa": False}, validate=refuse)
+    assert stat.S_IMODE(toml.stat().st_mode) == 0o644
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows access list")
+def test_an_edit_that_changes_no_key_still_narrows_a_loose_file_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Windows half: a file whose inherited list also grants SYSTEM is left with its owner's
+    entry alone by a set that changes no key, as by any set."""
+    import messagefoundry.store.store as store_mod
+    from messagefoundry.auth.anchor_path import SYSTEM_SID
+    from messagefoundry.config import atomic_edit
+    from messagefoundry.store.store import _read_dacl_sddl
+    from tests._win_acl import assert_owner_only, folder_granting
+
+    token = store_mod._current_user_sid()
+    assert token is not None
+    toml = folder_granting(tmp_path / "config", token, SYSTEM_SID) / "mf.toml"
+    toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
+    owner = atomic_edit._owner_of(toml)
+    assert owner is not None
+    # The token seam reports the file's real owner, so the test means the same on every runner.
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: owner)
+    # The positive control: the file starts with SYSTEM's inherited entry beside its owner's.
+    before = _read_dacl_sddl(toml, owner=False)
+    assert before is not None and ";SY)" in before, before
+    _unchanged_set(toml)
+    assert_owner_only(toml, owner)
+
+
+def test_a_bare_security_header_is_dropped_by_a_full_reset(tmp_path: Path) -> None:
+    """A bare ``[security]`` header with no comment is still dropped by a set that changes no
+    key, so a full reset-to-defaults leaves no header behind."""
+    from messagefoundry.config import security_edit
+
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\n\n[api]\nport = 9000\n", encoding="utf-8")
+    result = security_edit.set_security(toml, {"require_mfa": None}, validate=lambda _c: None)
+    assert result["op"] == "unchanged"
+    assert "[security]" not in toml.read_text(encoding="utf-8")

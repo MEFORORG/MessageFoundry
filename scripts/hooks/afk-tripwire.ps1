@@ -22,7 +22,12 @@
 
     WHAT IT DETECTS, at least:
       * a hook bypass: `--no-verify` on any git subcommand, `-n` on `git commit`,
-        `git -c core.hooksPath=...`, and pre-commit's `SKIP=` in front of a command;
+        `git -c core.hooksPath=...` or `git --config-env core.hooksPath=...`, and pre-commit's `SKIP=`
+        in front of a command;
+      * a `-c` or `--config-env` override of `include.path` or `includeIf.*`, which can load a
+        hooksPath from a file; of `alias.*`, which can run a git command under a new name, or any shell
+        command with `!`; of `remote.<name>.mirror`; and of `remote.<name>.push` with a `+` or `:`
+        refspec under `-c`, or with any value under `--config-env`, whose value names a variable;
       * a force push: `--force`, `-f`, `--force-with-lease`, `--mirror`, or a `+` refspec;
       * a ref deletion by push: `--delete`, `-d`, `--prune`, or a `:<branch>` refspec;
       * `git reset --hard`;
@@ -47,6 +52,12 @@
     WHAT IT DOES NOT SEE (SAIDS section 9: a rule is not a control until something enforces it).
     A script file that runs one of these acts, an alias or variable that spells the command, git
     plumbing that deletes or moves a ref (`update-ref -d`, `branch -D`), and every non-shell tool.
+    Nor config that does an act without a flag, at least: a `-c` key that runs a command
+    (`core.pager`, `core.editor`, `sequence.editor`, `core.sshCommand`, `core.fsmonitor`,
+    `diff.external`, `credential.helper`, `gpg.program`) or moves the work tree (`core.worktree`);
+    config set through the environment (`GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>` and
+    `GIT_CONFIG_VALUE_<n>`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, or a
+    moved `HOME` or `XDG_CONFIG_HOME`); and a persistent `git config core.hooksPath <dir>` write.
     The other section 4.4 tripwires -- a diff touching Class C paths, the same permission denial
     twice, `main` red for two hours, two seats on one item -- are rules only in this slice; ADR 0211
     says which the digest reports.
@@ -202,19 +213,59 @@ function Test-KillSwitchWrite($Argv) {
     return $false
 }
 
+function Get-ConfigOverrideHit([string]$Option, [string]$Pair) {
+    # A config override that points the hooks elsewhere skips them as surely as --no-verify; an
+    # include can load a file that does the same; an alias can run a git command under a new name,
+    # or any shell command with `!`; a remote's mirror setting, valueless meaning true, turns a plain
+    # push into a forced one, and so can a `+` push refspec, while a `:<dst>` one deletes (a bare `:`
+    # is the matching refspec, recorded all the same). -match folds case, as git does for a section and
+    # variable name; it also folds a subsection, which git does not, and so records more, never less.
+    if ($Pair -match '^core\.hooksPath=') { return "git $Option core.hooksPath (hook bypass)" }
+    if ($Pair -match '^include\.path=') { return "git $Option include.path (config include, can bypass hooks)" }
+    if ($Pair -match '^includeIf\.') { return "git $Option includeIf (config include, can bypass hooks)" }
+    if ($Pair -match '^alias\.') { return "git $Option alias (command alias override)" }
+    # Under --config-env the text after `=` names an environment variable, so the refspec is unseen.
+    $push = if ($Option -ceq '--config-env') { 'push=' } else { 'push=[+:]' }
+    if ($Pair -match "^remote\..+\.(mirror(=|$)|$push)") { return "git $Option remote mirror or push refspec (can force a push)" }
+    return $null
+}
+
+# Global options taking their value as the next argument. The first list is the one origin/main read
+# with before BACKLOG #5448; it skips the value of --exec-path, which takes none, and misses
+# --config-env, --attr-source and --shallow-file, which do (measured on git 2.55.0). Both parses run
+# and every hit either one sees is recorded, because a tripwire may only tighten: under the first, a
+# Class C word in the value position (`git --attr-source reset log --hard`) is the subcommand.
+# Resolve-GitSubcommand in block-blanket-git-stage.ps1 kept a copy of the first list. BACKLOG #5450
+# changes that copy on its own branch, whose wider list keeps --exec-path, so the lists here and
+# there differ, at least until one is changed to match the other; nothing tests them together.
+$script:GitValuedOptionLists = @(
+    @('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix'),
+    @('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env', '--attr-source', '--shallow-file')
+)
+
 function Find-GitTripwires($Argv, $Hits) {
-    $k = 0
-    # Global options before the subcommand; -C, -c and the bare long forms take a value.
-    while ($k -lt $Argv.Count -and $Argv[$k].T.StartsWith('-')) {
-        # A config override that points the hooks elsewhere skips them as surely as --no-verify.
-        if ($Argv[$k].T -ceq '-c' -and $k + 1 -lt $Argv.Count -and $Argv[$k + 1].T -match '^core\.hooksPath=') {
-            $Hits.Add('git -c core.hooksPath (hook bypass)')
+    $starts = [System.Collections.Generic.List[int]]::new()
+    foreach ($valued in $script:GitValuedOptionLists) {
+        $k = 0
+        # Global options before the subcommand.
+        while ($k -lt $Argv.Count -and $Argv[$k].T.StartsWith('-')) {
+            $t = $Argv[$k].T
+            $next = if ($k + 1 -lt $Argv.Count) { $Argv[$k + 1].T } else { '' }
+            # --config-env is -c with the value read from an environment variable, in both spellings
+            # git accepts (BACKLOG #5448): `--config-env=<key>=<var>` and `--config-env <key>=<var>`.
+            # The option NAME is matched case-sensitively, as git does; only the key folds.
+            $hit = if ($t -cin @('-c', '--config-env')) { Get-ConfigOverrideHit $t $next }
+            elseif ($t -cmatch '^--config-env=(.*)$') { Get-ConfigOverrideHit '--config-env' $Matches[1] }
+            if ($hit) { $Hits.Add($hit) }
+            if ($t -cin $valued) { $k++ }
+            $k++
         }
-        # The list Resolve-GitSubcommand in block-blanket-git-stage.ps1 uses; keep the two equal.
-        if ($Argv[$k].T -cin @('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix')) { $k++ }
-        $k++
+        if ($k -lt $Argv.Count -and -not $starts.Contains($k)) { $starts.Add($k) }
     }
-    if ($k -ge $Argv.Count) { return }
+    foreach ($k in $starts) { Find-GitSubcommandTripwires $Argv $k $Hits }
+}
+
+function Find-GitSubcommandTripwires($Argv, [int]$k, $Hits) {
     $sub = $Argv[$k].T
     $rest = @(if ($k + 1 -lt $Argv.Count) { $Argv[($k + 1)..($Argv.Count - 1)] })
     # A flag is an unquoted token, or a quoted one that is a single flag-shaped word: the shell
@@ -226,7 +277,10 @@ function Find-GitTripwires($Argv, $Hits) {
             $after = $p -gt 0 -and $rest[$p - 1].T -cin $valued
             if (-not $t.Q -or ($t.T -cmatch '^--?[A-Za-z][\w-]*(=\S*)?$' -and -not $after)) { $t.T }
         })
-    if (@($flags | Where-Object { Test-LongOption $_ '--no-verify' 9 }).Count) { $Hits.Add("git $sub --no-verify") }
+    # The record names acts, never command text, and the first parse can put an option's value (a path,
+    # a key=VAR) where the subcommand goes; only a subcommand-shaped word is named.
+    $subName = if ($sub -cmatch '^[a-z][a-z0-9-]*$') { $sub } else { '<subcommand>' }
+    if (@($flags | Where-Object { Test-LongOption $_ '--no-verify' 9 }).Count) { $Hits.Add("git $subName --no-verify") }
     switch -CaseSensitive ($sub) {
         'commit' {
             # -u takes its mode stuck on (`-uno`), so it ends a cluster like the value letters.

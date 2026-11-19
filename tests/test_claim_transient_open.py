@@ -16,6 +16,7 @@ is still dead-lettered and reported (the control). SQLite; the server backends m
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import pathlib
 import sqlite3
@@ -65,6 +66,14 @@ class _OutageCipher:
         return self._inner.decrypt(stored, aad=aad)
 
 
+class _TransitVerdictCipher(_OutageCipher):
+    """An :class:`_OutageCipher` that, as Vault Transit, cannot name its keys, so a key service's
+    verdict on a marked cell reads as a tag failure rather than a corrupt cell (BACKLOG #5884)."""
+
+    holds_key_for = None
+    names_no_keys = True  # as the Transit cipher declares
+
+
 Claim = Callable[[MessageStore], Awaitable[list[Any]]]
 
 
@@ -94,10 +103,12 @@ _ALL_CLAIMS = pytest.mark.parametrize(
 )
 
 
-async def _open(tmp_path: pathlib.Path) -> tuple[MessageStore, _OutageCipher, pathlib.Path]:
+async def _open(
+    tmp_path: pathlib.Path, cipher_cls: type[_OutageCipher] = _OutageCipher
+) -> tuple[MessageStore, _OutageCipher, pathlib.Path]:
     inner = make_cipher(generate_key(), write_v2=True)
     assert isinstance(inner, AesGcmCipher)
-    cipher = _OutageCipher(inner)
+    cipher = cipher_cls(inner)
     db = tmp_path / "claim.db"
     store = await MessageStore.open(db, cipher=cipher)  # type: ignore[arg-type]
     await store.enqueue_message(channel_id="IB", raw="MSH|r", deliveries=[(_DEST, "B1")])
@@ -348,13 +359,63 @@ async def test_a_verdict_is_still_dead_lettered_and_reported(
 ) -> None:
     """BACKLOG #5765: a 400 and a 413 are Vault's verdict on the row, so the claim
     dead-letters and reports it as before, never sets it aside to retry with no cap."""
-    store, cipher, db = await _open(tmp_path)
+    store, cipher, db = await _open(tmp_path, _TransitVerdictCipher)
     try:
         cipher.fault = _transit_error(kind)
         cipher.healthy_opens = 0
         assert all(i.payload != "B1" for i in await claim(store))
         assert _rows(db)[0][0] == "dead"
         assert _audited(db) >= 1
+    finally:
+        await store.close()
+
+
+@_ALL_CLAIMS
+async def test_a_corrupt_cell_under_a_held_key_is_dead_lettered_and_reported(
+    tmp_path: pathlib.Path, claim: Claim, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5884: a cipher that names its keys refusing a held-key cell for a reason other than
+    its AEAD check reads a corrupt cell, not drift. The claim still dead-letters it with exactly
+    one tag-failed audit row, whose cause says corrupt, and one alert, and its WARNING carries no
+    exception object, whose traceback could hold other rows' opened bodies."""
+    caplog.set_level(logging.WARNING, logger="messagefoundry.store.queue_tag")
+    store, cipher, db = await _open(tmp_path)
+    alerts: list[str] = []
+    cipher.set_tag_failure_hook(lambda _table, reason: alerts.append(reason))
+    try:
+        # Corrupt the head's stored cell (bad base64 under the held key's marker); the row behind
+        # it stays intact, so exactly one cell is corrupt.
+        head = "(SELECT MIN(rowid) FROM queue WHERE destination_name=?)"
+        ((sealed,),) = _side(db, f"SELECT payload FROM queue WHERE rowid={head}", (_DEST,))
+        corrupt = str(sealed).rsplit(":", 1)[0] + ":AAAAA"
+        _side(db, f"UPDATE queue SET payload=? WHERE rowid={head}", (corrupt, _DEST))
+        # B1's ciphertext is destroyed, so only B2 can leak. A claim that delivers past the dead
+        # head opens B2 in the same claim; a FIFO claim stops at the dead head, so the next opens it.
+        opened = [i.payload for i in await claim(store)]
+        if not opened:
+            opened = [i.payload for i in await claim(store)]
+        assert opened == ["B2"]
+        assert _rows(db)[0][0] == "dead"
+        assert _audited(db) == 1
+        (detail,) = _side(
+            db, "SELECT detail FROM audit_log WHERE action=?", (QUEUE_TAG_FAILED_ACTION,)
+        )
+        assert json.loads(detail[0])["cause"] == "corrupt" and "B2" not in detail[0]
+        assert len(alerts) == 1 and "is corrupt" in alerts[0] and "B2" not in alerts[0]
+        warned = [
+            r
+            for r in caplog.records
+            if r.name == "messagefoundry.store.queue_tag" and "is corrupt" in r.getMessage()
+        ]
+        assert len(warned) == 1
+        assert not any("B2" in r.getMessage() for r in caplog.records)
+        # Every WARNING the corrupt cell left, the store's dead-letter line included, carries no
+        # exception object and no traceback.
+        corrupt_lines = [r for r in caplog.records if "is corrupt" in r.getMessage()]
+        assert len(corrupt_lines) == 2
+        for record in corrupt_lines:
+            assert not any(isinstance(a, BaseException) for a in record.args or ())
+            assert record.exc_info is None
     finally:
         await store.close()
 

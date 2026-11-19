@@ -169,12 +169,17 @@ exists to stop.
 
 The fix is part of the change, not a follow-up:
 
-1. Every shared record carries `host` (`$env:COMPUTERNAME`). `seat.ps1` already writes it into its
+1. Every shared record carries `host`. `Get-CoordHost` in `coord-root.ps1` reads it from
+   `[Environment]::MachineName`, and its Python twin `coord_root.host()` makes the same call on a
+   native Windows Python (an MSYS2 or Cygwin one cuts the DNS label to the NetBIOS form instead).
+   Neither reads `$env:COMPUTERNAME`. At least mail's `from.host` and
+   `lock.ps1` still read that variable. `seat.ps1` already writes it into its
    stage log, not into the record.
 2. A liveness check judges only records whose `host` is this machine. A record from another host
    reads `ON <HOST>, NOT CHECKABLE HERE`, never `GONE`.
 3. A record with no `host` is treated as this machine's, which is true of every record written
-   before the change.
+   before the change. Mail is the exception: `mail.ps1` refuses a send to a seat id from before
+   the change whose record names no host, because the box it would key could be one nobody drains.
 
 ## The worktree gate must follow the root, by tightening
 
@@ -293,7 +298,7 @@ design. Reads and builds keep working.
    the watcher move the old box's inbox into the new box before they read. `seat.ps1` takes its
    prior from whichever of its two records says it is newer. `fleet.ps1` treats the old and new
    boxes of one tree as one seat. The lane hook reads whichever lane file holds the fresher level. A send to a seat id published before the change goes to the
-   new box. Writers write only the new key. `lane.ps1` still refuses to overwrite a record at its
+   new box, when its record names a host; one that names none is refused. Writers write only the new key. `lane.ps1` still refuses to overwrite a record at its
    own key that names another host. The key keeps two PCs apart, so such a record got there some
    other way: at least by a copy, by hand, by a collision on the short hash, or by a mistyped
    `coord-migrate.ps1 -SourceHost`. A record read from an old box is judged by its

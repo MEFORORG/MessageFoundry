@@ -1766,8 +1766,9 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
 ) -> None:
     # PR 2804 seventh hold, finding 1: --db overrides [store].path, so "the same arguments" would
     # point a new store's re-run, and its service, back at the old store. A new SQLite store's --db
-    # names the new path, on the re-run and wherever the service passes one (eighth hold: at least
-    # install-service.ps1 and supervise always do); a server store is named by
+    # names the new path, on the re-run and wherever the service passes one (eighth hold:
+    # install-service.ps1 always does, and a supervise does when started with --db, BACKLOG
+    # #5817); a server store is named by
     # [store].server/database, here and for the service. With the store kept, the re-run keeps
     # every argument, --db and --service-config among them.
     settings = _settings(tmp_path).model_copy(update={"backend": backend})
@@ -1789,17 +1790,17 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
         "parameter that goes only with it, at least -EngineWheelSha256, -RequirementsLock, "
         "-RequirementsLockSha256 and -BasePython, as for any re-run over the install root it "
         "built (`messagefoundry service install` cannot pass -DbPath, so never reinstall with "
-        "it), and supervise --db, which supervise passes to its engine shard as "
-        "messagefoundry.db, under --project-root if one is given, when its own command line "
-        "leaves it out"
+        "it), and supervise --db wherever a supervise command line passes one (without one, "
+        "supervise takes [store].path, as serve does)"
     )
     database = (
         ", once [store] names that new database, here and for the service (--db sets only "
         "[store].path, which does not name a server store)"
     )
     server = backend is not StoreBackend.SQLITE
-    # PR 2804 eighth hold: at least install-service.ps1 and supervise always pass --db, so it is
-    # named, not left out, and the service's own commands are named concretely.
+    # PR 2804 eighth hold: install-service.ps1 always passes --db, and a supervise started with
+    # one passes it on (BACKLOG #5817), so it is named, not left out, and the service's own
+    # commands are named concretely.
     assert "leave it out" not in step and "take it off" not in step, step
     named = "--db, which overrides [store].path, naming that new SQLite path" in step
     assert named is (new_store and not server), step
@@ -1812,8 +1813,8 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
 
 
 def test_the_service_commands_the_fallback_names_exist() -> None:
-    # PR 2804 eighth hold: the step names install-service.ps1's -DbPath and supervise's --db, which
-    # passes messagefoundry.db when left out. Tie both names to the real interfaces.
+    # PR 2804 eighth hold: the step names install-service.ps1's -DbPath and supervise's --db. Tie
+    # both names to the real interfaces.
     from messagefoundry.__main__ import _build_parser
 
     script = Path(__file__).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
@@ -1824,18 +1825,22 @@ def test_the_service_commands_the_fallback_names_exist() -> None:
     assert 'if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }' in source
     assert "serve --config $(Format-QuotedPath $Config) --db $(Format-QuotedPath $DbPath)" in source
     parser, _ = _build_parser()
-    supervise = parser.parse_args(["supervise", "--config", "c"])
-    assert supervise.db == "messagefoundry.db"
-    # supervise forwards its --db to the one engine shard SQLite allows, bare.
+    supervise = parser.parse_args(["supervise", "--config", "c", "--db", "new.db"])
+    assert supervise.db == "new.db"
+    # supervise forwards a given --db to the one engine shard SQLite allows, bare. Without one it
+    # takes [store].path (BACKLOG #5817), so the step names only a supervise that passes one.
+    assert parser.parse_args(["supervise", "--config", "c"]).db is None
     from messagefoundry.pipeline.supervisor import build_shard_specs
 
     (spec,) = build_shard_specs(["a"], config="c", db_base=supervise.db, base_port=8765)
     argv = list(spec.argv)
-    assert argv[argv.index("--db") + 1] == "messagefoundry.db", argv
+    assert "--db=new.db" in argv, argv  # one token (BACKLOG #5817)
     step = custody_host.keep_the_key_step(
         StoreSettings(key_provider="host", cipher_provider="aesgcm"), new_store=True
     )
-    assert "-DbPath" in step and "supervise --db" in step and "messagefoundry.db" in step, step
+    assert "-DbPath" in step and "supervise --db" in step, step
+    assert "(without one, supervise takes [store].path, as serve does)" in step, step
+    assert "as messagefoundry.db" not in step, step
 
 
 def test_the_advised_reinstall_is_one_the_installer_accepts() -> None:

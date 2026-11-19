@@ -495,7 +495,8 @@ control — Options #4):
   `ConnectorType.DICOMWEB` to the `(REST, SOAP, FHIR)` tuple that returns `egress.allowed_http`, so `deny_by_default`
   correctly refuses an unlisted DICOM destination.
 - **(egress 2) `check_egress_allowed`** — **fold `DICOMWEB` into the existing `(REST, SOAP, FHIR)` host-check
-  branch** (the branch body reads `dest.settings.get("url", "")`, calls `_http_egress_allowed`, and emits a
+  branch** (the branch body reads `dest.settings.get("url", "")`, calls `http_egress_allowed` (CORRECTED 2026-11-18 from its
+  former private name, `_http_egress_allowed`), and emits a
   `dest.type.value`-parameterized warning + `WiringError` that already names "dicomweb" generically; **this is
   exactly why `DICOMweb()` stores the endpoint under `"url"`**), and **add a standalone `DIMSE` branch modelled on
   X12's** (read `host`/`port`, match via `_mllp_egress_allowed` against `egress.allowed_tcp`, raise a `WiringError`

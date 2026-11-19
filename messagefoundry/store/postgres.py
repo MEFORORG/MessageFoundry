@@ -3365,17 +3365,27 @@ class PostgresStore:
         rows = await self._fetchall("SELECT namespace, key, value FROM state")
         cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
-            # #241 F2: fail closed (StoreKeylessError) on a keyless open of an encrypted store, rather
-            # than a raw JSONDecodeError from feeding an mfenc: blob straight to json.loads.
-            cache[(r["namespace"], r["key"])] = decrypt_json_cell(
-                self._cipher,
-                r["value"],
-                aad=cell_aad("state", "value", r["namespace"], r["key"]),
-                table="state",
+            cache[(r["namespace"], r["key"])] = self._decode_state_cell(
+                r["namespace"], r["key"], r["value"]
             )
         self._state_cache = cache
         vrows = await self._fetchall("SELECT namespace, version FROM state_version")
         self._state_versions = {r["namespace"]: int(r["version"]) for r in vrows}
+
+    def _decode_state_cell(self, namespace: str, key: str, stored: str) -> Any:
+        """Decrypt and decode one ``state`` cell, for both the open-time load and the follower
+        :meth:`converge_state_cache`, so both decode a cell the same way (BACKLOG #5311).
+
+        #241 F2: with no key configured, an encrypted cell raises StoreKeylessError rather than a
+        raw JSONDecodeError from feeding an mfenc: blob straight to json.loads.
+        :func:`decrypt_json_cell` states what else it refuses and what its error's message and
+        chain leave out; the traceback's frame locals still hold the decrypted text."""
+        return decrypt_json_cell(
+            self._cipher,
+            stored,
+            aad=cell_aad("state", "value", namespace, key),
+            table="state",
+        )
 
     async def _load_reference_cache(self) -> None:
         """Populate the in-memory reference cache from the ACTIVE snapshot of each set (ADR 0006).
@@ -3411,7 +3421,7 @@ class PostgresStore:
                 entry = cache[r["name"]] = new_reference_set(r["name"])
             versions[r["name"]] = r["version"]
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
-                # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
+                # #241 F2: fail closed on a keyless open of an encrypted store (see _decode_state_cell).
                 entry[r["key"]] = decrypt_json_cell(
                     self._cipher,
                     r["value"],
@@ -3475,14 +3485,7 @@ class PostgresStore:
             seen = self._state_versions.get(ns)
             if seen != version:
                 rows = await self._fetchall("SELECT key, value FROM state WHERE namespace=$1", ns)
-                fresh = {
-                    r["key"]: json.loads(
-                        self._cipher.decrypt(
-                            r["value"], aad=cell_aad("state", "value", ns, r["key"])
-                        )
-                    )
-                    for r in rows
-                }
+                fresh = {r["key"]: self._decode_state_cell(ns, r["key"], r["value"]) for r in rows}
                 pending.append((ns, version, seen, fresh))
         refreshed: list[str] = []
         for ns, version, seen, fresh in pending:
@@ -5727,7 +5730,8 @@ class PostgresStore:
 
     async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
-        tag is also audited and alerted (BACKLOG #2593). Returns ``None`` then.
+        tag is also audited and alerted (BACKLOG #2593), a corrupt cell included, whose audit row
+        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then.
 
         A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
         the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
@@ -5736,7 +5740,9 @@ class PostgresStore:
         the caller does with it."""
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
+        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
         except PROGRAMMING_ERRORS:
@@ -5749,11 +5755,11 @@ class PostgresStore:
             )
             if isinstance(exc, QueueTagError):
                 await report_queue_tag_failure(
-                    self, self._cipher, row, outcome="could not be dead-lettered"
+                    self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
-            await report_queue_tag_failure(self, self._cipher, row)
+            await report_queue_tag_failure(self, self._cipher, row, error=exc)
         return None
 
     async def _set_aside_claimed(self, tail: Sequence[Any], now: float | None) -> None:
@@ -5779,9 +5785,11 @@ class PostgresStore:
         pool."""
         try:
             opened = open_queue_cell(self._cipher, row)
-        except QueueTagError:
+        except QueueTagError as refused:
             if alert:
-                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+                alert_queue_tag_failure(
+                    self._cipher, row, error=refused, outcome="the read was refused"
+                )
             raise
         if row["body_ref"] is None:
             return opened
@@ -5831,7 +5839,10 @@ class PostgresStore:
         raises :class:`QueueTagError`, since no claim on this backend dereferences one (#2593)."""
         opened = open_queue_cell(self._cipher, row)
         if row["body_ref"] is not None:
-            raise QueueTagError("integrity: a store-once row is not delivered on this backend")
+            raise QueueTagError(
+                "integrity: a store-once row is not delivered on this backend",
+                cause="ref-not-delivered",
+            )
         return opened
 
     async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:

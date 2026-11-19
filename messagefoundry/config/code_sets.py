@@ -72,6 +72,8 @@ __all__ = [
     "set_active",
     "activated",
     "CodeSetError",
+    "CodeSetKeyError",
+    "CodeSetMissError",
     # --- #162: declared unmapped-value policy + re-run-safe capture ---
     "UnmappedKind",
     "UnmappedPolicy",
@@ -104,6 +106,40 @@ class CodeSetError(ValueError):
     A subclass of :class:`ValueError`; :func:`messagefoundry.config.wiring.code_set` re-raises these
     as :class:`~messagefoundry.config.wiring.WiringError` so a bad/missing code set is surfaced by
     ``validate`` / ``check`` / reload exactly like a missing ``env()`` key (fail loud)."""
+
+
+class _MissFields(Exception):
+    """A lookup miss's ``code_set``, as an attribute for a caller that needs it. The key is in
+    neither the error's message nor its attributes (BACKLOG #5320, see :func:`_miss_text`). It is
+    still a local of the raising frame, which the error's ``__traceback__`` reaches, so a sink that
+    captures frame locals would read it. ``code_set`` defaults, so a copy or a pickle, which
+    rebuilds from the message alone and then restores the attributes, still works."""
+
+    def __init__(self, message: str, *, code_set: str | None = None) -> None:
+        super().__init__(message)
+        self.code_set = code_set
+
+
+class CodeSetMissError(_MissFields, CodeSetError):
+    """:meth:`CodeSet.translate` missed and the code set declares no unmapped-value policy."""
+
+
+class CodeSetKeyError(_MissFields, KeyError):
+    """``cs[key]`` missed: a :class:`KeyError`, so ``cs.get()`` and ``except KeyError`` still work."""
+
+
+def _miss_text(name: str, key: object, *, kind: str = "code set") -> str:
+    """The message for a lookup miss in a code set or a reference set: the set and the key's
+    length, never the key (BACKLOG #5320). The key is usually a message field, so it may carry PHI.
+    A raised error's text goes at least to the store's error columns and message events, which are
+    ciphered at rest only when a store key is set, and to the log and the alert sinks, which are
+    outside the secured store (CLAUDE.md section 9). A short code is not hidden by a digest, which a
+    lookup over the possible values reverses, so no digest is given."""
+    if isinstance(key, str):
+        shape = f"{len(key)} character" if len(key) == 1 else f"{len(key)} characters"
+    else:
+        shape = f"type {type(key).__name__}"
+    return f"a key of {shape} is not in {kind} {name!r}"
 
 
 # --- #162: declared unmapped-value policy -------------------------------------
@@ -336,8 +372,9 @@ class CodeSet(Mapping[str, Any]):
 
     Behaves like a read-only ``dict`` (``cs[key]``, ``cs.get(key, default)``, ``key in cs``,
     ``len(cs)``, iteration) but rejects mutation — one instance is shared across every transform, so
-    reference data can't be edited from a handler. ``cs[missing]`` raises a :class:`KeyError` naming
-    the code set; ``cs.get(missing, default)`` returns the default.
+    reference data can't be edited from a handler. ``cs[missing]`` raises a :class:`CodeSetKeyError`
+    (a :class:`KeyError`) naming the code set, never the key; ``cs.get(missing, default)`` returns
+    the default.
 
     A code set may also declare an **unmapped-value policy** (``#162``, see :class:`UnmappedPolicy`),
     applied by :meth:`translate` on a miss so a Handler no longer hand-codes ``cs.get(key, default)``
@@ -367,8 +404,9 @@ class CodeSet(Mapping[str, Any]):
         A hit returns the mapped value (identical to ``cs[key]``). A miss applies the policy — a
         **pure** function of ``(key, table, policy)``: ``DEFAULT`` returns the configured value,
         ``PASSTHROUGH`` returns ``key`` unchanged, ``FLAG`` returns a :class:`Flagged` sentinel. With
-        no policy declared (``NONE``) a miss raises :class:`CodeSetError` (fail loud — declare a policy,
-        or use ``.get()``/``[]`` for the old None/KeyError behavior).
+        no policy declared (``NONE``) a miss raises :class:`CodeSetMissError`, a :class:`CodeSetError`
+        naming the code set, never the key (fail loud — declare a policy, or use ``.get()``/``[]`` for
+        the old None/KeyError behavior).
 
         The **only** effect beyond the return value is a record into the active run-scoped capture
         buffer (if a :func:`capturing` scope is active) — deterministic, in-memory, deduplicated, and
@@ -388,18 +426,25 @@ class CodeSet(Mapping[str, Any]):
             return key
         if kind is UnmappedKind.FLAG:
             return Flagged(self._name, key)
-        raise CodeSetError(
-            f"key {key!r} not in code set {self._name!r} and no unmapped_policy is declared — "
+        raise CodeSetMissError(
+            f"{_miss_text(self._name, key)} and no unmapped_policy is declared — "
             f"declare one (default/passthrough/flag) in codesets/{self._name}{POLICY_SIDECAR_SUFFIX}, "
-            "or use .get()/[] for the None/KeyError behavior"
+            "or use .get()/[] for the None/KeyError behavior",
+            code_set=self._name,
         )
 
     def __getitem__(self, key: str) -> Any:
         try:
             return self._data[key]
         except KeyError:
-            # Name the code set so a miss is self-explanatory in a transform traceback.
-            raise KeyError(f"key {key!r} not in code set {self._name!r}") from None
+            pass
+        # Name the code set so a miss is self-explanatory in a transform traceback. Raised outside
+        # the handler, so the dict's own KeyError, whose text is the key, is not even __context__.
+        raise CodeSetKeyError(_miss_text(self._name, key), code_set=self._name)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        # Straight to the dict, so a miss builds no CodeSetKeyError only to discard it.
+        return self._data.get(key, default)
 
     def __contains__(self, key: object) -> bool:
         return key in self._data

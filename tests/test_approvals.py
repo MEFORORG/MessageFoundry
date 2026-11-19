@@ -585,6 +585,49 @@ async def test_a_released_purge_of_an_outbound_another_engine_shard_owns_cancels
     await _assert_nothing_purged(engine, mid)
 
 
+_NOT_LEADER = (
+    "this node does not hold the cluster lease, so stop and purge outbound 'OB' on the leader's API"
+)
+
+
+async def test_a_released_purge_on_a_node_without_the_cluster_lease_cancels_nothing(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5792: a cluster standby delivers nothing, so its quiesced signal is vacuous, like a
+    non-owning engine shard's, and the leader may still be delivering the rows a purge cancels."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    async with _client(engine, service, ON) as c:
+        approval_id = await _hold_a_purge(c)
+        monkeypatch.setattr(rr.coordinator, "is_leader", lambda: False)
+        assert rr.outbound_quiesced("OB") is True  # so this check alone would let it through
+        ok = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "approver"))
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["result"] == {"cancelled": 0, "skipped": _NOT_LEADER}
+    await _assert_nothing_purged(engine, mid)
+
+
+async def test_an_inline_purge_on_a_node_without_the_cluster_lease_is_refused(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5792 at the route, with dual control off: a 409 naming the cause, and no cancel."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    monkeypatch.setattr(rr.coordinator, "is_leader", lambda: False)
+    async with _client(engine, service, OFF) as c:
+        r = await c.post("/connections/OB/purge?scope=all", headers=await _token(c, "op"))
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == _NOT_LEADER
+    await _assert_nothing_purged(engine, mid)
+
+
 async def test_a_skipped_release_keeps_the_owning_engine_shard_in_the_cut_tee_line(
     engine: Engine,
     tmp_path: Path,

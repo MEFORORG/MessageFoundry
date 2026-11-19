@@ -2296,7 +2296,7 @@ class MLLPSource(SourceConnector):
         # The rule ingress_guards.ingress_encoding reads too, so the reply is encoded in the charset
         # the runner decoded the body with. Config load refuses an env() inbound encoding, which the
         # runner's decode would not resolve, and a non-str or unusable name (BACKLOG #2431); the str()
-        # rule is the backstop that hands one that got past it to frame_reply's fallback, rather than
+        # rule is the backstop that hands one that got past it to encode_reply's fallback, rather than
         # raising a TypeError that leaves the reply unsent.
         self.encoding: str = declared_encoding(s.get("encoding"))
         # The inbound's ack mode, read only to NAK a frame the handler faulted on (BACKLOG #1619).

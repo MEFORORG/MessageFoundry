@@ -282,3 +282,338 @@ def test_json_is_exempt_from_the_guard() -> None:
         "-Json must stay usable inside Claude Code: it registers nothing"
     )
     assert "Refusing" not in allowed.stderr
+
+
+@requires_windows
+@pytest.mark.parametrize(("args", "hours"), [((), 4), (("-TimeLimitHours", "7"), 7)])
+def test_the_time_limit_reaches_the_plan_and_sets_the_runners_stop(
+    args: tuple[str, ...], hours: int
+) -> None:
+    """One hour never finished: measured 2026-11-18, the run was killed mid-list by the old fixed limit.
+
+    The default is 4. The runner's own stop must sit inside the limit, or the task is killed before the
+    runner writes its summary; and it must follow an explicit limit rather than stay at the default's.
+    """
+    p = plan(*args)
+    assert p["timeLimitHours"] == hours
+    stop = p["stopAfterMinutes"]
+    assert (hours - 1) * 60 < stop < hours * 60, "the runner must stop shortly before the limit"
+    assert f"-StopAfterMinutes {stop}" in p["argument"]
+
+
+@requires_windows
+@pytest.mark.parametrize("hours", ["0", "-1", "13"])
+def test_a_time_limit_out_of_range_is_refused(hours: str) -> None:
+    proc = run("-Json", "-TimeLimitHours", hours)
+    assert proc.returncode != 0, f"-TimeLimitHours {hours} was accepted: {proc.stdout}"
+    assert "TimeLimitHours" in proc.stderr
+    assert not proc.stdout.strip(), "a refused value must print no plan"
+
+
+def test_the_registration_uses_the_time_limit_the_plan_reports() -> None:
+    """Registration cannot be driven from a test, so the one line that builds its settings is read.
+
+    The plan is only a preview if the registration reads the same variable; the old literal one-hour
+    limit is the drift this pins shut.
+    """
+    src = INSTALLER.read_text(encoding="utf-8")
+    (settings,) = [line for line in src.splitlines() if "New-ScheduledTaskSettingsSet" in line]
+    assert "-ExecutionTimeLimit (New-TimeSpan -Hours $TimeLimitHours)" in settings, settings
+
+
+@requires_windows
+def test_the_plan_says_whether_the_primarys_runner_declares_the_stop() -> None:
+    """Registration refuses on a false here, since forwarding an undeclared parameter fails binding."""
+    p = plan()
+    runner = Path(p["runner"])
+    field = p["runnerDeclaresStopAfterMinutes"]
+    if not runner.is_file():
+        assert field is None
+    else:
+        assert field is ("StopAfterMinutes" in runner.read_text(encoding="utf-8"))
+
+
+# A prune-merged.ps1 stand-in that reports the credential-prompt variables it inherited.
+PRUNE_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours)\n"
+    '"stub prompt=$env:GIT_TERMINAL_PROMPT gcm=$env:GCM_INTERACTIVE"\n'
+    "exit 0\n"
+)
+
+
+def copy_runner(
+    tmp_path: Path, prune_stub: str = PRUNE_STUB, extra: dict[str, str] | None = None
+) -> tuple[Path, Path, dict[str, str]]:
+    """Copy the runner outside any repository, beside ``prune_stub`` as its prune-merged.ps1.
+
+    Only the coord files the runner dot-sources without -RemoveFinishedClaudeWorktrees are copied;
+    ``extra`` writes further files beside the runner. Returns the runner's path, the log directory and
+    the environment to run it under. Nothing here reaches the real repository: git discovery stops at
+    ``tmp_path`` and no GIT_* variable is inherited.
+    """
+    scripts = tmp_path / "copy" / "scripts"
+    (scripts / "coord").mkdir(parents=True)
+    for name in ("occupancy.ps1", "session-registry.ps1"):
+        shutil.copy2(ROOT / "scripts" / "coord" / name, scripts / "coord" / name)
+    (scripts / "worktree").mkdir()
+    shutil.copy2(RUNNER, scripts / "worktree" / RUNNER.name)
+    (scripts / "worktree" / PRUNE.name).write_text(prune_stub, encoding="utf-8")
+    for name, text in (extra or {}).items():
+        (scripts / "worktree" / name).write_text(text, encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "GCM_"))}
+    env.pop("CLAUDECODE", None)
+    env["GIT_CEILING_DIRECTORIES"] = str(tmp_path)
+    return scripts / "worktree" / RUNNER.name, tmp_path / "logs", env
+
+
+def read_log(log_dir: Path) -> str | None:
+    logs = list(log_dir.glob("prune-*.log"))
+    return logs[0].read_text(encoding="utf-8") if logs else None
+
+
+def run_copied_runner(
+    tmp_path: Path,
+    *args: str,
+    prune_stub: str = PRUNE_STUB,
+    extra: dict[str, str] | None = None,
+    env_extra: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], str | None]:
+    """Run a copy of the runner (see ``copy_runner``).
+
+    Returns the process and the log text (None when no log was written).
+    """
+    runner, log_dir, env = copy_runner(tmp_path, prune_stub, extra)
+    env.update(env_extra or {})
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(runner), "-LogDir", str(log_dir)]
+        + list(args),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+        check=False,
+    )
+    return proc, read_log(log_dir)
+
+
+@requires_windows
+def test_an_unhandled_error_in_the_runner_still_writes_an_exit_line(tmp_path: Path) -> None:
+    """A throw after the log directory exists used to end the run with nothing in the log.
+
+    Run without -RepoRoot outside any repository, resolving the primary throws. Before the trap no log
+    line was written at all; now the log must name the error and its line, and end with an exit line.
+    Nothing was attempted, so the code is 2, whose meaning promises that, not 1 ("attempted").
+    """
+    proc, text = run_copied_runner(tmp_path)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert text is not None, f"the error left no log line: {proc.stderr}"
+    assert "STOPPED on an unhandled error: Not inside a git repository" in text, text
+    assert re.search(r"\(at .*run-daily-prune\.ps1:\d+\)", text), text
+    assert re.search(r"^=== exit 2 \(REFUSED", text.splitlines()[-1]), text
+
+
+@requires_windows
+def test_the_prune_run_cannot_wait_on_a_credential_prompt_and_is_bracketed(
+    tmp_path: Path,
+) -> None:
+    """A scheduled run has nobody to answer a git credential prompt, so the child must not ask.
+
+    A stub prune-merged.ps1 reports what it inherited. The markers either side of it are what tells a
+    reader of a log that stops early whether it stopped inside that run.
+    """
+    proc, text = run_copied_runner(tmp_path, "-RepoRoot", str(tmp_path))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert text is not None, proc.stderr
+    lines = text.splitlines()
+    assert "stub prompt=0 gcm=never" in lines, text
+    stub_at = lines.index("stub prompt=0 gcm=never")
+    assert lines[stub_at - 1] == "--- prune-merged.ps1 running ---", text
+    assert re.match(r"--- prune-merged\.ps1 exit 0 at \d\d:\d\d:\d\d ---$", lines[stub_at + 1]), (
+        text
+    )
+    assert re.match(r"=== exit 0 \(OK\) at \d\d:\d\d:\d\d ===$", lines[-1]), text
+
+
+# A stub that reports what it inherited into the file $env:T_STARTED names, then waits long enough to
+# be stopped part way. A file, not the log: the runner's log holds the stub's lines until it returns.
+SLOW_PRUNE_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours)\n"
+    '"stub prompt=$env:GIT_TERMINAL_PROMPT gcm=$env:GCM_INTERACTIVE" | Set-Content $env:T_STARTED\n'
+    "Start-Sleep -Seconds 30\n"
+    "exit 0\n"
+)
+
+
+@requires_windows
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ({}, "after prompt=[] gcm=[] exists=False,False"),
+        (
+            {"GIT_TERMINAL_PROMPT": "1", "GCM_INTERACTIVE": "always"},
+            "after prompt=[1] gcm=[always] exists=True,True",
+        ),
+    ],
+    ids=["unset-before", "set-before"],
+)
+def test_a_hand_run_stopped_part_way_leaves_the_shells_prompt_variables_alone(
+    tmp_path: Path, before: dict[str, str], after: str
+) -> None:
+    """A stop part way must not leave the prompt variables changed in the operator's shell.
+
+    A hand run with ``&`` shares the caller's process. Here one pwsh stands in for that shell: the
+    runner runs in a second runspace of it and is stopped with a runspace Stop while the stub
+    prune-merged.ps1 is still running. Restored only in Exit-Run, both variables stayed set; the
+    runner's `finally` now removes each that was unset before and puts back each value that was set,
+    and the child still saw both as the runner set them.
+    """
+    runner, log_dir, env = copy_runner(tmp_path, SLOW_PRUNE_STUB)
+    started = tmp_path / "stub-started.txt"
+    env.update(
+        {
+            "T_RUNNER": str(runner),
+            "T_LOGDIR": str(log_dir),
+            "T_REPO": str(tmp_path),
+            "T_STARTED": str(started),
+            **before,
+        }
+    )
+    script = (
+        "$ps = [powershell]::Create().AddScript("
+        "'& $env:T_RUNNER -LogDir $env:T_LOGDIR -RepoRoot $env:T_REPO'); "
+        "$null = $ps.BeginInvoke(); $sw = [Diagnostics.Stopwatch]::StartNew(); "
+        "while ($sw.Elapsed.TotalSeconds -lt 60 -and -not (Test-Path -LiteralPath $env:T_STARTED)) "
+        "{ Start-Sleep -Milliseconds 100 }; "
+        "$ps.Stop(); "
+        '"state=$($ps.InvocationStateInfo.State) '
+        "after prompt=[$env:GIT_TERMINAL_PROMPT] gcm=[$env:GCM_INTERACTIVE] "
+        'exists=$(Test-Path Env:\\GIT_TERMINAL_PROMPT),$(Test-Path Env:\\GCM_INTERACTIVE)"'
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+        check=False,
+    )
+    assert started.is_file(), proc.stdout + proc.stderr
+    assert started.read_text(encoding="utf-8").strip() == "stub prompt=0 gcm=never"
+    assert "state=Stopped " in proc.stdout, f"the run must be stopped part way: {proc.stdout}"
+    assert after in proc.stdout, proc.stdout + proc.stderr
+
+
+# A prune-merged.ps1 stand-in that REFUSES the prune (exit 2, nothing attempted) and lists one finished
+# tree for the -RemoveFinishedClaudeWorktrees step.
+REFUSING_PRUNE_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours, [switch]$Json, [switch]$SkipGh)\n"
+    "if ($Json) {\n"
+    '  \'{"fence":{"idleHours":24},"counts":{"reportOnlyHeld":0},"reportOnly":['
+    '{"path":"X:/r/.claude/worktrees/a","claudeManaged":true,"branch":"b","whyFinished":"w"}]}\'\n'
+    "  exit 0\n"
+    "}\n"
+    '"stub refused"\n'
+    "exit 2\n"
+)
+
+# A finished-worktree-removal.ps1 stand-in: every path comes back with the outcome $env:T_OUTCOME
+# names, and with $env:T_THROW set the helper then throws, as an unexpected error part way would.
+REMOVING_HELPER_STUB = (
+    "function Assert-NoGitRedirect([string]$Who) { }\n"
+    "function Invoke-FinishedWorktreeRemoval {\n"
+    "  param([string]$Primary, [string[]]$Paths, [double]$IdleHours, [string[]]$Protect,"
+    " [switch]$Apply, $StopAt)\n"
+    "  foreach ($p in $Paths) {"
+    " [pscustomobject]@{ Path = $p; Outcome = $env:T_OUTCOME; Reason = 'stub'; Command = 'stub' } }\n"
+    "  if ($env:T_THROW) { throw 'stub failure after a row' }\n"
+    "}\n"
+)
+
+
+@requires_windows
+@pytest.mark.parametrize(
+    ("apply", "outcome", "throw", "expected"),
+    [
+        (True, "REMOVED", False, 1),
+        (True, "REMOVED", True, 1),
+        (True, "FAILED", False, 1),
+        (True, "FAILED", True, 1),
+        (True, "DECLINED", False, 1),
+        (True, "DECLINED", True, 1),
+        (True, "ORPHANED", False, 3),
+        (True, "ORPHANED", True, 3),
+        # Controls: nothing was attempted, so the prune's 2 stands.
+        (True, "REFUSED", False, 2),
+        (True, "REFUSED", True, 2),
+        (True, "NOT-REACHED", True, 2),
+        (False, "WOULD-REMOVE", False, 2),
+        (False, "WOULD-REMOVE", True, 2),
+    ],
+)
+def test_the_exit_code_says_nothing_was_attempted_only_when_that_is_true(
+    tmp_path: Path, apply: bool, outcome: str, throw: bool, expected: int
+) -> None:
+    """2 promises nothing was attempted. A refused prune returns 2, but the step may then remove trees.
+
+    Before, the normal end passed the prune's 2 through, and the trap's Max kept it; either way a run
+    that removed a tree said it had attempted nothing. Now a REMOVED, FAILED or DECLINED row makes it 1,
+    at the normal end and in the trap alike, and any other row leaves the 2.
+    """
+    proc, text = run_copied_runner(
+        tmp_path,
+        "-RepoRoot",
+        str(tmp_path),
+        *(["-Apply"] if apply else []),
+        "-RemoveFinishedClaudeWorktrees",
+        prune_stub=REFUSING_PRUNE_STUB,
+        extra={"finished-worktree-removal.ps1": REMOVING_HELPER_STUB},
+        env_extra={"T_OUTCOME": outcome, **({"T_THROW": "1"} if throw else {})},
+    )
+    assert text is not None, proc.stdout + proc.stderr
+    assert "--- prune-merged.ps1 exit 2 at " in text, text
+    assert f"{outcome:<12} X:/r/.claude/worktrees/a" in text, text
+    if throw:
+        assert "STOPPED on an unhandled error: stub failure after a row" in text, text
+    assert proc.returncode == expected, proc.stdout + proc.stderr
+    assert re.match(rf"=== exit {expected} \(", text.splitlines()[-1]), text
+
+
+# A stub that reports the location it ran in and what its -RepoRoot resolved to.
+WHERE_PRUNE_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours)\n"
+    '"stub repo=$((Resolve-Path -LiteralPath $RepoRoot).ProviderPath)"\n'
+    "exit 0\n"
+)
+
+
+@requires_windows
+def test_a_relative_repo_root_resolves_against_the_callers_location(tmp_path: Path) -> None:
+    """A hand run after Set-Location resolves -RepoRoot . where the caller stands, not where pwsh began.
+
+    The prune child is started with `&`, which starts it in the caller's PowerShell location. A child
+    started any other way can start in the process directory and prune a different repository.
+    """
+    runner, log_dir, env = copy_runner(tmp_path, WHERE_PRUNE_STUB)
+    here = tmp_path / "here"
+    here.mkdir()
+    env.update({"T_RUNNER": str(runner), "T_LOGDIR": str(log_dir), "T_HERE": str(here)})
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Set-Location -LiteralPath $env:T_HERE; & $env:T_RUNNER -LogDir $env:T_LOGDIR -RepoRoot .",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+        check=False,
+    )
+    text = read_log(log_dir)
+    assert text is not None, proc.stdout + proc.stderr
+    assert f"stub repo={here}" in text.splitlines(), text

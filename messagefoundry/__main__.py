@@ -366,15 +366,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     supervise.add_argument(
         "--db",
-        default="messagefoundry.db",
-        help="base store path; each shard gets <stem>_<shard>.db (a single default shard keeps the "
-        "bare path)",
+        default=None,
+        help="base store path (overrides [store].path, whose default is messagefoundry.db); each "
+        "engine shard gets <stem>_<shard>.db (a single default engine shard keeps the bare path)",
     )
     supervise.add_argument(
         "--base-port",
         type=int,
-        default=8765,
-        help="API port for the first shard; subsequent shards get base+1, base+2, ... (sorted order)",
+        default=None,
+        help="API port for the first engine shard (overrides [api].port, whose default is 8765); "
+        "subsequent engine shards get base+1, base+2, ... (sorted order)",
     )
     supervise.add_argument(
         "--env",
@@ -549,7 +550,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     security.add_argument(
         "--service-config",
         default="messagefoundry.toml",
-        help="service settings TOML the [security] section lives in (created on `set` if absent)",
+        help=(
+            "service settings TOML the [security] section lives in (created, if absent, by a "
+            "`set` that changes a key)"
+        ),
     )
     security.add_argument(
         "--data",
@@ -1438,6 +1442,8 @@ def _resolve_offline_anchor(
     service config is given); an absolute one is used as-is. The fail-loud trigger (AC-3) fires ONLY
     when an *explicit* ``--project-root`` is set AND the loaded graph references ``env()`` AND the
     selected ``<env>.toml`` is absent — a zero-``env()`` deployment, or a no-root launch, never trips it.
+    Under the same two conditions it also fails when ``[environments].dir`` or ``--env`` is one
+    :func:`~messagefoundry.config.environments.values_file_path` refuses (BACKLOG #5322).
     """
     from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
 
@@ -1529,7 +1535,11 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
         return None
     if not graph_references_env(reg):
         return None  # zero-env() deployment: the silent-empty contract is preserved (AC-3).
-    env_file = root / env_dir / f"{env_name}.toml"
+    # The one rule serve's load uses, so a dir or --env that leaves the root is refused here too
+    # rather than stated outside it (BACKLOG #5322).
+    env_file = _value_file_or_refusal(root, env_dir, env_name, lead="")
+    if env_file is None:
+        return 2
     if not env_file.is_file():
         print(
             f"error: the graph references env() but no value file was found at {env_file} under the "
@@ -1973,8 +1983,9 @@ def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> st
     """The supervisor process's own spool directory, beside its engine shards' (BACKLOG #2356).
 
     Its own for the reason :func:`_forward_spool_dir` gives: the spool locks its directory. The
-    default root is beside ``--db``, because each engine shard's ``[store].path`` is derived from
-    that flag, so the supervisor's directory lands next to theirs. ``db_base`` is anchored only by
+    default root is beside ``db_base``, because each engine shard's ``[store].path`` is derived
+    from it (the supervisor's merged ``[store].path``, from ``--db`` or the settings), so the
+    supervisor's directory lands next to theirs. ``db_base`` is anchored only by
     ``--project-root`` here, so a base_dir set in the file or the environment is applied too, as
     each engine shard's ``serve`` applies it to its own ``[store].path``. No engine shard's
     directory can take the name: those are ``engine`` or start ``shard-``."""
@@ -2495,7 +2506,8 @@ def _start_logging_gates(
         if _egress_gap is not None:
             print(
                 f"error: {_egress_gap}; refusing to start. List the collector in "
-                "[egress].allowed_syslog as 'host' (any port) or 'host:port'.",
+                "[egress].allowed_syslog as 'host' or '[v6]' (any port), or 'host:port' or "
+                "'[v6]:port', and give an IPv6 forward_host unbracketed.",
                 file=sys.stderr,
             )
             return 2
@@ -2700,7 +2712,16 @@ def _read_environment_values(
     from messagefoundry.engine_secrets import SecretsDirectoryError
     from messagefoundry.redaction import safe_exc
 
-    env_file = values_file_path(base_dir, dir_name, environment)
+    # A WiringError, the type this function's callers arm (BACKLOG #5322). The start check and the
+    # reader's own constructor refuse these inputs first, so this is the backstop. The refusal is
+    # raised outside the handler, so it carries no exception chain.
+    path_refusal = ""
+    try:
+        env_file = values_file_path(base_dir, dir_name, environment)
+    except ValueError as exc:
+        path_refusal = str(exc)
+    if path_refusal:
+        raise WiringError(path_refusal)
     if snapshot is not None and not snapshot.covers_environment_file(env_file):
         # Before the vetting below, so the plain read the engine then makes vets the file once.
         raise NotInSnapshot(f"{env_file} is not a value file the config snapshot read")
@@ -2743,6 +2764,29 @@ def _read_environment_values(
     # bytes on .object, so chaining either would carry every credential the file holds. `from None`
     # would not do: it leaves __context__ set.
     raise WiringError(f"{failed_on}: {refusal}")
+
+
+def _value_file_or_refusal(
+    base_dir: Path,
+    dir_name: str,
+    environment: str,
+    *,
+    lead: str = "refusing to start: ",
+    fleet: str = "",
+) -> Path | None:
+    """The value file a command reads, or ``None`` with the refusal printed when
+    :func:`~messagefoundry.config.environments.values_file_path` refuses ``[environments].dir`` or
+    the environment name; that function says on what grounds (BACKLOG #5322). ``serve``
+    and ``supervise`` call it ahead of :func:`_start_files_refused`, and so does the
+    ``--project-root`` check. ``supervise`` passes no ``lead`` and a ``fleet`` sentence that already
+    says it refuses to start, and the ``--project-root`` check passes no ``lead``."""
+    from messagefoundry.config.environments import values_file_path
+
+    try:
+        return values_file_path(base_dir, dir_name, environment)
+    except ValueError as exc:
+        print(f"error: {lead}{exc}{f'. {fleet}' if fleet else ''}", file=sys.stderr)
+        return None
 
 
 def _start_files_refused(service_config: str | None, env_file: Path, *, fleet: str = "") -> bool:
@@ -3038,12 +3082,12 @@ def _serve(args: argparse.Namespace) -> int:
     # else the working directory (unchanged default). Resolved here, ahead of the trust check below
     # and of the startup log that names it, because the standalone-repo / NSSM footgun is a
     # silently-wrong path.
-    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
+    from messagefoundry.config.environments import resolve_values_base_dir
 
     env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
-    env_file = values_file_path(env_base, settings.environments.dir, env_name)
+    env_file = _value_file_or_refusal(env_base, settings.environments.dir, env_name)
 
-    if _start_files_refused(service_config, env_file):
+    if env_file is None or _start_files_refused(service_config, env_file):
         return 2
 
     # Vault BACKLOG #2595 and #2601: a store key, another secret-class setting, or (vault #8212)
@@ -5490,18 +5534,16 @@ def _supervise(args: argparse.Namespace) -> int:
     # forwarder (BACKLOG #2356).
     configure_logging("INFO")
 
-    # ADR 0050 AC-9: anchor the discovery --config and the --db base under the project root HERE, before
-    # discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
-    # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
-    # supervisor (not only via each child re-anchoring a relative --db). --service-config is forwarded raw
-    # and each child serve resolves it under the forwarded --project-root (same precedence as serve).
+    # ADR 0050 AC-9: anchor the discovery --config here, and the db base once the settings load
+    # below has merged it, both before discover_shard_specs runs load_config() — so `supervise
+    # --project-root R --config <relative>` from a non-root CWD discovers engine shards under R, and
+    # each engine shard's <stem>_<shard>.db composes under R in the supervisor (not only via each
+    # child re-anchoring a relative --db). --service-config is forwarded raw and each child serve
+    # resolves it under the forwarded --project-root (same precedence as serve).
     cwd = Path.cwd()
     root = resolve_project_root(args.project_root, cwd=cwd)
     config = anchor_under_root(args.config, root, cwd=cwd)
     assert config is not None  # args.config always has a string default
-    db_base = anchor_under_root(args.db, root, cwd=cwd)
-    assert db_base is not None  # supervise --db has a string default ("messagefoundry.db")
-
     # Resolve the store backend up front so the no-split-store guard (ADR 0063) can refuse a >1-shard
     # config on SQLite BEFORE any subprocess is spawned. --service-config is anchored the same way each
     # child resolves it; --db only sets the SQLite path, never the backend.
@@ -5520,8 +5562,14 @@ def _supervise(args: argparse.Namespace) -> int:
     # here. Each engine shard is still started with the flag itself.
     # --db goes in as [store].path, as the offline commands merge it (BACKLOG #5926): every engine
     # shard is started with a --db derived from it, which overrides the file's value, so the load
-    # judges the path the shards use rather than one none of them reads.
-    supervise_cli: dict[str, dict[str, object]] = {"store": {"path": args.db}}
+    # judges the path the shards use rather than one none of them reads. --db and --base-port go in
+    # only when given, as `serve` passes its flags, so [store].path, [api].port and their MEFOR_
+    # variables reach the engine shards when the flags are absent (BACKLOG #5817).
+    supervise_cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        supervise_cli["store"] = {"path": args.db}
+    if args.base_port is not None:
+        supervise_cli["api"] = {"port": args.base_port}
     if args.env is not None:
         supervise_cli["ai"] = {"environment": args.env}
     settings, detail = _load_service_settings(service_config, cli=supervise_cli)
@@ -5529,16 +5577,31 @@ def _supervise(args: argparse.Namespace) -> int:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
         return 2
-    # BACKLOG #5926: each engine shard's store path is derived from the --db base, so test it the
-    # way [store].path is tested at load. A SQLite store only: a server backend opens no file at
-    # that path.
-    from messagefoundry.config.settings import StoreBackend, store_path_refusal
+    # Each engine shard's store path is derived from the merged [store].path, from --db or the
+    # settings (BACKLOG #5817). The load already refused a SQLite path no anchor can place
+    # (BACKLOG #5926): the raw --db went in unanchored, so the load tested the value itself.
+    from messagefoundry.pipeline.supervisor import base_names_no_stem
 
-    if settings.store.backend == StoreBackend.SQLITE:
-        db_refusal = store_path_refusal(args.db, name="--db")
-        if db_refusal is not None:
-            print(f"error: {db_refusal}", file=sys.stderr)
-            return 2
+    db_base = anchor_under_root(settings.store.path, root, cwd=cwd)
+    assert db_base is not None  # [store].path is a str, never None
+    if base_names_no_stem(settings.store.path) and not base_names_no_stem(db_base):
+        # Joining "" or "." under the root gives the root itself, whose own name would become
+        # each engine shard's stem (<root>_a, beside the root). A trailing "." names the same
+        # directory, so the supervisor still refuses several engine shards, as it would the value
+        # written, and one engine shard's --db still names the root.
+        db_base += "/."
+    # BACKLOG #5817: [api].port has no range check at load, and every engine shard's port counts
+    # up from it, so a value no socket takes is refused here, before the TLS renewal below writes
+    # anything. How many engine shards the graph has is known only once the supervisor loads it,
+    # so the range several of them need is checked there.
+    if not 0 <= settings.api.port <= 65535:
+        source = "--base-port" if args.base_port is not None else "[api].port"
+        print(
+            f"error: {source} {settings.api.port} is not a port from 0 to 65535; refusing to "
+            "start the fleet.",
+            file=sys.stderr,
+        )
+        return 2
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
     # below: every shard would refuse, and the supervisor would only restart them.
@@ -5621,15 +5684,14 @@ def _supervise(args: argparse.Namespace) -> int:
     # account can write would refuse every engine shard, and the supervisor would only restart
     # them. The value file is anchored as each engine shard anchors it: the forwarded
     # --project-root, else [environments].base_dir.
-    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
+    from messagefoundry.config.environments import resolve_values_base_dir
 
+    fleet_refusal = "Every engine shard would refuse to start; refusing to start the fleet."
     env_base = resolve_values_base_dir(args.project_root or settings.environments.base_dir, cwd=cwd)
-    env_file = values_file_path(env_base, settings.environments.dir, env_name)
-    if _start_files_refused(
-        service_config,
-        env_file,
-        fleet="Every engine shard would refuse to start; refusing to start the fleet.",
-    ):
+    env_file = _value_file_or_refusal(
+        env_base, settings.environments.dir, env_name, lead="", fleet=fleet_refusal
+    )
+    if env_file is None or _start_files_refused(service_config, env_file, fleet=fleet_refusal):
         return 2
     for startup_entry in startup_loosenings(startup):
         security_lines.append(startup_entry)
@@ -5816,7 +5878,7 @@ def _supervise(args: argparse.Namespace) -> int:
             config,
             store_backend=settings.store.backend,
             db_base=db_base,
-            base_port=args.base_port,
+            base_port=settings.api.port,
             env=args.env,
             service_config=args.service_config,
             project_root=args.project_root,
@@ -7085,6 +7147,15 @@ def _host_gated_store_settings(
     return settings
 
 
+#: The recovery an Unverifiable row seal gets (ADR 0217 (a)): the exact closing clause of
+#: ``auth.service._UNVERIFIABLE_ACCOUNT_REFUSAL``, whose opening names provision-admin's scan and
+#: so does not fit a host unlock (BACKLOG #5633).
+_UNVERIFIABLE_RECOVERY = (
+    "The seal may be planted: check that Vault is healthy and that every node holds the audit "
+    "key's latest version, then retry"
+)
+
+
 def _seal_refusal(username: str, act: str) -> str:
     """The fixed refusal of a host command whose write the store refused because the account's
     record fails its integrity seal (BACKLOG #3510). Logs it and returns the text, which the caller
@@ -7193,6 +7264,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         *reach_errors,
     )
 
+    # The name every refusal after the read uses: the stored username once the account is found,
+    # as the output and the audit row name it (BACKLOG #5633 item 7).
+    named = [wanted]
+
     async def run() -> tuple[str, Any]:
         """``(outcome, extra)``: ``extra`` is the report for ``unlocked``, the error for
         ``open-failed``, ``read-refused`` and ``refused``, else ``None``. Each catch is scoped to
@@ -7223,10 +7298,13 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 return ("read-refused", exc)
             if user is None:
                 return ("no-such-user", None)
+            named[0] = user.username
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
             # ADR 0197: both old expiries and both cycle counts, read before the clear so they are
-            # what the clear replaced. The engine is stopped for this command (ADR 0171).
+            # what the clear replaced. The engine is stopped for this command (ADR 0171). The
+            # stored username, which the output names too, not the argument as typed (#5633).
             report: dict[str, Any] = {
+                "username": user.username,
                 "was_locked_until": user.locked_until,
                 "was_second_step_locked_until": user.second_step_locked_until,
                 "lock_cycles": user.lock_cycles,
@@ -7238,7 +7316,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             audit = AuditAppend(
                 ADMIN_UNLOCKED_ACTION,
                 actor=actor,
-                detail=json.dumps({"username": user.username, **report}),
+                detail=json.dumps(report),
             )
             try:
                 cleared = await store.clear_lockout(
@@ -7276,8 +7354,18 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 f"{_sentence(codec_safe_str(extra))} Nothing was written.", as_json=args.json
             )
             return 2
-        # #1670: a path that is not a database, or a server the driver could not reach.
-        return _emit_store_open_error(extra, _store_label(settings.store), as_json=args.json)
+        # #1670: a path that is not a database, or a server the driver could not reach. A refusal
+        # class the engine defines, such as SchemaNotProvisionedError, is printed whole, so its
+        # remedy survives, as the transit-bound commands print one (BACKLOG #5633). A plain
+        # RuntimeError keeps the redacted rendering it had on main: one the engine raises can
+        # embed a driver's text, so printing it whole is left open rather than taken here.
+        whole = type(extra) is not RuntimeError and _is_engine_refusal(extra)
+        return _emit_store_open_error(
+            extra,
+            _store_label(settings.store),
+            as_json=args.json,
+            text=_engine_refusal_text(extra) if whole else None,
+        )
     if outcome in ("read-refused", "refused"):
         # Logged, so the cause can be found: WARNING names the class only, since a driver's
         # message can quote a stored value (ASVS 16.5.4); the traceback goes to DEBUG. A busy
@@ -7286,7 +7374,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         log.warning(
             "admin-unlock: the store refused the %s for %r (%s)",
             "account read" if outcome == "read-refused" else "unlock",
-            wanted,
+            named[0],
             type(extra).__name__,
         )
         log.debug("admin-unlock: the refusal's traceback", exc_info=extra)
@@ -7296,9 +7384,28 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             "nothing was written. Check the store key and the database, then re-run",
             as_json=args.json,
         )
+    # A Transit row seal is not a busy store, so neither gets the busy store's remedy (BACKLOG
+    # #5633 item 2). The Outage class covers a refused hmac or verify too, so its remedy names
+    # the token's grants.
+    if outcome == "refused" and isinstance(extra, TransitSealUnavailableError):
+        return _emit_error(
+            f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}): a row seal "
+            "could not be made or checked through Vault transit. The clear and its audit row are "
+            "one transaction, so neither was written. Check that Vault transit is reachable and "
+            "that the token holds transit/hmac and transit/verify on the audit key, then re-run",
+            as_json=args.json,
+        )
+    if outcome == "refused" and isinstance(extra, RowSealUnverifiableError):
+        return _emit_error(
+            f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}): Vault "
+            "transit would not check the account's row seal (stored key version "
+            f"{extra.stored_version}, probe version {extra.probe_version}). The clear and its "
+            "audit row are one transaction, so neither was written. " + _UNVERIFIABLE_RECOVERY,
+            as_json=args.json,
+        )
     if outcome == "refused":
         return _emit_error(
-            f"the store refused the unlock for {wanted!r} ({type(extra).__name__}). The clear and "
+            f"the store refused the unlock for {named[0]!r} ({type(extra).__name__}). The clear and "
             "its audit row are one transaction, so neither was written, unless a server "
             "database reported the error after its commit. If the engine is running, stop it "
             "and re-run; a second unlock is harmless",
@@ -7306,7 +7413,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
     if outcome == "changed":
         return _emit_error(
-            f"the account {wanted!r} was removed or changed while this command ran; nothing was "
+            f"the account {named[0]!r} was removed or changed while this command ran; nothing was "
             "written. Stop the engine and re-run",
             as_json=args.json,
         )
@@ -7314,7 +7421,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         return _emit_error(f"no local account named {wanted!r}", as_json=args.json)
     report = cast("dict[str, Any]", extra)
     if args.json:
-        print(json.dumps({"ok": True, "username": wanted, **report}))
+        print(json.dumps({"ok": True, **report}))
     else:
 
         def _state(label: str, until: float | None) -> str:
@@ -7334,7 +7441,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
         kept = "reset to 0" if report["cycles_reset"] else "kept"
         print(
-            f"OK: cleared lockout for {wanted!r} ({states}; {cycles}, {kept}); "
+            f"OK: cleared lockout for {report['username']!r} ({states}; {cycles}, {kept}); "
             "the password is UNCHANGED"
         )
     return 0
@@ -8448,7 +8555,9 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
     """Is a store key configured? The at-rest gate's one test for "keyed". A local key or a DPAPI key
     file counts when ``[store].key_provider`` reads it (BACKLOG #2077), and an external provider such
     as ``vault`` counts on its own (BACKLOG #1998). The rule is
-    :func:`~messagefoundry.store.keyprovider.provider_reads_a_configured_key`.
+    :func:`~messagefoundry.store.keyprovider.provider_reads_a_configured_key`. A
+    ``MEFOR_STORE_ENCRYPTION_KEY`` of blanks only beside a retired key does not count
+    (BACKLOG #5310, #5308), so the gate refuses it.
 
     The test reads what is CONFIGURED, not what resolves: the gate runs before ``open_store`` and must
     not need the network. That is safe because a source that cannot resolve fails closed at
@@ -8465,9 +8574,14 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
     store open plaintext. The DR backup path DOES resolve it, and refuses an ignored key there
     through ``store.base._checked_active_key``. ``rotate-key`` refuses this mode before it resolves
     a key (BACKLOG #2109)."""
+    from messagefoundry.store.base import blank_active_key, retired_without_active_refusal
     from messagefoundry.store.keyprovider import provider_reads_a_configured_key
 
     store = settings.store
+    if blank_active_key(store) and retired_without_active_refusal(store) is not None:
+        # A key of blanks only beside a retired key is no key (BACKLOG #5310, #5308). Answered
+        # here, so ``serve``, which runs the gate only when this says unkeyed, refuses it too.
+        return False
     if store.cipher_provider == "vault_transit" and (
         store.encryption_key or store.encryption_key_file
     ):
@@ -8477,11 +8591,14 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
 
 def _unread_key_text(settings: ServiceSettings) -> str:
     """The refusal text when the gate returns ``KEYLESS_REFUSED_BY_UNREAD_KEY``: which key source the
-    pinned ``[store].key_provider`` reads, and that the one that is set would be ignored (#2077)."""
+    pinned ``[store].key_provider`` reads, and that the one that is set would be ignored (#2077), or
+    that a retired key is set with no active key (BACKLOG #5310, #5308)."""
+    from messagefoundry.store.base import retired_without_active_refusal
     from messagefoundry.store.keyprovider import unread_key_refusal
 
     return (
         unread_key_refusal(settings.store)
+        or retired_without_active_refusal(settings.store)
         or "[store].key_provider does not read the key that is set."
     )
 
@@ -8542,16 +8659,24 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     A key that IS set but that a pinned ``[store].key_provider`` does not read returns
     ``KEYLESS_REFUSED_BY_UNREAD_KEY`` before the opt-out is consulted (BACKLOG #2077). No opt-out
     waives it: the settings name a key, so a keyless open is not what anyone configured.
-    ``open_store`` refuses the same case, through ``store.base._checked_active_key``."""
+    ``open_store`` refuses the same case, through ``store.base._checked_active_key``. So does a
+    retired key with no active key, by the same return (BACKLOG #5310, #5308), an active key of
+    blanks only counting as none. That sentinel's value names ``[store].key_provider``, which is
+    not this case's setting, so no caller may print the value: each prints
+    :func:`_unread_key_text`, which names the cause."""
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         keyless_opt_out_refusal,
     )
+    from messagefoundry.store.base import retired_without_active_refusal
     from messagefoundry.store.keyprovider import unread_key_refusal
 
     if _store_key_configured(settings):
         return None
-    if unread_key_refusal(settings.store) is not None:
+    if (
+        unread_key_refusal(settings.store) is not None
+        or retired_without_active_refusal(settings.store) is not None
+    ):
         return KEYLESS_REFUSED_BY_UNREAD_KEY
     return keyless_opt_out_refusal(settings.store, settings.security)
 
@@ -12324,16 +12449,20 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if seals.refused:
-        # Vault BACKLOG #5635: a seal that fails under a key this run holds, or is malformed, is
-        # left as it is. No key re-seals it, so it must not fail the run, or every later run would
-        # fail on it too (the BACKLOG #3181 precedent). Said here, not only logged.
+        # Vault BACKLOG #5635: a seal that names a key this run holds other than the active one, or
+        # is malformed, is left as it is. One that fails no key re-seals, so it must not fail the
+        # run, or every later run would fail on it too (the BACKLOG #3181 precedent).
+        # `ResealOutcome` says what else the count holds. Said here, not only logged.
         print(
             f"note: {seals.refused} user, role, open approval or directory-map record(s) were left "
-            "as they are: their seal fails under a key this run holds, or is malformed. The "
-            "causes include at least a change made outside the store and, if an engine was still "
-            "running, a write it made during this run. A record changed outside the store is "
-            "refused on every read and no key re-seals it, so it does not hold this rotation open; "
-            "recreate or remove it. The log names each kind."
+            "as they are: their seal names a key this run holds other than the active one, or is "
+            "malformed. The causes include at least a change made outside the store and, if an "
+            "engine was still running, a write it made during this run. A record changed outside "
+            "the store is refused on every read and no key re-seals it, so it does not hold this "
+            "rotation open; recreate or remove it. A write an engine made during this run may be "
+            "sound and still under the prior key: stop every engine using this store and re-run "
+            "before dropping that key. A re-run may count such a record again; do not remove an "
+            "account on this count alone."
         )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under
@@ -12984,9 +13113,10 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     is host access, as for ``admin-unlock``, whose docstring says why that gate is a real one.
     It keeps no session: the shell that runs it holds none.
 
-    The audit row is written after the revoke, as ``admin-unlock`` writes its own, and the audit
-    append is checked for a refusal before the revoke, so a refused row cannot follow a change
-    that already landed."""
+    The audit row is written after the revoke, and the audit append is checked for a refusal
+    before the revoke, so a refused row cannot follow a change that already landed.
+    ``admin-unlock`` no longer works this way: its row commits in the clear's own transaction
+    (BACKLOG #5633)."""
     import getpass
 
     from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
@@ -13834,6 +13964,7 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
+        _REMOVED_KEYS,
         _SECURITY_PASSTHROUGH,
         AuthSettings,
         SecuritySettings,
@@ -13841,6 +13972,9 @@ def _security(args: argparse.Namespace) -> int:
         _auth_default,
         _auth_limit_loosenings,
         _env_overrides,
+        _removed_key_message,
+        _unknown_key_report,
+        _unknown_keys,
         security_loosenings,
     )
 
@@ -14028,7 +14162,9 @@ def _security(args: argparse.Namespace) -> int:
                 "equal to the file's value, or one whose value is no loosening, adds no entry, and "
                 "at least the require_mfa and block_unlisted_outbound variables are never named. "
                 "That needs a whole-file load that ran and succeeded: `show` on an absent file runs "
-                "none and names none, while `set` on a new file loads what it wrote and names it. "
+                "none and names none, and neither does a `set` that changed no key where no file "
+                "exists, since it writes none, while `set` on a new file loads what it wrote and "
+                "names it. "
                 "The other sections are read as the whole-file load "
                 "resolves them, so a MEFOR_<SECTION>_<KEY> variable in THIS command's environment "
                 "counts there, which may not be the service's. One entry is not read from the "
@@ -14097,6 +14233,39 @@ def _security(args: argparse.Namespace) -> int:
             )
         # Precise per-field error before we touch the file: validate the merged [security] view.
         merged = dict(security_edit.read_security(path))
+        # BACKLOG #5327: a null reset of a key [security] does not define, and the file does not
+        # carry, would change nothing, so reporting it as set would leave the loosening the
+        # operator meant to reset in place. A non-null unknown key is refused by the whole-file
+        # load; a null one never reaches it. One the file does carry may be reset, since removing
+        # it is the repair for a file the load refuses.
+        unknown = list(
+            _unknown_keys(
+                "security",
+                SecuritySettings,
+                {k: v for k, v in updates.items() if v is None and k not in merged},
+            )
+        )
+        if unknown:
+            # A removed key is named with the loader's own refusal for it, never a nearest
+            # spelling: for require_sign_in that would be require_mfa, another switch. It is
+            # built directly from the arguments, so the refusal names no environment variable.
+            removed = [
+                _removed_key_message(table, key, _REMOVED_KEYS[(table, key)], built_directly=True)
+                for table, key, _near in unknown
+                if (table, key) in _REMOVED_KEYS
+            ]
+            typos = [item for item in unknown if (item[0], item[1]) not in _REMOVED_KEYS]
+            parts = [
+                "refused, nothing written: a null value resets a [security] key, and resetting a "
+                "key that is neither a [security] key nor set in the file would change nothing."
+            ]
+            if typos:
+                parts.append(
+                    f"Not a [security] key: {_unknown_key_report(typos)}. Check the spelling "
+                    "against docs/CONFIGURATION.md."
+                )
+            parts.extend(removed)
+            return _emit_error(" ".join(parts), as_json=args.json)
         for key, value in updates.items():
             if value is None:
                 merged.pop(key, None)
@@ -14261,8 +14430,9 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
 
 
 async def _close_store_quietly(store: Store) -> None:
-    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``store attest-transit-bound`` or
-    ``store withdraw-transit-bound`` has its result. A close that fails prints a warning naming its
+    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``admin-unlock``,
+    ``cipher-audit``, ``store attest-transit-bound`` or ``store withdraw-transit-bound`` has its
+    result. A close that fails prints a warning naming its
     class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()
@@ -14417,7 +14587,8 @@ def _emit_store_open_error(
     OSError, and its client errors, whose text ``safe_exc`` redacts by pattern only.
 
     ``text``, when given, replaces that rendering, for a caller that has already rendered the error
-    its own way: the transit-bound commands print an engine refusal whole (BACKLOG #2337).
+    its own way: the transit-bound commands print an engine refusal whole (BACKLOG #2337), and
+    ``admin-unlock`` a refusal class the engine defines (BACKLOG #5633).
     """
     message = f"cannot open the store at {path}: {_store_error_text(exc) if text is None else text}"
     if as_json:

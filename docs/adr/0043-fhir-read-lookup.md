@@ -18,7 +18,10 @@
   [`transports/fhir.py`](../../messagefoundry/transports/fhir.py) `FhirDestination` (`_INTERACTIONS`, `_probe`) ·
   [`transports/smart.py`](../../messagefoundry/transports/smart.py) `SmartBackendTokenProvider`/`token_provider_from_destination` ·
   [`pipeline/wiring_runner.py`](../../messagefoundry/pipeline/wiring_runner.py)
-  `_build_lookup_executor`/`_run_lookup`/`check_egress_allowed`/`_http_egress_allowed` ·
+  `_build_lookup_executor`/`_run_lookup` ·
+  [`transports/egress.py`](../../messagefoundry/transports/egress.py)
+  `check_egress_allowed`/`http_egress_allowed` (CORRECTED 2026-11-18: both were listed under
+  `wiring_runner.py`, the matcher as `_http_egress_allowed`, its former private name) ·
   [`config/settings.py`](../../messagefoundry/config/settings.py) `EgressSettings.allowed_http`
 
 ---
@@ -59,7 +62,8 @@ This is the **FHIR mirror of the gap ADR 0010 filled for SQL** — and the right
 - **The substrate is already shipped.** The pure FHIR codec (`FhirPeek`/`FhirResource`/`FhirPeekError`), the hardened
   HTTP plumbing in `transports/rest.py` (the no-redirect, TLS-verifying `_NO_REDIRECT_OPENER`, `_redact_url`, the
   cleartext-credential refusal), the `[egress].allowed_http` host gate
-  ([wiring_runner.py:2429](../../messagefoundry/pipeline/wiring_runner.py) `_http_egress_allowed`), and the **SMART
+  ([transports/egress.py](../../messagefoundry/transports/egress.py) `http_egress_allowed`; CORRECTED
+  2026-11-18: this read `wiring_runner.py:2429` `_http_egress_allowed`), and the **SMART
   Backend Services bearer** (`SmartBackendTokenProvider` / `with_smart_backend`,
   [transports/smart.py](../../messagefoundry/transports/smart.py)) all exist. A read lookup is a thin GET/search layer
   over them — it reuses, it does not re-implement.
@@ -149,7 +153,8 @@ seam:
 A FHIR read **dials out to an HTTP(S) host** — the same egress surface the `FhirDestination` outbound and the SMART
 token endpoint already pass. The `FhirLookup`'s `base_url` (and, when SMART is composed, its `smart_token_url`) **must**
 be checked against **`[egress].allowed_http`** at load/reload/start — the exact arm `FhirDestination`/SMART already use
-([wiring_runner.py:2429](../../messagefoundry/pipeline/wiring_runner.py) `_http_egress_allowed`;
+([transports/egress.py](../../messagefoundry/transports/egress.py) `http_egress_allowed`, CORRECTED
+2026-11-18 from `wiring_runner.py:2429` `_http_egress_allowed`;
 `check_egress_allowed` folds REST/SOAP/FHIR into the `allowed_http` branch — ADR 0022 §3.4). This adds a
 `check_fhir_lookup_allowed(name, settings, egress)` modelled on `check_lookup_allowed`
 ([wiring_runner.py:2128](../../messagefoundry/pipeline/wiring_runner.py)) but reading `allowed_http` (HTTP host) rather

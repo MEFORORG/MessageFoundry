@@ -144,14 +144,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           # Only `origin/main` needs fetching: the gate reads it (`git show origin/main:…`, `ls-tree`) and
-          # TWO-dot-diffs it against HEAD. No ancestry is resolved, so the shallow checkout is fine -- see
+          # TWO-dot-diffs it against HEAD. In --ci mode it asks git for no merge base and walks no history:
+          # the ownership arm and its history walk run only locally, and the rename pairing takes its
+          # source as the base's by construction rather than reading a fork point (BACKLOG #5453). That
+          # is why the depth-1 merge checkout beside a shallow fetch of main is fine -- see
           # the long note in ledger_check.py's tree-access section for why three-dot was wrong here, and
           # why its failure was silent.
           #
           # THE DEPTH IS NOW SLACK, AND IT IS KEPT DELIBERATELY. It was load-bearing for the backlog
           # REVERSE arm (BACKLOG #1470), which read the PARENTS of HEAD and refused when none was
-          # readable; that arm retired with the ledger (BACKLOG #1250) and the ADR rule resolves no
-          # ancestry, so `--depth=1` would pass today. Trimming it buys seconds and costs the next
+          # readable; that arm retired with the ledger (BACKLOG #1250) and the --ci ADR rule resolves
+          # no ancestry, so `--depth=1` would pass today. Trimming it buys seconds and costs the next
           # parent-reading rule a silent narrowing, which is the failure mode this depth was bought to
           # prevent. Leave it.
           git fetch --no-tags --depth=200 origin main
@@ -5628,7 +5631,7 @@ jobs:
           # the egress check fails fast on the FIRST denied dest, so a missing entry wedges service start.
           # fhir-prod.example.org is allowlisted HOST-ONLY: its prod URL (https://fhir-prod.example.org/fhir)
           # has no explicit port, so urlsplit().port is None and a ":443" suffix would NOT match (see
-          # _http_egress_allowed). A bare host matches any port, which is what we want for a default-port URL.
+          # http_egress_allowed). A bare host matches any port, which is what we want for a default-port URL.
           # `prod` FAIL-CLOSES on unbounded PHI RETENTION too (#186a, ASVS 14.2.4): both PHI-body windows —
           # [retention].messages_days (inbound bodies) and [retention].dead_letter_days (dead-lettered
           # outbound bodies, replayable until purged) — default to 0 = keep-forever, and a PRODUCTION PHI
@@ -6517,7 +6520,7 @@ jobs:
             docker exec mefor curl -fsS --cacert "$cert" https://127.0.0.1:8765/health >/dev/null 2>&1 && break || sleep 0.5
           done
           docker exec mefor curl -fsS --cacert "$cert" https://127.0.0.1:8765/health
-          # Send one synthetic ADT^A01 over the in-container MLLP listener (loopback:2575); fails on a non-AA ACK.
+          # Send one synthetic ADT^A01 over the in-container MLLP listener (loopback:2575); fails unless MSA-1 is AA or CA.
           docker exec mefor python /smoke/send_adt.py 127.0.0.1 2575
           # Read the disposition via the container's own python, SIGNED IN (`rigadmin get`, stdlib
           # only — no host python/jq needed). Same pin as the curl above: a default context would

@@ -144,17 +144,37 @@ $READ_ONLY_SUBCOMMANDS = @(
     'whatchanged', 'worktree'
 )
 
-# Resolve the token in SUBCOMMAND position, skipping git's leading global options. Returns $null
-# when it cannot tell -- and $null means "fall through to the substring predicates", i.e. deny as
-# before. It never means allow.
-function Resolve-GitSubcommand([string[]]$Tokens) {
+# Global options whose next word the resolver skips as their value. Skipping it is what stops
+# 'git -C <path> add -A' resolving its subcommand to <path>. An option missing from this list does
+# NOT only fall through to a deny (BACKLOG #5450): its value is read as the subcommand, so a value
+# that names a read-only subcommand ('git --attr-source status add -A', with a ref named status) is
+# suppressed, and any other value sends the arguments to the blanked view, where a quoted '"-A"' is
+# not seen. git 2.55.0 takes the value of --config-env, --attr-source and --shallow-file as the next
+# argument (measured), so they are listed. --exec-path is the exception: git's documentation says
+# the bare option prints the exec path and exits, so skipping its next word can cost only a false
+# deny. Keep the wide list equal to the one in afk-tripwire.ps1's Find-GitTripwires; BACKLOG #5448
+# brings that file's list to --config-env and --attr-source, and --shallow-file is not yet on it.
+#
+# THE LIST BEFORE BACKLOG #5450 IS KEPT, AND THE LOOP BELOW JUDGES A SEGMENT UNDER BOTH. Widening
+# the list moves some resolutions from a non-subcommand to a read-only word: 'git --attr-source HEAD
+# log add -A' read HEAD as the subcommand and was denied on the word add, and with the wide list it
+# reads log and would be allowed. A guard may only tighten, so the verdict is the union: a segment
+# is denied when either reading denies it. Delete the narrow list only with a measurement that every
+# reading it denies is also denied by the wide one.
+#
+# A QUOTED value is not read past by either list; docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5.1
+# says what that lets through and why it is still open.
+$GLOBAL_VALUE_OPTIONS_NARROW = '^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix)$'
+$GLOBAL_VALUE_OPTIONS = '^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix|--config-env|--attr-source|--shallow-file)$'
+
+# Resolve the token in SUBCOMMAND position, skipping git's leading global options; $ValueOptions
+# names the options whose value is skipped. Returns $null when it cannot tell -- and $null means
+# "fall through to the substring predicates", i.e. deny as before. It never means allow.
+function Resolve-GitSubcommand([string[]]$Tokens, [string]$ValueOptions) {
     for ($i = 1; $i -lt $Tokens.Count; $i++) {
         $t = $Tokens[$i]
         if ($t -notlike '-*') { return $t }
-        # Global options that take a SEPARATE value. Skipping the value is what stops
-        # 'git -C <path> add -A' resolving its subcommand to <path>. An option missing from this
-        # list only ever mis-resolves toward a non-subcommand, which falls through to a deny.
-        if ($t -cmatch '^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix)$') { $i++ }
+        if ($t -cmatch $ValueOptions) { $i++ }
     }
     return $null
 }
@@ -416,118 +436,125 @@ while ($true) {
     # $s is trimmed and starts with git, so the split yields no empty token to filter out.
     $tokens = @($s -split '\s+')
 
-    # THE ONE SUPPRESSION. A recognised read-only subcommand cannot stage, so 'git grep -n add'
-    # and 'git log --all --grep commit' allow. Anything unrecognised -- including $null -- falls
-    # through to the predicates below unchanged.
-    $sub = Resolve-GitSubcommand $tokens
-    if ($null -ne $sub -and $READ_ONLY_SUBCOMMANDS -ccontains $sub) { continue }
+    # BOTH READINGS ARE JUDGED, AND EITHER ONE DENYING DENIES; $GLOBAL_VALUE_OPTIONS says why. The
+    # narrow reading runs only when it resolves a different subcommand from the wide one.
+    $subs = @(Resolve-GitSubcommand $tokens $GLOBAL_VALUE_OPTIONS)
+    $narrowSub = Resolve-GitSubcommand $tokens $GLOBAL_VALUE_OPTIONS_NARROW
+    if ($narrowSub -cne $subs[0]) { $subs += $narrowSub }
+    foreach ($sub in $subs) {
+        # THE ONE SUPPRESSION. A recognised read-only subcommand cannot stage, so 'git grep -n add'
+        # and 'git log --all --grep commit' allow, when every reading resolves read-only. Anything
+        # unrecognised -- including $null -- falls through to the predicates below unchanged.
+        if ($null -ne $sub -and $READ_ONLY_SUBCOMMANDS -ccontains $sub) { continue }
 
-    # LIMB 1 -- the SUBCOMMAND, including the synonym. `stage` is documented and dispatches to the
-    # same builtin (`git stage -h` prints `usage: git add`), so testing only `add` let every flag
-    # and pathspec row below be defeated by one word.
-    #
-    # WHICH VIEW THE ARGUMENTS ARE READ FROM IS DECIDED HERE, and it is decided by the RESOLVED
-    # subcommand rather than by searching for the word. When the subcommand IS add/stage, every
-    # non-flag argument is a pathspec, so the raw view is correct and safe -- `git add` has no
-    # message flag whose quoted value could be mistaken for one. When it is anything else, the
-    # blanked view is correct: `git commit -m "wip; git add -a"` must not be read as a stage.
-    # A subcommand that does not resolve falls back to the ORIGINAL token search on the blanked
-    # view, which preserves every deny this guard made before.
-    $argView = if ($sub -ceq 'add' -or $sub -ceq 'stage') { $rawSeg } else { $s }
-    $staging = ($sub -ceq 'add' -or $sub -ceq 'stage') -or
-               ($null -eq $sub -and $s -cmatch '(^|\s)(?:add|stage)(\s|$)') -or
-               ($null -ne $sub -and $sub -cne 'commit' -and $s -cmatch '(^|\s)(?:add|stage)(\s|$)')
+        # LIMB 1 -- the SUBCOMMAND, including the synonym. `stage` is documented and dispatches to the
+        # same builtin (`git stage -h` prints `usage: git add`), so testing only `add` let every flag
+        # and pathspec row below be defeated by one word.
+        #
+        # WHICH VIEW THE ARGUMENTS ARE READ FROM IS DECIDED HERE, and it is decided by the RESOLVED
+        # subcommand rather than by searching for the word. When the subcommand IS add/stage, every
+        # non-flag argument is a pathspec, so the raw view is correct and safe -- `git add` has no
+        # message flag whose quoted value could be mistaken for one. When it is anything else, the
+        # blanked view is correct: `git commit -m "wip; git add -a"` must not be read as a stage.
+        # A subcommand that does not resolve falls back to the ORIGINAL token search on the blanked
+        # view, which preserves every deny this guard made before.
+        $argView = if ($sub -ceq 'add' -or $sub -ceq 'stage') { $rawSeg } else { $s }
+        $staging = ($sub -ceq 'add' -or $sub -ceq 'stage') -or
+                   ($null -eq $sub -and $s -cmatch '(^|\s)(?:add|stage)(\s|$)') -or
+                   ($null -ne $sub -and $sub -cne 'commit' -and $s -cmatch '(^|\s)(?:add|stage)(\s|$)')
 
-    # LIMB 2 -- the blanket-stage FLAG family, GENERATED from the option words rather than typed,
-    # per the method BACKLOG #1097 settled for worktree_gate.ps1's interpreter flag. A longer list
-    # has the same shape as the defect and decays the same way.
-    #
-    # WHY A LADDER AND NOT TWO SPELLINGS: git's parse-options binds a long option by any
-    # UNAMBIGUOUS ABBREVIATION, so `--a`, `--al`, `--up`, `--upd` and `--updat` all stage the tree.
-    # Generating an ambiguous rung costs nothing -- git refuses it, and a command git refuses is
-    # not a command to protect. $longFlag is built once, above the loop.
-    #
-    # A short-option CLUSTER, the same construction the commit branch below already used. The
-    # trigger set is EXACTLY {A, u} and CASE-SENSITIVE, and the case is the whole bound:
-    #   -A  --all      stages everything          MUST trigger
-    #   -u  --update   stages every tracked change MUST trigger
-    #   -a             NOT a git add flag; `git add -a` exits 129 `unknown switch`. Folding case
-    #                  here would deny commands git itself refuses: pure false-deny, zero gain.
-    #   -U  --unified  IS a real flag and stages nothing. Matching it denies legitimate work.
-    # `-a` and `-U` are pinned as ALLOW tests so the next reader cannot "simplify" this to (?i)[au].
-    # The cluster is written as a lookahead for the trigger letter, then the whole run. The plain
-    # form, '-[A-Za-z]*[Au][A-Za-z]*', tried every trigger letter in a long run against the rest of
-    # the run, which took time quadratic in the run's length. Both match the same tokens.
-    $shortFlag = '-(?=[A-Za-z]*[Au])[A-Za-z]*'
-    $blanketFlag = "(?:$longFlag|$shortFlag)"
+        # LIMB 2 -- the blanket-stage FLAG family, GENERATED from the option words rather than typed,
+        # per the method BACKLOG #1097 settled for worktree_gate.ps1's interpreter flag. A longer list
+        # has the same shape as the defect and decays the same way.
+        #
+        # WHY A LADDER AND NOT TWO SPELLINGS: git's parse-options binds a long option by any
+        # UNAMBIGUOUS ABBREVIATION, so `--a`, `--al`, `--up`, `--upd` and `--updat` all stage the tree.
+        # Generating an ambiguous rung costs nothing -- git refuses it, and a command git refuses is
+        # not a command to protect. $longFlag is built once, above the loop.
+        #
+        # A short-option CLUSTER, the same construction the commit branch below already used. The
+        # trigger set is EXACTLY {A, u} and CASE-SENSITIVE, and the case is the whole bound:
+        #   -A  --all      stages everything          MUST trigger
+        #   -u  --update   stages every tracked change MUST trigger
+        #   -a             NOT a git add flag; `git add -a` exits 129 `unknown switch`. Folding case
+        #                  here would deny commands git itself refuses: pure false-deny, zero gain.
+        #   -U  --unified  IS a real flag and stages nothing. Matching it denies legitimate work.
+        # `-a` and `-U` are pinned as ALLOW tests so the next reader cannot "simplify" this to (?i)[au].
+        # The cluster is written as a lookahead for the trigger letter, then the whole run. The plain
+        # form, '-[A-Za-z]*[Au][A-Za-z]*', tried every trigger letter in a long run against the rest of
+        # the run, which took time quadratic in the run's length. Both match the same tokens.
+        $shortFlag = '-(?=[A-Za-z]*[Au])[A-Za-z]*'
+        $blanketFlag = "(?:$longFlag|$shortFlag)"
 
-    # LIMB 3 -- a whole-tree PATHSPEC, kept a SEPARATE limb from the flags on purpose. A flag can be
-    # anchored on a leading `-`; a pathspec cannot, and the only thing separating the blanket
-    # `git add ./` from the scoped `git add ./src/x.py` is the trailing boundary. One fused rule
-    # would need one boundary to satisfy both tests and would be wrong for one of them. The two
-    # also earn different deny messages: telling an operator who typed `:/` that the problem was a
-    # flag is the wrong sentence.
-    # AT LEAST these -- this is not an enumeration of git's pathspec grammar. The dot form is a
-    # FAMILY: any path built only from single dots and separators names the current directory, so
-    # './.', '././', './/' and the backslash spellings stage exactly what '.' stages (measured,
-    # BACKLOG #1339). A double dot is NOT in the family: '..' is the whole tree from one level
-    # down and a scoped directory from two, and this guard cannot see the working directory.
-    # QUOTES ARE TOLERATED AROUND THE WHOLE TOKEN because `:(top)` cannot be typed unquoted in
-    # either shell -- the parentheses are syntax. The token must still be EXACTLY the pathspec:
-    # `git add './src/x.py'` stays allowed, because the trailing boundary is outside the quote.
-    # The dot family is written with ONE quantifier. A nested one ('(?:[/\\]+\.?)*') backtracks
-    # exponentially on a dot followed by a run of slashes, and a hook that hangs protects nothing.
-    $dotFamily = '\.(?:[/\\]\.?)*'
-    $treeRoot = "[`"']?(?:$dotFamily|:/|:\(top\))[`"']?"
-    # A redirect may be glued to the last argument ('git add .>/dev/null'), so '<' and '>' end a
-    # token the same way whitespace does.
-    $tokenEnd = '(\s|$|[<>])'
+        # LIMB 3 -- a whole-tree PATHSPEC, kept a SEPARATE limb from the flags on purpose. A flag can be
+        # anchored on a leading `-`; a pathspec cannot, and the only thing separating the blanket
+        # `git add ./` from the scoped `git add ./src/x.py` is the trailing boundary. One fused rule
+        # would need one boundary to satisfy both tests and would be wrong for one of them. The two
+        # also earn different deny messages: telling an operator who typed `:/` that the problem was a
+        # flag is the wrong sentence.
+        # AT LEAST these -- this is not an enumeration of git's pathspec grammar. The dot form is a
+        # FAMILY: any path built only from single dots and separators names the current directory, so
+        # './.', '././', './/' and the backslash spellings stage exactly what '.' stages (measured,
+        # BACKLOG #1339). A double dot is NOT in the family: '..' is the whole tree from one level
+        # down and a scoped directory from two, and this guard cannot see the working directory.
+        # QUOTES ARE TOLERATED AROUND THE WHOLE TOKEN because `:(top)` cannot be typed unquoted in
+        # either shell -- the parentheses are syntax. The token must still be EXACTLY the pathspec:
+        # `git add './src/x.py'` stays allowed, because the trailing boundary is outside the quote.
+        # The dot family is written with ONE quantifier. A nested one ('(?:[/\\]+\.?)*') backtracks
+        # exponentially on a dot followed by a run of slashes, and a hook that hangs protects nothing.
+        $dotFamily = '\.(?:[/\\]\.?)*'
+        $treeRoot = "[`"']?(?:$dotFamily|:/|:\(top\))[`"']?"
+        # A redirect may be glued to the last argument ('git add .>/dev/null'), so '<' and '>' end a
+        # token the same way whitespace does.
+        $tokenEnd = '(\s|$|[<>])'
 
-    # WHAT THESE LIMBS DO NOT REACH is listed once, with what git does for each form, in
-    # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md. It is not restated here, because the copy that
-    # stood here said '--renormalize' was not reached. Measured: the bare flag stages nothing,
-    # and '--renormalize .' was already denied by the pathspec limb.
-    #
-    # QUOTES ARE TOLERATED AROUND A FLAG TOO. 'git add "-A"' reaches git as -A. This is the add
-    # branch only, where the raw view is read; a quoted commit flag is blanked with its message.
-    if ($staging -and $argView -cmatch "(^|\s)[`"']?$blanketFlag[`"']?$tokenEnd") {
-        $reason = "git add/stage -A/--all/-u/--update (or a cluster containing A or u) stages everything, including files another session may be editing."
-        break
-    }
-    if ($staging -and $argView -cmatch "(^|\s)$treeRoot$tokenEnd") {
-        $reason = "git add/stage with a whole-tree pathspec (. ./ :/ :(top)) stages everything, including files another session may be editing."
-        break
-    }
-    # git commit with -a / -am / --all (auto-stages every tracked change). A single-dash flag
-    # cluster containing 'a' catches -a, -am, -na, etc.; '--amend' (double dash) is left alone.
-    # The cluster is a lookahead and then the run, for the reason given at $shortFlag above.
-    if ($s -cmatch '\bcommit\b' -and ($s -cmatch "(^|\s)--all$tokenEnd" -or $s -cmatch "(^|\s)-(?=[A-Za-z]*a)[A-Za-z]*$tokenEnd")) {
-        $reason = "git commit -a/-am/--all auto-stages every tracked change before committing."
-        break
-    }
-    # git commit with a whole-tree PATHSPEC. 'git commit -m wip .' commits every tracked change
-    # under the current directory, staged or not, and so do '-o .', '-i .' and '-- :/' (measured,
-    # BACKLOG #1339). The bounds below each keep a scoped commit allowed, and each narrows only
-    # THIS rule, which is new, so none can remove a deny the guard made before:
-    #   * a trailing shell comment is dropped ('git commit -m wip a.py  # not .');
-    #   * text inside round brackets is dropped, and so is everything after an unclosed one, so
-    #     a dot that belongs to a nested command is not the commit's pathspec
-    #     ('git commit -m wip -- $(git ls-files -m . | head -3)');
-    #   * only the arguments AFTER the word 'commit' are read ('git -C . commit -m wip a.py');
-    #   * the BLANKED view is read, so a dot inside a quoted message is not a pathspec;
-    #   * no quote is tolerated around the pathspec, because in the blanked view a quote next to
-    #     './' is the start of a quoted file name ('./"$f"'), not the end of the token.
-    # The price: a QUOTED pathspec is blanked with the message and still passes, and an unquoted
-    # one-character message ('git commit -m . file') is refused.
-    # 'commit' is matched as a whole word wherever the subcommand did not resolve to add or
-    # stage, for the same reason the staging test above falls back to the bare word.
-    if (-not $staging) {
-        $commitArgs = Remove-BracketedText ($s -creplace '(^|\s)#.*$', '')
-        if (Test-CommitPathspec $commitArgs "$dotFamily|:/" $tokenEnd) {
-            $reason = "git commit with a whole-tree pathspec (. ./ :/ :(top)) commits every tracked change under it, including files another session may be editing."
+        # WHAT THESE LIMBS DO NOT REACH is listed once, with what git does for each form, in
+        # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md. It is not restated here, because the copy that
+        # stood here said '--renormalize' was not reached. Measured: the bare flag stages nothing,
+        # and '--renormalize .' was already denied by the pathspec limb.
+        #
+        # QUOTES ARE TOLERATED AROUND A FLAG TOO. 'git add "-A"' reaches git as -A. This is the add
+        # branch only, where the raw view is read; a quoted commit flag is blanked with its message.
+        if ($staging -and $argView -cmatch "(^|\s)[`"']?$blanketFlag[`"']?$tokenEnd") {
+            $reason = "git add/stage -A/--all/-u/--update (or a cluster containing A or u) stages everything, including files another session may be editing."
             break
         }
+        if ($staging -and $argView -cmatch "(^|\s)$treeRoot$tokenEnd") {
+            $reason = "git add/stage with a whole-tree pathspec (. ./ :/ :(top)) stages everything, including files another session may be editing."
+            break
+        }
+        # git commit with -a / -am / --all (auto-stages every tracked change). A single-dash flag
+        # cluster containing 'a' catches -a, -am, -na, etc.; '--amend' (double dash) is left alone.
+        # The cluster is a lookahead and then the run, for the reason given at $shortFlag above.
+        if ($s -cmatch '\bcommit\b' -and ($s -cmatch "(^|\s)--all$tokenEnd" -or $s -cmatch "(^|\s)-(?=[A-Za-z]*a)[A-Za-z]*$tokenEnd")) {
+            $reason = "git commit -a/-am/--all auto-stages every tracked change before committing."
+            break
+        }
+        # git commit with a whole-tree PATHSPEC. 'git commit -m wip .' commits every tracked change
+        # under the current directory, staged or not, and so do '-o .', '-i .' and '-- :/' (measured,
+        # BACKLOG #1339). The bounds below each keep a scoped commit allowed, and each narrows only
+        # THIS rule, which is new, so none can remove a deny the guard made before:
+        #   * a trailing shell comment is dropped ('git commit -m wip a.py  # not .');
+        #   * text inside round brackets is dropped, and so is everything after an unclosed one, so
+        #     a dot that belongs to a nested command is not the commit's pathspec
+        #     ('git commit -m wip -- $(git ls-files -m . | head -3)');
+        #   * only the arguments AFTER the word 'commit' are read ('git -C . commit -m wip a.py');
+        #   * the BLANKED view is read, so a dot inside a quoted message is not a pathspec;
+        #   * no quote is tolerated around the pathspec, because in the blanked view a quote next to
+        #     './' is the start of a quoted file name ('./"$f"'), not the end of the token.
+        # The price: a QUOTED pathspec is blanked with the message and still passes, and an unquoted
+        # one-character message ('git commit -m . file') is refused.
+        # 'commit' is matched as a whole word wherever the subcommand did not resolve to add or
+        # stage, for the same reason the staging test above falls back to the bare word.
+        if (-not $staging) {
+            $commitArgs = Remove-BracketedText ($s -creplace '(^|\s)#.*$', '')
+            if (Test-CommitPathspec $commitArgs "$dotFamily|:/" $tokenEnd) {
+                $reason = "git commit with a whole-tree pathspec (. ./ :/ :(top)) commits every tracked change under it, including files another session may be editing."
+                break
+            }
+        }
     }
+    if ($reason) { break }
 }
 
 if (-not $reason) { exit 0 }

@@ -257,6 +257,15 @@ this line.**
 
 ### Fixed
 
+- **The High Availability pages degrade when the store does not answer.** The page, its live
+  fragment and both step-down confirm pages read the cluster membership and lease rows with no error
+  handling, so a store timeout or outage answered with an error body in place of the page. The page
+  and its fragment now show this node's in-memory status and the reason, with no node list and no
+  step-down control, and the confirm pages show the reason with no form. The page and the confirm
+  pages answer 503, and the live fragment answers 200 so the poller replaces the last view. The role shown is the node's
+  in-memory one and is marked unconfirmed. These pages log the failure once per run of failed reads.
+  (BACKLOG #5932)
+
 - **Federated sign-in and the IdP step-up reach the identity provider.** `POST /ui/oidc/start` and
   `POST /ui/reauth/oidc` answered with a 303 to the IdP, which Chromium blocks under the console's
   `form-action 'self'` because it checks that directive again on the redirect after a form POST.
@@ -292,10 +301,12 @@ this line.**
   Continue button that takes the operator through that re-auth to the code form first. Enroll and
   confirm still each take their own proof (ADR 0077), and a refused code still needs a fresh one:
   the re-rendered page offers the same Continue instead of a form that would drop the next code.
-  The confirm page itself is unchanged. A Continue can be posted while the confirm proof is
-  already held, from another tab or after Back. It now goes to the re-auth and leaves that proof
-  unspent. No code is checked and no failed attempt is recorded. The verify route's gate chain
-  grew by that check, so the engine seam moves. (BACKLOG #5931)
+  The confirm page, opened while no confirm proof is held (for example after Back from a refused
+  code, or after an engine restart), offers the same Continue instead of a code form. A Continue
+  can be posted while the confirm proof is already held, from another tab or after Back. It now
+  goes to the re-auth and leaves that proof unspent. No code is checked and no failed attempt is
+  recorded. The verify gate makes that check itself, just before it spends the proof, and the
+  gate's closure changed with it, so the engine seam moves. (BACKLOG #5931)
 - **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
   gave that page for any 503 the engine's flag handler raised, relying on a comment that the
   handler had no other. The handler raises no other today, so nothing an operator sees changes; a

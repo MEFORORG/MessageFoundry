@@ -805,6 +805,36 @@ suite("Steps modes: the provider's edit guard accepts a template and rejects a m
     }
   });
 
+  // BACKLOG #5942: JSON.stringify sends an infinity or NaN as null, which the engine writes as None.
+  test("a number that is not finite is refused, never sent", () => {
+    for (const value of [Infinity, -Infinity, NaN]) {
+      const read = readEditMessage({ ...base, value });
+      assert.ok(read && "refused" in read, `refused: ${String(value)}`);
+      assert.ok(read.refused.includes('"value"'), "the reason names the argument");
+    }
+    const ok = readEditMessage({ ...base, value: 2.5 });
+    assert.ok(ok && "edit" in ok);
+    assert.strictEqual(ok.edit.value, 2.5);
+  });
+
+  test("null passes only as a cleared nullable number field, and maps to a JSON null", () => {
+    const read = readEditMessage({ ...base, value: null, nullable: true });
+    assert.ok(read && "edit" in read);
+    assert.strictEqual(read.edit.value, null);
+    assert.deepStrictEqual(buildEditRequest(read.edit).params, { value: null });
+    for (const nullable of [undefined, false, "true", 1]) {
+      const refused = readEditMessage({ ...base, value: null, nullable });
+      assert.ok(refused && "refused" in refused, `refused with nullable ${String(nullable)}`);
+    }
+  });
+
+  test("a line coordinate that is not a whole number addresses no row and is dropped", () => {
+    for (const bad of [9.5, NaN, Infinity]) {
+      assert.strictEqual(readEditMessage({ ...base, lineStart: bad, value: "x" }), undefined);
+      assert.strictEqual(readEditMessage({ ...base, lineEnd: bad, value: "x" }), undefined);
+    }
+  });
+
   test("a message that is not a well-addressed edit is dropped, as before", () => {
     assert.strictEqual(readEditMessage(undefined), undefined);
     assert.strictEqual(readEditMessage({ ...base, command: "pickPath", value: "x" }), undefined);

@@ -466,6 +466,47 @@ def test_a_broad_account_that_can_read_is_a_problem(ace: tuple[int, int, str], n
     assert problem is not None and named in problem and "can read or change it" in problem
 
 
+@pytest.mark.parametrize(
+    "sid",
+    [
+        "S-1-18-3",  # Fresh public key identity
+        "S-1-18-4",  # Key trust identity
+        "S-1-18-5",  # Key property MFA
+        "S-1-18-6",  # Key property attestation
+        "S-1-5-1000",  # Other Organization
+        "S-1-5-65-1",  # This Organization Certificate
+        "S-1-5-90-0",  # Window Manager Group
+        "S-1-5-9",  # Enterprise Domain Controllers
+        "S-1-5-83-0",  # Virtual Machines
+        "S-1-5-84-0-0-0-0-0",  # USER MODE DRIVERS
+        "S-1-5-22",  # Legacy Enterprise Read-only Domain Controllers Beta
+        "S-1-5-32-554",  # Pre-Windows 2000 Compatible Access
+        "S-1-5-64-36",  # Cloud Account Authentication
+        "S-1-5-21-9-9-9-516",  # Domain Controllers
+        "S-1-5-21-9-9-9-521",  # Read-only Domain Controllers
+        "S-1-5-21-9-9-9-498",  # Enterprise Read-only Domain Controllers
+    ],
+)
+def test_more_well_known_groups_are_broad(sid: str) -> None:
+    # Vault BACKLOG #5929 item 3: each of these well-known groups passed the broad-group screen, so
+    # a read grant naming one would have widened read access to a key file.
+    assert "a group many accounts hold" in str(restricted_file._screened_principal(sid))
+    listed = _security((_ALLOW, _FULL, _SYSTEM), (_ALLOW, _READ, sid))
+    assert sid in str(restricted_file._windows_access_problem(listed))
+
+
+def test_a_domain_account_sid_is_not_a_broad_group() -> None:
+    # Vault BACKLOG #5929 item 4: an account of a domain (S-1-5-21-..., the shape a group managed
+    # service account's SID takes) is one account, so a read grant to it is not reported. Domain
+    # Computers in the same domain is the control.
+    account = "S-1-5-21-9-9-9-1105"
+    assert restricted_file._screened_principal(account) is None
+    listed = _security((_ALLOW, _FULL, _SYSTEM), (_ALLOW, _READ, account))
+    assert restricted_file._windows_access_problem(listed) is None
+    computers = _security((_ALLOW, _FULL, _SYSTEM), (_ALLOW, _READ, "S-1-5-21-9-9-9-515"))
+    assert restricted_file._windows_access_problem(computers) is not None
+
+
 def test_a_shared_service_account_is_an_account_not_a_broad_group() -> None:
     # An engine may run as NETWORK SERVICE, and an operator may grant it. The create accepts that
     # grant, so the check must not then report the file: one predicate serves both sides.
@@ -1274,7 +1315,10 @@ def test_windows_refuses_a_name_that_is_not_one_account(tmp_path: Path, name: st
         (3, False, False, "a domain"),
         (4, False, False, "an alias"),
         (6, False, False, "a deleted account"),
+        (7, False, False, "an invalid account"),
         (8, False, False, "an unknown account"),
+        (10, False, False, "a label"),
+        (11, False, False, "a logon session"),
         (12, False, False, "an account of kind 12"),
     ],
 )
@@ -1288,8 +1332,12 @@ def test_a_grant_name_may_resolve_to_a_computer_account(
         else:
             # The refusal names the kind the name resolved to.
             assert problem is not None and f"to {named}," in problem
-            # A name that resolves to no live account is not sent on to its SID literal.
-            assert ("by its SID" in problem) == (as_owner and kind not in (6, 8))
+            # Only an owner that can hold a file, a group, an alias or a computer account, is sent
+            # on to its SID literal: not a dead account, nor a domain, a label or a logon session.
+            assert ("by its SID" in problem) == (as_owner and kind in (2, 4, 9))
+            if not as_owner and kind not in (6, 7, 8):
+                # A grant refusal says the broad groups among well-known names are refused.
+                assert "less at least the known broad groups" in problem
 
 
 @windows_only
@@ -1312,7 +1360,9 @@ def test_windows_a_computer_account_grant_name_is_written(
 
 
 @windows_only
-@pytest.mark.parametrize("grant", [f"*{_USERS}", "*S-1-1-0", "*S-1-5-11", "*S-1-5-15"])
+@pytest.mark.parametrize(
+    "grant", [f"*{_USERS}", "*S-1-1-0", "*S-1-5-11", "*S-1-5-15", "*S-1-5-1000", "*S-1-18-3"]
+)
 def test_windows_refuses_a_read_grant_to_a_broad_group(tmp_path: Path, grant: str) -> None:
     # A grant that would make the key file broadly readable is not a restricted create. The control
     # is the per-service grant in the test above, which is created.

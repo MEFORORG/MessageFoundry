@@ -127,7 +127,8 @@ def test_a_collector_outside_the_list_is_refused_at_start(
     assert _errors(capsys.readouterr().err) == [
         f"error: the syslog collector [logging].forward_host {VERIFIED_LOG_FORWARDING_HOST!r} "
         "port 514 is not in the [egress].allowed_syslog allowlist; refusing to start. List the "
-        "collector in [egress].allowed_syslog as 'host' (any port) or 'host:port'."
+        "collector in [egress].allowed_syslog as 'host' or '[v6]' (any port), or 'host:port' or "
+        "'[v6]:port', and give an IPv6 forward_host unbracketed."
     ]
     assert recorder.forwards == [], "a forwarder was installed for a refused collector"
     assert recorder.spawned == 0
@@ -147,8 +148,8 @@ def test_an_unset_list_is_refused_at_start_under_the_deny_default(
     errors = _errors(capsys.readouterr().err)
     assert len(errors) == 1 and "[egress].allowed_syslog is empty" in errors[0], errors
     assert errors[0].endswith(
-        "refusing to start. List the collector in [egress].allowed_syslog as 'host' (any port) "
-        "or 'host:port'."
+        "refusing to start. List the collector in [egress].allowed_syslog as 'host' or '[v6]' "
+        "(any port), or 'host:port' or '[v6]:port', and give an IPv6 forward_host unbracketed."
     )
     assert recorder.forwards == [] and recorder.spawned == 0
 

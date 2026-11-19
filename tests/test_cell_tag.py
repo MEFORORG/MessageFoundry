@@ -875,7 +875,7 @@ def test_an_unread_oversize_decrypt_400_is_logged_once_per_interval(
     from messagefoundry.store import crypto_transit
     from messagefoundry.store.crypto_transit import TransitCipher
 
-    monkeypatch.setattr(crypto_transit, "_unread_body_logged_at", None)
+    monkeypatch.setattr(crypto_transit, "_logged_at", {})
     body = '{"errors":["cipher: message authentication failed"]}' + " " * (64 * 1024)
 
     class _Transit:

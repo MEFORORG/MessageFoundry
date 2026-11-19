@@ -50,6 +50,7 @@ SCRIPTS = (
     "claim-adjudicate.ps1",
     "alloc.ps1",
     "lane.ps1",
+    "lane-root.ps1",
     "mail-key.ps1",
     "coord-root.ps1",
     "occupancy.ps1",
@@ -89,8 +90,9 @@ def repo(tmp_path: Path) -> Path:
     for name in SCRIPTS:
         shutil.copy2(COORD / name, r / "scripts" / "coord" / name)
     (r / "docs" / "adr" / "0001-first.md").write_text("# First\n", encoding="utf-8")
-    # claim-adjudicate.ps1 refuses to run over a backlog namespace it could not read.
-    (r / "docs" / "BACKLOG.md").write_text("# Backlog\n", encoding="utf-8")
+    # claim-adjudicate.ps1 refuses to run over a backlog namespace it could not read, and a file
+    # with no item heading is not one (BACKLOG #5480), so the fixture carries one item.
+    (r / "docs" / "BACKLOG.md").write_text("# Backlog\n\n## 1. A fixture item\n", encoding="utf-8")
     git(r, "add", "-A")
     git(r, "commit", "-qm", "base", "--no-verify")
     return r
