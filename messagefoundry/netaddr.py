@@ -109,9 +109,11 @@ IPV4_EMBEDDINGS: Final[tuple[tuple[ipaddress.IPv6Network, int], ...]] = (
 #: does not key on their ``/64``, read by the span limit on its ``trusted_proxies``
 #: (``config.listener_proxies``, BACKLOG #5525), which must count keys the way the budget makes
 #: them. Two are left out. The IPv4-mapped block is read as the IPv4 range it names
-#: (:func:`ipv4_meaning`) before this is asked. SIIT is left out because the budget keying, at
-#: least ``_budget_key``, ``_embedded_client`` and ``_is_phantom``, does not read it as carrying an
-#: IPv4 client and keys its addresses on their ``/64``. That keying reads ``NAT64_WELL_KNOWN``,
+#: (:func:`ipv4_meaning`) before this is asked. SIIT is left out because the budget keying does
+#: not read it as carrying an IPv4 client: ``_embedded_client`` finds none in it, so
+#: ``_budget_key`` keys its addresses on their ``/64``, and ``_is_phantom`` reads every SIIT
+#: address as one no client can hold, since SIIT lies in the unassigned rest of ``::/8``
+#: (``_IETF_RESERVED``). That keying reads ``NAT64_WELL_KNOWN``,
 #: ``NAT64_LOCAL_USE``, ``IPV4_COMPATIBLE`` and ``ipaddress``'s Teredo and 6to4 readings, not this
 #: table.
 IPV4_EMBEDDING_PREFIXES: Final = tuple(
@@ -288,6 +290,9 @@ _ALLOWLIST_ENTRY_TYPES: Final = (
 #: tests/test_allowlist_restricts.py pins them to the table.
 _RULE_TEXT_LATE_RANGES: Final = ("::ffff:0:0/96", "64:ff9b::/96", "2001::/32")
 
+#: The bit at which 6to4's IPv4 address starts, read from the table for the rule text.
+_SIX_TO_FOUR_IPV4_START: Final = dict(IPV4_EMBEDDINGS)[SIX_TO_FOUR]
+
 #: The rule :func:`allowlist_shortfall` applies, as one clause both gates' refusals quote, so the
 #: floors, the examples and the derived ``/104`` are stated once in code (vault BACKLOG #5393).
 ALLOWLIST_RULE_TEXT: Final = (
@@ -298,10 +303,12 @@ ALLOWLIST_RULE_TEXT: Final = (
     f"one fixes at least {ALLOWLIST_MIN_PREFIX_V4} bits of the IPv4 address it carries, so is at "
     f"least a /{_LATE_IPV4_START + ALLOWLIST_MIN_PREFIX_V4} inside a prefix whose IPv4 address "
     f"starts at bit {_LATE_IPV4_START}, at least {', '.join(_RULE_TEXT_LATE_RANGES[:-1])} and "
-    f"{_RULE_TEXT_LATE_RANGES[-1]}; and the entries together count at most "
-    f"{ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses, two /{ALLOWLIST_MIN_PREFIX_V4} networks' "
-    "worth, an IPv6 entry inside such a prefix counting the IPv4 addresses it can carry, any "
-    "other IPv6 entry, a site's own NAT64 prefix among them, counting none, and loopback and "
+    f"{_RULE_TEXT_LATE_RANGES[-1]}, while inside 6to4's {SIX_TO_FOUR}, whose IPv4 address starts "
+    f"at bit {_SIX_TO_FOUR_IPV4_START}, the IPv6 floor already fixes that many; and the entries "
+    f"together count at most {ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses, "
+    f"two /{ALLOWLIST_MIN_PREFIX_V4} networks' worth, an IPv6 entry inside any prefix the gate "
+    "reads as carrying IPv4 addresses, 6to4 included, counting the IPv4 addresses it can carry, "
+    "any other IPv6 entry, a site's own NAT64 prefix among them, counting none, and loopback and "
     "multicast not counted where a plain IPv4 or IPv4-mapped entry lists them"
 )
 
@@ -357,8 +364,9 @@ def allowlist_shortfall(allowlist: Any) -> str | None:
     that table names, and one that contains a whole range does not count at all.
 
     **The list is also judged whole** (vault BACKLOG #5393). Entries that each meet a floor can
-    together admit the IPv4 internet, so the IPv4 addresses the list admits may number at most
-    :data:`ALLOWLIST_MAX_IPV4_ADDRESSES`. Plain IPv4 entries and IPv4-mapped ones are one space,
+    together admit the IPv4 internet, so the list's IPv4 address count, as
+    :data:`ALLOWLIST_RULE_TEXT` defines it, may be at most :data:`ALLOWLIST_MAX_IPV4_ADDRESSES`.
+    That count is not every IPv4 address the list admits, as the rest of this paragraph says. Plain IPv4 entries and IPv4-mapped ones are one space,
     where an overlap is counted once. Each other range in :data:`IPV4_EMBEDDINGS` is counted
     apart, since its addresses cannot be matched to plain IPv4 ones with certainty, so the same
     hosts listed under two ranges count twice, which can only fail closed. In the plain IPv4
