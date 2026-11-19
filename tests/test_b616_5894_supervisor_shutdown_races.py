@@ -17,7 +17,6 @@ from messagefoundry.pipeline.supervisor import (
     ShardDrainError,
     ShardSpec,
     Supervisor,
-    _drain_error_in,
     _run_supervisor,
 )
 from tests.test_supervisor import _spec
@@ -322,19 +321,20 @@ async def test_a_launch_that_ignores_the_cancel_past_the_grace_is_exit_3_and_ret
 
     specs = [_spec("a"), _spec("b", 1)]
     sup = Supervisor(specs, spawn=_spawner(spawn), terminate_grace=0.1)
-    runner = asyncio.create_task(sup.run())
-    await asyncio.wait_for(a.waiting.wait(), 5)
-    await asyncio.wait_for(hung.wait(), 5)
-    runner.cancel()
-    with pytest.raises(ShardDrainError, match="still running") as caught:
-        await asyncio.wait_for(runner, 5)
-    assert "cancelled at shutdown" in str(caught.value)
-    assert a.returncode == -15
-    # The supervisor still holds the stranded launch, so it is not garbage-collected mid-flight.
-    assert len(sup._launches) == 1
-    release.set()  # let the launch end, so the test leaves no pending task behind
-    (launch,) = sup._launches
-    await asyncio.wait_for(launch, 5)
+    try:
+        runner = asyncio.create_task(sup.run())
+        await asyncio.wait_for(a.waiting.wait(), 5)
+        await asyncio.wait_for(hung.wait(), 5)
+        runner.cancel()
+        with pytest.raises(ShardDrainError, match="still running") as caught:
+            await asyncio.wait_for(runner, 5)
+        assert "cancelled at shutdown" in str(caught.value)
+        assert a.returncode == -15
+        # The supervisor still holds the stranded launch, so it is not garbage-collected.
+        assert len(sup._launches) == 1
+    finally:
+        release.set()  # let the launch end, so the test leaves no pending task behind
+    await asyncio.wait_for(asyncio.gather(*sup._launches), 5)
 
 
 @pytest.mark.timeout(30)
@@ -354,12 +354,51 @@ async def test_a_launch_that_ignores_the_cancel_past_the_grace_exits_3() -> None
 
     specs = [_spec("default")]
     sup = Supervisor(specs, spawn=_spawner(spawn), terminate_grace=0.1)
-    code = asyncio.create_task(_run_supervisor(sup, specs, install_signal_handlers=False))
-    await asyncio.wait_for(hung.wait(), 5)
-    sup.stop()
-    assert await asyncio.wait_for(code, 5) == 3
-    release.set()
+    try:
+        code = asyncio.create_task(_run_supervisor(sup, specs, install_signal_handlers=False))
+        await asyncio.wait_for(hung.wait(), 5)
+        sup.stop()
+        assert await asyncio.wait_for(code, 5) == 3
+    finally:
+        release.set()
     await asyncio.wait_for(asyncio.gather(*sup._launches), 5)
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.asyncio
+async def test_run_refuses_to_start_while_a_launch_from_an_earlier_run_is_pending() -> None:
+    release = asyncio.Event()
+    hung = asyncio.Event()
+    proc = _Proc(exit_on_terminate=True)
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        hung.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        return proc
+
+    sup = Supervisor([_spec("default")], spawn=_spawner(spawn), terminate_grace=0.1)
+    try:
+        runner = asyncio.create_task(sup.run())
+        await asyncio.wait_for(hung.wait(), 5)
+        sup.stop()
+        with pytest.raises(ShardDrainError):
+            await asyncio.wait_for(runner, 5)
+        # The next run would blame itself for the old launch, so it refuses instead.
+        with pytest.raises(RuntimeError, match="still pending"):
+            await asyncio.wait_for(sup.run(), 5)
+    finally:
+        release.set()
+    await asyncio.wait_for(asyncio.gather(*sup._launches), 5)
+    # Once the old launch has ended, a run starts, and stops cleanly.
+    runner = asyncio.create_task(sup.run())
+    await asyncio.wait_for(proc.waiting.wait(), 5)
+    sup.stop()
+    await asyncio.wait_for(runner, 5)
+    assert sup.drain_failure is None
 
 
 @pytest.mark.timeout(30)
@@ -496,29 +535,94 @@ async def test_a_real_kill_failure_is_the_cause_ahead_of_a_stranded_launch() -> 
         return stuck
 
     sup = Supervisor([_spec("a"), _spec("b", 1)], spawn=_spawner(spawn), terminate_grace=0.1)
-    runner = asyncio.create_task(sup.run())
-    await asyncio.wait_for(stuck.waiting.wait(), 5)
-    await asyncio.wait_for(hung.wait(), 5)
-    runner.cancel()
-    with pytest.raises(ShardDrainError, match="2 engine shard") as caught:
-        await asyncio.wait_for(runner, 5)
-    assert isinstance(caught.value.__cause__, PermissionError)
-    release.set()
+    try:
+        runner = asyncio.create_task(sup.run())
+        await asyncio.wait_for(stuck.waiting.wait(), 5)
+        await asyncio.wait_for(hung.wait(), 5)
+        runner.cancel()
+        with pytest.raises(ShardDrainError, match="2 engine shard") as caught:
+            await asyncio.wait_for(runner, 5)
+        assert isinstance(caught.value.__cause__, PermissionError)
+    finally:
+        release.set()
     await asyncio.wait_for(asyncio.gather(*sup._launches), 5)
 
 
-def test_a_drain_error_anywhere_in_the_chain_is_found() -> None:
-    drain = ShardDrainError("1 engine shard child(ren) may still be running")
-    caused = KeyboardInterrupt()
-    caused.__cause__ = drain
-    contexted = KeyboardInterrupt()
-    contexted.__context__ = RuntimeError("wrapper")
-    contexted.__context__.__cause__ = drain
-    assert _drain_error_in(drain) is drain
-    assert _drain_error_in(caused) is drain
-    assert _drain_error_in(contexted) is drain
-    assert _drain_error_in(KeyboardInterrupt()) is None
-    assert _drain_error_in(None) is None
+@pytest.mark.timeout(30)
+@pytest.mark.asyncio
+async def test_a_launch_raising_a_fatal_exit_mid_drain_still_drains_every_child() -> None:
+    # Finding 1: engine shard "b"'s launch raises a BaseException while the drain settles it.
+    # The drain must still force "a", which ignores the stop request, record "b" as stranded,
+    # and only then raise the fatal exit.
+    class _Fatal(BaseException):
+        pass
+
+    a = _Proc()
+    hung = asyncio.Event()
+    go = asyncio.Event()
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        if spec.shard == "b":
+            hung.set()
+            await go.wait()
+            raise _Fatal
+        return a
+
+    sup = Supervisor([_spec("a"), _spec("b", 1)], spawn=_spawner(spawn), terminate_grace=0.2)
+    runner = asyncio.create_task(sup.run())
+    await asyncio.wait_for(a.waiting.wait(), 5)
+    await asyncio.wait_for(hung.wait(), 5)
+    sup.stop()
+    await asyncio.wait_for(a.terminated.wait(), 5)
+    go.set()
+    with pytest.raises(_Fatal):
+        await asyncio.wait_for(runner, 5)
+    assert a.killed
+    assert a.returncode == -9
+    assert sup.drain_failure is not None
+    assert "raised" in str(sup.drain_failure)
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.asyncio
+async def test_a_drain_cut_short_by_a_cancel_of_its_own_task_exits_3() -> None:
+    # Finding 2: asyncio.run's teardown cancels every task, the drain's own included. The child
+    # that ignored its stop request is still running, so the exit is 3, not a clean 0.
+    proc = _Proc()
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        return proc
+
+    specs = [_spec("default")]
+    sup = Supervisor(specs, spawn=_spawner(spawn), terminate_grace=5.0)
+    code = asyncio.create_task(_run_supervisor(sup, specs, install_signal_handlers=False))
+    await asyncio.wait_for(proc.waiting.wait(), 5)
+    sup.stop()
+    await asyncio.wait_for(proc.terminated.wait(), 5)
+    drains = [t for t in asyncio.all_tasks() if t.get_coro().__qualname__ == "Supervisor._drain"]  # type: ignore[union-attr]
+    assert len(drains) == 1
+    drains[0].cancel()
+    assert await asyncio.wait_for(code, 5) == 3
+    assert proc.returncode is None
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.asyncio
+async def test_a_cancelled_runner_after_a_failed_drain_exits_3() -> None:
+    # The outcome is read from the supervisor, so how run() ended does not decide the code.
+    proc = _Proc(terminate_error=PermissionError("refused"), kill_error=PermissionError("refused"))
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        return proc
+
+    specs = [_spec("default")]
+    sup = Supervisor(specs, spawn=_spawner(spawn), terminate_grace=0.1)
+    code = asyncio.create_task(_run_supervisor(sup, specs, install_signal_handlers=False))
+    await asyncio.wait_for(proc.waiting.wait(), 5)
+    for task in asyncio.all_tasks():
+        if task.get_name() == "supervisor":
+            task.cancel()
+    assert await asyncio.wait_for(code, 5) == 3
 
 
 def test_a_non_finite_terminate_grace_is_refused() -> None:

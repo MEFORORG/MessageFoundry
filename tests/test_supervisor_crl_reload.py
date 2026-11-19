@@ -66,6 +66,7 @@ class _Fleet:
     pki: _Pki
     seen: dict[str, bool] = field(default_factory=dict)
     crash_looped: set[str] = field(default_factory=set)
+    drain_failure: None = None  # as Supervisor.drain_failure: this fake never fails a drain
 
     async def run(self) -> None:
         # CONTROL: before the revocation, the forwarder accepts the collector.
@@ -194,6 +195,7 @@ class _SignalledFleet:
 
     handlers: dict[int, Callable[[], object]] = field(default_factory=dict)
     crash_looped: set[str] = field(default_factory=set)
+    drain_failure: None = None  # as Supervisor.drain_failure: this fake never fails a drain
     signalled_at: list[float] = field(default_factory=list)
 
     def take_over_signals(self, loop: asyncio.AbstractEventLoop) -> None:
