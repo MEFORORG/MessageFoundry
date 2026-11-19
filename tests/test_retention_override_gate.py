@@ -265,6 +265,13 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
         "[security].delete_message_bodies_after_days window where that window is bounded"
     )
     assert (shard_limit in text) is (inbound_days is not None)
+    # The acknowledgement does not stop the sibling purge, but it lifts an unset window's default
+    # bound, which then purges nothing; the text says what the switch changes.
+    switch = (
+        "Setting [security].allow_keeping_phi_indefinitely does not stop that purge, but it lifts "
+        "the default bound of an unset [security].delete_message_bodies_after_days"
+    )
+    assert (switch in text) is (inbound_days is not None)
     assert (
         "Otherwise, under plain serve or the serve --shard process that holds that inbound, it "
         "keeps forever" in text

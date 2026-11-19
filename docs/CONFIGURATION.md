@@ -1325,9 +1325,9 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
 >
 > **Under `enforce`, an override of `0` needs the same acknowledgement as a global `0`** (BACKLOG
-> #2368). Subject to the engine shard limit next, it keeps that connection's PHI forever, whatever
-> the global window says, but not every row about its messages; the refusal and the `AUDIT:` line
-> state which (BACKLOG #5967). The engine shard limit binds an inbound's override alone. Each
+> #2368). Subject to the engine shard limit next, it keeps forever what that override's purge
+> holds, whatever the global window says, and not every row about its messages; the refusal and the
+> `AUDIT:` line state which (BACKLOG #5967). The engine shard limit binds an inbound's override alone. Each
 > `serve --shard` process purges the shared store with only its own inbounds' overrides, so where a
 > `serve --shard` process that does not hold that inbound runs retention against the same store, it
 > purges that inbound's message bodies on the global window, and where that window is bounded the
@@ -1341,7 +1341,7 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 >   graph stays.
 > - Without it, under `warn`, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming
 >   each connection, with the remedy (owner ruling 2026-11-01). The graph loads with no
->   acknowledgement, and what the override holds is kept forever, subject to the engine-shard
+>   acknowledgement, and what the override holds is kept forever, subject to the engine shard
 >   limit above.
 > - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection.
 >

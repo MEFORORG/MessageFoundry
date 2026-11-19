@@ -3962,7 +3962,7 @@ _OVERRIDE_ARMS: tuple[tuple[str, tuple[str, ...]], ...] = (
             _OVERRIDE_AUDITED,
             "with the remedy",
             "what the override holds is kept forever",
-            "subject to the engine-shard limit above",
+            "subject to the engine shard limit above",
         ),
     ),
     ("- With it, the gate passes the graph", (_OVERRIDE_AUDITED,)),
@@ -3975,6 +3975,7 @@ _OVERRIDE_NOTE_FACTS = (
     # BACKLOG #5967: each engine shard process's retention reads its own inbounds' overrides
     # alone. The limit binds an inbound's override only, and only where a `serve --shard` process
     # that does not hold that inbound runs: plain `serve`, and the process that holds it, honour it.
+    "Subject to the engine shard limit next, it keeps forever what that override's purge holds",
     "The engine shard limit binds an inbound's override alone.",
     "where a `serve --shard` process that does not hold that inbound runs retention against the "
     "same store, it purges that inbound's message bodies on the global window, and where that "
