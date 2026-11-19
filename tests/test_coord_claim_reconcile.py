@@ -1294,6 +1294,51 @@ def test_a_gone_holder_recheck_that_cannot_run_is_not_released(repo: Path, tmp_p
     assert _history_keys(repo) == []
 
 
+def test_a_gone_holder_whose_branch_cannot_be_read_on_recheck_is_not_released(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The branch the scan judged is deleted before -Apply: nothing to compare, so the re-check
+    could not run, and the claim stays."""
+    side_effect = f"git -C {_ps_quote(str(repo))} branch -D unread | Out-Null"
+    claim, row = _gone_holder_release(
+        repo, tmp_path, "k-unread", "unread", tmp_path / "vanished", side_effect
+    )
+    assert claim.exists(), row
+    assert row["verdict"] == "RECHECK-FAILED", row
+    assert row["outcome"] == (
+        "NOT released -- the re-check could not run: the branch 'unread' could no longer be read"
+    ), row
+    assert _history_keys(repo) == []
+
+
+def test_a_present_holder_whose_fence_goes_blind_on_recheck_is_not_released(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """The fence reads UNAVAILABLE at the -Apply re-check: that is "could not look", not a change.
+
+    The gh stub removes the only session record while the scan probes, so the scan's fence was
+    available and the re-check's has examined nothing.
+    """
+    wt, tip = present_holder(repo, "blind-later")
+    claim = write_claim(repo, "9127", wt, "blind-later")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    record = cfg / "sessions" / f"{sleeper}.json"
+    stub = gh_router(
+        tmp_path,
+        head=json.dumps(pr_at(tip, "9127")),
+        on_head=f"Remove-Item -LiteralPath {_ps_quote(str(record))}",
+    )
+    proc = reconcile(repo, "-Json", "-Apply", "-GhCommand", str(stub), "-ConfigRoot", str(cfg))
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert not record.exists(), "the side effect must have run"
+    assert claim.exists(), row
+    assert row["verdict"] == "RECHECK-FAILED", row
+    assert row["outcome"].startswith("NOT released -- the re-check could not run:"), row
+    assert "UNAVAILABLE" in row["outcome"], row
+    assert _history_keys(repo) == []
+
+
 @pytest.mark.parametrize(
     ("deletes", "code", "outcome"),
     [

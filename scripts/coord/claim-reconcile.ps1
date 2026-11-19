@@ -62,10 +62,11 @@
     compares the key, holder, host, branch, both stamps and the file's whole text with what the scan
     read. On any difference the row reads CHANGED-SINCE-SCAN with the outcome "NOT released", and
     nothing is touched. A holder-present row that changed reads MERGED-HELD, with the same outcome. A
-    re-check that could not run -- the worktree list failed, the branch tip could not be read, or the
-    scan kept no copy to compare -- reads RECHECK-FAILED, with the outcome "NOT released -- the
-    re-check could not run", and is never released either. A window remains between the file's
-    re-read and claim.ps1's own read; it is narrowed, not closed.
+    re-check that could not run -- for example the worktree list failed, the branch tip or the claim
+    file could not be read, or a present holder's fence, status or HEAD could not be read -- reads
+    RECHECK-FAILED, with the outcome "NOT released -- the re-check could not run", and is never
+    released either. A window remains between the file's re-read and claim.ps1's own read; it is
+    narrowed, not closed.
 
     The gone-holder pull-request probe passes --repo, from origin's GitHub URL, and --base, the branch
     the reference names, and re-checks the base on each row it gets back. Without a GitHub origin it
@@ -487,7 +488,9 @@ function Get-HolderDirt([string]$Path) {
 # than asking GitHub again, and re-runs everything local.
 function Get-PresentHolderVerdict {
     param([object]$Claim, [string]$Key, [string]$Holder, [string]$Branch, [object]$KnownPr = $null)
-    $v = [ordered]@{ verdict = "HELD"; why = "holder directory exists"; tip = ""; pr = $null }
+    # unrun marks a HELD that means "could not look" rather than "looked and it fails", so the -Apply
+    # re-check can report it as a re-check that could not run instead of a change.
+    $v = [ordered]@{ verdict = "HELD"; why = "holder directory exists"; tip = ""; pr = $null; unrun = $false }
     if (-not $registered.ContainsKey($Holder)) {
         $v.why = "holder directory exists but is not a registered worktree of this repository"
         return $v
@@ -505,11 +508,16 @@ function Get-PresentHolderVerdict {
         return $v
     }
     $dirt = Get-HolderDirt $Holder
-    if ($dirt) { $v.why = "holder directory exists and is in use: $dirt"; return $v }
+    if ($dirt) {
+        $v.why = "holder directory exists and is in use: $dirt"
+        $v.unrun = $dirt -like "git status failed*"
+        return $v
+    }
     if ($locked.ContainsKey($Holder)) { $v.why = "holder directory exists and is locked (git worktree lock)"; return $v }
     $fence = Get-Fence
     if (-not $fence.Available) {
         $v.why = "holder directory exists; the occupancy fence is UNAVAILABLE ($($fence.Detail)), so a session in it cannot be ruled out"
+        $v.unrun = $true
         return $v
     }
     $in = @(Get-WorktreeOccupants -Occupancy $fence -Path $Holder -IncludeNested)
@@ -519,7 +527,7 @@ function Get-PresentHolderVerdict {
     }
     if ($NoPullRequests -and -not $KnownPr) { $v.why = "holder directory exists; merge probe skipped (-NoPullRequests)"; return $v }
     $tip = (& git -C $Holder rev-parse --verify --quiet HEAD 2>$null)
-    if (-not $tip) { $v.why = "holder directory exists; its HEAD could not be read"; return $v }
+    if (-not $tip) { $v.why = "holder directory exists; its HEAD could not be read"; $v.unrun = $true; return $v }
     $tip = ([string]$tip).Trim()
 
     $pr = if ($KnownPr) { $KnownPr } else { Find-MergedPullRequestCarrying -Branch $Branch -Tip $tip -Key $Key }
@@ -565,16 +573,17 @@ function Get-PresentHolderVerdict {
 
 # The claim file an -Apply re-check re-reads, and the checks both arms share: it still parses, its key
 # still names it in the spelling the scan read, and it is still held by the same worktree on this
-# machine. Why is "" when those hold; Claim and Text are what was read.
+# machine. Why is "" when those hold; Claim and Text are what was read. Unrun is set instead when the
+# file exists but could not be read, which is not evidence that it changed.
 function Read-ClaimAgain([string]$File, [object]$Row) {
-    $r = [pscustomobject]@{ Why = ""; Claim = $null; Text = "" }
+    $r = [pscustomobject]@{ Why = ""; Unrun = ""; Claim = $null; Text = "" }
     if (-not (Test-Path -LiteralPath $File)) { $r.Why = "the claim file is gone"; return $r }
-    try {
-        $r.Text = [string](Read-CoordText $File)
-        $r.Claim = $r.Text | ConvertFrom-Json -DateKind String -EA Stop
-    }
+    try { $r.Text = [string](Read-CoordText $File) }
+    catch { $r.Unrun = "the claim file could not be read: $($_.Exception.Message)"; return $r }
+    try { $r.Claim = $r.Text | ConvertFrom-Json -DateKind String -EA Stop }
     catch { $r.Why = "the claim file no longer parses"; return $r }
-    # An emptied file parses to nothing without throwing; the scan reads that as UNREADABLE.
+    # An emptied file parses to $null without throwing. The scan never saw it empty -- it judged this
+    # row RELEASABLE -- so an empty file now is a change.
     if ($null -eq $r.Claim) { $r.Why = "the claim file no longer parses"; return $r }
     $c = $r.Claim
     $k = Get-ClaimKey $c ([IO.Path]::GetFileNameWithoutExtension($File))
@@ -598,6 +607,7 @@ function New-Recheck([string]$Changed = "", [string]$Unrun = "") {
 # the scan with the scan's evidence.
 function Test-StillReleasable([object]$Row) {
     $again = Read-ClaimAgain $Row.claimFile $Row
+    if ($again.Unrun) { return New-Recheck -Unrun $again.Unrun }
     if ($again.Why) { return New-Recheck -Changed $again.Why }
     $fresh = Read-WorktreeRegistry
     if (-not $fresh.Ok) { return New-Recheck -Unrun "git worktree list failed" }
@@ -605,6 +615,7 @@ function Test-StillReleasable([object]$Row) {
     $script:locked = $fresh.Locked
     Reset-Fence
     $v = Get-PresentHolderVerdict -Claim $again.Claim -Key $Row.key -Holder $Row.holder -Branch ([string]$again.Claim.branch) -KnownPr $script:prByKey[$Row.key]
+    if ($v.unrun) { return New-Recheck -Unrun $v.why }
     if ($v.verdict -ne "RELEASABLE") { return New-Recheck -Changed $v.why }
     if ($v.tip -ne $Row.tip) { return New-Recheck -Changed "the holder's tip moved" }
     return New-Recheck
@@ -626,6 +637,7 @@ function Test-GoneHolderUnchanged([object]$Row) {
     if (-not $tip) { return New-Recheck -Unrun "the branch '$($Row.branch)' could no longer be read" }
     if ($tip -ne $seen.Tip) { return New-Recheck -Changed "the branch '$($Row.branch)' moved" }
     $again = Read-ClaimAgain $seen.File $Row
+    if ($again.Unrun) { return New-Recheck -Unrun $again.Unrun }
     if ($again.Why) { return New-Recheck -Changed $again.Why }
     $c = $again.Claim
     if ([string]$c.branch -cne $Row.branch) { return New-Recheck -Changed "the claim now names another branch" }
@@ -752,9 +764,11 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
     $contained = ($LASTEXITCODE -eq 0)
     $aheadText = (& git -C $repo rev-list --count "$mainRef..$ref" 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $refTip) {
-        # [int] of no output is 0, which would read as "carries nothing main lacks" and release.
+        # [int] of no output is 0, which would read as "carries nothing main lacks" and release. A tip
+        # that could not be read leaves the -Apply re-check nothing to compare, so it holds too.
+        $what = if (-not $refTip) { "the commit '$branch' names could NOT be read" } else { "the commits '$branch' carries beyond $mainRef could NOT be counted" }
         $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HOLD"
-            why = "the commits '$branch' carries beyond $mainRef could NOT be counted, so nothing about its work is proven" }
+            why = "$what, so nothing about its work is proven" }
         continue
     }
     $ahead = [int]$aheadText
