@@ -49,7 +49,7 @@
 
     THE RUNNER STOPS ITSELF BEFORE THE LIMIT. A task killed at its limit writes nothing, so the task
     passes run-daily-prune.ps1 -StopAfterMinutes, the limit less the margin $STOP_MARGIN_MINUTES sets.
-    Past that point the runner starts no further removal and writes its summary and exit line itself.
+    Past that point the runner starts no further removal.
     That margin covers one removal in flight, or the step's listing run, and the closing lines. It does
     not cover a hung prune-merged.ps1 run: the runner does not bound those, and a run killed inside the
     first one leaves its log ending after the "prune-merged.ps1 running" marker.

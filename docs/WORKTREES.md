@@ -741,7 +741,8 @@ logs one `SKIPPED` line instead and leaves the exit code alone. The installer se
 the task's time limit (`-TimeLimitHours`, default 4); a task registered before either existed keeps
 its old one-hour limit and no deadline until `install-daily-prune.ps1` is run again. A refusal or a decline is data and leaves the exit code alone; a
 failure raises it to `1`, and an orphan raises it to `3` and goes into `prune-merged.ps1`'s orphan
-ledger, so later runs keep reporting it. A list that could not be read skips the step, raising the
+ledger, so later runs keep reporting it. A `2` from the prune, which says nothing was attempted,
+becomes `1` once the step has removed a tree, failed one or had git decline one. A list that could not be read skips the step, raising the
 code to `2` on a dry run and to `1` under `-Apply`, since the prune before it may have removed
 siblings. With `-Apply` the runner refuses to run inside Claude Code. Tests:
 [`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py).

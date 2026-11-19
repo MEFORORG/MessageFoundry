@@ -57,11 +57,8 @@
     How many dated logs to keep. Older ones are deleted after each run.
 
 .NOTES
-    Once the log directory exists, at least these ways out write a last line, "=== exit N (meaning) at
-    HH:mm:ss ===", while the log can be written: the normal end, a refusal, and an unhandled error, which
-    is logged with its script line and exits 2 before the prune ran or on a dry run, 1 after an -Apply
-    prune, never below a code already set. A kill from outside (Task Scheduler's time limit, a reboot)
-    writes nothing; -StopAfterMinutes is there so the time limit is not reached.
+    A kill from outside (Task Scheduler's time limit, a reboot) writes nothing; -StopAfterMinutes is
+    there so the time limit is not reached.
 
 .EXAMPLE
     pwsh -File scripts\worktree\run-daily-prune.ps1 -LogDir C:\logs            # dry run, logged
@@ -326,7 +323,7 @@ elseif ($RemoveFinishedClaudeWorktrees) {
             Add-Content -LiteralPath $log
 
         # Refusals leave the code alone, as do trees the deadline left and git declining a tree every re-check passed: nothing
-        # changed, and the DECLINED line is there to be read. A removal that failed is a failure, and a
+        # changed, and the DECLINED line is there to be read. (A decline still turns the prune's 2 into 1, below.) A removal that failed is a failure, and a
         # deregistered tree still on disk is an orphan -- the same severity order prune-merged.ps1 uses.
         if ((& $n 'FAILED') -gt 0) { $code = [math]::Max($code, 1) }
         if ((& $n 'ORPHANED') -gt 0) { $code = [math]::Max($code, 3) }
