@@ -34,7 +34,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore, OutboxStatus
-from messagefoundry.transports.base import DestinationConnector, NegativeAckError
+from messagefoundry.transports.base import DeliveryError, DestinationConnector, NegativeAckError
 from messagefoundry.transports.http_auth import OAuth2ClientCredentialsProvider
 from tests._mllp_recorder import run_one_batch
 from tests._refusal_log_capture import until
@@ -118,7 +118,8 @@ class _RecordsStops(LoggingAlertSink):
     def __init__(self) -> None:
         super().__init__()
         self.stopped: list[tuple[str, str]] = []
-        self.errors: list[tuple[str, str | None]] = []
+        self.errors: list[tuple[str, str, str | None]] = []
+        self.restored: list[str] = []
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         self.stopped.append((name, detail))
@@ -126,7 +127,14 @@ class _RecordsStops(LoggingAlertSink):
     def connection_error(
         self, name: str, *, kind: str, detail: str | None = None, error_class: str | None = None
     ) -> None:
-        self.errors.append((name, error_class))
+        self.errors.append((name, kind, error_class))
+
+    def connection_restored(self, name: str) -> None:
+        self.restored.append(name)
+
+
+#: The one alert a dead-lettering configuration fault raises for its lane (ADR 0095 B.2).
+_CONFIG_FAULT_ALERT = (OUT, "config_fault", "NegativeAckError")
 
 
 async def _outbound_rows(store: MessageStore) -> list[tuple[str, int, str | None]]:
@@ -247,6 +255,7 @@ async def test_an_unmarked_permanent_refusal_still_dead_letters_each_row(
             await asyncio.sleep(0.02)
         assert not runner.outbound_stop_held(OUT)
         assert sink.stopped == []
+        assert sink.errors == []  # an ordinary reject is no connection error
     finally:
         await runner.stop()
 
@@ -319,8 +328,8 @@ async def test_under_the_dead_letter_policy_a_coded_token_reply_dead_letters_as_
     store: MessageStore, batched: bool
 ) -> None:
     # credential_fault_policy = "dead_letter" opts every configuration fault back into the
-    # fail-fast dead-letter, and the coded token reply follows it: the lane does not stop. It marks
-    # the lane down, so connection_error fires once across every row, not per row (owner ruling
+    # fail-fast dead-letter, and the coded token reply follows it: the lane does not stop. It alerts
+    # the lane, so connection_error fires once across every row, not per row (owner ruling
     # 2026-11-18 on PR 3069: "Yes, keep one connection_error alert on that path.").
     sink = _RecordsStops()
     connector = _MintsThroughACodedTokenEndpoint()
@@ -344,7 +353,7 @@ async def test_under_the_dead_letter_policy_a_coded_token_reply_dead_letters_as_
         assert await store.count_dead(allowed_channels=None) == 3
         assert sink.stopped == []
         assert not runner.outbound_stop_held(OUT)
-        assert sink.errors == [(OUT, "NegativeAckError")]  # exactly one, for the lane
+        assert sink.errors == [_CONFIG_FAULT_ALERT]  # exactly one, for the lane
     finally:
         await runner.stop()
         await connector.aclose()
@@ -388,6 +397,135 @@ async def test_a_coded_token_reply_from_a_retired_connector_goes_back_to_the_new
         assert await store.count_dead(allowed_channels=None) == 0
         assert sink.stopped == []
         assert not runner.outbound_stop_held(OUT)
+    finally:
+        await runner.stop()
+        await connector.aclose()
+
+
+class _Delivers:
+    """A connector that delivers every payload."""
+
+    def __init__(self) -> None:
+        self.sends = 0
+
+    async def send(self, payload: str) -> None:
+        self.sends += 1
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _deliver_one(store: MessageStore, runner: RegistryRunner, n: int) -> None:
+    body = _adt(n)
+    await store.enqueue_message(channel_id="c1", raw=body, deliveries=[(OUT, body)], now=200.0 + n)
+    item = await store.claim_next_fifo(OUT)
+    assert item is not None
+    await runner._process_delivery_item(OUT, item)
+
+
+async def test_a_prior_transport_fault_neither_suppresses_nor_replaces_the_config_fault_alert(
+    store: MessageStore,
+) -> None:
+    # The transport edge is already down (an unreachable token endpoint), then the endpoint comes
+    # back behind a proxy that codes its replies. The configuration fault still alerts, once, under
+    # its own kind: it is not folded into the open connection_lost.
+    sink = _RecordsStops()
+    connector = _MintsThroughACodedTokenEndpoint()
+    runner = _runner(store, connector, sink, policy="dead_letter")
+    runner._note_lane_unhealthy(OUT, "m0", DeliveryError("token endpoint unreachable"))
+    assert [kind for _, kind, _ in sink.errors] == ["connection_lost"]
+    try:
+        for n in (1, 2, 3):
+            await _deliver_one(store, runner, n)
+        assert await store.count_dead(allowed_channels=None) == 3
+        assert sink.errors[1:] == [_CONFIG_FAULT_ALERT]
+    finally:
+        await runner.stop()
+        await connector.aclose()
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["single-row", "batch"])
+async def test_a_delivery_clears_the_config_fault_edge_and_a_new_episode_alerts_again(
+    store: MessageStore, batched: bool
+) -> None:
+    sink = _RecordsStops()
+    make = _batch_runner if batched else _runner
+    runner = make(store, _Delivers(), sink, policy="dead_letter")
+
+    async def _one(connector: object, n: int) -> None:
+        runner._destinations[OUT] = cast(DestinationConnector, connector)
+        if batched:
+            body = _adt(n)
+            await store.enqueue_message(
+                channel_id="c1", raw=body, deliveries=[(OUT, body)], now=200.0 + n
+            )
+            await run_one_batch(runner, OUT)  # closes the connector
+        else:
+            await _deliver_one(store, runner, n)
+            await cast(DestinationConnector, connector).aclose()
+
+    try:
+        await _one(_MintsThroughACodedTokenEndpoint(), 1)
+        await _one(_MintsThroughACodedTokenEndpoint(), 2)
+        assert sink.errors == [_CONFIG_FAULT_ALERT] and sink.restored == []
+        await _one(_Delivers(), 3)  # the fix
+        assert sink.restored == [OUT]  # the open alert resolves
+        await _one(_MintsThroughACodedTokenEndpoint(), 4)  # the fault comes back
+        assert sink.errors == [_CONFIG_FAULT_ALERT, _CONFIG_FAULT_ALERT]
+    finally:
+        await runner.stop()
+
+
+async def test_under_the_dead_letter_policy_an_unmarked_reject_raises_no_connection_error(
+    store: MessageStore,
+) -> None:
+    sink = _RecordsStops()
+    connector = _UnmarkedRefusal()
+    runner = _runner(store, connector, sink, policy="dead_letter")
+    try:
+        for n in (1, 2, 3):
+            await _deliver_one(store, runner, n)
+        assert await store.count_dead(allowed_channels=None) == 3
+        assert sink.errors == []
+    finally:
+        await runner.stop()
+        await connector.aclose()
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["single-row", "batch"])
+@pytest.mark.parametrize("when", ["mid-send", "during-dead-letter"])
+async def test_under_the_dead_letter_policy_a_retired_connectors_config_fault_does_not_alert(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, when: str, batched: bool
+) -> None:
+    # A reload that retires the connector, while it mints or while its rows are being
+    # dead-lettered, may be the fix, so the old connector's fault raises no alert.
+    sink = _RecordsStops()
+    connector: _MintsThroughACodedTokenEndpoint
+    make = _batch_runner if batched else _runner
+    if when == "mid-send":
+        retiring = _RetiredMidSend()
+        connector = retiring
+        runner = make(store, connector, sink, policy="dead_letter")
+        retiring.runner = runner
+    else:
+        connector = _MintsThroughACodedTokenEndpoint()
+        runner = make(store, connector, sink, policy="dead_letter")
+        write = "dead_letter_batch" if batched else "dead_letter_now"
+        dead_letter = getattr(store, write)
+
+        async def _reload_lands_in_the_write(*args: object) -> None:
+            runner._destinations[OUT] = cast(DestinationConnector, _Delivers())
+            await dead_letter(*args)
+
+        monkeypatch.setattr(store, write, _reload_lands_in_the_write)
+    try:
+        if batched:
+            await _enqueue(store, 2)
+            await run_one_batch(runner, OUT)
+        else:
+            await _deliver_one(store, runner, 1)
+        assert await store.count_dead(allowed_channels=None) == (2 if batched else 1)
+        assert sink.errors == []
     finally:
         await runner.stop()
         await connector.aclose()

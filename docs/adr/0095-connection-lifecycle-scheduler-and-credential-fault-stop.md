@@ -571,19 +571,19 @@ It is raised in `transports/fhir.py` (`_agreed_reading`, comparing `_reply_readi
 > ruling there on 2026-11-18: "Stop the lane."
 
 `smart.request_token`, which both the SMART and the OAuth2 token providers call, raises a
-`NegativeAckError` with code `token-reply-coded`, `permanent` and `config_fault` when the token
-endpoint answers in a content coding other than `identity`. Every queued row mints its bearer
+`NegativeAckError` with code `token-reply-coded`, `permanent` and `config_fault` on a coded 2xx
+token reply with a body. Every queued row mints its bearer
 through that endpoint before it is sent, so every row would meet the same refusal. It takes the
 A.1 route: under `credential_fault_policy="stop"` the lane stops and the claimed rows go back to
 PENDING un-errored; under `"dead_letter"` the row, or every member of a batch, dead-letters.
 
-Under `"dead_letter"` a configuration fault a send raises now also marks the lane down, through
-the same edge-triggered `_note_lane_unhealthy` a transport failure uses. With
-`[diagnostics].connection_events` on, its default, `connection_error` fires once for the lane,
-and the next delivery that succeeds clears it. For `token-reply-coded` this follows the owner's
+Under `"dead_letter"` a configuration fault a send raises now also alerts the lane, on an edge of
+its own, apart from transport health. With `[diagnostics].connection_events` on, its default,
+`connection_error` of kind `config_fault` fires once for the lane, and the next delivery that
+succeeds clears it. For `token-reply-coded` this follows the owner's
 ruling of 2026-11-18 on PR 3069: "Yes, keep one connection_error alert on that path." The worker
 reads `config_fault`, never the code, so this is not only `token-reply-coded`. In at least these
-cases it does not mark the lane down: a configuration fault from a connector a reload has
+cases it does not alert: a configuration fault from a connector a reload has
 retired, a batch member refused alone by its re-attach or frame check, and a `credential_fault`,
 which it does not read.
 

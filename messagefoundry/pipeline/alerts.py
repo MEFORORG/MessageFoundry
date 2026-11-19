@@ -415,15 +415,12 @@ class AlertSink(Protocol):
         """An outbound connection's delivery lane went **down** — the first transport failure
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
         one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
-        event kind (``connection_lost``); ``detail`` is a ``safe_exc`` reason, and it can echo
-        transport text, so an implementation must not assume it is free of message content, and must
+        event kind (``connection_lost``, or ``config_fault`` under ADR 0095 Amendment B.2);
+        ``detail`` is a ``safe_exc`` reason, and it can echo transport text, so an implementation must not assume it is free of message content, and must
         not send it off the box (BACKLOG #5021).
         ``error_class`` is the failing exception's class name (BACKLOG #3210). A partner *rejection*
-        (``NegativeAckError``) is NOT a connection error and does not fire this. A permanent
-        ``NegativeAckError`` marked ``config_fault`` that dead-letters, under
-        ``credential_fault_policy = "dead_letter"``, does, with ``[diagnostics].connection_events``
-        on: it marks the lane down on the same edge, so it fires once, with ``error_class``
-        ``NegativeAckError``, until a delivery succeeds."""
+        (``NegativeAckError``) is NOT a connection error and does not fire this, except as ADR 0095
+        Amendment B.2 says."""
         ...
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
