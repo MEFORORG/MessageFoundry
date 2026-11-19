@@ -118,18 +118,29 @@ $thisHost = Get-CoordHost
 # ---------------------------------------------------------------------------------------------
 
 $records = @()
-$unreadableRecords = 0
+$unreadableRecordFiles = @()
 if (Test-Path -LiteralPath $seatsDir) {
     foreach ($d in @(Get-ChildItem -LiteralPath $seatsDir -Directory -EA SilentlyContinue |
                      Where-Object { $_.Name -notlike '.*' })) {
-        foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Filter *.json -EA SilentlyContinue)) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Filter *.json -File -EA SilentlyContinue)) {
             try {
-                $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop
+                $j = Read-CoordText $f.FullName -AllowAccessDenied | ConvertFrom-Json -EA Stop
                 $records += [pscustomobject]@{ Rec = $j; File = $f.FullName; Box = $d.Name }
+            } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
+                # Deleted between the listing and the read: a file that is gone holds no seat. Only
+                # the read's own not-found says so; a later Test-Path could not tell a vanished file
+                # from one whose read failed for another reason and then moved. A seats directory that
+                # is itself gone (a dropped share) is not a deleted record: every read after it would
+                # be skipped and the roster would come out smaller, so that counts as unreadable.
+                if (-not (Test-Path -LiteralPath $seatsDir -PathType Container)) { $unreadableRecordFiles += $f.FullName }
+                continue
             } catch {
-                # A record being written RIGHT NOW has exactly this shape. Counted, never dropped:
-                # dropping turns an occupied seat into an absent one in the receipt's own numbers.
-                $unreadableRecords++
+                # Counted, never dropped: dropping turns an occupied seat into an absent one in the
+                # receipt's own numbers. seat.ps1 writes a record by one atomic rename and the read
+                # retries a sharing violation and, with -AllowAccessDenied, the access denied Windows
+                # gives a file deleted but not yet gone, so a record that still fails is not busy.
+                # It fires a stop below: an unread record may be a seat the roster cannot show.
+                $unreadableRecordFiles += $f.FullName
             }
         }
     }
@@ -161,6 +172,27 @@ if ($wtOut) {
     }
 }
 
+# The worktree of this repo that holds a normalised cwd, or $null, so a session in a subdirectory
+# counts in the denominator (BACKLOG #5485). It walks up the cwd's ancestors to the nearest worktree
+# (the innermost, where worktrees nest), so the boundary is a separator and `repo-other` is not inside
+# `repo`. Both sides are lower-cased by ConvertTo-RegistryNormPath. A directory with its own .git
+# between the cwd and that worktree is another repository's tree, so the cwd is not this repo's.
+$repoWorktreeSet = [System.Collections.Generic.HashSet[string]]::new([string[]]@($repoWorktrees | Where-Object { $_ }), [System.StringComparer]::Ordinal)
+function Get-ContainingRepoWorktree([string]$Cwd) {
+    $below = @()
+    $p = $Cwd
+    while ($p) {
+        if ($repoWorktreeSet.Contains($p)) {
+            foreach ($b in $below) { if (Test-Path -LiteralPath "$b\.git") { return $null } }
+            return $p
+        }
+        $below += $p
+        $cut = $p.LastIndexOf('\')
+        $p = if ($cut -gt 0) { $p.Substring(0, $cut) } else { '' }
+    }
+    return $null
+}
+
 # LIVE sessions sitting in this repo's worktrees. This is the denominator: a session here that has
 # produced no record is EVIDENCE THE WRITER IS DEAD, not evidence the fleet is idle.
 $liveInRepo = @()
@@ -170,7 +202,8 @@ foreach ($row in $sessionRows) {
     # properties, and `.PSObject.Properties.Name` on it throws under StrictMode (BACKLOG #5491).
     $rawCwd = [string](Get-RecordField $row.Record 'cwd')
     $cwd = Get-NormPath $rawCwd
-    if (-not $cwd -or $repoWorktrees -notcontains $cwd) { continue }
+    $holder = Get-ContainingRepoWorktree $cwd
+    if (-not $holder) { continue }
     # A record that names no session is still a live session here, whatever its age, so it counts,
     # and it counts in liveWithoutRecord below too: no seat record can be matched to it, so the
     # roster is incomplete by it until it names its session.
@@ -181,7 +214,8 @@ foreach ($row in $sessionRows) {
         $liveInRepo += [pscustomobject]@{
             SessionId = $liveSid
             Cwd       = $cwd
-            Box       = (ConvertTo-BoxKey -Path $rawCwd)
+            # The worktree's box, not the cwd's: a subdirectory names a box no seat writes.
+            Box       = (ConvertTo-BoxKey -Path $holder)
             Root      = $row.Root
         }
     }
@@ -540,6 +574,7 @@ foreach ($r in $records) {
 # ---------------------------------------------------------------------------------------------
 
 $stops = @()
+if ($unreadableRecordFiles.Count -gt 0) { $stops += "recordsUnreadable=$($unreadableRecordFiles.Count) -- these seat record(s) could not be read or parsed, so a seat they hold may be absent from the roster below and it may be INCOMPLETE by them. Causes include at least a damaged record, an unreachable share and an access denial: read each first, and move it out of the seats directory by hand only if it is damaged: $($unreadableRecordFiles -join '; ')" }
 if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root with a sessions/ directory was found; every state below would be a guess' }
 if ($anonymousReadError) { $stops += "anonymousLiveRecords=UNREAD -- the scan for registry records that name no session failed ($anonymousReadError), so a relaunched seat could read INTERRUPTED below" }
 if ($anonymousNoCwd.Count -gt 0) { $stops += "anonymousLiveRecordsWithNoCwd=$($anonymousNoCwd.Count) -- registry record(s) name no session, are live or freshly written, and name no readable cwd ($($anonymousNoCwd -join '; ')), so no seat can be told apart from a relaunch of it" }
@@ -626,7 +661,7 @@ $receipt = [ordered]@{
     rootsExamined             = $rootsExamined
     fenceAvailable            = $fenceAvailable
     recordsExamined           = $records.Count
-    recordsUnreadable         = $unreadableRecords
+    recordsUnreadable         = $unreadableRecordFiles.Count
     seatRecordsIncomplete     = $incompleteRecords.Count
     liveSessionsInRepo        = $liveInRepo.Count
     liveSessionsWithoutRecord = $liveWithoutRecord.Count

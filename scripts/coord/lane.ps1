@@ -19,9 +19,9 @@
     not add a usage throttle here.
 
     THERE IS NO -Lane AND NO -BoxKey PARAMETER, AND ADDING ONE DEFEATS THE WHOLE DESIGN. The box key is
-    derived from $PWD, so a session can only ever state its OWN level. The failure this replaces is a
-    gauge that reported both lanes full while one sat idle, because it counted CLAIMS: measured
-    2026-08-23, one lane held nine claims and reported one active item and three free slots. Both
+    derived from git's resolved work tree root of $PWD, so a session can only ever state its OWN
+    level. The failure this replaces is a gauge that reported both lanes full while one sat idle,
+    because it counted CLAIMS: measured 2026-08-23, one lane held nine claims and reported one active item and three free slots. Both
     numbers were honest. Only the lane knows which is which.
 
     FREE MEANS BY WORK, NOT BY CLAIMS. Built-and-awaiting-land is FREE. Blocked is FREE. Parked on a
@@ -75,9 +75,57 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
 . $coordRootScript
 $thisHost = Get-CoordHost
 
+# The lane file and the claim hash are keyed on the WORK TREE ROOT; the current directory keyed a
+# subdirectory run on a box nobody reads (BACKLOG #5486). Read before the root is resolved, so a
+# directory with no work tree (a .git directory) refuses before anything is read or written.
+$here = (Get-Location).Path
+function Write-RootRefusal([string]$Why) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $Why, so the lane cannot be keyed and nothing was read or written.")
+    exit 2
+}
+# git writes UTF-8; PowerShell decodes a native command's output with [Console]::OutputEncoding,
+# which is an OEM code page on a stock console, so a non-ASCII path segment would come back mangled
+# and key a box nobody reads. Every git call that reads a path (here and in Resolve-CoordSharedRoot,
+# which reads --git-common-dir) runs inside this; the caller's encoding is put back afterwards.
+function Invoke-GitUtf8([scriptblock]$Action) {
+    $saved = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        & $Action
+    } finally {
+        [Console]::OutputEncoding = $saved
+    }
+}
+$revParse = @()
+$revParseExit = -1
+try {
+    Invoke-GitUtf8 {
+        $script:revParse = @(& git -c core.quotePath=false rev-parse --path-format=absolute --show-toplevel --show-prefix 2>$null)
+        $script:revParseExit = $LASTEXITCODE
+    }
+} catch {
+    Write-RootRefusal "git could not be run, or its output could not be decoded as UTF-8, in $here ($($_.Exception.Message))"
+}
+$top = if ($revParse.Count -ge 1) { ([string]$revParse[0]).Trim() } else { '' }
+if ($revParseExit -ne 0 -or -not $top) { Write-RootRefusal "git could not name the work tree root for $here" }
+$prefix = if ($revParse.Count -ge 2) { ([string]$revParse[1]).Trim().TrimEnd('/') } else { '' }
+# A removed worktree under the primary checkout (.claude/worktrees/<name> with no .git left) has git
+# walk up to the primary, so keying there would overwrite the primary's level. That container is the
+# population the worktree tooling names (scripts/worktree/find-emptied-worktrees.ps1). A live
+# worktree there is its own toplevel, so a directory in it that git places in the primary is no live
+# tree's, whether or not the primary ignores the container: it refuses without asking check-ignore,
+# whose answer could only let it through. Any other directory of a live tree, ignored or not (such as
+# .venv\Scripts), is still that tree's work and keys on its root.
+if ("$prefix/" -like '.claude/worktrees/*') {
+    Write-RootRefusal "$here is under the worktree container of $top but is no worktree of its own (a removed worktree reads this way)"
+}
+# git's resolved root, the path claim.ps1 records and seat records carry, so a tree reached through
+# a junction keys the same lane and claim hash as its target.
+$worktree = [System.IO.Path]::GetFullPath($top)
+
 # Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
 # and an error refuses rather than writing a level into a local copy nobody else reads.
-$sharedResolved = Resolve-CoordSharedRoot -From (Get-Location).Path
+$sharedResolved = Invoke-GitUtf8 { Resolve-CoordSharedRoot -From $worktree }
 if ($sharedResolved.Error) {
     [Console]::Error.WriteLine("lane.ps1: REFUSED -- the coordination root could not be resolved, so nothing was written: $($sharedResolved.Error)")
     exit 2
@@ -110,7 +158,6 @@ function Get-ClaimHash([string]$Worktree) {
     return (-join ($b[0..7] | ForEach-Object { $_.ToString('x2') }))
 }
 
-$worktree = (Get-Location).Path
 $boxKey   = ConvertTo-BoxKey -Path $worktree
 $lanesDir = Join-Path $sharedResolved.Path 'lanes'
 $tmpDir   = Join-Path $lanesDir '.tmp'

@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -583,12 +584,15 @@ def _fleet(
     raw_records: dict[str, str] | None = None,
     extra_seats: dict[str, str] | None = None,
     fleet_args: list[str] | None = None,
+    prepare: Callable[[Path], None] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run fleet.ps1 -Json over one seat whose own registry record is DEAD, beside an optional
     registry record that names no session. The record's cwd is the seat's worktree, or another
-    worktree, unless ``anonymous`` sets its own. ``raw_records`` maps more registry file names to
+    directory, unless ``anonymous`` sets its own. Both sit inside the primary checkout, which is a
+    worktree of this repo, so a live record in either counts in the denominator. ``raw_records`` maps more registry file names to
     their exact text, and ``extra_seats`` more seat boxes to the exact text of one seat record in
-    each. ``fleet_args`` replaces ``-Json``. Returns the run and the anonymous record's path."""
+    each. ``fleet_args`` replaces ``-Json``. ``prepare`` gets the repo after its first commit.
+    Returns the run and the anonymous record's path."""
     home = tmp_path / "home"
     root = home / ".claude"
     (root / "sessions").mkdir(parents=True)
@@ -609,6 +613,8 @@ def _fleet(
         + ["-m", "base"],
     ):
         subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    if prepare is not None:
+        prepare(repo)
     shared = tmp_path / "shared"
     seat_dir = shared / "seats" / "box-5491"
     seat_dir.mkdir(parents=True)
@@ -662,7 +668,8 @@ def test_fleet_reads_a_seat_with_an_anonymous_record_in_its_worktree_as_possibly
 ) -> None:
     """The record may be this seat relaunched, so the seat must not read INTERRUPTED, which -Chip and
     respawn.ps1 treat as respawnable, and the receipt names it. The seat's worktree is not a
-    registered git worktree here, so the denominator test below covers counting."""
+    registered git worktree here, but it sits inside the primary checkout, so the record counts in
+    the denominator too; the denominator tests below assert that count."""
     proc, anon = _fleet(tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS})
     j = _fleet_json(proc)
     row = {r["Box"]: r for r in j["rows"]}["box-5491"]
@@ -675,7 +682,9 @@ def test_fleet_reads_a_seat_with_an_anonymous_record_in_its_worktree_as_possibly
 def test_fleet_leaves_a_seat_alone_when_the_anonymous_record_is_in_another_worktree(
     tmp_path: Path,
 ) -> None:
-    """The twin: a record in another worktree is not this seat, so the seat keeps its own verdict."""
+    """The twin: a record in another directory is not this seat, so the seat keeps its own
+    verdict. That directory is inside the primary checkout, so the record still counts in the
+    denominator; that is not what this asserts."""
     proc, _ = _fleet(
         tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS}, anon_in_seat_worktree=False
     )
@@ -774,6 +783,76 @@ def test_fleet_counts_a_live_anonymous_record_in_a_real_worktree_in_its_denomina
     assert j["receipt"]["liveSessionsWithoutRecord"] == 1, j["receipt"]
     row = {r["Box"]: r for r in j["rows"]}["box-5491"]
     assert row["State"] == "POSSIBLY RUNNING", row
+
+
+def _live_named_record(cwd: Path) -> str:
+    """A LIVE registry record naming a session no seat record holds, sitting in ``cwd``."""
+    return json.dumps(
+        {
+            "pid": os.getpid(),
+            "startedAt": NOW_MS,
+            "sessionId": "5485live-0000-0000-0000-000000000000",
+            "cwd": str(cwd),
+        }
+    )
+
+
+def _linked_worktree(repo: Path) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(repo.parent / "repo-wt")],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _nested_repo(repo: Path) -> None:
+    (repo / "nested" / ".git").mkdir(parents=True)
+
+
+@pytest.mark.parametrize(
+    ("where", "counted", "prepare"),
+    [
+        ("repo/sub/dir", 1, None),
+        ("repo-wt/sub", 1, _linked_worktree),
+        ("repo-other", 0, None),
+        ("repo/nested/sub", 0, _nested_repo),
+    ],
+    ids=["subdirectory", "linked-worktree-subdirectory", "sibling-prefix", "nested-repository"],
+)
+def test_fleet_counts_a_live_session_in_a_worktree_subdirectory_in_its_denominator(
+    tmp_path: Path, where: str, counted: int, prepare: Callable[[Path], None] | None
+) -> None:
+    """BACKLOG #5485. A live session whose cwd is a subdirectory of one of this repo's worktrees is
+    a session in that worktree. Exact equality left it out of liveSessionsWithoutRecord, so the
+    roster read complete without it. A sibling directory sharing the name as a prefix is not inside
+    the worktree, and nor is a directory under another repository nested in it."""
+    # The cwd is not created: the denominator compares paths. A nested .git is what it reads.
+    proc, _ = _fleet(
+        tmp_path,
+        None,
+        raw_records={"99485.json": _live_named_record(tmp_path / where)},
+        prepare=prepare,
+    )
+    j = _fleet_json(proc)
+    assert j["receipt"]["liveSessionsWithoutRecord"] == counted, j["receipt"]
+    fired = [s for s in j["receipt"]["stopConditions"] if s.startswith("liveSessionsWithoutRecord")]
+    assert len(fired) == counted, j["receipt"]["stopConditions"]
+
+
+def test_fleet_raises_a_stop_when_a_seat_record_is_unreadable(tmp_path: Path) -> None:
+    """BACKLOG #5485. An unreadable seat record was counted in the receipt and fired no stop, so the
+    roster could read complete with a seat missing from it. The stop names that file and not the
+    parseable seat record _fleet always writes beside it, which is the twin. A record is written by
+    one atomic rename, so the stop says it is damaged and to move it out by hand, never to run again:
+    a rerun reads the same damaged file and stops the same way."""
+    proc, _ = _fleet(tmp_path, None, extra_seats={"box-5485": "{not json"})
+    j = _fleet_json(proc)
+    assert j["receipt"]["recordsUnreadable"] == 1, j["receipt"]
+    fired = [s for s in j["receipt"]["stopConditions"] if s.startswith("recordsUnreadable")]
+    assert len(fired) == 1, j["receipt"]["stopConditions"]
+    assert "box-5485" in fired[0] and "box-5491" not in fired[0], fired
+    assert "damaged" in fired[0] and "by hand" in fired[0], fired
+    assert "run again" not in fired[0], fired
 
 
 @pytest.mark.parametrize(
