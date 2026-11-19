@@ -194,11 +194,11 @@ A file that arrives by **rename or copy** onto an ADR path is an added ADR to ev
 turns git's rename detection off, so a `git mv` cannot hide it (BACKLOG #5453).
 
 Under rule 1, where git itself pairs the new file, diffed against the base, with the base's own ADR of
-the same number, the change is a rename, and its row must link the new name in the same commit; the
-refusal says so rather than calling it a reuse. Where the staged file is itself one the base carries,
-as when a merge brings in an ADR the base renamed, the refusal says the row is wrong. A branch's own
-ADR under a number the base has since spent is refused as a reuse, unless git scores its body as
-similar to the base's ADR under that number.
+the same number, and that ADR was at `HEAD` or at the fork point, so this branch is the one removing
+it, the change is a rename, and its row must link the new name in the same commit; the refusal says so
+rather than calling it a reuse. Where the staged file matches, path and bytes, one the base carries, as
+when a merge brings in an ADR the base renamed, the refusal says the row is wrong. Any other file under
+a number the base has spent, a stale branch's own ADR included, is refused as a reuse.
 
 Under rule 2, a same-number rename allocates nothing, so the gate grants it, but only on positive facts.
 Git pairs the file, diffed against `HEAD`, with an ADR of the same number. A walk of the base's history
@@ -209,10 +209,10 @@ second, at least where the branch was cut before the base deleted that ADR, merg
 restored it exactly and renamed it in a later commit. Rule 2's restore test then judges the file, and
 that test matches bytes at the path that lost them, so a revival under a new name is refused; its
 refusal says to keep the lost name until the restore lands on the base. A shallow clone cannot show
-that the base never held the number, so the rename is refused there with the truncated-history text,
-deepened or not; `git fetch --unshallow origin` makes it checkable. A git failure refuses too, and the
-gate drops `GIT_LITERAL_PATHSPECS` and `GIT_NOGLOB_PATHSPECS` from its own git calls, because either
-would make the walk's pattern match nothing.
+that the base never held the number, so the rename is refused there; `git fetch --unshallow origin`
+makes it checkable. A git failure refuses too. The gate drops the four `GIT_*_PATHSPECS` switches from
+its own git calls: `GIT_LITERAL_PATHSPECS` would make the walk's pattern match nothing, and
+`GIT_GLOB_PATHSPECS` and `GIT_ICASE_PATHSPECS` make `git ls-tree` refuse the gate's pathspec.
 
 The gate asks git for the pairing with no rename limit, over `docs/adr/` alone, so the size of the rest
 of the change cannot cost a rename its pairing. A rename onto a different number is a new number and

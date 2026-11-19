@@ -719,3 +719,63 @@ def test_a_merge_carrying_the_bases_own_renamed_adr_is_told_to_relink_the_row(re
     assert "does not link a file origin/main carries under that number" in out
     assert "already exists" not in out
     assert "alloc.ps1" not in out
+
+
+def _base_lands_0002_after_the_branch(repo: Path, slug: str, body: str) -> None:
+    """Cut branch ``stale``, then land ``docs/adr/0002-<slug>.md`` on the base, and return to stale."""
+    git(repo, "switch", "-q", "-c", "stale")
+    git(repo, "switch", "-q", "main")
+    rows = README_HEAD + ROW.format(n="0001", slug="first", title="First") + "\n"
+    write(repo, f"docs/adr/0002-{slug}.md", body)
+    write(repo, "docs/adr/README.md", rows + ROW.format(n="0002", slug=slug, title="A") + "\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "another session takes 0002")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "switch", "-q", "stale")
+
+
+def test_a_STALE_BASE_collision_with_a_SIMILAR_body_is_still_a_reuse(repo: Path) -> None:
+    """Diffed against the base, the base's later 0002 reads as removed by this branch, and a
+    similar body pairs with it. The branch never had that file, so it is no rename of it."""
+    _base_lands_0002_after_the_branch(repo, "alpha", BODY.replace("synthetic", "alpha"))
+    write(repo, "docs/adr/0002-beta.md", BODY.replace("synthetic", "beta"))
+    git(repo, "add", "-A")
+    base_status = git(
+        repo, "diff", "--cached", "-M", "--name-status", "origin/main", "--", "docs/adr/"
+    )
+    assert any(line.startswith("R") for line in base_status.splitlines()), base_status
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 already exists on origin/main as 0002-alpha.md" in out
+    assert "alloc.ps1" in out
+    assert "renamed" not in out
+
+
+def test_a_STALE_BASE_collision_on_the_SAME_PATH_with_other_bytes_is_still_a_reuse(
+    repo: Path,
+) -> None:
+    _base_lands_0002_after_the_branch(repo, "ledger", "# The base session's decision\n")
+    write(repo, "docs/adr/0002-ledger.md", "# This branch's own, different decision\n")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 already exists on origin/main as 0002-ledger.md" in out
+    assert "alloc.ps1" in out
+
+
+@pytest.mark.parametrize("var", ["GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"])
+def test_CONTROL_a_pathspec_switch_in_the_environment_does_not_crash_the_gate(
+    repo: Path, var: str
+) -> None:
+    git(repo, "mv", "docs/adr/0001-first.md", "docs/adr/0001-renamed.md")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD + ROW.format(n="0001", slug="renamed", title="First") + "\n",
+    )
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo, env={var: "1"})
+    assert code == 0, out

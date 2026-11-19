@@ -82,11 +82,17 @@ RESTORE_HISTORY_DEPTH = 200
 # with `pwsh -NoProfile -File scripts/coord/alloc.ps1 -Kind adr -Title "<title>"`.
 
 
-#: Environment switches that change what a pathspec matches. GIT_LITERAL_PATHSPECS turns every `*`
+#: Environment switches that change what a pathspec means. GIT_LITERAL_PATHSPECS turns every `*`
 #: literal and also disables `:(glob)` magic, so the history walk below would find no commit for a
-#: number the base did spend, exit 0, and grant a rename on that empty answer (BACKLOG #5453). Every
-#: pathspec this gate passes is its own, so it drops these rather than honour them.
-_PATHSPEC_ENV = ("GIT_LITERAL_PATHSPECS", "GIT_NOGLOB_PATHSPECS")
+#: number the base did spend, exit 0, and grant a rename on that empty answer (BACKLOG #5453).
+#: GIT_GLOB_PATHSPECS and GIT_ICASE_PATHSPECS make `git ls-tree` refuse its pathspec, which crashed
+#: the hook. Every pathspec this gate passes is its own, so it drops all four rather than honour them.
+_PATHSPEC_ENV = (
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+)
 
 
 def _git_env() -> dict[str, str]:
@@ -380,13 +386,14 @@ class Ledger:
         # Measured 2026-09-10 on this box: a `git` spawn is 53-315 ms whatever it does, and the
         # retired per-ref item sweep was five spawns plus two full parses of a 30k-line file per ref.
         self._parents: list[str] | None = None
-        self._renames: dict[str, str] | None = None
-        self._base_renames: dict[str, str] | None = None
+        # Rename pairs, keyed by whether the old tree is the base (see renamed_from).
+        self._pairs: dict[bool, dict[str, str]] = {}
         self._shallow: bool | None = None
         # Number -> the base commits that touched that number's ADR path, or None where git failed.
         self._number_commits: dict[str, list[str] | None] = {}
         # The ADR numbers at the fork point with the base, read once; None where git failed.
         self._fork_read = False
+        self._fork_sha: str | None = None
         self._fork_numbers: frozenset[str] | None = None
 
     def _resolve_alloc(self) -> None:
@@ -483,15 +490,10 @@ class Ledger:
         self, path: str, number: str, *, against_base: bool = False
     ) -> str | None:
         """The ADR this added path was renamed FROM, when that ADR has the same number; else None."""
-        if against_base:
-            if self._base_renames is None:
-                self._base_renames = self.renamed_from(against_base=True)
-            pairs = self._base_renames
-        else:
-            if self._renames is None:
-                self._renames = self.renamed_from(against_base=False)
-            pairs = self._renames
-        src = pairs.get(path)
+        key = against_base and not self.ci  # CI has one old tree, so one memo
+        if key not in self._pairs:
+            self._pairs[key] = self.renamed_from(against_base=key)
+        src = self._pairs[key].get(path)
         m = ADR_FILE.match(src) if src else None
         return src if m and m.group(1) == number else None
 
@@ -520,16 +522,35 @@ class Ledger:
             self._shallow = _clone_is_shallow()
         return self._shallow
 
-    def _numbers_at_fork(self) -> frozenset[str] | None:
-        """The ADR numbers in the fork point's tree, or None where git cannot say. Read once a run."""
+    def _fork_point(self) -> str | None:
+        """The merge-base with the base, or None where git cannot say. Read once a run, with the ADR
+        numbers in its tree."""
         if not self._fork_read:
             self._fork_read = True
             try:
                 fork = git("merge-base", self.base, "HEAD").strip()
                 self._fork_numbers = frozenset(_adr_numbers_in(fork))
+                self._fork_sha = fork or None
             except OSError:
-                self._fork_numbers = None
-        return self._fork_numbers
+                self._fork_sha, self._fork_numbers = None, None
+        return self._fork_sha
+
+    def _numbers_at_fork(self) -> frozenset[str] | None:
+        """The ADR numbers in the fork point's tree, or None where git cannot say."""
+        return self._fork_numbers if self._fork_point() is not None else None
+
+    def _removed_by_this_branch(self, src: str) -> bool:
+        """Did this branch carry ``src`` before this change removed it?
+
+        A local diff against the base reads an ADR the base added after the fork as removed by the
+        branch, so a stale branch's similar-bodied ADR under that number would pair with it and read
+        as a rename. Only a source at HEAD or at the fork point is one this branch removed. In CI
+        HEAD contains the base, so the fork point is the base itself.
+        """
+        if _obj_exists(f"HEAD:{src}"):
+            return True
+        fork = self._fork_point()
+        return fork is not None and _obj_exists(f"{fork}:{src}")
 
     def _commits_touching_number(self, number: str) -> list[str] | None:
         """Base commits that touched an ADR under this number, newest first, capped; None on a git
@@ -646,7 +667,9 @@ class Ledger:
     #   it fails closed        every uncertain answer is False, and False is the status quo refusal.
     #   it never runs in CI    its only caller sits inside the `not self.ci` ownership arm.
     #   it costs nothing on    the caller is the last conjunct of a chain that has already decided to
-    #     a passing commit     refuse, and ONE walk answers both questions the refusal needs.
+    #     a passing commit     refuse, and ONE walk answers both questions the refusal needs. The one
+    #                          exception is the rename grant (BACKLOG #5453), which runs the same
+    #                          memoized walk for a file git pairs with a same-number ADR.
     #   a negative is not      a shallow clone and a saturated cap both report no commits and exit 0,
     #     always an absence    so the walk returns WHY it found nothing. See _RestoreEvidence.
     def _history_of_this_number(self, path: str, number: str) -> _RestoreEvidence:
@@ -927,6 +950,9 @@ class Ledger:
                 # is a collision.
                 if not row_names_file(first_rows.get(number, ""), basename):
                     src = self.same_number_source(path, number, against_base=True)
+                    if src is not None and not self._removed_by_this_branch(src):
+                        src = None
+                    staged = _blob_id(f":{path}") if not self.ci else None
                     if src is not None:
                         # git pairs this file, against the base, with the base's own ADR of the
                         # SAME number, so it is a RENAME of that ADR (BACKLOG #5453), not a second
@@ -942,10 +968,11 @@ class Ledger:
                                 "its new name would be invisible in the index.",
                                 "make the row link the renamed file in THIS commit; keep the number",
                             )
-                    elif _obj_exists(f"{self.base}:{path}"):
-                        # The staged file IS the base's own, as when a merge brings in an ADR the
-                        # base renamed and the row was resolved back to the old link. Nothing is
-                        # reused; the row is wrong.
+                    elif staged is not None and staged == _blob_id(f"{self.base}:{path}"):
+                        # The staged file IS the base's own, path and bytes, as when a merge brings
+                        # in an ADR the base renamed and the row was resolved back to the old link.
+                        # Nothing is reused; the row is wrong. Same path with other bytes is a
+                        # stale branch's collision, and stays a reuse.
                         if number in rows:
                             self.fail(
                                 f"ADR {number}'s row in docs/adr/README.md does not link a file "
