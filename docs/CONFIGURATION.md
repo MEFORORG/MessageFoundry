@@ -3679,7 +3679,7 @@ format = "json"                       # structured stdout (one JSON object per l
 forward_host = "siem.hospital.local"  # ship a copy off-box to a syslog/SIEM collector
 forward_port = 6514                   # RFC 5425 syslog-over-TLS default
 forward_protocol = "tls"              # udp (default) | tcp | tls (native RFC 5425, no agent)
-forward_tls_ca_file = "C:/mefor/siem-ca.pem"   # required for tls unless forward_tls_verify = false
+forward_tls_ca_file = "C:/mefor/siem-ca.pem"   # required for verified tls; refused with forward_tls_verify = false
 # Opt-in startup clock-sync gate (ASVS 16.2.2) — warns on skew; add fail-closed to refuse start:
 # require_time_sync = true
 # ntp_peer = "ntp.hospital.local"
