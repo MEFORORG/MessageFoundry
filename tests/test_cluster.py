@@ -1850,7 +1850,7 @@ def test_cluster_timing_fields_refuse_a_non_finite_value(field: str, value: floa
     infinity passed too. Before the fix at least ``node_timeout_seconds`` and
     ``reclaim_interval_seconds`` loaded NaN, and the lease TTL loaded infinity."""
     with pytest.raises(ValueError, match="must be a finite number > 0"):
-        ClusterSettings(**{field: value})
+        ClusterSettings.model_validate({field: value})
 
 
 def test_cluster_timing_fields_still_take_the_shipped_defaults() -> None:
