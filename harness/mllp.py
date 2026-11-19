@@ -99,15 +99,13 @@ def _ack_code(ack_text: str) -> str:
 # How often a dial in progress looks at the stop flag, so stop() is seen within about this long
 # rather than after the whole connect timeout (BACKLOG #5947).
 _STOP_POLL_S = 0.1
-# What a non-blocking connect_ex returns while the dial is still in progress. Winsock says
-# WSAEWOULDBLOCK. On POSIX only EINPROGRESS means that: an EAGAIN or EWOULDBLOCK there is a dial
-# that failed, so it must surface as the error a blocking dial would have raised, not be polled as
-# if it were still connecting.
+# What a non-blocking connect_ex returns while the dial is still in progress. On Windows that is
+# WSAEWOULDBLOCK alone. On POSIX it is EINPROGRESS, or EINTR, after which the connect goes on
+# asynchronously (CPython bpo-23618), so both are polled. An EAGAIN or EWOULDBLOCK there is a dial
+# that failed, so it surfaces as the error a blocking dial would have raised.
 _WSAEWOULDBLOCK = 10035
-_DIAL_IN_PROGRESS_POSIX = frozenset({errno.EINPROGRESS})
-_DIAL_IN_PROGRESS_WINDOWS = frozenset(
-    {errno.EINPROGRESS, getattr(errno, "WSAEWOULDBLOCK", _WSAEWOULDBLOCK)}
-)
+_DIAL_IN_PROGRESS_POSIX = frozenset({errno.EINPROGRESS, errno.EINTR})
+_DIAL_IN_PROGRESS_WINDOWS = frozenset({getattr(errno, "WSAEWOULDBLOCK", _WSAEWOULDBLOCK)})
 
 
 def _dial_in_progress(code: int) -> bool:

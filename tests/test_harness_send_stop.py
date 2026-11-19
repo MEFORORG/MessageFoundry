@@ -11,6 +11,7 @@ dial here never settles, standing in for an unreachable host.
 from __future__ import annotations
 
 import errno
+import sys
 import threading
 import time
 from typing import Any
@@ -42,7 +43,8 @@ class _NeverConnects:
         pass
 
     def connect_ex(self, _addr: object) -> int:
-        return errno.EINPROGRESS
+        # What this platform's non-blocking connect returns while the dial is in progress.
+        return mllp._WSAEWOULDBLOCK if sys.platform == "win32" else errno.EINPROGRESS
 
     def close(self) -> None:
         self.closed = True
@@ -123,11 +125,9 @@ def test_a_socket_that_cannot_be_made_moves_on_to_the_next_address(
 def test_a_posix_eagain_dial_raises_its_own_error(
     monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
-    # On POSIX a non-blocking connect() returning EAGAIN or EWOULDBLOCK has failed; only
-    # EINPROGRESS is a dial in progress. Polled as if connecting, SO_ERROR reads 0 and the row
-    # reports a later broken pipe instead of the real error a blocking dial raised.
-    import sys
-
+    # On POSIX a non-blocking connect() returning EAGAIN or EWOULDBLOCK has failed; it is not a
+    # dial in progress. Polled as if connecting, SO_ERROR reads 0 and the row reports a later
+    # broken pipe instead of the real error a blocking dial raised.
     class _Refused(_NeverConnects):
         def connect_ex(self, _addr: object) -> int:
             return code
@@ -150,12 +150,39 @@ def test_a_posix_eagain_dial_raises_its_own_error(
     assert seen == code
 
 
-def test_a_windows_wouldblock_dial_is_still_in_progress(monkeypatch: pytest.MonkeyPatch) -> None:
-    import sys
+@pytest.mark.parametrize("code", [errno.EINPROGRESS, errno.EINTR], ids=["EINPROGRESS", "EINTR"])
+def test_a_posix_dial_in_progress_is_polled_to_completion(
+    monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    # A POSIX non-blocking connect() interrupted by a signal returns EINTR and goes on
+    # asynchronously (CPython bpo-23618), as with EINPROGRESS: the dial is polled, not failed.
+    class _Connects(_NeverConnects):
+        def connect_ex(self, _addr: object) -> int:
+            return code
 
+        def getsockopt(self, *_a: object) -> int:
+            return 0
+
+        def settimeout(self, _t: float) -> None:
+            pass
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(mllp, "_dial_settled", lambda _sock, _wait_s: True)
+    worker = SendWorker("127.0.0.1", 9, [], timeout=1.0, rate=0.0)
+    # Not pytest.raises: the traceback it keeps would hold the worker in a reference cycle.
+    failed: int | None = None
+    try:
+        worker._dial(_Connects(), ("127.0.0.1", 9), time.monotonic() + 1.0)  # type: ignore[arg-type]
+    except OSError as exc:
+        failed = exc.errno
+    assert failed is None
+
+
+def test_a_windows_dial_is_in_progress_only_on_wouldblock(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
     assert mllp._dial_in_progress(mllp._WSAEWOULDBLOCK)
-    assert mllp._dial_in_progress(errno.EINPROGRESS)
+    # On Windows errno.EINPROGRESS is WSAEINPROGRESS, a connect failure, not a dial in progress.
+    assert not mllp._dial_in_progress(10036)
 
 
 def test_the_pause_between_messages_keeps_a_fine_rate() -> None:
