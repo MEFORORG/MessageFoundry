@@ -364,6 +364,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # OIDC core allowlist entry excuses, as the control that the line stays clean (BACKLOG
         # #5445). A reworded comment arrives as an ENGINE diff the tooling path gate does not see.
         "test_scan_allowlist_whole_line_5445.py",
+        # Pins the cap on the workers `pytest -n auto` starts: tests/_xdist_worker_cap.py and the
+        # two conftests that register it, the repo-root one and the web console suite's. None of
+        # those is under scripts/** or .github/**, so an edit to one does not trip the tooling path
+        # gate; listed as tooling this guard would not run on the change that breaks it. It spawns
+        # no subprocess.
+        "test_xdist_auto_worker_cap.py",
     }
 )
 

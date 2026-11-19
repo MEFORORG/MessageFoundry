@@ -41,6 +41,11 @@ from _ui_clients import HEADERLESS_UI_REQUEST
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
+# Caps the workers `pytest -n auto` starts. Registered here as well as in the repo-root conftest,
+# because a run naming only this tree takes this package's pyproject.toml as its config file and
+# never loads the root one; tests/_xdist_worker_cap.py says why.
+from tests._xdist_worker_cap import pytest_xdist_auto_num_workers  # noqa: F401
+
 # The engine suite's request-deadline helper, which test_ui_dr_outlive.py imports. pytest rewrites
 # asserts only in test modules unless told, and the engine conftest that tells it may not be loaded.
 # An unrewritten assert vanishes under `python -O`.

@@ -925,6 +925,9 @@ Manager's watch reached the cloud session 29 seconds after its question.
 - Dependencies live in [`pyproject.toml`](pyproject.toml) (`>=` minimums, except packages pinned exactly where a measured guarantee depends on the version, at least uvicorn and websockets) and are pinned in a
   hash-locked `requirements.lock` (exported from `uv.lock`; CI checks it stays in sync and audits
   it — DEP-1). No ad-hoc installs — add deps to `pyproject.toml`, then re-run `uv lock`/`uv export`.
+- Run tests in parallel with `pytest -n auto`, which the root `conftest.py` caps at 8 workers so
+  concurrent sessions on one machine do not each take every CPU. Size one run with
+  `PYTEST_XDIST_AUTO_NUM_WORKERS=<n>`; do not pass a larger explicit `-n`.
 
 ```
 # tests (PySide6 harness/Qt tests need the offscreen platform)
