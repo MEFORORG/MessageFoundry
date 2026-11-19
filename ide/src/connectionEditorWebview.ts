@@ -156,6 +156,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // Keys the user chose to remove from the record; the save writes nothing for them. Cleared when
     // the fields are rebuilt, since the rebuild request already left them out.
     const REMOVED_KEYS = new Set();
+    // The keys the record itself carries (none on a create). A rebuild's descriptors cannot say
+    // this: they carry whatever the rebuild request sent as the value.
+    const RECORDED_KEYS = new Set(Object.keys((INITIAL && INITIAL.settings) || {}));
     // The cast an env() reference needs to read back as the field's declared type.
     const ENV_CASTS = { int: 'int', float: 'float', bool: 'bool' };
     // The descriptor a field gets when the user switches it between a literal and env(): empty, so
@@ -481,9 +484,13 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         if (el.dataset.kind === 'checkbox') {
           // A checkbox has no "untouched" state, so one the record did not set, left at the schema
           // default, writes nothing: the rule coerce in connectionForm.ts applies. Without it every
-          // edit save wrote an explicit value for each default bool.
+          // edit save wrote an explicit value for each default bool. "The record set it" is judged
+          // against the record itself, not the descriptor: a transport or direction rebuild carries
+          // what was ticked as the field's value, so a box moved off its default and back before
+          // the rebuild would otherwise write the default (BACKLOG #5976).
           const dflt = f.defaultValue;
-          if (f.value === undefined && dflt !== undefined && dflt !== null && el.checked === dflt) continue;
+          const fromRecord = f.value !== undefined && RECORDED_KEYS.has(key);
+          if (!fromRecord && dflt !== undefined && dflt !== null && el.checked === dflt) continue;
           settings[key] = el.checked;
           continue;
         }
