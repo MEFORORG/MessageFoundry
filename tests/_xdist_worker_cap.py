@@ -8,12 +8,13 @@ registered before that can take part, at least a ``-p`` plugin, an installed ent
 
 The PRIMARY registration is ``-p tests._xdist_worker_cap`` in the ``addopts`` of both pytest
 configs, the root ``pyproject.toml`` and ``packaging/messagefoundry-webconsole/pyproject.toml``
-(a run that names only the console tree takes that file as its config and rootdir). It reaches every
-run either file configures, including the runs no conftest reaches in time: ``pytest -n auto
-packaging`` from the repository root and ``pytest -n auto`` from ``packaging/`` (each collects the
-console suite, whose conftest loads only during collection, after xdist has sized the run), and
-``--noconftest`` under either config. Each of those resolved to 16 workers on a 16-core box before
-the ``-p`` entries were added, and to 8 after.
+(a run that names only the console tree takes that file as its config and rootdir). It reaches the
+runs either file configures that keep its ``addopts``, including at least these runs no conftest
+reaches in time: ``pytest -n auto packaging`` from the repository root and ``pytest -n auto`` from
+``packaging/`` (each collects the console suite, whose conftest loads only during collection, after
+xdist has sized the run), and ``--noconftest`` under either config. Measured with the real core
+count on a 16-core box, the three root-configured ones resolved to 16 workers before the ``-p``
+entries were added; each run named here resolved to 8 after.
 
 The two conftests, ``tests/conftest.py`` and the console suite's, still import the hook as well,
 so a run that overrides ``addopts`` (``-o addopts=...``) and loads one of them in time stays capped.
@@ -23,7 +24,8 @@ accepts the shared function because each registration is a different plugin obje
 
 THE ``-p`` ENTRIES NEED ``tests`` IMPORTABLE AT STARTUP, before any conftest, from whatever working
 directory pytest runs in. The editable install gives that: it puts the checkout root on ``sys.path``.
-The CI jobs that run pytest install editable, and so does ``scripts/worktree/ensure-venv.ps1``. For a
+The CI jobs that ran pytest when this was written installed editable, and so does
+``scripts/worktree/ensure-venv.ps1``; a job that installs otherwise fails at startup. For a
 run that loads either conftest this is no new requirement, since both import ``tests`` already. A
 root-configured run that loads neither did not need it before, and under an install that does not
 put the checkout root on ``sys.path`` it now fails at startup.

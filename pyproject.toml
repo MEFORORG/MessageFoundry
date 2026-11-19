@@ -632,8 +632,8 @@ testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]
 # serial-vs-parallel comparison and the worker sizing are recorded ONCE, in the comments above the
 # `Tests (pytest)` step and the matrix in .github/workflows/ci.yml. Read it there.
 #
-# `-p tests._xdist_worker_cap` caps `-n auto` for every run this file configures, the runs neither
-# conftest reaches in time included; that module's docstring says why it is loaded here as well.
+# `-p tests._xdist_worker_cap` caps `-n auto` for the runs this file configures, at least the ones
+# neither conftest reaches in time; that module's docstring says why, and which runs it misses.
 addopts = "--timeout=60 --timeout-method=thread -p tests._xdist_worker_cap"
 markers = [
     "win2025_acceptance: Windows Server 2025 on-server acceptance probes (env-gated; skip off-server).",

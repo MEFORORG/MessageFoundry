@@ -72,6 +72,6 @@ force-include = { "../../messagefoundry_webconsole" = "messagefoundry_webconsole
 asyncio_mode = "auto"
 asyncio_default_test_loop_scope = "session"
 asyncio_default_fixture_loop_scope = "session"
-# `-p tests._xdist_worker_cap` caps `-n auto` for every run this file configures, `--noconftest`
-# included; ../../tests/_xdist_worker_cap.py says why it is loaded here as well as from the conftest.
+# `-p tests._xdist_worker_cap` caps `-n auto` for the runs this file configures, `--noconftest`
+# among them; ../../tests/_xdist_worker_cap.py says why, and which runs it misses.
 addopts = "--timeout=60 --timeout-method=thread -p tests._xdist_worker_cap"
