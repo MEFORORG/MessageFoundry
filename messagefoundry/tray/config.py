@@ -35,7 +35,6 @@ from __future__ import annotations
 # load service_status (asyncio, subprocess, ctypes) or tomllib.
 __lazy_modules__ = ["messagefoundry.service_status", "tomllib"]
 
-import ipaddress
 import re
 import sys
 import tomllib
@@ -48,8 +47,8 @@ from urllib.parse import urlsplit
 from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
 from messagefoundry.service_status import is_safe_service_name
 
-# The engine's own [api] defaults, which a bind that names only one of host and port keeps for the
-# other (BACKLOG #5936).
+# The engine's own [api] defaults, which a `serve` command line naming only one of --host and --port
+# keeps for the other (BACKLOG #5936).
 _DEFAULT_BIND_HOST = "127.0.0.1"
 _DEFAULT_BIND_PORT = 8765
 # https because the engine serves TLS by default (ADR 0172). Plain http is right only behind a
@@ -61,9 +60,6 @@ _POLL_MIN_S = 1.0
 _POLL_MAX_S = 3600.0
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-# How pydantic's lax mode reads a bool, which is how serve reads [security].local_access_only.
-_LAX_TRUE = frozenset({"1", "on", "t", "true", "y", "yes"})
-_LAX_FALSE = frozenset({"0", "off", "f", "false", "n", "no"})
 _ENGINE_SCHEMES = frozenset({"http", "https"})
 _VALID_HOST = re.compile(r"^[A-Za-z0-9._:\[\]-]{1,255}$")
 _MAX_PATH_LEN = 4096
@@ -317,87 +313,6 @@ def _last_path_option(app_parameters: str, flags: frozenset[str]) -> str | None:
     return found
 
 
-def service_toml_bind(service_toml: dict[str, object] | None) -> tuple[str | None, int | None]:
-    """The API bind host and port the engine's settings file sets, ``None`` for each it leaves unset.
-
-    The file sets the host through ``[security]``, as ``serve`` desugars it: ``local_access_only``
-    pins loopback, and ``listen_address`` is the bind only when ``local_access_only`` is false. It
-    sets the port as ``[api].port``. Each value is read as ``serve`` reads it, which accepts a
-    quoted ``"false"`` or ``"9443"``. A value ``serve`` would refuse reads as unset, so the default
-    applies, as the tray treats every other untrusted hint. ``serve --host``/``--port`` and
-    ``MEFOR_*`` variables in the service's environment both outrank the file in ``serve``; this
-    function reads neither (BACKLOG #5936).
-    """
-    if not service_toml:
-        return None, None
-    host: str | None = None
-    security = service_toml.get("security")
-    if isinstance(security, dict) and (
-        "local_access_only" in security or "listen_address" in security
-    ):
-        local_only = _lax_bool(security.get("local_access_only", True))
-        address = security.get("listen_address", _DEFAULT_BIND_HOST)
-        if local_only is True:
-            host = _DEFAULT_BIND_HOST
-        elif local_only is False and isinstance(address, str) and _valid_host(address):
-            host = address
-    port: int | None = None
-    api = service_toml.get("api")
-    if isinstance(api, dict):
-        raw_port = _lax_int(api.get("port"))
-        if raw_port is not None and 1 <= raw_port <= 65535:
-            port = raw_port
-    return host, port
-
-
-def _lax_bool(value: object) -> bool | None:
-    """``value`` as pydantic's lax mode reads a bool, or ``None`` where it would refuse it.
-
-    The tray imports no pydantic, so this restates the rule; tests/test_tray_config.py holds it to
-    the engine's own ``SecuritySettings`` over a set of spellings. Case is ignored and surrounding
-    space is not, as there."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and value in (0, 1):
-        return bool(value)
-    if isinstance(value, str):
-        word = value.lower()
-        if word in _LAX_TRUE:
-            return True
-        if word in _LAX_FALSE:
-            return False
-    return None
-
-
-def _lax_int(value: object) -> int | None:
-    """``value`` as pydantic's lax mode reads a whole number, or ``None`` where it would refuse it.
-
-    Restated for the reason :func:`_lax_bool` gives, and held to the engine's ``ApiSettings`` the
-    same way: surrounding space, a sign, digit underscores and a zero fraction are accepted."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value) if value.is_integer() else None
-    if isinstance(value, str):
-        whole = re.fullmatch(r"([+-]?\d+(?:_\d+)*)(?:\.0+)?", value.strip())
-        if whole:
-            return int(whole.group(1))
-    return None
-
-
-def _probe_host(host: str) -> str:
-    """``host``, or the loopback of its family when it is a wildcard (unspecified) address."""
-    try:
-        address = ipaddress.ip_address(host.strip("[]"))
-    except ValueError:
-        return host
-    if not address.is_unspecified:
-        return host
-    return "::1" if address.version == 6 else "127.0.0.1"
-
-
 def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -> str | None:
     """A validated ``http(s)://host:port`` URL, or ``None`` if either part is missing/invalid.
 
@@ -411,7 +326,6 @@ def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -
         return None
     # A bare IPv6 literal must be bracketed or the ':'s read as the port separator — `serve
     # --host ::1` would otherwise yield the unparseable "http://::1:8765".
-    host = _probe_host(host)
     authority = f"[{host}]" if ":" in host and not host.startswith("[") else host
     return f"{'https' if tls else 'http'}://{authority}:{port}"
 
@@ -522,14 +436,13 @@ def compose_config(
     *,
     engine_tls: bool = True,
     engine_cacert: str | None = None,
-    service_bind: tuple[str | None, int | None] = (None, None),
 ) -> TrayConfig:
     """Merge built-in defaults ← registry hints ← TOML (TOML wins). Pure.
 
-    ``service_bind`` is the host and port the engine's own settings file sets
-    (:func:`service_toml_bind`). ``serve``'s ``--host``/``--port`` in the registry outrank it, and
-    a part neither sets keeps the engine's default, so a bind named only in part still yields the
-    engine's URL (BACKLOG #5936).
+    A ``serve`` command line that names only one of ``--host`` and ``--port`` keeps the engine's
+    default for the other, so a bind named only in part still yields the engine's URL (BACKLOG
+    #5936). The host and port come from the registry hints alone, never from the engine's
+    settings file (ADR 0113 amendment 2026-07-22).
 
     ``engine_tls`` scheme-corrects the *registry-derived* URL only; an explicit ``engine_url`` in
     ``tray.toml`` already carries its own scheme and always wins. It defaults to True for the same
@@ -551,12 +464,11 @@ def compose_config(
     # Registry hints (untrusted; validated).
     if reg is not None:
         host_hint, port_hint = parse_serve_args(reg.app_parameters or "")
-        file_host, file_port = service_bind
         # Built even when nothing names a part, so the scheme still follows engine_tls: an engine
         # behind a declared upstream terminator speaks http on the default bind too.
         url_hint = build_engine_url(
-            host_hint or file_host or _DEFAULT_BIND_HOST,
-            port_hint or file_port or _DEFAULT_BIND_PORT,
+            host_hint or _DEFAULT_BIND_HOST,
+            port_hint or _DEFAULT_BIND_PORT,
             tls=engine_tls,
         )
         if url_hint is not None:
@@ -672,7 +584,6 @@ def load_config(config_dir: Path, reader: RegistryReader | None = None) -> TrayC
         reg,
         engine_tls=engine_serves_https(service_toml),
         engine_cacert=generated_cert_path(service_toml, reg),
-        service_bind=service_toml_bind(service_toml),
     )
 
 

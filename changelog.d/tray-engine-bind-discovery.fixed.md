@@ -1,6 +1,6 @@
-- **The tray finds the engine bind in more places.** It now takes the host and port the engine's own settings
-  file sets (`[security].listen_address` with `local_access_only = false`, and
-  `[api].port`) when `serve --host`/`--port` in the service entry leave them unset, keeps the engine's
-  default for a part nothing sets, and probes a wildcard bind (`0.0.0.0`, `::`) on loopback. Each of
-  those used to probe the wrong or an unconnectable URL and show a running engine as down.
-  (`BACKLOG #5936`)
+- **The tray probes a partly named engine bind.** When `serve` in the service entry names only one of
+  `--host` and `--port`, the tray now keeps the engine's default for the other, and it follows the
+  engine's scheme when neither is named. It used to probe the default URL, which missed a non-default
+  port, a non-default host, and the http of a declared upstream terminator. A relative
+  `--service-config` now resolves under `--project-root`, as `serve` resolves it, so the tray reads
+  the scheme from the settings file the engine loads. (`BACKLOG #5936`)

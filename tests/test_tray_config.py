@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.tray.actions import console_url
 from messagefoundry.tray.config import (
     DEFAULT_ENGINE_URL,
     DEFAULT_SERVICE_NAME,
@@ -23,7 +24,6 @@ from messagefoundry.tray.config import (
     load_config,
     parse_serve_args,
     parse_service_config_arg,
-    service_toml_bind,
     service_toml_path,
 )
 
@@ -690,115 +690,7 @@ def test_load_config_an_operator_chain_pins_nothing(tmp_path: Path) -> None:
     assert cfg.engine_cacert is None
 
 
-# --- BACKLOG #5936: the engine bind from messagefoundry.toml, a partial bind, a wildcard bind -----
-
-
-@pytest.mark.parametrize(
-    ("data", "bind"),
-    [
-        (None, (None, None)),
-        ({}, (None, None)),
-        # local_access_only pins loopback, whatever listen_address says.
-        ({"security": {"local_access_only": True}}, ("127.0.0.1", None)),
-        # listen_address is the bind only with local_access_only explicitly false.
-        (
-            {"security": {"local_access_only": False, "listen_address": "10.0.0.5"}},
-            ("10.0.0.5", None),
-        ),
-        ({"security": {"local_access_only": False}}, ("127.0.0.1", None)),
-        ({"security": {"listen_address": "::1"}}, ("127.0.0.1", None)),
-        (
-            {"security": {"local_access_only": False, "listen_address": "0.0.0.0"}},
-            ("0.0.0.0", None),
-        ),
-        ({"api": {"port": 9443}}, (None, 9443)),
-        # Read as serve reads them: pydantic's lax mode takes these quoted and numeric spellings.
-        (
-            {"security": {"local_access_only": "FALSE", "listen_address": "10.0.0.5"}},
-            ("10.0.0.5", None),
-        ),
-        ({"security": {"local_access_only": 0, "listen_address": "10.0.0.5"}}, ("10.0.0.5", None)),
-        ({"security": {"local_access_only": "yes"}}, ("127.0.0.1", None)),
-        ({"api": {"port": " 9443 "}}, (None, 9443)),
-        ({"api": {"port": "+9443"}}, (None, 9443)),
-        ({"api": {"port": 9443.0}}, (None, 9443)),
-        # What serve would refuse, or a port no client can reach, reads as unset.
-        ({"security": {"local_access_only": "maybe", "listen_address": "10.0.0.5"}}, (None, None)),
-        ({"security": {"local_access_only": " false", "listen_address": "10.0.0.5"}}, (None, None)),
-        ({"security": {"local_access_only": 2, "listen_address": "10.0.0.5"}}, (None, None)),
-        ({"security": {"local_access_only": False, "listen_address": "bad host"}}, (None, None)),
-        ({"api": {"port": True}}, (None, None)),
-        ({"api": {"port": 0}}, (None, None)),
-        ({"api": {"port": "94x3"}}, (None, None)),
-        ({"security": "x", "api": "y"}, (None, None)),
-    ],
-)
-def test_service_toml_bind(
-    data: dict[str, object] | None, bind: tuple[str | None, int | None]
-) -> None:
-    assert service_toml_bind(data) == bind
-
-
-_LAX_BOOL_SPELLINGS: list[object] = [
-    True, False, "false", "FALSE", " false", "Off", "no", "n", "f", "0", "1", 0, 1, 2,
-    0.0, 1.0, "yes", "on", "t", "y", "maybe", "", None, "true ",
-]  # fmt: skip
-_LAX_INT_SPELLINGS: list[object] = [
-    9443, " 9443 ", "+9443", "9_443", "9443.0", 9443.0, 9443.5, "9443.5", "1e3", True, "0x10",
-    "", "-1", "9443 ", "9__443", None, [9443],
-]  # fmt: skip
-
-
-@pytest.mark.parametrize("value", _LAX_BOOL_SPELLINGS)
-def test_local_access_only_is_read_as_the_engine_reads_it(value: object) -> None:
-    """The tray restates pydantic's lax bool; the engine's own model is the oracle."""
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import SecuritySettings
-    from messagefoundry.tray.config import _lax_bool
-
-    try:
-        expected: bool | None = SecuritySettings.model_validate(
-            {"local_access_only": value}
-        ).local_access_only
-    except ValidationError:
-        expected = None
-    assert _lax_bool(value) == expected
-
-
-@pytest.mark.parametrize("value", _LAX_INT_SPELLINGS)
-def test_api_port_is_read_as_the_engine_reads_it(value: object) -> None:
-    """The tray restates pydantic's lax int; the engine's own model is the oracle."""
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import ApiSettings
-    from messagefoundry.tray.config import _lax_int
-
-    try:
-        expected: int | None = ApiSettings.model_validate({"port": value}).port
-    except ValidationError:
-        expected = None
-    assert _lax_int(value) == expected
-
-
-@pytest.mark.parametrize(
-    ("host", "probed"),
-    [
-        ("0.0.0.0", "127.0.0.1"),
-        ("::", "[::1]"),
-        ("[::]", "[::1]"),
-        ("::0", "[::1]"),
-        ("0:0:0:0:0:0:0:0", "[::1]"),
-        ("10.0.0.5", "10.0.0.5"),
-        ("::1", "[::1]"),
-    ],
-)
-def test_build_engine_url_probes_loopback_for_a_wildcard_bind(host: str, probed: str) -> None:
-    """An unspecified address, in any spelling, accepts on loopback too, and no client can connect
-    to it."""
-    assert build_engine_url(host, 9100, tls=True) == f"https://{probed}:9100"
-    if probed != "10.0.0.5":
-        assert is_local_engine(build_engine_url(host, 9100) or "") is True
+# --- BACKLOG #5936: a partial bind, and what the tray does NOT take from messagefoundry.toml -------
 
 
 def test_compose_a_declared_terminator_with_no_bind_named_is_probed_over_http() -> None:
@@ -814,83 +706,70 @@ def test_compose_a_port_only_bind_keeps_the_default_host() -> None:
 
 
 def test_compose_a_host_only_bind_keeps_the_default_port() -> None:
-    reg = ServiceRegistryInfo(app_parameters="serve --config C:\\cfg --host 0.0.0.0")
-    assert compose_config(None, reg).engine_url == "https://127.0.0.1:8765"
+    reg = ServiceRegistryInfo(app_parameters="serve --config C:\\cfg --host 10.0.0.5")
+    assert compose_config(None, reg).engine_url == "https://10.0.0.5:8765"
 
 
-def test_compose_the_command_line_bind_outranks_the_settings_file() -> None:
-    reg = ServiceRegistryInfo(app_parameters="serve --host 127.0.0.1 --port 9100")
-    cfg = compose_config(None, reg, service_bind=("10.0.0.5", 9443))
-    assert cfg.engine_url == "https://127.0.0.1:9100"
-    # Each part separately: the file fills only the part the command line leaves unset.
-    reg = ServiceRegistryInfo(app_parameters="serve --port 9100")
-    assert compose_config(None, reg, service_bind=("10.0.0.5", 9443)).engine_url == (
-        "https://10.0.0.5:9100"
-    )
+@pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+def test_a_wildcard_bind_is_monitor_only_as_on_main(host: str) -> None:
+    """``serve --host 0.0.0.0`` or ``::`` is not a loopback URL, so the tray is monitor-only.
+
+    Probing a wildcard on loopback, and with it keeping service control, is withdrawn: under ADR
+    0113 AC-7 monitor-only keys on the engine URL's locality alone."""
+    reg = ServiceRegistryInfo(app_parameters=f"serve --host {host} --port 8765")
+    cfg = compose_config(None, reg)
+    assert cfg.monitor_only is True
+    assert not is_local_engine(cfg.engine_url)
 
 
-def test_compose_tray_toml_engine_url_outranks_the_settings_file_bind() -> None:
-    reg = ServiceRegistryInfo(app_parameters="serve")
-    cfg = compose_config(
-        {"engine_url": "https://127.0.0.1:7000"}, reg, service_bind=("0.0.0.0", 9443)
-    )
-    assert cfg.engine_url == "https://127.0.0.1:7000"
+@pytest.mark.parametrize(
+    "service_toml",
+    [
+        '[security]\nlocal_access_only = false\nlisten_address = "10.0.0.5"\n',
+        '[security]\nlocal_access_only = false\nlisten_address = "0.0.0.0"\n',
+        "[api]\nport = 9443\n",
+        '[security]\nlocal_access_only = false\nlisten_address = "attacker.example"\n'
+        "[api]\nport = 9443\n",
+    ],
+)
+def test_a_settings_file_bind_does_not_move_the_probe_or_the_console(
+    tmp_path: Path, service_toml: str
+) -> None:
+    """ADR 0113's 2026-07-22 amendment lifts no host or port out of the operator settings file.
 
-
-def test_load_config_reads_the_bind_from_the_service_toml(tmp_path: Path) -> None:
-    """The row's first case: the bind lives in messagefoundry.toml and AppParameters names none."""
-    (tmp_path / "messagefoundry.toml").write_text(
-        '[security]\nlocal_access_only = false\nlisten_address = "0.0.0.0"\n'
-        '[api]\nport = 9443\ntls_cert_file = "engine.pem"\n',
-        encoding="utf-8",
-    )
+    The file is reached through an untrusted registry hint, so a host or port named there must
+    change neither the URL the tray probes nor the one Open Console opens.
+    """
+    (tmp_path / "messagefoundry.toml").write_text(service_toml, encoding="utf-8")
     reader = _FakeReader(
         ServiceRegistryInfo(app_directory=str(tmp_path), app_parameters="serve --config C:\\cfg")
     )
     cfg = load_config(tmp_path, reader)
-    assert cfg.engine_url == "https://127.0.0.1:9443"
+    assert cfg.engine_url == DEFAULT_ENGINE_URL
+    assert console_url(cfg.engine_url) == DEFAULT_ENGINE_URL + "/ui"
     assert cfg.monitor_only is False
 
 
 @pytest.mark.parametrize(
-    ("service_toml", "app_parameters"),
+    "app_parameters",
     [
         # The installer's form: install-service.ps1 always writes --host and --port.
-        ("", "serve --config C:\\cfg --host 10.0.0.5 --port 8765"),
+        "serve --config C:\\cfg --host 10.0.0.5 --port 8765",
         # --host with no --port, which keeps the engine's default port.
-        ("", "serve --config C:\\cfg --host 10.0.0.5"),
-        # The same bind written in the engine's settings file instead.
-        (
-            '[security]\nlocal_access_only = false\nlisten_address = "10.0.0.5"\n',
-            "serve --config C:\\cfg",
-        ),
+        "serve --config C:\\cfg --host 10.0.0.5",
     ],
 )
-def test_a_lan_bind_is_monitor_only_wherever_it_was_written(
-    tmp_path: Path, service_toml: str, app_parameters: str
-) -> None:
-    """The control decision follows what the bind is, never where it was written (ADR 0113 AC-7).
-
-    A LAN bind is a non-loopback host, so it is monitor-only whether ``serve --host`` or
-    ``[security].listen_address`` names it: monitor-only keys on locality alone.
-    """
-    (tmp_path / "messagefoundry.toml").write_text(
-        service_toml + '[api]\ntls_cert_file = "engine.pem"\n', encoding="utf-8"
-    )
-    reader = _FakeReader(
-        ServiceRegistryInfo(app_directory=str(tmp_path), app_parameters=app_parameters)
-    )
-    cfg = load_config(tmp_path, reader)
+def test_a_lan_bind_is_monitor_only(app_parameters: str) -> None:
+    """A LAN bind is a non-loopback host, so it is monitor-only (ADR 0113 AC-7)."""
+    cfg = compose_config(None, ServiceRegistryInfo(app_parameters=app_parameters))
     assert cfg.engine_url == "https://10.0.0.5:8765"
     assert cfg.monitor_only is True
 
 
 def test_a_remote_tray_toml_engine_url_is_monitor_only() -> None:
-    """An operator's non-loopback ``engine_url`` degrades the tray whatever the service binds."""
+    """An operator's non-loopback ``engine_url`` degrades the tray."""
     reg = ServiceRegistryInfo(app_parameters="serve")
-    cfg = compose_config(
-        {"engine_url": "https://10.0.0.5:7000"}, reg, service_bind=("10.0.0.5", None)
-    )
+    cfg = compose_config({"engine_url": "https://10.0.0.5:7000"}, reg)
     assert cfg.monitor_only is True
 
 
@@ -933,18 +812,18 @@ def test_a_relative_service_config_anchors_under_the_project_root(tmp_path: Path
     assert service_toml_path(reg) == install / "\\estate" / "mf.toml"
 
 
-def test_load_config_reads_the_bind_from_the_file_under_the_project_root(tmp_path: Path) -> None:
-    """The bind comes from the settings file serve loads, not a same-named one in AppDirectory."""
+def test_load_config_reads_the_scheme_from_the_file_under_the_project_root(tmp_path: Path) -> None:
+    """The scheme comes from the settings file serve loads, not a same-named one in AppDirectory."""
     install = tmp_path / "install"
     repo = tmp_path / "repo"
     install.mkdir()
     repo.mkdir()
-    (install / "mf.toml").write_text("[api]\nport = 7001\n", encoding="utf-8")
-    (repo / "mf.toml").write_text("[api]\nport = 7002\n", encoding="utf-8")
+    (install / "mf.toml").write_text("[api]\n", encoding="utf-8")
+    (repo / "mf.toml").write_text("[api]\ntls_terminated_upstream = true\n", encoding="utf-8")
     reader = _FakeReader(
         ServiceRegistryInfo(
             app_directory=str(install),
             app_parameters=f'serve --project-root "{repo}" --service-config mf.toml',
         )
     )
-    assert load_config(tmp_path, reader).engine_url == "https://127.0.0.1:7002"
+    assert load_config(tmp_path, reader).engine_url == "http://127.0.0.1:8765"
