@@ -2659,12 +2659,14 @@ A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the
   is declared. An `env()` value is refused by the build check, which `messagefoundry check` runs in
   its build leg when the config has a `messagefoundry.toml`, and at each sync.
 - **The statement timeout.** `DatabaseRef(statement_timeout=…)`, whole seconds, bounds the sync's
-  statement by the DATABASE connector's rule: unset is 30 s, `0` is no limit, and a negative,
-  fractional or boolean value is refused when declared, an `env()` value by the build check and at
-  each sync. A statement that runs past it (`HYT00`) fails that sync as
+  statement by the DATABASE connector's rule: unset is 30 s, `0` is no limit, and at least a
+  negative, fractional or boolean value, or one above `2**31 - 1`, the most pyodbc takes, is refused
+  when declared, an `env()` value by the build check and at each sync. A statement that runs past
+  it (`HYT00`) fails that sync as
   `ReferenceStatementTimedOut`, and the last-good snapshot keeps serving; a driver that refuses the
-  value fails it as `ReferenceStatementTimeoutRefused`. The 30 s default was chosen for one
-  statement per message, and a large set's statement can need more. At `0`, an uncancelled
+  value fails it as `ReferenceStatementTimeoutRefused`. The 30 s default is the store's own
+  `[store].command_timeout` default, as on the SQL Server preset, and a large set's statement can
+  need more. At `0`, an uncancelled
   statement holds the sequential sync pass, and every other set's sync behind it, until it returns.
 - **The result must fit the declared columns.** At least these refusals apply. A `key_column` or
   `value_column` the result lacks, or holds twice, as a join can, fails the sync as
@@ -2676,8 +2678,10 @@ A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the
 
 The sync's log line and alert carry the error's class name only, never its text, because a source
 error can hold a reference key. The class names above are what tell those failures apart. The two
-column and key refusals are also logged with their text, which names the set, the setting and row
-ordinals, never a column's name or a key.
+column and key refusals are also logged with their text, which names the set and what was refused,
+never a column's name or a key: a `ReferenceColumnMismatch` names the setting (`key_column` or
+`value_column`), or says that a column name came twice with no `value_column` set, and a
+`ReferenceKeyRefused` names the row ordinals.
 
 Neither the statement gate nor the row ceiling is read-only authority, for the reasons in the table above, and the sync pool is
 autocommit. Give the `DatabaseRef` login `SELECT` on what the statement reads, and nothing else. The

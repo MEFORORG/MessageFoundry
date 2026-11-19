@@ -391,7 +391,8 @@ async def _load_database_source(
         login_timeout=_login_timeout(settings, "DATABASE reference source"),
     )
     # Every borrow from this pool carries the statement timeout, as a DATABASE connector's does
-    # (BACKLOG #5756), so an uncancelled statement no longer holds the sync pass without bound.
+    # (BACKLOG #5756). A non-zero value bounds an uncancelled statement's hold on the sync pass; at
+    # 0, or where the pool could not be tracked (logged at WARNING), nothing bounds it.
     _bound_statements(pool, statement_timeout)
     try:
         # What names the login, never the password, so the remembered key holds no credential.
@@ -746,8 +747,8 @@ class ReferenceSyncRunner:
                     probed=self._roles_probed,
                 )
             except (ReferenceColumnMismatch, ReferenceKeyRefused) as exc:
-                # Logged whole, as ReferenceKeyCollision is below: the text holds the set's name, a
-                # setting and row ordinals, never a column name or a key.
+                # Logged whole, as ReferenceKeyCollision is below: the text holds the set's name and,
+                # by refusal, the column setting, or the row ordinals, never a column name or a key.
                 log.error("%s (not synced)", exc)
                 raise
         else:
