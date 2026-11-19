@@ -2706,12 +2706,16 @@ def _read_environment_values(
     from messagefoundry.engine_secrets import SecretsDirectoryError
     from messagefoundry.redaction import safe_exc
 
+    # A WiringError, the type this function's callers arm (BACKLOG #5322). The start check and the
+    # reader's own constructor refuse these inputs first, so this is the backstop. The refusal is
+    # raised outside the handler, so it carries no exception chain.
+    path_refusal = ""
     try:
         env_file = values_file_path(base_dir, dir_name, environment)
     except ValueError as exc:
-        # A WiringError, the type this function's callers arm (BACKLOG #5322). The start check and
-        # the reader's own constructor refuse these inputs first, so this is the backstop.
-        raise WiringError(str(exc)) from None
+        path_refusal = str(exc)
+    if path_refusal:
+        raise WiringError(path_refusal)
     if snapshot is not None and not snapshot.covers_environment_file(env_file):
         # Before the vetting below, so the plain read the engine then makes vets the file once.
         raise NotInSnapshot(f"{env_file} is not a value file the config snapshot read")

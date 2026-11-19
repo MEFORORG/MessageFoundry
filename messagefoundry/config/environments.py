@@ -198,9 +198,8 @@ def _leaves_base(value: str) -> bool:
     itself uses the host's rules, so on POSIX a backslash stays part of a folder name. Windows strips
     the trailing dots and spaces of a part, so ``...`` and ``.. `` are refused with ``..``."""
     path = PureWindowsPath(value)
-    return bool(path.drive or path.root) or any(
-        part != "." and not part.strip(". ") for part in path.parts
-    )
+    # pathlib drops a "." part itself, so every part left of only dots and spaces is refused.
+    return bool(path.drive or path.root) or any(not part.strip(". ") for part in path.parts)
 
 
 def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> Path:
@@ -224,7 +223,8 @@ def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> P
     if _leaves_base(dir_name):
         raise ValueError(
             "[environments].dir must be a folder under the environments base directory: no drive, "
-            "no leading slash and no '..' (value withheld)"
+            "no leading slash or backslash, and no part of only dots or spaces such as '..' "
+            "(value withheld)"
         )
     # The validator's own alphabet has no separator and no ':', so the file name is one plain part.
     if not environment or not set(environment) <= _ENV_NAME_ALLOWED:
@@ -255,7 +255,8 @@ def load_environment_values(
     validation, read it as missing. A file
     that cannot be stated or read raises its ``OSError``
     (:func:`~messagefoundry.config.snapshot.is_regular_file` says which is which).
-    :func:`environment_values_from_bytes` says what it refuses.
+    :func:`environment_values_from_bytes` says what it refuses. A ``dir_name`` or ``environment``
+    that :func:`values_file_path` refuses raises its ``ValueError`` before anything is read.
     """
     from messagefoundry.config.snapshot import is_regular_file
 
