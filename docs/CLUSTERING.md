@@ -168,6 +168,12 @@ cluster coordinates the parts that must not double-run or interleave:
   upgrade bumps it to `1`.
 - **Leader-gated WRITE singletons.** Retention purges and the lease-reclaim sweep run **only on the
   leader**, so they never double-execute.
+- **An operator purge runs on the leader only.** On a node that does not hold the leader lease, an
+  inline connection purge answers 409, and a purge released under dual control cancels nothing and
+  records that refusal as its skip (BACKLOG #5792). A node that has lost the lease delivers
+  nothing, so an outbound it stopped can read as quiesced while the new leader delivers it. Stop
+  and purge the outbound on the leader. The check is read when the purge runs; it is not a store
+  fence, so leadership can still change before the cancel completes.
 - **Leader-gated poll-source intake.** Only the leader polls a **shared** external resource (a watched
   directory / DB-poll table / remote dir). Under active-passive the standby doesn't run the graph at
   all, so this is belt-and-suspenders (the poll loop is also internally leader-gated).

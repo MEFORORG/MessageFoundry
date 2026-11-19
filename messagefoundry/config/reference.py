@@ -35,6 +35,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
+from messagefoundry.config.code_sets import _miss_text
+
 __all__ = [
     "ReferenceSet",
     "ReferenceView",
@@ -63,8 +65,8 @@ class ReferenceSet(Mapping[str, Any]):
 
     Behaves like a read-only ``dict`` (``rs[key]``, ``rs.get(key, default)``, ``key in rs``,
     ``len(rs)``, iteration) but rejects mutation — one snapshot is shared across every transform, so a
-    Handler must never edit it. ``rs[missing]`` raises a :class:`KeyError` naming the set;
-    ``rs.get(missing, default)`` returns the default (sparse external data). Wraps the snapshot mapping
+    Handler must never edit it. ``rs[missing]`` raises a :class:`KeyError` naming the set, never the
+    key; ``rs.get(missing, default)`` returns the default (sparse external data). Wraps the snapshot mapping
     **by reference** (no copy) — the view is already read-only and the sync swaps it wholesale, so a
     large table isn't copied on every lookup."""
 
@@ -82,7 +84,14 @@ class ReferenceSet(Mapping[str, Any]):
         try:
             return self._data[key]
         except KeyError:
-            raise KeyError(f"key {key!r} not in reference set {self._name!r}") from None
+            pass
+        # The set and the key's length, never the key, which may carry PHI (BACKLOG #5320). Raised
+        # outside the handler, so the dict's own KeyError, whose text is the key, is not __context__.
+        raise KeyError(_miss_text(self._name, key, kind="reference set"))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        # Straight to the snapshot, so a miss on a sparse set builds no KeyError only to discard it.
+        return self._data.get(key, default)
 
     def __contains__(self, key: object) -> bool:
         return key in self._data

@@ -604,9 +604,13 @@ class FileDestination(DestinationConnector):
         try:
             await self._run_fs(self._write, payload)
         except OSError as exc:
-            # Raised before a name was rendered, so the only path it can quote is the configured
-            # directory. A failure after it comes back from _write already as a DeliveryError.
-            raise DeliveryError(f"file write failed: {exc}") from exc
+            # Raised before a name was rendered, but reduced the way _write's arm is (BACKLOG #5302).
+            reason = _write_failure_reason(exc)
+        else:
+            return
+        # Raised outside the handler, so the OS error is neither __cause__ nor __context__. The
+        # configured directory goes last, so the store's length bound cuts it before the reason.
+        raise DeliveryError(f"file write failed: {reason} (directory {self.directory})")
 
     async def validate_startup(self) -> None:
         """Opt-in at-start directory validation (#114) — the outbound mirror of
@@ -661,12 +665,33 @@ class FileDestination(DestinationConnector):
         The syscall count on the default path is unchanged: ``mkdir(parents=True, exist_ok=True)``
         already probed ``is_dir()`` on its ``FileExistsError`` branch, which is the common one."""
         if self.validate_directory:
-            if not self.directory.is_dir():
-                raise FileNotFoundError(
-                    f"destination directory {self.directory} does not exist and validate_directory is "
-                    "on, so it is never created on write"
-                )
-            return
+            # stat, not is_dir(): is_dir() is False for a missing directory, a refused one and an
+            # unreachable share alike, so its answer cannot name the cause. The stat's error does.
+            # A missing directory (POSIX ENOENT, or Win32 file or path not found) gets short words
+            # naming the setting, so the stored text's length bound leaves room for the directory
+            # send adds. Any other failed stat, a share fault such as Win32 53 (network path not
+            # found) included, propagates with its own errno and OS text, which send keeps,
+            # dropping the path it quotes. A path the OS cannot take (a NUL) is a ValueError,
+            # which is no OSError, so it is turned into one here rather than escape send.
+            failure: OSError
+            try:
+                mode = self.directory.stat().st_mode
+            except FileNotFoundError as exc:
+                if getattr(exc, "winerror", None) not in (None, 2, 3):
+                    failure = exc
+                else:
+                    failure = FileNotFoundError(
+                        errno.ENOENT, "not found, and validate_directory never creates it"
+                    )
+            except ValueError:
+                failure = OSError(errno.EINVAL, "not a valid path")
+            else:
+                if stat.S_ISDIR(mode):
+                    return
+                failure = NotADirectoryError(errno.ENOTDIR, "not a directory")
+            # Raised outside the handler, so the stat's error, which quotes the path, is not chained
+            # to the words that replace it.
+            raise failure
         try:
             self.directory.mkdir(parents=True)
         except FileExistsError:
@@ -695,16 +720,8 @@ class FileDestination(DestinationConnector):
             self._write_as(name, target, payload)
         except OSError as exc:
             # An OS error quotes the path it failed on, and its last part is this name, rendered
-            # from message fields, or a bumped name-1.ext of it. The error text goes at least to
-            # last_error and to the stored alert reason, so it keeps the type, errno and OS text
-            # only (BACKLOG #2814). An OSError with no errno keeps its type alone, unless it is one of
-            # this module's own, whose fixed message never names a file.
-            fixed_message = isinstance(exc, (_Unconfined, _Replaced))
-            reason = (
-                _describe_os_error(exc)
-                if exc.errno is not None or fixed_message
-                else type(exc).__name__
-            )
+            # from message fields, or a bumped name-1.ext of it (BACKLOG #2814).
+            reason = _write_failure_reason(exc)
         else:
             return
         # Raised outside the handler, so the OS error, which quotes the path, is on neither
@@ -3026,6 +3043,20 @@ def _describe_os_error(
         return f"{type(exc).__name__}: [Errno {exc.errno}] {exc.strerror or ''}".rstrip()
     # A message-only OSError keeps its message, redacted, with the known name swapped for a label.
     return safe_exc(exc, file_name=file_name)
+
+
+def _write_failure_reason(exc: OSError) -> str:
+    """The reason a file delivery failed, as its DeliveryError carries it (BACKLOG #2814, #5302).
+
+    The text goes at least to last_error and the stored alert reason, so it keeps the type, errno
+    and OS text only, never the path an OS error quotes, whose last part can be a name rendered from
+    message fields. An OSError with no errno keeps its type alone, unless its message is fixed words
+    that never name a file: this module's own refusals, and a credential logon error, which carries
+    a Win32 code."""
+    fixed_message = isinstance(exc, (_Unconfined, _Replaced, wincred.CredentialLogonError))
+    if exc.errno is not None or fixed_message:
+        return _describe_os_error(exc)
+    return type(exc).__name__
 
 
 class _Unconfined(OSError):

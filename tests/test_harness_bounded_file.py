@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.bounded_file import NOT_REGULAR, read_capped
+from harness.bounded_file import NOT_REGULAR, read_capped, read_fd_capped
 from harness.sinks.file import FileSink
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
@@ -236,16 +236,14 @@ def test_the_file_sink_records_a_file_changed_while_read_once_it_settles(
     target = tmp_path / "x.hl7"
     with FileSink(tmp_path) as sink:
         target.write_bytes(b"MSH|first\r")
-        real = read_capped
+        real = read_fd_capped
 
-        def swap_then_read(
-            path: Path, cap: int, *, follow_symlinks: bool = True
-        ) -> tuple[bytes, str]:
-            monkeypatch.setattr(file_sink, "read_capped", real)
+        def swap_then_read(fd: int, cap: int) -> tuple[bytes, str]:
+            monkeypatch.setattr(file_sink, "read_fd_capped", real)
             target.write_bytes(_BODY)  # a different size: the signature moves
-            return real(path, cap, follow_symlinks=follow_symlinks)
+            return real(fd, cap)
 
-        monkeypatch.setattr(file_sink, "read_capped", swap_then_read)
+        monkeypatch.setattr(file_sink, "read_fd_capped", swap_then_read)
         assert sink.records() == []  # changed while read: not recorded yet
         settled = sink.records()
         assert sink.records() == settled
@@ -256,20 +254,16 @@ def test_the_file_sink_records_a_file_removed_right_after_its_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A file read whole and then moved away is still a delivery, judged inside by its folder."""
-    import harness.sinks.file as file_sink
-
     target = tmp_path / "x.hl7"
     with FileSink(tmp_path) as sink:
         target.write_bytes(_BODY)
+        real = FileSink._inside
 
-        def read_then_remove(
-            path: Path, cap: int, *, follow_symlinks: bool = True
-        ) -> tuple[bytes, str]:
-            result = read_capped(path, cap, follow_symlinks=follow_symlinks)
-            path.unlink()
-            return result
+        def remove_after_read(self: FileSink, path: Path, link: bool, root: Path) -> bool:
+            path.unlink()  # the handle is closed by now, as it is when the engine moves a file on
+            return real(self, path, link, root)
 
-        monkeypatch.setattr(file_sink, "read_capped", read_then_remove)
+        monkeypatch.setattr(FileSink, "_inside", remove_after_read)
         records = sink.records()
     assert [(r.payload, r.meta["inside"]) for r in records] == [(_BODY, "true")]
 
@@ -355,13 +349,15 @@ def test_the_file_sink_refuses_an_unsafe_listed_name_before_joining_it(
             self.name = name
 
     class _Listing:
-        def __init__(self, folder: Path) -> None:
+        def __init__(self, folder: Path | int) -> None:
             self.folder = folder
 
         def __enter__(self) -> list[_Entry]:
             with real(self.folder) as listing:
                 names = [entry.name for entry in listing]
-            if Path(self.folder) == tmp_path:
+            held = self.folder
+            listed = os.fstat(held) if isinstance(held, int) else os.stat(held)
+            if os.path.samestat(listed, os.stat(tmp_path)):
                 # Never by POSIX rules on a Windows host, where `C:` would join to the folder
                 # or a path on that drive, depending on the folder's drive.
                 names += _BAD_NAMES + (_WINDOWS_BAD_NAMES if windows else ())

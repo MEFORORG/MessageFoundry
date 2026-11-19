@@ -26,9 +26,13 @@ through -- but the write fails for the same reason, so nothing is exposed. Both 
 together. The fold below closes the case exactly when git will answer, which is exactly when the write
 becomes possible.
 
-**THE FOLD IS ADDITIVE**: it makes more spellings resolve onto a governed root, so every verdict it
-changes moves ALLOW to DENY. It sits at the single shared comparison point, so rules 3, 3b, 3c and 3d
-inherit it together instead of drifting apart.
+**THE FOLD IS NEVER THE ONLY ANSWER.** It makes more spellings resolve onto a governed root. Since
+BACKLOG #5454 it also resolves ``..``, ``.`` and trailing dots behind a device prefix, which reads at least
+some governed paths as ungoverned. So every governed-path decision is asked under BOTH path forms, the
+folded ``Get-ComparablePath`` and the pre-#5454 ``Get-ComparablePathLexical``, and denies if either
+does. ``Get-ComparablePath``'s docstring states it, and ``tests/test_worktree_gate_dos_device.py`` pins
+the cases. The fold sits at the shared comparison point, so a rule inherits it wherever that rule
+reaches it.
 """
 
 from __future__ import annotations
@@ -85,8 +89,14 @@ def _brace_block(src: str, name: str) -> str:
         i += 1
 
 
-def comparable(paths: list[str]) -> list[str]:
-    """Run the SHIPPED ``Get-ComparablePath`` over each path and return what it produced."""
+def comparable(paths: list[str], prelude: str = "", *, lexical: bool = False) -> list[str]:
+    """Run the SHIPPED ``Get-ComparablePath`` over each path and return what it produced.
+
+    ``prelude`` is PowerShell run before the first call, for example to set the thread culture.
+    ``lexical`` runs ``Get-ComparablePathLexical`` instead: the pre-#5454 form every governed-path
+    decision also asks (BACKLOG #5454). Each result comes back on its own ``|``-prefixed line, so an empty
+    result, the "could not resolve" sentinel, is returned as ``""`` rather than lost to the strip.
+    """
     src = GATE_SOURCE.read_text(encoding="utf-8")
     # The host-spellings list lives outside both functions and the fold consults it. An earlier version
     # of this helper omitted it, and every UNC row came back UNFOLDED -- a clean, wrong result that
@@ -102,17 +112,21 @@ def comparable(paths: list[str]) -> list[str]:
     if marker in src:
         var_start = src.index(marker)
         var = src[var_start : src.index("function Get-ComparablePath", var_start)]
-    block = var + "\n".join(_brace_block(src, n) for n in ("Get-FullPathRaw", "Get-ComparablePath"))
-    body = "\n".join(f"Get-ComparablePath '{p}'" for p in paths)
+    names = ["Get-FullPathRaw", "Get-ComparablePath"]
+    if lexical:
+        names.append("Get-ComparablePathLexical")
+    block = var + "\n".join(_brace_block(src, n) for n in names)
+    fn = "Get-ComparablePathLexical" if lexical else "Get-ComparablePath"
+    body = "\n".join(f"'|' + ({fn} '{p}')" for p in paths)
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", block + "\n" + body],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", block + "\n" + prelude + "\n" + body],
         capture_output=True,
         text=True,
         encoding="utf-8",
         timeout=60,
     )
     assert proc.returncode == 0, proc.stderr
-    return proc.stdout.strip().splitlines()
+    return [line[1:] for line in proc.stdout.splitlines() if line.startswith("|")]
 
 
 def test_every_local_spelling_of_one_path_compares_equal() -> None:

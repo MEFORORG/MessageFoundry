@@ -131,9 +131,10 @@ def test_a_client_built_with_a_longer_timeout_keeps_it_on_the_queued_calls() -> 
 
 def test_the_timeout_matches_the_ides_sign_in_timeout() -> None:
     """The two clients of the same queue wait the same time for the sign-in's reply. This pins the
-    IDE's constant only: the IDE has no client-wide timeout, so the Python client's floor for a
-    client built with a longer one has no IDE counterpart. The IDE's constant is read from its
-    source, so a change on either side reds here."""
+    IDE's constant only: the IDE has no configurable client-wide timeout (its default POST
+    deadline, ``POST_TIMEOUT_MS`` in ``engineClient.ts``, is this same constant), so the Python
+    client's floor for a client built with a longer one has no IDE counterpart. The IDE's constant
+    is read from its source, so a change on either side reds here."""
     source = Path(__file__).resolve().parents[1] / "ide" / "src" / "signInSession.ts"
     line = next(
         ln for ln in source.read_text(encoding="utf-8").splitlines() if "SIGN_IN_TIMEOUT_MS =" in ln

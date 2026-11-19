@@ -1527,7 +1527,9 @@ def _kill_hook(proc: asyncio.subprocess.Process, job: int | None) -> None:
     if job is not None:
         proctree.terminate_job(job)
         return
-    if proctree.kill_process_group(proc.pid, started_as_leader=proctree.ADOPT_NEW_SESSION):
+    if proctree.kill_process_group(
+        proc.pid, started_as_leader=proctree.ADOPT_NEW_SESSION, warn_empty=True
+    ):
         return
     if proc.returncode is None:
         try:
