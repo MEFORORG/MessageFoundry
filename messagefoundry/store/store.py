@@ -1020,15 +1020,17 @@ REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 #: the row, so this is damage rather than an erasure, and the reference itself opened: named apart
 #: from a reference that did not, so an operator knows which row to look for (BACKLOG #4996).
 REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
-#: The ``last_error`` of a re-ingress token whose own ``payload`` failed its queue tag at the handoff
-#: (BACKLOG #5982), after its claim had opened it: at least a routing column or the payload cell
-#: changed outside the store, or the payload was blanked. Named apart from a corrupt reference,
-#: because it is audited and alerted as a tag failure. The server backends import it.
+#: The ``last_error`` of a re-ingress token whose own ``payload`` failed its queue tag after its
+#: claim had opened it (BACKLOG #5982), at the reply read or at the handoff: at least a routing
+#: column or the payload cell changed outside the store, or the payload was blanked. Named apart
+#: from a corrupt reference or an undecryptable reply, because it is audited and alerted as a tag
+#: failure. The server backends and the re-ingress worker import it.
 REINGRESS_TOKEN_TAG_FAILED: Final = "integrity: the re-ingress work-row failed its queue tag"
-#: The ``outcome`` the handoff reports that tag failure with. It says the handoff refused the token
-#: rather than that the token is dead: the failure is queued for reporting before the dead-letter
-#: write, so a write or commit that then fails is still reported, and the token, left claimed, is
-#: refused and reported again on a later pass.
+#: The ``outcome`` the handoff reports that tag failure with (BACKLOG #5982). It says the handoff
+#: refused the token rather than that the token is dead. Each backend's handoff queues the report
+#: before its dead-letter write, so it is sent even when that write or its commit fails, or is
+#: fenced. The token then stays live, and a later claim refuses and reports it again under the
+#: claim's own outcome.
 REINGRESS_TAG_FAILURE_OUTCOME: Final = "was refused at the re-ingress handoff"
 #: The ``outcome`` the re-ingress worker's reply read reports a tag failure with
 #: (:meth:`MessageStore.response_body_for_work_row`), which then raises, so the worker dead-letters
@@ -15988,7 +15990,7 @@ class MessageStore:
         queue_tag_rows: list[aiosqlite.Row],
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
-        ``tag_failures``, and a work-row whose own payload failed its queue tag, once dead-lettered,
+        ``tag_failures``, and a work-row whose own payload failed its queue tag, before its dead-letter,
         to ``queue_tag_rows`` (BACKLOG #5982), for the caller to audit after the writer lock is
         released."""
         async with _writer_txn(self._db, self._lock):
@@ -16233,6 +16235,7 @@ class MessageStore:
         The token's ``payload`` is opened under its own tag (BACKLOG #5982). A token that fails it
         raises :class:`QueueTagError`, after the failure is audited and alerted as a claim reports
         one, so the worker dead-letters it rather than peek a reply it could not read."""
+        refused: QueueTagError | None = None
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
@@ -16257,15 +16260,16 @@ class MessageStore:
                     (mid, dest, seq),
                 )
                 art = await cur.fetchone()
-                return (
-                    self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
-                    if (art and art["body"] is not None)
-                    else ""
-                )
-        await report_queue_tag_failure(
-            self, self._cipher, row, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
+        if refused is not None:
+            await report_queue_tag_failure(
+                self, self._cipher, row, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
+            )
+            raise refused
+        return (
+            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
+            if (art and art["body"] is not None)
+            else ""
         )
-        raise refused
 
     async def record_ack_sent(
         self,

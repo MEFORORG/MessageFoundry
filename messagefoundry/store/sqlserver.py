@@ -9164,7 +9164,7 @@ class SqlServerStore:
         queue_tag_rows: list[dict[str, Any]],
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
-        ``tag_failures``, and a work-row whose own payload failed its queue tag, once dead-lettered,
+        ``tag_failures``, and a work-row whose own payload failed its queue tag, before its dead-letter,
         to ``queue_tag_rows`` (BACKLOG #5982), for the caller to audit."""
         # ADR 0157 C1: every DEAD branch below is TERMINAL on a claimed RESPONSE work-row AND
         # finalize the origin, so each is guarded. The SUCCESS path is deliberately NOT guarded: it
