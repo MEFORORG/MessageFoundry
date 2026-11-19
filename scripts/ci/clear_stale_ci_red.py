@@ -223,7 +223,7 @@ def _started(run: dict[str, object]) -> datetime | None:
     if not isinstance(raw, str) or not raw:
         return None
     try:
-        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        stamp = datetime.fromisoformat(raw)
     except ValueError:
         return None
     return stamp if stamp.tzinfo is not None else None
@@ -241,6 +241,9 @@ def _rank(run: dict[str, object]) -> tuple[bool, bool, datetime, bool, str]:
     passing and a failing run can share it -- the non-success (BACKLOG #5464). The run id last only
     makes equal-verdict picks deterministic. A pairwise "does this run outrank that one" folded over
     the list was not transitive across three runs, so it is a key and not a comparison.
+
+    The cost is deliberate and is named: a failed run whose start cannot be read speaks over every
+    later passing re-run of its name, so that context keeps the label until the head moves.
     """
     unsettled = run.get("status") != "completed"
     fails = run.get("conclusion") != "success"
