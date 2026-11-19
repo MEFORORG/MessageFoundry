@@ -100,6 +100,29 @@ def test_stall_threshold_default_off_and_toml_override(tmp_path: Path) -> None:
     assert st.max_oldest_seconds == 120.0
 
 
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_buildup_and_stall_thresholds_refuse_non_positive_or_non_finite(value: float) -> None:
+    # BACKLOG #5778: zero or below is crossed by every lane at all times (an alert per queued
+    # message); NaN or infinity is never crossed (the alert silently off). Both are refused at load,
+    # on the per-connection models and on the [delivery] keys that mirror them.
+    with pytest.raises(ValueError):
+        BuildupThreshold(max_oldest_seconds=value)
+    with pytest.raises(ValueError):
+        StallThreshold(max_oldest_seconds=value)
+    with pytest.raises(ValueError):
+        DeliverySettings(buildup_max_oldest_seconds=value)
+    with pytest.raises(ValueError):
+        DeliverySettings(stall_max_oldest_seconds=value)
+
+
+@pytest.mark.parametrize("depth", [0, -5])
+def test_buildup_depth_refuses_below_one(depth: int) -> None:
+    with pytest.raises(ValueError):
+        BuildupThreshold(max_depth=depth)
+    with pytest.raises(ValueError):
+        DeliverySettings(buildup_max_depth=depth)
+
+
 def test_saturation_threshold_default_off_and_toml_override(tmp_path: Path) -> None:
     # The [delivery] saturation_sustain_samples key mirrors SaturationThreshold; the saturation
     # (rising-backlog derivative) alert is OFF by default (deny-by-default, #93, ADR 0014 amendment),

@@ -544,10 +544,14 @@ class BuildupThreshold(BaseModel):
     pending message's age** reaches ``max_oldest_seconds``. ``None`` disables that dimension; both
     ``None`` disables buildup alerting for the connection. The age dimension defaults on (a head stuck
     over five minutes is a problem in any environment); depth is opt-in (a healthy ceiling depends on
-    the connection's throughput, so there's no safe universal default)."""
+    the connection's throughput, so there's no safe universal default).
 
-    max_depth: int | None = None
-    max_oldest_seconds: float | None = 300.0
+    A set dimension must be a positive, finite number (BACKLOG #5778): a depth or age of zero (or
+    below) is crossed by every lane at all times, and NaN or infinity is never crossed, which
+    silently disables the alert that ``None`` disables on purpose."""
+
+    max_depth: int | None = Field(default=None, ge=1)
+    max_oldest_seconds: float | None = Field(default=300.0, gt=0, allow_inf_nan=False)
 
 
 class StallThreshold(BaseModel):
@@ -560,9 +564,12 @@ class StallThreshold(BaseModel):
     default) **disables** the stall alert for the connection — deny-by-default/off unless an operator
     configures a threshold (it overlaps ``queue_buildup``'s age dimension, so it is opt-in to avoid
     double-paging by default). Resolution mirrors the other per-lane policies: per-connection
-    ``stall=`` override > the ``[delivery]`` global default > built-in (off)."""
+    ``stall=`` override > the ``[delivery]`` global default > built-in (off).
 
-    max_oldest_seconds: float | None = None
+    A set threshold must be positive and finite, for the reasons :class:`BuildupThreshold` gives
+    (BACKLOG #5778)."""
+
+    max_oldest_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 #: BACKLOG #5768: the rise, in messages, a lane's backlog must clear before saturation fires.
