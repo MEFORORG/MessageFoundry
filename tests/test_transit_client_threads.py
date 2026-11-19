@@ -267,20 +267,6 @@ def _encrypt_in_a_thread(factory: Callable[[], Any]) -> list[BaseException]:
 
 
 @_vault_extra
-def test_a_thread_client_that_cannot_be_built_is_an_outage_not_a_verdict() -> None:
-    """A thread whose own client cannot be built for a transport reason gave no verdict on the
-    value, so it is the no-verdict error, never a refusal that would read the value as damaged."""
-    import requests
-
-    def refuse_connect() -> Any:
-        raise requests.exceptions.ConnectionError("synthetic connection refused")
-
-    passed = _encrypt_in_a_thread(refuse_connect)
-    assert len(passed) == 1 and isinstance(passed[0], CipherUnavailableError)
-    assert isinstance(passed[0].__cause__, requests.exceptions.ConnectionError)
-
-
-@_vault_extra
 def test_a_thread_client_build_refusal_is_a_refusal_not_an_outage() -> None:
     """Mutation: relabel every build failure as a requests ConnectionError. Red: a deterministic
     configuration refusal, such as the TLS-suite check's ValueError, reads as an outage that a

@@ -6,7 +6,7 @@
   store closes the others it holds, even when an earlier close step raised; the cipher stays
   usable, because more than one store can share it. A cipher no store holds is not closed this
   way. Building a client sends no request to Vault, so a build failure is never a network
-  failure; a TLS-suite refusal is one such failure. A thread whose client cannot be built gets, on a read, the
+  failure; a TLS-suite refusal is one such build failure. A thread whose client cannot be built gets, on a read, the
   no-verdict outage error, since Vault was never asked about the value; on a write it gets the
   refusal, so the write is not retried for ever. (`BACKLOG #5963`)
 - **Every Transit request the cipher sends now times out at 5 seconds to connect and 30 seconds
