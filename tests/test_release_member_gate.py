@@ -634,13 +634,15 @@ def test_distribution_reads_a_hyphenated_toolkit_filename_as_the_toolkit(filenam
         # A parent segment an extractor resolves back to the engine package.
         "messagefoundry_toolkit/../messagefoundry/x.py",
         "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/../messagefoundry/x.py",
-        # The root is stripped for the engine test, never for the .data test.
+        # An engine name-version directory, and a .data tree.
         "messagefoundry_toolkit-0.4.0.data/purelib/x.py",
         "./messagefoundry_toolkit-0.4.0.data/scripts/messagefoundry",
     ],
 )
 def test_a_prefixed_or_dotted_engine_member_in_a_toolkit_archive_is_refused(member: str) -> None:
-    assert split_violation(member, "messagefoundry-toolkit") is not None
+    # The root a tar's listing shares, as inspect() derives it; a .data tree is refused with it.
+    first = [p for p in member.split("/") if p not in ("", ".")][0]
+    assert split_violation(member, "messagefoundry-toolkit", first) is not None
 
 
 @pytest.mark.parametrize(
@@ -681,110 +683,115 @@ def _link(name: str, target: str, kind: bytes) -> tarfile.TarInfo:
 
 
 @pytest.mark.parametrize(
-    ("kind", "target", "shown"),
+    ("kind", "target"),
     [
-        (tarfile.SYMTYPE, "../messagefoundry/__init__.py", "messagefoundry/__init__.py"),
-        (tarfile.SYMTYPE, "/tmp/x/CLAUDE.md", "CLAUDE.md"),
-        (
-            tarfile.LNKTYPE,
-            "messagefoundry_toolkit-0.4.0/messagefoundry/__init__.py",
-            "messagefoundry/__init__.py",
-        ),
+        (tarfile.SYMTYPE, "../messagefoundry/__init__.py"),
+        (tarfile.SYMTYPE, "real.py"),  # a link inside the toolkit's own tree is refused too
+        (tarfile.SYMTYPE, ".."),  # the head of a chained-link escape
+        (tarfile.SYMTYPE, "/usr/lib/python3.14/site-packages/messagefoundry/__init__.py"),
+        (tarfile.LNKTYPE, "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/real.py"),
+        (tarfile.FIFOTYPE, ""),
     ],
 )
-def test_the_cli_refuses_a_tar_link_whose_target_is_forbidden(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], kind: bytes, target: str, shown: str
+def test_the_cli_refuses_every_tar_link_or_special_member(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], kind: bytes, target: str
 ) -> None:
-    # BACKLOG #5470: getnames() never read a link's target, so an innocent link name passed.
-    sdist = _write_tar(
-        tmp_path / "dist" / "messagefoundry_toolkit-0.4.0.tar.gz",
-        [
-            tarfile.TarInfo("messagefoundry_toolkit-0.4.0/PKG-INFO"),
-            _link("messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/helper.py", target, kind),
-        ],
-    )
-    assert main([str(sdist)]) == 1
-    err = capsys.readouterr().err
-    assert "messagefoundry_toolkit/helper.py (a link to" in err and shown in err
-
-
-def test_the_cli_passes_a_tar_link_whose_target_is_clean(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Control for the refusal above: a link inside the toolkit's own tree passes."""
+    # BACKLOG #5470: getnames() never read a link's target, and a target read as text cannot follow
+    # a chain of links, so a published archive carrying any link is refused.
     sdist = _write_tar(
         tmp_path / "dist" / "messagefoundry_toolkit-0.4.0.tar.gz",
         [
             tarfile.TarInfo("messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/real.py"),
-            _link(
-                "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/alias.py",
-                "real.py",
-                tarfile.SYMTYPE,
-            ),
-        ],
-    )
-    assert main([str(sdist)]) == 0
-    # The link's target is an extra entry, not a member, so the count stays at the two members.
-    assert "inspected 2 members" in capsys.readouterr().out
-
-
-def test_a_symlink_target_is_read_from_the_link_s_own_directory(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """``a/h.py -> ../messagefoundry/x.py`` lands inside the toolkit package, so it passes; read
-    from the archive root, the same target would name the engine package."""
-    sdist = _write_tar(
-        tmp_path / "dist" / "messagefoundry_toolkit-0.4.0.tar.gz",
-        [
-            tarfile.TarInfo(
-                "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/messagefoundry/x.py"
-            ),
-            _link(
-                "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/a/h.py",
-                "../messagefoundry/x.py",
-                tarfile.SYMTYPE,
-            ),
-        ],
-    )
-    assert main([str(sdist)]) == 0
-    capsys.readouterr()
-
-
-@pytest.mark.parametrize(
-    "target",
-    [
-        "/usr/lib/python3.14/site-packages/messagefoundry/__init__.py",
-        "../../../site-packages/messagefoundry/__init__.py",
-        "C:/Python314/Lib/site-packages/messagefoundry/__init__.py",
-    ],
-)
-def test_the_cli_refuses_a_link_target_outside_the_archive(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], target: str
-) -> None:
-    sdist = _write_tar(
-        tmp_path / "dist" / "messagefoundry_toolkit-0.4.0.tar.gz",
-        [
-            _link(
-                "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/h.py", target, tarfile.SYMTYPE
-            )
+            _link("messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/h.py", target, kind),
         ],
     )
     assert main([str(sdist)]) == 1
-    assert "(a link to" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert (
+        "ships messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/h.py -- a link" in captured.err
+    )
+    assert "inspected 2 members" in captured.out
 
 
-def test_the_cli_refuses_a_zip_symlink_entry_whose_target_is_the_engine(
+def test_the_cli_passes_a_tar_of_regular_files_and_directories(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    wheel = tmp_path / "toolkit-dist" / _TOOLKIT_WHEEL
-    wheel.parent.mkdir(parents=True)
-    with zipfile.ZipFile(wheel, "w") as zf:
+    """Control for the refusal above: the same archive with no link passes."""
+    folder = tarfile.TarInfo("messagefoundry_toolkit-0.4.0/messagefoundry_toolkit")
+    folder.type = tarfile.DIRTYPE
+    sdist = _write_tar(
+        tmp_path / "dist" / "messagefoundry_toolkit-0.4.0.tar.gz",
+        [folder, tarfile.TarInfo("messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/real.py")],
+    )
+    assert main([str(sdist)]) == 0
+    assert "inspected 2 members" in capsys.readouterr().out
+
+
+def _toolkit_zip(path: Path, link_mode: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("messagefoundry_toolkit/__init__.py", "")
-        link = zipfile.ZipInfo("messagefoundry_toolkit/h.py")
-        link.external_attr = (0o120777 << 16) & 0xFFFF0000
-        zf.writestr(link, "../messagefoundry/__init__.py")
+        entry = zipfile.ZipInfo("messagefoundry_toolkit/h.py")
+        entry.external_attr = link_mode << 16
+        zf.writestr(entry, "../messagefoundry/__init__.py")
+    return path
+
+
+def test_the_cli_refuses_a_zip_symlink_entry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wheel = _toolkit_zip(tmp_path / "toolkit-dist" / _TOOLKIT_WHEEL, 0o120777)
     assert main([str(wheel)]) == 1
-    assert "messagefoundry_toolkit/h.py (a link to" in capsys.readouterr().err
+    assert "ships messagefoundry_toolkit/h.py -- a link" in capsys.readouterr().err
+
+
+def test_the_cli_passes_the_same_zip_entry_as_a_regular_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Control: only the link mode bit differs from the refusal above."""
+    wheel = _toolkit_zip(tmp_path / "toolkit-dist" / _TOOLKIT_WHEEL, 0o100644)
+    assert main([str(wheel)]) == 0
+    assert "inspected 2 members" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "root",
+    ["messagefoundry_toolkit-main", "messagefoundry_toolkit-v0.4.0", "messagefoundry_toolkit"],
+)
+def test_the_cli_strips_whatever_single_root_a_toolkit_tar_has(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], root: str
+) -> None:
+    sdist = _write_tar(
+        tmp_path / "dist" / "messagefoundry_toolkit-0.4.0.tar.gz",
+        [tarfile.TarInfo(f"{root}/PKG-INFO"), tarfile.TarInfo(f"{root}/messagefoundry/x.py")],
+    )
+    assert main([str(sdist)]) == 1
+    assert f"ships {root}/messagefoundry/x.py" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry.py",
+        "messagefoundry.pth",
+        "messagefoundry.cpython-314-x86_64-linux-gnu.so",
+        "messagefoundry-0.4.0.dist-info/METADATA",
+    ],
+)
+def test_a_toolkit_archive_may_not_carry_an_engine_named_module_or_dist_info(member: str) -> None:
+    assert split_violation(member, "messagefoundry-toolkit") is not None
+
+
+def test_a_hyphenated_harness_filename_is_not_exempt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exemption is keyed on the name as the build writes it, so a rename only tightens."""
+    wheel = _write_wheel(
+        tmp_path / "harness-dist" / "messagefoundry-harness-0.4.0-py3-none-any.whl",
+        ("harness/__init__.py", "harness/tests/test_x.py"),
+    )
+    assert main([str(wheel)]) == 1
+    assert "test or development content" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

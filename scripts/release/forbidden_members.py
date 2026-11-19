@@ -44,7 +44,6 @@ and the zero-member control below is what keeps a failed listing from reading as
 from __future__ import annotations
 
 import argparse
-import posixpath
 import re
 import stat
 import sys
@@ -141,21 +140,22 @@ RETIRED_ENGINE_PATHS: tuple[tuple[str, ...], ...] = (
 )
 
 
+_SPECIAL = "a link or special file; a published distribution carries regular files only"
+
+
 class InspectionError(RuntimeError):
     """An archive could not be inspected, so nothing about it has been proved."""
 
 
-def _members(archive: Path) -> list[tuple[str, str]]:
-    """Every ``(path, shown)`` pair to test in ``archive``, or raise :class:`InspectionError`.
+def _members(archive: Path) -> list[tuple[str, bool]]:
+    """Every member of ``archive`` as ``(name, special)``, or raise :class:`InspectionError`.
 
-    ``path`` is what the rules read and ``shown`` is how the error line names it. A member is one
-    pair, its name both times. A link member adds a pair for its TARGET too (BACKLOG #5470): the
-    listing alone never read a target, so an innocently named link whose extraction exposes an
-    engine path would pass. A tar hard link's target is an archive path. A symbolic link's, in a
-    tar or as a zip entry whose mode says link, is relative to the link's own directory, so it is
-    joined there; :func:`escapes_root` refuses one that is absolute or climbs out. The release
-    builds the toolkit wheel-only today, so the tar half guards a toolkit sdist that would be built
-    later, and every tar the gate is given now.
+    ``special`` marks a member that is not a regular file or directory: a tar symbolic or hard
+    link, device or fifo, or a zip entry whose Unix mode says symbolic link. :func:`inspect`
+    refuses every one (BACKLOG #5470). Reading names alone never saw a link's target, so an
+    innocently named link, or a chain of them, could make extraction write into the engine
+    package or outside the archive. Modelling targets by text cannot follow a chain; a published
+    distribution has no reason to carry a link, so refusing the class closes it whole.
 
     RAISING RATHER THAN RETURNING EMPTY IS THE POINT. "No forbidden member" and "the listing failed"
     are the same empty set, and a gate that cannot tell them apart reports a clean archive when it read
@@ -166,12 +166,12 @@ def _members(archive: Path) -> list[tuple[str, str]]:
     try:
         if archive.suffix.lower() in {".whl", ".zip"}:
             with zipfile.ZipFile(archive) as zf:
-                return [pair for info in zf.infolist() for pair in _zip_entries(zf, info)]
+                return [(i.filename, stat.S_ISLNK(i.external_attr >> 16)) for i in zf.infolist()]
         if suffixes[-2:] == [".tar", ".gz"] or archive.suffix.lower() == ".tgz":
             # `r:gz` and not `r:*`: the mode must be the one the filename promised, so a `.tar.gz`
             # that is secretly an uncompressed tar fails here rather than being read anyway.
             with tarfile.open(archive, "r:gz") as tf:
-                return [pair for info in tf.getmembers() for pair in _tar_entries(info)]
+                return [(i.name, not (i.isfile() or i.isdir())) for i in tf.getmembers()]
     # `EOFError` IS NOT AN `OSError`, and a truncated archive is exactly what raises it: a `.tar.gz`
     # cut mid-stream gives "Compressed file ended before the end-of-stream marker was reached" from
     # gzip, which an `OSError` clause walks straight past. Measured against a 40-byte truncation of a
@@ -187,38 +187,18 @@ def _members(archive: Path) -> list[tuple[str, str]]:
     )
 
 
-def _link_entry(name: str, target: str) -> tuple[str, str]:
-    """The ``(path, shown)`` pair for a link ``name`` whose target is ``target`` as stored."""
-    return target, f"{name} (a link to {target})"
+def _common_root(names: Sequence[str]) -> str | None:
+    """The one top-level directory every member of a tar sits under, or ``None``.
 
-
-def _symlink_target(name: str, linkname: str) -> str:
-    """A symbolic link's target as an archive path: joined to the link's own directory. An absolute
-    target, a drive letter included, stays absolute, so :func:`escapes_root` sees it."""
-    target = linkname.replace("\\", "/")
-    if re.match(r"[A-Za-z]:", target):
-        return target
-    return posixpath.join(posixpath.dirname(name.replace("\\", "/")), target)
-
-
-def _tar_entries(info: tarfile.TarInfo) -> list[tuple[str, str]]:
-    """The ``(path, shown)`` pairs one tar member contributes: itself, and any link target."""
-    entries = [(info.name, info.name)]
-    if info.issym():
-        entries.append(_link_entry(info.name, _symlink_target(info.name, info.linkname)))
-    elif info.islnk():
-        entries.append(_link_entry(info.name, info.linkname))
-    return entries
-
-
-def _zip_entries(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> list[tuple[str, str]]:
-    """The ``(path, shown)`` pairs one zip entry contributes. ``unzip`` restores an entry whose
-    Unix mode says symbolic link as a link to the path its content names, so that target counts."""
-    entries = [(info.filename, info.filename)]
-    if stat.S_ISLNK(info.external_attr >> 16):
-        linkname = zf.read(info).decode("utf-8", "replace")
-        entries.append(_link_entry(info.filename, _symlink_target(info.filename, linkname)))
-    return entries
+    An sdist puts everything under one ``<name>-<version>/`` root whatever the version looks like,
+    and the toolkit test reads the FIRST component, so the split rule tests each member without it
+    too (BACKLOG #5470). Derived from the listing, as the sdist leak gate does, not guessed from a
+    version shape."""
+    firsts = {tuple(_parts(n))[:1] for n in names}
+    if len(firsts) != 1 or not any(len(_parts(n)) > 1 for n in names):
+        return None
+    (first,) = firsts
+    return first[0] if first else None
 
 
 def _normalise(part: str) -> str:
@@ -363,7 +343,7 @@ def _resolve_dots(parts: list[str]) -> tuple[list[str], bool]:
 
 
 def escapes_root(member: str) -> str | None:
-    """Why ``member`` (a name, or a link target) points outside the archive, or ``None``.
+    """Why ``member`` points outside the archive, or ``None``.
 
     An absolute path, a drive letter, or a ``..`` that climbs above the archive's top level names a
     file the archive does not hold, such as an installed engine package, so no rule here can read
@@ -376,21 +356,26 @@ def escapes_root(member: str) -> str | None:
     return None
 
 
-def _split_candidates(member: str) -> list[list[str]]:
-    """Every reading of ``member`` the split rule tests, normalised: as written, with ``..``
-    applied, and each of those without a leading sdist ``<name>-<version>/`` root (BACKLOG #5470).
-
-    The toolkit test reads the FIRST component, so a root such as ``messagefoundry_toolkit-0.4.0/``
-    in front of ``messagefoundry/`` hid the engine package from it. Every reading is tested, never
-    just the stripped one, so stripping a root cannot hide a ``<name>.data/`` tree either."""
+def _split_candidates(member: str, root: str | None) -> list[list[str]]:
+    """Every reading of ``member`` the split rule tests, normalised: as written and with ``..``
+    applied, each also without the archive's common ``root`` when it has one (BACKLOG #5470).
+    Every reading is tested, so stripping a root cannot hide a ``<name>.data/`` tree."""
     raw = _parts(member)
-    readings = [raw, _resolve_dots(raw)[0]]
-    for parts in list(readings):
-        if len(parts) > 1 and _name_version(parts[0]) is not None:
-            readings.append(parts[1:])
-            readings.append(_resolve_dots(parts[1:])[0])
+    readings = [raw]
+    if root is not None and raw[:1] == [root]:
+        readings.append(raw[1:])
+    readings += [_resolve_dots(parts)[0] for parts in readings]
     unique = dict.fromkeys(tuple(_normalise(p) for p in parts) for parts in readings if parts)
     return [list(parts) for parts in unique]
+
+
+def _names_engine(part: str) -> bool:
+    """Whether one normalised component installs as the engine: its package or module by stem,
+    or its ``<name>-<version>.dist-info`` or sdist root by name."""
+    name = _name_version(part)
+    return _stem(part) == ENGINE_DISTRIBUTION or (
+        name is not None and re.sub(r"[-_.]+", "-", name) == ENGINE_DISTRIBUTION
+    )
 
 
 def _split_rule(parts: list[str], dist: str) -> str | None:
@@ -402,19 +387,20 @@ def _split_rule(parts: list[str], dist: str) -> str | None:
             if _has_retired_run(parts, retired):
                 return f"{'/'.join(retired)} moved to the toolkit distribution (ADR 0201)"
     elif dist == TOOLKIT_DISTRIBUTION:
-        if parts[0] == ENGINE_DISTRIBUTION:
+        if _names_engine(parts[0]):
             return "the toolkit may not write into the engine's package directory (ADR 0201)"
         if parts[0].endswith(".data"):
             return "the toolkit ships no wheel .data tree, which installs outside its package"
     return None
 
 
-def split_violation(member: str, dist: str) -> str | None:
+def split_violation(member: str, dist: str, root: str | None = None) -> str | None:
     """Why ``member`` breaks the engine and toolkit split for distribution ``dist``, or ``None``.
 
     An engine archive may carry nothing named for the toolkit's import package, as a directory, a
     module or a ``.pth`` (any component whose stem is ``messagefoundry_toolkit``), and no retired
-    engine path. A toolkit archive may carry nothing whose first component is ``messagefoundry``,
+    engine path. A toolkit archive may carry nothing whose first component installs as the
+    engine (``messagefoundry`` by stem, or an engine ``<name>-<version>`` directory),
     and no ``<name>.data/`` tree at all: PEP 427 installs ``purelib``, ``platlib``, ``scripts`` and
     ``data`` outside the package, where each can overwrite the engine's package or its console
     script. The toolkit has no reason to ship one, so refusing the whole class is simpler than
@@ -422,7 +408,9 @@ def split_violation(member: str, dist: str) -> str | None:
     distribution passes. Split and normalised exactly as :func:`forbidden` is, and tested in every
     reading :func:`_split_candidates` names.
     """
-    for parts in _split_candidates(member):
+    if dist not in (ENGINE_DISTRIBUTION, TOOLKIT_DISTRIBUTION):
+        return None
+    for parts in _split_candidates(member, root):
         why = _split_rule(parts, dist)
         if why is not None:
             return why
@@ -440,13 +428,18 @@ def distribution(archive: Path) -> str:
     its whole stem. A name no rule names is never exempt from the test-content rule, and the split
     rule does not run for it: that rule is keyed on the two names it was written for.
     """
+    return re.sub(r"[-_.]+", "-", _declared_name(archive)).casefold()
+
+
+def _declared_name(archive: Path) -> str:
+    """The name part of ``archive``'s filename as written, before normalisation."""
     name = archive.name
     lowered = name.lower()
     for suffix in (".tar.gz", ".tgz", ".whl", ".zip"):
         if lowered.endswith(suffix):
             name = name[: -len(suffix)]
             break
-    return re.sub(r"[-_.]+", "-", _name_version(name) or name).casefold()
+    return _name_version(name) or name
 
 
 def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
@@ -467,24 +460,27 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
             )
             continue
         dist = distribution(archive)
-        tooling = dist in TEST_TOOLING_DISTRIBUTIONS
+        # The exemption is keyed on the name as the build writes it, underscores only: a hyphenated
+        # spelling reads as the same distribution but is not exempt, so a rename only tightens.
+        tooling = dist in TEST_TOOLING_DISTRIBUTIONS and "-" not in _declared_name(archive)
+        names = [name for name, _special in entries]
+        root = _common_root(names) if archive.suffix.lower() not in {".whl", ".zip"} else None
         hits = [
-            (shown, why)
-            for path, shown in entries
+            (name, why)
+            for name, special in entries
             if (
-                why := forbidden(path)
-                or escapes_root(path)
-                or (None if tooling else development_content(path))
-                or split_violation(path, dist)
+                why := (_SPECIAL if special else None)
+                or forbidden(name)
+                or escapes_root(name)
+                or (None if tooling else development_content(name))
+                or split_violation(name, dist, root)
             )
             is not None
         ]
-        errors.extend(f"::error::{archive.name} ships {shown} -- {why}" for shown, why in hits)
-        # A link target is an extra entry, not a member, so the count is of members alone.
-        members = sum(1 for path, shown in entries if path == shown)
-        total += members
+        errors.extend(f"::error::{archive.name} ships {name} -- {why}" for name, why in hits)
+        total += len(entries)
         verdict = f"{len(hits)} forbidden" if hits else "none forbidden"
-        print(f"member gate: inspected {members} members in {archive.name}, {verdict}")
+        print(f"member gate: inspected {len(entries)} members in {archive.name}, {verdict}")
         if tooling:
             # Said in the log every time, so the exemption is visible where the verdict is read.
             print(
