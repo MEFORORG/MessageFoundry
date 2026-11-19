@@ -3761,16 +3761,28 @@ _NOT_AN_OBJECT = {
     "number": "5",
     "string": '"cancelled"',
     "boolean": "true",
+    # An object, but its flag is no JSON boolean: a [bool] cast read these as verdicts.
+    "flag-null": '{"unavailable": null}',
+    "flag-zero": '{"unavailable": 0}',
+    "flag-string": '{"unavailable": "false"}',
+}
+
+# Positive controls, classified in the same run: a check that called everything MALFORMED fails here.
+_WELL_FORMED = {
+    "marked": ('{"unavailable": true, "reason": "cancelled"}', "UNAVAILABLE"),
+    "cleared": ('{"unavailable": false}', "AVAILABLE"),
+    "reason-only": ('{"reason": "cancelled"}', "UNAVAILABLE"),
 }
 
 
 def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_path: Path) -> None:
     """Vault BACKLOG #5305. Red pre-fix: every one of these fell through to UNAVAILABLE -- the verdict
     for a recorded cancellation, which the collector honours by refusing to publish a live account --
-    and an array holding a cleared marker read as AVAILABLE outright. One pwsh run classifies them
-    all; the end-to-end test below drives the collector and the reader on two of them.
+    or read as AVAILABLE outright. One pwsh run classifies them all beside well-formed controls; the
+    end-to-end test below drives the collector and the reader on two of them.
     """
-    for name, body in _NOT_AN_OBJECT.items():
+    bodies = {**_NOT_AN_OBJECT, **{name: body for name, (body, _) in _WELL_FORMED.items()}}
+    for name, body in bodies.items():
         (tmp_path / name).mkdir()
         (tmp_path / name / "unavailable.json").write_text(body, encoding="utf-8")
     script = "; ".join(
@@ -3779,7 +3791,7 @@ def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_p
             "$out = [ordered]@{}",
             *(
                 f"$out['{name}'] = (Get-RootUnavailability -StateDir '{tmp_path / name}').state"
-                for name in _NOT_AN_OBJECT
+                for name in bodies
             ),
             "$out | ConvertTo-Json -Compress | Write-Output",
         ]
@@ -3793,7 +3805,9 @@ def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_p
     )
     assert proc.returncode == 0, proc.stderr
     states = json.loads(proc.stdout)
-    assert states == dict.fromkeys(_NOT_AN_OBJECT, "MALFORMED"), states
+    expected = dict.fromkeys(_NOT_AN_OBJECT, "MALFORMED")
+    expected.update({name: state for name, (_, state) in _WELL_FORMED.items()})
+    assert states == expected, states
 
 
 @pytest.mark.parametrize("name", ["empty", "array-of-clear"])

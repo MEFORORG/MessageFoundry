@@ -289,15 +289,19 @@ function Get-RootUnavailability {
     # and JSON null parse to $null without throwing, and an array or a scalar parses cleanly, so the
     # catch alone let all of them fall through to UNAVAILABLE -- the verdict for a recorded
     # cancellation, which stops the collector publishing a live account. An array holding
-    # `{"unavailable": false}` even read as AVAILABLE. Only an object can say anything here.
-    if ($doc -isnot [System.Management.Automation.PSCustomObject]) {
+    # `{"unavailable": false}` even read as AVAILABLE. Only an object can say anything here, and its
+    # `unavailable` flag only as a JSON boolean: a [bool] cast read null, "", 0 or [] as AVAILABLE and
+    # the string "false" as UNAVAILABLE.
+    $flag = $null
+    if ($doc -is [System.Management.Automation.PSCustomObject]) { $flag = $doc.PSObject.Properties['unavailable'] }
+    if ($doc -isnot [System.Management.Automation.PSCustomObject] -or ($flag -and $flag.Value -isnot [bool])) {
         $o.state = 'MALFORMED'
-        $o.reason = "the availability marker at $path is not a readable JSON object, so this account is treated as UNAVAILABLE rather than assumed spendable"
+        $o.reason = "the availability marker at $path could not be read, or is not a JSON object with a boolean 'unavailable', so this account is treated as UNAVAILABLE rather than assumed spendable"
         return $o
     }
     # A MARKER SAYING `unavailable: false` IS AN ANSWER, not a broken file. It is what -Clear could
     # leave behind, and honouring it is what lets an operator record "checked, still live" explicitly.
-    if ($doc.PSObject.Properties.Name -contains 'unavailable' -and -not [bool]$doc.unavailable) { return $o }
+    if ($flag -and -not $flag.Value) { return $o }
 
     $o.reason = [string]$doc.reason
     if (-not $o.reason) { $o.reason = 'no reason recorded in the marker' }
