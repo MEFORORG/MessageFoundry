@@ -54,34 +54,17 @@ def test_the_tests_conftest_registers_the_cap_in_this_run(pytestconfig: pytest.C
 
 
 def _binds_the_cap(source: str) -> bool:
-    """Whether ``source`` imports the cap hook at module level, bare or as the body of a ``try``
-    whose only handler catches ``ModuleNotFoundError`` and re-raises some other missing module."""
-    tree = ast.parse(source)
+    """Whether ``source`` imports the cap hook, under its own name, as a bare module-level statement.
 
-    def imports_it(stmts: list[ast.stmt]) -> bool:
-        return any(
-            isinstance(node, ast.ImportFrom)
-            and node.module == "tests._xdist_worker_cap"
-            and any(
-                a.name == "pytest_xdist_auto_num_workers" and a.asname is None for a in node.names
-            )
-            for node in stmts
-        )
-
-    for stmt in tree.body:
-        if imports_it([stmt]):
-            return True
-        if isinstance(stmt, ast.Try) and imports_it(stmt.body):
-            handlers = stmt.handlers
-            narrow = (
-                len(handlers) == 1
-                and isinstance(handlers[0].type, ast.Name)
-                and handlers[0].type.id == "ModuleNotFoundError"
-                and any(isinstance(n, ast.Raise) for n in ast.walk(handlers[0]))
-            )
-            if narrow:
-                return True
-    return False
+    Bare, not guarded: the console suite already needs ``tests/`` importable, so a guard would only
+    let a fault drop the cap silently.
+    """
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "tests._xdist_worker_cap"
+        and any(a.name == "pytest_xdist_auto_num_workers" and a.asname is None for a in node.names)
+        for node in ast.parse(source).body
+    )
 
 
 def test_the_console_conftest_registers_the_cap_too() -> None:
@@ -102,8 +85,19 @@ def test_the_console_conftest_registers_the_cap_too() -> None:
         "except ImportError:\n    pass\n",
         "def f():\n    from tests._xdist_worker_cap import pytest_xdist_auto_num_workers\n",
         "from tests._xdist_worker_cap import pytest_xdist_auto_num_workers as other\n",
+        "try:\n    from tests._xdist_worker_cap import pytest_xdist_auto_num_workers\n"
+        "except ModuleNotFoundError:\n    pass\n",
+        "try:\n    from tests._xdist_worker_cap import pytest_xdist_auto_num_workers\n"
+        "except ModuleNotFoundError:\n    raise\nexcept ImportError:\n    pass\n",
     ],
-    ids=["absent", "swallows-every-import-error", "not-module-level", "renamed"],
+    ids=[
+        "absent",
+        "swallows-every-import-error",
+        "not-module-level",
+        "renamed",
+        "swallows-a-missing-module",
+        "two-handlers",
+    ],
 )
 def test_the_console_binding_check_goes_red_without_the_binding(source: str) -> None:
     """Negative control: the check above must be able to fail."""

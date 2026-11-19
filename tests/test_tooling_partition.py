@@ -365,10 +365,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # #5445). A reworded comment arrives as an ENGINE diff the tooling path gate does not see.
         "test_scan_allowlist_whole_line_5445.py",
         # Pins the cap on the workers `pytest -n auto` starts: tests/_xdist_worker_cap.py and the
-        # two conftests that register it, the repo-root one and the web console suite's. ci.yml's
-        # `tooling=` path predicate matches none of those three paths, so an edit to one alone does
-        # not trip the tooling path gate; listed as tooling this guard would not run on the change
-        # that breaks it.
+        # two conftests that register it, tests/conftest.py and the web console suite's. ci.yml's
+        # `tooling=` path predicate matches tests/conftest.py but neither of the other two, so an
+        # edit to one of those alone does not trip the tooling path gate; listed as tooling this
+        # guard would not run on the change that breaks it.
         "test_xdist_auto_worker_cap.py",
     }
 )

@@ -4,25 +4,28 @@
 
 Two conftests register the hook below, because neither is loaded for every invocation:
 
-* the repo-root ``conftest.py``, which pytest loads for any run configured by the root
-  ``pyproject.toml``, under either testpath;
+* ``tests/conftest.py``, for runs that collect anything under ``tests/``: no arguments (pytest
+  uses ``testpaths``), a ``tests/...`` argument, or ``.``, where pytest also loads the conftest of
+  each ``test*`` directory below the argument;
 * ``packaging/messagefoundry-webconsole/tests/conftest.py``, because a run that names only that
   tree takes the web console's own ``pyproject.toml`` as its config file and rootdir, and then never
-  loads the repo-root conftest.
+  loads ``tests/conftest.py``.
 
 pytest-xdist resolves ``-n auto`` inside ``pytest_cmdline_main``, so only a conftest pytest loads
 before that, an "initial conftest", can take part; that is why this cannot live in a fixture or in a
 later hook. Where both conftests are loaded the wrapper runs twice, which is harmless: capping an
 already capped count changes nothing, and an override passes through both.
 
+No repo-root ``conftest.py`` registers it: importing one under pytest's default ``prepend`` mode
+moves the repository root to the front of ``sys.path``, which silences the cross-checkout refusal
+in ``tests/conftest.py`` and changes where ``messagefoundry_webconsole`` is imported from.
+
 Both import it package-qualified, the house idiom ``tests/test_conftest_name_collision_guard.py``
 describes; the web console suite already reaches ``tests/_deadline_capture.py`` the same way.
 
-At least these runs stay uncapped: ``--noconftest``, a ``--confcutdir`` below the conftest that
-would register the hook (measured: ``--confcutdir=tests`` gave 16 workers), a ``-c`` naming a config
-whose rootdir loads neither conftest, and the console tree tested where the engine's ``tests/`` is
-not importable (that conftest warns). The cap is per run, not per machine: seven concurrent runs can
-still start seven times ``MAX_AUTO_WORKERS``.
+At least these runs stay uncapped: ``--noconftest``, a run whose arguments reach neither
+conftest, and a ``-c`` naming a config whose rootdir loads neither. The cap is per run, not per
+machine: seven concurrent runs can still start seven times ``MAX_AUTO_WORKERS``.
 
 WHY NOT xdist's ``--maxprocesses`` IN ``addopts``. It would cap without code, but it also caps an
 explicit ``-n N``, which this cap deliberately leaves alone, and a run under ``-p no:xdist`` (the web
@@ -36,12 +39,12 @@ from collections.abc import Generator
 
 import pytest
 
-#: The most workers ``-n auto`` (or ``-n logical``) may start in one run. Many sessions run pytest
-#: at once on one development PC, and each ``-n auto`` run sizes itself to the machine's physical
-#: cores (16 on that box), so they fight for the same CPUs and memory. Measured 2026-11-18 on a
-#: 32-logical-CPU box: at least seven concurrent pytest runs, 85 python processes and 27.8 GB of
-#: private memory. The cap is an upper bound only: a machine with fewer cores, such as a 4 vCPU CI
-#: runner, keeps its own count.
+#: The most workers ``-n auto`` (or ``-n logical``) starts in one run when ``AUTO_WORKERS_ENV`` is
+#: unset or not an integer; a valid override is not capped. Many sessions run pytest at once on one
+#: development PC, and each ``-n auto`` run sizes itself to the machine's physical cores (16 on that
+#: box), so they fight for the same CPUs and memory. Measured 2026-11-18 on a 32-logical-CPU box: at
+#: least seven concurrent pytest runs, 85 python processes and 27.8 GB of private memory. The cap is
+#: an upper bound only: a machine with fewer cores, such as a 4 vCPU CI runner, keeps its own count.
 MAX_AUTO_WORKERS = 8
 
 #: pytest-xdist's own per-run override. Its hook implementation returns this value ahead of any CPU

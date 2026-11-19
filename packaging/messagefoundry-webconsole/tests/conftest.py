@@ -19,10 +19,10 @@ The shared ``engine`` fixture (moved out of ``test_webui.py`` so the golden-surf
 an app too) lives here as well. The mid-test asyncio<->aiosqlite cross-loop concern is handled by the
 session loop scopes in ``pyproject.toml`` — not here.
 
-One module imports from the engine suite rather than copying: ``test_ui_dr_outlive.py`` uses
-``tests/_deadline_capture.py``, so it needs the engine checkout's ``tests/`` importable. That
-helper's docstring says how it is reached. This conftest also imports the ``-n auto`` worker cap
-from ``tests/_xdist_worker_cap.py``, but tolerates its absence, so no other test needs ``tests/``.
+This suite needs the engine checkout's ``tests/`` importable. At least this conftest imports the
+``-n auto`` worker cap from ``tests/_xdist_worker_cap.py``, and test modules import shared helpers
+from it rather than copying them (``test_ui_dr_outlive.py`` uses ``tests/_deadline_capture.py``,
+whose docstring says how it is reached).
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ import functools
 import inspect
 import logging
 import sys
-import warnings
 from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -43,14 +42,8 @@ from _ui_clients import HEADERLESS_UI_REQUEST
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
-# Caps pytest -n auto; tests/_xdist_worker_cap.py says why it is registered here too. Where the
-# engine checkout's tests/ is not importable this suite still runs, uncapped, rather than failing.
-try:
-    from tests._xdist_worker_cap import pytest_xdist_auto_num_workers  # noqa: F401
-except ModuleNotFoundError as exc:
-    if exc.name not in ("tests", "tests._xdist_worker_cap"):
-        raise
-    warnings.warn(f"pytest -n auto runs uncapped: {exc}", stacklevel=1)
+# Caps pytest -n auto; tests/_xdist_worker_cap.py says why it is registered here too.
+from tests._xdist_worker_cap import pytest_xdist_auto_num_workers  # noqa: F401
 
 # The engine suite's request-deadline helper, which test_ui_dr_outlive.py imports. pytest rewrites
 # asserts only in test modules unless told, and the engine conftest that tells it may not be loaded.
