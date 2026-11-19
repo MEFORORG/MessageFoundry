@@ -99,8 +99,12 @@ async def test_the_second_step_checks_the_secret_the_seal_covered(
     assert user is not None
     _swap_the_stored_secret(monkeypatch, store)
     assert await store.get_totp_secret(identity.user_id) == _ATTACKER  # the swap is live
-    assert not await service._verify_second_factor(user, clock.code(_ATTACKER))
-    assert await service._verify_second_factor(user, clock.code(secret))  # control
+    assert not await service._verify_second_factor(
+        user, clock.code(_ATTACKER), totp_secret=await service._totp_secret(user)
+    )
+    assert await service._verify_second_factor(
+        user, clock.code(secret), totp_secret=await service._totp_secret(user)
+    )  # control
 
 
 async def test_a_secret_written_into_the_cell_after_the_load_is_not_used(
@@ -116,7 +120,9 @@ async def test_a_secret_written_into_the_cell_after_the_load_is_not_used(
     cell = store.cipher().encrypt(_ATTACKER, aad=cell_aad("users", "totp_secret", identity.user_id))
     await _raw_for(path)("UPDATE users SET totp_secret=? WHERE id=?", (cell, identity.user_id))
     assert await store.get_totp_secret(identity.user_id) == _ATTACKER  # the cell is the attacker's
-    assert not await service._verify_second_factor(user, clock.code(_ATTACKER))
+    assert not await service._verify_second_factor(
+        user, clock.code(_ATTACKER), totp_secret=await service._totp_secret(user)
+    )
 
 
 async def test_the_combined_sign_in_checks_the_secret_the_seal_covered(

@@ -254,9 +254,10 @@ async def test_the_service_paths_that_open_the_totp_cell_open_it_off_the_loop(
     # Cannot fail once the equality above passes. It restates that census in a form the
     # vacuous-absence lint reads as a guard on the on-loop walk below; the equality is the check.
     assert seen, "the spy recorded no open, so the on-loop walk below would inspect nothing"
-    # A verify opens the cell for the enrolment it checks, for the code, and again for the
-    # enrolment the row holds after the check; the replay's after-read is its third.
-    assert len(seen["two-step"]) >= 3 and len(seen["replayed"]) >= 3, seen
+    # BACKLOG #5781: a verify opens the cell ONCE, for the enrolment it checks, and checks the code
+    # against that secret; the after-check reads find the row's TOTP columns unmoved, so they open
+    # nothing, on a replay's failed spend too. Three each before the fix.
+    assert len(seen["two-step"]) == 1 and len(seen["replayed"]) == 1, seen
     loop_thread = threading.current_thread()
     on_loop = sorted(p for p, threads in seen.items() if loop_thread in threads)
     assert on_loop == [], f"a TOTP cell was opened on the event loop by: {on_loop}"
@@ -298,36 +299,36 @@ async def test_a_cell_that_did_not_open_before_the_check_spends_no_code(
         await store.close()
 
 
-async def test_a_cell_that_opens_before_the_check_but_not_for_it_spends_no_code(
+async def test_a_verify_checks_its_code_against_the_one_open_of_the_cell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The other order: the enrolment read before the check opens, the check's own open does not.
-    The check raises at its TOTP decrypt, before any recovery code is read, so the verify is refused
-    ``factor_unverified``, never raised, and the recovery code still verifies afterwards."""
+    """BACKLOG #5781: the two-step verify opens the TOTP cell once, for the enrolment it reads
+    before the check, and checks the code against that secret; the after-check comparison of an
+    unmoved row opens nothing. A cipher that refuses every open after the first, as a Transit
+    service that starts failing mid-request does, therefore still lets a good code through. RED
+    when the check, or the after-check comparison of an unmoved row, opens the cell again: that
+    open is refused, and the verify answers ``factor_unverified``."""
     from messagefoundry.store.crypto import CipherError
 
     store = await MessageStore.open(":memory:")
     try:
-        service, _identity, password, _steps, codes = await _totp_admin(
+        service, _identity, password, steps, _codes = await _totp_admin(
             store, monkeypatch, before_confirm=lambda: None
         )
+        pending = await service.login(ADMIN_USERNAME, password)
+        assert pending.ok and pending.token is not None
         real_open = store.open_totp_secret
         opens = [0]
 
-        def second_fails(user_id: str, cell: str | None) -> str | None:
+        def only_the_first_opens(user_id: str, cell: str | None) -> str | None:
             opens[0] += 1
-            if opens[0] == 2:
-                raise CipherError("synthetic: the cipher service dropped this request")
+            if opens[0] > 1:
+                raise CipherError("synthetic: the cipher service refused this request")
             return real_open(user_id, cell)
 
-        monkeypatch.setattr(store, "open_totp_secret", second_fails)
-        pending = await service.login(ADMIN_USERNAME, password)
-        assert pending.ok and pending.token is not None
-        assert not (await service.verify_mfa(pending.token, codes[0])).ok
-        assert opens[0] == 2, "the verify did not reach the check's own open"
-        rows = await store.list_audit(action="auth.mfa_failed")
-        assert any((r["detail"] or "").find("factor_unverified") >= 0 for r in rows), rows
-        assert (await service.verify_mfa(pending.token, codes[0])).ok
+        monkeypatch.setattr(store, "open_totp_secret", only_the_first_opens)
+        assert (await service.verify_mfa(pending.token, steps.next_code())).ok
+        assert opens[0] == 1, f"the verify opened the cell {opens[0]} times"
     finally:
         await store.close()
 

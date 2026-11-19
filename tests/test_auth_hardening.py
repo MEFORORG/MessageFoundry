@@ -763,7 +763,9 @@ async def test_recovery_code_verify_cost_does_not_vary_with_the_code(
     verified = await service._load_user(user.id)
     assert verified is not None
     calls["n"] = 0
-    ok = await service._verify_second_factor(verified, presented)
+    ok = await service._verify_second_factor(
+        verified, presented, totp_secret=await service._totp_secret(verified)
+    )
 
     assert ok is (present != "wrong"), why
     assert calls["n"] == slots, (
@@ -821,12 +823,18 @@ async def test_a_failed_totp_attempt_costs_the_recovery_walk_whatever_the_reason
     verified = await service._load_user(user.id)  # the checked record, after the enrolment
     assert verified is not None
     if present == "replayed":
-        assert await service._verify_second_factor(verified, code, arrived=arrived) is True
+        opened = await service._totp_secret(verified)
+        assert (
+            await service._verify_second_factor(verified, code, totp_secret=opened, arrived=arrived)
+            is True
+        )
     elif present == "wrong":
         code = f"{(int(code) + 1) % 1_000_000:06d}"
 
     used.clear()
-    ok = await service._verify_second_factor(verified, code, arrived=arrived)
+    ok = await service._verify_second_factor(
+        verified, code, totp_secret=await service._totp_secret(verified), arrived=arrived
+    )
 
     assert ok is expect_ok
     expected = [] if expect_ok else walk
