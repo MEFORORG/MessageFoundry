@@ -111,7 +111,9 @@ def write_claim(
     return p
 
 
-def reconcile(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def reconcile(
+    repo: Path, *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "pwsh",
@@ -125,6 +127,7 @@ def reconcile(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
+        env=env,
     )
 
 
@@ -221,10 +224,118 @@ def test_apply_releases_only_the_releasable_and_records_each_one(
     assert records[0]["prior_branch"] == "landed"
 
 
+def test_a_claim_whose_key_names_another_file_is_never_released(repo: Path, tmp_path: Path) -> None:
+    """BACKLOG #5482: -Release deletes the file the KEY names, so the key must name this file.
+
+    ``k-a.json`` carries the key ``k-b`` and judges releasable; ``k-b.json`` is a real claim guarding
+    unmerged work. Releasing ``k-a.json`` by its key would delete ``k-b.json`` instead.
+    """
+    landed_branch(repo, "landed")
+    unmerged_branch(repo, "unmerged")
+    guarded = write_claim(repo, "k-b", tmp_path / "vanished", "unmerged")
+    stray = write_claim(repo, "k-a", tmp_path / "vanished", "landed")
+    claim = json.loads(stray.read_bytes())
+    claim["key"] = "k-b"
+    stray.write_bytes(json.dumps(claim).encode("utf-8"))
+
+    proc = reconcile(repo, "-Json", "-Apply")
+    assert proc.returncode == 0, proc.stderr
+    out = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}
+    assert guarded.exists(), "the claim the stray key names must survive"
+    assert stray.exists(), "a mismatched claim is reported, never released"
+    assert out["k-a"]["verdict"] == "KEY-MISMATCH", out
+    assert "outcome" not in out["k-a"], out
+    assert out["k-b"]["verdict"] == "HOLD", out
+
+
+def test_a_date_shaped_key_is_released_under_its_own_spelling(repo: Path, tmp_path: Path) -> None:
+    """BACKLOG #5482: ConvertFrom-Json would read an ISO-shaped key as a [datetime].
+
+    Through [string] it came back as local short text, which -Release folds to a file that does not
+    exist; claim.ps1 exits 0 on that, so the row read "released" while the claim stayed.
+    """
+    landed_branch(repo, "landed")
+    key = "2026-08-01T00:00:00"
+    p = write_claim(
+        repo, "2026-08-01t00-00-00", tmp_path / "vanished", "landed"
+    )  # claim.ps1's name
+    claim = json.loads(p.read_bytes())
+    claim["key"] = key
+    p.write_bytes(json.dumps(claim).encode("utf-8"))
+
+    proc = reconcile(repo, "-Json", "-Apply")
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert row["key"] == key, row
+    assert not p.exists(), row
+    assert row["outcome"] == "released", row
+
+
+def test_a_case_variant_file_name_is_a_key_mismatch(repo: Path, tmp_path: Path) -> None:
+    """claim.ps1 writes the folded, lower-case name; on a case-sensitive disk a variant is another file."""
+    landed_branch(repo, "landed")
+    p = write_claim(repo, "k-case", tmp_path / "vanished", "landed")
+    variant = p.with_name("K-Case.json")
+    p.rename(variant)
+    proc = reconcile(repo, "-Json", "-Apply")
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert row["verdict"] == "KEY-MISMATCH", row
+    assert variant.exists(), row
+
+
+def _ps_function(path: Path, name: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    start = text.index(f"function {name}(")
+    return text[start : text.index("\n}\n", start) + 2]
+
+
+def test_the_key_file_fold_is_claim_ps1s_own() -> None:
+    """The copy in claim-reconcile.ps1 must fold a key exactly as claim.ps1 -Release does."""
+    assert _ps_function(RECONCILE, "ConvertTo-KeyFile") == _ps_function(CLAIM, "ConvertTo-KeyFile")
+
+
 def _gh_stub(tmp_path: Path, payload: str) -> Path:
     """Stand-in for `gh`. Ignores its arguments and prints one canned JSON document."""
     stub = tmp_path / "gh-stub.ps1"
     stub.write_text(f"param()\n@'\n{payload}\n'@\n", encoding="utf-8")
+    return stub
+
+
+def github_origin(repo: Path) -> None:
+    """A GitHub-shaped origin: every pull-request probe is scoped with --repo, and holds without one."""
+    if "origin" not in git(repo, "remote").split():
+        git(repo, "remote", "add", "origin", "https://github.com/example/sandbox.git")
+
+
+def _merged_pr(tip: str, base: str = "main", landing: str | None = None) -> str:
+    """One merged pull request as `gh pr list --json` prints it."""
+    pr: dict[str, object] = {
+        "number": 346,
+        "headRefOid": tip,
+        "mergedAt": "2026-08-12T17:45:36Z",
+        "baseRefName": base,
+    }
+    if landing is not None:
+        pr["mergeCommit"] = {"oid": landing}
+    return json.dumps([pr])
+
+
+def _scoped_gh_stub(tmp_path: Path, payload: str) -> Path:
+    """A `gh` that answers ``payload`` only to a call scoped to the sandbox repo and to base main.
+
+    Any other call gets ``[]``, the answer a correctly scoped query gets from a repository where the
+    branch never merged. So only a probe that passes both --repo and --base sees the evidence. Each
+    is matched as a whole token, so ``--base main-next`` is not ``--base main``.
+    """
+    stub = tmp_path / "gh-scoped.ps1"
+    stub.write_text(
+        "$a = $args -join ' '\n"
+        "if ($a -match '(^| )--repo example/sandbox( |$)' -and $a -match '(^| )--base main( |$)') {\n"
+        f"@'\n{payload}\n'@\n"
+        "} else { '[]' }\n",
+        encoding="utf-8",
+    )
     return stub
 
 
@@ -239,22 +350,53 @@ def test_a_squash_merged_branch_is_releasable_when_a_merged_pr_has_its_tip(
     unmerged_branch(repo, "squashed")
     tip = git(repo, "rev-parse", "squashed").strip()
     write_claim(repo, "k-squashed", tmp_path / "vanished", "squashed")
-    stub = _gh_stub(
-        tmp_path, f'[{{"number":346,"headRefOid":"{tip}","mergedAt":"2026-08-12T17:45:36Z"}}]'
-    )
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr(tip))
 
     out = verdicts(repo, "-GhCommand", str(stub))
     assert out["k-squashed"] == "RELEASABLE"
+
+
+def test_a_gone_holder_probe_is_scoped_to_the_repo_and_base(repo: Path, tmp_path: Path) -> None:
+    """BACKLOG #5481: the gone-holder probe asks the same scoped question the present arm asks."""
+    unmerged_branch(repo, "scoped")
+    tip = git(repo, "rev-parse", "scoped").strip()
+    write_claim(repo, "k-scoped", tmp_path / "vanished", "scoped")
+    github_origin(repo)
+    out = verdicts(repo, "-GhCommand", str(_scoped_gh_stub(tmp_path, _merged_pr(tip))))
+    assert out["k-scoped"] == "RELEASABLE", out
+
+
+def test_a_gone_holder_pr_merged_into_another_base_does_not_release(
+    repo: Path, tmp_path: Path
+) -> None:
+    """BACKLOG #5481: a branch of that name merged into another base proves nothing about main."""
+    unmerged_branch(repo, "other-base")
+    tip = git(repo, "rev-parse", "other-base").strip()
+    write_claim(repo, "k-other-base", tmp_path / "vanished", "other-base")
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr(tip, base="parent-feature"))
+    assert verdicts(repo, "-GhCommand", str(stub))["k-other-base"] == "HOLD"
+
+
+def test_a_gone_holder_with_no_github_origin_does_not_release(repo: Path, tmp_path: Path) -> None:
+    """BACKLOG #5481: with no repository to scope the probe to, the question cannot be asked."""
+    unmerged_branch(repo, "no-origin")
+    tip = git(repo, "rev-parse", "no-origin").strip()
+    write_claim(repo, "k-no-origin", tmp_path / "vanished", "no-origin")
+    proc = reconcile(repo, "-Json", "-GhCommand", str(_gh_stub(tmp_path, _merged_pr(tip))))
+    assert proc.returncode == 0, proc.stderr
+    row = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}["k-no-origin"]
+    assert row["verdict"] == "HOLD", row
+    assert "could NOT be established" in row["why"], row
 
 
 def test_a_merged_pr_at_a_DIFFERENT_tip_does_not_release(repo: Path, tmp_path: Path) -> None:
     """A PR proves some earlier state landed -- not the state this claim is guarding."""
     unmerged_branch(repo, "moved-on")
     write_claim(repo, "k-moved", tmp_path / "vanished", "moved-on")
-    stub = _gh_stub(
-        tmp_path,
-        '[{"number":1,"headRefOid":"0000000000000000000000000000000000000000","mergedAt":"2026-08-01T00:00:00Z"}]',
-    )
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr("0" * 40))
 
     assert verdicts(repo, "-GhCommand", str(stub))["k-moved"] == "HOLD"
 
@@ -379,24 +521,54 @@ def test_a_branch_whose_files_match_the_LANDING_commit_is_releasable(
     git(repo, "commit", "-qm", "main moves on and edits the same file")
 
     write_claim(repo, "k-landing", tmp_path / "vanished", "feature")
-    stub = _gh_stub(
-        tmp_path,
-        '[{"number":346,"headRefOid":"0000000000000000000000000000000000000000",'
-        f'"mergedAt":"2026-08-12T17:45:36Z","mergeCommit":{{"oid":"{landing}"}}}}]',
-    )
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr("0" * 40, landing=landing))
     out = verdicts(repo, "-GhCommand", str(stub))
     assert out["k-landing"] == "RELEASABLE", out
+
+
+def test_a_rename_whose_deletion_never_landed_holds(repo: Path, tmp_path: Path) -> None:
+    """BACKLOG #5483: arm four must compare a renamed file's OLD path too.
+
+    The branch renames ``old.txt`` to ``new.txt``. The landing commit carries ``new.txt``
+    byte-identical but still has ``old.txt``, so the deletion is unmerged work. With rename detection
+    on, the diff lists only ``new.txt``, which matches, and the claim read releasable.
+    """
+    git(repo, "config", "diff.renames", "true")  # git's default, pinned against a user setting
+    (repo / "old.txt").write_text("content that moves\n" * 20, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "a file the branch will rename")
+
+    git(repo, "branch", "renamer", "main")
+    wt = repo.parent / "wt-renamer"
+    git(repo, "worktree", "add", "-q", str(wt), "renamer")
+    git(wt, "mv", "old.txt", "new.txt")
+    git(wt, "commit", "-qm", "rename old.txt to new.txt")
+    git(repo, "worktree", "remove", "--force", str(wt))
+
+    # the landing: the new path arrives, the old path stays -- half the rename merged
+    shutil.copy2(repo / "old.txt", repo / "new.txt")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "squash that took the new file but not the deletion (#347)")
+    landing = git(repo, "rev-parse", "HEAD").strip()
+
+    write_claim(repo, "k-rename", tmp_path / "vanished", "renamer")
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr("0" * 40, landing=landing))
+    proc = reconcile(repo, "-Json", "-GhCommand", str(stub))
+    assert proc.returncode == 0, proc.stderr
+    row = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}["k-rename"]
+    assert row["verdict"] == "HOLD", row
+    # held by the blob comparison, not by a diff that could not run
+    assert "differ from the landing commit" in row["why"], row
 
 
 def test_a_merged_pr_with_no_readable_landing_commit_holds(repo: Path, tmp_path: Path) -> None:
     """The negative control for arm four: a PR at another tip proves an earlier state landed."""
     unmerged_branch(repo, "other-tip")
     write_claim(repo, "k-other", tmp_path / "vanished", "other-tip")
-    stub = _gh_stub(
-        tmp_path,
-        '[{"number":1,"headRefOid":"0000000000000000000000000000000000000000",'
-        '"mergedAt":"2026-08-01T00:00:00Z","mergeCommit":{"oid":""}}]',
-    )
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr("0" * 40, landing=""))
     assert verdicts(repo, "-GhCommand", str(stub))["k-other"] == "HOLD"
 
 
@@ -485,8 +657,7 @@ def present_holder(repo: Path, name: str) -> tuple[Path, str]:
     Also gives the sandbox a GitHub-shaped origin, because the arm scopes every gh call with --repo
     and holds the claim when it cannot. The stub ignores the value; no network is touched.
     """
-    if "origin" not in git(repo, "remote").split():
-        git(repo, "remote", "add", "origin", "https://github.com/example/sandbox.git")
+    github_origin(repo)
     wt = repo.parent / f"wt-{name}"
     git(repo, "worktree", "add", "-q", str(wt), "-b", name)
     (wt / f"{name}.txt").write_text("the delivered work", encoding="utf-8")
@@ -810,6 +981,39 @@ def test_apply_releases_a_finished_present_holder_and_leaves_the_worktree(
     assert Path(records[0]["invoked_from"]).resolve() == repo.resolve()
 
 
+def test_a_claim_stamp_with_no_offset_cannot_be_ordered(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """Read as text, an offset-less stamp is local or UTC by guess, hours apart. It holds."""
+    wt, tip = present_holder(repo, "no-offset")
+    p = write_claim(repo, "9126", wt, "no-offset")
+    claim = json.loads(p.read_bytes())
+    claim["claimed"] = "2026-08-12T12:00:00"
+    p.write_bytes(json.dumps(claim).encode("utf-8"))
+    cfg = fence_root(tmp_path, sleeper, repo)
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr_at(tip, "9126"))))
+    assert verdict["9126"] == "MERGED-HELD", why
+    assert "timestamp is unreadable" in why["9126"]
+
+
+def test_apply_releases_a_present_holder_claim_with_no_key_field(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """The -Apply re-check keys a claim with no key field by its file name, as the scan does."""
+    wt, tip = present_holder(repo, "no-key-field")
+    p = write_claim(repo, "9125", wt, "no-key-field")
+    claim = json.loads(p.read_bytes())
+    del claim["key"]
+    p.write_bytes(json.dumps(claim).encode("utf-8"))
+    cfg = fence_root(tmp_path, sleeper, repo)
+    stub = gh_router(tmp_path, head=json.dumps(pr_at(tip, "9125")))
+    proc = reconcile(repo, "-Json", "-Apply", "-GhCommand", str(stub), "-ConfigRoot", str(cfg))
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert row.get("outcome") == "released", row
+    assert not p.exists(), row
+
+
 def test_apply_rechecks_a_holder_that_changed_after_the_scan(
     repo: Path, tmp_path: Path, sleeper: int
 ) -> None:
@@ -838,6 +1042,7 @@ def test_apply_rechecks_a_holder_that_changed_after_the_scan(
     assert moved.exists(), "a holder that changed after the scan must keep its claim"
     assert out["9121"]["verdict"] == "MERGED-HELD", out["9121"]
     assert "changed since the scan" in out["9121"]["why"]
+    assert out["9121"]["outcome"].startswith("NOT released"), out["9121"]
     assert not still.exists(), "the untouched holder is the positive control"
     assert out["9122"]["verdict"] == "RELEASABLE"
     assert out["9122"]["outcome"] == "released", "the JSON carries each release's outcome"
@@ -895,3 +1100,279 @@ def test_apply_with_claims_dir_is_refused(repo: Path, tmp_path: Path) -> None:
     proc = reconcile(repo, "-Apply", "-ClaimsDir", str(audit))
     assert proc.returncode == 2, proc.stdout
     assert live.exists()
+
+
+def _ps_quote(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _gone_holder_release(
+    repo: Path, tmp_path: Path, key: str, branch: str, holder: Path, side_effect: str = ""
+) -> tuple[Path, dict[str, object]]:
+    """One gone-holder claim on an unmerged branch, released through the pull-request arm.
+
+    ``side_effect`` is PowerShell the gh stub runs on the probe for ``branch``, which runs after the
+    scan read the claim file, so the scan judges RELEASABLE from what it read before the change. One
+    claim per run keeps each pwsh spawn far inside TIMEOUT; a single run carrying six claims took
+    about 32s of its 45 and crashed an xdist worker under -n 4.
+    """
+    unmerged_branch(repo, branch)
+    claim = write_claim(repo, key, holder, branch)
+    github_origin(repo)
+    tip = git(repo, "rev-parse", branch).strip()
+    stub = gh_router(tmp_path, head=_merged_pr(tip), on_head=side_effect)
+    proc = reconcile(repo, "-Json", "-Apply", "-GhCommand", str(stub))
+    assert proc.returncode == 0, proc.stderr
+    return claim, {c["key"]: c for c in json.loads(proc.stdout)["claims"]}[key]
+
+
+def _history_keys(repo: Path) -> list[str]:
+    history = claims_dir(repo) / ".history"
+    if not history.exists():
+        return []
+    lines = history.read_text(encoding="utf-8").strip().splitlines()
+    return sorted(json.loads(line)["key"] for line in lines)
+
+
+def _replace_in_file(path: Path, old: str, new: str) -> str:
+    """PowerShell that rewrites ``old`` to ``new`` in ``path``, for a gh stub side effect."""
+    return (
+        f"$p = {_ps_quote(str(path))}; [IO.File]::WriteAllText($p, "
+        f"[IO.File]::ReadAllText($p).Replace({_ps_quote(old)}, {_ps_quote(new)}))"
+    )
+
+
+@pytest.mark.parametrize("case", ["respelled", "retaken", "recreated", "shifted"])
+def test_apply_rereads_a_gone_holder_claim_and_keeps_one_that_changed(
+    repo: Path, tmp_path: Path, case: str
+) -> None:
+    """A gone holder's release takes -Force, so -Apply re-reads the claim file before it.
+
+    The gh stub changes the claim while the scan probes its pull request. One edit re-spells the key,
+    one names another holder, one re-creates the holder directory with the file untouched -- a bare
+    -Take re-asserts a claim without writing it, so only the holder shows it is back -- and one moves
+    the branch. Each must survive with the outcome NOT released. The two positive controls below
+    are the claims nothing changes, which ARE released.
+    """
+    claim_path = claims_dir(repo) / f"k-{case}.json"
+    holder = tmp_path / ("reborn-holder" if case == "recreated" else "vanished")
+    other = str(tmp_path / "someone-else").replace("\\", "/")
+    worktree_json = json.dumps({"worktree": str(holder).replace("\\", "/")})[1:-1]
+    side_effect, reason, landed = {
+        "respelled": (
+            _replace_in_file(claim_path, '"key": "k-respelled"', '"key": "K-Respelled"'),
+            "another spelling of its key",
+            "K-Respelled",
+        ),
+        "retaken": (
+            _replace_in_file(claim_path, worktree_json, json.dumps({"worktree": other})[1:-1]),
+            "held by another worktree",
+            "someone-else",
+        ),
+        "recreated": (
+            f"New-Item -ItemType Directory -Path {_ps_quote(str(holder))} | Out-Null",
+            "holder directory exists again",
+            "",
+        ),
+        "shifted": (
+            f"git -C {_ps_quote(str(repo))} branch -f shifted main | Out-Null",
+            "moved",
+            "",
+        ),
+    }[case]
+
+    claim, row = _gone_holder_release(repo, tmp_path, f"k-{case}", case, holder, side_effect)
+
+    assert claim.exists(), row
+    if landed:
+        assert landed in claim.read_text(encoding="utf-8"), "the edit must have landed"
+    assert row["verdict"] == "CHANGED-SINCE-SCAN", row
+    assert reason in str(row["why"]), row
+    assert str(row["outcome"]).startswith("NOT released"), row
+    assert _history_keys(repo) == [], row
+
+
+def test_apply_releases_an_unchanged_gone_holder_claim_landed_locally(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Positive control for the re-read: a landed branch, nothing changed, released."""
+    landed_branch(repo, "landed")
+    control = write_claim(repo, "k-control", tmp_path / "vanished", "landed")
+    proc = reconcile(repo, "-Json", "-Apply")
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert not control.exists(), row
+    assert row["outcome"] == "released", row
+    assert _history_keys(repo) == ["k-control"]
+
+
+def test_apply_releases_an_unchanged_gone_holder_claim_through_the_pr_arm(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Positive control for the branch-tip compare: the pull-request arm, nothing changed, released."""
+    squash_ok, row = _gone_holder_release(
+        repo, tmp_path, "k-squash-ok", "squash-ok", tmp_path / "vanished"
+    )
+    assert not squash_ok.exists(), row
+    assert row["outcome"] == "released", row
+    assert _history_keys(repo) == ["k-squash-ok"]
+
+
+def _git_shim(tmp_path: Path, fail_when: str) -> dict[str, str]:
+    """An environment whose ``git`` exits 1 when ``fail_when`` holds, else runs the real git.
+
+    ``fail_when`` is a PowerShell condition over ``$a``, the call's arguments joined by spaces. The
+    shim is a ``git.ps1`` in a directory put first on PATH, which pwsh resolves before git.exe.
+    """
+    real = shutil.which("git")
+    assert real, "git is not on PATH"
+    shim = tmp_path / "git-shim"
+    shim.mkdir()
+    (shim / "git.ps1").write_text(
+        "$a = $args -join ' '\n"
+        f"if ({fail_when}) {{ exit 1 }}\n"
+        f"& {_ps_quote(real)} @args\n"
+        "exit $LASTEXITCODE\n",
+        encoding="utf-8",
+    )
+    return {**os.environ, "PATH": f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+
+def test_a_failed_worktree_list_refuses_the_scan(repo: Path, tmp_path: Path) -> None:
+    """An empty registry would read every holder as deregistered, half the release evidence."""
+    landed_branch(repo, "landed")
+    p = write_claim(repo, "k-landed", tmp_path / "vanished", "landed")
+    assert verdicts(repo)["k-landed"] == "RELEASABLE"  # the control: unshimmed, it releases
+    env = _git_shim(tmp_path, "$a -like '* worktree list*'")
+    proc = reconcile(repo, "-Json", "-Apply", env=env)
+    assert proc.returncode == 2, proc.stdout
+    assert "git worktree list failed" in proc.stderr, proc.stderr
+    assert p.exists()
+    assert _history_keys(repo) == []
+
+
+def test_a_failed_ahead_count_holds(repo: Path, tmp_path: Path) -> None:
+    """[int] of no output is 0, which would read as "carries nothing main lacks" and release."""
+    landed_branch(repo, "landed")
+    write_claim(repo, "k-landed", tmp_path / "vanished", "landed")
+    env = _git_shim(tmp_path, "$a -like '* rev-list --count *'")
+    proc = reconcile(repo, "-Json", env=env)
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert row["verdict"] == "HOLD", row
+    assert "could NOT be counted" in row["why"], row
+
+
+def test_a_gone_holder_recheck_that_cannot_run_is_not_released(repo: Path, tmp_path: Path) -> None:
+    """A re-check that could not run is not a change, and is not a release either.
+
+    The gh stub drops a marker while the scan probes, and the git shim fails ``worktree list`` once
+    the marker exists, so the scan's own list succeeds and only the -Apply re-check's fails.
+    """
+    marker = tmp_path / "fail-worktree-list"
+    env = _git_shim(
+        tmp_path,
+        f"$a -like '* worktree list*' -and (Test-Path -LiteralPath {_ps_quote(str(marker))})",
+    )
+    unmerged_branch(repo, "unrun")
+    claim = write_claim(repo, "k-unrun", tmp_path / "vanished", "unrun")
+    github_origin(repo)
+    tip = git(repo, "rev-parse", "unrun").strip()
+    stub = gh_router(
+        tmp_path,
+        head=_merged_pr(tip),
+        on_head=f"New-Item -ItemType File -Path {_ps_quote(str(marker))} | Out-Null",
+    )
+    proc = reconcile(repo, "-Json", "-Apply", "-GhCommand", str(stub), env=env)
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert marker.exists(), "the side effect must have run"
+    assert claim.exists(), row
+    assert row["verdict"] == "RECHECK-FAILED", row
+    assert row["outcome"] == "NOT released -- the re-check could not run: git worktree list failed"
+    assert "changed since the scan" not in row["why"], row
+    assert _history_keys(repo) == []
+
+
+def test_a_gone_holder_whose_branch_cannot_be_read_on_recheck_is_not_released(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The branch the scan judged is deleted before -Apply: nothing to compare, so the re-check
+    could not run, and the claim stays."""
+    side_effect = f"git -C {_ps_quote(str(repo))} branch -D unread | Out-Null"
+    claim, row = _gone_holder_release(
+        repo, tmp_path, "k-unread", "unread", tmp_path / "vanished", side_effect
+    )
+    assert claim.exists(), row
+    assert row["verdict"] == "RECHECK-FAILED", row
+    assert row["outcome"] == (
+        "NOT released -- the re-check could not run: the branch 'unread' could no longer be read"
+    ), row
+    assert _history_keys(repo) == []
+
+
+def test_a_present_holder_whose_fence_goes_blind_on_recheck_is_not_released(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """The fence reads UNAVAILABLE at the -Apply re-check: that is "could not look", not a change.
+
+    The gh stub removes the only session record while the scan probes, so the scan's fence was
+    available and the re-check's has examined nothing.
+    """
+    wt, tip = present_holder(repo, "blind-later")
+    claim = write_claim(repo, "9127", wt, "blind-later")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    record = cfg / "sessions" / f"{sleeper}.json"
+    stub = gh_router(
+        tmp_path,
+        head=json.dumps(pr_at(tip, "9127")),
+        on_head=f"Remove-Item -LiteralPath {_ps_quote(str(record))}",
+    )
+    proc = reconcile(repo, "-Json", "-Apply", "-GhCommand", str(stub), "-ConfigRoot", str(cfg))
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert not record.exists(), "the side effect must have run"
+    assert claim.exists(), row
+    assert row["verdict"] == "RECHECK-FAILED", row
+    assert row["outcome"].startswith("NOT released -- the re-check could not run:"), row
+    assert "UNAVAILABLE" in row["outcome"], row
+    assert _history_keys(repo) == []
+
+
+@pytest.mark.parametrize(
+    ("deletes", "code", "outcome"),
+    [
+        (
+            False,
+            0,
+            "NOT released -- claim.ps1 printed no release and the claim file is still there",
+        ),
+        (True, 0, "NOT released -- claim.ps1 found no claim under that key"),
+        (False, 1, "release FAILED (exit 1) -- the claim file is still there"),
+        (True, 1, "release FAILED (exit 1) -- but the claim file is gone; read claims/.history"),
+    ],
+)
+def test_apply_reports_not_released_when_claim_ps1_prints_no_release(
+    repo: Path, tmp_path: Path, deletes: bool, code: int, outcome: str
+) -> None:
+    """claim.ps1 exits 0 on "No claim on <key>", so only its success line shows a release happened.
+
+    The sandbox's claim.ps1 is replaced by one that prints that line, and in some cases first deletes
+    the file, as a peer's release in the gap would, or exits non-zero, as a step that threw after the
+    delete would. Each row reads NOT released or FAILED, and says whether the file is still there.
+    """
+    landed_branch(repo, "landed")
+    p = write_claim(repo, "k-vanishing", tmp_path / "vanished", "landed")
+    delete = f"Remove-Item -LiteralPath {_ps_quote(str(p))}\n" if deletes else ""
+    (repo / "scripts" / "coord" / "claim.ps1").write_text(
+        "param([string]$Release, [switch]$Force)\n"
+        + delete
+        + f"Write-Host \"No claim on '$Release' -- nothing to release.\"\nexit {code}\n",
+        encoding="utf-8",
+    )
+    proc = reconcile(repo, "-Json", "-Apply")
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert row["verdict"] == "RELEASABLE", row
+    assert row["outcome"] == outcome, row
+    assert p.exists() is not deletes, row

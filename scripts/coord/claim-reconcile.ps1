@@ -46,6 +46,32 @@
     the record cannot be written (BACKLOG #1068). A second writer of that file would be a second
     definition of it.
 
+    A RELEASE BY KEY MUST NAME THE FILE JUDGED (BACKLOG #5482). `claim.ps1 -Release <key>` deletes the
+    file the key folds to, not the file this read. A claim whose key does not fold, case-sensitively,
+    to its own file name is reported as KEY-MISMATCH and never released, in either arm. That check runs
+    before the ELSEWHERE check, so a mismatched record from another machine reads KEY-MISMATCH. Claim
+    files are parsed with `ConvertFrom-Json -DateKind String`, so an ISO-shaped key stays the text it
+    was written as; that switch arrived in pwsh 7.5, and on an older pwsh this refuses to run at all.
+
+    -Apply RE-READS A GONE HOLDER'S CLAIM just before it releases one. The release takes -Force, which
+    deletes whatever claim sits under the key by then, so a key re-taken between the scan and -Apply
+    would otherwise be released. The re-check first re-tests that the holder directory is still
+    absent and unregistered and that the branch still names the commit the scan judged, because a bare
+    `claim.ps1 -Take` on a held key writes nothing, so the file alone cannot show a re-assertion. It
+    then re-reads the file LAST, so the gap before claim.ps1's own read is as short as it can be, and
+    compares the key, holder, host, branch, both stamps and the file's whole text with what the scan
+    read. On any difference the row reads CHANGED-SINCE-SCAN with the outcome "NOT released", and
+    nothing is touched. A holder-present row that changed reads MERGED-HELD, with the same outcome. A
+    re-check that could not run -- for example the worktree list failed, the branch tip or the claim
+    file could not be read, or a present holder's fence, status or HEAD could not be read -- reads
+    RECHECK-FAILED, with the outcome "NOT released -- the re-check could not run", and is never
+    released either. A window remains between the file's re-read and claim.ps1's own read; it is
+    narrowed, not closed.
+
+    The gone-holder pull-request probe passes --repo, from origin's GitHub URL, and --base, the branch
+    the reference names, and re-checks the base on each row it gets back. Without a GitHub origin it
+    asks nothing and the claim is held.
+
     WHAT THIS CANNOT SEE, because a control trusted past its reach is worse than no control.
 
     It answers one question -- "can this be released on evidence?" -- and it is deliberately weaker
@@ -146,8 +172,9 @@ param(
     # carries 13 commits origin/main lacks, and its five claims all read HOLD on the local test alone.
     [switch]$NoPullRequests,
     # The probe itself, injectable so a test can stub it -- the pattern test_announce_hook.py uses
-    # for presence.ps1. Must accept `pr list --head <branch> --state merged --json ...` and, for the
-    # holder-present arm, `pr list --repo --base --head|--search`, and `pr view <n> --repo --json commits`.
+    # for presence.ps1. Must accept `pr list --repo --head <branch> --base --state merged --json ...`
+    # and, for the holder-present arm, `pr list --repo --base --head|--search`, and
+    # `pr view <n> --repo --json commits`.
     [string]$GhCommand = "gh",
     # Audit a set of claims that is not the live registry. Exists for one job: replaying these rules
     # over claims that have ALREADY been released, reconstructed from claims/.history, so a release
@@ -169,6 +196,13 @@ if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
 }
 
 $ErrorActionPreference = "Stop"
+
+# Every claim file is parsed with -DateKind String (BACKLOG #5482), which arrived in pwsh 7.5. Without
+# it the parse fails on 7.4 and every claim would read UNREADABLE, so refuse instead (seat.ps1 does too).
+if ($PSVersionTable.PSVersion -lt [version]'7.5') {
+    [Console]::Error.WriteLine("claim-reconcile.ps1: REFUSED -- needs pwsh 7.5 or later for ConvertFrom-Json -DateKind; this is $($PSVersionTable.PSVersion). Nothing was scanned or released.")
+    exit 2
+}
 
 # -ClaimsDir exists to AUDIT a reconstructed copy, and a release always lands in the LIVE registry,
 # because claim.ps1 resolves its own. Together they would judge one file and delete another.
@@ -204,6 +238,31 @@ else {
 }
 $claimTool = Join-Path $PSScriptRoot "claim.ps1"
 
+# A COPY of claim.ps1's ConvertTo-KeyFile, which cannot be dot-sourced because it runs on load.
+# tests/test_coord_claim_reconcile.py holds the two bodies equal. claim.ps1 -Release <key> deletes
+# the file this names, so a claim whose key does not fold to its own file name is never released.
+function ConvertTo-KeyFile([string]$Key) {
+    $safe = ($Key.Trim().ToLowerInvariant() -replace '[^a-z0-9._-]+', '-').Trim('-')
+    if (-not $safe) { throw "Key '$Key' reduces to nothing usable -- pick something with letters or digits." }
+    $safe
+}
+
+# The file a claim's key names, or "" when the key reduces to nothing.
+function Get-KeyFileName([string]$Key) {
+    try { return (ConvertTo-KeyFile $Key) } catch { return "" }
+}
+
+# A claim's key, and whether it names the file it was read from. ONE predicate for the scan and the
+# -Apply re-check. A claim with no key field is keyed by its file name, which names itself only when
+# the name is already in claim.ps1's folded form; any other name is a KEY-MISMATCH. The
+# comparison is case-sensitive: claim.ps1 writes the folded, lower-case name, and on a case-sensitive
+# disk a case variant is another file.
+function Get-ClaimKey([object]$Claim, [string]$BaseName) {
+    $key = if ($Claim.key) { [string]$Claim.key } else { $BaseName }
+    $keyFile = Get-KeyFileName $key
+    return [pscustomobject]@{ Key = $key; KeyFile = $keyFile; NamesFile = ($keyFile -and $keyFile -ceq $BaseName) }
+}
+
 function ConvertTo-Norm([string]$Path) {
     if (-not $Path) { return "" }
     ($Path -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
@@ -236,15 +295,24 @@ if (-not (Test-Path -LiteralPath $claimsDir)) {
 #
 # `git worktree lock` is git's own "in use" flag. prune-merged honours it, and so does the
 # holder-present arm: a locked holder is never released on a merge, however clean it looks.
+#
+# Ok is false when `git worktree list` failed. An empty registry then would read every holder as
+# deregistered, which is the half of the release evidence it exists to supply, so callers hold.
 function Read-WorktreeRegistry {
     $reg = @{}; $lock = @{}; $last = ""
-    foreach ($line in (& git -C $repo worktree list --porcelain)) {
+    $lines = @(& git -C $repo worktree list --porcelain 2>$null)
+    $ok = ($LASTEXITCODE -eq 0)
+    foreach ($line in $lines) {
         if ($line -like 'worktree *') { $last = ConvertTo-Norm $line.Substring(9); $reg[$last] = $true }
         elseif ($last -and ($line -eq 'locked' -or $line -like 'locked *')) { $lock[$last] = $true }
     }
-    return @{ Registered = $reg; Locked = $lock }
+    return @{ Registered = $reg; Locked = $lock; Ok = $ok }
 }
 $wtRegistry = Read-WorktreeRegistry
+if (-not $wtRegistry.Ok) {
+    [Console]::Error.WriteLine("claim-reconcile.ps1: REFUSED -- git worktree list failed, so no holder can be shown deregistered. Nothing was scanned or released.")
+    exit 2
+}
 $registered = $wtRegistry.Registered
 $locked = $wtRegistry.Locked
 
@@ -262,13 +330,29 @@ $ghAvailable = $false
 if (-not $NoPullRequests) {
     $ghAvailable = [bool](Get-Command $GhCommand -ErrorAction SilentlyContinue)
 }
+# Both pull-request arms scope every GitHub call with --repo, and every `pr list` with --base too
+# (BACKLOG #5481). Without --repo gh answers from the caller's cwd or its default-repo setting, and
+# this script is run by absolute path from other checkouts -- the vault shares engine history and
+# has pull requests of its own. --base, re-checked on every returned row, keeps a pull request merged
+# into some other branch from reading as a merge into main. No GitHub origin means the question
+# cannot be asked, and the claim is held.
+$ghRepo = ""
+$originUrl = (& git -C $repo remote get-url origin 2>$null)
+if ($originUrl -and ([string]$originUrl) -match '^(?:https?://[^/@]*@?[^/]*github\.com/|git@github\.com:|ssh://git@github\.com/)(?<o>[^/]+)/(?<r>[^/]+?)(?:\.git)?/?$') {
+    $ghRepo = "$($Matches['o'])/$($Matches['r'])"
+}
+# The base a pull request must have merged INTO for its merge to say anything about $mainRef.
+$baseBranch = $mainRef -replace '^origin/', ''
+
 function Test-LandedByPullRequest {
     param([string]$Branch, [string]$Tip)
-    if (-not $ghAvailable) { return $null }
+    # Scoped as the block above says; a branch of this name merged elsewhere proves nothing here.
+    if (-not $ghAvailable -or -not $ghRepo) { return $null }
     try {
-        $raw = & $GhCommand pr list --head $Branch --state merged --json number,headRefOid,mergedAt,mergeCommit --limit 5 2>$null
+        $raw = & $GhCommand pr list --repo $ghRepo --head $Branch --base $baseBranch --state merged --json number,headRefOid,mergedAt,mergeCommit,baseRefName --limit 5 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $raw) { return $null }
-        $prs = @($raw | ConvertFrom-Json)
+        # The base is checked again on each row, so an answer that ignored --base still proves nothing.
+        $prs = @(@(ConvertFrom-GhJson $raw) | Where-Object { $_.baseRefName -eq $baseBranch })
         foreach ($pr in $prs) {
             if ($pr.headRefOid -and $Tip -and $pr.headRefOid -eq $Tip) {
                 return [pscustomobject]@{ Number = $pr.number; MergedAt = $pr.mergedAt; ExactTip = $true; Landing = "" }
@@ -288,11 +372,16 @@ function Test-LandedByPullRequest {
 }
 
 # ConvertFrom-Json coerces an ISO-8601 string into a [datetime] (claim.ps1's ConvertTo-Stamp records
-# the same trap), so a claim's stamps and a PR's `mergedAt` can each arrive in either shape. Compare
+# the same trap). Claim files are parsed with -DateKind String, but a PR's `mergedAt` comes through
+# ConvertFrom-GhJson's default parse, so a stamp can arrive in either shape. Compare
 # them as offsets, never as local wall-clock text. $null means unreadable, and the caller holds on it.
 function ConvertTo-Instant($Value) {
     if ($Value -is [datetimeoffset]) { return $Value }
     if ($Value -is [datetime]) { return [datetimeoffset]$Value }
+    # A claim stamp now arrives as text (-DateKind String). One with no offset is ambiguous: the
+    # default parse read it as local time, AssumeUniversal as UTC, hours apart, and the ordering
+    # against a merge rests on it. It is unreadable, so the caller holds.
+    if ($Value -and [string]$Value -notmatch '(?:Z|[+-]\d{2}:?\d{2})\s*$') { return $null }
     $parsed = [datetimeoffset]::MinValue
     if ($Value -and [datetimeoffset]::TryParse([string]$Value, [Globalization.CultureInfo]::InvariantCulture,
             [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { return $parsed }
@@ -303,18 +392,6 @@ function ConvertFrom-GhJson($Raw) {
     if (-not $Raw) { return @() }
     return @((@($Raw) -join "`n") | ConvertFrom-Json)
 }
-
-# The holder-present arm scopes every GitHub call with --repo. Without it gh answers from the caller's
-# cwd or its default-repo setting, and this script is run by absolute path from other checkouts -- the
-# vault shares engine history and has pull requests of its own. prune-merged.ps1 scopes the same way
-# for the same reason. No GitHub origin means the question cannot be asked, and the claim is held.
-$ghRepo = ""
-$originUrl = (& git -C $repo remote get-url origin 2>$null)
-if ($originUrl -and ([string]$originUrl) -match '^(?:https?://[^/@]*@?[^/]*github\.com/|git@github\.com:|ssh://git@github\.com/)(?<o>[^/]+)/(?<r>[^/]+?)(?:\.git)?/?$') {
-    $ghRepo = "$($Matches['o'])/$($Matches['r'])"
-}
-# The base a pull request must have merged INTO for its merge to say anything about $mainRef.
-$baseBranch = $mainRef -replace '^origin/', ''
 
 function New-PrEvidence($Pr, [string]$As) {
     [pscustomobject]@{ Number = $Pr.number; MergedAt = $Pr.mergedAt; As = $As; Text = "$($Pr.title)`n$($Pr.body)" }
@@ -411,7 +488,9 @@ function Get-HolderDirt([string]$Path) {
 # than asking GitHub again, and re-runs everything local.
 function Get-PresentHolderVerdict {
     param([object]$Claim, [string]$Key, [string]$Holder, [string]$Branch, [object]$KnownPr = $null)
-    $v = [ordered]@{ verdict = "HELD"; why = "holder directory exists"; tip = ""; pr = $null }
+    # unrun marks a HELD that means "could not look" rather than "looked and it fails", so the -Apply
+    # re-check can report it as a re-check that could not run instead of a change.
+    $v = [ordered]@{ verdict = "HELD"; why = "holder directory exists"; tip = ""; pr = $null; unrun = $false }
     if (-not $registered.ContainsKey($Holder)) {
         $v.why = "holder directory exists but is not a registered worktree of this repository"
         return $v
@@ -429,11 +508,16 @@ function Get-PresentHolderVerdict {
         return $v
     }
     $dirt = Get-HolderDirt $Holder
-    if ($dirt) { $v.why = "holder directory exists and is in use: $dirt"; return $v }
+    if ($dirt) {
+        $v.why = "holder directory exists and is in use: $dirt"
+        $v.unrun = $dirt -like "git status failed*"
+        return $v
+    }
     if ($locked.ContainsKey($Holder)) { $v.why = "holder directory exists and is locked (git worktree lock)"; return $v }
     $fence = Get-Fence
     if (-not $fence.Available) {
         $v.why = "holder directory exists; the occupancy fence is UNAVAILABLE ($($fence.Detail)), so a session in it cannot be ruled out"
+        $v.unrun = $true
         return $v
     }
     $in = @(Get-WorktreeOccupants -Occupancy $fence -Path $Holder -IncludeNested)
@@ -443,7 +527,7 @@ function Get-PresentHolderVerdict {
     }
     if ($NoPullRequests -and -not $KnownPr) { $v.why = "holder directory exists; merge probe skipped (-NoPullRequests)"; return $v }
     $tip = (& git -C $Holder rev-parse --verify --quiet HEAD 2>$null)
-    if (-not $tip) { $v.why = "holder directory exists; its HEAD could not be read"; return $v }
+    if (-not $tip) { $v.why = "holder directory exists; its HEAD could not be read"; $v.unrun = $true; return $v }
     $tip = ([string]$tip).Trim()
 
     $pr = if ($KnownPr) { $KnownPr } else { Find-MergedPullRequestCarrying -Branch $Branch -Tip $tip -Key $Key }
@@ -487,32 +571,115 @@ function Get-PresentHolderVerdict {
     return $v
 }
 
-# The -Apply re-check for a holder-present row. Returns "" when the row still stands, otherwise why it
-# does not. It re-reads the claim file (another holder, or a new claim under the same key), refreshes
-# the worktree list and the fence, and runs the same predicate as the scan with the scan's evidence.
+# The claim file an -Apply re-check re-reads, and the checks both arms share: it still parses, its key
+# still names it in the spelling the scan read, and it is still held by the same worktree on this
+# machine. Why is "" when those hold; Claim and Text are what was read. Unrun is set instead when the
+# file exists but could not be read, which is not evidence that it changed.
+function Read-ClaimAgain([string]$File, [object]$Row) {
+    $r = [pscustomobject]@{ Why = ""; Unrun = ""; Claim = $null; Text = "" }
+    if (-not (Test-Path -LiteralPath $File)) { $r.Why = "the claim file is gone"; return $r }
+    try { $r.Text = [string](Read-CoordText $File) }
+    catch { $r.Unrun = "the claim file could not be read: $($_.Exception.Message)"; return $r }
+    try { $r.Claim = $r.Text | ConvertFrom-Json -DateKind String -EA Stop }
+    catch { $r.Why = "the claim file no longer parses"; return $r }
+    # An emptied file parses to $null without throwing. The scan never saw it empty -- it judged this
+    # row RELEASABLE -- so an empty file now is a change.
+    if ($null -eq $r.Claim) { $r.Why = "the claim file no longer parses"; return $r }
+    $c = $r.Claim
+    $k = Get-ClaimKey $c ([IO.Path]::GetFileNameWithoutExtension($File))
+    if (-not $k.NamesFile) { $r.Why = "the claim file's key no longer names that file" }
+    elseif ($k.Key -cne $Row.key) { $r.Why = "the claim was re-taken under another spelling of its key" }
+    elseif ((ConvertTo-Norm ([string]$c.worktree)) -ne $Row.holder) { $r.Why = "the claim is now held by another worktree" }
+    elseif (-not (Test-CoordRecordIsHere $c)) { $r.Why = "the claim is now held on $(Get-CoordRecordHost $c)" }
+    return $r
+}
+
+# What an -Apply re-check found. Changed is why the row no longer stands; Unrun is why the re-check
+# could not run at all. Both empty means the row still stands. The two are kept apart because "the
+# claim changed" is a finding and "we could not look" is not, and a report must not say the first
+# when only the second is true. Either one keeps the claim.
+function New-Recheck([string]$Changed = "", [string]$Unrun = "") {
+    [pscustomobject]@{ Changed = $Changed; Unrun = $Unrun }
+}
+
+# The -Apply re-check for a holder-present row. It re-reads the claim file (another holder, or a new
+# claim under the same key), refreshes the worktree list and the fence, and runs the same predicate as
+# the scan with the scan's evidence.
 function Test-StillReleasable([object]$Row) {
-    $file = $Row.claimFile
-    if (-not (Test-Path -LiteralPath $file)) { return "the claim file is gone" }
-    try { $c = Read-CoordText $file | ConvertFrom-Json -EA Stop }
-    catch { return "the claim file no longer parses" }
-    if ((ConvertTo-Norm ([string]$c.worktree)) -ne $Row.holder) { return "the claim is now held by another worktree" }
-    if (-not (Test-CoordRecordIsHere $c)) { return "the claim is now held on $(Get-CoordRecordHost $c)" }
+    $again = Read-ClaimAgain $Row.claimFile $Row
+    if ($again.Unrun) { return New-Recheck -Unrun $again.Unrun }
+    if ($again.Why) { return New-Recheck -Changed $again.Why }
     $fresh = Read-WorktreeRegistry
+    if (-not $fresh.Ok) { return New-Recheck -Unrun "git worktree list failed" }
     $script:registered = $fresh.Registered
     $script:locked = $fresh.Locked
     Reset-Fence
-    $v = Get-PresentHolderVerdict -Claim $c -Key $Row.key -Holder $Row.holder -Branch ([string]$c.branch) -KnownPr $script:prByKey[$Row.key]
-    if ($v.verdict -ne "RELEASABLE") { return $v.why }
-    if ($v.tip -ne $Row.tip) { return "the holder's tip moved" }
+    $v = Get-PresentHolderVerdict -Claim $again.Claim -Key $Row.key -Holder $Row.holder -Branch ([string]$again.Claim.branch) -KnownPr $script:prByKey[$Row.key]
+    if ($v.unrun) { return New-Recheck -Unrun $v.why }
+    if ($v.verdict -ne "RELEASABLE") { return New-Recheck -Changed $v.why }
+    if ($v.tip -ne $Row.tip) { return New-Recheck -Changed "the holder's tip moved" }
+    return New-Recheck
+}
+
+# The -Apply re-check for a gone-holder row. That release goes through -Force, which deletes whatever
+# claim sits under the key by then, so without this a key re-taken between the scan and -Apply would be
+# released. A session re-asserting a claim with a bare -Take writes nothing, so the holder's absence and
+# deregistration and the branch tip the verdict rested on are read again first. The file is read last,
+# so the gap between its read and claim.ps1's is as short as this process can make it.
+function Test-GoneHolderUnchanged([object]$Row) {
+    $seen = $script:scannedByKey[$Row.key]
+    if (-not $seen) { return New-Recheck -Unrun "the scan kept no copy of the claim to compare against" }
+    if (Test-Path -LiteralPath $Row.holder) { return New-Recheck -Changed "the holder directory exists again" }
+    $fresh = Read-WorktreeRegistry
+    if (-not $fresh.Ok) { return New-Recheck -Unrun "git worktree list failed" }
+    if ($fresh.Registered.ContainsKey($Row.holder)) { return New-Recheck -Changed "the holder is a registered worktree again" }
+    $tip = Get-BranchTip $Row.branch
+    if (-not $tip) { return New-Recheck -Unrun "the branch '$($Row.branch)' could no longer be read" }
+    if ($tip -ne $seen.Tip) { return New-Recheck -Changed "the branch '$($Row.branch)' moved" }
+    $again = Read-ClaimAgain $seen.File $Row
+    if ($again.Unrun) { return New-Recheck -Unrun $again.Unrun }
+    if ($again.Why) { return New-Recheck -Changed $again.Why }
+    $c = $again.Claim
+    if ([string]$c.branch -cne $Row.branch) { return New-Recheck -Changed "the claim now names another branch" }
+    foreach ($field in @("claimed", "refreshed")) {
+        if ([string]$c.$field -cne [string]$seen.Claim.$field) { return New-Recheck -Changed "the claim's '$field' stamp changed, so it was taken again" }
+    }
+    if ($again.Text -cne $seen.Text) { return New-Recheck -Changed "the claim file's text changed" }
+    return New-Recheck
+}
+
+# The ref a claim's branch resolves to, local first, then origin's; "" when neither exists.
+function Resolve-BranchRef([string]$Branch) {
+    foreach ($cand in @($Branch, "origin/$Branch")) {
+        if (& git -C $repo rev-parse --verify --quiet $cand) { return $cand }
+    }
+    return ""
+}
+
+# The commit that ref names, "" when there is none. The gone-holder re-check compares it with the scan's.
+function Get-BranchTip([string]$Branch) {
+    $ref = Resolve-BranchRef $Branch
+    if (-not $ref) { return "" }
+    $tip = (& git -C $repo rev-parse --verify --quiet "$ref^{commit}" 2>$null)
+    if ($tip) { return ([string]$tip).Trim() }
     return ""
 }
 
 $rows = @()
 $script:prByKey = @{}
+# Each claim file as the scan read it, by key, for the gone-holder -Apply re-check.
+$script:scannedByKey = @{}
 foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)) {
     $verdict = "UNKNOWN"; $why = ""; $key = $f.BaseName; $holder = ""; $branch = ""
 
-    try { $c = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
+    # -DateKind String (BACKLOG #5482): the default coerces any ISO-8601-shaped string into a
+    # [datetime], and a key is free text, so a key like "2026-08-01T00:00:00" would come back through
+    # [string] as "08/01/2026 00:00:00" -- a key nobody typed, which -Release folds to a file that does
+    # not exist. claim.ps1 records the same trap beside its own -Take.
+    try {
+        $text = Read-CoordText $f.FullName
+        $c = $text | ConvertFrom-Json -DateKind String -EA Stop
+    }
     catch {
         # An unreadable claim belongs to the registry, not to any worktree. It is reported and never
         # released: we could not read whose it is, and claim_check.py reads a malformed claim as
@@ -521,10 +688,24 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
         continue
     }
 
-    $key = if ($c.key) { [string]$c.key } else { $f.BaseName }
+    $claimKey = Get-ClaimKey $c $f.BaseName
+    $key = $claimKey.Key
     $holder = ConvertTo-Norm ([string]$c.worktree)
     $branch = [string]$c.branch
     $note = [string]$c.note
+
+    # The release goes through `claim.ps1 -Release <key>`, which deletes the file the KEY names, not
+    # this one (BACKLOG #5482). A key that folds to another file name would release a different
+    # claim, or nothing while reading as released. Judged here, it is reported and never released.
+    if (-not $claimKey.NamesFile) {
+        $names = if ($claimKey.KeyFile) { "'$($claimKey.KeyFile).json'" } else { "no file at all" }
+        $rows += [pscustomobject]@{ key = $f.BaseName; holder = $holder; branch = $branch; note = $note; verdict = "KEY-MISMATCH"
+            why = "the file is '$($f.Name)' but its key reads '$key', which names $names -- a release by that key would act on another file" }
+        continue
+    }
+
+    # Only a key that names its own file gets here, so no two scanned claims share a key.
+    $script:scannedByKey[$key] = [pscustomobject]@{ File = $f.FullName; Text = [string]$text; Claim = $c }
 
     if (-not $holder) {
         $rows += [pscustomobject]@{ key = $key; holder = ""; branch = $branch; note = $note; verdict = "UNKNOWN"; why = "claim names no worktree" }
@@ -567,10 +748,9 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
         continue
     }
 
-    $ref = $null
-    foreach ($cand in @($branch, "origin/$branch")) {
-        if (& git -C $repo rev-parse --verify --quiet $cand) { $ref = $cand; break }
-    }
+    $ref = Resolve-BranchRef $branch
+    $refTip = if ($ref) { Get-BranchTip $branch } else { "" }
+    $script:scannedByKey[$key] | Add-Member -NotePropertyName Tip -NotePropertyValue $refTip
     if (-not $ref) {
         # The branch is gone everywhere. That is consistent with a squash-merge plus remote deletion,
         # and equally with somebody deleting unmerged work. Both look identical from here, so this is
@@ -582,15 +762,23 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
 
     & git -C $repo merge-base --is-ancestor $ref $mainRef 2>$null
     $contained = ($LASTEXITCODE -eq 0)
-    $ahead = [int](& git -C $repo rev-list --count "$mainRef..$ref")
+    $aheadText = (& git -C $repo rev-list --count "$mainRef..$ref" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $refTip) {
+        # [int] of no output is 0, which would read as "carries nothing main lacks" and release. A tip
+        # that could not be read leaves the -Apply re-check nothing to compare, so it holds too.
+        $what = if (-not $refTip) { "the commit '$branch' names could NOT be read" } else { "the commits '$branch' carries beyond $mainRef could NOT be counted" }
+        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HOLD"
+            why = "$what, so nothing about its work is proven" }
+        continue
+    }
+    $ahead = [int]$aheadText
 
     if ($contained -or $ahead -eq 0) {
         $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "RELEASABLE"
             why = "holder gone and deregistered; '$branch' carries no commit that $mainRef lacks" }
     }
     else {
-        $tip = (& git -C $repo rev-parse $ref 2>$null)
-        $pr = Test-LandedByPullRequest -Branch $branch -Tip ($tip ? $tip.Trim() : "")
+        $pr = Test-LandedByPullRequest -Branch $branch -Tip $refTip
         if ($pr -is [pscustomobject] -and $pr.ExactTip) {
             $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "RELEASABLE"
                 why = "holder gone and deregistered; PR #$($pr.Number) merged $($pr.MergedAt) with head at this exact tip -- squashed, so the $ahead commit(s) are the same work" }
@@ -608,11 +796,20 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
             $landing = $pr.Landing
             $base = (& git -C $repo merge-base $ref $landing 2>$null)
             $touched = @()
-            if ($base) { $touched = @(& git -C $repo diff --name-only ($base.Trim()) $ref 2>$null) }
-            $identical = $touched.Count -gt 0
-            foreach ($f in $touched) {
-                $a = (& git -C $repo rev-parse --quiet --verify "${ref}:$f" 2>$null)
-                $b = (& git -C $repo rev-parse --quiet --verify "${landing}:$f" 2>$null)
+            $listed = $false
+            # --no-renames (BACKLOG #5483): with rename detection on, a rename lists only its NEW path,
+            # so a deletion the landing commit never took would drop out of the comparison below.
+            # With it the old path is listed and compared too, and a path missing on either side
+            # never matches, so a rename or deletion holds. A failed diff is "could not list", never
+            # "touched nothing".
+            if ($base) {
+                $touched = @(& git -C $repo diff --no-renames --name-only ($base.Trim()) $ref 2>$null)
+                $listed = ($LASTEXITCODE -eq 0)
+            }
+            $identical = $listed -and $touched.Count -gt 0
+            foreach ($path in $touched) {
+                $a = (& git -C $repo rev-parse --quiet --verify "${ref}:$path" 2>$null)
+                $b = (& git -C $repo rev-parse --quiet --verify "${landing}:$path" 2>$null)
                 if (-not $a -or -not $b -or $a -ne $b) { $identical = $false; break }
             }
             if ($identical) {
@@ -621,7 +818,10 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
             }
             else {
                 $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HOLD"
-                    why = "$ahead commit(s) not on $mainRef; PR #$($pr.Number) merged but this tip is not its head and the branch files differ from the landing commit" }
+                    why = "$ahead commit(s) not on $mainRef; PR #$($pr.Number) merged but this tip is not its head and " +
+                        $(if (-not $listed) { "the files this branch touched could NOT be listed" }
+                        elseif (-not $touched.Count) { "the branch changes no file against the merge-base, so nothing could be compared" }
+                        else { "the branch files differ from the landing commit" }) }
             }
         }
         elseif ($pr -is [pscustomobject]) {
@@ -718,31 +918,56 @@ foreach ($r in @($rows | Where-Object { $_.verdict -eq "RELEASABLE" -and $_.note
 # -Apply releases BEFORE the report is printed, so each releasable row carries its outcome and the
 # report never names a release that did not happen. A holder-present row is re-checked first.
 if ($Apply) {
+    $notReleasedChanged = "NOT released -- the claim or its holder changed since the scan"
     foreach ($r in @($rows | Where-Object { $_.verdict -eq "RELEASABLE" })) {
         $releaseArgs = @("-Release", $r.key, "-Force")
-        if ($r.PSObject.Properties['tip']) {
-            $changed = Test-StillReleasable $r
-            if ($changed) {
-                $r.verdict = "MERGED-HELD"
-                $r.why = "$($r.why) -- but changed since the scan, so it was not released: $changed"
-                continue
-            }
+        $present = [bool]$r.PSObject.Properties['tip']
+        $check = if ($present) { Test-StillReleasable $r } else { Test-GoneHolderUnchanged $r }
+        if ($check.Unrun) {
+            $r.verdict = "RECHECK-FAILED"
+            $r.why = "$($r.why) -- but the re-check before the release could not run: $($check.Unrun)"
+            $r | Add-Member -NotePropertyName outcome -NotePropertyValue "NOT released -- the re-check could not run: $($check.Unrun)" -Force
+            continue
+        }
+        if ($check.Changed) {
+            # A present holder that moved fails the holder-present arm, so it reads MERGED-HELD. A
+            # gone holder's claim that no longer reads as scanned reads CHANGED-SINCE-SCAN.
+            $r.verdict = if ($present) { "MERGED-HELD" } else { "CHANGED-SINCE-SCAN" }
+            $r.why = "$($r.why) -- but changed since the scan, so it was not released: $($check.Changed)"
+            $r | Add-Member -NotePropertyName outcome -NotePropertyValue $notReleasedChanged -Force
+            continue
+        }
+        if ($present) {
             # -AsWorktree and NO -Force: claim.ps1 re-tests that the holder still owns the key, in its
             # own process, just before it removes the file. -Force would delete whatever claim sits
-            # under the key by then, including one somebody else took a moment ago.
+            # under the key by then, including one somebody else took a moment ago. A gone holder
+            # cannot take -AsWorktree, so its release keeps -Force, and the re-read above is what
+            # stands in for that ownership test. A window remains between that read and claim.ps1's.
             $releaseArgs = @("-Release", $r.key, "-AsWorktree", $r.holder)
         }
         # The ledger writer stays in one place. A gone holder's release needs -Force, because it is
         # held by a worktree that is not this one, which is the condition that defines that set.
-        & pwsh -NoProfile -File $claimTool @releaseArgs | Out-Null
-        $outcome = if ($LASTEXITCODE -eq 0) { "released" } else { "release FAILED -- claim untouched" }
+        $said = @(& pwsh -NoProfile -File $claimTool @releaseArgs 2>&1 | ForEach-Object { [string]$_ })
+        $code = $LASTEXITCODE
+        # claim.ps1 exits 0 on "No claim on <key> -- nothing to release" too, and that leaves no file
+        # either, so neither the exit code nor a missing file shows a release happened. Its own
+        # success line does. The scan let through only keys that fold to their own file name.
+        $released = $code -eq 0 -and @($said | Where-Object { $_ -like "Released claim on *" }).Count -gt 0
+        # A non-zero exit can follow the delete (a step after it threw), so the file says which it was.
+        $keyFile = Join-Path $claimsDir "$(Get-KeyFileName $r.key).json"
+        $outcome = if ($code -ne 0 -and (Test-Path -LiteralPath $keyFile)) { "release FAILED (exit $code) -- the claim file is still there" }
+        elseif ($code -ne 0) { "release FAILED (exit $code) -- but the claim file is gone; read claims/.history" }
+        elseif (-not $released -and (Test-Path -LiteralPath $keyFile)) { "NOT released -- claim.ps1 printed no release and the claim file is still there" }
+        elseif (-not $released) { "NOT released -- claim.ps1 found no claim under that key" }
+        elseif (Test-Path -LiteralPath $keyFile) { "released -- and a claim file is under that key again" }
+        else { "released" }
         $r | Add-Member -NotePropertyName outcome -NotePropertyValue $outcome -Force
     }
 }
 
 $releasable = @($rows | Where-Object { $_.verdict -eq "RELEASABLE" })
 $hold = @($rows | Where-Object { $_.verdict -eq "HOLD" })
-$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "NOTE-POINTS-ELSEWHERE", "MERGED-HELD", "ELSEWHERE") })
+$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "KEY-MISMATCH", "NOTE-POINTS-ELSEWHERE", "MERGED-HELD", "ELSEWHERE", "CHANGED-SINCE-SCAN", "RECHECK-FAILED") })
 
 if ($Json) {
     [pscustomobject]@{
