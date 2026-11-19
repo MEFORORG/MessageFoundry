@@ -603,6 +603,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, computed_field
@@ -673,6 +674,27 @@ class Deferred(BaseModel):
         return Leaf()
 
 
+class DeferredBroken(BaseModel):
+    model_config = ConfigDict(defer_build=True)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def gone(self) -> NoSuchModel:  # noqa: F821 -- deliberately unresolvable
+        raise AssertionError
+
+
+class ComputedMeta(BaseModel):
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def v(self) -> Annotated[int, Marker]:
+        return 0
+
+
+@dataclasses.dataclass
+class WithCallable:
+    cb: Callable[[NoSuchArg], int] | None = None  # noqa: F821 -- deliberately unresolvable
+
+
 @dataclasses.dataclass
 class Broken:
     missing: NoSuchName  # noqa: F821 -- deliberately unresolvable
@@ -732,9 +754,27 @@ def test_annotated_metadata_is_not_walked_as_a_type(postponed: types.ModuleType)
     assert _names(sd._closure({"WithMetadata"}, postponed, "synthetic")) == {"WithMetadata"}
 
 
-def test_a_deferred_computed_field_return_type_fails_loud(postponed: types.ModuleType) -> None:
+def test_a_deferred_build_is_completed_rather_than_order_dependent(
+    postponed: types.ModuleType,
+) -> None:
+    """A ``defer_build`` model's computed return type is unresolved until first use; discovery
+    completes it itself, so the result does not depend on what validated the model earlier."""
+    assert _names(sd._closure({"Deferred"}, postponed, "synthetic")) == {"Deferred", "Leaf"}
+
+
+def test_a_computed_field_that_cannot_resolve_fails_loud(postponed: types.ModuleType) -> None:
     with pytest.raises(sd.SeamDiscoveryError, match="not resolved yet"):
-        sd._closure({"Deferred"}, postponed, "synthetic")
+        sd._closure({"DeferredBroken"}, postponed, "synthetic")
+
+
+def test_a_computed_field_annotated_metadata_is_not_walked(postponed: types.ModuleType) -> None:
+    assert _names(sd._closure({"ComputedMeta"}, postponed, "synthetic")) == {"ComputedMeta"}
+
+
+def test_an_unresolved_callable_parameter_fails_loud(postponed: types.ModuleType) -> None:
+    """``Callable[[X], R]`` holds ``X`` in a list ``get_args`` does not flatten."""
+    with pytest.raises(sd.SeamDiscoveryError, match="UNRESOLVED"):
+        sd._closure({"WithCallable"}, postponed, "synthetic")
 
 
 def test_a_string_annotation_left_unresolved_fails_loud() -> None:

@@ -219,6 +219,12 @@ def _named_annotations(dto: type) -> list[tuple[str, object]]:
     ``scripts/webconsole_seam_snapshot.py``, which records the NAMES; keep the two in step.
     """
     if isinstance(dto, type) and issubclass(dto, BaseModel):
+        # A deferred build (defer_build=True, or a forward ref pending at class creation) completes
+        # only on first use, so its annotations would depend on whether something had validated the
+        # model earlier in the process. Completing it here makes discovery order-independent; one
+        # that still cannot complete is refused by _refuse_unresolved below.
+        if not dto.__pydantic_complete__:
+            dto.model_rebuild(raise_errors=False)
         try:
             fields = dto.model_fields
             computed = dto.model_computed_fields
@@ -228,7 +234,9 @@ def _named_annotations(dto: type) -> list[tuple[str, object]]:
                 "the closure cannot be completed, so the surface would be under-covered"
             ) from exc
         named: list[tuple[str, object]] = [(n, f.annotation) for n, f in fields.items()]
-        named += [(n, c.return_type) for n, c in computed.items()]
+        # Pydantic strips a stored field's outer Annotated but keeps a computed field's; strip it
+        # here too, because its metadata is data, not a type position.
+        named += [(n, _strip_annotated(c.return_type)) for n, c in computed.items()]
     else:
         # Reached only for a dataclass DTO -- _is_dto() gates every caller, and mypy cannot carry
         # that narrowing across the call boundary.
@@ -250,6 +258,12 @@ def _named_annotations(dto: type) -> list[tuple[str, object]]:
         named = [(f.name, hints[f.name]) for f in dataclasses.fields(typing.cast("Any", dto))]
     _refuse_unresolved(dto, [annotation for _name, annotation in named])
     return named
+
+
+def _strip_annotated(annotation: object) -> object:
+    if typing.get_origin(annotation) is typing.Annotated:
+        return typing.get_args(annotation)[0]
+    return annotation
 
 
 def _refuse_unresolved(dto: type, annotations: list[object]) -> None:
@@ -285,8 +299,12 @@ def _refuse_unresolved(dto: type, annotations: list[object]) -> None:
                 raise SeamDiscoveryError(
                     f"{dto.__module__}.{dto.__qualname__}: a computed field's return type is not "
                     "resolved yet (a deferred build or a pending forward reference), so the "
-                    "nested-model closure cannot see through it. Call model_rebuild() on the model."
+                    "nested-model closure cannot see through it. Define the referenced type "
+                    "where the annotation can resolve it."
                 )
+            if isinstance(current, list):  # Callable[[X, Y], R] holds its parameters in a list
+                stack.extend(current)
+                continue
             origin = typing.get_origin(current)
             if origin is typing.Literal:
                 continue
