@@ -920,6 +920,11 @@ _POSTGRES = (
 )
 
 
+def _sqlserver_with_acquire_timeout(seconds: float) -> str:
+    """:data:`_SQLSERVER` with ``[store].acquire_timeout`` set, the pool wait the claim borrows under."""
+    return _SQLSERVER.replace("[cluster]", f"acquire_timeout = {seconds}\n[cluster]")
+
+
 def _load(tmp_path: Path, text: str) -> Any:
     cfg = tmp_path / "messagefoundry.toml"
     cfg.write_text(text, encoding="utf-8")
@@ -978,7 +983,7 @@ def test_the_same_clamp_loads_on_postgres(tmp_path: Path) -> None:
 
 def test_a_shorter_pool_wait_brings_the_same_clamp_inside_the_margin(tmp_path: Path) -> None:
     """Control on the term: a 3 s acquire_timeout makes the reach 3 + 5 = 8 s, under 9."""
-    text = _SQLSERVER.replace("[cluster]", "acquire_timeout = 3.0\n[cluster]")
+    text = _sqlserver_with_acquire_timeout(3.0)
     s = _load(tmp_path, text + "lease_renew_timeout_seconds = 5.0\n")
     assert s.cluster.lease_renew_timeout_seconds == 5.0
 
@@ -1051,7 +1056,7 @@ def test_a_floored_derived_clamp_names_widening_alone(tmp_path: Path) -> None:
     (BACKLOG #5979)."""
     s = _load(
         tmp_path,
-        _SQLSERVER.replace("[cluster]", "acquire_timeout = 0.5\n[cluster]")
+        _sqlserver_with_acquire_timeout(0.5)
         + "heartbeat_seconds = 1.0\nleader_fence_timeout_seconds = 2.0\n"
         + "leader_lease_ttl_seconds = 4.2\n",
     )
