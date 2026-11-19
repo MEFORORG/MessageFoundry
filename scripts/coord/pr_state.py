@@ -282,7 +282,9 @@ def fetch_required(gh: Gh, repo: str) -> list[str]:
             gh(["api", "--paginate", "--slurp", f"repos/{repo}/rules/branches/{BASE_BRANCH}"], None)
         )
         rules = [rule for page in pages for rule in page]
-        found = required_contexts.branch_protection_contexts(branch)
+        # allow_empty: the rulesets may carry every required context, and an empty COMBINED set is
+        # reported by the caller as its own error.
+        found = required_contexts.branch_protection_contexts(branch, allow_empty=True)
         found += required_contexts.ruleset_contexts(rules)
     except (ValueError, RuntimeError, KeyError, TypeError, AttributeError) as exc:
         raise PollError(f"required contexts unreadable: {exc!r}") from exc

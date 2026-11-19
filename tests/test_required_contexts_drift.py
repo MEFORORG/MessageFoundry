@@ -14,6 +14,8 @@ from typing import Any
 
 import pytest
 
+from scripts.ci.required_contexts import branch_protection_contexts, ruleset_contexts
+
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "scripts" / "ci" / "check_required_contexts_drift.py"
 _CANONICAL = _REPO / ".github" / "required-contexts.txt"
@@ -52,9 +54,15 @@ def payload() -> dict[str, Any]:
     return parsed
 
 
-def _contexts(d: dict[str, Any]) -> list[str]:
-    contexts: list[str] = d["protection"]["required_status_checks"]["contexts"]
-    return contexts
+def _set_server(d: dict[str, Any], names: list[str]) -> None:
+    """Set the server's required set in BOTH places the payload carries it (``contexts``, ``checks``).
+
+    The reader takes the union of the two (BACKLOG #5465), so an arm that edits only one list would
+    leave the other still naming every context and measure nothing.
+    """
+    rsc = d["protection"]["required_status_checks"]
+    rsc["contexts"] = list(names)
+    rsc["checks"] = [{"context": n, "app_id": None} for n in names]
 
 
 def test_it_passes_when_the_file_matches_the_server(
@@ -62,7 +70,7 @@ def test_it_passes_when_the_file_matches_the_server(
 ) -> None:
     """THE POSITIVE ARM. Without it, a script that always exits 1 would pass every arm below."""
     d = copy.deepcopy(payload)
-    _contexts(d)[:] = _declared()
+    _set_server(d, _declared())
     r = _run(d, tmp_path)
     assert r.returncode == 0, f"clean tree must pass:\n{r.stdout}\n{r.stderr}"
     assert "matches the server exactly" in r.stdout
@@ -71,7 +79,7 @@ def test_it_passes_when_the_file_matches_the_server(
 def test_a_server_only_context_is_detected(payload: dict[str, Any], tmp_path: Path) -> None:
     """The measured 2026-08-30 defect: the server required a context the file did not name."""
     d = copy.deepcopy(payload)
-    _contexts(d)[:] = [*_declared(), "Invented (server-only)"]
+    _set_server(d, [*_declared(), "Invented (server-only)"])
     r = _run(d, tmp_path)
     assert r.returncode == 1
     assert "Invented (server-only)" in (r.stdout + r.stderr)
@@ -84,7 +92,7 @@ def test_a_file_only_context_is_detected(payload: dict[str, Any], tmp_path: Path
     assert len(declared) > 1, (
         "the register must name more than one context for this arm to mean anything"
     )
-    _contexts(d)[:] = declared[1:]
+    _set_server(d, declared[1:])
     r = _run(d, tmp_path)
     assert r.returncode == 1
     assert declared[0] in (r.stdout + r.stderr)
@@ -95,7 +103,7 @@ def test_zero_server_contexts_fails_rather_than_reporting_accurate(
 ) -> None:
     """FAIL CLOSED. An empty required set is not evidence the file is right."""
     d = copy.deepcopy(payload)
-    _contexts(d)[:] = []
+    _set_server(d, [])
     r = _run(d, tmp_path)
     assert r.returncode != 0
     assert "matches the server exactly" not in r.stdout
@@ -107,6 +115,7 @@ def test_a_missing_contexts_key_is_a_distinct_failure(
     """An UNREADABLE answer and a REAL drift are different facts, so they carry different exits."""
     d = copy.deepcopy(payload)
     del d["protection"]["required_status_checks"]["contexts"]
+    del d["protection"]["required_status_checks"]["checks"]
     r = _run(d, tmp_path)
     assert r.returncode == 2, "an unreadable payload must not share an exit code with real drift"
     assert "Treating as a FAILURE" in (r.stdout + r.stderr)
@@ -243,3 +252,98 @@ def test_the_job_that_runs_this_checker_is_not_a_required_context() -> None:
         + "\nIt reads branch protection over the network, so every merge would then depend on that "
         "call succeeding. Keep it advisory: a red run is a report, not a gate."
     )
+
+
+def _branch(**rsc: Any) -> dict[str, Any]:
+    return {"protected": True, "protection": {"required_status_checks": rsc}}
+
+
+def test_the_reader_unions_contexts_and_checks() -> None:
+    """BACKLOG #5465: a context carried only under ``checks`` is still required."""
+    read = branch_protection_contexts
+    assert read(_branch(contexts=[], checks=[{"context": "cla", "app_id": 1}])) == ["cla"]
+    assert read(
+        _branch(contexts=["CI gate"], checks=[{"context": "CI gate"}, {"context": "cla"}])
+    ) == ["CI gate", "cla"]
+    assert read(_branch(contexts=["CI gate"])) == ["CI gate"]
+
+
+@pytest.mark.parametrize(
+    ("branch", "why"),
+    [
+        (_branch(contexts=[], checks=[]), "lists no context"),
+        (_branch(contexts=[]), "lists no context"),
+        (_branch(enforcement_level="off", contexts=["CI gate"]), "enforcement_level is off"),
+        (
+            {
+                "protected": False,
+                "protection": {
+                    "enabled": False,
+                    "required_status_checks": {
+                        "enforcement_level": "off",
+                        "contexts": [],
+                        "checks": [],
+                    },
+                },
+            },
+            "not protected",
+        ),
+    ],
+)
+def test_an_empty_or_unenforced_required_set_is_refused(branch: dict[str, Any], why: str) -> None:
+    """BACKLOG #5465: each of these read as "nothing required" before; now each refuses."""
+    read = branch_protection_contexts
+    with pytest.raises(RuntimeError, match=why):
+        read(branch)
+    # A caller that unions with the rulesets and refuses an empty combined set opts in to [].
+    assert read(branch, allow_empty=True) == []
+
+
+def test_a_payload_with_neither_list_refuses_even_when_empty_is_allowed() -> None:
+    read = branch_protection_contexts
+    with pytest.raises(RuntimeError, match="not an empty required set"):
+        read({"protection": {}}, allow_empty=True)
+    for bad in (
+        _branch(contexts=[], checks=[{"app_id": 1}]),
+        _branch(contexts=[""]),
+        _branch(contexts=[None]),
+        _branch(contexts=["CI gate"], checks=["CI gate"]),
+        _branch(contexts=["  "]),
+        {"protected": False, "protection": {"required_status_checks": {"checks": ["CI gate"]}}},
+    ):
+        with pytest.raises(RuntimeError, match="names no context"):
+            read(bad, allow_empty=True)
+
+
+def test_an_unprotected_branch_with_no_status_checks_block_reads_empty_when_allowed() -> None:
+    """GitHub may omit required_status_checks entirely for an unprotected branch."""
+    payload = {"protected": False, "protection": {"enabled": False}}
+    assert branch_protection_contexts(payload, allow_empty=True) == []
+    with pytest.raises(RuntimeError, match="not protected"):
+        branch_protection_contexts(payload)
+
+
+def test_the_frozen_live_payload_still_reads(payload: dict[str, Any]) -> None:
+    """The positive control on the real shape: enforced, both lists populated, nothing refused."""
+    rsc = payload["protection"]["required_status_checks"]
+    expected = {*rsc["contexts"], *(c["context"] for c in rsc["checks"])}
+    assert set(branch_protection_contexts(payload)) == expected
+
+
+def test_a_non_object_status_check_block_is_a_refusal_not_a_crash() -> None:
+    """The drift checker catches RuntimeError as "unreadable"; an AttributeError would escape it."""
+    for bad in ({"protection": ["x"]}, {"protection": {"required_status_checks": "x"}}):
+        with pytest.raises(RuntimeError, match="not an object"):
+            branch_protection_contexts(bad)
+
+
+def test_a_blank_ruleset_context_is_refused() -> None:
+    for blank in (None, "", " "):
+        rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": blank}]},
+            }
+        ]
+        with pytest.raises(RuntimeError, match="names no context"):
+            ruleset_contexts(rules)
