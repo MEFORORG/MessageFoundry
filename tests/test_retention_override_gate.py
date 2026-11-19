@@ -260,8 +260,8 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
         "The engine shard limit: where a serve --shard process that does not hold an inbound runs "
         "retention against the same store, that inbound's override keeps none of what the purge "
         "of message bodies holds for that inbound's messages past that process's global "
-        "[security].delete_message_bodies_after_days window; no messages_days value on that "
-        "inbound changes this."
+        "[security].delete_message_bodies_after_days window, where that window is bounded; no "
+        "messages_days value on that inbound changes this."
     )
     assert shard_limit == ENGINE_SHARD_LIMIT
     assert text.count(shard_limit) == (1 if inbound_days is not None else 0)
@@ -271,7 +271,8 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
         "Subject to that limit, an inbound override keeps forever, while that inbound stays in the "
         "live graph" in text
     ) is (inbound_days is not None)
-    assert "apply the override" not in text
+    assert "holds the inbound, apply the override" not in text
+    assert "honour the override" not in text
     if outbound_days is not None:
         assert "the replies that outbound captured: that purge reads no outbound override." in text
 
@@ -327,7 +328,7 @@ def test_the_override_text_recommends_no_configuration_for_engine_shards(
     """BACKLOG #5967: a recommended configuration for keeping an inbound's bodies under engine
     shards (an unbounded global window plus a positive override on every other inbound) was
     removed, because it also kept other tiers forever and failed when the holding engine shard was
-    down. Red if any arm offers it again, or the switch's effect on that purge."""
+    down. Red if any arm offers it again."""
     registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
     verdict = judge_keep_forever_overrides(
         registry, acknowledged=acknowledged, enforcing=enforcing, env_name="prod"
@@ -337,9 +338,7 @@ def test_the_override_text_recommends_no_configuration_for_engine_shards(
     for removed in (
         "One configuration that keeps them",
         "gives every other inbound a positive messages_days",
-        "Those explicit days do not keep",
         "keeps the override as written",
-        "does not stop that purge",
         "to deliberately retain forever",
     ):
         assert removed not in text

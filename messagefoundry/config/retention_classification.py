@@ -578,8 +578,8 @@ ENGINE_SHARD_LIMIT: Final[str] = (
     "The engine shard limit: where a serve --shard process that does not hold an inbound runs "
     "retention against the same store, that inbound's override keeps none of what the purge of "
     "message bodies holds for that inbound's messages past that process's global "
-    f"{_window_setting('messages_days')} window; no messages_days value on that inbound changes "
-    "this."
+    f"{_window_setting('messages_days')} window, where that window is bounded; no messages_days "
+    "value on that inbound changes this."
 )
 
 

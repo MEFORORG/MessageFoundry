@@ -1330,8 +1330,8 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > `AUDIT:` line state which (BACKLOG #5967). **The engine shard limit:** where a `serve --shard`
 > process that does not hold an inbound runs retention against the same store, that inbound's
 > override keeps none of what the purge of message bodies holds for that inbound's messages past
-> that process's global `[security].delete_message_bodies_after_days` window; no `messages_days`
-> value on that inbound changes this. The
+> that process's global `[security].delete_message_bodies_after_days` window, where that window is
+> bounded; no `messages_days` value on that inbound changes this. The
 > overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
 > and on every config reload:
 >

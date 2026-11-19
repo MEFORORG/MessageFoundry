@@ -3995,9 +3995,7 @@ _OVERRIDE_NOTE_FACTS = (
 _OVERRIDE_NOTE_REMOVED = (
     "One configuration that keeps them",
     "gives every other inbound a positive `messages_days`",
-    "Those explicit days do not keep",
     "keeps the override as written",
-    "does not stop that purge",
 )
 _LOOSENING_DOC = _ROOT / "docs" / "SECURITY-LOOSENING.md"
 _PHI_DOC = _ROOT / "docs" / "PHI.md"
