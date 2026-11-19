@@ -6758,14 +6758,47 @@ def case_twins(names: Iterable[str]) -> Iterator[tuple[str, str]]:
     #5392). A SQL Server store with a case-insensitive default collation compares the queue,
     response and scope rows a connection name keys without case, so two such connections would
     share them there while SQLite and Postgres keep them apart. A connection or FHIR lookup name is
-    ASCII (the name rule), so ``casefold`` is exactly that collation's comparison for it; trailing
-    spaces and width, which SQL Server also ignores, cannot occur in one. Per table: an inbound and
-    an outbound may share a name, as they may exactly."""
-    seen: dict[str, str] = {}
+    ASCII (the name rule), so the fold is exactly that collation's comparison for it. A reference
+    set or database lookup name is not bound by the name rule, so the fold also drops trailing
+    U+0020 spaces, which SQL Server's ``=`` ignores, and maps the full-width ASCII forms and the
+    ideographic space to ASCII, the width a ``_CI_AS`` collation ignores. It still only
+    approximates the collation for such a name: at least kana differences and half-width katakana,
+    which that collation also ignores, are not folded, so a pair differing only there passes. A
+    name that is not a string is compared as it is rather than folded, so it cannot crash this. Per
+    table: an inbound and an outbound may share a name, as they may exactly."""
+    seen: dict[object, str] = {}
     for name in names:
-        first = seen.setdefault(name.casefold(), name)
+        key: object = name
+        if isinstance(name, str):
+            key = name.translate(_FULL_WIDTH_TO_ASCII).casefold().rstrip(" ")
+        first = seen.setdefault(key, name)
         if first != name:
             yield first, name
+
+
+#: The full-width ASCII forms (U+FF01 to U+FF5E) and the ideographic space, mapped to ASCII: the
+#: width difference a SQL Server ``_CI_AS`` collation ignores, and no more, so it folds nothing
+#: that collation keeps apart (BACKLOG #5392).
+_FULL_WIDTH_TO_ASCII: Final = {
+    **{code: code - 0xFEE0 for code in range(0xFF01, 0xFF5F)},
+    0x3000: 0x20,
+}
+
+
+#: The registry tables :meth:`Registry.graph_problems` refuses case twins in, as (rename kind,
+#: :class:`Registry` attribute, the label a refusal names) (BACKLOG #5392). Each table's names are
+#: written into records a SQL Server column comparing without case would merge: the connections
+#: key queue, response and scope rows, and every kind's record name (``connection_names``) reaches
+#: at least the attestation and loosening records. An inbound and an outbound are separate tables
+#: here because they may share a name exactly. The rename kinds are ``impact.RENAMEABLE_KINDS``
+#: ones, so ``plan_rename`` refuses a rename onto a twin in exactly these tables.
+CASE_TWIN_TABLES: Final[tuple[tuple[str, str, str], ...]] = (
+    ("inbound", "inbound", "inbound connection"),
+    ("outbound", "outbound", "outbound connection"),
+    ("fhir_lookup", "fhir_lookups", "fhir lookup"),
+    ("lookup", "lookups", "database lookup"),
+    ("reference", "references", "reference set"),
+)
 
 
 @dataclass
@@ -6977,16 +7010,13 @@ class Registry:
         # Before the other rules: some read the same literals laxly, and validate raises only the
         # first problem, so a symptom would hide the bad literal (vault BACKLOG #3234).
         yield from self.bool_literal_problems()
-        for kind, table in (
-            ("inbound connection", self.inbound),
-            ("outbound connection", self.outbound),
-            ("fhir lookup", self.fhir_lookups),
-        ):
-            for first, second in case_twins(table):
+        for _rename_kind, attribute, kind in CASE_TWIN_TABLES:
+            for first, second in case_twins(getattr(self, attribute)):
                 yield (
-                    f"duplicate {kind} name: {second!r} differs only in case from {first!r}, and "
-                    "a SQL Server store column that compares without case, at least the alert "
-                    "and event columns, would read the two as one"
+                    f"duplicate {kind} name: {second!r} differs only in case, width or trailing "
+                    f"spaces from {first!r}, and "
+                    "a SQL Server store column that compares without case would read the records "
+                    "naming the two as one"
                 )
         for conn in self.inbound.values():
             if conn.router not in self.routers:

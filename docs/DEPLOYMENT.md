@@ -442,12 +442,14 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   the key, and with `mtls_subject` it is a CA plus a subject list. Once `intake_auth` names a mode,
   this gate judges only that mode, and the allow-list is not consulted here. The listener still
   refuses a peer outside `source_ip_allowlist` on every connection. With `intake_auth = none`, the
-  default, a `source_ip_allowlist` counts when every entry is /8 or narrower for IPv4, or /32 or
-  narrower for IPv6. An IPv6 entry inside a prefix the gate reads as carrying IPv4 addresses, at
-  least the IPv4-mapped `::ffff:0:0/96`, the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`,
-  and Teredo's `2001::/32`, must also be /104 or narrower, which fixes at least 8 bits of the IPv4
-  address, so `::ffff:0:0/96` does not count. An IPv6 entry that holds one of those prefixes does
-  not count at any width, so `64:ff9b::/32` does not count either, though it meets the /32 floor.
+  default, a `source_ip_allowlist` counts only when it meets the allow-list rule. The rule judges
+  each entry against a prefix floor, judges an IPv6 entry by the IPv4 addresses it can carry, and
+  judges the whole list against a cap that caps the IPv4 address count that
+  `ALLOWLIST_RULE_TEXT` in netaddr.py defines, which is not every address the list admits
+  (vault BACKLOG #2622, #5393). The rule is stated once, as `ALLOWLIST_RULE_TEXT` in
+  [netaddr.py](../messagefoundry/netaddr.py), and a refusal quotes it and, when a list is set,
+  names the part the list failed. So `0.0.0.0/0` does not count, and neither does a list of
+  entries that each meet the floor but together pass the cap.
   `tls_ca_file` alone does not count, because it accepts any certificate that CA ever signed.
   `--allow-insecure-bind` does not waive this gate.
 
@@ -666,7 +668,7 @@ self-signed placeholder).
 | **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **always required**; no setting turns it off, and `serve` refuses to start without it on any bind (vault BACKLOG #2719) | — (auth-gated) | **Yes** — refused without an operator certificate; [SECURITY.md, Enforcement model](SECURITY.md#enforcement-model) states the rule and its one dev escape |
 | **MLLP source** | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`; ≥TLS 1.2. **Plaintext by default** | None (MLLP has no app auth) | — | **Yes** — non-loopback plaintext refused (`check_mllp_tls_exposure`) |
 | **HTTP source** (`Http()`, ADR 0023) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `intake_auth`: `api_key`, `bearer` or `mtls_subject` (no HTTP Basic mode). Default `none` | per-connection `source_ip_allowlist` — defaults to no restriction | **Yes** — non-loopback plaintext refused (`check_http_tls_exposure`), **and** `check_http_intake_auth` refuses a non-loopback listener with *no* effective peer control under `enforce`, and warns under `warn`. The caveat above lists what counts |
-| **DICOM C-STORE SCP** (`DICOM()`, ADR 0025) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + cert/key; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `calling_ae_allowlist` / `require_called_ae_title` / mTLS (DIMSE has no transport auth of its own) | per-connection `source_ip_allowlist` | **Yes** — non-loopback plaintext refused (`check_dimse_tls_exposure`), **and** a non-loopback SCP with *no* verifiable peer control is refused at construction, on every instance. An IP allow-list counts only when it meets the floors in the caveat above (vault BACKLOG #2622); mTLS counts. A calling-AE allow-list alone does not count (BACKLOG #316) |
+| **DICOM C-STORE SCP** (`DICOM()`, ADR 0025) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + cert/key; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `calling_ae_allowlist` / `require_called_ae_title` / mTLS (DIMSE has no transport auth of its own) | per-connection `source_ip_allowlist` | **Yes** — non-loopback plaintext refused (`check_dimse_tls_exposure`), **and** a non-loopback SCP with *no* verifiable peer control is refused at construction, on every instance. An IP allow-list counts only when it meets the allow-list rule, stated once as `ALLOWLIST_RULE_TEXT` in [netaddr.py](../messagefoundry/netaddr.py): per-entry prefix floors and a cap on the IPv4 addresses the entries together count (vault BACKLOG #2622, #5393); mTLS counts. A calling-AE allow-list alone does not count (BACKLOG #316) |
 | **Raw TCP source** | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); no TLS to enable, so keep loopback / firewall-segment / proxy-terminate |
 | **X12 source** (ISA/IEA framed) | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only (same socket plumbing as raw TCP) | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); keep loopback / firewall-segment / proxy-terminate |
 | **File source** | local filesystem | n/a (no network) | n/a | — | n/a |

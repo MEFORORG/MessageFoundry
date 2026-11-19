@@ -19,9 +19,9 @@ import pytest
 
 from messagefoundry import connection_names
 from messagefoundry.api import validation
-from messagefoundry.config import wiring
+from messagefoundry.config import impact, wiring
 from messagefoundry.config.connections_edit import upsert_connection
-from messagefoundry.config.impact import plan_rename
+from messagefoundry.config.impact import RENAMEABLE_KINDS, plan_rename
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry_toolkit.corepoint_import import import_corepoint
 from tests.test_api_input_validation import _accepts
@@ -329,3 +329,114 @@ def test_a_rename_onto_a_case_twin_is_refused_at_plan_time(tmp_path: Path) -> No
         plan_rename(registry, config, "inbound", "IB_ACME_ORU", "ib_acme_adt")
     # The control: a rename to its own case variant is not a twin of another connection.
     plan_rename(registry, config, "inbound", "IB_ACME_ORU", "ib_acme_oru")
+
+
+_REFERENCE_CALL = (
+    'Reference("{name}", source=DatabaseRef(server="db.example.org", database="d", '
+    'statement="SELECT code FROM t", key_column="code"))'
+)
+_LOOKUP_CALL = 'DatabaseLookup("{name}", server="db.example.org", database="d")'
+_FHIR_CALL = 'FhirLookup("{name}", url="https://fhir.example.org/fhir")'
+
+
+def _lookups(tmp_path: Path, *names: str, module: str = "lookups.py") -> Path:
+    """A config declaring a FhirLookup, a DatabaseLookup and a reference set under each name."""
+    lines = ["from messagefoundry import DatabaseLookup, DatabaseRef, FhirLookup, Reference"]
+    for name in names:
+        lines += [call.format(name=name) for call in (_FHIR_CALL, _LOOKUP_CALL, _REFERENCE_CALL)]
+    (tmp_path / module).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    ("call", "kind"),
+    [
+        (_FHIR_CALL, "fhir lookup"),
+        (_LOOKUP_CALL, "database lookup"),
+        (_REFERENCE_CALL, "reference set"),
+    ],
+    ids=["fhir_lookup", "lookup", "reference"],
+)
+def test_a_lookup_or_reference_case_twin_is_refused_at_load(
+    tmp_path: Path, call: str, kind: str
+) -> None:
+    # BACKLOG #5392: the twin check covered only inbound, outbound and FHIR lookup names.
+    _lookups(tmp_path, "EPIC")
+    (tmp_path / "twin.py").write_text(
+        "from messagefoundry import DatabaseLookup, DatabaseRef, FhirLookup, Reference\n"
+        + call.format(name="epic")
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match=f"duplicate {kind} name: 'epic' differs only in case"):
+        load_config(tmp_path, allow_empty=True)
+
+
+def test_one_name_in_each_lookup_kind_still_loads(tmp_path: Path) -> None:
+    # The control: the check is per table, so one name may be a FHIR lookup, a database lookup and
+    # a reference set at once, and two names differing by more than case load.
+    registry = load_config(_lookups(tmp_path, "EPIC", "EPIC2"), allow_empty=True)
+    assert set(registry.fhir_lookups) == set(registry.lookups) == set(registry.references)
+    assert set(registry.lookups) == {"EPIC", "EPIC2"}
+
+
+@pytest.mark.parametrize("kind", ["fhir_lookup", "lookup", "reference"])
+def test_a_lookup_rename_onto_a_case_twin_is_refused_at_plan_time(
+    tmp_path: Path, kind: str
+) -> None:
+    # BACKLOG #5392: plan_rename refused a twin only for inbound and outbound names.
+    config = _lookups(tmp_path, "EPIC", "CLAR")
+    registry = load_config(config, allow_empty=True)
+    with pytest.raises(WiringError, match="differs only in case"):
+        plan_rename(registry, config, kind, "CLAR", "epic")
+    # The control: a rename to its own case variant is not a twin of another name.
+    plan_rename(registry, config, kind, "CLAR", "clar")
+
+
+def test_every_twin_table_pairs_a_rename_kind_with_its_own_registry_table() -> None:
+    registry = wiring.Registry()
+    for rename_kind, attribute, _label in wiring.CASE_TWIN_TABLES:
+        assert rename_kind in RENAMEABLE_KINDS
+        # The table plan_rename checks is the one graph_problems checks, not merely a table.
+        assert getattr(registry, attribute) is impact._table(registry, rename_kind)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("EPIC", "EPIC "), ("EPIC", "\uff25\uff30\uff29\uff23")],  # a trailing space; full width
+    ids=["trailing_space", "full_width"],
+)
+def test_a_reference_twin_by_width_or_trailing_space_is_refused(
+    tmp_path: Path, first: str, second: str
+) -> None:
+    # A reference set name is not bound by the name rule, and SQL Server's `=` ignores a trailing
+    # space and a _CI_AS collation ignores width, so casefold alone would let these load.
+    (tmp_path / "refs.py").write_text(
+        "from messagefoundry import DatabaseRef, Reference\n"
+        + "\n".join(_REFERENCE_CALL.format(name=name) for name in (first, second))
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="duplicate reference set name: .*differs only in case"):
+        load_config(tmp_path, allow_empty=True)
+
+
+def test_the_twin_fold_keeps_a_no_break_space_and_a_superscript_apart(tmp_path: Path) -> None:
+    # The fold adds width and trailing U+0020 to casefold, and no more: a no-break space and a
+    # superscript are compared as written. Whether a given SQL Server collation also keeps these
+    # apart is not measured here, so this test pins the fold, not the store. casefold folds
+    # further than a SQL Server collation may, at least the long s, the Kelvin sign and the sharp
+    # s (to s, k and ss), so a name beside such a twin can be refused that the store would keep
+    # apart. That over-refusal fails closed.
+    names = ("EPIC", "EPIC\u00a0", "x2", "x\u00b2")
+    (tmp_path / "refs.py").write_text(
+        "from messagefoundry import DatabaseRef, Reference\n"
+        + "\n".join(_REFERENCE_CALL.format(name=name) for name in names)
+        + "\n",
+        encoding="utf-8",
+    )
+    assert set(load_config(tmp_path, allow_empty=True).references) == set(names)
+
+
+def test_a_name_that_is_not_a_string_does_not_crash_the_twin_check() -> None:
+    assert list(wiring.case_twins([123, "123", "A", "a"])) == [("A", "a")]  # type: ignore[list-item]

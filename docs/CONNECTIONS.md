@@ -15,9 +15,16 @@ Mirth/NextGen Connect parity reference for what's planned.
 - **MESSAGE TYPE** — the HL7 message code carried (`ADT`, `ORM`, `ORU`, `SIU`, `DFT`, `MDM`, `VXU`, …),
   or `MIXED` / `ALL` when a connection isn't message‑type‑specific.
 
-Two inbound, or two outbound, connections may not have names that differ only in case
-(`IB_Test_ADT` beside `IB_TEST_ADT`): the config refuses to load, because a SQL Server store column
-that compares without case would read the two as one (BACKLOG #5392).
+Within each registry table that `CASE_TWIN_TABLES` in
+[config/wiring.py](../messagefoundry/config/wiring.py) lists, two names may not differ only in case
+(`IB_Test_ADT` beside `IB_TEST_ADT`): the config refuses to load, and a rename onto such a name is
+refused, because a SQL Server store column that compares without case would read the two as one
+(BACKLOG #5392). A name of a kind no table there lists is not checked: at least router, handler
+and code-set names. A `DatabaseLookup` or reference-set name, which the connection-name rule
+does not bind, is also refused beside one that differs from it only in trailing spaces, or in the
+width of the full-width forms `case_twins` there folds; that function says what the check still
+misses, other width differences among them. An inbound and an outbound may still share a name up
+to case, as they may exactly.
 
 Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sample uses partner
 `Test`: **`IB_Test_ADT`** (inbound MLLP) → **`FILE-OUT_Test_ADT`** (outbound file).
@@ -3753,7 +3760,7 @@ The **bind interface** is the service-level `[inbound].bind_host` (or a per-conn
 >
 > **CAUTION: `calling_ae_allowlist` does not satisfy this gate on its own (BACKLOG #316).** It used to: the three controls were counted as co-equal. But a Calling AE Title is a string the caller asserts about **itself** in the association request — no key, no signature, nothing to verify — and AE Titles are published in conformance statements and visible in any capture. An SCP whose only control was an AE-title list was reachable by anyone who could route to it and knew one string, while passing a check named "fail-closed peer controls". **Keep it — it is still enforced at association time and is a genuinely useful filter** (it catches a misrouted sender and pins intent). It simply has to be **paired** with `source_ip_allowlist` or mTLS off-loopback.
 >
-> **CAUTION: a `source_ip_allowlist` counts only when it is narrow (vault BACKLOG #2622).** Every entry must meet the HTTP intake gate's prefix floors, applied by the same function; [DEPLOYMENT.md](DEPLOYMENT.md) states them. So `["0.0.0.0/0"]` or `["::/0"]` does not count, and one too-wide entry stops the whole list counting. With no mTLS, an SCP with such a list is refused at construction like one with no list. **mTLS still counts by presence:** `tls` + `tls_ca_file` admits any client certificate that CA signed, with no subject binding. The HTTP gate refuses that shape; this gate does not yet.
+> **CAUTION: a `source_ip_allowlist` counts only when it is narrow (vault BACKLOG #2622).** Every entry must meet the HTTP intake gate's prefix floors, applied by the same function, `allowlist_shortfall` in [netaddr.py](../messagefoundry/netaddr.py). So `["0.0.0.0/0"]` or `["::/0"]` does not count, and one too-wide entry stops the whole list counting. The list is also judged whole: it does not count when its entries together exceed the cap on IPv4 addresses, counted as `ALLOWLIST_RULE_TEXT` in that file defines the count (vault BACKLOG #5393). That count is not every address the list admits, so a list that admits more addresses than the cap can still count. The refusal names which rule the list failed. With no mTLS, an SCP with such a list is refused at construction like one with no list. **mTLS still counts by presence:** `tls` + `tls_ca_file` admits any client certificate that CA signed, with no subject binding. The HTTP gate refuses that shape; this gate does not yet.
 >
 > **WARNING: the construction gate counts controls, so the wrong spelling passes it.** Set
 > `calling_ae_allowlist` (AE titles are attacker-chosen strings on an unauthenticated association —
