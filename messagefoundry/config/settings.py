@@ -4145,7 +4145,9 @@ class AuthSettings(_Section):
         idle_seconds = self.session_idle_timeout_minutes * 60
         if self.mfa_verify_min_elapsed_seconds >= idle_seconds:
             raise ValueError(
-                "mfa_verify_min_elapsed_seconds must be shorter than session_idle_timeout_minutes"
+                # Named by the key an operator sets: the [auth] spelling is refused at load.
+                "[auth].mfa_verify_min_elapsed_seconds must be shorter than "
+                "[security].sign_out_after_idle_minutes"
             )
         return self
 
