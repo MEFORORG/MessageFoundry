@@ -49,6 +49,7 @@ from forbidden_members import (  # noqa: E402
     TEST_TOOLING_DISTRIBUTIONS,
     development_content,
     distribution,
+    escapes_root,
     forbidden,
     main,
     split_violation,
@@ -723,7 +724,96 @@ def test_the_cli_passes_a_tar_link_whose_target_is_clean(
         ],
     )
     assert main([str(sdist)]) == 0
+    # The link's target is an extra entry, not a member, so the count stays at the two members.
+    assert "inspected 2 members" in capsys.readouterr().out
+
+
+def test_a_symlink_target_is_read_from_the_link_s_own_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``a/h.py -> ../messagefoundry/x.py`` lands inside the toolkit package, so it passes; read
+    from the archive root, the same target would name the engine package."""
+    sdist = _write_tar(
+        tmp_path / "dist" / "messagefoundry_toolkit-0.4.0.tar.gz",
+        [
+            tarfile.TarInfo(
+                "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/messagefoundry/x.py"
+            ),
+            _link(
+                "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/a/h.py",
+                "../messagefoundry/x.py",
+                tarfile.SYMTYPE,
+            ),
+        ],
+    )
+    assert main([str(sdist)]) == 0
     capsys.readouterr()
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "/usr/lib/python3.14/site-packages/messagefoundry/__init__.py",
+        "../../../site-packages/messagefoundry/__init__.py",
+        "C:/Python314/Lib/site-packages/messagefoundry/__init__.py",
+    ],
+)
+def test_the_cli_refuses_a_link_target_outside_the_archive(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], target: str
+) -> None:
+    sdist = _write_tar(
+        tmp_path / "dist" / "messagefoundry_toolkit-0.4.0.tar.gz",
+        [
+            _link(
+                "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/h.py", target, tarfile.SYMTYPE
+            )
+        ],
+    )
+    assert main([str(sdist)]) == 1
+    assert "(a link to" in capsys.readouterr().err
+
+
+def test_the_cli_refuses_a_zip_symlink_entry_whose_target_is_the_engine(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wheel = tmp_path / "toolkit-dist" / _TOOLKIT_WHEEL
+    wheel.parent.mkdir(parents=True)
+    with zipfile.ZipFile(wheel, "w") as zf:
+        zf.writestr("messagefoundry_toolkit/__init__.py", "")
+        link = zipfile.ZipInfo("messagefoundry_toolkit/h.py")
+        link.external_attr = (0o120777 << 16) & 0xFFFF0000
+        zf.writestr(link, "../messagefoundry/__init__.py")
+    assert main([str(wheel)]) == 1
+    assert "messagefoundry_toolkit/h.py (a link to" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["/messagefoundry_toolkit/x.py", "../x.py", "messagefoundry_toolkit/../../x.py", "C:/x.py"],
+)
+def test_a_member_outside_the_archive_is_refused(member: str) -> None:
+    assert escapes_root(member) is not None
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["messagefoundry_toolkit/../messagefoundry_toolkit/x.py", "a/./b.py", "messagefoundry/x.py"],
+)
+def test_a_member_inside_the_archive_does_not_escape(member: str) -> None:
+    assert escapes_root(member) is None
+
+
+@pytest.mark.parametrize(
+    ("member", "dist"),
+    [
+        # A trailing space on a dot segment is the same segment to the normaliser.
+        (". /messagefoundry/x.py", "messagefoundry-toolkit"),
+        ("messagefoundry_toolkit/.. /messagefoundry/x.py", "messagefoundry-toolkit"),
+        ("messagefoundry/. /anon/x.py", "messagefoundry"),
+    ],
+)
+def test_a_dot_segment_with_a_trailing_space_is_still_a_dot_segment(member: str, dist: str) -> None:
+    assert split_violation(member, dist) is not None
 
 
 def test_the_cli_refuses_a_hyphen_named_toolkit_sdist_carrying_the_engine(

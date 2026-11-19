@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import posixpath
 import re
+import stat
 import sys
 import tarfile
 import zipfile
@@ -148,11 +149,13 @@ def _members(archive: Path) -> list[tuple[str, str]]:
     """Every ``(path, shown)`` pair to test in ``archive``, or raise :class:`InspectionError`.
 
     ``path`` is what the rules read and ``shown`` is how the error line names it. A member is one
-    pair, its name both times. A tar link member adds a pair for its TARGET too (BACKLOG #5470):
-    ``getnames()`` alone never read a link's ``linkname``, so a toolkit sdist could carry an
-    innocently named link whose extraction exposes an engine path. A hard link's target is an
-    archive path; a symbolic link's is relative to the link's own directory, so it is joined there
-    and also tested as written.
+    pair, its name both times. A link member adds a pair for its TARGET too (BACKLOG #5470): the
+    listing alone never read a target, so an innocently named link whose extraction exposes an
+    engine path would pass. A tar hard link's target is an archive path. A symbolic link's, in a
+    tar or as a zip entry whose mode says link, is relative to the link's own directory, so it is
+    joined there; :func:`escapes_root` refuses one that is absolute or climbs out. The release
+    builds the toolkit wheel-only today, so the tar half guards a toolkit sdist that would be built
+    later, and every tar the gate is given now.
 
     RAISING RATHER THAN RETURNING EMPTY IS THE POINT. "No forbidden member" and "the listing failed"
     are the same empty set, and a gate that cannot tell them apart reports a clean archive when it read
@@ -163,7 +166,7 @@ def _members(archive: Path) -> list[tuple[str, str]]:
     try:
         if archive.suffix.lower() in {".whl", ".zip"}:
             with zipfile.ZipFile(archive) as zf:
-                return [(name, name) for name in zf.namelist()]
+                return [pair for info in zf.infolist() for pair in _zip_entries(zf, info)]
         if suffixes[-2:] == [".tar", ".gz"] or archive.suffix.lower() == ".tgz":
             # `r:gz` and not `r:*`: the mode must be the one the filename promised, so a `.tar.gz`
             # that is secretly an uncompressed tar fails here rather than being read anyway.
@@ -184,14 +187,37 @@ def _members(archive: Path) -> list[tuple[str, str]]:
     )
 
 
+def _link_entry(name: str, target: str) -> tuple[str, str]:
+    """The ``(path, shown)`` pair for a link ``name`` whose target is ``target`` as stored."""
+    return target, f"{name} (a link to {target})"
+
+
+def _symlink_target(name: str, linkname: str) -> str:
+    """A symbolic link's target as an archive path: joined to the link's own directory. An absolute
+    target, a drive letter included, stays absolute, so :func:`escapes_root` sees it."""
+    target = linkname.replace("\\", "/")
+    if re.match(r"[A-Za-z]:", target):
+        return target
+    return posixpath.join(posixpath.dirname(name.replace("\\", "/")), target)
+
+
 def _tar_entries(info: tarfile.TarInfo) -> list[tuple[str, str]]:
     """The ``(path, shown)`` pairs one tar member contributes: itself, and any link target."""
     entries = [(info.name, info.name)]
-    if info.issym() or info.islnk():
-        targets = [info.linkname]
-        if info.issym():
-            targets.append(posixpath.join(posixpath.dirname(info.name), info.linkname))
-        entries.extend((t, f"{info.name} (a link to {t})") for t in dict.fromkeys(targets))
+    if info.issym():
+        entries.append(_link_entry(info.name, _symlink_target(info.name, info.linkname)))
+    elif info.islnk():
+        entries.append(_link_entry(info.name, info.linkname))
+    return entries
+
+
+def _zip_entries(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> list[tuple[str, str]]:
+    """The ``(path, shown)`` pairs one zip entry contributes. ``unzip`` restores an entry whose
+    Unix mode says symbolic link as a link to the path its content names, so that target counts."""
+    entries = [(info.filename, info.filename)]
+    if stat.S_ISLNK(info.external_attr >> 16):
+        linkname = zf.read(info).decode("utf-8", "replace")
+        entries.append(_link_entry(info.filename, _symlink_target(info.filename, linkname)))
     return entries
 
 
@@ -229,8 +255,9 @@ def _parts(member: str) -> list[str]:
     :func:`forbidden` says why both separators count and why empty components drop out. A ``.``
     component names the directory it sits in, so ``./messagefoundry/x.py`` is ``messagefoundry/x.py``
     to an extractor, and keeping it hid that from a rule that reads the first component or a
-    consecutive run (BACKLOG #5470). Dropping one never removes a component a rule could match."""
-    return [p for p in member.replace("\\", "/").split("/") if p and p != "."]
+    consecutive run (BACKLOG #5470). Dropping one never removes a component a rule could match.
+    ``. `` counts as ``.``, as :func:`_normalise` reads a trailing space."""
+    return [p for p in member.replace("\\", "/").split("/") if p and p.rstrip(" ") != "."]
 
 
 def forbidden(member: str) -> str | None:
@@ -319,16 +346,34 @@ def _name_version(stem: str) -> str | None:
     return None
 
 
-def _resolve_dots(parts: list[str]) -> list[str]:
-    """``parts`` with each ``..`` applied to the component before it, as an extractor would."""
+def _resolve_dots(parts: list[str]) -> tuple[list[str], bool]:
+    """``parts`` with each ``..`` applied to the component before it, as an extractor would, and
+    whether a ``..`` climbed above the first component. ``.. `` counts as ``..``."""
     resolved: list[str] = []
+    climbed = False
     for part in parts:
-        if part == "..":
+        if part.rstrip(" ") == "..":
             if resolved:
                 resolved.pop()
+            else:
+                climbed = True
         else:
             resolved.append(part)
-    return resolved
+    return resolved, climbed
+
+
+def escapes_root(member: str) -> str | None:
+    """Why ``member`` (a name, or a link target) points outside the archive, or ``None``.
+
+    An absolute path, a drive letter, or a ``..`` that climbs above the archive's top level names a
+    file the archive does not hold, such as an installed engine package, so no rule here can read
+    it. A published distribution has no reason to carry one, so it is refused (BACKLOG #5470)."""
+    unified = member.replace("\\", "/")
+    if unified.startswith("/") or re.match(r"[A-Za-z]:", unified):
+        return "the path is absolute, outside the archive"
+    if _resolve_dots(_parts(member))[1]:
+        return "the path climbs above the archive's top level"
+    return None
 
 
 def _split_candidates(member: str) -> list[list[str]]:
@@ -339,11 +384,11 @@ def _split_candidates(member: str) -> list[list[str]]:
     in front of ``messagefoundry/`` hid the engine package from it. Every reading is tested, never
     just the stripped one, so stripping a root cannot hide a ``<name>.data/`` tree either."""
     raw = _parts(member)
-    readings = [raw, _resolve_dots(raw)] if ".." in raw else [raw]
+    readings = [raw, _resolve_dots(raw)[0]]
     for parts in list(readings):
         if len(parts) > 1 and _name_version(parts[0]) is not None:
             readings.append(parts[1:])
-            readings.append(_resolve_dots(parts[1:]))
+            readings.append(_resolve_dots(parts[1:])[0])
     unique = dict.fromkeys(tuple(_normalise(p) for p in parts) for parts in readings if parts)
     return [list(parts) for parts in unique]
 
@@ -392,7 +437,8 @@ def distribution(archive: Path) -> str:
     digit. A conforming name is written with underscores, but a hyphenated one
     (``messagefoundry-toolkit-0.4.0.tar.gz``) must not read as its first word, which named the
     engine and skipped the toolkit rule (BACKLOG #5470). A filename with no version segment yields
-    its whole stem, which matches no distribution a rule names, so the result is the strict path.
+    its whole stem. A name no rule names is never exempt from the test-content rule, and the split
+    rule does not run for it: that rule is keyed on the two names it was written for.
     """
     name = archive.name
     lowered = name.lower()
@@ -427,15 +473,18 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
             for path, shown in entries
             if (
                 why := forbidden(path)
+                or escapes_root(path)
                 or (None if tooling else development_content(path))
                 or split_violation(path, dist)
             )
             is not None
         ]
         errors.extend(f"::error::{archive.name} ships {shown} -- {why}" for shown, why in hits)
-        total += len(entries)
+        # A link target is an extra entry, not a member, so the count is of members alone.
+        members = sum(1 for path, shown in entries if path == shown)
+        total += members
         verdict = f"{len(hits)} forbidden" if hits else "none forbidden"
-        print(f"member gate: inspected {len(entries)} members in {archive.name}, {verdict}")
+        print(f"member gate: inspected {members} members in {archive.name}, {verdict}")
         if tooling:
             # Said in the log every time, so the exemption is visible where the verdict is read.
             print(
