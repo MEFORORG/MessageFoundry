@@ -23,7 +23,7 @@ import pytest
 
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store import crypto_transit
-from messagefoundry.store.crypto import CipherError, CipherUnavailableError
+from messagefoundry.store.crypto import CipherError, CipherUnavailableError, gave_no_verdict
 from messagefoundry.store.crypto_transit import (
     TRANSIT_REQUEST_TIMEOUT_S,
     TransitCipher,
@@ -35,6 +35,7 @@ from messagefoundry.store.store import MessageStore
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 from tests._vault_hop_env import STORE, supply_vault_hop
 from tests.test_crypto_transit import _KEY_NAME, _FakeClient, _FakeTransit
+from tests.test_transit_batch import _frames_reach
 
 _vault_extra = pytest.mark.skipif(
     not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
@@ -270,19 +271,9 @@ def test_a_thread_client_that_cannot_be_built_is_an_outage_not_a_verdict() -> No
     """A thread whose own client cannot be built for a transport reason gave no verdict on the
     value, so it is the no-verdict error, never a refusal that would read the value as damaged."""
     import requests
-    import urllib3
-
-    def drop() -> Any:
-        raise urllib3.exceptions.ProtocolError("synthetic dropped connection")
 
     def refuse_connect() -> Any:
         raise requests.exceptions.ConnectionError("synthetic connection refused")
-
-    relabelled = _encrypt_in_a_thread(drop)
-    assert len(relabelled) == 1 and isinstance(relabelled[0], CipherUnavailableError)
-    cause = relabelled[0].__cause__
-    assert isinstance(cause, requests.exceptions.ConnectionError)
-    assert isinstance(cause.__cause__, urllib3.exceptions.ProtocolError)
 
     passed = _encrypt_in_a_thread(refuse_connect)
     assert len(passed) == 1 and isinstance(passed[0], CipherUnavailableError)
@@ -301,8 +292,59 @@ def test_a_thread_client_build_refusal_is_a_refusal_not_an_outage() -> None:
     failures = _encrypt_in_a_thread(refuse)
     assert len(failures) == 1
     assert not isinstance(failures[0], CipherUnavailableError)
+    assert isinstance(failures[0], CipherError) and not gave_no_verdict(failures[0])
     assert isinstance(failures[0].__cause__, ValueError)
     assert str(failures[0].__cause__) == "synthetic TLS-suite refusal"
+
+
+@_vault_extra
+def test_a_decrypt_build_refusal_gives_no_verdict() -> None:
+    """Mutation: give a decrypt build failure the encrypt side's refusal. Red: a cell walk reads
+    every cell as damaged although Transit was never asked, rather than stopping as could-not-run.
+    The text the refusal had and its cause are kept."""
+
+    def refuse() -> Any:
+        raise ValueError("synthetic TLS-suite refusal")
+
+    cipher = TransitCipher(_FakeClient(_FakeTransit()), _KEY_NAME, client_factory=refuse)
+    failures: list[CipherError] = []
+
+    def decrypt() -> None:
+        try:
+            cipher.decrypt("mfenc:v3:vault:v1:c3ludGhldGlj")
+        except CipherError as exc:
+            failures.append(exc)
+
+    _in_thread(decrypt)
+    assert len(failures) == 1 and isinstance(failures[0], CipherUnavailableError)
+    assert gave_no_verdict(failures[0])
+    assert str(failures[0]) == f"Transit decrypt failed (key={_KEY_NAME!r}): ValueError"
+    assert isinstance(failures[0].__cause__, ValueError)
+    assert str(failures[0].__cause__) == "synthetic TLS-suite refusal"
+
+
+@_vault_extra
+def test_a_batch_decrypt_build_failure_keeps_no_traceback_to_other_plaintext() -> None:
+    """Mutation: return the batch build failure's errors without detaching them. Red: a returned
+    error's cause keeps a traceback whose frames reach decrypt_many's locals, which hold the
+    plaintext of a value already opened (BACKLOG #6706)."""
+
+    def refuse() -> Any:
+        raise ValueError("synthetic TLS-suite refusal")
+
+    cipher = TransitCipher(
+        _FakeClient(_FakeTransit()), _KEY_NAME, client_factory=refuse, allow_unmarked=True
+    )
+    opened: list[list[str | CipherError]] = []
+    items: list[tuple[str, bytes | None]] = [("synthetic opened plaintext", None)]
+    items += [(f"mfenc:v3:vault:v1:c3ludGhldGlj{n}", None) for n in range(2)]
+    _in_thread(lambda: opened.append(cipher.decrypt_many(items)))
+    results = opened[0]
+    assert results[0] == "synthetic opened plaintext"
+    for error in results[1:]:
+        assert isinstance(error, CipherUnavailableError)
+        assert isinstance(error.__cause__, ValueError)
+        assert not _frames_reach(error, "synthetic opened plaintext")
 
 
 @_vault_extra
@@ -330,7 +372,7 @@ def test_a_build_refusal_on_a_batch_leaves_batching_on() -> None:
     assert not cipher._batch_alone
     assert len(opened[0]) == 2
     for result in opened[0]:
-        assert isinstance(result, CipherError) and not isinstance(result, CipherUnavailableError)
+        assert isinstance(result, CipherUnavailableError)  # a decrypt build failure: no verdict
         assert isinstance(result.__cause__, ValueError)
     assert len(raised) == 1 and not isinstance(raised[0], CipherUnavailableError)
     assert isinstance(raised[0].__cause__, ValueError)

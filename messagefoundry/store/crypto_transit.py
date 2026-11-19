@@ -78,6 +78,7 @@ from messagefoundry.store.crypto import (
     b64_chars,
     batch_chars,
     decrypt_or_error,
+    detached,
     gave_no_verdict,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
@@ -389,14 +390,18 @@ def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
     return UnauthenticatedCipherError(refused) if unauthenticated else CipherError(refused)
 
 
-def _batch_build_failure(op: str, key: str, exc: Exception) -> CipherError:
-    """The error each value of a batch gets when the calling thread's client could not be built
-    (BACKLOG #5963): the one a single ``encrypt`` or ``decrypt`` gives that failure, with ``exc`` as
-    its cause. The batch paths read the client before their request's handler, because that handler
-    reads any failure it does not call an outage as Transit refusing the batch, and that turns
-    batching off for the whole cipher although Transit was never asked."""
+def _build_failure(op: str, key: str, exc: Exception) -> CipherError:
+    """The error a data-key ``encrypt`` or ``decrypt`` gives when the calling thread's client
+    could not be built (BACKLOG #5963), its text the one :func:`_transit_failure` gives ``exc``.
+
+    For a ``decrypt`` it is always :class:`CipherUnavailableError`: Transit was never asked, so it
+    gave no verdict on the value, and a cell walk that reads :func:`gave_no_verdict` would stop as
+    could-not-run rather than mark every cell damaged. For an ``encrypt`` it stays what
+    :func:`_transit_failure` reads, so a deterministic refusal, a TLS-suite ValueError among them,
+    is not an outage a write would retry for ever."""
     error = _transit_failure(op, key, exc)
-    error.__cause__ = exc
+    if op == "decrypt" and not isinstance(error, CipherUnavailableError):
+        error = CipherUnavailableError(str(error))
     return error
 
 
@@ -475,36 +480,26 @@ class TransitCipher(_UnmarkedPolicy):
     @property
     def _client(self) -> Any:
         """The hvac client the calling thread uses (BACKLOG #5963), built on its first use there
-        when this cipher has a factory. The cipher's request paths read it inside the handler that
-        turns a failed Transit request into the cipher's own error, so a build that raises reaches
-        that handler too. A failed build is not cached: the thread's next call builds again.
-
-        Only a network or transport failure of the build reads as an outage: a requests connection
-        error or timeout propagates as it is, and a urllib3 timeout or protocol error is raised as a
-        requests connection error. Every other build failure, a TLS-suite refusal's ValueError among
-        them, propagates unchanged, so the handler reads it as the refusal it is rather than an
-        outage a write would retry for ever."""
+        when this cipher has a factory. A build failure propagates unchanged and is not cached: the
+        thread's next call builds again. The data-key paths, ``encrypt`` and ``decrypt`` single and
+        batch, read it through :meth:`_thread_client` before their request's handler, which turns a
+        build failure into :func:`_build_failure`'s error. The audit-key paths read it where they
+        send their request, so a build failure there meets the handling a failed request does."""
         if self._client_factory is None:
             return self._shared_client
         held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
         if held is not None and held.generation == self._generation:
             return held.client
         generation = self._generation
-        try:
-            client = self._client_factory()
-        except Exception as exc:
-            # The [vault] extra is present wherever a factory is; the import is lazy as elsewhere.
-            import requests  # noqa: PLC0415
-            import urllib3  # noqa: PLC0415
+        return self._hold(self._client_factory(), generation)
 
-            if isinstance(exc, (urllib3.exceptions.TimeoutError, urllib3.exceptions.ProtocolError)):
-                # is_vault_unavailable reads the requests families only, and still reads a hop
-                # refusal anywhere in this chain as a refusal.
-                raise requests.exceptions.ConnectionError(
-                    f"a Transit client could not be built for this thread: {type(exc).__name__}"
-                ) from exc
-            raise
-        return self._hold(client, generation)
+    def _thread_client(self, op: str) -> Any:
+        """:attr:`_client` for a data-key ``op``, a build failure raised as
+        :func:`_build_failure`'s error with the failure as its cause (BACKLOG #5963)."""
+        try:
+            return self._client
+        except Exception as exc:
+            raise _build_failure(op, self._key, exc) from exc
 
     def _hold(self, client: Any, generation: int) -> Any:
         """Keep ``client`` as the calling thread's own, closed when the thread drops it or when
@@ -546,11 +541,12 @@ class TransitCipher(_UnmarkedPolicy):
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
         pt_b64 = base64.b64encode(plaintext.encode("utf-8")).decode("ascii")
         assoc = self._associated_data(aad)
+        client = self._thread_client("encrypt")
         try:
             kwargs: dict[str, Any] = {"name": self._key, "plaintext": pt_b64}
             if assoc is not None:
                 kwargs["associated_data"] = assoc
-            response: Any = self._client.secrets.transit.encrypt_data(**kwargs)
+            response: Any = client.secrets.transit.encrypt_data(**kwargs)
             ciphertext = response["data"]["ciphertext"]  # "vault:v1:…" — no plaintext, no key
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
@@ -580,11 +576,12 @@ class TransitCipher(_UnmarkedPolicy):
             )
         ciphertext = stored[len(_V3_PREFIX) :]  # the full "vault:v1:…" blob (may contain ':')
         assoc = self._associated_data(aad)
+        client = self._thread_client("decrypt")
         try:
             kwargs: dict[str, Any] = {"name": self._key, "ciphertext": ciphertext}
             if assoc is not None:
                 kwargs["associated_data"] = assoc
-            response: Any = self._client.secrets.transit.decrypt_data(**kwargs)
+            response: Any = client.secrets.transit.decrypt_data(**kwargs)
             plaintext_b64 = response["data"]["plaintext"]
         except Exception as exc:
             # Covers a failed AEAD tag (wrong cell AAD / corrupt blob) AND transport failure — both fail
@@ -683,11 +680,14 @@ class TransitCipher(_UnmarkedPolicy):
         its order."""
         sent = [(stored[len(_V3_PREFIX) :], aad) for stored, aad in batch]
         try:
-            client = self._client
-        except Exception as exc:
             # Outside the batch handler: a thread whose client could not be built never asked
-            # Transit, so it must not read as Transit refusing the batch (see _batch_build_failure).
-            return [_batch_build_failure("decrypt", self._key, exc) for _ in batch]
+            # Transit, so it must not read as Transit refusing the batch, which turns batching off.
+            client = self._thread_client("decrypt")
+        except CipherError as failure:
+            # Detached as every returned error is: the cause's traceback reaches decrypt_many's
+            # frame, which holds the plaintext of the values already opened (BACKLOG #6706). The
+            # copies share that one cause.
+            return _unasked(detached(failure), len(batch))
         response: Any = None
         failed = unavailable = bad_request = False
         failure_type = ""
@@ -767,11 +767,8 @@ class TransitCipher(_UnmarkedPolicy):
             (base64.b64encode(plaintext.encode("utf-8")).decode("ascii"), aad)
             for plaintext, aad in batch
         ]
-        try:
-            client = self._client
-        except Exception as exc:
-            # Raised as encrypt would raise it, outside the batch handler (see _batch_build_failure).
-            raise _batch_build_failure("encrypt", self._key, exc) from exc
+        # Raised as encrypt raises it, outside the batch handler (see _decrypt_batch).
+        client = self._thread_client("encrypt")
         response: Any = None
         failed = unavailable = bad_request = False
         failure_type = ""
