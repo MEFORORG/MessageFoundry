@@ -133,9 +133,10 @@ def _check_unchanged(path: Path, *, exists: bool, validate: Validate) -> None:
     other than a regular file, which the replace could not have replaced, is refused too. A file
     that is there is checked as it stands, under the edit lock the caller holds, so a file the
     engine would refuse is never reported as left fine. With nothing at the path, none is created:
-    an empty file is checked instead, in a private directory beside it named as the replace names
-    its candidate directory (so a killed run's leftover is removed by the next replace), as the
-    replace would have checked the empty file it wrote."""
+    an empty file is checked instead, as the replace would have checked the empty file it wrote, in
+    a private directory beside the path that the replace's own stale-candidate sweep recognises and
+    its own cleanup removes, logging rather than raising so a cleanup fault never hides the check's
+    outcome."""
     # The replace's own link refusal, so the two refuse a link in the same words.
     atomic_edit._refuse_a_link(path, SecurityEditError)
     if exists:
@@ -146,15 +147,20 @@ def _check_unchanged(path: Path, *, exists: bool, validate: Validate) -> None:
             f"{path.name} was not changed: it is not a regular file, so it is no settings file to "
             "edit. Point --service-config at the settings TOML file"
         )
+    atomic_edit._remove_stale_candidates(path)
     with atomic_edit.refused_as(path, SecurityEditError, "create its edit candidate"):
-        private = tempfile.TemporaryDirectory(
-            dir=path.parent, prefix=f".{path.name}.", suffix=atomic_edit.CANDIDATE_DIR_SUFFIX
+        private = Path(
+            tempfile.mkdtemp(
+                dir=path.parent, prefix=f".{path.name}.", suffix=atomic_edit.CANDIDATE_DIR_SUFFIX
+            )
         )
-    with private as folder:
-        empty = Path(folder) / path.name
+    try:
+        empty = private / path.name
         with atomic_edit.refused_as(path, SecurityEditError, "write its edit candidate"):
             empty.write_bytes(b"")
         _checked(validate)(empty)
+    finally:
+        atomic_edit._remove_private_dir(private)
 
 
 def _checked(validate: Validate) -> Validate:

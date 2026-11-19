@@ -549,7 +549,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     security.add_argument(
         "--service-config",
         default="messagefoundry.toml",
-        help="service settings TOML the [security] section lives in (created on `set` if absent)",
+        help=(
+            "service settings TOML the [security] section lives in (created, if absent, by a "
+            "`set` that changes a key)"
+        ),
     )
     security.add_argument(
         "--data",
