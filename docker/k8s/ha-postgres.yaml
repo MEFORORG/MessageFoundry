@@ -245,7 +245,13 @@ spec:
             - { name: MEFOR_API_TLS_CERT_FILE, value: "/etc/mefor/tls/engine/api.crt" }
             - { name: MEFOR_API_TLS_KEY_FILE, value: "/etc/mefor/tls/engine/api.key" }
             # Off loopback serve also refuses this certificate bind until you attest revocation with
-            # MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
+            # MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate). The value is
+            # your attestation, so it comes from the Secret's tls-revocation-attested key and this
+            # file never writes it. The key is NOT optional: without it the kubelet refuses to start
+            # the container, rather than the engine exiting and restarting forever. Set it to 1 only
+            # if your PKI enforces revocation; a value the engine reads as false still refuses.
+            - name: MEFOR_TLS_REVOCATION_ATTESTED
+              valueFrom: { secretKeyRef: { name: mefor-secrets, key: tls-revocation-attested } }
             - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # each MLLP() must set tls=True (exposure gate)
             # --- production guardrails ---
             - { name: MEFOR_SECURITY_REQUIRE_MFA, value: "true" }       # covers directory accounts too; off + exposed = refused under enforce
@@ -266,6 +272,40 @@ spec:
             # [store].encrypt defaults true + trust_server_certificate defaults false — the DB connection is
             # TLS-verified. Give the managed DB a CA-trusted cert; do NOT set MEFOR_ALLOW_INSECURE_TLS.
             - { name: MEFOR_CLUSTER_ENABLED, value: "true" }        # the leader lease + graph gating come on here
+            # --- what an enforcing start needs (BACKLOG ##5934) ---
+            # [security].enforcement defaults to enforce, and nothing here lowers it, so serve refuses to
+            # start until each block below holds. Replace every REPLACE value with your own. At least
+            # these gates read them; serve's refusal message names any other one your config trips.
+            # Security notices and credential reminders (ASVS 6.3.5/6.3.7/6.4.5): an SMTP relay, a
+            # sender and a recipient. The relay hop verifies its certificate by default.
+            - { name: MEFOR_ALERTS_EMAIL_SMTP_HOST, value: "REPLACE-smtp.example.org" }
+            - { name: MEFOR_ALERTS_SMTP_ALLOWED_HOSTS, value: "REPLACE-smtp.example.org" }
+            - { name: MEFOR_ALERTS_EMAIL_FROM, value: "REPLACE-mefor@example.org" }
+            - { name: MEFOR_ALERTS_EMAIL_TO, value: "REPLACE-mefor-ops@example.org" }
+            # Off-box log forwarding: verified TLS to a collector that is not this host (ADR 0200),
+            # on the egress allowlist block_unlisted_outbound requires. The CA and CRL are baked into
+            # the config image under /config, root-owned like the config itself, because the engine
+            # refuses a CA another account could replace. Rebuild the image with a fresh CRL before
+            # the baked one's nextUpdate.
+            - { name: MEFOR_LOGGING_FORWARD_HOST, value: "REPLACE-siem.example.org" }
+            - { name: MEFOR_LOGGING_FORWARD_PORT, value: "6514" }     # RFC 5425; use your collector's port
+            - { name: MEFOR_LOGGING_FORWARD_PROTOCOL, value: "tls" }
+            - { name: MEFOR_LOGGING_FORWARD_TLS_CA_FILE, value: "/config/pki/syslog-ca.pem" }
+            - { name: MEFOR_LOGGING_FORWARD_TLS_CRL_FILE, value: "/config/pki/syslog-crl.pem" }
+            - { name: MEFOR_EGRESS_ALLOWED_SYSLOG, value: "REPLACE-siem.example.org" }
+            # Retention bounds (ASVS 14.2.7). The message-body and dead-letter windows default on;
+            # these two tiers need a window or an acknowledgement. Transform state takes the
+            # acknowledgement, which the gate names as the safe answer there: a window deletes it by
+            # write time, while a Handler may still be using it.
+            - { name: MEFOR_RETENTION_SEARCH_PRESET_DAYS, value: "30" }
+            - { name: MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY, value: "true" }
+            # The store hop checks revocation: under enforce, a verified Postgres hop with no CRL
+            # refuses at store open. Baked into the config image as the syslog CRL is.
+            - { name: MEFOR_STORE_SSL_CRL_FILE, value: "/config/pki/store-crl.pem" }
+            # The log spool (ADR 0200): a writable directory for records the collector has not yet
+            # taken. The root file system is read-only and these pods have no PVC, so it is the
+            # log-spool emptyDir below. Records still spooled are lost when the pod is deleted.
+            - { name: MEFOR_LOGGING_FORWARD_SPOOL_DIR, value: "/var/lib/mefor/log-spool" }
             # Secrets injected from the Secret as env (never plain manifest values):
             - name: MEFOR_STORE_PASSWORD
               valueFrom: { secretKeyRef: { name: mefor-secrets, key: store-password } }
@@ -276,6 +316,7 @@ spec:
           volumeMounts:
             - { name: tls, mountPath: /etc/mefor/tls, readOnly: true }   # copy-tls's 0600 copies
             - { name: tmp, mountPath: /tmp }               # writable tmpfs for the read-only root fs
+            - { name: log-spool, mountPath: /var/lib/mefor/log-spool }   # the forwarder's spool, above
             # NOTE: NO store PVC here — durability is in the external Postgres, the pods are stateless.
           # Liveness only. /health is tokenless + always 200 and answers BEFORE the engine finishes
           # starting — a pure liveness signal, not readiness. It is up on EVERY node (leader + standbys),
@@ -302,6 +343,8 @@ spec:
               - { key: api.key, path: api.key }
         - name: tmp
           emptyDir: { medium: Memory }
+        - name: log-spool               # on the node's disk, so it outlives a container restart
+          emptyDir: { sizeLimit: 1Gi }
 #
 # DO NOT add a HorizontalPodAutoscaler to this Deployment. HA replicas are for FAILOVER, not for spreading
 # one partner's inbound load: only the leader processes (active-passive), sticky long-lived MLLP senders

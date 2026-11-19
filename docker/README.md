@@ -150,6 +150,8 @@ against one case that matters, described under
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
   (the Postgres-led cloud guide, MLLP L4-LB recipe, and edge-relay topology) and
   [`docs/CLOUD-PHI-HIPAA.md`](../docs/CLOUD-PHI-HIPAA.md) (the cloud HIPAA posture) before deploying it.
+  Like the single-node manifest it carries a block *what an enforcing start needs* with `REPLACE`
+  values, and adds the store CRL and a writable `log-spool` volume, since these pods have no PVC.
   For a local taste of the HA shape: `docker compose --profile ha up` (adds a Postgres + a PAIR of
   clustered engines — `engine-ha` + `engine-standby` — that share one leader lease, so you can stop the
   leader and watch the other promote; the default `docker compose up` stays single-node SQLite, unchanged).

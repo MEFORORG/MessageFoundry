@@ -41,7 +41,7 @@ from messagefoundry.transports.egress import syslog_forward_refusal
 
 _ROOT = Path(__file__).resolve().parents[1]
 _K8S = _ROOT / "docker" / "k8s"
-_MANIFESTS = {"statefulset.yaml": False}  # name -> Postgres store
+_MANIFESTS = {"ha-postgres.yaml": True, "statefulset.yaml": False}  # name -> Postgres store
 _ATTEST = "MEFOR_TLS_REVOCATION_ATTESTED"
 
 

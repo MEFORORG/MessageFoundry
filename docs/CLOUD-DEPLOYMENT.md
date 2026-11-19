@@ -365,11 +365,16 @@ TLS-terminating collector).
 2. **Build a config-baked image** (`FROM messagefoundry:postgres; COPY config /config`, root-owned files)
    and push it to your private registry. Base it on the `runtime-postgres` variant
    ([`docker/README.md`](../docker/README.md), "Image variants"): the slim default carries no `asyncpg`,
-   so the Postgres store cannot open on it.
+   so the Postgres store cannot open on it. Bake the syslog CA and CRL and the store CRL the
+   manifest names under `/config/pki/` into the same image.
 3. **Create the Secret** ([`docker/k8s/secret.example.yaml`](../docker/k8s/secret.example.yaml)) with
-   `store-encryption-key`, `store-password`, and the API TLS cert/key (and optional `api-tls-key-password`).
+   `store-encryption-key`, `store-password`, `tls-revocation-attested`, and the API TLS cert/key (and
+   optional `api-tls-key-password`).
 4. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with all three `image:` fields
    (`tls-dir`, `copy-tls` and `engine`) set to your baked image and `MEFOR_STORE_SERVER` set to the managed-PG endpoint.
+   Replace every `REPLACE` value in its block *what an enforcing start needs*: the engine starts under
+   `[security].enforcement = enforce`, and refuses until at least the alert channel, the log forwarding
+   and the retention bounds there are yours.
 5. **Stand up the L4 NLB** (one listener per MLLP port, primary-only TCP-connect health check at a ~10s
    interval, deregistration delay ~60s) per [§3](#3-mllp-exposure--an-operator-built-l4-load-balancer-that-follows-failover).
 6. **Verify HA:** `GET /cluster/nodes` shows 3 nodes + one `leader_node_id`; delete the leader pod and
