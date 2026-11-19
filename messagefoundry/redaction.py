@@ -2370,9 +2370,10 @@ def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> s
 
 def _glued_end_tag_rest(text: str, token: str, end: int, field_run: re.Pattern[str]) -> str | None:
     """The rest of a vocabulary end tag a field run cut through, when its ``token`` ends on
-    the tag's name (``a|b|<family>Smith</family`` before `` Zqxdoe>``), masked under BOTH rule sets:
-    :func:`_end_tag_rest`'s, which the XML pass applies to the same rest when no run took the tag,
-    and the one field-run rule that applies here: a last word glued to what follows must not open the
+    the tag's name (``a|b|<family>Smith</family`` before `` Zqxdoe>``), masked only where both of
+    these allow it: :func:`_end_tag_rest`'s rules, read on the text as the XML pass reads it (this
+    module's trailing note removed), which that pass applies to the same rest when no run took the
+    tag; and the one field-run rule that applies here: a last word glued to what follows must not open the
     next run's token, which would start inside the mask (BACKLOG #5925 item 1). The flat passes run
     before the XML pass, so without this the run took the tag's name and the rest it left was read
     by neither. ``None`` keeps the rest as it stood.
@@ -2388,8 +2389,16 @@ def _glued_end_tag_rest(text: str, token: str, end: int, field_run: re.Pattern[s
     assert line is not None  # the pattern matches the empty string
     stop = line.end()
     rest = text[end:stop]
+    # The XML pass reads the text without this module's trailing note (_redact_structured strips
+    # it), so the rest is judged on that text too: with the note left on, a rest that ends the
+    # text would read as followed by a line break and lose the end-of-text refusals.
+    body = text
+    if text.endswith("unscanned]"):
+        note = _TRAILING_NOTES.search(text)
+        if note is not None and stop <= note.start():
+            body = text[: note.start()]
     # _end_tag_rest returns the line masked, or unchanged where its rules refuse.
-    if _end_tag_rest(text, end, stop, True) == rest:
+    if _end_tag_rest(body, end, stop, True) == rest:
         return None
     words = _GLUED_WORD.findall(rest)
     if not words:  # _end_tag_rest masks only a rest with a word; a stand-in for it may not

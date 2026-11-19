@@ -179,6 +179,38 @@ def test_a_field_run_rest_the_end_tag_rules_refuse_stays_as_main_left_it(text: s
     assert redact(text) == main
 
 
+def _clamped_at(shape: str) -> str:
+    """``shape`` as :func:`redaction.clamp_untrusted` leaves it when the cut lands right after it:
+    the shape, then the bound note. The window is searched, since the cut lands only on whitespace."""
+    text = shape + " 12" * 200
+    for window in range(len(shape), len(shape) + 200):
+        clamped = redaction.clamp_untrusted(text, window=window)
+        if clamped.startswith(shape + "\n"):
+            return clamped
+    raise AssertionError(f"no window cuts right after {shape!r}")
+
+
+@pytest.mark.parametrize(
+    "shape", ["a|b|</family zqxP", "a|b|</family Zqx 4455", "a|b|</family Kim"]
+)
+def test_a_clamped_field_run_rest_is_judged_as_the_xml_pass_judges_it(shape: str) -> None:
+    """Code review round 3 (Manager repair): the bound note a clamp appends is stripped before the
+    XML pass reads the text, so the field-run arm judges the rest without it too. With the note left
+    on, a rest that ends the text read as followed by a line break and lost the end-of-text
+    refusals, so it was masked where main kept it. The answer is main's, with no new masking.
+
+    The clamp's name walk drops a trailing capitalized word such as ``Kim`` whole, so for that
+    shape the clamped text is built from the note directly."""
+    try:
+        clamped = _clamped_at(shape)
+    except AssertionError:
+        clamped = f"{shape}\n{redaction._clamp_marker(500)}"
+    assert redaction._TRAILING_NOTES.search(clamped) is not None  # the premise: the note is on
+    with _main():
+        main = redact(clamped)
+    assert redact(clamped) == main
+
+
 @pytest.mark.parametrize(
     ("a", "raw"),
     [
