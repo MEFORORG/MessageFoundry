@@ -84,10 +84,11 @@ on:
 permissions: {}
 
 concurrency:
-  group: asvs-anchor-report-${{ github.ref }}
-  # Only pull request runs, which skip the job anyway, are superseded. A push run is the only one
-  # that attributes breakage to its range (github.event.before), so a cancelled push run would lose
-  # that range for good.
+  # Only pull request runs, which skip the job anyway, share a group and supersede each other. A push
+  # run is the only one that attributes breakage to its range (github.event.before), so each push and
+  # dispatch run gets a group of its own: a shared group would let a newer run cancel a PENDING one
+  # even with cancel-in-progress off, and that range would be lost for good. net-helper.yml's pattern.
+  group: asvs-anchor-report-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -104,6 +105,11 @@ jobs:
     # would run that branch's copy of this file and of scripts/asvs/, the same exposure. The
     # `pull_request` trigger above stays: on a pull request this job reports SKIPPED, which is the
     # visible not-run the block above asks for.
+    #
+    # THIS GUARD BINDS ONLY THE COPY OF THIS FILE ON main. A branch can edit its own copy, `if:`
+    # included, and a pull request runs that copy. So the guard is not what would protect a vault
+    # credential held here; the header's decision that no such credential exists in this repository
+    # is, and this guard adds nothing to that case.
     if: >-
       ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && github.ref == 'refs/heads/main'
