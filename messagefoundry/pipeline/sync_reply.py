@@ -39,13 +39,8 @@ _POLL_CEILING_SECONDS: Final = 0.25
 #: therefore scales with load rather than being a constant an operator has to reason about.
 _POLL_SCALE_AFTER_WAITERS: Final = 8
 
-#: Failed delivery states for an awaited outbound's row. Neither proves the turn will get no reply:
-#: ``complete_with_response`` refuses only a ``done`` row, so a dead or cancelled row can still be
-#: completed with a capture, and a sibling handler upstream may yet emit another row to the outbound.
-_FAILED_ROW_STATES: Final = frozenset({OutboxStatus.DEAD.value, OutboxStatus.CANCELLED.value})
-#: Settled delivery states: the failed ones plus ``done``. Any other state, including one this module
-#: does not know, counts as live.
-_SETTLED_ROW_STATES: Final = _FAILED_ROW_STATES | {OutboxStatus.DONE.value}
+#: Terminal delivery states for the awaited destination's row: no reply can still arrive.
+_TERMINAL_ROW_STATES: Final = frozenset({OutboxStatus.DEAD.value, OutboxStatus.CANCELLED.value})
 
 
 def poll_period(waiters: int) -> float:
@@ -63,9 +58,7 @@ def poll_period(waiters: int) -> float:
 
 #: Outcomes that count as "a reply came back", so they get a ``reply_returned`` row. ``rejected`` and
 #: ``empty`` belong here: the partner answered, and the answer is what the caller was waiting for even
-#: when it is negative or deliberately blank. An ``empty`` whose detail reads ``seq=None`` is the one
-#: exception: a delivery that captured nothing (a plain ``mark_done``, as shadow mode performs), so
-#: no partner answer exists, and the missing seq is what tells the two apart on the timeline.
+#: when it is negative or deliberately blank.
 _RETURNED_OUTCOMES: Final = frozenset(
     {ReplyOutcome.REPLY, ReplyOutcome.REJECTED, ReplyOutcome.EMPTY}
 )
@@ -187,8 +180,7 @@ class SyncReplyResolverImpl:
         else:
             # Every other outcome already has its own disposition trail — a dead/cancelled row, an
             # UNROUTED message, or (for degraded) the metric label. Minting a second record of the
-            # same fact would make the timeline read as two events where one thing happened. A
-            # ``done`` row with no captured reply resolves ``empty`` and is recorded above.
+            # same fact would make the timeline read as two events where one thing happened.
             return
 
         try:
@@ -238,26 +230,16 @@ class SyncReplyResolverImpl:
                             message_id, state.latest_response_seq, elapsed_ms()
                         )
 
-                    # Decide only once no new row to this outbound can appear (ADR 0154 D3,
-                    # amended 2026-11-18): the message is terminal, or no ingress or routed row of
-                    # it is still unsettled. Until then a sibling handler upstream may yet emit a
-                    # row here that captures the reply, and routed rows carry a NULL
-                    # destination_name, so the row set alone cannot rule that out. An unrelated
-                    # outbound still retrying does not hold the turn: only upstream work can add a
-                    # row here.
-                    rows = state.row_states
-                    if not rows:
-                        if state.message_is_terminal:
-                            # Nothing was routed here at all. Only on the message's own terminal
-                            # status: an upstream row settled by a failure (a dead routed row) is
-                            # not "nothing routed", and the absence of rows alone is the
-                            # 502-for-a-message-we-then-delivered defect.
-                            return self._done(ReplyOutcome.NO_ROUTE, elapsed_ms())
-                    elif state.message_is_terminal or not state.upstream_in_flight:
-                        settled = self._settled(rows, elapsed_ms())
-                        if settled is not None:
-                            return settled
-                        # A live row: keep waiting for it to settle.
+                    # Fail fast on a PROVEN-terminal delivery, but only on the row's own state —
+                    # never on the ABSENCE of rows. A sibling handler still upstream leaves this
+                    # empty (routed rows carry a NULL destination_name), and reading that as
+                    # exclusion is the 502-for-a-message-we-then-delivered defect.
+                    if any(s in _TERMINAL_ROW_STATES for s in state.row_states):
+                        return self._done(ReplyOutcome.FAILED, elapsed_ms())
+
+                    if state.message_is_terminal:
+                        # Terminal with no reply and no dead row: nothing routed here at all.
+                        return self._done(ReplyOutcome.NO_ROUTE, elapsed_ms())
 
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -327,17 +309,6 @@ class SyncReplyResolverImpl:
             if str(name).strip().lower() == "content-type":
                 return str(value)
         return None
-
-    def _settled(self, rows: tuple[str, ...], waited_ms: int) -> InboundReply | None:
-        """Map a fully settled ``reply_from`` row set with no capture, or ``None`` while one is live."""
-        if not all(s in _SETTLED_ROW_STATES for s in rows):
-            return None
-        if OutboxStatus.DONE.value in rows:
-            # Delivered, but no reply was captured (a plain mark_done, as shadow or simulate mode
-            # performs). That is "delivered, no reply", never delivery_failed, which would invite a
-            # resend.
-            return self._done(ReplyOutcome.EMPTY, waited_ms)
-        return self._done(ReplyOutcome.FAILED, waited_ms)
 
     def _done(
         self, outcome: ReplyOutcome, waited_ms: int, *, response_seq: int | None = None

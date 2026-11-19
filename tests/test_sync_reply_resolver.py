@@ -125,8 +125,7 @@ async def test_the_highest_seq_wins_and_ack_sent_is_ignored() -> None:
 
 
 async def test_a_dead_row_fails_fast_rather_than_waiting_out_the_budget() -> None:
-    # mark_failed runs the finalizer in the same transaction, so a lone dead row reads beside ERROR.
-    store = _Store([_flowing(status=MessageStatus.ERROR.value, row_states=("dead",))])
+    store = _Store([_flowing(row_states=("dead",))])
     reply = await _resolver(store, timeout=30.0)("m1")
     assert reply.outcome is ReplyOutcome.FAILED
     assert reply.waited_ms < 5000, "it waited instead of failing fast on a proven-terminal row"
@@ -297,7 +296,7 @@ async def test_outcomes_with_their_own_disposition_trail_mint_no_second_row() ->
     # A dead row, an UNROUTED message and a degraded read each already leave their own record.
     # Duplicating them here would make the timeline read as two events where one thing happened.
     for states in (
-        _flowing(status=MessageStatus.ERROR.value, row_states=("dead",)),
+        _flowing(row_states=("dead",)),
         _flowing(status=MessageStatus.UNROUTED.value, row_states=()),
     ):
         store = _RecordingStore([states])

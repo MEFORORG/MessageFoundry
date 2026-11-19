@@ -429,8 +429,7 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   rejection, at least a SOAP fault in a 2xx body, comes back as a `502` that carries the partner's
   body. A delivery that dead-letters captures no reply, so a caller still waiting gets a fixed-JSON
   `502` without the partner's status or body. Most partner `4xx` statuses dead-letter the delivery
-  at once. CONNECTIONS.md, linked below, says when that `502` can wait on another handler of the
-  same message, and how a delivery that captured no reply is answered.
+  at once.
   `check_http_sync_reply` refuses a `reply_from` it cannot serve safely. Examples are an outbound
   that does not capture its response, and one that would retry forever. See
   [CONNECTIONS.md](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023).

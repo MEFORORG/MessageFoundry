@@ -1359,24 +1359,6 @@ class ClaimedHeads:
     head_skipped: frozenset[str] = frozenset()
 
 
-#: Counts a message's unsettled ``ingress``/``routed`` rows (ADR 0154 D3, amended 2026-11-18). Plain
-#: ``COUNT`` so SQLite and SQL Server share it; ``postgres.py`` keeps its ``$n`` twin inline, so a
-#: change here changes that copy too. A message has few rows.
-_UPSTREAM_IN_FLIGHT_SQL: Final = (
-    "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND stage IN (?,?)"
-    " AND status NOT IN (?,?,?)"
-)
-
-
-def _upstream_in_flight_params(message_id: str) -> tuple[str, ...]:
-    return (
-        message_id,
-        Stage.INGRESS.value,
-        Stage.ROUTED.value,
-        *_RESOLVED_STATUSES,
-    )
-
-
 @dataclass(frozen=True)
 class ReplyWaitState:
     """One metadata-only snapshot for a synchronous-reply wait tick (ADR 0154 D3).
@@ -1391,15 +1373,6 @@ class ReplyWaitState:
     means an empty ``row_states`` does **not** mean "this message was excluded". Concluding that it
     does is the defect ADR 0154 revision 1 shipped: a ``502`` returned for a message the engine then
     delivered normally. Consult :attr:`message_is_terminal` before ever interpreting an empty list.
-
-    **Read order is load-bearing.** Every backend reads the message status, then
-    :attr:`upstream_in_flight`, then the row states, then the reply, and on a pooled backend each
-    read may see its own snapshot. Upstream before rows: a row the upstream read could still have
-    produced is then already visible to the row read. Rows before reply: ``complete_with_response``
-    flips the row to ``done``, inserts the capture and runs the finalizer in ONE transaction, so a
-    row read that sees ``done`` was taken after the capture committed, and a reply read taken after
-    it sees that capture. Reading the reply first would let a capture that commits between the two
-    reads show a ``done`` row with no reply, an ``empty`` answer for a reply that exists.
     """
 
     #: ``messages.status`` for the awaited message, or ``None`` when the row no longer exists.
@@ -1411,13 +1384,6 @@ class ReplyWaitState:
     #: ``kind='response'``, or ``None`` when no reply has been captured. An ADR 0021 ``ack_sent`` row
     #: is excluded, so the inbound ACK we returned can never be mistaken for the partner's reply.
     latest_response_seq: int | None
-    #: Whether any ``ingress`` or ``routed`` row of the message is still unsettled (any state but
-    #: ``done``/``dead``/``cancelled``). A new outbound row to the awaited outbound can appear only
-    #: while one is: the router and transform handoffs each consume their row and write the next
-    #: stage's rows in ONE transaction. Read before :attr:`row_states`, so a ``False`` here means
-    #: every row the row read can ever see already existed when it ran. Defaults to ``True``, the
-    #: conservative reading, for a caller that cannot tell.
-    upstream_in_flight: bool = True
 
     @property
     def message_is_terminal(self) -> bool:
@@ -16652,7 +16618,7 @@ class MessageStore:
         Deliberately **not** built on :meth:`outbox_for`. That is a ``SELECT *`` fed through
         ``_decode_row``, so it decrypts ``last_error`` and pulls the payload ciphertext on **every
         tick** — a cost a poll loop cannot carry, and PHI this path has no business touching.
-        Modelled on :meth:`pending_depth` instead: four narrow indexed reads sharing one pooled
+        Modelled on :meth:`pending_depth` instead: three narrow indexed reads sharing one pooled
         connection, decoding nothing.
 
         See :class:`ReplyWaitState` for why the message's own status is returned alongside the row
@@ -16660,9 +16626,6 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute("SELECT status FROM messages WHERE id=?", (message_id,))
             message_row = await cur.fetchone()
-            # Read BEFORE the rows: see ReplyWaitState.upstream_in_flight.
-            cur = await db.execute(_UPSTREAM_IN_FLIGHT_SQL, _upstream_in_flight_params(message_id))
-            upstream_row = await cur.fetchone()
             cur = await db.execute(
                 "SELECT status FROM queue WHERE message_id=? AND stage=? AND destination_name=?",
                 (message_id, Stage.OUTBOUND.value, destination_name),
@@ -16681,7 +16644,6 @@ class MessageStore:
             message_status=(str(message_row["status"]) if message_row is not None else None),
             row_states=tuple(str(r["status"]) for r in queue_rows),
             latest_response_seq=(int(seq) if seq is not None else None),
-            upstream_in_flight=bool(upstream_row is not None and upstream_row["n"]),
         )
 
     # --- recovery / replay ---------------------------------------------------

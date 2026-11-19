@@ -322,7 +322,6 @@ from messagefoundry.store.store import (
     _opt_float,
     _session_cap_groups,
     _transit_attestation_row,
-    _upstream_in_flight_params,
     ad_map_write_async,
     admin_guard_counts,
     append_rename_audits,
@@ -7527,16 +7526,9 @@ class PostgresStore:
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
 
-        Four narrow indexed reads, decoding nothing — see :class:`ReplyWaitState` for why the
+        Three narrow indexed reads, decoding nothing — see :class:`ReplyWaitState` for why the
         message's own status is returned alongside the destination's row states."""
         message_row = await self._fetchone("SELECT status FROM messages WHERE id=$1", message_id)
-        # Read BEFORE the rows: see ReplyWaitState.upstream_in_flight. The $n twin of
-        # store._UPSTREAM_IN_FLIGHT_SQL; change both together.
-        upstream_row = await self._fetchone(
-            "SELECT COUNT(*) AS n FROM queue WHERE message_id=$1 AND stage IN ($2,$3)"
-            " AND status NOT IN ($4,$5,$6)",
-            *_upstream_in_flight_params(message_id),
-        )
         queue_rows = await self._fetchall(
             "SELECT status FROM queue WHERE message_id=$1 AND stage=$2 AND destination_name=$3",
             message_id,
@@ -7557,7 +7549,6 @@ class PostgresStore:
             message_status=(str(message_row["status"]) if message_row is not None else None),
             row_states=tuple(str(r["status"]) for r in queue_rows),
             latest_response_seq=(int(seq) if seq is not None else None),
-            upstream_in_flight=bool(upstream_row is not None and upstream_row["n"]),
         )
 
     # --- recovery / replay ---------------------------------------------------

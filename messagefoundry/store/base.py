@@ -1101,10 +1101,8 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3): the message's own
-        status, whether any ``ingress``/``routed`` row of it is unsettled (``upstream_in_flight``, read
-        before the rows; a backend that leaves its default of ``True`` makes every non-terminal turn
-        wait for the terminal status), the awaited destination's outbound row states, and the highest
-        committed ``response_seq`` for it.
+        status, the awaited destination's outbound row states, and the highest committed
+        ``response_seq`` for it.
 
         The inbound HTTP listener's sync-reply path polls this while a caller is blocked, so it must
         stay cheap and must decrypt **nothing** — see :class:`ReplyWaitState`, which also documents
