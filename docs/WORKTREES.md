@@ -429,7 +429,8 @@ pwsh -NoProfile -File scripts\coord\recoverable.ps1                 # this workt
 pwsh -NoProfile -File scripts\coord\recoverable.ps1 -Worktree <p> -Json
 ```
 
-It exits non-zero if any file is at risk. Each row carries a **binary `Verdict`** — the only thing a
+It exits 1 if any file is at risk, and 2 when it refuses because it could not look, for example
+on a failed `git status`; a refusal prints no rows. Each row carries a **binary `Verdict`** — the only thing a
 caller has to act on — and a **`Reason`** from a closed set, because three of the four causes are
 `AT-RISK` and "absent" is not the same problem as "modified":
 
@@ -699,7 +700,7 @@ race deterministically with no threads and no sleeps.
 scheduled task, as you and never as SYSTEM, that runs
 [`run-daily-prune.ps1`](../scripts/worktree/run-daily-prune.ps1) from the **primary** checkout. The
 runner calls `prune-merged.ps1`, appends what it printed to a dated log under
-`%LOCALAPPDATA%\MessageFoundry\worktree-prune`, and passes its exit code back. The task **dry-runs
+`%LOCALAPPDATA%\MessageFoundry\worktree-prune`, and passes its exit code back (or `4`, below). The task **dry-runs
 unless registered with `-Apply`**, and the installer refuses to run inside Claude Code (`-Json`, which
 registers nothing, excepted). Run it from a plain terminal:
 
@@ -734,13 +735,48 @@ says what else the step does not see.
 The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
 refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as it
 is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check
-passed and git still refused), `FAILED` or `ORPHANED`, with its reason, then a summary line with the
-counts and the drive's free space. A refusal or a decline is data and leaves the exit code alone; a
-failure raises it to `1`, and an orphan raises it to `3` and goes into `prune-merged.ps1`'s orphan
-ledger, so later runs keep reporting it. A list that could not be read skips the step, raising the
-code to `2` on a dry run and to `1` under `-Apply`, since the prune before it may have removed
-siblings. With `-Apply` the runner refuses to run inside Claude Code. Tests:
-[`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py).
+passed and git still refused), `FAILED`, `ORPHANED` or `NOT-REACHED` (the runner's
+`-StopAfterMinutes` deadline passed before that tree was started), with its reason, then a summary
+line with the counts and the drive's free space. The installer sets the deadline inside the task's
+time limit (`-TimeLimitHours`, default 4); a task registered before either existed keeps its old
+one-hour limit and no deadline until `install-daily-prune.ps1` is run again.
+
+**The deadline bounds both `prune-merged.ps1` runs too**, the prune and the step's listing run. With
+it, each is started as a child process and waited on for the time left. One still running at the
+deadline is killed with its whole process tree, `git` included, and logged as `--- prune-merged.ps1
+TIMED OUT after N min, killed at HH:mm:ss ---` after what it printed. The kill is a hard one, the
+same Task Scheduler's limit would make, only earlier and logged. Under `-Apply` it can leave what the
+child was doing half done, and no later run is sure to report it: a worktree partly deleted before git
+deregistered it, a stale git lock file in the primary that refuses later git commands until removed
+by hand, claims left behind, or a truncated orphan ledger. Past the deadline before the prune run,
+nothing is started and the log says `NOT STARTED`. The step is skipped with one `SKIPPED`
+line when the prune run was not started or was killed, when the deadline passed before the listing
+run, or when the listing run was killed. Without a deadline both runs are started with `&`, unbounded,
+as before.
+
+**A deadline stop exits `4`, DEADLINE, where the run earned no other code**: a killed or unstarted
+run, a skipped step, or a `NOT-REACHED` tree. `4` is the runner's own code, not one `prune-merged.ps1`
+returns, and it replaces only a `0`. A `1`, `2` or `3` the run earned stays the exit code, because a
+real failure matters more than a partial run, and a deadline stop is expected most nights while a
+backlog drains; the log still records the stop. Two deadline stops exit `1` instead: an `-Apply`
+prune run killed part way, which attempted something and did not finish, and a child the kill could
+not end, logged as `kill FAILED` with its pid, which may still be running. Before, a deadline stop left the code alone, so a run that skipped work
+exited as if it had finished it.
+
+The exit code starts as the prune's, and each row changes it as the row arrives, before the row's
+log line is written. A refusal leaves it alone; a tree the deadline left marks a deadline stop. An orphan raises it to `3`
+and goes into `prune-merged.ps1`'s orphan ledger, so later runs keep reporting it. A `2` from the
+prune says nothing was attempted, so a `REMOVED`, `FAILED` or `DECLINED` row turns it into `1`; apart
+from that, a failure raises the code to at least `1`, and nothing lowers it. An unhandled error after
+the log path is set exits with at least `2` before the prune started or on a dry run, and at least `1`
+once an `-Apply` prune has started, never below the code the prune and the rows have set. A list that
+could not be read skips the step, raising the code to at least `2` on a dry run and at least `1` under
+`-Apply`, since the prune before it may have removed siblings. A deadline stop turns a `0` into `4`. With `-Apply` the runner refuses to run
+inside Claude Code. Tests:
+[`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py)
+for the step, and
+[`tests/test_worktree_install_daily_prune.py`](../tests/test_worktree_install_daily_prune.py) for the
+exit codes and the prompt variables.
 
 ## A scheduled hygiene report that deletes nothing — `hygiene-report.ps1`
 

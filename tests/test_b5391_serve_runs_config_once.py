@@ -59,7 +59,8 @@ def _boot(
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND", "true")
-    monkeypatch.setenv("MEFOR_EGRESS_ALLOWED_MLLP", '["10.0.0.1"]')
+    # Comma-separated: a JSON list here is refused at load (BACKLOG #5915).
+    monkeypatch.setenv("MEFOR_EGRESS_ALLOWED_MLLP", "10.0.0.1")
     monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI", "true")
     monkeypatch.setenv("MEFOR_ALERTS_SECURITY_NOTIFICATIONS_REQUIRED", "false")

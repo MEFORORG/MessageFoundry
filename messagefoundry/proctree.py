@@ -20,11 +20,16 @@ BACKLOG #2622).
 these escape: on POSIX a descendant that leaves the group (``setsid``, and ``sudo`` in its default
 ``use_pty`` mode) or that the engine's account may not signal; on Windows, work a child hands to
 another process outside its tree (a WMI provider, Task Scheduler, a service). A failure to set up
-the job degrades to a single-process kill, logged. When :func:`kill_process_group` sends no signal,
-its callers fall back to a single-process kill, the DR hook's only while its shell has not exited.
-Of that function's own refusals only a failed signal is logged: at least a group that cannot be
-read, a group ``pid`` does not lead, and, with ``started_as_leader=True``, the caller's own group
-return ``False`` with nothing logged.
+the job degrades to a single-process kill, logged. :func:`kill_process_group` tells a group it
+signalled (:attr:`GroupKill.SENT`) from one it found empty (:attr:`GroupKill.EMPTY`) and from one
+it sent nothing to with members possibly left (:attr:`GroupKill.NOT_SENT`); only ``SENT`` is truthy.
+What a caller does next is its own. The DR hook kills its shell alone on anything but ``SENT``, and
+only while the shell has not exited; the sandbox stops on ``EMPTY`` and tries
+:func:`kill_reaped_leader_group` on ``NOT_SENT`` before any single-process kill. Of
+:func:`kill_process_group`'s own outcomes only a failed signal is logged: at least a group that
+cannot be read, a group ``pid`` does not lead, and, with ``started_as_leader=True``, the caller's
+own group return ``NOT_SENT`` with nothing logged, and an empty group returns ``EMPTY`` with nothing
+logged unless the caller passes ``warn_empty=True``, as the DR hook does.
 :func:`kill_reaped_leader_group` has no process left to fall back to, and says so in its return
 value; it logs a failed signal and nothing else.
 
@@ -34,6 +39,7 @@ Standard library only (``ctypes``), so ``pipeline/`` modules may import it.
 from __future__ import annotations
 
 import ctypes
+import enum
 import logging
 import os
 import signal
@@ -267,12 +273,34 @@ def resume_into_job(pid: int, *, who: str) -> int | None:
         _close_handle(kernel32, int(handle))
 
 
-def kill_process_group(pid: int, *, started_as_leader: bool = False) -> bool:
-    """``SIGKILL`` the process group that ``pid`` leads, on POSIX. Returns whether the signal was
-    sent.
+class GroupKill(enum.Enum):
+    """What :func:`kill_process_group` did. Only :attr:`SENT` is truthy, so a caller that tests the
+    result as a bool reads "the signal was sent", as it did when the function returned ``bool``."""
 
-    Returns ``False``, signalling nothing, on Windows, when ``pid`` leads no group of its own, when
-    its group cannot be read, or when the signal fails. The caller then kills the one process.
+    #: The group was sent ``SIGKILL``.
+    SENT = "sent"
+    #: ``killpg`` found no process in the group (``ESRCH``): nothing is left to kill.
+    EMPTY = "empty"
+    #: Nothing was sent and members may remain: Windows, a group that could not be read, one ``pid``
+    #: does not lead, the caller's own group, or a signal that failed.
+    NOT_SENT = "not_sent"
+
+    def __bool__(self) -> bool:
+        return self is GroupKill.SENT
+
+
+def kill_process_group(
+    pid: int, *, started_as_leader: bool = False, warn_empty: bool = False
+) -> GroupKill:
+    """``SIGKILL`` the process group that ``pid`` leads, on POSIX, and say what happened.
+
+    Returns :attr:`GroupKill.SENT` when the signal was sent, :attr:`GroupKill.EMPTY` when
+    ``killpg`` found the group empty, and :attr:`GroupKill.NOT_SENT`, signalling nothing, at least
+    on Windows, when ``pid`` leads no group of its own, when its group cannot be read, with
+    ``started_as_leader=True`` when ``pid`` is the caller's own group, or when the signal fails.
+    Only the failed signal is logged, and, with ``warn_empty=True``, an empty group too, under the
+    line a failed signal wrote before :class:`GroupKill` existed. The DR hook passes it so its
+    empty-group ``WARNING`` stays as it was. The module docstring says what each caller does next.
 
     The leadership check reads ``pid``'s group, so it needs ``pid`` to still be a live process.
     ``started_as_leader=True`` is for a caller that started ``pid`` with
@@ -280,28 +308,44 @@ def kill_process_group(pid: int, *, started_as_leader: bool = False) -> bool:
     still reaches the group's other members after the leader has exited and been reaped. Either way
     this never signals the caller's own group (the engine's, or pytest's)."""
     if sys.platform == "win32":
-        return False
+        return GroupKill.NOT_SENT
     if started_as_leader:
         if pid == os.getpgrp():
-            return False
+            return GroupKill.NOT_SENT
         pgid = pid
     else:
         try:
             pgid = os.getpgid(pid)
         except OSError:
-            return False
+            return GroupKill.NOT_SENT
         if pgid != pid:
-            return False
+            return GroupKill.NOT_SENT
+    return _killpg(pgid, warn_empty=warn_empty)
+
+
+def _killpg(pgid: int, *, warn_empty: bool = False) -> GroupKill:
+    """``SIGKILL`` group ``pgid``, telling a group found empty (``ESRCH``) from a failed signal."""
+    if sys.platform == "win32":  # no process groups; the callers return before this
+        return GroupKill.NOT_SENT
     try:
         os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError as exc:
+        if warn_empty:
+            log.warning(
+                "could not signal process group %d (%s); kill degrades to a single-process kill",
+                pgid,
+                exc.strerror or type(exc).__name__,
+            )
+        return GroupKill.EMPTY  # no process is left in the group
     except OSError as exc:
+        # The caller, not this module, decides what follows, so the line says only what is known.
         log.warning(
-            "could not signal process group %d (%s); kill degrades to a single-process kill",
+            "could not signal process group %d (%s), so a process in it may survive",
             pgid,
             exc.strerror or type(exc).__name__,
         )
-        return False
-    return True
+        return GroupKill.NOT_SENT
+    return GroupKill.SENT
 
 
 def kill_reaped_leader_group(pid: int) -> bool | None:
@@ -309,8 +353,12 @@ def kill_reaped_leader_group(pid: int) -> bool | None:
 
     Returns ``True`` when the signal was sent, ``False`` when there was nothing to signal (Windows,
     the caller's own group, or a group with no members left), and ``None`` when it sent none and
-    members may remain: ``pid`` may name another process now, or the signal failed. Unlike
-    :func:`kill_process_group` there is no single-process fallback, since the leader is gone.
+    members may remain: ``pid`` names a live process, the lookup of ``pid`` failed some other way,
+    or the signal failed. A live process is another one that took the pid after the reap, or, for a
+    caller that calls this before it knows ``pid`` was reaped, ``pid`` itself, still alive or a
+    zombie whose group the kernel reads, whose group :func:`kill_process_group` declined to signal
+    (it leads none, or the signal failed). This function never signals a live ``pid``'s group; that
+    caller decides what to do with ``None``. There is no single-process fallback here.
 
     POSIX does not reuse a pid while a process group with that id has members, so while the group a
     reaped leader led has a member, ``pid`` names no live process and ``killpg(pid)`` reaches that
@@ -329,13 +377,5 @@ def kill_reaped_leader_group(pid: int) -> bool | None:
         return None
     else:
         return None  # the pid names a live process, which cannot be the reaped leader
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return False  # the group is empty
-    except OSError as exc:
-        log.warning(
-            "could not signal process group %d (%s)", pid, exc.strerror or type(exc).__name__
-        )
-        return None
-    return True
+    result = _killpg(pid)
+    return None if result is GroupKill.NOT_SENT else result is GroupKill.SENT

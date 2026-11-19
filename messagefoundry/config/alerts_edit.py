@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import tomlkit
+from tomlkit.items import Array, InlineTable
 
 from messagefoundry.config import atomic_edit
 
@@ -111,9 +112,18 @@ def add_rule(
             doc["alerts"] = alerts
         rules = alerts.get("rules")
         if rules is None:
-            rules = tomlkit.aot()
+            # An array of tables cannot sit inside an inline ``alerts = {...}`` table (BACKLOG #5774).
+            rules = tomlkit.array() if isinstance(alerts, InlineTable) else tomlkit.aot()
             alerts["rules"] = rules
-        rules.append(_build_table(obj))
+        if isinstance(rules, Array):
+            # BACKLOG #5774: ``rules = [{...}]`` is a valid inline array, and appending a table
+            # into it wrote TOML that does not parse, so the add was refused for that file. One more
+            # inline table is appended instead, and the array's comments stay where they are.
+            rule = tomlkit.inline_table()
+            rule.update(_rule_values(obj))
+            rules.append(rule)
+        else:
+            rules.append(_build_table(obj))
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "add", "index": len(rules) - 1}
@@ -168,11 +178,15 @@ def _validate_input(obj: Any) -> None:
         )
 
 
+def _rule_values(obj: dict[str, Any]) -> dict[str, Any]:
+    # None = field absent; [] (suppress) is a real value, kept.
+    return {key: obj[key] for key in _RULE_FIELDS if obj.get(key) is not None}
+
+
 def _build_table(obj: dict[str, Any]) -> Any:
     table = tomlkit.table()
-    for key in _RULE_FIELDS:
-        if obj.get(key) is not None:  # None = field absent; [] (suppress) is a real value, kept
-            table[key] = obj[key]
+    for key, value in _rule_values(obj).items():
+        table[key] = value
     return table
 
 

@@ -47,6 +47,7 @@ from messagefoundry.config.settings import (
     EscalationTier,
     LoggingSettings,
     StoreSettings,
+    SyslogProtocol,
     TlsSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture
@@ -2026,9 +2027,15 @@ def test_a_blank_settings_pin_refuses_at_load(
 
     with pytest.raises(ValidationError, match=re.escape(setting) + " is set but empty"):
         model.model_validate({field: blank})
-    # The controls: absent means no pin, and a real pin loads unchanged.
+    # The controls: absent means no pin, and a real pin loads unchanged. The client-CA pin needs the
+    # client CA it pins, which needs a server cert (BACKLOG #5315).
+    anchor = (
+        {"tls_cert_file": "server.pem", "tls_client_ca_file": "client-ca.pem"}
+        if model is ApiSettings
+        else {}
+    )
     assert getattr(model.model_validate({}), field) is None
-    assert getattr(model.model_validate({field: "ab" * 32}), field) == "ab" * 32
+    assert getattr(model.model_validate({**anchor, field: "ab" * 32}), field) == "ab" * 32
 
 
 def test_a_blank_settings_pin_from_the_environment_refuses(tmp_path: Path) -> None:
@@ -2845,8 +2852,13 @@ _DIALLING_UNREAD: dict[str, dict[str, Any]] = {
     },
     "forward-off": {"log_settings": {**_SYSLOG_TLS, "forward_enabled": False}},
     "forward-no-host": {"log_settings": {"forward_protocol": "tls"}},
-    "forward-udp": {"log_settings": {**_SYSLOG_TLS, "forward_protocol": "udp"}},
-    "forward-no-verify": {"log_settings": {**_SYSLOG_TLS, "forward_tls_verify": False}},
+}
+
+#: A forwarder CA on a hop that never reads it now refuses at load (BACKLOG #5316), so these reach
+#: the spec builder only through an unvalidated model, which an embedder can still build.
+_FORWARD_CA_REFUSED: dict[str, dict[str, Any]] = {
+    "forward-udp": {"forward_protocol": SyslogProtocol.UDP},
+    "forward-no-verify": {"forward_tls_verify": False},
 }
 
 
@@ -2870,6 +2882,28 @@ def test_a_dialling_settings_ca_its_hop_does_not_read_is_not_collected(
     """The control for the case above: a CA no hop trusts is not checked, so a missing file
     refuses nothing. Red under: a hop condition dropped from its spec builder."""
     assert _dialling_specs(str(tmp_path / "gone.pem"), **_DIALLING_UNREAD[case]) == []
+
+
+@pytest.mark.parametrize("case", sorted(_FORWARD_CA_REFUSED))
+def test_a_forward_ca_its_hop_does_not_read_refuses_at_load_and_is_not_collected(
+    tmp_path: Path, case: str
+) -> None:
+    """The load refuses the CA. Past an unvalidated build the spec builder still skips it. The
+    control, the same build on verified TLS, is collected, so the skip is not the model's doing."""
+    from pydantic import ValidationError
+
+    base: dict[str, Any] = {
+        "forward_host": "collector.example.org",
+        "forward_protocol": SyslogProtocol.TLS,
+        "forward_tls_ca_file": str(tmp_path / "gone.pem"),
+    }
+    with pytest.raises(ValidationError, match=r"\[logging\]\.forward_tls_ca_file applies only"):
+        LoggingSettings(**{**base, **_FORWARD_CA_REFUSED[case]})
+    # model_construct runs no validator, so forward_enabled is set here as the loader would.
+    built = {**base, "forward_enabled": True}
+    unread = LoggingSettings.model_construct(**{**built, **_FORWARD_CA_REFUSED[case]})
+    assert ta.log_forward_anchor_spec(unread) is None
+    assert ta.log_forward_anchor_spec(LoggingSettings.model_construct(**built)) is not None
 
 
 @pytest.mark.parametrize("case", ["internal-augment", "email-transport", "forward-tls"])

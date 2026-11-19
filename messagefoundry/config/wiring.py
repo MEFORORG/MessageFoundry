@@ -4615,6 +4615,8 @@ def Direct(
     ``host:port`` over STARTTLS. Cert/key material is loaded + validated at construction (fail loud),
     except the certificates' validity window: construction only warns on it, and each send refuses
     a recipient cert or issuing anchor outside it (code ``direct-cert-validity``, BACKLOG #5631).
+    What construction refuses in the recipient cert, including one that does not name every address
+    in ``recipients``, is listed under *Recipient trust* in ``docs/CONNECTIONS.md``.
 
     **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
     verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``
@@ -8826,6 +8828,32 @@ def _coerce_content_type(name: str, content_type: ContentType | str) -> ContentT
     )
 
 
+def finite_seconds(value: object, *, key: str, where: str) -> float:
+    """A connection-level number of seconds, ``strict_timeout_s``, ``waiting_display_delay`` or
+    ``send_min_interval_seconds``, as a finite float, or a :class:`WiringError` naming ``where`` and ``key`` with the value withheld
+    (BACKLOG #5321). Both authoring surfaces read it here: the connections.toml reader and the shared
+    build_inbound_connection / build_outbound_connection choke points.
+
+    A bool and anything but an int or a float are refused first, so text is not read as a number.
+    The number is then read by :func:`~messagefoundry.transports.base.float_setting`, which holds the
+    rest of the rule: a NaN, an infinity and an integer too large for a float are refused. A NaN
+    compares false with ``> 0``, so as ``strict_timeout_s`` it would disable the strict-validation
+    backstop; an infinity would enable one that never fires, or a display delay that never ends. Zero
+    and negatives come back as they are, for the caller's own rule."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise WiringError(f"{where}: {key} must be a number of seconds (value withheld)")
+    # Imported here: messagefoundry.transports imports this module at its top level.
+    from messagefoundry.transports.base import float_setting
+
+    # The refusal is raised outside the handler, so it carries no exception chain.
+    refusal: str
+    try:
+        return float_setting(value, knob=key, transport=f"{where}:")
+    except ValueError as exc:
+        refusal = str(exc)
+    raise WiringError(refusal)
+
+
 def build_inbound_connection(
     name: str,
     spec: ConnectionSpec,
@@ -9079,7 +9107,13 @@ def build_inbound_connection(
         ack_mode=ack_mode,
         ack_after=ack_after,
         validation=Validation(
-            strict=strict, hl7_version=hl7_version, strict_timeout_s=strict_timeout_s
+            strict=strict,
+            hl7_version=hl7_version,
+            strict_timeout_s=None
+            if strict_timeout_s is None
+            else finite_seconds(
+                strict_timeout_s, key="strict_timeout_s", where=f"inbound connection {name!r}"
+            ),
         ),
         content_type=content_type,
         inline=inline,
@@ -9307,6 +9341,9 @@ def build_outbound_connection(
             f"outbound connection {name!r}: dead_letter_days must be >= 0 "
             "(0 = keep forever, omit to inherit the global [retention] window)"
         )
+    waiting_display_delay = finite_seconds(
+        waiting_display_delay, key="waiting_display_delay", where=f"outbound connection {name!r}"
+    )
     if waiting_display_delay < 0:
         # #136 (ADR 0065 amendment): the cosmetic "Waiting for Reply" pre-display delay is seconds; a
         # negative value is meaningless (0.0 = show immediately). Fail loud at wiring (dry-run / check).
@@ -9339,6 +9376,13 @@ def build_outbound_connection(
             f"(env {send_pace.key!r}) — it is a plain pacing interval in seconds, not a "
             "per-environment or secret value. Give it a plain number (0.5), or omit it "
             "for no pacing."
+        )
+    if send_pace is not None:
+        # BACKLOG #5321: held to the finite rule both surfaces share. An infinity would stall the lane
+        # after its first send, a NaN would turn pacing off, and an integer too large for a float
+        # would raise OverflowError at lane setup rather than at load.
+        send_pace = finite_seconds(
+            send_pace, key="send_min_interval_seconds", where=f"outbound connection {name!r}"
         )
     if send_pace is not None and send_pace < 0:
         # BACKLOG #82: per-connection egress send pacing (min seconds between sends on this lane). A

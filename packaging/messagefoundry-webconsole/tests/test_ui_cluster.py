@@ -496,6 +496,9 @@ class _Coordinator(NullCoordinator):
         )
         self._step_down = StepdownOutcome(*step_down)
         self._raises = raises
+        # Set by a test after sign-in, since _console reads the page once to prove the session.
+        self.members_raise: Exception | None = None
+        self.lease_raise: Exception | None = None
         self.step_down_calls = 0
 
     def is_clustered(self) -> bool:
@@ -508,9 +511,13 @@ class _Coordinator(NullCoordinator):
         return self._owns_row
 
     async def cluster_members(self) -> list[ClusterMember]:
+        if self.members_raise is not None:
+            raise self.members_raise
         return self._members
 
     async def leadership_lease(self) -> tuple[str | None, float | None]:
+        if self.lease_raise is not None:
+            raise self.lease_raise
         return ("node-a", 1_700_000_030.0) if self._clustered else (self.node_id, None)
 
     async def step_down_leadership(
@@ -774,3 +781,79 @@ async def test_each_engine_refusal_renders_its_own_page(
     assert f"<h1>{headline}</h1>" in r.text
     assert f"Engine message (status {status})" in r.text
     assert coord.step_down_calls == calls
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ConnectionError("store unreachable"), TimeoutError("pool exhausted")],
+    ids=["outage", "timeout"],
+)
+async def test_a_store_failure_degrades_the_pages_instead_of_a_500(
+    tmp_path: Path, failure: Exception
+) -> None:
+    """BACKLOG #5932. The membership read is a store read, so a store timeout or outage used to
+    unwind every cluster page into the catch-all 500. Each now renders this node's in-memory status
+    and the reason, and neither confirm page offers a form it could not describe."""
+    coord = _Coordinator()
+    async with _console(tmp_path, coord) as (_engine, c):
+        coord.members_raise = failure
+        page_ = await c.get("/ui/cluster")
+        assert page_.status_code == 503, page_.text
+        assert "<h1>High Availability</h1>" in page_.text
+        assert "could not read cluster membership" in page_.text
+        assert "unconfirmed" in page_.text and "primary" in page_.text
+        assert not _offers(page_.text, CONFIRM)
+        live = await c.get("/ui/cluster/live")
+        # Ok, so the page's poller swaps it in rather than keeping the last good view.
+        assert live.status_code == 200
+        assert 'id="ha-live"' in live.text and "<html" not in live.text
+        assert "could not read cluster membership" in live.text
+        assert not _offers(live.text, CONFIRM)
+        for path, post in (
+            (CONFIRM, "/ui/cluster/stepdown"),
+            (FORCE_CONFIRM, "/ui/cluster/force-stepdown"),
+        ):
+            confirm = await c.get(path)
+            assert confirm.status_code == 503, path
+            assert "could not read cluster membership" in confirm.text
+            assert post not in confirm.text
+        # The store answers again: the same session reads the full page.
+        coord.members_raise = None
+        assert (await c.get("/ui/cluster")).status_code == 200
+    assert coord.step_down_calls == 0
+
+
+_LOGGER = "messagefoundry_webconsole.routes.cluster"
+
+
+async def test_a_failed_lease_read_degrades_and_keeps_the_notice(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5932, the second store read: membership answers and the lease read then fails. The
+    post-stepdown notice still shows, since the stepdown it reports already ran, and an outage
+    logs one warning however often the page polls."""
+    coord = _Coordinator()
+    async with _console(tmp_path, coord) as (_engine, c):
+        coord.lease_raise = ConnectionError("store unreachable")
+        with caplog.at_level("DEBUG", logger=_LOGGER):
+            page_ = await c.get("/ui/cluster", params={"m": "drained"})
+            for _ in range(3):
+                assert (await c.get("/ui/cluster/live")).status_code == 200
+        assert page_.status_code == 503
+        assert "could not read cluster membership" in page_.text
+        assert "Leadership lease released with force" in page_.text
+        released = await c.get("/ui/cluster", params={"m": "released"})
+        # Neither the notice nor the intro points at a lease owner or a cluster view not shown.
+        assert "lease owner below" not in released.text
+        assert "shows the whole cluster" not in released.text
+        assert "cannot read the lease owner right now" in released.text
+        warnings = [r for r in caplog.records if r.name == _LOGGER and r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        # The store answers again, so the next failure is a new outage and warns again.
+        coord.lease_raise = None
+        assert (await c.get("/ui/cluster")).status_code == 200
+        coord.lease_raise = ConnectionError("store unreachable")
+        caplog.clear()
+        with caplog.at_level("DEBUG", logger=_LOGGER):
+            assert (await c.get("/ui/cluster/live")).status_code == 200
+        assert [r.levelname for r in caplog.records if r.name == _LOGGER] == ["WARNING"]

@@ -3722,15 +3722,12 @@ def test_an_unmarked_root_is_untouched_by_any_of_this(tmp_path: Path) -> None:
 
 
 def test_a_damaged_marker_does_not_stop_a_live_account_publishing(tmp_path: Path) -> None:
-    """FAIL CLOSED IN THE READER, FAIL OPEN IN THE WRITER -- and the first version of the collector
-    guard got this backwards.
-
-    It suppressed on MALFORMED as well as UNAVAILABLE, so a torn write or a half-flushed marker would
+    """It suppressed on MALFORMED as well as UNAVAILABLE, so a torn write would
     stop a LIVE account publishing at all, with one status-bar line as the only signal. That is exactly
     what the collector's own comment forbids, and the try/catch around the call did not cover it: the
     guard catches a THROW, not a MALFORMED verdict.
 
-    The asymmetry is deliberate and this test is the only thing pinning it. A damaged marker must still
+    A damaged marker must still
     REFUSE on the read -- asserted here in the same test, so a fix that simply stopped honouring
     MALFORMED anywhere would fail rather than pass.
     """
@@ -3748,6 +3745,283 @@ def test_a_damaged_marker_does_not_stop_a_live_account_publishing(tmp_path: Path
     code, doc = read(state)
     assert code == UNAVAILABLE, doc
     assert doc["marker_state"] == "MALFORMED"
+
+
+# Each parses WITHOUT throwing, so before BACKLOG #5305 the catch that names a damaged marker never
+# ran. Not all are non-objects: the flag-* bodies are objects whose flag cannot be read.
+_MALFORMED_BODIES = {
+    "empty": "",
+    "whitespace": "  \r\n ",
+    "null": "null",
+    "array": "[]",
+    "array-of-marker": '[{"unavailable": true, "reason": "cancelled"}]',
+    "array-of-clear": '[{"unavailable": false}]',
+    "number": "5",
+    "string": '"cancelled"',
+    "boolean": "true",
+    # An object, but its flag is no JSON boolean: a [bool] cast read these as verdicts.
+    "flag-null": '{"unavailable": null}',
+    "flag-zero": '{"unavailable": 0}',
+    "flag-string": '{"unavailable": "false"}',
+    "flag-empty-string": '{"unavailable": ""}',
+    "flag-other-string": '{"unavailable": "yes"}',
+    "flag-array": '{"unavailable": []}',
+    "flag-object": '{"unavailable": {}}',
+    "flag-negative-zero": '{"unavailable": -0.0}',
+    # ConvertFrom-Json keeps the last of a repeated key silently, so this read as AVAILABLE.
+    "flag-repeated": '{"unavailable": true, "unavailable": false}',
+    "flag-repeated-same": '{"unavailable": true, "unavailable": true}',
+    # A repeated effective_from picked PENDING or UNAVAILABLE by order alone.
+    "effective-from-repeated": (
+        '{"unavailable": true, "effective_from": "2000-01-01T00:00:00Z",'
+        ' "effective_from": "2099-01-01T00:00:00Z"}'
+    ),
+}
+
+# Positive controls, classified in the same run: a check that called everything MALFORMED fails here.
+_WELL_FORMED = {
+    "marked": ('{"unavailable": true, "reason": "cancelled"}', "UNAVAILABLE"),
+    "cleared": ('{"unavailable": false}', "AVAILABLE"),
+    "reason-only": ('{"reason": "cancelled"}', "UNAVAILABLE"),
+    # A truthy non-boolean flag still reads as the cancellation its writer most likely meant.
+    "flag-one": ('{"unavailable": 1}', "UNAVAILABLE"),
+    "flag-float": ('{"unavailable": 0.5}', "UNAVAILABLE"),
+    "flag-negative": ('{"unavailable": -3}', "UNAVAILABLE"),
+    "flag-big": ('{"unavailable": 123456789012345678901234567890}', "UNAVAILABLE"),
+    "flag-true-string": ('{"unavailable": "true"}', "UNAVAILABLE"),
+    "flag-true-upper": ('{"unavailable": "TRUE"}', "UNAVAILABLE"),
+    # ConvertFrom-Json's own grammar: comments, single quotes, a bare key, a raw newline in a string
+    # and a trailing comma. The repeat count must accept what the parse accepted.
+    "lenient-grammar": (
+        "{'unavailable': true, /* c */ reason: 'cancelled\nby owner',}",
+        "UNAVAILABLE",
+    ),
+    # A repeated reason picks no verdict, so it is no damage.
+    "reason-repeated": ('{"unavailable": true, "reason": "a", "reason": "b"}', "UNAVAILABLE"),
+    # A nested flag is not the marker's own, so it cannot count as a repeat.
+    "nested-flag": ('{"unavailable": false, "detail": {"unavailable": true}}', "AVAILABLE"),
+}
+
+
+def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_path: Path) -> None:
+    """Vault BACKLOG #5305. Red pre-fix: every one of these fell through to UNAVAILABLE
+    or read as AVAILABLE outright. One pwsh run classifies them all beside well-formed controls.
+    """
+    bodies = {**_MALFORMED_BODIES, **{name: body for name, (body, _) in _WELL_FORMED.items()}}
+    for name, body in bodies.items():
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "unavailable.json").write_text(body, encoding="utf-8")
+    # A directory at the marker path read as an absent marker, so AVAILABLE; an empty state dir is the
+    # control that the absent case still reads AVAILABLE.
+    (tmp_path / "directory" / "unavailable.json").mkdir(parents=True)
+    (tmp_path / "absent").mkdir()
+    names = [*bodies, "directory", "absent"]
+    script = "; ".join(
+        [
+            f". '{CONFIG_ROOTS}'",
+            "$out = [ordered]@{}",
+            *(
+                f"$out['{name}'] = (Get-RootUnavailability -StateDir '{tmp_path / name}').state"
+                for name in names
+            ),
+            # The reason names the cause, so the operator knows what to fix.
+            f"$out['directory-reason'] = (Get-RootUnavailability -StateDir '{tmp_path / 'directory'}').reason",
+            f"$out['flag-repeated-reason'] = (Get-RootUnavailability -StateDir '{tmp_path / 'flag-repeated'}').reason",
+            "$out | ConvertTo-Json -Compress | Write-Output",
+        ]
+    )
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    states = json.loads(proc.stdout)
+    assert "is a directory" in states.pop("directory-reason"), states
+    assert "repeats the 'unavailable' key" in states.pop("flag-repeated-reason"), states
+    expected = dict.fromkeys(_MALFORMED_BODIES, "MALFORMED")
+    expected.update({name: state for name, (_, state) in _WELL_FORMED.items()})
+    expected.update({"directory": "MALFORMED", "absent": "AVAILABLE"})
+    assert states == expected, states
+
+
+@pytest.mark.parametrize("name", ["array-of-clear", "flag-null", "flag-repeated"])
+def test_a_marker_that_parses_to_no_object_does_not_stop_a_live_account_publishing(
+    tmp_path: Path, name: str
+) -> None:
+    """Vault BACKLOG #5305, end to end: the collector's damaged-marker guard publishes, and the
+    reader still refuses, so the fix cannot pass by dropping the marker check altogether.
+
+    Only markers the pre-#5305 reader did NOT read as UNAVAILABLE: those it did still suppress, as
+    the next test pins. This is that test's negative control.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    (state / "unavailable.json").write_text(_MALFORMED_BODIES[name], encoding="utf-8")
+
+    line = collect(state, {"rate_limits": {"seven_day": window(42.0, 3600)}})
+    assert "unavailable" not in line, f"a damaged marker blanked a live account: {line}"
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(42.0)
+
+    code, doc = read(state)
+    assert code == UNAVAILABLE, doc
+    assert doc["marker_state"] == "MALFORMED", doc
+
+
+# The collector's suppression set is the pre-#5305 reader's UNAVAILABLE set, unchanged. Each entry is
+# (body, the reader's state now, whether the collector suppresses), and each suppression value was
+# measured against origin/main's Get-RootUnavailability before this change: True exactly where main
+# read UNAVAILABLE.
+_SUPPRESSION = {
+    # Main read these as UNAVAILABLE, so the collector suppressed; the reader now says MALFORMED.
+    "array-of-marker": ('[{"unavailable": true, "reason": "cancelled"}]', "MALFORMED", True),
+    "flag-repeated-same": ('{"unavailable": true, "unavailable": true}', "MALFORMED", True),
+    "flag-yes": ('{"unavailable": "yes"}', "MALFORMED", True),
+    "flag-one-string": ('{"unavailable": "1"}', "MALFORMED", True),
+    "flag-string-false": ('{"unavailable": "false"}', "MALFORMED", True),
+    "flag-object": ('{"unavailable": {}}', "MALFORMED", True),
+    "flag-array-of-one": ('{"unavailable": [1]}', "MALFORMED", True),
+    "flag-repeated-then-true": ('{"unavailable": false, "unavailable": true}', "MALFORMED", True),
+    "empty": ("", "MALFORMED", True),
+    "whitespace": ("  \r\n ", "MALFORMED", True),
+    "null": ("null", "MALFORMED", True),
+    "array": ("[]", "MALFORMED", True),
+    "array-of-two-clears": ('[{"unavailable": false}, {"unavailable": false}]', "MALFORMED", True),
+    "number": ("5", "MALFORMED", True),
+    "string": ('"cancelled"', "MALFORMED", True),
+    "boolean-false": ("false", "MALFORMED", True),
+    "effective-from-repeated-past-last": (
+        '{"unavailable": true, "effective_from": "2099-01-01T00:00:00Z",'
+        ' "effective_from": "2000-01-01T00:00:00Z"}',
+        "MALFORMED",
+        True,
+    ),
+    # NaN and Infinity read UNAVAILABLE in both readers, and the collector suppressed on them in both.
+    "flag-nan": ('{"unavailable": NaN}', "UNAVAILABLE", True),
+    "flag-infinity": ('{"unavailable": Infinity}', "UNAVAILABLE", True),
+    "flag-negative-infinity": ('{"unavailable": -Infinity}', "UNAVAILABLE", True),
+    "marked": ('{"unavailable": true}', "UNAVAILABLE", True),
+    # Negative controls: main did not read these as UNAVAILABLE, so the collector publishes.
+    "array-of-clear": ('[{"unavailable": false}]', "MALFORMED", False),
+    "flag-null": ('{"unavailable": null}', "MALFORMED", False),
+    "flag-zero": ('{"unavailable": 0}', "MALFORMED", False),
+    "flag-repeated": ('{"unavailable": true, "unavailable": false}', "MALFORMED", False),
+    "effective-from-repeated-future-last": (
+        '{"unavailable": true, "effective_from": "2000-01-01T00:00:00Z",'
+        ' "effective_from": "2099-01-01T00:00:00Z"}',
+        "MALFORMED",
+        False,
+    ),
+    "torn": ("{ torn write", "MALFORMED", False),
+    "pending": (
+        '{"unavailable": true, "effective_from": "2099-01-01T00:00:00Z"}',
+        "PENDING",
+        False,
+    ),
+    "cleared": ('{"unavailable": false}', "AVAILABLE", False),
+}
+
+
+def test_the_collector_suppresses_on_exactly_the_markers_it_suppressed_on_before(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #5305 changed what the reader calls MALFORMED, not what the collector suppresses
+    on. records_cancellation carries the old set beside the new state, so both are pinned per marker
+    in one pwsh run. A directory at the marker path read as an absent marker before, so it does not
+    suppress either.
+    """
+    for name, (body, _, _) in _SUPPRESSION.items():
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "unavailable.json").write_text(body, encoding="utf-8")
+    (tmp_path / "directory" / "unavailable.json").mkdir(parents=True)
+    (tmp_path / "absent").mkdir()
+    names = [*_SUPPRESSION, "directory", "absent"]
+    script = "; ".join(
+        [
+            f". '{CONFIG_ROOTS}'",
+            "$out = [ordered]@{}",
+            *(
+                f"$a = Get-RootUnavailability -StateDir '{tmp_path / name}'; "
+                f"$out['{name}'] = @($a.state, [bool]$a.records_cancellation)"
+                for name in names
+            ),
+            "$out | ConvertTo-Json -Compress | Write-Output",
+        ]
+    )
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    got = json.loads(proc.stdout)
+    expected = {name: [state, bit] for name, (_, state, bit) in _SUPPRESSION.items()}
+    expected.update({"directory": ["MALFORMED", False], "absent": ["AVAILABLE", False]})
+    assert got == expected, got
+
+
+@pytest.mark.parametrize(
+    "name", ["array-of-marker", "flag-repeated-same", "flag-yes", "flag-one-string", "flag-nan"]
+)
+def test_a_marker_main_read_as_a_cancellation_still_stops_the_collector(
+    tmp_path: Path, name: str
+) -> None:
+    """Vault BACKLOG #5305, end to end. These markers read UNAVAILABLE before the change, so the
+    collector refused to publish for them; it still refuses, while the reader names the damage.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    body, marker_state, _ = _SUPPRESSION[name]
+    (state / "unavailable.json").write_text(body, encoding="utf-8")
+
+    line = collect(state, {"rate_limits": {"seven_day": window(42.0, 3600)}})
+    assert "account unavailable" in line, line
+    assert not (state / "latest.json").exists(), (
+        "the collector published for a recorded cancellation"
+    )
+
+    code, doc = read(state)
+    assert code == UNAVAILABLE, doc
+    assert doc["marker_state"] == marker_state, doc
+
+
+def test_an_unavailable_state_suppresses_even_when_the_bit_is_false(tmp_path: Path) -> None:
+    """Vault BACKLOG #5305. The bit and the state come from two reads of the marker, so they can
+    disagree across a concurrent write or an effective_from boundary. A stubbed reader returning
+    UNAVAILABLE with the bit false must still stop the collector publishing.
+    """
+    coord = tmp_path / "coord"
+    coord.mkdir()
+    shutil.copy(COLLECT, coord / "usage-collect.ps1")
+    (coord / "config-roots.ps1").write_text(
+        f". '{CONFIG_ROOTS}'\n"
+        "function Get-RootUnavailability { param([string]$StateDir)\n"
+        "    [ordered]@{ state = 'UNAVAILABLE'; reason = 'stub'; records_cancellation = $false } }\n",
+        encoding="utf-8",
+    )
+    state = tmp_path / ".claude-account-9" / "mefor-usage"
+    state.mkdir(parents=True)
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(coord / "usage-collect.ps1")]
+        + ["-StateDir", str(state)],
+        input=json.dumps({"rate_limits": {"seven_day": window(42.0, 3600)}}),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(None),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "account unavailable -- stub" in proc.stdout, proc.stdout
+    assert not (state / "latest.json").exists(), "an UNAVAILABLE state published"
 
 
 # ------------------------------------------ BACKLOG #1459: roots that never publish, and why

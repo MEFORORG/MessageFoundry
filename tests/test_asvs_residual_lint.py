@@ -75,6 +75,46 @@ residual = "The gate reads messagefoundry/__main__.py:1125 but the prose says __
         ("a lockfile", "requirements.lock:961 pins it", [("requirements.lock", "961")]),
         ("spaced colon", "settings.py : 1359", [("settings.py", "1359")]),
         ("two on one line", "a.py:1 and b/c.py:22", [("a.py", "1"), ("b/c.py", "22")]),
+        # Matched before BACKLOG #5468 as well, because a dot inside a path was always allowed;
+        # kept so the leading-dot change cannot lose it.
+        (
+            "a dot-directory below a plain one",
+            "see tools/.config/x.toml:3",
+            [("tools/.config/x.toml", "3")],
+        ),
+        # BACKLOG #5468: each shape below passed the lint unseen before the fix.
+        (
+            "a dot-directory",
+            "see .github/workflows/ci.yml:12 for the job",
+            [(".github/workflows/ci.yml", "12")],
+        ),
+        (
+            "a dotfile",
+            "pinned in .pre-commit-config.yaml:40",
+            [(".pre-commit-config.yaml", "40")],
+        ),
+        (
+            "a relative ./ prefix",
+            "see ./messagefoundry/auth/service.py:724",
+            [("./messagefoundry/auth/service.py", "724")],
+        ),
+        ("a relative ../ prefix", "see ../x/y.py:12", [("../x/y.py", "12")]),
+        (r"a relative .\ prefix", r"see .\scripts\foo.ps1:3", [(r".\scripts\foo.ps1", "3")]),
+        (
+            "a dot-directory, windows separator",
+            r"see .github\workflows\ci.yml:12",
+            [(r".github\workflows\ci.yml", "12")],
+        ),
+        (
+            "a js file",
+            "messagefoundry_webconsole/static/app.js:88 renders it",
+            [("messagefoundry_webconsole/static/app.js", "88")],
+        ),
+        ("a css file", "static/app.css:153", [("static/app.css", "153")]),
+        ("a cs file", "net-helper/NetOps.cs:85", [("net-helper/NetOps.cs", "85")]),
+        # Not the retired ECH sidecar tree: test_ech_record_premise refuses that path anywhere
+        # under tests/ unless it carries the retrieval SHA.
+        ("a go module file", "tools/go-proxy/go.mod:4", [("tools/go-proxy/go.mod", "4")]),
     ],
 )
 def test_the_citation_shapes_that_occur_are_detected(
@@ -93,6 +133,12 @@ def test_the_citation_shapes_that_occur_are_detected(
         ("a bare number", "the value is 1125"),
         ("a time", "at 06:17 daily"),
         ("an unknown extension", "image.png:12"),
+        # Controls for the leading dot (BACKLOG #5468): a dot that is not the start of a path
+        # token must not start a match, and a dot-name with no line is still not a citation.
+        ("an ellipsis before a name", "and so on ...app.js:3"),
+        ("a double dot before a name", "path ..app.js:3"),
+        ("a dotfile with no line", "see .pre-commit-config.yaml for the hooks"),
+        ("a dot-word with no extension", "the .github directory: 3 workflows"),
         # A citation already inside a longer path token must not also match its own tail.
         ("no double-count of a suffix", "messagefoundry/config/settings.py:1359"),
     ],
@@ -114,6 +160,11 @@ def test_the_detector_is_live_and_the_negative_control_is_a_real_zero() -> None:
 def test_a_bare_basename_is_flagged_as_naming_no_location() -> None:
     assert Citation("1.1.1", "residual", "settings.py", 5).bare is True
     assert Citation("1.1.1", "residual", "messagefoundry/config/settings.py", 5).bare is False
+    # A relative prefix adds no directory (BACKLOG #5468 widened the pattern to admit it).
+    assert Citation("1.1.1", "residual", "./settings.py", 5).bare is True
+    assert Citation("1.1.1", "residual", r"..\settings.py", 5).bare is True
+    assert Citation("1.1.1", "residual", "./messagefoundry/settings.py", 5).bare is False
+    assert Citation("1.1.1", "residual", ".github/ci.yml", 5).bare is False
 
 
 # --------------------------------------------------------------------------------------------
