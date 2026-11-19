@@ -248,9 +248,8 @@ function Test-MarkerRecordsCancellation {
         a recorded cancellation, and many of those markers -- an array-wrapped marker, an agreeing
         repeated key, a flag of "yes" or "1", an empty file, a bare scalar -- read as UNAVAILABLE
         before, so the collector suppressed on them. Reading them as MALFORMED alone would let an
-        account its operator meant to cancel publish again. This is the old reader's verdict logic,
-        statement for statement, so the set it returns true for is exactly the old UNAVAILABLE set,
-        neither wider nor narrower. Do not tidy it into the new reader's rules; that changes the set.
+        account its operator meant to cancel publish again. This is the old reader's verdict logic.
+        Do not tidy it into the new reader's rules; that changes the set.
         Never throws: a throw in the old reader reached the collector's catch, which published.
     #>
     param([Parameter(Mandatory)][string]$Path)
@@ -335,7 +334,7 @@ function Get-RootUnavailability {
             # grammar ConvertFrom-Json parses with, so it accepts exactly what that accepted, and it yields
             # every property name; depth 1 is the marker's own keys. A case-variant repeat already throws
             # in ConvertFrom-Json. Only the two keys that pick the verdict count: a repeated `reason`
-            # changes no verdict, and MALFORMED would let a cancelled account publish.
+            # changes no verdict.
             if ($doc -is [System.Management.Automation.PSCustomObject]) {
                 $readerType = 'Newtonsoft.Json.JsonTextReader' -as [type]
                 if (-not $readerType) { $damage = 'could not be checked for a repeated key, because Newtonsoft.Json is not loaded' }
@@ -368,8 +367,7 @@ function Get-RootUnavailability {
     # ITS `unavailable` FLAG IS A JSON BOOLEAN, OR A TRUTHY STAND-IN FOR ONE. A [bool] cast read null,
     # "", 0 or [] as AVAILABLE and the string "false" as UNAVAILABLE. A truthy non-boolean -- a non-zero
     # number, or the string "true" in any case -- still reads UNAVAILABLE: whoever wrote it most likely
-    # meant a cancellation, and the collector suppresses publishing only on UNAVAILABLE, so reading it as
-    # MALFORMED would let a cancelled account publish. Every other non-boolean is MALFORMED.
+    # meant a cancellation. Every other non-boolean is MALFORMED.
     $flag = $null
     if (-not $damage) {
         if ($doc -isnot [System.Management.Automation.PSCustomObject]) { $damage = 'is not a JSON object' }

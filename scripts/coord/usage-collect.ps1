@@ -254,21 +254,16 @@ try {
     # missing sibling or an unreadable marker must fall through to the normal publish rather than
     # suppress a live account's reading -- the fail-closed direction belongs in the READER, where a
     # wrong answer is visible, not in the writer, where it would silently blank a working account.
-    # UNAVAILABLE ONLY -- NOT MALFORMED, AND THE FIRST VERSION OF THIS BLOCK GOT THAT WRONG. It
-    # suppressed on both, which is the exact thing the paragraph above forbids: a torn write or a
-    # half-flushed marker would then stop a LIVE account from publishing at all, with one status-bar
-    # line as the only signal. The try/catch guards against a THROW, not against a MALFORMED verdict,
-    # so it did not cover this. A damaged marker publishes normally here and usage.ps1 refuses it on
-    # the read, which is what "fail closed in the reader, fail open in the writer" actually means.
     #
-    # THE BIT, NOT THE STATE (BACKLOG #5305). The reader now reports MALFORMED for markers it used to
+    # THE STATE OR THE BIT (BACKLOG #5305). The reader now reports MALFORMED for markers it used to
     # read as UNAVAILABLE -- an array-wrapped marker, an agreeing repeated key, a flag of "yes".
-    # records_cancellation is true for exactly the markers the reader called UNAVAILABLE before that
-    # change, so this suppresses on the same set it always did, while the reader refuses them as damaged.
+    # records_cancellation (see Test-MarkerRecordsCancellation) keeps those suppressing, while the
+    # reader refuses them as damaged. The bit and the state come from two reads of the file, so an
+    # UNAVAILABLE state suppresses on its own too, whichever read saw it.
     if ($HaveConfigRoots) {
         $av = $null
         try { $av = Get-RootUnavailability -StateDir $StateDir } catch { }
-        if ($av -and $av.records_cancellation) {
+        if ($av -and ($av.state -eq 'UNAVAILABLE' -or $av.records_cancellation)) {
             Write-Output "mefor-usage: account unavailable -- $([string]$av.reason)"
             exit 0
         }

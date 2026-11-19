@@ -3786,8 +3786,7 @@ _WELL_FORMED = {
     "marked": ('{"unavailable": true, "reason": "cancelled"}', "UNAVAILABLE"),
     "cleared": ('{"unavailable": false}', "AVAILABLE"),
     "reason-only": ('{"reason": "cancelled"}', "UNAVAILABLE"),
-    # A truthy non-boolean flag still reads as the cancellation its writer most likely meant, because
-    # the collector suppresses publishing only on UNAVAILABLE.
+    # A truthy non-boolean flag still reads as the cancellation its writer most likely meant.
     "flag-one": ('{"unavailable": 1}', "UNAVAILABLE"),
     "flag-float": ('{"unavailable": 0.5}', "UNAVAILABLE"),
     "flag-negative": ('{"unavailable": -3}', "UNAVAILABLE"),
@@ -3997,6 +3996,37 @@ def test_a_marker_main_read_as_a_cancellation_still_stops_the_collector(
     code, doc = read(state)
     assert code == UNAVAILABLE, doc
     assert doc["marker_state"] == marker_state, doc
+
+
+def test_an_unavailable_state_suppresses_even_when_the_bit_is_false(tmp_path: Path) -> None:
+    """Vault BACKLOG #5305. The bit and the state come from two reads of the marker, so they can
+    disagree across a concurrent write or an effective_from boundary. A stubbed reader returning
+    UNAVAILABLE with the bit false must still stop the collector publishing.
+    """
+    coord = tmp_path / "coord"
+    coord.mkdir()
+    shutil.copy(COLLECT, coord / "usage-collect.ps1")
+    (coord / "config-roots.ps1").write_text(
+        f". '{CONFIG_ROOTS}'\n"
+        "function Get-RootUnavailability { param([string]$StateDir)\n"
+        "    [ordered]@{ state = 'UNAVAILABLE'; reason = 'stub'; records_cancellation = $false } }\n",
+        encoding="utf-8",
+    )
+    state = tmp_path / ".claude-account-9" / "mefor-usage"
+    state.mkdir(parents=True)
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(coord / "usage-collect.ps1")]
+        + ["-StateDir", str(state)],
+        input=json.dumps({"rate_limits": {"seven_day": window(42.0, 3600)}}),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(None),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "account unavailable -- stub" in proc.stdout, proc.stdout
+    assert not (state / "latest.json").exists(), "an UNAVAILABLE state published"
 
 
 # ------------------------------------------ BACKLOG #1459: roots that never publish, and why
