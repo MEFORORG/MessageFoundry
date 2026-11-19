@@ -33,6 +33,11 @@
     cost of the two errors is not symmetric: a false AT RISK costs a look, a false RECOVERABLE costs
     the file.
 
+    EXIT CODES. 0: nothing at risk. 1: at least one file AT RISK. 2: refused -- the script could not
+    look (no such worktree, not a git worktree, an unresolvable ref, or a failed git status), so it
+    reports nothing and says why on stderr. A refusal is kept off 1 so a caller can tell
+    cannot-look from at-risk, and off 0 so it never reads as clean.
+
     NOT FETCHING ERRS THE SAME WAY, WHICH IS WHY -NoFetch IS SAFE. A stale `origin/main` can only
     fail to contain something that has since landed, so it can only move a file from RECOVERABLE to
     AT RISK. It cannot invent a match. The ref actually compared against is printed with every run,
@@ -69,12 +74,19 @@ $ErrorActionPreference = 'Stop'
 # the three verdicts. $ErrorActionPreference='Stop' does not turn a native exit code into a throw,
 # so the calls are made directly and their exit code read immediately after.
 
+# EVERY refusal goes through here and exits 2. A throw would exit 1, which is the AT-RISK verdict,
+# and a caller must be able to tell cannot-look from at-risk.
+function Stop-Refused([string]$Message) {
+    [Console]::Error.WriteLine($Message)
+    exit 2
+}
+
 if (-not $Worktree) { $Worktree = (Get-Location).Path }
-if (-not (Test-Path -LiteralPath $Worktree)) { throw "no such worktree: $Worktree" }
+if (-not (Test-Path -LiteralPath $Worktree)) { Stop-Refused "no such worktree: $Worktree -- refusing" }
 $script:Root = (Resolve-Path -LiteralPath $Worktree).Path
 
 $top = & git -C $script:Root rev-parse --show-toplevel 2>$null
-if ($LASTEXITCODE -ne 0 -or -not $top) { throw "not inside a git worktree: $script:Root" }
+if ($LASTEXITCODE -ne 0 -or -not $top) { Stop-Refused "not inside a git worktree: $script:Root -- refusing" }
 $script:Root = $top
 
 if (-not $NoFetch) {
@@ -83,7 +95,7 @@ if (-not $NoFetch) {
 
 $refSha = & git -C $script:Root rev-parse --verify --quiet "$Ref" 2>$null
 if (-not $refSha) {
-    throw "cannot resolve $Ref in $script:Root -- refusing to judge anything against a ref that does not exist"
+    Stop-Refused "cannot resolve $Ref in $script:Root -- refusing to judge anything against a ref that does not exist"
 }
 
 # --untracked-files=all, because the default collapses an untracked DIRECTORY to a single entry and
@@ -91,6 +103,11 @@ if (-not $refSha) {
 # -z, because a path may contain a space, and porcelain v1 QUOTES such paths rather than emitting
 # them raw -- parsing the quoted form is a second, silently different unescaper.
 $raw = & git -C $script:Root status --porcelain --untracked-files=all -z 2>$null
+# A failed status is NOT an empty one. Unchecked, it left $raw empty and the run reported no
+# untracked files and exited 0 -- cannot-look rendered as nothing-at-risk.
+if ($LASTEXITCODE -ne 0) {
+    Stop-Refused "git status failed (exit $LASTEXITCODE) in $script:Root -- refusing to report the untracked files as safe when they could not be listed"
+}
 $entries = @()
 if ($raw) { $entries = ($raw -split "`0") | Where-Object { $_ } }
 
@@ -199,6 +216,6 @@ else {
 }
 
 # Exit 1 when anything is at risk, so this can be used as a check and not only read by a human.
-# Nothing at risk -- including the no-untracked-files case -- exits 0.
+# Nothing at risk -- including the no-untracked-files case -- exits 0. A refusal exits 2 (Stop-Refused).
 if ($atRisk.Count -gt 0) { exit 1 }
 exit 0

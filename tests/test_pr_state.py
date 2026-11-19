@@ -922,3 +922,96 @@ def test_no_list_and_no_flagged_runs_reads_unknown_with_its_reason() -> None:
     ctx = {"oid": _sha(1), "nodes": [], "hasNextPage": False}
     verdict = ps.shape_pr(_pr(1), None, ctx)["required"]
     assert verdict["state"] == "UNKNOWN" and verdict["reason"] == "no required-context list"
+
+
+# --- BACKLOG #5489: stamps compare as times, and a missing stamp fails closed ----------------------
+
+
+def _required(tmp_path: Path, *runs: dict[str, Any]) -> dict[str, Any]:
+    contexts = [_run("CI gate"), _run("cla"), *runs]
+    rc, doc = _main(tmp_path, FakeGh([_pr(1)], {1: contexts}), NOW, "--force")
+    # A failed poll keeps the last good data, so an unchecked error would let the second list order
+    # pass on the first order's verdict.
+    assert rc == 0 and doc["error"] is None, doc["error"]
+    return dict(doc["data"]["pullRequests"][0]["required"])
+
+
+def test_a_later_fractional_second_failure_beats_an_older_whole_second_success(
+    tmp_path: Path,
+) -> None:
+    """As text, '...10:00:00.5Z' sorts before '...10:00:00Z', so the older success won."""
+    green = {**_run("test"), "startedAt": "2026-10-22T10:00:00Z"}
+    red = {**_run("test", "FAILURE"), "startedAt": "2026-10-22T10:00:00.5Z"}
+    for order in ((green, red), (red, green)):
+        assert _required(tmp_path, *order)["failing"] == ["test"]
+
+
+def test_a_later_whole_second_success_beats_an_older_fractional_failure(tmp_path: Path) -> None:
+    """The control: real time order still lets a genuinely newer success speak."""
+    red = {**_run("test", "FAILURE"), "startedAt": "2026-10-22T10:00:00.5Z"}
+    green = {**_run("test"), "startedAt": "2026-10-22T10:00:01Z"}
+    for order in ((green, red), (red, green)):
+        assert _required(tmp_path, *order)["state"] == "SUCCESS"
+
+
+@pytest.mark.parametrize("stamp", [None, "", "not a time"], ids=["absent", "empty", "garbage"])
+def test_a_failure_with_no_usable_stamp_does_not_lose_to_an_older_success(
+    tmp_path: Path, stamp: str | None
+) -> None:
+    green = {**_run("test"), "startedAt": "2026-10-22T10:00:00Z"}
+    red = {**_run("test", "FAILURE"), "startedAt": stamp}
+    for order in ((green, red), (red, green)):
+        assert _required(tmp_path, *order)["failing"] == ["test"]
+
+
+def test_a_success_with_no_stamp_does_not_beat_a_stamped_failure(tmp_path: Path) -> None:
+    red = {**_run("test", "FAILURE"), "startedAt": "2026-10-22T10:00:00Z"}
+    green = {**_run("test"), "startedAt": None}
+    for order in ((green, red), (red, green)):
+        assert _required(tmp_path, *order)["failing"] == ["test"]
+
+
+def test_a_failure_with_no_stamp_key_at_all_does_not_lose_to_an_older_success(
+    tmp_path: Path,
+) -> None:
+    green = {**_run("test"), "startedAt": "2026-10-22T10:00:00Z"}
+    red = _run("test", "FAILURE")  # no startedAt key, and no createdAt either
+    for order in ((green, red), (red, green)):
+        assert _required(tmp_path, *order)["failing"] == ["test"]
+
+
+def test_a_status_context_is_ranked_by_its_created_at_as_a_time(tmp_path: Path) -> None:
+    """The createdAt fallback: a later fractional-second FAILURE status beats an older SUCCESS."""
+
+    def status(state: str, created: str) -> dict[str, Any]:
+        return {
+            "__typename": "StatusContext",
+            "context": "test",
+            "state": state,
+            "isRequired": True,
+            "createdAt": created,
+        }
+
+    green = status("SUCCESS", "2026-10-22T10:00:00Z")
+    red = status("FAILURE", "2026-10-22T10:00:00.25Z")
+    for order in ((green, red), (red, green)):
+        assert _required(tmp_path, *order)["failing"] == ["test"]
+    later_green = status("SUCCESS", "2026-10-22T10:00:01Z")
+    for order in ((later_green, red), (red, later_green)):
+        assert _required(tmp_path, *order)["state"] == "SUCCESS"
+
+
+def test_a_run_cancelled_while_queued_is_ranked_by_its_completion(tmp_path: Path) -> None:
+    """No startedAt, but a completedAt: a re-run started after it still speaks, either order."""
+    cancelled = {
+        **_run("test", "CANCELLED"),
+        "startedAt": None,
+        "completedAt": "2026-10-22T10:00:00Z",
+    }
+    rerun = {**_run("test"), "startedAt": "2026-10-22T11:00:00Z"}
+    for order in ((cancelled, rerun), (rerun, cancelled)):
+        assert _required(tmp_path, *order)["state"] == "SUCCESS"
+
+
+def test_the_contexts_query_asks_for_completed_at() -> None:
+    assert "completedAt" in ps.contexts_query({1: _sha(1)})
