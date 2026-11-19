@@ -282,18 +282,47 @@ def _normalise(part: str) -> str:
     return part.rstrip(". ").casefold()
 
 
+def non_canonical(member: str) -> str | None:
+    """Why ``member``'s name is not canonical, or ``None`` (BACKLOG #5470).
+
+    EXTRACTORS DISAGREE ON A NON-CANONICAL NAME, SO NO READING OF ONE CAN BE TRUSTED. Measured with
+    ``zipfile.extractall`` on Python 3.14.7 on Windows: ``messagefoundry/../anon/__init__.py`` is
+    written as ``messagefoundry/anon/__init__.py``, because ``zipfile`` DROPS a ``..`` component
+    where a reader that applies it, as :func:`_split_candidates` does, sees ``anon/__init__.py``. So
+    the retired ``messagefoundry/anon`` package passed the split rule and would have installed. The
+    same run wrote ``e./f.py`` as ``e/f.py`` and ``... /i.py`` as ``i.py``. Every rule below models
+    some readings of such a name, and a model is one reading short whenever an extractor disagrees
+    with it. A build backend writes none of these shapes, so the gate refuses the class, as it
+    refuses links, before any rule reads the name: a backslash, an empty component (a doubled or a
+    leading separator; one trailing ``/`` on a zip directory entry is allowed), a component made
+    only of dots and spaces (``.``, ``..``, ``...``, ``   ``, ``.. ``), and a component ending in a
+    dot or a space.
+    """
+    if "\\" in member:
+        return "the name holds a backslash, which extractors do not agree is a separator"
+    for part in member.removesuffix("/").split("/"):
+        if not part:
+            return "the name has an empty component, a doubled or leading separator"
+        if not part.strip(". "):
+            return f"component {part!r} is made only of dots and spaces"
+        if part[-1] in ". ":
+            return f"component {part!r} ends in a dot or a space"
+    return None
+
+
 def _parts(member: str) -> list[str]:
     """``member``'s path components, split on BOTH ``/`` and ``\\``, empty and ``.`` ones dropped.
 
     ONE copy for every rule below, so an evasion closed in the split is closed for all of them.
     :func:`forbidden` says why both separators count and why empty components drop out. A ``.``
     component names the directory it sits in, so ``./messagefoundry/x.py`` is ``messagefoundry/x.py``
-    to an extractor, and keeping it hid that from a rule that reads the first component or a
-    consecutive run (BACKLOG #5470). Dropping one never removes a component a rule could match.
-    ``. `` counts as ``.``, as :func:`_normalise` reads a trailing space. So does every other
-    component that :func:`_normalise` reduces to nothing (``...``, ``   ``, ``. .``): Windows strips
-    trailing dots and spaces and then drops the empty component, so ``   /messagefoundry/x.py``
-    writes ``messagefoundry/x.py`` there. ``..`` is the one such component kept, because it climbs."""
+    to an extractor that drops it. Every other component that :func:`_normalise` reduces to nothing
+    (``. ``, ``...``, ``   ``) is dropped too, so the per-rule readings see the path an extractor
+    that strips trailing dots and spaces would write. ``..`` (and ``.. ``) is kept, because it climbs.
+
+    THIS READING IS NOT THE DEFENCE AGAINST SUCH NAMES. :func:`non_canonical` refuses every name
+    holding one of these components, because extractors disagree on them and no single reading can
+    be right for all of them. The reading stays so a refused name still gets its per-rule reason."""
     return [
         p for p in member.replace("\\", "/").split("/") if p.rstrip(" ") == ".." or _normalise(p)
     ]
@@ -583,8 +612,9 @@ def filename_problem(archive: Path) -> str | None:
         )
     # A wheel filename writes its name with underscores (the wheel spec escapes every run of
     # ``-``, ``_`` and ``.`` to ``_``), so a hyphen in it is no wheel any build writes. Placing it
-    # by its canonical name gave ``messagefoundry-webconsole-0.4.0-...whl`` the console's (empty)
-    # split rule where the engine rule used to run on it.
+    # by its canonical name gave ``messagefoundry-webconsole-0.4.0-...whl`` the console's split
+    # rule, which refuses no toolkit code and no retired engine path, where the engine rule used
+    # to run on it.
     if archive.suffix.lower() == ".whl" and "-" in _declared_name(archive):
         return (
             "it is a wheel whose distribution name contains a hyphen, which no wheel build writes, "
@@ -647,6 +677,7 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
                 why := (_SPECIAL if special else None)
                 or forbidden(name)
                 or escapes_root(name)
+                or non_canonical(name)
                 or (None if tooling else development_content(name))
                 or next(filter(None, (split_violation(name, d, root) for d in split_dists)), None)
             )
@@ -733,7 +764,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{len(FORBIDDEN_BASENAMES)} forbidden basenames, {len(FORBIDDEN_PATH_COMPONENTS)} "
         f"forbidden path components, test or development content outside "
         f"{len(TEST_TOOLING_DISTRIBUTIONS)} test-tooling distribution, links and special members, "
-        f"paths leaving the archive, unplaceable filenames, rootless sdists, and the engine and "
+        f"paths leaving the archive, non-canonical names, unplaceable filenames, rootless sdists, and the engine and "
         f"toolkit split"
     )
     return 0

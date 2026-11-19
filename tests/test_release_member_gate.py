@@ -55,6 +55,7 @@ from forbidden_members import (  # noqa: E402
     filename_problem,
     forbidden,
     main,
+    non_canonical,
     split_violation,
 )
 
@@ -934,10 +935,22 @@ def test_gnu_tar_s_dot_entry_does_not_hide_the_root(
     assert "top-level" not in err
 
 
-def test_a_clean_rooted_toolkit_sdist_with_a_dot_entry_passes(
+def test_a_clean_rooted_toolkit_sdist_passes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Control for the root refusals: one root, a GNU ``./`` entry, and nothing engine-named."""
+    """Control for the root refusals: one root, and nothing engine-named."""
+    sdist = _write_tar(
+        tmp_path / "dist" / _TK_SDIST,
+        _files(f"{_TK_ROOT}/PKG-INFO", f"{_TK_ROOT}/messagefoundry_toolkit/x.py"),
+    )
+    assert main([str(sdist)]) == 0, capsys.readouterr().err
+
+
+def test_a_gnu_dot_entry_is_refused_as_non_canonical(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same clean sdist with GNU tar's ``./`` entry is refused: a ``.`` component is not a
+    canonical name, and no build backend this gate is pointed at writes one."""
     sdist = _write_tar(
         tmp_path / "dist" / _TK_SDIST,
         [
@@ -945,7 +958,8 @@ def test_a_clean_rooted_toolkit_sdist_with_a_dot_entry_passes(
             *_files(f"./{_TK_ROOT}/PKG-INFO", f"./{_TK_ROOT}/messagefoundry_toolkit/x.py"),
         ],
     )
-    assert main([str(sdist)]) == 0, capsys.readouterr().err
+    assert main([str(sdist)]) == 1
+    assert "is made only of dots and spaces" in capsys.readouterr().err
 
 
 def test_a_zip_sdist_has_its_root_derived_and_checked(
@@ -1103,8 +1117,8 @@ def test_known_distributions_match_the_published_project_names() -> None:
     ],
 )
 def test_a_component_that_normalises_to_nothing_is_dropped(member: str, dist: str) -> None:
-    """Windows strips trailing dots and spaces and drops the empty component, so these write the
-    engine path the rule exists to stop."""
+    """An extractor that strips trailing dots and spaces and drops the empty component writes the
+    engine path the rule exists to stop, so the split rule's own reading drops them too."""
     assert split_violation(member, dist) is not None
 
 
@@ -1776,3 +1790,84 @@ def test_the_retired_path_control_fails_when_the_rule_retires_nothing(tmp_path: 
     out = _output(proc)
     assert proc.returncode != 0, f"the control passed with no retired path listed:\n{out}"
     assert "ACCEPTED" in out, f"the control failed, but not for the reason it names:\n{out}"
+
+
+# The third repair of BACKLOG #5470: a non-canonical name is refused before any rule reads it,
+# because extractors disagree on it. ``zipfile.extractall`` drops a ``..`` component, so each engine
+# wheel member below extracts as the retired path, and each passed the gate at 864942586c0.
+
+_PARENT_HOPS = (
+    "messagefoundry/../anon/__init__.py",
+    "messagefoundry/../generators/adt.py",
+    "messagefoundry/../hl7schema.py",
+    "messagefoundry/../hl7structures.py",
+)
+
+
+@pytest.mark.parametrize("member", _PARENT_HOPS)
+def test_the_cli_refuses_an_engine_wheel_whose_parent_segment_hides_a_retired_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], member: str
+) -> None:
+    wheel = _write_wheel(tmp_path / "dist" / _ENGINE_WHEEL, (*_CLEAN_WHEEL, member))
+    assert main([str(wheel)]) == 1
+    err = capsys.readouterr().err
+    assert f"ships {member} -- component '..' is made only of dots and spaces" in err
+
+
+@pytest.mark.parametrize("member", _PARENT_HOPS)
+def test_zipfile_extracts_the_parent_hop_as_the_retired_path(tmp_path: Path, member: str) -> None:
+    """The premise of the refusal, measured rather than asserted: the extracted path is retired."""
+    wheel = _write_wheel(tmp_path / "w.whl", (member,))
+    with zipfile.ZipFile(wheel) as zf:
+        zf.extractall(tmp_path / "out")
+    written = [p.relative_to(tmp_path / "out").as_posix() for p in (tmp_path / "out").rglob("*")]
+    assert member.replace("/../", "/") in written
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry/../anon/__init__.py",
+        "messagefoundry/./x.py",
+        "./messagefoundry/x.py",
+        ".",
+        "messagefoundry//x.py",
+        "/messagefoundry/x.py",
+        "messagefoundry/x.py//",
+        "",
+        "messagefoundry\\anon\\__init__.py",
+        "messagefoundry/.../anon/x.py",
+        "messagefoundry/   /anon/x.py",
+        "messagefoundry/.. /anon/x.py",
+        "messagefoundry/. ./anon/x.py",
+        "messagefoundry./x.py",
+        "messagefoundry /x.py",
+        "messagefoundry/x.py.",
+        "messagefoundry/x.py ",
+    ],
+)
+def test_a_non_canonical_name_is_refused(member: str) -> None:
+    assert non_canonical(member) is not None
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry/__init__.py",
+        "messagefoundry/",  # a zip directory entry's one trailing separator
+        "messagefoundry-0.4.0.dist-info/METADATA",
+        ".hidden/x.py",  # a leading dot is not a trailing one
+        "a.b/c..d.py",
+        "with space/x y.py",
+    ],
+)
+def test_a_canonical_name_is_not_refused(member: str) -> None:
+    assert non_canonical(member) is None
+
+
+def test_the_cli_still_passes_a_clean_engine_wheel(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Control for the parent-hop cases: the same wheel without the hop passes."""
+    wheel = _write_wheel(tmp_path / "dist" / _ENGINE_WHEEL, _CLEAN_WHEEL)
+    assert main([str(wheel)]) == 0, capsys.readouterr().err
