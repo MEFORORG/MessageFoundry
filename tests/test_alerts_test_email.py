@@ -321,3 +321,45 @@ async def test_test_email_writes_metadata_only_audit(
     assert SMTP_PASSWORD_SECRET not in detail
     for addr in ("oncall@example.com", "ops@example.com", "alerts@example.com"):
         assert addr not in detail
+
+
+# --- 8. A PROVIDER REFERENCE IS RESOLVED OFF THE EVENT LOOP -------------------
+
+
+async def test_test_email_resolves_a_provider_reference_off_the_event_loop(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5793: with ``email_password_secret`` set, the password comes from the
+    ``[secrets].provider``, and for the vault provider that is a blocking HTTP read. The route
+    resolves it in a worker thread, so the event loop keeps serving other requests meanwhile. The
+    stub provider records the thread it ran on; the send gets the value it returned, which shows
+    the reference was the one resolved. RED when the route resolves it on the loop."""
+    import threading
+
+    resolved_on: list[threading.Thread] = []
+
+    class _RecordingProvider:
+        def resolve(self, ref: str) -> str:
+            assert ref == "alerts/smtp#password"
+            resolved_on.append(threading.current_thread())
+            return SMTP_PASSWORD_SECRET
+
+    sent: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.alert_sinks.send_plain_email",
+        lambda **kwargs: sent.append(dict(kwargs)),
+    )
+    app = create_app(
+        engine,
+        allow_no_auth=True,
+        alerts_settings=_email_alerts(
+            email_password=None, email_password_secret="alerts/smtp#password"
+        ),
+    )
+    app.state.secret_provider = _RecordingProvider()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.post("/alerts/test-email")
+    assert r.status_code == 200 and r.json()["success"] is True, r.text
+    assert len(sent) == 1 and sent[0]["password"] == SMTP_PASSWORD_SECRET, sent
+    assert len(resolved_on) == 1, resolved_on
+    assert resolved_on[0] is not threading.current_thread(), "resolved on the event loop"
