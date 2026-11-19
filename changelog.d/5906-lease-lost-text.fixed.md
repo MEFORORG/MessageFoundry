@@ -4,5 +4,5 @@
   was not running. A resend into a stopped outbound is refused with a 409 that says to resend
   through the leader, where it said to start the connection first, a start that node refuses. An
   upload resend into a stopped inbound on such a node, or on one whose graph is down, is refused
-  with a 409 naming that cause, where it said to start the inbound; it names no other engine,
-  because the uploaded file is held on this node. (`BACKLOG #5906`)
+  with a 409 saying that this node refuses the resend, where it said to start the inbound.
+  (`BACKLOG #5906`)

@@ -778,7 +778,7 @@ def _graph_down_detail(rr: RegistryRunner, kind: str, name: str) -> str | None:
     ``None``: a downed graph (BACKLOG #5702), or a cluster node that lost its lease while its graph
     still runs, whose start door refuses with ``RunnerLeaseLostError`` (BACKLOG #5906). Either way
     "start it before resending" would point at a refused control. The upload resend into an
-    inbound has its own text (:func:`_inbound_down_detail`), because its file is this node's."""
+    inbound has its own text (:func:`_inbound_down_detail`), which names no other engine."""
     if not rr.running:
         return (
             f"{kind} {name!r} is not running because this engine's graph is not running "
@@ -794,10 +794,9 @@ def _graph_down_detail(rr: RegistryRunner, kind: str, name: str) -> str | None:
 
 def _inbound_down_detail(rr: RegistryRunner, name: str) -> str:
     """The 409 reason for an upload resend into an inbound that is not running. On a downed graph
-    (BACKLOG #5702) or a node that lost its cluster lease (BACKLOG #5906) it names only the cause,
-    with no remedy: an uploaded file lives in this node's ``[store].uploads_dir``, so "resend
-    through the leader" or another engine would point at one that does not hold the file, and the
-    start the inbound needs is refused here. Otherwise it says to start the inbound."""
+    (BACKLOG #5702) or a node that lost its cluster lease (BACKLOG #5906) it says only that this
+    node refuses the resend: the start the inbound needs is refused here too, so "start it before
+    resending" would point at a refused control. Otherwise it says to start the inbound."""
     if not rr.running:
         return (
             f"inbound {name!r} is not running because this engine's graph is not running "
