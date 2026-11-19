@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A token endpoint answering in a content coding stops the lane and keeps the queue (BACKLOG #5910).
+"""A coded 2xx token reply (scoped on smart.request_token) stops the lane and keeps the queue (#5910).
 
 Every queued row mints its bearer through the same endpoint, so every row would meet the same
 refusal. ``request_token`` marks it a configuration fault, and the delivery worker's existing

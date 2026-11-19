@@ -1316,8 +1316,9 @@ class NegativeAckError(DeliveryError):
     endpoint they name (ADR 0095 Amendment B.2). At least: an FTP server refusing ``AUTH TLS`` or
     ``PROT P``, demanding TLS of a plain session, or refusing the greeting; an HTTP endpoint or web
     proxy sending a Digest challenge the engine refuses (BACKLOG #2323); or an OAuth2 or SMART
-    token endpoint answering in a content coding the engine does not decode
-    (``token-reply-coded``, BACKLOG #5910). Every queued row would fail the same way, so the delivery worker stops the lane and keeps the queue, under the
+    token endpoint answering a coded 2xx reply, as
+    :func:`~messagefoundry.transports.smart.request_token` scopes it (``token-reply-coded``,
+    BACKLOG #5910). Every queued row would fail the same way, so the delivery worker stops the lane and keeps the queue, under the
     same ``credential_fault_policy`` as a credential fault. ADR 0095 Amendment B says where "every row"
     is weaker for HTTP than for FTP. Only meaningful when ``permanent`` is True.
 

@@ -160,9 +160,14 @@ def request_token(
     ``rest.auth_challenge_refused`` builds (BACKLOG #2989); no built provider's hop reaches that
     handler, since a Digest proxy in front of an https token endpoint is refused at build.
 
-    A 2xx reply with a body in a content coding the engine does not decode is a permanent
+    A 2xx reply that :func:`~messagefoundry.transports.bounded_read.reply_framing_fault` refuses
+    for its content coding is a permanent
     :class:`~messagefoundry.transports.base.NegativeAckError` coded
-    :data:`TOKEN_REPLY_CODED_CODE`, and a configuration fault: every queued row mints through the
+    :data:`TOKEN_REPLY_CODED_CODE`. That is a reply whose ``Content-Encoding`` names any coding but
+    ``identity``, unless it is a ``204`` or carries ``Content-Length: 0``; an empty chunked or
+    close-framed coded reply is refused too. A reply that check refuses first for its header block
+    or framing takes that refusal instead, and a non-2xx reply is the retryable mint failure above.
+    The coded refusal is a configuration fault: every queued row mints through the
     same endpoint and would meet the same refusal, so it is not retried, and under the default
     ``credential_fault_policy`` the delivery worker stops the lane and keeps the queue. Owner ruling
     2026-11-18 on PR 3069, in the owner's words: "Stop the lane."
@@ -509,8 +514,8 @@ class _TokenEndpointProvider(abc.ABC):
         (a token ``POST``); the connector calls it inside its off-loop ``send()`` worker. Raises
         :class:`~messagefoundry.transports.base.DeliveryError` (transient) if acquisition fails, or
         the permanent configuration fault :func:`request_token` names for a refused Digest
-        challenge, or the permanent ``token-reply-coded`` configuration fault it raises for a reply
-        in a content coding."""
+        challenge, or the permanent ``token-reply-coded`` configuration fault it raises for a coded
+        2xx reply, as :func:`request_token` scopes it."""
         with self._lock:
             if self._cached_token is not None and time.monotonic() < self._cached_expiry_monotonic:
                 return self._cached_token

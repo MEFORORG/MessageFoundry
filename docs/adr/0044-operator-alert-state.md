@@ -94,12 +94,12 @@ Add an `alert_instance` table to `_SCHEMA` ([`store/store.py`](../../messagefoun
 shaped like the `connection_event` table (metadata-only, encrypted `reason` at rest via the existing
 `_CIPHER_COLUMNS` mechanism), keyed on the **same identity ADR 0014 already throttles by** — the
 `(event_type, connection)` pair from `_emit`'s `key = f"{event['type']}:{event['connection']}"`
-([`alert_sinks.py:446`](../../messagefoundry/pipeline/alert_sinks.py)). One open instance per key:
+([`alert_sinks.py:446`](../../messagefoundry/pipeline/alert_sinks.py)) (amended 2026-11-19, see below). One open instance per key:
 
 | Column | Notes |
 |---|---|
 | `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` (SQLite) / backend-native identity |
-| `event_type` | the `AlertSink` event name (bounded enum — must be in `_ALERT_EVENT_TYPES`, [`config/settings.py:1034`](../../messagefoundry/config/settings.py)) |
+| `event_type` | the `AlertSink` event name (bounded enum — must be in `_ALERT_EVENT_TYPES`, [`config/settings.py:1034`](../../messagefoundry/config/settings.py)) (amended 2026-11-19, see below) |
 | `connection` | inbound/outbound connection name (or the cert/db/`engine-integrity` label that already stands in for `connection` in `_emit`) — **config metadata, never payload** |
 | `severity` | the effective ADR 0014 severity (`info`/`warning`/`critical`) — last write wins |
 | `status` | `open` \| `acknowledged` \| `resolved` |

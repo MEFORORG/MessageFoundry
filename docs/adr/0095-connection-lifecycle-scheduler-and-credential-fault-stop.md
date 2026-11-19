@@ -572,7 +572,7 @@ It is raised in `transports/fhir.py` (`_agreed_reading`, comparing `_reply_readi
 
 `smart.request_token`, which both the SMART and the OAuth2 token providers call, raises a
 `NegativeAckError` with code `token-reply-coded`, `permanent` and `config_fault` on a coded 2xx
-token reply with a body. Every queued row mints its bearer
+token reply, as `smart.request_token` scopes it. Every queued row mints its bearer
 through that endpoint before it is sent, so every row would meet the same refusal. It takes the
 A.1 route: under `credential_fault_policy="stop"` the lane stops and the claimed rows go back to
 PENDING un-errored; under `"dead_letter"` the row, or every member of a batch, dead-letters.

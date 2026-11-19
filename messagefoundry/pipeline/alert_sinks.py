@@ -328,7 +328,7 @@ _AUTO_RESOLVE: dict[str, str] = {
 #: ``connection_error``, so neither's page suppresses the other's or replaces its reason. A rule's
 #: control action is not split this way: it is throttled per ``(event_type, connection)``
 #: (``NotifierAlertSink._last_control``). ``connection_restored`` of the same kind resolves it.
-#: ADR 0044's 2026-11-19 amendment states the instance key, and ADR 0128 section 4 states the
+#: ADR 0044's 2026-11-19 amendment states the instance key, and the 2026-11-19 amendment to ADR 0128 section 4 states the
 #: notification and control throttles.
 _CONFIG_FAULT_INSTANCE = "connection_error.config_fault"
 
@@ -1349,10 +1349,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._realert_seconds = realert_seconds
         self._rules = AlertRuleSet(rules or [])
         self._last_sent: dict[str, float] = {}
-        # ADR 0128 section 4 (owner ruling 2026-11-19): per "<event_type>:<connection>", when a rule's
+        # ADR 0128 section 4, amended 2026-11-19 (owner ruling): per "<event_type>:<connection>", when a rule's
         # control action was last dispatched. The control throttle reads only this map, apart from
-        # the notification throttle above, whether or not that emit's page was throttled. ADR 0128
-        # section 4 states the bound per (event_type, connection) and at least its limits.
+        # the notification throttle above, whether or not that emit's page was throttled. The 2026-11-19
+        # amendment to ADR 0128 section 4 states the bound per (event_type, connection) and at least
+        # its limits.
         self._last_control: dict[str, float] = {}
         # Durable alert-state (ADR 0044, #56): when wired, every emit upserts a resolvable instance on
         # the (type, connection) key BEFORE the throttle, and an inverse signal auto-resolves it. None =
@@ -2271,7 +2272,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         throttled = last is not None and now - last < cooldown
         if not throttled:
             self._last_sent[key] = now
-        # #144 (ADR 0128 section 4, owner ruling 2026-11-19): the auto-remediation control action is
+        # #144 (ADR 0128 section 4, amended 2026-11-19 by owner ruling): the auto-remediation control action is
         # decided on its own throttle, _last_control, per (event_type, connection), whether or not
         # the notification was throttled. It is recorded only when a control task is dispatched, so
         # an emit the guards below skip does not hold back a later restart. A skip is logged only

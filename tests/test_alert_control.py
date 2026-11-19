@@ -282,7 +282,7 @@ async def _settle_control(sink: NotifierAlertSink) -> None:
 async def test_a_restart_runs_on_its_own_throttle_across_connection_error_kinds(
     clock: _Clock,
 ) -> None:
-    # Owner ruling 2026-11-19 (ADR 0128 section 4): the restart is throttled on when a restart last
+    # Owner ruling 2026-11-19 (ADR 0128 section 4, its amendment): the restart is throttled on when a restart last
     # ran, never on when a page last went out. A transport page whose restart was throttled must not
     # hold back the next config_fault episode's restart once the cooldown since the last restart
     # has passed.

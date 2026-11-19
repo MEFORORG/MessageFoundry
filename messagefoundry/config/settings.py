@@ -6259,7 +6259,7 @@ class AlertRule(BaseModel):
     # #144 (ADR 0128): OPTIONAL auto-remediation control action fired when this rule matches — one of
     # "restart_inbound" / "restart_outbound" (whitelisted). None (default) = notify only, no control
     # (byte-identical). Dispatched OFF the delivery worker + never-raise; throttled on its own, apart
-    # from the notification, per event+connection (ADR 0128 section 4 states the bound and at least
+    # from the notification, per event+connection (the 2026-11-19 amendment to ADR 0128 section 4 states the bound and at least
     # its limits, a zero cooldown and a schedule switch; owner ruling 2026-11-19); independent of transport suppression (transports=[] ⇒
     # quiet auto-remediation). Requires the notifier (≥1 transport). Pure data — no embedded code.
     # BACKLOG #1898: allowed only with an event_type in _ALERT_CONTROL_EVENT_TYPES; "any" and every
