@@ -86,3 +86,15 @@ def test_a_legacy_width_row_with_an_escaped_pipe_still_pads(tmp_path: Path) -> N
     assert len(rows) == 1
     assert rows[0]["summary"] == "old | row"
     assert rows[0]["target"] == "-"
+
+
+def test_a_hand_written_row_without_a_closing_pipe_reads(tmp_path: Path) -> None:
+    ledger = tmp_path / "OWNER-ITEMS.md"
+    ol.ensure(str(ledger))
+    row = "| " + " | ".join(ol.cell(_rec("8", "a | b")[c]) for c in ol.COLUMNS)
+    with ledger.open("a", encoding="utf-8") as fh:
+        fh.write(row + "\n")  # no closing separator
+    rows = ol.read(str(ledger))
+    assert len(rows) == 1
+    assert rows[0]["summary"] == "a | b"
+    assert rows[0]["target"] == "-"
