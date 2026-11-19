@@ -2548,9 +2548,10 @@ def _holds_lockout_state(user: UserRecord) -> bool:
 
 
 #: What :meth:`AuthService._clear_after_reauth` did: wrote the reset with its rows, found only a
-#: lockout column changed, was refused by a Vault transit Outage (so the caller's own row is
-#: written, hard; a store error the read-back does not settle raises instead), or found the account gone, disabled, re-bound, its sessions ended or its
-#: record failing its seal, so the re-auth must grant nothing (BACKLOG #5900).
+#: lockout column changed, was refused by a Vault transit Outage at the account record's seal (so
+#: the caller's own row is written, hard; a store error the read-back does not settle raises
+#: instead), or found the account gone, disabled, re-bound, its own ``session_epoch`` moved or
+#: its record failing its seal, so the re-auth must grant nothing (BACKLOG #5900).
 _ReauthClear = Literal["cleared", "kept", "refused", "denied"]
 
 #: The pauses, in seconds, before each read-back of a re-auth's lockout reset whose write raised
@@ -7976,7 +7977,8 @@ class AuthService:
         establish the account and asked the store to end the rotated session, whether or not that
         revoke landed, and when the password re-auth raised from its stamp onward (BACKLOG
         #5900), so a store fault on the row does not replace the exception propagating. Hard when
-        that re-auth's clear was refused, so a step-up it grants is never left unaudited. Never
+        that re-auth's clear was refused, so its rotated token is never handed back without the
+        row. Never
         soft for a failed re-proof that finished."""
 
         async def row() -> None:
@@ -15652,6 +15654,37 @@ class AuthService:
             )
         return found, None
 
+    async def _end_reauth_rotated_session_shielded(
+        self,
+        rotated_token: str,
+        actor: str,
+        cause: str,
+        ended: list[bool],
+        *,
+        propagate: bool = False,
+    ) -> None:
+        """:meth:`_end_reauth_rotated_session`, run to completion through a cancel the way
+        :func:`_write_through_cancellation` runs its writes, a cancel that lands meanwhile being
+        re-raised after it (BACKLOG #5900). Its answer is appended to ``ended``, which the caller
+        reads even when that cancel propagates. A revoke that fails is logged and appends nothing,
+        so it never replaces an exception the caller is propagating; with ``propagate``, when the
+        caller has none, it raises instead. ``cause`` says why the session is ended."""
+
+        async def end_rotated() -> None:
+            if propagate:
+                ended.append(await self._end_reauth_rotated_session(rotated_token, actor))
+                return
+            try:
+                ended.append(await self._end_reauth_rotated_session(rotated_token, actor))
+            except Exception as revoke_exc:  # noqa: BLE001 -- the caller's exception stands
+                _log.warning(
+                    "a re-auth whose %s could not end the session it rotated (%s)",
+                    cause,
+                    type(revoke_exc).__name__,
+                )
+
+        await _write_through_cancellation([end_rotated])
+
     async def _end_reauth_rotated_session(self, rotated_token: str, actor: str) -> bool:
         """Ask the store to end the session a re-auth rotated once :meth:`_clear_after_reauth`
         answered ``"denied"`` or raised (BACKLOG #5900), and say whether the revoke landed, as far
@@ -15725,9 +15758,12 @@ class AuthService:
         second-factor requirement and no lock is live (BACKLOG #1638's rule for the login leg), and
         only once its rotation succeeded and the account's lockout state is still what the proof
         saw, decided by the store's compare-and-set (:meth:`_clear_after_reauth`, BACKLOG #5900).
-        An account that cannot be established there, gone, disabled, re-bound or failing its seal,
-        is granted nothing: the store is asked to end the rotated session, and the answer is
-        ``session_lost``. A success that clears a run of failures is labelled
+        An account that cannot be established there, gone, disabled, re-bound, its own
+        ``session_epoch`` moved or failing its seal, is granted nothing: the store is asked to end
+        the rotated session, and the answer is ``session_lost``. A clear that raises, at least on a
+        store error it cannot read back or a cancel, also asks the store to end the rotated
+        session, and the error propagates; so does a hard ``auth.reauth`` row that is refused after
+        a rotation. A success that clears a run of failures is labelled
         ``auth.login_after_failures``; that row and the ``auth.reauth`` row commit with the clear.
         The ``auth.reauth`` row is written even when the ceremony raises from its stamp onward."""
         if await self.session_steps_up_at_idp(token):
@@ -15913,25 +15949,13 @@ class AuthService:
                         elevation = Elevation(session_lost=True)
                         clear_denied_session_ended = False
                         ended: list[bool] = []
-                        cause = type(exc).__name__
-
-                        async def end_rotated() -> None:
-                            try:
-                                ended.append(
-                                    await self._end_reauth_rotated_session(
-                                        rotated_token, identity.username
-                                    )
-                                )
-                            except Exception as revoke_exc:  # noqa: BLE001 -- exc stands
-                                _log.warning(
-                                    "a re-auth whose lockout clear raised (%s) could not end the "
-                                    "session it rotated (%s)",
-                                    cause,
-                                    type(revoke_exc).__name__,
-                                )
-
                         try:
-                            await _write_through_cancellation([end_rotated])
+                            await self._end_reauth_rotated_session_shielded(
+                                rotated_token,
+                                identity.username,
+                                f"its lockout clear raised ({type(exc).__name__})",
+                                ended,
+                            )
                         finally:
                             # Also when a second cancel lands: the revoke ran to completion.
                             clear_denied_session_ended = bool(ended and ended[0])
@@ -15951,11 +15975,20 @@ class AuthService:
                         lost = True
                         elevation = Elevation(session_lost=True)
                         # False until the revoke answers, so a raise from it still reads as a
-                        # denied clear on the row the ``finally`` writes.
+                        # denied clear on the row the ``finally`` writes. Run to completion
+                        # through a cancel, as on the raise path above.
                         clear_denied_session_ended = False
-                        clear_denied_session_ended = await self._end_reauth_rotated_session(
-                            rotated_token, identity.username
-                        )
+                        denied_ended: list[bool] = []
+                        try:
+                            await self._end_reauth_rotated_session_shielded(
+                                rotated_token,
+                                identity.username,
+                                "its clear was denied",
+                                denied_ended,
+                                propagate=True,
+                            )
+                        finally:
+                            clear_denied_session_ended = bool(denied_ended and denied_ended[0])
                 if elevation.ok:
                     # vault BACKLOG #2145: a step-up on an account that owes no factor is how a
                     # first-seen address passes its challenge, so it becomes known.
@@ -15975,13 +16008,36 @@ class AuthService:
                 # propagating (a defect the soft write re-raises still does). Hard after a refused
                 # clear, which runs after the address was marked known and the purpose grant was
                 # minted: a fault that refuses the row raises, so the rotated token, and with it
-                # the grant, is never handed back, but the address stays marked known.
-                await self._write_reauth_row(
-                    lost=lost or not finished,
-                    actor=identity.username,
-                    detail=reauth_detail(interrupted=not finished),
-                    client=client,
-                )
+                # the grant, is never handed back, but the address stays marked known. The
+                # rotated session is then ended, through a cancel too, rather than left live.
+                try:
+                    await self._write_reauth_row(
+                        lost=lost or not finished,
+                        actor=identity.username,
+                        detail=reauth_detail(interrupted=not finished),
+                        client=client,
+                    )
+                except BaseException:
+                    if finished and elevation.token is not None:
+                        row_refused_ended: list[bool] = []
+                        try:
+                            await self._end_reauth_rotated_session_shielded(
+                                elevation.token,
+                                identity.username,
+                                "its auth.reauth row was refused",
+                                row_refused_ended,
+                            )
+                        finally:
+                            # No row records it, so the log does.
+                            _log.warning(
+                                "a re-auth for %s whose auth.reauth row was refused %s the "
+                                "session it rotated",
+                                scrub_log_argument(identity.username),
+                                "ended"
+                                if row_refused_ended and row_refused_ended[0]
+                                else "could not end",
+                            )
+                    raise
         await self._record_reproof_lockout(proof, client=client, audit_detail=provider_detail)
         if proof.session_revoked:
             await self._revoke_for_budget(hash_token(token))

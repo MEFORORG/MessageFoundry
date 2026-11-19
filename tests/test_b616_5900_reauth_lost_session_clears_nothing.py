@@ -1156,3 +1156,32 @@ async def test_a_cancel_during_the_clear_ends_the_rotated_session(
         assert rows[0]["clear_raised"] is True and rows[0]["session_ended"] is True
     finally:
         await store.close()
+
+
+async def test_an_outage_at_the_clear_and_a_refused_row_end_the_rotated_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Transit Outage at the account record's seal answers refused, and the same Outage refuses
+    the hard ``auth.reauth`` row. The re-auth raises, its rotated token never handed back, and the
+    session it rotated is ended rather than left live with its purpose grant."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+        real_audit = store.record_audit
+
+        async def outage(user_id: str, **kwargs: Any) -> None:
+            raise _outage(user_id)
+
+        async def refuse_reauth_row(action: str, **kwargs: Any) -> Any:
+            if action == "auth.reauth":
+                raise OSError("synthetic row refusal")
+            return await real_audit(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_login_success", outage)
+        monkeypatch.setattr(service, "_user_seal_outage", lambda refused: None)
+        monkeypatch.setattr(store, "record_audit", refuse_reauth_row)
+        with pytest.raises(OSError, match="synthetic row refusal"):
+            await service.reauth(identity, GOOD, token=token, purpose=STEP_UP_ACTION_MFA_ENROLL)
+        assert await store.list_sessions("u-bob") == [], "the rotated session was left live"
+    finally:
+        await store.close()
