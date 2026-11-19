@@ -241,6 +241,7 @@ from messagefoundry.store.store import (
     REINGRESS_ARTIFACT_ERASED,
     REINGRESS_ARTIFACT_MISSING,
     REINGRESS_PEEK_FAILED,
+    REINGRESS_READ_TAG_FAILURE_OUTCOME,
     REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
     REINGRESS_TOKEN_TAG_FAILED,
@@ -6263,14 +6264,14 @@ class PostgresStore:
                         seq = int(seq_s)
                     except QueueTagError:
                         # BACKLOG #5982: dead-lettered like a corrupt reference, then audited and
-                        # alerted as a claim reports a tag failure, after the transaction.
-                        dead = await _consume_dead(
+                        # alerted as a claim reports a tag failure, after the transaction. Queued
+                        # first, so a dead-letter write that fails is still reported.
+                        queue_tag_rows.append(wr)
+                        return await _consume_dead(
                             "ingress_handoff(tag-failed)",
                             REINGRESS_TOKEN_TAG_FAILED,
                             "re-ingress work-row failed its integrity check",
                         )
-                        queue_tag_rows.append(wr)
-                        return dead
                     except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
                         # A corrupt/undecryptable work-row reference can never be re-ingressed.
                         # Mirrors the SQLite branch and the depth-cap branch.
@@ -6490,7 +6491,11 @@ class PostgresStore:
         try:
             ref = open_queue_cell(self._cipher, row) or ""
         except QueueTagError:
-            return None  # BACKLOG #5982: `ingress_handoff` dead-letters, audits and alerts it
+            # BACKLOG #5982: audited and alerted, then raised, as on SQLite.
+            await report_queue_tag_failure(
+                self, self._cipher, row, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
+            )
+            raise
         try:
             mid, dest, seq_s = ref.split("\x1f")
             seq = int(seq_s)

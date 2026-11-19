@@ -243,6 +243,7 @@ from messagefoundry.store.store import (
     REINGRESS_ARTIFACT_ERASED,
     REINGRESS_ARTIFACT_MISSING,
     REINGRESS_PEEK_FAILED,
+    REINGRESS_READ_TAG_FAILURE_OUTCOME,
     REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
     REINGRESS_TOKEN_TAG_FAILED,
@@ -9115,7 +9116,9 @@ class SqlServerStore:
         dead-lettered (and the token still consumed; one whose reply is erased is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
-        corrupt ref, and the failure is audited once the transaction has closed. A ``peek_failed``
+        corrupt ref, and the failure is audited once the transaction has closed; so is a work-row
+        whose own ``payload`` fails its queue tag (:data:`REINGRESS_TOKEN_TAG_FAILED`, BACKLOG
+        #5982), which is also alerted. A ``peek_failed``
         child stores ``refused_raw`` and ``refused_metadata`` as :meth:`QueueStore.ingress_handoff`
         says (vault BACKLOG #4796)."""
         tag_failures: list[CellTagError] = []
@@ -9221,14 +9224,14 @@ class SqlServerStore:
                     seq = int(seq_s)
                 except QueueTagError:
                     # BACKLOG #5982: dead-lettered like a corrupt reference, then audited and
-                    # alerted as a claim reports a tag failure, after the transaction.
-                    dead = await _consume_dead(
+                    # alerted as a claim reports a tag failure, after the transaction. Queued
+                    # first, so a dead-letter write that fails is still reported.
+                    queue_tag_rows.append(work_row)
+                    return await _consume_dead(
                         "ingress_handoff(tag-failed)",
                         REINGRESS_TOKEN_TAG_FAILED,
                         "re-ingress work-row failed its integrity check",
                     )
-                    queue_tag_rows.append(work_row)
-                    return dead
                 except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
                     return await _consume_dead(
                         "ingress_handoff(corrupt-ref)",
@@ -9458,7 +9461,9 @@ class SqlServerStore:
         worker's HL7 peek. ``None`` if the work-row is missing/consumed or its ref is unparseable; ``''``
         if the artifact row is missing, its body was erased, or the reply was empty, as on SQLite.
         Reads the SAME immutable artifact ``ingress_handoff``
-        re-reads, so the peek and the persisted raw always agree."""
+        re-reads, so the peek and the persisted raw always agree. A token whose ``payload`` fails its
+        own tag is audited, alerted and raised as :class:`QueueTagError`, as on SQLite (BACKLOG
+        #5982)."""
         row = await self._fetchone(
             f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
             (response_row_id, Stage.RESPONSE.value),
@@ -9468,7 +9473,10 @@ class SqlServerStore:
         try:
             ref = open_queue_cell(self._cipher, row) or ""
         except QueueTagError:
-            return None  # BACKLOG #5982: `ingress_handoff` dead-letters, audits and alerts it
+            await report_queue_tag_failure(
+                self, self._cipher, row, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
+            )
+            raise
         try:
             mid, dest, seq_s = ref.split("\x1f")
             seq = int(seq_s)

@@ -1021,14 +1021,19 @@ REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 #: from a reference that did not, so an operator knows which row to look for (BACKLOG #4996).
 REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
 #: The ``last_error`` of a re-ingress token whose own ``payload`` failed its queue tag at the handoff
-#: (BACKLOG #5982): its routing fields changed outside the store after the claim opened it. Named apart
-#: from a corrupt reference, because it is audited and alerted as a tag failure. The server backends
-#: import it.
+#: (BACKLOG #5982), after its claim had opened it: at least a routing column or the payload cell
+#: changed outside the store, or the payload was blanked. Named apart from a corrupt reference,
+#: because it is audited and alerted as a tag failure. The server backends import it.
 REINGRESS_TOKEN_TAG_FAILED: Final = "integrity: the re-ingress work-row failed its queue tag"
-#: The ``outcome`` that tag failure is reported with. It says the handoff refused the token rather
-#: than that the token is dead: a commit that fails after the dead-letter write leaves the token
-#: claimed, to be refused and reported again on the next pass.
+#: The ``outcome`` the handoff reports that tag failure with. It says the handoff refused the token
+#: rather than that the token is dead: the failure is queued for reporting before the dead-letter
+#: write, so a write or commit that then fails is still reported, and the token, left claimed, is
+#: refused and reported again on a later pass.
 REINGRESS_TAG_FAILURE_OUTCOME: Final = "was refused at the re-ingress handoff"
+#: The ``outcome`` the re-ingress worker's reply read reports a tag failure with
+#: (:meth:`MessageStore.response_body_for_work_row`), which then raises, so the worker dead-letters
+#: the token rather than peek a reply it could not read.
+REINGRESS_READ_TAG_FAILURE_OUTCOME: Final = "was refused at the re-ingress reply read"
 #: The ``error`` of a re-ingress child whose body failed its HL7 peek, when the worker passes no reason
 #: of its own. The server backends import it, and so does the re-ingress worker, which leads it with
 #: the refused-body allowance note when it stores only the head (vault BACKLOG #4796).
@@ -15933,7 +15938,9 @@ class MessageStore:
         Returns ``True`` if this call performed the handoff, ``False`` if it was an already-consumed no-op.
 
         An origin whose metadata cell fails its row tag (BACKLOG #2593) makes the token unrecoverable:
-        it is dead-lettered and consumed like a corrupt reference, and the failure is audited. A token
+        it is dead-lettered and consumed like a corrupt reference, and the failure is audited. So is a
+        token whose own ``payload`` fails its queue tag (:data:`REINGRESS_TOKEN_TAG_FAILED`, BACKLOG
+        #5982), which is also alerted, as a claim reports a tag failure. A token
         whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
         produces no child and cannot be replayed. One whose ``response`` row is missing is damage: it
         is dead-lettered under :data:`REINGRESS_ARTIFACT_MISSING` and keeps its reference as the
@@ -16022,14 +16029,14 @@ class MessageStore:
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)
             except QueueTagError:
-                # BACKLOG #5982: the token's routing fields no longer build the tag its payload was
-                # sealed under. Dead-lettered like a corrupt reference, then audited and alerted as
-                # a claim reports a tag failure, once the writer lock is released.
-                dead = await _consume_dead(
+                # BACKLOG #5982: the payload no longer opens under the token's own tag. Dead-lettered
+                # like a corrupt reference, then audited and alerted as a claim reports a tag
+                # failure, once the writer lock is released. Queued first, so a dead-letter write
+                # that fails is still reported.
+                queue_tag_rows.append(wr)
+                return await _consume_dead(
                     REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
                 )
-                queue_tag_rows.append(wr)
-                return dead
             except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
                 # A corrupt/undecryptable work-row reference (DB corruption, a cipher/key failure)
                 # can NEVER be re-ingressed. Mirrors the depth-cap branch (a different
@@ -16221,7 +16228,11 @@ class MessageStore:
         prior handoff) or its reference is malformed, and ``""`` if the artifact row is missing, its
         body was erased, or the reply was empty; :meth:`ingress_handoff` tells those apart. The
         ``ingress_handoff`` it precedes re-reads the same immutable artifact for the message raw, so the
-        peek and the raw always agree."""
+        peek and the raw always agree.
+
+        The token's ``payload`` is opened under its own tag (BACKLOG #5982). A token that fails it
+        raises :class:`QueueTagError`, after the failure is audited and alerted as a claim reports
+        one, so the worker dead-letters it rather than peek a reply it could not read."""
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
@@ -16232,24 +16243,29 @@ class MessageStore:
                 return None
             try:
                 ref = open_queue_cell(self._cipher, row) or ""
-            except QueueTagError:
-                return None  # BACKLOG #5982: `ingress_handoff` dead-letters, audits and alerts it
-            try:
-                mid, dest, seq_s = ref.split("\x1f")
-                seq = int(seq_s)
-            except ValueError:
-                return None  # `ingress_handoff` dead-letters it as a corrupt reference
-            cur = await db.execute(
-                "SELECT body FROM response"
-                " WHERE message_id=? AND destination_name=? AND response_seq=?",
-                (mid, dest, seq),
-            )
-            art = await cur.fetchone()
-        return (
-            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
-            if (art and art["body"] is not None)
-            else ""
+            except QueueTagError as err:
+                refused = err  # reported below, once the read connection is released
+            else:
+                try:
+                    mid, dest, seq_s = ref.split("\x1f")
+                    seq = int(seq_s)
+                except ValueError:
+                    return None  # `ingress_handoff` dead-letters it as a corrupt reference
+                cur = await db.execute(
+                    "SELECT body FROM response"
+                    " WHERE message_id=? AND destination_name=? AND response_seq=?",
+                    (mid, dest, seq),
+                )
+                art = await cur.fetchone()
+                return (
+                    self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
+                    if (art and art["body"] is not None)
+                    else ""
+                )
+        await report_queue_tag_failure(
+            self, self._cipher, row, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
         )
+        raise refused
 
     async def record_ack_sent(
         self,
