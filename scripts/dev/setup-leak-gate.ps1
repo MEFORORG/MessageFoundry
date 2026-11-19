@@ -67,12 +67,13 @@ $example = Join-Path $secDir 'scan-tokens.local.txt.example'
 $scanner = Join-Path $secDir 'scan_forbidden.py'
 
 # Every git call this script makes, its own and the scanner's, must answer about $repo. An inherited
-# GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE -- exported by a hook, or left behind in the operator's shell
-# -- outranks both -C and the current directory, so the scan would list another repository's tracked
-# files (or another index) and report its verdict as this checkout's. Each call runs with the three
-# dropped, and they are restored afterwards so a caller that dot-sources or invokes this in-process
-# keeps its own environment.
-$gitRedirects = 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'
+# location variable -- exported by a hook, or left behind in the operator's shell -- outranks both -C
+# and the current directory, so the scan would list another repository's tracked files (or another
+# index), and check-ignore would read another repository's exclude rules, each reported as this
+# checkout's. The list is the location set scripts/worktree/worktree-gates.ps1 refuses
+# ($GIT_REDIRECT_NAMES); keep the two in step. Each call runs with them dropped, and they are
+# restored afterwards so a caller that dot-sources or invokes this in-process keeps its environment.
+$gitRedirects = 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE'
 function Invoke-WithoutGitRedirect([scriptblock]$Body) {
     $saved = @{}
     foreach ($name in $gitRedirects) {

@@ -70,7 +70,7 @@ def _derived_tokens(marker: str) -> str:
 
 
 #: Git variables that would point a temp checkout's git calls at another repository or index.
-_GIT_REDIRECTS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+_GIT_REDIRECTS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -469,3 +469,20 @@ def test_an_inherited_git_dir_does_not_point_the_scan_at_another_repository(
     control = _run(root, "-Synthetic", env=env)
     assert control.returncode != 0, control.stdout
     assert "VERIFY FAILED" in control.stdout, control.stdout
+
+
+def test_an_inherited_git_work_tree_does_not_defeat_the_ignore_guard(
+    rig: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """An exported ``GIT_WORK_TREE`` naming another directory makes ``git -C <repo> check-ignore``
+    refuse the path as outside the work tree, so the guard read the token file as NOT ignored,
+    deleted what it had just installed and threw. Run with the variable dropped, the guard answers
+    about this checkout."""
+    root, shim, _ = rig
+    other = tmp_path / "other-wt"
+    other.mkdir()
+    proc = _run(root, "-Synthetic", env=_env(shim, GIT_WORK_TREE=str(other)))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "NOT git-ignored" not in proc.stdout + proc.stderr
+    assert "CONFIGURED (synthetic)" in proc.stdout, proc.stdout
