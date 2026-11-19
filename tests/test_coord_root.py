@@ -348,6 +348,46 @@ def test_the_host_predicate_gives_one_answer_in_both_languages() -> None:
     assert want["none"] == ["", True]
 
 
+def test_host_ignores_computername_and_matches_powershell(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A spoofed COMPUTERNAME must not move the name a record carries. Get-CoordHost reads
+    # [Environment]::MachineName, which does not read it; the twin must not either.
+    monkeypatch.setenv("COMPUTERNAME", "SPOOFED-NOT-ME")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", f". '{PS}'; Get-CoordHost"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    ps_name = proc.stdout.strip()
+    assert ps_name and ps_name != "SPOOFED-NOT-ME"
+    assert coord_root.host() == ps_name
+
+
+def test_host_fallback_is_the_netbios_form_not_the_full_dns_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Where GetComputerNameW is unavailable or fails (an MSYS2 or Cygwin Python on a Windows host
+    # included), the DNS label is cut as the NetBIOS name is: upper case and at most 15 characters.
+    # An uncut label would never equal the name PowerShell writes.
+    monkeypatch.setenv("COMPUTERNAME", "SPOOFED-NOT-ME")
+    monkeypatch.setattr(coord_root, "_windows_computer_name", lambda: None)
+    monkeypatch.setattr(
+        coord_root.socket, "gethostname", lambda: "workstation-long-17.corp.example"
+    )
+    assert coord_root.host() == "WORKSTATION-LON"
+
+
+def test_host_off_windows_is_the_first_label_with_its_case_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # .NET's MachineName off Windows is the host name up to its first dot, case kept.
+    monkeypatch.setenv("COMPUTERNAME", "SPOOFED-NOT-ME")
+    monkeypatch.setattr(coord_root.socket, "gethostname", lambda: "BuildBox-Linux-Runner.example")
+    monkeypatch.setattr(coord_root, "_WINDOWS_HOST", False)
+    assert coord_root.host() == "BuildBox-Linux-Runner"
+
+
 def test_resolving_the_shared_root_once_matches_per_kind_resolution(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
