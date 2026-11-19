@@ -32,11 +32,6 @@ exactly like a missing ``env()`` key — surfaced by ``validate`` / ``check`` / 
   :mod:`messagefoundry.config.environments`); a nested table value → ``{key: {…}}``. Read via
   :mod:`tomllib`.
 
-**Rows are read-only.** A multi-column CSV row, a nested TOML table and a TOML array are frozen once
-loaded: an ordinary edit raises :class:`TypeError`, and ``copy.deepcopy`` gives a copy to edit. One
-table serves every message until reload (BACKLOG #5897). The guard stops an accidental edit, not a
-C-level writer; :class:`_FrozenDict` and :class:`_FrozenList` name at least some that pass.
-
 **Resolution.** :func:`~messagefoundry.config.wiring.load_config` loads every code set into a registry
 and makes it the **active** set *before* importing config modules (so a module-top-level
 ``DIET = code_set("epic_diets")`` resolves), and the :class:`RegistryRunner` re-publishes the live
@@ -47,7 +42,6 @@ active set; :func:`set_active` to publish one outside a ``with`` block.
 
 from __future__ import annotations
 
-import copy
 import csv
 import io
 import logging
@@ -59,7 +53,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePath
-from typing import Any, NoReturn
+from typing import Any
 
 from messagefoundry.redaction import codec_safe_str
 
@@ -337,242 +331,6 @@ def _drain_capture(buffer: UnmappedCapture, message_id: str | None) -> None:
 # --- code set ----------------------------------------------------------------
 
 
-#: How many containers deep :func:`_freeze` walks. It equals the sandbox codec's ``_MAX_DEPTH`` (a
-#: test pins the two), so a table a loader built (plain dicts and lists, ``str`` keys) that loads
-#: also crosses into the sandbox child; a directly built value the freeze stores as given, such as a
-#: dict subclass, is not counted the same way. The walk keeps its own stack, so the freeze adds no
-#: frame per level; ``tomllib`` still recurses while parsing a file.
-_MAX_FREEZE_DEPTH = 256
-
-
-def _read_only(self: object, *args: object, **kwargs: object) -> NoReturn:
-    shallow = "list(value)" if isinstance(self, list) else "dict(value) or value.copy()"
-    raise TypeError(
-        f"{type(self).__name__} is a read-only code-set value; take copy.deepcopy(value) to "
-        f"modify it ({shallow} is shallow, so nested values stay read-only)"
-    )
-
-
-class _FrozenDict(dict[str, Any]):
-    """A code-set row (a multi-column CSV row, a nested TOML table) that refuses mutation.
-
-    A ``dict`` subclass, not a ``MappingProxyType``: it stays ``isinstance(row, dict)``, equal to a
-    plain dict and JSON-serializable, so a Handler's existing reads are unchanged. It still passes
-    ``isinstance(row, MutableMapping)``, as any ``dict`` subclass does. ``copy.deepcopy(row)`` hands
-    back a plain, mutable copy all the way down; ``dict(row)`` and ``row.copy()`` are shallow, so
-    their nested values stay read-only.
-
-    The contents are set in ``__new__`` and ``__init__`` does nothing, so ``type(row)(items)`` (as
-    :func:`dataclasses.asdict` calls it) builds a new frozen row and a second ``__init__`` call
-    changes nothing. The freeze guards against an accidental edit, not a hostile Handler: a C-level
-    writer that bypasses the overrides, such as an unbound ``dict.__setitem__(row, ...)``, is not
-    stopped."""
-
-    __slots__ = ()
-    __setitem__ = __delitem__ = __ior__ = _read_only
-    clear = pop = popitem = setdefault = update = _read_only
-
-    def __new__(cls, *args: Any, **kwargs: Any) -> _FrozenDict:
-        row = dict.__new__(cls)
-        dict.__init__(row, *args, **kwargs)
-        return row
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass  # filled in __new__; a re-init must not rewrite the row
-
-    def __reduce__(self) -> tuple[Any, ...]:
-        # Copy/pickle rebuild a plain dict: the default protocol would call the refused __setitem__.
-        return (dict, (dict(self),))
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
-        # Iterative, so a row the freeze accepted at its depth bound also deep-copies.
-        return _thaw(self, memo)  # type: ignore[no-any-return]
-
-
-class _FrozenList(list[Any]):
-    """A code-set array value (a TOML array) that refuses mutation; see :class:`_FrozenDict`.
-
-    The same limit applies: ``heapq``'s C functions and an unbound ``list.append(arr, ...)`` write
-    through the C list API and are not stopped."""
-
-    __slots__ = ()
-    __setitem__ = __delitem__ = __iadd__ = __imul__ = _read_only
-    append = extend = insert = pop = remove = clear = sort = reverse = _read_only
-
-    def __new__(cls, *args: Any) -> _FrozenList:
-        arr = list.__new__(cls)
-        list.__init__(arr, *args)
-        return arr
-
-    def __init__(self, *args: Any) -> None:
-        pass  # filled in __new__; a re-init must not rewrite the array
-
-    def __reduce__(self) -> tuple[Any, ...]:
-        return (list, (list(self),))
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> list[Any]:
-        return _thaw(self, memo)  # type: ignore[no-any-return]
-
-
-#: The container types :func:`_freeze` rebuilds, and what each becomes. Matched by exact type, so a
-#: subclass a caller built on purpose (a ``defaultdict``, a ``NamedTuple``), a ``set`` and any other
-#: value are stored as given. The loaders produce only plain dicts and lists; a tuple arrives by
-#: direct construction.
-_FREEZERS: dict[type, Callable[[Any], Any]] = {dict: _FrozenDict, list: _FrozenList, tuple: tuple}
-_FREEZABLE: frozenset[type] = frozenset(_FREEZERS)
-#: The containers :func:`_thaw` walks itself for ``copy.deepcopy``: each thaws to a plain dict, list
-#: or tuple. Every other value goes through ``copy.deepcopy``.
-_THAWABLE: frozenset[type] = frozenset({_FrozenDict, _FrozenList, tuple})
-
-
-def _freeze(name: str, value: Any) -> Any:
-    """Freeze ``value``, a container of a type in :data:`_FREEZABLE`, all the way down, once at
-    construction, so a lookup returns the stored object at no per-call cost and the table it came
-    from refuses an ordinary edit (BACKLOG #5897).
-
-    A plain dict or list becomes its read-only subclass. A tuple is rebuilt from frozen members; only
-    a top-level tuple holding no dict, list or tuple is kept as given, while a nested tuple is always
-    rebuilt into an equal new tuple. A value nesting more than
-    :data:`_MAX_FREEZE_DEPTH` containers raises :class:`CodeSetError` naming ``name``."""
-    children = value.values() if type(value) is dict else value
-    if _FREEZABLE.isdisjoint(map(type, children)):
-        # The common row shapes are flat: freeze in one step, skipping the walk's bookkeeping.
-        return value if type(value) is tuple else _FREEZERS[type(value)](value)
-    return _rebuild(value, _FREEZERS, _unchanged, bound_for=name)
-
-
-def _thaw(value: Any, memo: dict[int, Any]) -> Any:
-    """A plain, mutable deep copy of frozen ``value``; other leaves go through ``copy.deepcopy``.
-
-    It honours ``memo`` as ``copy.deepcopy`` does: each new dict or list is recorded under the
-    original's id before it is filled, so a sub-object reached twice is copied once and a cycle
-    through dicts and lists copies as a cycle. A tuple cannot be recorded before it is filled: if a
-    leaf's own deep copy records it first, that copy is kept, and a cycle that runs back through
-    thawable children into a tuple still being copied raises :class:`ValueError` at once rather than
-    copy it twice. The walk keeps its own stack, so a value at :data:`_MAX_FREEZE_DEPTH` copies
-    without recursing."""
-    keep_alive: list[Any] = memo.setdefault(id(memo), [])
-    open_tuples: set[int] = set()
-
-    def start(original: Any) -> _ThawFrame:
-        if type(original) is tuple:
-            open_tuples.add(id(original))
-            return _ThawFrame(original, [])
-        target: Any = {} if isinstance(original, dict) else []
-        memo[id(original)] = target
-        keep_alive.append(original)
-        return _ThawFrame(original, target)
-
-    stack = [start(value)]
-    while True:
-        frame = stack[-1]
-        for key, child in frame.children:
-            new_key = copy.deepcopy(key, memo) if frame.is_dict else None
-            if type(child) not in _THAWABLE:
-                frame.add(new_key, copy.deepcopy(child, memo))
-            elif id(child) in memo:
-                frame.add(new_key, memo[id(child)])
-            elif id(child) in open_tuples:
-                raise ValueError("a code-set value holds a cycle back into a tuple")
-            else:
-                frame.pending_key = new_key
-                stack.append(start(child))
-                break
-        else:
-            stack.pop()
-            built = frame.target
-            original = frame.original
-            if type(original) is tuple:
-                open_tuples.discard(id(original))
-                if id(original) in memo:
-                    built = memo[id(original)]  # a leaf's deep copy reached it first; keep that one
-                else:
-                    # As copy.deepcopy does, a tuple whose members all copy to themselves is reused.
-                    same = all(new is old for new, old in zip(built, original, strict=True))
-                    built = original if same else tuple(built)
-                    memo[id(original)] = built
-                    keep_alive.append(original)
-            if not stack:
-                return built
-            parent = stack[-1]
-            parent.add(parent.pending_key, built)
-
-
-class _ThawFrame:
-    """One open container in :func:`_thaw`'s walk: the original and the copy being filled."""
-
-    __slots__ = ("original", "target", "is_dict", "children", "pending_key")
-
-    def __init__(self, original: Any, target: Any) -> None:
-        self.original = original
-        self.target = target
-        self.is_dict = isinstance(original, dict)
-        self.children: Iterator[tuple[Any, Any]] = (
-            iter(original.items()) if self.is_dict else enumerate(original)
-        )
-        self.pending_key: Any = None
-
-    def add(self, key: Any, child: Any) -> None:
-        if self.is_dict:
-            self.target[key] = child
-        else:
-            self.target.append(child)
-
-
-def _unchanged(leaf: Any) -> Any:
-    return leaf
-
-
-def _rebuild(
-    value: Any,
-    builders: Mapping[type, Callable[[Any], Any]],
-    leaf: Callable[[Any], Any],
-    bound_for: str | None = None,
-) -> Any:
-    """Rebuild ``value`` bottom-up, each container whose exact type is in ``builders`` through its
-    builder and every other child through ``leaf``.
-
-    The walk keeps its own stack rather than recursing, so it spends no interpreter frame per level.
-    With ``bound_for`` set, a container deeper than :data:`_MAX_FREEZE_DEPTH` raises
-    :class:`CodeSetError` naming that code set."""
-    stack = [_Frame(value, None)]
-    while True:
-        frame = stack[-1]
-        for key, child in frame.children:
-            if type(child) in builders:
-                if bound_for is not None and len(stack) >= _MAX_FREEZE_DEPTH:
-                    raise CodeSetError(
-                        f"code set {bound_for!r}: a value is nested too deeply to load"
-                    )
-                stack.append(_Frame(child, key))
-                break
-            frame.add(key, leaf(child))
-        else:
-            stack.pop()
-            built = builders[type(frame.value)](frame.built)
-            if not stack:
-                return built
-            stack[-1].add(frame.key, built)
-
-
-class _Frame:
-    """One open container in :func:`_rebuild`'s walk, with the rebuilt children so far."""
-
-    __slots__ = ("value", "is_dict", "children", "built", "key")
-
-    def __init__(self, value: Any, key: Any) -> None:
-        self.value = value
-        self.is_dict = isinstance(value, dict)
-        self.children: Iterator[tuple[Any, Any]] = (
-            iter(value.items()) if self.is_dict else enumerate(value)
-        )
-        self.built: list[Any] = []  # (key, child) pairs for a dict, children otherwise
-        self.key = key  # this container's key (or index) in its parent
-
-    def add(self, key: Any, child: Any) -> None:
-        self.built.append((key, child) if self.is_dict else child)
-
-
 class CodeSet(Mapping[str, Any]):
     """A frozen, read-only reference table: ``name`` + an immutable ``key → value`` mapping.
 
@@ -591,23 +349,7 @@ class CodeSet(Mapping[str, Any]):
         self, name: str, data: Mapping[str, Any], policy: UnmappedPolicy | None = None
     ) -> None:
         self._name = name
-        # Rows are frozen here, not copied per lookup: a Handler that mutated a returned row would
-        # otherwise alter the table shared by every later message until reload (BACKLOG #5897).
-        # One pass over the values at load; only container values are rebuilt.
-        # A value nested past the freeze's bound raises CodeSetError, which every loader catches.
-        frozen: dict[str, Any] = dict(data)
-        out_of_stack = False
-        try:
-            for key, value in frozen.items():
-                if type(value) in _FREEZABLE:
-                    frozen[key] = _freeze(name, value)
-        except RecursionError:
-            # A caller already at the interpreter's limit: the freeze's few frames tipped it over.
-            out_of_stack = True
-        if out_of_stack:
-            # Raised after the handler, so the CodeSetError every loader catches carries no context.
-            raise CodeSetError(f"code set {name!r}: the caller's stack is too deep to load it")
-        self._data = frozen
+        self._data: dict[str, Any] = dict(data)
         self._policy: UnmappedPolicy = policy if policy is not None else UnmappedPolicy()
 
     @property
@@ -670,10 +412,6 @@ class CodeSet(Mapping[str, Any]):
 
     def __repr__(self) -> str:
         return f"CodeSet(name={self._name!r}, entries={len(self._data)})"
-
-    def __reduce__(self) -> tuple[Any, ...]:
-        # A copy or unpickle goes back through __init__, so its rows are frozen as this one's are.
-        return (type(self), (self._name, self._data, self._policy))
 
 
 # --- loading -----------------------------------------------------------------
@@ -769,8 +507,7 @@ def parse_policy(sidecar_name: str, data: bytes) -> UnmappedPolicy:
     snapshot load."""
     try:
         raw = tomllib.loads(data.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError, RecursionError) as exc:
-        # RecursionError: tomllib's own bound on a deeply nested array, table or dotted key.
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         invalid: str | None = (
             f"policy sidecar {sidecar_name!r}: invalid TOML — {codec_safe_str(exc)}"
         )
@@ -913,8 +650,7 @@ def _parse_toml(name: str, data: bytes) -> dict[str, Any]:
     """Flat TOML table → ``{key: scalar}``; a nested table value → ``{key: {…}}`` (mirrors environments)."""
     try:
         raw = tomllib.loads(data.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError, RecursionError) as exc:
-        # RecursionError: tomllib's own bound on a deeply nested array, table or dotted key.
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         invalid = f"code set {name!r}: invalid TOML — {codec_safe_str(exc)}"
     else:
         # tomllib already rejects duplicate keys (TOMLDecodeError), so no extra dup check is needed.

@@ -21,12 +21,6 @@ code sets); the directory is created on the first `upsert`.
 - **TOML** (`<name>.toml`) — hand-authored / legacy. Summarized by `list` and shown **read-only** in
   the grid; the CLI never *writes* TOML. (A TOML-in-grid editor is a fast-follow.)
 
-**Rows are read-only.** A multi-column row, a nested TOML table and a TOML array come back from a
-lookup read-only: an ordinary edit such as `row["display"] = ...` raises `TypeError`, because one
-loaded table serves every message until reload. The guard stops an accidental edit, not every write:
-code that writes through Python's C-level container API directly still gets through. Take `copy.deepcopy(row)` to get a copy you can change;
-`dict(row)` is shallow, so its nested values stay read-only.
-
 Both editors — a hand edit and a GUI save — write the same `codesets/<name>.csv`, so they are
 interchangeable.
 
