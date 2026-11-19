@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import logging
 import textwrap
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -285,3 +287,108 @@ async def test_postgres_converge_merge_leaves_the_namespace_for_a_clean_reseed()
     assert await store.converge_state_cache() == ["corr"]
     assert store._state_cache[("corr", "K")] == "local, stale"  # the merge keeps the local value
     assert store._state_versions == {"corr": 6}  # below the shared 7, so the next tick reseeds
+
+
+def test_postgres_own_bump_record_never_lowers_the_held_version() -> None:
+    from messagefoundry.store.postgres import PostgresStore
+
+    store: Any = object.__new__(PostgresStore)
+    store._state_versions = {"corr": 5}
+    # Two transform workers in this process bumped "corr" to 6 and 7; the later one records first.
+    store._record_own_state_bumps([("corr", 7)])
+    assert store._state_versions == {"corr": 6}
+    store._record_own_state_bumps([("corr", 6)])
+    assert store._state_versions == {"corr": 6}  # not back down to 5
+
+
+async def test_postgres_out_of_order_own_records_do_not_reseed_over_a_local_key() -> None:
+    from messagefoundry.store.postgres import PostgresStore
+
+    cipher = make_cipher(generate_key())
+    store: Any = object.__new__(PostgresStore)
+    store._cipher = cipher
+    store._state_cache = new_state_cache()
+    store._state_versions = {"corr": 5}
+
+    async def _fetchall(sql: str, *args: Any) -> list[dict[str, Any]]:
+        if "state_version" in sql:
+            return [{"namespace": "corr", "version": 6}]  # this handle's earlier write, bumped to 6
+        # While the rows are read, the later write (bumped to 7, its row not in this read) publishes
+        # its key and records first; the earlier write's record then follows.
+        store._state_cache[("corr", "LATER")] = "local"
+        store._record_own_state_bumps([("corr", 7)])
+        store._record_own_state_bumps([("corr", 6)])
+        aad = cell_aad("state", "value", "corr", "EARLIER")
+        return [{"key": "EARLIER", "value": cipher.encrypt(json.dumps("v"), aad=aad)}]
+
+    store._fetchall = _fetchall
+    assert await store.converge_state_cache() == ["corr"]
+    assert store._state_cache[("corr", "LATER")] == "local"  # merged, not reseeded away
+    assert store._state_cache[("corr", "EARLIER")] == "v"
+
+
+class _AsyncNull:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _VersionConn:
+    """Records the namespace order of each ``state_version`` upsert."""
+
+    def __init__(self, purged: list[tuple[str, str]] | None = None) -> None:
+        self.order: list[str] = []
+        self._purged = purged or []
+
+    async def fetchrow(self, sql: str, ns: str, now: float) -> dict[str, int]:
+        assert "state_version" in sql
+        self.order.append(ns)
+        return {"version": 1}
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, str]]:
+        return [{"namespace": n, "key": k} for n, k in self._purged]
+
+    def transaction(self) -> _AsyncNull:
+        return _AsyncNull()
+
+
+async def test_postgres_bumps_state_versions_in_sorted_order() -> None:
+    from messagefoundry.store.postgres import PostgresStore
+
+    store: Any = object.__new__(PostgresStore)
+    conn = _VersionConn()
+    bumped = await store._bump_state_versions(conn, ["zeta", "alpha", "zeta", "mid"], 1.0)
+    # One global lock order, so two engine shards bumping overlapping namespaces cannot deadlock.
+    assert conn.order == ["alpha", "mid", "zeta"]
+    assert bumped == [("alpha", 1), ("mid", 1), ("zeta", 1)]
+
+
+async def test_postgres_purge_state_bumps_in_sorted_order() -> None:
+    from messagefoundry.store.postgres import PostgresStore
+
+    store: Any = object.__new__(PostgresStore)
+    store._state_cache = new_state_cache()
+    store._state_versions = {}
+    store._cluster_state_convergence = True
+    conn = _VersionConn(purged=[("zeta", "k1"), ("alpha", "k2"), ("zeta", "k3")])
+
+    @asynccontextmanager
+    async def _acquire(**kw: Any) -> AsyncIterator[_VersionConn]:
+        yield conn
+
+    store._timed_acquire = _acquire
+    assert await store.purge_state(older_than=1.0, now=2.0) == 3
+    assert conn.order == ["alpha", "zeta"]
+
+
+def test_postgres_transform_handoff_bumps_through_the_sorted_helper() -> None:
+    import inspect
+
+    from messagefoundry.store.postgres import PostgresStore
+
+    # transform_handoff needs a live pool to drive end to end; pin that it takes the one sorted path.
+    src = inspect.getsource(PostgresStore.transform_handoff)
+    assert "self._bump_state_versions(" in src
+    assert "INSERT INTO state_version" not in src

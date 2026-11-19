@@ -3470,10 +3470,41 @@ class PostgresStore:
         converge skip that sibling's write for good (BACKLOG #5984; engine shards write the same
         namespaces at once). On a gap the held version is set to ``ver - 1``, which is below the
         shared version, so the next converge re-reads the namespace, and it also differs from the
-        ``seen`` a converge in flight captured, so that pass merges rather than reseeds."""
+        ``seen`` a converge in flight captured, so that pass merges rather than reseeds.
+
+        The held version never moves down. Two transform workers in this process can record out of
+        order, the later bump first; lowering the held version for the earlier one could land it back
+        on the ``seen`` a converge in flight captured, and that pass would then reseed destructively
+        and drop the later write's just-published key for a tick. Keeping the higher value loses
+        nothing: the earlier write committed before the later bump's upsert could take the row lock,
+        so any read the higher value vouches for already holds it."""
         for ns, ver in bumped:
             held = self._state_versions.get(ns, 0)
-            self._state_versions[ns] = ver if held == ver - 1 else ver - 1
+            self._state_versions[ns] = max(held, ver if held == ver - 1 else ver - 1)
+
+    async def _bump_state_versions(
+        self, conn: Any, namespaces: Iterable[str], now: float
+    ) -> list[tuple[str, int]]:
+        """Bump each distinct namespace's ``state_version`` row in ``conn``'s transaction, in sorted
+        order, and return the versions bumped to.
+
+        Every path that locks these rows takes them in one global order, so two engine shards (or two
+        cluster nodes) writing overlapping namespaces wait on each other instead of deadlocking, as a
+        first-appearance order could (BACKLOG #5984)."""
+        bumped: list[tuple[str, int]] = []
+        for ns in sorted(set(namespaces)):
+            row = await conn.fetchrow(
+                "INSERT INTO state_version (namespace, version, updated_at) "
+                "VALUES ($1, 1, $2) "
+                "ON CONFLICT (namespace) DO UPDATE SET "
+                "version = state_version.version + 1, updated_at = excluded.updated_at "
+                "RETURNING version",
+                ns,
+                now,
+            )
+            assert row is not None, "state_version upsert returned no row"
+            bumped.append((ns, int(row["version"])))
+        return bumped
 
     async def converge_state_cache(self) -> list[str]:
         """Pull any newer shared transform-state writes into this node's local cache (Track B Step 6b).
@@ -5024,18 +5055,9 @@ class PostgresStore:
                 # here, so the bump never double-applies.
                 bumped: list[tuple[str, int]] = []
                 if self._cluster_state_convergence and state_ops:
-                    for ns in dict.fromkeys(n for n, _, _ in state_ops):  # distinct, order-stable
-                        row = await conn.fetchrow(
-                            "INSERT INTO state_version (namespace, version, updated_at) "
-                            "VALUES ($1, 1, $2) "
-                            "ON CONFLICT (namespace) DO UPDATE SET "
-                            "version = state_version.version + 1, updated_at = excluded.updated_at "
-                            "RETURNING version",
-                            ns,
-                            now,
-                        )
-                        assert row is not None, "state_version upsert returned no row"
-                        bumped.append((ns, int(row["version"])))
+                    bumped = await self._bump_state_versions(
+                        conn, (n for n, _, _ in state_ops), now
+                    )
                 total_targets = len(deliveries) + len(pt_deliveries)
                 await self._event(
                     conn,
@@ -12293,18 +12315,7 @@ class PostgresStore:
             purged_keys = [(r["namespace"], r["key"]) for r in rows]
             bumped: list[tuple[str, int]] = []
             if self._cluster_state_convergence:
-                for ns in dict.fromkeys(n for n, _ in purged_keys):  # distinct, order-stable
-                    vrow = await conn.fetchrow(
-                        "INSERT INTO state_version (namespace, version, updated_at) "
-                        "VALUES ($1, 1, $2) "
-                        "ON CONFLICT (namespace) DO UPDATE SET "
-                        "version = state_version.version + 1, updated_at = excluded.updated_at "
-                        "RETURNING version",
-                        ns,
-                        now,
-                    )
-                    assert vrow is not None, "state_version upsert returned no row"
-                    bumped.append((ns, int(vrow["version"])))
+                bumped = await self._bump_state_versions(conn, (n for n, _ in purged_keys), now)
         # Commit succeeded → evict the purged keys from the read-through cache.
         for ck in purged_keys:
             # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
