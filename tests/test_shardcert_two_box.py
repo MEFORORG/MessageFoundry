@@ -879,6 +879,7 @@ async def test_engine_ladder_does_not_wait_for_a_soak_after_its_climb_aborts(
         {"soak_rate": 10.0, "drain_timeout": float("nan")},
         {"soak_rate": 10.0, "drain_timeout": [1]},
         {"soak_rate": 10**400},
+        {"skip": "false", "soak_rate": 10.0},
     ],
 )
 async def test_engine_ladder_refuses_a_malformed_ladder_soak(
@@ -904,11 +905,14 @@ async def test_engine_ladder_refuses_a_malformed_ladder_soak(
     monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
     _no_payload(monkeypatch)
     base = FileDropCoord(tmp_path / "coord", run_id="mal")
+    # An earlier run's soak left SHARDS_READY behind; the drive reads it before ENGINE_SETUP_FAILED.
+    base.for_run("mal.soak").post(SHARDS_READY, {"stale": True})
     kwargs = _engine_ladder_kwargs(base, tmp_path)
     kwargs["rates"] = [10.0]
     result = await asyncio.wait_for(ladder.run_engine_ladder(**kwargs), timeout=10.0)
     assert soak_calls == []
     assert "soak" not in result.rungs_armed
+    assert base.for_run("mal.soak").read(SHARDS_READY) is None
     assert any("LADDER_SOAK malformed" in n for n in result.notes), result.notes
     assert base.for_run("mal.soak").read(sc.ENGINE_SETUP_FAILED) is not None
 

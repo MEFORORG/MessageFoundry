@@ -3540,13 +3540,27 @@ async def run_engine_ladder(
             break
 
     soak_coord = base_coord.for_run(f"{base_coord.run_id}.soak")
-    if climb_aborted:
-        result.notes.append("no soak: the climb aborted")
-        # A drive that was slow rather than gone may still reach the soak. Tell it at once rather than
-        # leave it waiting out its SHARDS_READY window. Best effort, as below.
-        with contextlib.suppress(OSError):
-            soak_coord.post(ENGINE_SETUP_FAILED, {"reason": "the engine half aborted its climb"})
+
+    def refuse_soak(note: str, reason: str) -> EngineLadderResult:
+        # Tell the drive at once rather than leave it waiting out its SHARDS_READY window. An earlier run
+        # under this run_id may have left its soak's SHARDS_READY and drain results here, and the drive
+        # reads SHARDS_READY before ENGINE_SETUP_FAILED, so they go first. Best effort, as in
+        # _reset_store_or_signal: a coord write error must not replace this half's own outcome, and it
+        # is recorded rather than dropped.
+        result.notes.append(note)
+        try:
+            soak_coord.clear_messages(
+                SHARDS_READY, DRIVE_START, ENGINE_DRAINED, ENGINE_RUNG_REPORT, RUNG_ABORTED
+            )
+            soak_coord.post(ENGINE_SETUP_FAILED, {"reason": reason})
+        except OSError as exc:
+            log.warning("could not tell the drive half there is no soak: %s", exc)
+            result.notes.append(f"could not tell the drive half there is no soak ({exc})")
         return result
+
+    if climb_aborted:
+        # A drive that was slow rather than gone may still reach the soak.
+        return refuse_soak("no soak: the climb aborted", "the engine half aborted its climb")
 
     # Soak: the drive picks the rate (highest sustained, or an override) and posts LADDER_SOAK.
     try:
@@ -3554,7 +3568,8 @@ async def run_engine_ladder(
     except CoordTimeout:
         result.notes.append("no LADDER_SOAK from the drive — ending without a soak")
         return result
-    if soak_msg.get("skip"):
+    skip = soak_msg.get("skip")
+    if skip is True:
         # The drive names its cause in its own report: no sustained rung, the soak disabled, or an
         # aborted climb at least.
         result.notes.append("drive signalled no soak (its report says why)")
@@ -3563,13 +3578,9 @@ async def run_engine_ladder(
     soak_rate = _soak_field(soak_msg, "soak_rate", math.nan)
     soak_hold = _soak_field(soak_msg, "hold_seconds", soak_hold_seconds)
     soak_drain = _soak_field(soak_msg, "drain_timeout", soak_drain_timeout)
-    if soak_rate is None or soak_hold is None or soak_drain is None:
-        result.notes.append("LADDER_SOAK malformed: ending without a soak")
-        # Tell the drive at once rather than leave it waiting out its SHARDS_READY window. Best effort, as
-        # in _reset_store_or_signal: a coord write error must not replace this half's own outcome.
-        with contextlib.suppress(OSError):
-            soak_coord.post(ENGINE_SETUP_FAILED, {"reason": "LADDER_SOAK malformed"})
-        return result
+    # The drive posts skip as true or not at all; any other value is as malformed as a bad number.
+    if skip not in (None, False) or soak_rate is None or soak_hold is None or soak_drain is None:
+        return refuse_soak("LADDER_SOAK malformed: ending without a soak", "LADDER_SOAK malformed")
     soak_rung = LadderRung(
         index=-1,
         ingress_rate=soak_rate,
