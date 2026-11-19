@@ -438,7 +438,10 @@ def _split_candidates(member: str, root: str | None) -> list[list[str]]:
     # Resolved and stripped on the components as written: normalising first would turn ``..`` into
     # an empty string that no longer climbs.
     raw = _parts(member)
-    readings = [raw, _resolve_dots(raw)[0]]
+    # ``.. `` is read both as the ``..`` it climbs as and as the empty component that stripping
+    # its trailing space and dots leaves, so neither reading hides a run behind it.
+    dropped = [part for part in raw if part == ".." or part.rstrip(" ") != ".."]
+    readings = [raw, _resolve_dots(raw)[0], dropped]
     if root is not None:
         key = _normalise(root)
         readings += [parts[1:] for parts in readings if parts and _normalise(parts[0]) == key]

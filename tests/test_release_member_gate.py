@@ -824,6 +824,7 @@ def test_a_member_inside_the_archive_does_not_escape(member: str) -> None:
         (". /messagefoundry/x.py", "messagefoundry-toolkit"),
         ("messagefoundry_toolkit/.. /messagefoundry/x.py", "messagefoundry-toolkit"),
         ("messagefoundry/. /anon/x.py", "messagefoundry"),
+        ("messagefoundry/.. /anon/__init__.py", "messagefoundry"),
     ],
 )
 def test_a_dot_segment_with_a_trailing_space_is_still_a_dot_segment(member: str, dist: str) -> None:
