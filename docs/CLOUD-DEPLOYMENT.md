@@ -372,9 +372,10 @@ TLS-terminating collector).
    optional `api-tls-key-password`).
 4. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with all three `image:` fields
    (`tls-dir`, `copy-tls` and `engine`) set to your baked image and `MEFOR_STORE_SERVER` set to the managed-PG endpoint.
-   Replace every `REPLACE` value in its block *what an enforcing start needs*: the engine starts under
-   `[security].enforcement = enforce`, and refuses until at least the alert channel, the log forwarding
-   and the retention bounds there are yours.
+   Uncomment every entry in its block *what an enforcing start needs* and give it your own value. They
+   ship commented, so as shipped the engine, which starts under `[security].enforcement = enforce`,
+   refuses to start until at least the alert channel, the log forwarding and the retention bounds
+   there are set.
 5. **Stand up the L4 NLB** (one listener per MLLP port, primary-only TCP-connect health check at a ~10s
    interval, deregistration delay ~60s) per [§3](#3-mllp-exposure--an-operator-built-l4-load-balancer-that-follows-failover).
 6. **Verify HA:** `GET /cluster/nodes` shows 3 nodes + one `leader_node_id`; delete the leader pod and

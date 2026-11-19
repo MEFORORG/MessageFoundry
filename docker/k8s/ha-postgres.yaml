@@ -272,36 +272,41 @@ spec:
             # [store].encrypt defaults true + trust_server_certificate defaults false — the DB connection is
             # TLS-verified. Give the managed DB a CA-trusted cert; do NOT set MEFOR_ALLOW_INSECURE_TLS.
             - { name: MEFOR_CLUSTER_ENABLED, value: "true" }        # the leader lease + graph gating come on here
-            # --- what an enforcing start needs (BACKLOG ##5934) ---
-            # [security].enforcement defaults to enforce, and nothing here lowers it, so serve refuses to
-            # start until each block below holds. Replace every REPLACE value with your own. At least
-            # these gates read them; serve's refusal message names any other one your config trips.
+            # --- what an enforcing start needs (BACKLOG #5934) ---
+            # [security].enforcement defaults to enforce and nothing here lowers it. As shipped, serve
+            # REFUSES to start: the inputs below are commented out, because a placeholder value would
+            # pass these gates and start an engine whose notices and logs go nowhere. Uncomment each
+            # line and give it your own value. At least these gates read them; serve's refusal
+            # message names any other one your config trips.
             # Security notices and credential reminders (ASVS 6.3.5/6.3.7/6.4.5): an SMTP relay, a
             # sender and a recipient. The relay hop verifies its certificate by default.
-            - { name: MEFOR_ALERTS_EMAIL_SMTP_HOST, value: "REPLACE-smtp.example.org" }
-            - { name: MEFOR_ALERTS_SMTP_ALLOWED_HOSTS, value: "REPLACE-smtp.example.org" }
-            - { name: MEFOR_ALERTS_EMAIL_FROM, value: "REPLACE-mefor@example.org" }
-            - { name: MEFOR_ALERTS_EMAIL_TO, value: "REPLACE-mefor-ops@example.org" }
+            # - { name: MEFOR_ALERTS_EMAIL_SMTP_HOST, value: "REPLACE-smtp.example.org" }
+            # - { name: MEFOR_ALERTS_SMTP_ALLOWED_HOSTS, value: "REPLACE-smtp.example.org" }
+            # - { name: MEFOR_ALERTS_EMAIL_FROM, value: "REPLACE-mefor@example.org" }
+            # - { name: MEFOR_ALERTS_EMAIL_TO, value: "REPLACE-mefor-ops@example.org" }
             # Off-box log forwarding: verified TLS to a collector that is not this host (ADR 0200),
-            # on the egress allowlist block_unlisted_outbound requires. The CA and CRL are baked into
-            # the config image under /config, root-owned like the config itself, because the engine
+            # on the egress allowlist block_unlisted_outbound requires. Bake the CA and CRL into the
+            # config image under /config, root-owned like the config itself, because the engine
             # refuses a CA another account could replace. Rebuild the image with a fresh CRL before
             # the baked one's nextUpdate.
-            - { name: MEFOR_LOGGING_FORWARD_HOST, value: "REPLACE-siem.example.org" }
-            - { name: MEFOR_LOGGING_FORWARD_PORT, value: "6514" }     # RFC 5425; use your collector's port
-            - { name: MEFOR_LOGGING_FORWARD_PROTOCOL, value: "tls" }
-            - { name: MEFOR_LOGGING_FORWARD_TLS_CA_FILE, value: "/config/pki/syslog-ca.pem" }
-            - { name: MEFOR_LOGGING_FORWARD_TLS_CRL_FILE, value: "/config/pki/syslog-crl.pem" }
-            - { name: MEFOR_EGRESS_ALLOWED_SYSLOG, value: "REPLACE-siem.example.org" }
+            # - { name: MEFOR_LOGGING_FORWARD_HOST, value: "REPLACE-siem.example.org" }
+            # - { name: MEFOR_LOGGING_FORWARD_PORT, value: "6514" }
+            # - { name: MEFOR_LOGGING_FORWARD_PROTOCOL, value: "tls" }
+            # - { name: MEFOR_LOGGING_FORWARD_TLS_CA_FILE, value: "/config/pki/syslog-ca.pem" }
+            # - { name: MEFOR_LOGGING_FORWARD_TLS_CRL_FILE, value: "/config/pki/syslog-crl.pem" }
+            # - { name: MEFOR_EGRESS_ALLOWED_SYSLOG, value: "REPLACE-siem.example.org" }
             # Retention bounds (ASVS 14.2.7). The message-body and dead-letter windows default on;
-            # these two tiers need a window or an acknowledgement. Transform state takes the
-            # acknowledgement, which the gate names as the safe answer there: a window deletes it by
-            # write time, while a Handler may still be using it.
-            - { name: MEFOR_RETENTION_SEARCH_PRESET_DAYS, value: "30" }
-            - { name: MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY, value: "true" }
+            # these two tiers need a window or an acknowledgement, and both are your decision. For
+            # transform state the gate names the acknowledgement as the safe answer: a window deletes
+            # it by write time, while a Handler may still be using it.
+            # - { name: MEFOR_RETENTION_SEARCH_PRESET_DAYS, value: "REPLACE-days" }
+            # - { name: MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY, value: "true" }
             # The store hop checks revocation: under enforce, a verified Postgres hop with no CRL
-            # refuses at store open. Baked into the config image as the syslog CRL is.
-            - { name: MEFOR_STORE_SSL_CRL_FILE, value: "/config/pki/store-crl.pem" }
+            # refuses at store open. Postgres only: a SQL Server store refuses this setting at load.
+            # Every replica reads the same file, so a baked CRL expires on all three at once at its
+            # nextUpdate; replace it before then, with a coordinated rollout (docs/CLOUD-DEPLOYMENT.md
+            # section 4).
+            # - { name: MEFOR_STORE_SSL_CRL_FILE, value: "/config/pki/store-crl.pem" }
             # The log spool (ADR 0200): a writable directory for records the collector has not yet
             # taken. The root file system is read-only and these pods have no PVC, so it is the
             # log-spool emptyDir below. Records still spooled are lost when the pod is deleted.
