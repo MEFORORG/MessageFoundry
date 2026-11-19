@@ -642,9 +642,10 @@ class Engine:
         self._applied_config_version: int = 0
         self._config_version_seeded = False
         # Transform-state read-through convergence (Track B Step 6b). Spawned ONLY where another process
-        # shares a converging store (_start_state_convergence), so a lone process never pays for it. Each tick it read-throughs any namespace a
-        # sibling node wrote/purged into this node's local _state_cache (off the hot path, so state_get
-        # stays a pure sync dict lookup). Mirrors _config_convergence's lifecycle.
+        # shares a converging store (_start_state_convergence), so a lone process never pays for it.
+        # Each tick it read-throughs any namespace a sibling process wrote/purged into this process's
+        # _state_cache (off the hot path, so state_get stays a pure sync dict lookup). Mirrors
+        # _config_convergence's lifecycle.
         self._state_convergence: StateConvergenceRunner | None = None
         # The active environment name ([ai].environment / serve --env), passed to every runner this
         # engine builds so a Handler's current_environment() resolves to it (per-face transform logic).
@@ -1907,7 +1908,7 @@ class Engine:
         #5984). Reuses the cluster heartbeat interval (owner decision) and the engine's alert sink."""
         if not self._shares_transform_state():
             return
-        if not self.store.converges_transform_state:
+        if not getattr(self.store, "converges_transform_state", False):
             log.warning(
                 "transform state does not converge across the processes sharing this store: the "
                 "%s backend has no state read-through, so a state_get on one cluster node or engine "
@@ -2676,7 +2677,9 @@ class Engine:
             # (Single-node NullCoordinator is_clustered() is False, so this never runs there; its boot
             # residue was already recovered by the unconditional reset_stale_inflight in start().)
             await self.store.reset_stale_inflight()
-        if self._coordinator.is_clustered() and not self.store.converges_transform_state:
+        if self._coordinator.is_clustered() and not getattr(
+            self.store, "converges_transform_state", False
+        ):
             # BACKLOG #5984: this backend cannot converge transform state while it runs, and a standby
             # warmed its cache at open, so it would serve state as of its own start while the prior
             # leader went on writing. Re-read it whole here, before the workers start. A write the

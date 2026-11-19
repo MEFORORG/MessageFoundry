@@ -603,8 +603,8 @@ class QueueStore(StoreLifecycle, Protocol):
     def enable_state_convergence(self) -> None:
         """Turn on per-namespace state-version bumping for cross-node convergence (Track B Step 6b). The
         engine calls this only where another process shares the store, a cluster
-        (``coordinator.is_clustered()``) or an engine shard of a multi-shard config, BEFORE workers start, so a
-        sibling's :meth:`converge_state_cache` sees every write. Single-node never calls it → no version
+        (``coordinator.is_clustered()``) or an engine shard of a multi-shard config, BEFORE workers
+        start, so a sibling's :meth:`converge_state_cache` sees every write. Single-node never calls it → no version
         writes → byte-identical. A no-op on backends without cross-node convergence (SQLite, SQL Server)."""
         ...
 

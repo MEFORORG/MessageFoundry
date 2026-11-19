@@ -6,7 +6,8 @@ where the store really converges.
 Three defects, each pinned here. A clustered engine over a backend whose ``converge_state_cache`` is a
 no-op (SQL Server) started a ``StateConvergenceRunner`` whose start line announced a convergence nothing
 performed. An engine shard of a multi-shard config runs the NullCoordinator over the same unified store,
-so it never started the runner, nor turned on the version bump a sibling shard's runner reads. And a
+so it never started the runner, nor turned on the version bump a sibling engine shard's runner
+reads. And a
 SQL Server standby promoted to leader served the state cache it warmed at open. No DB is needed: the
 engine tests run over SQLite with a stand-in coordinator, the store test over a bare SQL Server handle.
 """
@@ -50,7 +51,7 @@ class _ClusterCoordinator(NullCoordinator):
 
 
 def _graph(cfgdir: Path, tmp_path: Path, *, shards: tuple[str, ...] = ()) -> None:
-    """One inbound per shard tag (one untagged inbound when ``shards`` is empty)."""
+    """One inbound per engine-shard tag (one untagged inbound when ``shards`` is empty)."""
     cfgdir.mkdir()
     lines = ["from messagefoundry import inbound, outbound, router, handler, Send, File"]
     for i, shard in enumerate(shards or (None,)):
@@ -123,8 +124,8 @@ async def test_an_engine_shard_turns_on_convergence(tmp_path: Path) -> None:
     eng.add_registry(filter_registry_for_shard(load_config(cfgdir), "a"))
     await eng.start()
     try:
-        assert enabled == [1]  # the sibling shard's runner can see this shard's writes
-        assert eng._state_convergence is not None  # and this shard reads through the sibling's
+        assert enabled == [1]  # the sibling engine shard's runner sees this engine shard's writes
+        assert eng._state_convergence is not None  # and this engine shard reads the sibling's
     finally:
         await eng.stop()
 
@@ -237,7 +238,7 @@ def test_postgres_records_only_a_contiguous_own_bump() -> None:
 
     store: Any = object.__new__(PostgresStore)
     store._state_versions = {"corr": 5, "solo": 3}
-    # "corr": a sibling shard bumped to 6 before this handle's own write bumped to 7, so recording 7
+    # "corr": a sibling engine shard bumped to 6 before this handle's own write bumped to 7, so recording 7
     # would make the next converge skip the sibling's write. "solo": contiguous, so 4 is reflected.
     # "new": this handle's write created the namespace at version 1.
     store._record_own_state_bumps([("corr", 7), ("solo", 4), ("new", 1)])
@@ -260,3 +261,27 @@ async def test_postgres_open_reads_versions_before_rows() -> None:
     await store._load_state_cache()
     assert order == ["versions", "rows"]  # a write between the reads leaves the version behind
     assert store._state_versions == {"ns": 9}
+
+
+async def test_postgres_converge_merge_leaves_the_namespace_for_a_clean_reseed() -> None:
+    from messagefoundry.store.postgres import PostgresStore
+
+    cipher = make_cipher(generate_key())
+    store: Any = object.__new__(PostgresStore)
+    store._cipher = cipher
+    store._state_cache = new_state_cache()
+    store._state_cache[("corr", "K")] = "local, stale"
+    store._state_versions = {"corr": 5}
+
+    async def _fetchall(sql: str, *args: Any) -> list[dict[str, Any]]:
+        if "state_version" in sql:
+            return [{"namespace": "corr", "version": 7}]
+        # A local write's gap record lands while the rows are read, as on an engine shard.
+        store._state_versions["corr"] = 6
+        aad = cell_aad("state", "value", "corr", "K")
+        return [{"key": "K", "value": cipher.encrypt(json.dumps("sibling"), aad=aad)}]
+
+    store._fetchall = _fetchall
+    assert await store.converge_state_cache() == ["corr"]
+    assert store._state_cache[("corr", "K")] == "local, stale"  # the merge keeps the local value
+    assert store._state_versions == {"corr": 6}  # below the shared 7, so the next tick reseeds

@@ -2196,8 +2196,9 @@ class PostgresStore:
         # open (_load_state_cache) and advanced on every gated transform_handoff/purge_state bump.
         self._state_versions: dict[str, int] = {}
         # Gates the in-txn state-version bump. The engine flips it on (enable_state_convergence) only where
-        # another process shares the store (a cluster, or engine shards), BEFORE workers start; single-node never turns it on, so no state_version rows are ever
-        # written and the backend stays byte-identical.
+        # another process shares the store (a cluster, or engine shards), BEFORE workers start; a lone
+        # process never turns it on, so no state_version rows are ever written and the backend stays
+        # byte-identical.
         self._cluster_state_convergence: bool = False
         # H1 fencing token: the leader epoch this node currently holds + the leader_lease row to validate
         # it against, both pushed by the engine on promotion via set_leader_epoch() (the store NEVER
@@ -3528,11 +3529,15 @@ class PostgresStore:
                 # window, advancing the DB version past `version`. A destructive reseed from the stale
                 # `fresh` would drop that just-committed local key; merge non-destructively instead
                 # (setdefault keeps any newer local value) so the sibling rows we read still land. We
-                # deliberately record `version` (< the DB version the local write bumped to) so the next
-                # tick does a clean reseed that reconciles any sibling deletes this merge could not see.
+                # deliberately record `version - 1`, below the version just scanned, so the next tick
+                # does a clean reseed that reconciles any sibling update or delete this merge kept a
+                # stale local value over. Recording `version` was safe only while the local write
+                # always landed after the scan; with engine shards writing at once it can land before
+                # it, and the scanned version is then the shared one (BACKLOG #5984).
                 for k, v in fresh.items():
                     if (ns, k) not in self._state_cache:  # setdefault would decrypt the kept value
                         self._state_cache[(ns, k)] = v
+                version -= 1
             self._state_versions[ns] = version
             refreshed.append(ns)
         return refreshed
